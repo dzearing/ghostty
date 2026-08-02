@@ -30,10 +30,13 @@
 # Without that check "nothing happened" is equally consistent with the keys never
 # arriving (the T240 lesson).
 #
-# The restored window is created with `+new-window --target=` on purpose. Its
-# blob is keyed by that ipc name, which is stable across app runs; an unnamed
-# window's key is index-derived (`win-0`), and the relaunched app's own blank
-# window overwrites it before the user can press anything (T338).
+# The fixture builds TWO multi-pane windows and both must come back: one named
+# with `+new-window --target=`, and one the user never named, which carries only
+# the auto ipc name (`window-N`) the app allocates. That second window is the
+# T338 case: its key used to be that per-run name, so the relaunched app's own
+# blank startup window claimed it and overwrote the topology inside the layout
+# debounce - before anyone could press anything. Keys are per-window uuids now,
+# so the correct answer is two rebuilt windows, not one.
 #
 # T248: the repo's agent AND its app are killed at setup and the agent's state is
 # dropped, so the fixture is built fresh instead of measuring the previous run's
@@ -153,15 +156,23 @@ function Layouts-Store {
     return @($doc.layouts)
 }
 
-# Poll until the named window's blob claims $n session ids. A record can exist
-# before its panes have published their ids (the OPEN reply is async and
-# syncSessionLayout re-arms a retry), so waiting for EXISTENCE would race a
-# correct implementation (the T334 lesson).
-function Wait-BlobIds($key, $n, $timeoutSec = 30) {
+# Poll until the blob of the window named $ipcName claims $n session ids. A
+# record can exist before its panes have published their ids (the OPEN reply is
+# async and syncSessionLayout re-arms a retry), so waiting for EXISTENCE would
+# race a correct implementation (the T334 lesson).
+#
+# The lookup goes through the BLOB's `ipc_name`, not the record key: since T338
+# the key is the window's stable uuid, which is exactly the point - no key in
+# this store is derived from anything the app re-allocates per run.
+function Wait-BlobIds($ipcName, $n, $timeoutSec = 30) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $rec = $null
     while ((Get-Date) -lt $deadline) {
-        $rec = @(Layouts-Store | Where-Object { $_.key -eq $key }) | Select-Object -First 1
+        $rec = @(Layouts-Store | Where-Object {
+                $w = $null
+                try { $w = $_.blob | ConvertFrom-Json } catch {}
+                $null -ne $w -and $w.ipc_name -eq $ipcName
+            }) | Select-Object -First 1
         if ($null -ne $rec -and @($rec.session_ids).Count -ge $n) { return $rec }
         Start-Sleep -Milliseconds 500
     }
@@ -278,21 +289,37 @@ try {
 
     # --- 2. the rule's positive side ---------------------------------------
     Write-Host ''
-    Write-Host '2. a 3-pane named window makes the button appear'
+    Write-Host '2. two multi-pane windows - one named, one only auto-named'
+    # The startup window is the T338 fixture: the user never named it, so its
+    # only ipc name is the auto `window-N` the app allocates from a per-process
+    # counter - the very name the relaunched app hands its own blank window.
+    $shapes0 = @(Get-WindowShapes)
+    $autoName = if ($shapes0.Count -ge 1) { $shapes0[0].Name } else { '' }
+    Assert ($autoName -match '^window-\d+$') "the startup window carries an auto ipc name ($autoName)"
+    & $Exe +split --target=$autoName --direction=down 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+
     & $Exe +new-window --target=t335-multi 2>$null | Out-Null
     Start-Sleep -Seconds 2
     & $Exe +split --target=t335-multi --direction=right 2>$null | Out-Null
     Start-Sleep -Seconds 2
     & $Exe +split --target=t335-multi --direction=down 2>$null | Out-Null
-    $alive2 = @(Wait-AliveCount 4)
-    Assert ($alive2.Count -ge 4) "the machine now has four live sessions ($($alive2.Count))"
+    $alive2 = @(Wait-AliveCount 5)
+    Assert ($alive2.Count -ge 5) "the machine now has five live sessions ($($alive2.Count))"
 
-    # The blob is the thing Restore All reads, so wait for it to SETTLE here
-    # rather than discovering mid-rebuild that it was still filling in.
+    # The blobs are the thing Restore All reads, so wait for them to SETTLE here
+    # rather than discovering mid-rebuild that they were still filling in.
     $blob = Wait-BlobIds 't335-multi' 3
     Assert ($null -ne $blob -and @($blob.session_ids).Count -eq 3) `
-        "the agent holds the window's layout with its three session ids ($(@($blob.session_ids).Count))"
+        "the agent holds the named window's layout with its three session ids ($(@($blob.session_ids).Count))"
     $multiIds = if ($null -ne $blob) { @($blob.session_ids) } else { @() }
+
+    $blobAuto = Wait-BlobIds $autoName 2
+    Assert ($null -ne $blobAuto -and @($blobAuto.session_ids).Count -eq 2) `
+        "and the auto-named window's, with its two ($(@($blobAuto.session_ids).Count))"
+    $autoIds = if ($null -ne $blobAuto) { @($blobAuto.session_ids) } else { @() }
+    Assert ($null -ne $blobAuto -and $blobAuto.key -ne $autoName) `
+        'the auto-named window is keyed by something other than its per-run name (T338)'
 
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'the chooser reopens'
@@ -314,7 +341,7 @@ try {
     Stop-RepoProcesses @('ghoztty')
     Remove-LayoutManifest
     $orphans = @(Get-AliveSessions)
-    Assert ($orphans.Count -ge 4) "the sessions outlived the app ($($orphans.Count) alive)"
+    Assert ($orphans.Count -ge 5) "the sessions outlived the app ($($orphans.Count) alive)"
 
     $g = Launch-Gui $errlog2 @('--session-persistence=true')
     if (-not $g) { Write-Host 'SETUP FAIL: GUI died on relaunch'; exit 1 }
@@ -347,12 +374,20 @@ try {
     Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed itself onto the rebuild'
 
     $shapesAfter = @(Get-WindowShapes)
-    Assert ($shapesAfter.Count -eq ($shapesBefore.Count + 1)) `
-        "exactly one window came back ($($shapesBefore.Count) -> $($shapesAfter.Count))"
+    Assert ($shapesAfter.Count -eq ($shapesBefore.Count + 2)) `
+        "both windows came back ($($shapesBefore.Count) -> $($shapesAfter.Count))"
     $restored = @($shapesAfter | Where-Object { $_.Name -eq 't335-multi' }) | Select-Object -First 1
     Assert ($null -ne $restored) 'the rebuilt window kept its ipc name'
     Assert ($null -ne $restored -and $restored.Panes -eq 3) `
         "and its recorded split topology - three panes ($(if ($restored) { $restored.Panes } else { 0 }))"
+    # The auto-named window is identified by SHAPE, not by name: its recorded
+    # `window-N` collides with the one the relaunched app already handed its own
+    # blank window, and which registration survives that is T121's question, not
+    # this one's. The blank window is single-pane; a 2-pane window can only be
+    # the rebuilt one.
+    $restoredAuto = @($shapesAfter | Where-Object { $_.Panes -eq 2 }) | Select-Object -First 1
+    Assert ($null -ne $restoredAuto) `
+        'the window the user never named came back too, with its two panes (T338)'
 
     # The independent oracle: the agent, dialled directly, now reports a viewer
     # on every one of those sessions. Nothing about this reading goes through
@@ -361,6 +396,9 @@ try {
     $attachedAfter = @(Get-Sessions | Where-Object { $multiIds -contains $_.id -and $_.attached }).Count
     Assert ($attachedAfter -eq 3) `
         "the agent reports all three original sessions ATTACHED ($attachedAfter of 3)"
+    $attachedAuto = @(Get-Sessions | Where-Object { $autoIds -contains $_.id -and $_.attached }).Count
+    Assert ($attachedAuto -eq 2) `
+        "and both of the auto-named window's sessions ATTACHED ($attachedAuto of 2)"
 
     # --- 4. the double-attach guard ----------------------------------------
     Write-Host ''

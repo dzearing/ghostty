@@ -1125,10 +1125,18 @@ pub fn syncSessionLayout(self: *App) void {
 ///     its repaint without waiting on any ack.
 ///   * **Convergent.** The push is a full RECONCILE against `pushed_layouts`,
 ///     not an incremental edit: unchanged windows cost nothing, changed windows
-///     are re-pushed, and vanished keys are deleted. That is what lets the key
-///     be the manifest's index-derived id — closing window 0 renames window 1
-///     to `win-0`, and the reconcile pushes `win-0`'s new bytes and deletes the
-///     now-absent `win-1` in the same pass.
+///     are re-pushed, and vanished keys are deleted. `pushed_layouts` holds only
+///     what THIS run pushed, so the delete pass can never reach a previous run's
+///     blobs — which is the whole point of the store.
+///
+/// The key is `Window.layout_uuid` (T338), not the manifest's `id`. The id is
+/// unique within one file but not across app runs: the auto IPC name
+/// `window-N` comes from a per-process counter and `win-{index}` is a position
+/// in this run's window list, so run 2's first window pushed under run 1's
+/// first window's key. Since the push is an upsert, the relaunched app's blank
+/// startup window overwrote the topology inside the 250ms layout debounce —
+/// destroying the record precisely in the crash-with-no-manifest case that
+/// "Restore All" exists for.
 fn pushLayoutBlobs(self: *App, file: session_layout.File) void {
     const gpa = self.core_app.alloc;
 
@@ -1154,29 +1162,33 @@ fn pushLayoutBlobs(self: *App, file: session_layout.File) void {
     var live: std.StringHashMapUnmanaged(void) = .empty;
     defer live.deinit(gpa);
     for (file.windows) |win| {
-        live.put(gpa, win.id, {}) catch {};
+        // T338: the key is the window's stable uuid, NOT its manifest `id`.
+        // `orelse win.id` covers only a blob-sourced window written by a
+        // pre-T338 build; every window this app captures has a uuid.
+        const key = win.uuid orelse win.id;
+        live.put(gpa, key, {}) catch {};
 
         const blob = layout_blobs.serializeWindow(arena, win) catch |err| {
-            log.warn("layout push: serialize '{s}' failed err={}", .{ win.id, err });
+            log.warn("layout push: serialize '{s}' failed err={}", .{ key, err });
             continue;
         };
         const hash = layout_blobs.blobHash(blob);
-        if (self.pushed_layouts.get(win.id)) |prev| {
+        if (self.pushed_layouts.get(key)) |prev| {
             if (prev == hash) continue;
         }
         const ids = layout_blobs.sessionIds(arena, win) catch |err| {
-            log.warn("layout push: session ids for '{s}' failed err={}", .{ win.id, err });
+            log.warn("layout push: session ids for '{s}' failed err={}", .{ key, err });
             continue;
         };
-        conn.setLayoutNoWait(win.id, blob, ids, false) catch |err| {
-            log.warn("layout push: SET_LAYOUT '{s}' failed err={}", .{ win.id, err });
+        conn.setLayoutNoWait(key, blob, ids, false) catch |err| {
+            log.warn("layout push: SET_LAYOUT '{s}' failed err={}", .{ key, err });
             continue;
         };
-        // Own the key: `win.id` lives in the caller's capture arena.
-        const gop = self.pushed_layouts.getOrPut(gpa, win.id) catch continue;
+        // Own the key: it lives in the caller's capture arena.
+        const gop = self.pushed_layouts.getOrPut(gpa, key) catch continue;
         if (!gop.found_existing) {
-            gop.key_ptr.* = gpa.dupe(u8, win.id) catch {
-                _ = self.pushed_layouts.remove(win.id);
+            gop.key_ptr.* = gpa.dupe(u8, key) catch {
+                _ = self.pushed_layouts.remove(key);
                 continue;
             };
         }
@@ -1327,6 +1339,9 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
                 try arena.dupe(u8, n)
             else
                 try std.fmt.allocPrint(arena, "win-{d}", .{wi}),
+            // The identity that survives this app run (T338). `id` above does
+            // not: both spellings restart per process.
+            .uuid = try arena.dupe(u8, win.layoutUuid()),
             .frame = frame_max.frame,
             .maximized = frame_max.maximized,
             .title_override = if (win.title_override) |t| try arena.dupe(u8, t) else null,
@@ -1593,6 +1608,12 @@ fn restoreWindow(
     const window = self.createWindow(.{
         .surface_overrides = &ov0,
         .ipc_name = win.ipc_name,
+        // Re-adopt the layout identity (T338) so the rebuilt window keeps
+        // pushing to the key its predecessor used, instead of orphaning that
+        // blob and adding a duplicate under a fresh one. Applies to both
+        // rebuild sources — the local manifest and an agent-held blob — since
+        // both arrive here as a `session_layout.Window`.
+        .layout_uuid = win.uuid,
     }) catch |err| {
         // Ownership transfers to the window, so a window that was never created
         // leaves the dial to us — the same contract `openDialedWindow` keeps,

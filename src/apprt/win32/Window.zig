@@ -94,6 +94,7 @@ const system_colors = @import("system_colors.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
 const window_memory = @import("window_memory.zig");
+const pane_id = @import("pane_id.zig");
 const host_defaults = @import("host_defaults.zig");
 const commands = @import("commands.zig");
 const menu_bar = @import("menu_bar.zig");
@@ -359,6 +360,18 @@ title_override: ?[:0]u8 = null,
 /// terminals (not IPC-addressable) or if registration failed.
 ipc_name: ?[]u8 = null,
 
+/// This window's stable layout identity (T338) — the key its agent-side
+/// layout blob is pushed under, and what `session_layout.Window.uuid`
+/// records. Generated once here and re-adopted by every restore, because
+/// nothing else about a window survives an app run: `ipc_name` is
+/// auto-allocated `window-N` from a counter that restarts at 1, and a
+/// `win-{index}` id is a position in this run's window list. Keyed on either
+/// of those, the relaunched app's blank startup window claims the dead run's
+/// blob and the topology "Restore All" exists to read is gone before anyone
+/// can press it. Fixed-size (no allocation, no failure path) — a window
+/// always has one, valid from the top of `init`.
+layout_uuid: pane_id.Buf = [_]u8{'0'} ** pane_id.len,
+
 /// Hero mode (fork feature, T19; TRUE port T58/T59a): per-tab presentation
 /// state. The split tree is untouched — the selected leaf fills the hero
 /// region on the left; every other leaf is HIDDEN (renderer kept awake)
@@ -415,6 +428,15 @@ pub const InitOptions = struct {
     /// Canonical IPC name for this window (`+new-window --target`).
     /// Borrowed; duped at registration. Null → auto-generated `window-N`.
     ipc_name: ?[]const u8 = null,
+
+    /// The stable layout identity to ADOPT instead of generating a fresh one
+    /// (T338): `session_layout.Window.uuid` for the window being restored,
+    /// whether from the local manifest or from an agent-held layout blob. A
+    /// restored window MUST keep pushing to the key its predecessor used, or
+    /// the rebuild leaves the old blob orphaned and pushes a duplicate under a
+    /// new one. Borrowed for this init only (copied into the window's own
+    /// buffer); ignored when malformed. Null ⇒ generate.
+    layout_uuid: ?[]const u8 = null,
 };
 
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
@@ -609,6 +631,21 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         .pending_surface_overrides = options.surface_overrides,
     };
 
+    // Stable layout identity (T338), before anything can capture a layout.
+    // A malformed recorded value is discarded rather than adopted: a bad key
+    // costs the user this window's restorability either way, and generating a
+    // fresh one at least keeps the store's keys well-formed.
+    if (options.layout_uuid) |u| {
+        if (pane_id.isValid(u)) {
+            @memcpy(&self.layout_uuid, u);
+        } else {
+            log.warn("ignoring malformed layout uuid (len={d})", .{u.len});
+            _ = pane_id.generate(&self.layout_uuid);
+        }
+    } else {
+        _ = pane_id.generate(&self.layout_uuid);
+    }
+
     const style: u32 = if (options.is_quick_terminal)
         w32.WS_POPUP
     else if (app.config.@"window-decoration" == .none)
@@ -792,6 +829,13 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 }
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
+/// This window's stable layout identity (T338). Valid from the top of `init`
+/// onward; the same value for the window's whole life, including across a
+/// restore that re-adopted it.
+pub fn layoutUuid(self: *const Window) []const u8 {
+    return &self.layout_uuid;
+}
+
 pub fn deinit(self: *Window) void {
     // Close the rename dialog / machine chooser first (each re-enables and
     // refocuses this window's HWND, which must still be alive).

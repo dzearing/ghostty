@@ -17,7 +17,8 @@
 //! ## On-disk shape
 //!
 //!   {"version":1,"windows":[
-//!     {"id":"win-0","frame":{"x":..,"y":..,"w":..,"h":..},"maximized":false,
+//!     {"id":"win-0","uuid":"<uuid>","frame":{"x":..,"y":..,"w":..,"h":..},
+//!      "maximized":false,
 //!      "title_override":..?,"ipc_name":..?,"active_tab":0,
 //!      "tabs":[{"nodes":[{"split":{"layout":"horizontal","ratio":0.5,
 //!                                  "left":1,"right":2}},
@@ -128,8 +129,23 @@ pub const Tab = struct {
 
 /// One window: outer placement, the window-level title pin (T92), its IPC name
 /// (`+new-window --target`), the active tab index, and its tabs in order.
+///
+/// `id` identifies the window WITHIN one file: the IPC name when it has one,
+/// else `win-{index}`. It is deliberately NOT stable across app runs — the
+/// auto IPC name (`window-N`) and the index both restart per process — so it
+/// may only ever be used to tell this file's windows apart.
+///
+/// `uuid` is the window's stable identity ACROSS runs (T338): generated once
+/// when the window is created and re-adopted by every restore, so a key derived
+/// from it still names the same window after a quit, a crash, or a rebuild.
+/// That is what the agent-side layout blob is keyed on — with `id` as the key,
+/// the relaunched app's blank startup window took the dead run's key and
+/// silently overwrote the topology "Restore All" exists to read. Additive and
+/// optional: a manifest written by a pre-T338 build has none, and the reader
+/// falls back to `id` exactly as before.
 pub const Window = struct {
     id: []const u8,
+    uuid: ?[]const u8 = null,
     frame: ?Frame = null,
     maximized: bool = false,
     title_override: ?[]const u8 = null,
@@ -383,6 +399,45 @@ test "writeAtomic + load round-trip; no .tmp leftover; missing file loads null" 
         "abcabcabcabcabcabcabcabcabcabcab",
         loaded.value.windows[0].tabs[0].nodes[0].leaf.?.session_id.?,
     );
+}
+
+test "window uuid round-trips, is dropped when absent, and falls back to id" {
+    const alloc = testing.allocator;
+
+    const nodes = [_]Node{.{ .leaf = .{ .session_id = "abcabcabcabcabcabcabcabcabcabcab" } }};
+    const tabs = [_]Tab{.{ .nodes = &nodes, .active = true }};
+    const windows = [_]Window{
+        .{ .id = "window-1", .uuid = "1AC1F1F0-0000-4000-8000-000000000001", .tabs = &tabs },
+        .{ .id = "win-1", .tabs = &tabs },
+    };
+    const body = try serialize(alloc, .{ .windows = &windows });
+    defer alloc.free(body);
+    // Present on the window that has one; dropped entirely on the one that
+    // doesn't (emit_null_optional_fields=false), so a pre-T338 reader sees the
+    // same bytes it always did.
+    try testing.expect(std.mem.indexOf(u8, body, "\"uuid\":\"1AC1F1F0") != null);
+    try testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, body, "\"id\":\"win-1\",\"uuid\""),
+    );
+
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "1AC1F1F0-0000-4000-8000-000000000001",
+        parsed.value.windows[0].uuid.?,
+    );
+    try testing.expect(parsed.value.windows[1].uuid == null);
+
+    // A manifest from a pre-T338 build parses with a null uuid, which is what
+    // makes `uuid orelse id` the correct key derivation for both.
+    const legacy =
+        \\{"version":1,"windows":[{"id":"win-0","tabs":[{"nodes":[{"leaf":{}}]}]}]}
+    ;
+    var old = try parse(alloc, legacy);
+    defer old.deinit();
+    try testing.expect(old.value.windows[0].uuid == null);
+    try testing.expectEqualStrings("win-0", old.value.windows[0].uuid orelse old.value.windows[0].id);
 }
 
 test "parse tolerates unknown fields and missing optionals (additive interop)" {

@@ -5987,3 +5987,51 @@ Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/chooser-restore-all.ps1` ALL PASS twice (31 assertions). Regression:
 `chooser-resume.ps1`, `chooser-sessions.ps1`, `ipc-machine-chooser.ps1` (72) and
 `layout-blobs.ps1` all ALL PASS.
+
+## 2026-08-02 - T338: a window that outlives its app run needs a name that does too
+
+Restore All rebuilds what the agent holds, and for an ordinary window the agent
+no longer held it. The blob key was the manifest window id - the ipc name when a
+window has one, `win-{index}` when it does not - and NEITHER survives an app run:
+the auto ipc name `window-N` comes off a counter that restarts at 1 per process.
+So the relaunched app's blank startup window pushed under run 1's first window's
+key, the push is an upsert, and the topology was gone inside the 250ms layout
+debounce. The one case Restore All exists for - a crash that took the local
+manifest with it - is also the case that destroyed the record.
+
+Every window now carries a `layout_uuid`, generated from the same `pane_id`
+generator the panes use and re-adopted by `restoreWindow` - which covers both
+rebuild sources for free, since launch-time restore and Restore All both arrive
+there as a `session_layout.Window`. The manifest records it as an optional
+`uuid`; the key is `uuid orelse id`, and that fallback is the only path a
+pre-T338 blob can take.
+
+The consequence worth writing down: this makes the agent's store an ARCHIVE
+rather than a mirror. Old blobs stop being recycled, and nothing in the app
+bounds them - the delete pass deliberately only reaches keys THIS run pushed.
+What bounds them is `SessionStore.reapLayouts`, which drops a record once none of
+its sessions exists. That was always true; it just was not load-bearing while
+every key got overwritten anyway.
+
+The positive control is the evidence. Reverting only the key expression turned 9
+assertions red - but F3, "the dead run's record survived under its own key",
+stayed GREEN, because the key `window-1` was still there. Only its CONTENTS had
+been replaced. A test for this defect has to assert what a record SAYS, not that
+it exists.
+
+`chooser-restore-all.ps1` lost its workaround: it named its fixture window
+precisely because an explicit ipc name was the only stable key. Its startup
+window is now split too, so the crash orphans two multi-pane windows and both
+must come back (1 -> 3). The unnamed one is found by SHAPE, not name - its
+`window-N` collides with the one the relaunched app already handed its own blank
+window, which is T121's problem, not this one's.
+
+Filed T342 (that script's step-4 Tab walk failed once in two runs; a flaky
+positive control is worse than none) and T343 (in-place agent recovery still
+pairs windows to captures by POSITION, restating the capture's skip rule by hand
+- the uuid is a real key it could use).
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
+Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS.
+`layout-blobs.ps1` ALL PASS (37, incl. the new section F). `chooser-restore-all.ps1`
+ALL PASS (36).

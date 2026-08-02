@@ -12,14 +12,18 @@
 #   A. one startup window -> one record, one session id, a single-leaf blob.
 #   B. +split -> the SAME record now has 3 nodes (a split over two leaves) and
 #      TWO session ids. (Upsert, not a second record.)
-#   C. +new-window --target=blob-second -> a SECOND record, keyed by the ipc
-#      name; the first is untouched.
+#   C. +new-window --target=blob-second -> a SECOND record under its own stable
+#      key; the first is untouched.
 #   D. +close --target=blob-second -> that record is DELETED and the survivor
 #      is the first window. This is the close path, with no close hook: the
 #      sync's reconcile pass is what removes it.
 #   E. hard-kill the GUI (the quit / crash / upgrade class) -> the blobs SURVIVE
 #      in the agent. That is the whole point of the store: the machine stays
 #      restorable while no viewer is running.
+#   F. (T338) relaunch with the local manifest GONE - the crash case Restore All
+#      exists for - and the dead run's record must still be there, intact,
+#      ALONGSIDE the new window's. Keys are per-window uuids, so the new blank
+#      startup window cannot claim the dead run's key.
 #
 # Non-interactive and headless-safe: no foreground grabs, no synthetic input, so
 # it does not need the T211 background-desktop harness. Fully hermetic: a
@@ -74,6 +78,15 @@ function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 # --- the store under test ----------------------------------------------------
 
 function Layouts-Path($tmp) { Join-Path $tmp 'ghoztty\local-agent-debug\layouts.json' }
+
+# The blob key shape since T338: a window's stable uuid (8-4-4-4-12 hex), the
+# same textual form as a pane id. NOT the manifest `id` (`window-N` / `win-N`),
+# which restarts per app process and is what made a relaunch overwrite the
+# previous run's topology.
+function Is-Uuid($s) {
+    return ($s -is [string]) -and
+        ($s -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+}
 
 # Parsed layouts.json, or $null. Each element gains a decoded `.win` (the blob
 # parsed as a session-layout window) so assertions read the topology directly.
@@ -205,6 +218,9 @@ Assert "A5 the record claims exactly the live session id" (
 Assert "A6 the leaf carries that same session id" (
     $null -ne $recA -and @(Nodes $recA)[0].leaf.session_id -eq $aliveA[0])
 $keyA = if ($null -ne $recA) { $recA.key } else { '' }
+Assert "A7 the record is keyed by the window's stable uuid (T338)" (Is-Uuid $keyA)
+Assert "A8 that key is the uuid the blob itself records (T338)" (
+    $null -ne $recA -and $null -ne $recA.win -and $recA.win.uuid -eq $keyA)
 
 # ============================================================================
 "== B: a split UPSERTS the same record (two leaves, two session ids)"
@@ -227,19 +243,28 @@ Assert "B5 every live session id appears in the record" (
     (@(@(Alive-Ids $rowsB) | Where-Object { $recB.session_ids -contains $_ }).Count -eq 2))
 
 # ============================================================================
-"== C: a second window is a second record, keyed by its ipc name"
+"== C: a second window is a second record under its own stable key"
 # ============================================================================
 Run-Cli '+new-window --target=blob-second' "$tmp\newwin.txt" 20 | Out-Null
 Wait-AliveCount $tmp 'c' 3 20 | Out-Null
 $recsC = Wait-Records $tmp 2 25
 Assert "C1 the agent holds two layout records" (@($recsC).Count -eq 2)
-$recC2 = @($recsC | Where-Object { $_.key -eq 'blob-second' }) | Select-Object -First 1
-Assert "C2 the new record is keyed by the ipc name" ($null -ne $recC2)
-Assert "C3 the new record's blob carries that ipc name" (
-    $null -ne $recC2 -and $null -ne $recC2.win -and $recC2.win.ipc_name -eq 'blob-second')
+# The record is IDENTIFIED by its blob (the ipc name it carries), not by its
+# key: since T338 the key is the window's stable uuid, and keying on anything
+# derived per app run is the defect that task fixes.
+$recC2 = @($recsC | Where-Object {
+        $null -ne $_.win -and $_.win.ipc_name -eq 'blob-second' }) | Select-Object -First 1
+Assert "C2 the new window has its own record, found by the ipc name in its blob" (
+    $null -ne $recC2)
+Assert "C3 that record is keyed by a uuid, NOT by the ipc name (T338)" (
+    $null -ne $recC2 -and $recC2.key -ne 'blob-second' -and (Is-Uuid $recC2.key))
+Assert "C4 the key is exactly the uuid recorded in the blob (T338)" (
+    $null -ne $recC2 -and $recC2.key -eq $recC2.win.uuid)
 $recC1 = @($recsC | Where-Object { $_.key -eq $keyA }) | Select-Object -First 1
-Assert "C4 the first window's record is still there, still two-leaf" (
+Assert "C5 the first window's record is still there, still two-leaf" (
     $null -ne $recC1 -and @(Nodes $recC1).Count -eq 3)
+Assert "C6 the two windows hold different keys" (
+    $null -ne $recC1 -and $null -ne $recC2 -and $recC1.key -ne $recC2.key)
 
 # ============================================================================
 "== D: closing that window DELETES its record (the reconcile pass)"
@@ -261,6 +286,41 @@ $recE = @($recsE) | Select-Object -First 1
 Assert "E2 it still names the sessions the agent is keeping alive" (
     $null -ne $recE -and @($recE.session_ids).Count -eq 2 -and
     (@(@($idsE) | Where-Object { $recE.session_ids -contains $_ }).Count -eq 2))
+
+# ============================================================================
+"== F: (T338) a relaunch with no local manifest does not eat the dead run's record"
+# ============================================================================
+# The exact case Restore All is for: the app died without writing (or with a
+# lost) session-layout manifest, so launch-time restore can do nothing and the
+# only surviving copy of the topology is the agent's. Before T338 the blob key
+# was the manifest's per-run window id, so the relaunched app's blank startup
+# window UPSERTED the dead run's key inside the 250ms layout debounce and the
+# record was gone before anyone could press anything.
+Remove-Item (Join-Path $tmp 'ghoztty\session-layout-debug.json') -Force -ErrorAction SilentlyContinue
+Assert "F1 the local manifest really is gone before the relaunch" (
+    -not (Test-Path (Join-Path $tmp 'ghoztty\session-layout-debug.json')))
+
+Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
+    '--title=t338-relaunch', '--window-width=100', '--window-height=30') | Out-Null
+
+# The new run's blank window is a third session; its push is what used to
+# destroy the record. Two records is the fixed behavior.
+$recsF = Wait-Records $tmp 2 30
+Assert "F2 the store holds TWO records - the dead run's and the new one's" (
+    @($recsF).Count -eq 2)
+$recF1 = @($recsF | Where-Object { $_.key -eq $keyA }) | Select-Object -First 1
+Assert "F3 the dead run's record survived under its own key" ($null -ne $recF1)
+Assert "F4 it still describes the two-leaf window it always did" (
+    $null -ne $recF1 -and @(Nodes $recF1).Count -eq 3)
+Assert "F5 it still claims the sessions the agent kept alive" (
+    $null -ne $recF1 -and @($recF1.session_ids).Count -eq 2 -and
+    (@(@($idsE) | Where-Object { $recF1.session_ids -contains $_ }).Count -eq 2))
+$recF2 = @($recsF | Where-Object { $_.key -ne $keyA }) | Select-Object -First 1
+Assert "F6 the new window took a fresh uuid key of its own" (
+    $null -ne $recF2 -and (Is-Uuid $recF2.key) -and $recF2.key -ne $keyA)
+Assert "F7 the new record claims a session the old one does not" (
+    $null -ne $recF2 -and @($recF2.session_ids).Count -eq 1 -and
+    -not ($idsE -contains $recF2.session_ids[0]))
 
 # ============================================================================
 "== cleanup"
