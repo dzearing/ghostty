@@ -604,11 +604,11 @@ const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyo
 const GhosttyRemoteStateCallback = *const fn (i32, ?*anyopaque) callconv(.c) void;
 
 /// One process-table row (activity monitor, §9.3 process view). Mirrors the wire
-/// `Proc`. `name`/`user`/`cmd` are always non-null NUL-terminated C strings — an
-/// empty string means "unavailable" (the agent left `user`/`cmd` null), NEVER a
+/// `Proc`. `name`/`user`/`cmd`/`tty` are always non-null NUL-terminated C strings —
+/// an empty string means "unavailable" (the agent left the field null), NEVER a
 /// NULL pointer (so the Swift side can read them unconditionally). `cpu_pct` is
 /// per-core: a fully-busy single thread reads ~100; a multithreaded process can
-/// exceed 100. Normalize by `ghostty_host_metrics_s.ncpu` for a 0..100 total.
+/// exceed 100 — the top(1) / Activity Monitor convention, displayed as-is.
 const ghostty_proc_s = extern struct {
     pid: i64,
     ppid: i64,
@@ -617,6 +617,9 @@ const ghostty_proc_s = extern struct {
     name: [*:0]const u8,
     user: [*:0]const u8,
     cmd: [*:0]const u8,
+    /// Controlling terminal without the `/dev/` prefix ("ttys004"), "" when the
+    /// process has none. Keys pane attribution in the activity monitor.
+    tty: [*:0]const u8,
 };
 
 /// A snapshot of the remote host's process table returned by
@@ -3029,6 +3032,12 @@ pub const CAPI = struct {
                 a.free(user);
                 break;
             };
+            const tty = a.dupeZ(u8, p.tty orelse "") catch {
+                a.free(name);
+                a.free(user);
+                a.free(cmd);
+                break;
+            };
             arr[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -3037,6 +3046,7 @@ pub const CAPI = struct {
                 .name = name.ptr,
                 .user = user.ptr,
                 .cmd = cmd.ptr,
+                .tty = tty.ptr,
             };
             filled = i + 1;
         }
@@ -3046,6 +3056,7 @@ pub const CAPI = struct {
                 a.free(std.mem.sliceTo(r.name, 0));
                 a.free(std.mem.sliceTo(r.user, 0));
                 a.free(std.mem.sliceTo(r.cmd, 0));
+                a.free(std.mem.sliceTo(r.tty, 0));
             }
             a.free(arr);
             return empty;
@@ -3082,6 +3093,7 @@ pub const CAPI = struct {
             a.free(std.mem.sliceTo(r.name, 0));
             a.free(std.mem.sliceTo(r.user, 0));
             a.free(std.mem.sliceTo(r.cmd, 0));
+            a.free(std.mem.sliceTo(r.tty, 0));
         }
         a.free(rows);
     }
@@ -3202,11 +3214,45 @@ pub const CAPI = struct {
         }
     };
 
+    /// Host metrics for THIS machine ONLY — no process enumeration.
+    ///
+    /// Exists because the two local consumers want different things: the machine
+    /// CARD needs just the host gauges, while the process TABLE needs the full
+    /// table. Serving the card from `ghostty_local_proc_list` was doubly wrong:
+    ///
+    ///   1. Correctness. The proc sampler derives per-process CPU% from deltas
+    ///      against its own prev-sample baselines, and each call REPLACES them.
+    ///      With the card polling at 5.0s and the table at 1.5s against one shared
+    ///      sampler, a card tick landing just before a table tick left the table
+    ///      measuring a delta over a near-zero wall window — every row read 0.
+    ///   2. Cost. The card discarded the process rows it paid to enumerate
+    ///      (hundreds of pids × 3 syscalls each) every 5 seconds, forever.
+    ///
+    /// Touches ONLY `host_sampler`, so it can never perturb the table's baselines.
+    /// Returns `cpu_pct == 0` on the very first call (no baseline yet), like any
+    /// delta sampler. Scalars only — nothing to free.
+    export fn ghostty_local_host_metrics() ghostty_host_metrics_s {
+        LocalSamplers.mutex.lock();
+        defer LocalSamplers.mutex.unlock();
+        const host = LocalSamplers.host_sampler.sample();
+        return .{
+            .cpu_pct = host.cpu_pct,
+            .mem_used = host.mem_used,
+            .mem_total = host.mem_total,
+            .ncpu = host.ncpu,
+            .uptime_s = host.uptime_s orelse 0,
+            .load1 = host.load1 orelse -1,
+        };
+    }
+
     /// A one-shot snapshot of THIS machine's process table (§9.3, the "Local"
     /// machine). SYNCHRONOUS but cheap (a local OS enumeration). The host metrics
     /// come from a persistent local `Sampler`, so host CPU% is a real delta after
     /// the first poll. `timeout_ms` is accepted for API symmetry with the remote
     /// call but unused (there is no RPC). Free with `ghostty_local_proc_list_free`.
+    ///
+    /// Callers that need ONLY the host gauges must use
+    /// `ghostty_local_host_metrics` instead — see the note there.
     export fn ghostty_local_proc_list(timeout_ms: u32) ghostty_proc_list_s {
         _ = timeout_ms;
         const a = global.alloc;
@@ -3244,6 +3290,7 @@ pub const CAPI = struct {
                 a.free(@constCast(p.name));
                 if (p.user) |u| a.free(@constCast(u));
                 if (p.cmd) |c| a.free(@constCast(c));
+                if (p.tty) |t| a.free(@constCast(t));
             }
             procs.deinit(a);
         }
@@ -3264,6 +3311,12 @@ pub const CAPI = struct {
                 a.free(user);
                 break;
             };
+            const tty = a.dupeZ(u8, p.tty orelse "") catch {
+                a.free(name);
+                a.free(user);
+                a.free(cmd);
+                break;
+            };
             arr[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -3272,6 +3325,7 @@ pub const CAPI = struct {
                 .name = name.ptr,
                 .user = user.ptr,
                 .cmd = cmd.ptr,
+                .tty = tty.ptr,
             };
             filled = i + 1;
         }
@@ -3280,6 +3334,7 @@ pub const CAPI = struct {
                 a.free(std.mem.sliceTo(r.name, 0));
                 a.free(std.mem.sliceTo(r.user, 0));
                 a.free(std.mem.sliceTo(r.cmd, 0));
+                a.free(std.mem.sliceTo(r.tty, 0));
             }
             a.free(arr);
             return empty;
@@ -3314,6 +3369,7 @@ pub const CAPI = struct {
             a.free(std.mem.sliceTo(r.name, 0));
             a.free(std.mem.sliceTo(r.user, 0));
             a.free(std.mem.sliceTo(r.cmd, 0));
+            a.free(std.mem.sliceTo(r.tty, 0));
         }
         a.free(rows);
     }

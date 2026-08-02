@@ -877,6 +877,22 @@ pub const Proc = struct {
     mem_bytes: u64 = 0,
     user: ?[]const u8 = null,
     cmd: ?[]const u8 = null,
+    /// Controlling terminal name WITHOUT the `/dev/` prefix (macOS `ttys004`,
+    /// Linux `pts/4`), or null when the process has no controlling terminal
+    /// (a daemon, or a child that called `setsid`). Windows always reports null.
+    ///
+    /// The client uses this to attribute a process to the pane it is running in:
+    /// every process in a pane inherits the pane's tty, so a tty match seeds
+    /// attribution and the ppid chain propagates it to setsid'd descendants.
+    ///
+    /// A NAME rather than the raw `dev_t` deliberately: device numbers are only
+    /// meaningful on the machine that minted them, so a raw dev could never be
+    /// matched against a remote pane's tty. Names compare across the wire.
+    ///
+    /// Additive and back-compatible: an older agent omits the field and it
+    /// decodes as null (attribution simply reports nothing), and an older client
+    /// ignores it (`ignore_unknown_fields`). No capability gate needed.
+    tty: ?[]const u8 = null,
 };
 
 /// `PROC_LIST` (0x70). Request the process table; `sort`/`limit` shape the reply.

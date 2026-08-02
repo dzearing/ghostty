@@ -635,6 +635,7 @@ pub const OwnedProcSnapshot = struct {
             self.alloc.free(@constCast(p.name));
             if (p.user) |u| self.alloc.free(@constCast(u));
             if (p.cmd) |c| self.alloc.free(@constCast(c));
+            if (p.tty) |t| self.alloc.free(@constCast(t));
         }
         self.alloc.free(self.procs);
         self.* = undefined;
@@ -1536,6 +1537,7 @@ pub const Connection = struct {
                 self.alloc.free(@constCast(p.name));
                 if (p.user) |u| self.alloc.free(@constCast(u));
                 if (p.cmd) |c| self.alloc.free(@constCast(c));
+                if (p.tty) |t| self.alloc.free(@constCast(t));
             }
             self.alloc.free(procs);
         }
@@ -1545,6 +1547,8 @@ pub const Connection = struct {
             const user: ?[]const u8 = if (p.user) |u| try self.alloc.dupe(u8, u) else null;
             errdefer if (user) |u| self.alloc.free(u);
             const cmd: ?[]const u8 = if (p.cmd) |c| try self.alloc.dupe(u8, c) else null;
+            errdefer if (cmd) |c| self.alloc.free(c);
+            const tty: ?[]const u8 = if (p.tty) |t| try self.alloc.dupe(u8, t) else null;
             procs[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -1553,6 +1557,7 @@ pub const Connection = struct {
                 .mem_bytes = p.mem_bytes,
                 .user = user,
                 .cmd = cmd,
+                .tty = tty,
             };
             filled = i + 1;
         }

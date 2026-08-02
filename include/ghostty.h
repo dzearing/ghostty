@@ -1535,10 +1535,13 @@ GHOSTTY_API void ghostty_remote_connection_metrics_unsubscribe(
     ghostty_remote_connection_t);
 
 // One row of the remote host's process table (activity monitor process view).
-// name/user/cmd are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
+// name/user/cmd/tty are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
 // string ("") means "unavailable", never a NULL pointer. cpu_pct is PER-CORE: a
-// fully-busy single thread is ~100; a multithreaded process can exceed 100.
-// Divide by host.ncpu for a Task-Manager-style 0..100 total.
+// fully-busy single thread is ~100; a multithreaded process can exceed 100 — the
+// same convention as top(1) and macOS Activity Monitor's "% CPU" column, and the
+// value is displayed as-is. (Dividing by host.ncpu would yield a Task-Manager-style
+// share of the whole machine, which is a DIFFERENT quantity — see host.cpu_pct,
+// which already reports exactly that for the host as a whole.)
 typedef struct {
   int64_t pid;
   int64_t ppid;
@@ -1547,6 +1550,12 @@ typedef struct {
   const char* name;   // process name (never NULL; "" if unknown)
   const char* user;   // owning user (never NULL; "" if unavailable)
   const char* cmd;    // command line (never NULL; "" if unavailable)
+  // Controlling terminal WITHOUT the /dev/ prefix ("ttys004", "pts/4"); "" when
+  // the process has no controlling terminal (a daemon, or a setsid'd child) or
+  // the platform has none (Windows). Used to attribute a process to the pane it
+  // runs in: processes inherit their pane's tty, so a tty match seeds attribution
+  // and the ppid chain carries it to setsid'd descendants.
+  const char* tty;
 } ghostty_proc_s;
 
 // A one-shot snapshot of the remote host's process table. ok == false means the
@@ -1617,6 +1626,17 @@ GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
 // deltas. All are SYNCHRONOUS; the proc-list is cheap (a local OS enumeration)
 // but should still be called off the main thread, consistent with the remote API.
 // ---------------------------------------------------------------------------
+
+// Host gauges for THIS machine only — NO process enumeration, nothing to free.
+//
+// Use this, not ghostty_local_proc_list, when you only want the host CPU/memory
+// numbers. The proc list computes per-process CPU% from deltas against baselines
+// that each call REPLACES, so a second caller polling it on a different interval
+// silently destroys the first caller's deltas (and pays for a full process
+// enumeration it then discards). This entry point touches only the host sampler.
+//
+// Returns cpu_pct == 0 on the first call (a delta sampler has no baseline yet).
+GHOSTTY_API ghostty_host_metrics_s ghostty_local_host_metrics(void);
 
 // A one-shot snapshot of THIS machine's process table. Reuses the SAME
 // ghostty_proc_list_s struct as the remote path (host is filled from the local

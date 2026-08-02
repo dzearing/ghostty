@@ -1608,6 +1608,7 @@ pub const Server = struct {
                 self.alloc.free(@constCast(p.name));
                 if (p.user) |u| self.alloc.free(@constCast(u));
                 if (p.cmd) |c| self.alloc.free(@constCast(c));
+                if (p.tty) |t| self.alloc.free(@constCast(t));
             }
             procs.deinit(self.alloc);
         }
