@@ -25,4 +25,9 @@ test {
     // nobody has checked.
     _ = @import("win32/PaneView.zig");
     _ = @import("win32/ViewerPane.zig");
+    // The WebView2 host floor (T372): the loader-less runtime probe and the
+    // shared environment. Same rule again — T373 is its first caller, and a
+    // module that touches the registry, LoadLibraryW and a COM vtable is the
+    // last one that should go uncompiled until then.
+    _ = @import("win32/webview2.zig");
 }

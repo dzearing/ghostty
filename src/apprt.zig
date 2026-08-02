@@ -132,6 +132,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/overlay_zorder.zig");
 
+    // Pure win32 WebView2 path/version math — the arithmetic half of the
+    // loader-less runtime probe (T372), same no-OS-imports deal.
+    _ = @import("apprt/win32/webview2_paths.zig");
+
     // Pure win32 machine-chooser row model + geometry (T172), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");

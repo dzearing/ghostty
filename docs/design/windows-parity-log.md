@@ -6593,3 +6593,58 @@ Validation: both `zig build test` lanes, `test-agent`, the Debug win32 build,
 P1-P3, hero-mode, pane-banner, split-divider, window-title, and session-close
 (added on purpose - `closeSplitSurface` -> `closeSplitPane` is the path its
 close-intent wiring walks) all green on the box.
+
+## 2026-08-02 - T90d split -> T372: the WebView2 door opens, loader-less
+
+T90d was split before it was started (-> **T372** COM floor + probe + env,
+**T373** host window + controller + error card, **T374** `--view` E2E + verb
+rejections, **T375** shim + injection blob), on the T321 test: reading it
+against the code turned up more distinct mechanisms than one context can carry.
+
+The decisive fact is what this repo's one existing piece of COM does. `win32.zig`
+declares `ITaskbarList3` - a vtable, GUIDs, `CoCreateInstance` - so *consuming*
+COM is precedented. Every COM object here today is somebody else's, and we only
+call it. WebView2 needs the other direction: environment creation, controller
+creation and every event arrive through **callback objects the app implements**,
+with our own vtable, our own refcount, invoked by a browser process on our
+message loop. Nothing in `src/apprt/win32/` had ever done that.
+
+**T372 landed the floor and it is proven, not assumed.** Two modules:
+`webview2_paths.zig` (pure - version parse/compare, the DLL and UDF joins - in
+the none lane with the other pure win32 modules) and `webview2.zig` (the probe,
+the COM decls, our completed handler, and the `Host` that owns the ONE shared
+environment).
+
+Four things worth carrying:
+
+**The design's registry key is not the one the reference loader uses, and this
+box has both.** T90a §1 pinned `EdgeUpdate\Clients\{guid}` (`pv` + `location`,
+joined); `webview/webview` reads `ClientState\{guid}`'s `EBWebView`, which is
+already the versioned directory. Both are read now, `ClientState` first, HKLM
+then HKCU. Reading only the pinned one would have worked here and failed
+silently on a box with the other.
+
+**A client key that EXISTS is not a runtime.** EdgeUpdate leaves it behind after
+an uninstall at `pv = 0.0.0.0`, so the probe parses the version and tests
+`usable()`, then `access()`es the client DLL - a key pointing at a deleted
+install is as useless as no key.
+
+**The undocumented ABI is `(bool, runtime_type, PCWSTR userDataFolder,
+IUnknown *options, handler *)` - and takes no browser directory.** The DLL knows
+where it lives, so loading it by full path IS "pointing at a runtime". The live
+test drives registry -> `LoadLibraryW` -> `GetProcAddress` -> the internal
+export -> our handler -> a real COM object, then asks the environment its own
+`get_BrowserVersionString` and asserts it equals what the registry advertised
+(`150.0.4078.105`). A guessed calling convention cannot survive that. It also
+pins a fact T373 needs: an *environment* starts no browser process - the
+user-data folder stays empty and no `msedgewebview2.exe` appears. That arrives
+with the controller.
+
+**The skip is loud, and the reason is this turn.** The live test degrades to
+"no runtime here" on a box without one. Its first green run had an empty
+user-data folder, which reads exactly like a silent skip; only the log
+distinguished them. It now logs `SKIPPED live environment test` at **warn**.
+
+Validation: both lanes, `test-agent`, P1-P3 green. The win32 lane failed once on
+`server.zig:3488 fc.last_resize.?` - the known ConPTY flake (T346/T258), green
+on re-run and untouched by this change.

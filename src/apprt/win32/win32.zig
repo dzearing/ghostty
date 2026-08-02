@@ -1916,7 +1916,12 @@ pub const MA_NOACTIVATE: isize = 3;
 
 pub const HKEY = *opaque {};
 pub const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+pub const HKEY_LOCAL_MACHINE: HKEY = @ptrFromInt(0x80000002);
 pub const KEY_READ: u32 = 0x00020019;
+/// Read the 32-bit registry view (`WOW6432Node` on a 64-bit box). EdgeUpdate
+/// writes there, and letting the flag do the redirection keeps one path
+/// string correct on both bitnesses (T372).
+pub const KEY_WOW64_32KEY: u32 = 0x0200;
 pub const KEY_QUERY_VALUE: u32 = 0x0001;
 pub const KEY_SET_VALUE: u32 = 0x0002;
 pub const REG_SZ: u32 = 1;
@@ -1952,6 +1957,15 @@ pub extern "advapi32" fn RegSetValueExW(
 ) callconv(.winapi) u32;
 
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
+
+/// Set (or, with a null value, remove) a process environment variable.
+/// `std.process` has no portable setter, and the T372 probe tests need the
+/// real process environment to change so the runtime-absent branch is
+/// reachable on a box that HAS the runtime.
+pub extern "kernel32" fn SetEnvironmentVariableW(
+    lpName: [*:0]const u16,
+    lpValue: ?[*:0]const u16,
+) callconv(.winapi) i32;
 
 pub extern "kernel32" fn ExpandEnvironmentStringsW(
     lpSrc: [*:0]const u16,
@@ -2022,6 +2036,11 @@ pub const CLSCTX_INPROC_SERVER: u32 = 0x1;
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
 pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
+/// Free a buffer a COM method allocated with `CoTaskMemAlloc` — e.g. the
+/// string `ICoreWebView2Environment::get_BrowserVersionString` hands back
+/// (T372).
+pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+
 pub extern "ole32" fn CoCreateInstance(
     rclsid: *const GUID,
     pUnkOuter: ?*anyopaque,
