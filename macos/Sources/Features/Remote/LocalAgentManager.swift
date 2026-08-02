@@ -327,6 +327,9 @@ final class LocalAgentManager {
     /// only (never spawns) and frees that probe connection after reading. The
     /// `LIST_SESSIONS` RPC runs on a background queue; `completion` is delivered
     /// on the main actor — nil ⇒ no local agent reachable or the RPC failed.
+    ///
+    /// (See `warmSharedHandle` below for the long-lived-subscription variant.)
+
     /// The warm shared local-agent connection, when one is healthy and its agent
     /// is still alive. **Borrowed, never owned**: `LocalAgentManager` holds this
     /// for the app's lifetime, so a caller must not free it — only use it for the

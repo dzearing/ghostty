@@ -48,9 +48,15 @@ struct MachineChooserView: View {
     /// read-only list of that machine's active sessions.
     @ObservedObject var browser: SessionBrowserProbe
     /// Live per-session CPU for the SELECTED target, from the agent's pushed
-    /// `session_cpu` stream. Owned here so it dies with the chooser — the stream
-    /// (and any connection it dialed) must not outlive this transient page.
-    @StateObject private var sessionCPU = SessionCPUProbe()
+    /// `session_cpu` stream.
+    ///
+    /// Owned by the PRESENTER, not by this view, and torn down in its `finish`
+    /// alongside `probe`/`browser`. A `@StateObject` here relying on
+    /// `.onDisappear` does not work: the chooser is an NSPanel that gets
+    /// `orderOut`, which hides the window without removing the SwiftUI view from
+    /// its hosting controller — so `.onDisappear` never fires and the stream (and
+    /// the agent-side pump enumerating every process behind it) runs forever.
+    @ObservedObject var sessionCPU: SessionCPUProbe
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
     /// Secondary action: open the Activity Monitor for the selected row instead of
@@ -291,8 +297,10 @@ struct MachineChooserView: View {
             refreshRosters()
         }
         .onDisappear {
-            // The page is gone: stop the stream and drop any connection it
-            // dialed. Nothing this panel started should outlive it.
+            // Belt-and-braces for hosts that really do remove the view. The
+            // authoritative teardown is the presenter's `finish` — see the
+            // note on `sessionCPU`; this alone would never fire for the modal
+            // NSPanel the chooser actually uses. `stop()` is idempotent.
             sessionCPU.stop()
         }
     }
@@ -1591,11 +1599,17 @@ enum MachineChooser {
         // T16). Torn down in `finish` like the metrics probe.
         let browser = SessionBrowserProbe()
 
+        // Pushed per-session CPU for the selected row. Owned here, NOT by the
+        // view, for the same reason as the two probes above: the view's
+        // `.onDisappear` never fires for this modal panel.
+        let sessionCPU = SessionCPUProbe()
+
         let finish: (WindowTarget?) -> Void = { target in
             // Tear down all probe connections BEFORE handing control back, so
             // no probe connection outlives the picker no matter the choice.
             probe.stop()
             browser.stop()
+            sessionCPU.stop()
             pollTask?.cancel()
             if let windowRef {
                 NSApp.stopModal()
@@ -1608,6 +1622,7 @@ enum MachineChooser {
             registry: registry,
             probe: probe,
             browser: browser,
+            sessionCPU: sessionCPU,
             onSelect: { finish($0) },
             onCancel: { finish(nil) },
             onActivityMonitor: { machine in
