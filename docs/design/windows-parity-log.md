@@ -5661,3 +5661,38 @@ re-run, above), `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0,
 (was 50) with `-NegativeControl` failing exactly 2 (the detail-pane signature
 and the monogram fill, each reached); regression green across `relay-account`,
 `chooser-menu` (57) and `host-settings` (65).
+
+## 2026-08-01 - T322: the field that made a filter a constant, and the five lanes that were not checking the file
+
+Mac's `BrowsedSession.isConnectable` is `alive || relaunchable`, and its comment
+says the second term is there to keep resumable reboot-floor tombstones listed.
+`relaunchable` never arrived: it exists on the wire (`protocol.zig:576`) and in
+`connection.OwnedSession` (`:681`), but both JSON rows that carry it outward -
+the C API's `SessionJsonRow` (`embedded.zig`) and `+sessions --json`'s `JsonRow`
+(`cli/sessions.zig`) - emitted twelve fields without it. Swift decoded `?? false`,
+so the filter written to KEEP those rows was the thing removing them. Both rows
+now emit it; additive, no protocol bump. Windows reads the Zig struct directly,
+so this is also the divergence T318 would otherwise have inherited by default.
+
+Verified end-to-end rather than by compile: the live repo agent's real
+tombstones come back `"alive": false, "exit_code": null, "relaunchable": true`.
+The unit test decodes into a struct that REQUIRES the key, so dropping it fails
+the parse; and it was confirmed *reachable* by filter count (75 vs a 74 baseline)
+instead of assumed.
+
+The turn's finding is the near-miss. A positive control - breaking the new line
+to a nonexistent field - showed **every standing lane exits 0 on it**, including
+a macOS-target lib build, which constructs the lib and never installs it
+(`build.zig:320`), so nothing depends on the compile and it never runs. `CAPI` is
+reached only from `main_c.zig:41`, which no exe lane touches. The one lane that
+does name the error is a windows-target lib, and it cannot build for an unrelated
+POSIX-only reason (`ssh_transport.zig`). So the C API is edited from this seat
+and compiled by nothing: **T323**. **T324** is the deliberately-out-of-scope
+half - the human `+sessions` column still prints a relaunchable tombstone as
+plain `dead`.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`test-agent` exit 0 (first run hit T258's known `server.zig:2684` ConPTY flake;
+green on re-run), `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0 (after
+killing the repo's own running `ghoztty-agent.exe`, which held the install
+target). P1-P3 ALL PASS.

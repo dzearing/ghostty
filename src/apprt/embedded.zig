@@ -2795,7 +2795,8 @@ pub const CAPI = struct {
     /// machine — because the transport is resolved through `handle.conn()`.
     /// Returns a JSON array string (each element:
     /// `{id, alive, exit_code, attached, activity, pid, cwd, argv, title,
-    /// created_at, last_activity, pinned}`), freed with `ghostty_string_free`.
+    /// created_at, last_activity, pinned, relaunchable}`), freed with
+    /// `ghostty_string_free`.
     /// Returns `.empty` on any failure (no connection, timeout, malformed
     /// reply). `timeout_ms == 0` ⇒ the 5s default. BLOCKING; call off the main
     /// thread (mirror the `_proc_list` / `_query_cwd_timeout` usage).
@@ -2830,6 +2831,13 @@ pub const CAPI = struct {
             created_at: i64,
             last_activity: i64,
             pinned: bool,
+            /// True for a relaunchable reboot-floor tombstone (`alive == false`
+            /// but the recorded argv/cwd can revive it via RELAUNCH). Swift's
+            /// `BrowsedSession.isConnectable` is `alive || relaunchable`, so
+            /// without this key that filter collapses to `alive` and hides the
+            /// very rows it was written to keep (T322). Additive — an older
+            /// decoder ignores the key.
+            relaunchable: bool,
         };
 
         const rows = handle.alloc.alloc(SessionJsonRow, roster.sessions.len) catch return .empty;
@@ -2848,6 +2856,7 @@ pub const CAPI = struct {
                 .created_at = s.created_at,
                 .last_activity = s.last_activity,
                 .pinned = s.pinned,
+                .relaunchable = s.relaunchable,
             };
         }
 

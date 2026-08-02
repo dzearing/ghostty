@@ -235,6 +235,11 @@ const JsonRow = struct {
     created_at: i64,
     last_activity: i64,
     pinned: bool,
+    /// True for a relaunchable reboot-floor tombstone (`alive == false`, but the
+    /// recorded argv/cwd can revive it via RELAUNCH). Emitted so a consumer can
+    /// tell a resumable tombstone from a genuinely-exited one; an older reader
+    /// that does not know the key ignores it (additive, no protocol bump — T322).
+    relaunchable: bool,
 };
 
 fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connection.OwnedSession) !void {
@@ -253,9 +258,70 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
             .created_at = s.created_at,
             .last_activity = s.last_activity,
             .pinned = s.pinned,
+            .relaunchable = s.relaunchable,
         };
     }
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });
     try stdout.writeAll(json);
     try stdout.writeAll("\n");
+}
+
+test "printJson emits relaunchable for a reboot-floor tombstone" {
+    // A relaunchable tombstone is dead-but-resumable: the row has to carry the
+    // flag, because `alive` alone cannot distinguish it from a genuinely-exited
+    // child and every consumer's "is this connectable?" test is
+    // `alive || relaunchable` (T322).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const sessions = [_]connection.OwnedSession{
+        .{
+            .id = "aaaa",
+            .alive = false,
+            .exit_code = null,
+            .attached = false,
+            .activity = "idle",
+            .pid = 0,
+            .title = null,
+            .cwd = "/tmp",
+            .argv = "zsh",
+            .created_at = 1,
+            .last_activity = 2,
+            .pinned = false,
+            .relaunchable = true,
+        },
+        .{
+            .id = "bbbb",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "busy",
+            .pid = 42,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 3,
+            .last_activity = 4,
+            .pinned = true,
+            .relaunchable = false,
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    var arena: ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    try printJson(arena.allocator(), &out.writer, &sessions);
+
+    const json = out.written();
+    const parsed = try std.json.parseFromSlice([]struct {
+        id: []const u8,
+        relaunchable: bool,
+    }, alloc, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try testing.expect(parsed.value[0].relaunchable);
+    try testing.expect(!parsed.value[1].relaunchable);
 }
