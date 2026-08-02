@@ -192,6 +192,11 @@ test {
     // only non-std import is `remote/protocol.zig`, which builds in every lane).
     _ = @import("apprt/win32/layout_blobs.zig");
 
+    // Pure win32 cross-machine frame re-anchoring — a window frame authored on
+    // another machine's monitors, clamped onto one of ours (T336), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/restore_frame.zig");
+
     // Pure win32 local-agent crash-recovery policy: when a dropped shared link
     // is a real drop, and whose session a tree swap may never end (T145). Its
     // only non-std import is the shared-core `remote/connection.zig` link-state

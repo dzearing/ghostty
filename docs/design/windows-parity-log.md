@@ -9,6 +9,40 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-02 - **T336 done - cross-machine Restore All, which closes T146.**
+  Rebuilding a REMOTE machine's whole topology here is T335's machinery pointed
+  at a dialed connection, so what the task was really about is the one
+  structural difference: **a win32 window OWNS its transport**. One dial per
+  window, plus one for the pull - a shared connection would die with whichever
+  rebuilt window the user closed first. `RestoreTransport` makes that a value
+  (connection + local_agent + the dial the window takes + machine identity +
+  the reanchor bit), so no caller can set the connection and forget the
+  ownership.
+  - **The double-attach guard stayed, against the task's own prediction.** Mac
+    drops it cross-machine because its ids come from the local manifest; ours
+    are read off live panes, so it keeps working over the relay - and without it
+    a second press would tear apart the windows the first press built. It needed
+    SCOPING, not deleting: a session id means nothing without its machine.
+  - **T319's fixture could not test this, for a product reason.** Only an APP
+    pushing to ITS OWN local agent creates a layout blob (T334), so a bare
+    `--listen` agent holds none and a correct implementation returns zero
+    against it - a test that passes while proving nothing. The only machine here
+    an app has lived on is this box, whose agent speaks a NAMED PIPE, so
+    `test/win32/lib/PipeBridge.ps1` fronts it on TCP and the relay bridges to
+    that. Deleting `port.json` afterwards is what makes it honest: the Local row
+    can then only fail, so everything the app saw, it saw through the relay.
+  - Also: frames authored on the far machine's monitors are re-clamped onto a
+    visible local one (`restore_frame.zig`, 9 unit tests); `FakeRelay` gained
+    `-TripUnauthorizedFile` because a permanently-401 device can never load the
+    roster a gated button needs; CLAUDE.md's "Restore All is local only on
+    Windows" is retired.
+  - Filed **T339**: the N+1 dials run on the GUI thread (Mac dials off it) -
+    invisible on loopback, ~2 s of frozen app for 6 windows on a real relay.
+  - Validation: `chooser-restore-all-remote.ps1` ALL PASS (32) twice; both test
+    lanes, `test-agent`, the GUI Debug link, P1-P3, and the four chooser/layout
+    scripts green. `session-reattach` is 2 red - both the pre-existing T223
+    focus-churn assertions the script labels as such.
+
 - 2026-08-01 - **T312 done** (T227's last split; chooser finding 10). The
   owner-drawn machine list draws three states now instead of one:
   `chooser_rows.rowPaint` resolves fill/border/ring together and `drawRow`

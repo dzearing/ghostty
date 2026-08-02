@@ -464,6 +464,25 @@ Work these first, in order, before falling back to first-todo-in-table:
         a different verb), and the keyboard sub-cursor's index space must equal
         the rendered list's — the bug T312 just finished proving this list is
         prone to.
+      **~~T336~~ (done, 2026-08-02) — cross-machine Restore All lands, and with
+      it T146.** The rebuild is T335's machinery pointed at a dialed connection;
+      the task was really about the one structural difference, and it settled
+      the way the split predicted: **a win32 window owns its transport**, so it
+      is one dial per window plus one for the pull, carried as a single
+      `RestoreTransport` value rather than a convention. Two things it turned
+      up. The double-attach guard **stayed** (the task predicted it would not
+      apply): ours reads live panes, not the local manifest, so it keeps working
+      over the relay — and without it a second press would tear apart the
+      windows the first press built; it needed SCOPING, since a session id means
+      nothing without its machine. And **T319's fixture could not test this at
+      all**, for a product reason worth remembering: only an app pushing to its
+      own local agent creates a layout blob (T334), so a bare `--listen` agent
+      holds none and a correct implementation returns zero against it. The stand-
+      in is `test/win32/lib/PipeBridge.ps1` — this box's own agent, fronted on
+      TCP and reached through the relay — with `port.json` deleted so the Local
+      row can only fail and everything the app saw, it saw through the relay.
+      Follow-up **T339** (the N+1 dials run on the GUI thread).
+
       - **~~T321~~ (split 2026-08-02 → T334 → T335 → T336)** — agent-owned
         layout blobs + **Restore All**. Split before it was started: reading its
         three parts against the code turned up a fourth nobody had scoped —

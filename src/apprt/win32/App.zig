@@ -38,6 +38,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const session_layout = @import("session_layout.zig");
 const layout_blobs = @import("layout_blobs.zig");
+const restore_frame = @import("restore_frame.zig");
 const agent_recovery = @import("agent_recovery.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -1383,6 +1384,42 @@ const AttachProbe = struct {
     }
 };
 
+/// Which transport a rebuild's panes ride, and what the rebuilt window owns of
+/// it. Threaded through the restore helpers as ONE value so a caller cannot set
+/// the connection and forget the ownership that goes with it — the two are the
+/// same decision (T336).
+///
+/// **win32 windows each own their transport.** `openDialedWindow` stores the
+/// dial on the window and `Window.deinit` tears it down, so a shared connection
+/// would die with whichever rebuilt window the user closed first and leave the
+/// rest attached to a corpse. Mac can hand every rebuilt window ONE
+/// `RemoteConnection` (`SessionLayoutRestore.swift:659-675`) because a
+/// connection there is refcounted and owned by nobody in particular; here the
+/// rule is one dial per window, stated rather than inherited.
+const RestoreTransport = struct {
+    /// The connection each restored leaf ATTACHes over.
+    conn: *remote_connection.Connection,
+    /// true ⇒ this box's own agent (the launch-time and local Restore All
+    /// paths). false ⇒ a CROSS-MACHINE dial, which also stops `createWindow`
+    /// from handing the window a local agent it must not use.
+    local_agent: bool = true,
+    /// Non-null ⇒ the window being built TAKES OWNERSHIP of this dial. Set for
+    /// exactly one window; a second window needs its own dial.
+    dialed: ?Window.RemoteDialed = null,
+    /// Recorded on the window so T68's "New Window" re-dials the same machine.
+    /// Strings borrowed for the call; `setRemoteMachine` dupes them.
+    machine: ?Window.RemoteMachine = null,
+    /// Re-clamp the recorded frame onto a visible LOCAL monitor. Cross-machine
+    /// only: a frame from our own manifest describes monitors we still have,
+    /// and moving it would be the app second-guessing the user (see
+    /// `restore_frame.zig`).
+    reanchor: bool = false,
+
+    fn local(conn: *remote_connection.Connection) RestoreTransport {
+        return .{ .conn = conn };
+    }
+};
+
 /// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Loads the
 /// session-layout manifest T89f1 wrote, probes the local agent for which of its
 /// sessions are still alive, and rebuilds every restorable window/tab/split —
@@ -1450,7 +1487,7 @@ pub fn restoreSessionLayout(self: *App) bool {
     var restored: usize = 0;
     for (file.windows) |win| {
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
-        self.restoreWindow(win, conn, attach_ptr) catch |err| {
+        self.restoreWindow(win, .local(conn), attach_ptr) catch |err| {
             log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
             continue;
         };
@@ -1496,7 +1533,7 @@ fn restoreWindowHasAttachableLeaf(
 /// fresh agent-backed pane.
 fn restoreAttachOverride(
     leaf: session_layout.Leaf,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
 ) Surface.Overrides {
     const sid: ?[]const u8 = if (leaf.session_id) |s| blk: {
@@ -1510,8 +1547,8 @@ fn restoreAttachOverride(
         // app restart — the exact class of breakage T112 hit with pids.
         .pane_id = leaf.pane_id,
         .remote = .{
-            .connection = conn,
-            .local_agent = true,
+            .connection = tr.conn,
+            .local_agent = tr.local_agent,
             .session_id = sid,
         },
     };
@@ -1538,33 +1575,52 @@ fn restoreFirstLeaf(nodes: []const session_layout.Node, idx: usize) ?session_lay
 fn restoreWindow(
     self: *App,
     win: session_layout.Window,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
 ) !void {
-    if (win.tabs.len == 0) return error.CorruptLayout;
+    if (win.tabs.len == 0) {
+        if (tr.dialed) |d| d.deinitDestroy(self.core_app.alloc);
+        return error.CorruptLayout;
+    }
 
     // Tab 0's first surface is created by createWindow's initial addTab; hand it
     // that leaf's ATTACH override up front. `ov0` must outlive createWindow.
-    const first_leaf = restoreFirstLeaf(win.tabs[0].nodes, 0) orelse return error.CorruptLayout;
-    var ov0 = restoreAttachOverride(first_leaf, conn, attach);
-    const window = try self.createWindow(.{
+    const first_leaf = restoreFirstLeaf(win.tabs[0].nodes, 0) orelse {
+        if (tr.dialed) |d| d.deinitDestroy(self.core_app.alloc);
+        return error.CorruptLayout;
+    };
+    var ov0 = restoreAttachOverride(first_leaf, tr, attach);
+    const window = self.createWindow(.{
         .surface_overrides = &ov0,
         .ipc_name = win.ipc_name,
-    });
-    try self.restoreTab(window, 0, win.tabs[0], conn, attach);
+    }) catch |err| {
+        // Ownership transfers to the window, so a window that was never created
+        // leaves the dial to us — the same contract `openDialedWindow` keeps,
+        // for the same reason: the caller must never have to guess.
+        if (tr.dialed) |d| d.deinitDestroy(self.core_app.alloc);
+        return err;
+    };
+    // From here the WINDOW owns the transport: every later failure leaves a
+    // partially built window alive, and `Window.deinit` is what frees it.
+    if (tr.dialed) |d| window.remote_dialed = d;
+    if (tr.machine) |m| window.setRemoteMachine(m) catch |err| {
+        // Non-fatal: only T68's "New Window inherits the remote host" degrades.
+        log.warn("session-restore: recording machine identity failed err={}", .{err});
+    };
+    try self.restoreTab(window, 0, win.tabs[0], tr, attach);
 
     // Remaining tabs, appended in manifest order (addTab activates each new tab,
     // so consecutive inserts keep the recorded order regardless of
     // window-new-tab-position).
     for (win.tabs[1..], 1..) |tab, ti| {
         const lf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
-        var ov = restoreAttachOverride(lf, conn, attach);
+        var ov = restoreAttachOverride(lf, tr, attach);
         window.pending_surface_overrides = &ov;
         _ = window.addTab() catch |err| {
             window.pending_surface_overrides = null;
             return err;
         };
-        try self.restoreTab(window, ti, tab, conn, attach);
+        try self.restoreTab(window, ti, tab, tr, attach);
     }
 
     // Window-level presentation: title pin, active tab, outer placement.
@@ -1573,7 +1629,7 @@ fn restoreWindow(
         const active: usize = @min(@as(usize, win.active_tab), window.tab_count - 1);
         window.selectTabIndex(active);
     }
-    applyRestoreFrame(window, win.frame, win.maximized);
+    applyRestoreFrame(window, win.frame, win.maximized, tr.reanchor);
 }
 
 /// Rebuild one tab: replay the split tree onto its (already-created) first
@@ -1583,12 +1639,12 @@ fn restoreTab(
     window: *Window,
     tab_index: usize,
     tab: session_layout.Tab,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
 ) !void {
     if (tab.nodes.len == 0) return error.CorruptLayout;
     const first_surface = window.tab_active_surface[tab_index];
-    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, conn, attach, 0);
+    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, tr, attach, 0);
 
     if (tab.color) |c| {
         if (std.meta.stringToEnum(tab_color.TabColor, c)) |tc| window.tab_colors[tab_index] = tc;
@@ -1609,7 +1665,7 @@ fn restoreBuildSubtree(
     nodes: []const session_layout.Node,
     idx: usize,
     anchor: *Surface,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
     depth: usize,
 ) !void {
@@ -1626,7 +1682,7 @@ fn restoreBuildSubtree(
     // The NEW surface takes the right/bottom position — attach it to the first
     // leaf of the right subtree.
     const right_leaf = restoreFirstLeaf(nodes, sp.right) orelse return error.CorruptLayout;
-    var ov = restoreAttachOverride(right_leaf, conn, attach);
+    var ov = restoreAttachOverride(right_leaf, tr, attach);
     window.pending_surface_overrides = &ov;
 
     // `.right`/`.down` put the OLD (anchor) surface on the left/top with `ratio`
@@ -1642,8 +1698,8 @@ fn restoreBuildSubtree(
         return error.CorruptLayout;
     };
 
-    try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, attach, depth + 1);
-    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, attach, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.left, anchor, tr, attach, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, tr, attach, depth + 1);
 }
 
 // =============================================================================
@@ -2207,29 +2263,51 @@ fn rebuildTabInPlace(
     if (tab.nodes.len == 0) return error.CorruptLayout;
     const first_leaf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
 
-    var ov = restoreAttachOverride(first_leaf, conn, attach);
+    // Always the LOCAL agent: in-place recovery re-binds panes whose local
+    // agent link dropped (T145). A cross-machine window's transport belongs to
+    // the window and is torn down with it, never recovered here.
+    const tr: RestoreTransport = .local(conn);
+    var ov = restoreAttachOverride(first_leaf, tr, attach);
     const root = try window.replaceTabRootSurface(tab_index, &ov);
 
     // Everything below the root is the ordinary restore walk. `restoreTab`
     // would re-apply color/hero/title too, but those live on the WINDOW and
     // were never lost — only the surfaces were — so we replay just the splits.
-    try self.restoreBuildSubtree(window, tab.nodes, 0, root, conn, attach, 0);
+    try self.restoreBuildSubtree(window, tab.nodes, 0, root, tr, attach, 0);
 }
 
 /// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact
 /// screen rect the capture recorded. Maximized: set the (restored-down) rect,
 /// then maximize over it — matching T85's remembered-maximized behavior. Null
 /// frame ⇒ leave the created position (config/cascade) as-is.
-fn applyRestoreFrame(window: *Window, frame: ?session_layout.Frame, maximized: bool) void {
+fn applyRestoreFrame(
+    window: *Window,
+    frame: ?session_layout.Frame,
+    maximized: bool,
+    /// Cross-machine (T336): clamp a frame authored on ANOTHER machine's
+    /// monitors onto one of ours. Never for our own manifest — see
+    /// `restore_frame.zig`.
+    reanchor: bool,
+) void {
     const hwnd = window.hwnd orelse return;
     if (frame) |f| {
+        const placed: session_layout.Frame = if (reanchor) blk: {
+            const r = reanchorFrame(.{ .x = f.x, .y = f.y, .w = f.w, .h = f.h });
+            if (r.x != f.x or r.y != f.y or r.w != f.w or r.h != f.h) {
+                log.info(
+                    "session-restore: frame {d},{d} {d}x{d} is off every monitor here, re-anchored to {d},{d} {d}x{d}",
+                    .{ f.x, f.y, f.w, f.h, r.x, r.y, r.w, r.h },
+                );
+            }
+            break :blk .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        } else f;
         _ = w32.SetWindowPos(
             hwnd,
             null,
-            f.x,
-            f.y,
-            f.w,
-            f.h,
+            placed.x,
+            placed.y,
+            placed.w,
+            placed.h,
             w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
         );
     }
@@ -2237,6 +2315,41 @@ fn applyRestoreFrame(window: *Window, frame: ?session_layout.Frame, maximized: b
         window.start_maximized = true;
         _ = w32.ShowWindow(hwnd, w32.SW_MAXIMIZE);
     }
+}
+
+/// The win32 half of `restore_frame.reanchor`: ask the OS the two questions the
+/// pure rule needs — does this rectangle touch any monitor, and what is the
+/// primary's work area — and clamp.
+///
+/// `MonitorFromRect(MONITOR_DEFAULTTONULL)` IS the intersection query (it
+/// returns null when the rect touches nothing), so there is no monitor
+/// enumeration here and no chance of the two answers disagreeing. A failure to
+/// read the primary's work area leaves the frame alone: replaying a recorded
+/// position beats inventing one from nothing.
+fn reanchorFrame(frame: restore_frame.Rect) restore_frame.Rect {
+    var rc: w32.RECT = .{
+        .left = frame.x,
+        .top = frame.y,
+        .right = frame.x +| frame.w,
+        .bottom = frame.y +| frame.h,
+    };
+    if (w32.MonitorFromRect(&rc, w32.MONITOR_DEFAULTTONULL) != null) return frame;
+
+    const primary = w32.MonitorFromPoint(.{ .x = 0, .y = 0 }, w32.MONITOR_DEFAULTTOPRIMARY) orelse
+        return frame;
+    var mi: w32.MONITORINFO = undefined;
+    mi.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.GetMonitorInfoW(primary, &mi) == 0) return frame;
+
+    const work: restore_frame.Rect = .{
+        .x = mi.rcWork.left,
+        .y = mi.rcWork.top,
+        .w = mi.rcWork.right - mi.rcWork.left,
+        .h = mi.rcWork.bottom - mi.rcWork.top,
+    };
+    // `MonitorFromRect` already answered the visibility question, so only the
+    // clamp half of the rule runs here.
+    return restore_frame.centerOn(frame, work);
 }
 
 /// Create, track, and populate a new Window (with its first tab). Shared by
@@ -2447,6 +2560,13 @@ pub const RestoreAllError = error{
     /// GET_LAYOUTS failed or came back unreadable — a transport fault, not an
     /// empty machine. Answering "nothing to restore" here would be a lie.
     PullFailed,
+    /// The relay refused the dial outright (T336): the machine is unreachable
+    /// or its agent is down.
+    DialFailed,
+    /// The relay rejected our bearer (401/403). Distinct from `DialFailed`
+    /// because the fix is the account row, not the network — the same split
+    /// T319 drew for the roster.
+    Unauthorized,
 };
 
 /// Restore ALL of the LOCAL agent's windows (T335, Mac's `resumeAllSessions`):
@@ -2463,10 +2583,8 @@ pub const RestoreAllError = error{
 /// states the same property (`SessionLayoutRestore.swift:586-588`).
 ///
 /// The cross-machine half (rebuild ANOTHER machine's topology here, over the
-/// relay) is T336; this one dials nothing.
+/// relay) is `restoreAllRelaySessions`; this one dials nothing.
 pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
-    const gpa = self.core_app.alloc;
-
     // Non-spawning would be wrong here, unlike the push: the user asked for
     // this, so resolving (and if necessary starting) the agent is the job.
     const conn = self.local_agent.sharedConnection() orelse {
@@ -2474,7 +2592,91 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
         return error.NoAgent;
     };
 
-    const payload = conn.requestLayouts(restore_probe_timeout_ns) catch |err| {
+    const restored = try self.restoreAllFrom(conn, .local);
+    if (restored > 0) {
+        // The rebuilt windows are this box's again: record them locally so the
+        // NEXT launch restores them from the manifest without the round trip
+        // (Mac's `bindLocal`). Deliberately NOT done for a cross-machine
+        // rebuild — those windows are not ours to promise back, and
+        // `captureSessionLayout` skips them anyway.
+        self.markLayoutDirty();
+    }
+    return restored;
+}
+
+/// Restore ALL of a RELAY machine's windows here (T336, Mac's
+/// `resumeAllRemoteSessions`): dial that machine, pull ITS agent-owned layout
+/// blobs, and rebuild the whole topology locally with every pane ATTACHed to a
+/// session that keeps running over there. Returns how many windows were rebuilt.
+///
+/// **Every rebuilt window gets its own dial.** The pull runs on a dial this
+/// function owns and frees; each window then takes a fresh one it owns for life
+/// (`RestoreTransport`). Mac shares one connection across the rebuild
+/// (`SessionLayoutRestore.swift:659-675`) — win32 cannot, because `Window.deinit`
+/// tears its transport down, so the first window the user closed would take the
+/// others' agent with it. N windows is N+1 dials, and that is the deliberate
+/// answer to the ownership question rather than an accident of the loop.
+///
+/// It runs SYNCHRONOUSLY on the GUI thread, like the single-session remote
+/// resume it generalizes (T320's `resumeRelaySession`). That is fine for a
+/// loopback or LAN relay and visible on a slow one; T339 moves it off-thread.
+pub fn restoreAllRelaySessions(
+    self: *App,
+    relay_base: []const u8,
+    device: []const u8,
+    token: []const u8,
+) RestoreAllError!usize {
+    const alloc = self.core_app.alloc;
+
+    // The PULL's own connection: short-lived by design, exactly like the
+    // roster's browse dial (`SessionRoster.worker`). Freed below whatever
+    // happens — the windows never ride it.
+    var pull = self.dialRelay(relay_base, device, token) catch |err| return err;
+    defer pull.deinitDestroy(alloc);
+
+    const machine: Window.RemoteMachine = .{ .relay = .{ .base = relay_base, .device = device } };
+    return self.restoreAllFrom(pull.conn(), .{ .relay = .{
+        .base = relay_base,
+        .device = device,
+        .token = token,
+        .machine = machine,
+    } });
+}
+
+/// Where a Restore All's windows come from, and how each one is transported.
+const RestoreAllSource = union(enum) {
+    /// This box's agent: the windows ride the shared local connection and are
+    /// bound back into the local manifest by the caller.
+    local,
+    /// Another machine over the relay: each window dials its own transport.
+    relay: struct {
+        base: []const u8,
+        device: []const u8,
+        token: []const u8,
+        machine: Window.RemoteMachine,
+    },
+};
+
+/// The rebuild both Restore All paths share: pull the agent-owned layout blobs
+/// (`GET_LAYOUTS`, T334) over `pull`, probe liveness, and replay each decoded
+/// window through the SAME helpers launch-time restore uses. Returns how many
+/// windows were rebuilt (0 is a valid answer — the agent may hold nothing, or
+/// everything it holds may already be open here).
+///
+/// The point of the exercise is the SOURCE: the topology comes from the AGENT's
+/// copy, not from any local file. That is what makes it work after the manifest
+/// is gone — a crash, a wiped profile, a machine whose agent outlived its app —
+/// which is exactly when a user wants their windows back and exactly when
+/// launch-time restore can do nothing. Mac states the same property
+/// (`SessionLayoutRestore.swift:586-588`).
+fn restoreAllFrom(
+    self: *App,
+    pull: *remote_connection.Connection,
+    source: RestoreAllSource,
+) RestoreAllError!usize {
+    const gpa = self.core_app.alloc;
+
+    const payload = pull.requestLayouts(restore_probe_timeout_ns) catch |err| {
         log.warn("restore all: GET_LAYOUTS failed err={}", .{err});
         return error.PullFailed;
     };
@@ -2491,9 +2693,18 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
         log.warn("restore all: {d} blob(s) skipped as unreadable", .{decoded.skipped});
     }
 
-    var probe = AttachProbe.take(gpa, conn);
+    var probe = AttachProbe.take(gpa, pull);
     defer probe.deinit();
     const attach_ptr = probe.attachSet();
+
+    // Which machine's panes count as "already here" for the guard below. A
+    // session id is only meaningful WITH the machine that owns it, so the walk
+    // is scoped: a local id and a remote id that happen to match are two
+    // different sessions on two different boxes.
+    const scope: ?Window.RemoteMachine = switch (source) {
+        .local => null,
+        .relay => |r| r.machine,
+    };
 
     var restored: usize = 0;
     for (decoded.windows) |win| {
@@ -2503,11 +2714,42 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
         // attach, so rebuilding a window whose panes are already on screen would
         // quietly steal them from the window that has them — and the user would
         // watch their own terminal go blank to make a copy of itself.
-        if (self.windowIsOpenLocally(win)) {
+        //
+        // Mac skips the guard entirely for a cross-machine rebuild because its
+        // ids come from the LOCAL manifest and cannot match. Ours are read off
+        // the live panes, so the same check keeps working across the relay —
+        // pressing Restore All twice on a remote machine must not tear apart the
+        // windows the first press built.
+        if (self.windowIsOpenOn(win, scope)) {
             log.info("restore all: '{s}' is already open here, skipping", .{win.id});
             continue;
         }
-        self.restoreWindow(win, conn, attach_ptr) catch |err| {
+
+        // Per-window transport. The dial happens BEFORE the rebuild so a
+        // machine that stops answering mid-restore costs a skipped window
+        // rather than a half-built one.
+        const tr: RestoreTransport = switch (source) {
+            .local => .local(pull),
+            .relay => |r| blk: {
+                const dialed = self.dialRelay(r.base, r.device, r.token) catch |err| {
+                    log.warn(
+                        "restore all: window '{s}' dial failed err={}",
+                        .{ win.id, err },
+                    );
+                    continue;
+                };
+                break :blk .{
+                    .conn = dialed.conn(),
+                    .local_agent = false,
+                    .dialed = dialed,
+                    .machine = r.machine,
+                    // The far machine's monitors are not ours (T336).
+                    .reanchor = true,
+                };
+            },
+        };
+
+        self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("restore all: window '{s}' failed err={}", .{ win.id, err });
             continue;
         };
@@ -2516,36 +2758,71 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
 
     if (restored > 0) {
         log.info("restore all: rebuilt {d} window(s) from the agent's layouts", .{restored});
-        // The rebuilt windows are this box's again: record them locally so the
-        // NEXT launch restores them from the manifest without the round trip
-        // (Mac's `bindLocal`).
-        self.markLayoutDirty();
     } else {
         log.info("restore all: nothing to rebuild ({d} layout(s) held)", .{decoded.windows.len});
     }
     return restored;
 }
 
-/// Whether any leaf of `win` names a session one of our panes already has open.
-/// One leaf is enough: a window is restored as a unit, so a partial rebuild
-/// would either steal that pane or come back missing it.
-fn windowIsOpenLocally(self: *const App, win: session_layout.Window) bool {
+/// Dial an enrolled relay device for a restore, mapping the transport's errors
+/// onto the two the chooser can actually say something useful about. Heap-owned
+/// so the result can be handed to a window; the caller frees it if it does not.
+fn dialRelay(
+    self: *App,
+    relay_base: []const u8,
+    device: []const u8,
+    token: []const u8,
+) RestoreAllError!Window.RemoteDialed {
+    const alloc = self.core_app.alloc;
+    const dialed = alloc.create(relay_dial.Dialed) catch return error.DialFailed;
+    dialed.* = relay_dial.dial(alloc, relay_base, device, token, .raw) catch |err| {
+        log.warn(
+            "restore all: relay dial failed relay={s} device={s} err={}",
+            .{ relay_base, device, err },
+        );
+        alloc.destroy(dialed);
+        // A rejected bearer is not an unreachable machine, and telling the user
+        // to check the network when the fix is signing in wastes their time
+        // (the split T319 drew for the roster).
+        return if (err == error.WebSocketUnauthorized) error.Unauthorized else error.DialFailed;
+    };
+    return .{ .relay = dialed };
+}
+
+/// Whether any leaf of `win` names a session one of our panes already has open
+/// ON THE SAME MACHINE. One leaf is enough: a window is restored as a unit, so a
+/// partial rebuild would either steal that pane or come back missing it.
+///
+/// `scope` null means the LOCAL agent's sessions; a machine means panes dialed
+/// to that machine. Without the scoping a remote id could collide with a local
+/// one and silently drop a window from the rebuild.
+fn windowIsOpenOn(
+    self: *const App,
+    win: session_layout.Window,
+    scope: ?Window.RemoteMachine,
+) bool {
     for (win.tabs) |tab| {
         for (tab.nodes) |node| {
             const leaf = node.leaf orelse continue;
             const sid = leaf.session_id orelse continue;
             if (sid.len == 0) continue;
-            if (self.paneForSession(sid) != null) return true;
+            if (self.paneForSession(sid, scope) != null) return true;
         }
     }
     return false;
 }
 
-/// The open pane ATTACHed to `id`, or null. Reads the LIVE id off the pane's
-/// remote backend — the same source `captureLeaf` writes the manifest from — so
-/// a freshly OPENed persistent pane counts, not just a re-attached one.
-fn paneForSession(self: *const App, id: []const u8) ?*Surface {
+/// The open pane ATTACHed to `id` on the machine named by `scope`, or null.
+/// Reads the LIVE id off the pane's remote backend — the same source
+/// `captureLeaf` writes the manifest from — so a freshly OPENed persistent pane
+/// counts, not just a re-attached one.
+fn paneForSession(
+    self: *const App,
+    id: []const u8,
+    scope: ?Window.RemoteMachine,
+) ?*Surface {
     for (self.windows.items) |win| {
+        if (!windowIsOn(win, scope)) continue;
         for (0..win.tab_count) |t| {
             var it = win.tab_trees[t].iterator();
             while (it.next()) |entry| {
@@ -2556,6 +2833,24 @@ fn paneForSession(self: *const App, id: []const u8) ?*Surface {
         }
     }
     return null;
+}
+
+/// Whether `win`'s panes live on the machine named by `scope` (null ⇒ this box).
+/// A window with no dial is local; a dialed one is identified by the machine it
+/// was opened against, which is exactly what T68 already records.
+fn windowIsOn(win: *const Window, scope: ?Window.RemoteMachine) bool {
+    const want = scope orelse return win.remote_dialed == null;
+    const have = win.remote_machine orelse return false;
+    return switch (want) {
+        .relay => |w| switch (have) {
+            .relay => |h| std.mem.eql(u8, w.base, h.base) and std.mem.eql(u8, w.device, h.device),
+            .tcp => false,
+        },
+        .tcp => |w| switch (have) {
+            .tcp => |h| w.port == h.port and std.mem.eql(u8, w.host, h.host),
+            .relay => false,
+        },
+    };
 }
 
 /// Resume ONE browsed session of a RELAY machine (T320): dial that machine and

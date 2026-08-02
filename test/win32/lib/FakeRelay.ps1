@@ -42,6 +42,11 @@
 # Both are the NORMAL case in a chooser listing every enrolled device, and both
 # must resolve to a state of the region rather than a modal.
 #
+# Two more are FILE-triggered, so a run can change the machine's behaviour
+# part-way through - after a fixture has been built through it, or after a
+# roster has loaded: `-TripFile` (502 from then on) and
+# `-TripUnauthorizedFile` (401 from then on).
+#
 # Everything is loopback-only and lives in a background job; `Stop-FakeRelay`
 # kills it. The request log is the independent evidence that a dial really went
 # through the relay rather than some local shortcut.
@@ -59,13 +64,21 @@ function Start-FakeRelay {
         # While this file EXISTS, every `/v1/client/connect` answers 502. It is
         # how a negative control turns the relay off partway through a run,
         # after the fixture it needs has already been built through it.
-        [string]$TripFile = ''
+        [string]$TripFile = '',
+        # The same idea as `-TripFile`, answering 401 instead of 502: while this
+        # file EXISTS the bearer is treated as expired. A device that is
+        # PERMANENTLY unauthorized (`-UnauthorizedDevice`) can never get its
+        # roster loaded, so it cannot reach a surface that is gated on having
+        # one - the Restore All button, for instance. Expiring a credential
+        # AFTER the roster loaded is both the reachable path and the honest one:
+        # tokens go stale between one click and the next.
+        [string]$TripUnauthorizedFile = ''
     )
 
     Remove-Item $LogPath -ErrorAction SilentlyContinue
 
     $job = Start-Job -ScriptBlock {
-        param($port, $agentPort, $devicesJson, $logPath, $unauthDev, $deadDev, $tripFile)
+        param($port, $agentPort, $devicesJson, $logPath, $unauthDev, $deadDev, $tripFile, $tripAuthFile)
 
         function Write-RelayLog([string]$m) {
             Add-Content -Path $logPath -Value ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $m)
@@ -185,8 +198,14 @@ function Start-FakeRelay {
 
                     $tripped = $false
                     if ($tripFile -and (Test-Path $tripFile)) { $tripped = $true }
+                    $trippedAuth = $false
+                    if ($tripAuthFile -and (Test-Path $tripAuthFile)) { $trippedAuth = $true }
 
-                    if ($tripped) {
+                    if ($trippedAuth) {
+                        Write-RelayLog "REJECT 401 (tripped) device=$device"
+                        Write-Http $ns '401 Unauthorized' 'text/plain' 'expired'
+                        $client.Close()
+                    } elseif ($tripped) {
                         Write-RelayLog "REJECT 502 (tripped) device=$device"
                         Write-Http $ns '502 Bad Gateway' 'text/plain' 'tripped'
                         $client.Close()
@@ -346,7 +365,7 @@ function Start-FakeRelay {
 
             if ($idle) { Start-Sleep -Milliseconds 5 }
         }
-    } -ArgumentList $Port, $AgentPort, $DevicesJson, $LogPath, $UnauthorizedDevice, $UnreachableDevice, $TripFile
+    } -ArgumentList $Port, $AgentPort, $DevicesJson, $LogPath, $UnauthorizedDevice, $UnreachableDevice, $TripFile, $TripUnauthorizedFile
 
     # Wait for the listener to actually bind before handing the job back: a
     # relay that is not listening yet reads exactly like a relay that is broken.

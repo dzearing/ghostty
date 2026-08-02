@@ -1128,11 +1128,12 @@ fn actionComposition(self: *const MachineChooser) chooser_layout.Composition {
 fn compositionFor(row: ?Row, alive: usize) chooser_layout.Composition {
     const r = row orelse return .{};
     return .{
-        // The `r == .local` clause is T336's to delete: the rebuild path exists
-        // for the local agent only today, and Mac's own rule is machine-agnostic
-        // (MachineChooserView.swift:145-155). Offering the button on a remote row
-        // it cannot act on would be worse than not offering it at all.
-        .restore_all = r == .local and chooser_sessions.restoreAllAvailable(alive),
+        // Machine-agnostic since T336, which is also Mac's rule
+        // (MachineChooserView.swift:145-155): the count of LIVE sessions is the
+        // whole condition, and where they run only decides which transport the
+        // rebuild takes. Until T336 this carried an `r == .local` clause,
+        // because offering a button that cannot act is worse than no button.
+        .restore_all = chooser_sessions.restoreAllAvailable(alive),
         .activity = r != .local,
         .menu = chooser_menu.hasMenu(menuState(r)),
     };
@@ -2504,14 +2505,14 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
     }
 }
 
-/// Restore ALL of the selected machine's windows (T335): rebuild its whole
-/// window/tab/split topology here from the layout blobs the AGENT holds, with
-/// every pane ATTACHed to its still-running session.
+/// Restore ALL of the selected machine's windows (T335 local, T336 relay):
+/// rebuild its whole window/tab/split topology here from the layout blobs THAT
+/// machine's agent holds, with every pane ATTACHed to its still-running session.
 ///
-/// Local only for now (T336 is the relay half), which `compositionFor` already
-/// enforces by not offering the button on a device row — the guard here is the
-/// second lock on the same door, because a keyboard path that reached it anyway
-/// must not open a window on a machine's behalf without its topology.
+/// The two arms differ only in transport — a local rebuild rides the shared
+/// agent connection, a remote one dials the machine (and gives each rebuilt
+/// window its own dial) — so the decision, the messaging and the outcomes all
+/// live here once.
 ///
 /// Unlike the per-session resume, this one runs BEFORE the chooser closes: the
 /// rebuild's failure modes are worth saying out loud, and a dismissed chooser
@@ -2520,17 +2521,28 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
 /// equivalent and does not steal the user's next keystroke.
 fn restoreAll(self: *MachineChooser) void {
     const row = self.selectedRow() orelse return;
-    if (row != .local) {
-        self.setHint("Restoring another machine's windows isn't supported yet.");
-        return;
-    }
-
     const app = self.window.app;
-    const n = app.restoreAllLocalSessions() catch |err| {
+
+    // Dialled synchronously while the chooser is still alive: `relay_base`, the
+    // token and the device id are all borrowed from it, exactly as
+    // `openSelection` and `resumeRow` borrow them.
+    const n = switch (row) {
+        .local => app.restoreAllLocalSessions(),
+        .device => |i| relay: {
+            const dev = self.devices[i];
+            const tok = self.token orelse {
+                self.setHint("Not signed in - use Sign in with Google above.");
+                return;
+            };
+            break :relay app.restoreAllRelaySessions(self.relay_base, dev.id, tok);
+        },
+    } catch |err| {
         log.warn("machine chooser: restore all failed err={}", .{err});
         self.setHint(switch (err) {
             error.NoAgent => "The session agent isn't running - there's nothing to restore from.",
             error.PullFailed => "Couldn't read this machine's saved layouts from the agent.",
+            error.DialFailed => "Couldn't reach that machine - is its agent running?",
+            error.Unauthorized => "Session expired - sign in again above.",
         });
         return;
     };
@@ -3096,17 +3108,20 @@ test "compositionFor: Activity and the menu appear together, on remote rows only
     try testing.expect(!none.restore_all);
 }
 
-test "compositionFor: Restore All needs two live sessions, and the local row" {
-    // The rule (>= 2 alive) is Mac's; the local-only clause is T336's to remove.
+test "compositionFor: Restore All needs two live sessions, on ANY machine" {
+    // The rule (>= 2 alive) is Mac's, and since T336 it is the WHOLE rule: the
+    // count decides, not which machine the count came from.
     try testing.expect(!compositionFor(.local, 0).restore_all);
     try testing.expect(!compositionFor(.local, 1).restore_all);
     try testing.expect(compositionFor(.local, 2).restore_all);
     try testing.expect(compositionFor(.local, 7).restore_all);
 
-    // A remote machine with plenty of live sessions still does not get it here:
-    // there is no rebuild path for another machine's topology yet, and a button
-    // that cannot act is worse than an absent one.
-    try testing.expect(!compositionFor(.{ .device = 0 }, 5).restore_all);
+    // A remote machine takes the identical ladder — the T336 regression, since
+    // the pre-T336 rule answered false for every one of these.
+    try testing.expect(!compositionFor(.{ .device = 0 }, 0).restore_all);
+    try testing.expect(!compositionFor(.{ .device = 0 }, 1).restore_all);
+    try testing.expect(compositionFor(.{ .device = 0 }, 2).restore_all);
+    try testing.expect(compositionFor(.{ .device = 0 }, 5).restore_all);
 }
 
 test "the action row's own packing puts Activity between New Window and the menu" {

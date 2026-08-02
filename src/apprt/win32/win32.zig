@@ -113,6 +113,9 @@ pub const SWP_FRAMECHANGED: u32 = 0x0020;
 
 // MonitorFromWindow flags
 pub const MONITOR_DEFAULTTONEAREST: u32 = 0x00000002;
+/// Return NULL when the point/rect is on no monitor — which makes
+/// `MonitorFromRect` a "does this rectangle touch any screen?" query (T336).
+pub const MONITOR_DEFAULTTONULL: u32 = 0x00000000;
 
 pub const HMONITOR = *opaque {};
 
@@ -1620,6 +1623,11 @@ pub const MONITOR_DEFAULTTOPRIMARY: u32 = 0x00000001;
 
 pub extern "user32" fn MonitorFromPoint(
     pt: POINT,
+    dwFlags: u32,
+) callconv(.winapi) ?HMONITOR;
+
+pub extern "user32" fn MonitorFromRect(
+    lprc: *const RECT,
     dwFlags: u32,
 ) callconv(.winapi) ?HMONITOR;
 

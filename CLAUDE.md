@@ -628,14 +628,18 @@ From there:
   there is no topology to rebuild and Resume already covers it. The layout comes
   from the blobs the **agent** holds, not from the local `session-layout.json`,
   which is what makes it work after a crash that lost the manifest — precisely
-  when launch-time restore can do nothing.
+  when launch-time restore can do nothing. Pointed at a **remote** machine it
+  dials that machine for the layouts and gives **every rebuilt window its own
+  connection** (a Windows detail with no Mac analog: a win32 window owns its
+  transport and frees it on close, so one shared dial would die with the first
+  window closed). A frame authored on the far machine's monitors is re-clamped
+  onto a visible local one; a window whose sessions are already open here is
+  skipped rather than attached twice.
 
-Both work **cross-machine on macOS** (browse a relay machine's roster and resume
-it locally), which shipped 2026-07-16. On **Windows**, browsing and Resume-one
-work for both the local agent and relay machines, but **Restore All is local
-only** — the cross-machine rebuild is tracked as T336 in
-`docs/design/windows-parity-tasks/`, and until it lands the button is offered on
-the Local row alone.
+Both work **cross-machine on macOS and Windows** — browse a relay machine's
+roster, resume one session or rebuild the whole topology locally. Cross-machine
+Resume shipped on macOS 2026-07-16; on Windows, browse/Resume-one landed with
+T318–T320 and cross-machine Restore All with T336 (2026-08-02).
 
 ### Agent contract & upgrade compatibility
 
