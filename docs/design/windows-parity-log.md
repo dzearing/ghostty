@@ -6552,3 +6552,44 @@ immediate re-run - **T258**, the filed flake, in the filed file, on a task that
 touched no agent code. And every "nothing was created" assertion in
 `viewer-panes.ps1` is paired with a positive control running the same verb
 without `--view`: "no window appeared" is trivially true if IPC is simply dead.
+
+## 2026-08-02 - T90c: the tree could not tell a leaf from a terminal
+
+`SplitTree(Surface)` made "leaf" and "terminal" the same word. Retyped to
+`SplitTree(PaneView)` - a tagged union `{ terminal: *Surface, viewer:
+*ViewerPane }` that carries the ref count the tree protocol drives - across
+Window, IpcHandlers, IpcRegistry (`Target.pane`), HeroCarousel, MachineChooser,
+SessionRoster, RenameDialog and App. `tab_active_surface` became
+`tab_active_pane: [64]*PaneView` in the same pass: an active pane that cannot
+be a viewer makes a focused viewer unrepresentable, and half a retype is the
+divergence this project does not ship. `ViewerPane.zig` ships as scaffolding
+(HWND, visibility, title, location, pane id) so T90d fills a real shape in
+rather than re-cutting the union; nothing constructs one yet.
+
+**Ownership goes one way, and the count lives in one place.** The PaneView
+holds exactly ONE reference on its Surface; `Surface.ref_count` is untouched,
+so its teardown is byte-identical. `Surface.pane_view` is the back-pointer the
+destroy paths need - chiefly `Surface.deinit`'s `ipcForget`, whose registry key
+is now the leaf - and it is deliberately NOT cleared before `Surface.unref`,
+because teardown reaches back through it. `destroyUnowned` exists because
+`unref` on a never-ref'd pane would wrap a `u32` to `maxInt` and leak
+everything beneath it.
+
+**A pure refactor found a real double free.** `newSplitAt`'s function-wide
+`errdefer` freed the new surface while the later `defer insert_tree.deinit()` -
+which runs FIRST, defers being LIFO - had already unref'd it to zero and
+destroyed it. Any failure of `SplitTree.split` hit it, and it predates this
+task. Cleanup now hands off in one direction: once the insert tree owns the
+pane, its deinit is the only thing that frees.
+
+The terminal-only verbs now answer CLAUDE.md's documented `... is a viewer
+pane, not a terminal` instead of type-erroring, and `+list`/the session
+manifest grew their viewer branches. Every one of those is unreachable until
+T90d constructs a viewer, which is exactly why **T371** is filed: `PaneView`'s
+ref/unref cannot be unit-tested (the terminal arm needs a live Surface), so a
+leak or double-free in the new owner shows up only as a crash.
+
+Validation: both `zig build test` lanes, `test-agent`, the Debug win32 build,
+P1-P3, hero-mode, pane-banner, split-divider, window-title, and session-close
+(added on purpose - `closeSplitSurface` -> `closeSplitPane` is the path its
+close-intent wiring walks) all green on the box.

@@ -16,6 +16,7 @@ const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
+const PaneView = @import("PaneView.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
@@ -146,10 +147,12 @@ hwnd: ?w32.HWND = null,
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
 tab_count: usize = 0,
-tab_trees: [64]SplitTree(Surface) = undefined,
+tab_trees: [64]SplitTree(PaneView) = undefined,
 
-/// The currently focused surface within each tab.
-tab_active_surface: [64]*Surface = undefined,
+/// The currently focused PANE within each tab — a terminal or a viewer
+/// (T90c). Call sites that genuinely need a terminal narrow with
+/// `.surface()`; the rest work on any leaf.
+tab_active_pane: [64]*PaneView = undefined,
 
 /// Index of the currently active (visible) tab.
 active_tab: usize = 0,
@@ -266,8 +269,8 @@ is_quick_terminal: bool = false,
 
 /// Split divider drag state.
 dragging_split: bool = false,
-drag_split_handle: SplitTree(Surface).Node.Handle = .root,
-drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
+drag_split_handle: SplitTree(PaneView).Node.Handle = .root,
+drag_split_layout: SplitTree(PaneView).Split.Layout = .horizontal,
 drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
 /// The split node whose divider grab band the pointer is currently over
@@ -275,7 +278,7 @@ drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 /// change — a cursor tells nobody who is looking at the divider, and shows
 /// up on no screenshot. Active-tab state, so it is dropped alongside the
 /// hero transients whenever the tab or the tree changes.
-hover_split: ?SplitTree(Surface).Node.Handle = null,
+hover_split: ?SplitTree(PaneView).Node.Handle = null,
 
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
@@ -1114,32 +1117,39 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     return rect;
 }
 
-/// Returns the currently active Surface, or null if there are no tabs.
-pub fn getActiveSurface(self: *Window) ?*Surface {
+/// Returns the currently active pane, or null if there are no tabs.
+pub fn getActivePane(self: *Window) ?*PaneView {
     if (self.tab_count == 0) return null;
-    return self.tab_active_surface[self.active_tab];
+    return self.tab_active_pane[self.active_tab];
 }
 
-/// Find the tab index containing a given surface.
-/// Checks tab_active_surface first, then scans all trees.
-pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
-    for (self.tab_active_surface[0..self.tab_count], 0..) |s, i| {
-        if (s == surface) return i;
+/// Returns the currently active Surface, or null if there are no tabs or
+/// the active pane is a viewer.
+pub fn getActiveSurface(self: *Window) ?*Surface {
+    const pane = self.getActivePane() orelse return null;
+    return pane.surface();
+}
+
+/// Find the tab index containing a given pane.
+/// Checks tab_active_pane first, then scans all trees.
+pub fn findTabIndex(self: *Window, pane: *PaneView) ?usize {
+    for (self.tab_active_pane[0..self.tab_count], 0..) |p, i| {
+        if (p == pane) return i;
     }
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            if (entry.view == surface) return i;
+            if (entry.view == pane) return i;
         }
     }
     return null;
 }
 
-/// Find the Node.Handle for a surface in a given tab's tree.
-fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surface).Node.Handle {
+/// Find the Node.Handle for a pane in a given tab's tree.
+fn findHandle(self: *Window, tab_idx: usize, pane: *PaneView) ?SplitTree(PaneView).Node.Handle {
     var it = self.tab_trees[tab_idx].iterator();
     while (it.next()) |entry| {
-        if (entry.view == surface) return entry.handle;
+        if (entry.view == pane) return entry.handle;
     }
     return null;
 }
@@ -1267,7 +1277,7 @@ pub fn addTab(self: *Window) !*Surface {
     defer if (inherit) |*i| i.deinit(alloc);
     if (self.pending_surface_overrides == null) {
         const parent: ?*Surface = if (self.tab_count > 0)
-            self.tab_active_surface[self.active_tab]
+            self.tab_active_pane[self.active_tab].surface()
         else
             null;
         inherit = self.buildRemoteInherit(parent);
@@ -1281,14 +1291,18 @@ pub fn addTab(self: *Window) !*Surface {
 
     const surface = try alloc.create(Surface);
     try surface.init(self.app, self, .tab);
-    // After surface.init succeeds, create the SplitTree which takes ownership
-    // via ref(). If this fails, we manually clean up.
-    var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
+    // After surface.init succeeds, wrap it as a pane and create the SplitTree,
+    // which takes ownership via ref(). If either fails, clean up by hand.
+    const pane = PaneView.createTerminal(alloc, surface) catch |err| {
         surface.deinit();
         alloc.destroy(surface);
         return err;
     };
-    errdefer tree.deinit(); // tree.deinit() calls unref() which deinits+frees surface
+    var tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
+        pane.destroyUnowned(alloc);
+        return err;
+    };
+    errdefer tree.deinit(); // tree.deinit() calls unref() which frees pane+surface
 
     // Determine insert position based on config.
     const pos: usize = switch (self.app.config.@"window-new-tab-position") {
@@ -1300,7 +1314,7 @@ pub fn addTab(self: *Window) !*Surface {
     var i: usize = self.tab_count;
     while (i > pos) : (i -= 1) {
         self.tab_trees[i] = self.tab_trees[i - 1];
-        self.tab_active_surface[i] = self.tab_active_surface[i - 1];
+        self.tab_active_pane[i] = self.tab_active_pane[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
         self.tab_title_pinned[i] = self.tab_title_pinned[i - 1];
@@ -1311,7 +1325,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_hero_scroll[i] = self.tab_hero_scroll[i - 1];
     }
     self.tab_trees[pos] = tree;
-    self.tab_active_surface[pos] = surface;
+    self.tab_active_pane[pos] = pane;
     self.tab_title_pinned[pos] = false;
     self.tab_colors[pos] = .none;
     self.tab_hero_active[pos] = false;
@@ -1387,9 +1401,13 @@ pub fn replaceTabRootSurface(
         alloc.destroy(surface);
         return err;
     };
-    var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
+    const pane = PaneView.createTerminal(alloc, surface) catch |err| {
         surface.deinit();
         alloc.destroy(surface);
+        return err;
+    };
+    var tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
+        pane.destroyUnowned(alloc);
         return err;
     };
     errdefer tree.deinit();
@@ -1399,7 +1417,7 @@ pub fn replaceTabRootSurface(
     // their teardown (which posts messages).
     var old_tree = self.tab_trees[tab_index];
     self.tab_trees[tab_index] = tree;
-    self.tab_active_surface[tab_index] = surface;
+    self.tab_active_pane[tab_index] = pane;
     self.tab_hero_active[tab_index] = false;
     self.tab_hero_index[tab_index] = 0;
     old_tree.deinit();
@@ -1415,16 +1433,16 @@ pub fn setTabSurfacesVisible(self: *Window, tab: usize, visible: bool) void {
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| {
         entry.view.setVisible(visible);
-        if (entry.view.hwnd) |h|
+        if (entry.view.hwnd()) |h|
             _ = w32.ShowWindow(h, if (visible) w32.SW_SHOW else w32.SW_HIDE);
     }
 }
 
-/// Close a tab by surface pointer. Removes from the tab list,
+/// Close a tab by pane pointer. Removes from the tab list,
 /// deinits the tree, and adjusts the active tab index.
-pub fn closeTab(self: *Window, surface: *Surface) void {
-    log.debug("closeTab called for surface={x} tab_count={}", .{ @intFromPtr(surface), self.tab_count });
-    const idx = self.findTabIndex(surface) orelse return;
+pub fn closeTab(self: *Window, pane: *PaneView) void {
+    log.debug("closeTab called for pane={x} tab_count={}", .{ @intFromPtr(pane), self.tab_count });
+    const idx = self.findTabIndex(pane) orelse return;
     self.closeTabByIndex(idx);
 }
 
@@ -1445,7 +1463,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     var i: usize = idx;
     while (i + 1 < self.tab_count) : (i += 1) {
         self.tab_trees[i] = self.tab_trees[i + 1];
-        self.tab_active_surface[i] = self.tab_active_surface[i + 1];
+        self.tab_active_pane[i] = self.tab_active_pane[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
         self.tab_title_pinned[i] = self.tab_title_pinned[i + 1];
@@ -1472,11 +1490,11 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
 }
 
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
-pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Surface) void {
+pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, pane: *PaneView) void {
     switch (mode) {
-        .this => self.closeSplitSurface(surface),
+        .this => self.closeSplitPane(pane),
         .other => {
-            var current = self.findTabIndex(surface) orelse return;
+            var current = self.findTabIndex(pane) orelse return;
             var i: usize = self.tab_count;
             while (i > 0) {
                 i -= 1;
@@ -1487,7 +1505,7 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
             }
         },
         .right => {
-            const current = self.findTabIndex(surface) orelse return;
+            const current = self.findTabIndex(pane) orelse return;
             var i: usize = self.tab_count;
             while (i > current + 1) {
                 i -= 1;
@@ -1499,65 +1517,65 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
 
 /// Close a single surface within a split tree. If it's the last surface
 /// in the tab, close the entire tab instead.
-pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
+pub fn closeSplitPane(self: *Window, pane: *PaneView) void {
     const alloc = self.app.core_app.alloc;
-    const tab = self.findTabIndex(surface) orelse {
-        log.debug("closeSplitSurface: surface not found in any tab", .{});
+    const tab = self.findTabIndex(pane) orelse {
+        log.debug("closeSplitPane: pane not found in any tab", .{});
         return;
     };
     const tree = &self.tab_trees[tab];
 
     if (!tree.isSplit()) {
-        log.debug("closeSplitSurface: not split, closing whole tab", .{});
-        self.closeTab(surface);
+        log.debug("closeSplitPane: not split, closing whole tab", .{});
+        self.closeTab(pane);
         return;
     }
 
-    const handle = self.findHandle(tab, surface) orelse {
-        log.debug("closeSplitSurface: handle not found", .{});
+    const handle = self.findHandle(tab, pane) orelse {
+        log.debug("closeSplitPane: handle not found", .{});
         return;
     };
-    log.debug("closeSplitSurface: removing handle={} from tab={}", .{ handle.idx(), tab });
+    log.debug("closeSplitPane: removing handle={} from tab={}", .{ handle.idx(), tab });
 
     // Find next focus target BEFORE removing.
     const next_handle = (tree.goto(alloc, handle, .next) catch null) orelse
         (tree.goto(alloc, handle, .previous) catch null);
 
-    // Extract the surface pointer from the next handle before we modify the tree.
-    const next_surface: ?*Surface = if (next_handle) |nh| blk: {
+    // Extract the pane pointer from the next handle before we modify the tree.
+    const next_pane: ?*PaneView = if (next_handle) |nh| blk: {
         break :blk switch (tree.nodes[nh.idx()]) {
             .leaf => |v| v,
             .split => null,
         };
     } else null;
-    log.debug("closeSplitSurface: has_next={}", .{next_surface != null});
+    log.debug("closeSplitPane: has_next={}", .{next_pane != null});
 
     const new_tree = tree.remove(alloc, handle) catch {
-        log.err("failed to remove surface from split tree", .{});
+        log.err("failed to remove pane from split tree", .{});
         return;
     };
-    log.debug("closeSplitSurface: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
+    log.debug("closeSplitPane: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
 
     // T89e: user closed this one pane → END its agent session (CLOSE), not
     // detach. The surviving panes in `new_tree` keep their default (detach)
-    // intent; only the removed `surface` is marked. old_tree.deinit() below
-    // unrefs `surface` to zero, freeing it and reading this flag as its
+    // intent; only the removed `pane` is marked. old_tree.deinit() below
+    // unrefs `pane` to zero, freeing it and reading this flag as its
     // termio backend tears down.
-    surface.setSessionCloseIntent(true);
+    pane.setSessionCloseIntent(true);
 
     var old_tree = self.tab_trees[tab];
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
 
-    if (next_surface) |ns| {
-        log.debug("closeSplitSurface: focusing next surface", .{});
-        self.tab_active_surface[tab] = ns;
+    if (next_pane) |ns| {
+        log.debug("closeSplitPane: focusing next pane", .{});
+        self.tab_active_pane[tab] = ns;
         self.heroOnTreeChanged(tab);
         self.layoutSplits();
         self.app.markLayoutDirty(); // T89f: split closed → re-persist the layout
-        if (ns.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+        if (ns.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     } else {
-        log.debug("closeSplitSurface: no next surface, closing tab", .{});
+        log.debug("closeSplitPane: no next pane, closing tab", .{});
         self.closeTabByIndex(tab);
     }
 }
@@ -1589,13 +1607,13 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         var it = self.tab_trees[self.active_tab].iterator();
         while (it.next()) |entry| {
             entry.view.setVisible(false);
-            if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+            if (entry.view.hwnd()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         }
     }
     self.active_tab = idx;
-    const surface = self.tab_active_surface[idx];
+    const pane = self.tab_active_pane[idx];
     self.layoutSplits();
-    if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+    if (pane.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     self.updateWindowTitle();
 }
 
@@ -1607,19 +1625,19 @@ fn leafCount(self: *Window, tab: usize) usize {
     return n;
 }
 
-/// The tree-iteration-order index of `surface` in a tab, if present.
-fn leafIndexOf(self: *Window, tab: usize, surface: *Surface) ?usize {
+/// The tree-iteration-order index of `pane` in a tab, if present.
+fn leafIndexOf(self: *Window, tab: usize, pane: *PaneView) ?usize {
     var i: usize = 0;
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| : (i += 1) {
-        if (entry.view == surface) return i;
+        if (entry.view == pane) return i;
     }
     return null;
 }
 
 /// The leaf at a tree-iteration-order index, if in range. Pub: the
 /// hero slide painter resolves its outgoing/incoming snapshots by index.
-pub fn leafAt(self: *Window, tab: usize, index: usize) ?*Surface {
+pub fn leafAt(self: *Window, tab: usize, index: usize) ?*PaneView {
     var i: usize = 0;
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| : (i += 1) {
@@ -1639,7 +1657,7 @@ pub fn toggleHeroMode(self: *Window) void {
         self.resetPointerTransients();
     } else {
         if (self.leafCount(tab) <= 1) return;
-        const focused = self.tab_active_surface[tab];
+        const focused = self.tab_active_pane[tab];
         self.tab_hero_index[tab] = @intCast(self.leafIndexOf(tab, focused) orelse 0);
         self.tab_hero_scroll[tab] = 0;
         self.tab_trees[tab].zoom(null);
@@ -1648,7 +1666,7 @@ pub fn toggleHeroMode(self: *Window) void {
     self.layoutSplits();
     // Repaint everything: entering paints the carousel, leaving clears it.
     if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
-    if (self.tab_active_surface[tab].hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+    if (self.tab_active_pane[tab].hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Move the hero selection (clamped), focus it, and re-layout — animated
@@ -1669,13 +1687,13 @@ fn heroSelect(self: *Window, index: isize) void {
 
     self.tab_hero_index[tab] = @intCast(clamped);
     const view = self.leafAt(tab, clamped) orelse return;
-    self.tab_active_surface[tab] = view;
+    self.tab_active_pane[tab] = view;
     // Mac parity: a selection change resets the wheel-scroll offset.
     self.tab_hero_scroll[tab] = 0;
 
     if (self.heroStartAnims(old_index, clamped, old_top0)) return;
     self.layoutSplits();
-    if (view.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+    if (view.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Clamp/deactivate hero state after the tab's tree changed (split
@@ -1698,11 +1716,11 @@ pub fn heroOnTreeChanged(self: *Window, tab: usize) void {
 /// heroSelect so external focus changes get the same animations as
 /// keyboard/click selection (the redundant deferred SetFocus it issues is
 /// a no-op — the surface already has focus).
-pub fn heroOnSurfaceFocused(self: *Window, surface: *Surface) void {
+pub fn heroOnPaneFocused(self: *Window, pane: *PaneView) void {
     const tab = self.active_tab;
     if (!self.tab_hero_active[tab]) return;
-    const index = self.leafIndexOf(tab, surface) orelse return;
-    log.debug("heroOnSurfaceFocused hwnd={?} index={} cur={}", .{ surface.hwnd, index, self.tab_hero_index[tab] });
+    const index = self.leafIndexOf(tab, pane) orelse return;
+    log.debug("heroOnPaneFocused hwnd={?} index={} cur={}", .{ pane.hwnd(), index, self.tab_hero_index[tab] });
     if (index == self.tab_hero_index[tab]) return;
     self.heroSelect(@intCast(index));
 }
@@ -1748,14 +1766,17 @@ fn heroStartAnims(self: *Window, old_index: usize, new_index: usize, old_top0: ?
     const out_view = self.leafAt(tab, old_index) orelse return false;
     const in_view = self.leafAt(tab, new_index) orelse return false;
     // The slide owner-paints both SNAPSHOTS; without both DIBs (e.g.
-    // immediately after entering hero mode) swap instantly instead.
-    if (out_view.snap_dib == null or in_view.snap_dib == null) return false;
+    // immediately after entering hero mode) swap instantly instead. A
+    // viewer pane has no renderer and therefore never has one.
+    const out_surface = out_view.surface() orelse return false;
+    const in_surface = in_view.surface() orelse return false;
+    if (out_surface.snap_dib == null or in_surface.snap_dib == null) return false;
     const start = std.time.Instant.now() catch return false;
 
     self.hero_slide = .{ .from_index = old_index, .to_index = new_index, .start = start };
     // Both hero HWNDs stay hidden for the whole slide; the incoming one
     // is shown (and focused) by heroAnimTick when the slide completes.
-    if (out_view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+    if (out_view.hwnd()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
 
     // Re-center: decay from the old strip position to the new centered
     // one (Mac: 0.3s, skipped on first show — entering hero mode never
@@ -1806,7 +1827,7 @@ fn heroShowSelected(self: *Window, focus: bool) void {
     const tab = self.active_tab;
     if (!self.tab_hero_active[tab]) return;
     const view = self.leafAt(tab, self.tab_hero_index[tab]) orelse return;
-    if (view.hwnd) |h| {
+    if (view.hwnd()) |h| {
         _ = w32.ShowWindow(h, w32.SW_SHOW);
         if (focus) App.deferSetFocus(h); // T48: defer out of WndProc
     }
@@ -2052,7 +2073,10 @@ fn heroSnapTick(self: *Window) void {
     const geo = HeroCarousel.geometry(self) orelse return;
     var it = self.tab_trees[self.active_tab].iterator();
     while (it.next()) |entry| {
-        entry.view.heroSnapRequest(
+        // Hero snapshots come from a renderer thread, so viewer panes have
+        // none (T90a S15: viewers are excluded from hero mode).
+        const surface = entry.view.surface() orelse continue;
+        surface.heroSnapRequest(
             @intCast(@max(geo.layout.thumb_w, 1)),
             @intCast(@max(geo.layout.thumb_h, 1)),
         );
@@ -2068,9 +2092,10 @@ fn heroOnSnapReady(self: *Window, leaf_hwnd_int: usize) void {
     var it = self.tab_trees[self.active_tab].iterator();
     var index: usize = 0;
     while (it.next()) |entry| : (index += 1) {
-        const h = entry.view.hwnd orelse continue;
+        const h = entry.view.hwnd() orelse continue;
         if (@intFromPtr(h) != leaf_hwnd_int) continue;
-        if (entry.view.heroSnapPublish()) {
+        const surface = entry.view.surface() orelse continue;
+        if (surface.heroSnapPublish()) {
             if (self.hwnd) |wh| {
                 if (HeroCarousel.tileRect(self, index)) |r| {
                     var inv: w32.RECT = .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
@@ -2109,7 +2134,7 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
     while (it.next()) |entry| : (leaf_i += 1) {
         // Renderer stays awake even for hidden leaves (thumbnail source).
         entry.view.setVisible(true);
-        if (entry.view.hwnd) |h| {
+        if (entry.view.hwnd()) |h| {
             // Banner strip band above the hero-sized terminal (T101);
             // hidden leaves get the same inset so their thumbnail aspect
             // matches what selection will show.
@@ -2155,7 +2180,7 @@ pub fn layoutSplits(self: *Window) void {
         while (it.next()) |entry| {
             if (entry.handle == zoomed_handle) {
                 entry.view.setVisible(true);
-                if (entry.view.hwnd) |h| {
+                if (entry.view.hwnd()) |h| {
                     // Banner strip band above the zoomed terminal (T101).
                     const inset = entry.view.bannerLayoutInset(rect.right - rect.left, rect.bottom - rect.top);
                     const w = @max(rect.right - rect.left, 1);
@@ -2165,7 +2190,7 @@ pub fn layoutSplits(self: *Window) void {
                 }
             } else {
                 entry.view.setVisible(false);
-                if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+                if (entry.view.hwnd()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
             }
         }
         return;
@@ -2207,7 +2232,7 @@ pub fn updateDimOverlays(self: *Window) void {
                 .is_split = tree.isSplit(),
                 .zoomed = tree.zoomed != null,
                 .hero = self.tab_hero_active[tab],
-                .focused_pane = entry.view == self.tab_active_surface[tab],
+                .focused_pane = entry.view == self.tab_active_pane[tab],
             });
             if (dim) {
                 entry.view.showDimOverlay(color, alpha);
@@ -2245,7 +2270,8 @@ pub fn updatePaneBanners(self: *Window) void {
     for (0..self.tab_count) |tab| {
         var it = self.tab_trees[tab].iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
+            // Banners are terminal-only (`+set-banner` rejects viewers).
+            const surface = entry.view.surface() orelse continue;
             const overlay = surface.banner_overlay orelse continue;
             surface.refreshBannerColors();
             overlay.updatePosition(surface.scale);
@@ -2253,12 +2279,12 @@ pub fn updatePaneBanners(self: *Window) void {
     }
 }
 
-fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
+fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneView).Node.Handle, rect: w32.RECT) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| {
             view.setVisible(true);
-            if (view.hwnd) |h| {
+            if (view.hwnd()) |h| {
                 // Reserve the sticky-banner strip band above the terminal
                 // (T101): the grid starts below the strip, never under it.
                 const inset = view.bannerLayoutInset(rect.right - rect.left, rect.bottom - rect.top);
@@ -2317,7 +2343,7 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     };
     // A drag is a held hover (design system §5), and it outranks the pointer's
     // last hover position: mid-drag the pointer can leave the band entirely.
-    const hot_handle: ?SplitTree(Surface).Node.Handle =
+    const hot_handle: ?SplitTree(PaneView).Node.Handle =
         if (self.dragging_split) self.drag_split_handle else self.hover_split;
 
     self.paintDividerNode(hdc, tree, .root, rect, brush, hot_brush orelse brush, hot_handle);
@@ -2326,12 +2352,12 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
 fn paintDividerNode(
     self: *Window,
     hdc: w32.HDC,
-    tree: SplitTree(Surface),
-    handle: SplitTree(Surface).Node.Handle,
+    tree: SplitTree(PaneView),
+    handle: SplitTree(PaneView).Node.Handle,
     rect: w32.RECT,
     rest_brush: w32.HBRUSH,
     hot_brush: w32.HBRUSH,
-    hot_handle: ?SplitTree(Surface).Node.Handle,
+    hot_handle: ?SplitTree(PaneView).Node.Handle,
 ) void {
     if (handle.idx() >= tree.nodes.len) return;
     const brush = if (hot_handle) |h| (if (h == handle) hot_brush else rest_brush) else rest_brush;
@@ -2363,8 +2389,8 @@ fn paintDividerNode(
 }
 
 const DividerHit = struct {
-    handle: SplitTree(Surface).Node.Handle,
-    layout: SplitTree(Surface).Split.Layout,
+    handle: SplitTree(PaneView).Node.Handle,
+    layout: SplitTree(PaneView).Split.Layout,
 };
 
 /// Hit-test the split divider grab band at (x, y) in window client
@@ -2386,8 +2412,8 @@ pub fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
 
 fn hitTestDividerNode(
     self: *Window,
-    tree: SplitTree(Surface),
-    handle: SplitTree(Surface).Node.Handle,
+    tree: SplitTree(PaneView),
+    handle: SplitTree(PaneView).Node.Handle,
     rect: w32.RECT,
     x: i32,
     y: i32,
@@ -2421,7 +2447,7 @@ fn hitTestDividerNode(
 
 /// The client-coordinate rect of ONE split's divider band in the active
 /// tab, or null when the handle is not a visible split there.
-fn dividerBandRect(self: *Window, target: SplitTree(Surface).Node.Handle) ?w32.RECT {
+fn dividerBandRect(self: *Window, target: SplitTree(PaneView).Node.Handle) ?w32.RECT {
     if (self.tab_count == 0) return null;
     if (self.tab_hero_active[self.active_tab]) return null;
     const tree = self.tab_trees[self.active_tab];
@@ -2432,10 +2458,10 @@ fn dividerBandRect(self: *Window, target: SplitTree(Surface).Node.Handle) ?w32.R
 
 fn dividerBandRectNode(
     self: *Window,
-    tree: SplitTree(Surface),
-    handle: SplitTree(Surface).Node.Handle,
+    tree: SplitTree(PaneView),
+    handle: SplitTree(PaneView).Node.Handle,
     rect: w32.RECT,
-    target: SplitTree(Surface).Node.Handle,
+    target: SplitTree(PaneView).Node.Handle,
 ) ?w32.RECT {
     if (handle.idx() >= tree.nodes.len) return null;
     switch (tree.nodes[handle.idx()]) {
@@ -2483,7 +2509,7 @@ fn dividerBandRectNode(
 /// screen and was invisible to the capture — a state that exists on the glass
 /// and nowhere else. Only the band rect is invalidated, so the panes never
 /// repaint and there is no flicker.
-fn refreshDividerBand(self: *Window, handle: ?SplitTree(Surface).Node.Handle) void {
+fn refreshDividerBand(self: *Window, handle: ?SplitTree(PaneView).Node.Handle) void {
     const hwnd = self.hwnd orelse return;
     const h = handle orelse return;
     var r = self.dividerBandRect(h) orelse return;
@@ -2494,7 +2520,7 @@ fn refreshDividerBand(self: *Window, handle: ?SplitTree(Surface).Node.Handle) vo
 /// Set (or clear) the hovered split divider, repainting when it changed.
 /// Idempotent — WM_MOUSEMOVE fires for every pixel of travel, and only a
 /// transition is worth a repaint.
-fn setDividerHover(self: *Window, handle: ?SplitTree(Surface).Node.Handle) void {
+fn setDividerHover(self: *Window, handle: ?SplitTree(PaneView).Node.Handle) void {
     const same = if (self.hover_split) |old|
         (if (handle) |new| old == new else false)
     else
@@ -2534,7 +2560,7 @@ fn updateDividerHover(self: *Window, x: i32, y: i32) void {
     self.setDividerHover(if (self.hitTestDivider(x, y)) |hit| hit.handle else null);
 }
 
-fn startDividerDrag(self: *Window, handle: SplitTree(Surface).Node.Handle, layout: SplitTree(Surface).Split.Layout) void {
+fn startDividerDrag(self: *Window, handle: SplitTree(PaneView).Node.Handle, layout: SplitTree(PaneView).Split.Layout) void {
     self.dragging_split = true;
     self.drag_split_handle = handle;
     self.drag_split_layout = layout;
@@ -2577,7 +2603,7 @@ fn endDividerDrag(self: *Window) void {
     // behind and it must go back to rest. No readable cursor (a background
     // desktop) reads as "not hovered", which is the safe answer.
     var pt: w32.POINT = undefined;
-    var hover: ?SplitTree(Surface).Node.Handle = null;
+    var hover: ?SplitTree(PaneView).Node.Handle = null;
     if (w32.GetCursorPos_(&pt) != 0) {
         if (self.hwnd) |hwnd| {
             _ = w32.ScreenToClient(hwnd, &pt);
@@ -2595,9 +2621,9 @@ fn endDividerDrag(self: *Window) void {
 }
 
 /// Create a new split in the active tab.
-pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?*Surface {
+pub fn newSplit(self: *Window, direction: SplitTree(PaneView).Split.Direction) !?*Surface {
     if (self.tab_count == 0) return null;
-    return self.newSplitAt(self.tab_active_surface[self.active_tab], direction, 0.5);
+    return self.newSplitAt(self.tab_active_pane[self.active_tab], direction, 0.5);
 }
 
 /// Split at a specific surface (IPC `+split --pane`), with an explicit
@@ -2605,8 +2631,8 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?
 /// effects only apply when its tab is active.
 pub fn newSplitAt(
     self: *Window,
-    at: *Surface,
-    direction: SplitTree(Surface).Split.Direction,
+    at: *PaneView,
+    direction: SplitTree(PaneView).Split.Direction,
     ratio: f16,
 ) !?*Surface {
     if (self.tab_count == 0) return null;
@@ -2620,7 +2646,7 @@ pub fn newSplitAt(
     var inherit: ?RemoteInherit = null;
     defer if (inherit) |*i| i.deinit(alloc);
     if (self.pending_surface_overrides == null) {
-        inherit = self.buildRemoteInherit(at);
+        inherit = self.buildRemoteInherit(at.surface());
         if (inherit) |*i| self.pending_surface_overrides = &i.overrides;
     }
     defer if (inherit != null) {
@@ -2632,19 +2658,36 @@ pub fn newSplitAt(
     // darken light ones). Captured before init; applied after so the core
     // terminal exists. An explicit IPC `--color` overwrites this right
     // after newSplitAt returns.
-    const inherited_tint = color_math.shiftedTint(at.effectiveBackground());
+    // A viewer parent has no terminal background to inherit from; fall back
+    // to the window's own so a split off a viewer still gets a valid tint.
+    const inherited_tint = color_math.shiftedTint(if (at.surface()) |s| s.effectiveBackground() else .{
+        .r = self.app.config.background.r,
+        .g = self.app.config.background.g,
+        .b = self.app.config.background.b,
+    });
 
-    // Create new surface.
+    // Create new surface. Cleanup hands off in one direction and is never
+    // doubled up: once `insert_tree` owns the pane, ITS deinit is the only
+    // thing that frees the surface. (An `errdefer` covering the surface for
+    // the whole function would run on top of that `defer` and free it twice
+    // if `split` below failed.)
     const new_surface = try alloc.create(Surface);
-    errdefer {
-        new_surface.deinit();
+    new_surface.init(self.app, self, .split) catch |err| {
         alloc.destroy(new_surface);
-    }
-    try new_surface.init(self.app, self, .split);
+        return err;
+    };
     new_surface.applyBackgroundTint(inherited_tint, false);
 
-    // Create a single-node tree for the new surface.
-    var insert_tree = try SplitTree(Surface).init(alloc, new_surface);
+    // Wrap it as a pane and build a single-node tree to insert.
+    const new_pane = PaneView.createTerminal(alloc, new_surface) catch |err| {
+        new_surface.deinit();
+        alloc.destroy(new_surface);
+        return err;
+    };
+    var insert_tree = SplitTree(PaneView).init(alloc, new_pane) catch |err| {
+        new_pane.destroyUnowned(alloc);
+        return err;
+    };
     defer insert_tree.deinit();
 
     // Split the current tree at the target surface.
@@ -2662,10 +2705,10 @@ pub fn newSplitAt(
     self.tab_trees[tab] = new_tree;
 
     // Focus the new surface.
-    self.tab_active_surface[tab] = new_surface;
+    self.tab_active_pane[tab] = new_pane;
     self.heroOnTreeChanged(tab);
     if (self.tab_hero_active[tab]) {
-        if (self.leafIndexOf(tab, new_surface)) |index| {
+        if (self.leafIndexOf(tab, new_pane)) |index| {
             self.tab_hero_index[tab] = @intCast(index);
         }
     }
@@ -2701,10 +2744,10 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
 
     const tree = &self.tab_trees[tab];
 
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    const active_pane = self.tab_active_pane[tab];
+    const handle = self.findHandle(tab, active_pane) orelse return;
 
-    const target: SplitTree(Surface).Goto = switch (goto_target) {
+    const target: SplitTree(PaneView).Goto = switch (goto_target) {
         .previous => .previous,
         .next => .next,
         .up => .{ .spatial = .up },
@@ -2718,7 +2761,7 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
 
     switch (tree.nodes[dest_handle.idx()]) {
         .leaf => |surface| {
-            self.tab_active_surface[tab] = surface;
+            self.tab_active_pane[tab] = surface;
 
             // Navigating away from a zoomed split must not focus a hidden
             // pane (T77). Match Mac/GTK `split-preserve-zoom`: clear the
@@ -2733,7 +2776,7 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
                 self.layoutSplits();
             }
 
-            if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+            if (surface.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         },
         .split => {},
     }
@@ -2765,10 +2808,10 @@ pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
 
     const tree = &self.tab_trees[tab];
 
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    const active_pane = self.tab_active_pane[tab];
+    const handle = self.findHandle(tab, active_pane) orelse return;
 
-    const target: SplitTree(Surface).Goto = switch (goto_target) {
+    const target: SplitTree(PaneView).Goto = switch (goto_target) {
         .previous => .previous,
         .next => .next,
         .up => .{ .spatial = .up },
@@ -2792,7 +2835,7 @@ pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     old_tree.deinit();
 
     self.layoutSplits();
-    if (active_surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+    if (active_pane.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Resize the nearest split in the given direction by the given pixel amount.
@@ -2802,10 +2845,10 @@ pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
     const tab = self.active_tab;
     const tree = &self.tab_trees[tab];
 
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    const active_pane = self.tab_active_pane[tab];
+    const handle = self.findHandle(tab, active_pane) orelse return;
 
-    const layout: SplitTree(Surface).Split.Layout = switch (rs.direction) {
+    const layout: SplitTree(PaneView).Split.Layout = switch (rs.direction) {
         .left, .right => .horizontal,
         .up, .down => .vertical,
     };
@@ -2850,8 +2893,8 @@ pub fn toggleSplitZoom(self: *Window) void {
 
     if (!tree.isSplit()) return;
 
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    const active_pane = self.tab_active_pane[tab];
+    const handle = self.findHandle(tab, active_pane) orelse return;
 
     if (tree.zoomed) |z| {
         if (z == handle) {
@@ -2898,8 +2941,8 @@ pub fn moveTab(self: *Window, amount: isize) void {
     if (new_index == self.active_tab) return;
 
     // Swap all tab state between active_tab and new_index.
-    std.mem.swap(SplitTree(Surface), &self.tab_trees[self.active_tab], &self.tab_trees[new_index]);
-    std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
+    std.mem.swap(SplitTree(PaneView), &self.tab_trees[self.active_tab], &self.tab_trees[new_index]);
+    std.mem.swap(*PaneView, &self.tab_active_pane[self.active_tab], &self.tab_active_pane[new_index]);
     std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
     std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
     std.mem.swap(bool, &self.tab_title_pinned[self.active_tab], &self.tab_title_pinned[new_index]);
@@ -2928,7 +2971,7 @@ pub fn reportColorScheme(self: *Window) void {
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
+            const surface = entry.view.surface() orelse continue;
             if (!surface.core_surface_ready) continue;
             surface.core_surface.colorSchemeCallback(scheme) catch |err| {
                 log.warn("color scheme callback failed err={}", .{err});
@@ -2944,7 +2987,8 @@ pub fn activityAggregate(self: *Window) terminal.osc.Command.ActivityState {
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            switch (entry.view.activity_state) {
+            const surface = entry.view.surface() orelse continue;
+            switch (surface.activity_state) {
                 .needs_input => return .needs_input,
                 .busy => aggregate = .busy,
                 .idle => {},
@@ -3015,9 +3059,10 @@ pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
 /// tab's focused pane drives the tab title (Mac parity — background
 /// panes keep their own pane title without relabeling the tab).
 pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
-    const tab_idx = self.findTabIndex(surface) orelse return;
+    const pane = surface.pane_view orelse return;
+    const tab_idx = self.findTabIndex(pane) orelse return;
     if (self.tab_title_pinned[tab_idx]) return;
-    if (self.tab_active_surface[tab_idx] != surface) return;
+    if (self.tab_active_pane[tab_idx] != pane) return;
     var wbuf: [256]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
     const len: u16 = @intCast(@min(wlen, 255));
@@ -3033,7 +3078,7 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
 pub fn refreshTabTitle(self: *Window, tab_idx: usize) void {
     if (tab_idx >= self.tab_count) return;
     if (self.tab_title_pinned[tab_idx]) return;
-    const title = self.tab_active_surface[tab_idx].title orelse return;
+    const title = self.tab_active_pane[tab_idx].title() orelse return;
     var wbuf: [256]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
     const len: u16 = @intCast(@min(wlen, 255));
@@ -4255,7 +4300,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
 
     // Save the source tab state
     const saved_tree = self.tab_trees[from];
-    const saved_surface = self.tab_active_surface[from];
+    const saved_surface = self.tab_active_pane[from];
     const saved_title = self.tab_titles[from];
     const saved_title_len = self.tab_title_lens[from];
     const saved_title_pinned = self.tab_title_pinned[from];
@@ -4270,7 +4315,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
         var i: usize = from;
         while (i < to) : (i += 1) {
             self.tab_trees[i] = self.tab_trees[i + 1];
-            self.tab_active_surface[i] = self.tab_active_surface[i + 1];
+            self.tab_active_pane[i] = self.tab_active_pane[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
             self.tab_title_pinned[i] = self.tab_title_pinned[i + 1];
@@ -4285,7 +4330,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
         var i: usize = from;
         while (i > to) : (i -= 1) {
             self.tab_trees[i] = self.tab_trees[i - 1];
-            self.tab_active_surface[i] = self.tab_active_surface[i - 1];
+            self.tab_active_pane[i] = self.tab_active_pane[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
             self.tab_title_pinned[i] = self.tab_title_pinned[i - 1];
@@ -4299,7 +4344,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
 
     // Place the saved tab at the destination
     self.tab_trees[to] = saved_tree;
-    self.tab_active_surface[to] = saved_surface;
+    self.tab_active_pane[to] = saved_surface;
     self.tab_titles[to] = saved_title;
     self.tab_title_lens[to] = saved_title_len;
     self.tab_title_pinned[to] = saved_title_pinned;
@@ -4963,7 +5008,9 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
     outer: for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
+            // Viewers run no process, so they never gate a close (Mac
+            // parity: `+close` never prompts for a viewer pane).
+            const surface = entry.view.surface() orelse continue;
             if (surface.core_surface_ready and
                 surface.core_surface.needsConfirmQuit() and
                 // The core's verdict is `cursorIsAtPrompt`, which no Windows
@@ -5355,7 +5402,8 @@ pub fn windowWndProc(
             for (0..window.tab_count) |i| {
                 var it = window.tab_trees[i].iterator();
                 while (it.next()) |entry| {
-                    if (entry.view.scrollbar) |sb| _ = sb.repositionAndResize();
+                    const surface = entry.view.surface() orelse continue;
+                    if (surface.scrollbar) |sb| _ = sb.repositionAndResize();
                 }
             }
             // The dim overlays are screen-positioned popups too (T74).
@@ -5381,14 +5429,18 @@ pub fn windowWndProc(
         w32.WM_ENTERSIZEMOVE => {
             if (window.tab_count > 0) {
                 var it = window.tab_trees[window.active_tab].iterator();
-                while (it.next()) |entry| entry.view.in_live_resize = true;
+                while (it.next()) |entry| {
+                    if (entry.view.surface()) |s| s.in_live_resize = true;
+                }
             }
             return 0;
         },
         w32.WM_EXITSIZEMOVE => {
             if (window.tab_count > 0) {
                 var it = window.tab_trees[window.active_tab].iterator();
-                while (it.next()) |entry| entry.view.in_live_resize = false;
+                while (it.next()) |entry| {
+                    if (entry.view.surface()) |s| s.in_live_resize = false;
+                }
             }
             // T85: the user finished an interactive resize/move — remember
             // the outer size. Drag-to-top ("aero snap" maximize) can zoom

@@ -201,7 +201,10 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         };
         const hovered = win.hero_hover_tile >= 0 and
             @as(usize, @intCast(win.hero_hover_tile)) == i;
-        paintTile(win, mem_dc, entry.view, local, i == geo.selected, hovered);
+        // Hero tiles are renderer snapshots, so only terminal panes have
+        // one to paint (T90a S15: viewers are excluded from hero mode).
+        const surface = entry.view.surface() orelse continue;
+        paintTile(win, mem_dc, surface, local, i == geo.selected, hovered);
     }
 
     _ = w32.BitBlt(hdc_screen, region.left, region.top, rw, rh, mem_dc, 0, 0, w32.SRCCOPY);
@@ -362,7 +365,8 @@ fn paintSlideSnap(
     h: i32,
 ) void {
     if (y >= h or y + h <= 0) return;
-    const view = win.leafAt(tab, index) orelse return;
+    const pane = win.leafAt(tab, index) orelse return;
+    const view = pane.surface() orelse return;
     const dib = view.snap_dib orelse return;
     if (view.snap_dib_w <= 0 or view.snap_dib_h <= 0) return;
     const src_dc = w32.CreateCompatibleDC(dc) orelse return;

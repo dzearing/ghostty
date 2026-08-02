@@ -221,8 +221,8 @@ pub fn open(window: *Window, level: Level, target: ?*Surface) void {
             title_len = tlen;
         },
         // Tab: the target tab's current (possibly pinned) title.
-        .tab => if (target) |s| {
-            if (window.findTabIndex(s)) |tab_idx| {
+        .tab => if (target) |s| if (s.pane_view) |pv| {
+            if (window.findTabIndex(pv)) |tab_idx| {
                 const tlen = window.tab_title_lens[tab_idx];
                 @memcpy(title_buf[0..tlen], window.tab_titles[tab_idx][0..tlen]);
                 title_len = tlen;
@@ -507,14 +507,14 @@ pub fn finish(self: *RenameDialog) void {
     self.close();
     switch (level) {
         .window => window.setTitleOverride(title),
-        .tab => if (target) |s| {
+        .tab => if (target) |s| if (s.pane_view) |pv| {
             // Address-only liveness resolve; a pane closed while the
             // dialog was open simply no-ops.
-            if (window.findTabIndex(s)) |tab_idx|
+            if (window.findTabIndex(pv)) |tab_idx|
                 window.setTabTitlePin(tab_idx, title);
         },
-        .pane => if (target) |s| {
-            if (window.findTabIndex(s) != null) s.setUserTitle(title);
+        .pane => if (target) |s| if (s.pane_view) |pv| {
+            if (window.findTabIndex(pv) != null) s.setUserTitle(title);
         },
     }
 }

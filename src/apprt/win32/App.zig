@@ -26,6 +26,7 @@ const RelayAccountRow = @import("RelayAccountRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
+const PaneView = @import("PaneView.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
@@ -1262,7 +1263,7 @@ fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.
         surface.core_surface.remoteSessionId()
     else
         null;
-    const ipc_name = self.ipcNameOf(.{ .pane = surface });
+    const ipc_name = if (surface.pane_view) |pv| self.ipcNameOf(.{ .pane = pv }) else null;
     return .{
         .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
         .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
@@ -1298,7 +1299,18 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
             const nodes = try arena.alloc(session_layout.Node, tree.nodes.len);
             for (tree.nodes, 0..) |node, ni| {
                 nodes[ni] = switch (node) {
-                    .leaf => |surface| leaf: {
+                    .leaf => |pane| leaf: {
+                        // A viewer leaf has no agent session to capture; it is
+                        // described by the T89f-reserved additive fields
+                        // instead. T90h owns restoring them.
+                        const surface = pane.surface() orelse break :leaf .{ .leaf = .{
+                            .kind = "viewer",
+                            .pane_id = try arena.dupe(u8, pane.paneId()),
+                            .viewer_location = if (pane.viewer().?.location) |loc|
+                                try arena.dupe(u8, loc)
+                            else
+                                null,
+                        } };
                         const leaf = try self.captureLeaf(arena, surface);
                         // No id yet but this leaf is EXPECTED to be agent-backed
                         // (its window rides the local agent, or the surface's
@@ -1664,7 +1676,8 @@ fn restoreTab(
     attach: ?*const std.StringHashMap(void),
 ) !void {
     if (tab.nodes.len == 0) return error.CorruptLayout;
-    const first_surface = window.tab_active_surface[tab_index];
+    const first_pane = window.tab_active_pane[tab_index];
+    const first_surface = first_pane.surface() orelse return error.CorruptLayout;
     try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, tr, attach, 0);
 
     if (tab.color) |c| {
@@ -1693,7 +1706,8 @@ fn restoreBuildSubtree(
     if (depth > nodes.len or idx >= nodes.len) return error.CorruptLayout;
     const node = nodes[idx];
     if (node.leaf) |lf| {
-        if (lf.ipc_name) |n| self.ipcRegister(n, .{ .pane = anchor }) catch |err|
+        if (lf.ipc_name) |n| if (anchor.pane_view) |pv|
+            self.ipcRegister(n, .{ .pane = pv }) catch |err|
             log.warn("session-restore: pane IPC register '{s}' failed err={}", .{ n, err });
         return;
     }
@@ -1709,9 +1723,10 @@ fn restoreBuildSubtree(
     // `.right`/`.down` put the OLD (anchor) surface on the left/top with `ratio`
     // as its share — the exact inverse of the capture (which stored the left
     // child's ratio). horizontal → right, vertical → down.
-    const dir: SplitTree(Surface).Split.Direction =
+    const dir: SplitTree(PaneView).Split.Direction =
         if (std.mem.eql(u8, sp.layout, "vertical")) .down else .right;
-    const new_surface = window.newSplitAt(anchor, dir, @floatCast(sp.ratio)) catch |err| {
+    const anchor_pane = anchor.pane_view orelse return error.CorruptLayout;
+    const new_surface = window.newSplitAt(anchor_pane, dir, @floatCast(sp.ratio)) catch |err| {
         window.pending_surface_overrides = null;
         return err;
     } orelse {
@@ -2847,9 +2862,10 @@ fn paneForSession(
         for (0..win.tab_count) |t| {
             var it = win.tab_trees[t].iterator();
             while (it.next()) |entry| {
-                if (!entry.view.core_surface_ready) continue;
-                const sid = entry.view.core_surface.remoteSessionId() orelse continue;
-                if (std.mem.eql(u8, sid, id)) return entry.view;
+                const surface = entry.view.surface() orelse continue;
+                if (!surface.core_surface_ready) continue;
+                const sid = surface.core_surface.remoteSessionId() orelse continue;
+                if (std.mem.eql(u8, sid, id)) return surface;
             }
         }
     }
@@ -2934,7 +2950,8 @@ pub fn openRemoteWindowFrom(
     var command: ?[]const u8 = explicit.command;
     var cwd: ?[]const u8 = explicit.working_directory;
     if (parent.tab_count > 0) {
-        const pane = parent.tab_active_surface[parent.active_tab];
+        const pane = parent.tab_active_pane[parent.active_tab].surface() orelse
+            return error.CreateFailed;
         if (command == null) command = pane.core_surface.remoteCommand();
         if (cwd == null) {
             if (parent.remote_dialed) |dialed| {
@@ -3423,10 +3440,9 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.closeTabMode(
-                        value,
-                        core_surface.rt_surface,
-                    );
+                    if (core_surface.rt_surface.pane_view) |pv| {
+                        core_surface.rt_surface.parent_window.closeTabMode(value, pv);
+                    }
                 },
             }
             return true;
@@ -3786,7 +3802,8 @@ pub fn performAction(
                         for (0..w.tab_count) |i| {
                             var it = w.tab_trees[i].iterator();
                             while (it.next()) |entry| {
-                                if (entry.view.scrollbar) |sb| {
+                                const surface = entry.view.surface() orelse continue;
+                                if (surface.scrollbar) |sb| {
                                     sb.setTheme(self.config.background.toTerminalRGB(), fg);
                                 }
                             }
@@ -3813,7 +3830,8 @@ pub fn performAction(
                     for (0..w.tab_count) |i| {
                         var it = w.tab_trees[i].iterator();
                         while (it.next()) |entry| {
-                            if (entry.view.scrollbar) |sb| {
+                            const s2 = entry.view.surface() orelse continue;
+                            if (s2.scrollbar) |sb| {
                                 sb.setTheme(bg, self.config.foreground.toTerminalRGB());
                             }
                         }
@@ -3996,8 +4014,10 @@ pub fn performAction(
                         _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                         _ = w32.SetForegroundWindow(hwnd);
                         // Make sure the tab containing this surface is active.
-                        if (win.findTabIndex(core_surface.rt_surface)) |idx| {
-                            if (idx != win.active_tab) win.selectTabIndex(idx);
+                        if (core_surface.rt_surface.pane_view) |pane| {
+                            if (win.findTabIndex(pane)) |idx| {
+                                if (idx != win.active_tab) win.selectTabIndex(idx);
+                            }
                         }
                         // Focus the surface's child HWND (deferred — T48).
                         if (core_surface.rt_surface.hwnd) |sh| {
@@ -4877,9 +4897,9 @@ fn surfaceWndProc(
 
         w32.WM_CLOSE => {
             // Posted by Surface.close() to defer destruction to the
-            // message loop. This is the safe place to call closeSplitSurface
+            // message loop. This is the safe place to call closeSplitPane
             // (outside of core_surface callbacks).
-            surface.parent_window.closeSplitSurface(surface);
+            if (surface.pane_view) |pane| surface.parent_window.closeSplitPane(pane);
             return 0;
         },
 
@@ -5225,12 +5245,12 @@ fn surfaceWndProc(
         w32.WM_SETFOCUS => {
             // Update the active surface for this tab when a split pane gains focus.
             const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_surface[tab] = surface;
+            if (surface.pane_view) |pv| surface.parent_window.tab_active_pane[tab] = pv;
             // T92: the tab label / titlebar follow the focused pane's
             // title (no-op when the tab title is user-pinned or the
             // title is unchanged).
             surface.parent_window.refreshTabTitle(tab);
-            surface.parent_window.heroOnSurfaceFocused(surface);
+            if (surface.pane_view) |pv| surface.parent_window.heroOnPaneFocused(pv);
             // Dim the pane that lost the active slot, undim this one (T74).
             surface.parent_window.updateDimOverlays();
             surface.handleFocus(true);

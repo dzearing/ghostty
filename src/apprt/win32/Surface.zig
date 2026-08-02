@@ -19,6 +19,7 @@ const App = @import("App.zig");
 const ClaudeIntegration = @import("ClaudeIntegration.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
+const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -308,9 +309,15 @@ snap_dib_w: i32 = 0,
 snap_dib_h: i32 = 0,
 snap_dib_seq: u32 = 0,
 
-/// Reference count for SplitTree ownership. Starts at 0 because
-/// SplitTree.init() calls ref() to take initial ownership.
+/// Reference count for SplitTree ownership. Starts at 0 because the owning
+/// `PaneView` calls ref() to take initial ownership (before T90c the tree
+/// held this reference directly; the counting is unchanged).
 ref_count: u32 = 0,
+
+/// The split-tree leaf that owns this surface (T90c), or null before the
+/// wrapper exists / after the surface is orphaned. Lets the destroy paths
+/// that only hold a `*Surface` name the leaf — see `deinit`'s `ipcForget`.
+pane_view: ?*PaneView = null,
 
 /// SplitTree view protocol: increment reference count.
 pub fn ref(self: *Surface, alloc: Allocator) Allocator.Error!*Surface {
@@ -670,8 +677,10 @@ pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
     // Drop IPC names pointing at this pane before the memory can be
-    // recycled.
-    self.app.ipcForget(.{ .pane = self });
+    // recycled. Registry targets are keyed on the PaneView leaf (T90c), so
+    // a surface that never made it into a tree — an init that failed before
+    // `PaneView.createTerminal` — has no names to drop.
+    if (self.pane_view) |pv| self.app.ipcForget(.{ .pane = pv });
 
     if (self.title) |t| {
         self.app.core_app.alloc.free(t);

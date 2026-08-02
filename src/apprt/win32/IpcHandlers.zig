@@ -14,8 +14,9 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
+const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
-const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
+const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(PaneView);
 const w32 = @import("win32.zig");
 const color_math = @import("color_math.zig");
 const apprt = @import("../../apprt.zig");
@@ -120,12 +121,21 @@ fn wrapCommandArgv(
 
 extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) windows.BOOL;
 
+/// The pane a target names: the pane itself, or a window's focused pane.
+/// Null when the window has no tabs left.
+fn targetPane(entry: App.IpcTarget) ?*PaneView {
+    return switch (entry) {
+        .pane => |p| p,
+        .window => |w| if (w.tab_count == 0) null else w.tab_active_pane[w.active_tab],
+    };
+}
+
 /// Raise and focus the window that owns `entry` (and the pane itself for
 /// pane targets).
 fn focusTarget(entry: App.IpcTarget) void {
     const window = switch (entry) {
         .window => |w| w,
-        .pane => |s| s.parent_window,
+        .pane => |p| p.parentWindow(),
     };
     if (window.hwnd) |hwnd| {
         if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
@@ -133,7 +143,7 @@ fn focusTarget(entry: App.IpcTarget) void {
     }
     switch (entry) {
         .window => {},
-        .pane => |s| if (s.hwnd) |h| {
+        .pane => |p| if (p.hwnd()) |h| {
             App.deferSetFocus(h); // T48
         },
     }
@@ -268,7 +278,8 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // contrast foreground + WCAG-adjusted palette (Mac applyColorScheme).
     if (resolveColor(args.color)) |tint| {
         if (window.tab_count > 0) {
-            window.tab_active_surface[window.active_tab].applyBackgroundTint(tint, true);
+            if (window.tab_active_pane[window.active_tab].surface()) |s|
+                s.applyBackgroundTint(tint, true);
         }
     }
 
@@ -327,7 +338,7 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             // `--split-color` (T67): explicit tint for the inline split
             // (overwrites the auto-shifted inheritance newSplitAt applied).
             if (resolveColor(args.split_color)) |tint| s.applyBackgroundTint(tint, true);
-            if (args.name) |n| app.ipcRegister(n, .{ .pane = s }) catch {};
+            if (args.name) |n| if (s.pane_view) |pv| app.ipcRegister(n, .{ .pane = pv }) catch {};
         }
     }
 
@@ -560,7 +571,7 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             return try errorResponse(ctx.alloc, "no window found for split", .{});
         if (window.tab_count == 0)
             return try errorResponse(ctx.alloc, "no surface to split", .{});
-        const at = window.tab_active_surface[window.active_tab];
+        const at = window.tab_active_pane[window.active_tab];
         _ = window.newSplitAt(at, direction, ratio) catch |err| {
             log.warn("IPC split --from-focused failed err={}", .{err});
             return try errorResponse(ctx.alloc, "failed to create split", .{});
@@ -572,14 +583,14 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // names a window (or a pane, whose window is used) and splits at its
     // active surface; neither → the foreground (else most recent) window.
     var window: *Window = undefined;
-    var at: *Surface = undefined;
+    var at: *PaneView = undefined;
     if (args.pane) |pane_name| {
         const entry = app.ipcLookup(pane_name) orelse
             return try errorResponse(ctx.alloc, "pane '{s}' not found", .{pane_name});
         switch (entry) {
-            .pane => |surface| {
-                at = surface;
-                window = surface.parent_window;
+            .pane => |pane| {
+                at = pane;
+                window = pane.parentWindow();
             },
             .window => return try errorResponse(ctx.alloc, "pane '{s}' not found", .{pane_name}),
         }
@@ -588,17 +599,17 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
         window = switch (entry) {
             .window => |w| w,
-            .pane => |surface| surface.parent_window,
+            .pane => |pane| pane.parentWindow(),
         };
         if (window.tab_count == 0)
             return try errorResponse(ctx.alloc, "target '{s}' has no surface to split", .{target});
-        at = window.tab_active_surface[window.active_tab];
+        at = window.tab_active_pane[window.active_tab];
     } else {
         window = frontWindow(app) orelse
             return try errorResponse(ctx.alloc, "no window found for split", .{});
         if (window.tab_count == 0)
             return try errorResponse(ctx.alloc, "no surface to split", .{});
-        at = window.tab_active_surface[window.active_tab];
+        at = window.tab_active_pane[window.active_tab];
     }
 
     // Surface overrides for the new pane.
@@ -678,7 +689,7 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     if (resolveColor(args.color)) |tint| new_surface.applyBackgroundTint(tint, true);
 
     if (args.name) |name| {
-        app.ipcRegister(name, .{ .pane = new_surface }) catch {};
+        if (new_surface.pane_view) |pv| app.ipcRegister(name, .{ .pane = pv }) catch {};
     }
 
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
@@ -699,14 +710,10 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     const entry = ctx.app.ipcLookup(name) orelse
         return try errorResponse(ctx.alloc, "pane '{s}' not found in registry", .{name});
-    const surface: *Surface = switch (entry) {
-        .pane => |s| s,
-        .window => |w| surface: {
-            if (w.tab_count == 0)
-                return try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name});
-            break :surface w.tab_active_surface[w.active_tab];
-        },
-    };
+    const pane = targetPane(entry) orelse
+        return try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name});
+    const surface = pane.surface() orelse
+        return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{name});
     if (!surface.core_surface_ready)
         return try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name});
 
@@ -820,7 +827,7 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             return try errorResponse(ctx.alloc, "target window '{s}' not found", .{target});
         break :window switch (entry) {
             .window => |w| w,
-            .pane => |surface| surface.parent_window,
+            .pane => |pane| pane.parentWindow(),
         };
     } else frontWindow(app) orelse
         return try errorResponse(ctx.alloc, "no focused window found", .{});
@@ -829,24 +836,24 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const tab = window.active_tab;
     const tree = &window.tab_trees[tab];
 
-    var surfaces: std.StringHashMapUnmanaged(*Surface) = .empty;
+    var surfaces: std.StringHashMapUnmanaged(*PaneView) = .empty;
     for (names.items) |name| {
         const entry = app.ipcLookup(name) orelse
             return try errorResponse(ctx.alloc, "pane '{s}' not found in registry", .{name});
-        const surface = switch (entry) {
-            .pane => |s| s,
+        const pane = switch (entry) {
+            .pane => |p| p,
             .window => return try errorResponse(ctx.alloc, "pane '{s}' not found in registry", .{name}),
         };
         const in_tree = in_tree: {
             var it = tree.iterator();
             while (it.next()) |view_entry| {
-                if (view_entry.view == surface) break :in_tree true;
+                if (view_entry.view == pane) break :in_tree true;
             }
             break :in_tree false;
         };
         if (!in_tree)
             return try errorResponse(ctx.alloc, "pane '{s}' is not in the target window", .{name});
-        try surfaces.put(arena, name, surface);
+        try surfaces.put(arena, name, pane);
     }
 
     // Build the replacement tree in its own arena (SplitTree owns it).
@@ -862,17 +869,17 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // new tree now owns.
     const response = try ctx.alloc.dupe(u8, "{\"success\":true}");
 
-    // Take ownership references on the kept surfaces BEFORE dropping the
+    // Take ownership references on the kept panes BEFORE dropping the
     // old tree, so they can't hit refcount 0 during the swap.
     var kept_it = surfaces.valueIterator();
-    while (kept_it.next()) |surface_ptr| {
-        _ = surface_ptr.*.ref(gpa) catch {};
+    while (kept_it.next()) |pane_ptr| {
+        _ = pane_ptr.*.ref(gpa) catch {};
     }
 
     // Swap trees. Old-tree deinit unrefs every old view: panes not in the
     // new layout reach refcount 0 and are destroyed (their registry names
     // drop via ipcForget in Surface.deinit).
-    const current_focus = window.tab_active_surface[tab];
+    const current_focus = window.tab_active_pane[tab];
     var old_tree = window.tab_trees[tab];
     window.tab_trees[tab] = .{
         .arena = tree_arena,
@@ -881,20 +888,20 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     };
     old_tree.deinit();
 
-    // Focus: keep the focused surface if it survived, else the first leaf.
-    const focus: *Surface = focus: {
+    // Focus: keep the focused pane if it survived, else the first leaf.
+    const focus: *PaneView = focus: {
         var it = window.tab_trees[tab].iterator();
-        var first: ?*Surface = null;
+        var first: ?*PaneView = null;
         while (it.next()) |view_entry| {
             if (first == null) first = view_entry.view;
             if (view_entry.view == current_focus) break :focus current_focus;
         }
         break :focus first.?; // validated non-empty layout above
     };
-    window.tab_active_surface[tab] = focus;
+    window.tab_active_pane[tab] = focus;
     window.heroOnTreeChanged(tab);
     window.layoutSplits();
-    if (focus.hwnd) |h| App.deferSetFocus(h); // T48
+    if (focus.hwnd()) |h| App.deferSetFocus(h); // T48
     window.updateWindowTitle();
     // T110: the whole tree (topology AND every split ratio) just changed —
     // re-persist, else a restore rebuilds the PRE-rearrange shape.
@@ -909,7 +916,7 @@ fn buildLayoutNode(
     arena: Allocator,
     nodes: *std.ArrayList(SplitTree.Node),
     node: std.json.Value,
-    surfaces: *const std.StringHashMapUnmanaged(*Surface),
+    surfaces: *const std.StringHashMapUnmanaged(*PaneView),
 ) Allocator.Error!SplitTree.Node.Handle {
     const handle: SplitTree.Node.Handle = @enumFromInt(nodes.items.len);
     try nodes.append(arena, undefined);
@@ -971,7 +978,9 @@ fn handleSetState(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // Pane targets set just that pane; window targets set every pane in
     // the window (Mac handleSetState semantics).
     switch (entry) {
-        .pane => |surface| {
+        .pane => |pane| {
+            const surface = pane.surface() orelse
+                return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target});
             surface.activity_state = state;
             surface.parent_window.updateWindowTitle();
         },
@@ -979,7 +988,8 @@ fn handleSetState(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             for (0..window.tab_count) |i| {
                 var it = window.tab_trees[i].iterator();
                 while (it.next()) |view_entry| {
-                    view_entry.view.activity_state = state;
+                    const surface = view_entry.view.surface() orelse continue;
+                    surface.activity_state = state;
                 }
             }
             window.updateWindowTitle();
@@ -1004,11 +1014,10 @@ fn handleSetBanner(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const entry = ctx.app.ipcLookup(target) orelse
         return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
 
-    const surface = switch (entry) {
-        .pane => |s| s,
-        .window => |w| w.getActiveSurface() orelse
-            return try errorResponse(ctx.alloc, "target '{s}' has no focused pane", .{target}),
-    };
+    const pane = targetPane(entry) orelse
+        return try errorResponse(ctx.alloc, "target '{s}' has no focused pane", .{target});
+    const surface = pane.surface() orelse
+        return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target});
 
     surface.setPaneBanner(if (args.clear) null else args.text);
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
@@ -1029,7 +1038,7 @@ fn handleRename(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
     const window = switch (entry) {
         .window => |w| w,
-        .pane => |surface| surface.parent_window,
+        .pane => |pane| pane.parentWindow(),
     };
 
     // titleOverride semantics: the override wins over terminal-reported
@@ -1064,14 +1073,10 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     const entry = ctx.app.ipcLookup(target_name) orelse
         return try errorResponse(ctx.alloc, "target '{s}' not found", .{target_name});
-    const surface: *Surface = switch (entry) {
-        .pane => |s| s,
-        .window => |w| surface: {
-            if (w.tab_count == 0)
-                return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
-            break :surface w.tab_active_surface[w.active_tab];
-        },
-    };
+    const pane = targetPane(entry) orelse
+        return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
+    const surface = pane.surface() orelse
+        return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target_name});
     if (!surface.core_surface_ready)
         return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
 
@@ -1127,7 +1132,7 @@ fn handleClose(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         // matching the Mac server's withConfirmation:false /
         // closeWindowImmediately). Registry entries drop via ipcForget in
         // the destroy paths.
-        .pane => |surface| surface.parent_window.closeSplitSurface(surface),
+        .pane => |pane| pane.parentWindow().closeSplitPane(pane),
         .window => |window| window.close(),
     }
 
@@ -1203,7 +1208,10 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             for (0..window.tab_count) |i| {
                 var it = window.tab_trees[i].iterator();
                 while (it.next()) |entry| {
-                    const shell_pid = surfaceShellPid(entry.view);
+                    // A viewer runs no shell, so it can never be the pane a
+                    // pid lives in.
+                    const surface = entry.view.surface() orelse continue;
+                    const shell_pid = surfaceShellPid(surface);
                     if (shell_pid == 0) continue;
                     if (!ProcessTree.isAncestor(&pid_map, shell_pid, query_pid)) continue;
                     const name = app.ipcNameOf(.{ .pane = entry.view }) orelse name: {
@@ -1254,7 +1262,7 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 arena,
                 &window.tab_trees[i],
                 .root,
-                window.tab_active_surface[i],
+                window.tab_active_pane[i],
             );
             try tabs.append(arena, .{
                 .id = try std.fmt.allocPrint(arena, "{d}", .{i}),
@@ -1307,7 +1315,7 @@ fn buildNode(
     arena: Allocator,
     tree: *const SplitTree,
     handle: SplitTree.Node.Handle,
-    active_surface: *Surface,
+    active_pane: *PaneView,
 ) Allocator.Error!*const apprt.ipc.List.Node {
     const node = try arena.create(apprt.ipc.List.Node);
 
@@ -1318,15 +1326,40 @@ fn buildNode(
     }
 
     switch (tree.nodes[handle.idx()]) {
-        .leaf => |surface| {
+        .leaf => |pane| {
+            // A viewer leaf reports the Mac's additive `type`/`url` shape and
+            // none of the terminal fields — it has no shell, no pwd, and no
+            // banner (CLAUDE.md: `+list` marks viewer panes with a `view:`
+            // prefix; JSON `"type": "viewer"` plus `"url"`).
+            const surface = pane.surface() orelse {
+                const vid = try arena.dupe(u8, pane.paneId());
+                const vname = ctx.app.ipcNameOf(.{ .pane = pane }) orelse name: {
+                    ctx.app.ipcRegister(vid, .{ .pane = pane }) catch {};
+                    break :name vid;
+                };
+                const viewer = pane.viewer().?;
+                node.* = .{ .leaf = .{
+                    .id = vid,
+                    .title = viewer.title orelse "",
+                    .working_directory = "",
+                    .pid = 0,
+                    .tty = "",
+                    .name = vname,
+                    .focused = pane == active_pane,
+                    .exit_code = null,
+                    .pane_type = "viewer",
+                    .url = if (viewer.location) |loc| try arena.dupe(u8, loc) else null,
+                } };
+                return node;
+            };
             // T113: the leaf `id` is the pane's stable ghoztty-owned id, the
             // same value its processes see as `$GHOZTTY_PANE_ID` and the same
             // shape the Mac reports (`pane.id.uuidString`). It used to be the
             // decimal `core_surface.id`, which changed on every re-attach and
             // matched nothing in the pane's environment.
             const id = try arena.dupe(u8, surface.paneId());
-            const name = ctx.app.ipcNameOf(.{ .pane = surface }) orelse name: {
-                ctx.app.ipcRegister(id, .{ .pane = surface }) catch {};
+            const name = ctx.app.ipcNameOf(.{ .pane = pane }) orelse name: {
+                ctx.app.ipcRegister(id, .{ .pane = pane }) catch {};
                 break :name id;
             };
             // T111b: read the pane's CACHED working directory. This used to
@@ -1381,7 +1414,7 @@ fn buildNode(
                     .pid = @intCast(surfaceShellPid(surface)),
                     .tty = "",
                     .name = name,
-                    .focused = surface == active_surface,
+                    .focused = pane == active_pane,
                     .exit_code = null,
                     .background_tint = if (surface.background_tint) |tint| tint: {
                         const buf = try arena.alloc(u8, 7);
@@ -1401,8 +1434,8 @@ fn buildNode(
                     .vertical => "vertical",
                 },
                 .ratio = @floatCast(split.ratio),
-                .left = try buildNode(ctx, arena, tree, split.left, active_surface),
-                .right = try buildNode(ctx, arena, tree, split.right, active_surface),
+                .left = try buildNode(ctx, arena, tree, split.left, active_pane),
+                .right = try buildNode(ctx, arena, tree, split.right, active_pane),
             } };
         },
     }

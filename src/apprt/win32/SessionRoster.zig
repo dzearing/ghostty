@@ -590,14 +590,15 @@ fn liveTitleFor(app: *App, id: []const u8) ?[]const u8 {
                 // persistent pane has none and every pane on screen would be
                 // badged `attached` (someone else has it) instead of `open`
                 // (you do). Same source `captureLeaf` writes the manifest from.
-                if (!entry.view.core_surface_ready) continue;
-                const sid = entry.view.core_surface.remoteSessionId() orelse continue;
+                const s2 = entry.view.surface() orelse continue;
+                if (!s2.core_surface_ready) continue;
+                const sid = s2.core_surface.remoteSessionId() orelse continue;
                 if (!std.mem.eql(u8, sid, id)) continue;
                 // An open pane with no title yet still means OPEN, so report an
                 // empty string rather than null — the ladder treats empty as an
                 // absent rung and falls through, and the caller reads non-null
                 // as "ours".
-                return if (entry.view.title) |t2| t2 else "";
+                return if (s2.title) |t2| t2 else "";
             }
         }
     }

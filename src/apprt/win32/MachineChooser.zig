@@ -2567,8 +2567,9 @@ fn focusOpenSession(self: *MachineChooser, id: []const u8) bool {
         for (0..win.tab_count) |t| {
             var it = win.tab_trees[t].iterator();
             while (it.next()) |entry| {
-                if (!entry.view.core_surface_ready) continue;
-                const sid = entry.view.core_surface.remoteSessionId() orelse continue;
+                const s2 = entry.view.surface() orelse continue;
+                if (!s2.core_surface_ready) continue;
+                const sid = s2.core_surface.remoteSessionId() orelse continue;
                 if (!std.mem.eql(u8, sid, id)) continue;
                 log.info("machine chooser: session already open, focusing its pane", .{});
                 const surface = entry.view;
@@ -2577,12 +2578,12 @@ fn focusOpenSession(self: *MachineChooser, id: []const u8) bool {
                 // otherwise take the foreground back off it.
                 self.close(false);
                 win.selectTabIndex(t);
-                win.tab_active_surface[t] = surface;
+                win.tab_active_pane[t] = surface;
                 if (win.hwnd) |hwnd| {
                     if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                     _ = w32.SetForegroundWindow(hwnd);
                 }
-                if (surface.hwnd) |h| App.deferSetFocus(h); // T48
+                if (surface.hwnd()) |h| App.deferSetFocus(h); // T48
                 return true;
             }
         }

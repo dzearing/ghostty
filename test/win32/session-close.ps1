@@ -10,7 +10,7 @@
 # close ends only that session.
 #
 #   A. +close the startup PANE by id -> the session ENDS. Exercises
-#      closeSplitSurface -> closeTab -> closeTabByIndex's close-intent wiring.
+#      closeSplitPane -> closeTab -> closeTabByIndex's close-intent wiring.
 #   B. +close the startup WINDOW (--target=window-1) -> the session ENDS.
 #      Exercises Window.close -> markAllSessionsClose.
 #   C. hard-kill the GUI with NO close -> the session SURVIVES (alive, now

@@ -9,7 +9,7 @@ const IpcRegistry = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const Surface = @import("Surface.zig");
+const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
 const pane_id_mod = @import("pane_id.zig");
 
@@ -21,7 +21,11 @@ window_counter: u64 = 0,
 
 pub const Target = union(enum) {
     window: *Window,
-    pane: *Surface,
+    /// A split-tree leaf: terminal OR viewer. The PaneView union carries the
+    /// kind, so the registry deliberately does NOT grow a third variant
+    /// (T90a S3) — one `.pane` case keeps every lookup path kind-agnostic
+    /// and each verb narrows where it actually needs a terminal.
+    pane: *PaneView,
 
     pub fn eql(self: Target, other: Target) bool {
         return switch (self) {
@@ -84,16 +88,18 @@ fn findPaneByIdentity(live_windows: []const *Window, name: []const u8) ?Target {
 
     for (live_windows) |win| {
         for (0..win.tab_count) |i| {
-            var surfaces = win.tab_trees[i].iterator();
-            while (surfaces.next()) |v| {
-                const s = v.view;
+            var panes = win.tab_trees[i].iterator();
+            while (panes.next()) |v| {
+                const pane = v.view;
                 if (surface_id) |sid| {
-                    // A legacy spelling names a surface only once its core
+                    // The legacy spellings name a SURFACE, so they can only
+                    // ever resolve a terminal pane — and only once its core
                     // surface is up (`core_surface.id` is set by init).
+                    const s = pane.surface() orelse continue;
                     if (!s.core_surface_ready) continue;
-                    if (s.core_surface.id == sid) return .{ .pane = s };
-                } else if (pane_id_mod.eql(s.paneId(), name)) {
-                    return .{ .pane = s };
+                    if (s.core_surface.id == sid) return .{ .pane = pane };
+                } else if (pane_id_mod.eql(pane.paneId(), name)) {
+                    return .{ .pane = pane };
                 }
             }
         }
@@ -136,12 +142,12 @@ fn prune(self: *IpcRegistry, alloc: Allocator, live_windows: []const *Window) vo
                 }
                 break :alive false;
             },
-            .pane => |s| alive: {
+            .pane => |p| alive: {
                 for (live_windows) |win| {
                     for (0..win.tab_count) |i| {
-                        var surfaces = win.tab_trees[i].iterator();
-                        while (surfaces.next()) |v| {
-                            if (v.view == s) break :alive true;
+                        var panes = win.tab_trees[i].iterator();
+                        while (panes.next()) |v| {
+                            if (v.view == p) break :alive true;
                         }
                     }
                 }

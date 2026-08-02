@@ -19,4 +19,10 @@ test {
     // reference is not checked by any lane, and discovering that in the
     // wiring task is discovering it too late.
     _ = @import("win32/system_colors.zig");
+    // The split tree's leaf type and the viewer leaf it makes room for
+    // (T90c). ViewerPane has no constructor caller until T90d, and the same
+    // rule as system_colors applies: a module no lane compiles is a module
+    // nobody has checked.
+    _ = @import("win32/PaneView.zig");
+    _ = @import("win32/ViewerPane.zig");
 }
