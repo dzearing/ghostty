@@ -258,6 +258,14 @@ Start-Sleep -Seconds 3
 if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 $top = Wait-TestWindow -ProcessId $gpid -Class 'GhozttyWindow'
 if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+# Control the window this script's conditions are ratios OF (T267). Most T58
+# layout assertions are ratios of the client size and survive any placement;
+# the ABSOLUTE ones underneath do not - the divider drag moves a fixed 150 px
+# and then requires the hero to have narrowed by >= 100, and the carousel
+# pixel signature samples from y = 40 to Height - 10. On a small or maximized
+# window those change meaning.
+Set-TestWindowSize -Window $top -Width 1400 -Height 900 | Out-Null
+Start-Sleep -Milliseconds 500
 Assert (-not (Test-TestDesktopLeak -ProcessId $gpid)) `
     'GUI is NOT enumerable on the interactive desktop'
 

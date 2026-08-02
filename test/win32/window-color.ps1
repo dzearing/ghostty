@@ -178,6 +178,13 @@ Start-Sleep -Seconds 3
 if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 $launchTop = Wait-TestWindow -ProcessId $appPid -Class 'GhozttyWindow'
 if ($launchTop -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: launch window not found'; exit 1 }
+# T267 sweep: this script deliberately does NOT call Set-TestWindowSize. No
+# assertion here is a ratio of the window - section 7 right-clicks the pane's
+# own CENTRE (derived from its client rect, whatever that is) and the banner
+# probe reads an overlay it locates by HWND. What it needed was DETERMINISM,
+# not a particular size, and the launch helper now supplies it by clearing
+# window_placement-debug, so every launch is the built-in 800x600 default
+# instead of whatever the last GUI script left behind.
 Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) `
     'GUI is NOT enumerable on the interactive desktop'
 

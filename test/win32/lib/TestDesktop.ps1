@@ -1430,9 +1430,51 @@ function New-TestDesktop {
 }
 
 <#
+Delete the DEBUG window-placement memory (T85) so the next launch opens at the
+app's built-in 800x600 default instead of whatever the LAST debug window was
+left at - including maximized.
+
+WHY (T267). Every GUI script clears `session-layout-debug.json` before it
+launches, and NONE of them cleared this second file, so a script that sets no
+size inherited its window from whichever script ran before it. That makes a
+script's SETUP a function of run order, and nothing fails when it goes wrong -
+the geometry is simply different. It cost two real red runs against a build
+that was behaving correctly: `chrome-merged-row.ps1` failed its own second run
+(its section 7 maximizes, so the next run opened maximized, where the top edge
+hit-tests HTCAPTION instead of HTTOP), and `tab-strip.ps1` went three red once
+that was clean, because every condition it sets up is a RATIO of the tab run
+and it had never controlled the window the ratio is taken of.
+
+Cleared at LAUNCH rather than in each script's `finally`: a script that dies
+mid-run cannot poison the next one, and a new script gets it for free.
+
+The path is derived from `$env:LOCALAPPDATA` at call time, which is the same
+value `CreateProcessW` is about to hand the child - so the throwaway-LOCALAPPDATA
+scripts resolve to THEIR dir, not the user's. Only ever the `-debug` file: a
+release build writes `window_placement`, which belongs to the user's installed
+Ghoztty (the `Clear-DebugSessionLayout` rule in lib\CleanSlate.ps1).
+
+Returns $true if a file was removed.
+#>
+function Clear-TestWindowPlacement {
+    $local = $env:LOCALAPPDATA
+    if (-not $local) { return $false }
+    $path = Join-Path $local 'ghoztty\window_placement-debug'
+    if (-not (Test-Path $path)) { return $false }
+    Remove-Item $path -Force -ErrorAction SilentlyContinue
+    return (-not (Test-Path $path))
+}
+
+<#
 Launch an executable ON the test desktop (STARTUPINFO.lpDesktop). Returns
 { Pid, Process }; Process is the usual System.Diagnostics.Process, so
 $app.Process.HasExited works exactly as with Start-Process.
+
+Launching ghoztty.exe also clears the debug window-placement memory
+(Clear-TestWindowPlacement, T267) so window geometry never depends on run
+order. -KeepWindowPlacement opts out, and is for the two scripts whose SUBJECT
+is that memory (window-size-memory.ps1, reset-window-size.ps1): deleting the
+file between their launches would delete the thing under test.
 #>
 function Start-OnTestDesktop {
     param(
@@ -1440,9 +1482,13 @@ function Start-OnTestDesktop {
         [string[]]$Arguments = @(),
         [string]$WorkingDirectory,
         [string]$StdErr,
+        [switch]$KeepWindowPlacement,
         $Desktop
     )
     $td = Resolve-TestDesktop $Desktop
+    if (-not $KeepWindowPlacement -and (Split-Path -Leaf $Exe) -ieq 'ghoztty.exe') {
+        Clear-TestWindowPlacement | Out-Null
+    }
     $argLine = ($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $procId = $td.StartProcess($Exe, $argLine, $WorkingDirectory, $StdErr)
     if ($procId -eq 0) { throw "Start-OnTestDesktop failed: $($td.LastError)" }

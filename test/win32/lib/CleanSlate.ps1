@@ -109,6 +109,11 @@ function Clear-DebugSessionLayout {
     which is the same file the user's installed Ghoztty restores from; that one
     is never ours to delete. Returns $true if a file was removed.
     #>
+    # The OTHER debug state file - window_placement-debug (T85), which decides
+    # a new window's size - is cleared by the launch helper itself
+    # (Clear-TestWindowPlacement in lib\TestDesktop.ps1, T267) rather than
+    # here, because every GUI script goes through Start-OnTestDesktop while
+    # only some dot-source this file. One copy, in the file that launches.
     $local = $env:LOCALAPPDATA
     if (-not $local) { return $false }
     $path = Join-Path $local 'ghoztty\session-layout-debug.json'

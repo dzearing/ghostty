@@ -112,6 +112,12 @@ try {
     # client top is `sysFrameY` BELOW its window top. Cleared before the launch
     # and again in `finally`, so a script that maximizes leaves no trace (the
     # T248 lesson, in a file T248 did not name).
+    #
+    # T267 generalized the pre-launch half: Start-OnTestDesktop now clears this
+    # file before every ghoztty launch, so the line below is redundant and kept
+    # only as local documentation of the trap. The `finally` copy is NOT
+    # redundant - it keeps this script's maximize out of the developer's next
+    # hand-launched debug window, which no test helper is around to clear.
     Remove-Item "$env:LOCALAPPDATA\ghoztty\window_placement-debug" -Force -ErrorAction SilentlyContinue
     $app = Start-OnTestDesktop -Exe $exe -Arguments @(
         '--config-default-files=false',

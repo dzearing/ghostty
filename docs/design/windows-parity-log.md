@@ -6348,3 +6348,43 @@ Residuals: **T358** (`PROC_SPAWN` still passes a null `lpEnvironment`, and it
 matters more there - that is Activity Monitor's "New Process", a bare command
 name with no shell to fail in) and **T359** (`remote-test-client` is an
 on-demand build target that two acceptance scripts require).
+
+## 2026-08-02 - T267: a script's window came from whichever script ran before it
+
+Every GUI acceptance script clears `session-layout-debug.json` before it
+launches. None of them cleared the OTHER debug state file -
+`window_placement-debug`, the T85 memory of the last window's outer size and
+maximized flag - so a script that never calls `Set-TestWindowSize` opened at
+whatever the previous script left behind, maximized included. Nothing failed
+when that went wrong; the geometry was simply different, which is the same
+invisible family as T248.
+
+The fix is one call in one place: `Start-OnTestDesktop` now deletes the file
+before every `ghoztty.exe` launch. At LAUNCH rather than in each script's
+`finally`, so a script that dies mid-run cannot poison the next one and a new
+script gets the isolation for free; in the launch helper rather than beside
+`Clear-DebugSessionLayout` in `CleanSlate.ps1`, because all 52 GUI scripts load
+TestDesktop.ps1 and only some dot-source CleanSlate. `-KeepWindowPlacement` is
+the opt-out, for the two scripts whose SUBJECT is that memory.
+
+`test\win32\window-placement-isolation.ps1` - ALL PASS (9) - is the guard, and
+its shape is the point: a lone "the window was not maximized" assertion is green
+for entirely the wrong reason if the poison is inert, so the script proves the
+poison BITES first (`-KeepWindowPlacement` -> opened maximized) and only then
+that the clear defeats it. Positive control before oracle, the T240 lesson.
+
+Two residuals, and the second is the more useful one. `reset_window_size` lands
+the client 38 px too tall in two independent scripts - `setClientSize` still
+predicts the frame with `AdjustWindowRectEx(WS_OVERLAPPEDWINDOW)` while T254
+took over `WM_NCCALCSIZE` (**T360**; no `src/` file was touched this turn, so it
+predates it). And this task's own Validation - the suite forward, forward again,
+reverse - **could not be run**: a throwaway runner managed two scripts in ~18
+minutes, so a single pass is hours. There is no suite runner and the suite's
+wall-clock had never been measured (**T361**). Also **T362**: the win32 test
+lane is flaky, `font.Collection.test.add full` exiting 5 on one run and green on
+the next against an unchanged tree.
+
+So order-independence here is measured for eight scripts and argued for the
+rest - but the residual risk changed shape, from a silent geometry difference
+that depends on run order into a loud, deterministic red in any script that
+needs more than 800x600.

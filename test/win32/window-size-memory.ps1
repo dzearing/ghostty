@@ -102,7 +102,12 @@ function Launch([string[]]$configArgs) {
             '--keybind=f9=reset_window_size'
             '--keybind=f8=toggle_maximize'
         ) + $configArgs
-        $a = Start-OnTestDesktop -Exe $exe -Arguments $cliArgs
+        # -KeepWindowPlacement: the launch helper deletes
+        # window_placement-debug before every ghoztty launch (T267) so no
+        # script inherits another's geometry. Here that file IS the subject -
+        # every case reads what the PREVIOUS launch persisted - so this is the
+        # documented opt-out.
+        $a = Start-OnTestDesktop -Exe $exe -Arguments $cliArgs -KeepWindowPlacement
     } finally {
         $env:LOCALAPPDATA = $savedLocal
     }

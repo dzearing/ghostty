@@ -23,6 +23,10 @@
 #
 # LOCALAPPDATA is redirected to a throwaway dir so the T85 placement
 # memory (written by the maximize control) never leaks between tests.
+# Both launches share that dir, so the second one - the 800x600 fallback
+# case - would still have inherited the first's maximize; the launch helper
+# now deletes window_placement-debug before every ghoztty launch (T267),
+# which is exactly the isolation this header already asked for.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
 param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
