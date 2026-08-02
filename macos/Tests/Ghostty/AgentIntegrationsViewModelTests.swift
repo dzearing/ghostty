@@ -10,18 +10,21 @@ struct AgentIntegrationsViewModelTests {
         return url
     }
 
-    @Test func rowsCoverAllAgentTypes() throws {
+    @Test func rowsShowOfferedAndInstalledAgentsOnly() throws {
         let vm = AgentIntegrationsViewModel(homeDirectoryURL: try tempHome())
-        #expect(vm.rows.map(\.agent) == RuntimeAgent.allCases)
+        // Claude is offered (shown even when not installed); Copilot is gated off
+        // (isOffered == false) and not installed, so it is hidden (H3).
+        #expect(vm.rows.map(\.agent) == [.claude])
     }
 
-    @Test func undetectedAgentRowIsNotDetected() throws {
+    @Test func gatedUndetectedCopilotRowIsHidden() throws {
         let vm = AgentIntegrationsViewModel(homeDirectoryURL: try tempHome())
-        let copilot = try #require(vm.rows.first { $0.agent == .copilot })
-        #expect(copilot.status.detected == false)
-        #expect(copilot.status.state == .notInstalled)
-        #expect(copilot.busy == false)
-        #expect(copilot.errorText == nil)
+        #expect(vm.rows.first { $0.agent == .copilot } == nil)
+        let claude = try #require(vm.rows.first { $0.agent == .claude })
+        #expect(claude.status.detected == false)
+        #expect(claude.status.state == .notInstalled)
+        #expect(claude.busy == false)
+        #expect(claude.errorText == nil)
     }
 
     @Test func setUpInstallsAndUpdatesRow() async throws {
@@ -29,20 +32,21 @@ struct AgentIntegrationsViewModelTests {
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
         let vm = AgentIntegrationsViewModel(homeDirectoryURL: home)
         await vm.setUp(.copilot)
+        // Once installed, a gated agent's row surfaces so it can be managed.
         let copilot = try #require(vm.rows.first { $0.agent == .copilot })
         #expect(copilot.status.state == .installed)
         #expect(copilot.busy == false)
         #expect(copilot.errorText == nil)
     }
 
-    @Test func uninstallRemovesAndUpdatesRow() async throws {
+    @Test func uninstallRemovesGatedCopilotRow() async throws {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
         let vm = AgentIntegrationsViewModel(homeDirectoryURL: home)
         await vm.setUp(.copilot)
+        #expect(vm.rows.first { $0.agent == .copilot }?.status.state == .installed)
         await vm.uninstall(.copilot)
-        let copilot = try #require(vm.rows.first { $0.agent == .copilot })
-        #expect(copilot.status.state == .notInstalled)
-        #expect(copilot.errorText == nil)
+        // Gated + now uninstalled → the row disappears (no new setup offered).
+        #expect(vm.rows.first { $0.agent == .copilot } == nil)
     }
 }
