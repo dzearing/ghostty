@@ -197,11 +197,14 @@ function Test-MenuGone([int]$gpid, [int]$ms = 2000) {
     return $false
 }
 
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# Exact-exe rather than a '*zig-out*' CommandLine match (T53b), plus the
+# sibling agent and the debug session-layout manifest, so a previous run's
+# window cannot be restored under this run's target name.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 700
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
 }
 
 # --- Stateful fake relay device directory ------------------------------------

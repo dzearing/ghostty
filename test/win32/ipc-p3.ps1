@@ -15,13 +15,15 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# Exact-exe matching is still the rule (T53b); the reset now also kills the
+# sibling agent and drops the debug session-layout manifest. This script's
+# oracles read pane CONTENT (+read, OSC state), which is exactly what a stale
+# focused pane from a previous run would answer with.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        # Exact exe match only — '*zig-out*' also matched a detached soak
-        # instance running from zig-out-release (T53b) and killed it.
-        Where-Object { $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 function Get-P3Title {
     cmd /c "`"$Exe`" +list > `"$tmp\list.txt`" 2>&1" | Out-Null

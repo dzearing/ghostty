@@ -220,13 +220,14 @@ function Send-DlgText([IntPtr]$dlg, [string]$text) {
     Start-Sleep -Milliseconds 150
 }
 
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# Same app+agent kill as before, but exact-exe (a '*zig-out*' CommandLine
+# match also catches a detached zig-out-release instance, T53b) and with the
+# debug session-layout manifest dropped, which the private copy never did.
 function Stop-DebugGhoztty {
-    foreach ($name in 'ghoztty.exe', 'ghoztty-agent.exe') {
-        Get-CimInstance Win32_Process -Filter "Name='$name'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 800
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
 }
 
 function Get-Store {

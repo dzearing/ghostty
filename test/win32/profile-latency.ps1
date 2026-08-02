@@ -306,10 +306,12 @@ Rep "exe: $exe ($(($exeItem).LastWriteTime), $(($exeItem).Length) bytes)"
 Rep "isolated log: $profLog"
 
 # --- Fresh isolated instance --------------------------------------------------
-Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+# T248: "fresh" has to include the sibling agent and the debug session-layout
+# manifest. Without them `--target=prof` focuses the PERSISTED pane from the
+# previous run — a pane with its own scrollback and its own warmed-up state,
+# which is not the cold instance these numbers are supposed to describe.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
 & $exe +new-window --target=prof --shell=cmd | Out-Null
 Start-Sleep -Seconds 3

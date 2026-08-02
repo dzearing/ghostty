@@ -23,11 +23,15 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# The old filter matched any CommandLine containing 'zig-out', which also
+# catches a detached instance running from zig-out-release (T53b); the shared
+# one is exact-exe, kills the sibling agent, and drops the debug
+# session-layout manifest so a previous run's pane cannot be focused here.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 function Read-Pane([int]$lines = 10) {
     cmd /c "`"$Exe`" +read --name=wia --lines=$lines > `"$tmp\read.txt`" 2>&1" | Out-Null

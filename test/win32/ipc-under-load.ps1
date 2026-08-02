@@ -41,11 +41,11 @@ function Assert([bool]$cond, [string]$label) {
 
 # Kill only stale instances of THE EXE UNDER TEST — never the whole
 # zig-out* family: a detached soak (T53b) runs from zig-out-release and
-# must survive this script running against the debug exe.
-Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+# must survive this script running against the debug exe. T248: the sibling
+# agent and the debug session-layout manifest go too, or `--target=ipcload`
+# focuses a PERSISTED pane from the previous run instead of a fresh shell.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
 & $exe +new-window --target=ipcload --shell=cmd | Out-Null
 Start-Sleep -Seconds 3

@@ -91,10 +91,11 @@ while ($true) {
 '@ | Set-Content -Encoding ascii $altscrScript
 
 # --- Fresh isolated instance + layout -----------------------------------------
-Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.CommandLine -notmatch '\+' -and $_.ExecutablePath -eq $exe } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+# T248: the sibling agent and the debug session-layout manifest are part of
+# "fresh" — a soak that inherits the previous run's persisted pane is soaking
+# a pane nobody just created, with hours of its own scrollback already in it.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
 # Auto-launch flow: +new-window spawns the GUI (detached) when no -soak
 # instance answers, and names the window.

@@ -68,10 +68,11 @@ public class WheelDrv {
 $wheelLines = 3
 
 # --- Setup: fresh debug instance ---------------------------------------------
-Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+# T248: the sibling agent and the debug session-layout manifest go too. This
+# script scrolls a pane and counts lines against what it just wrote — a pane
+# RESTORED from the previous run arrives with a scrollback nobody here filled.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
 $proc = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 3

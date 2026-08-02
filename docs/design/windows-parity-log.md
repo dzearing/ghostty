@@ -6186,3 +6186,36 @@ real tag. **T348** carries that first run (and one unexplained
 compiler-terminated-mid-link under load, which is the shape of a CI flake).
 **T349**: the download page still offers only the DMG - defensible while the
 Windows build was 24 releases stale, not any more.
+
+## 2026-08-02 - T248: the acceptance suite could measure the previous run
+
+`+new-window --target=<name>` is idempotent by design, session persistence is
+on by default, and the agent outlives the app. So from the second run onward a
+script that reuses a target name can FOCUS last run's pane - fixture never
+executed, `+read` and pixel oracles reading last run's screen, every assertion
+green. Found for real while building `color-contrast.ps1` (T150); now cut at
+the source.
+
+The fix is hoisted, not copied: `test\win32\lib\CleanSlate.ps1`, one
+`Reset-GhozttyTestState`, called by 19 scripts that each used to carry their
+own kill helper. **T248 named one resurrection path and there were two** -
+killing the agent still leaves `session-layout-debug.json`, which describes the
+window by target NAME and restores it on the next launch regardless. Only the
+`-debug` file is ever deleted: a release build writes `session-layout.json`,
+which is the user's installed Ghoztty's restore state.
+
+`test\win32\target-staleness.ps1` is the executable proof, positive control
+first: kill the app only, re-issue the same target with a different fixture,
+and the stale pane comes back today on this box. Then the full reset, and the
+new fixture runs. A control that stops reproducing fails the script rather
+than passing quietly.
+
+The audit found the bigger sibling. A script aims by ENDPOINT, not by exe
+path - the pipe name comes from the BUILD MODE - so a `zig build
+-Dapp-runtime=win32` without `-Doptimize=Debug` puts the whole suite on the
+user's installed Ghoztty. Observed before any change: `zig-out\bin\ghoztty.exe
++list --json` answered with the installed exe, and that install was holding a
+leaked `[target: p1win] P1Title` window from an earlier `ipc-p1.ps1` run.
+`Assert-GhozttyUnderTest` now pre-flights every reset; the cold-box half is
+**T350**. Also **T351** (~29 scripts still carry private kill helpers) and
+**T352** (target names are still fixed strings shared across runs).

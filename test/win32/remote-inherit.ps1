@@ -51,14 +51,14 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# Same app+agent kill as before, but exact-exe (a '*zig-out*' CommandLine
+# match also catches a detached zig-out-release instance, T53b) and with the
+# debug session-layout manifest dropped, which the private copy never did.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 
 function Get-ListJson {

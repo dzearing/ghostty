@@ -56,10 +56,14 @@ function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: the app+agent kill and the debug session-layout manifest come from
+# lib\CleanSlate.ps1 now — a pane from a previous run survives an app-only
+# kill twice over and gets FOCUSED under the same target name. The flood-shell
+# sweep stays here: it is this script's own litter, not shared hygiene.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') -or $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 0 | Out-Null
     # Kill any orphaned flood shell from the click-storm phase.
     Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
         Where-Object { $_.CommandLine -like '*FD-LOAD*' } |

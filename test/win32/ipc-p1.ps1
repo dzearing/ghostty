@@ -21,13 +21,16 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy. Exact-exe matching is still
+# the rule ('*zig-out*' also matched a detached soak instance running from
+# zig-out-release, T53b), and the reset now also kills the sibling agent and
+# drops the debug session-layout manifest — a pane from a previous run survives
+# an app-only kill twice over, and `+new-window --target=` then FOCUSES it
+# instead of running this run's fixture.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        # Exact exe match only — '*zig-out*' also matched a detached soak
-        # instance running from zig-out-release (T53b) and killed it.
-        Where-Object { $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 
 function Get-List {

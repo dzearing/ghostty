@@ -92,11 +92,14 @@ function Start-Sleeper {
 $sleepers = @()
 function Kill-Sleepers { foreach ($s in $sleepers) { Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue } }
 
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
+# Exact-exe rather than a '*zig-out*' CommandLine match (T53b), plus the
+# sibling agent and the debug session-layout manifest, so a previous run's
+# pane cannot be focused in place of this run's fixture.
 function Stop-DebugGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
+    Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
 }
 
 function Ghoz($argList) {
