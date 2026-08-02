@@ -74,11 +74,13 @@ const ACTIVITY_ID: u16 = 104;
 /// restyled `ACCOUNT_ID`: the signed-out state must stay a real themed button,
 /// and one HWND cannot be both a themed push button and an owner-drawn link.
 const ACCOUNT_LINK_ID: u16 = 105;
+const RESTORE_ALL_ID: u16 = 106;
 
 /// The action row's captions. Measured (not assumed) to size their buttons, so
 /// they live where both the creation and the measurement can see them.
 const PRIMARY_LABEL = "New Window";
 const ACTIVITY_LABEL = "Activity";
+const RESTORE_ALL_LABEL = "Restore All";
 
 /// `Host Settings…` needs the per-host defaults store, which T174 built
 /// (`host_defaults.zig` + `HostSettingsDialog.zig`) — one bool, at the one place
@@ -141,6 +143,11 @@ hint: w32.HWND,
 /// The detail pane's primary action ("New Window"), Mac's `.borderedProminent`
 /// button — in the detail header, NOT the footer (which holds Cancel alone).
 primary_btn: w32.HWND,
+/// "Restore All" — rebuild this machine's whole window topology here (T335).
+/// Offered only when the highlighted machine has at least two ALIVE sessions
+/// (`chooser_sessions.restoreAllAvailable`), so it is hidden far more often than
+/// it is shown.
+restore_all_btn: w32.HWND,
 /// "Activity" — opens the Activity Monitor for the selected machine (T177).
 /// Mac gates it on the row being remote, in the same `if case .remote` that
 /// carries the `…` menu (MachineChooserView.swift:474-491), so the two appear
@@ -267,6 +274,11 @@ pub fn filterRows(devices: []const relay_directory.Device, needle: []const u8, o
 /// Open the chooser for the currently focused window. Idempotent: an already-
 /// open chooser is focused instead of a second one being created.
 pub fn open(window: *Window) void {
+    // Every control here is created with a comptime UTF-16 literal, and each one
+    // costs comptime branches to transcode. The function crossed the 1000-branch
+    // default when T335 added its button, so the budget is stated rather than
+    // being one string literal away from a build failure again.
+    @setEvalBranchQuota(10_000);
     if (window.machine_chooser) |existing| {
         _ = w32.SetForegroundWindow(existing.hwnd);
         _ = w32.SetFocus(existing.filter);
@@ -292,6 +304,7 @@ pub fn open(window: *Window) void {
         .list = undefined,
         .hint = undefined,
         .primary_btn = undefined,
+        .restore_all_btn = undefined,
         .activity_btn = undefined,
         .menu_btn = undefined,
         .cancel_btn = undefined,
@@ -552,6 +565,29 @@ pub fn open(window: *Window) void {
         self.destroyState();
         return;
     };
+    // "Rebuild this machine's full window layout here" (466-473). Created
+    // hidden like Activity, and hidden far more often: it needs the selected
+    // machine to have two or more live sessions, which `refreshDetail` decides
+    // from the roster.
+    self.restore_all_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral(RESTORE_ALL_LABEL),
+        w32.WS_CHILD,
+        seed.left,
+        seed.top,
+        l.action_min_btn_w,
+        seed.bottom - seed.top,
+        hwnd,
+        @ptrFromInt(@as(usize, RESTORE_ALL_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    _ = w32.SetWindowTheme(self.restore_all_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
     // "Open Activity Monitor for <machine>" (474-481). Created hidden: the row
     // that is selected when the chooser opens may not be a remote one, and
     // `refreshDetail` is what decides.
@@ -637,9 +673,9 @@ pub fn open(window: *Window) void {
     );
     if (self.font) |f| {
         for ([_]w32.HWND{
-            self.filter,        self.list,        self.account_status,
-            self.account_btn,   self.primary_btn, self.activity_btn,
-            self.menu_btn,      self.cancel_btn,
+            self.filter,          self.list,        self.account_status,
+            self.account_btn,     self.primary_btn, self.restore_all_btn,
+            self.activity_btn,    self.menu_btn,    self.cancel_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
@@ -1070,11 +1106,9 @@ fn layoutActions(self: *MachineChooser, l: Layout) void {
     for (row.kinds[0..row.len], row.rects[0..row.len]) |kind, r| {
         const hwnd = switch (kind) {
             .primary => self.primary_btn,
+            .restore_all => self.restore_all_btn,
             .activity => self.activity_btn,
             .menu => self.menu_btn,
-            // T146's "Restore All" has no control yet; the packer already knows
-            // where it goes, which is the point of naming it.
-            .restore_all => continue,
         };
         _ = w32.MoveWindow(hwnd, r.left, r.top, r.width(), r.height(), 1);
     }
@@ -1082,16 +1116,23 @@ fn layoutActions(self: *MachineChooser, l: Layout) void {
 
 /// Which optional actions the selected row offers. Mac gates BOTH Activity and
 /// the `…` menu on `if case .remote(let machine)` (MachineChooserView.swift:
-/// 474-491) — the Local row gets neither.
+/// 474-491) — the Local row gets neither. Restore All is gated on the machine's
+/// live session COUNT instead (T335), which is why the roster is read here.
 fn actionComposition(self: *const MachineChooser) chooser_layout.Composition {
-    return compositionFor(self.selectedRow());
+    return compositionFor(self.selectedRow(), self.roster.aliveCount());
 }
 
 /// Pure half of `actionComposition` — unit-tested. `null` is the empty list
-/// (the filter matched nothing), which offers no actions at all.
-fn compositionFor(row: ?Row) chooser_layout.Composition {
+/// (the filter matched nothing), which offers no actions at all. `alive` is how
+/// many of the highlighted machine's sessions are running.
+fn compositionFor(row: ?Row, alive: usize) chooser_layout.Composition {
     const r = row orelse return .{};
     return .{
+        // The `r == .local` clause is T336's to delete: the rebuild path exists
+        // for the local agent only today, and Mac's own rule is machine-agnostic
+        // (MachineChooserView.swift:145-155). Offering the button on a remote row
+        // it cannot act on would be worse than not offering it at all.
+        .restore_all = r == .local and chooser_sessions.restoreAllAvailable(alive),
         .activity = r != .local,
         .menu = chooser_menu.hasMenu(menuState(r)),
     };
@@ -1103,6 +1144,7 @@ fn compositionFor(row: ?Row) chooser_layout.Composition {
 fn measureActions(self: *const MachineChooser) chooser_layout.ActionText {
     return .{
         .primary = self.measureCaption(PRIMARY_LABEL),
+        .restore_all = self.measureCaption(RESTORE_ALL_LABEL),
         .activity = self.measureCaption(ACTIVITY_LABEL),
     };
 }
@@ -1399,10 +1441,17 @@ fn syncRoster(self: *MachineChooser) void {
 
 /// Repaint the detail pane after the roster changed. The subtitle's count lives
 /// there too, so this is one invalidate and not two.
+///
+/// It also re-applies the action row, because one action is a function OF the
+/// roster: "Restore All" appears at two live sessions and goes away again when a
+/// Kill drops the machine back to one (T335). The roster arrives asynchronously,
+/// so a composition applied only on selection change would be computed before
+/// the data it is derived from exists — the button would never appear at all.
 fn refreshSessions(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
     var r = rect(l.detail);
     _ = w32.InvalidateRect(self.hwnd, &r, 1);
+    self.applyActionComposition(l);
 }
 
 /// The highlighted row, or null when the list is empty.
@@ -1428,10 +1477,18 @@ fn refreshDetail(self: *MachineChooser) void {
         self.primary_btn,
         if (row == null) w32.SW_HIDE else w32.SW_SHOW,
     );
+    self.applyActionComposition(l);
+}
+
+/// Show/hide the optional detail actions for the current selection and re-pack
+/// the run. Called both when the SELECTION changes and when the ROSTER changes,
+/// since the composition depends on both.
+fn applyActionComposition(self: *MachineChooser, l: Layout) void {
     // Hidden rather than greyed: Mac omits the menu on rows that have none,
     // and a `…` that opens nothing is worse than no `…` at all. Activity is
     // gated on the same thing Mac gates it on — the row being remote.
     const comp = self.actionComposition();
+    _ = w32.ShowWindow(self.restore_all_btn, if (comp.restore_all) w32.SW_SHOW else w32.SW_HIDE);
     _ = w32.ShowWindow(self.activity_btn, if (comp.activity) w32.SW_SHOW else w32.SW_HIDE);
     _ = w32.ShowWindow(self.menu_btn, if (comp.menu) w32.SW_SHOW else w32.SW_HIDE);
     // The row is packed as a run, so dropping a button MOVES the ones after it.
@@ -1439,7 +1496,8 @@ fn refreshDetail(self: *MachineChooser) void {
     // Focus must not be left on a control the user can no longer see.
     const focus = w32.GetFocus();
     if ((!comp.menu and focus == @as(?w32.HWND, self.menu_btn)) or
-        (!comp.activity and focus == @as(?w32.HWND, self.activity_btn)))
+        (!comp.activity and focus == @as(?w32.HWND, self.activity_btn)) or
+        (!comp.restore_all and focus == @as(?w32.HWND, self.restore_all_btn)))
     {
         _ = w32.SetFocus(self.list);
     }
@@ -2121,6 +2179,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                         self.openActivityMonitor();
                         return 0;
                     },
+                    RESTORE_ALL_ID => {
+                        self.restoreAll();
+                        return 0;
+                    },
                     else => {},
                 }
             } else if (control_id == FILTER_ID and notification == w32.EN_CHANGE) {
@@ -2442,6 +2504,49 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
     }
 }
 
+/// Restore ALL of the selected machine's windows (T335): rebuild its whole
+/// window/tab/split topology here from the layout blobs the AGENT holds, with
+/// every pane ATTACHed to its still-running session.
+///
+/// Local only for now (T336 is the relay half), which `compositionFor` already
+/// enforces by not offering the button on a device row — the guard here is the
+/// second lock on the same door, because a keyboard path that reached it anyway
+/// must not open a window on a machine's behalf without its topology.
+///
+/// Unlike the per-session resume, this one runs BEFORE the chooser closes: the
+/// rebuild's failure modes are worth saying out loud, and a dismissed chooser
+/// has nowhere to say them. Mac uses a modal alert
+/// (`SessionLayoutRestore.swift:755-773`); the footer hint is this dialog's
+/// equivalent and does not steal the user's next keystroke.
+fn restoreAll(self: *MachineChooser) void {
+    const row = self.selectedRow() orelse return;
+    if (row != .local) {
+        self.setHint("Restoring another machine's windows isn't supported yet.");
+        return;
+    }
+
+    const app = self.window.app;
+    const n = app.restoreAllLocalSessions() catch |err| {
+        log.warn("machine chooser: restore all failed err={}", .{err});
+        self.setHint(switch (err) {
+            error.NoAgent => "The session agent isn't running - there's nothing to restore from.",
+            error.PullFailed => "Couldn't read this machine's saved layouts from the agent.",
+        });
+        return;
+    };
+    if (n == 0) {
+        // A successful pull that rebuilt nothing is a different fact from a
+        // failed one, and the user is owed the difference: their windows are
+        // either already here or genuinely not saved.
+        self.setHint("Nothing to restore - these sessions are already open, or no layout was saved.");
+        return;
+    }
+    log.info("machine chooser: restore all rebuilt {d} window(s)", .{n});
+    // Do NOT refocus the owner: the rebuilt windows are what the user asked to
+    // be looking at.
+    self.close(false);
+}
+
 /// Focus the pane already ATTACHed to `id`, if one of our windows has it.
 /// Returns true when the chooser was dismissed onto it.
 fn focusOpenSession(self: *MachineChooser, id: []const u8) bool {
@@ -2556,16 +2661,17 @@ pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
         hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
         hwnd == self.account_status or hwnd == self.account_btn or
-        hwnd == self.account_link or
+        hwnd == self.account_link or hwnd == self.restore_all_btn or
         hwnd == self.activity_btn or hwnd == self.menu_btn;
 }
 
 /// Keyboard focus targets, in Tab order — the same left-to-right order the
 /// action row is painted in, so Tab walks the row the way the eye does.
-/// `activity` (T177) and `menu` (T176) follow the primary action they sit
-/// beside; `account` is the sign-in/out button (T141), last in the cycle so Tab
-/// from the filter still reaches the list first, the common path.
-pub const Focusable = enum { filter, list, primary, activity, menu, cancel, account };
+/// `restore_all` (T335), `activity` (T177) and `menu` (T176) follow the primary
+/// action they sit beside; `account` is the sign-in/out button (T141), last in
+/// the cycle so Tab from the filter still reaches the list first, the common
+/// path.
+pub const Focusable = enum { filter, list, primary, restore_all, activity, menu, cancel, account };
 
 /// Pure Tab-order cycle. Unit-tested.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
@@ -2573,14 +2679,16 @@ pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
         .filter => .account,
         .list => .filter,
         .primary => .list,
-        .activity => .primary,
+        .restore_all => .primary,
+        .activity => .restore_all,
         .menu => .activity,
         .cancel => .menu,
         .account => .cancel,
     } else switch (cur) {
         .filter => .list,
         .list => .primary,
-        .primary => .activity,
+        .primary => .restore_all,
+        .restore_all => .activity,
         .activity => .menu,
         .menu => .cancel,
         .cancel => .account,
@@ -2594,6 +2702,7 @@ fn hwndFor(self: *const MachineChooser, f: Focusable) w32.HWND {
         .filter => self.filter,
         .list => self.list,
         .primary => self.primary_btn,
+        .restore_all => self.restore_all_btn,
         .activity => self.activity_btn,
         .menu => self.menu_btn,
         .cancel => self.cancel_btn,
@@ -2636,6 +2745,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 self.openRowMenuFromButton();
             } else if (focus == @as(?w32.HWND, self.activity_btn)) {
                 self.openActivityMonitor();
+            } else if (focus == @as(?w32.HWND, self.restore_all_btn)) {
+                self.restoreAll();
             } else if (self.roster.cursor != chooser_sessions.no_cursor and self.resumeCursor()) {
                 // The session sub-cursor is in the roster: Return resumes THAT
                 // row, not the machine's primary action (Mac's `submit`,
@@ -2687,6 +2798,13 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 .list
             else if (focus == @as(?w32.HWND, self.primary_btn))
                 .primary
+            else if (focus == @as(?w32.HWND, self.restore_all_btn))
+                .restore_all
+                // Activity was missing from this ladder until T335: focus on it
+                // read as `.filter`, so Tab from Activity jumped back to the
+                // list instead of stepping on to the `…` menu beside it.
+            else if (focus == @as(?w32.HWND, self.activity_btn))
+                .activity
             else if (focus == @as(?w32.HWND, self.menu_btn))
                 .menu
             else if (focus == @as(?w32.HWND, self.cancel_btn))
@@ -2926,10 +3044,11 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> primary -> activity -> menu -> cancel -> account -> filter" {
+test "nextFocus: forward cycle filter -> list -> primary -> restore_all -> activity -> menu -> cancel -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
     try testing.expectEqual(Focusable.primary, nextFocus(.list, false));
-    try testing.expectEqual(Focusable.activity, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.restore_all, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.activity, nextFocus(.restore_all, false));
     try testing.expectEqual(Focusable.menu, nextFocus(.activity, false));
     try testing.expectEqual(Focusable.cancel, nextFocus(.menu, false));
     try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
@@ -2941,50 +3060,90 @@ test "nextFocus: backward cycle reverses" {
     try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
     try testing.expectEqual(Focusable.menu, nextFocus(.cancel, true));
     try testing.expectEqual(Focusable.activity, nextFocus(.menu, true));
-    try testing.expectEqual(Focusable.primary, nextFocus(.activity, true));
+    try testing.expectEqual(Focusable.restore_all, nextFocus(.activity, true));
+    try testing.expectEqual(Focusable.primary, nextFocus(.restore_all, true));
     try testing.expectEqual(Focusable.list, nextFocus(.primary, true));
     try testing.expectEqual(Focusable.filter, nextFocus(.list, true));
 }
 
-test "the detail actions sit with the primary action in the Tab order" {
-    // Activity and the `…` act on the machine the primary button opens, so they
-    // must follow it directly rather than turning up after Cancel — and in the
-    // order they are painted in (T177).
-    try testing.expectEqual(Focusable.activity, nextFocus(.primary, false));
-    try testing.expectEqual(Focusable.menu, nextFocus(.activity, false));
-    try testing.expectEqual(Focusable.activity, nextFocus(.menu, true));
-    try testing.expectEqual(Focusable.primary, nextFocus(.activity, true));
+test "the Tab order is the paint order of the action run" {
+    // Restore All, Activity and the `…` all act on the machine the primary
+    // button opens, so they follow it directly rather than turning up after
+    // Cancel — and in the order they are painted in (T177, T335). The forward
+    // and backward walks are each other's inverse across the whole run.
+    const run = [_]Focusable{ .primary, .restore_all, .activity, .menu };
+    for (run[0 .. run.len - 1], run[1..]) |a, b| {
+        try testing.expectEqual(b, nextFocus(a, false));
+        try testing.expectEqual(a, nextFocus(b, true));
+    }
 }
 
 test "compositionFor: Activity and the menu appear together, on remote rows only" {
     // Mac gates both on the same `if case .remote(let machine)`
     // (MachineChooserView.swift:474-491).
-    const local = compositionFor(.local);
+    const local = compositionFor(.local, 0);
     try testing.expect(!local.activity);
     try testing.expect(!local.menu);
 
-    const device = compositionFor(.{ .device = 0 });
+    const device = compositionFor(.{ .device = 0 }, 0);
     try testing.expect(device.activity);
     try testing.expect(device.menu);
 
     // Nothing selected (the filter matched nothing): no actions at all.
-    const none = compositionFor(null);
+    const none = compositionFor(null, 9);
     try testing.expect(!none.activity);
     try testing.expect(!none.menu);
+    try testing.expect(!none.restore_all);
+}
 
-    // Restore All is T146's; the row must not claim it yet.
-    try testing.expect(!device.restore_all);
+test "compositionFor: Restore All needs two live sessions, and the local row" {
+    // The rule (>= 2 alive) is Mac's; the local-only clause is T336's to remove.
+    try testing.expect(!compositionFor(.local, 0).restore_all);
+    try testing.expect(!compositionFor(.local, 1).restore_all);
+    try testing.expect(compositionFor(.local, 2).restore_all);
+    try testing.expect(compositionFor(.local, 7).restore_all);
+
+    // A remote machine with plenty of live sessions still does not get it here:
+    // there is no rebuild path for another machine's topology yet, and a button
+    // that cannot act is worse than an absent one.
+    try testing.expect(!compositionFor(.{ .device = 0 }, 5).restore_all);
 }
 
 test "the action row's own packing puts Activity between New Window and the menu" {
     const l = layout(1.0, 1);
-    const row = chooser_layout.actionRow(l, compositionFor(.{ .device = 0 }), .{
+    const row = chooser_layout.actionRow(l, compositionFor(.{ .device = 0 }, 0), .{
         .primary = 70,
         .activity = 44,
     });
     try testing.expectEqual(@as(usize, 3), row.len);
     try testing.expect(row.rect(.primary).?.right <= row.rect(.activity).?.left);
     try testing.expect(row.rect(.activity).?.right <= row.rect(.menu).?.left);
+}
+
+test "the action row packs Restore All between New Window and Activity" {
+    // The whole row at once — the case the packer was named for (T177) and
+    // could not be exercised until a caller could set the flag.
+    const l = layout(1.0, 1);
+    const comp: chooser_layout.Composition = .{ .restore_all = true, .activity = true, .menu = true };
+    const row = chooser_layout.actionRow(l, comp, .{
+        .primary = 70,
+        .restore_all = 66,
+        .activity = 44,
+    });
+    try testing.expectEqual(@as(usize, 4), row.len);
+    try testing.expect(row.rect(.primary).?.right <= row.rect(.restore_all).?.left);
+    try testing.expect(row.rect(.restore_all).?.right <= row.rect(.activity).?.left);
+    try testing.expect(row.rect(.activity).?.right <= row.rect(.menu).?.left);
+
+    // Dropping it closes the gap rather than leaving a hole — the reason the
+    // row is packed as a RUN and re-packed on every selection change.
+    const without = chooser_layout.actionRow(l, .{ .activity = true, .menu = true }, .{
+        .primary = 70,
+        .restore_all = 66,
+        .activity = 44,
+    });
+    try testing.expectEqual(@as(usize, 3), without.len);
+    try testing.expectEqual(row.rect(.restore_all).?.left, without.rect(.activity).?.left);
 }
 
 test "menuState: the Local row has no menu, a device row gets the relay menu" {

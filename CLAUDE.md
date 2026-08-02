@@ -608,9 +608,34 @@ of the LaunchAgent is an HKCU Run entry (`GhozttyAgent`) the GUI
 writes/refreshes when persistence engages. Design + measured E2E results:
 `docs/design/session-persistence.md`; E2E harness: `scripts/e2e/session-persistence.py`.
 
-Cross-machine session *move* (browse another machine's live sessions from the
-Cmd-Shift-N chooser and resume them locally over the relay) is **scoped but not
-yet built** — see tasks T16–T18 in `docs/design/session-persistence-tasks.json`.
+### Browsing and resuming sessions from the chooser
+
+The machine chooser (Cmd-Shift-N on macOS, Ctrl+Shift+N on Windows) is where a
+machine's live sessions are browsed and taken over. Select a machine and its
+**session roster** appears in the detail pane — one card per connectable
+session, with its title, working directory, activity state and a Kill control.
+From there:
+
+- **Resume one** — Right steps the keyboard cursor into the roster, Up/Down walk
+  it, and Return opens a window here whose pane **ATTACHes** to that session
+  (the process keeps running on its own machine; only the viewer is local). A
+  session already open in one of your panes is focused instead of attached
+  twice. Dead-but-relaunchable rows are listed — their recorded command is worth
+  seeing — but cannot be resumed; reviving one is a RELAUNCH, a different verb.
+- **Restore All** — rebuilds the machine's *whole* window/tab/split topology
+  here, every pane attached to its still-running session. The button appears
+  only when the selected machine has **two or more live sessions**: with one
+  there is no topology to rebuild and Resume already covers it. The layout comes
+  from the blobs the **agent** holds, not from the local `session-layout.json`,
+  which is what makes it work after a crash that lost the manifest — precisely
+  when launch-time restore can do nothing.
+
+Both work **cross-machine on macOS** (browse a relay machine's roster and resume
+it locally), which shipped 2026-07-16. On **Windows**, browsing and Resume-one
+work for both the local agent and relay machines, but **Restore All is local
+only** — the cross-machine rebuild is tracked as T336 in
+`docs/design/windows-parity-tasks/`, and until it lands the button is offered on
+the Local row alone.
 
 ### Agent contract & upgrade compatibility
 

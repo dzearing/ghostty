@@ -1343,6 +1343,46 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
 /// never drop) rather than hanging startup.
 const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 
+/// The liveness probe every rebuild takes before replaying a topology: the
+/// agent's roster, plus the set of session ids we will ATTACH (alive, or a
+/// relaunchable tombstone).
+///
+/// `set` being null is NOT the same as an empty set. Null means the probe
+/// itself failed — liveness UNKNOWN, so attempt every leaf rather than drop a
+/// window over a transport fault. An empty set means the agent answered and owns
+/// nothing, which really does mean nothing is attachable.
+///
+/// The set BORROWS its keys from `roster`, so the two are freed together and
+/// neither may outlive this struct.
+const AttachProbe = struct {
+    roster: ?remote_connection.OwnedSessions = null,
+    set: ?std.StringHashMap(void) = null,
+
+    fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
+        var self: AttachProbe = .{};
+        self.roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
+            log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
+            return self;
+        };
+        var m = std.StringHashMap(void).init(gpa);
+        for (self.roster.?.sessions) |sess| {
+            if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
+        }
+        self.set = m;
+        return self;
+    }
+
+    /// What the restore helpers take: null ⇒ unknown ⇒ attempt every leaf.
+    fn attachSet(self: *const AttachProbe) ?*const std.StringHashMap(void) {
+        return if (self.set) |*m| m else null;
+    }
+
+    fn deinit(self: *AttachProbe) void {
+        if (self.set) |*m| m.deinit();
+        if (self.roster) |*s| s.deinit();
+    }
+};
+
 /// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Loads the
 /// session-layout manifest T89f1 wrote, probes the local agent for which of its
 /// sessions are still alive, and rebuilds every restorable window/tab/split —
@@ -1399,27 +1439,13 @@ pub fn restoreSessionLayout(self: *App) bool {
         return false;
     };
 
-    // Probe the roster. `attach_set` null ⇒ the probe failed (UNKNOWN — attempt
-    // every leaf); a present set holds every session we can ATTACH: alive
-    // (same-PID re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
+    // Probe the roster. A null set ⇒ the probe failed (UNKNOWN — attempt every
+    // leaf); a present set holds every session we can ATTACH: alive (same-PID
+    // re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
     // Genuinely-exited/unknown ids are absent → their leaves re-open fresh.
-    var roster: ?remote_connection.OwnedSessions = conn.requestSessions(
-        restore_probe_timeout_ns,
-    ) catch |err| blk: {
-        log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
-        break :blk null;
-    };
-    defer if (roster) |*s| s.deinit();
-
-    var attach_set: ?std.StringHashMap(void) = if (roster) |*s| set: {
-        var m = std.StringHashMap(void).init(gpa);
-        for (s.sessions) |sess| {
-            if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
-        }
-        break :set m;
-    } else null;
-    defer if (attach_set) |*m| m.deinit();
-    const attach_ptr: ?*const std.StringHashMap(void) = if (attach_set) |*m| m else null;
+    var probe = AttachProbe.take(gpa, conn);
+    defer probe.deinit();
+    const attach_ptr = probe.attachSet();
 
     var restored: usize = 0;
     for (file.windows) |win| {
@@ -2409,6 +2435,127 @@ pub fn resumeLocalSession(
     const window = try self.createWindow(.{ .surface_overrides = &ov });
     if (window.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
     return window;
+}
+
+/// What can go wrong rebuilding a machine's whole topology. Both arms are
+/// user-facing (the chooser turns them into a footer hint), which is why "the
+/// agent had nothing for us" is NOT one of them — that is a successful pull with
+/// a count of zero, and it deserves a different sentence.
+pub const RestoreAllError = error{
+    /// No connection to the local agent, so there is nothing to pull from.
+    NoAgent,
+    /// GET_LAYOUTS failed or came back unreadable — a transport fault, not an
+    /// empty machine. Answering "nothing to restore" here would be a lie.
+    PullFailed,
+};
+
+/// Restore ALL of the LOCAL agent's windows (T335, Mac's `resumeAllSessions`):
+/// pull the agent-owned layout blobs (`GET_LAYOUTS`, T334), probe liveness, and
+/// replay each decoded window through the SAME rebuild launch-time restore uses.
+/// Returns how many windows were rebuilt (0 is a valid answer — the agent may
+/// hold nothing, or everything it holds may already be open here).
+///
+/// The point of the exercise is the SOURCE: the topology comes from the AGENT's
+/// copy, not from this box's `session-layout.json`. That is what makes it work
+/// after the manifest is gone — a crash, a wiped profile, a first run on a
+/// machine whose agent outlived its app — which is exactly when a user wants
+/// their windows back and exactly when launch-time restore can do nothing. Mac
+/// states the same property (`SessionLayoutRestore.swift:586-588`).
+///
+/// The cross-machine half (rebuild ANOTHER machine's topology here, over the
+/// relay) is T336; this one dials nothing.
+pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
+    const gpa = self.core_app.alloc;
+
+    // Non-spawning would be wrong here, unlike the push: the user asked for
+    // this, so resolving (and if necessary starting) the agent is the job.
+    const conn = self.local_agent.sharedConnection() orelse {
+        log.warn("restore all: no local agent connection", .{});
+        return error.NoAgent;
+    };
+
+    const payload = conn.requestLayouts(restore_probe_timeout_ns) catch |err| {
+        log.warn("restore all: GET_LAYOUTS failed err={}", .{err});
+        return error.PullFailed;
+    };
+    defer gpa.free(payload);
+
+    const decoded = layout_blobs.decodeLayouts(gpa, payload) catch |err| {
+        log.warn("restore all: layouts payload unreadable err={}", .{err});
+        return error.PullFailed;
+    };
+    defer decoded.deinit();
+    if (decoded.skipped > 0) {
+        // Said out loud rather than silently: "3 of 5 windows" is a different
+        // fact from "3 windows", and only one of them is worth investigating.
+        log.warn("restore all: {d} blob(s) skipped as unreadable", .{decoded.skipped});
+    }
+
+    var probe = AttachProbe.take(gpa, conn);
+    defer probe.deinit();
+    const attach_ptr = probe.attachSet();
+
+    var restored: usize = 0;
+    for (decoded.windows) |win| {
+        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
+        // Mac's double-attach guard (`SessionLayoutRestore.swift:695-699`) in the
+        // identity win32 actually has: the agent rebinds a session to the NEWEST
+        // attach, so rebuilding a window whose panes are already on screen would
+        // quietly steal them from the window that has them — and the user would
+        // watch their own terminal go blank to make a copy of itself.
+        if (self.windowIsOpenLocally(win)) {
+            log.info("restore all: '{s}' is already open here, skipping", .{win.id});
+            continue;
+        }
+        self.restoreWindow(win, conn, attach_ptr) catch |err| {
+            log.warn("restore all: window '{s}' failed err={}", .{ win.id, err });
+            continue;
+        };
+        restored += 1;
+    }
+
+    if (restored > 0) {
+        log.info("restore all: rebuilt {d} window(s) from the agent's layouts", .{restored});
+        // The rebuilt windows are this box's again: record them locally so the
+        // NEXT launch restores them from the manifest without the round trip
+        // (Mac's `bindLocal`).
+        self.markLayoutDirty();
+    } else {
+        log.info("restore all: nothing to rebuild ({d} layout(s) held)", .{decoded.windows.len});
+    }
+    return restored;
+}
+
+/// Whether any leaf of `win` names a session one of our panes already has open.
+/// One leaf is enough: a window is restored as a unit, so a partial rebuild
+/// would either steal that pane or come back missing it.
+fn windowIsOpenLocally(self: *const App, win: session_layout.Window) bool {
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            const sid = leaf.session_id orelse continue;
+            if (sid.len == 0) continue;
+            if (self.paneForSession(sid) != null) return true;
+        }
+    }
+    return false;
+}
+
+/// The open pane ATTACHed to `id`, or null. Reads the LIVE id off the pane's
+/// remote backend — the same source `captureLeaf` writes the manifest from — so
+/// a freshly OPENed persistent pane counts, not just a re-attached one.
+fn paneForSession(self: *const App, id: []const u8) ?*Surface {
+    for (self.windows.items) |win| {
+        for (0..win.tab_count) |t| {
+            var it = win.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                if (!entry.view.core_surface_ready) continue;
+                const sid = entry.view.core_surface.remoteSessionId() orelse continue;
+                if (std.mem.eql(u8, sid, id)) return entry.view;
+            }
+        }
+    }
+    return null;
 }
 
 /// Resume ONE browsed session of a RELAY machine (T320): dial that machine and

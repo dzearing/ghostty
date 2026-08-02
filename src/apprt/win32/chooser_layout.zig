@@ -472,8 +472,9 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
 ///
 /// (`MachineChooserView.detailHeader`, MachineChooserView.swift:456-494) — a
 /// run whose composition depends on the selected machine, not four fixed slots.
-/// `restore_all` belongs to T146 and is never present yet; it is named here
-/// because the row has to be able to grow by one without moving anything else.
+/// `restore_all` (T335) is the rarest of them: it needs the machine to have two
+/// or more live sessions, so the row really does grow and shrink by one while
+/// the chooser is open — which is why it was named here from the start.
 pub const Action = enum { primary, restore_all, activity, menu };
 
 pub const max_actions: usize = 4;

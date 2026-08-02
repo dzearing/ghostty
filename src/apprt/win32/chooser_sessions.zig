@@ -394,6 +394,40 @@ pub fn resumeTarget(target: Target, s: Session) Resume {
 }
 
 // ---------------------------------------------------------------------
+// Restore All (T335)
+// ---------------------------------------------------------------------
+
+/// How many ALIVE sessions a machine must have before "Restore All" is offered.
+/// Mac's number, and its reason is the reason to port it rather than to soften
+/// it (`MachineChooserView.swift:145-155`): with one session there is no
+/// TOPOLOGY to rebuild, and resuming that single pane is what the per-session
+/// Return already does. A Restore All that lights up on one session is a second
+/// button for the first button's job.
+pub const restore_all_min_alive: usize = 2;
+
+/// How many of `sessions` are ALIVE — the datum the rule is taken of. This is
+/// `isResumable`, deliberately, and NOT `isConnectable`: a relaunchable
+/// tombstone is worth LISTING (its recorded argv/cwd can revive it) but has no
+/// live child to attach, so a machine holding two tombstones offers a Restore
+/// All that would rebuild two fresh shells and call it a restore. Same
+/// distinction T320 drew one level down.
+pub fn aliveCount(sessions: []const Session) usize {
+    var n: usize = 0;
+    for (sessions) |s| {
+        if (isResumable(s)) n += 1;
+    }
+    return n;
+}
+
+/// Whether a machine with `alive` live sessions can offer "Restore All". Takes
+/// the COUNT rather than the sessions so the caller can supply it from whatever
+/// it already has (the chooser counts the roster's own rows, which are filtered
+/// for optimistic kills); the rule itself lives here, once.
+pub fn restoreAllAvailable(alive: usize) bool {
+    return alive >= restore_all_min_alive;
+}
+
+// ---------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------
 
@@ -990,6 +1024,28 @@ test "resumeTarget names the machine the roster is pointed at" {
     // to a plausible-looking attach.
     try testing.expectEqual(Resume.none, resumeTarget(.none, alive));
     try testing.expectEqual(Resume.none, resumeTarget(.local, .{ .alive = true }));
+}
+
+test "restoreAllAvailable: two ALIVE sessions, and tombstones do not count" {
+    const alive: Session = .{ .id = "a", .alive = true };
+    const alive2: Session = .{ .id = "b", .alive = true };
+    const tombstone: Session = .{ .id = "c", .alive = false, .relaunchable = true };
+    const dead: Session = .{ .id = "d", .alive = false, .exit_code = 1 };
+
+    // 0 / 1 / 2 alive — the rule's whole domain.
+    try testing.expect(!restoreAllAvailable(aliveCount(&.{})));
+    try testing.expect(!restoreAllAvailable(aliveCount(&.{alive})));
+    try testing.expect(restoreAllAvailable(aliveCount(&.{ alive, alive2 })));
+
+    // Two relaunchable tombstones LOOK like two rows (both are rendered) and
+    // must still not offer it: there is nothing to attach to.
+    try testing.expectEqual(@as(usize, 0), aliveCount(&.{ tombstone, tombstone }));
+    try testing.expect(!restoreAllAvailable(aliveCount(&.{ tombstone, tombstone })));
+
+    // Mixed: one alive among the dead is still one.
+    try testing.expectEqual(@as(usize, 1), aliveCount(&.{ tombstone, alive, dead }));
+    try testing.expect(!restoreAllAvailable(aliveCount(&.{ tombstone, alive, dead })));
+    try testing.expect(restoreAllAvailable(aliveCount(&.{ tombstone, alive, dead, alive2 })));
 }
 
 test "the cursor's index space is the RENDERED list, with a dead row planted mid-roster" {

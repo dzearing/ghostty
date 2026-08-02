@@ -558,6 +558,24 @@ pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const
     return out[0..n];
 }
 
+/// How many of this machine's sessions are ALIVE — the datum "Restore All" is
+/// gated on (`chooser_sessions.restoreAllAvailable`, T335). Counted off the same
+/// set `visible` renders, so an optimistically-killed session is gone from both
+/// and the button cannot outlive the rows that justify it. NOT capped at
+/// `max_rows`: the gate is a property of the machine, not of what fits on
+/// screen.
+pub fn aliveCount(self: *const SessionRoster) usize {
+    const roster = self.owned orelse return 0;
+    var n: usize = 0;
+    for (roster.sessions) |s| {
+        if (self.isKilled(s.id)) continue;
+        // One predicate for "can this be attached", shared with the per-session
+        // resume — a tombstone is listed but is not alive.
+        if (chooser_sessions.isResumable(.{ .id = s.id, .alive = s.alive })) n += 1;
+    }
+    return n;
+}
+
 /// The title of an OPEN pane bound to `id`, or null. Also the answer to "is
 /// this session open in one of our windows", which is what turns the badge from
 /// `attached` (someone else holds it) into `open` (you do).

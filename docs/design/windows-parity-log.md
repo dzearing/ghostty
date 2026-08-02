@@ -5880,3 +5880,47 @@ single-pane path.
 Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
 Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/layout-blobs.ps1` ALL PASS twice (21 assertions).
+
+## 2026-08-02 - T335 (T321 split): Restore All, and a Tab walk that never walked
+
+The button T177 packed a slot for finally exists. Selecting a machine with two
+or more LIVE sessions offers **Restore All**, which pulls the layout blobs T334
+started pushing, probes liveness, and replays each window through the SAME
+`restoreWindow` that launch-time restore uses - so a rebuild is a restore
+sourced from the AGENT's copy rather than from this box's manifest. That source
+is the point: it works when the local manifest is gone, which is exactly the
+case a crash produces and exactly when launch-time restore can do nothing.
+
+Mac's `>= 2 alive` rule ported with its reason attached: one session has no
+topology to rebuild and Resume already opens it, so a Restore All that lights up
+on one pane is a second button for the first button's job. The predicate is
+`alive`, not `isConnectable` - two relaunchable tombstones look like two rows
+and have nothing to attach to.
+
+Two properties are load-bearing and neither is obvious. The composition is
+re-applied when the ROSTER changes, not only when the selection does: the roster
+arrives asynchronously, so a button derived from it and computed only on
+selection change is computed before its data exists and never appears. And the
+rebuild skips a window whose sessions are already open here - the agent rebinds
+a session to the newest ATTACH, so a second rebuild would take the panes out of
+the window it just made.
+
+The interesting failure was in the harness. `Send-TestKeys` SetFocus()es its
+`-Target` before posting, so five Tabs aimed at the filter walk the same first
+step five times; a probe printing the focused HWND after each said `filter,
+list, list, list, list`. Each Tab has to be re-aimed at whatever now holds
+focus. That is also why a real defect had survived since T177: the chooser's Tab
+ladder never recognised the Activity button, so focus on it read as the filter
+and Tab jumped back to the list. **No test had ever taken a second Tab.**
+
+Filed **T338**: the blob key is not stable across app runs (`window-N` comes
+from a per-process counter), so the relaunched app's blank window takes the dead
+run's key and the previous first window becomes unrestorable - verified with a
+before/after reading of the agent's store. The new script names its fixture
+window to work around it.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
+Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
+`test/win32/chooser-restore-all.ps1` ALL PASS twice (31 assertions). Regression:
+`chooser-resume.ps1`, `chooser-sessions.ps1`, `ipc-machine-chooser.ps1` (72) and
+`layout-blobs.ps1` all ALL PASS.
