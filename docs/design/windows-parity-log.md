@@ -6219,3 +6219,48 @@ leaked `[target: p1win] P1Title` window from an earlier `ipc-p1.ps1` run.
 `Assert-GhozttyUnderTest` now pre-flights every reset; the cold-box half is
 **T350**. Also **T351** (~29 scripts still carry private kill helpers) and
 **T352** (target names are still fixed strings shared across runs).
+
+## 2026-08-02 - T39: the site could not offer a build the release now produces
+
+T38 made every release PRODUCE the Windows artifacts. The site still offered
+one platform, so a Windows visitor's only path was the releases list. Now
+there is a second `.download-card` beside the macOS DMG - "Windows Installer /
+x64, per-user, no admin" - plus a note line carrying the version, the
+Windows 10 1809+ 64-bit floor, and the portable-ZIP alternative. No new CSS:
+`.download-cards` was already a wrapping flex row with a mobile stack rule.
+
+The task was really about **who keeps the link current**. There is no static
+URL for "the latest win-v release" - they publish `--latest=false` on purpose,
+because installed builds scan for the newest `win-v` tag and marking one latest
+would hijack the Mac Sparkle flow. Between a client-side GitHub API lookup and
+a release-time rewrite, the rewrite won: no runtime dependency on a 60/hr
+unauthenticated API, works with JS off, and it puts the site on the same
+trigger as the artifacts. **A step that needs a human to remember it is exactly
+how the Windows channel fell 24 releases behind**, and hand-editing the site
+would have rebuilt that gap one layer up.
+
+So `release-windows.yml` gained a website step - after the publish, gated on
+it, so the links can never precede the assets - calling
+`dist/website/update-windows-links.py`. That script matches by element `id`,
+never by version number: a regex loose enough to find "the version" on that
+page also finds `Ghoztty-1.28.0-arm64.dmg` and would retarget the macOS
+download at a Windows tag. And a missing anchor is an ERROR, not a no-op -
+"reported success and changed nothing" is the failure this repo has paid for
+at T214 and T303, and here it would mean a release that succeeded over a site
+that never moved.
+
+Found on the way: **gh-pages now has two concurrent writers**. `release.yml`
+pushes `appcast.xml` from the same tag push, so a plain `git push` from both
+loses a race about half the time - and the loser is a release whose appcast
+entry or download link silently never landed. Both sides rebase-and-retry now.
+The mirror at `relay/deploy/ghpages/index.html` had drifted again (v1.12.0
+against a live v1.28.0, the same drift its own sync commit complained about);
+it is synced, and F1 of the new script fails whenever it drifts again.
+
+`test\win32\website-windows-download.ps1` - ALL PASS, 40 assertions, including
+the rewrite script run for real and live 200s on both URLs. Deployed as
+gh-pages `2ac90c763`; the live page served the card 30s after the push.
+Residuals: **T353** (nothing in that workflow has ever been run by GitHub - the
+retry loop especially is dead code until the day it matters) and **T354** (the
+only published win-v release predates the portable ZIP, so that link points at
+the release page until the next publish promotes it).

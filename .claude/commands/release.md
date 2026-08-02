@@ -160,7 +160,14 @@ Update the **macOS app** version on the gh-pages landing page (only if the app w
 git worktree add /tmp/ghoztty-gh-pages gh-pages
 ```
 
-In `/tmp/ghoztty-gh-pages/index.html`, replace all occurrences of the old version with `vX.Y.Z` (download button text, DMG download URL including filename, and footer version string). Do NOT touch the Remote Agent section — its version badge fetches the agent's `version.json` from the relay live, so it updates itself when Step 4 publishes; there is nothing to hand-edit for the agent.
+In `/tmp/ghoztty-gh-pages/index.html`, replace the **macOS** occurrences of the old version with `vX.Y.Z` (download button text, DMG download URL including filename, and the `macOS vX.Y.Z` note line).
+
+Do NOT touch two things by hand:
+
+- The **Remote Agent** section — its version badge fetches the agent's `version.json` from the relay live, so it updates itself when Step 4 publishes.
+- The **Windows** download card and its `Windows vX.Y.Z` note line (`id="win-msi-link"`, `id="win-zip-link"`, `id="win-version"`) — `release-windows.yml` retargets those at the `win-vX.Y.Z` release it just published, in the same run, via `dist/website/update-windows-links.py` (T39). Editing them by hand is how they would come to advertise a Windows build that does not exist. If a release ran with `publish=false`, the site correctly still points at the previous `win-v` release.
+
+Also mirror the change into `relay/deploy/ghpages/index.html` on `main` so the in-repo copy does not drift from the live site (it has twice). `test/win32/website-windows-download.ps1` fails when it does.
 
 ```bash
 cd /tmp/ghoztty-gh-pages && git add index.html && git commit -m "Update website version to vX.Y.Z" && git push origin gh-pages

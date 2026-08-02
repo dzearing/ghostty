@@ -197,4 +197,18 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add appcast.xml
           git commit -m "Update appcast for v${VERSION}"
-          git push origin gh-pages
+
+          # release-windows.yml now writes index.html on this same branch from
+          # the same tag push (T39), so this push has a concurrent writer.
+          # Rebase and retry rather than losing the appcast entry to a race.
+          for attempt in 1 2 3 4 5; do
+            if git push origin gh-pages; then
+              echo "appcast pushed (attempt $attempt)"
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt) -- rebasing onto origin/gh-pages"
+            git pull --rebase origin gh-pages
+            sleep $(( attempt * 3 ))
+          done
+          echo "::error::could not push the appcast after 5 attempts"
+          exit 1
