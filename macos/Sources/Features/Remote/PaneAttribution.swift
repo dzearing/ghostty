@@ -105,33 +105,64 @@ enum PaneAttribution {
             let panes = controller.surfaceTree.root?.leaves() ?? []
             let windowLabel = windowLabel(for: controller)
 
+            // Gather each pane's raw parts first, then name them as a GROUP.
+            // A label is only useful if it distinguishes, and whether a pane's
+            // own title distinguishes it depends on what its siblings are called
+            // — which can't be known one pane at a time.
+            struct Candidate {
+                let tty: String
+                let paneID: UUID
+                let paneTitle: String
+                let cwd: String
+            }
+            var candidates: [Candidate] = []
             for pane in panes {
                 guard let surface = pane.surfaceView,
                       let rawTTY = surface.surfaceModel?.ttyName,
                       case let tty = bareTTY(rawTTY),
                       !tty.isEmpty
                 else { continue }
+                candidates.append(Candidate(
+                    tty: tty,
+                    paneID: pane.id,
+                    paneTitle: pane.title.trimmingCharacters(in: .whitespacesAndNewlines),
+                    cwd: surface.pwd.map { ($0 as NSString).lastPathComponent } ?? ""
+                ))
+            }
 
-                let paneTitle = pane.title.trimmingCharacters(in: .whitespacesAndNewlines)
-                let cwd = surface.pwd.map { ($0 as NSString).lastPathComponent } ?? ""
+            // A pane's own title earns a suffix only when it actually separates
+            // it from its siblings. Two panes both titled "~/git" (the common
+            // case — the shell reports the cwd) tell you nothing, so they fall
+            // back to a positional "pane N" in split order. Without this the
+            // column reproduces the very problem it exists to solve: every row
+            // reading the same string.
+            let titleCounts = candidates.reduce(into: [String: Int]()) { $0[$1.paneTitle, default: 0] += 1 }
+            let single = candidates.count == 1
 
-                // One pane in the window ⇒ the window label already identifies it.
-                // Several ⇒ say which one, or the column can't tell them apart —
-                // which is the whole reason the column exists.
+            for (index, c) in candidates.enumerated() {
+                let titleIsDistinguishing =
+                    !c.paneTitle.isEmpty &&
+                    c.paneTitle != windowLabel &&
+                    titleCounts[c.paneTitle] == 1
+
                 let label: String
-                if panes.count > 1, !paneTitle.isEmpty, paneTitle != windowLabel {
-                    label = "\(windowLabel) › \(paneTitle)"
-                } else {
+                if single {
+                    // Only one pane: the window label already identifies it.
                     label = windowLabel
+                } else if titleIsDistinguishing {
+                    label = "\(windowLabel) › \(c.paneTitle)"
+                } else {
+                    label = "\(windowLabel) › pane \(index + 1)"
                 }
 
                 var detailParts = ["Window: \(windowLabel)"]
-                if !paneTitle.isEmpty { detailParts.append("Pane: \(paneTitle)") }
-                if !cwd.isEmpty { detailParts.append("Directory: \(cwd)") }
-                detailParts.append("TTY: \(tty)")
+                if !c.paneTitle.isEmpty { detailParts.append("Pane: \(c.paneTitle)") }
+                if !single { detailParts.append("Pane position: \(index + 1) of \(candidates.count)") }
+                if !c.cwd.isEmpty { detailParts.append("Directory: \(c.cwd)") }
+                detailParts.append("TTY: \(c.tty)")
 
-                result[tty] = AttributedPane(
-                    paneID: pane.id,
+                result[c.tty] = AttributedPane(
+                    paneID: c.paneID,
                     label: label,
                     detail: detailParts.joined(separator: "\n")
                 )

@@ -635,6 +635,13 @@ struct MachineChooserView: View {
                 .foregroundStyle(session.alive ? Color.green : Color.secondary)
                 .padding(.top, 4)
 
+            // CPU sits in its own fixed-width column ahead of the title so the
+            // meters stack into a scannable vertical strip. Inline after the
+            // title it moved with every label's length, which is precisely what
+            // stops you comparing rows at a glance.
+            cpuMeterColumn(session)
+                .padding(.top, 2)
+
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(session.label(liveTitle: liveTitle, persistedTitle: persistedTitle))
@@ -642,7 +649,6 @@ struct MachineChooserView: View {
                         .lineLimit(1)
                     if session.alive {
                         activityBadge(session.activity)
-                        cpuMeter(session)
                     } else {
                         pill(exitedLabel(session), .secondary)
                     }
@@ -718,33 +724,53 @@ struct MachineChooserView: View {
     /// the honest one here, because "is this agent runaway?" is exactly a question
     /// about how many cores it is eating.
     ///
-    /// Shown only above a floor: every idle session drawing a 0% bar would be
-    /// noise competing with the busy one this is meant to make obvious. Hidden
-    /// entirely (not zeroed) when the agent can't serve the stream.
+    /// Shown for every live session once a reading arrives, INCLUDING 0%.
+    /// Hiding idle rows seemed tidier, but it makes "idle" and "the meter isn't
+    /// working" look identical — and it removes the baseline that makes a busy
+    /// row obvious, since 400% only reads as alarming next to neighbours sitting
+    /// at 0. A missing meter now means exactly one thing: the agent can't serve
+    /// the stream.
+    /// Width of the whole CPU column. Fixed, and reserved even when there is no
+    /// meter to draw, so every row's title starts at the same x — a column that
+    /// collapses on some rows isn't a column.
+    private static let cpuColumnWidth: CGFloat = 62
+    private static let cpuBarWidth: CGFloat = 26
+
     @ViewBuilder
-    private func cpuMeter(_ session: BrowsedSession) -> some View {
-        if sessionCPU.supported, let pct = sessionCPU.cpuBySession[session.id], pct >= 1 {
-            // The bar saturates at one full core; beyond that the number carries
-            // the magnitude. A bar scaled to ncpu would leave the common
-            // one-busy-core case as a barely visible sliver.
-            let fill = min(Double(pct) / 100.0, 1.0)
-            let tint: Color = pct >= 100 ? .red : (pct >= 40 ? .orange : .secondary)
-            HStack(spacing: 4) {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.secondary.opacity(0.22))
-                    .frame(width: 26, height: 4)
-                    .overlay(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(tint)
-                            .frame(width: 26 * fill, height: 4)
-                    }
-                Text("\(Int(pct.rounded()))%")
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+    private func cpuMeterColumn(_ session: BrowsedSession) -> some View {
+        Group {
+            if session.alive, sessionCPU.supported, let pct = sessionCPU.cpuBySession[session.id] {
+                // The bar saturates at one full core; beyond that the number
+                // carries the magnitude. A bar scaled to ncpu would leave the
+                // common one-busy-core case as a barely visible sliver.
+                let fill = min(Double(pct) / 100.0, 1.0)
+                // An idle row stays visually quiet — a drawn-but-empty track —
+                // so the busy one still pops without the idle ones vanishing.
+                let tint: Color = pct >= 100 ? .red : (pct >= 40 ? .orange : .secondary)
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.secondary.opacity(0.22))
+                        .frame(width: Self.cpuBarWidth, height: 4)
+                        .overlay(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(tint)
+                                .frame(width: Self.cpuBarWidth * fill, height: 4)
+                        }
+                    // Trailing-aligned and monospaced so the digits form a
+                    // straight edge down the column instead of ragging.
+                    Text("\(Int(pct.rounded()))%")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .help(cpuMeterHelp(pct))
+            } else {
+                // Dead session, or no reading yet: hold the space open.
+                Color.clear
             }
-            .help(cpuMeterHelp(pct))
         }
+        .frame(width: Self.cpuColumnWidth, alignment: .leading)
     }
 
     /// Tooltip for the CPU meter. Names the units (a number over 100 is
