@@ -708,15 +708,17 @@ struct MachineChooserView: View {
                     } else {
                         pill(exitedLabel(session), .secondary)
                     }
-                    // Note: no "pinned" badge — every persistent local session is
-                    // pinned (protected from the idle reaper), so it's noise, not
-                    // signal. "open" is what the user cares about; show it (and
-                    // keep "attached" only for attached-ELSEWHERE sessions).
-                    if isOpenLocally {
-                        pill("open", .green)
-                    } else if session.attached {
-                        pill("attached", .secondary)
-                    }
+                    // No "open"/"attached"/"pinned" chips. A chip should mark the
+                    // EXCEPTION, and none of these are: every persistent local
+                    // session is pinned, and since the list now hides sessions this
+                    // viewer cannot resume, every remaining row is either open here
+                    // or genuinely detached — so "open" sat on nearly all of them
+                    // and "attached" on none. They cost a column of chrome to say
+                    // nothing, and the row's own button already draws the
+                    // distinction: "Show" for a session on screen, "Resume" for one
+                    // that is not. Only genuinely exceptional states get a chip —
+                    // the activity badge (busy / needs input), and how a dead
+                    // session exited.
                 }
                 if let cwd = session.cwd, !cwd.isEmpty {
                     Text(cwd)
@@ -788,12 +790,17 @@ struct MachineChooserView: View {
     /// the stream.
     private static let cpuBarWidth: CGFloat = 26
 
-    /// Width reserved for the percentage. Fixed, and sized for the WIDEST
-    /// reading rather than the common one: per-core CPU is uncapped, so a fully
-    /// busy 16-core machine reads "1600%". Sizing this to "0%" would let the
-    /// number grow under load and shove every title sideways — the list would
-    /// twitch exactly when something interesting is happening.
-    private static let cpuValueWidth: CGFloat = 38
+    /// Width reserved for the percentage. Fixed, so the number can never resize
+    /// and shove the titles — the list must not twitch just because a session got
+    /// busy.
+    ///
+    /// Sized for three digits ("999%"), not for the theoretical maximum. Per-core
+    /// CPU is uncapped, so a fully busy 16-core box could read "1600%" — but
+    /// reserving for that bought a guarantee nobody exercises and left a visible
+    /// gap on EVERY row, since the common reading is "0%". Three digits covers up
+    /// to ten fully-busy cores in a single session; beyond that the value simply
+    /// runs into its slack, which is the right thing to degrade.
+    private static let cpuValueWidth: CGFloat = 27
 
     /// Width of the whole CPU column, reserved even when there is no meter to
     /// draw, so every row's title starts at the same x — a column that collapses
