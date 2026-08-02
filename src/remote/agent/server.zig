@@ -2824,6 +2824,61 @@ test "SESSION_CPU_SUB pushes per-session CPU; SESSION_CPU_UNSUB stops the pump c
     try testing.expect(h.server.session_cpu_thread == null);
 }
 
+test "SESSIONS_SUB pushes the roster immediately and again when it changes" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(33);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.sessions_push};
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.sessions_push);
+
+    // Subscribing sends one straight away, so a subscriber starts from truth
+    // instead of waiting for something to change.
+    try h.client.sendControlJson(.sessions_sub, protocol.control_channel, struct {}{});
+    const first = try h.client.waitControl(.sessions);
+    var p1 = try protocol.parseJson(protocol.Sessions, alloc, first.payload);
+    defer p1.deinit();
+
+    // A push must arrive on the CONTROL channel: that is how the client tells a
+    // push from a LIST_SESSIONS reply, which is echoed on the request channel.
+    try testing.expectEqual(protocol.control_channel, first.channel);
+
+    // Unsubscribe stops it. No pump to join -- the roster pump idles on its
+    // condition variable until something marks it dirty.
+    try h.client.sendControlJson(.sessions_unsub, protocol.control_channel, struct {}{});
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        if (!h.server.sessions_push) break;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(!h.server.sessions_push);
+}
+
+test "sessions_push: an OLDER client that never advertises it leaves the stream off" {
+    // New agent, old app: the negotiated flag must stay false so the agent never
+    // pushes an opcode the client would treat as a fatal framing error, and the
+    // client keeps its LIST_SESSIONS poll.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(34);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const old_caps = [_][]const u8{protocol.capability.close_session};
+    try h.client.handshakeCaps(&old_caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.sessions_push);
+    try testing.expect(neg.close_session);
+}
+
 test "session_cpu: an OLDER client that never advertises it leaves the stream off" {
     // The compatibility direction that matters: a new agent talking to an app
     // that predates `session_cpu`. The negotiated flag must stay false so the

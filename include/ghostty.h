@@ -1639,6 +1639,27 @@ typedef void (*ghostty_session_cpu_cb)(
     const ghostty_session_cpu_s* rows, size_t rows_len, uint32_t interval_ms,
     void* userdata);
 
+// Callback for a pushed session roster. `json` is the raw SESSIONS payload --
+// the same bytes a LIST_SESSIONS reply carries, so you decode it with one path
+// and pushed/polled rosters can never drift. Valid only for the duration of the
+// call. Fires on the connection's control-reader thread; hop to your own queue
+// before touching UI.
+typedef void (*ghostty_sessions_cb)(const char* json, void* userdata);
+
+// Subscribe to the pushed session roster: the agent sends one immediately and
+// then on every change (create, exit, close, attach, detach). Event-driven, so
+// the client never polls and cannot show a session that has already exited.
+//
+// Returns false if the agent did not advertise the "sessions_push" capability
+// (an older build) -- keep polling LIST_SESSIONS in that case.
+GHOSTTY_API bool ghostty_remote_connection_sessions_subscribe(
+    ghostty_remote_connection_t, ghostty_sessions_cb, void* userdata);
+
+// Stop the pushed session roster and clear the callback. Safe when not
+// subscribed.
+GHOSTTY_API void ghostty_remote_connection_sessions_unsubscribe(
+    ghostty_remote_connection_t);
+
 // Subscribe to the pushed per-session CPU stream.
 //
 // Returns false if the agent did not advertise the "session_cpu" capability

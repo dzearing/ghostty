@@ -615,6 +615,12 @@ const GhosttySessionCpuCallback = *const fn (
     ?*anyopaque,
 ) callconv(.c) void;
 
+/// Callback for a pushed session ROSTER. `json` is the raw `SESSIONS` payload —
+/// the same bytes a `LIST_SESSIONS` reply carries, so the caller decodes it with
+/// one path and pushed/polled rosters can never drift. NUL-terminated and valid
+/// only for the duration of the call. Fires on the control-reader thread.
+const GhosttySessionsCallback = *const fn (?[*:0]const u8, ?*anyopaque) callconv(.c) void;
+
 /// Callback invoked on every connection link-state transition (§5.1 FSM;
 /// WP-D1 connection-status surface). `state` is a `GHOSTTY_REMOTE_CONN_*`
 /// value (the integer mirror of `connection.LinkState.State`). NOTE: it fires
@@ -690,6 +696,12 @@ pub const RemoteConnectionHandle = struct {
         userdata: ?*anyopaque,
     };
 
+    /// Trampoline state for the pushed session roster. Same pinning discipline.
+    pub const SessionsTrampoline = struct {
+        cb: GhosttySessionsCallback,
+        userdata: ?*anyopaque,
+    };
+
     /// Trampoline state for the link-state callback (WP-D1): the C callback +
     /// the caller's opaque `userdata`. Stored inline on the handle (stable for
     /// the handle's life) so its address can serve as the Zig `StateHandler`
@@ -725,6 +737,9 @@ pub const RemoteConnectionHandle = struct {
     /// Trampoline for the pushed per-session CPU stream, or null when not
     /// subscribed. Pinned inline like `metrics_cb`.
     session_cpu_cb: ?SessionCpuTrampoline = null,
+
+    /// Trampoline for the pushed session roster, or null when not subscribed.
+    sessions_cb: ?SessionsTrampoline = null,
 
     /// Trampoline state for the link-state observer (WP-D1), or null when not
     /// registered. Same pinning discipline as `metrics_cb`: lives inline on the
@@ -3040,6 +3055,49 @@ pub const CAPI = struct {
         }
 
         tramp.cb(&c_rows, n, interval_ms, tramp.userdata);
+    }
+
+    /// Bridge a pushed session roster to the C callback. The payload is a JSON
+    /// slice (not NUL-terminated) so it is copied into a stack buffer and
+    /// terminated. A roster larger than the buffer is DROPPED rather than
+    /// truncated: half a JSON document would fail to parse anyway, and the next
+    /// change pushes a fresh one.
+    fn sessionsTrampoline(ctx: *anyopaque, json: []const u8) void {
+        const tramp: *const RemoteConnectionHandle.SessionsTrampoline = @ptrCast(@alignCast(ctx));
+        var buf: [64 * 1024]u8 = undefined;
+        if (json.len >= buf.len) return;
+        @memcpy(buf[0..json.len], json);
+        buf[json.len] = 0;
+        tramp.cb(@ptrCast(&buf), tramp.userdata);
+    }
+
+    /// Subscribe to the pushed session roster. The agent sends one immediately
+    /// and then on every change (create, exit, close, attach, detach), so the
+    /// client never polls and cannot render a session that has already exited.
+    ///
+    /// Returns false when the agent did not advertise `sessions_push` (an older
+    /// build); the caller then keeps its LIST_SESSIONS poll.
+    export fn ghostty_remote_connection_sessions_subscribe(
+        handle: *RemoteConnectionHandle,
+        callback: GhosttySessionsCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        handle.sessions_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeSessions(&handle.sessions_cb.?, sessionsTrampoline) catch {
+            handle.sessions_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed session roster and clear the callback. Safe when not
+    /// subscribed and against an older agent.
+    export fn ghostty_remote_connection_sessions_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeSessions();
+        handle.sessions_cb = null;
     }
 
     /// Subscribe to the pushed per-session CPU stream (§9.3 chooser meters).

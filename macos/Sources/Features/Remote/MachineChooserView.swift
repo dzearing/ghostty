@@ -963,12 +963,30 @@ struct MachineChooserView: View {
     private var liveSessionInfo: LiveSessionInfo {
         var info = LiveSessionInfo()
         for controller in TerminalController.all {
+            // A PINNED window title is the most intentional name the window has
+            // -- the user typed it -- and it wins in the titlebar (window title →
+            // tab title → pane title). The row used only `pane.title`, so
+            // renaming a window left the picker showing the old shell-derived
+            // name: the rename appeared to do nothing here.
+            let windowTitle = controller.effectiveWindowTitleOverride?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let panes = controller.surfaceTree.root?.leaves() ?? []
             for pane in controller.surfaceTree {
                 guard let view = pane.surfaceView,
                       let sid = view.liveRemoteSessionID
                 else { continue }
                 info.openIDs.insert(sid)
-                if !pane.title.isEmpty { info.titles[sid] = pane.title }
+                let paneTitle = pane.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Prefer the window title, but keep the pane title as a
+                // disambiguator when the window holds several panes -- otherwise
+                // every pane of a renamed window collapses to one identical row.
+                if let windowTitle, !windowTitle.isEmpty {
+                    info.titles[sid] = (panes.count > 1 && !paneTitle.isEmpty && paneTitle != windowTitle)
+                        ? "\(windowTitle) › \(paneTitle)"
+                        : windowTitle
+                } else if !paneTitle.isEmpty {
+                    info.titles[sid] = paneTitle
+                }
             }
         }
         return info
@@ -1800,5 +1818,10 @@ enum MachineChooser {
         // collapsed row (cheap: reuses the warm shared connection, no dial).
         // Remote machines are browsed lazily on expand.
         browser.primeLocal()
+        // Prefer a live subscription over the 2s poll: the agent tells us the
+        // moment a session is created, exits, is closed, attaches or detaches.
+        // Falls back to polling by itself against an older agent, so there is no
+        // branch here.
+        browser.subscribeLocalPush()
     }
 }

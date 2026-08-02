@@ -170,6 +170,73 @@ final class SessionBrowserProbe: ObservableObject {
     private var inflight: Set<String> = []
     private var stopped = false
 
+    /// Live push subscription for the LOCAL agent's roster, when the agent
+    /// supports it. Set once `subscribeLocalPush` succeeds; nil means we are
+    /// polling instead (an older agent, or no warm connection).
+    ///
+    /// A push is strictly better than the 2s poll it replaces: the roster
+    /// changes at the instant a session is created, exits, is closed, attaches
+    /// or detaches, and the agent tells us then. A poll can only ever be as
+    /// fresh as its last tick, and — as this feature learned the hard way — a
+    /// poll whose completion cannot be delivered silently freezes with no
+    /// symptom other than stale rows.
+    private var pushBox: Unmanaged<PushBox>?
+    private var pushHandle: ghostty_remote_connection_t?
+
+    /// Bridges the C roster callback back to the probe. `probe` is weak so the
+    /// box never keeps it alive.
+    fileprivate final class PushBox {
+        weak var probe: SessionBrowserProbe?
+        let key: String
+        init(probe: SessionBrowserProbe, key: String) {
+            self.probe = probe
+            self.key = key
+        }
+    }
+
+    /// True once the local roster is served by pushes, so the poll can stand
+    /// down for it.
+    private(set) var localIsPushed = false
+
+    /// Subscribe to the local agent's pushed roster. No-op if already
+    /// subscribed. Falls back silently to polling when the agent is older or
+    /// there is no warm shared connection — the caller does not branch.
+    func subscribeLocalPush() {
+        guard !stopped, pushBox == nil else { return }
+        guard let handle = LocalAgentManager.shared.warmSharedHandle else { return }
+        let box = PushBox(probe: self, key: Self.localKey)
+        let unmanaged = Unmanaged.passRetained(box)
+        let ok = ghostty_remote_connection_sessions_subscribe(
+            handle, sessionsRosterTrampoline, unmanaged.toOpaque())
+        guard ok else {
+            unmanaged.release()
+            return
+        }
+        pushBox = unmanaged
+        pushHandle = handle
+        localIsPushed = true
+        expanded.insert(Self.localKey)
+    }
+
+    /// Tear the push down. Idempotent.
+    private func unsubscribePush() {
+        if let pushHandle {
+            ghostty_remote_connection_sessions_unsubscribe(pushHandle)
+        }
+        pushHandle = nil
+        pushBox?.release()
+        pushBox = nil
+        localIsPushed = false
+    }
+
+    /// Apply a pushed roster. Main-actor; same decode + bookkeeping as a polled
+    /// reply, so pushed and polled rosters are indistinguishable downstream.
+    fileprivate func ingestPushedRoster(key: String, json: Data) {
+        guard !stopped else { return }
+        guard let sessions = try? JSONDecoder().decode([BrowsedSession].self, from: json) else { return }
+        finish(key, sessions, keepOnFailure: true)
+    }
+
     /// Sessions the user just KILLED, per roster key, hidden optimistically so
     /// the row vanishes immediately instead of lingering (and degrading to a
     /// "pid" label) during the close's undo window while the agent still lists
@@ -324,6 +391,9 @@ final class SessionBrowserProbe: ObservableObject {
     /// the last good roster rather than flipping the list to an error.
     func refreshLocalInPlace() {
         let key = Self.localKey
+        // Pushed rosters are authoritative and arrive the moment anything
+        // changes; polling on top of them would only add redundant RPCs.
+        guard !localIsPushed else { return }
         guard expanded.contains(key), !inflight.contains(key) else { return }
         inflight.insert(key)
         LocalAgentManager.shared.listLocalSessions { [weak self] sessions in
@@ -437,10 +507,28 @@ final class SessionBrowserProbe: ObservableObject {
     /// no fetch outlives the picker. In-flight background reads land in `finish`
     /// which no-ops once `stopped` is set.
     func stop() {
+        unsubscribePush()
         stopped = true
         states.removeAll()
         expanded.removeAll()
         inflight.removeAll()
         killedByKey.removeAll()
+    }
+}
+
+
+/// Global, capture-free C callback for the pushed session roster. Fires on the
+/// connection's control-reader thread against a borrowed buffer, so it copies
+/// the JSON out BEFORE hopping to main.
+private func sessionsRosterTrampoline(
+    _ json: UnsafePointer<CChar>?,
+    _ ud: UnsafeMutableRawPointer?
+) {
+    guard let json, let ud else { return }
+    let data = Data(String(cString: json).utf8)
+    let box = Unmanaged<SessionBrowserProbe.PushBox>.fromOpaque(ud).takeUnretainedValue()
+    let key = box.key
+    onMainEvenWhenModal {
+        box.probe?.ingestPushedRoster(key: key, json: data)
     }
 }
