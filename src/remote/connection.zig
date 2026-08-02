@@ -140,6 +140,12 @@ pub const SessionCpuHandler = *const fn (
     interval_ms: u32,
 ) void;
 
+/// Callback for a pushed session roster. `json` is the raw `SESSIONS` payload,
+/// borrowed for the duration of the call — the client decodes it with the same
+/// path it uses for a `LIST_SESSIONS` reply, so pushed and polled rosters can
+/// never diverge. Fires on the control-reader thread.
+pub const SessionsHandler = *const fn (ctx: *anyopaque, json: []const u8) void;
+
 /// One queued outbound frame, owned by the writer queue until the writer emits it.
 /// `payload` is a private heap copy the queue owns and frees; the caller's slice is
 /// not retained past `enqueue`.
@@ -833,6 +839,8 @@ pub const Connection = struct {
     metrics_handler_ctx: *anyopaque = undefined,
     session_cpu_handler: ?SessionCpuHandler = null,
     session_cpu_handler_ctx: *anyopaque = undefined,
+    sessions_handler: ?SessionsHandler = null,
+    sessions_handler_ctx: *anyopaque = undefined,
 
     // --- Health & link state (increment 2) ------------------------------------
     /// Injected millisecond clock (real by default, fake in tests).
@@ -933,6 +941,7 @@ pub const Connection = struct {
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
         protocol.capability.session_cpu,
+        protocol.capability.sessions_push,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1158,6 +1167,44 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         self.metrics_handler = null;
+    }
+
+    /// Subscribe to the pushed session ROSTER. The agent sends a `sessions`
+    /// frame immediately and then on every change (create, exit, close, attach,
+    /// detach) — so the client never polls and can never render a session that
+    /// has already exited.
+    ///
+    /// `error.Unsupported` when the peer did not advertise `sessions_push`; the
+    /// caller then keeps its `LIST_SESSIONS` poll. Never sends the opcode to
+    /// such a peer (an unknown opcode is a fatal framing error).
+    pub fn subscribeSessions(
+        self: *Connection,
+        ctx: *anyopaque,
+        handler: SessionsHandler,
+    ) !void {
+        if (self.negotiated) |n| {
+            if (!n.sessions_push) return error.Unsupported;
+        } else |_| return error.Unsupported;
+
+        {
+            self.sessions_handler_ctx = ctx;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            self.sessions_handler = handler;
+        }
+        try self.writeControl(.sessions_sub, protocol.control_channel, "{}");
+    }
+
+    /// Stop the pushed roster and clear the handler; no callback fires after
+    /// this returns. Safe when not subscribed and against an older agent.
+    pub fn unsubscribeSessions(self: *Connection) void {
+        const supported = if (self.negotiated) |n| n.sessions_push else |_| false;
+        if (supported) {
+            self.writeControl(.sessions_unsub, protocol.control_channel, "{}") catch {};
+        }
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        self.sessions_handler = null;
     }
 
     /// Subscribe to the pushed per-session CPU stream. `interval_ms` is a HINT —
@@ -2647,9 +2694,25 @@ pub const Connection = struct {
                 _ = self.deliverRpcReply(frame);
             },
             .sessions => {
-                // Reply to a LIST_SESSIONS RPC (T10). Same-channel correlation, like
-                // CWD/PROC_SNAPSHOT: the agent echoes SESSIONS on the request channel.
-                // Dropped if no caller is parked (a late reply after a timeout).
+                // Two sources share this frame type, distinguished by channel:
+                //
+                //  * a REPLY to a LIST_SESSIONS RPC, echoed on the REQUEST channel
+                //    (same-channel correlation, like CWD/PROC_SNAPSHOT). Dropped
+                //    if no caller is parked (a late reply after a timeout).
+                //  * a PUSH from `sessions_sub`, sent on the CONTROL channel
+                //    whenever the roster changes.
+                //
+                // Reusing one frame type is deliberate: pushed and polled rosters
+                // are byte-identical, so the client has a single decode path and
+                // the two can never drift apart.
+                if (frame.channel == protocol.control_channel) {
+                    self.write_mutex.lock();
+                    const handler = self.sessions_handler;
+                    const ctx = self.sessions_handler_ctx;
+                    self.write_mutex.unlock();
+                    if (handler) |h| h(ctx, frame.payload);
+                    return;
+                }
                 _ = self.deliverRpcReply(frame);
             },
             .proc_kill_result, .proc_spawn_result => {

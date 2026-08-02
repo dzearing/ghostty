@@ -130,6 +130,17 @@ pub const FrameType = enum(u8) {
     session_cpu_sub = 0x79, // C→A  {interval_ms}     — a HINT; the agent decides
     session_cpu = 0x7a, // A→C  {interval_ms, sessions[]}
     session_cpu_unsub = 0x7b, // C→A  {}
+
+    // Pushed session roster. The client subscribes once and the agent sends a
+    // `sessions` frame (the SAME payload `list_sessions` replies with) whenever
+    // the roster actually changes — created, exited, closed, attached, detached.
+    // Event-driven, not polled: the chooser previously re-ran `list_sessions`
+    // every 2s and still showed stale rows, because a poll can only ever be as
+    // fresh as its last tick and its completion can be lost. Gated on the
+    // `sessions_push` capability (new opcodes are a fatal framing error to a
+    // peer that does not know them).
+    sessions_sub = 0x7c, // C→A  {}
+    sessions_unsub = 0x7d, // C→A  {}
 };
 
 // -----------------------------------------------------------------------------
@@ -386,6 +397,15 @@ pub const capability = struct {
     /// number and never a fallback poll the agent did not consent to).
     pub const session_cpu = "session_cpu";
 
+    /// Pushed session roster (`sessions_sub`/`sessions_unsub`, 0x7c-0x7d; the
+    /// agent replies on the existing `sessions` frame). The agent pushes the
+    /// roster whenever it CHANGES, so a viewer never has to poll and can never
+    /// show a session that has already exited.
+    ///
+    /// Gated because these are new opcodes. Without it the client falls back to
+    /// its `list_sessions` poll, which still works — just less promptly.
+    pub const sessions_push = "sessions_push";
+
     /// Re-attach **grid snapshot**: on ATTACH the agent, having tracked each
     /// session's visible screen in a headless emulator, replays a self-contained
     /// VT repaint of the current on-screen grid so the pane repaints EXACTLY and
@@ -462,6 +482,11 @@ pub const Negotiated = struct {
     /// peer, in which case the client never sends `session_cpu_sub` (an unknown
     /// opcode would be a fatal framing error) and the chooser shows no meter.
     session_cpu: bool = false,
+
+    /// True iff BOTH peers advertised `capability.sessions_push` — the agent
+    /// will push the roster on every change instead of the client polling.
+    /// False against an older peer, which keeps the poll.
+    sessions_push: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -492,6 +517,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.grid_snapshot),
         .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
             hasCapability(remote.capabilities, capability.session_cpu),
+        .sessions_push = hasCapability(local.capabilities, capability.sessions_push) and
+            hasCapability(remote.capabilities, capability.sessions_push),
     };
 }
 

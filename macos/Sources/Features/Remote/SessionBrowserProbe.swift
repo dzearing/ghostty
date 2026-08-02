@@ -408,12 +408,20 @@ final class SessionBrowserProbe: ObservableObject {
         guard let sessions else { states[key] = .failed; return }
         // Keep just-killed sessions hidden while the agent still lists them
         // (undo window); once one is truly gone from the roster, stop hiding it.
+        // Drop rows for panes the user just closed. Their sessions are still
+        // alive for the undo window, so the agent legitimately reports them --
+        // but the user closed those windows and must not be offered a Resume.
+        // Reconcile first so the hidden set can't grow: anything the agent no
+        // longer reports has finished closing and needs no hiding.
+        ClosingSessions.shared.reconcile(against: Set(sessions.map { $0.id }))
+        let visible = ClosingSessions.shared.visible(sessions)
+
         if var kills = killedByKey[key], !kills.isEmpty {
-            kills = kills.intersection(Set(sessions.map(\.id)))
+            kills = kills.intersection(Set(visible.map { $0.id }))
             killedByKey[key] = kills.isEmpty ? nil : kills
-            states[key] = .loaded(kills.isEmpty ? sessions : sessions.filter { !kills.contains($0.id) })
+            states[key] = .loaded(kills.isEmpty ? visible : visible.filter { !kills.contains($0.id) })
         } else {
-            states[key] = .loaded(sessions)
+            states[key] = .loaded(visible)
         }
     }
 

@@ -273,6 +273,20 @@ pub const Server = struct {
     session_cpu_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
     session_cpu_stop: bool = false,
 
+    /// True while this connection has subscribed to the pushed session roster
+    /// (`sessions_sub`). Plain bool, no pump: the roster is EVENT-driven — the
+    /// agent pushes when it changes, not on a clock — so there is nothing to
+    /// time and nothing to tear down but the flag.
+    sessions_push: bool = false,
+
+    /// Roster push pump. Unlike the metrics/session-cpu pumps this has no
+    /// interval — it sleeps until something actually changes the roster.
+    roster_thread: ?std.Thread = null,
+    roster_mutex: std.Thread.Mutex = .{},
+    roster_cond: std.Thread.Condition = .{},
+    roster_dirty: bool = false,
+    roster_stop: bool = false,
+
     /// Process-table sampler for `proc_list` (§9.3 process view). Unlike the metrics
     /// pump it needs no thread: `proc_list` is request/reply, sampled synchronously on
     /// the control reader. It holds per-pid CPU baselines across calls so a repeated
@@ -294,6 +308,7 @@ pub const Server = struct {
             protocol.capability.close_session,
             protocol.capability.grid_snapshot,
             protocol.capability.session_cpu,
+            protocol.capability.sessions_push,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -405,6 +420,7 @@ pub const Server = struct {
         // timed cond wait immediately rather than waiting out the interval.
         self.stopMetricsPump();
         self.stopSessionCpuPump();
+        self.stopRosterPump();
         self.signalClose();
         self.control.close();
         self.data.close();
@@ -541,6 +557,10 @@ pub const Server = struct {
             .code = code,
             .runtime_ms = runtime_ms,
         }) catch {};
+        // A child exited on its own -- the case a poll handled worst:
+        // the row stayed 'alive' until the next tick, which is how exited
+        // sessions came to be shown as live "Resume" rows.
+        self.markRosterDirty();
     }
 
     /// Push the session's changed foreground pid as `META{foreground_pid}` on
@@ -716,6 +736,8 @@ pub const Server = struct {
             .metrics_unsub => self.handleMetricsUnsub(),
             .session_cpu_sub => self.handleSessionCpuSub(frame.payload),
             .session_cpu_unsub => self.handleSessionCpuUnsub(),
+            .sessions_sub => self.handleSessionsSub(),
+            .sessions_unsub => self.sessions_push = false,
             .proc_list => self.handleProcList(frame.channel, frame.payload),
             .proc_kill => self.handleProcKill(frame.channel, frame.payload),
             .proc_spawn => self.handleProcSpawn(frame.channel, frame.payload),
@@ -799,6 +821,8 @@ pub const Server = struct {
         // metadata (§5.4, T12). Runs after our unlock; no-op when persistence is
         // disabled (meta_path null, e.g. every test + non-persistent serve path).
         self.store.persistMeta();
+        // A new session exists.
+        self.markRosterDirty();
     }
 
     /// Bind session `s` to this connection: point its outbound bridge at us, mark it
@@ -1045,6 +1069,8 @@ pub const Server = struct {
         };
         self.store.mutex.unlock();
         if (reap_id) |id| self.store.reapUnboundTombstone(id);
+        // The roster changed (a session is now detached, and possibly reaped).
+        self.markRosterDirty();
     }
 
     fn handleClose(self: *Server, channel: u128) void {
@@ -1084,6 +1110,8 @@ pub const Server = struct {
             // rewrite the layout file so it doesn't accumulate dead topology.
             if (self.store.reapLayouts() > 0) self.store.persistLayouts();
         }
+        // A session was closed and freed.
+        self.markRosterDirty();
     }
 
     /// `CLOSE_SESSION` (0x2c): end a session BY SESSION ID — the session-scoped
@@ -1136,6 +1164,8 @@ pub const Server = struct {
             .ok = unlinked != null,
             .found = found,
         }) catch {};
+        // A session was closed by id.
+        self.markRosterDirty();
     }
 
     /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the
@@ -1192,6 +1222,81 @@ pub const Server = struct {
     /// holding the lock across it is cheap (unlike `handleGetCwd`, which must query
     /// the OS and therefore unlocks first).
     fn handleListSessions(self: *Server, channel: u128) void {
+        self.sendRoster(channel);
+    }
+
+    /// `SESSIONS_SUB`: start pushing the roster to this connection, and send one
+    /// immediately so the subscriber starts from truth instead of waiting for the
+    /// next change.
+    fn handleSessionsSub(self: *Server) void {
+        self.sessions_push = true;
+        if (self.roster_thread == null) {
+            self.roster_mutex.lock();
+            self.roster_stop = false;
+            self.roster_mutex.unlock();
+            self.roster_thread = std.Thread.spawn(.{}, rosterPumpLoop, .{self}) catch null;
+        }
+        // Send one immediately so the subscriber starts from truth rather than
+        // waiting for the next change.
+        self.sendRoster(protocol.control_channel);
+    }
+
+    /// Note that the roster CHANGED, so the pump sends a fresh one.
+    ///
+    /// Deliberately does not send inline. Several call sites run with
+    /// `store.mutex` HELD — `bridgeExit` most importantly, which the pty reader
+    /// invokes from inside the store's locked region (`session.zig`
+    /// `onChildOutput`). Sending there would re-enter `store.mutex` via
+    /// `sendRoster` and deadlock that thread on a non-recursive mutex, wedging
+    /// the agent. So this only touches the roster mutex — never the store's —
+    /// and is safe to call from anywhere, holding anything.
+    ///
+    /// Coalescing falls out for free: a burst of changes sets one flag and the
+    /// pump sends one roster.
+    fn markRosterDirty(self: *Server) void {
+        if (!self.sessions_push) return;
+        self.roster_mutex.lock();
+        self.roster_dirty = true;
+        self.roster_cond.signal();
+        self.roster_mutex.unlock();
+    }
+
+    /// Roster pump: wait to be told the roster changed, then send it.
+    ///
+    /// LOCK ORDER: takes `roster_mutex` ONLY to read/clear the flag, and
+    /// RELEASES it before `sendRoster` takes `store.mutex`. Never holds both, so
+    /// it cannot invert against `markRosterDirty` (called under `store.mutex`).
+    fn rosterPumpLoop(self: *Server) void {
+        while (true) {
+            self.roster_mutex.lock();
+            while (!self.roster_dirty and !self.roster_stop and !self.closed) {
+                self.roster_cond.wait(&self.roster_mutex);
+            }
+            const stop = self.roster_stop or self.closed;
+            self.roster_dirty = false;
+            self.roster_mutex.unlock();
+            if (stop) return;
+            self.sendRoster(protocol.control_channel);
+        }
+    }
+
+    /// Stop + join the roster pump. Idempotent; safe with no pump running. MUST
+    /// NOT outlive the Server (joined in `shutdown`).
+    fn stopRosterPump(self: *Server) void {
+        self.roster_mutex.lock();
+        self.roster_stop = true;
+        self.roster_cond.signal();
+        self.roster_mutex.unlock();
+        if (self.roster_thread) |t| {
+            t.join();
+            self.roster_thread = null;
+        }
+    }
+
+    /// Serialize the whole roster and send it on `channel` as a `sessions` frame
+    /// — the same payload `LIST_SESSIONS` replies with, so a pushed roster and a
+    /// polled one are byte-identical and the client needs one decode path.
+    fn sendRoster(self: *Server, channel: u128) void {
         self.store.mutex.lock();
         defer self.store.mutex.unlock();
 
@@ -1496,6 +1601,8 @@ pub const Server = struct {
         // The alive set changed (a tombstone became alive) — refresh the on-disk
         // metadata so a subsequent restart re-materializes it.
         self.store.persistMeta();
+        // A tombstone became alive again.
+        self.markRosterDirty();
     }
 
     fn handlePing(self: *Server, payload: []const u8) void {
