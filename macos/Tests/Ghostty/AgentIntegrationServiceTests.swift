@@ -59,6 +59,54 @@ struct AgentIntegrationServiceTests {
         #expect(!FileManager.default.fileExists(atPath: skill.path))
     }
 
+    // H2/TAU2: a FAILED install of one agent must not delete the shared banner
+    // that a working sibling's live hooks still invoke. The old install()
+    // rollback removed the banner unconditionally.
+    @Test func failedInstallRollbackKeepsSharedBannerForOtherAgent() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        // Claude is fully installed and its hooks reference the shared banner.
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
+        let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
+        #expect(FileManager.default.fileExists(atPath: banner.path))
+
+        // Make Copilot's skills install fail: plant an UNMANAGED file (no marker)
+        // at the skill path so ManagedFile.write refuses it and throws, triggering
+        // rollback AFTER the banner component has already run.
+        let skill = home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md")
+        try FileManager.default.createDirectory(at: skill.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "not ghoztty owned".write(to: skill, atomically: true, encoding: .utf8)
+
+        let outcome = AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
+        guard case .failed = outcome else {
+            Issue.record("expected copilot install to fail, got \(outcome)")
+            return
+        }
+        // Rollback must NOT delete the shared banner Claude still uses.
+        #expect(FileManager.default.fileExists(atPath: banner.path))
+    }
+
+    // H2/TAU3: uninstalling one agent must keep the banner when a sibling with a
+    // partially-installed integration (hooks present, skills manually deleted)
+    // still references it. The old refcount keyed off the aggregate state()
+    // (→ .notInstalled for a partial install) and wrongly dropped the banner.
+    @Test func uninstallKeepsBannerWhenSiblingHooksStillPresent() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
+
+        // Partially-install Claude: remove its skills dir but keep its hooks.
+        try FileManager.default.removeItem(at: home.appendingPathComponent(".claude/skills"))
+
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        // Claude's hooks still call the banner, so it must survive.
+        #expect(FileManager.default.fileExists(atPath: banner.path))
+    }
+
     @Test func uninstalledOutcomeLabel() {
         #expect(IntegrationOutcome.uninstalled.label == "removed")
     }

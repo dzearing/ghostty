@@ -10,11 +10,29 @@ struct RuntimeIntegrationFactoryTests {
         return url
     }
 
-    @Test func availabilityFollowsConfigDir() throws {
+    @Test func availabilityFollowsConfigDirAndOfferGate() throws {
         let home = try tempHome()
         #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default).isEmpty)
+        // Copilot is detectable but gated off (isOffered == false), so it is
+        // never offered even when its config dir exists (H3).
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default) == [.copilot])
+        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default).isEmpty)
+        // Claude is offered once its config dir exists.
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default) == [.claude])
+    }
+
+    // H2: the banner must be ordered before the hooks component, and hooks must
+    // be last — the refcount-on-uninstall correctness proof depends on it.
+    @Test func bannerComponentPrecedesHooksWhichAreLast() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        let integ = RuntimeIntegrationFactory.make(for: .claude, homeDirectoryURL: home, fileManager: .default)
+        let names = integ.components.map(\.name)
+        let bannerIdx = try #require(names.firstIndex(of: RuntimeIntegrationFactory.bannerComponentName))
+        let hooksIdx = try #require(names.firstIndex(of: RuntimeIntegrationFactory.hooksComponentName))
+        #expect(bannerIdx < hooksIdx)
+        #expect(hooksIdx == names.count - 1)
     }
 
     @Test func endToEndCopilotInstall() throws {

@@ -69,21 +69,14 @@ enum AgentIntegrationService {
     static func uninstall(agent: RuntimeAgent,
                           homeDirectoryURL: URL = URL(fileURLWithPath: LoginShell.homePath),
                           fileManager: FileManager = .default) -> IntegrationOutcome {
+        // The shared banner is refcounted inside its own component (see
+        // RuntimeIntegrationFactory.make): it removes the script only when no
+        // agent's hooks still reference it. Uninstall no longer special-cases the
+        // banner, so the guarantee holds for ANY caller of
+        // RuntimeIntegration.uninstall() — including the install() rollback path.
         let integ = RuntimeIntegrationFactory.make(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
-
-        // The banner script lives at one shared path used by every agent's
-        // hooks. Only remove it when no other agent still relies on it —
-        // otherwise uninstalling one agent would break the others.
-        let bannerNeededByOthers = RuntimeAgent.allCases.contains { other in
-            other != agent
-                && RuntimeIntegrationFactory.make(for: other, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager).state() != .notInstalled
-        }
-        let components = bannerNeededByOthers
-            ? integ.components.filter { $0.name != RuntimeIntegrationFactory.bannerComponentName }
-            : integ.components
-        let scoped = RuntimeIntegration(agent: agent, components: components, requiredDirectory: nil, fileManager: fileManager)
         do {
-            try scoped.uninstall()
+            try integ.uninstall()
         } catch {
             return .failed(error.localizedDescription)
         }
