@@ -327,6 +327,25 @@ final class LocalAgentManager {
     /// only (never spawns) and frees that probe connection after reading. The
     /// `LIST_SESSIONS` RPC runs on a background queue; `completion` is delivered
     /// on the main actor — nil ⇒ no local agent reachable or the RPC failed.
+    /// The warm shared local-agent connection, when one is healthy and its agent
+    /// is still alive. **Borrowed, never owned**: `LocalAgentManager` holds this
+    /// for the app's lifetime, so a caller must not free it — only use it for the
+    /// duration of a subscription and unsubscribe when done.
+    ///
+    /// Exposed for long-lived subscriptions (the chooser's per-session CPU
+    /// stream), which — unlike `listLocalSessions`' one-shot RPC — need the SAME
+    /// connection to stay open across pushes. Returns nil when there is no warm
+    /// connection; callers then simply do without rather than spawning an agent.
+    var warmSharedHandle: ghostty_remote_connection_t? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let existing = sharedOwner,
+              existing.linkState != .dead,
+              sharedAgentPid > 0,
+              kill(sharedAgentPid, 0) == 0 || errno == EPERM
+        else { return nil }
+        return existing.handle
+    }
+
     func listLocalSessions(_ completion: @escaping @MainActor ([BrowsedSession]?) -> Void) {
         dispatchPrecondition(condition: .onQueue(.main))
 

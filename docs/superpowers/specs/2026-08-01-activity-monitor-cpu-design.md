@@ -228,6 +228,37 @@ a single-core-pinned process must read ~100, not ~0.1 and not ~5.6.
 
 ---
 
+## What live verification changed
+
+Two defects survived the unit tests and were caught only by running the panel.
+Both are recorded here because they are the reason the "verify against ground
+truth" constraint exists.
+
+1. **The machine predicate was inverted for the default configuration.**
+   Attribution keyed on `controller.remoteMachine == nil` to mean "local". But a
+   session-persistence pane reaches its agent over loopback and therefore
+   carries a `Machine` named `127.0.0.1`, for which `Machine.isLocalMachine` is
+   true. So under the Local source — the default, and the case that matters
+   most — every pane was skipped and the column was blank. The panel showed
+   `1 of 512` with no attribution. The predicate now asks where a pane's
+   processes actually *live*, not whether it has a `Machine` at all.
+
+2. **The session-CPU pump skipped the push when the roster was empty.** It
+   looked like a harmless early-out. It means a client cannot distinguish a
+   live-but-idle stream from a dead one, and — worse — a client whose sessions
+   all ended would keep rendering the last roster forever, because nothing ever
+   told it they went away. An empty roster now still sends a frame.
+
+Confirmed working, against `top`:
+
+- A core pinned with `yes > /dev/null` reads **99.7** in the table
+  (`top`: 85.5–86.5, its two-sample average ramping toward ~100). Pre-fix that
+  same row rendered **0.1**.
+- A busy grandchild **two levels below a setsid'd process** attributes to its
+  pane, exercising the tty seed and the ppid propagation together.
+- The chooser row renders `~/git ▬▬ 100%`, the roll-up of a busy child rather
+  than of the session's idle shell.
+
 ## Rejected alternatives
 
 - **Agent stamps each `Proc` with its owning session id** (instead of `tty`).

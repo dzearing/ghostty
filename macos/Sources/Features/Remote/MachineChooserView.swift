@@ -47,6 +47,10 @@ struct MachineChooserView: View {
     /// T16). Drives each row's disclosure: a session-count badge + an expandable
     /// read-only list of that machine's active sessions.
     @ObservedObject var browser: SessionBrowserProbe
+    /// Live per-session CPU for the SELECTED target, from the agent's pushed
+    /// `session_cpu` stream. Owned here so it dies with the chooser — the stream
+    /// (and any connection it dialed) must not outlive this transient page.
+    @StateObject private var sessionCPU = SessionCPUProbe()
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
     /// Secondary action: open the Remote Activity Monitor for a machine instead of
@@ -282,6 +286,11 @@ struct MachineChooserView: View {
         }
         .onReceive(rosterRefreshTimer) { _ in
             refreshRosters()
+        }
+        .onDisappear {
+            // The page is gone: stop the stream and drop any connection it
+            // dialed. Nothing this panel started should outlive it.
+            sessionCPU.stop()
         }
     }
 
@@ -633,6 +642,7 @@ struct MachineChooserView: View {
                         .lineLimit(1)
                     if session.alive {
                         activityBadge(session.activity)
+                        cpuMeter(session)
                     } else {
                         pill(exitedLabel(session), .secondary)
                     }
@@ -699,6 +709,57 @@ struct MachineChooserView: View {
         .contentShape(Rectangle())
         .onTapGesture { browseCursor = index }
         .simultaneousGesture(TapGesture(count: 2).onEnded { resume(session, parent: target) })
+    }
+
+    /// A compact CPU meter for a live session: a small bar plus the percentage.
+    ///
+    /// The number is per-core over the session's WHOLE process tree, so a session
+    /// running four busy threads reads ~400% — the same convention as top(1), and
+    /// the honest one here, because "is this agent runaway?" is exactly a question
+    /// about how many cores it is eating.
+    ///
+    /// Shown only above a floor: every idle session drawing a 0% bar would be
+    /// noise competing with the busy one this is meant to make obvious. Hidden
+    /// entirely (not zeroed) when the agent can't serve the stream.
+    @ViewBuilder
+    private func cpuMeter(_ session: BrowsedSession) -> some View {
+        if sessionCPU.supported, let pct = sessionCPU.cpuBySession[session.id], pct >= 1 {
+            // The bar saturates at one full core; beyond that the number carries
+            // the magnitude. A bar scaled to ncpu would leave the common
+            // one-busy-core case as a barely visible sliver.
+            let fill = min(Double(pct) / 100.0, 1.0)
+            let tint: Color = pct >= 100 ? .red : (pct >= 40 ? .orange : .secondary)
+            HStack(spacing: 4) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.secondary.opacity(0.22))
+                    .frame(width: 26, height: 4)
+                    .overlay(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(tint)
+                            .frame(width: 26 * fill, height: 4)
+                    }
+                Text("\(Int(pct.rounded()))%")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+            }
+            .help(cpuMeterHelp(pct))
+        }
+    }
+
+    /// Tooltip for the CPU meter. Names the units (a number over 100 is
+    /// confusing without them) and, when the agent has throttled itself, says so
+    /// — otherwise a slow-moving meter reads as a broken one.
+    private func cpuMeterHelp(_ pct: Float) -> String {
+        var text = String(
+            format: "%.0f%% CPU across this session's whole process tree (100%% = one core).",
+            pct)
+        let ms = sessionCPU.agentIntervalMs
+        if ms > 2000 {
+            text += String(format: "\nUpdating every %.0fs — the agent is throttling itself under load.",
+                           Double(ms) / 1000.0)
+        }
+        return text
     }
 
     /// A small activity badge for a live session: busy / needs-input are shown;
@@ -827,9 +888,16 @@ struct MachineChooserView: View {
     /// can render it (fetch-on-select; lazy for remote machines).
     private func ensureFetched(_ target: WindowTarget?) {
         switch target {
-        case .local: browser.fetchIfNeededLocal()
-        case .remote(let m): browser.fetchIfNeeded(machine: m)
-        default: break
+        case .local:
+            browser.fetchIfNeededLocal()
+            sessionCPU.subscribeLocal()
+        case .remote(let m):
+            browser.fetchIfNeeded(machine: m)
+            sessionCPU.subscribe(machine: m)
+        default:
+            // Nothing selected (or a non-browsable row): don't keep a stream
+            // running for a target the user is no longer looking at.
+            sessionCPU.stop()
         }
     }
 
