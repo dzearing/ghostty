@@ -82,7 +82,12 @@ git tag vX.Y.Z
 git push origin main --tags
 ```
 
-This triggers the release workflow which builds, signs, notarizes, and publishes a DMG to GitHub Releases.
+One tag push starts **both** platforms (T38):
+
+- `release.yml` builds, signs, notarizes, and publishes `Ghoztty-X.Y.Z-arm64.dmg` to the `vX.Y.Z` release.
+- `release-windows.yml` cross-builds the Windows terminal and publishes `Ghoztty-X.Y.Z-x64.msi` + `Ghoztty-portable-X.Y.Z-x64.zip` to a `win-vX.Y.Z` release (`--latest=false`, so the Mac latest/Sparkle flow is untouched). The separate tag is a contract with shipped binaries: installed Windows builds find updates by scanning the releases list for the newest `win-v` tag (`src/apprt/win32/update_check.zig`).
+
+They are separate workflows so a Windows failure cannot interrupt the signing/notarization pipeline. Both artifacts are defined by `dist/windows-installer/build-release-artifacts.sh`, which the on-box path (`scripts/publish-windows-release.ps1`) runs too, so a hand publish and CI cannot drift.
 
 ### Step 4: Publish the Windows Agent Installer
 
@@ -113,12 +118,13 @@ Note: this step is independent of the macOS release — if the SSH upload fails,
 
 ### Step 5: Monitor Build
 
-Watch the release workflow:
+Watch BOTH release workflows — the release is not out until each has published its own artifacts:
 ```bash
 gh run list --repo dzearing/ghoztty --workflow release.yml --limit 1
+gh run list --repo dzearing/ghoztty --workflow release-windows.yml --limit 1
 ```
 
-Monitor it until completion. If it fails, check logs with `gh run view <id> --repo dzearing/ghoztty --log-failed` and fix the issue.
+Monitor them until completion. If one fails, check logs with `gh run view <id> --repo dzearing/ghoztty --log-failed` and fix the issue. They are independent: a Windows failure leaves the DMG release valid, and re-running `release-windows.yml` (`gh workflow run release-windows.yml -f version=X.Y.Z -f publish=true`) republishes just the Windows half. The on-box fallback, from a Windows machine at the tagged commit, is `scripts\publish-windows-release.ps1` (it defaults `-Version` to the newest `vX.Y.Z` tag).
 
 ### Step 6: Publish Release
 
@@ -165,6 +171,7 @@ git worktree remove /tmp/ghoztty-gh-pages
 
 Show a summary:
 - Version released (macOS app tag) — or "app unchanged, not re-released"
+- Windows: `win-vX.Y.Z` with the MSI + portable ZIP (link) — or the workflow run that failed
 - Agent: published `<date-hash>` (with download links) — or "unchanged, skipped"
 - Release notes
 - Link to the GitHub release

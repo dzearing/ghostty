@@ -6137,3 +6137,51 @@ turn must pass.
 The macOS subsection is written from source but has not been run on a Mac. Filed
 **T347** (`seat: mac`) instead of claiming it - which is what the rule this task
 just added requires.
+
+## 2026-08-02 - T38: the release published one platform, and the number said so
+
+The Windows channel was at **win-v1.4.1** while the macOS channel was at
+**v1.28.0**. Twenty-four releases in which a Windows user saw nothing - not
+because anyone forgot, but because the two halves were different *kinds* of
+process. macOS releases on a tag push (`release.yml`, macos-15, DMG +
+notarization + appcast). Windows released when a human sat at this box and ran
+`publish-windows-release.ps1`. A process that needs a second machine and a
+person runs when someone remembers.
+
+So the Windows half is a workflow on the same trigger now
+(`release-windows.yml`, ubuntu-latest, cross-compile + wixl - no Windows runner
+needed anywhere), and the *artifact set* moved out of both publishers into
+`dist/windows-installer/build-release-artifacts.sh`, which CI and the on-box
+script both call. The portable ZIP is new
+(`Ghoztty-portable-<version>-x64.zip`, same payload as the MSI under one
+`Ghoztty/` root); the MSI keeps its name. Published builds also pick up
+`-Dstrip=false`, which the local delivery build has carried since T48 and the
+shipped one never did.
+
+Three decisions carry it. **A separate workflow, not a job in `release.yml`** -
+the macOS job is a signing pipeline and a Windows failure must not interrupt it
+- with the cost that the trigger can drift, so the acceptance script asserts the
+two tag patterns are IDENTICAL. **The `win-v` tag stays** even though the task
+said "same tag": installed builds find updates by scanning for the newest
+`win-v` tag (`update_check.zig:16`), so publishing onto `vX.Y.Z` instead would
+make every shipped build blind to updates forever. Same version, own tag. And
+**the `yy.m.d.NN` FILEVERSION formula had two live copies** (build-msi.sh and a
+PowerShell restatement); `--print-file-version` is the single source now - the
+T257 lesson applied before it cost anything.
+
+On the way it turned up that **`publish-windows-release.ps1` could not run at
+all**: a UTF-8 em dash in a BOM-less .ps1 decodes under PS 5.1 to a cp1252 smart
+quote, which CLOSES the string - a parse error under `powershell -File` since
+the day it was written. The 1.4.1 publish must have gone through pwsh 7 or a
+bash hop. The acceptance script now parses the file and rejects non-ASCII.
+
+Validation: the on-box dry-run publish end to end (exit 0, both artifacts at
+1.28.0 with version+arch names, stopped before `gh release create`);
+`test\win32\release-artifacts.ps1` ALL PASS (28); and the CI job's riskiest
+step - the Linux cross-build with the workflow's exact flags - proven in a
+debian container with the CI zig. What is NOT proven is GitHub running the job:
+`workflow_dispatch` needs the file on `main`, and the only other trigger is a
+real tag. **T348** carries that first run (and one unexplained
+compiler-terminated-mid-link under load, which is the shape of a CI flake).
+**T349**: the download page still offers only the DMG - defensible while the
+Windows build was 24 releases stale, not any more.

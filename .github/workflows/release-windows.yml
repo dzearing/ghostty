@@ -1,0 +1,143 @@
+on:
+  push:
+    # Deliberately the SAME pattern release.yml uses, not a stricter one:
+    # "every release ships Windows too" is only true if a tag that reaches
+    # the macOS job always reaches this one. A tag that is not X.Y.Z fails
+    # loudly below rather than being silently skipped here.
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (X.Y.Z, no leading v)"
+        required: true
+      publish:
+        description: "Publish the win-v release (off = build artifacts only)"
+        type: boolean
+        default: false
+
+name: Release (Windows)
+
+# The Windows half of a release (T38). The same vX.Y.Z tag push that builds
+# and publishes the macOS DMG in release.yml builds the Windows terminal
+# here, so one release produces both platforms' artifacts at the same
+# version -- Ghoztty-<version>-x64.msi and Ghoztty-portable-<version>-x64.zip
+# alongside Ghoztty-<version>-arm64.dmg.
+#
+# It is a SEPARATE workflow, not a job in release.yml, for two reasons: the
+# macOS job is a signing/notarization pipeline that a Windows failure must
+# not be able to interrupt, and the Windows artifacts publish onto their own
+# win-v<version> release (created with --latest=false). That tag is a
+# contract, not a preference: installed Windows builds find updates by
+# scanning the releases list for the newest win-v tag
+# (src/apprt/win32/update_check.zig), so publishing Windows assets onto the
+# vX.Y.Z release instead would make every installed build blind to updates.
+#
+# Everything the artifacts are made of lives in
+# dist/windows-installer/build-release-artifacts.sh, which the on-box manual
+# path (scripts/publish-windows-release.ps1) runs too -- so CI and a hand
+# publish cannot drift apart. Nothing here needs a Windows runner: the exe
+# cross-compiles for x86_64-windows-gnu and the MSI is built with wixl.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+
+      - name: Install msitools (wixl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y msitools wixl
+
+      - name: Set release variables
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+            PUBLISH=true
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            VERSION=${VERSION#v}
+            PUBLISH="${{ github.event.inputs.publish }}"
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version must be X.Y.Z (got '$VERSION')"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "PUBLISH=$PUBLISH" >> $GITHUB_ENV
+          echo "TAG=win-v$VERSION" >> $GITHUB_ENV
+          echo "MSI=zig-out/Ghoztty-$VERSION-x64.msi" >> $GITHUB_ENV
+          echo "ZIP=zig-out/Ghoztty-portable-$VERSION-x64.zip" >> $GITHUB_ENV
+
+      - name: Build Windows artifacts
+        run: |
+          # The same-day rebuild counter: republishing a version on the same
+          # date needs a strictly greater MSI ProductVersion or the package
+          # refuses to install over itself. It is kept to TWO digits on
+          # purpose -- ProductVersion is yy.m.d<NN>, so a three-digit NN
+          # makes day 1 run 999 (26.8.1999) outrank day 2 run 1 (26.8.201)
+          # and the upgrade ordering inverts. github.run_number is
+          # monotonic, so mod 99 only repeats after 99 releases in one day.
+          BUILD_NUM=$(( (${{ github.run_number }} - 1) % 99 + 1 ))
+          dist/windows-installer/build-release-artifacts.sh \
+            --semver "$VERSION" --build-num "$BUILD_NUM"
+
+      - name: Verify artifacts
+        run: |
+          # The point of the release is the PAIR, at one version. Assert both
+          # exist under their versioned names before anything is published --
+          # a missing half is how a "successful" release ships one platform.
+          for f in "$MSI" "$ZIP"; do
+            [ -f "$f" ] || { echo "::error::$f was not produced"; exit 1; }
+            echo "$(du -h "$f")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghoztty-windows-${{ env.VERSION }}
+          path: |
+            ${{ env.MSI }}
+            ${{ env.ZIP }}
+
+      - name: Publish win-v release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          Windows build of Ghoztty $VERSION (commit $(git rev-parse --short HEAD)),
+          published alongside the macOS v$VERSION release.
+
+          **Install:** download \`Ghoztty-$VERSION-x64.msi\` and run it (per-user, no
+          admin). Upgrades an existing install in place -- close Ghoztty first.
+
+          **Portable:** \`Ghoztty-portable-$VERSION-x64.zip\` needs no installer --
+          unzip it and run \`Ghoztty\ghoztty.exe\`.
+
+          Installed builds check this channel and show a notification when a newer
+          \`win-v*\` release appears (notify-only; nothing downloads automatically).
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists -- replacing its assets"
+            gh release upload "$TAG" "$MSI" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$(git rev-parse HEAD)" \
+              --title "Ghoztty for Windows v$VERSION" \
+              --latest=false --notes-file "$NOTES" \
+              "$MSI" "$ZIP"
+          fi
+          echo "published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"

@@ -11,6 +11,7 @@
 #                                       [--out <path>] [--skip-build]
 #                                       [--semver <X.Y.Z>]
 #                                       [--test-identity <Name>]
+#                                       [--print-file-version]
 #
 # Defaults:
 #   version    $(date +%Y%m%d)-$(git rev-parse --short HEAD) build stamp,
@@ -32,6 +33,10 @@
 #              NOTE with --semver the exe must already carry the matching
 #              -Dversion-string/-Dwindows-update-check (the on-box publish
 #              script builds natively, then runs this under Docker).
+#   --print-file-version  print the per-build FILEVERSION (yy.m.d.NN) this
+#              run would use and exit, so a caller that builds the exe
+#              itself (build-release-artifacts.sh, T38) passes the SAME
+#              -Dwindows-file-version instead of restating the formula.
 #   --test-identity <Name>  build a THROWAWAY MSI under a distinct product
 #              identity (Name, install dir, UpgradeCode, registry key, and
 #              component-GUID namespace all derived from <Name>) so on-box
@@ -80,20 +85,28 @@ while [[ $# -gt 0 ]]; do
     --skip-build)  SKIP_BUILD=1; shift ;;
     --test-identity)   TEST_IDENTITY="${2:?--test-identity needs a value}"; shift 2 ;;
     --test-identity=*) TEST_IDENTITY="${1#*=}"; shift ;;
+    --print-file-version) PRINT_FILE_VERSION=1; shift ;;
     -h|--help)     sed -n '2,50p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)             echo "error: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Per-build FILEVERSION: yy.m.d.NN, strictly increasing across builds so MSI
+# file versioning always prefers the newer package exe (see header). This is
+# the ONE definition of the rule -- a caller that builds the exe itself asks
+# for it with --print-file-version rather than restating the formula (four
+# private copies of a chrome datum is how T257's DPI bug survived).
+FILE_VERSION="$(date +%-y).$(date +%-m).$(date +%-d).$BUILD_NUM"
+if [[ "${PRINT_FILE_VERSION:-0}" -eq 1 ]]; then
+  echo "$FILE_VERSION"
+  exit 0
+fi
 
 for tool in wixl msiinfo python3; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found (brew install msitools)" >&2; exit 1; }
 done
 
 cd "$REPO_ROOT"
-
-# Per-build FILEVERSION: yy.m.d.NN, strictly increasing across builds so MSI
-# file versioning always prefers the newer package exe (see header).
-FILE_VERSION="$(date +%-y).$(date +%-m).$(date +%-d).$BUILD_NUM"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   EXTRA_BUILD_ARGS=()
