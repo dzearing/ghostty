@@ -90,6 +90,21 @@ const VerbArgs = verb_args.VerbArgs;
 const parseVerbArgs = verb_args.parseVerbArgs;
 const dropPrefix = verb_args.dropPrefix;
 
+/// `--view` on `+new-window`/`+split`. Two answers, in the Mac server's own
+/// order: an ambiguous `--view` + command is rejected the same way on both
+/// platforms (that check outlives this function), and then — until viewer
+/// panes land here (T90c–T90h) — `--view` is refused explicitly rather than
+/// dropped as an unknown flag, which used to open a TERMINAL and say nothing.
+///
+/// Returns the error response to send, or null to carry on.
+fn viewArgResponse(ctx: Context, args: VerbArgs) Allocator.Error!?[]u8 {
+    if (verb_args.viewConflictsWithCommand(args))
+        return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_command_conflict_error});
+    if (args.view != null)
+        return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_unsupported_error});
+    return null;
+}
+
 /// Shell resolution (`--shell` flag → `command-shell` config → cmd.exe),
 /// then the pure per-flavor wrap table.
 fn wrapCommandArgv(
@@ -141,6 +156,10 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const arena = arena_state.allocator();
 
     var args = try parseVerbArgs(arena, request.arguments);
+
+    // Before anything is created or focused (Mac checks here too,
+    // IPCServer.swift:386 — ahead of its idempotent target focus).
+    if (try viewArgResponse(ctx, args)) |response| return response;
 
     // `--from-focused` (T68): mirror the keyboard "New Window" action on the
     // focused window so a REMOTE parent's machine is inherited (the Mac
@@ -495,6 +514,9 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const arena = arena_state.allocator();
 
     const args = try parseVerbArgs(arena, request.arguments);
+
+    // First thing, as on the Mac (IPCServer.swift:572).
+    if (try viewArgResponse(ctx, args)) |response| return response;
 
     // Idempotent: an existing live pane under --name is focused, not
     // recreated.

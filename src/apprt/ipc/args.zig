@@ -36,6 +36,11 @@ pub const VerbArgs = struct {
     /// `+list --pid=<pid>`: resolve the pane whose shell is an ancestor
     /// of this process id (Windows; the tty-less equivalent of --tty).
     pid: ?u32 = null,
+    /// `+new-window --view` / `+split --view`: open a VIEWER pane (a file or
+    /// a website) instead of a terminal. Parsed here so the win32 server can
+    /// answer `--view` explicitly instead of dropping it as an unknown flag
+    /// and silently opening a terminal (T90b; viewer panes land in T90c–T90h).
+    view: ?[]const u8 = null,
     /// `--color` / `--split-color` (T67): background tint for the new
     /// window/pane and for `+new-window`'s inline split. Values are raw
     /// strings here (`#rgb`, `#rrggbb`, or `random`) — resolution happens
@@ -116,6 +121,8 @@ pub fn parseVerbArgs(
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--split-percent=")) |v| {
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
+        } else if (dropPrefix(arg, "--view=")) |v| {
+            result.view = v;
         } else if (dropPrefix(arg, "--color=")) |v| {
             result.color = v;
         } else if (dropPrefix(arg, "--split-color=")) |v| {
@@ -139,6 +146,26 @@ pub fn parseVerbArgs(
 pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
     return null;
+}
+
+/// A viewer pane renders a file or a website; it has no shell, so there is
+/// nothing for a command to run in. Byte-matches the Mac server's string
+/// (`IPCServer.swift:387` for `+new-window`, `:574` for `+split`).
+pub const view_command_conflict_error = "--view cannot be combined with --command/-e";
+
+/// The interim answer while viewer panes are Mac-only (design §10). Until
+/// T90d lands the WebView2 host, `--view` on win32 used to fall into the
+/// unknown-flag drop and silently open a TERMINAL — the wrong pane, with no
+/// hint that anything was ignored. Explicit failure beats silent wrong
+/// behavior; delete this (and its two call sites) when viewers land.
+pub const view_unsupported_error = "viewers are not yet supported on Windows";
+
+/// Whether `--view` was given alongside a command. `-e` counts: the Mac
+/// parser folds trailing `-e` argv into `config.command` before the check,
+/// so the two platforms reject the same command lines.
+pub fn viewConflictsWithCommand(args: VerbArgs) bool {
+    if (args.view == null) return false;
+    return args.command != null or args.e_args.len > 0;
 }
 
 /// The directory a `+new-window` auto-launch should start the GUI in (T132),
@@ -446,6 +473,56 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqualStrings("x=y", parsed.env[1].value);
     try testing.expectEqualStrings("{\"pane\":\"a\"}", parsed.layout.?);
     try testing.expectEqual(@as(?u32, 4242), parsed.pid);
+}
+
+test "parseVerbArgs: --view is captured, not dropped as an unknown flag" {
+    var arena = testArena();
+    defer arena.deinit();
+
+    // A path and a URL are both just the flag's value here; classification
+    // (and relative-path resolution) happens CLI-side in cli/view_args.zig.
+    const file = try parseVerbArgs(arena.allocator(), &[_][]const u8{
+        "--target=dev", "--view=D:\\git\\ghoztty\\README.md",
+    });
+    try testing.expectEqualStrings("D:\\git\\ghoztty\\README.md", file.view.?);
+
+    const url = try parseVerbArgs(arena.allocator(), &[_][]const u8{"--view=https://example.com"});
+    try testing.expectEqualStrings("https://example.com", url.view.?);
+
+    // Absent stays absent — a terminal request must not look like a viewer.
+    const none = try parseVerbArgs(arena.allocator(), &[_][]const u8{"--target=dev"});
+    try testing.expect(none.view == null);
+}
+
+test "viewConflictsWithCommand: --command and -e both conflict, alone neither does" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const with_command = try parseVerbArgs(alloc, &[_][]const u8{
+        "--view=README.md", "--command=pwsh",
+    });
+    try testing.expect(viewConflictsWithCommand(with_command));
+
+    // `-e` is a command too: Mac folds it into `config.command` before the
+    // same check, so a `--view -e` line must be rejected on both platforms.
+    const with_e = try parseVerbArgs(alloc, &[_][]const u8{
+        "--view=README.md", "-e", "pwsh", "-NoLogo",
+    });
+    try testing.expect(viewConflictsWithCommand(with_e));
+
+    // Each one on its own is a perfectly good request.
+    const view_only = try parseVerbArgs(alloc, &[_][]const u8{"--view=README.md"});
+    try testing.expect(!viewConflictsWithCommand(view_only));
+    const command_only = try parseVerbArgs(alloc, &[_][]const u8{"--command=pwsh"});
+    try testing.expect(!viewConflictsWithCommand(command_only));
+
+    // `--split-command` is NOT a conflict: it configures the OTHER pane of an
+    // inline split, which stays a terminal. Mac checks `config.command` only.
+    const split_command = try parseVerbArgs(alloc, &[_][]const u8{
+        "--view=README.md", "--split-command=pwsh",
+    });
+    try testing.expect(!viewConflictsWithCommand(split_command));
 }
 
 test "parseVerbArgs: -e captures everything after, no flag parsing" {

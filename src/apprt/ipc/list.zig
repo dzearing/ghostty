@@ -36,6 +36,15 @@ pub const List = struct {
         focused: bool,
         /// null while the child is running.
         exit_code: ?i64,
+        /// Pane kind: `"terminal"` or `"viewer"` (JSON key `"type"`). The Mac
+        /// server encodes this unconditionally (`IPCMessage.swift:103`), so it
+        /// is emitted for terminals too and the default keeps every existing
+        /// caller correct. `src/cli/list.zig` already reads it to pick the
+        /// `view:` prefix — the gap this closes was server-side only.
+        pane_type: []const u8 = "terminal",
+        /// The viewed file path or URL; terminals report null, which the Mac
+        /// server also encodes rather than omitting (`IPCMessage.swift:104`).
+        url: ?[]const u8 = null,
         /// Background tint as `#rrggbb` (T67). Additive and optional like
         /// `build`: null omits the field, so the golden Mac shape below is
         /// unchanged for untinted panes (the Mac server never sends it).
@@ -207,6 +216,13 @@ pub const List = struct {
         try jws.write(term.focused);
         try jws.objectField("exit_code");
         try jws.write(term.exit_code);
+        // Mac's field order, and unconditional like Mac's encoder: `type` and
+        // `url` sit between `exit_code` and `banner`. The Windows-only
+        // `background_tint` keeps its place immediately before `banner`.
+        try jws.objectField("type");
+        try jws.write(term.pane_type);
+        try jws.objectField("url");
+        try jws.write(term.url);
         if (term.background_tint) |tint| {
             try jws.objectField("background_tint");
             try jws.write(tint);
@@ -257,7 +273,8 @@ test "List: banner is additive (T35)" {
             "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
             "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
             "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
-            "\"focused\":true,\"exit_code\":null,\"banner\":\"**PR #1**\\nline2\"}}}]}]}}",
+            "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null," ++
+            "\"banner\":\"**PR #1**\\nline2\"}}}]}]}}",
         json,
     );
 }
@@ -336,7 +353,56 @@ test "List: background_tint is additive (T67)" {
             "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
             "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
             "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
-            "\"focused\":true,\"exit_code\":null,\"background_tint\":\"#334455\"}}}]}]}}",
+            "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null," ++
+            "\"background_tint\":\"#334455\"}}}]}]}}",
+        json,
+    );
+}
+
+test "List: viewer leaf reports type/url (T90b)" {
+    const testing = std.testing;
+
+    // No win32 pane can produce this yet (viewers land in T90c–T90h), but the
+    // wire shape is what `src/cli/list.zig` already renders as `view: <title>
+    // <url>`, so it is pinned here rather than discovered later.
+    const viewer: List.Node = .{ .leaf = .{
+        .id = "11",
+        .title = "README.md",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "doc",
+        .focused = true,
+        .exit_code = null,
+        .pane_type = "viewer",
+        .url = "D:\\git\\ghoztty\\README.md",
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "README.md",
+        .index = 0,
+        .selected = true,
+        .splits = &viewer,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "README.md",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"README.md\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+            "{\"id\":\"0\",\"title\":\"README.md\",\"index\":0,\"selected\":true,\"splits\":" ++
+            "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"README.md\"," ++
+            "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"doc\"," ++
+            "\"focused\":true,\"exit_code\":null,\"type\":\"viewer\"," ++
+            "\"url\":\"D:\\\\git\\\\ghoztty\\\\README.md\"}}}]}]}}",
         json,
     );
 }
@@ -395,10 +461,10 @@ test "List: golden shape — window with split tab" {
             "{\"type\":\"split\",\"direction\":\"horizontal\",\"ratio\":0.5," ++
             "\"left\":{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"nvim\"," ++
             "\"working_directory\":\"C:\\\\src\",\"pid\":0,\"tty\":\"\",\"name\":\"ide\"," ++
-            "\"focused\":true,\"exit_code\":null}}," ++
+            "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null}}," ++
             "\"right\":{\"type\":\"leaf\",\"terminal\":{\"id\":\"12\",\"title\":\"pwsh\"," ++
             "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"12\"," ++
-            "\"focused\":false,\"exit_code\":null}}}}]}]}}",
+            "\"focused\":false,\"exit_code\":null,\"type\":\"terminal\",\"url\":null}}}}]}]}}",
         json,
     );
 }

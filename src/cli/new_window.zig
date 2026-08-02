@@ -7,6 +7,7 @@ const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const lib = @import("../lib/main.zig");
 const homedir = @import("../os/homedir.zig");
+const view_args = @import("view_args.zig");
 const global = &@import("../global.zig").state;
 
 pub const Options = struct {
@@ -278,7 +279,7 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try resolveViewArgument(alloc, opts._arguments.items);
+    try view_args.resolve(alloc, opts._arguments.items);
 
     const arguments = if (opts._arguments.items.len == 0) null else opts._arguments.items;
 
@@ -306,28 +307,6 @@ fn runArgs(
     return 1;
 }
 
-/// Rewrite a relative `--view=` path to an absolute one, resolved against
-/// `--working-directory=` when present (else the caller's cwd; note this
-/// command always inserts the caller's cwd as `--working-directory` when
-/// none was given, so the base is always present here). URLs (containing
-/// "://"), `about:` pages such as the blank browser start page, and absolute
-/// paths pass through untouched.
-fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
-    for (arguments, 0..) |arg, i| {
-        const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
-        if (rest.len == 0) return;
-        if (rest[0] == '/') return;
-        if (std.mem.indexOf(u8, rest, "://") != null) return;
-        if (std.mem.startsWith(u8, rest, "about:")) return;
-
-        var base: ?[]const u8 = null;
-        for (arguments) |a| {
-            if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
-        }
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
-        const resolved = try std.fs.path.resolve(alloc, &.{ cwd, rest });
-        arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
-        return;
-    }
-}
+// `--view=` resolution is shared with `+split`: see `cli/view_args.zig`.
+// (This command always inserts the caller's cwd as `--working-directory`
+// when none was given, so the resolve base is always present here.)

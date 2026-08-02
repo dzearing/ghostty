@@ -6507,3 +6507,48 @@ The `-Dtest-filter` check is the part worth repeating: a green lane proves the
 file COMPILED, not that its tests ran. Filtering on "Breaker" raised the count
 by exactly 5 over the unfiltered baseline and the single named test by exactly
 1, which is what makes "20 tests pass" a measurement.
+
+## 2026-08-02 - T90b: `--view` said nothing and opened a terminal
+
+The viewer-pane IPC/CLI floor. `--view` had no `VerbArgs` field, so it fell into
+the verb parser's unknown-flag drop and `+new-window --view=README.md` opened a
+plain TERMINAL and reported success. It is now answered explicitly, and
+`viewer-panes.ps1` (31 asserts, ALL PASS x3) is the seed the rest of Phase K
+grows into.
+
+Three things the work settled.
+
+**The task's own wording was self-contradictory, and the code told us which
+half to keep.** It asked for `"type":"terminal"` on every leaf *and* for the
+golden Mac shape to stay untouched. Mac's `TerminalData` encodes `pane_type`
+and `url` with `encode`, not `encodeIfPresent` (`IPCMessage.swift:103-104`), so
+it has been sending `"type":"terminal","url":null` on every leaf since the
+viewer work landed - which means the four golden tests in `apprt/ipc/list.zig`
+had quietly drifted away from the encoder whose header says they pin it.
+Emitting both unconditionally in Mac's field order *restores* the match; the
+goldens were corrected, not relaxed. That the file asks callers to "keep them
+in sync with any Mac change" and provides nothing to enforce it is **T370** -
+T257's lesson (copies of one datum, no way to notice they disagree) in a second
+subsystem.
+
+**Check order is a decision, not a detail.** The `--view` + `--command`/`-e`
+conflict is checked BEFORE the interim not-supported error, in both verbs,
+because the conflict is permanent and shared with the Mac while the interim
+error is deleted by T90d. An ambiguous command line has to fail the same way on
+both platforms today and after T90d. `--split-command` is deliberately not a
+conflict; `-e` is, because Mac folds it into `config.command` before the same
+check.
+
+**The `isAbsolute` fix was hoisted, not applied twice.** Both verbs carried
+byte-identical private copies of `resolveViewArgument` and both carried the
+same live bug: `rest[0] == '/'` called `C:\src\README.md` *relative* and glued
+the caller's cwd onto its front. One copy now lives in `src/cli/view_args.zig`
+with the classification split out as a pure `needsResolution`, so the drive-
+letter and UNC cases are testable without a window.
+
+Also worth recording: `test-agent` failed once on
+`remote.agent.server.test.client DATA reaches the child` and was green on the
+immediate re-run - **T258**, the filed flake, in the filed file, on a task that
+touched no agent code. And every "nothing was created" assertion in
+`viewer-panes.ps1` is paired with a positive control running the same verb
+without `--view`: "no window appeared" is trivially true if IPC is simply dead.
