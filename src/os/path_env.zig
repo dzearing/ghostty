@@ -1,8 +1,14 @@
-//! Pure logic for the Windows user-PATH self-heal (T70): deciding whether
-//! a directory is already on a `;`-separated PATH value and building the
-//! appended value when it is not. No OS imports, so the unit tests run in
-//! every app-runtime lane (the hero_math/dim_math pattern). The registry
-//! and environment plumbing lives in PathInstaller.zig.
+//! Pure logic for Windows `;`-separated PATH values: deciding whether a
+//! directory is already on one and building the appended value when it is
+//! not. No OS imports, so the unit tests run in every app-runtime lane (the
+//! hero_math/dim_math pattern).
+//!
+//! Two callers share it, which is why it lives in `src/os` rather than under
+//! an apprt (T42): the GUI's user-PATH self-heal (T70,
+//! `apprt/win32/PathInstaller.zig`, which owns the registry write) and the
+//! agent's user-environment overlay (`os/user_env.zig`, which owns the
+//! registry read). A second copy of `normalize`/`eqlDir` is exactly the
+//! four-copies-four-chances-to-be-wrong trap T257 wrote down.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 

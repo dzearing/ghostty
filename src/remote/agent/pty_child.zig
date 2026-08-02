@@ -914,6 +914,17 @@ pub const PtySpawner = struct {
         var child_env = try cloneEnvMap(self.alloc, self.env);
         defer child_env.deinit();
 
+        // T42: on Windows, add whatever the interactive user's registry
+        // environment has that ours lacks — above all the HKCU `Path`. The
+        // agent's own environment is a snapshot of whoever started it (an HKCU
+        // `Run` entry, a scheduled task, an SSH bridge, a self-update
+        // relaunch), and a CROSS-MACHINE OPEN forwards no env at all, so
+        // without this a remote session gets the system PATH and none of the
+        // user's. Additive and per-spawn: it never weakens what we already
+        // have, and a PATH edit made after the agent started still reaches the
+        // next session. No-op off Windows (a POSIX shell is spawned `-lic`).
+        internal_os.user_env.overlay(self.alloc, &child_env);
+
         // Set TERM for the child. COLORTERM signals 24-bit color support to
         // apps that don't trust TERM alone (the emulating end is Ghostty, which
         // renders truecolor regardless of the advertised TERM).

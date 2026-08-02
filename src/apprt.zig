@@ -70,8 +70,9 @@ test {
     // Pure win32 background-tint color math (T67), same no-OS-imports deal.
     _ = @import("apprt/win32/color_math.zig");
 
-    // Pure win32 user-PATH self-heal logic (T70), same no-OS-imports deal.
-    _ = @import("apprt/win32/path_env.zig");
+    // (The pure user-PATH logic moved to `os/path_env.zig` with T42 — the
+    // agent's user-env overlay needs it too — and is exercised from
+    // `os/main.zig`'s test block, i.e. in every lane rather than just this one.)
 
     // Pure win32 Claude Code setup logic (T71), same no-OS-imports deal.
     _ = @import("apprt/win32/claude_setup.zig");

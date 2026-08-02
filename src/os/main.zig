@@ -26,7 +26,9 @@ pub const i18n = @import("i18n.zig");
 pub const ipc_client = @import("ipc_client.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
+pub const path_env = @import("path_env.zig");
 pub const passwd = @import("passwd.zig");
+pub const user_env = @import("user_env.zig");
 pub const xdg = @import("xdg.zig");
 pub const windows = @import("windows.zig");
 pub const macos = @import("macos.zig");
@@ -73,8 +75,10 @@ test {
     _ = i18n;
     _ = ipc_client;
     _ = path;
+    _ = path_env;
     _ = uri;
     _ = shell;
+    _ = user_env;
 
     if (comptime builtin.os.tag == .linux) {
         _ = kernel_info;

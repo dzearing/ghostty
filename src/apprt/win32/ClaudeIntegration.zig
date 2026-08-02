@@ -26,7 +26,7 @@ const w32 = @import("win32.zig");
 const App = @import("App.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const setup = @import("claude_setup.zig");
-const path_env = @import("path_env.zig");
+const path_env = @import("../../os/path_env.zig");
 
 const log = std.log.scoped(.win32_claude);
 

@@ -6306,3 +6306,45 @@ Residuals: **T355** (the agent lane never asked whether its pid was real),
 **T356** (a cross-machine pane still always confirms; only its own agent can
 see those descendants), **T357** (the forced-confirm branches have no coverage
 now that no-dialog is a normal outcome).
+
+## 2026-08-02 - T42: a remote session got the system PATH and none of the user's
+
+Every child the agent spawns clones ONE environment: the map `PtySpawner.init`
+captured with `getEnvMap` at startup (`pty_child.zig:799`, cloned at `:914`).
+That map belongs to whoever started the agent - an HKCU `Run` entry, a
+scheduled task, an SSH bridge, a self-update relaunch - and nothing ever
+reconciled it with the user's own registry environment. The local agent papers
+over it with `OPEN.env` (T04a) because the app has a real environment; a
+CROSS-MACHINE OPEN forwards nothing by design, which is exactly why the
+Mac->Windows case was the one the user hit. Same class as the working directory
+already documented in `openWorkingDirectory` ("an agent started by the HKCU
+`Run` entry inherits `C:\WINDOWS\system32`") - that comment was the cwd, this
+was the environment block.
+
+`src/os/user_env.zig` reads the two keys Windows itself composes a logon
+environment from and overlays them per spawn. The decision that carries it is
+**additive only**: `Path` is MERGED with the process's own value FIRST, then
+the registry entries it lacks; every other variable is applied only if missing.
+Faithful logon order (`system;user`, inherited value discarded) would have
+silently re-ordered PATH resolution under every harness on this box for no
+gain - a shim directory a test deliberately prepended would have stopped
+shadowing. Additive is also what makes per-spawn safe, and per-spawn is what
+keeps it fresh: a PATH edit made after the agent started reaches the next
+session, where a once-at-startup overlay would inherit the very staleness it
+fixes.
+
+The PATH-entry normalization moved from `apprt/win32/path_env.zig` to
+`os/path_env.zig` rather than being copied - T257's four-copies lesson - and
+its tests now run in every lane instead of only win32.
+
+`test\win32\agent-user-env.ps1` - ALL PASS. It reproduces the condition with no
+second machine: a real agent started with a STRIPPED PATH, driven over a pipe,
+with the child dumping its environment via `set > <file>`. The file matters:
+an 80-column ConPTY wraps a long PATH mid-entry, so a PTY-scraping assertion
+would have been measuring the terminal. Section 2 is the negative control -
+the same run with `GHOZTTY_USER_ENV=off` leaves the stripped PATH stripped, so
+the marker's presence is the fix rather than a PATH that was never stripped.
+Residuals: **T358** (`PROC_SPAWN` still passes a null `lpEnvironment`, and it
+matters more there - that is Activity Monitor's "New Process", a bare command
+name with no shell to fail in) and **T359** (`remote-test-client` is an
+on-demand build target that two acceptance scripts require).
