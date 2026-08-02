@@ -98,4 +98,24 @@ struct AgentIntegrationServiceTests {
         let claude = try #require(statuses.first { $0.agent == .claude })
         #expect(claude.pluginManaged == true)
     }
+
+    @Test func uninstallingOneAgentKeepsSharedBannerForOther() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
+        #expect(FileManager.default.fileExists(atPath: banner.path))
+
+        // Uninstalling one agent must keep the shared banner (the other still uses it).
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(FileManager.default.fileExists(atPath: banner.path))
+        let claude = try #require(AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default).first { $0.agent == .claude })
+        #expect(claude.state == .installed)
+
+        // Uninstalling the last integrated agent removes the shared banner.
+        #expect(AgentIntegrationService.uninstall(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(!FileManager.default.fileExists(atPath: banner.path))
+    }
 }

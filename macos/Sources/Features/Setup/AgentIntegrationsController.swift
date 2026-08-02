@@ -12,16 +12,18 @@ final class AgentIntegrationsController: NSWindowController {
     private convenience init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 320),
-            styleMask: [.titled, .closable],
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false)
         window.title = "Agent Integrations"
         window.isReleasedWhenClosed = false
         window.isMovableByWindowBackground = true
         self.init(window: window)
-        window.contentView = NSHostingView(rootView: AgentIntegrationsView(viewModel: viewModel, onDone: { [weak window] in
+        let hostingView = NSHostingView(rootView: AgentIntegrationsView(viewModel: viewModel, onDone: { [weak window] in
             window?.performClose(nil)
         }))
+        window.contentView = hostingView
+        window.setContentSize(hostingView.fittingSize)
         window.center()
     }
 

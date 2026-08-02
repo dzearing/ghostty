@@ -70,8 +70,20 @@ enum AgentIntegrationService {
                           homeDirectoryURL: URL = URL(fileURLWithPath: LoginShell.homePath),
                           fileManager: FileManager = .default) -> IntegrationOutcome {
         let integ = RuntimeIntegrationFactory.make(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+
+        // The banner script lives at one shared path used by every agent's
+        // hooks. Only remove it when no other agent still relies on it —
+        // otherwise uninstalling one agent would break the others.
+        let bannerNeededByOthers = RuntimeAgent.allCases.contains { other in
+            other != agent
+                && RuntimeIntegrationFactory.make(for: other, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager).state() != .notInstalled
+        }
+        let components = bannerNeededByOthers
+            ? integ.components.filter { $0.name != RuntimeIntegrationFactory.bannerComponentName }
+            : integ.components
+        let scoped = RuntimeIntegration(agent: agent, components: components, requiredDirectory: nil, fileManager: fileManager)
         do {
-            try integ.uninstall()
+            try scoped.uninstall()
         } catch {
             return .failed(error.localizedDescription)
         }

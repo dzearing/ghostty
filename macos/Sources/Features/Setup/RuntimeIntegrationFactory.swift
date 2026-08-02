@@ -2,6 +2,8 @@
 import Foundation
 
 enum RuntimeIntegrationFactory {
+    static let bannerComponentName = "banner-script"
+
     static func availableAgents(homeDirectoryURL: URL, fileManager: FileManager) -> [RuntimeAgent] {
         RuntimeAgent.allCases.filter {
             var isDir: ObjCBool = false
@@ -15,7 +17,7 @@ enum RuntimeIntegrationFactory {
         let skills = SkillComponent(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
 
         var components: [IntegrationComponent] = [
-            IntegrationComponent(name: "banner-script", state: banner.state, install: banner.install, uninstall: banner.uninstall),
+            IntegrationComponent(name: bannerComponentName, state: banner.state, install: banner.install, uninstall: banner.uninstall),
             IntegrationComponent(name: "skills", state: skills.state, install: skills.install, uninstall: skills.uninstall),
         ]
 

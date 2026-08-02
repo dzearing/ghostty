@@ -57,8 +57,8 @@ struct AgentIntegrationsView: View {
                 Task { await viewModel.uninstall(agent) }
             }
             Button("Cancel", role: .cancel) { confirmingUninstall = nil }
-        } message: { _ in
-            Text("This removes the banner script, skills, and hooks Ghoztty installed. Your configuration is otherwise untouched.")
+        } message: { agent in
+            Text("This removes the banner script, skills, and hooks Ghoztty installed. Your \(agent.displayName) configuration is otherwise untouched.")
         }
     }
 }
