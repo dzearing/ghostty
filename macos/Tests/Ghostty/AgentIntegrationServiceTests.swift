@@ -48,4 +48,18 @@ struct AgentIntegrationServiceTests {
         try #"{"drifted":true}\n// ghoztty-managed"#.write(to: hookFile, atomically: true, encoding: .utf8)
         #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .upgraded)
     }
+
+    @Test func uninstallRemovesInstalledIntegration() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        // After uninstall the skills file Ghoztty wrote is gone.
+        let skill = home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md")
+        #expect(!FileManager.default.fileExists(atPath: skill.path))
+    }
+
+    @Test func uninstalledOutcomeLabel() {
+        #expect(IntegrationOutcome.uninstalled.label == "removed")
+    }
 }

@@ -2,7 +2,7 @@
 import Foundation
 
 enum IntegrationOutcome: Equatable {
-    case installed, upToDate, upgraded, notFound, pluginPresent, failed(String)
+    case installed, upToDate, upgraded, notFound, pluginPresent, uninstalled, failed(String)
 
     var label: String {
         switch self {
@@ -11,6 +11,7 @@ enum IntegrationOutcome: Equatable {
         case .upgraded: "upgraded"
         case .notFound: "not found"
         case .pluginPresent: "plugin already present"
+        case .uninstalled: "removed"
         case .failed(let d): "failed — \(d)"
         }
     }
@@ -53,5 +54,17 @@ enum AgentIntegrationService {
 
     static func summary(_ results: [(RuntimeAgent, IntegrationOutcome)]) -> String {
         results.map { "\($0.0.displayName): \($0.1.label)" }.joined(separator: " · ")
+    }
+
+    static func uninstall(agent: RuntimeAgent,
+                          homeDirectoryURL: URL = URL(fileURLWithPath: LoginShell.homePath),
+                          fileManager: FileManager = .default) -> IntegrationOutcome {
+        let integ = RuntimeIntegrationFactory.make(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+        do {
+            try integ.uninstall()
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        return .uninstalled
     }
 }
