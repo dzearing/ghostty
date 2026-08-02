@@ -107,6 +107,10 @@ pub const Options = struct {
 pub const ConnectError = error{
     /// The server did not return `101 Switching Protocols`.
     WebSocketUpgradeFailed,
+    /// The server rejected the bearer (`401`/`403`). Split out from
+    /// `WebSocketUpgradeFailed` because it is the one dial failure the user can
+    /// DO something about, and it has to be spelled that way (T319).
+    WebSocketUnauthorized,
     /// `Sec-WebSocket-Accept` was missing or did not match our key.
     WebSocketBadAccept,
     /// The HTTP response was malformed / too large for the handshake buffer.
@@ -347,6 +351,9 @@ pub const WsClient = struct {
         const status = try r.takeDelimiterInclusive('\n');
         if (!is101(status)) {
             log.warn("ws upgrade rejected: {s}", .{std.mem.trimRight(u8, status, "\r\n")});
+            if (statusCode(status)) |code| {
+                if (code == 401 or code == 403) return ConnectError.WebSocketUnauthorized;
+            }
             return ConnectError.WebSocketUpgradeFailed;
         }
 
@@ -387,6 +394,19 @@ pub const WsClient = struct {
         _ = it.next() orelse return false; // HTTP/1.1
         const code = it.next() orelse return false;
         return std.mem.eql(u8, code, "101");
+    }
+
+    /// The status line's numeric code, or null when it is not a status line we
+    /// can read. Only used to tell a REJECTED credential apart from a relay
+    /// that is simply unreachable — the two need different words in the UI
+    /// (T319), and everything above the transport sees only an error value.
+    fn statusCode(status_line: []const u8) ?u16 {
+        const s = std.mem.trimRight(u8, status_line, "\r\n");
+        var it = std.mem.tokenizeScalar(u8, s, ' ');
+        const proto = it.next() orelse return null;
+        if (!std.mem.startsWith(u8, proto, "HTTP/")) return null;
+        const code = it.next() orelse return null;
+        return std.fmt.parseInt(u16, code, 10) catch null;
     }
 
     fn splitHeader(line: []const u8) ?struct { name: []const u8, value: []const u8 } {
@@ -818,6 +838,15 @@ test "is101: status-line parsing" {
     try testing.expect(!WsClient.is101("HTTP/1.1 200 OK\r\n"));
     try testing.expect(!WsClient.is101("HTTP/1.1 401 Unauthorized\r\n"));
     try testing.expect(!WsClient.is101("garbage"));
+}
+
+test "statusCode: a rejected credential is distinguishable from an unreachable relay" {
+    try testing.expectEqual(@as(?u16, 401), WsClient.statusCode("HTTP/1.1 401 Unauthorized\r\n"));
+    try testing.expectEqual(@as(?u16, 403), WsClient.statusCode("HTTP/1.1 403 Forbidden\r\n"));
+    try testing.expectEqual(@as(?u16, 502), WsClient.statusCode("HTTP/1.1 502 Bad Gateway\r\n"));
+    try testing.expectEqual(@as(?u16, 101), WsClient.statusCode("HTTP/1.1 101"));
+    try testing.expectEqual(@as(?u16, null), WsClient.statusCode("garbage"));
+    try testing.expectEqual(@as(?u16, null), WsClient.statusCode("HTTP/1.1 nope\r\n"));
 }
 
 test "splitHeader: name/value split" {

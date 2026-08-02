@@ -35,6 +35,7 @@ const icon_button = @import("icon_button.zig");
 const LocalAgent = @import("LocalAgent.zig");
 const session_layout = @import("session_layout.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
+const relay_dial = @import("../../remote/relay_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const w32 = @import("win32.zig");
 
@@ -62,8 +63,29 @@ const max_killed = 16;
 // State (GUI thread only)
 // ---------------------------------------------------------------------
 
+/// Everything the worker needs to reach a REMOTE machine's agent. There is no
+/// new RPC on this path — `Connection.requestSessions` is transport-agnostic
+/// (`connection.zig:1598`), which is Mac's own claim about it
+/// (`SessionBrowserProbe.swift:93-96`) — so the whole remote half of this file
+/// is the dial and who owns it.
+pub const Remote = struct {
+    /// The relay HTTPS base (an `http://` base is a loopback test relay).
+    base: []const u8,
+    /// The enrolled device id.
+    device: []const u8,
+    /// The bearer the relay authenticates with.
+    token: []const u8,
+};
+
 alloc: Allocator,
 state: chooser_sessions.State = .loading,
+/// Which machine these sessions belong to (T319). Every fetch, adopt and paint
+/// is about THIS target; moving it resets the region, because machine A's
+/// sessions under machine B's name is the one thing worse than an empty pane.
+target: chooser_sessions.Target = .none,
+/// Relay credentials for a `.remote` target, BORROWED from the chooser (its
+/// arena and its device listing both outlive the roster). Null for `.local`.
+remote: ?Remote = null,
 /// The fetched roster. Owned; freed here and replaced whole by each adopt.
 owned: ?remote_connection.OwnedSessions = null,
 /// Bumped on every fetch. A reply carrying an older serial is stale — its
@@ -122,10 +144,40 @@ const Request = struct {
     warm: ?*remote_connection.Connection,
     /// A session to END before listing, for the Kill path. Owned.
     kill_id: ?[]u8,
+    /// A relay target, DEEP-COPIED off the GUI thread's borrowed strings: the
+    /// chooser that owns them can close while this dial is still blocking.
+    remote: ?OwnedRemote = null,
 
     fn destroy(self: *Request) void {
         if (self.kill_id) |k| self.alloc.free(k);
+        if (self.remote) |r| r.deinit(self.alloc);
         self.alloc.destroy(self);
+    }
+};
+
+const OwnedRemote = struct {
+    base: []u8,
+    device: []u8,
+    token: []u8,
+
+    fn dupe(alloc: Allocator, src: Remote) ?OwnedRemote {
+        const base = alloc.dupe(u8, src.base) catch return null;
+        const device = alloc.dupe(u8, src.device) catch {
+            alloc.free(base);
+            return null;
+        };
+        const token = alloc.dupe(u8, src.token) catch {
+            alloc.free(base);
+            alloc.free(device);
+            return null;
+        };
+        return .{ .base = base, .device = device, .token = token };
+    }
+
+    fn deinit(self: OwnedRemote, alloc: Allocator) void {
+        alloc.free(self.base);
+        alloc.free(self.device);
+        alloc.free(self.token);
     }
 };
 
@@ -138,12 +190,68 @@ pub const Result = struct {
     /// Whether a requested Kill was confirmed by the agent. Null when this
     /// fetch did not carry one.
     killed_ok: ?bool = null,
+    /// The relay rejected our bearer. A different sentence from "couldn't
+    /// reach it", because it is the one the user can act on.
+    unauthorized: bool = false,
 
     pub fn destroy(self: *Result) void {
         if (self.roster) |*r| r.deinit();
         self.alloc.destroy(self);
     }
 };
+
+/// Point the roster at a machine (T319) and fetch if the move calls for it.
+/// `remote` carries the relay credentials for a `.remote` target and is ignored
+/// otherwise; it is BORROWED — the worker deep-copies what it needs.
+///
+/// Returns true when the region changed and the caller should repaint.
+pub fn show(
+    self: *SessionRoster,
+    app: *App,
+    chooser_id: u64,
+    target: chooser_sessions.Target,
+    remote: ?Remote,
+) bool {
+    switch (chooser_sessions.transitionFor(self.target, target, self.state, self.inflight)) {
+        .nothing => return false,
+        .reset => {
+            self.clear();
+            self.target = target;
+            self.remote = null;
+            return true;
+        },
+        .reset_and_fetch => {
+            self.clear();
+            self.target = target;
+            self.remote = if (target == .remote) remote else null;
+            self.fetch(app, chooser_id, null);
+            return true;
+        },
+        .refresh_in_place => {
+            // Same machine: keep the rows AND the credentials, and refetch
+            // without touching `state` (`fetch` only moves to `loading` when
+            // there is nothing to show).
+            self.fetch(app, chooser_id, null);
+            return false;
+        },
+    }
+}
+
+/// Drop everything that belongs to the machine we are leaving. Not optional:
+/// the rows, the scroll offset and the optimistic kill hides are all statements
+/// about a specific agent.
+fn clear(self: *SessionRoster) void {
+    if (self.owned) |*o| o.deinit();
+    self.owned = null;
+    self.state = .loading;
+    self.scroll = 0;
+    self.hover_kill = -1;
+    self.killed_count = 0;
+    // Bump the serial so a reply already in flight for the OLD machine is
+    // dropped instead of adopted under the new machine's name.
+    self.serial +%= 1;
+    self.inflight = false;
+}
 
 /// Start a roster fetch (optionally ending `kill_id` first) on a detached
 /// thread. `chooser_id` identifies the chooser the reply belongs to; the reply
@@ -154,6 +262,10 @@ pub const Result = struct {
 /// is where `LocalAgent`'s state lives. The blocking part is all the worker
 /// does; when there is no warm connection the worker dials the EXISTING agent
 /// itself and frees that probe afterwards — browsing must never SPAWN an agent.
+/// A `.remote` target skips all of that and dials the relay instead, freeing
+/// that connection when it is done: per-machine browse connections are
+/// short-lived (`SessionBrowserProbe.swift:145-149`), unlike the local agent's
+/// warm one, which `LocalAgent` owns and this never frees.
 pub fn fetch(
     self: *SessionRoster,
     app: *App,
@@ -161,6 +273,7 @@ pub fn fetch(
     kill_id: ?[]const u8,
 ) void {
     if (comptime builtin.os.tag != .windows) return;
+    if (self.target == .none) return;
     const msg_hwnd = app.msg_hwnd orelse {
         self.state = .failed;
         return;
@@ -178,9 +291,26 @@ pub fn fetch(
         .hwnd = msg_hwnd,
         .chooser_id = chooser_id,
         .serial = self.serial,
-        .warm = app.local_agent.sharedConnectionIfWarm(),
+        // A remote target never borrows the local agent's connection — that
+        // would silently list THIS box's sessions under another machine's name.
+        .warm = if (self.target == .local) app.local_agent.sharedConnectionIfWarm() else null,
         .kill_id = null,
     };
+    if (self.target == .remote) {
+        // No credential at all is the signed-out case, and it gets the SAME
+        // actionable sentence a rejected one does — "couldn't reach it" would
+        // send the user looking at the network.
+        const r = self.remote orelse {
+            req.destroy();
+            self.state = .unauthorized;
+            return;
+        };
+        req.remote = OwnedRemote.dupe(self.alloc, r) orelse {
+            req.destroy();
+            self.state = .failed;
+            return;
+        };
+    }
     if (kill_id) |k| {
         req.kill_id = self.alloc.dupe(u8, k) catch {
             req.destroy();
@@ -204,13 +334,29 @@ fn worker(req: *Request) void {
     const alloc = req.alloc;
 
     var probe: ?tcp_dial.Dialed = null;
-    const conn: ?*remote_connection.Connection = req.warm orelse blk: {
+    var relay: ?relay_dial.Dialed = null;
+    var unauthorized = false;
+    const conn: ?*remote_connection.Connection = if (req.remote) |r| blk: {
+        // A REMOTE machine: dial the relay, read, free. Short-lived by design
+        // — a browse must not leave a connection open to every machine the user
+        // clicked through.
+        relay = relay_dial.dial(alloc, r.base, r.device, r.token, .raw) catch |err| {
+            log.warn("chooser roster: relay dial failed device={s} err={}", .{ r.device, err });
+            unauthorized = err == error.WebSocketUnauthorized;
+            break :blk null;
+        };
+        log.info("chooser roster: relay dialled device={s}", .{r.device});
+        break :blk relay.?.conn;
+    } else req.warm orelse blk: {
         // No warm connection: dial the agent that is ALREADY running. Never
         // spawn one — browsing a roster must not start a daemon.
         probe = LocalAgent.dialProbe(alloc);
         break :blk if (probe) |p| p.conn else null;
     };
     defer if (probe) |*p| p.deinit();
+    // The relay connection is ours alone, so it is freed here. The local
+    // agent's warm one is `LocalAgent`'s and is never touched.
+    defer if (relay) |*r| r.deinit();
 
     var killed_ok: ?bool = null;
     var roster: ?remote_connection.OwnedSessions = null;
@@ -229,6 +375,13 @@ fn worker(req: *Request) void {
             break :r null;
         };
     }
+    // NOTE (T328): a Kill on a REMOTE row loses its connection between the dial
+    // and the reply — `CLOSE_SESSION` and the refetch behind it both come back
+    // `error.ConnectionClosed` — so the roster keeps the rows it already had.
+    // The user still sees the killed row vanish (the optimistic hide), but the
+    // refetch that would confirm it does not happen. A retry on a fresh dial
+    // was tried here and WEDGED the worker, which is worse than the stale
+    // count, so it is not shipped: the cause is settled in T328 first.
 
     const res = alloc.create(Result) catch {
         if (roster) |*r| r.deinit();
@@ -240,6 +393,7 @@ fn worker(req: *Request) void {
         .serial = req.serial,
         .roster = roster,
         .killed_ok = killed_ok,
+        .unauthorized = unauthorized,
     };
     if (w32.PostMessageW(req.hwnd, WM_APP_CHOOSER_SESSIONS, @intFromPtr(res), 0) == 0) {
         // The app is going away; nothing will ever collect this.
@@ -263,18 +417,38 @@ pub fn adopt(self: *SessionRoster, res: *Result) bool {
         self.state = .loaded;
         self.pruneKilled();
         // The acceptance oracle: an owner-drawn roster has no HWNDs to read
-        // back, so what it LOADED is said out loud (T318).
-        log.info("chooser roster: loaded {d} session(s)", .{self.owned.?.sessions.len});
+        // back, so what it LOADED is said out loud (T318) — WITH the machine it
+        // loaded from (T319), because "5 sessions" is the same sentence whether
+        // they came from this box or the one the user clicked.
+        log.info("chooser roster: loaded {d} session(s) target={s} device={s}", .{
+            self.owned.?.sessions.len,
+            @tagName(self.target),
+            self.targetDevice(),
+        });
         if (res.killed_ok) |ok| {
             log.info("chooser roster: close session confirmed={}", .{ok});
         }
     } else {
         // A failed fetch does not erase a roster we already have: showing the
         // last known list beats blanking the region on one hiccup.
-        if (self.owned == null) self.state = .failed;
+        if (self.owned == null) self.state = if (res.unauthorized) .unauthorized else .failed;
+        log.info("chooser roster: fetch failed target={s} device={s} state={s}", .{
+            @tagName(self.target),
+            self.targetDevice(),
+            @tagName(self.state),
+        });
     }
     self.scroll = 0;
     return true;
+}
+
+/// The target's device id for logging, or `-` when there is no device (the
+/// local agent, or no selection at all).
+fn targetDevice(self: *const SessionRoster) []const u8 {
+    return switch (self.target) {
+        .remote => |id| id,
+        else => "-",
+    };
 }
 
 /// Optimistically hide a session the user just killed.
@@ -358,11 +532,15 @@ pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const
         if (!chooser_sessions.isConnectable(row)) continue;
         if (self.isKilled(s.id)) continue;
 
+        // The live rung works for a remote machine too: a pane of ours attached
+        // to one of ITS sessions carries that session's id. The manifest rung
+        // does not — the saved layout is this box's, so its titles say nothing
+        // about another machine and matching one would be a coincidence.
         const live = liveTitleFor(app, s.id);
         out[n] = .{
             .session = row,
             .live_title = live,
-            .persisted_title = self.persistedTitleFor(s.id),
+            .persisted_title = if (self.target == .local) self.persistedTitleFor(s.id) else null,
             .open_locally = live != null,
         };
         n += 1;
@@ -456,12 +634,10 @@ pub fn paint(self: *const SessionRoster, ctx: PaintCtx, rows: []const VisibleRow
     const hdc = ctx.hdc;
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
+    if (self.target == .none) return;
+
     if (self.state != .loaded or rows.len == 0) {
-        const text = switch (self.state) {
-            .loading => chooser_sessions.loading_text,
-            .failed => chooser_sessions.failed_text,
-            .loaded => chooser_sessions.empty_text,
-        };
+        const text = chooser_sessions.stateText(self.state) orelse chooser_sessions.empty_text;
         var r = rect(ctx.region);
         const old = if (ctx.caption_font) |f| w32.SelectObject(hdc, f) else null;
         _ = w32.SetTextColor(hdc, rgb(chrome_theme.textSecondaryOn(ctx.bg)));

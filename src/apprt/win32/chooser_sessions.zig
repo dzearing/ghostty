@@ -223,11 +223,94 @@ pub fn activityBadge(activity: []const u8) ?Badge {
 /// What the roster region is showing. The loading and failed states are states
 /// OF THE REGION, never a modal and never a blocked chooser — the threading
 /// rule T295 set and `SessionBrowserProbe.swift:142-149` states for Mac.
-pub const State = enum { loading, failed, loaded };
+///
+/// `unauthorized` is a SECOND failure and not a nicety: a chooser lists every
+/// enrolled device, so "your relay session expired" is the one failure the user
+/// can actually act on, and it must not be spelled as "couldn't reach this
+/// machine's agent" (T319).
+pub const State = enum { loading, failed, unauthorized, loaded };
 
 pub const loading_text = "Loading sessions...";
 pub const failed_text = "Couldn't reach this machine's agent";
 pub const empty_text = "No active sessions";
+/// The SAME wording `MachineChooser` already uses for `error.Unauthorized`
+/// (`:755`, `:1663`, `:1673`). One condition, one sentence — a second wording
+/// for the same state is how a surface stops reading as one surface.
+pub const unauthorized_text = "Session expired — sign in again above.";
+
+/// The placeholder line for a state, or null when the region has real rows to
+/// draw instead.
+pub fn stateText(state: State) ?[]const u8 {
+    return switch (state) {
+        .loading => loading_text,
+        .failed => failed_text,
+        .unauthorized => unauthorized_text,
+        .loaded => null,
+    };
+}
+
+// ---------------------------------------------------------------------
+// Which machine the roster is pointed at (T319)
+// ---------------------------------------------------------------------
+
+/// The machine whose sessions the detail pane is showing. Windows is
+/// master-detail where Mac is a set of expandable rows, so there is exactly one
+/// of these at a time and "collapsed" is spelled `none` — no row selected, or a
+/// row that has no roster to show.
+pub const Target = union(enum) {
+    none,
+    /// This box's own `ghoztty-agent`.
+    local,
+    /// A relay device, by its device id. Borrowed from the directory listing,
+    /// which outlives the dialog.
+    remote: []const u8,
+};
+
+pub fn targetEql(a: Target, b: Target) bool {
+    return switch (a) {
+        .none => b == .none,
+        .local => b == .local,
+        .remote => |a_id| switch (b) {
+            .remote => |b_id| std.mem.eql(u8, a_id, b_id),
+            else => false,
+        },
+    };
+}
+
+/// What pointing the roster at `next` should do to it.
+pub const Transition = enum {
+    /// A different machine: drop what is shown and fetch from scratch. The drop
+    /// is not optional — showing machine A's sessions under machine B's name is
+    /// worse than showing nothing.
+    reset_and_fetch,
+    /// Drop what is shown and fetch NOTHING: the selection landed somewhere
+    /// with no roster (an empty filter result).
+    reset,
+    /// The same machine, already resolved: fetch again but KEEP the rows, so a
+    /// re-selection never flashes the region back to `loading` under the user
+    /// (Mac's `refreshInPlace` vs `fetchIfNeeded`, `SessionBrowserProbe.swift:303-338`).
+    refresh_in_place,
+    /// The same machine with a fetch already in flight, or nothing to show.
+    /// Doing anything here would only cancel work that is about to answer.
+    nothing,
+};
+
+pub fn transitionFor(
+    current: Target,
+    next: Target,
+    state: State,
+    inflight: bool,
+) Transition {
+    if (!targetEql(current, next)) {
+        return if (next == .none) .reset else .reset_and_fetch;
+    }
+    if (next == .none) return .nothing;
+    if (inflight) return .nothing;
+    if (state == .loaded) return .refresh_in_place;
+    // A previous attempt failed (or never resolved) and the user came back to
+    // the row: try again rather than leaving a dead region.
+    return .reset_and_fetch;
+}
 
 // ---------------------------------------------------------------------
 // Geometry
@@ -692,4 +775,90 @@ test "badge and dot colors clear the chrome contrast floor on both themes" {
         try testing.expect(contrast(dotInk(card, true), card) >= floor);
         try testing.expect(contrast(dotInk(card, false), card) >= floor);
     }
+}
+
+// ---------------------------------------------------------------------
+// Target / transitions (T319)
+// ---------------------------------------------------------------------
+
+test "targetEql compares remote machines by device id, not by tag" {
+    try testing.expect(targetEql(.none, .none));
+    try testing.expect(targetEql(.local, .local));
+    try testing.expect(!targetEql(.local, .none));
+    try testing.expect(targetEql(.{ .remote = "dev-a" }, .{ .remote = "dev-a" }));
+    // The bug this exists to stop: two DIFFERENT machines comparing equal would
+    // leave machine A's sessions on screen under machine B's name.
+    try testing.expect(!targetEql(.{ .remote = "dev-a" }, .{ .remote = "dev-b" }));
+    try testing.expect(!targetEql(.{ .remote = "dev-a" }, .local));
+    try testing.expect(!targetEql(.local, .{ .remote = "dev-a" }));
+}
+
+test "moving to another machine always resets and refetches" {
+    // ... whatever the old machine's state was: a loaded roster is the WORST
+    // thing to keep, because it looks like an answer about the new machine.
+    for ([_]State{ .loading, .failed, .unauthorized, .loaded }) |s| {
+        try testing.expectEqual(
+            Transition.reset_and_fetch,
+            transitionFor(.local, .{ .remote = "dev-a" }, s, false),
+        );
+        try testing.expectEqual(
+            Transition.reset_and_fetch,
+            transitionFor(.{ .remote = "dev-a" }, .{ .remote = "dev-b" }, s, false),
+        );
+    }
+    // Even mid-flight: the in-flight reply belongs to the OLD machine and is
+    // dropped on its serial, so a new fetch has to be started here or the new
+    // row would sit on `loading` forever.
+    try testing.expectEqual(
+        Transition.reset_and_fetch,
+        transitionFor(.local, .{ .remote = "dev-a" }, .loading, true),
+    );
+}
+
+test "re-selecting the same machine refreshes in place, never back to loading" {
+    try testing.expectEqual(
+        Transition.refresh_in_place,
+        transitionFor(.local, .local, .loaded, false),
+    );
+    try testing.expectEqual(
+        Transition.refresh_in_place,
+        transitionFor(.{ .remote = "dev-a" }, .{ .remote = "dev-a" }, .loaded, false),
+    );
+    // A fetch already answering: leave it alone.
+    try testing.expectEqual(
+        Transition.nothing,
+        transitionFor(.local, .local, .loading, true),
+    );
+    // A failed machine the user came back to: try again.
+    for ([_]State{ .loading, .failed, .unauthorized }) |s| {
+        try testing.expectEqual(
+            Transition.reset_and_fetch,
+            transitionFor(.local, .local, s, false),
+        );
+    }
+}
+
+test "a selection with no roster clears the region and dials nothing" {
+    try testing.expectEqual(Transition.reset, transitionFor(.local, .none, .loaded, false));
+    try testing.expectEqual(
+        Transition.reset,
+        transitionFor(.{ .remote = "dev-a" }, .none, .loaded, false),
+    );
+    try testing.expectEqual(Transition.nothing, transitionFor(.none, .none, .loading, false));
+}
+
+test "every non-loaded state has a placeholder line and loaded has none" {
+    try testing.expectEqualStrings(loading_text, stateText(.loading).?);
+    try testing.expectEqualStrings(failed_text, stateText(.failed).?);
+    // The expired-credential line is the one the rest of the chooser already
+    // uses; a second wording for the same state is the defect.
+    try testing.expectEqualStrings(unauthorized_text, stateText(.unauthorized).?);
+    try testing.expectEqual(@as(?[]const u8, null), stateText(.loaded));
+}
+
+test "the count label agrees with the roster it counts" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("0 sessions", countLabel(&buf, 0));
+    try testing.expectEqualStrings("1 session", countLabel(&buf, 1));
+    try testing.expectEqualStrings("2 sessions", countLabel(&buf, 2));
 }

@@ -5733,3 +5733,55 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
 `test-agent` exit 0, `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0
 (after killing the repo's own running `ghoztty-agent.exe`, which held the install
 target). P1-P3 ALL PASS. New: `test/win32/chooser-sessions.ps1` ALL PASS (16).
+
+## 2026-08-01 - T319 (T146 split): the roster reaches another machine, and the relay finally has a stand-in
+
+The chooser's session roster now follows the selection to a REMOTE machine: a
+relay device's row dials that machine, runs `LIST_SESSIONS` over that
+connection, and shows its sessions with the same rows, badges and Kill. No new
+RPC - `Connection.requestSessions` is transport-agnostic - so the task was the
+dial, its ownership (dialled, read, freed; the local agent's warm connection is
+`LocalAgent`'s and is never touched here), and the per-row states. The pure half
+is `chooser_sessions.Target` + `transitionFor`, which is where Mac's
+`refreshInPlace` vs `fetchIfNeeded` distinction lives: re-selecting a machine
+must not flash its region back to `Loading`. Telling an expired credential apart
+from an unreachable machine needed one transport change - `ws_client` collapsed
+every non-101 into `WebSocketUpgradeFailed`, and now returns
+`WebSocketUnauthorized` on 401/403 - because "session expired" is the one dial
+failure a user can act on.
+
+The finding is a THIRD `row != .local` gate. Painting and the subtitle count
+both lost theirs; `sessionView` - hit-testing, hover, scroll - kept one, so a
+remote machine's cards drew and could not be clicked. It keys on the roster's
+own target now. A test caught it, not a reading.
+
+The bigger half is that none of this was testable. Every relay-dialled surface
+in the app goes through `relay_dial.dial`, and nothing on box could answer one:
+`activity-monitor-remote.ps1` says exactly that in its own header.
+`test/win32/lib/FakeRelay.ps1` is the stand-in - device directory and a real
+RFC 6455 upgrade bridged to a `ghoztty-agent --listen`, one port, one loop, with
+401/502 injection by device id and a trip file so a negative control can turn
+the relay off AFTER the fixture was built through it. It cost two bugs worth
+keeping: `[int] -shr 56` is silently `-shr 24` in .NET (the 8-byte frame length
+went out corrupt), and BOTH obvious peer-liveness probes are wrong -
+`TcpClient.Connected` reports the last I/O's state, and
+`Poll(SelectRead) && Available == 0` races the loop's own reads and tore down
+healthy bridges 30 ms after the upgrade, which reached the app as
+`error.ConnectionClosed`.
+
+What makes the count mean something is the fixture, not the assertion: the app
+runs with persistence off and every repo agent is killed first, so the Local row
+MUST resolve to `failed` while the device row loads 2. A roster that quietly
+enumerated this box would put the same number on both.
+
+Two follow-ups. **T328**: a Kill on a remote row loses its refetch - the close
+and the list behind it both fail (`ConnectionClosed`, sometimes `Timeout`, which
+is T326 exactly), so the row vanishes by optimistic hide while the count goes
+stale. A retry on a fresh dial WEDGED the worker and was reverted; the script
+prints a NOTE where that assertion belongs rather than asserting the bug green.
+**T329**: the fake relay makes T295's uncovered DIALED entry testable at last.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`test-agent` exit 0. P1-P3 ALL PASS. New:
+`test/win32/chooser-sessions-remote.ps1` ALL PASS (19) and `-NegativeControl`
+ALL PASS (13); `chooser-sessions.ps1` still ALL PASS (16).

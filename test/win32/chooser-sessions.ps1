@@ -103,61 +103,10 @@ function Get-Sessions {
 # found in four copies of the tab-strip datum.
 function Px([double]$dip, [double]$scale) { return [int][math]::Floor($dip * $scale + 0.5) }
 
-# The chooser's session region and the first card's Kill button, derived the
-# way `chooser_layout.layout` / `chooser_sessions.rowLayout` derive them. Every
-# number here is a pure DIP constant - nothing on this path comes from text
-# metrics, which is the only reason it can be re-derived at all (T256).
-function Get-RosterGeometry([double]$s) {
-    $margin = Px 16 $s
-    $gap = Px 8 $s
-    $controlH = Px 28 $s
-    $clientW = Px 840 $s
-    $clientH = Px 540 $s
-
-    $avatarD = Px 32 $s
-    $emailH = (Px 12 $s) + (Px 4 $s)
-    $linkH = (Px 14 $s) + (Px 4 $s)
-    $stackGap = Px 2 $s
-    $accountH = [math]::Max([math]::Max($avatarD, $emailH + $stackGap + $linkH), $controlH)
-    $headerDividerY = $gap + $accountH + $gap
-
-    $cancelTop = $clientH - $margin - $controlH
-    $footerDividerY = $cancelTop - $margin
-    $bodyTop = $headerDividerY + 1
-    $bodyBottom = $footerDividerY
-
-    $masterW = Px 260 $s
-    $detailLeft = $masterW + 1
-    $glyphW = Px 32 $s
-    $titleH = (Px 20 $s) + (Px 4 $s)
-    $subtitleH = (Px 12 $s) + (Px 4 $s)
-    $glyphBottom = $bodyTop + $margin + $glyphW
-    $subBottom = $bodyTop + $margin + $titleH + (Px 2 $s) + $subtitleH
-    $identityBottom = [math]::Max($glyphBottom, $subBottom)
-    $actionTop = $identityBottom + (Px 12 $s)
-
-    $left = $detailLeft + $margin
-    $right = $clientW - $margin
-    $top = $actionTop + $controlH + (Px 12 $s)
-    $bottom = $bodyBottom - $margin
-
-    # First card: padded on all sides, its Kill button a 28 DIP painted square
-    # against the trailing padding, centred on the title's line box.
-    $padX = Px 12 $s
-    $padY = Px 8 $s
-    $cardTitleH = (Px 14 $s) + (Px 4 $s)
-    $killW = Px 28 $s
-    $killX = $right - $padX - [int]([math]::Floor($killW / 2))
-    $killY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
-
-    return [pscustomobject]@{
-        Left = $left; Top = $top; Right = $right; Bottom = $bottom
-        KillX = $killX; KillY = $killY
-        # A point INSIDE the first card's fill and clear of every mark: one
-        # scale-step in from the card's left edge, on the title's line.
-        CardX = $left + (Px 4 $s); CardY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
-    }
-}
+# The chooser's session region and the first card's Kill button. Hoisted into
+# `lib\ChromeGeometry.ps1` in T319, the moment a SECOND script needed to click
+# the same Kill button - one datum, one implementation (T257).
+function Get-RosterGeometry([double]$s) { return Get-TestChooserRosterGeometry -Scale $s }
 
 function Launch-Gui($errlog, [string[]]$extra) {
     $args = @('--window-width=100', '--window-height=30') + $extra

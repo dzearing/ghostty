@@ -425,3 +425,72 @@ function Get-TestTabRunRight {
     if ($tabs.Count -eq 0) { return $m.PadL }
     return $tabs[$tabs.Count - 1].Right
 }
+
+# ---------------------------------------------------------------------------
+# The machine chooser's session roster (T318, hoisted here in T319)
+# ---------------------------------------------------------------------------
+#
+# Same rule as the tab strip above, for the same reason: `chooser-sessions.ps1`
+# derived this privately, and the moment a SECOND script needed to click the
+# same Kill button there were two copies of one datum - which is exactly the
+# shape T257 spent a task deleting four times over. It lives here now.
+#
+# Everything on this path is a pure DIP constant out of `chooser_layout.layout`
+# and `chooser_sessions.rowLayout`; nothing comes from text metrics, which is
+# the only reason it can be re-derived at all rather than measured (T256).
+function Get-TestChooserRosterGeometry {
+    param(
+        [Parameter(Mandatory = $true)][double]$Scale
+    )
+    $s = $Scale
+    $margin = Get-TestChromeDip 16 $s
+    $gap = Get-TestChromeDip 8 $s
+    $controlH = Get-TestChromeDip 28 $s
+    $clientW = Get-TestChromeDip 840 $s
+    $clientH = Get-TestChromeDip 540 $s
+
+    $avatarD = Get-TestChromeDip 32 $s
+    $emailH = (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 4 $s)
+    $linkH = (Get-TestChromeDip 14 $s) + (Get-TestChromeDip 4 $s)
+    $stackGap = Get-TestChromeDip 2 $s
+    $accountH = [math]::Max([math]::Max($avatarD, $emailH + $stackGap + $linkH), $controlH)
+    $headerDividerY = $gap + $accountH + $gap
+
+    $cancelTop = $clientH - $margin - $controlH
+    $footerDividerY = $cancelTop - $margin
+    $bodyTop = $headerDividerY + 1
+    $bodyBottom = $footerDividerY
+
+    $masterW = Get-TestChromeDip 260 $s
+    $detailLeft = $masterW + 1
+    $glyphW = Get-TestChromeDip 32 $s
+    $titleH = (Get-TestChromeDip 20 $s) + (Get-TestChromeDip 4 $s)
+    $subtitleH = (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 4 $s)
+    $glyphBottom = $bodyTop + $margin + $glyphW
+    $subBottom = $bodyTop + $margin + $titleH + (Get-TestChromeDip 2 $s) + $subtitleH
+    $identityBottom = [math]::Max($glyphBottom, $subBottom)
+    $actionTop = $identityBottom + (Get-TestChromeDip 12 $s)
+
+    $left = $detailLeft + $margin
+    $right = $clientW - $margin
+    $top = $actionTop + $controlH + (Get-TestChromeDip 12 $s)
+    $bottom = $bodyBottom - $margin
+
+    # First card: padded on all sides, its Kill button a 28 DIP painted square
+    # against the trailing padding, centred on the title's line box.
+    $padX = Get-TestChromeDip 12 $s
+    $padY = Get-TestChromeDip 8 $s
+    $cardTitleH = (Get-TestChromeDip 14 $s) + (Get-TestChromeDip 4 $s)
+    $killW = Get-TestChromeDip 28 $s
+    $killX = $right - $padX - [int]([math]::Floor($killW / 2))
+    $killY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
+
+    return [pscustomobject]@{
+        Left  = $left; Top = $top; Right = $right; Bottom = $bottom
+        KillX = $killX; KillY = $killY
+        # A point INSIDE the first card's fill and clear of every mark: one
+        # scale-step in from the card's left edge, on the title's line.
+        CardX = $left + (Get-TestChromeDip 4 $s)
+        CardY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
+    }
+}

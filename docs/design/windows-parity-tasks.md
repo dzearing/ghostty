@@ -443,9 +443,22 @@ Work these first, in order, before falling back to first-todo-in-table:
       - **T318** — the LOCAL machine's roster in the detail pane, Mac's label
         ladder (`liveTitle` → agent title → persisted title → cwd basename →
         argv → `pid N`), and Kill.
-      - **T319** — the same roster for a REMOTE machine over the relay. No new
-        RPC; the work is the dial, its ownership, and per-row failure that
-        never becomes a modal.
+      - **~~T319~~ (done, 2026-08-01)** — the same roster for a REMOTE machine
+        over the relay. The prediction held: no new RPC, and the work was the
+        dial, its ownership, and the per-row failures. Two things it turned up.
+        A **third** `row != .local` gate, in `sessionView` — painting and the
+        subtitle had lost theirs, so a remote machine's cards drew and could not
+        be clicked; and `ws_client` collapsed every non-101 into one error, so a
+        rejected bearer could not be told from an unreachable relay (it returns
+        `WebSocketUnauthorized` on 401/403 now).
+        The bigger half is that **no relay-dialled surface had ever been
+        exercised on box** — `activity-monitor-remote.ps1` says so in its own
+        header. `test/win32/lib/FakeRelay.ps1` is the stand-in: directory +
+        a real WebSocket upgrade bridged to a `ghoztty-agent --listen`, with
+        401/502 injection and a trip file. Follow-ups **T328** (a Kill on a
+        remote row loses its refetch — the NOTE the script prints instead of
+        asserting the bug green) and **T329** (T295's uncovered DIALED entry is
+        testable at last).
       - **T320** — resume ONE browsed session. Two Mac rules carry it: only
         ALIVE sessions attach (a *relaunchable* tombstone needs `RELAUNCH`,
         a different verb), and the keyboard sub-cursor's index space must equal

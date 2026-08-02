@@ -731,10 +731,10 @@ pub fn open(window: *Window) void {
 
     window.machine_chooser = self;
 
-    // Prime the local roster the moment the dialog opens (Mac's `primeLocal`),
-    // so the count is in the detail subtitle before the user has looked at it.
-    // Off-thread, so this costs the dialog nothing.
-    self.roster.fetch(window.app, self.id, null);
+    // Prime the selected row's roster the moment the dialog opens (Mac's
+    // `primeLocal`), so the count is in the detail subtitle before the user has
+    // looked at it. Off-thread, so this costs the dialog nothing.
+    self.syncRoster();
 
     _ = w32.EnableWindow(owner, 0);
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
@@ -1329,7 +1329,7 @@ fn detailSubtitle(
     row: Row,
     base: []const u8,
 ) []const u8 {
-    if (row != .local) return base;
+    _ = row;
     if (self.roster.state != .loaded) return base;
 
     var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
@@ -1340,12 +1340,11 @@ fn detailSubtitle(
     return std.fmt.bufPrint(buf, "{s} - {s}", .{ count, base }) catch base;
 }
 
-/// Paint the roster region for the selected row. Only the Local row has a
-/// roster today; a remote machine's comes over its own transport in T319, and
-/// until then its pane keeps the region empty rather than showing the local
-/// machine's sessions under a remote heading.
+/// Paint the roster region for the selected row. Every row has one since T319 —
+/// the local agent's, or a relay machine's over its own short-lived dial — and
+/// the roster paints nothing at all when it is pointed at no machine.
 fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void {
-    if (row != .local) return;
+    _ = row;
     var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const visible = self.roster.visible(self.window.app, &rows);
     self.roster.paint(.{
@@ -1372,6 +1371,28 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
     log.debug("chooser roster: reply landed after its chooser closed", .{});
 }
 
+/// Point the roster at whatever row is selected (T319). Called on open and on
+/// every selection change; the roster itself decides whether that means a fresh
+/// fetch, a refresh in place, or nothing at all.
+fn syncRoster(self: *MachineChooser) void {
+    var target: chooser_sessions.Target = .none;
+    var remote: ?SessionRoster.Remote = null;
+    if (self.selectedRow()) |row| switch (row) {
+        .local => target = .local,
+        .device => |i| if (i < self.devices.len) {
+            target = .{ .remote = self.devices[i].id };
+            // No credential leaves `remote` null, which the roster reads as the
+            // signed-out state and says so — it does not dial and fail.
+            if (self.token) |tok| remote = .{
+                .base = self.relay_base,
+                .device = self.devices[i].id,
+                .token = tok,
+            };
+        },
+    };
+    if (self.roster.show(self.window.app, self.id, target, remote)) self.refreshSessions();
+}
+
 /// Repaint the detail pane after the roster changed. The subtitle's count lives
 /// there too, so this is one invalidate and not two.
 fn refreshSessions(self: *MachineChooser) void {
@@ -1394,6 +1415,10 @@ fn refreshDetail(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
     var r = rect(l.detail);
     _ = w32.InvalidateRect(self.hwnd, &r, 1);
+    // The roster follows the selection (T319). Before the repaint below, so a
+    // move to another machine blanks the region in the SAME frame the header
+    // changes — a stale roster under a new machine name is the defect.
+    self.syncRoster();
     const row = self.selectedRow();
     _ = w32.ShowWindow(
         self.primary_btn,
@@ -2221,8 +2246,11 @@ fn sessionView(
     self: *MachineChooser,
     rows: []SessionRoster.VisibleRow,
 ) ?struct { region: chooser_layout.Rect, rows: []const SessionRoster.VisibleRow } {
-    const row = self.selectedRow() orelse return null;
-    if (row != .local) return null;
+    // The ROSTER's target decides, not the selected row: the two agree, but a
+    // second reading of "does this row have a roster" is a second place for
+    // them to stop agreeing. A remote machine's rows are hit-tested, hovered
+    // and killed exactly like the local agent's (T319).
+    if (self.roster.target == .none) return null;
     const l = layout(self.window.scale, self.hint_lines);
     return .{ .region = l.sessions, .rows = self.roster.visible(self.window.app, rows) };
 }
