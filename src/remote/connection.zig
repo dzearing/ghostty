@@ -1684,6 +1684,43 @@ pub const Connection = struct {
         if (!parsed.value.ok) return error.SetLayoutFailed;
     }
 
+    /// Fire-and-forget `SET_LAYOUT`: the same frame as `setLayout`, but it does
+    /// NOT register an RPC slot and does not wait for the ack (the agent's
+    /// `SET_LAYOUT_RESULT` lands on a channel nobody claimed and is dropped —
+    /// see the `.set_layout_result` arm of the control reader). Mirrors
+    /// `closeSessionNoWait`, and for the same reason.
+    ///
+    /// The caller is a UI thread mirroring its window topology as housekeeping
+    /// (win32's `App.syncSessionLayout`, T334): it pushes one frame per window
+    /// on every layout mutation, does nothing with the answer, and must not
+    /// stall a repaint on an agent hiccup — a bounded RPC there would cost the
+    /// whole timeout, per window, in front of a user who is dragging a split.
+    /// `enqueue` only appends to the writer thread's queue, so this never
+    /// touches the socket on the calling thread.
+    ///
+    /// Ungated by design: unlike `close_session`, the `SET_LAYOUT`/`GET_LAYOUTS`
+    /// opcodes shipped in the same commit as the agent handler that answers them
+    /// (43bfb8e4a, 2026-07-16), which predates every `ghoztty-agent` binary that
+    /// has ever run on Windows — so there is no skew window in which a peer
+    /// could see this opcode as unknown.
+    pub fn setLayoutNoWait(
+        self: *Connection,
+        key: []const u8,
+        blob: ?[]const u8,
+        session_ids: []const []const u8,
+        delete: bool,
+    ) !void {
+        const set: protocol.SetLayout = .{
+            .key = key,
+            .blob = blob,
+            .session_ids = session_ids,
+            .delete = delete,
+        };
+        const json = try protocol.encodeJson(self.alloc, set);
+        defer self.alloc.free(json);
+        try self.writeControl(.set_layout, std.crypto.random.int(u128), json);
+    }
+
     /// Fetch every stored layout blob (§5.4 "Resume all", T18). Sends
     /// `GET_LAYOUTS{}` and awaits `LAYOUTS{layouts:[...]}`, returning the RAW reply
     /// payload JSON duped into `self.alloc` (the caller — the Swift resumer —

@@ -5832,3 +5832,51 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
 Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/chooser-resume.ps1` ALL PASS (21); `chooser-sessions.ps1` still ALL
 PASS (16).
+
+## 2026-08-02 - T321 split -> T334: this machine was invisible to Restore All, because it pushed nothing
+
+T321 (agent-owned layout blobs + Restore All) was split before it was started.
+Reading its three parts against the code turned up a fourth nobody had scoped:
+**win32 pushes no layout blobs at all.** `grep -rn "setLayout|requestLayouts"
+src/apprt/win32/` matches only doc comments, and the sole `Connection.setLayout`
+caller in the tree is `embedded.zig:2909` - the C API Mac's
+`LocalAgentManager.pushLayout` uses. So the store Restore All reads from is
+always empty here, and a Windows machine cannot be restored from anywhere,
+including from itself. Children: **T334** (this), **T335** (the button, the
+`>= 2 alive` rule, the LOCAL rebuild, the CLAUDE.md correction), **T336** (the
+cross-machine half; it closes T146). **T337** came out of the same reading and
+is not a child: the blob schema is lineage-shaped, so a Mac viewer decodes
+nothing from a Windows machine and vice versa.
+
+T334 is the plumbing. `Connection.setLayoutNoWait` is the fire-and-forget
+`SET_LAYOUT` (mirroring `closeSessionNoWait`): `enqueue` only appends to the
+writer thread's queue, so the mirror never touches the socket on the UI thread.
+It is deliberately ungated where `close_session` is gated, and the reason is
+checkable: these opcodes shipped in the SAME commit as the agent handler that
+answers them (`43bfb8e4a`, 2026-07-16), which predates every `ghoztty-agent.exe`
+that has ever run - there is no skew window. `layout_blobs.zig` (new, pure, in
+the every-lane test block) is the two conversions: a window out to blob +
+session ids, and a `LAYOUTS` reply back to replayable windows. A malformed INNER
+blob is skipped and counted; a malformed OUTER payload is an error, because
+answering "no windows" over a transport fault is the failure that looks like
+success.
+
+The design decision worth keeping is that the push is a **reconcile, not an
+edit**. There is no window-close hook: each sync re-pushes only what changed and
+DELETES every tracked key that is no longer live. That same property is what
+makes the manifest's index-derived key safe - closing window 0 renames window 1
+to `win-0`, and one pass pushes the new bytes and deletes the absent `win-1`.
+
+Two lessons from the acceptance script, both about asserting too early. The
+session id a record claims is NOT present on the first push (the pane publishes
+it asynchronously; `syncSessionLayout` already re-arms a retry for exactly
+this), so the script waits for the record to settle rather than to exist. And PS
+5.1's array unrolling failed only the SIMPLE case: the single-leaf window came
+back from a helper as a bare `PSCustomObject` with a `$null` `.Count`, while the
+three-node split tree survived - so the trap passed the interesting assertion
+and failed the trivial one, which reads exactly like a product bug in the
+single-pane path.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
+Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
+`test/win32/layout-blobs.ps1` ALL PASS twice (21 assertions).

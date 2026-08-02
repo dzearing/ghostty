@@ -464,11 +464,23 @@ Work these first, in order, before falling back to first-todo-in-table:
         a different verb), and the keyboard sub-cursor's index space must equal
         the rendered list's — the bug T312 just finished proving this list is
         prone to.
-      - **T321** — agent-owned layout blobs + **Restore All** (the
-        `chooser_layout.Composition.restore_all` flag T177 left named and
-        unset), offered only at ≥ 2 alive sessions. It also owns the correction
-        of CLAUDE.md's stale *"scoped but not yet built"* claim, landing in the
-        same commit that makes the statement true on both platforms.
+      - **~~T321~~ (split 2026-08-02 → T334 → T335 → T336)** — agent-owned
+        layout blobs + **Restore All**. Split before it was started: reading its
+        three parts against the code turned up a fourth nobody had scoped —
+        **win32 pushes no layout blobs at all**, so the agent Restore All reads
+        from is always empty here (only `embedded.zig:2909`, Mac's C API, ever
+        calls `Connection.setLayout`). **T334** is that plumbing (SET_LAYOUT on
+        sync + delete on close, GET_LAYOUTS decode); **T335** is the button, the
+        ≥ 2-alive rule, the LOCAL rebuild through the existing
+        `App.restoreWindow`, and the CLAUDE.md correction; **T336** is the
+        cross-machine half and closes T146 — separated because win32 windows
+        each OWN their transport where Mac hands every rebuilt window one
+        connection, so N windows is N dials or a stated sharing rule.
+        **T337** came out of the same reading and is not a child: the blob
+        schema is *lineage-shaped* (Mac pushes camelCase
+        `SessionLayoutManifest.Entry`, win32 will push snake_case flat-node
+        `session_layout.Window`), so cross-machine Restore All works within a
+        lineage and silently shows "nothing to restore" across one.
 
       **T322** came out of the same reading and should be settled before T318
       renders a row: `relaunchable` exists on the wire (`protocol.zig:576`) and

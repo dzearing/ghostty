@@ -37,6 +37,7 @@ const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const session_layout = @import("session_layout.zig");
+const layout_blobs = @import("layout_blobs.zig");
 const agent_recovery = @import("agent_recovery.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -156,6 +157,22 @@ wakeup_pending: std.atomic.Value(bool) = .init(false),
 /// async). Incremented each pending re-arm, reset to 0 once a capture finds
 /// every agent-backed leaf resolved (or the ceiling is hit).
 layout_sid_retries: u16 = 0,
+
+/// What we last mirrored to the local agent's layout-blob store (T334), keyed
+/// by manifest window id with the pushed blob's hash as the value. Keys are
+/// owned by this map.
+///
+/// It exists to keep the push CHEAP and CONVERGENT: a sync re-pushes only the
+/// windows whose bytes actually changed, and every key that is no longer in the
+/// live topology is deleted — which is what makes a window CLOSE remove its
+/// blob without a separate close hook, and what makes index-derived keys
+/// (`win-0`, `win-1`) safe despite shifting when an earlier window closes.
+pushed_layouts: std.StringHashMapUnmanaged(u64) = .empty,
+
+/// The connection `pushed_layouts` describes. A reconnect (agent restart, link
+/// recovery) means the peer's store is not the one we tracked, so the map is
+/// dropped and the whole topology re-pushed rather than assumed present.
+pushed_layouts_conn: ?*remote_connection.Connection = null,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -975,6 +992,13 @@ pub fn terminate(self: *App) void {
     // Free the IPC target registry (keys are owned).
     self.ipc_registry.deinit(alloc);
 
+    // Layout-blob bookkeeping (T334): the agent KEEPS the blobs on purpose —
+    // they are what makes this machine restorable after we exit — so this frees
+    // only our own key strings.
+    self.clearPushedLayouts();
+    self.pushed_layouts.deinit(alloc);
+    self.pushed_layouts_conn = null;
+
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
         self.bg_brush = null;
@@ -1052,6 +1076,9 @@ pub fn syncSessionLayout(self: *App) void {
     const gpa = self.core_app.alloc;
     if (!self.config.@"session-persistence") {
         session_layout.clear(gpa);
+        // Persistence just went off (or was never on): the agent must not keep
+        // offering this machine's windows for restore either.
+        self.pushLayoutBlobs(.{});
         return;
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1062,6 +1089,7 @@ pub fn syncSessionLayout(self: *App) void {
         return;
     };
     session_layout.write(gpa, file);
+    self.pushLayoutBlobs(file);
 
     // If an agent-backed pane hasn't published its session id yet, the manifest
     // just written has a null session_id for it (not re-attachable). Re-arm a
@@ -1074,6 +1102,111 @@ pub fn syncSessionLayout(self: *App) void {
     } else {
         self.layout_sid_retries = 0;
     }
+}
+
+/// Mirror the just-captured topology to the LOCAL agent's layout-blob store
+/// (T334) — one `SET_LAYOUT{key, blob, session_ids}` per window, plus a delete
+/// for every key that is no longer in the topology.
+///
+/// This is what makes a Windows machine visible to "Restore All" (§5.4/T18):
+/// the agent holds the blobs, so another viewer — this box after a quit, or a
+/// different machine over the relay — can rebuild the whole window/tab/split
+/// topology from the AGENT's copy rather than from a local file it does not
+/// have. The macOS analog is `LocalAgentManager.pushLayout`/`deleteLayout`.
+///
+/// Three properties, each load-bearing:
+///
+///   * **Non-spawning.** `sharedConnectionIfWarm` never dials and never starts
+///     an agent (Mac's `warmSharedOwner` rule). Mirroring a layout is
+///     housekeeping; it must not be the thing that launches a daemon.
+///   * **Non-blocking.** `setLayoutNoWait` only enqueues the frame for the
+///     writer thread, so this runs on the UI thread between a split drag and
+///     its repaint without waiting on any ack.
+///   * **Convergent.** The push is a full RECONCILE against `pushed_layouts`,
+///     not an incremental edit: unchanged windows cost nothing, changed windows
+///     are re-pushed, and vanished keys are deleted. That is what lets the key
+///     be the manifest's index-derived id — closing window 0 renames window 1
+///     to `win-0`, and the reconcile pushes `win-0`'s new bytes and deletes the
+///     now-absent `win-1` in the same pass.
+fn pushLayoutBlobs(self: *App, file: session_layout.File) void {
+    const gpa = self.core_app.alloc;
+
+    const conn = self.local_agent.sharedConnectionIfWarm() orelse {
+        // No agent to mirror to. Keep the map: if this is a transient link
+        // drop, the identity check below re-pushes everything once a new
+        // connection appears.
+        return;
+    };
+    // A different connection ⇒ a store we have never written to (an agent
+    // restart materializes its blobs from disk, but we cannot know they match
+    // what we last sent). Forget what we think we pushed and send it all again.
+    if (self.pushed_layouts_conn != conn) {
+        self.clearPushedLayouts();
+        self.pushed_layouts_conn = conn;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Pass 1: upsert every window whose bytes changed.
+    var live: std.StringHashMapUnmanaged(void) = .empty;
+    defer live.deinit(gpa);
+    for (file.windows) |win| {
+        live.put(gpa, win.id, {}) catch {};
+
+        const blob = layout_blobs.serializeWindow(arena, win) catch |err| {
+            log.warn("layout push: serialize '{s}' failed err={}", .{ win.id, err });
+            continue;
+        };
+        const hash = layout_blobs.blobHash(blob);
+        if (self.pushed_layouts.get(win.id)) |prev| {
+            if (prev == hash) continue;
+        }
+        const ids = layout_blobs.sessionIds(arena, win) catch |err| {
+            log.warn("layout push: session ids for '{s}' failed err={}", .{ win.id, err });
+            continue;
+        };
+        conn.setLayoutNoWait(win.id, blob, ids, false) catch |err| {
+            log.warn("layout push: SET_LAYOUT '{s}' failed err={}", .{ win.id, err });
+            continue;
+        };
+        // Own the key: `win.id` lives in the caller's capture arena.
+        const gop = self.pushed_layouts.getOrPut(gpa, win.id) catch continue;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = gpa.dupe(u8, win.id) catch {
+                _ = self.pushed_layouts.remove(win.id);
+                continue;
+            };
+        }
+        gop.value_ptr.* = hash;
+    }
+
+    // Pass 2: delete the keys that are gone (a closed window, a renamed one).
+    var stale: std.ArrayList([]const u8) = .empty;
+    defer stale.deinit(gpa);
+    var it = self.pushed_layouts.iterator();
+    while (it.next()) |entry| {
+        if (live.contains(entry.key_ptr.*)) continue;
+        stale.append(gpa, entry.key_ptr.*) catch continue;
+    }
+    for (stale.items) |key| {
+        conn.setLayoutNoWait(key, null, &.{}, true) catch |err| {
+            log.warn("layout push: delete '{s}' failed err={}", .{ key, err });
+            continue;
+        };
+        if (self.pushed_layouts.fetchRemove(key)) |kv| gpa.free(kv.key);
+    }
+}
+
+/// Drop the pushed-blob bookkeeping (and its owned keys). Does NOT touch the
+/// agent's store — the caller either has no connection to it or is about to
+/// re-push everything.
+fn clearPushedLayouts(self: *App) void {
+    const gpa = self.core_app.alloc;
+    var it = self.pushed_layouts.iterator();
+    while (it.next()) |entry| gpa.free(entry.key_ptr.*);
+    self.pushed_layouts.clearRetainingCapacity();
 }
 
 const FrameCapture = struct {

@@ -187,6 +187,11 @@ test {
     // Windows / in the none lane).
     _ = @import("apprt/win32/session_layout.zig");
 
+    // Pure win32 agent-owned layout blobs — one window in and out of the
+    // SET_LAYOUT/GET_LAYOUTS wire shape (T334), same no-OS-imports deal (its
+    // only non-std import is `remote/protocol.zig`, which builds in every lane).
+    _ = @import("apprt/win32/layout_blobs.zig");
+
     // Pure win32 local-agent crash-recovery policy: when a dropped shared link
     // is a real drop, and whose session a tree swap may never end (T145). Its
     // only non-std import is the shared-core `remote/connection.zig` link-state
