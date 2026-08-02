@@ -415,6 +415,86 @@ pub const ProcSampler = struct {
     }
 };
 
+/// Sum `cpu_pct` over `root` and every transitive descendant of it in `procs`.
+///
+/// Used for the per-session CPU roll-up: a session is busy because the agent
+/// running inside it is busy, not because its shell is, so the number the chooser
+/// wants covers the whole tree hanging off the session's child pid.
+///
+/// Walks a ppid→children adjacency map built once per call by the caller (see
+/// `childMap`), so rolling up N sessions over one snapshot stays linear rather
+/// than rescanning the table per session. Robust to cycles (a visited set — a
+/// corrupt/racy ppid must not hang the pump) and to a root that isn't present
+/// (returns 0).
+fn subtreeCpu(
+    children: *const std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(i64)),
+    cpu_by_pid: *const std.AutoHashMapUnmanaged(i64, f32),
+    root: i64,
+    scratch: *std.ArrayListUnmanaged(i64),
+    seen: *std.AutoHashMapUnmanaged(i64, void),
+    alloc: Allocator,
+) f32 {
+    scratch.clearRetainingCapacity();
+    seen.clearRetainingCapacity();
+    if (cpu_by_pid.get(root) == null) return 0;
+    scratch.append(alloc, root) catch return 0;
+    seen.put(alloc, root, {}) catch return 0;
+
+    var total: f32 = 0;
+    while (scratch.pop()) |pid| {
+        total += cpu_by_pid.get(pid) orelse 0;
+        const kids = children.get(pid) orelse continue;
+        for (kids.items) |kid| {
+            if (seen.contains(kid)) continue;
+            seen.put(alloc, kid, {}) catch continue;
+            scratch.append(alloc, kid) catch continue;
+        }
+    }
+    return total;
+}
+
+/// Per-session CPU totals for `roots`, computed over one process snapshot.
+///
+/// `out` is filled in the same order as `roots` (0 for a root that isn't in the
+/// snapshot — an exited session, or one clipped by the row cap). Caller owns
+/// `out`, which must already have `roots.len` capacity.
+pub fn rollUpByRoot(
+    alloc: Allocator,
+    procs: []const protocol.Proc,
+    roots: []const i64,
+    out: []f32,
+) void {
+    @memset(out, 0);
+    if (roots.len == 0 or procs.len == 0) return;
+
+    var children: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(i64)) = .empty;
+    var cpu_by_pid: std.AutoHashMapUnmanaged(i64, f32) = .empty;
+    defer {
+        var it = children.valueIterator();
+        while (it.next()) |list| list.deinit(alloc);
+        children.deinit(alloc);
+        cpu_by_pid.deinit(alloc);
+    }
+
+    for (procs) |p| {
+        cpu_by_pid.put(alloc, p.pid, p.cpu_pct) catch continue;
+        const gop = children.getOrPut(alloc, p.ppid) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(alloc, p.pid) catch {};
+    }
+
+    var scratch: std.ArrayListUnmanaged(i64) = .empty;
+    var seen: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    defer {
+        scratch.deinit(alloc);
+        seen.deinit(alloc);
+    }
+
+    for (roots, 0..) |root, i| {
+        out[i] = subtreeCpu(&children, &cpu_by_pid, root, &scratch, &seen, alloc);
+    }
+}
+
 /// Convert a mach-absolute-time tick count to nanoseconds given a
 /// `mach_timebase_info` ratio (`ns = ticks * numer / denom`).
 ///
@@ -766,6 +846,42 @@ test "perCorePct: per-core busy fraction" {
     try testing.expectEqual(@as(f32, 0.0), perCorePct(0, 1000, 0));
     // Non-monotonic busy (recycled pid) → 0, never negative.
     try testing.expectEqual(@as(f32, 0.0), perCorePct(1000, 500, 100 * std.time.ns_per_ms));
+}
+
+test "rollUpByRoot: sums a session's whole process tree" {
+    const alloc = testing.allocator;
+    // A pane's shell (100) with claude (200) under it, claude's node worker (300),
+    // and a setsid'd Bash-tool grandchild (400 → 500). Plus an unrelated tree (900)
+    // that must NOT leak into the total.
+    const procs = [_]protocol.Proc{
+        .{ .pid = 100, .ppid = 1, .name = "zsh", .cpu_pct = 1 },
+        .{ .pid = 200, .ppid = 100, .name = "claude", .cpu_pct = 10 },
+        .{ .pid = 300, .ppid = 200, .name = "node", .cpu_pct = 100 },
+        .{ .pid = 400, .ppid = 200, .name = "bash", .cpu_pct = 2 },
+        .{ .pid = 500, .ppid = 400, .name = "jq", .cpu_pct = 50 },
+        .{ .pid = 900, .ppid = 1, .name = "other", .cpu_pct = 77 },
+    };
+    var out: [3]f32 = undefined;
+    // Root 100 = the whole session; root 200 = just claude's side; root 12345 is
+    // absent from the snapshot (an exited session) and must read 0, not garbage.
+    rollUpByRoot(alloc, &procs, &.{ 100, 200, 12345 }, &out);
+    try testing.expectEqual(@as(f32, 163), out[0]); // 1+10+100+2+50
+    try testing.expectEqual(@as(f32, 162), out[1]); // 10+100+2+50
+    try testing.expectEqual(@as(f32, 0), out[2]);
+}
+
+test "rollUpByRoot: a ppid cycle terminates instead of hanging the pump" {
+    const alloc = testing.allocator;
+    // 100 → 200 → 300 → 100. A corrupt or racy ppid read must not spin forever;
+    // each pid is counted exactly once.
+    const procs = [_]protocol.Proc{
+        .{ .pid = 100, .ppid = 300, .name = "a", .cpu_pct = 1 },
+        .{ .pid = 200, .ppid = 100, .name = "b", .cpu_pct = 2 },
+        .{ .pid = 300, .ppid = 200, .name = "c", .cpu_pct = 4 },
+    };
+    var out: [1]f32 = undefined;
+    rollUpByRoot(alloc, &procs, &.{100}, &out);
+    try testing.expectEqual(@as(f32, 7), out[0]);
 }
 
 test "machTicksToNs: converts mach absolute time units to nanoseconds" {

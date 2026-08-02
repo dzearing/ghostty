@@ -594,6 +594,27 @@ const ghostty_host_metrics_s = extern struct {
 /// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
 const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
 
+/// One session's CPU roll-up, pushed on the `session_cpu` stream. `id` is a
+/// NUL-terminated session id; `cpu_pct` is per-core over the session's WHOLE
+/// process tree (so a session running four busy threads reads ~400).
+const ghostty_session_cpu_s = extern struct {
+    id: [*:0]const u8,
+    cpu_pct: f32,
+};
+
+/// Callback for one pushed per-session CPU sample. `rows`/`rows_len` and every
+/// string they point at are valid ONLY for the duration of the call — the
+/// decode arena is released as soon as it returns, so copy anything you keep.
+/// `interval_ms` is the cadence the AGENT chose, which may be longer than the
+/// one requested (it throttles itself under load); a client can use it to tell a
+/// slow stream from a dead one. Fires on the connection's control-reader thread.
+const GhosttySessionCpuCallback = *const fn (
+    ?[*]const ghostty_session_cpu_s,
+    usize,
+    u32,
+    ?*anyopaque,
+) callconv(.c) void;
+
 /// Callback invoked on every connection link-state transition (§5.1 FSM;
 /// WP-D1 connection-status surface). `state` is a `GHOSTTY_REMOTE_CONN_*`
 /// value (the integer mirror of `connection.LinkState.State`). NOTE: it fires
@@ -662,6 +683,13 @@ pub const RemoteConnectionHandle = struct {
         userdata: ?*anyopaque,
     };
 
+    /// Trampoline state for the per-session CPU callback. Same pinning
+    /// discipline as `metrics_cb`.
+    pub const SessionCpuTrampoline = struct {
+        cb: GhosttySessionCpuCallback,
+        userdata: ?*anyopaque,
+    };
+
     /// Trampoline state for the link-state callback (WP-D1): the C callback +
     /// the caller's opaque `userdata`. Stored inline on the handle (stable for
     /// the handle's life) so its address can serve as the Zig `StateHandler`
@@ -693,6 +721,10 @@ pub const RemoteConnectionHandle = struct {
     /// `&self.metrics_cb.?` as the handler ctx, so it must stay pinned for the
     /// life of the subscription (the handle is heap-allocated and stable).
     metrics_cb: ?MetricsTrampoline = null,
+
+    /// Trampoline for the pushed per-session CPU stream, or null when not
+    /// subscribed. Pinned inline like `metrics_cb`.
+    session_cpu_cb: ?SessionCpuTrampoline = null,
 
     /// Trampoline state for the link-state observer (WP-D1), or null when not
     /// registered. Same pinning discipline as `metrics_cb`: lives inline on the
@@ -2972,6 +3004,76 @@ pub const CAPI = struct {
             return false;
         };
         return true;
+    }
+
+    /// Bridge one pushed per-session CPU sample to the C callback.
+    ///
+    /// The wire rows carry Zig slices (pointer+length, NOT NUL-terminated), so the
+    /// ids must be re-materialized as C strings. That needs an allocation, and this
+    /// runs on the control-reader thread on every push — so it uses one stack
+    /// buffer with a bounded row count rather than touching the heap on a hot,
+    /// non-main thread. A machine with more sessions than the cap reports the first
+    /// `max_rows`; the meter is a glanceable indicator, not an inventory (that's
+    /// what `+sessions` is for).
+    fn sessionCpuTrampoline(
+        ctx: *anyopaque,
+        rows: []const remote_protocol.SessionCpuRow,
+        interval_ms: u32,
+    ) void {
+        const tramp: *const RemoteConnectionHandle.SessionCpuTrampoline = @ptrCast(@alignCast(ctx));
+
+        const max_rows = 128;
+        const max_id = 64;
+        var c_rows: [max_rows]ghostty_session_cpu_s = undefined;
+        var id_buf: [max_rows][max_id]u8 = undefined;
+
+        var n: usize = 0;
+        for (rows) |r| {
+            if (n >= max_rows) break;
+            // Skip (rather than truncate) an id that cannot round-trip: a
+            // truncated id would silently address the WRONG session.
+            if (r.id.len == 0 or r.id.len >= max_id) continue;
+            @memcpy(id_buf[n][0..r.id.len], r.id);
+            id_buf[n][r.id.len] = 0;
+            c_rows[n] = .{ .id = @ptrCast(&id_buf[n]), .cpu_pct = r.cpu_pct };
+            n += 1;
+        }
+
+        tramp.cb(&c_rows, n, interval_ms, tramp.userdata);
+    }
+
+    /// Subscribe to the pushed per-session CPU stream (§9.3 chooser meters).
+    ///
+    /// Returns false when the agent did not advertise the `session_cpu`
+    /// capability — an older agent that would treat the opcode as a fatal framing
+    /// error. Callers render no meter in that case rather than falling back to a
+    /// poll the agent never agreed to.
+    ///
+    /// `interval_ms` is a HINT. The agent floors it and stretches it under load,
+    /// and reports the cadence it actually used in every callback.
+    export fn ghostty_remote_connection_session_cpu_subscribe(
+        handle: *RemoteConnectionHandle,
+        interval_ms: u32,
+        callback: GhosttySessionCpuCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        handle.session_cpu_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeSessionCpu(interval_ms, &handle.session_cpu_cb.?, sessionCpuTrampoline) catch {
+            handle.session_cpu_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed per-session CPU stream and clear the callback. After this
+    /// returns no further callback fires. Safe when not subscribed (no-op), and
+    /// safe against an older agent (the gated opcode is simply never sent).
+    export fn ghostty_remote_connection_session_cpu_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeSessionCpu();
+        handle.session_cpu_cb = null;
     }
 
     /// Stop the pushed metrics stream and clear the callback. After this returns no

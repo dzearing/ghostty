@@ -262,6 +262,17 @@ pub const Server = struct {
     metrics_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
     metrics_stop: bool = false,
 
+    /// Per-session CPU push pump (`session_cpu`). Same shape and same lifetime
+    /// discipline as the metrics pump above: a per-connection thread, lazily
+    /// spawned on the first `session_cpu_sub`, torn down on unsub or shutdown,
+    /// joined before the Server dies. Separate from the metrics pump because the
+    /// two run at different cadences and this one throttles itself under load.
+    session_cpu_thread: ?std.Thread = null,
+    session_cpu_mutex: std.Thread.Mutex = .{},
+    session_cpu_cond: std.Thread.Condition = .{},
+    session_cpu_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
+    session_cpu_stop: bool = false,
+
     /// Process-table sampler for `proc_list` (§9.3 process view). Unlike the metrics
     /// pump it needs no thread: `proc_list` is request/reply, sampled synchronously on
     /// the control reader. It holds per-pid CPU baselines across calls so a repeated
@@ -282,6 +293,7 @@ pub const Server = struct {
             protocol.capability.flow,
             protocol.capability.close_session,
             protocol.capability.grid_snapshot,
+            protocol.capability.session_cpu,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -392,6 +404,7 @@ pub const Server = struct {
         // outlive the Server (the just-fixed UAF class). Signalling stop wakes its
         // timed cond wait immediately rather than waiting out the interval.
         self.stopMetricsPump();
+        self.stopSessionCpuPump();
         self.signalClose();
         self.control.close();
         self.data.close();
@@ -701,6 +714,8 @@ pub const Server = struct {
             .flow => self.handleFlow(frame.payload),
             .metrics_sub => self.handleMetricsSub(frame.payload),
             .metrics_unsub => self.handleMetricsUnsub(),
+            .session_cpu_sub => self.handleSessionCpuSub(frame.payload),
+            .session_cpu_unsub => self.handleSessionCpuUnsub(),
             .proc_list => self.handleProcList(frame.channel, frame.payload),
             .proc_kill => self.handleProcKill(frame.channel, frame.payload),
             .proc_spawn => self.handleProcSpawn(frame.channel, frame.payload),
@@ -1572,6 +1587,161 @@ pub const Server = struct {
             self.metrics_mutex.unlock();
             if (stop) return;
         }
+    }
+
+    // --- Per-session CPU push stream (`session_cpu`) --------------------------
+
+    /// The cadence the agent actually uses for the per-session CPU stream.
+    ///
+    /// The client's `requested_ms` is a HINT, not a mandate. This is a push
+    /// stream precisely so the machine doing the work decides how much work to
+    /// do: the chooser has no idea whether the agent is idle or pinned, and a
+    /// fixed client-side poll would hammer a box exactly when it can least
+    /// afford it.
+    ///
+    /// So: clamp up to a floor (a hostile or zero interval must not busy-spin the
+    /// pump), then stretch under load, then cap. The cap matters as much as the
+    /// backoff — a throttle with no ceiling silently becomes a hang, and the
+    /// client is told the real interval in every frame so it can distinguish a
+    /// slow stream from a dead one.
+    pub fn throttledIntervalMs(requested_ms: u32, host_cpu_pct: f32) u32 {
+        const floor_ms: u32 = 500;
+        const cap_ms: u32 = 10_000;
+        var v: u32 = @max(requested_ms, floor_ms);
+        if (host_cpu_pct >= 85) {
+            v *|= 4;
+        } else if (host_cpu_pct >= 60) {
+            v *|= 2;
+        }
+        return @min(v, cap_ms);
+    }
+
+    /// `SESSION_CPU_SUB`: start (or re-interval) the per-session CPU pump.
+    fn handleSessionCpuSub(self: *Server, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.SessionCpuSub, self.alloc, payload) catch return;
+        defer parsed.deinit();
+
+        self.session_cpu_mutex.lock();
+        self.session_cpu_interval_ms = parsed.value.interval_ms;
+        const need_spawn = self.session_cpu_thread == null;
+        if (need_spawn) self.session_cpu_stop = false;
+        self.session_cpu_cond.signal(); // wake an existing pump for the new hint
+        self.session_cpu_mutex.unlock();
+
+        if (need_spawn) {
+            self.session_cpu_thread = std.Thread.spawn(.{}, sessionCpuPumpLoop, .{self}) catch null;
+        }
+    }
+
+    /// `SESSION_CPU_UNSUB`: stop + join the pump (idempotent).
+    fn handleSessionCpuUnsub(self: *Server) void {
+        self.stopSessionCpuPump();
+    }
+
+    /// Signal the per-session CPU pump to stop, wake its timed wait, and join it.
+    /// Idempotent and safe with no pump running. Called by `session_cpu_unsub` and
+    /// `shutdown` — the pump MUST NOT outlive the Server.
+    fn stopSessionCpuPump(self: *Server) void {
+        self.session_cpu_mutex.lock();
+        self.session_cpu_stop = true;
+        self.session_cpu_interval_ms = 0;
+        self.session_cpu_cond.signal();
+        self.session_cpu_mutex.unlock();
+        if (self.session_cpu_thread) |t| {
+            t.join();
+            self.session_cpu_thread = null;
+        }
+    }
+
+    /// The per-session CPU pump: sample the process table, roll each session's
+    /// whole subtree up into one number, push a `session_cpu` frame, wait, repeat.
+    ///
+    /// Owns its OWN `ProcSampler`, deliberately. Per-process CPU% is a delta
+    /// against per-pid baselines that each `sample()` REPLACES, so sharing the
+    /// Server's request/reply `proc_sampler` would make this pump and `proc_list`
+    /// silently destroy each other's deltas whenever their timings interleaved —
+    /// the exact bug that made the local activity monitor report 0% for every row.
+    /// `metricsPumpLoop` owns its own `metrics.Sampler` for the same reason.
+    fn sessionCpuPumpLoop(self: *Server) void {
+        var sampler = proc.ProcSampler.init(self.alloc);
+        defer sampler.deinit();
+        var host_sampler = metrics.Sampler.init();
+
+        while (true) {
+            self.session_cpu_mutex.lock();
+            if (self.session_cpu_stop or self.closed) {
+                self.session_cpu_mutex.unlock();
+                return;
+            }
+            const requested = self.session_cpu_interval_ms;
+            self.session_cpu_mutex.unlock();
+
+            // How loaded are we? This decides the cadence, so sample it first.
+            const host = host_sampler.sample();
+            const interval_ms = throttledIntervalMs(requested, host.cpu_pct);
+
+            self.pushSessionCpu(&sampler, interval_ms);
+
+            self.session_cpu_mutex.lock();
+            if (!self.session_cpu_stop and !self.closed) {
+                self.session_cpu_cond.timedWait(
+                    &self.session_cpu_mutex,
+                    @as(u64, interval_ms) * std.time.ns_per_ms,
+                ) catch {};
+            }
+            const stop = self.session_cpu_stop or self.closed;
+            self.session_cpu_mutex.unlock();
+            if (stop) return;
+        }
+    }
+
+    /// One pump iteration: enumerate, roll up per session, send. Split out of the
+    /// loop so every allocation is scoped to a single arena that dies here.
+    fn pushSessionCpu(self: *Server, sampler: *proc.ProcSampler, interval_ms: u32) void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var procs: std.ArrayListUnmanaged(protocol.Proc) = .empty;
+        // The enumeration runs UNLOCKED — it queries the whole machine and touches
+        // no session-store state (same discipline as `handleProcList`).
+        _ = sampler.sample(aa, &procs, 0) catch return;
+
+        // Snapshot session id + root pid under the store lock, copying the ids into
+        // the arena. We must NOT hold the store mutex across the socket write, and
+        // `id_str` lives on a session that could be reaped the moment we let go.
+        var ids: std.ArrayListUnmanaged([]const u8) = .empty;
+        var roots: std.ArrayListUnmanaged(i64) = .empty;
+        {
+            self.store.mutex.lock();
+            defer self.store.mutex.unlock();
+            var it = self.store.table.by_id.valueIterator();
+            while (it.next()) |sp| {
+                const s = sp.*;
+                // A dead session has no tree to roll up; reporting 0 for it would
+                // be indistinguishable from an idle live one.
+                if (!s.alive) continue;
+                const id = aa.dupe(u8, s.id_str[0..]) catch break;
+                ids.append(aa, id) catch break;
+                roots.append(aa, s.pid) catch break;
+            }
+        }
+        // NOTE: an empty roster still sends a frame. Skipping the push would mean
+        // the client cannot tell a live-but-idle stream from a dead one, and — worse
+        // — a client that had sessions and now has none would keep rendering the
+        // last roster forever, because nothing ever told it they went away.
+        const totals = aa.alloc(f32, roots.items.len) catch return;
+        proc.rollUpByRoot(aa, procs.items, roots.items, totals);
+
+        const rows = aa.alloc(protocol.SessionCpuRow, ids.items.len) catch return;
+        for (ids.items, totals, 0..) |id, cpu, i| {
+            rows[i] = .{ .id = id, .cpu_pct = cpu };
+        }
+
+        self.sendJson(.session_cpu, protocol.control_channel, protocol.SessionCpu{
+            .interval_ms = interval_ms,
+            .sessions = rows,
+        }) catch {};
     }
 
     // --- Process table (§9.3 process view) -----------------------------------
@@ -2481,6 +2651,83 @@ test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
         std.Thread.yield() catch {};
     }
     try testing.expect(h.server.metrics_thread == null);
+}
+
+test "throttledIntervalMs: the agent, not the client, decides the cadence" {
+    // The client's hint is honored when the machine is idle...
+    try testing.expectEqual(@as(u32, 2000), Server.throttledIntervalMs(2000, 5));
+    // ...but a zero/hostile interval is floored so the pump can't busy-spin.
+    try testing.expectEqual(@as(u32, 500), Server.throttledIntervalMs(0, 0));
+    try testing.expectEqual(@as(u32, 500), Server.throttledIntervalMs(1, 0));
+    // Loaded ⇒ back off, so the stream costs less exactly when the box is busy.
+    try testing.expectEqual(@as(u32, 4000), Server.throttledIntervalMs(2000, 70));
+    try testing.expectEqual(@as(u32, 8000), Server.throttledIntervalMs(2000, 95));
+    // Backoff is BOUNDED: an unbounded throttle is indistinguishable from a hang.
+    try testing.expectEqual(@as(u32, 10_000), Server.throttledIntervalMs(60_000, 0));
+    try testing.expectEqual(@as(u32, 10_000), Server.throttledIntervalMs(5000, 95));
+    // Saturating math: a huge hint must not wrap around to a tiny interval.
+    try testing.expectEqual(@as(u32, 10_000), Server.throttledIntervalMs(std.math.maxInt(u32), 95));
+}
+
+test "SESSION_CPU_SUB pushes per-session CPU; SESSION_CPU_UNSUB stops the pump cleanly" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(31);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.session_cpu};
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    // The stream is opcode-gated, so both peers must advertise the capability.
+    try testing.expect(neg.session_cpu);
+
+    try h.client.sendControlJson(.session_cpu_sub, protocol.control_channel, protocol.SessionCpuSub{
+        .interval_ms = 10,
+    });
+
+    const f1 = try h.client.waitControl(.session_cpu);
+    var p1 = try protocol.parseJson(protocol.SessionCpu, alloc, f1.payload);
+    defer p1.deinit();
+    // The agent reports the cadence it CHOSE, which is floored above the 10ms hint.
+    try testing.expectEqual(@as(u32, 500), p1.value.interval_ms);
+    for (p1.value.sessions) |row| {
+        try testing.expect(row.id.len > 0);
+        try testing.expect(row.cpu_pct >= 0);
+    }
+
+    // Unsubscribe: the pump stops and joins (testing.allocator catches any leak,
+    // and a pump outliving the Server would be a UAF).
+    try h.client.sendControlJson(.session_cpu_unsub, protocol.control_channel, protocol.SessionCpuUnsub{});
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        if (h.server.session_cpu_thread == null) break;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(h.server.session_cpu_thread == null);
+}
+
+test "session_cpu: an OLDER client that never advertises it leaves the stream off" {
+    // The compatibility direction that matters: a new agent talking to an app
+    // that predates `session_cpu`. The negotiated flag must stay false so the
+    // client never receives an opcode it would treat as a fatal framing error,
+    // and the connection keeps working for everything else.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(32);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const old_caps = [_][]const u8{protocol.capability.close_session};
+    try h.client.handshakeCaps(&old_caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.session_cpu);
+    // Unrelated capabilities still negotiate normally.
+    try testing.expect(neg.close_session);
 }
 
 test "PROC_LIST→PROC_SNAPSHOT: agent enumerates real processes on the request channel" {

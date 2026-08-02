@@ -1617,6 +1617,47 @@ GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
     ghostty_remote_connection_t, const char* cmd, const char* cwd,
     uint32_t timeout_ms);
 
+// One session's CPU roll-up, pushed on the session-CPU stream. cpu_pct is
+// PER-CORE and covers the session's WHOLE process tree (shell + every
+// descendant), because a session is busy when the agent running in it is busy,
+// not when its shell is. So a session running four busy threads reads ~400.
+typedef struct {
+  const char* id;  // session id, matching ghostty_remote_connection_list_sessions
+  float cpu_pct;
+} ghostty_session_cpu_s;
+
+// Callback for one pushed per-session CPU sample.
+//
+// rows/rows_len and every string they point at are valid ONLY for the duration
+// of the call — copy anything you keep. Fires on the connection's control-reader
+// thread, so hop to your own queue before touching UI.
+//
+// interval_ms is the cadence the AGENT chose, which may be LONGER than the one
+// requested: the agent throttles itself when the machine is loaded. Use it to
+// distinguish a deliberately slow stream from a dead one.
+typedef void (*ghostty_session_cpu_cb)(
+    const ghostty_session_cpu_s* rows, size_t rows_len, uint32_t interval_ms,
+    void* userdata);
+
+// Subscribe to the pushed per-session CPU stream.
+//
+// Returns false if the agent did not advertise the "session_cpu" capability
+// (an agent older than this feature — remember the agent outlives the app and
+// is frequently a different build). Show no meter in that case: the opcode is
+// NOT sent to such an agent, because an unknown opcode is a fatal framing error
+// that would kill an otherwise healthy connection.
+//
+// interval_ms is a HINT, not a mandate — the agent floors it, may stretch it
+// under load, and reports what it actually used in every callback.
+GHOSTTY_API bool ghostty_remote_connection_session_cpu_subscribe(
+    ghostty_remote_connection_t, uint32_t interval_ms,
+    ghostty_session_cpu_cb, void* userdata);
+
+// Stop the pushed per-session CPU stream and clear the callback. After this
+// returns no further callback fires. Safe when not subscribed.
+GHOSTTY_API void ghostty_remote_connection_session_cpu_unsubscribe(
+    ghostty_remote_connection_t);
+
 // ---------------------------------------------------------------------------
 // LOCAL (in-process) activity-monitor provider — the "Local" machine in the
 // panel's switcher. These take NO connection handle: they sample / kill / spawn

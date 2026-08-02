@@ -122,6 +122,14 @@ pub const FrameType = enum(u8) {
     proc_kill_result = 0x76, // A→C  {pid, ok, error?}
     proc_spawn = 0x77, // C→A  {cmd, cwd?, detached?}
     proc_spawn_result = 0x78, // A→C  {ok, pid?, error?}
+
+    // Per-session CPU roll-up. A server→client stream gated by a sub/unsub, like
+    // `metrics` — and, like it, only sent when the `session_cpu` capability was
+    // negotiated by BOTH peers (a new opcode is a fatal framing error to a peer
+    // that does not know it).
+    session_cpu_sub = 0x79, // C→A  {interval_ms}     — a HINT; the agent decides
+    session_cpu = 0x7a, // A→C  {interval_ms, sessions[]}
+    session_cpu_unsub = 0x7b, // C→A  {}
 };
 
 // -----------------------------------------------------------------------------
@@ -366,6 +374,18 @@ pub const capability = struct {
     /// that omits it keeps working over the channel-scoped `close` alone.
     pub const close_session = "close_session";
 
+    /// Pushed per-session CPU roll-up (`session_cpu_sub`/`session_cpu`/
+    /// `session_cpu_unsub`, 0x79–0x7b): the agent reports each session's CPU%
+    /// summed over its WHOLE process tree, so the chooser can show a runaway
+    /// agent at a glance without pulling the entire process table.
+    ///
+    /// Gated because these are NEW OPCODES, not new fields — an older peer treats
+    /// an unknown opcode as a fatal framing error, so the client must not send
+    /// `session_cpu_sub` unless the agent advertised this string. When it is
+    /// absent the chooser simply shows no meter (reduced function, never a wrong
+    /// number and never a fallback poll the agent did not consent to).
+    pub const session_cpu = "session_cpu";
+
     /// Re-attach **grid snapshot**: on ATTACH the agent, having tracked each
     /// session's visible screen in a headless emulator, replays a self-contained
     /// VT repaint of the current on-screen grid so the pane repaints EXACTLY and
@@ -436,6 +456,12 @@ pub const Negotiated = struct {
     /// Additive: false against any older peer, so the agent falls back to today's
     /// ring-only replay and the client just renders whatever DATA arrives.
     grid_snapshot: bool = false,
+
+    /// True iff BOTH peers advertised `capability.session_cpu` — i.e. the pushed
+    /// per-session CPU stream (0x79-0x7b) is safe to use. False against any older
+    /// peer, in which case the client never sends `session_cpu_sub` (an unknown
+    /// opcode would be a fatal framing error) and the chooser shows no meter.
+    session_cpu: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -464,6 +490,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.close_session),
         .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
             hasCapability(remote.capabilities, capability.grid_snapshot),
+        .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
+            hasCapability(remote.capabilities, capability.session_cpu),
     };
 }
 
@@ -926,6 +954,44 @@ pub const Metrics = struct {
 
 /// `METRICS_UNSUB` (0x74). Stop the pushed metrics stream. No fields.
 pub const MetricsUnsub = struct {};
+
+// --- Per-session CPU roll-up (pushed stream, gated on `capability.session_cpu`) --
+//
+// The chooser wants one number per session: is this agent session busy? That is a
+// property of the session's WHOLE process tree — a session is busy because the
+// agent running in it is busy, not because its zsh is — so the roll-up happens
+// AGENT-SIDE, where the session→child-pid table lives. The client would otherwise
+// have to pull the entire process table on a timer just to sum a few subtrees.
+
+/// One session's CPU roll-up.
+pub const SessionCpuRow = struct {
+    /// The session id, matching `SESSIONS`/`LIST_SESSIONS`.
+    id: []const u8,
+    /// Per-core CPU% summed over the session's shell and every descendant, in the
+    /// same units as `Proc.cpu_pct`: ~100 per fully-busy core, so a session running
+    /// four busy threads reads ~400. NOT clamped.
+    cpu_pct: f32 = 0,
+};
+
+/// `SESSION_CPU_SUB` (0x79). Subscribe to the pushed per-session CPU stream.
+pub const SessionCpuSub = struct {
+    /// The cadence the client would LIKE, as a hint. The agent treats it as a
+    /// floor and may push less often when the machine is loaded — see
+    /// `SessionCpu.interval_ms` for what it actually chose.
+    interval_ms: u32 = 2000,
+};
+
+/// `SESSION_CPU` (0x7a). One pushed per-session CPU sample (control channel).
+pub const SessionCpu = struct {
+    /// The cadence the agent ACTUALLY used for this sample, which may be longer
+    /// than the client asked for (it throttles itself under load). Reported so the
+    /// client can tell "idle" from "stale" instead of assuming its hint was honored.
+    interval_ms: u32 = 0,
+    sessions: []const SessionCpuRow = &.{},
+};
+
+/// `SESSION_CPU_UNSUB` (0x7b). Stop the pushed per-session CPU stream. No fields.
+pub const SessionCpuUnsub = struct {};
 
 /// `PROC_KILL` (0x75). Signal/kill a process by pid. `signal` defaults (agent-side)
 /// to a terminate when null.

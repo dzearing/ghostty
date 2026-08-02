@@ -130,6 +130,16 @@ pub const ControlHandler = *const fn (ctx: *anyopaque, conn: *Connection, frame:
 /// by-value snapshot (no borrowed storage), so it is safe to copy out.
 pub const MetricsHandler = *const fn (ctx: *anyopaque, host: protocol.HostMetrics) void;
 
+/// Callback for one pushed per-session CPU sample. `rows` BORROWS the decoded
+/// arena and is valid only for the duration of the call — copy anything you keep.
+/// `interval_ms` is the cadence the AGENT chose (it throttles itself under load),
+/// not the one the client asked for. Fires on the control-reader thread.
+pub const SessionCpuHandler = *const fn (
+    ctx: *anyopaque,
+    rows: []const protocol.SessionCpuRow,
+    interval_ms: u32,
+) void;
+
 /// One queued outbound frame, owned by the writer queue until the writer emits it.
 /// `payload` is a private heap copy the queue owns and frees; the caller's slice is
 /// not retained past `enqueue`.
@@ -821,6 +831,8 @@ pub const Connection = struct {
     /// like `ctrl_handler` (publish discipline; see `setControlHandler`).
     metrics_handler: ?MetricsHandler = null,
     metrics_handler_ctx: *anyopaque = undefined,
+    session_cpu_handler: ?SessionCpuHandler = null,
+    session_cpu_handler_ctx: *anyopaque = undefined,
 
     // --- Health & link state (increment 2) ------------------------------------
     /// Injected millisecond clock (real by default, fake in tests).
@@ -913,9 +925,14 @@ pub const Connection = struct {
     /// `grid_snapshot` asks a modern agent to append a visible-screen repaint on
     /// re-attach (FIX 2); an older agent that never advertises it just replays its
     /// ring as before.
+    /// `session_cpu` asks a modern agent for the pushed per-session CPU roll-up
+    /// the chooser's meters render; an older agent never advertises it, the
+    /// negotiated flag stays false, and we never send the opcode (which that agent
+    /// would treat as a fatal framing error) — the meters just don't appear.
     pub const client_capabilities = [_][]const u8{
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
+        protocol.capability.session_cpu,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1141,6 +1158,61 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         self.metrics_handler = null;
+    }
+
+    /// Subscribe to the pushed per-session CPU stream. `interval_ms` is a HINT —
+    /// the agent floors it and stretches it under its own load, reporting what it
+    /// actually used in each callback.
+    ///
+    /// Returns `error.Unsupported` when the peer did not advertise
+    /// `capability.session_cpu`. That check is NOT optional politeness: an
+    /// unknown opcode is a fatal framing error to an older agent, so sending
+    /// `session_cpu_sub` blind would kill a working connection. Callers treat
+    /// `Unsupported` as "show no meter".
+    ///
+    /// The handler fires on the control-reader thread. The caller MUST call
+    /// `unsubscribeSessionCpu` before freeing `ctx`.
+    pub fn subscribeSessionCpu(
+        self: *Connection,
+        interval_ms: u32,
+        ctx: *anyopaque,
+        handler: SessionCpuHandler,
+    ) !void {
+        if (self.negotiated) |n| {
+            if (!n.session_cpu) return error.Unsupported;
+        } else |_| return error.Unsupported;
+
+        // Publish the handler slot BEFORE subscribing so the first pushed frame
+        // is never dropped for lack of a handler.
+        {
+            self.session_cpu_handler_ctx = ctx;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            self.session_cpu_handler = handler;
+        }
+
+        const sub: protocol.SessionCpuSub = .{ .interval_ms = interval_ms };
+        const json = try protocol.encodeJson(self.alloc, sub);
+        defer self.alloc.free(json);
+        try self.writeControl(.session_cpu_sub, protocol.control_channel, json);
+    }
+
+    /// Stop the pushed per-session CPU stream and clear the handler slot, so no
+    /// further callback fires after this returns. Safe when not subscribed, and
+    /// safe against an older agent (we simply never send the gated opcode).
+    pub fn unsubscribeSessionCpu(self: *Connection) void {
+        const supported = if (self.negotiated) |n| n.session_cpu else |_| false;
+        if (supported) {
+            const json = protocol.encodeJson(self.alloc, protocol.SessionCpuUnsub{}) catch null;
+            if (json) |j| {
+                defer self.alloc.free(j);
+                self.writeControl(.session_cpu_unsub, protocol.control_channel, j) catch {};
+            }
+        }
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        self.session_cpu_handler = null;
     }
 
     // --- Observability (increment 2, §6.4) -----------------------------------
@@ -2686,6 +2758,20 @@ pub const Connection = struct {
                 const ctx = self.metrics_handler_ctx;
                 self.write_mutex.unlock();
                 if (handler) |h| h(ctx, parsed.value.host);
+            },
+            .session_cpu => {
+                // Pushed per-session CPU roll-up. Same discipline as `.metrics`:
+                // decode failures are dropped silently, and the slot is read under
+                // the lock its publish is ordered by. `rows` borrows the parsed
+                // arena, so the handler must copy anything it keeps — the arena
+                // dies when this scope exits.
+                var parsed = protocol.parseJson(protocol.SessionCpu, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                self.write_mutex.lock();
+                const handler = self.session_cpu_handler;
+                const ctx = self.session_cpu_handler_ctx;
+                self.write_mutex.unlock();
+                if (handler) |h| h(ctx, parsed.value.sessions, parsed.value.interval_ms);
             },
             else => {},
         }
