@@ -139,6 +139,45 @@ must not push the glyph below 3:1 against the *new* fill. Check both states.
 Runtime theming (user background colors, `background-opacity`, system accent)
 must be re-checked against these floors, not assumed — that is what T150 is for.
 
+A **fixed** foreground color cannot satisfy a floor, because a floor is a
+statement about two colors. `chooser_rows.secondary_gray = #999999` looked like
+a reasonable de-emphasized grey and was 2.8:1 on Fluent's light surface — under
+both floors — so a light theme took the sublines, the status rings and the
+glyphs out together (T310). Derive de-emphasized foregrounds from the surface
+(`chrome_theme.textSecondaryOn`) and let the search enforce the floor.
+
+### 2.4 Type ramp
+
+**Three sizes, one module: `src/apprt/win32/type_ramp.zig`.**
+
+| Role | Size | Weight | Where |
+|---|---|---|---|
+| Caption | **12** | 400 | sublines, subtitles, status strips, badges |
+| Body | **14** | 400 | list-row titles, buttons, input fields, labels |
+| Body strong | 14 | 600 | an emphasized body run |
+| Subtitle | **20** | 600 | a pane's subject |
+
+Two rules go with it:
+
+- **Body is 14, not the system metric's 12, and that is a conscious
+  divergence.** `SPI_GETNONCLIENTMETRICS` reports a 9 pt / 12 px body on
+  Win11; Win11's own modern apps are at 14, and matching the GDI metric makes a
+  dialog look like it shipped in 2009 next to Settings. Caption sits AT the
+  system metric on purpose, so the smallest text we draw is never smaller than
+  Windows' own. Reasoning and measurements: `win32-machine-chooser.md` §1.1,
+  §3.2.
+- **Emphasis is weight, never size.** A strong run is the same height as the
+  body around it, so it cannot reflow the line box it sits in.
+
+A line box is its role's height plus `sm` (4) of leading. Derive it — a
+hardcoded 17 stops matching its text the moment the ramp moves.
+
+The ramp exists because the number did not: `font_h = px(15, scale)` was
+written out in **seven** dialogs, a size nobody chose, and the first task to
+fix one copy would have made that dialog the odd one out. Same argument as
+T257's chrome-geometry hoist: the duplication is not the defect, the silent
+divergence it permits is.
+
 ---
 
 ## 3. Shape

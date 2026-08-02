@@ -14,6 +14,10 @@
 
 const std = @import("std");
 const chooser_rows = @import("chooser_rows.zig");
+/// The one type ramp (T310). This module states font ROLES; the sizes behind
+/// them live in `type_ramp.zig` so the chooser cannot drift from the other
+/// dialog surfaces.
+const type_ramp = @import("type_ramp.zig");
 
 /// A rectangle in physical pixels, left/top inclusive and right/bottom
 /// exclusive — the same convention as `RECT`, which this converts to at the
@@ -78,9 +82,14 @@ pub const Layout = struct {
     footer_divider_y: i32,
     cancel: Rect,
 
-    /// `CreateFontW` heights (positive; the caller negates them).
+    /// `CreateFontW` heights (positive; the caller negates them), from
+    /// `type_ramp`. `font_h` is the ramp's BODY, `caption_font_h` its caption
+    /// (the detail subtitle and the status strip), `title_font_h` its subtitle
+    /// role — the detail pane's subject, which is also semibold.
     font_h: i32,
+    caption_font_h: i32,
     title_font_h: i32,
+    title_font_weight: i32,
     /// Height of one wrapped line of status-strip text.
     hint_line_h: i32,
 };
@@ -101,10 +110,19 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     const client_h = px(540, scale);
 
     const margin = px(16, scale);
-    const gap = px(10, scale);
+    // Mac's 10 is off the 4 DIP scale; §3.2 maps it to `md`. This one number is
+    // the account row's vertical padding AND the filter->list gap, so it moved
+    // in one place.
+    const gap = px(8, scale);
+
+    // One control height across the whole surface (design system §2.1): the
+    // footer's Cancel, the detail pane's action row, the filter field and the
+    // account control are all 28. Two heights that differ by 2 do not read as
+    // a deliberate hierarchy, they read as nobody having decided.
+    const control_h = px(28, scale);
 
     // Account header — Mac pads it 16 horizontal / 10 vertical (251-252).
-    const account_h = px(26, scale);
+    const account_h = control_h;
     const account_btn_w = px(150, scale);
     const account_top = gap;
     const header_divider_y = account_top + account_h + gap;
@@ -112,7 +130,7 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
 
     // Footer — Cancel alone, 16 all round (737-742).
     const btn_w = px(96, scale);
-    const btn_h = px(28, scale);
+    const btn_h = control_h;
     const cancel_top = client_h - margin - btn_h;
     const footer_divider_y = cancel_top - margin;
 
@@ -123,9 +141,10 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     const master_w = px(260, scale);
     const master: Rect = .{ .left = 0, .top = body_top, .right = master_w, .bottom = body_bottom };
 
-    // Filter: 14 horizontal / 14 top / 10 bottom (329-330).
-    const filter_pad = px(14, scale);
-    const filter_h = px(26, scale);
+    // Filter: Mac's 14 horizontal / 14 top / 10 bottom (329-330), snapped to
+    // the scale — 14 -> `lg` (12), 10 -> `md` (8, the shared `gap`).
+    const filter_pad = px(12, scale);
+    const filter_h = control_h;
     const filter: Rect = .{
         .left = filter_pad,
         .top = master.top + filter_pad,
@@ -135,7 +154,9 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
 
     // Status strip at the bottom of the column, then the list fills what is
     // left between it and the filter.
-    const hint_line_h = px(16, scale);
+    // The status strip is caption text, so its wrapped line box is the caption
+    // role plus the same `sm` leading every other line box on the surface has.
+    const hint_line_h = type_ramp.caption(scale).height + px(4, scale);
     const hint_h = hint_line_h * lines;
     const hint: Rect = .{
         .left = filter_pad,
@@ -170,9 +191,13 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
 
     // Detail header — 16 padding, a 30-wide glyph column, 12 to the text, and
     // 14 between the identity block and the action row (440-454).
-    const glyph_w = px(30, scale);
-    const title_h = px(24, scale);
-    const subtitle_h = px(17, scale);
+    // The pane's mark is the system's LARGE icon size (`SM_CXICON`, 32), the
+    // way the row's is its small one (`SM_CXSMICON`, 16) — one rule for both
+    // instead of Mac's 30 and our own 20.
+    const glyph_w = px(32, scale);
+    // Line boxes from the ramp plus `sm` of leading, like the row's.
+    const title_h = type_ramp.subtitle(scale).height + px(4, scale);
+    const subtitle_h = type_ramp.caption(scale).height + px(4, scale);
     const detail_glyph: Rect = .{
         .left = detail.left + margin,
         .top = detail.top + margin,
@@ -194,7 +219,8 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
         .bottom = detail_title.bottom + px(2, scale) + subtitle_h,
     };
     const identity_bottom = @max(detail_glyph.bottom, detail_subtitle.bottom);
-    const action_top = identity_bottom + px(14, scale);
+    // Mac's 14 between the identity block and the actions -> `lg` (§3.2).
+    const action_top = identity_bottom + px(12, scale);
 
     return .{
         .client_w = client_w,
@@ -241,8 +267,10 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
             .right = client_w - margin,
             .bottom = cancel_top + btn_h,
         },
-        .font_h = px(15, scale),
-        .title_font_h = px(20, scale),
+        .font_h = type_ramp.body(scale).height,
+        .caption_font_h = type_ramp.caption(scale).height,
+        .title_font_h = type_ramp.subtitle(scale).height,
+        .title_font_weight = type_ramp.subtitle(scale).weight,
         .hint_line_h = hint_line_h,
     };
 }
@@ -631,6 +659,89 @@ test "layout: account row is right-aligned against the client edge" {
     try testing.expectEqual(l.client_w - 16, l.account_btn.right);
     try testing.expect(l.account_status.right < l.account_btn.left);
     try testing.expect(l.account_status.left > 0);
+}
+
+test "layout: every gap is on the 4 DIP spacing scale (T310)" {
+    // The companion to `chooser_rows`' scale test, and together they are what
+    // keeps win32-machine-chooser.md §3.2's mapping from rotting. Mac's 14
+    // (filter pad, identity->actions) and 10 (account v-pad, filter->list) are
+    // off the scale and were copied here verbatim before T310.
+    const l = layout(1.0, 1);
+    const on_scale = [_]i32{ 2, 4, 8, 12, 16, 24 };
+    const gaps = [_]struct { name: []const u8, v: i32 }{
+        .{ .name = "client -> account", .v = l.account_status.top },
+        .{ .name = "account -> header rule", .v = l.header_divider_y - l.account_btn.bottom },
+        .{ .name = "dialog left margin", .v = l.account_status.left },
+        .{ .name = "account text -> control", .v = l.account_btn.left - l.account_status.right },
+        .{ .name = "client -> account control (right)", .v = l.client_w - l.account_btn.right },
+        .{ .name = "master -> filter (top)", .v = l.filter.top - l.master.top },
+        .{ .name = "master -> filter (left)", .v = l.filter.left - l.master.left },
+        .{ .name = "filter -> list", .v = l.list.top - l.filter.bottom },
+        .{ .name = "master -> list (left)", .v = l.list.left - l.master.left },
+        .{ .name = "hint -> master bottom", .v = l.master.bottom - l.hint.bottom },
+        .{ .name = "detail -> glyph (left)", .v = l.detail_glyph.left - l.detail.left },
+        .{ .name = "detail -> glyph (top)", .v = l.detail_glyph.top - l.detail.top },
+        .{ .name = "glyph -> title", .v = l.detail_title.left - l.detail_glyph.right },
+        .{ .name = "title -> subtitle", .v = l.detail_subtitle.top - l.detail_title.bottom },
+        .{ .name = "identity -> actions", .v = l.action_row.top - @max(l.detail_glyph.bottom, l.detail_subtitle.bottom) },
+        .{ .name = "detail right margin", .v = l.detail.right - l.action_row.right },
+        .{ .name = "action gap", .v = l.action_gap },
+        .{ .name = "action button padding", .v = l.action_btn_pad },
+        .{ .name = "footer rule -> cancel", .v = l.cancel.top - l.footer_divider_y },
+        .{ .name = "cancel -> client bottom", .v = l.client_h - l.cancel.bottom },
+        .{ .name = "cancel -> client right", .v = l.client_w - l.cancel.right },
+    };
+    for (gaps) |g| {
+        if (std.mem.indexOfScalar(i32, &on_scale, g.v) == null) {
+            std.debug.print("off-scale gap: {s} = {d}\n", .{ g.name, g.v });
+            return error.OffSpacingScale;
+        }
+    }
+}
+
+test "layout: one control height across the surface (T310)" {
+    // Design system §2.1. The filter and the account control used to be 26
+    // while Cancel and the action row were 28 — a 2 px difference that reads
+    // as nobody having decided, not as a hierarchy.
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        try testing.expectEqual(l.cancel.height(), l.filter.height());
+        try testing.expectEqual(l.cancel.height(), l.account_btn.height());
+        try testing.expectEqual(l.cancel.height(), l.account_status.height());
+        try testing.expectEqual(l.cancel.height(), l.action_row.height());
+    }
+    try testing.expectEqual(@as(i32, 28), layout(1.0, 1).filter.height());
+}
+
+test "layout: the fonts come from the ramp, in role order (T310)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        try testing.expectEqual(type_ramp.caption(scale).height, l.caption_font_h);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        try testing.expectEqual(type_ramp.subtitle(scale).height, l.title_font_h);
+        try testing.expectEqual(type_ramp.weight_semibold, l.title_font_weight);
+        try testing.expect(l.caption_font_h < l.font_h);
+        try testing.expect(l.font_h < l.title_font_h);
+        // The row's subline is the same caption role as the detail pane's, so
+        // the two smallest texts on the surface are one size, not two.
+        try testing.expectEqual(l.caption_font_h, chooser_rows.rowMetrics(scale).subtitle_font_h);
+        // Every line box has room for the text it holds.
+        try testing.expect(l.detail_title.height() > l.title_font_h);
+        try testing.expect(l.detail_subtitle.height() > l.caption_font_h);
+        try testing.expect(l.hint_line_h > l.caption_font_h);
+    }
+    // Body is 14, not the 15 nobody chose and not the system metric's 12.
+    try testing.expectEqual(@as(i32, 14), layout(1.0, 1).font_h);
+}
+
+test "layout: the status strip still leaves a real list at every scale" {
+    // §4 finding 13, kept as a verify: the strip grows UPWARD into the list,
+    // so the worst case is a 4-line strip at the largest scale.
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, chooser_rows.max_hint_lines);
+        const row_h = chooser_rows.rowMetrics(scale).height;
+        try testing.expect(@divTrunc(l.list.height(), row_h) >= 5);
+    }
 }
 
 test "layout: scales with DPI" {

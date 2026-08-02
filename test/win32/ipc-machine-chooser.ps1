@@ -153,6 +153,28 @@ function Get-ShotPixel($Shot, [int]$X, [int]$Y) {
     return @([int]$px.R, [int]$px.G, [int]$px.B)
 }
 
+# The first column in a screen band holding a pixel at least $Min bright in
+# every channel, as an offset from $X0 - or -1 if there is none.
+#
+# The threshold is what makes this a probe for the TEXT column rather than for
+# "anything drawn": the row's title is COLOR_TEXT (230) while its status ring
+# and machine glyph are the de-emphasized ramp (~160), so a floor between the
+# two finds where the text begins without having to know where the glyph ended.
+function Get-FirstBrightColumn($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$Min) {
+    for ($x = $X0; $x -lt $X1; $x++) {
+        for ($y = $Y0; $y -lt $Y1; $y++) {
+            $lx = $x - $Shot.Left
+            $ly = $y - $Shot.Top
+            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.Width -or $ly -ge $Shot.Height) { continue }
+            $px = $Shot.Bitmap.GetPixel($lx, $ly)
+            if ([int]$px.R -ge $Min -and [int]$px.G -ge $Min -and [int]$px.B -ge $Min) {
+                return $x - $X0
+            }
+        }
+    }
+    return -1
+}
+
 # A cheap position-weighted checksum of a screen rect: two different strings
 # rendered in the same box give different values, where a bare drawn-pixel
 # COUNT can collide.
@@ -321,6 +343,10 @@ try {
     $edit = Get-NthChild $chooser 'Edit' 0
     Assert ($list -ne [IntPtr]::Zero) 'chooser has a machine list'
 
+    # The live DPI scale, derived from the window's own fixed 840 width. Needed
+    # this early since T310, because the row probes below are stated in DIP.
+    $scale = Get-ChooserScale $chooser
+
     $shot = Get-Shot $chooser
     Assert ((Get-TestDistinctColors -Shot $shot) -ge 8) "the chooser capture holds real content ($(Get-TestDistinctColors -Shot $shot) distinct colors)"
 
@@ -360,6 +386,27 @@ try {
         Assert ($pillTint -ge 25) "selected row is accent-tinted (b-r = $pillTint at the pill)"
         Assert ($gutterTint -le 10) "selection is inset, not full-width (b-r = $gutterTint in the gutter)"
         Assert ($unselTint -le 10) "unselected row stays untinted (b-r = $unselTint)"
+
+        # T310 finding 8: the icon column is 28, not 20, so the text column's
+        # left edge is 68 DIP from the row's edge (4 pill inset + 8 + a 12
+        # status column + 4 + a 28 icon column + 12) where it used to be 60.
+        # That 8 DIP is the whole visible consequence of reserving a column
+        # instead of letting the mark BE the column, and it is only checkable
+        # on screen - the unit test can only prove the number, not that the
+        # painter used it.
+        #
+        # Row 0 is Local, which draws no status shape, so the only marks in the
+        # band are the machine glyph (dim) and the title (bright).
+        $bandTop = $lr.Top + 1
+        $bandBot = $bandTop + $rowH
+        # MEASURED on this box at 1.25: the first bright column is 87 px, i.e.
+        # `text_x` (85) plus the "L" of "Local"'s left bearing. The retired
+        # geometry put `text_x` at 60 DIP -> 76 px, so the window between them
+        # is ~9 px and the bounds have to sit INSIDE it to discriminate: a floor
+        # of 62 DIP would round to 78 and pass the old build too.
+        $textAt = Get-FirstBrightColumn $shot $lr.Left $bandTop ($lr.Left + (Dip $scale 110)) $bandBot 200
+        Assert ($textAt -ge (Dip $scale 65)) "the row's text starts past the reserved 28 icon column (first bright column at $textAt, want >= $(Dip $scale 65))"
+        Assert ($textAt -ge 0 -and $textAt -le (Dip $scale 74)) "the row's text column has not run away (first bright column at $textAt, want <= $(Dip $scale 74))"
     }
 
     if ($edit -ne [IntPtr]::Zero) {
@@ -372,7 +419,12 @@ try {
     }
 
     $script:chooserH1 = Get-Height $chooser
-    $scale = Get-ChooserScale $chooser
+    # One wrapped line of the status strip. Since T310 that box is the type
+    # ramp's CAPTION (12) plus `sm` leading, and the STATIC is rendered in the
+    # caption font too - the reserved height and the font that fills it have to
+    # come from the same place or a wrapped strip clips again (the T140 defect).
+    # 12 + 4 still lands on 16, so this line is unchanged and is now also the
+    # check that the two did not drift apart.
     $script:hintLineH = Dip $scale 16
     $hint1 = Get-LowestChild $chooser 'Static'
     if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = Get-Height $hint1 }
@@ -425,6 +477,31 @@ try {
     }
     $inFooter = @($buttons | Where-Object { ($_.Top - $orgY) -ge $footerY })
     Assert ($inFooter.Count -eq 1 -and $inFooter[0].Text -eq 'Cancel') "Cancel is alone in the footer (found: $(($inFooter | ForEach-Object { $_.Text }) -join ', '))"
+
+    # --- T310: one control height across the surface -------------------------
+    # Design system 2.1. The filter field and the account control were 26 while
+    # Cancel and the detail pane's action row were 28 - a 2 px difference that
+    # reads as nobody having decided rather than as a hierarchy, and invisible
+    # at 100% until you put two of them on one screenshot.
+    #
+    # Asserted as a RELATIONSHIP between real HWNDs, not against a re-derived
+    # number: `Dip` rounds half-to-even and the layout module rounds half away
+    # from zero, so a script that rebuilt the height from 28 * scale would carry
+    # T257's latent DPI bug for a claim it can make without any arithmetic.
+    if ($cancel) {
+        $ctlH = $cancel.Bottom - $cancel.Top
+        if ($primary) {
+            Assert ((($primary.Bottom - $primary.Top)) -eq $ctlH) "the detail action is the same height as Cancel (primary=$($primary.Bottom - $primary.Top), cancel=$ctlH)"
+        }
+        if ($edit -ne [IntPtr]::Zero) {
+            $eh = Get-Height $edit
+            Assert ($eh -eq $ctlH) "the filter field is the same height as Cancel (filter=$eh, cancel=$ctlH)"
+        }
+        $acct = $buttons | Where-Object { $_.Text -match 'Sign' } | Select-Object -First 1
+        if ($acct) {
+            Assert ((($acct.Bottom - $acct.Top)) -eq $ctlH) "the account control is the same height as Cancel (account=$($acct.Bottom - $acct.Top), cancel=$ctlH)"
+        }
+    }
 
     # The detail pane names the selected machine, and it FOLLOWS the selection:
     # arrowing onto the relay device must repaint it.

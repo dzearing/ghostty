@@ -120,6 +120,10 @@ test {
     // bar/hover/text palette (T304), same no-OS-imports deal.
     _ = @import("apprt/win32/chrome_theme.zig");
 
+    // Pure win32 dialog type ramp — caption/body/subtitle in one place
+    // (T310), same no-OS-imports deal.
+    _ = @import("apprt/win32/type_ramp.zig");
+
     // Pure win32 layered-overlay z-order policy (T142), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/overlay_zorder.zig");

@@ -150,6 +150,24 @@ pub fn textOn(surface: Rgb) Rgb {
     return color_math.contrastAdjusted(color_math.wash(surface, text_wash), surface);
 }
 
+/// De-emphasized text for a surface that is NOT the bar — the chooser's row
+/// sublines, its detail subtitle, its status strip, and the marks that carry
+/// the same de-emphasis (an offline status ring, a machine glyph).
+///
+/// Hoisted out of `resolve` in T310 so the chooser can consume the ramp
+/// instead of re-deriving it. What it replaces there was a flat
+/// `secondary_gray = #999999`, which is 2.8:1 on Fluent's light surface — under
+/// BOTH the 4.5:1 text floor and the 3:1 chrome floor, so on a light theme the
+/// sublines, the ring and the glyph went illegible together. A wash toward the
+/// surface's own contrasting side plus a searched floor cannot do that on any
+/// background, which is the whole reason `textOn` is shaped this way.
+pub fn textSecondaryOn(surface: Rgb) Rgb {
+    return color_math.contrastAdjusted(
+        color_math.wash(surface, text_secondary_wash),
+        surface,
+    );
+}
+
 /// The accent as drawn on a surface that is NOT the bar — the chooser's row
 /// pill, the Activity Monitor's active card. Same floor and the same search as
 /// `resolve`, so a surface that is not the tab strip still gets the user's
@@ -164,10 +182,7 @@ pub fn resolve(chrome_bg: Rgb, accent: Rgb) Palette {
         .bar = bar,
         .hover = color_math.wash(bar, hover_wash),
         .text = textOn(bar),
-        .text_secondary = color_math.contrastAdjusted(
-            color_math.wash(bar, text_secondary_wash),
-            bar,
-        ),
+        .text_secondary = textSecondaryOn(bar),
         .accent = accentOn(bar, accent),
         .on_accent = color_math.contrastForeground(accentOn(bar, accent)),
         .danger = accentOn(bar, danger_base),
@@ -238,6 +253,29 @@ test "resolve: the light theme the old arithmetic could not express" {
     try testing.expect(d.bar.r > dark.r);
     try testing.expect(d.hover.r > d.bar.r);
     try testing.expect(color_math.luminance(d.text) > 0.5);
+}
+
+test "textSecondaryOn: the floor the fixed grey could not hold (T310)" {
+    // The concrete defect finding 12 names: #999999 on Fluent's light surface.
+    const gray: Rgb = .{ .r = 0x99, .g = 0x99, .b = 0x99 };
+    try testing.expect(ratio(gray, surface_light) < 3.0);
+
+    // The derived answer clears the TEXT floor on both surfaces, and it is the
+    // same function `resolve` uses for the bar — one ramp, not two.
+    for ([_]Rgb{ surface_light, surface_dark, .{ .r = 0x28, .g = 0x28, .b = 0x28 } }) |s| {
+        try testing.expect(ratio(textSecondaryOn(s), s) >= 4.4);
+        // ...and it stays de-emphasized: dimmer than the primary ramp, never
+        // equal to it, or the two roles stop being two roles.
+        try testing.expect(ratio(textSecondaryOn(s), s) < ratio(textOn(s), s));
+    }
+
+    // It follows the surface's own direction instead of heading for one end.
+    try testing.expect(color_math.luminance(textSecondaryOn(surface_light)) < 0.5);
+    try testing.expect(color_math.luminance(textSecondaryOn(surface_dark)) > 0.5);
+
+    // And `resolve` still answers the bar with exactly this function.
+    const p = resolve(surface_dark, default_accent);
+    try testing.expectEqual(textSecondaryOn(p.bar), p.text_secondary);
 }
 
 test "resolve: the accent survives as the user's color when it already clears 3:1" {

@@ -303,6 +303,13 @@ footer) are the only borders on the surface; nothing gets a decorative outline.
 Read out of the source 2026-08-01. This is the delta list T227 works, ordered
 by how visible it is.
 
+**Status, 2026-08-01.** T227 split into **T310** (findings 4, 7, 8, 9, 12 —
+DONE), **T311** (5, 6) and **T312** (10). Findings 2 and 3 were already closed
+by T305 before this table was acted on: `chooser_rows`' washes are
+`color_math.wash` and its accent is a parameter. Finding 1 is **T308**.
+Finding 13 was verified by T310 and holds — the list keeps at least 5 whole rows
+against a 4-line strip at 1.0/1.25/1.5/2.0.
+
 | # | Finding | Evidence | Severity |
 |---|---|---|---|
 | 1 | **The whole surface is hardcoded dark.** `COLOR_BG = RGB(32,32,32)`, `COLOR_FIELD_BG`, `COLOR_TEXT`, `COLOR_LABEL` are constants, and `DWMWA_USE_IMMERSIVE_DARK_MODE` is set to a literal `1`. `HostSettingsDialog.zig` repeats all four constants verbatim. | `MachineChooser.zig:92-95, 310`; `HostSettingsDialog.zig:36-39` | high (light theme) |

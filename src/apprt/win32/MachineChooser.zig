@@ -562,9 +562,9 @@ pub fn open(window: *Window) void {
     );
     if (self.font) |f| {
         for ([_]w32.HWND{
-            self.filter,         self.list,         self.hint,
-            self.account_status, self.account_btn,  self.primary_btn,
-            self.activity_btn,   self.menu_btn,     self.cancel_btn,
+            self.filter,        self.list,        self.account_status,
+            self.account_btn,   self.primary_btn, self.activity_btn,
+            self.menu_btn,      self.cancel_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
@@ -587,6 +587,12 @@ pub fn open(window: *Window) void {
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
+    // The status strip is the same caption role (§3.2), and `hint_line_h` is
+    // derived from it — so it takes the caption font rather than the body one,
+    // or the reserved height and the wrapped text stop agreeing.
+    if (self.subtitle_font) |f| {
+        _ = w32.SendMessageW(self.hint, w32.WM_SETFONT, @intFromPtr(f), 1);
+    }
     // The detail pane's machine name is Mac's `.title3` + `.semibold`: bigger
     // than the dialog font and heavier, so the pane has an obvious subject.
     self.title_font = w32.CreateFontW(
@@ -594,7 +600,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        600,
+        l.title_font_weight,
         0,
         0,
         0,
@@ -807,8 +813,11 @@ fn setHint(self: *MachineChooser, text: []const u8) void {
 }
 
 /// How many wrapped lines `text` needs at the current hint width, measured with
-/// the dialog's own font via `DT_CALCRECT | DT_WORDBREAK` — the same wrapping
+/// the strip's OWN font via `DT_CALCRECT | DT_WORDBREAK` — the same wrapping
 /// the STATIC will do, so the reserved height always matches what is drawn.
+/// That font is the caption role since T310; measuring with the body font while
+/// the STATIC renders in caption is how a reserved height quietly stops being
+/// the height that gets used.
 fn measureHintLines(self: *const MachineChooser, text: []const u8) i32 {
     if (text.len == 0) return 1;
     const l = layout(self.window.scale, self.hint_lines);
@@ -817,7 +826,7 @@ fn measureHintLines(self: *const MachineChooser, text: []const u8) i32 {
 
     const hdc = w32.GetDC(self.hint) orelse return 1;
     defer _ = w32.ReleaseDC(self.hint, hdc);
-    const prev = if (self.font) |f| w32.SelectObject(hdc, f) else null;
+    const prev = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
     defer if (prev) |p| {
         _ = w32.SelectObject(hdc, p);
     };
@@ -966,7 +975,7 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
     const row = self.selectedRow() orelse {
-        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondary_gray));
+        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(DIALOG_BG)));
         var r = rect(l.detail);
         var wbuf: [32]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&wbuf, "No machines") catch return;
@@ -991,11 +1000,18 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
         ),
     };
 
-    // The glyph keeps its 20:16 proportions inside the taller detail box.
+    // The mark is square at the system's large-icon size (T310), the way the
+    // row's is square at its small-icon size — one rule for both.
     const box = l.detail_glyph;
-    const gw = box.width();
-    const gh = @divTrunc(gw * 4, 5);
-    drawGlyphBox(hdc, box.left, box.top + @divTrunc(box.height() - gh, 2), gw, gh, detail.glyph);
+    drawGlyphBox(
+        hdc,
+        box.left,
+        box.top,
+        box.width(),
+        box.height(),
+        detail.glyph,
+        chooser_rows.secondaryOn(DIALOG_BG),
+    );
 
     var title_rect = rect(l.detail_title);
     const old_font = if (self.title_font) |f| w32.SelectObject(hdc, f) else null;
@@ -1003,9 +1019,14 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     drawTextUtf8(hdc, detail.title, &title_rect);
     if (old_font) |o| _ = w32.SelectObject(hdc, o);
 
+    // The detail subtitle is the ramp's CAPTION role, like the row subline it
+    // echoes — it was drawing at body size, which made it compete with the
+    // machine name instead of supporting it.
     var sub_rect = rect(l.detail_subtitle);
-    _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondary_gray));
+    const old_sub = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(DIALOG_BG)));
     drawTextUtf8(hdc, detail.subtitle, &sub_rect);
+    if (old_sub) |o| _ = w32.SelectObject(hdc, o);
 }
 
 /// The highlighted row, or null when the list is empty.
@@ -1392,7 +1413,7 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
             .bottom = r.top + m.subtitle_y + m.subtitle_h,
         };
         const old = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
-        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondary_gray));
+        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(ROW_BG)));
         drawTextUtf8(hdc, text.subtitle, &sub_rect);
         if (old) |o| _ = w32.SelectObject(hdc, o);
     }
@@ -1421,7 +1442,13 @@ fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: 
     const cy = r.top + m.status_cy;
 
     const online = status == .online;
-    const color = if (online) chooser_rows.online_green else chooser_rows.secondary_gray;
+    // Both clamped against the surface they land on (T310): the dot to the 3:1
+    // chrome floor so it keeps its green, the ring to the de-emphasized text
+    // ramp so it matches the subline beside it.
+    const color = if (online)
+        chooser_rows.onlineOn(ROW_BG)
+    else
+        chooser_rows.secondaryOn(ROW_BG);
     const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(color)) orelse return;
     defer _ = w32.DeleteObject(pen);
     const brush: ?*anyopaque = if (online)
@@ -1443,15 +1470,34 @@ fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: 
 /// tofu risk if Segoe's symbol font is missing): a laptop silhouette for the
 /// local machine, a two-unit rack for a relay device.
 fn drawGlyph(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, glyph: chooser_rows.Glyph) void {
-    drawGlyphBox(hdc, r.left + m.glyph_x, r.top + m.glyph_y, m.glyph_w, m.glyph_h, glyph);
+    drawGlyphBox(
+        hdc,
+        r.left + m.glyph_x,
+        r.top + m.glyph_y,
+        m.glyph_w,
+        m.glyph_h,
+        glyph,
+        chooser_rows.secondaryOn(ROW_BG),
+    );
 }
 
 /// `drawGlyph` at an absolute box, so the detail pane can draw the same
-/// silhouette at its own (larger) size.
-fn drawGlyphBox(hdc: w32.HDC, x: i32, y: i32, w: i32, h: i32, glyph: chooser_rows.Glyph) void {
+/// silhouette at its own (larger) size. `color` is a parameter because the two
+/// callers sit on different surfaces — the rows on the column wash, the detail
+/// pane on the dialog background — and a mark's contrast floor is only
+/// meaningful against what is actually behind it (T310).
+fn drawGlyphBox(
+    hdc: w32.HDC,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    glyph: chooser_rows.Glyph,
+    color: chooser_rows.Rgb,
+) void {
     // A bigger glyph needs a heavier stroke or it reads as a wireframe.
     const pen_w: i32 = if (w >= 24) 2 else 1;
-    const pen = w32.CreatePen(w32.PS_SOLID, pen_w, rgb(chooser_rows.secondary_gray)) orelse return;
+    const pen = w32.CreatePen(w32.PS_SOLID, pen_w, rgb(color)) orelse return;
     defer _ = w32.DeleteObject(pen);
     const old_pen = w32.SelectObject(hdc, pen);
     const old_brush = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_BRUSH));

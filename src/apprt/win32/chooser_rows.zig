@@ -20,6 +20,14 @@ const std = @import("std");
 const color_math = @import("color_math.zig");
 pub const Rgb = color_math.Rgb;
 
+/// The de-emphasized text ramp and the 3:1 chrome clamp both live in
+/// `chrome_theme`; this module consumes them rather than keeping its own
+/// answer (T310, the T206 rule).
+const chrome_theme = @import("chrome_theme.zig");
+/// The one type ramp (T310). The row's subline is the ramp's caption role, not
+/// a number chosen here.
+const type_ramp = @import("type_ramp.zig");
+
 /// Shape-coded reachability of a row, mirroring Mac's `statusIndicator`:
 /// online is a filled dot, offline a hollow ring, and `none` reserves the
 /// column without drawing (the Local row) so every row shares one grid.
@@ -129,10 +137,19 @@ pub const RowMetrics = struct {
     fill_inset_y: i32,
     fill_radius: i32,
     /// Status indicator: a `dot_d`-diameter circle centered on `status_cx`.
+    /// `status_col_w` is the column RESERVED for it — the Local row draws no
+    /// shape but still pays for the column, so every row shares one grid.
     status_cx: i32,
     status_cy: i32,
+    status_col_w: i32,
     dot_d: i32,
-    /// Machine glyph box.
+    /// The reserved icon COLUMN (28 DIP, §3.2). It is the column — not the
+    /// mark — that holds the text's left edge steady, so a glyph that grows
+    /// cannot push the titles of every row sideways (S1 1001).
+    glyph_col_x: i32,
+    glyph_col_w: i32,
+    /// The mark drawn inside that column, centered: `SM_CXSMICON` (16 DIP),
+    /// the size Windows draws a small icon at.
     glyph_x: i32,
     glyph_y: i32,
     glyph_w: i32,
@@ -155,44 +172,66 @@ fn px(v: f32, scale: f32) i32 {
 }
 
 /// Row geometry at `scale` (the owner window's DPI scale). Pure — tested.
+///
+/// Every gap here is on the design system's 4 DIP scale (§1) and every one is
+/// named by `docs/design/win32-machine-chooser.md` §3.2's Mac→Windows mapping.
+/// Five of them were not, before T310: `fill_inset_y = 1`, `title_y = 7`, a 6
+/// glyph gap, a 10 text gap and a 10 right pad. The scale test at the bottom of
+/// this file is what stops them coming back.
 pub fn rowMetrics(scale: f32) RowMetrics {
     const fill_inset_x = px(4, scale);
-    const fill_inset_y = px(1, scale);
+    // Row-to-row rhythm is 2 (§3.1) and it is paid TWICE — once by the row
+    // above and once by the row below — so the datum is the gap and the inset
+    // is derived from it. Writing `px(1, scale)` states half a gap as if it
+    // were a spacing choice, which is how an off-scale number gets in.
+    const row_gap = px(2, scale);
+    const fill_inset_y = @divTrunc(row_gap, 2);
 
     const status_left = fill_inset_x + px(8, scale);
     const status_col_w = px(12, scale);
     const dot_d = px(8, scale);
 
-    const glyph_x = status_left + status_col_w + px(6, scale);
-    const glyph_w = px(20, scale);
+    // `sm` between the status column and the icon column; the icon column is
+    // Mac's 28 box; `lg` from the column to the text (§3.2).
+    const glyph_col_x = status_left + status_col_w + px(4, scale);
+    const glyph_col_w = px(28, scale);
+    const glyph_mark = px(16, scale);
 
-    const title_y = px(7, scale);
-    const title_h = px(17, scale);
+    // Line boxes follow the type ramp: a body line with `sm` of leading, a
+    // caption line with the same. A hardcoded 17/14 would silently stop
+    // matching the text the moment the ramp moved.
+    const v_pad = px(4, scale);
+    const title_y = v_pad;
+    const title_h = type_ramp.body(scale).height + px(4, scale);
     const subtitle_y = title_y + title_h + px(2, scale);
-    const subtitle_h = px(14, scale);
-    const height = subtitle_y + subtitle_h + px(4, scale);
-
-    const glyph_h = px(16, scale);
+    const subtitle_h = type_ramp.caption(scale).height + px(4, scale);
+    const height = subtitle_y + subtitle_h + v_pad;
 
     return .{
         .height = height,
         .fill_inset_x = fill_inset_x,
         .fill_inset_y = fill_inset_y,
-        .fill_radius = px(6, scale),
+        // §3.1: a list item is the smallest surface on the dialog, so it takes
+        // the scale's smallest radius. Mac's 6 encodes macOS's larger radius
+        // language and does not survive the crossing.
+        .fill_radius = px(4, scale),
         .status_cx = status_left + @divTrunc(status_col_w, 2),
         .status_cy = @divTrunc(height, 2),
+        .status_col_w = status_col_w,
         .dot_d = dot_d,
-        .glyph_x = glyph_x,
-        .glyph_y = @divTrunc(height - glyph_h, 2),
-        .glyph_w = glyph_w,
-        .glyph_h = glyph_h,
-        .text_x = glyph_x + glyph_w + px(10, scale),
-        .text_pad_right = px(10, scale),
+        .glyph_col_x = glyph_col_x,
+        .glyph_col_w = glyph_col_w,
+        .glyph_x = glyph_col_x + @divTrunc(glyph_col_w - glyph_mark, 2),
+        .glyph_y = @divTrunc(height - glyph_mark, 2),
+        .glyph_w = glyph_mark,
+        .glyph_h = glyph_mark,
+        .text_x = glyph_col_x + glyph_col_w + px(12, scale),
+        .text_pad_right = px(8, scale),
         .title_y = title_y,
         .title_h = title_h,
         .subtitle_y = subtitle_y,
         .subtitle_h = subtitle_h,
-        .subtitle_font_h = px(12, scale),
+        .subtitle_font_h = type_ramp.caption(scale).height,
     };
 }
 
@@ -218,10 +257,30 @@ pub fn blend(bg: Rgb, fg: Rgb, alpha: f64) Rgb {
     return color_math.mix(bg, fg, alpha);
 }
 
-/// Mac's `.green` for an online device.
+/// Mac's `.green` for an online device. A BASE, never drawn raw: `onlineOn`
+/// clamps it to the surface it lands on.
 pub const online_green: Rgb = .{ .r = 0x34, .g = 0xC7, .b = 0x59 };
-/// The "secondary" gray Mac uses for offline rings, glyphs and sublines.
-pub const secondary_gray: Rgb = .{ .r = 0x99, .g = 0x99, .b = 0x99 };
+
+/// De-emphasized foreground for a row's subline, the detail pane's subtitle,
+/// the status strip, the machine glyph and an offline status ring.
+///
+/// This replaced a flat `secondary_gray = #999999` in T310 (§4 finding 12).
+/// That grey is **2.8:1 on Fluent's light surface** — under the 4.5:1 text
+/// floor AND under the 3:1 chrome floor — so on a light theme every one of
+/// those elements went illegible at once, and nothing in the code said so.
+/// `chrome_theme` already answers this question for the tab bar's own
+/// de-emphasized text; consuming it is the T206 rule, and it means the floor is
+/// enforced by search on whatever surface the caller actually paints on.
+pub fn secondaryOn(bg: Rgb) Rgb {
+    return chrome_theme.textSecondaryOn(bg);
+}
+
+/// The online status dot, clamped to the 3:1 chrome floor (WCAG 1.4.11) — it
+/// is a meaningful mark, not text, so it takes the chrome floor rather than
+/// being dragged onto the text ramp and losing its green.
+pub fn onlineOn(bg: Rgb) Rgb {
+    return chrome_theme.accentOn(bg, online_green);
+}
 
 /// Selection fill: the accent at Mac's 0.25 over the row background.
 ///
@@ -266,6 +325,13 @@ pub fn dividerColor(bg: Rgb) Rgb {
 // ---------------------------------------------------------------------
 
 const testing = std.testing;
+
+fn ratio(a: Rgb, b: Rgb) f64 {
+    return color_math.wcagContrastRatio(
+        color_math.wcagLuminance(a),
+        color_math.wcagLuminance(b),
+    );
+}
 
 test "localRow: pinned this-machine row, no status shape" {
     const r = localRow();
@@ -363,6 +429,88 @@ test "rowMetrics: scales with DPI" {
     try testing.expectEqual(a.text_x * 2, b.text_x);
     try testing.expectEqual(a.dot_d * 2, b.dot_d);
     try testing.expectEqual(a.subtitle_font_h * 2, b.subtitle_font_h);
+    try testing.expectEqual(a.glyph_col_w * 2, b.glyph_col_w);
+}
+
+test "rowMetrics: every gap is on the 4 DIP spacing scale (T310)" {
+    // Design system §1, and the test that keeps win32-machine-chooser.md
+    // §3.2's Mac→Windows mapping from rotting. Five of these were off it
+    // before T310 and every one of them looked deliberate in isolation.
+    const m = rowMetrics(1.0);
+    const on_scale = [_]i32{ 2, 4, 8, 12, 16, 24 };
+    const gaps = [_]struct { name: []const u8, v: i32 }{
+        .{ .name = "row edge -> pill", .v = m.fill_inset_x },
+        .{ .name = "row-to-row rhythm", .v = m.fill_inset_y * 2 },
+        .{ .name = "pill -> status column", .v = (m.status_cx - @divTrunc(m.status_col_w, 2)) - m.fill_inset_x },
+        .{ .name = "status column -> icon column", .v = m.glyph_col_x - (m.status_cx + @divTrunc(m.status_col_w, 2)) },
+        .{ .name = "icon column -> text", .v = m.text_x - (m.glyph_col_x + m.glyph_col_w) },
+        .{ .name = "text right pad", .v = m.text_pad_right },
+        .{ .name = "row top pad", .v = m.title_y },
+        .{ .name = "title -> subtitle", .v = m.subtitle_y - (m.title_y + m.title_h) },
+        .{ .name = "row bottom pad", .v = m.height - (m.subtitle_y + m.subtitle_h) },
+    };
+    for (gaps) |g| {
+        if (std.mem.indexOfScalar(i32, &on_scale, g.v) == null) {
+            std.debug.print("off-scale gap: {s} = {d}\n", .{ g.name, g.v });
+            return error.OffSpacingScale;
+        }
+    }
+
+    // Sizes are not gaps and have their own sources: §3.1's reserved 12 status
+    // column, §3.2's 28 icon column, `SM_CXSMICON` (16), Mac's 8 dot, and the
+    // scale's smallest radius (4).
+    try testing.expectEqual(@as(i32, 12), m.status_col_w);
+    try testing.expectEqual(@as(i32, 28), m.glyph_col_w);
+    try testing.expectEqual(@as(i32, 16), m.glyph_w);
+    try testing.expectEqual(@as(i32, 8), m.dot_d);
+    try testing.expectEqual(@as(i32, 4), m.fill_radius);
+}
+
+test "rowMetrics: the icon column holds the text edge, the mark sits inside it" {
+    // §3.2: the COLUMN is 28 so the text cannot drift per row; the MARK is
+    // SM_CXSMICON (16), the size Windows draws a small icon at. Before T310
+    // there was no column — the 20-wide mark WAS the column, so a wider glyph
+    // would have pushed every title sideways.
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const m = rowMetrics(scale);
+        try testing.expect(m.glyph_w < m.glyph_col_w);
+        try testing.expectEqual(m.glyph_w, m.glyph_h);
+        // Centered in its column, within a pixel of rounding on both sides.
+        const lead = m.glyph_x - m.glyph_col_x;
+        const trail = (m.glyph_col_x + m.glyph_col_w) - (m.glyph_x + m.glyph_w);
+        try testing.expect(@abs(lead - trail) <= 1);
+        // And the mark never escapes the column it is centered in.
+        try testing.expect(m.glyph_x >= m.glyph_col_x);
+        try testing.expect(m.glyph_x + m.glyph_w <= m.glyph_col_x + m.glyph_col_w);
+    }
+    try testing.expectEqual(@as(i32, 28), rowMetrics(1.0).glyph_col_w);
+    try testing.expectEqual(@as(i32, 16), rowMetrics(1.0).glyph_w);
+}
+
+test "rowMetrics: the selection pill takes the scale's smallest radius" {
+    // §3.1: 4 for the smallest surface. Mac's 6 is macOS's radius language.
+    try testing.expectEqual(@as(i32, 4), rowMetrics(1.0).fill_radius);
+    inline for (.{ @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const m = rowMetrics(scale);
+        // It scales, and it never grows past half the pill's own height or the
+        // "rounded rect" stops being one.
+        try testing.expect(m.fill_radius > 0);
+        try testing.expect(m.fill_radius * 2 <= m.height - 2 * m.fill_inset_y);
+    }
+}
+
+test "rowMetrics: the text line boxes follow the type ramp, not their own numbers" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const m = rowMetrics(scale);
+        // The subline IS the ramp's caption role — the same font the painter
+        // creates from `subtitle_font_h`.
+        try testing.expectEqual(type_ramp.caption(scale).height, m.subtitle_font_h);
+        // Each line box has room for its text plus leading, and the title's
+        // box is the larger of the two because its font is.
+        try testing.expect(m.title_h > type_ramp.body(scale).height);
+        try testing.expect(m.subtitle_h > type_ramp.caption(scale).height);
+        try testing.expect(m.title_h > m.subtitle_h);
+    }
 }
 
 test "clampHintLines: at least one line, never unbounded" {
@@ -409,6 +557,42 @@ test "selection and hover sit between the background and their source color" {
     const hov = hoverFill(bg);
     try testing.expect(hov.r > bg.r);
     try testing.expect(hov.b < sel.b);
+}
+
+test "secondaryOn / onlineOn hold their floors on every surface (T310)" {
+    // §4 finding 12: the retired `secondary_gray = #999999` had no floor at
+    // all, and it is 2.8:1 on Fluent's light surface — under both the 4.5:1
+    // text floor and the 3:1 chrome floor, so the sublines, the offline ring
+    // and the machine glyph went illegible together on a light theme.
+    const gray: Rgb = .{ .r = 0x99, .g = 0x99, .b = 0x99 };
+    const light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
+    try testing.expect(ratio(gray, light) < 3.0);
+
+    // A sweep, not a hand-picked pair — a single background is exactly how the
+    // fixed grey survived this long.
+    var v: u16 = 0;
+    while (v <= 255) : (v += 8) {
+        const c: u8 = @intCast(v);
+        for ([_]Rgb{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = @intCast(255 - v), .b = 0x40 },
+            .{ .r = 0x20, .g = c, .b = @intCast(255 - v) },
+        }) |bg| {
+            // Text floor for the de-emphasized ramp...
+            try testing.expect(ratio(secondaryOn(bg), bg) >= 4.4);
+            // ...and the chrome floor for the status mark, which keeps its
+            // green instead of being dragged onto the text ramp.
+            try testing.expect(ratio(onlineOn(bg), bg) >= 2.95);
+        }
+    }
+
+    // The online dot stays recognizably green, and stays distinguishable from
+    // the de-emphasized ramp — shape-coded or not, the two must not converge.
+    for ([_]Rgb{ light, .{ .r = 0x20, .g = 0x20, .b = 0x20 } }) |bg| {
+        const on = onlineOn(bg);
+        try testing.expect(on.g > on.r and on.g > on.b);
+        try testing.expect(!on.eql(secondaryOn(bg)));
+    }
 }
 
 test "selection tracks the accent it is given, and the washes follow luminance" {

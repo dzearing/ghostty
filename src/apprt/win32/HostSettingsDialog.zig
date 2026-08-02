@@ -25,6 +25,7 @@ const HostSettingsDialog = @This();
 const std = @import("std");
 const App = @import("App.zig");
 const host_defaults = @import("host_defaults.zig");
+const type_ramp = @import("type_ramp.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -201,7 +202,10 @@ pub fn layoutFor(
             .right = cancel_left + btn_w,
             .bottom = btn_top + btn_h,
         },
-        .font_h = px(15, scale),
+        // The Ctrl+Shift+N surface's body role (T310). Host Settings is part of
+        // that surface, so it takes the ramp with the chooser rather than
+        // keeping the seventh copy of a 15 nobody chose.
+        .font_h = type_ramp.body(scale).height,
     };
 }
 

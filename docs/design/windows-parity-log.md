@@ -5457,3 +5457,69 @@ box's accent is verified restored after every run including that one.
 Follow-ups: T307 (an open panel does not repaint on an accent change), T308 (the
 panels are still hardcoded dark), T309 (two derivations of the light/dark
 decision).
+
+## 2026-08-01 - T310 (T227 split): the chooser gets the ramp, and a fixed grey turns out to be a light-theme outage
+
+T227 was the Ctrl+Shift+N polish pass and it was too big for one context, so it
+split three ways: **T310** (metrics, type, the secondary contrast floor),
+**T311** (the account row's avatar and its Sign Out link), **T312** (the list has
+no focus indicator). Two of the doc's thirteen findings were already closed by
+T305 before anyone acted on the table - `chooser_rows`' washes are
+`color_math.wash` and its accent is a parameter - and finding 1 belongs to T308.
+
+The visible half is arithmetic against `win32-machine-chooser.md` 3.2: the row's
+selection radius 6 -> 4, a **28 reserved icon column** with a 16 mark centered in
+it where a 20-wide mark used to BE the column, the five off-scale row spacings
+snapped (1 -> a derived half of a 2 rhythm, 7 -> 4, 6 -> 4, 10 -> 12, 10 -> 8),
+plus the two Mac numbers 3.2 names in the layout module itself (filter pad
+14 -> 12, the shared gap 10 -> 8). Two spacing-scale tests - one per module -
+now walk every gap and fail on any value outside {2,4,8,12,16,24}. Sizes are
+asserted separately and by source, because a size is not a gap.
+
+**The type ramp could not be edited in place, only hoisted.** `font_h =
+px(15, scale)` is written out in SEVEN dialogs. Changing the chooser's copy to
+3.2's 14 would have made the chooser the one dialog that disagrees with the
+rest - a different inconsistency, not a fix - so the ramp became
+`src/apprt/win32/type_ramp.zig` (caption 12 / body 14 / subtitle 20 semibold),
+the Ctrl+Shift+N surface consumes it, `win32-design-system.md` gains 2.4, and
+the other five dialogs are **T313** rather than quietly left behind. Same
+argument T257 made for the chrome geometry: the duplication is not the defect,
+the silent divergence it permits is.
+
+**A fixed foreground color cannot satisfy a contrast floor.**
+`secondary_gray = #999999` carried the row sublines, the offline status rings,
+the machine glyphs and the detail subtitle. It is 5.2:1 on the dark wash the
+chooser paints and **2.8:1 on Fluent's light surface** - under the 4.5:1 text
+floor AND the 3:1 chrome floor - so a light theme would have taken all four out
+together, and nothing in the code said so. It is now `secondaryOn(bg)` and
+`onlineOn(bg)`, delegating to a `chrome_theme.textSecondaryOn` hoisted out of
+`resolve` so the bar's answer and the chooser's cannot drift, and scored by a
+96-background sweep rather than a hand-picked pair - which is exactly how the
+grey survived this long.
+
+Two process notes.
+
+**The claim with no oracle was named, not faked.** Finding 12's defect is
+light-theme-only and the chooser is still hardcoded dark (T308), so a pixel probe
+for it would measure a surface this build cannot produce. Per T305's rule the
+claim is scored where it is real - the unit sweep - and the gap is written into
+the task instead of dressed up as a passing assertion.
+
+**A pixel probe needs a threshold that discriminates, and the first one did
+not.** Finding 8's whole visible consequence is the text column moving 8 DIP
+right, so the probe finds the first BRIGHT column in row 0's band (the title is
+230, the glyph beside it is the de-emphasized ramp, so brightness separates them
+without knowing where the glyph ends). The first bound was 62 DIP, which rounds
+to 78 at this box's 1.25 - and the retired geometry lands at ~78 too, so it would
+have passed both builds. Measured 87 now; the bounds sit inside the ~9 px window.
+Having to write it as a band at all is **T314**: this script keeps a private
+banker's-rounding `Dip`, the T257 divergence in the one script T257 did not
+sweep, and a metric the module composes from individually-rounded parts cannot
+be reproduced by rounding the total at any rounding mode.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0, `test-agent` exit 0.
+P1-P3 ALL PASS. On box `ipc-machine-chooser` ALL PASS **50** (was 45) with
+`-NegativeControl` failing exactly 1; regression green across `host-settings`
+(65), `chooser-menu` (57), `relay-account`, `chrome-theme` (34), `tab-strip`
+(56) and `activity-monitor` (82).
