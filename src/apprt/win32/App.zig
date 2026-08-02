@@ -2137,6 +2137,13 @@ pub const RemoteOpenOptions = struct {
     /// "New Window" on it can re-dial the same agent. Strings borrowed;
     /// `Window.setRemoteMachine` dupes.
     machine: ?Window.RemoteMachine = null,
+    /// ATTACH to this existing session instead of OPENing a fresh one (T320,
+    /// resuming a browsed session). Borrowed for the duration of the call.
+    /// Non-null suppresses the per-host cwd/shell defaults below: an ATTACH's
+    /// shell and working directory were fixed when its session was first
+    /// opened, and sending them again would describe a spawn that is not
+    /// happening.
+    session_id: ?[]const u8 = null,
 };
 
 pub const RemoteOpenError = error{ DialFailed, CreateFailed } || Allocator.Error;
@@ -2162,14 +2169,17 @@ pub fn openDialedWindow(
     // cwd + shell, and an explicit value from the caller (the chooser, or the
     // `+new-remote-window` flags, or T68's inheritance) always wins. Mac does
     // this in `Machine.applyOpenDefaults`; win32 has ONE open tail, so this is
-    // the single seeding site. Only ever an OPEN — an ATTACH's shell/cwd were
-    // fixed when its session was first opened, and no ATTACH comes through here.
+    // the single seeding site. Only ever an OPEN — an ATTACH (T320) resumes a
+    // session whose shell and cwd were fixed when it was first opened, so it
+    // skips the lookup entirely rather than sending values nothing will read.
     var defaults: host_defaults.Resolved = .{};
-    if (opts.machine) |machine| host_defaults.lookup(
-        self.core_app.alloc,
-        machine.hostDefaultsKey(),
-        &defaults,
-    );
+    if (opts.session_id == null) {
+        if (opts.machine) |machine| host_defaults.lookup(
+            self.core_app.alloc,
+            machine.hostDefaultsKey(),
+            &defaults,
+        );
+    }
 
     const overrides: Surface.Overrides = .{
         .remote = .{
@@ -2177,6 +2187,7 @@ pub fn openDialedWindow(
             .working_directory = opts.working_directory orelse defaults.workingDirectory(),
             .shell = opts.shell orelse defaults.shell(),
             .command = opts.command,
+            .session_id = opts.session_id,
         },
     };
 
@@ -2231,6 +2242,70 @@ pub fn openRelayWindow(
     var opts_with_machine = opts;
     opts_with_machine.machine = .{ .relay = .{ .base = relay_base, .device = device } };
     return self.openDialedWindow(.{ .relay = dialed }, opts_with_machine);
+}
+
+/// Resume ONE browsed session of the LOCAL agent (T320): open a window whose
+/// first pane ATTACHes to `session_id` instead of OPENing a fresh shell. The
+/// machine chooser's session roster produces the id; this is the same override
+/// shape launch-time restore builds (`restoreAttachOverride`), which is the
+/// point — a resume is a restore of one leaf, on demand.
+///
+/// `pane_id` is the layout manifest's recorded id for that session when the
+/// caller found one (T113: the shell we are attaching to still carries it in
+/// `$GHOZTTY_PANE_ID`). Both slices are borrowed for the duration of the call.
+pub fn resumeLocalSession(
+    self: *App,
+    session_id: []const u8,
+    pane_id: ?[]const u8,
+) !*Window {
+    // No agent ⇒ nothing to attach to. Opening a plain window instead would
+    // silently give the user a fresh shell in place of the session they picked.
+    const conn = self.local_agent.sharedConnection() orelse {
+        log.warn("resume session: no local agent connection", .{});
+        return error.NoAgent;
+    };
+    var ov: Surface.Overrides = .{
+        .pane_id = pane_id,
+        .remote = .{
+            .connection = conn,
+            .local_agent = true,
+            .session_id = session_id,
+        },
+    };
+    log.info("resume session: attaching local session id={s}", .{session_id});
+    const window = try self.createWindow(.{ .surface_overrides = &ov });
+    if (window.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+    return window;
+}
+
+/// Resume ONE browsed session of a RELAY machine (T320): dial that machine and
+/// open a local window whose pane ATTACHes to `session_id` over the new
+/// transport. The relay half of the same story — one dial, then the shared
+/// open tail, so a resumed remote window owns its connection exactly like a
+/// `+new-remote-window` one and re-dials the same machine for its own "New
+/// Window" (T68).
+pub fn resumeRelaySession(
+    self: *App,
+    relay_base: []const u8,
+    device: []const u8,
+    token: []const u8,
+    session_id: []const u8,
+) RemoteOpenError!*Window {
+    const alloc = self.core_app.alloc;
+    const dialed = try alloc.create(relay_dial.Dialed);
+    dialed.* = relay_dial.dial(alloc, relay_base, device, token, .raw) catch |err| {
+        log.warn(
+            "resume session: relay dial failed relay={s} device={s} err={}",
+            .{ relay_base, device, err },
+        );
+        alloc.destroy(dialed);
+        return error.DialFailed;
+    };
+    log.info("resume session: attaching remote session id={s} device={s}", .{ session_id, device });
+    return self.openDialedWindow(.{ .relay = dialed }, .{
+        .session_id = session_id,
+        .machine = .{ .relay = .{ .base = relay_base, .device = device } },
+    });
 }
 
 /// T68: the "New Window" action on a focused REMOTE window — dial the same

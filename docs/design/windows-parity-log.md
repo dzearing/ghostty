@@ -5785,3 +5785,50 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
 `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/chooser-sessions-remote.ps1` ALL PASS (19) and `-NegativeControl`
 ALL PASS (13); `chooser-sessions.ps1` still ALL PASS (16).
+
+## 2026-08-02 - T320 (T146 split): a browsed session becomes openable, and the test's own fixture was the bug
+
+Return on a session row now dismisses the chooser and opens a window whose pane
+ATTACHes to that session. The keyboard model is Mac's verbatim - Right steps
+into the roster, Up/Down walk it, stepping above the first row hands navigation
+back to the machine list, Return resumes the cursored row instead of the
+machine's primary action - and it needed no focus plumbing at all, because
+`handleKey` already intercepts arrows and Return before any control sees them.
+Left/Right are consumed only when the filter cannot use them: in a field with
+text they are caret keys.
+
+Mac's index-space rule (`highlightedSessions` filters to `isConnectable` so
+Return resumes the row the highlight is on) is STRUCTURAL here rather than
+duplicated: the painter, `killAt`, `rowAt` and the cursor all take the same
+`[]const VisibleRow` that `visible()` returned, so there is no second list to
+disagree with. The cursor is clamped where it is used, not kept in sync, so a
+roster that shrank under it cannot resume whatever slid into the index. The
+alive guard lives once, in `resumeTarget`, which hands back `.none` for a
+tombstone - callers have nothing to forget.
+
+One deliberate divergence, filed as T330: a row already open in one of our own
+panes is FOCUSED, not attached twice. The agent rebinds a session to its newest
+ATTACH (`agent/server.zig:1026-1067`), so Mac's unconditional resume takes the
+pane away from the window that has it, and "show me that session" is satisfied
+either way.
+
+The lesson is the fixture. A session that is merely listed cannot test resume -
+every session the app has open takes the focus short-circuit - so the test needs
+a live session with NO viewer, built the way a user gets one: run panes under
+the agent, kill the APP only, drop the layout manifest, relaunch. The first run
+failed 6 assertions and all 6 were the script assuming the agent lists sessions
+in creation order and picking row 0. The agent's order is its store's; the app's
+own session came first, so the "orphan" it resumed was a pane it already had
+open. Rows are chosen by what they ARE now (alive, no viewer) and the cursor is
+walked to that index - which tests the index space harder than a fixed 0 did.
+
+Follow-ups: **T331** (the REMOTE half of resume has never run on box; T319's
+FakeRelay can answer one), **T332** (`+list --json` never reports a pane's
+session, so the pane-side oracle this task's own validation assumed does not
+exist), **T333** (`adopt` resets the scroll, which now jumps a parked cursor off
+screen on a refresh in place).
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
+Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS. New:
+`test/win32/chooser-resume.ps1` ALL PASS (21); `chooser-sessions.ps1` still ALL
+PASS (16).

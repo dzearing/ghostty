@@ -1352,6 +1352,10 @@ fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void 
         .region = l.sessions,
         .scale = self.window.scale,
         .bg = DIALOG_BG,
+        // The user's accent floored against the surface the cards composite on
+        // — the same resolution `drawRow` does for the list's selected pill, so
+        // one selection language covers both halves of the dialog (T320).
+        .accent = chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached()),
         .label_font = self.strong_font,
         .caption_font = self.subtitle_font,
     }, visible);
@@ -2063,7 +2067,11 @@ fn registerClass(app: *App) ?void {
     divider_brush = w32.CreateSolidBrush(rgb(chooser_rows.dividerColor(DIALOG_BG)));
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // The roster's cards are painted on the dialog, so the dialog is what
+        // has to be told to deliver double clicks — without CS_DBLCLKS the
+        // second click of a resume arrives as another WM_LBUTTONDOWN and the
+        // gesture silently does not exist (T320).
+        .style = w32.CS_DBLCLKS,
         .lpfnWndProc = &dialogWndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -2180,6 +2188,13 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             if (self.onSessionClick(loWordSigned(lparam), hiWordSigned(lparam))) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        // Single click points the cursor at a row, double click resumes it —
+        // Mac's own gesture split (`MachineChooserView.swift:700-701`) and the
+        // one every Windows list already teaches.
+        w32.WM_LBUTTONDBLCLK => {
+            if (self.onSessionDoubleClick(loWordSigned(lparam), hiWordSigned(lparam))) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_MOUSEWHEEL => {
             if (self.onSessionWheel(@as(i16, @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)))))) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2271,14 +2286,191 @@ fn setKillHover(self: *MachineChooser, index: i32) void {
     self.refreshSessions();
 }
 
-/// A click in the roster. Returns true when it was consumed.
+/// A click in the roster. Returns true when it was consumed. Kill is tested
+/// first: its hit box lives INSIDE a card, so one point answers both and the
+/// more specific control has to win.
 fn onSessionClick(self: *MachineChooser, x: i32, y: i32) bool {
     var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const view = self.sessionView(&buf) orelse return false;
-    const idx = self.roster.killAt(view.rows, view.region, self.window.scale, x, y) orelse
+    if (self.roster.killAt(view.rows, view.region, self.window.scale, x, y)) |idx| {
+        self.confirmKill(view.rows[idx]);
+        return true;
+    }
+    const idx = self.roster.rowAt(view.rows, view.region, self.window.scale, x, y) orelse
         return false;
-    self.confirmKill(view.rows[idx]);
+    // Point the keyboard cursor at the clicked card (Mac's `onTapGesture`), so
+    // a click followed by Return resumes the row the user just touched.
+    const next: i32 = @intCast(idx);
+    if (self.roster.cursor != next) {
+        self.roster.cursor = next;
+        self.refreshSessions();
+    }
     return true;
+}
+
+/// A double click in the roster: resume that session. Returns true when
+/// consumed. Falls through to the single-click behavior for a card that is not
+/// resumable, so the cursor still lands where the user clicked.
+fn onSessionDoubleClick(self: *MachineChooser, x: i32, y: i32) bool {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return false;
+    // A double click that landed on Kill is still a Kill (its confirmation runs
+    // a nested pump, and the second click already opened it).
+    if (self.roster.killAt(view.rows, view.region, self.window.scale, x, y) != null) return true;
+    const idx = self.roster.rowAt(view.rows, view.region, self.window.scale, x, y) orelse
+        return false;
+    self.resumeRow(view.rows[idx]);
+    return true;
+}
+
+/// Whether Left/Right belong to the roster cursor rather than to the filter's
+/// caret. Pure so the rule is testable: the filter owns them whenever it has
+/// focus AND has text to move a caret through — an empty field has no caret to
+/// move, so navigation is free to take them.
+pub fn horizontalIsNav(filter_focused: bool, filter_len: usize) bool {
+    return !(filter_focused and filter_len > 0);
+}
+
+fn horizontalIsNavigation(self: *const MachineChooser) bool {
+    const focused = w32.GetFocus() == @as(?w32.HWND, self.filter);
+    var buf: [256]u8 = undefined;
+    return horizontalIsNav(focused, self.filterText(&buf).len);
+}
+
+/// Right: step the keyboard cursor into the roster, and scroll its first card
+/// into view.
+fn enterSessions(self: *MachineChooser) void {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return;
+    self.roster.cursor = chooser_sessions.enterCursor(self.roster.cursor, view.rows.len);
+    _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
+}
+
+/// Up/Down inside the roster. Repaints once for the move and the scroll
+/// together — they are one visual change.
+fn moveSessionCursor(self: *MachineChooser, delta: i32) void {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse {
+        self.roster.cursor = chooser_sessions.no_cursor;
+        return;
+    };
+    self.roster.cursor = chooser_sessions.moveCursor(
+        self.roster.cursor,
+        delta,
+        view.rows.len,
+    );
+    _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
+    self.refreshSessions();
+}
+
+/// Resume the row the keyboard cursor is on (Return). No cursor ⇒ not ours.
+fn resumeCursor(self: *MachineChooser) bool {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return false;
+    const idx = self.roster.cursorIndex(view.rows) orelse return false;
+    self.resumeRow(view.rows[idx]);
+    return true;
+}
+
+/// Resume ONE browsed session (T320): dismiss the chooser and open a local
+/// window whose pane ATTACHes to that session — the local agent's, or a relay
+/// machine's over its own transport.
+///
+/// The chooser produces a target and closes; the attach itself belongs to `App`
+/// (Mac keeps the same separation via `WindowTarget.resumeSession`, and
+/// `MachineChooser.zig` is large enough without owning an attach path).
+///
+/// Everything the target borrows is copied to the stack FIRST: `close` frees
+/// the arena the device listing and the session strings are parsed into.
+fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
+    const target = chooser_sessions.resumeTarget(self.roster.target, row.session);
+
+    // Already open in one of our panes: focus it instead of attaching a second
+    // viewer. The agent rebinds a session to the newest ATTACH, so a second
+    // attach would quietly take the pane away from the window that has it —
+    // and "show me that session" is what the user asked for either way. A
+    // deliberate divergence from Mac, which resumes unconditionally (T330).
+    if (row.open_locally) {
+        if (self.focusOpenSession(row.session.id)) return;
+    }
+
+    switch (target) {
+        .none => {
+            // A tombstone row: listed (its command and cwd are worth seeing)
+            // but there is no live child to attach to.
+            self.setHint("That session has exited - it can't be resumed.");
+        },
+        .local => |sid| {
+            var id_buf: [128]u8 = undefined;
+            if (sid.len == 0 or sid.len > id_buf.len) return;
+            const id = id_buf[0..sid.len];
+            @memcpy(id, sid);
+            // The recorded pane id, so a resumed pane answers to the
+            // `$GHOZTTY_PANE_ID` its still-running shell was baked with (T113).
+            var pane_buf: [64]u8 = undefined;
+            const pane_id: ?[]const u8 = if (self.roster.persistedPaneIdFor(sid)) |p| blk: {
+                if (p.len == 0 or p.len > pane_buf.len) break :blk null;
+                @memcpy(pane_buf[0..p.len], p);
+                break :blk pane_buf[0..p.len];
+            } else null;
+
+            const app = self.window.app;
+            self.close(true);
+            _ = app.resumeLocalSession(id, pane_id) catch |err| {
+                log.warn("machine chooser: resume local session failed err={}", .{err});
+            };
+        },
+        .remote => |r| {
+            const tok = self.token orelse {
+                self.setHint("Not signed in - use Sign in with Google above.");
+                return;
+            };
+            const app = self.window.app;
+            // Dial synchronously while the chooser is still alive (relay_base,
+            // token and the ids are borrowed from it); close only on success,
+            // exactly as `openSelection` does for a new remote window.
+            _ = app.resumeRelaySession(self.relay_base, r.device, tok, r.session) catch |err| {
+                log.warn("machine chooser: resume relay session failed err={}", .{err});
+                self.setHint(switch (err) {
+                    error.DialFailed => "Couldn't reach that machine - is its agent running?",
+                    else => "Couldn't resume that session.",
+                });
+                return;
+            };
+            self.close(false);
+        },
+    }
+}
+
+/// Focus the pane already ATTACHed to `id`, if one of our windows has it.
+/// Returns true when the chooser was dismissed onto it.
+fn focusOpenSession(self: *MachineChooser, id: []const u8) bool {
+    const app = self.window.app;
+    for (app.windows.items) |win| {
+        for (0..win.tab_count) |t| {
+            var it = win.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                if (!entry.view.core_surface_ready) continue;
+                const sid = entry.view.core_surface.remoteSessionId() orelse continue;
+                if (!std.mem.eql(u8, sid, id)) continue;
+                log.info("machine chooser: session already open, focusing its pane", .{});
+                const surface = entry.view;
+                // Close WITHOUT refocusing the owner: the pane we are about to
+                // raise may live in a different window, and the owner would
+                // otherwise take the foreground back off it.
+                self.close(false);
+                win.selectTabIndex(t);
+                win.tab_active_surface[t] = surface;
+                if (win.hwnd) |hwnd| {
+                    if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+                    _ = w32.SetForegroundWindow(hwnd);
+                }
+                if (surface.hwnd) |h| App.deferSetFocus(h); // T48
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 fn onSessionWheel(self: *MachineChooser, wheel_delta: i16) bool {
@@ -2444,12 +2636,38 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 self.openRowMenuFromButton();
             } else if (focus == @as(?w32.HWND, self.activity_btn)) {
                 self.openActivityMonitor();
+            } else if (self.roster.cursor != chooser_sessions.no_cursor and self.resumeCursor()) {
+                // The session sub-cursor is in the roster: Return resumes THAT
+                // row, not the machine's primary action (Mac's `submit`,
+                // `MachineChooserView.swift:1373-1381`).
             } else {
                 self.openSelection();
             }
             return true;
         },
+        // Right steps INTO the detail pane's session list and Left steps back
+        // out (Mac binds both, `:315-318`). They are consumed only when the
+        // filter cannot use them: Left/Right in a field with text are caret
+        // keys, and taking those would make the filter uneditable.
+        w32.VK_RIGHT, w32.VK_LEFT => {
+            if (!self.horizontalIsNavigation()) return false;
+            const before = self.roster.cursor;
+            if (vk == w32.VK_RIGHT) {
+                self.enterSessions();
+            } else {
+                self.roster.cursor = chooser_sessions.no_cursor;
+            }
+            if (self.roster.cursor != before) self.refreshSessions();
+            return true;
+        },
         w32.VK_UP, w32.VK_DOWN => {
+            // With the cursor inside the roster, Up/Down walk the sessions;
+            // stepping above the first row hands navigation back to the
+            // machine list (Mac's `move`, `:1309-1322`).
+            if (self.roster.cursor != chooser_sessions.no_cursor) {
+                self.moveSessionCursor(if (vk == w32.VK_UP) -1 else 1);
+                return true;
+            }
             const cur: i32 = @intCast(w32.SendMessageW(self.list, w32.LB_GETCURSEL, 0, 0));
             const delta: i32 = if (vk == w32.VK_UP) -1 else 1;
             const next = clampSelection(cur, delta, self.row_count);

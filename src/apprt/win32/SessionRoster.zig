@@ -95,6 +95,12 @@ inflight: bool = false,
 scroll: i32 = 0,
 /// Index (into the VISIBLE rows) whose Kill button is under the pointer, or -1.
 hover_kill: i32 = -1,
+/// The keyboard sub-cursor (T320): an index into the VISIBLE rows, or
+/// `chooser_sessions.no_cursor` when the machine row itself is highlighted and
+/// the roster is not being navigated. Same index space as `hover_kill`,
+/// `killAt` and `paint` — every one of them takes the rows array `visible()`
+/// returned, so there is no second list for the two to disagree about.
+cursor: i32 = chooser_sessions.no_cursor,
 
 /// Sessions the user just killed, hidden optimistically so the row vanishes at
 /// once instead of lingering — and degrading to a "pid" label — during the
@@ -246,6 +252,10 @@ fn clear(self: *SessionRoster) void {
     self.state = .loading;
     self.scroll = 0;
     self.hover_kill = -1;
+    // The cursor belongs to the roster it was pointing at: a new machine's
+    // rows are not the rows the user was walking (Mac clears `browseCursor`
+    // on every highlight move, `MachineChooserView.swift:1328`).
+    self.cursor = chooser_sessions.no_cursor;
     self.killed_count = 0;
     // Bump the serial so a reply already in flight for the OLD machine is
     // dropped instead of adopted under the new machine's name.
@@ -590,6 +600,26 @@ fn persistedTitleFor(self: *const SessionRoster, id: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The pane id the saved layout recorded for `id`, or null. A resumed pane
+/// re-adopts it (T113): the shell we are ATTACHing to is still running with
+/// that value baked into `$GHOZTTY_PANE_ID`, so handing it a fresh one would
+/// break the pane's ability to name itself. Only meaningful for the LOCAL
+/// machine — the manifest is this box's.
+pub fn persistedPaneIdFor(self: *const SessionRoster, id: []const u8) ?[]const u8 {
+    if (self.target != .local) return null;
+    const parsed = self.manifest orelse return null;
+    for (parsed.value.windows) |win| {
+        for (win.tabs) |tab| {
+            for (tab.nodes) |node| {
+                const leaf = node.leaf orelse continue;
+                const sid = leaf.session_id orelse continue;
+                if (std.mem.eql(u8, sid, id)) return leaf.pane_id;
+            }
+        }
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------
@@ -602,6 +632,10 @@ pub const PaintCtx = struct {
     region: chooser_layout.Rect,
     scale: f32,
     bg: chooser_sessions.Rgb,
+    /// The user's accent, already floored against `bg` by the caller — the same
+    /// value the machine list's selected pill is painted with, so the keyboard
+    /// cursor reads as the same selection (T320).
+    accent: chooser_sessions.Rgb,
     /// Body semibold — the session's name.
     label_font: ?*anyopaque,
     /// Caption — the sublines and the badges.
@@ -688,10 +722,27 @@ fn paintRow(
 ) void {
     const hdc = ctx.hdc;
     const hovered = self.hover_kill == index;
-    const card_bg = chooser_sessions.cardFill(ctx.bg);
+    const cursored = self.cursor == index;
+    // Everything on the card composites against the card's OWN surface, so a
+    // cursored card's text and badges are floored against the accent wash they
+    // actually sit on rather than against the plain card (the T206 rule).
+    const card_bg = if (cursored)
+        chooser_sessions.cursorFill(ctx.bg, ctx.accent)
+    else
+        chooser_sessions.cardFill(ctx.bg);
 
-    // The card.
+    // The card, plus the cursor's ring — the mark is never fill alone, so the
+    // cursor survives a low-contrast accent and a color-blind reading (§2.4).
     fillRound(hdc, l.card, m.radius, card_bg);
+    if (cursored) {
+        strokeRound(
+            hdc,
+            l.card,
+            m.radius,
+            chooser_sessions.cursorBorder(ctx.bg, ctx.accent),
+            @max(@as(i32, @intFromFloat(@round(ctx.scale))), 1),
+        );
+    }
 
     // Liveness: filled dot when alive, hollow ring for a tombstone — shape as
     // well as color, so the state survives a color-blind reading (§2.4).
@@ -836,6 +887,34 @@ fn fillRound(hdc: w32.HDC, r: chooser_layout.Rect, radius: i32, color: chooser_s
     _ = w32.SelectObject(hdc, op);
 }
 
+/// The same rounded rect, outlined instead of filled — a wide pen centered on
+/// the path, so the ring is inset by half its width the way every other ring in
+/// the chrome is.
+fn strokeRound(
+    hdc: w32.HDC,
+    r: chooser_layout.Rect,
+    radius: i32,
+    color: chooser_sessions.Rgb,
+    width: i32,
+) void {
+    const pen = w32.CreatePen(w32.PS_SOLID, width, rgb(color)) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const ob = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_BRUSH));
+    defer _ = w32.SelectObject(hdc, ob);
+    const op = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, op);
+    const inset = @divTrunc(width, 2);
+    _ = w32.RoundRect(
+        hdc,
+        r.left + inset,
+        r.top + inset,
+        r.right - inset,
+        r.bottom - inset,
+        radius * 2,
+        radius * 2,
+    );
+}
+
 fn drawDot(hdc: w32.HDC, r: chooser_layout.Rect, color: chooser_sessions.Rgb, filled: bool) void {
     const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(color)) orelse return;
     defer _ = w32.DeleteObject(pen);
@@ -910,6 +989,81 @@ pub fn killAt(
             l.kill_hit.top <= y and y < l.kill_hit.bottom) return i;
     }
     return null;
+}
+
+/// The visible row whose CARD contains the client point, or null. The Kill
+/// button sits inside a card, so callers test `killAt` first — one point can
+/// answer both, and Kill is the more specific of the two.
+pub fn rowAt(
+    self: *const SessionRoster,
+    rows: []const VisibleRow,
+    region: chooser_layout.Rect,
+    scale: f32,
+    x: i32,
+    y: i32,
+) ?usize {
+    if (x < region.left or x >= region.right) return null;
+    if (y < region.top or y >= region.bottom) return null;
+
+    const m = chooser_sessions.metrics(scale);
+    var cy = region.top - self.scroll;
+    for (rows, 0..) |row, i| {
+        const subs = chooser_sessions.sublineCount(row.session);
+        const l = chooser_sessions.rowLayout(m, region.left, cy, region.width(), subs);
+        cy = l.card.bottom + m.row_gap;
+        if (l.card.left <= x and x < l.card.right and
+            l.card.top <= y and y < l.card.bottom) return i;
+    }
+    return null;
+}
+
+/// The keyboard cursor as an index INTO `rows`, or null when it points nowhere.
+/// Clamped HERE, at the point of use, rather than kept in sync with every
+/// change to the roster: a refetch or an optimistic Kill can shrink the list
+/// under a parked cursor, and the row that slid into its index is not the row
+/// the user was pointing at.
+pub fn cursorIndex(self: *SessionRoster, rows: []const VisibleRow) ?usize {
+    self.cursor = chooser_sessions.clampCursor(self.cursor, rows.len);
+    if (self.cursor == chooser_sessions.no_cursor) return null;
+    return @intCast(self.cursor);
+}
+
+/// Scroll the cursor's card fully into the region. Returns true when the offset
+/// moved. Keyboard navigation that walks off the bottom of a long roster has to
+/// bring the row with it, or the highlight is somewhere the user cannot see.
+pub fn scrollToCursor(
+    self: *SessionRoster,
+    rows: []const VisibleRow,
+    region: chooser_layout.Rect,
+    scale: f32,
+) bool {
+    const idx = self.cursorIndex(rows) orelse return false;
+    const m = chooser_sessions.metrics(scale);
+
+    // The card's top/bottom in CONTENT space (scroll-independent).
+    var top: i32 = 0;
+    var height: i32 = 0;
+    for (rows, 0..) |row, i| {
+        const h = chooser_sessions.rowHeight(m, chooser_sessions.sublineCount(row.session));
+        if (i == idx) {
+            height = h;
+            break;
+        }
+        top += h + m.row_gap;
+    }
+
+    const before = self.scroll;
+    if (top < self.scroll) {
+        self.scroll = top;
+    } else if (top + height > self.scroll + region.height()) {
+        self.scroll = top + height - region.height();
+    }
+    self.scroll = chooser_sessions.clampScroll(
+        self.scroll,
+        contentHeight(rows, scale),
+        region.height(),
+    );
+    return self.scroll != before;
 }
 
 /// Apply a wheel notch. Returns true when the offset actually changed, so the

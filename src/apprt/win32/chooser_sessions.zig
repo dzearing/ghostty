@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const chooser_layout = @import("chooser_layout.zig");
+const chooser_rows = @import("chooser_rows.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
@@ -313,6 +314,86 @@ pub fn transitionFor(
 }
 
 // ---------------------------------------------------------------------
+// Resume (T320)
+// ---------------------------------------------------------------------
+
+/// Whether a row can be RESUMED — opened here as a pane ATTACHed to its live
+/// child. Deliberately NOT `isConnectable`: a *relaunchable* tombstone is worth
+/// LISTING (its recorded argv/cwd can revive it) but there is no live process to
+/// attach to, and reviving it is `RELAUNCH` — a different verb, and not this
+/// task. Mac states the same rule and enforces it in `resume`
+/// (`MachineChooserView.swift:167-168`); collapsing the two predicates into one
+/// is the bug both comments exist to prevent.
+pub fn isResumable(s: Session) bool {
+    return s.alive;
+}
+
+/// The keyboard sub-cursor is OUT of the roster (the machine row itself is
+/// highlighted). Mac spells this `browseCursor == nil`.
+pub const no_cursor: i32 = -1;
+
+/// Right arrow: step the cursor INTO the rendered roster (Mac's
+/// `enterSessions`, `:815-818`). A roster with nothing rendered — loading,
+/// failed, or empty — has nowhere to step, and an already-entered cursor stays
+/// where it is rather than jumping home.
+pub fn enterCursor(cur: i32, count: usize) i32 {
+    if (cur != no_cursor) return cur;
+    if (count == 0) return no_cursor;
+    return 0;
+}
+
+/// Up/Down with the cursor inside the roster (Mac's `move`, `:1313-1319`):
+/// stepping above the first row hands navigation BACK to the machine list, and
+/// stepping past the last clamps rather than wrapping — a wrap would send the
+/// user to the top of a long roster they were walking down.
+pub fn moveCursor(cur: i32, delta: i32, count: usize) i32 {
+    if (count == 0) return no_cursor;
+    const next = cur + delta;
+    if (next < no_cursor + 1) return no_cursor;
+    const last: i32 = @intCast(count - 1);
+    return @min(next, last);
+}
+
+/// Hold the cursor inside a roster that changed underneath it. A live refetch
+/// (or an optimistic Kill) can shrink the rendered list while the cursor sits
+/// past its new end; the row that slid into the index is NOT the row the user
+/// was pointing at, so the cursor clamps to the last row rather than silently
+/// re-pointing at whatever arrived.
+pub fn clampCursor(cur: i32, count: usize) i32 {
+    if (cur == no_cursor) return no_cursor;
+    if (count == 0) return no_cursor;
+    const last: i32 = @intCast(count - 1);
+    return std.math.clamp(cur, 0, last);
+}
+
+/// What resuming a row means, resolved from the machine the roster is pointed at
+/// — Mac's `resumeTarget` (`MachineChooserView.swift:127-133`) with its caller's
+/// `session.alive` guard folded in, so there is ONE place that can say yes.
+///
+/// The chooser does not attach anything itself: it produces one of these,
+/// closes, and hands it to `App` — the separation Mac keeps
+/// (`WindowTarget.resumeSession`) and the reason `MachineChooser.zig` does not
+/// grow an attach path.
+pub const Resume = union(enum) {
+    /// Not resumable: a dead row, or no machine selected.
+    none,
+    /// A session of THIS box's `ghoztty-agent`, by id.
+    local: []const u8,
+    /// A session of a relay machine: its device id and the session id.
+    remote: struct { device: []const u8, session: []const u8 },
+};
+
+pub fn resumeTarget(target: Target, s: Session) Resume {
+    if (!isResumable(s)) return .none;
+    if (s.id.len == 0) return .none;
+    return switch (target) {
+        .none => .none,
+        .local => .{ .local = s.id },
+        .remote => |device| .{ .remote = .{ .device = device, .session = s.id } },
+    };
+}
+
+// ---------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------
 
@@ -535,6 +616,20 @@ pub fn cardFill(bg: Rgb) Rgb {
 /// step and not a repaint in a different language.
 pub fn cardHoverFill(bg: Rgb) Rgb {
     return color_math.mix(cardFill(bg), chrome_theme.textOn(bg), chrome_theme.hover_wash);
+}
+
+/// The card under the keyboard sub-cursor (T320), and its 1 DIP ring. Both come
+/// from `chooser_rows` — the SAME selection fill and border the machine list
+/// paints its highlighted row with — because a chooser that says "this is the
+/// thing you are driving" in two visual languages is a chooser with two
+/// selections. Mac's own session cursor is likewise its accent at a fill plus a
+/// stroke (`MachineChooserView.swift:690-697`).
+pub fn cursorFill(bg: Rgb, accent: Rgb) Rgb {
+    return chooser_rows.selectionFill(bg, accent);
+}
+
+pub fn cursorBorder(bg: Rgb, accent: Rgb) Rgb {
+    return chooser_rows.selectionBorder(bg, accent);
 }
 
 /// The liveness dot: green (floored) when alive, the de-emphasized ink when the
@@ -861,4 +956,108 @@ test "the count label agrees with the roster it counts" {
     try testing.expectEqualStrings("0 sessions", countLabel(&buf, 0));
     try testing.expectEqualStrings("1 session", countLabel(&buf, 1));
     try testing.expectEqualStrings("2 sessions", countLabel(&buf, 2));
+}
+
+// ---------------------------------------------------------------------
+// Resume + the keyboard sub-cursor (T320)
+// ---------------------------------------------------------------------
+
+test "resumable is alive only - a relaunchable tombstone is listable, not attachable" {
+    try testing.expect(isResumable(.{ .alive = true }));
+    // Listable (isConnectable) and NOT resumable: reviving it is RELAUNCH.
+    const tombstone: Session = .{ .alive = false, .relaunchable = true };
+    try testing.expect(isConnectable(tombstone));
+    try testing.expect(!isResumable(tombstone));
+    try testing.expect(!isResumable(.{ .alive = false, .exit_code = 1 }));
+}
+
+test "resumeTarget names the machine the roster is pointed at" {
+    const alive: Session = .{ .id = "abc", .alive = true };
+    switch (resumeTarget(.local, alive)) {
+        .local => |id| try testing.expectEqualStrings("abc", id),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (resumeTarget(.{ .remote = "dev-a" }, alive)) {
+        .remote => |r| {
+            try testing.expectEqualStrings("dev-a", r.device);
+            try testing.expectEqualStrings("abc", r.session);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // The alive guard lives HERE, so no caller can forget it.
+    try testing.expectEqual(Resume.none, resumeTarget(.local, .{ .id = "abc", .relaunchable = true }));
+    // No machine selected, and a row with no id, resolve to nothing rather than
+    // to a plausible-looking attach.
+    try testing.expectEqual(Resume.none, resumeTarget(.none, alive));
+    try testing.expectEqual(Resume.none, resumeTarget(.local, .{ .alive = true }));
+}
+
+test "the cursor's index space is the RENDERED list, with a dead row planted mid-roster" {
+    // What an agent hands back: two live sessions with an unconnectable dead one
+    // between them. The roster renders only the connectable rows, so the second
+    // rendered row is the THIRD raw session — and a cursor that walked the raw
+    // list would resume the wrong pane (Mac's `highlightedSessions` filters for
+    // exactly this reason).
+    const raw = [_]Session{
+        .{ .id = "one", .alive = true },
+        .{ .id = "gone", .alive = false, .exit_code = 1 },
+        .{ .id = "two", .alive = true },
+    };
+    var rendered: [raw.len]Session = undefined;
+    var n: usize = 0;
+    for (raw) |s| {
+        if (!isConnectable(s)) continue;
+        rendered[n] = s;
+        n += 1;
+    }
+    const rows = rendered[0..n];
+    try testing.expectEqual(@as(usize, 2), rows.len);
+
+    // Enter, then walk: every cursor value indexes the rendered list, and the
+    // resume it produces names that row's session.
+    var cur = enterCursor(no_cursor, rows.len);
+    try testing.expectEqual(@as(i32, 0), cur);
+    switch (resumeTarget(.local, rows[@intCast(cur)])) {
+        .local => |id| try testing.expectEqualStrings("one", id),
+        else => return error.TestUnexpectedResult,
+    }
+    cur = moveCursor(cur, 1, rows.len);
+    try testing.expectEqual(@as(i32, 1), cur);
+    switch (resumeTarget(.local, rows[@intCast(cur)])) {
+        .local => |id| try testing.expectEqualStrings("two", id),
+        else => return error.TestUnexpectedResult,
+    }
+    // Down at the end clamps — it does not wrap to the top of the roster.
+    try testing.expectEqual(@as(i32, 1), moveCursor(cur, 1, rows.len));
+}
+
+test "the cursor enters, leaves at the top, and never enters an empty roster" {
+    // Right into an empty roster is a no-op: there is nothing to point at.
+    try testing.expectEqual(no_cursor, enterCursor(no_cursor, 0));
+    try testing.expectEqual(@as(i32, 0), enterCursor(no_cursor, 3));
+    // Already inside: Right holds position rather than jumping home.
+    try testing.expectEqual(@as(i32, 2), enterCursor(2, 3));
+    // Up off the first row hands navigation back to the machine list.
+    try testing.expectEqual(no_cursor, moveCursor(0, -1, 3));
+    // And a roster that emptied under the cursor cannot hold one.
+    try testing.expectEqual(no_cursor, moveCursor(1, 1, 0));
+}
+
+test "clampCursor holds the cursor inside a roster that shrank" {
+    try testing.expectEqual(@as(i32, 1), clampCursor(3, 2));
+    try testing.expectEqual(@as(i32, 1), clampCursor(1, 2));
+    try testing.expectEqual(no_cursor, clampCursor(0, 0));
+    // Out of the roster stays out: a refetch must not pull the cursor in.
+    try testing.expectEqual(no_cursor, clampCursor(no_cursor, 5));
+}
+
+test "the cursor card wears the chooser's own selection colors" {
+    const bg: Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 };
+    const accent: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
+    // Same functions the machine list's highlighted row uses — asserted, not
+    // just intended, so a later divergence fails here.
+    try testing.expectEqual(chooser_rows.selectionFill(bg, accent), cursorFill(bg, accent));
+    try testing.expectEqual(chooser_rows.selectionBorder(bg, accent), cursorBorder(bg, accent));
+    // And the ring is distinguishable from the fill it rings.
+    try testing.expect(!std.meta.eql(cursorFill(bg, accent), cursorBorder(bg, accent)));
 }
