@@ -6074,6 +6074,12 @@ unconditionally - the pre-T344 behavior - turns 15 assertions red, including
 
 `next` now answers **T37**, a doc task this box can do.
 
+Filed **T345**: Current priorities being empty means `next` is the ordering
+authority for the first time, and its policy is lowest-id-first. Every turn
+files its follow-ups as the highest ids, so that policy puts the tasks live work
+just turned up permanently behind the original backlog. Worth deciding, not
+inheriting.
+
 Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
 `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/parity-tasks-seat.ps1` ALL PASS (41), twice.
