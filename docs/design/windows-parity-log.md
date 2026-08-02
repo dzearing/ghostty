@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-01 - **T312 done** (T227's last split; chooser finding 10). The
+  owner-drawn machine list draws three states now instead of one:
+  `chooser_rows.rowPaint` resolves fill/border/ring together and `drawRow`
+  reads `ODS_FOCUS` alongside `ODS_SELECTED`. The rim REPLACES the pill's
+  outline rather than nesting inside it, and `focus_path_inset` carries the
+  pen's half-width so §2.2's "inset 1 DIP" is where it says it is instead of
+  hanging over the pill's edge.
+  - **The acceptance script had been measuring a state it never named.** The
+    chooser opens with focus in the FILTER, so `selected row is accent-tinted`
+    was a probe of the *unfocused* selection all along - invisible while there
+    was only one state, and a failure against a correct build the moment there
+    were two. Both halves are asserted now, each in the state it belongs to
+    (8 new assertions; 72 ALL PASS, negative control still 2 FAILURE(S)).
+  - Filed **T317**: the win32 test lane segfaulted once in
+    `terminal.PageList` (`page.verifyIntegrity` -> `hash_map.get`) and passed
+    on an immediate re-run of the same tree. Same shape as T258 one lane over,
+    and the same cost - it teaches turns to re-run a floor lane until green.
+  - Floor: both test lanes, the full win32 GUI Debug link, `test-agent`,
+    P1-P3 - all green on the box.
+
 - 2026-07-31 - **T217 batch 3** (10 of 23): `confirm-dialogs`, `config-errors`,
   `remote-inherit` migrated onto the background test desktop. The two dialog
   scripts are ALL PASS x3 (27 and 15 assertions) with FAILING negative

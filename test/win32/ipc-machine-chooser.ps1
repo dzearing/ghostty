@@ -197,6 +197,30 @@ function Get-FirstBrightColumn($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [i
     return -1
 }
 
+# The strongest blue tint (b - r) anywhere in a screen rect.
+#
+# The focus rim (T312) is `chrome_theme.accentOn(fill, accent)` - the accent
+# clamped to 3:1 against the pill it sits INSIDE - so with the accent this
+# script pins it is far bluer than the 25%-blend fill around it. A max is the
+# right statistic because the rim is two DIP of a rounded rectangle: its exact
+# x moves with DPI rounding, and a fixed-coordinate probe would be asserting
+# where the rim is rather than that it exists. Everything else in the band is
+# grey text or a grey glyph, so nothing else competes.
+function Get-MaxBlueTint($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
+    $max = -255
+    for ($y = $Y0; $y -lt $Y1; $y++) {
+        for ($x = $X0; $x -lt $X1; $x++) {
+            $lx = $x - $Shot.Left
+            $ly = $y - $Shot.Top
+            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.Width -or $ly -ge $Shot.Height) { continue }
+            $px = $Shot.Bitmap.GetPixel($lx, $ly)
+            $t = [int]$px.B - [int]$px.R
+            if ($t -gt $max) { $max = $t }
+        }
+    }
+    return $max
+}
+
 # A cheap position-weighted checksum of a screen rect: two different strings
 # rendered in the same box give different values, where a bare drawn-pixel
 # COUNT can collide.
@@ -388,14 +412,25 @@ try {
         $count = [int](Invoke-TestMessage -Window $list -Message $LB_GETCOUNT)
         Assert ($count -eq 2) "list shows Local + the fetched device (got $count rows)"
 
-        # Pixel oracle: the selected row is an INSET rounded accent pill. Probe
-        # the gutter beside it (must stay list background) and the pill itself
-        # (must be accent-tinted), then an unselected row at the same x as a
-        # negative control. This is exactly what the T140 screenshot got wrong:
-        # a full-width system-blue selection bar.
+        # Pixel oracle: the selected row is an INSET rounded pill. Probe the
+        # gutter beside it (must stay list background) and the pill itself,
+        # then an unselected row at the same x as a negative control. This is
+        # exactly what the T140 screenshot got wrong: a full-width system-blue
+        # selection bar.
+        #
+        # T312 splits this in two, because the pill's strength is now a
+        # function of WHERE KEYBOARD FOCUS IS and a probe that does not say
+        # which state it measures is measuring whichever one it happened to
+        # catch. The chooser opens with focus in the FILTER
+        # (`MachineChooser.open` -> `SetFocus(self.filter)`), so this shot is
+        # the list UNFOCUSED: a neutral pill, no accent in it.
         $lr = Get-Rect $list
         $yRow0 = $lr.Top + 1 + [int]($rowH / 2)
         $yRow1 = $lr.Top + 1 + $rowH + [int]($rowH / 2)
+        $rowTop = $lr.Top + 1
+        $rowBot = $rowTop + $rowH
+        $pillX0 = $lr.Left + (Dip $scale 4)
+        $pillX1 = $lr.Left + (Dip $scale 60)
         $gutter = Get-ShotPixel $shot ($lr.Left + 3) $yRow0
         $pill = Get-ShotPixel $shot ($lr.Left + 14) $yRow0
         $unsel = Get-ShotPixel $shot ($lr.Left + 14) $yRow1
@@ -409,9 +444,55 @@ try {
         $gutterTint = $gutter[2] - $gutter[0]
         $pillTint = $pill[2] - $pill[0]
         $unselTint = $unsel[2] - $unsel[0]
-        Assert ($pillTint -ge 25) "selected row is accent-tinted (b-r = $pillTint at the pill)"
         Assert ($gutterTint -le 10) "selection is inset, not full-width (b-r = $gutterTint in the gutter)"
         Assert ($unselTint -le 10) "unselected row stays untinted (b-r = $unselTint)"
+
+        # --- T312 finding 10: focus is visible, and it is a THIRD state -----
+        #
+        # Three claims, each measured in the state it belongs to:
+        #   1. list unfocused -> the selected row is a NEUTRAL pill. Drawn
+        #      (brighter than the row background beside it) but carrying none
+        #      of the accent, which is what says "the caret is elsewhere".
+        #   2. list focused   -> the pill takes the accent AND grows a rim
+        #      that is more accent than the fill it sits inside.
+        #   3. focus leaves   -> it goes back.
+        #
+        # The trigger and the color are separate oracles (T233): the region
+        # signature says the row repainted at all, the tints say what it
+        # repainted INTO. A signature alone would pass on any change; a tint
+        # alone cannot tell a repaint from a stale capture.
+        Assert ($pillTint -le 10) "unfocused list: the selected row carries no accent (b-r = $pillTint)"
+        Assert (($pill[0] - $gutter[0]) -ge 12) "unfocused list: the selected row still draws a neutral pill (r $($pill[0]) vs gutter $($gutter[0]))"
+        $rimUnfocused = Get-MaxBlueTint $shot $pillX0 $rowTop $pillX1 $rowBot
+        $sigUnfocused = Get-RegionSignature $shot $pillX0 $rowTop $pillX1 $rowBot
+        Assert ($rimUnfocused -le 12) "unfocused list: no focus rim anywhere in the pill (max b-r = $rimUnfocused)"
+
+        # One Tab from the filter is the list (`nextFocus`: filter -> list).
+        Send-TestControlKey -Control $chooser -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 350
+        $shotFocus = Get-Shot $chooser
+        $pillF = Get-ShotPixel $shotFocus ($lr.Left + 14) $yRow0
+        $pillFTint = $pillF[2] - $pillF[0]
+        $rimFocused = Get-MaxBlueTint $shotFocus $pillX0 $rowTop $pillX1 $rowBot
+        $sigFocused = Get-RegionSignature $shotFocus $pillX0 $rowTop $pillX1 $rowBot
+        Close-TestWindowPixels $shotFocus
+        Assert ($sigFocused -ne $sigUnfocused) "Tab onto the list repaints the focused row (signature $sigUnfocused -> $sigFocused)"
+        Assert ($pillFTint -ge 25) "focused list: the selected row is accent-tinted (b-r = $pillFTint at the pill)"
+        Assert ($rimFocused -ge ($pillFTint + 40)) "focused list: a focus rim reads above the fill it sits in (rim b-r = $rimFocused vs fill $pillFTint)"
+
+        # And it reverts. Tab again rather than Shift+Tab: the app asks
+        # `GetKeyState(VK_SHIFT)`, which a POSTED message never sets, so a
+        # posted Shift+Tab would go forwards and this assertion would be
+        # testing the wrong transition. Forward from the list is the detail
+        # action, which is always visible.
+        Send-TestControlKey -Control $chooser -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 350
+        $shotBlur = Get-Shot $chooser
+        $pillB = Get-ShotPixel $shotBlur ($lr.Left + 14) $yRow0
+        $rimBlur = Get-MaxBlueTint $shotBlur $pillX0 $rowTop $pillX1 $rowBot
+        Close-TestWindowPixels $shotBlur
+        Assert ((($pillB[2] - $pillB[0])) -le 10) "Tab away: the selection gives the accent back (b-r = $(($pillB[2] - $pillB[0])))"
+        Assert ($rimBlur -le 12) "Tab away: the focus rim is gone (max b-r = $rimBlur)"
 
         # T310 finding 8: the icon column is 28, not 20, so the text column's
         # left edge is 68 DIP from the row's edge (4 pill inset + 8 + a 12

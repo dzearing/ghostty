@@ -1605,35 +1605,47 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     }
 
     const m = chooser_rows.rowMetrics(self.window.scale);
-    const selected = (dis.itemState & w32.ODS_SELECTED) != 0;
-    const hovered = self.hover_row == idx;
+    // Three states, three signals (T312). `ODS_FOCUS` is the LIST's keyboard
+    // focus landing on its caret row, which is a different question from
+    // `ODS_SELECTED` — a row stays selected while the user tabs away, and
+    // before T312 the painter could not tell those apart.
+    const state: chooser_rows.RowState = .{
+        .selected = (dis.itemState & w32.ODS_SELECTED) != 0,
+        .focused = (dis.itemState & w32.ODS_FOCUS) != 0,
+        .hovered = self.hover_row == idx,
+    };
 
     // Background first: the column wash the row sits on, so the pill
     // composites against what is actually behind it.
     if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
 
-    if (selected or hovered) {
-        // The user's accent, floored to 3:1 against the row it composites over
-        // (T305). It used to be `chooser_rows.accent`, the literal `#3D8EF8`.
-        const accent = chrome_theme.accentOn(ROW_BG, system_colors.accentCached());
-        const fill = if (selected)
-            chooser_rows.selectionFill(ROW_BG, accent)
-        else
-            chooser_rows.hoverFill(ROW_BG);
+    // The user's accent, floored to 3:1 against the row it composites over
+    // (T305). It used to be `chooser_rows.accent`, the literal `#3D8EF8`.
+    const paint = chooser_rows.rowPaint(
+        ROW_BG,
+        chrome_theme.accentOn(ROW_BG, system_colors.accentCached()),
+        state,
+    );
+
+    const pill: w32.RECT = .{
+        .left = r.left + m.fill_inset_x,
+        .top = r.top + m.fill_inset_y,
+        .right = r.right - m.fill_inset_x,
+        .bottom = r.bottom - m.fill_inset_y,
+    };
+
+    if (paint.fill) |fill| {
         const brush = w32.CreateSolidBrush(rgb(fill));
-        const pen = if (selected)
-            w32.CreatePen(w32.PS_SOLID, 1, rgb(chooser_rows.selectionBorder(ROW_BG, accent)))
-        else
-            w32.CreatePen(w32.PS_SOLID, 1, rgb(fill));
+        const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(paint.border orelse fill));
         if (brush != null and pen != null) {
             const old_brush = w32.SelectObject(hdc, brush);
             const old_pen = w32.SelectObject(hdc, pen);
             _ = w32.RoundRect(
                 hdc,
-                r.left + m.fill_inset_x,
-                r.top + m.fill_inset_y,
-                r.right - m.fill_inset_x,
-                r.bottom - m.fill_inset_y,
+                pill.left,
+                pill.top,
+                pill.right,
+                pill.bottom,
                 m.fill_radius * 2,
                 m.fill_radius * 2,
             );
@@ -1642,6 +1654,28 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
         }
         if (brush) |b| _ = w32.DeleteObject(b);
         if (pen) |p| _ = w32.DeleteObject(p);
+    }
+
+    // §2.2's focus ring, inside the pill so a focused-and-selected row reads as
+    // one control. `NULL_BRUSH` because this is a rim, not a second fill.
+    if (paint.ring) |ring| {
+        const pen = w32.CreatePen(w32.PS_SOLID, m.focus_ring_w, rgb(ring));
+        if (pen) |p| {
+            const old_pen = w32.SelectObject(hdc, p);
+            const old_brush = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_BRUSH));
+            _ = w32.RoundRect(
+                hdc,
+                pill.left + m.focus_path_inset,
+                pill.top + m.focus_path_inset,
+                pill.right - m.focus_path_inset,
+                pill.bottom - m.focus_path_inset,
+                m.focus_ring_radius * 2,
+                m.focus_ring_radius * 2,
+            );
+            _ = w32.SelectObject(hdc, old_pen);
+            _ = w32.SelectObject(hdc, old_brush);
+            _ = w32.DeleteObject(p);
+        }
     }
 
     const text = self.rowText(self.rows[@intCast(idx)]);
@@ -1818,6 +1852,18 @@ fn listWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(
         w32.WM_MOUSELEAVE => {
             self.tracking_leave = false;
             self.setHover(-1);
+        },
+        // T312: the selection WEAKENS when the list stops being the focused
+        // control, so a focus change repaints more than the caret row's rim.
+        // The listbox does send its own `ODA_FOCUS` draw, but only for the
+        // caret item and only as an optimization of the focus rect it thinks
+        // it owns; a whole-list invalidate after the default handler has
+        // updated its state makes the repaint the definition rather than a
+        // behavior we are relying on.
+        w32.WM_SETFOCUS, w32.WM_KILLFOCUS => {
+            const res = w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+            _ = w32.InvalidateRect(hwnd, null, 0);
+            return res;
         },
         // Right-click is the second way into the management menu (Mac's
         // `.contextMenu` on the row). Select the row under the cursor first —

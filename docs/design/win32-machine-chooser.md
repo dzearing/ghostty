@@ -304,7 +304,7 @@ Read out of the source 2026-08-01. This is the delta list T227 works, ordered
 by how visible it is.
 
 **Status, 2026-08-01.** T227 split into **T310** (findings 4, 7, 8, 9, 12 —
-DONE), **T311** (5, 6) and **T312** (10). Findings 2 and 3 were already closed
+DONE), **T311** (5, 6 — DONE) and **T312** (10 — DONE). Findings 2 and 3 were already closed
 by T305 before this table was acted on: `chooser_rows`' washes are
 `color_math.wash` and its accent is a parameter. Finding 1 is **T308**.
 Finding 13 was verified by T310 and holds — the list keeps at least 5 whole rows
@@ -321,7 +321,7 @@ against a 4-line strip at 1.0/1.25/1.5/2.0.
 | 7 | **Row radius 6, off the design-system scale** (§3.1 target 4). | `chooser_rows.zig:180` | low |
 | 8 | **Icon column is 20 wide, not 28** — so the text column's left edge does not match Mac's grid, and a wider glyph would push it. | `chooser_rows.zig:166` vs S1 1001 | low |
 | 9 | **Off-scale spacing survives in five places**: `fill_inset_y = 1`, `title_y = 7`, glyph gap `6`, text gap `10`, `text_pad_right = 10`. | `chooser_rows.zig:158-189` | low |
-| 10 | **No focus indicator on the owner-drawn list.** Tab order exists and is tested (`nextFocus`), but a focused-but-not-selected row is invisible, and selection is drawn the same whether the list has focus or not. | `MachineChooser.zig:1745-1854` | medium |
+| 10 | ~~**No focus indicator on the owner-drawn list.** Tab order exists and is tested (`nextFocus`), but a focused-but-not-selected row is invisible, and selection is drawn the same whether the list has focus or not.~~ **FIXED — T312.** The painter reads `ODS_FOCUS` as well as `ODS_SELECTED` and resolves three states in `chooser_rows.rowPaint`: focused selection (accent fill + a §2.2 rim inside the pill), unfocused selection (neutral wash + a 3:1 outline), hover (fill only). | `MachineChooser.zig:1745-1854` | medium |
 | 11 | **No count badge on a row** and **no session list in the detail pane** — the detail subtitle says "Online · host" where Mac says "N sessions · host". | `chooser_rows.zig:103-111` | deferred to T146 |
 | 12 | **`secondary_gray` is a fixed `#999999`** with no contrast floor against whatever background it lands on (design system §2.3 requires 4.5:1 text / 3:1 chrome). | `chooser_rows.zig:236` | medium |
 | 13 | **The status strip caps at 4 lines and steals from the list** — correct and deliberate (`clampHintLines`), but the list can then be as short as 5 rows; check that against the 540 height at 200%. | `chooser_layout.zig:147-161` | verify only |
