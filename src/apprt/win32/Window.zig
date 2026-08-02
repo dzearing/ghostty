@@ -93,6 +93,7 @@ const chrome_theme = @import("chrome_theme.zig");
 const system_colors = @import("system_colors.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
+const title_spinner = @import("title_spinner.zig");
 const window_memory = @import("window_memory.zig");
 const pane_id = @import("pane_id.zig");
 const ProcessTree = @import("ProcessTree.zig");
@@ -3332,6 +3333,83 @@ fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
     return true;
 }
 
+/// The title font's em in physical pixels — literally the number
+/// `createTabFont` hands `CreateFontW`, so the spinner cell (T60) scales with
+/// the font it is measured and drawn in rather than with a constant that
+/// happens to agree at 100%.
+fn titleFontEm(self: *Window) i32 {
+    return @intFromFloat(16.0 * self.scale);
+}
+
+/// Measure a title the way `drawTitleText` will paint it (T60): a leading
+/// spinner glyph occupies a fixed-width cell instead of contributing its own
+/// per-frame advance.
+///
+/// Anything that sizes a box around a title has to come through here rather
+/// than measuring the raw string — a tab measured one way and painted the
+/// other is sized for a layout it does not use, which is the T235 inverse
+/// (`preferredWidth`/`titleRect`) breaking from the outside.
+fn measureTitleText(hdc: w32.HDC, title: []const u16, em: i32) i32 {
+    if (title.len == 0) return 0;
+    const s = title_spinner.forPaint(title);
+    const rest: []const u16 = if (s) |sp| title[sp.rest..] else title;
+    var w: i32 = 0;
+    if (rest.len > 0) {
+        var size: w32.SIZE = undefined;
+        if (w32.GetTextExtentPoint32W(hdc, rest.ptr, @intCast(rest.len), &size) != 0) {
+            w = size.cx;
+        }
+    }
+    if (s != null) w += title_spinner.cellWidth(em);
+    return w;
+}
+
+/// Draw a window/tab title into `rect` (T60).
+///
+/// An ordinary title is one `DrawTextW`, exactly as before. A title that
+/// leads with an animated glyph is two: the glyph CENTERED in a fixed-width
+/// cell at the left, and the rest of the string starting at that cell's right
+/// edge — so the spinner animates in place and no frame of it can move the
+/// text, the tab, the "+" or the tabs after it.
+fn drawTitleText(hdc: w32.HDC, title: []const u16, rect: w32.RECT, em: i32, flags: u32) void {
+    if (title.len == 0) return;
+    const s = title_spinner.forPaint(title) orelse {
+        var r = rect;
+        _ = w32.DrawTextW(hdc, title.ptr, @intCast(title.len), &r, flags);
+        return;
+    };
+
+    const cell = title_spinner.cellWidth(em);
+    var gr = w32.RECT{
+        .left = rect.left,
+        .top = rect.top,
+        .right = @min(rect.left + cell, rect.right),
+        .bottom = rect.bottom,
+    };
+    if (gr.right > gr.left) {
+        // No DT_END_ELLIPSIS: a glyph that overruns its cell is meant to
+        // overhang into the gap before the text (see `cellWidth`), and an
+        // ellipsized spinner would read as a rendering bug.
+        _ = w32.DrawTextW(
+            hdc,
+            title.ptr,
+            @intCast(s.glyph_len),
+            &gr,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        );
+    }
+
+    var tr = w32.RECT{
+        .left = rect.left + cell,
+        .top = rect.top,
+        .right = rect.right,
+        .bottom = rect.bottom,
+    };
+    if (tr.right <= tr.left) return;
+    const rest = title[s.rest..];
+    _ = w32.DrawTextW(hdc, rest.ptr, @intCast(rest.len), &tr, flags);
+}
+
 /// Paint the caption band: background, window title, and the three system
 /// buttons (T254).
 ///
@@ -3391,12 +3469,11 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
             // color. A caption that picked its own grey would read as a
             // different app's titlebar.
             _ = w32.SetTextColor(mem_dc, w32.RGB(pal.text.r, pal.text.g, pal.text.b));
-            var tr = stripRect(l.title);
-            _ = w32.DrawTextW(
+            drawTitleText(
                 mem_dc,
-                &title_buf,
-                n,
-                &tr,
+                title_buf[0..@intCast(n)],
+                stripRect(l.title),
+                self.titleFontEm(),
                 w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS,
             );
         }
@@ -3712,17 +3789,17 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // font `DrawTextW` renders the titles in a few lines further down. Measure
     // with a different font and every tab is sized for a string it will not
     // draw.
+    //
+    // Through `measureTitleText`, not `GetTextExtentPoint32W` directly, so an
+    // animated leading glyph is measured as the fixed cell the painter gives
+    // it (T60). Measuring the raw string here would keep the chiclet — and
+    // the "+" and every tab right of it — re-sizing on every spinner frame
+    // even though the text itself no longer moved.
+    const em = self.titleFontEm();
     var prefer: [MAX_TABS]i32 = undefined;
     for (0..self.tab_count) |i| {
         const title_len = self.tab_title_lens[i];
-        var text_w: i32 = 0;
-        if (title_len > 0) {
-            var size: w32.SIZE = undefined;
-            if (w32.GetTextExtentPoint32W(mem_dc, @ptrCast(&self.tab_titles[i]), @intCast(title_len), &size) != 0) {
-                text_w = size.cx;
-            }
-        }
-        prefer[i] = m.preferredWidth(text_w);
+        prefer[i] = m.preferredWidth(measureTitleText(mem_dc, self.tab_titles[i][0..title_len], em));
     }
     // NOT `client_w` when the caption shares this row (T205): the run has to
     // stop at the seam, and `stripClientWidth` is the one place that width is
@@ -3815,12 +3892,11 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         const title_len = self.tab_title_lens[i];
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
-            var text_rect = stripRect(m.titleRect(tab));
-            _ = w32.DrawTextW(
+            drawTitleText(
                 mem_dc,
-                @ptrCast(&self.tab_titles[i]),
-                @intCast(title_len),
-                &text_rect,
+                self.tab_titles[i][0..title_len],
+                stripRect(m.titleRect(tab)),
+                em,
                 w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
             );
         }

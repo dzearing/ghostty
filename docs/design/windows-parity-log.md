@@ -9,6 +9,37 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-02 - **T60 done - the title jitter was not the braille and not
+  centering.** The filed guess named Claude Code's braille pane spinner and a
+  re-centering title; both are wrong. Measured in the app's own font at the
+  user's 125%, the braille frames are all 15 px and the title is `DT_LEFT`
+  everywhere. What moves is the leading glyph of a TAB/window title, whose
+  frames come from four Unicode blocks and measure **4 px (U+00B7) to 27 px
+  (U+2733)** - a 23 px swing several times a second, with everything after the
+  glyph laid out from that advance. So each frame slid the text inside its box
+  AND resized the tab, because a tab asks for the width its own title needs
+  (T235) - which drags the close button, the "+", and every tab after it.
+  - Fix: `title_spinner.zig` gives a leading symbol-plus-space a **fixed cell**
+    and starts the text at its right edge, in BOTH the measure and the paint
+    path (measuring one way and painting the other would break T235's
+    `preferredWidth`/`titleRect` inverse from the outside). The rule is
+    structural, not Claude Code's eight codepoints - special-casing braille
+    would have fixed nothing, and special-casing the eight would break on the
+    next agent's alphabet.
+  - Both negative controls were RUN. `T60_NEUTERED = true` rebuilt shows the
+    bug in numbers - the tab's right edge across 672/678/683/685/694 - while
+    all four controls stay green.
+  - **The lesson is the control, not the fix.** The acceptance script's first
+    version drove the tab title through a mechanism that silently did nothing,
+    and its "the tab never moved" assertion passed against a tab whose title
+    never changed. Three ways to set a title do NOT work from PS 5.1 (OSC 0/2
+    from a nested `powershell -Command`, the same on raw stdout, and
+    `$host.UI.RawUI.WindowTitle`) because PS 5.1 leaves VT processing off;
+    `chcp 65001` + cmd's `title` does. A control that reads the title back is
+    now what makes section 2 mean anything.
+  - Floor green; the win32 lane flaked once on `terminal.search.screen` with a
+    recursive panic and passed on re-run - filed as **T369** with T136.
+
 - 2026-08-02 - **T29 done - the Mac action fallthroughs are real, and they are
   an inherited UPSTREAM defect, not the bad merge the task guessed.** `git log
   -L` on the region names it: upstream `38e64c370` implemented

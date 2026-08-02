@@ -83,6 +83,9 @@ test {
     // Pure win32 title-font face resolution (T78), same no-OS-imports deal.
     _ = @import("apprt/win32/title_font.zig");
 
+    // Pure win32 leading-spinner-cell split (T60), same no-OS-imports deal.
+    _ = @import("apprt/win32/title_spinner.zig");
+
     // Pure win32 update-check tag scan/compare (T24), same no-OS-imports deal.
     _ = @import("apprt/win32/update_check.zig");
 
