@@ -38,15 +38,33 @@ struct ProcRow: Identifiable, Hashable {
     /// Process id. Unique within a single snapshot, so it serves as the table id.
     let pid: Int64
     let ppid: Int64
-    /// Per-core CPU% (a fully-busy thread is ~100; multithreaded procs may exceed
-    /// 100). Normalized to 0..100 for display by dividing by `ncpu`.
+    /// Per-core CPU%, displayed AS-IS: a fully-busy thread reads ~100 and a
+    /// multithreaded process legitimately exceeds it (400 for four busy threads),
+    /// exactly like top(1) and macOS Activity Monitor's "% CPU" column.
+    ///
+    /// This is deliberately NOT divided by `ncpu`. Doing so answers a different
+    /// question — "what share of the whole machine is this?" — which the header's
+    /// host gauge already reports, and on an 18-core box it renders a fully-pinned
+    /// core as `5.6` and anything ordinary as `0.0`.
     let cpuPctPerCore: Float
     let memBytes: UInt64
     let name: String
     let user: String
     let cmd: String
+    /// Controlling terminal, bare ("ttys004"), or "" when the process has none.
+    /// Keys pane attribution — see `PaneAttribution`.
+    let tty: String
+    /// The Ghoztty pane this process is running in, or nil if it isn't one of
+    /// ours. Filled in after the snapshot is marshaled, since attribution needs
+    /// the whole table (it walks the ppid chain) plus the live pane list.
+    var pane: AttributedPane?
 
     var id: Int64 { pid }
+
+    /// Sort key for the "Window / Pane" column. Unattributed rows sort last
+    /// rather than clumping at the top under an empty string, so ascending order
+    /// puts the interesting rows first.
+    var paneSortKey: String { pane?.label ?? "\u{10FFFF}" }
 }
 
 /// A snapshot of a host's load for the monitor header. For remote sources CPU% is
@@ -280,15 +298,23 @@ final class RemoteActivityMonitorModel: ObservableObject {
         return cardSummaries[src] ?? CardSummary()
     }
 
-    /// One-shot local host sample (off-main) feeding the Local card summary.
+    /// One-shot local HOST sample (off-main) feeding the Local card summary.
+    ///
+    /// Uses `ghostty_local_host_metrics`, NOT `ghostty_local_proc_list`. The card
+    /// only ever read `list.host`, but going through the proc list made it a second
+    /// consumer of the shared per-process CPU sampler: every call replaces that
+    /// sampler's prev-sample baselines, so this 5s timer landing near the table's
+    /// 1.5s timer left the table measuring a delta over a near-zero wall window and
+    /// reporting 0% for every row. (It also enumerated hundreds of processes every
+    /// 5 seconds only to throw the rows away.)
     private func sampleLocalCard() {
         guard !stopped else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let list = ghostty_local_proc_list(0)
-            let h = list.host
+            let h = ghostty_local_host_metrics()
             let cpu = h.cpu_pct, memU = h.mem_used, memT = h.mem_total, up = h.uptime_s
-            let ok = list.ok
-            ghostty_local_proc_list_free(list)
+            // A host read has no failure mode of its own; a machine that reports no
+            // memory at all is the one signal that sampling didn't work.
+            let ok = memT > 0
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, !self.stopped else { return }
@@ -454,7 +480,8 @@ final class RemoteActivityMonitorModel: ObservableObject {
                         memBytes: p.mem_bytes,
                         name: String(cString: p.name),
                         user: String(cString: p.user),
-                        cmd: String(cString: p.cmd)
+                        cmd: String(cString: p.cmd),
+                        tty: String(cString: p.tty)
                     ))
                 }
             }
@@ -482,7 +509,19 @@ final class RemoteActivityMonitorModel: ObservableObject {
                     if ok {
                         self.truncated = truncated
                         self.rootPid = rootPid
-                        self.procs = rows
+                        // Attribute against the CURRENT pane list: panes open,
+                        // close, and get renamed between refreshes, and a pid can
+                        // be recycled into a different pane entirely. Runs here on
+                        // main because reading the pane list touches AppKit.
+                        let owners = PaneAttribution.attribute(
+                            procs: rows,
+                            panesByTTY: PaneAttribution.panesByTTY(for: self.source)
+                        )
+                        self.procs = owners.isEmpty ? rows : rows.map { row in
+                            var r = row
+                            r.pane = owners[row.pid]
+                            return r
+                        }
                         var merged = self.host
                         merged.memUsed = host.memUsed
                         merged.memTotal = host.memTotal
@@ -677,27 +716,43 @@ struct RemoteActivityMonitorView: View {
     /// Seeded to the active source's index on appear.
     @State private var focusedCardIndex: Int = 0
 
-    /// Whether filtering to ghoztty-spawned processes is even possible: requires a
-    /// known root pid. When the agent pre-dates the `agent_pid` field (`rootPid ==
-    /// 0`) we can't compute the descendant set, so we always show everything.
-    private var canFilterSpawned: Bool { model.rootPid != 0 }
+    /// Whether filtering to ghoztty-spawned processes is even possible: we need
+    /// either a known root pid or at least one attributed pane. When the agent
+    /// pre-dates the `agent_pid` field AND nothing attributes, we can't compute the
+    /// set at all, so we always show everything.
+    private var canFilterSpawned: Bool {
+        model.rootPid != 0 || model.procs.contains { $0.pane != nil }
+    }
 
     /// Whether the table is currently restricted to ghoztty-spawned processes.
     private var spawnedOnlyActive: Bool { canFilterSpawned && !showAll }
 
-    /// The set of pids that are ghoztty-spawned: `rootPid` plus every transitive
-    /// descendant (BFS over a ppid→children adjacency map). Robust to cycles
-    /// (visited set) and missing parents (a pid with no path to `rootPid` is simply
-    /// excluded). Empty when there's no known root.
+    /// The set of pids that are ghoztty-spawned: everything attributed to one of
+    /// our panes, PLUS `rootPid` and its transitive descendants.
+    ///
+    /// The root-descendant BFS alone is not sufficient, and on this platform is
+    /// usually empty. `rootPid` for a local source is the APP's pid, but with
+    /// `session-persistence = on` (the default) every pane's shell is a child of
+    /// `ghoztty-agent`, not of the app — the app process has no children at all, so
+    /// the BFS finds only the app itself and the filter hides every pane process it
+    /// exists to show. Pane attribution reaches those subtrees directly, and it also
+    /// covers the remote case where the panes belong to that machine's agent.
+    ///
+    /// The BFS is kept because it still catches processes the app spawned itself
+    /// (non-persistent panes, and helpers with no pane of their own). Robust to
+    /// cycles (visited set) and missing parents (a pid with no path to the root is
+    /// simply excluded).
     private var spawnedPIDs: Set<Int64> {
+        var result = Set(model.procs.lazy.filter { $0.pane != nil }.map(\.pid))
+
         let root = model.rootPid
-        guard root != 0 else { return [] }
+        guard root != 0 else { return result }
         // children[ppid] = [pid, …]
         var children: [Int64: [Int64]] = [:]
         for p in model.procs {
             children[p.ppid, default: []].append(p.pid)
         }
-        var result: Set<Int64> = [root]
+        result.insert(root)
         var queue: [Int64] = [root]
         while let pid = queue.popLast() {
             guard let kids = children[pid] else { continue }
@@ -997,8 +1052,10 @@ struct RemoteActivityMonitorView: View {
             }
             .width(min: 120, ideal: 200)
 
+            // Per-core %CPU, shown as-is (top / Activity Monitor convention): a
+            // fully-busy thread is ~100 and a multithreaded process exceeds it.
             TableColumn("% CPU", value: \.cpuPctPerCore) { row in
-                Text(String(format: "%.1f", normalized(row.cpuPctPerCore)))
+                Text(String(format: "%.1f", row.cpuPctPerCore))
                     .monospacedDigit()
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
@@ -1010,6 +1067,21 @@ struct RemoteActivityMonitorView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(min: 70, ideal: 90, max: 110)
+
+            // Which window/pane the process belongs to. This is the column that
+            // makes a filtered list readable: without it, twenty agent sessions all
+            // render as the same process name (Claude Code reports its version
+            // string, "2.1.220", as its accounting name) with nothing to tell them
+            // apart. Sorts by label so a window's processes group together.
+            TableColumn("Window / Pane", value: \.paneSortKey) { row in
+                let pane = row.pane
+                Text(pane?.label ?? "—")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(pane == nil ? Color.secondary.opacity(0.6) : Color.primary)
+                    .help(pane?.detail ?? "Not started by a Ghoztty pane.")
+            }
+            .width(min: 100, ideal: 180)
 
             // Full executable path (from ghostty_proc_s.cmd). May be empty until
             // the agent populates it; long paths truncate at the head with the
