@@ -9,6 +9,35 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-02 - **T29 done - the Mac action fallthroughs are real, and they are
+  an inherited UPSTREAM defect, not the bad merge the task guessed.** `git log
+  -L` on the region names it: upstream `38e64c370` implemented
+  `SHOW_CHILD_EXITED` by replacing the body the five cases SHARED - the
+  `known but unimplemented ... return false` one - and left the four preceding
+  `fallthrough`s attached to the new call. The chain looks deliberate because
+  it was, for the body it used to have.
+  - **The severity is not in the wrong case, it is in the C union.** Every arm
+    reads `action.action` as a different member; the four that fell through are
+    **void-payload** actions, and `Action.cval`'s `@unionInit` leaves the rest
+    of the extern union UNDEFINED. So `toggle_window_decorations` read
+    `child_exited.timetime_ms` out of garbage and could pop a "process exited"
+    bar over a live surface. `size_limit` - emitted on every surface init -
+    escaped only by luck: its `max_width/max_height` overlay `timetime_ms`, and
+    they are 0, so the `> 0` guard rejected it. That is why nobody noticed.
+  - **Win32 cannot have this bug**, which is worth stating as more than a
+    status: it switches on a Zig tagged union, so the compiler binds each arm's
+    payload to its tag. The defect class exists only across the C boundary.
+  - **The Mac half of the validation was NOT run and is not claimed** - this box
+    has no Swift toolchain, so the fix rests on a code read plus the
+    archaeology. Filed as **T340** (Mac seat: build + keybind-verify) rather
+    than left implied. **T341** is the root enabler: make `cval` zero the
+    union's bytes so the next wrong reader gets a defined zero, testable in the
+    none lane here.
+  - Floor green: none lane, `test-agent`, P1-P3 ALL PASS. The win32 lane failed
+    once on **T258** (`client DATA reaches the child`, len 0 vs `ls -la\n`) and
+    was green on the identical re-run; recorded there as its third occurrence -
+    a third distinct assertion, same file, same "bytes had not arrived" shape.
+
 - 2026-08-02 - **T336 done - cross-machine Restore All, which closes T146.**
   Rebuilding a REMOTE machine's whole topology here is T335's machinery pointed
   at a dialed connection, so what the task was really about is the one

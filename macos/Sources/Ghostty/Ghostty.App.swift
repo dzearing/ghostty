@@ -669,6 +669,23 @@ extension Ghostty {
             case GHOSTTY_ACTION_PRESENT_TERMINAL:
                 return presentTerminal(app, target: target)
 
+            case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
+                return showChildExited(app, target: target, v: action.action.child_exited)
+
+            // Known but unimplemented on macOS. These must NOT fall through
+            // into an implemented case: every case reads `action.action` as a
+            // different member of the same C union, and for a void-payload
+            // action (toggle_tab_overview, toggle_window_decorations,
+            // quit_timer) those bytes are UNDEFINED — Zig's `@unionInit` in
+            // `Action.cval` leaves the rest of the extern union
+            // uninitialized. Falling through to showChildExited read
+            // `child_exited.timetime_ms` out of that garbage and could show a
+            // bogus "process exited" bar over a live surface.
+            //
+            // These four were the shared "unimplemented" body until upstream
+            // 38e64c370 ("macOS: add bottom bar when child exits") replaced
+            // that body with the showChildExited call and left them attached
+            // to it by fallthrough.
             case GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW:
                 fallthrough
             case GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS:
@@ -676,9 +693,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_SIZE_LIMIT:
                 fallthrough
             case GHOSTTY_ACTION_QUIT_TIMER:
-                fallthrough
-            case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
-                return showChildExited(app, target: target, v: action.action.child_exited)
+                Ghostty.logger.info("known but unimplemented action action=\(action.tag.rawValue)")
+                return false
+
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
                 return copyTitleToClipboard(app, target: target)
             case GHOSTTY_ACTION_ACTIVITY_STATE:
