@@ -62,6 +62,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
+const com = @import("com.zig");
 const paths = @import("webview2_paths.zig");
 const build_config = @import("../../build_config.zig");
 
@@ -116,23 +117,13 @@ pub const Failure = enum {
 
 // -------------------------------------------------------------------- COM
 
-const GUID = w32.GUID;
-const HRESULT = w32.HRESULT;
-
-const S_OK: HRESULT = 0;
-const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x8000_4002));
-const E_POINTER: HRESULT = @bitCast(@as(u32, 0x8000_4003));
-
-fn failed(hr: HRESULT) bool {
-    return hr < 0;
-}
-
-const IID_IUnknown: GUID = .{
-    .Data1 = 0x00000000,
-    .Data2 = 0x0000,
-    .Data3 = 0x0000,
-    .Data4 = .{ 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 },
-};
+/// The COM floor lives in `com.zig` (T376): the IIDs, the HRESULT helpers,
+/// and the generic callback object every handler in this file is an instance
+/// of. Re-exported here so this module reads as one piece.
+const GUID = com.GUID;
+const HRESULT = com.HRESULT;
+const S_OK = com.S_OK;
+const failed = com.failed;
 
 // {4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}
 const IID_EnvironmentCompletedHandler: GUID = .{
@@ -141,11 +132,6 @@ const IID_EnvironmentCompletedHandler: GUID = .{
     .Data3 = 0x4BD2,
     .Data4 = .{ 0xB6, 0xB5, 0x12, 0x4F, 0xEE, 0x6C, 0xC1, 0x4D },
 };
-
-fn guidEql(a: *const GUID, b: *const GUID) bool {
-    return a.Data1 == b.Data1 and a.Data2 == b.Data2 and
-        a.Data3 == b.Data3 and std.mem.eql(u8, &a.Data4, &b.Data4);
-}
 
 /// `ICoreWebView2Environment`, declared through the two methods this band
 /// needs. Slots we never call are typed as opaque pointers on purpose: an
@@ -201,94 +187,38 @@ pub const ICoreWebView2Environment = extern struct {
 /// `ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler` — a COM object
 /// **we** implement and hand to the runtime.
 ///
-/// Layout rule: the vtable pointer must be the first field, because that is
-/// the only part of us COM ever dereferences. Everything after it is ours;
-/// `extern struct` is what guarantees the order.
+/// The vtable, the reference counting and the interface matching are
+/// `com.Callback`'s (T376); what is specific to this interface is its IID and
+/// `onEnvironmentCompleted` below.
 ///
 /// Lifetime: the runtime `AddRef`s this before it keeps it and `Release`s it
 /// after `Invoke`, so the object frees itself when the count reaches zero. It
 /// is created with a count of 1 (the reference the creating call owns) and
 /// that reference is dropped right after the create call returns.
-const EnvCompletedHandler = extern struct {
-    vtable: *const Vtbl,
-    refs: i32,
+const EnvCompletedHandler = com.Callback(IID_EnvironmentCompletedHandler, onEnvironmentCompleted);
+
+fn onEnvironmentCompleted(
     host: *Host,
-
-    const Vtbl = extern struct {
-        QueryInterface: *const fn (*EnvCompletedHandler, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
-        AddRef: *const fn (*EnvCompletedHandler) callconv(.winapi) u32,
-        Release: *const fn (*EnvCompletedHandler) callconv(.winapi) u32,
-        Invoke: *const fn (*EnvCompletedHandler, HRESULT, ?*ICoreWebView2Environment) callconv(.winapi) HRESULT,
-    };
-
-    const vtable_impl: Vtbl = .{
-        .QueryInterface = queryInterface,
-        .AddRef = addRef,
-        .Release = release,
-        .Invoke = invoke,
-    };
-
-    fn create(host: *Host) Allocator.Error!*EnvCompletedHandler {
-        const self = try host.alloc.create(EnvCompletedHandler);
-        self.* = .{ .vtable = &vtable_impl, .refs = 1, .host = host };
-        return self;
-    }
-
-    fn queryInterface(
-        self: *EnvCompletedHandler,
-        riid: *const GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) HRESULT {
-        // `out` is never null in practice, but a COM caller is not ours to
-        // trust and E_POINTER is the contract's answer.
-        if (guidEql(riid, &IID_IUnknown) or guidEql(riid, &IID_EnvironmentCompletedHandler)) {
-            _ = addRef(self);
-            out.* = @ptrCast(self);
-            return S_OK;
-        }
-        out.* = null;
-        return E_NOINTERFACE;
-    }
-
-    fn addRef(self: *EnvCompletedHandler) callconv(.winapi) u32 {
-        self.refs += 1;
-        return @intCast(self.refs);
-    }
-
-    fn release(self: *EnvCompletedHandler) callconv(.winapi) u32 {
-        self.refs -= 1;
-        const remaining = self.refs;
-        if (remaining <= 0) {
-            const alloc = self.host.alloc;
-            alloc.destroy(self);
-            return 0;
-        }
-        return @intCast(remaining);
-    }
-
-    fn invoke(
-        self: *EnvCompletedHandler,
-        result: HRESULT,
-        env: ?*ICoreWebView2Environment,
-    ) callconv(.winapi) HRESULT {
-        // Runs on the thread that made the create call — our GUI thread, off
-        // its message loop. Keep it short and never block: this is a callback
-        // from the browser process's proxy.
-        if (failed(result) or env == null) {
-            log.warn("environment creation failed hr=0x{X:0>8} env={s}", .{
-                @as(u32, @bitCast(result)),
-                if (env == null) "null" else "set",
-            });
-            self.host.finishFailure(.create_callback_failed);
-            return S_OK;
-        }
-        // The pointer is borrowed for the duration of Invoke; we are keeping
-        // it, so we take our own reference.
-        env.?.addRef();
-        self.host.finishSuccess(env.?);
+    result: HRESULT,
+    env: ?*ICoreWebView2Environment,
+) HRESULT {
+    // Runs on the thread that made the create call — our GUI thread, off its
+    // message loop. Keep it short and never block: this is a callback from
+    // the browser process's proxy.
+    if (failed(result) or env == null) {
+        log.warn("environment creation failed hr=0x{X:0>8} env={s}", .{
+            @as(u32, @bitCast(result)),
+            if (env == null) "null" else "set",
+        });
+        host.finishFailure(.create_callback_failed);
         return S_OK;
     }
-};
+    // The pointer is borrowed for the duration of Invoke; we are keeping it,
+    // so we take our own reference.
+    env.?.addRef();
+    host.finishSuccess(env.?);
+    return S_OK;
+}
 
 /// `CreateWebViewEnvironmentWithOptionsInternal`, the export we call in place
 /// of `WebView2Loader.dll`'s `CreateCoreWebView2EnvironmentWithOptions`.
@@ -573,13 +503,13 @@ pub const Host = struct {
         };
         defer self.alloc.free(udf);
 
-        const handler = EnvCompletedHandler.create(self) catch {
+        const handler = EnvCompletedHandler.create(self.alloc, self) catch {
             return self.finishFailure(.environment_unavailable);
         };
         // Our own reference; the runtime takes its own if it keeps it. Note
         // this can free the handler outright when the call below fails before
         // AddRef-ing, which is the point.
-        defer _ = handler.vtable.Release(handler);
+        defer handler.release();
 
         const hr = create_fn(true, .installed, udf.ptr, null, handler);
         if (failed(hr)) {
@@ -672,24 +602,22 @@ test "Failure: every case answers with a message and a hint" {
     }
 }
 
-test "guidEql" {
-    try testing.expect(guidEql(&IID_IUnknown, &IID_IUnknown));
-    try testing.expect(!guidEql(&IID_IUnknown, &IID_EnvironmentCompletedHandler));
-}
-
 test "the completed handler is a well-behaved COM object" {
     // No runtime involved: this exercises OUR vtable, which is the half of
-    // the contract we can get wrong without Microsoft's help.
+    // the contract we can get wrong without Microsoft's help. It is also the
+    // regression oracle for T376's port onto `com.Callback` — the generic is
+    // only correct if this handler still behaves exactly as it did when it
+    // was forty hand-written lines.
     var host = Host.init(testing.allocator);
     defer host.deinit();
 
-    const h = try EnvCompletedHandler.create(&host);
+    const h = try EnvCompletedHandler.create(host.alloc, &host);
 
     // QueryInterface for IUnknown and for our own IID both succeed and both
     // take a reference; anything else is E_NOINTERFACE with a null out-param.
     // `Release` reports the count AFTER the decrement, so 1→2→1 reads as 1.
     var out: ?*anyopaque = null;
-    try testing.expectEqual(S_OK, h.vtable.QueryInterface(h, &IID_IUnknown, &out));
+    try testing.expectEqual(S_OK, h.vtable.QueryInterface(h, &com.IID_IUnknown, &out));
     try testing.expect(out != null);
     try testing.expectEqual(@as(u32, 1), h.vtable.Release(h));
 
@@ -700,7 +628,7 @@ test "the completed handler is a well-behaved COM object" {
 
     out = @ptrFromInt(0xDEAD);
     const bogus: GUID = .{ .Data1 = 1, .Data2 = 2, .Data3 = 3, .Data4 = .{ 4, 5, 6, 7, 8, 9, 10, 11 } };
-    try testing.expectEqual(E_NOINTERFACE, h.vtable.QueryInterface(h, &bogus, &out));
+    try testing.expectEqual(com.E_NOINTERFACE, h.vtable.QueryInterface(h, &bogus, &out));
     try testing.expect(out == null);
 
     // AddRef/Release count symmetrically, and the last Release frees.
@@ -714,7 +642,7 @@ test "a failing Invoke reports the failure instead of dereferencing null" {
     defer host.deinit();
     host.state = .creating;
 
-    const h = try EnvCompletedHandler.create(&host);
+    const h = try EnvCompletedHandler.create(host.alloc, &host);
     // E_FAIL with a null environment: the shape a create failure arrives in.
     try testing.expectEqual(S_OK, h.vtable.Invoke(h, @bitCast(@as(u32, 0x80004005)), null));
     try testing.expectEqual(Host.State.failed, host.state);
@@ -726,7 +654,7 @@ test "a failing Invoke reports the failure instead of dereferencing null" {
     var host2 = Host.init(testing.allocator);
     defer host2.deinit();
     host2.state = .creating;
-    const h2 = try EnvCompletedHandler.create(&host2);
+    const h2 = try EnvCompletedHandler.create(host2.alloc, &host2);
     try testing.expectEqual(S_OK, h2.vtable.Invoke(h2, S_OK, null));
     try testing.expectEqual(Host.State.failed, host2.state);
     _ = h2.vtable.Release(h2);

@@ -6648,3 +6648,38 @@ distinguished them. It now logs `SKIPPED live environment test` at **warn**.
 Validation: both lanes, `test-agent`, P1-P3 green. The win32 lane failed once on
 `server.zig:3488 fc.last_resize.?` - the known ConPTY flake (T346/T258), green
 on re-run and untouched by this change.
+
+## 2026-08-02 - T376: five handlers, one refcount
+
+T372 shipped one hand-written COM callback object and filed this task in the
+same breath, because T373 adds four more and T375 a fifth. `src/apprt/win32/
+com.zig` is now the single implementation of the vtable, the reference count
+and the interface matching; a handler is an IID plus an `Invoke` body.
+
+**The implementation's signature IS the parameterization.** `com.Callback(IID,
+onEnvironmentCompleted)` reads the context type and both `Invoke` argument types
+off the function with `@typeInfo`, so the vtable slot cannot disagree with what
+it dispatches to - the exact mismatch that a fifth copy-paste produces.
+
+**A COM object cannot hold an `Allocator`.** `extern struct` refuses it (the
+compiler says so; it was measured, not assumed), and the layout has to be extern
+because the vtable pointer must be at offset 0. The old handler dodged this by
+freeing through `self.host.alloc`, which works only because its context happens
+to own an allocator - T373's handlers hang off a `ViewerPane` that does not. It
+is carried as the interface's two words and rebuilt on free, with a counting
+allocator asserting the free lands on the allocator the object was created
+with. A leak checker cannot see a free through the wrong heap.
+
+**The sibling IID is the interesting rejection.** The old test rejected an
+invented GUID; the new one rejects the other handler's real IID, because that is
+the failure that happens when five interfaces share a file - and it hands the
+caller a pointer whose `Invoke` has a different signature.
+
+Validation: T372's handler tests are the regression oracle and passed unmodified
+apart from `create(alloc, ctx)`, including the LIVE one - the real runtime drove
+our generated vtable and the environment still reports `150.0.4078.105`. Both
+lanes, `test-agent`, P2/P3 green. P1 reported 2 FAILURE(S) on its first run
+after the rebuild and ALL PASS on the immediate re-run with nothing changed;
+which two is unrecoverable because the run was summarised to its last line, so
+that is filed as **T379** rather than shrugged off - a floor that fails without
+saying what failed is not a floor.

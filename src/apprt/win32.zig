@@ -25,6 +25,11 @@ test {
     // nobody has checked.
     _ = @import("win32/PaneView.zig");
     _ = @import("win32/ViewerPane.zig");
+    // The COM callback object every WebView2 handler is an instance of
+    // (T376). Listed in its own right, not just as webview2.zig's import:
+    // its refcount and interface matching are the part a fifth handler would
+    // have got wrong, so the lane should name what it is checking.
+    _ = @import("win32/com.zig");
     // The WebView2 host floor (T372): the loader-less runtime probe and the
     // shared environment. Same rule again — T373 is its first caller, and a
     // module that touches the registry, LoadLibraryW and a COM vtable is the
