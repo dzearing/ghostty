@@ -71,6 +71,48 @@ struct HookComponentTests {
         #expect(hooks["Stop"] == nil)
     }
 
+    // H1: a present-but-unparseable shared settings.json must NEVER be
+    // overwritten. install() throws, the file's bytes are unchanged, and state()
+    // reports .outdated (never .notInstalled, which would offer a destructive
+    // "Set up" right before the wipe).
+    @Test func claudeUnparseableSettingsIsNotOverwritten() throws {
+        let home = try tempHome()
+        let settings = home.appendingPathComponent(".claude/settings.json")
+        try FileManager.default.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = #"{"theme":"dark", "oops": ,}"#  // present but invalid JSON
+        try original.write(to: settings, atomically: true, encoding: .utf8)
+        let c = HookComponent(spec: ClaudeHookSpec(), homeDirectoryURL: home, fileManager: .default)
+        #expect(c.state() == .outdated)
+        #expect(throws: HookComponentError.self) { try c.install() }
+        let after = try String(contentsOf: settings, encoding: .utf8)
+        #expect(after == original)
+    }
+
+    // A valid-JSON but non-object root (top-level array) is also unsafe to
+    // merge into and must be refused, not silently replaced.
+    @Test func claudeTopLevelArraySettingsIsNotOverwritten() throws {
+        let home = try tempHome()
+        let settings = home.appendingPathComponent(".claude/settings.json")
+        try FileManager.default.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "[1,2,3]".write(to: settings, atomically: true, encoding: .utf8)
+        let c = HookComponent(spec: ClaudeHookSpec(), homeDirectoryURL: home, fileManager: .default)
+        #expect(c.state() == .outdated)
+        #expect(throws: HookComponentError.self) { try c.install() }
+        #expect(try String(contentsOf: settings, encoding: .utf8) == "[1,2,3]")
+    }
+
+    // An absent or empty settings.json has no user data to lose, so a fresh
+    // install proceeds from an empty base.
+    @Test func claudeEmptySettingsInstallsCleanly() throws {
+        let home = try tempHome()
+        let settings = home.appendingPathComponent(".claude/settings.json")
+        try FileManager.default.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "".write(to: settings, atomically: true, encoding: .utf8)
+        let c = HookComponent(spec: ClaudeHookSpec(), homeDirectoryURL: home, fileManager: .default)
+        try c.install()
+        #expect(c.state() == .installed)
+    }
+
     private func readJSON(_ url: URL) throws -> [String: Any] {
         let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
         return obj as? [String: Any] ?? [:]
