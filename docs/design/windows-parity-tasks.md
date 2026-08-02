@@ -421,11 +421,50 @@ Work these first, in order, before falling back to first-todo-in-table:
       the obvious `TrackMouseEvent` fix has an unproven premise about a child
       under the cursor) and **T316** (the signed-out row still shows a sentence
       Mac has no state for; decide it and write it into §2.4 either way).
-      **T312** — the owner-drawn list has no focus indicator — is what is left.
-    - **T146** — the other half of the chooser's *function* (cross-machine
-      session browse/resume, Kill, Restore All). Still todo, still 4 Mac
-      commits with zero Windows references, and it also owns the correction of
-      CLAUDE.md's stale "scoped but not yet built" claim.
+      **~~T312~~ (done, 2026-08-01)** — the owner-drawn list's focus indicator —
+      closed the split, and with it T227. **The Ctrl+Shift+N polish pass is
+      done.**
+    - **T146 (split 2026-08-01 → T318 → T319/T320 → T321)** — the other half of
+      the chooser's *function*: cross-machine session browse/resume, Kill,
+      Restore All. Split before it was started, per the context rule: four Mac
+      commits behind one title, and `MachineChooser.zig` (108 KB) matches
+      `session` exactly **four** times, all four the relay error string
+      *"Session expired — sign in again above."* — so the surface has zero of
+      it.
+
+      The children are **UI tasks, not systems tasks**, because the data plane
+      is already cross-platform Zig and already called from win32:
+      `Connection.requestSessions` (`connection.zig:1598`), `requestLayouts`
+      (`:1693`), `closeSession` (`:2114`), with `App.zig:1263` already running
+      the first against the local agent's warm shared connection. T295's
+      dial-off-thread + ownership discipline is the pattern T319 reuses rather
+      than re-derives.
+
+      - **T318** — the LOCAL machine's roster in the detail pane, Mac's label
+        ladder (`liveTitle` → agent title → persisted title → cwd basename →
+        argv → `pid N`), and Kill.
+      - **T319** — the same roster for a REMOTE machine over the relay. No new
+        RPC; the work is the dial, its ownership, and per-row failure that
+        never becomes a modal.
+      - **T320** — resume ONE browsed session. Two Mac rules carry it: only
+        ALIVE sessions attach (a *relaunchable* tombstone needs `RELAUNCH`,
+        a different verb), and the keyboard sub-cursor's index space must equal
+        the rendered list's — the bug T312 just finished proving this list is
+        prone to.
+      - **T321** — agent-owned layout blobs + **Restore All** (the
+        `chooser_layout.Composition.restore_all` flag T177 left named and
+        unset), offered only at ≥ 2 alive sessions. It also owns the correction
+        of CLAUDE.md's stale *"scoped but not yet built"* claim, landing in the
+        same commit that makes the statement true on both platforms.
+
+      **T322** came out of the same reading and should be settled before T318
+      renders a row: `relaunchable` exists on the wire (`protocol.zig:576`) and
+      in the client struct (`connection.zig:564`) but is **omitted from the C
+      API row** (`embedded.zig:2820-2833`), so Mac's
+      `isConnectable = alive || relaunchable` filter is a constant today and
+      hides the resumable reboot-floor tombstones `wp4_e2e.zig:868` proves are
+      resumable. Windows reads the Zig struct directly and would diverge by
+      default.
 
 0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
    **~~T211~~ → ~~T212~~ (split) → ~~T216~~ → T217 → T218 → T210 → T208 →

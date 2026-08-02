@@ -5053,6 +5053,43 @@ does nothing is not - T286 enables it. And sampling runs off the GUI thread with
 each one; a dropped tick is deliberate, so a slow machine cannot accumulate a
 backlog of enumerations.
 
+## 2026-08-01 - T146 split into T318 -> T319/T320 -> T321, before it was started
+
+T312 closed T227, which closed the Ctrl+Shift+N polish block, so the next
+priority item is T146 - the chooser's *function* half. It is four Mac commits
+behind one title and the context rule says that gets split before it is picked
+up, not after. Evidence, not estimate: `MachineChooser.zig` is 108 KB and
+matches `session` exactly **four** times, and all four are the string "Session
+expired - sign in again above." in relay error mapping (:728, :1567, :1577,
+:1579). The surface has none of it. Mac's supporting code is ~19.5 KB
+(`SessionBrowserProbe.swift`) + ~30 KB (`SessionLayoutManifest.swift`) + ~38 KB
+(`SessionLayoutRestore.swift`), and the three comparable tasks on this same
+surface each split (T226 into four, T227 into three, T203 into three).
+
+The scoping read changed what the children ARE, which is the point of doing it.
+**The data plane is already cross-platform Zig and already called from win32**:
+`Connection.requestSessions` (`connection.zig:1598`), `requestLayouts` (:1693),
+`closeSession` (:2114) - and `App.zig:1263` already runs the first against the
+local agent's warm shared connection. Mac reaches the same functions through
+`embedded.zig:2802/:2913`; win32 calls them directly. So T318-T321 are UI +
+threading tasks in the shape T295 already established, not systems tasks, and
+each child file cites the Mac lines it ports rather than restating them.
+
+**T322 is the finding.** `relaunchable` is on the wire (`protocol.zig:576`,
+round-tripped by the test at :2094) and in the client struct
+(`connection.zig:564`), but the C API row omits it - `SessionJsonRow`
+(`embedded.zig:2820-2833`) emits twelve fields and that is not one of them, and
+Swift decodes it `?? false` (`SessionBrowserProbe.swift:49`). So Mac's
+`isConnectable = alive || relaunchable` (:56) is `alive` alone, and the filter
+written to KEEP resumable reboot-floor tombstones is what hides them - the same
+rows `wp4_e2e.zig:868` asserts are resumable. `+sessions --json` has the hole
+too (`cli/sessions.zig:237`). It matters here because Windows reads the Zig
+struct directly and would show what Mac hides: a platform divergence created by
+an omission rather than a decision. Settle it before T318 renders a row.
+
+Docs-only turn: `parity-tasks.ps1 validate` ALL PASS (352 tasks), no source
+touched, so the build/test floor was not re-run.
+
 Follow-ups: **T288** (two private copies of the same case-fold substring
 search), **T289** (the panel is keyboard-operable but has no visible focus
 anywhere, which section 2.2 calls an accessibility defect rather than a polish
