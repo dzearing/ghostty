@@ -1580,7 +1580,7 @@ struct MachineChooserView: View {
     }
 }
 
-/// Presents the window-target chooser as an application-modal panel centered on
+/// Presents the window-target chooser as a MODELESS floating panel centered on
 /// the active (key) window — or the main screen if there is none — and calls
 /// `completion` with the chosen target, or nil if the user cancelled.
 ///
@@ -1591,12 +1591,38 @@ struct MachineChooserView: View {
 /// status and may appear/disappear as devices come and go. Callers should
 /// special-case the nothing-to-choose case (no machines AND no relay account)
 /// before calling this (e.g. just open a local window directly).
+/// Reports a user-initiated close (close button, Cmd-W) so the presenter can
+/// tear its probes down. A modeless panel has no modal session to end, so this
+/// is the only signal that the picker went away.
+@MainActor
+private final class MachineChooserPanelDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
+    nonisolated func windowWillClose(_ notification: Notification) {
+        MainActor.assumeIsolated { onClose() }
+    }
+}
+
 @MainActor
 enum MachineChooser {
+    /// The open panel and its delegate. `NSApp.runModal` used to retain the
+    /// panel AND block `present` until it closed; modeless, nothing else holds
+    /// it, so the presenter must.
+    private static var openPanel: NSWindow?
+    private static var openPanelDelegate: MachineChooserPanelDelegate?
+
     static func present(
         registry: MachineRegistry = .shared,
         completion: @escaping (WindowTarget?) -> Void
     ) {
+        // Modeless means a second invocation would stack a second panel -- the
+        // modal session used to make that impossible. Focus the open one.
+        if let existing = Self.openPanel {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
         // Capture the window we're presenting over BEFORE we activate/raise our
         // own panel, so we can center on it.
         let anchorWindow = NSApp.keyWindow ?? NSApp.mainWindow
@@ -1621,7 +1647,13 @@ enum MachineChooser {
         // `.onDisappear` never fires for this modal panel.
         let sessionCPU = SessionCPUProbe()
 
+        // Runs exactly once, however the picker goes away: a pick, Cancel, or the
+        // user closing the panel (which arrives via the delegate and re-enters
+        // here), so the guard is load-bearing.
+        var finished = false
         let finish: (WindowTarget?) -> Void = { target in
+            if finished { return }
+            finished = true
             // Tear down all probe connections BEFORE handing control back, so
             // no probe connection outlives the picker no matter the choice.
             probe.stop()
@@ -1629,9 +1661,11 @@ enum MachineChooser {
             sessionCPU.stop()
             pollTask?.cancel()
             if let windowRef {
-                NSApp.stopModal()
-                windowRef.orderOut(nil)
+                windowRef.delegate = nil   // don't re-enter via windowWillClose
+                windowRef.close()
             }
+            Self.openPanel = nil
+            Self.openPanelDelegate = nil
             completion(target)
         }
 
@@ -1659,10 +1693,20 @@ enum MachineChooser {
 
         let hosting = NSHostingController(rootView: view)
         let window = NSPanel(contentViewController: hosting)
-        window.styleMask = [.titled]
+        // Modeless needs its own way out -- under runModal the buttons were the
+        // only exits. Floating + not hiding on deactivate means the picker stays
+        // visible while you work behind it, which is the whole point: you can
+        // close a terminal window and watch the roster update.
+        window.styleMask = [.titled, .closable]
+        window.level = .floating
+        window.hidesOnDeactivate = false
         window.title = "New Window"
         window.isReleasedWhenClosed = false
         window.isMovableByWindowBackground = true
+        let panelDelegate = MachineChooserPanelDelegate { finish(nil) }
+        window.delegate = panelDelegate
+        Self.openPanel = window
+        Self.openPanelDelegate = panelDelegate
         windowRef = window
 
         // Size the window to the SwiftUI content's natural size BEFORE centering.
@@ -1689,9 +1733,14 @@ enum MachineChooser {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         // Refresh the account device list from the relay on open (WP-C2). The
-        // continuation runs during the modal session (the modal panel runloop
-        // mode is a common mode, so main-queue work is delivered — the probe
-        // relies on the same behavior). Rows update in place as it lands.
+        // Rows update in place as it lands.
+        //
+        // NOTE: this comment used to claim the modal-panel runloop mode is a
+        // common mode "so main-queue work is delivered". It is not. Under
+        // `runModal` every `DispatchQueue.main.async` completion — the
+        // session-roster refresh included — sat undelivered until the panel
+        // closed, which froze the roster and left closed sessions showing as
+        // "Resume" rows. The panel is modeless now, so the main queue drains.
         Task { @MainActor in
             await registry.refreshFromRelay()
         }
@@ -1720,6 +1769,5 @@ enum MachineChooser {
         // collapsed row (cheap: reuses the warm shared connection, no dial).
         // Remote machines are browsed lazily on expand.
         browser.primeLocal()
-        NSApp.runModal(for: window)
     }
 }
