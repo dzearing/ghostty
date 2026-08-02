@@ -282,9 +282,11 @@ final class SessionBrowserProbe: ObservableObject {
             let handle = dial()
             let sessions: [BrowsedSession]? = handle.flatMap { RemoteSessionRoster.list(handle: $0) }
             if let handle { ghostty_remote_connection_free(handle) }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
-            }
+            // Must land while the chooser's modal panel is up -- see
+            // `onMainEvenWhenModal`. With a plain main-queue hop this never
+            // runs until the dialog closes, leaving `inflight` set forever and
+            // freezing the roster.
+            onMainEvenWhenModal { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
         }
     }
 
@@ -387,12 +389,10 @@ final class SessionBrowserProbe: ObservableObject {
                 _ = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
                 ghostty_remote_connection_free(handle)
             }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let self, !self.stopped else { return }
-                    self.states[key] = nil
-                    self.fetch(machine: machine)
-                }
+            onMainEvenWhenModal {
+                guard let self, !self.stopped else { return }
+                self.states[key] = nil
+                self.fetch(machine: machine)
             }
         }
     }

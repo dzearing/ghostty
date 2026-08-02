@@ -54,7 +54,32 @@ pub const Record = struct {
     title: ?[]const u8 = null,
     pinned: bool = false,
     created_ms: i64 = 0,
+    /// How many agent restarts this record has been materialized across WITHOUT
+    /// anyone resuming it. Bounds the reboot floor so the file self-heals.
+    ///
+    /// Without it the file is a ratchet that only grows. `materialize` marks
+    /// every record it loads `relaunchable = true`, and `persistMeta` keeps any
+    /// relaunchable tombstone — so a record, once written, is re-loaded and
+    /// re-written forever. Each stale record then shows in the chooser as a
+    /// permanent "Resume" row for a process that exited long ago, and the list
+    /// grows with every restart (observed here: 8 → 9 → 11 → 13 → 14). The
+    /// existing "the file self-heals on the next open/close" comment in
+    /// `persistMeta` could never come true for exactly this reason.
+    ///
+    /// Reset to 0 the moment the session is genuinely resumed (RELAUNCH or a
+    /// successful ATTACH), so a session someone actually uses is never aged out.
+    ///
+    /// Additive and back-compatible: an older agent omits the field, it decodes
+    /// as 0, and the record simply gets a fresh allowance.
+    unclaimed_restarts: u32 = 0,
 };
+
+/// How many agent restarts a never-resumed tombstone may survive before it is
+/// dropped from the file. Two, not one: a reboot that immediately restarts the
+/// agent (or an agent upgrade landing before the user returns) must not cost
+/// them the session, which is the whole point of the reboot floor. Past that it
+/// is stale — nothing has re-attached to it across two full agent lifetimes.
+pub const max_unclaimed_restarts: u32 = 2;
 
 /// The whole file. `sessions` is a present (possibly empty) array so a reader
 /// distinguishes "no live sessions" from a corrupt/absent file.

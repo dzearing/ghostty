@@ -362,7 +362,7 @@ final class LocalAgentManager {
             let handle = existing.handle
             DispatchQueue.global(qos: .userInitiated).async {
                 let sessions = RemoteSessionRoster.list(handle: handle)
-                DispatchQueue.main.async { completion(sessions) }
+                onMainEvenWhenModal { completion(sessions) }
             }
             return
         }
@@ -371,12 +371,12 @@ final class LocalAgentManager {
         // browsing never starts an agent. Free the probe connection afterward.
         DispatchQueue.global(qos: .userInitiated).async {
             guard let conn = Self.dialExisting(paths: .current) else {
-                DispatchQueue.main.async { completion(nil) }
+                onMainEvenWhenModal { completion(nil) }
                 return
             }
             let sessions = RemoteSessionRoster.list(handle: conn.handle)
             ghostty_remote_connection_free(conn.handle)
-            DispatchQueue.main.async { completion(sessions) }
+            onMainEvenWhenModal { completion(sessions) }
         }
     }
 
@@ -397,19 +397,19 @@ final class LocalAgentManager {
             let handle = existing.handle
             DispatchQueue.global(qos: .userInitiated).async {
                 let ok = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
-                DispatchQueue.main.async { completion(ok) }
+                onMainEvenWhenModal { completion(ok) }
             }
             return
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
             guard let conn = Self.dialExisting(paths: .current) else {
-                DispatchQueue.main.async { completion(false) }
+                onMainEvenWhenModal { completion(false) }
                 return
             }
             let ok = RemoteSessionKiller.close(handle: conn.handle, sessionID: sessionID)
             ghostty_remote_connection_free(conn.handle)
-            DispatchQueue.main.async { completion(ok) }
+            onMainEvenWhenModal { completion(ok) }
         }
     }
 

@@ -814,6 +814,9 @@ pub const Server = struct {
         // the previous viewer's pushes died with its connection (wp3).
         s.fg_pid = 0;
         s.bound = true;
+        // A client attached: the session is in use, so it is not a stale
+        // reboot-floor leftover -- reset its unclaimed-restart allowance.
+        s.unclaimed_restarts = 0;
         s.streaming = true;
         // Track the channel once (avoid dupes across re-attach within one conn).
         for (self.bound_channels.items) |c| if (c == s.channel) return;
@@ -1414,6 +1417,11 @@ pub const Server = struct {
         rs.pid = spawned.pid;
         rs.alive = true;
         rs.relaunchable = false;
+        // Claimed: someone actually resumed this session, so it is not a stale
+        // reboot-floor leftover. Reset the unclaimed-restart allowance
+        // (`session_meta.Record.unclaimed_restarts`) or a session in daily use
+        // could still age out of the file after a couple of restarts.
+        rs.unclaimed_restarts = 0;
         rs.exit_code = null;
         rs.last_activity_ms = self.clock.now();
         // Fresh pty ⇒ fresh tty path (wp3); stable stack copy for the
