@@ -440,6 +440,57 @@ pub const InitOptions = struct {
     layout_uuid: ?[]const u8 = null,
 };
 
+/// Is this a build that must announce itself as not-the-release (T43)?
+///
+/// Debug AND ReleaseSafe, matching the Mac gate (`TerminalView.swift:81`
+/// checks `GHOSTTY_BUILD_MODE_DEBUG || GHOSTTY_BUILD_MODE_RELEASE_SAFE`) — a
+/// ReleaseSafe build is a dev build too, and a marker that only Debug carries
+/// tells a user running one nothing. What ships is ReleaseFast, which is
+/// unmarked.
+///
+/// One predicate, two markers: the chrome tint (`chromePalette`) and the
+/// " [DEBUG]" title suffix (`updateWindowTitle`). They were two different gates
+/// for exactly one commit.
+pub const debug_build = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
+};
+
+/// Is the chrome tint half of the debug marker live in this process?
+///
+/// `GHOZTTY_DEBUG_MARKER=0` turns it off. That hook is not a convenience: the
+/// win32 acceptance suite measures chrome pixels in a DEBUG build **as the
+/// proxy for what ships**, and a marker that recolors the band would leave
+/// every one of those claims asserting a surface no user ever sees. tab-strip.
+/// ps1 said so immediately — 8 red, including "an inactive tab is invisible
+/// against the strip", because every chrome surface is a fixed-fraction wash of
+/// the bar and a tinted bar is a lighter bar, so the washes step less far.
+///
+/// So a script that measures the shipped chrome sets this and controls its own
+/// input (the T267 rule); `chrome-theme.ps1` leaves it alone and is the one
+/// script that owns the marker itself. The title suffix is unaffected — it
+/// costs no pixel and no script reads a title it did not set.
+///
+/// Read once and cached: `chromePalette` runs per paint.
+var debug_marker_state: ?bool = null;
+
+fn debugMarkerEnabled() bool {
+    if (comptime !debug_build) return false;
+    if (debug_marker_state) |v| return v;
+    var buf: [16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const v = if (std.process.getEnvVarOwned(fba.allocator(), "GHOZTTY_DEBUG_MARKER")) |s|
+        // Anything but an explicit off keeps the marker: a mistyped value must
+        // not silently disarm the one thing that says "this is not the release".
+        !(std.mem.eql(u8, s, "0") or std.ascii.eqlIgnoreCase(s, "false") or
+            std.ascii.eqlIgnoreCase(s, "off"))
+    else |_|
+        // Absent, or too long to be any of the off spellings.
+        true;
+    debug_marker_state = v;
+    return v;
+}
+
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
 /// system apps theme is light. A missing/erroring value is treated as light,
 /// which is how the Personalize key reads before it is ever written.
@@ -475,12 +526,17 @@ pub fn systemUsesLightTheme() bool {
 /// drop the cache and invalidate the chrome instead.
 fn chromePalette(self: *const Window) chrome_theme.Palette {
     const bg = self.app.config.background;
+    const base = chrome_theme.chromeBase(
+        self.app.config.@"window-theme",
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+        systemUsesLightTheme(),
+    );
     return chrome_theme.resolve(
-        chrome_theme.chromeBase(
-            self.app.config.@"window-theme",
-            .{ .r = bg.r, .g = bg.g, .b = bg.b },
-            systemUsesLightTheme(),
-        ),
+        // T43: a debug build's chrome is tinted so the window is unmistakable
+        // at a glance. Applied to the BASE, so every color `resolve` derives —
+        // the text ramp, the accent, the danger red — carries its contrast
+        // floor against the band that is really painted.
+        if (debugMarkerEnabled()) chrome_theme.debugChromeBase(base) else base,
         system_colors.accentCached(),
     );
 }
@@ -2924,9 +2980,10 @@ pub fn updateWindowTitle(self: *Window) void {
     }
 
     // Debug builds mark themselves in the title (and thus the taskbar) so
-    // a dev instance is never mistaken for the installed release — the
-    // Windows equivalent of the Mac debug banner.
-    if (comptime builtin.mode == .Debug) {
+    // a dev instance is never mistaken for the installed release. The other
+    // half of that marking is the tinted chrome band (T43, `chromePalette`);
+    // this one reaches the taskbar and Alt-Tab, where no pixel of ours does.
+    if (comptime debug_build) {
         const dbg = std.unicode.utf8ToUtf16LeStringLiteral(" [DEBUG]");
         @memcpy(buf[len..][0..dbg.len], dbg);
         len += dbg.len;

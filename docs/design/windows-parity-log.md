@@ -6388,3 +6388,57 @@ So order-independence here is measured for eight scripts and argued for the
 rest - but the residual risk changed shape, from a silent geometry difference
 that depends on run order into a loud, deterministic red in any script that
 needs more than 800x600.
+
+## 2026-08-02 - T43: the debug build looked exactly like the user's release
+
+The only thing separating a dev instance from the installed release was eight
+characters of window title. The Mac build has shown a real banner since forever
+(`TerminalView.swift:81`); Windows had an interim `" [DEBUG]"` suffix added in
+July 2026 and nothing else.
+
+Translated literally, Mac's answer is a full-width warning strip stacked above
+the terminal - a row straight out of the design system's section 6 budget, which
+T234 and T205 had just spent two tasks reclaiming 95 physical px of. So the
+marker went into chrome the window already pays for: the whole caption/tab band
+is now tinted warning amber (`#795f27` against a release `#303030` on a dark
+background). Zero rows, zero geometry, no rect moved - so no layout module, hit
+test or `ChromeGeometry.ps1` datum changed with it.
+
+Two decisions carry the color. **The tint goes into the BASE**, before
+`chrome_theme.resolve` derives anything, so the text ramp, the accent and the
+danger red all recompute their contrast floors against the band that is really
+painted; a tint dropped onto `Palette.bar` afterwards would leave every floor
+measured against a surface no longer on screen. And **a fixed hue cannot mark a
+background that already IS that hue** - on an amber terminal background
+`mix(base, amber)` is the base again and the debug build looks exactly like the
+release one - so a second hue takes over below a minimum channel distance.
+Amber and violet are 508 apart, so by the triangle inequality no background can
+defeat both, which is asserted rather than argued.
+
+The interesting half is what the acceptance suite said. A tint that recolors
+the band is not a neutral addition here: **the GUI scripts run a DEBUG build and
+read its chrome pixels as the proxy for what ships**, so a marked band moves
+every one of those claims onto a surface no user ever sees. That is measured,
+not feared. A baseline run with the tint compiled out was fully green; with it
+live `tab-strip.ps1` went 8 red on a build that was painting exactly what it
+was told to - *"an inactive tab is invisible against the strip"*, *"dead space
+right of the tab is bar background (R=102)"* - and `tab-color.ps1` could only
+measure 1 of its 2 chiclets. One root cause: every chrome surface is a fixed
+FRACTION wash of the bar, and a tinted bar is a lighter bar, so each wash steps
+less far (inactive-tab step 14 -> 9 on black).
+
+So `GHOZTTY_DEBUG_MARKER=0` is set once, in `test/win32/lib/TestDesktop.ps1` -
+a script must control the inputs its conditions are a function of (T267), and a
+new script gets it for free. `chrome-theme.ps1` re-enables it and is the one
+script that owns the marker, the same opt-out shape `-KeepWindowPlacement` uses
+for the two scripts that own the placement memory. Its assertions are
+two-directional against `+version`'s own build-mode line, so *"release build
+unaffected"* is a real check rather than an untested half, and `-NegativeControl`
+now flips the marker claim too - it goes red, which is what proves the probe can
+see the tint at all.
+
+Follow-ups: **T363** (`tab-strip.ps1` hardcodes the bar's R range as 10..40 - a
+private absolute restatement of a color the app derives, the colour-domain twin
+of the geometry copies T257 deleted; it only survives because the marker is off
+there) and **T364** (the compressed wash steps themselves, which a human running
+a debug build still sees).

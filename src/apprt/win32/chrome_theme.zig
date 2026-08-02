@@ -71,6 +71,63 @@ pub const ui_contrast_target: f64 = 3.0;
 /// two different reds (`#C42B1C` vs `RGB(232,65,65)`).
 pub const danger_base: Rgb = .{ .r = 0xC4, .g = 0x2B, .b = 0x1C };
 
+/// The debug build's marker hue (T43): warning amber, the same signal the Mac
+/// debug banner carries as a yellow `exclamationmark.triangle.fill`.
+pub const debug_tint: Rgb = .{ .r = 0xFF, .g = 0xB0, .b = 0x00 };
+
+/// The marker hue for the one background amber cannot mark: a terminal
+/// background that is ALREADY amber. See `debugChromeBase`.
+pub const debug_tint_fallback: Rgb = .{ .r = 0x7B, .g = 0x2F, .b = 0xF7 };
+
+/// How far the chrome background is dragged toward the marker hue. Enough that
+/// the band reads as a different COLOR at a glance rather than as a shade —
+/// "unmistakable" is T43's whole validation — and not so far that the band
+/// stops being the window's own theme underneath.
+pub const debug_tint_amount: f64 = 0.35;
+
+/// The channel distance (sum of |dR|+|dG|+|dB|) a tinted base must clear
+/// against the untinted one to count as marked.
+pub const debug_min_delta: u16 = 48;
+
+fn channelDistance(a: Rgb, b: Rgb) u16 {
+    const d = struct {
+        fn f(x: u8, y: u8) u16 {
+            return if (x > y) @as(u16, x - y) else @as(u16, y - x);
+        }
+    }.f;
+    return d(a.r, b.r) + d(a.g, b.g) + d(a.b, b.b);
+}
+
+/// The chrome background a DEBUG (or ReleaseSafe) build paints from.
+///
+/// Why this and not a badge or a banner row. Mac stacks a full-width warning
+/// strip above the terminal (`TerminalView.swift:81`); on Windows that row
+/// would come straight out of the terminal, and T234/T205 had just spent two
+/// tasks giving 95 physical px of it BACK. The design system's rule is
+/// explicit — *vertical space belongs to the terminal* — so the marker has to
+/// live in chrome the window already pays for. Tinting the band costs zero
+/// rows and zero geometry: no rect moves, so no layout module, hit test or
+/// acceptance-script datum changes with it. (T43's own Details names "a tinted
+/// tab bar" as one of the two candidate vehicles; this is that one.)
+///
+/// Everything downstream is re-derived from the tinted base by `resolve`, so
+/// the text ramp, the accent and the danger red all get their contrast floors
+/// recomputed against the band that is actually painted. A tint applied to
+/// `Palette.bar` AFTER the fact would leave every floor measured against a
+/// surface no longer on screen.
+///
+/// The fallback exists because a fixed hue cannot mark a background that
+/// already IS that hue: on an amber terminal background, `mix(base, amber)` is
+/// the base again and the debug build would look exactly like the release one.
+/// Amber and violet are 508 apart in channel distance, so by the triangle
+/// inequality no background can be within `debug_min_delta / debug_tint_amount`
+/// (137) of both — asserted in the sweep below rather than argued.
+pub fn debugChromeBase(base: Rgb) Rgb {
+    const amber = color_math.mix(base, debug_tint, debug_tint_amount);
+    if (channelDistance(amber, base) >= debug_min_delta) return amber;
+    return color_math.mix(base, debug_tint_fallback, debug_tint_amount);
+}
+
 /// Decode the DWORD Windows stores for the accent color. It is **ABGR**
 /// (`0xAABBGGRR`), not ARGB — read it as ARGB and every accent comes out with
 /// its red and blue swapped, which is the kind of bug that looks like a
@@ -296,6 +353,89 @@ test "resolve: the accent survives as the user's color when it already clears 3:
     // Still well under the text floor — proof it stopped at the UI floor
     // instead of being dragged onto the text ramp.
     try testing.expect(ratio(p.accent, p.bar) < 4.5);
+}
+
+test "debugChromeBase: every background comes back visibly marked (T43)" {
+    // The sweep is the point. A hand-picked background proves nothing here:
+    // the failure mode this guards against is "the debug build looks like the
+    // release build", and it only shows up on the backgrounds nobody checked.
+    var bases: std.ArrayList(Rgb) = .empty;
+    defer bases.deinit(testing.allocator);
+    var v: u16 = 0;
+    while (v <= 255) : (v += 1) {
+        const c: u8 = @intCast(v);
+        // Greys...
+        try bases.append(testing.allocator, .{ .r = c, .g = c, .b = c });
+        // ...the amber ramp itself, which is the case the fallback exists for...
+        try bases.append(testing.allocator, .{
+            .r = @intCast(@min(255, @as(u16, c) + 128)),
+            .g = @intCast((@as(u16, c) * 176) / 255),
+            .b = @intCast(c / 4),
+        });
+        // ...and saturated backgrounds, where a per-channel rule skews hue.
+        try bases.append(testing.allocator, .{ .r = c, .g = @intCast(255 - v), .b = 0x40 });
+        try bases.append(testing.allocator, .{ .r = 0x20, .g = c, .b = @intCast(255 - v) });
+    }
+    // The two hues the marker can be, exactly as they are painted.
+    try bases.append(testing.allocator, debug_tint);
+    try bases.append(testing.allocator, debug_tint_fallback);
+
+    for (bases.items) |base| {
+        const marked = debugChromeBase(base);
+        try testing.expect(channelDistance(marked, base) >= debug_min_delta);
+    }
+}
+
+test "debugChromeBase: no background can defeat both marker hues" {
+    // The argument the fallback rests on, checked rather than asserted in
+    // prose: amber and violet are far enough apart that a background within
+    // reach of one is out of reach of the other.
+    const span = channelDistance(debug_tint, debug_tint_fallback);
+    const reach: u16 = @intFromFloat(@as(f64, @floatFromInt(debug_min_delta)) / debug_tint_amount);
+    try testing.expect(span > 2 * reach);
+
+    // And the preferred hue really is preferred: a neutral background gets
+    // amber, not the fallback, so "the debug band is amber" stays learnable.
+    for ([_]Rgb{ surface_light, surface_dark, .{ .r = 0x1E, .g = 0x1E, .b = 0x2E } }) |bg| {
+        try testing.expectEqual(color_math.mix(bg, debug_tint, debug_tint_amount), debugChromeBase(bg));
+    }
+    // A background that IS the marker hue takes the fallback instead of coming
+    // back unmarked — the whole reason there are two.
+    try testing.expectEqual(
+        color_math.mix(debug_tint, debug_tint_fallback, debug_tint_amount),
+        debugChromeBase(debug_tint),
+    );
+}
+
+test "debugChromeBase: the marker survives resolve with every floor intact" {
+    // A marked band is still a BAND: the text on it, the accent and the danger
+    // red all keep the floors `resolve` enforces, because the tint goes in
+    // BEFORE the derivation rather than on top of it.
+    var v: u16 = 0;
+    while (v <= 255) : (v += 8) {
+        const c: u8 = @intCast(v);
+        for ([_]Rgb{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = @intCast(255 - v), .b = 0x40 },
+            .{ .r = 0x20, .g = c, .b = @intCast(255 - v) },
+        }) |bg| {
+            for ([_]Rgb{ default_accent, .{ .r = 0x68, .g = 0x00, .b = 0x81 } }) |a| {
+                const p = resolve(debugChromeBase(bg), a);
+                try testing.expect(ratio(p.text, p.bar) >= 4.4);
+                try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
+                try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
+                try testing.expect(ratio(p.danger, p.bar) >= ui_contrast_target - 0.05);
+                try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
+                try testing.expect(ratio(p.on_danger, p.danger) >= 4.4);
+
+                // And the marked band is distinguishable from the band the
+                // same background would have produced unmarked — which is the
+                // property a screenshot of the two builds has to show.
+                const plain = resolve(bg, a);
+                try testing.expect(channelDistance(p.bar, plain.bar) >= 16);
+            }
+        }
+    }
 }
 
 test "resolve: every floor holds across the whole background x accent space" {

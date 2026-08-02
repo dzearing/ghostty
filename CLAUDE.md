@@ -784,6 +784,13 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   under `%LOCALAPPDATA%\Programs\Ghoztty`, not an extracted portable copy. This
   is the on-box analog of the `/Applications/Ghoztty.app` rule. Always run the
   freshly built `zig-out\bin\ghoztty.exe`.
+- **A debug build announces itself** (T43): its whole caption/tab band is
+  tinted warning amber and its title carries `" [DEBUG]"`, so a dev instance is
+  never mistaken for the user's installed release. Gated on `Debug`/
+  `ReleaseSafe` (the Mac banner's own gate). `GHOZTTY_DEBUG_MARKER=0` turns the
+  tint off — the GUI acceptance harness sets it, because those scripts measure
+  debug chrome as the proxy for what ships (see
+  `docs/design/win32-design-system.md` §2.5).
 - **Debug builds link the Console subsystem**, so `std.log` output goes to
   stderr in the shell you launched from, like every other platform. Release
   builds use the GUI subsystem (no console) and append `info` and above to

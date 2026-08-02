@@ -32,6 +32,19 @@
 #      `WM_DWMCOLORIZATIONCOLORCHANGED` is posted to the top-level window and
 #      the next panel must paint the NEW one (the invalidation is wired).
 #
+#   C. THE DEBUG BUILD MARKS ITSELF (T43), and the release build does not.
+#      A Debug/ReleaseSafe build drags the chrome background toward warning
+#      amber before anything is derived from it, so the whole band is amber and
+#      the window cannot be mistaken for the installed release; the taskbar half
+#      is the " [DEBUG]" title suffix. Scored inside A rather than as its own
+#      section, because A already measures the exact surface the marker changes
+#      and a second copy of that machinery is what T257 spent a task deleting.
+#      Both assertions are two-directional - `+version`'s own "build mode" line
+#      says which build this is, and the expectation flips with it, so "release
+#      build unaffected" is a real check rather than an untested half. That also
+#      defuses T350 here: a non-Debug zig-out changes the expected pixel, and
+#      this script would notice rather than fail mysteriously.
+#
 # WHAT THIS SCRIPT DOES NOT CLAIM. T305's validation text asks for the
 # ACTIVE-TAB INDICATOR to track the accent. There is no such pixel: the tab
 # strip paints no accent at all - a tab's fill comes from `tab_shape.fillColor`
@@ -75,10 +88,16 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-chrome-theme-stderr.log'
+$isDebugBuild = $null   # resolved from `+version` once the helpers are defined
 Remove-Item $errlog -ErrorAction SilentlyContinue
 $env:GHOZTTY_PIPE_SUFFIX = '-chromethemetest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# The harness disables the T43 debug marker so every other GUI script measures
+# the chrome that SHIPS. This script is the one that owns the marker, so it
+# turns it back on - after the dot-source, which is where the default is set.
+$env:GHOZTTY_DEBUG_MARKER = '1'
 
 $script:pass = 0
 $script:fail = 0
@@ -106,6 +125,17 @@ function Kill-RepoInstances {
 $BAR_WASH = 0.08          # chrome_theme.bar_wash
 $TEXT_FLOOR = 4.5         # WCAG 1.4.3, the design system's text floor
 
+# chrome_theme.debugChromeBase (T43): a Debug/ReleaseSafe build drags the
+# chrome background toward warning amber before anything is derived from it, so
+# the window is unmistakably not the installed release. Mirrored here because
+# this script measures the band a DEBUG build paints - an oracle that expected
+# the release band would fail on every run and be "fixed" by deleting the
+# marker.
+$DEBUG_TINT = @(0xFF, 0xB0, 0x00)           # chrome_theme.debug_tint
+$DEBUG_TINT_FALLBACK = @(0x7B, 0x2F, 0xF7)  # chrome_theme.debug_tint_fallback
+$DEBUG_TINT_AMOUNT = 0.35                   # chrome_theme.debug_tint_amount
+$DEBUG_MIN_DELTA = 48                       # chrome_theme.debug_min_delta
+
 function Get-Lum601([int]$r, [int]$g, [int]$b) {
     return (0.299 * $r + 0.587 * $g + 0.114 * $b) / 255.0
 }
@@ -124,6 +154,40 @@ function Get-Wash([int[]]$Rgb, [double]$A) {
         $out += [int][Math]::Max(0, [Math]::Min(255, $w))
     }
     return , $out
+}
+
+# color_math.mix: composite $Fg over $Bg at $A, resolved to an opaque color.
+function Get-Mix([int[]]$Bg, [int[]]$Fg, [double]$A) {
+    $out = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $v = [double]$Bg[$i] * (1.0 - $A) + [double]$Fg[$i] * $A
+        $out += [int][Math]::Max(0, [Math]::Min(255, [Math]::Round($v, [MidpointRounding]::AwayFromZero)))
+    }
+    return , $out
+}
+
+function Get-ChannelDistance([int[]]$A, [int[]]$B) {
+    return [Math]::Abs($A[0] - $B[0]) + [Math]::Abs($A[1] - $B[1]) + [Math]::Abs($A[2] - $B[2])
+}
+
+# chrome_theme.debugChromeBase.
+function Get-DebugChromeBase([int[]]$Base) {
+    $amber = Get-Mix $Base $DEBUG_TINT $DEBUG_TINT_AMOUNT
+    if ((Get-ChannelDistance $amber $Base) -ge $DEBUG_MIN_DELTA) { return , $amber }
+    return , (Get-Mix $Base $DEBUG_TINT_FALLBACK $DEBUG_TINT_AMOUNT)
+}
+
+# Does the exe under test mark itself (T43)? Read off `+version`'s own "build
+# mode" line rather than assumed from the path: T350 is the standing hazard of
+# a non-Debug zig-out silently aiming a script at a build it was not written
+# for, and here the EXPECTED PIXEL differs between the two.
+function Test-ExeIsDebugBuild([string]$Path) {
+    $out = (& $Path +version 2>&1 | Out-String)
+    # Zig prints the enum with its leading dot (`build mode    : .Debug`).
+    if ($out -notmatch 'build mode\s*:\s*\.?(\w+)') {
+        throw "chrome-theme: could not read the build mode out of '$Path +version'"
+    }
+    return @('Debug', 'ReleaseSafe') -contains $Matches[1]
 }
 
 function Get-WcagChannel([int]$c) {
@@ -287,6 +351,9 @@ function Close-Panel([IntPtr]$panel) {
 
 # ---------------------------------------------------------------------------
 
+$isDebugBuild = Test-ExeIsDebugBuild $exe
+Write-Host ("build under test: " + $(if ($isDebugBuild) { 'marks itself (Debug/ReleaseSafe)' } else { 'release, unmarked' }))
+
 Kill-RepoInstances
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
@@ -317,6 +384,17 @@ try {
         if (-not $g) { Write-Host "SETUP FAIL: GUI did not come up on $hex"; exit 1 }
         try {
             Assert (-not (Test-TestDesktopLeak -ProcessId $g.Pid)) "A/$($case.Name) window is NOT on the interactive desktop"
+
+            # T43's other half, and the only one that reaches the taskbar and
+            # Alt-Tab, where the app paints no pixel of its own. Same gate as
+            # the tint (`Window.debug_build`), asserted in both directions for
+            # the same reason.
+            if ($case.Name -eq 'light') {
+                $title = Get-TestWindowText -Window $g.Top
+                Assert (($title -like '*[[]DEBUG]*') -eq $isDebugBuild) `
+                    "A/T43 window title carries ' [DEBUG]' iff the build marks itself (title: '$title')"
+            }
+
             $m = Get-TestChromeMetrics -Window $g.Top -StripVisible $false
             Assert ($m.CaptionH -gt 0) "A/$($case.Name) the window paints its own caption band"
 
@@ -332,9 +410,29 @@ try {
                 Assert ($null -ne $band) "A/$($case.Name) the caption band captured"
                 if ($null -eq $band) { continue }
 
-                $want = Get-Wash $bg $BAR_WASH
+                # The base the band is washed FROM: the background, plus the
+                # T43 debug tint when this exe is a build that marks itself.
+                $base = if ($isDebugBuild) { Get-DebugChromeBase $bg } else { , $bg }
+                $want = Get-Wash $base $BAR_WASH
                 Assert ($band.Mode[0] -eq $want[0] -and $band.Mode[1] -eq $want[1] -and $band.Mode[2] -eq $want[2]) `
-                    ("A/$($case.Name) band fill is wash(bg, bar_wash) = $(Format-Rgb $want) (measured $(Format-Rgb $band.Mode))")
+                    ("A/$($case.Name) band fill is wash(base, bar_wash) = $(Format-Rgb $want) (measured $(Format-Rgb $band.Mode))")
+
+                # T43, both directions. A debug build's band must NOT be the
+                # band the same background would paint in a release build, and
+                # a release build's must BE it. Written as one assertion with
+                # two answers because "release build unaffected" is half of
+                # T43's validation and is otherwise never checked anywhere.
+                $plain = Get-Wash $bg $BAR_WASH
+                $marked = (Get-ChannelDistance $band.Mode $plain) -ge 16
+                # `-NegativeControl` inverts this the same way it inverts the
+                # direction claim below: it asserts a DEBUG build paints the
+                # release band, which is exactly the regression "the debug
+                # build looks like the release build" - so that run MUST fail
+                # here too, and a probe that could not see the tint is caught.
+                $wantMarked = if ($NegativeControl -and $case.Name -eq 'light') { -not $isDebugBuild } else { $isDebugBuild }
+                Assert ($marked -eq $wantMarked) `
+                    ("A/$($case.Name) T43 debug marker present == build marks itself ($(if ($isDebugBuild) { 'debug' } else { 'release' }) build; " +
+                     "band $(Format-Rgb $band.Mode) vs untinted $(Format-Rgb $plain))")
 
                 # The direction claim, and the whole point of the change: on a
                 # LIGHT background the band goes DARKER. `background + 20` can

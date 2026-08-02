@@ -178,6 +178,47 @@ fix one copy would have made that dialog the odd one out. Same argument as
 T257's chrome-geometry hoist: the duplication is not the defect, the silent
 divergence it permits is.
 
+### 2.5 Build-mode marking (T43)
+
+A build that is **not the shipped release** — `Debug` or `ReleaseSafe`, the
+same pair Mac gates its banner on — must be unmistakable at a glance, so a dev
+instance is never mistaken for the user's terminal.
+
+| Marker | Where | Rule |
+|---|---|---|
+| **Chrome tint** | the whole caption/tab band | The chrome background is dragged 35% toward warning amber (`chrome_theme.debugChromeBase`) **before** anything is derived from it |
+| **Title suffix** | `" [DEBUG]"` | The taskbar and Alt-Tab, where the app paints no pixel of its own |
+
+Two rules make it safe:
+
+- **The tint goes into the BASE, never onto `Palette.bar`.** Everything
+  `chrome_theme.resolve` derives — the text ramp, the accent, the danger red —
+  then carries its §2.3 floor against the band that is really painted. A tint
+  applied after the fact leaves every floor measured against a surface no
+  longer on screen.
+- **A fixed marker hue cannot mark a background that already IS that hue.** On
+  an amber terminal background `mix(base, amber)` is the base again and the
+  debug build looks exactly like the release one, so a second hue (violet)
+  takes over below a minimum channel distance. Amber and violet are far enough
+  apart that no background can defeat both — asserted, not argued.
+
+**It is a tint and not a banner row on purpose.** Mac stacks a full-width
+warning strip above the terminal; on Windows that row comes straight out of
+§6's budget, which T234 and T205 had just spent two tasks reclaiming 95
+physical px of. A tint costs zero rows and zero geometry — no rect moves, so no
+layout module, hit test or acceptance-script datum changes with it.
+
+**`GHOZTTY_DEBUG_MARKER=0` turns the tint off, and the GUI acceptance harness
+sets it.** Those scripts run a DEBUG build and read its chrome pixels *as the
+proxy for what ships*; a recolored band would move every one of those claims
+onto a surface no user ever sees. That is measured, not feared — with the
+marker live `tab-strip.ps1` went 8 red on a correct build, because every chrome
+surface is a fixed-fraction wash of the bar and a **tinted bar is a lighter
+bar, so each wash steps less far** (one failure was literally "an inactive tab
+is invisible against the strip"). The default lives once, in
+`test/win32/lib/TestDesktop.ps1`; `chrome-theme.ps1` re-enables it and is the
+one script that owns the marker.
+
 ---
 
 ## 3. Shape

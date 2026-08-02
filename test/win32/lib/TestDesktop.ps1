@@ -1374,6 +1374,28 @@ $script:GhozttyTestDesktopPids = @()
 # Read it with Get-TestLaunchedPids.
 $script:GhozttyTestDesktopAllPids = @()
 
+# T43: measure the chrome the USER gets, not the chrome a dev build wears.
+#
+# A Debug/ReleaseSafe build tints its whole caption/tab band amber so it cannot
+# be mistaken for the installed release. Every GUI script here runs a DEBUG
+# build and reads its chrome pixels AS THE PROXY FOR WHAT SHIPS - so left on,
+# the marker would quietly move every one of those claims onto a surface no
+# user ever sees. It is not hypothetical: with the marker live, `tab-strip.ps1`
+# went 8 red on a build that was behaving correctly, because every chrome
+# surface is a fixed-fraction wash of the bar and a tinted bar is a lighter
+# bar, so each wash steps less far ("an inactive tab is invisible against the
+# strip" was one of them).
+#
+# Set HERE, at harness load, for the same reason `Clear-TestWindowPlacement`
+# runs at launch rather than in each script's finally: a script must control
+# the inputs its conditions are a function of (T267), and a new script gets it
+# for free. `chrome-theme.ps1` is the one script whose SUBJECT is the marker;
+# it re-enables it after dot-sourcing, which is the same opt-out shape
+# `-KeepWindowPlacement` uses for the scripts that own the placement memory.
+#
+# Inherited by every child: `StartProcess` passes a null lpEnvironment.
+$env:GHOZTTY_DEBUG_MARKER = '0'
+
 # VK codes by friendly name. Single characters fall through to VkKeyScan-free
 # uppercase mapping, which is what every existing script already assumes.
 $script:GhozttyTestVk = @{
