@@ -23,12 +23,17 @@ final class AgentIntegrationsViewModel: ObservableObject {
         refresh()
     }
 
-    /// Re-read every agent's state from disk, preserving any inline error text.
+    /// Re-read every agent's state from disk, preserving per-row busy and error text.
     func refresh() {
-        let priorErrors = Dictionary(rows.map { ($0.agent, $0.errorText) }, uniquingKeysWith: { a, _ in a })
+        let prior = Dictionary(rows.map { ($0.agent, $0) }, uniquingKeysWith: { a, _ in a })
         rows = AgentIntegrationService
             .allAgentStatuses(homeDirectoryURL: homeDirectoryURL)
-            .map { Row(agent: $0.agent, status: $0, busy: false, errorText: priorErrors[$0.agent] ?? nil) }
+            .map { status in
+                Row(agent: status.agent,
+                    status: status,
+                    busy: prior[status.agent]?.busy ?? false,
+                    errorText: prior[status.agent]?.errorText)
+            }
         jqMissing = !AgentIntegrationService.jqAvailable
     }
 
