@@ -159,23 +159,7 @@ extension AppDelegate {
     }
 
     @IBAction func setupAgentIntegrations(_ sender: Any?) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let agents = AgentIntegrationService.availableAgents()
-            guard !agents.isEmpty else {
-                DispatchQueue.main.async {
-                    Self.showSetupAlert(title: "No Agents Found",
-                        message: "No supported coding-agent CLI (Claude Code, Copilot CLI) was found. Install one, then run this again.")
-                }
-                return
-            }
-            let results = agents.map { ($0, AgentIntegrationService.install(agent: $0)) }
-            let jqMissing = !AgentIntegrationService.jqAvailable
-            DispatchQueue.main.async {
-                var msg = AgentIntegrationService.summary(results)
-                if jqMissing { msg += "\n\nThe status banner needs jq — install it with: brew install jq" }
-                Self.showSetupAlert(title: "Agent Integrations", message: msg)
-            }
-        }
+        AgentIntegrationsController.shared.show()
     }
 
     private static func showSetupAlert(
