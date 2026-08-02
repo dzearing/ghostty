@@ -6442,3 +6442,37 @@ private absolute restatement of a color the app derives, the colour-domain twin
 of the geometry copies T257 deleted; it only survives because the marker is off
 there) and **T364** (the compressed wash steps themselves, which a human running
 a debug build still sees).
+
+## 2026-08-02 - T365: a dropped remote window had no way back, and no opinion about it
+
+T56 (WP-D1 remote reconnect) was the next todo and it is four tasks, not one:
+Mac's ladder is ~400 lines welded to AppKit notifications, dispatch queues and
+the surface tree, and `Window.zig` is already 5.6k lines. Split into **T365**
+(policy), **T366** (driver), **T367** (status pill), **T368** (acceptance).
+
+T365 is the policy, pure, in the shape `agent_recovery.zig` already set for
+local in-place recovery: `src/apprt/win32/remote_reconnect.zig`, 20 tests,
+registered in `src/apprt.zig` so it tests in every lane.
+
+The three decisions that are decisions rather than constants. **What counts as
+a drop** - `degraded` is a LIVE link (§5.1 returns it to connected on any
+authentic packet), so a ladder must not start on one; and a self-healable
+`disconnected` window has to recover on a genuine link-up, because its surfaces
+still ride that same connection and a thawed agent means it works again.
+**When to stop** - exhausting the five-attempt, exactly-30s ladder is NOT
+terminal: the window is kept, the state stays truthfully self-healable, and the
+slow re-dial is armed (only when there is a session to re-ATTACH - a bare dial
+has nothing to come back to). Terminal is reserved for verdicts retrying cannot
+change. **When the session is the problem** - a stale session can probe ALIVE
+and then kill the link on every ATTACH; the breaker counts swaps that die
+inside 10s and condemns at 3, judging each swap at most once so two drops for
+one completion can't convict on a third of the evidence.
+
+One product decision worth naming: only a MANUAL reconnect may answer
+`session_gone` with a fresh shell. Automatic paths go terminal - silently
+replacing a user's dead grid with an empty prompt is a surprise, not a recovery.
+
+The `-Dtest-filter` check is the part worth repeating: a green lane proves the
+file COMPILED, not that its tests ran. Filtering on "Breaker" raised the count
+by exactly 5 over the unfiltered baseline and the single named test by exactly
+1, which is what makes "20 tests pass" a measurement.

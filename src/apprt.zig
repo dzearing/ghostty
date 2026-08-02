@@ -208,4 +208,10 @@ test {
     // older than the one we ship, and may it be restarted now or only after a
     // confirmation (T147). Pure std, same no-OS-imports deal.
     _ = @import("apprt/win32/agent_upgrade.zig");
+
+    // Pure win32 per-window remote reconnect ladder policy (T365/WP-D1): what
+    // counts as a drop, the backoff schedule, when to stop, and the
+    // poisoned-session breaker. Same `remote/connection.zig`-only import as
+    // `agent_recovery.zig`, so it builds and tests in every lane.
+    _ = @import("apprt/win32/remote_reconnect.zig");
 }
