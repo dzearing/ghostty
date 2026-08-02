@@ -95,7 +95,24 @@ struct MachineChooserView: View {
     /// Drives the live-refresh poll: while the chooser is open, re-fetch the
     /// relevant rosters every couple seconds so new/closed panes and pane
     /// renames show without reopening. Bounded to local + the selected remote.
-    private let rosterRefreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    ///
+    /// Fires in `.modalPanel` as well as `.common`, and that is load-bearing:
+    /// the chooser is shown with `NSApp.runModal(for:)`, which pumps the run
+    /// loop in `NSModalPanelRunLoopMode` — a mode that is NOT a member of
+    /// `.common`. A `.common`-only timer therefore never fires for as long as
+    /// the dialog is up, so the roster froze at whatever it held when it opened:
+    /// closed sessions lingered as "Resume" rows indefinitely, and reopening the
+    /// dialog was the only way to see the truth. Exactly the staleness this timer
+    /// exists to prevent. (`pollTask` alongside it kept working because a Swift
+    /// `Task` is not run-loop-mode dependent — only this timer was affected.)
+    ///
+    /// Only one run loop mode is active at a time, so the merge cannot
+    /// double-fire; it just means the poll survives whether or not the dialog is
+    /// modal.
+    private let rosterRefreshTimer = Publishers.Merge(
+        Timer.publish(every: 2, on: .main, in: .common).autoconnect(),
+        Timer.publish(every: 2, on: .main, in: .modalPanel).autoconnect()
+    )
 
     /// The background for row `idx`: accent when selected, a faint wash on hover,
     /// else clear. Drives the manual selection/hover highlight.
