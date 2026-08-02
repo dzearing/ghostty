@@ -63,6 +63,7 @@ const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
 const com = @import("com.zig");
+const iface = @import("webview2_iface.zig");
 const paths = @import("webview2_paths.zig");
 const build_config = @import("../../build_config.zig");
 
@@ -133,56 +134,23 @@ const IID_EnvironmentCompletedHandler: GUID = .{
     .Data4 = .{ 0xB6, 0xB5, 0x12, 0x4F, 0xEE, 0x6C, 0xC1, 0x4D },
 };
 
-/// `ICoreWebView2Environment`, declared through the two methods this band
-/// needs. Slots we never call are typed as opaque pointers on purpose: an
-/// unused slot with a *guessed* signature is a crash waiting for the day
-/// somebody calls it, while an opaque one cannot be called at all.
+/// The WebView2 interfaces themselves live in `webview2_iface.zig` (T373)
+/// alongside the controller and profile vtables this file has no business
+/// knowing about. Re-exported so the environment still reads as this module's
+/// subject.
+pub const ICoreWebView2Environment = iface.ICoreWebView2Environment;
+
+/// The browser version an environment is actually running, as UTF-8. Caller
+/// owns the result.
 ///
-/// Vtable order mirrors WebView2.h's `ICoreWebView2Environment : IUnknown`.
-/// Per the COM versioning contract, later interface revisions
-/// (`ICoreWebView2Environment_2`, …) are reached by `QueryInterface`, never by
-/// assuming trailing slots exist.
-pub const ICoreWebView2Environment = extern struct {
-    vtable: *const Vtbl,
-
-    pub const Vtbl = extern struct {
-        // IUnknown
-        QueryInterface: *const fn (*ICoreWebView2Environment, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
-        AddRef: *const fn (*ICoreWebView2Environment) callconv(.winapi) u32,
-        Release: *const fn (*ICoreWebView2Environment) callconv(.winapi) u32,
-        // ICoreWebView2Environment
-        /// (HWND parentWindow, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*)
-        /// — T373 calls this; declared opaque until it has a handler to pass.
-        CreateCoreWebView2Controller: *const anyopaque,
-        CreateWebResourceResponse: *const anyopaque,
-        get_BrowserVersionString: *const fn (*ICoreWebView2Environment, *?[*:0]u16) callconv(.winapi) HRESULT,
-        add_NewBrowserVersionAvailable: *const anyopaque,
-        remove_NewBrowserVersionAvailable: *const anyopaque,
-    };
-
-    pub fn addRef(self: *ICoreWebView2Environment) void {
-        _ = self.vtable.AddRef(self);
-    }
-
-    pub fn release(self: *ICoreWebView2Environment) void {
-        _ = self.vtable.Release(self);
-    }
-
-    /// The browser version this environment is actually running, as UTF-8.
-    /// Caller owns the result.
-    ///
-    /// This is the cheapest possible proof that the environment is a live COM
-    /// object and not a pointer that merely came back non-null: the string is
-    /// produced by the browser process, allocated with `CoTaskMemAlloc`, and
-    /// has to match what the registry advertised.
-    pub fn browserVersion(self: *ICoreWebView2Environment, alloc: Allocator) ![]u8 {
-        var raw: ?[*:0]u16 = null;
-        const hr = self.vtable.get_BrowserVersionString(self, &raw);
-        if (failed(hr) or raw == null) return error.BrowserVersionUnavailable;
-        defer w32.CoTaskMemFree(@ptrCast(raw.?));
-        return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw.?));
-    }
-};
+/// The string comes back `CoTaskMemAlloc`ed, so freeing it is an OS call —
+/// which is why this is a function here rather than a method on the
+/// OS-import-free interface declaration.
+pub fn browserVersion(env: *ICoreWebView2Environment, alloc: Allocator) ![]u8 {
+    const raw = env.browserVersionRaw() orelse return error.BrowserVersionUnavailable;
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw));
+}
 
 /// `ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler` — a COM object
 /// **we** implement and hand to the runtime.
@@ -794,7 +762,7 @@ test "host: creates a real environment on this box, and it reports its version" 
     }
 
     try testing.expectEqual(Host.State.ready, host.state);
-    const reported = try host.env.?.browserVersion(testing.allocator);
+    const reported = try browserVersion(host.env.?, testing.allocator);
     defer testing.allocator.free(reported);
     log.warn("live environment reports browser version {s}", .{reported});
     try testing.expectEqualStrings(expected_version, reported);

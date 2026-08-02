@@ -28,6 +28,8 @@ const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const PaneView = @import("PaneView.zig");
 const Surface = @import("Surface.zig");
+const ViewerPane = @import("ViewerPane.zig");
+const webview2 = @import("webview2.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
@@ -183,6 +185,13 @@ hinstance: w32.HINSTANCE,
 class_atom: u16 = 0,
 terminal_class_atom: u16 = 0,
 msg_class_atom: u16 = 0,
+viewer_class_atom: u16 = 0,
+
+/// The app-wide WebView2 host: one runtime probe, one shared
+/// `ICoreWebView2Environment` for every viewer pane (T372/T373). Created
+/// lazily — a session that never opens a viewer never starts a browser
+/// process, and a box with no WebView2 runtime never notices this exists.
+webview2_host: webview2.Host = undefined,
 
 /// List of active Window containers (tabbed windows).
 windows: std.ArrayList(*Window) = .empty,
@@ -433,6 +442,20 @@ pub fn init(
     errdefer if (self.msg_class_atom != 0) {
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
     };
+
+    // Register the viewer pane host class (T373). The class is registered
+    // whether or not this box has a WebView2 runtime: a pane with no runtime
+    // still needs a window to paint its error card in.
+    self.viewer_class_atom = ViewerPane.registerClass(hinstance);
+    if (self.viewer_class_atom == 0) return error.Win32Error;
+    errdefer if (self.viewer_class_atom != 0) {
+        _ = w32.UnregisterClassW(ViewerPane.CLASS_NAME, self.hinstance);
+    };
+
+    // The WebView2 host is inert until the first viewer pane asks it for an
+    // environment, so constructing it costs nothing on a session that never
+    // opens one.
+    self.webview2_host = .init(alloc);
 
     // Create a message-only window for receiving WM_APP_WAKEUP.
     // HWND_MESSAGE makes it a message-only window (invisible, no rendering).
@@ -1006,6 +1029,14 @@ pub fn terminate(self: *App) void {
         self.bg_brush = null;
     }
 
+    // Releases the shared environment; the client DLL stays loaded on purpose
+    // (see `webview2.Host.client_dll`).
+    self.webview2_host.deinit();
+
+    if (self.viewer_class_atom != 0) {
+        _ = w32.UnregisterClassW(ViewerPane.CLASS_NAME, self.hinstance);
+        self.viewer_class_atom = 0;
+    }
     if (self.msg_class_atom != 0) {
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
         self.msg_class_atom = 0;

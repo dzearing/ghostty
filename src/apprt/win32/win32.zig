@@ -1084,6 +1084,11 @@ pub const ES_WANTRETURN: u32 = 0x1000;
 pub const WS_CHILD: u32 = 0x40000000;
 pub const WS_VISIBLE_STYLE: u32 = 0x10000000;
 pub const WS_BORDER: u32 = 0x00800000;
+/// Excludes the areas occupied by child windows when painting the parent.
+/// A viewer pane needs it: WebView2 parents its own Chromium windows inside
+/// the pane's host window, and painting the pane background over them is a
+/// visible flash on every resize.
+pub const WS_CLIPCHILDREN: u32 = 0x02000000;
 
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,

@@ -136,6 +136,9 @@ test {
     // loader-less runtime probe (T372), same no-OS-imports deal.
     _ = @import("apprt/win32/webview2_paths.zig");
 
+    // Pure win32 viewer error-card geometry (T373), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_error_card.zig");
+
     // Pure win32 machine-chooser row model + geometry (T172), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");

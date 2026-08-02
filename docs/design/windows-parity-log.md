@@ -6683,3 +6683,61 @@ after the rebuild and ALL PASS on the immediate re-run with nothing changed;
 which two is unrecoverable because the run was summarised to its last line, so
 that is filed as **T379** rather than shrugged off - a floor that fails without
 saying what failed is not a floor.
+
+## 2026-08-02 - T373: a viewer pane with a window, a controller, and a way to fail
+
+T90d's second child. The pane now owns a `GhozttyViewer` child window and, in
+it, a live `ICoreWebView2Controller` created on T372's shared environment -
+bounds, visibility, DPI, focus, dark mode, teardown, and the native error card
+for the boxes where none of that is possible. Four files: `webview2_iface.zig`
+(the vtables Microsoft hands us), `viewer_error_card.zig` (pure, none lane),
+`ViewerPane.zig`, and the `App` wiring.
+
+**The vtables were transcribed, not remembered.** Slot ORDER is the entire
+contract, this box has no WebView2 SDK on it, and the online reference lists
+members alphabetically rather than in vtable order - so the SDK's own
+`WebView2.h` was downloaded to a scratchpad and read for its
+`DECLSPEC_XFGVIRT(Interface, method)` annotations, which state per slot which
+interface in the derivation chain contributed it. Nothing vendored; what
+survived is the declarations plus `@sizeOf`/`@offsetOf` asserts on every count.
+Not a formality: `IID_ICoreWebView2Profile` is `{79110AD3-CD5D-...-C60658F17A5F}`
+and the value this session would have written from memory differed in three
+places. **A wrong IID does not crash** - the `QueryInterface` fails, dark mode
+silently stays AUTO, and nothing ever says so.
+
+**`ICoreWebView2_13` is 105 slots we never call, then `get_Profile`.** One
+`[102]*const anyopaque` block whose only contract is its length, rather than 102
+names that are never used and could each be wrong. Safe against a runtime newer
+than the header because of the COM rule that makes each revision its own IID: a
+QI for `_13` returns a pointer whose first 106 slots are `_13`'s.
+
+**The live test is the oracle and it says what it proved.** Register the class,
+host window under a bare hidden parent, both async hops against the real
+runtime, then round-trip every slot the pane depends on: bounds set and read
+back, resized and read back, visibility toggled and read back,
+`ShouldDetectMonitorScaleChanges` FALSE, `RasterizationScale` equal to what the
+pane pushed, `PreferredColorScheme` dark then light. It logs
+`live controller ready` at warn on SUCCESS, T372's rule: "78 tests passed"
+cannot distinguish a run that talked to a browser process from one that took
+the no-runtime skip. Confirmed by filtering the lane to it (78 vs a 77 baseline)
+rather than trusting a green summary.
+
+**A pane can be closed mid-creation**, and creation is two async hops, so
+neither hop carries the pane pointer - both carry a heap token the pane nulls on
+the way out. Two references, never three: one the pane holds for life, one that
+MOVES from the environment waiter to the controller handler without being
+dropped in between, so there is one place a hop can lose it and it is the same
+place the hop ends. A late callback closes the controller it was handed, or a
+renderer process outlives the pane that asked for it.
+
+**A child window never receives `WM_DPICHANGED`** - the top-level does. So the
+pane re-reads its scale from the host window on every bounds sync, which a DPI
+change always causes: no new plumbing from `Window` and no way for the two to
+drift, with monitor detection off because the window already owns the scale.
+
+Validation: both lanes, `test-agent`, P1-P3 ALL PASS. Follow-ups **T380** (the
+unfocused-split dim is still a no-op on the viewer arm - it had no window to dim
+before this) and **T381** (the card's geometry is asserted at four scales but
+its paint has never been rendered here, because this box HAS the runtime; the
+`GHOZTTY_WEBVIEW2_BROWSER_DIR` drill makes it reachable once T374 can construct
+a viewer).

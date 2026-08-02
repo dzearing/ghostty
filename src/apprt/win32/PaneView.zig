@@ -183,7 +183,9 @@ pub fn bannerLayoutInset(self: *PaneView, slot_w: i32, slot_h: i32) i32 {
 pub fn showDimOverlay(self: *PaneView, color: u32, alpha: u8) void {
     switch (self.kind) {
         .terminal => |s| s.showDimOverlay(color, alpha),
-        // T90d: viewers get the same overlay once they own a host window.
+        // T373 gave viewers a host window, so the overlay now has something to
+        // sit on; wiring it is T380 (the unfocused-split dim is a T74 layered
+        // popup, and a viewer's Chromium children change the z-order rules).
         .viewer => {},
     }
 }

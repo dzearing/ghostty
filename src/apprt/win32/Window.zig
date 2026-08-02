@@ -2971,6 +2971,14 @@ pub fn reportColorScheme(self: *Window) void {
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
+            // A viewer pane takes the same signal through its profile's
+            // `PreferredColorScheme`, which is what the bundled viewer CSS and
+            // the hljs themes key on (T90a design §14) — the viewer half of
+            // the same OS report, not a second mechanism.
+            if (entry.view.viewer()) |v| {
+                v.setColorScheme(scheme == .dark);
+                continue;
+            }
             const surface = entry.view.surface() orelse continue;
             if (!surface.core_surface_ready) continue;
             surface.core_surface.colorSchemeCallback(scheme) catch |err| {
