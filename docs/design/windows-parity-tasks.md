@@ -409,6 +409,19 @@ Work these first, in order, before falling back to first-todo-in-table:
       re-deriving it, and keeps the type ramp, the avatar/monogram, the radius
       and icon column, the off-scale spacings, the list focus indicator, and
       the `secondary_gray` contrast floor.
+
+      **~~T310~~ → ~~T311~~ → T312.** T311 (done, 2026-08-01) recomposed the
+      account row: the band is now sized to its tallest CONTENT (36 DIP, up
+      from the 28 control height) so it can hold Mac's email-over-link stack,
+      "Sign Out" is an owner-drawn LINK beside a 32 DIP accent monogram, and
+      both states' controls size to their own measured captions — the sign-in
+      button is 198 px at 1.25 against the retired fixed slot's 188, and the
+      link is 70. Its own follow-ups are **T315** (the link's hover can stick
+      when the pointer leaves the dialog without crossing it — deferred because
+      the obvious `TrackMouseEvent` fix has an unproven premise about a child
+      under the cursor) and **T316** (the signed-out row still shows a sentence
+      Mac has no state for; decide it and write it into §2.4 either way).
+      **T312** — the owner-drawn list has no focus indicator — is what is left.
     - **T146** — the other half of the chooser's *function* (cross-machine
       session browse/resume, Kill, Restore All). Still todo, still 4 Mac
       commits with zero Windows references, and it also owns the correction of

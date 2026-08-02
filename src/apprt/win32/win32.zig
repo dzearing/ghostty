@@ -989,8 +989,11 @@ pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
 pub const WM_MEASUREITEM: u32 = 0x002C;
 pub const WM_DRAWITEM: u32 = 0x002B;
 pub const ODT_LISTBOX: u32 = 2;
+pub const ODT_BUTTON: u32 = 4;
 pub const ODA_DRAWENTIRE: u32 = 0x0001;
 pub const ODS_SELECTED: u32 = 0x0001;
+pub const ODS_DISABLED: u32 = 0x0004;
+pub const ODS_FOCUS: u32 = 0x0010;
 
 pub const MEASUREITEMSTRUCT = extern struct {
     CtlType: u32,
@@ -1045,10 +1048,18 @@ pub const BM_GETCHECK: u32 = 0x00F0;
 pub const BM_SETCHECK: u32 = 0x00F1;
 pub const BST_UNCHECKED: usize = 0;
 pub const BST_CHECKED: usize = 1;
+/// A button the owner paints itself (`WM_DRAWITEM`). The chooser's "Sign Out"
+/// is a LINK, which no system button style draws — but it still has to be a
+/// BUTTON so it keeps a tab stop, a focus rect and BN_CLICKED (T311).
+pub const BS_OWNERDRAW: u32 = 0x0000000B;
 // STATIC control styles.
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;
 pub const SS_CENTERIMAGE: u32 = 0x0200;
+/// Middle-truncate with an ellipsis when the text does not fit — Mac
+/// middle-truncates the account email (win32-machine-chooser.md §2.4), which
+/// keeps the domain visible where `SS_ENDELLIPSIS` would eat it.
+pub const SS_PATHELLIPSIS: u32 = 0x00008000;
 
 // Edit control notification codes (high word of wParam in WM_COMMAND)
 pub const EN_CHANGE: u16 = 0x0300;
@@ -1406,6 +1417,12 @@ pub extern "gdi32" fn SaveDC(hdc: HDC) callconv(.winapi) i32;
 pub extern "gdi32" fn RestoreDC(hdc: HDC, state: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
 pub const NULL_BRUSH: i32 = 5;
+
+/// The system's own focus indicator: an XOR'd dotted outline, so it reads on
+/// whatever it lands on. Used by the chooser's owner-drawn account link, which
+/// has no border of its own to thicken (T311) — the design system requires focus
+/// to be visible and never carried by color alone.
+pub extern "user32" fn DrawFocusRect(hdc: HDC, lprc: *const RECT) callconv(.winapi) i32;
 
 // Machine-chooser owner-drawn rows (T172): status dot + machine glyph.
 pub extern "gdi32" fn Ellipse(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) i32;

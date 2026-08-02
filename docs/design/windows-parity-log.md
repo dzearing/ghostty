@@ -5523,3 +5523,84 @@ P1-P3 ALL PASS. On box `ipc-machine-chooser` ALL PASS **50** (was 45) with
 `-NegativeControl` failing exactly 1; regression green across `host-settings`
 (65), `chooser-menu` (57), `relay-account`, `chrome-theme` (34), `tab-strip`
 (56) and `activity-monitor` (82).
+
+## 2026-08-01 - T311 (T227 split): the account row stops being a slot, and the test that could not see the state it was testing
+
+Findings 5 and 6 of `win32-machine-chooser.md`: no avatar and no monogram, and
+"Sign Out" as a button where Mac has a link - both states sharing one fixed
+150 DIP slot, so both were as wide as "Sign in with Google…".
+
+**Neither is really a paint bug; the LAYOUT could not express the signed-in
+state.** `Layout` named one `account_status` rect and one `account_btn` rect,
+which is exactly Mac's signed-OUT composition and nothing else - and the band
+was `control_h`, so a two-line stack had nowhere to go even if someone drew one.
+So the row became a packer, the shape T177 already gave the detail pane's action
+row: `AccountBand` + `accountRow(l, state, text)` returning
+`{text, avatar?, link?, button?}`. The band is now `max(avatar_d, email_h + 2 +
+link_h, control_h)` = **36 DIP**, up from 28; the dialog did not grow with it
+(Mac's fixed 840x540), so the body took the 8 and the list sheds it in whole
+rows the way the wrapping status strip already did.
+
+Three decisions the task asked to be stated rather than made silently. **The
+monogram is 32, not Mac's 34** - 34 is off the 4 DIP scale and 32 is
+`SM_CXICON`, the rule the detail pane's mark already follows, so the surface has
+one identity-mark size instead of two nearby ones. **Its fill is flat accent,
+not a gradient**: the letter's contrast floor is computed against ONE color, and
+a gradient makes that floor a function of position - legible at one end of the
+disc and not necessarily at the other - for a cue the shape already carries.
+And **the letter is `type_ramp.bodyStrong`, not a new size**: Mac's `size * 0.42`
+of a 34 circle is 14.3, which IS the ramp's body, so the mark lands on Mac's
+number while T310's ramp stays 12/14/20.
+
+**The link is a second control, not a restyled button.** `BS_OWNERDRAW` keeps
+the tab stop, the focus and `BN_CLICKED` that a clickable STATIC would throw
+away, and only the paint is ours - accent, borderless, underlined on
+hover/press, system focus rect when focused. The signed-out state keeps a REAL
+themed button: owner-drawing it too would have made it the one hand-painted
+button on a surface of themed ones, which is the inconsistency the design system
+calls a defect. `accountControl()` is the single answer to "the thing the user
+can press", so the focus cycle, the Enter handler and the click routing cannot
+disagree, and the Tab walk's existing skip-the-hidden loop needed no change.
+Hover comes from `WM_SETCURSOR` - the child forwards it, and the message already
+names the window under the pointer, so enter and leave are one test. Its gap
+(no message arrives at all if the pointer leaves the dialog without crossing it,
+so the underline can stick) is **T315**, deferred with its reasoning: the
+obvious `TrackMouseEvent`-on-the-parent fix has an unproven premise about a
+child under the cursor, and getting it wrong kills the hover instead of the
+stick.
+
+**The acceptance script could not reach the state it was about to test.** Both
+existing `ipc-machine-chooser` runs are signed OUT at the ACCOUNT tier - run 1
+has a credential via `GHOSTTY_RELAY_TOKEN` but no account - so nothing in it had
+ever rendered the signed-in row. A third run now seeds a DPAPI account store
+directly, and that is what the new assertions measure: the disc is the PINNED
+accent (`rgb 61,142,248`), it carries a letter, the email and the link share a
+right edge, the email sits above it. ALL PASS **65** (was 50).
+
+Its lesson is small and general: **a control that is hidden is not on the row.**
+`relay-account.ps1` identified the account control as "the topmost BUTTON",
+which was sound while the row had one - with two, the hidden one is still the
+topmost, so the signed-in run would have read the signed-OUT caption and
+reported a working flip as broken. `Get-ChooserControls` filters on `Visible`
+now.
+
+Finding 6 measured at 1.25: sign-in button **198 px**, link **70**, retired
+fixed slot 188 - three numbers where there used to be one. Follow-ups **T315**
+(above) and **T316** (the signed-out row still shows a sentence Mac has no state
+for; decide it and write it into §2.4 either way).
+
+**The win32 lane hung, and it was T258 again.** `remote.agent.server.test.FLOW
+pause halts streaming` sat at a flat 123.02s of CPU across two samples two
+minutes apart, 4 threads all waiting, no child - killed at ~11 minutes, and the
+"1 failed / exit 255" is the kill. The immediately preceding run of the same
+lane on the same source was exit 0, and this diff cannot reach an agent test.
+Same test, same profile, same lane as T258's recorded T205 hang, appended there
+as a fourth datapoint: the hang is now 2 of 2 in the **win32** lane rather than
+`test-agent`, so the lane is not the variable, the test is. Re-run exit 0.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0 (on the
+re-run, above), `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0,
+`test-agent` exit 0. P1-P3 ALL PASS. On box `ipc-machine-chooser` ALL PASS **65**
+(was 50) with `-NegativeControl` failing exactly 2 (the detail-pane signature
+and the monogram fill, each reached); regression green across `relay-account`,
+`chooser-menu` (57) and `host-settings` (65).

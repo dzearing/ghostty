@@ -60,11 +60,13 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $env:GHOZTTY_PIPE_SUFFIX = '-mctest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+Add-Type -AssemblyName System.Security
 
 $script:pass = 0
 $script:fail = 0
 $script:skip = 0
 $script:negReached = $false
+$script:negReached3 = $false
 # Signed-in geometry, captured in run 1 and compared against the signed-out
 # run's (T172 wrapping footer).
 $script:chooserH1 = 0
@@ -72,6 +74,9 @@ $script:hintH1 = 0
 $script:hintLineH = 0
 $script:listH1 = 0
 $script:rowH1 = 0
+# The signed-OUT account control's width, compared against the signed-in link's
+# in the T311 section: one fixed slot would make them equal.
+$script:acctBtnW1 = 0
 # Write-Host, not the pipeline: a helper that asserts must never also return a
 # value, or its caller gets @('  PASS ...', $value) (the T217 batch-5 trap).
 function Assert($cond, $name) {
@@ -105,16 +110,33 @@ function Get-LowestChild([IntPtr]$parent, [string]$cls) {
     return $best
 }
 
-# {Text, Left, Top, Right, Bottom} for every $cls child, so a test can find a
-# control by its LABEL instead of by creation order. Text via WM_GETTEXT, which
-# unlike GetWindowTextW is not a stale cross-process cache.
+# {Text, Left, Top, Right, Bottom, Visible} for every $cls child, so a test can
+# find a control by its LABEL instead of by creation order. Text via WM_GETTEXT,
+# which unlike GetWindowTextW is not a stale cross-process cache.
+#
+# `Visible` matters since T311: the account row carries TWO controls (a bordered
+# button and a link) and hides the one this state does not use, so a lookup that
+# ignores visibility can return the control the user cannot see.
 function Get-Controls([IntPtr]$parent, [string]$cls) {
     return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
         [pscustomobject]@{
-            Text   = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
-            Left   = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
+            Hwnd    = [IntPtr]$_.Hwnd
+            Text    = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
+            Left    = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
+            Visible = $_.Visible
         }
     })
+}
+
+# Seed a DPAPI account store in the CURRENT (T93) shape, so a GUI comes up
+# SIGNED IN without running the browser flow. The account row's signed-in
+# composition (T311) is otherwise unreachable from this script.
+function Write-AccountStore([string]$path, [string]$token, [string]$email, [string]$relayBase) {
+    $exp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600
+    $json = "{`"session_token`":`"$token`",`"expiry`":$exp,`"email`":`"$email`",`"relay_base`":`"$relayBase`"}"
+    $enc = [Security.Cryptography.ProtectedData]::Protect(
+        [Text.Encoding]::UTF8.GetBytes($json), $null, 'CurrentUser')
+    [IO.File]::WriteAllBytes($path, $enc)
 }
 
 # The chooser's client width is `px(840, scale)` by construction (T175, see
@@ -275,6 +297,10 @@ $errlog = Join-Path $env:TEMP "ghoztty-mc-stderr-$PID.log"
 Remove-Item $errlog -ErrorAction SilentlyContinue
 $acctDir = Join-Path $env:TEMP "ghoztty-mc-acct-$PID"
 $acctDir2 = Join-Path $env:TEMP "ghoztty-mc-acct2-$PID"
+# T311's third run comes up with a REAL (seeded) account, which is the only way
+# to reach the account row's signed-in composition.
+$acctDir3 = Join-Path $env:TEMP "ghoztty-mc-acct3-$PID"
+$T311_EMAIL = 'monogram@example.com'
 
 # --- Pin the accent the selection pill is drawn from (T305) -----------------
 #
@@ -497,9 +523,17 @@ try {
             $eh = Get-Height $edit
             Assert ($eh -eq $ctlH) "the filter field is the same height as Cancel (filter=$eh, cancel=$ctlH)"
         }
-        $acct = $buttons | Where-Object { $_.Text -match 'Sign' } | Select-Object -First 1
+        # Signed OUT, the account row's control is the bordered button; the
+        # signed-in state's link is hidden, so `Visible` is what tells them apart
+        # (T311).
+        $acct = $buttons | Where-Object { $_.Visible -and $_.Text -match 'Sign' } | Select-Object -First 1
         if ($acct) {
             Assert ((($acct.Bottom - $acct.Top)) -eq $ctlH) "the account control is the same height as Cancel (account=$($acct.Bottom - $acct.Top), cancel=$ctlH)"
+            $script:acctBtnW1 = $acct.Right - $acct.Left
+            # T311 finding 6: the slot used to be a flat 150 DIP whatever the
+            # caption was. "Sign in with Google…" is WIDER than that, so a
+            # content-sized button is measurably not the retired slot.
+            Assert ($script:acctBtnW1 -ne (Dip $scale 150)) "the account button is sized to its caption, not the retired 150 DIP slot (width=$($script:acctBtnW1), retired=$(Dip $scale 150))"
         }
     }
 
@@ -594,6 +628,107 @@ try {
         }
         Assert (-not ($g2.App.Process -and $g2.App.Process.HasExited)) 'app survived the signed-out chooser'
     }
+
+    # --- T311: the account row's identity block (findings 5 and 6) -----------
+    # Signed IN, Mac's account row is the email over a LINK-styled "Sign Out"
+    # with a 34 px accent monogram circle beside them; win32 drew a static plus
+    # a 150 DIP button and no identity cue at all. This run seeds a DPAPI
+    # account store so the app comes up signed in - the composition is
+    # unreachable from the two runs above, both of which are signed out at the
+    # ACCOUNT tier (run 1 has a credential, via GHOSTTY_RELAY_TOKEN, but no
+    # account).
+    Stop-DebugGhoztty
+    New-Item -ItemType Directory -Force -Path $acctDir3 | Out-Null
+    $store3 = Join-Path $acctDir3 'account.dat'
+    Write-AccountStore $store3 'faketoken-t311' $T311_EMAIL "http://127.0.0.1:$DirPort"
+    $errlog3 = Join-Path $env:TEMP "ghoztty-mc-stderr3-$PID.log"
+    $env:GHOSTTY_ACCOUNT_STORE = $store3
+    $g3 = Launch-Gui $errlog3
+    Remove-Item 'env:GHOSTTY_ACCOUNT_STORE' -ErrorAction SilentlyContinue
+    if (-not $g3) {
+        Write-Host 'SETUP FAIL: signed-in GUI did not come up'
+        $script:fail++
+    } else {
+        $chooser3 = Open-Chooser $g3
+        Assert ($chooser3 -ne [IntPtr]::Zero) 'chooser opens with a seeded account'
+        if ($chooser3 -ne [IntPtr]::Zero) {
+            Start-Sleep -Milliseconds 500
+            $scale3 = Get-ChooserScale $chooser3
+            $cr3 = Get-TestWindowRect -Window $chooser3 -Client
+            $org3X = $cr3.Left
+            $org3Y = $cr3.Top
+
+            # The account band is everything above the header rule; both account
+            # controls live in it and nothing else does.
+            $bandBot3 = $org3Y + (Dip $scale3 52)
+            $acctBtns = @(Get-Controls $chooser3 'Button' | Where-Object { $_.Top -lt $bandBot3 })
+            $liveAcct = @($acctBtns | Where-Object { $_.Visible })
+            Assert ($acctBtns.Count -eq 2) "the account row carries both controls (found $($acctBtns.Count))"
+            Assert ($liveAcct.Count -eq 1) "exactly one account control is visible at a time (visible: $($liveAcct.Count))"
+            if ($liveAcct.Count -eq 1) {
+                # Finding 6, the behavioural half: signed in, the control is the
+                # LINK - and its width follows "Sign Out", not the wider
+                # "Sign in with Google…" the signed-out state shows. One shared
+                # 150 DIP slot would make these two equal.
+                Assert ($liveAcct[0].Text -eq 'Sign Out') "signed in, the account control reads 'Sign Out' (got '$($liveAcct[0].Text)')"
+                $linkW = $liveAcct[0].Right - $liveAcct[0].Left
+                Assert ($script:acctBtnW1 -gt 0) 'the signed-out button width was captured to compare against'
+                Assert ($linkW -lt $script:acctBtnW1) "the link is sized to ITS caption, not to a slot shared with sign-in (link=$linkW, button=$($script:acctBtnW1))"
+                # A link has no border and no button padding, so it is also
+                # shorter than the surface's button floor.
+                Assert ($linkW -lt (Dip $scale3 96)) "the link is not padded like a button (width=$linkW, button floor=$(Dip $scale3 96))"
+            }
+
+            # The email is the identity text, right-aligned above the link.
+            $topStatic = $null
+            foreach ($s in Get-Controls $chooser3 'Static') {
+                if ($null -eq $topStatic -or $s.Top -lt $topStatic.Top) { $topStatic = $s }
+            }
+            Assert ($null -ne $topStatic -and $topStatic.Text -eq $T311_EMAIL) "the account row shows the signed-in email (got '$(if ($topStatic) { $topStatic.Text })')"
+            if ($topStatic -and $liveAcct.Count -eq 1) {
+                Assert ([Math]::Abs($topStatic.Right - $liveAcct[0].Right) -le 1) "the email and the link share a right edge (email=$($topStatic.Right), link=$($liveAcct[0].Right))"
+                Assert ($topStatic.Bottom -le $liveAcct[0].Top) 'the email sits ABOVE the link, as a stack'
+            }
+
+            # Finding 5, the pixel half: the monogram circle. Its fill is
+            # `chrome_theme.accentOn(DIALOG_BG, accent)` and the accent is PINNED
+            # at the top of this script (#3D8EF8, which clears the 3:1 floor
+            # unassisted, so it comes back untouched) - T305's rule that an
+            # oracle for a system-derived pixel must state its input.
+            #
+            # The disc is `avatar_d` (32) square at the band's trailing edge:
+            # x in [840-16-32, 840-16], y centered in the 36 band that starts 8
+            # below the client top.
+            $avR = $org3X + (Dip $scale3 824)
+            $avL = $org3X + (Dip $scale3 792)
+            $avT = $org3Y + (Dip $scale3 10)
+            $avB = $org3Y + (Dip $scale3 42)
+            $shot3 = Get-Shot $chooser3
+            Assert ((Get-TestDistinctColors -Shot $shot3) -ge 8) "the signed-in capture holds real content ($(Get-TestDistinctColors -Shot $shot3) distinct colors)"
+            # Sample INSIDE the disc but off its center line, where the letter
+            # is: the fill is what the ring reads.
+            $ring = Get-ShotPixel $shot3 ($avL + [int](($avR - $avL) * 0.12)) ($avT + [int](($avB - $avT) * 0.5))
+            $fillHit = ([Math]::Abs($ring[0] - 0x3D) -le 12 -and
+                        [Math]::Abs($ring[1] - 0x8E) -le 12 -and
+                        [Math]::Abs($ring[2] - 0xF8) -le 12)
+            $script:negReached3 = $true
+            if ($NegativeControl) {
+                Assert (-not $fillHit) "NEGATIVE CONTROL: the monogram disc is NOT the pinned accent (rgb $($ring -join ','))"
+            } else {
+                Assert $fillHit "the monogram disc is filled with the pinned accent (rgb $($ring -join ','), want 61,142,248)"
+            }
+            # …and it carries a letter: pixels inside the disc that are NOT the
+            # fill. `contrastForeground(#3D8EF8)` is black here, so the glyph is
+            # as far from the fill as it gets.
+            $glyph = Measure-DrawnPixels $shot3 ($avL + 6) ($avT + 6) ($avR - 6) ($avB - 6) 0x3D 0x8E 0xF8 20
+            Assert ($glyph -ge 10) "the monogram draws its letter ($glyph non-fill pixels inside the disc)"
+
+            Close-TestWindowPixels $shot3
+            Send-TestControlKey -Control $chooser3 -Key Escape | Out-Null
+            Start-Sleep -Milliseconds 300
+        }
+        Assert (-not ($g3.App.Process -and $g3.App.Process.HasExited)) 'app survived the signed-in chooser'
+    }
 } finally {
     if ($hadAccent) {
         Set-ItemProperty -Path $DWM_KEY -Name AccentColor -Value $origAccent -Type DWord
@@ -605,7 +740,7 @@ try {
     Stop-Job $dirJob -ErrorAction SilentlyContinue
     Remove-Job $dirJob -Force -ErrorAction SilentlyContinue
     Remove-Item $hitFile, $errlog -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $acctDir, $acctDir2 -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $acctDir, $acctDir2, $acctDir3 -ErrorAction SilentlyContinue
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)
@@ -620,10 +755,15 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
 }
 
-# A -NegativeControl run that never reached the inverted assertion proves
-# nothing, so say so instead of exiting green.
+# A -NegativeControl run that never reached an inverted assertion proves
+# nothing, so say so instead of exiting green. There are TWO since T311 (the
+# detail pane following the selection, and the monogram's fill), so a
+# -NegativeControl run is expected to fail exactly 2.
 if ($NegativeControl -and -not $script:negReached) {
-    Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
+    Assert $false 'NEGATIVE CONTROL never reached its inverted assertion (detail pane)'
+}
+if ($NegativeControl -and -not $script:negReached3) {
+    Assert $false 'NEGATIVE CONTROL never reached its inverted assertion (monogram)'
 }
 
 Write-Host ''

@@ -186,7 +186,39 @@ pub fn statusText(email: ?[]const u8, busy: bool) []const u8 {
     return if (e.len == 0) "Not signed in" else e;
 }
 
+/// The monogram letter for the avatar circle (T311): the email's first LETTER,
+/// uppercased, mirroring Mac's `initials` (MachineChooserView.swift:942-976).
+///
+/// Mac takes `first?.uppercased()` outright; this skips leading punctuation and
+/// digits first, because an address like `+ghoztty@…` or `1@…` would otherwise
+/// put a symbol in the identity mark. When there is no letter at all the mark
+/// still draws — with `?`, which reads as "we do not know who this is" rather
+/// than as an empty accent disc. Returns null only when there is nothing signed
+/// in, which is the state that has no avatar at all.
+pub fn monogram(email: ?[]const u8) ?u8 {
+    const e = email orelse return null;
+    if (e.len == 0) return null;
+    for (e) |c| {
+        if (std.ascii.isAlphabetic(c)) return std.ascii.toUpper(c);
+    }
+    return '?';
+}
+
 const testing = std.testing;
+
+test "monogram: the first letter, uppercased, and never an empty disc" {
+    try testing.expectEqual(@as(?u8, 'M'), monogram("me@example.com"));
+    try testing.expectEqual(@as(?u8, 'D'), monogram("dzearing@gmail.com"));
+    // Leading punctuation/digits are skipped — a "+" in the mark is not an
+    // identity cue, and gmail's plus-addressing makes that a real address.
+    try testing.expectEqual(@as(?u8, 'G'), monogram("+ghoztty@example.com"));
+    try testing.expectEqual(@as(?u8, 'A'), monogram("1account@example.com"));
+    // No letter anywhere: the disc still draws, with a legible placeholder.
+    try testing.expectEqual(@as(?u8, '?'), monogram("12345@678.90"));
+    // Signed out (or an empty email) has no avatar at all.
+    try testing.expectEqual(@as(?u8, null), monogram(null));
+    try testing.expectEqual(@as(?u8, null), monogram(""));
+}
 
 test "buttonLabel: signed-in offers sign out, busy overrides both" {
     try testing.expectEqualStrings("Sign Out", buttonLabel(true, false));

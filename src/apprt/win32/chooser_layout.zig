@@ -42,10 +42,12 @@ pub const Layout = struct {
     client_w: i32,
     client_h: i32,
 
-    /// Account row: status text on the left, the Sign In / Sign Out button
-    /// right-aligned, with a full-width rule beneath at `header_divider_y`.
-    account_status: Rect,
-    account_btn: Rect,
+    /// The account row's band and its metrics (T311). What sits IN the band
+    /// depends on the sign-in state — signed in it is Mac's email-over-link
+    /// stack with a monogram circle beside it, signed out a single bordered
+    /// button — so the pieces come from `accountRow`, never from fixed slots.
+    /// A full-width rule closes the band at `header_divider_y`.
+    account: AccountBand,
     header_divider_y: i32,
 
     /// The master column — a faint wash behind the filter, the row list and
@@ -73,10 +75,17 @@ pub const Layout = struct {
     action_row: Rect,
     /// Gap between two action buttons (Mac's `HStack(spacing: 8)`, 456).
     action_gap: i32,
-    /// A labeled action button is its measured caption plus `action_btn_pad` on
-    /// each side, never narrower than this.
+    /// A labeled button is its measured caption plus `action_btn_pad` on each
+    /// side, never narrower than this. These are the SURFACE's button-sizing
+    /// rule, not the action row's private numbers — the account row's bordered
+    /// control sizes by the same two, so a caption of the same width comes out
+    /// the same width wherever it is (T311).
     action_min_btn_w: i32,
     action_btn_pad: i32,
+
+    /// The one control height across the surface (design system §2.1): Cancel,
+    /// the action row, the filter field and the account row's bordered button.
+    control_h: i32,
 
     /// Footer: a rule, then Cancel alone at the trailing edge.
     footer_divider_y: i32,
@@ -92,6 +101,36 @@ pub const Layout = struct {
     title_font_weight: i32,
     /// Height of one wrapped line of status-strip text.
     hint_line_h: i32,
+};
+
+/// The account row's band and the metrics `accountRow` packs it from (T311).
+///
+/// Split out because the row has two compositions, not one: Mac's
+/// `accountRow` (MachineChooserView.swift:903-976) draws the email over a
+/// LINK-styled "Sign Out" with a monogram circle beside them when signed in,
+/// and a single bordered button when signed out. A `Layout` that named one
+/// status rect and one button rect could only describe the second, which is
+/// how the win32 row ended up as a static plus a 150 DIP slot sized for the
+/// longer of two captions (findings 5 and 6).
+pub const AccountBand = struct {
+    /// The whole row, inside the dialog's side margins.
+    band: Rect,
+    /// Gap between the band's pieces (`md`, Mac's 10 snapped to the scale).
+    gap: i32,
+    /// The monogram circle's diameter. Mac's 34 is off the 4 DIP scale; this is
+    /// the system's LARGE icon size (`SM_CXICON`, 32) — the same rule the detail
+    /// pane's mark already follows, so the two identity marks on the surface are
+    /// one size and not two nearby ones.
+    avatar_d: i32,
+    /// Line box of the email (the ramp's caption role) and of the link (its body
+    /// role), each the font plus `sm` of leading like every other line box here.
+    email_h: i32,
+    link_h: i32,
+    /// Between the two lines of the stack — Mac's 1, snapped to the scale's 2,
+    /// the same value the detail pane puts between its title and subtitle.
+    stack_gap: i32,
+    /// Mac caps the email at 240 and middle-truncates the rest (2.4).
+    email_max_w: i32,
 };
 
 fn px(v: f32, scale: f32) i32 {
@@ -122,11 +161,18 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     const control_h = px(28, scale);
 
     // Account header — Mac pads it 16 horizontal / 10 vertical (251-252).
-    const account_h = control_h;
-    const account_btn_w = px(150, scale);
+    //
+    // The band is as tall as the tallest thing that can go in it (design system
+    // §2.3: size the container to the control). Signed in that is the two-line
+    // email/link stack, not the 28 control height — a band pinned to `control_h`
+    // is exactly what forced the row to be one static and one button.
+    const avatar_d = px(32, scale);
+    const email_h = type_ramp.caption(scale).height + px(4, scale);
+    const link_h = type_ramp.body(scale).height + px(4, scale);
+    const stack_gap = px(2, scale);
+    const account_h = @max(@max(avatar_d, email_h + stack_gap + link_h), control_h);
     const account_top = gap;
     const header_divider_y = account_top + account_h + gap;
-    const account_btn_left = client_w - margin - account_btn_w;
 
     // Footer — Cancel alone, 16 all round (737-742).
     const btn_w = px(96, scale);
@@ -225,17 +271,19 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     return .{
         .client_w = client_w,
         .client_h = client_h,
-        .account_status = .{
-            .left = margin,
-            .top = account_top,
-            .right = account_btn_left - px(8, scale),
-            .bottom = account_top + account_h,
-        },
-        .account_btn = .{
-            .left = account_btn_left,
-            .top = account_top,
-            .right = account_btn_left + account_btn_w,
-            .bottom = account_top + account_h,
+        .account = .{
+            .band = .{
+                .left = margin,
+                .top = account_top,
+                .right = client_w - margin,
+                .bottom = account_top + account_h,
+            },
+            .gap = gap,
+            .avatar_d = avatar_d,
+            .email_h = email_h,
+            .link_h = link_h,
+            .stack_gap = stack_gap,
+            .email_max_w = px(240, scale),
         },
         .header_divider_y = header_divider_y,
         .master = master,
@@ -260,6 +308,7 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
         .action_gap = px(8, scale),
         .action_min_btn_w = px(96, scale),
         .action_btn_pad = px(12, scale),
+        .control_h = control_h,
         .footer_divider_y = footer_divider_y,
         .cancel = .{
             .left = client_w - margin - btn_w,
@@ -273,6 +322,127 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
         .title_font_weight = type_ramp.subtitle(scale).weight,
         .hint_line_h = hint_line_h,
     };
+}
+
+// ---------------------------------------------------------------------
+// The account row (T311)
+// ---------------------------------------------------------------------
+
+/// What the account row is showing. Mac branches its `accountRow` on exactly
+/// these three (MachineChooserView.swift:903-932) and draws a different thing in
+/// each; the "unconfigured" fourth is a build without a relay base, which win32
+/// reports through the status strip instead.
+pub const AccountState = enum { signed_in, signed_out, busy };
+
+/// Pure state derivation, so the chooser and the tests agree on what "busy
+/// while signed in" is (busy wins — the row is describing an operation, not an
+/// account).
+pub fn accountState(signed_in: bool, busy: bool) AccountState {
+    if (busy) return .busy;
+    return if (signed_in) .signed_in else .signed_out;
+}
+
+/// Measured caption widths in physical pixels, WITHOUT padding — the caller
+/// measures its own strings with the font it will draw them in and passes them
+/// here, so this module stays text-free (T235's lesson, the same contract
+/// `ActionText` has).
+pub const AccountText = struct {
+    /// The email, measured in the ramp's CAPTION role.
+    email: i32 = 0,
+    /// "Sign Out", measured in the ramp's BODY role — a link has no padding, so
+    /// this IS its width.
+    link: i32 = 0,
+    /// The bordered control's caption, in the BODY role.
+    button: i32 = 0,
+};
+
+/// The packed account row. Every field but `text` is optional because the row
+/// has two compositions and a control that is not in this state must be hidden,
+/// not moved off-screen.
+pub const AccountRow = struct {
+    /// The status text: the email when signed in (top of the stack), the state
+    /// sentence otherwise. Right-aligned in both, so it always ends where the
+    /// trailing element begins.
+    text: Rect,
+    /// The monogram circle — signed in only.
+    avatar: ?Rect = null,
+    /// The "Sign Out" link — signed in only, sized to its measured caption.
+    link: ?Rect = null,
+    /// The bordered sign-in control — signed out / busy only, sized to ITS
+    /// measured caption. Finding 6: the two states used to share one 150 DIP
+    /// slot, so both were as wide as "Sign in with Google…".
+    button: ?Rect = null,
+};
+
+/// Pack the account row for `state`. Pure — unit-tested.
+///
+/// Signed in, Mac's composition is a right-aligned email over a link with the
+/// avatar to their right (2.4); signed out it is one bordered button at the
+/// trailing edge. Everything stays inside the band: a caption wide enough to
+/// overflow is clamped to the band's leading edge and the control truncates it,
+/// which is what the email's own 240 cap already assumes.
+pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow {
+    const a = l.account;
+    const band = a.band;
+
+    switch (state) {
+        .signed_in => {
+            const avatar_top = band.top + @divTrunc(band.height() - a.avatar_d, 2);
+            const avatar: Rect = .{
+                .left = band.right - a.avatar_d,
+                .top = avatar_top,
+                .right = band.right,
+                .bottom = avatar_top + a.avatar_d,
+            };
+
+            const stack_right = avatar.left - a.gap;
+            const room = @max(0, stack_right - band.left);
+            const stack_h = a.email_h + a.stack_gap + a.link_h;
+            const stack_top = band.top + @divTrunc(band.height() - stack_h, 2);
+
+            const email_w = @min(@max(text.email, 0), @min(a.email_max_w, room));
+            const email: Rect = .{
+                .left = stack_right - email_w,
+                .top = stack_top,
+                .right = stack_right,
+                .bottom = stack_top + a.email_h,
+            };
+
+            const link_w = @min(@max(text.link, 0), room);
+            const link: Rect = .{
+                .left = stack_right - link_w,
+                .top = email.bottom + a.stack_gap,
+                .right = stack_right,
+                .bottom = email.bottom + a.stack_gap + a.link_h,
+            };
+
+            return .{ .text = email, .avatar = avatar, .link = link };
+        },
+        .signed_out, .busy => {
+            const btn_w = @min(
+                band.width(),
+                @max(l.action_min_btn_w, @max(text.button, 0) + 2 * l.action_btn_pad),
+            );
+            const btn_top = band.top + @divTrunc(band.height() - l.control_h, 2);
+            const button: Rect = .{
+                .left = band.right - btn_w,
+                .top = btn_top,
+                .right = band.right,
+                .bottom = btn_top + l.control_h,
+            };
+
+            // The sentence is one body line box, centered on the band the way
+            // the button is — two things on one row share a center line.
+            const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
+            const status: Rect = .{
+                .left = band.left,
+                .top = status_top,
+                .right = @max(band.left, button.left - a.gap),
+                .bottom = status_top + a.link_h,
+            };
+            return .{ .text = status, .button = button };
+        },
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -441,7 +611,7 @@ test "layout: master column is a fixed 260 with the detail pane beside it" {
 
 test "layout: the body sits between the header and footer rules" {
     const l = layout(1.0, 1);
-    try testing.expect(l.header_divider_y > l.account_btn.bottom - 1);
+    try testing.expect(l.header_divider_y > l.account.band.bottom - 1);
     try testing.expect(l.master.top > l.header_divider_y);
     try testing.expectEqual(l.footer_divider_y, l.master.bottom);
     try testing.expectEqual(l.master.top, l.detail.top);
@@ -656,9 +826,113 @@ test "actionRow: scales with DPI" {
 
 test "layout: account row is right-aligned against the client edge" {
     const l = layout(1.0, 1);
-    try testing.expectEqual(l.client_w - 16, l.account_btn.right);
-    try testing.expect(l.account_status.right < l.account_btn.left);
-    try testing.expect(l.account_status.left > 0);
+    const out = accountRow(l, .signed_out, .{ .button = 120 });
+    try testing.expectEqual(l.client_w - 16, out.button.?.right);
+    try testing.expect(out.text.right < out.button.?.left);
+    try testing.expect(out.text.left > 0);
+
+    // Signed in, the trailing element is the monogram, and the stack is right
+    // -aligned against it rather than against the client edge.
+    const in = accountRow(l, .signed_in, .{ .email = 140, .link = 50 });
+    try testing.expectEqual(l.client_w - 16, in.avatar.?.right);
+    try testing.expectEqual(in.avatar.?.left - l.account.gap, in.text.right);
+    try testing.expectEqual(in.text.right, in.link.?.right);
+}
+
+test "accountRow: the two states are different compositions, not one slot (T311)" {
+    const l = layout(1.0, 1);
+
+    const out = accountRow(l, .signed_out, .{ .button = 120 });
+    try testing.expect(out.button != null);
+    try testing.expect(out.avatar == null);
+    try testing.expect(out.link == null);
+
+    const in = accountRow(l, .signed_in, .{ .email = 140, .link = 50 });
+    try testing.expect(in.button == null);
+    try testing.expect(in.avatar != null);
+    try testing.expect(in.link != null);
+
+    // Busy is the signed-out composition with its own caption: Mac replaces the
+    // whole block while an operation is in flight.
+    const busy = accountRow(l, .busy, .{ .button = 60 });
+    try testing.expect(busy.button != null);
+    try testing.expect(busy.avatar == null);
+
+    try testing.expectEqual(AccountState.busy, accountState(true, true));
+    try testing.expectEqual(AccountState.busy, accountState(false, true));
+    try testing.expectEqual(AccountState.signed_in, accountState(true, false));
+    try testing.expectEqual(AccountState.signed_out, accountState(false, false));
+}
+
+test "accountRow: the bordered control is sized to ITS caption (T311, finding 6)" {
+    // The defect: one 150 DIP slot for both captions, so "Signing in…" was as
+    // wide as "Sign in with Google…". A measured caption has to move the width.
+    const l = layout(1.0, 1);
+    const wide = accountRow(l, .signed_out, .{ .button = 140 }).button.?;
+    const narrow = accountRow(l, .busy, .{ .button = 60 }).button.?;
+    try testing.expect(wide.width() > narrow.width());
+    try testing.expectEqual(140 + 2 * l.action_btn_pad, wide.width());
+    // …and never narrower than the floor Cancel sits at, so a short caption is
+    // still a button rather than a chip.
+    try testing.expectEqual(l.action_min_btn_w, narrow.width());
+    try testing.expectEqual(l.cancel.width(), narrow.width());
+
+    // Both states stay inside the band, and a caption that cannot fit is
+    // clamped rather than drawn over the master column.
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const ls = layout(scale, 1);
+        const huge = accountRow(ls, .signed_out, .{ .button = 5000 });
+        try testing.expect(huge.button.?.left >= ls.account.band.left);
+        try testing.expect(huge.button.?.right <= ls.account.band.right);
+        try testing.expect(huge.text.right >= huge.text.left);
+    }
+}
+
+test "accountRow: the signed-in stack and the monogram nest in the band (T311)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        const band = l.account.band;
+        const row = accountRow(l, .signed_in, .{ .email = 140, .link = 50 });
+        const av = row.avatar.?;
+        const link = row.link.?;
+
+        // Everything inside the band, in both axes.
+        for ([_]Rect{ row.text, link, av }) |r| {
+            try testing.expect(r.top >= band.top);
+            try testing.expect(r.bottom <= band.bottom);
+            try testing.expect(r.left >= band.left);
+            try testing.expect(r.right <= band.right);
+        }
+
+        // The mark is square (a circle's bounding box, not an oval).
+        try testing.expectEqual(av.width(), av.height());
+        try testing.expectEqual(l.account.avatar_d, av.width());
+
+        // The stack is two stacked lines that do not overlap, and nothing
+        // touches the monogram.
+        try testing.expectEqual(l.account.stack_gap, link.top - row.text.bottom);
+        try testing.expect(link.right + l.account.gap <= av.left);
+
+        // The email cap is Mac's 240: a longer address is truncated by the
+        // control, not allowed to push the stack into the master column.
+        const long = accountRow(l, .signed_in, .{ .email = 4000, .link = 50 });
+        try testing.expectEqual(l.account.email_max_w, long.text.width());
+        try testing.expect(long.text.left >= band.left);
+    }
+}
+
+test "accountRow: signed-out sentence and button share a center line (T311)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        const row = accountRow(l, .signed_out, .{ .button = 120 });
+        const btn = row.button.?;
+        const text_mid = row.text.top + @divTrunc(row.text.height(), 2);
+        const btn_mid = btn.top + @divTrunc(btn.height(), 2);
+        try testing.expect(@abs(text_mid - btn_mid) <= 1);
+        // The bordered control is the surface's one control height.
+        try testing.expectEqual(l.control_h, btn.height());
+        try testing.expectEqual(l.cancel.height(), btn.height());
+    }
 }
 
 test "layout: every gap is on the 4 DIP spacing scale (T310)" {
@@ -667,13 +941,19 @@ test "layout: every gap is on the 4 DIP spacing scale (T310)" {
     // (filter pad, identity->actions) and 10 (account v-pad, filter->list) are
     // off the scale and were copied here verbatim before T310.
     const l = layout(1.0, 1);
+    const acct_out = accountRow(l, .signed_out, .{ .button = 120 });
+    const acct_in = accountRow(l, .signed_in, .{ .email = 140, .link = 50 });
     const on_scale = [_]i32{ 2, 4, 8, 12, 16, 24 };
     const gaps = [_]struct { name: []const u8, v: i32 }{
-        .{ .name = "client -> account", .v = l.account_status.top },
-        .{ .name = "account -> header rule", .v = l.header_divider_y - l.account_btn.bottom },
-        .{ .name = "dialog left margin", .v = l.account_status.left },
-        .{ .name = "account text -> control", .v = l.account_btn.left - l.account_status.right },
-        .{ .name = "client -> account control (right)", .v = l.client_w - l.account_btn.right },
+        .{ .name = "client -> account", .v = l.account.band.top },
+        .{ .name = "account -> header rule", .v = l.header_divider_y - l.account.band.bottom },
+        .{ .name = "dialog left margin", .v = l.account.band.left },
+        .{ .name = "account text -> control", .v = acct_out.button.?.left - acct_out.text.right },
+        .{ .name = "client -> account control (right)", .v = l.client_w - acct_out.button.?.right },
+        .{ .name = "account stack -> monogram", .v = acct_in.avatar.?.left - acct_in.link.?.right },
+        .{ .name = "client -> monogram (right)", .v = l.client_w - acct_in.avatar.?.right },
+        .{ .name = "account email -> link", .v = acct_in.link.?.top - acct_in.text.bottom },
+        .{ .name = "band -> monogram (top)", .v = acct_in.avatar.?.top - l.account.band.top },
         .{ .name = "master -> filter (top)", .v = l.filter.top - l.master.top },
         .{ .name = "master -> filter (left)", .v = l.filter.left - l.master.left },
         .{ .name = "filter -> list", .v = l.list.top - l.filter.bottom },
@@ -706,11 +986,40 @@ test "layout: one control height across the surface (T310)" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
         const l = layout(scale, 1);
         try testing.expectEqual(l.cancel.height(), l.filter.height());
-        try testing.expectEqual(l.cancel.height(), l.account_btn.height());
-        try testing.expectEqual(l.cancel.height(), l.account_status.height());
+        try testing.expectEqual(l.cancel.height(), l.control_h);
+        try testing.expectEqual(
+            l.cancel.height(),
+            accountRow(l, .signed_out, .{ .button = 120 }).button.?.height(),
+        );
         try testing.expectEqual(l.cancel.height(), l.action_row.height());
     }
     try testing.expectEqual(@as(i32, 28), layout(1.0, 1).filter.height());
+}
+
+test "layout: the account band is sized to its tallest content, not to a control (T311)" {
+    // Design system §2.3. Before T311 the band WAS `control_h`, which is why the
+    // row could only ever hold one line of text and one button — the composition
+    // Mac uses when you are signed OUT.
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        const a = l.account;
+        const stack_h = a.email_h + a.stack_gap + a.link_h;
+        try testing.expect(a.band.height() >= stack_h);
+        try testing.expect(a.band.height() >= a.avatar_d);
+        try testing.expect(a.band.height() >= l.control_h);
+        try testing.expectEqual(@max(@max(stack_h, a.avatar_d), l.control_h), a.band.height());
+        // Line boxes come from the ramp: caption for the email, body for the
+        // link, so the row consumes T310's ramp rather than restating sizes.
+        try testing.expectEqual(type_ramp.caption(scale).height + px(4, scale), a.email_h);
+        try testing.expectEqual(type_ramp.body(scale).height + px(4, scale), a.link_h);
+        try testing.expect(a.email_h < a.link_h);
+    }
+    // The band grew from the 28 control height to the stack's own height; the
+    // dialog did NOT grow with it (it is Mac's fixed 840x540), so the body took
+    // the difference.
+    try testing.expectEqual(@as(i32, 36), layout(1.0, 1).account.band.height());
+    try testing.expectEqual(@as(i32, 840), layout(1.0, 1).client_w);
+    try testing.expectEqual(@as(i32, 540), layout(1.0, 1).client_h);
 }
 
 test "layout: the fonts come from the ramp, in role order (T310)" {

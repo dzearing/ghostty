@@ -136,8 +136,15 @@ function Stop-TestProcs {
 # Enabled}. Text comes from WM_GETTEXT (Get-TestControlText), not GetWindowTextW,
 # which is cross-process cached and reads stale for a label the app just changed
 # - and "the label changed in place" is exactly this script's claim.
+#
+# VISIBLE controls only (T311): the account row now carries two of them - a
+# bordered button for the signed-out state and an owner-drawn link for the
+# signed-in one - and hides whichever this state does not use. A hidden control
+# is not on the row, and including it would make "the topmost button" return the
+# one the user cannot see.
 function Get-ChooserControls([IntPtr]$parent, [string]$cls) {
-    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
+    return @(Get-TestChildWindows -Window $parent -Class $cls |
+        Where-Object { $_.Visible } | ForEach-Object {
         $h = [IntPtr]$_.Hwnd
         [pscustomobject]@{
             Hwnd    = $h

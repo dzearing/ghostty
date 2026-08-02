@@ -51,6 +51,8 @@ const HostSettingsDialog = @import("HostSettingsDialog.zig");
 const host_defaults = @import("host_defaults.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const color_math = @import("color_math.zig");
+const type_ramp = @import("type_ramp.zig");
 const system_colors = @import("system_colors.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
@@ -66,6 +68,10 @@ const LIST_ID: u16 = 101;
 const ACCOUNT_ID: u16 = 102;
 const MENU_ID: u16 = 103;
 const ACTIVITY_ID: u16 = 104;
+/// The signed-in state's "Sign Out" LINK (T311). A second control rather than a
+/// restyled `ACCOUNT_ID`: the signed-out state must stay a real themed button,
+/// and one HWND cannot be both a themed push button and an owner-drawn link.
+const ACCOUNT_LINK_ID: u16 = 105;
 
 /// The action row's captions. Measured (not assumed) to size their buttons, so
 /// they live where both the creation and the measurement can see them.
@@ -138,11 +144,27 @@ menu_btn: w32.HWND,
 cancel_btn: w32.HWND,
 account_status: w32.HWND,
 account_btn: w32.HWND,
+/// The signed-in state's "Sign Out" link (T311). Only one of it and
+/// `account_btn` is ever visible — see `accountControl`.
+account_link: w32.HWND,
+/// True while the pointer is over the link, so it can underline. Tracked from
+/// `WM_SETCURSOR` (which the child forwards to us) rather than a subclass: the
+/// message already names the window under the cursor, so entering and leaving
+/// are the same one line.
+link_hot: bool = false,
 font: ?*anyopaque = null,
 /// Smaller font for the dimmed row subline (Mac's `.caption`).
 subtitle_font: ?*anyopaque = null,
 /// Semibold display font for the detail pane's machine name (Mac's `.title3`).
 title_font: ?*anyopaque = null,
+/// Body, underlined — the link's hover/pressed face. A link is accent-colored
+/// at rest (Fluent's HyperlinkButton, and Mac's `.link` style) and underlines
+/// when the pointer is on it, so the affordance is not carried by color alone.
+link_font: ?*anyopaque = null,
+/// Body, semibold — the monogram letter. Mac sets it at `size * 0.42` of a 34
+/// circle, which IS 14: the ramp's body size, so the mark lands on Mac's number
+/// without inventing a fourth type size (T310's ramp stays 12/14/20).
+strong_font: ?*anyopaque = null,
 
 /// The listbox's original window procedure, saved when it is subclassed for
 /// hover tracking. Restored is unnecessary — the control dies with the dialog.
@@ -260,6 +282,7 @@ pub fn open(window: *Window) void {
         .cancel_btn = undefined,
         .account_status = undefined,
         .account_btn = undefined,
+        .account_link = undefined,
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
 
@@ -317,16 +340,25 @@ pub fn open(window: *Window) void {
         @sizeOf(u32),
     );
 
-    // Account row (T141): status text + the Sign In / Sign Out button.
+    // Account row (T141, recomposed in T311): the status/email text, the
+    // signed-out state's bordered button, and the signed-in state's link.
+    // Positions come from `accountRow` at `refreshAccountRow` time — the row has
+    // two compositions, so nothing here has a fixed slot.
+    //
+    // `SS_RIGHT` because the block is right-aligned in BOTH states (Mac 2.4);
+    // `SS_PATHELLIPSIS` because the email is middle-truncated; `SS_CENTERIMAGE`
+    // so the single line sits on the rect's center line rather than its top;
+    // `SS_NOPREFIX` because an address may contain '&'.
     self.account_status = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
-        l.account_status.left,
-        l.account_status.top,
-        l.account_status.right - l.account_status.left,
-        l.account_status.bottom - l.account_status.top,
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.SS_RIGHT |
+            w32.SS_PATHELLIPSIS | w32.SS_CENTERIMAGE | w32.SS_NOPREFIX,
+        l.account.band.left,
+        l.account.band.top,
+        l.account.band.width(),
+        l.account.band.height(),
         hwnd,
         null,
         window.app.hinstance,
@@ -341,10 +373,10 @@ pub fn open(window: *Window) void {
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
         std.unicode.utf8ToUtf16LeStringLiteral(""),
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
-        l.account_btn.left,
-        l.account_btn.top,
-        l.account_btn.right - l.account_btn.left,
-        l.account_btn.bottom - l.account_btn.top,
+        l.account.band.left,
+        l.account.band.top,
+        l.account.band.width(),
+        l.control_h,
         hwnd,
         @ptrFromInt(@as(usize, ACCOUNT_ID)),
         window.app.hinstance,
@@ -355,6 +387,27 @@ pub fn open(window: *Window) void {
         return;
     };
     _ = w32.SetWindowTheme(self.account_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
+    // The link is a BUTTON so it keeps the tab stop, the focus rect and
+    // BN_CLICKED that a clickable STATIC would throw away; only its PAINT is
+    // ours (`drawAccountLink`).
+    self.account_link = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD | w32.BS_OWNERDRAW,
+        l.account.band.left,
+        l.account.band.top,
+        l.account.band.width(),
+        l.account.link_h,
+        hwnd,
+        @ptrFromInt(@as(usize, ACCOUNT_LINK_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
 
     self.filter = w32.CreateWindowExW(
         0,
@@ -569,6 +622,42 @@ pub fn open(window: *Window) void {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
     }
+    // The link's hover/pressed face: the same body size, underlined. Two fonts
+    // rather than one underlined one, because an always-underlined link is a
+    // 2003 look — Fluent and Mac both underline on interaction only.
+    self.link_font = w32.CreateFontW(
+        -l.font_h,
+        0,
+        0,
+        0,
+        400,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
+    );
+    // The monogram letter (T311): body size, semibold.
+    self.strong_font = w32.CreateFontW(
+        -l.font_h,
+        0,
+        0,
+        0,
+        type_ramp.weight_semibold,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
+    );
     // The row subline is a notch smaller, like Mac's `.caption`. Owner-drawn
     // rows select it into the DC themselves, so it is never sent WM_SETFONT.
     self.subtitle_font = w32.CreateFontW(
@@ -682,25 +771,95 @@ fn rowText(self: *const MachineChooser, row: Row) chooser_rows.RowText {
     };
 }
 
-/// Relabel the account row from the current state: the email (or "Not signed
-/// in") on the left, "Sign Out" / "Sign in with Google…" on the button, and the
-/// button disabled while an operation is in flight (T141).
+/// Relabel AND recompose the account row from the current state (T141, T311).
+/// Signed in it is the email over a "Sign Out" link with a monogram beside
+/// them; signed out (or busy) it is one bordered button sized to its own
+/// caption. The two controls swap visibility — a hidden one is not placed
+/// off-screen, so `IsWindowVisible` stays the honest answer for the Tab walk
+/// and for the acceptance script.
 fn refreshAccountRow(self: *MachineChooser) void {
     const busy = RelayAccountRow.isRunning();
-    setText(self.account_status, RelayAccountRow.statusText(self.email, busy));
-    setText(self.account_btn, RelayAccountRow.buttonLabel(self.email != null, busy));
+    const state = chooser_layout.accountState(self.email != null, busy);
+    const signed_in = state == .signed_in;
 
-    // Hand focus off BEFORE disabling the button. Disabling the focused control
-    // makes Windows drop the thread's keyboard focus entirely, and with no
-    // focus window WM_KEYDOWN arrives with `msg.hwnd == null` — which the app's
-    // message loop cannot attribute to this dialog, so Enter/Escape/Tab go
-    // dead for as long as the sign-in runs (measured, not theorized:
-    // `relay-account.ps1` asserts focus stays inside the chooser while busy,
-    // and it failed before this line existed).
-    if (busy and w32.GetFocus() == @as(?w32.HWND, self.account_btn)) {
+    setText(self.account_status, RelayAccountRow.statusText(self.email, busy));
+    setText(self.account_link, RelayAccountRow.buttonLabel(true, false));
+    setText(self.account_btn, RelayAccountRow.buttonLabel(false, busy));
+
+    // The email is the ramp's CAPTION role and the state sentence its BODY, so
+    // the STATIC's font follows the state the same way its rect does.
+    const status_font = if (signed_in) self.subtitle_font else self.font;
+    if (status_font) |f| _ = w32.SendMessageW(self.account_status, w32.WM_SETFONT, @intFromPtr(f), 1);
+
+    // Hand focus off BEFORE disabling or hiding the control that has it.
+    // Disabling the focused control makes Windows drop the thread's keyboard
+    // focus entirely, and with no focus window WM_KEYDOWN arrives with
+    // `msg.hwnd == null` — which the app's message loop cannot attribute to this
+    // dialog, so Enter/Escape/Tab go dead for as long as the sign-in runs
+    // (measured, not theorized: `relay-account.ps1` asserts focus stays inside
+    // the chooser while busy, and it failed before this line existed). Hiding
+    // does the same thing, which is why the guard covers both controls.
+    const focus = w32.GetFocus();
+    const on_account = focus == @as(?w32.HWND, self.account_btn) or
+        focus == @as(?w32.HWND, self.account_link);
+    if (on_account and (busy or focus != @as(?w32.HWND, self.accountControl()))) {
         _ = w32.SetFocus(self.filter);
     }
+
+    _ = w32.ShowWindow(self.account_btn, if (signed_in) w32.SW_HIDE else w32.SW_SHOW);
+    _ = w32.ShowWindow(self.account_link, if (signed_in) w32.SW_SHOW else w32.SW_HIDE);
     _ = w32.EnableWindow(self.account_btn, if (busy) 0 else 1);
+
+    self.applyAccountRow(layout(self.window.scale, self.hint_lines));
+}
+
+/// The account row's VISIBLE control — the link when signed in, the bordered
+/// button otherwise. One name for "the thing the user can press", so the focus
+/// cycle, the Enter handler and the click routing cannot disagree about which
+/// of the two is live.
+fn accountControl(self: *const MachineChooser) w32.HWND {
+    return if (self.email != null and !RelayAccountRow.isRunning())
+        self.account_link
+    else
+        self.account_btn;
+}
+
+/// Place the account row's controls for the current state, and repaint the band
+/// (the monogram is painted, not a control, so moving the stack has to
+/// invalidate it).
+fn applyAccountRow(self: *MachineChooser, l: Layout) void {
+    const state = chooser_layout.accountState(self.email != null, RelayAccountRow.isRunning());
+    const row = chooser_layout.accountRow(l, state, self.measureAccount(state));
+
+    _ = w32.MoveWindow(
+        self.account_status,
+        row.text.left,
+        row.text.top,
+        row.text.width(),
+        row.text.height(),
+        1,
+    );
+    if (row.link) |r| _ = w32.MoveWindow(self.account_link, r.left, r.top, r.width(), r.height(), 1);
+    if (row.button) |r| _ = w32.MoveWindow(self.account_btn, r.left, r.top, r.width(), r.height(), 1);
+
+    var band = rect(l.account.band);
+    _ = w32.InvalidateRect(self.hwnd, &band, 1);
+}
+
+/// Caption widths for the account row, each measured in the font it will be
+/// DRAWN in — the layout module is text-free by design (T235's lesson), and the
+/// email is caption-sized while the link and the button are body-sized, so one
+/// measurement font would be wrong for one of them.
+fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountState) chooser_layout.AccountText {
+    return switch (state) {
+        .signed_in => .{
+            .email = self.measureWith(self.subtitle_font, RelayAccountRow.statusText(self.email, false)),
+            .link = self.measureWith(self.font, RelayAccountRow.buttonLabel(true, false)),
+        },
+        .signed_out, .busy => .{
+            .button = self.measureWith(self.font, RelayAccountRow.buttonLabel(false, state == .busy)),
+        },
+    };
 }
 
 /// The account button was clicked: sign out when signed in, else sign in. Both
@@ -853,8 +1012,6 @@ fn applyLayout(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
 
     const placements = [_]struct { hwnd: w32.HWND, r: w32.RECT }{
-        .{ .hwnd = self.account_status, .r = rect(l.account_status) },
-        .{ .hwnd = self.account_btn, .r = rect(l.account_btn) },
         .{ .hwnd = self.filter, .r = rect(l.filter) },
         .{ .hwnd = self.list, .r = rect(l.list) },
         .{ .hwnd = self.hint, .r = rect(l.hint) },
@@ -870,6 +1027,9 @@ fn applyLayout(self: *MachineChooser) void {
             1,
         );
     }
+    // The account row is packed, not slotted (T311), so it places itself from
+    // the state rather than from a fixed rect in `Layout`.
+    self.applyAccountRow(l);
     self.layoutActions(l);
 }
 
@@ -920,16 +1080,26 @@ fn measureActions(self: *const MachineChooser) chooser_layout.ActionText {
     };
 }
 
-/// Width of `text` in the dialog font, in physical pixels.
+/// Width of `text` in the dialog's body font, in physical pixels.
 fn measureCaption(self: *const MachineChooser, text: []const u8) i32 {
+    return self.measureWith(self.font, text);
+}
+
+/// Width of `text` in `font`, in physical pixels. A width measured in the wrong
+/// font is worse than no measurement: it sizes a slot the text does not fit.
+fn measureWith(self: *const MachineChooser, font: ?*anyopaque, text: []const u8) i32 {
     const hdc = w32.GetDC(self.hwnd) orelse return 0;
     defer _ = w32.ReleaseDC(self.hwnd, hdc);
-    const old = if (self.font) |f| w32.SelectObject(hdc, f) else null;
+    const old = if (font) |f| w32.SelectObject(hdc, f) else null;
     defer if (old) |o| {
         _ = w32.SelectObject(hdc, o);
     };
 
-    var wbuf: [64]u16 = undefined;
+    // Sized for an email, not for a button caption: `utf8ToUtf16Le` returns
+    // NoSpaceLeft for anything longer, and a measurement that silently returns
+    // 0 collapses the slot it was supposed to size.
+    var wbuf: [256]u16 = undefined;
+    if (text.len > wbuf.len) return 0;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
     var r: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = w32.DrawTextW(
@@ -966,7 +1136,92 @@ fn paintChrome(self: *MachineChooser, hdc: w32.HDC) void {
         for (&rules) |*r| _ = w32.FillRect(hdc, r, b);
     }
 
+    self.paintAccount(hdc, l);
     self.paintDetail(hdc, l);
+}
+
+/// The account row's monogram circle (T311). Mac draws the Google profile
+/// picture when it has one and falls back to initials on an accent gradient
+/// (MachineChooserView.swift:942-976); the brokered sign-in never hands us a
+/// picture URL, so the monogram IS the win32 avatar.
+///
+/// The fill is FLAT accent, not a gradient. The letter's contrast floor is
+/// computed against one color — a gradient would make the floor a function of
+/// position, so the glyph would be legible at one end of the disc and not
+/// necessarily at the other, and there is no second color anybody chose. The
+/// cue Mac is buying with the gradient (this is an identity mark, not a button)
+/// is already carried by the shape.
+fn paintAccount(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
+    const email = self.email orelse return;
+    if (RelayAccountRow.isRunning()) return;
+    const row = chooser_layout.accountRow(l, .signed_in, self.measureAccount(.signed_in));
+    const box = row.avatar orelse return;
+
+    const fill = chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached());
+    const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(fill)) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const brush = w32.CreateSolidBrush(rgb(fill)) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    const old_pen = w32.SelectObject(hdc, pen);
+    const old_brush = w32.SelectObject(hdc, brush);
+    _ = w32.Ellipse(hdc, box.left, box.top, box.right, box.bottom);
+    _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.SelectObject(hdc, old_brush);
+
+    const letter = RelayAccountRow.monogram(email) orelse return;
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(hdc, rgb(color_math.contrastForeground(fill)));
+    const old_font = if (self.strong_font) |f| w32.SelectObject(hdc, f) else null;
+    defer if (old_font) |o| {
+        _ = w32.SelectObject(hdc, o);
+    };
+    var r = rect(box);
+    var wbuf = [_]u16{letter};
+    _ = w32.DrawTextW(
+        hdc,
+        &wbuf,
+        1,
+        &r,
+        w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
+    );
+}
+
+/// The "Sign Out" link (T311, finding 6). Mac styles it `.link`; Windows has no
+/// link BUTTON style, so the control is `BS_OWNERDRAW` — it keeps the tab stop,
+/// the focus and BN_CLICKED, and only the paint is ours.
+///
+/// Rest is accent text on the dialog surface with no border and no underline
+/// (Fluent's HyperlinkButton); hover and press underline it, and focus draws the
+/// system's own focus rect — so no state is signalled by color alone.
+fn drawAccountLink(self: *const MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
+    const hdc = dis.hDC;
+    var r = dis.rcItem;
+    if (bg_brush) |b| _ = w32.FillRect(hdc, &r, b);
+
+    const disabled = (dis.itemState & w32.ODS_DISABLED) != 0;
+    const pressed = (dis.itemState & w32.ODS_SELECTED) != 0;
+    const focused = (dis.itemState & w32.ODS_FOCUS) != 0;
+    const marked = self.link_hot or pressed or focused;
+
+    const color = if (disabled)
+        chooser_rows.secondaryOn(DIALOG_BG)
+    else
+        chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached());
+
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(hdc, rgb(color));
+    const face = if (marked) self.link_font else self.font;
+    const old_font = if (face) |f| w32.SelectObject(hdc, f) else null;
+    var text_rect = r;
+    drawTextUtf8Aligned(
+        hdc,
+        RelayAccountRow.buttonLabel(true, false),
+        &text_rect,
+        w32.DT_RIGHT | w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
+    );
+    if (old_font) |o| _ = w32.SelectObject(hdc, o);
+
+    if (focused) _ = w32.DrawFocusRect(hdc, &r);
 }
 
 /// The detail pane's header: the selected machine's glyph, name and subtitle —
@@ -1421,15 +1676,20 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
 
 /// One line of ellipsized, vertically centered UTF-8 text.
 fn drawTextUtf8(hdc: w32.HDC, text: []const u8, r: *w32.RECT) void {
-    var wbuf: [256]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return;
-    _ = w32.DrawTextW(
+    drawTextUtf8Aligned(
         hdc,
-        &wbuf,
-        @intCast(wlen),
+        text,
         r,
         w32.DT_LEFT | w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
     );
+}
+
+/// `drawTextUtf8` with the caller's own `DT_` flags — the account link is
+/// right-aligned against the monogram, where everything else here is left.
+fn drawTextUtf8Aligned(hdc: w32.HDC, text: []const u8, r: *w32.RECT, flags: u32) void {
+    var wbuf: [256]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return;
+    _ = w32.DrawTextW(hdc, &wbuf, @intCast(wlen), r, flags);
 }
 
 /// The leading status column: a filled green dot when online, a hollow gray
@@ -1674,7 +1934,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                         self.cancel();
                         return 0;
                     },
-                    ACCOUNT_ID => {
+                    ACCOUNT_ID, ACCOUNT_LINK_ID => {
                         self.onAccountClicked();
                         return 0;
                     },
@@ -1708,6 +1968,30 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             if (dis.CtlType == w32.ODT_LISTBOX and dis.CtlID == LIST_ID) {
                 self.drawRow(dis);
                 return 1;
+            }
+            if (dis.CtlType == w32.ODT_BUTTON and dis.CtlID == ACCOUNT_LINK_ID) {
+                self.drawAccountLink(dis);
+                return 1;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        // Link hover, without a subclass: WM_SETCURSOR names the window under
+        // the pointer, and a child that does not handle it forwards it here —
+        // so "over the link" and "left the link" are the same test, and the
+        // hand cursor is set at the one place that already knows.
+        w32.WM_SETCURSOR => {
+            const over: ?w32.HWND = @ptrFromInt(wparam);
+            const hot = over == @as(?w32.HWND, self.account_link) and
+                w32.IsWindowVisible(self.account_link) != 0;
+            if (hot != self.link_hot) {
+                self.link_hot = hot;
+                _ = w32.InvalidateRect(self.account_link, null, 1);
+            }
+            if (hot) {
+                if (w32.LoadCursorW(null, w32.IDC_HAND)) |c| {
+                    _ = w32.SetCursor(c);
+                    return 1;
+                }
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
@@ -1785,6 +2069,7 @@ pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
         hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
         hwnd == self.account_status or hwnd == self.account_btn or
+        hwnd == self.account_link or
         hwnd == self.activity_btn or hwnd == self.menu_btn;
 }
 
@@ -1825,7 +2110,10 @@ fn hwndFor(self: *const MachineChooser, f: Focusable) w32.HWND {
         .activity => self.activity_btn,
         .menu => self.menu_btn,
         .cancel => self.cancel_btn,
-        .account => self.account_btn,
+        // Whichever of the two account controls is live in this state (T311) —
+        // the Tab walk already steps over anything hidden, and this keeps the
+        // stop pointing at the one the user can actually press.
+        .account => self.accountControl(),
     };
 }
 
@@ -1853,7 +2141,9 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             // Enter on a non-default button presses IT, not the default Open
             // button — this loop intercepts Enter before the control sees it.
             const focus = w32.GetFocus();
-            if (focus == @as(?w32.HWND, self.account_btn)) {
+            if (focus == @as(?w32.HWND, self.account_btn) or
+                focus == @as(?w32.HWND, self.account_link))
+            {
                 self.onAccountClicked();
             } else if (focus == @as(?w32.HWND, self.menu_btn)) {
                 self.openRowMenuFromButton();
@@ -1888,7 +2178,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 .menu
             else if (focus == @as(?w32.HWND, self.cancel_btn))
                 .cancel
-            else if (focus == @as(?w32.HWND, self.account_btn))
+            else if (focus == @as(?w32.HWND, self.account_btn) or
+                focus == @as(?w32.HWND, self.account_link))
                 .account
             else
                 .filter;
@@ -2022,6 +2313,14 @@ fn close(self: *MachineChooser, refocus_owner: bool) void {
     if (self.title_font) |f| {
         _ = w32.DeleteObject(f);
         self.title_font = null;
+    }
+    if (self.link_font) |f| {
+        _ = w32.DeleteObject(f);
+        self.link_font = null;
+    }
+    if (self.strong_font) |f| {
+        _ = w32.DeleteObject(f);
+        self.strong_font = null;
     }
 
     if (refocus_owner) {
