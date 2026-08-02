@@ -2,7 +2,8 @@
 # ConfirmDialog (T50 pattern, class 'GhozttyConfirmDialog').
 #
 # Covered sites + semantics:
-#   1. ctrl+w (close_surface with a live cmd.exe) -> surface close confirm:
+#   1. ctrl+w (close_surface with a BUSY shell - see Launch-Gui) -> surface
+#        close confirm:
 #        appears, renders DARK (avg lum < 90), Escape cancels (pane stays),
 #        Enter on the DEFAULT button cancels (MB_DEFBUTTON2 parity - an
 #        accidental Enter must never approve), Tab+Enter approves (window
@@ -110,7 +111,37 @@ function Launch-Gui {
     $surface = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: surface not found'; exit 1 }
     Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) 'window is NOT enumerable on the interactive desktop'
+    # T41: an IDLE shell no longer confirms - the close paths ask the process
+    # table now, because no Windows shell emits the OSC 133 marks the core's
+    # `cursorIsAtPrompt` reads. Every case below is about the DIALOG, so give
+    # the shell a live child; otherwise these dialogs correctly never appear.
+    # (T41's own behavior - idle vs busy - is close-confirm-idle.ps1.)
+    Send-TestText -Window $top -Target $surface -Text 'ping -n 600 127.0.0.1' | Out-Null
+    Send-TestKeys -Window $top -Target $surface -Key Enter | Out-Null
+    $busy = $false
+    for ($t = 0; $t -lt 30 -and -not $busy; $t++) {
+        Start-Sleep -Milliseconds 400
+        $busy = [bool](Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" |
+            Where-Object { $_.ParentProcessId -and (Test-Ancestor $_.ProcessId $app.Pid) })
+    }
+    if (-not $busy) { Write-Host 'SETUP FAIL: could not make the pane busy (no ping under the app)'; exit 1 }
     return @{ App = $app; Pid = $app.Pid; Top = $top; Surface = $surface }
+}
+
+# Is $Root anywhere in $Pid's parent chain? Used only to confirm the setup
+# ping really belongs to this run's app.
+function Test-Ancestor([int]$ProcessIdToCheck, [int]$Root) {
+    $map = @{}
+    Get-CimInstance Win32_Process | ForEach-Object { $map[[int]$_.ProcessId] = [int]$_.ParentProcessId }
+    $cur = $ProcessIdToCheck
+    for ($d = 0; $d -lt 32; $d++) {
+        if ($cur -eq $Root) { return $true }
+        if (-not $map.ContainsKey($cur)) { return $false }
+        $next = $map[$cur]
+        if ($next -eq 0 -or $next -eq $cur) { return $false }
+        $cur = $next
+    }
+    return $false
 }
 
 Kill-RepoInstances

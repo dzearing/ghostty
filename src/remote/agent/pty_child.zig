@@ -157,6 +157,8 @@ const win_job = if (is_windows) struct {
         hJob: HANDLE,
         hProcess: HANDLE,
     ) callconv(.winapi) BOOL;
+    /// The OS process id behind a process HANDLE; 0 on failure.
+    extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
 } else struct {};
 
 /// Process-global, lazily-initialized kill-on-close job handle. Created once on
@@ -815,10 +817,17 @@ pub const PtySpawner = struct {
     fn spawnFn(ctx: *anyopaque, open: protocol.Open) anyerror!server.Spawner.Result {
         const self: *PtySpawner = @ptrCast(@alignCast(ctx));
         const pc = try self.spawnChild(open);
-        // `Result.pid` is an i64 identifier for the monitor view. On POSIX `pc.pid`
-        // is the integer pid; on Windows it is the process HANDLE (a pointer), so we
-        // surface its integer value (the OS process id is not separately tracked).
-        const pid_i64: i64 = if (is_windows) @intCast(@intFromPtr(pc.pid)) else @intCast(pc.pid);
+        // `Result.pid` is the child's OS process id. On POSIX `pc.pid` already is
+        // one; on Windows `posix.pid_t` is the process HANDLE, so ask the OS for
+        // the pid behind it. This used to surface the HANDLE's integer value,
+        // which is not a pid in any process — it made `+list --json`'s `pid`,
+        // `+sessions`' child pid, and every ancestry walk against a
+        // session-persistence pane answer with a number that names nothing (T41).
+        const pid_i64: i64 = if (is_windows) pid: {
+            const id = win_job.GetProcessId(pc.pid);
+            if (id == 0) log.warn("GetProcessId failed for spawned child; reporting 0", .{});
+            break :pid @intCast(id);
+        } else @intCast(pc.pid);
         // The PTY slave path (wp3): `Pty.getProcessInfo` resolves it per-OS
         // (macOS TIOCPTYGNAME / Linux ptsname_r, cached in the pty struct inside
         // the heap-owned PtyChild — stable until terminate) and returns null on

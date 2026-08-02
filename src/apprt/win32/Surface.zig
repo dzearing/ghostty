@@ -29,6 +29,7 @@ const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
 const menu_label = @import("menu_label.zig");
 const pane_id_mod = @import("pane_id.zig");
+const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -1161,15 +1162,73 @@ pub fn heroSnapPublish(self: *Surface) bool {
     return true;
 }
 
+/// The LOCAL pid of this pane's shell, or 0 when there is none to name.
+///
+/// Session-persistence panes are remote-backed but LOCAL — their child runs
+/// under this box's `ghoztty-agent`, so the agent-reported child pid is a real
+/// pid in this machine's process table. A CROSS-MACHINE pane's pid indexes
+/// ANOTHER machine's table and is never returned: matching it here would
+/// silently name an unrelated local process.
+pub fn shellPid(self: *Surface) u32 {
+    if (!self.core_surface_ready) return 0;
+    switch (self.core_surface.io.backend) {
+        .exec => |*exec| {
+            const process = exec.subprocess.process orelse return 0;
+            return switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |handle| w32.GetProcessId(handle) else 0,
+                .flatpak => 0,
+            };
+        },
+        .remote => |*r| {
+            if (!r.local) return 0;
+            const pid = r.child_pid.load(.acquire);
+            if (pid <= 0) return 0;
+            return std.math.cast(u32, pid) orelse 0;
+        },
+    }
+}
+
+/// True when this pane's shell is sitting idle — nothing is running under it,
+/// so closing the pane destroys no work (T41). `map` is a Toolhelp32 snapshot
+/// (`ProcessTree.snapshot`); callers closing a whole window take one for every
+/// pane rather than one each.
+///
+/// Answers FALSE whenever it cannot know: no shell pid (a cross-machine pane,
+/// a surface that is not up yet), a shell missing from the snapshot (Toolhelp32
+/// failed, and an empty map would otherwise read as "nothing is running"), a
+/// read-only surface, or `confirm-close-surface = always` — a confirmation the
+/// user configured unconditionally is not a question about the shell.
+pub fn shellIsIdle(self: *Surface, map: *const ProcessTree.PidMap) bool {
+    if (!self.core_surface_ready) return false;
+    if (self.core_surface.readonly) return false;
+    if (self.core_surface.config.confirm_close_surface == .always) return false;
+    const pid = self.shellPid();
+    if (pid == 0) return false;
+    if (!ProcessTree.contains(map, pid)) return false;
+    return !ProcessTree.hasDescendants(map, pid);
+}
+
+/// `shellIsIdle` against a snapshot taken here. A failed snapshot answers
+/// "not idle", same as an unknown shell.
+pub fn shellIsIdleNow(self: *Surface) bool {
+    const alloc = self.app.core_app.alloc;
+    var map = ProcessTree.snapshot(alloc) catch return false;
+    defer map.deinit(alloc);
+    return self.shellIsIdle(&map);
+}
+
 pub fn close(self: *Surface, process_active: bool) void {
     log.debug("Surface.close called process_active={}", .{process_active});
     // If a shell command is still running, prompt the user before
     // closing. Without this, Ctrl+Shift+W silently kills the running
-    // process — macOS shows the same kind of dialog for parity. We
-    // only prompt for programmatic close paths; the X-button path
-    // bypasses needsConfirmQuit entirely (cmd.exe lacks OSC 133 so
-    // the core would return process_active=true unconditionally).
-    if (process_active) {
+    // process — macOS shows the same kind of dialog for parity.
+    //
+    // `process_active` is the core's verdict, and on Windows it is always
+    // true: it comes from `cursorIsAtPrompt`, which needs OSC 133 marks that
+    // cmd.exe and stock PowerShell never emit. So an idle shell sitting at its
+    // prompt looked identical to a running build. The process table is what
+    // knows here, so a shell with no descendants closes without a dialog (T41).
+    if (process_active and !self.shellIsIdleNow()) {
         const result = ConfirmDialog.show(
             self.app,
             self.parent_window.hwnd,

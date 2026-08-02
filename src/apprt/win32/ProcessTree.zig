@@ -71,6 +71,38 @@ pub fn isAncestor(map: *const PidMap, ancestor: u32, descendant: u32) bool {
     return false;
 }
 
+/// Whether any process in the snapshot descends from `pid`. `pid` itself does
+/// NOT count (unlike `isAncestor`, which is inclusive), so an idle shell with
+/// nothing running under it answers false.
+///
+/// This is the Windows answer to "is anything running in this pane?" (T41).
+/// The Mac asks the terminal instead — `cursorIsAtPrompt`, fed by the shell's
+/// OSC 133 marks — but cmd.exe and stock PowerShell emit none, so on this
+/// platform the shell is always "not at a prompt" and the process table is the
+/// only thing that knows.
+///
+/// Conservative by construction: a recycled pid whose stale parent link points
+/// at `pid` reports a descendant that isn't one, which shows a confirmation
+/// that wasn't needed rather than skipping one that was.
+pub fn hasDescendants(map: *const PidMap, pid: u32) bool {
+    if (pid == 0) return false;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const candidate = entry.key_ptr.*;
+        if (candidate == pid) continue;
+        if (isAncestor(map, pid, candidate)) return true;
+    }
+    return false;
+}
+
+/// Whether `pid` appears in the snapshot at all. Callers use this to tell
+/// "the snapshot says nothing runs under this shell" from "there is no
+/// snapshot" — `snapshot` returns an EMPTY map when Toolhelp32 fails, and an
+/// empty map answers `hasDescendants` with a confident, wrong false.
+pub fn contains(map: *const PidMap, pid: u32) bool {
+    return map.contains(pid);
+}
+
 // -----------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -115,4 +147,56 @@ test "isAncestor: self-parent root terminates" {
     defer map.deinit(alloc);
     try testing.expect(!isAncestor(&map, 99, 30));
     try testing.expect(isAncestor(&map, 4, 30));
+}
+
+test "hasDescendants: idle leaf has none" {
+    const alloc = testing.allocator;
+    // 100 (app) -> 200 (shell), nothing under the shell.
+    var map = try testMap(alloc, &.{ .{ 100, 0 }, .{ 200, 100 } });
+    defer map.deinit(alloc);
+    try testing.expect(!hasDescendants(&map, 200));
+    try testing.expect(hasDescendants(&map, 100)); // the shell is one
+}
+
+test "hasDescendants: direct child and grandchild both count" {
+    const alloc = testing.allocator;
+    // 200 (shell) -> 300 (cmd /c) -> 400 (ping)
+    var map = try testMap(alloc, &.{ .{ 200, 100 }, .{ 300, 200 }, .{ 400, 300 } });
+    defer map.deinit(alloc);
+    try testing.expect(hasDescendants(&map, 200));
+    try testing.expect(hasDescendants(&map, 300));
+    try testing.expect(!hasDescendants(&map, 400));
+}
+
+test "hasDescendants: siblings are not descendants" {
+    const alloc = testing.allocator;
+    // Two shells under the same app: neither is under the other.
+    var map = try testMap(alloc, &.{ .{ 100, 0 }, .{ 200, 100 }, .{ 201, 100 } });
+    defer map.deinit(alloc);
+    try testing.expect(!hasDescendants(&map, 200));
+    try testing.expect(!hasDescendants(&map, 201));
+}
+
+test "hasDescendants: empty snapshot and pid 0" {
+    const alloc = testing.allocator;
+    var empty = try testMap(alloc, &.{});
+    defer empty.deinit(alloc);
+    try testing.expect(!hasDescendants(&empty, 200));
+    try testing.expect(!contains(&empty, 200));
+
+    var map = try testMap(alloc, &.{ .{ 100, 0 }, .{ 200, 100 } });
+    defer map.deinit(alloc);
+    // pid 0 is the "no parent" sentinel, never a real process to ask about.
+    try testing.expect(!hasDescendants(&map, 0));
+    try testing.expect(contains(&map, 200));
+    try testing.expect(!contains(&map, 999));
+}
+
+test "hasDescendants: cycle in a stale snapshot terminates" {
+    const alloc = testing.allocator;
+    // 10 <-> 20 recycled cycle, plus an unrelated root.
+    var map = try testMap(alloc, &.{ .{ 10, 20 }, .{ 20, 10 }, .{ 99, 0 } });
+    defer map.deinit(alloc);
+    try testing.expect(hasDescendants(&map, 10));
+    try testing.expect(!hasDescendants(&map, 99));
 }

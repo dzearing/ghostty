@@ -6264,3 +6264,45 @@ Residuals: **T353** (nothing in that workflow has ever been run by GitHub - the
 retry loop especially is dead code until the day it matters) and **T354** (the
 only published win-v release predates the portable ZIP, so that link points at
 the release page until the next publish promotes it).
+
+## 2026-08-02 - T41: the confirmation asked about a shell that had nothing to lose
+
+Closing a tab that was just cmd.exe at a prompt asked "processes are still
+running". The core decides that from `cursorIsAtPrompt`, fed by the shell's OSC
+133 marks - and no Windows shell emits any, so the answer was always "running".
+The Windows-native tiebreaker is the process table: `ProcessTree.hasDescendants`
+behind `Surface.shellIsIdle`, consulted by both close paths (Ctrl+Shift+W and
+the window-level X, which takes one snapshot for all its panes). It answers
+FALSE whenever it cannot know - unknown pid, a shell absent from the snapshot
+(Toolhelp32 failure returns an EMPTY map, which otherwise reads as "nothing is
+running"), `readonly`, `confirm-close-surface = always` - so the failure
+direction is a needless dialog, never a silently killed build.
+
+The task's own guess was right and cheap. The work was underneath it: **with
+session-persistence ON - the default, so this is every user's pane - the pid the
+app had was fake.** `PtySpawner.spawnFn` reported `@intFromPtr(pc.pid)` on
+Windows, where `posix.pid_t` is a HANDLE, and the comment said so out loud
+("the OS process id is not separately tracked"). That number reached
+`+sessions`, `+list --json`, and `Remote.child_pid`, and named nothing in any
+process. The acceptance script found it as `shell pid 492 names a live process
+-> FAIL`; `GetProcessId(pc.pid)` fixes it.
+
+Two things came out of that, and both are the same lesson. **The exec backend is
+the one nobody runs**: a script that only covered `--session-persistence=false`
+would have been green over a feature that was dead for users, so the script runs
+BOTH backends as sections A and B. And `IpcHandlers` kept a private
+`surfaceShellPid` returning 0 for every remote pane, which means `+list --pid` -
+how a process finds its own pane, what `/reset-context` runs on - could not
+resolve a pane whenever persistence was on. It calls `Surface.shellPid` now, and
+the new script carries the only on-box coverage `--pid` has ever had.
+
+`test\win32\close-confirm-idle.ps1` - ALL PASS (23), busy case first in each
+section as the positive control for the idle case, `Win32_Process` as the
+independent busy/idle oracle, and "the window actually closed" asserted so a
+swallowed chord cannot pass as a skipped confirmation; `-NegativeControl` fails.
+`confirm-dialogs.ps1` needed its PREMISE repaired rather than its assertions -
+its idle cmd.exe is now exactly the no-dialog case - and passes 27 unchanged.
+Residuals: **T355** (the agent lane never asked whether its pid was real),
+**T356** (a cross-machine pane still always confirms; only its own agent can
+see those descendants), **T357** (the forced-confirm branches have no coverage
+now that no-dialog is a normal outcome).

@@ -1387,22 +1387,13 @@ fn buildNode(
     return node;
 }
 
-extern "kernel32" fn GetProcessId(Process: windows.HANDLE) callconv(.winapi) windows.DWORD;
-
-/// The pane's shell process id, or 0 when unavailable (remote panes, spawn
-/// still in flight). On Windows Command.pid holds the process HANDLE.
+/// The pane's shell process id, or 0 when unavailable. Lives on the Surface
+/// (`Surface.shellPid`) because the close-confirmation path needs the same
+/// answer; this used to be a private copy here that returned 0 for EVERY
+/// remote pane, which with session-persistence on (the default) is every local
+/// pane — so `+list --pid` could not find a pane it was run from inside.
 fn surfaceShellPid(surface: *Surface) u32 {
-    if (!surface.core_surface_ready) return 0;
-    switch (surface.core_surface.io.backend) {
-        .exec => |*exec| {
-            const process = exec.subprocess.process orelse return 0;
-            return switch (process) {
-                .fork_exec => |cmd| if (cmd.pid) |handle| GetProcessId(handle) else 0,
-                .flatpak => 0,
-            };
-        },
-        .remote => return 0,
-    }
+    return surface.shellPid();
 }
 
 test {

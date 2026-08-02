@@ -95,6 +95,7 @@ const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
 const window_memory = @import("window_memory.zig");
 const pane_id = @import("pane_id.zig");
+const ProcessTree = @import("ProcessTree.zig");
 const host_defaults = @import("host_defaults.zig");
 const commands = @import("commands.zig");
 const menu_bar = @import("menu_bar.zig");
@@ -4819,13 +4820,23 @@ pub fn cancelTabRename(self: *Window) void {
 /// When the last tab has already been closed (tab_count == 0) there is
 /// nothing to confirm, so this returns true silently.
 pub fn confirmCloseIfNeeded(self: *Window) bool {
+    // One process snapshot for the whole window: `shellIsIdle` is asked once
+    // per pane and Toolhelp32 is not cheap enough to walk per tab (T41).
+    const alloc = self.app.core_app.alloc;
+    var pid_map = ProcessTree.snapshot(alloc) catch ProcessTree.PidMap.empty;
+    defer pid_map.deinit(alloc);
+
     var needs = false;
     outer: for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
             const surface = entry.view;
             if (surface.core_surface_ready and
-                surface.core_surface.needsConfirmQuit())
+                surface.core_surface.needsConfirmQuit() and
+                // The core's verdict is `cursorIsAtPrompt`, which no Windows
+                // shell answers (no OSC 133) — so it says "running" for an
+                // idle prompt too. The process table is the tiebreaker.
+                !surface.shellIsIdle(&pid_map))
             {
                 needs = true;
                 break :outer;

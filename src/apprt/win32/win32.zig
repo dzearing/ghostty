@@ -664,6 +664,11 @@ pub extern "kernel32" fn SetConsoleCtrlHandler(
     Add: i32,
 ) callconv(.winapi) i32;
 
+/// The pid behind a process HANDLE. Returns 0 on failure.
+pub extern "kernel32" fn GetProcessId(
+    Process: std.os.windows.HANDLE,
+) callconv(.winapi) u32;
+
 pub extern "user32" fn ToUnicode(
     wVirtKey: u32,
     wScanCode: u32,
