@@ -2,9 +2,53 @@
 
 A fork of [Ghostty](https://github.com/ghostty-org/ghostty) that adds CLI-driven window management for AI agents and automation.
 
+Ghoztty ships on **macOS and Windows**, and the two are kept symmetric. Read
+the next section before you add anything.
+
+## Platform symmetry is a standing rule
+
+**Every new feature must land in BOTH the macOS and the Windows build.** (User
+directive, 2026-07-13.) A feature that exists on one platform and not the other
+is an unfinished feature, not a platform-specific one — the divergence is the
+defect, the same way an off-scale spacing value is a defect in the win32 design
+system even when it looks fine in isolation.
+
+What that means in practice:
+
+- **Translate the feature, not the implementation.** Where a concept has no
+  native counterpart, build the Windows-native equivalent rather than skipping
+  it or emulating the Mac mechanism: AF_UNIX socket → owner-only-DACL **named
+  pipe**, LaunchAgent → **HKCU Run** entry, Keychain → **DPAPI** store,
+  `+list --tty` → `+list --pid`, `-lic` shell invocation → per-flavor
+  (`pwsh -NoExit -Command`, `cmd /K`, `wsl --`). Every one of those pairs is
+  documented in the sections below; follow the pattern instead of inventing a
+  new one.
+- **The CLI surface is identical on both platforms.** A verb, flag, or default
+  that exists on one CLI and not the other is the divergence this project
+  explicitly does not ship — Windows briefly had `+relay-login`/`+relay-logout`
+  with no Mac analog and they were **removed** (T141), not kept. If a capability
+  needs a GUI affordance on one platform, give it that affordance on both.
+- **Land both, or file the other half.** If you genuinely cannot implement the
+  second platform in the same change (no box to validate on, a dependency that
+  is not ready), the change is not done until a task exists for the other
+  seat — on Windows that is
+  `powershell -NoProfile -File scripts\parity-tasks.ps1 new -Title "…"`, with
+  `seat: mac` for work that only the Mac seat can validate. Never leave the
+  gap undocumented.
+- **Both seats work the same branch**, so pull before starting and push at
+  every task boundary.
+
+Windows parity work is tracked in `docs/design/windows-parity-tasks/` (one file
+per task) with `docs/design/windows-parity-tasks.md` as the narrative index; the
+Windows session protocol lives in `go.md`.
+
 ## CLI Window Management
 
-IPC commands communicate with a running Ghoztty instance over a Unix domain socket. All commands are idempotent — named targets that already exist are focused instead of recreated.
+IPC commands communicate with a running Ghoztty instance over a local IPC
+endpoint (a Unix domain socket on macOS, a named pipe on Windows — see
+Architecture). All commands are idempotent — named targets that already exist
+are focused instead of recreated. The verbs, flags, and semantics below are the
+same on both platforms.
 
 ### `ghoztty +new-window`
 
@@ -699,13 +743,124 @@ ring/snapshot/gap-fill replay, HELLO handshake):
 
 Design + status: `docs/design/session-persistence.md`.
 
-## Build & Test
+## Build, run & debug
+
+Both platforms build from the same `zig build`; what differs is the app runtime
+(`-Dapp-runtime`, which defaults to `none` on macOS and `win32` on Windows) and
+what comes out the other end. **The installed app is the user's primary
+terminal on both platforms — never test against it.**
+
+### macOS
 
 ```bash
-zig build -Doptimize=Debug
+zig build -Doptimize=Debug      # -> zig-out/Ghoztty-Debug.app (xcodebuild)
+open -na zig-out/Ghoztty-Debug.app
 ```
 
-**NEVER modify, replace, copy over, or touch `/Applications/Ghoztty.app` in any way.** The installed app is the user's primary terminal. Always test with the debug build at `zig-out/Ghoztty-Debug.app`. The debug build uses a separate socket (`ghostty-debug-<uid>.sock`) and a separate bundle identifier so it can run alongside the release app.
+- **NEVER modify, replace, copy over, or touch `/Applications/Ghoztty.app` in
+  any way.** Always test with the debug build at `zig-out/Ghoztty-Debug.app`.
+  The debug build uses a separate socket (`ghostty-debug-<uid>.sock`) and a
+  separate bundle identifier, so it runs alongside the release app.
+- IPC endpoint: `$TMPDIR/ghostty[-debug]-<uid>.sock`.
+- Logs: `sudo log stream --level debug --predicate
+  'subsystem=="com.dzearing.ghoztty"'`.
+- Swift frontend sources live in `macos/`; `zig build` drives `xcodebuild` for
+  them (`src/build/GhosttyXcodebuild.zig`).
+
+### Windows
+
+```powershell
+$env:ZIG_GLOBAL_CACHE_DIR = 'D:\zig-global-cache'   # MUST be on the repo's drive
+zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
+.\zig-out\bin\ghoztty.exe
+```
+
+- **`ZIG_GLOBAL_CACHE_DIR` must sit on the same drive as the repo.** Across
+  drives, `std.fs.path.relative` returns an absolute path and zig 0.15.2's build
+  runner panics in `convertPathArg` (`assert(!isAbsolute(child_cwd_rel))` in std
+  `Run.zig`) — it aborts the run before any test executes, which reads like a
+  test failure and is not one.
+- **Never run or overwrite an installed Ghoztty** — not the installed release
+  under `%LOCALAPPDATA%\Programs\Ghoztty`, not an extracted portable copy. This
+  is the on-box analog of the `/Applications/Ghoztty.app` rule. Always run the
+  freshly built `zig-out\bin\ghoztty.exe`.
+- **Debug builds link the Console subsystem**, so `std.log` output goes to
+  stderr in the shell you launched from, like every other platform. Release
+  builds use the GUI subsystem (no console) and append `info` and above to
+  `%LOCALAPPDATA%\ghoztty\ghoztty.log`; add `-Dwindows-console=true` to give a
+  release build a console when you need to debug one live.
+- IPC endpoint: the named pipe `\\.\pipe\ghoztty[-debug]-<USERNAME>` — the
+  `-debug` suffix is what lets a debug build run alongside the installed
+  release. `GHOZTTY_PIPE_SUFFIX` overrides the suffix; `GHOZTTY_IPC_SOCKET`
+  (baked into every pane) overrides the whole endpoint, see Instance
+  addressability.
+- **A leftover debug agent fails the build, not the code.** The agent outlives
+  the app on purpose, so a `ghoztty-agent.exe` left running from `zig-out\bin`
+  by an earlier test run holds its own exe open and the install step dies with
+  `unable to update file … AccessDenied`. Stop *that* process — match on
+  `ExecutablePath`, never on name — and re-run:
+
+  ```powershell
+  Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+      Where-Object { $_.ExecutablePath -eq 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe' } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  ```
+
+  The installed release runs its own agent from `%LOCALAPPDATA%\Programs\
+  Ghoztty` and owns the user's live sessions — killing it by name would take
+  the user's terminal sessions with it.
+- The session-persistence agent builds alongside the app as
+  `zig-out\bin\ghoztty-agent.exe` (a required sibling of `ghoztty.exe`); its
+  state lives under `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\` and it is
+  dialed over `\\.\pipe\ghoztty-agent[-debug]-<USERNAME>`. A stale agent from an
+  earlier build keeps running by design — see Agent contract & upgrade
+  compatibility.
+- Release/delivery build (what ships, and what the delivery scripts stage):
+
+  ```powershell
+  zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast `
+      -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix zig-out-release
+  ```
+
+  `-Dstrip=false` is load-bearing: a stripped release build produces
+  undebuggable crash dumps. Delivery to the user's install locations goes
+  through `scripts/launch-upgrade.ps1` (never a hand-rolled `Start-Process`);
+  `go.md` has the full protocol and the staleness gates.
+
+### Test lanes and acceptance scripts
+
+The floor for any change — all of these green, on the platform you changed:
+
+```powershell
+zig build test -Dapp-runtime=none      # pure logic, no app runtime
+zig build test -Dapp-runtime=win32     # win32 apprt units (Windows)
+zig build test-agent                   # ghoztty-agent, incl. real-pty tests
+```
+
+`zig build test` with no `-Dapp-runtime` is the `none` lane on macOS and the
+`win32` lane on Windows, so **name the lane explicitly** rather than assuming
+the bare command covers both.
+
+On Windows, behavior that unit tests cannot reach is covered by non-interactive
+PowerShell acceptance scripts in `test/win32/` (80+ of them). The standing
+regression floor is P1–P3, which must stay ALL PASS:
+
+```powershell
+powershell -NoProfile -File test\win32\ipc-p1.ps1   # +new-window, +list, +close
+powershell -NoProfile -File test\win32\ipc-p2.ps1   # +split, +rename, +send-keys
+powershell -NoProfile -File test\win32\ipc-p3.ps1   # +read, +set-state, OSC 7777, +rearrange
+```
+
+Each prints a single `ALL PASS` / `N FAILURE(S)` line at the end, so
+`| Select-Object -Last 1` is enough to read the result. They default to
+`-Exe D:\git\ghoztty\zig-out\bin\ghoztty.exe` and only ever touch ghoztty
+processes running from that exact path, so they cannot disturb the user's
+installed release.
+
+**Everything gets tests**: pure logic → unit tests in the `none` lane;
+behavior → an on-box acceptance script. Win32 chrome geometry belongs in the
+pure geometry modules and must be asserted at 1.0, 1.25, 1.5 and 2.0 scaling
+(see the design-system section below).
 
 ## Windows UI: the design system is mandatory
 
@@ -754,7 +909,9 @@ at 1.25.
 
 ## Architecture
 
-- **Zig core** (`src/`): terminal emulation, input handling, CLI commands, IPC client
+- **Zig core** (`src/`): terminal emulation, input handling, CLI commands, IPC client — shared by both platforms
 - **Swift macOS app** (`macos/`): SwiftUI frontend, IPC server, split tree layout
-- Split panes use a binary tree (`SplitTree`) with a ratio (0.0–1.0) per split node
-- IPC uses JSON messages over a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock`, overridden per pane by `$GHOZTTY_IPC_SOCKET` (see Instance addressability)
+- **Zig win32 app** (`src/apprt/win32/`): native Win32 frontend, IPC server (`IpcServer`/`IpcHandlers`/`IpcRegistry`), split tree layout, tab strip and chrome. Selected by `-Dapp-runtime=win32`, which is the default on Windows
+- **`ghoztty-agent`** (`src/remote/agent/`): the session-persistence / remote-machines daemon, built by `zig build agent` and tested by `zig build test-agent`. One codebase, PTYs on macOS and ConPTYs on Windows
+- Split panes use a binary tree (`SplitTree`) with a ratio (0.0–1.0) per split node, on both frontends
+- IPC uses the same JSON messages on both platforms over a different local transport: a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock` on macOS, the named pipe `\\.\pipe\ghoztty[-debug]-<USERNAME>` on Windows. Both are overridden per pane by `$GHOZTTY_IPC_SOCKET` (see Instance addressability). The client side resolves in exactly one place on both platforms — `apprt.ipc.socketPath()` (`src/apprt/ipc.zig`), which delegates the pipe name to `ipc_client.endpointPath()` (`src/os/ipc_client.zig`) on Windows — so the derivation cannot drift

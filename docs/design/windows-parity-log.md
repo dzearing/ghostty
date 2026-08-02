@@ -6084,3 +6084,56 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
 `test-agent` exit 0. P1-P3 ALL PASS. New:
 `test/win32/parity-tasks-seat.ps1` ALL PASS (41), twice.
 `parity-tasks.ps1 validate` ALL PASS (374 tasks).
+
+## 2026-08-02 - T37: CLAUDE.md only told half the project how to build itself
+
+The repo's `## Build & Test` was four lines long, macOS-only, and its single
+command (`zig build -Doptimize=Debug`) produces no Windows app at all - it omits
+`-Dapp-runtime=win32`. A Windows seat following CLAUDE.md alone could not build,
+run, or debug anything. That is the same asymmetry T37 exists to outlaw, sitting
+in the document that is supposed to outlaw it.
+
+Three changes. **`## Platform symmetry is a standing rule` now opens the file**,
+ahead of the CLI reference, because a rule 700 lines down is read after the code
+is written. It states the 2026-07-13 directive and makes it actionable: translate
+the feature not the implementation (naming the six pairs already settled here -
+AF_UNIX -> named pipe, LaunchAgent -> HKCU Run, Keychain -> DPAPI, `--tty` ->
+`--pid`, `-lic` -> per-flavor shell); the CLI surface is identical on both
+platforms, with the removed `+relay-login`/`+relay-logout` (T141) as the worked
+example; and land both halves or file the other, naming `parity-tasks.ps1 new`
+and `seat: mac` so the escape hatch is an action.
+
+**`## Build, run & debug` replaces `## Build & Test`** with a macOS subsection, a
+Windows subsection, and a shared lane subsection. The interesting fact is one
+neither seat had written down: `-Dapp-runtime` defaults to `none` on macOS and
+`win32` on Windows (`Runtime.default`), so bare `zig build test` is a *different
+lane on each platform*. That is the actual reason go.md insists on naming both,
+and the doc now says so. Console vs GUI subsystem, `%LOCALAPPDATA%\ghoztty\
+ghoztty.log`, `-Dwindows-console=true`, the `\\.\pipe\ghoztty[-debug]-<USERNAME>`
+endpoint, and the P1/P2/P3 coverage split were all read out of source and script
+headers rather than recalled - the first draft guessed P2/P3 and guessed wrong.
+
+**Architecture and the intro are platform-correct**: both asserted "Unix domain
+socket" unconditionally, and the Architecture list had no win32 apprt entry and
+no `ghoztty-agent` entry at all.
+
+The gotcha nobody had recorded turned up by *being* the fresh session: the
+documented build failed cold with `unable to update file ... ghoztty-agent.exe:
+AccessDenied`. An agent left running from `zig-out\bin` by an earlier test run
+holds its own exe open - permanent, since the agent outliving the app is the
+design. Documented with a kill snippet that matches on `ExecutablePath`; matching
+by name would kill the installed release's agent and the user's live sessions
+with it.
+
+Every command in the new Windows section was run verbatim: build exit 0, both
+lanes exit 0, `test-agent` exit 0, P1-P3 ALL PASS. `test-agent` failed once on
+`unknown channel DATA is ignored` - 3/3 green under `-Dtest-filter`, 1/1 on a
+clean full re-run, and this change touches no code. Its waiters spin a fixed
+10,000 `Thread.yield()`s instead of a deadline, so a loaded box burns the budget
+before the server thread is scheduled once (`got` came back empty, not partial).
+Filed **T346**; a load-sensitive gate is the wrong property for something every
+turn must pass.
+
+The macOS subsection is written from source but has not been run on a Mac. Filed
+**T347** (`seat: mac`) instead of claiming it - which is what the rule this task
+just added requires.
