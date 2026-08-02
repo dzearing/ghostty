@@ -62,4 +62,40 @@ struct AgentIntegrationServiceTests {
     @Test func uninstalledOutcomeLabel() {
         #expect(IntegrationOutcome.uninstalled.label == "removed")
     }
+
+    @Test func allAgentStatusesCoversEveryRuntime() throws {
+        let home = try tempHome()
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(statuses.map(\.agent) == RuntimeAgent.allCases)
+    }
+
+    @Test func undetectedAgentIsNotDetectedAndNotInstalled() throws {
+        let home = try tempHome() // no .copilot / .claude dirs
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let copilot = try #require(statuses.first { $0.agent == .copilot })
+        #expect(copilot.detected == false)
+        #expect(copilot.state == .notInstalled)
+        #expect(copilot.pluginManaged == false)
+    }
+
+    @Test func detectedInstalledAgentReportsInstalled() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let copilot = try #require(statuses.first { $0.agent == .copilot })
+        #expect(copilot.detected == true)
+        #expect(copilot.state == .installed)
+    }
+
+    @Test func claudePluginPresenceReportsPluginManaged() throws {
+        let home = try tempHome()
+        let pluginsDir = home.appendingPathComponent(".claude/plugins")
+        try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
+        try #"{"plugins":[{"name":"ghoztty"}]}"#
+            .write(to: pluginsDir.appendingPathComponent("installed_plugins.json"), atomically: true, encoding: .utf8)
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let claude = try #require(statuses.first { $0.agent == .claude })
+        #expect(claude.pluginManaged == true)
+    }
 }

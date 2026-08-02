@@ -1,6 +1,16 @@
 // macos/Sources/Features/Setup/AgentIntegrationService.swift
 import Foundation
 
+/// A UI-facing snapshot of one runtime's Ghoztty-integration state.
+struct AgentStatus: Equatable, Sendable {
+    let agent: RuntimeAgent
+    /// The runtime's config dir (~/.claude, ~/.copilot) exists on disk.
+    let detected: Bool
+    let state: RuntimeIntegrationState
+    /// Claude only: an external `ghoztty` plugin already owns the hooks.
+    let pluginManaged: Bool
+}
+
 enum IntegrationOutcome: Equatable {
     case installed, upToDate, upgraded, notFound, pluginPresent, uninstalled, failed(String)
 
@@ -66,5 +76,18 @@ enum AgentIntegrationService {
             return .failed(error.localizedDescription)
         }
         return .uninstalled
+    }
+
+    static func allAgentStatuses(homeDirectoryURL: URL = URL(fileURLWithPath: LoginShell.homePath),
+                                 fileManager: FileManager = .default) -> [AgentStatus] {
+        RuntimeAgent.allCases.map { agent in
+            let dir = agent.configDirectoryURL(homeDirectoryURL: homeDirectoryURL)
+            var isDir: ObjCBool = false
+            let detected = fileManager.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+            let integ = RuntimeIntegrationFactory.make(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+            let pluginManaged = agent == .claude
+                && ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+            return AgentStatus(agent: agent, detected: detected, state: integ.state(), pluginManaged: pluginManaged)
+        }
     }
 }
