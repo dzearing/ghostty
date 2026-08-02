@@ -3,6 +3,7 @@ import SwiftUI
 
 struct AgentIntegrationsView: View {
     @ObservedObject var viewModel: AgentIntegrationsViewModel
+    let onDone: () -> Void
     @State private var confirmingUninstall: RuntimeAgent?
 
     var body: some View {
@@ -38,7 +39,7 @@ struct AgentIntegrationsView: View {
 
             HStack {
                 Spacer()
-                Button("Done") { NSApp.keyWindow?.performClose(nil) }
+                Button("Done") { onDone() }
                     .keyboardShortcut(.defaultAction)
             }
         }

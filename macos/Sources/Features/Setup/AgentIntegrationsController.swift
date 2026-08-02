@@ -19,13 +19,19 @@ final class AgentIntegrationsController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.isMovableByWindowBackground = true
         self.init(window: window)
-        window.contentView = NSHostingView(rootView: AgentIntegrationsView(viewModel: viewModel))
+        window.contentView = NSHostingView(rootView: AgentIntegrationsView(viewModel: viewModel, onDone: { [weak window] in
+            window?.performClose(nil)
+        }))
         window.center()
     }
 
     func show() {
         viewModel.refresh()
-        NSApp.activate(ignoringOtherApps: true)
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         window?.makeKeyAndOrderFront(nil)
     }
 }
