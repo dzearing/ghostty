@@ -53,9 +53,12 @@ struct MachineChooserView: View {
     @StateObject private var sessionCPU = SessionCPUProbe()
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
-    /// Secondary action: open the Remote Activity Monitor for a machine instead of
-    /// a window. Triggered by the per-row chart button.
-    var onActivityMonitor: (Machine) -> Void
+    /// Secondary action: open the Activity Monitor for the selected row instead of
+    /// a window. Triggered by the detail header's "See Activity" button.
+    ///
+    /// `nil` means **this Mac** — the monitor's in-process Local source, which
+    /// needs no connection. A non-nil machine is dialed.
+    var onActivityMonitor: (Machine?) -> Void
 
     /// Signed-in Google account state for the footer row (WP-B2). Observed so
     /// the row flips between "Sign in with Google…" and "<email> · Sign Out"
@@ -481,14 +484,23 @@ struct MachineChooserView: View {
                     .help("Rebuild this machine's full window layout here")
                 }
 
-                if case .remote(let machine) = target {
-                    Button {
-                        onActivityMonitor(machine)
-                    } label: {
-                        Label("Activity", systemImage: "chart.bar.xaxis")
-                    }
-                    .help("Open Activity Monitor for \(machine.name)")
+                // Push the inspect action to the trailing edge, away from the
+                // open actions. "See Activity" doesn't open a window, so
+                // grouping it with the buttons that do invites misclicks — and
+                // a right-aligned slot keeps it on this row rather than adding
+                // a second row of chrome to an already compact dialog.
+                Spacer(minLength: 12)
 
+                switch target {
+                case .local:
+                    seeActivityButton(machine: nil, named: detailTitle(target))
+                case .remote(let machine):
+                    seeActivityButton(machine: machine, named: machine.name)
+                default:
+                    EmptyView()
+                }
+
+                if case .remote(let machine) = target {
                     Menu {
                         managementActions(for: machine)
                     } label: {
@@ -499,7 +511,10 @@ struct MachineChooserView: View {
                     .fixedSize()
                     .help("Manage \(machine.name)")
                 }
-                Spacer()
+                // NOTE: no trailing Spacer. The one above is what pushes the
+                // inspect action to the trailing edge; a second Spacer here
+                // would split the free space evenly between them and park the
+                // button in the middle instead of flush right.
             }
         }
         .padding(16)
@@ -598,6 +613,22 @@ struct MachineChooserView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
         }
+    }
+
+    /// The trailing "See Activity" action in the detail header.
+    ///
+    /// Offered for **This Mac** as well as remote machines: the Activity Monitor
+    /// has had a Local source all along, but the button was gated to remote rows,
+    /// so the most common case — inspecting your own machine — had no entry point
+    /// here at all. `machine == nil` opens that Local source directly (no dial).
+    @ViewBuilder
+    private func seeActivityButton(machine: Machine?, named name: String) -> some View {
+        Button {
+            onActivityMonitor(machine)
+        } label: {
+            Label("See Activity", systemImage: "chart.bar.xaxis")
+        }
+        .help("Open Activity Monitor for \(name)")
     }
 
     /// A centered placeholder card for the empty / failed session states.
@@ -1580,10 +1611,16 @@ enum MachineChooser {
             onSelect: { finish($0) },
             onCancel: { finish(nil) },
             onActivityMonitor: { machine in
-                // Dismiss the chooser (tearing down its probes via `finish`) and
-                // open the Activity Monitor on a freshly-dialed connection.
+                // Dismiss the chooser (tearing down its probes via `finish`),
+                // then open the monitor. This Mac uses the in-process Local
+                // source — dialing a connection to ourselves would be pointless
+                // and would fail whenever no agent is listening.
                 finish(nil)
-                RemoteActivityMonitor.presentDialing(machine: machine)
+                if let machine {
+                    RemoteActivityMonitor.presentDialing(machine: machine)
+                } else {
+                    RemoteActivityMonitor.presentLocal()
+                }
             },
             account: .shared
         )
