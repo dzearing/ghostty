@@ -786,11 +786,19 @@ struct MachineChooserView: View {
     /// row obvious, since 400% only reads as alarming next to neighbours sitting
     /// at 0. A missing meter now means exactly one thing: the agent can't serve
     /// the stream.
-    /// Width of the whole CPU column. Fixed, and reserved even when there is no
-    /// meter to draw, so every row's title starts at the same x — a column that
-    /// collapses on some rows isn't a column.
-    private static let cpuColumnWidth: CGFloat = 62
     private static let cpuBarWidth: CGFloat = 26
+
+    /// Width reserved for the percentage. Fixed, and sized for the WIDEST
+    /// reading rather than the common one: per-core CPU is uncapped, so a fully
+    /// busy 16-core machine reads "1600%". Sizing this to "0%" would let the
+    /// number grow under load and shove every title sideways — the list would
+    /// twitch exactly when something interesting is happening.
+    private static let cpuValueWidth: CGFloat = 38
+
+    /// Width of the whole CPU column, reserved even when there is no meter to
+    /// draw, so every row's title starts at the same x — a column that collapses
+    /// on some rows isn't a column.
+    private static let cpuColumnWidth: CGFloat = cpuBarWidth + 4 + cpuValueWidth
 
     @ViewBuilder
     private func cpuMeterColumn(_ session: BrowsedSession) -> some View {
@@ -812,13 +820,19 @@ struct MachineChooserView: View {
                                 .fill(tint)
                                 .frame(width: Self.cpuBarWidth * fill, height: 4)
                         }
-                    // Trailing-aligned and monospaced so the digits form a
-                    // straight edge down the column instead of ragging.
+                    // Leading-aligned in a FIXED-width slot: the number belongs
+                    // to the bar, so it sits right after it and the slack falls on
+                    // its right, against the title. Pushing it to the trailing
+                    // edge instead put the gap between bar and number and parked
+                    // the number against the title, which read as if it belonged
+                    // to the title. Monospaced digits so it does not shimmer as
+                    // the value changes.
                     Text("\(Int(pct.rounded()))%")
                         .font(.caption2)
                         .monospacedDigit()
                         .foregroundStyle(tint == .secondary ? Color.secondary : tint)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .fixedSize()
+                        .frame(width: Self.cpuValueWidth, alignment: .leading)
                 }
                 .help(cpuMeterHelp(pct))
             } else {
