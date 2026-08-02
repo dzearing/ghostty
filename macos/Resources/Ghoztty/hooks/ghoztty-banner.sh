@@ -355,7 +355,7 @@ prompt-hook)
     # task. A resumed session keeps its id, so its banner is preserved.
     session=$(printf '%s' "$input" | json_str_field session_id)
     if [ -n "$session" ] && [ "$session" != "$(read_field session)" ]; then
-        pairs+=(session "$session" title "" goal "" status "" pr "" bugs "" last "")
+        pairs+=(session "$session" title "" goal "" status "" pr "" bugs "")
     fi
 
     jq_merge "${pairs[@]}"
@@ -377,7 +377,7 @@ session-start-hook)
     [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
     # Reset task fields but keep the resolved pane cache; record the new id so
     # the prompt-hook doesn't re-wipe on this session's first prompt.
-    pairs=(title "" goal "" status "" asked "" did "" pr "" bugs "" last "" activity "")
+    pairs=(title "" goal "" status "" asked "" did "" pr "" bugs "" activity "")
     [ -n "$session" ] && pairs+=(session "$session")
     jq_merge "${pairs[@]}"
     ;;
