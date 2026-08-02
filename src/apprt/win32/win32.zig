@@ -1934,6 +1934,11 @@ pub extern "kernel32" fn ExpandEnvironmentStringsW(
 // -----------------------------------------------------------------------
 
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
+/// Broadcast by DWM when the user changes their accent color. `wparam` carries
+/// the composed colorization color, which is NOT the accent (it is blended
+/// with the afterglow and the opacity slider) — treat the message as a signal
+/// and re-read the accent from the registry (`system_colors.zig`, T305).
+pub const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
 pub const HWND_BROADCAST: HWND = @ptrFromInt(0xFFFF);
 pub const SMTO_ABORTIFHUNG: u32 = 0x0002;

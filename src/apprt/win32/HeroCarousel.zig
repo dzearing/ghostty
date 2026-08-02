@@ -13,8 +13,46 @@ const Window = @import("Window.zig");
 const Surface = @import("Surface.zig");
 const w32 = @import("win32.zig");
 const hero_math = @import("hero_math.zig");
+const chrome_theme = @import("chrome_theme.zig");
+const color_math = @import("color_math.zig");
+const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32);
+
+/// The band's own backdrop: the window background darkened ~30% toward black
+/// (Mac: black @ 0.3 alpha over the window background). Derived once here
+/// because it is BOTH what the band is filled with and the surface the accent
+/// below has to read against — two call sites deriving it separately is how
+/// the strip's `background + 20` ended up in two files.
+fn bandBackdrop(win: *Window) color_math.Rgb {
+    const bg = win.app.config.background;
+    return .{
+        .r = @intCast((@as(u16, bg.r) * 7) / 10),
+        .g = @intCast((@as(u16, bg.g) * 7) / 10),
+        .b = @intCast((@as(u16, bg.b) * 7) / 10),
+    };
+}
+
+/// The carousel's two accent states (T305). They used to be the literals
+/// `RGB(106,106,255)` and `RGB(139,92,246)` — a blue and a purple that were
+/// neither the user's accent nor each other, ported as raw numbers off Mac's
+/// `Color(0.416,0.416,1.0)` / `Color(0.545,0.361,0.965)`.
+///
+///   - `on`   — selected, and the hovered/dragged divider: the accent itself,
+///              floored to 3:1 against the band so a dark accent still reads.
+///   - `soft` — a hovered tile: the same accent stepped toward the band, so
+///              hover reads as "this could become the selection" instead of as
+///              an unrelated second hue.
+const BandAccent = struct { on: color_math.Rgb, soft: color_math.Rgb };
+
+fn bandAccent(win: *Window) BandAccent {
+    const back = bandBackdrop(win);
+    const on = chrome_theme.accentOn(back, system_colors.accentCached());
+    // Toward the band, then floored again: a hover that stepped back so far it
+    // stopped reading against the backdrop would be a hover nobody sees, which
+    // is the failure the 3:1 floor exists for.
+    return .{ .on = on, .soft = chrome_theme.accentOn(back, color_math.mix(on, back, 0.35)) };
+}
 
 /// Everything needed to place carousel tiles for the active tab.
 pub const Geometry = struct {
@@ -120,12 +158,8 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
 
     // Background: window background darkened ~30% toward black (Mac:
     // black @ 0.3 alpha over the window background).
-    const bg = win.app.config.background;
-    const bg_color = w32.RGB(
-        @intCast((@as(u16, bg.r) * 7) / 10),
-        @intCast((@as(u16, bg.g) * 7) / 10),
-        @intCast((@as(u16, bg.b) * 7) / 10),
-    );
+    const back = bandBackdrop(win);
+    const bg_color = w32.RGB(back.r, back.g, back.b);
     var full: w32.RECT = .{ .left = 0, .top = 0, .right = rw, .bottom = rh };
     if (w32.CreateSolidBrush(bg_color)) |brush| {
         _ = w32.FillRect(mem_dc, &full, brush);
@@ -142,8 +176,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         .right = @divTrunc(band_w - line_w, 2) + line_w,
         .bottom = rh,
     };
+    const div_accent = bandAccent(win).on;
     const div_color = if (win.hero_divider_hover or win.hero_divider_drag)
-        w32.RGB(106, 106, 255)
+        w32.RGB(div_accent.r, div_accent.g, div_accent.b)
     else
         w32.RGB(96, 96, 96);
     if (w32.CreateSolidBrush(div_color)) |brush| {
@@ -231,9 +266,11 @@ fn paintTile(
     }
 
     // Border on top of the content, outside the clip so the full stroke
-    // width lands. Selected: 2px accent blue (Mac 0.416,0.416,1.0).
-    // Hovered: 1px purple (Mac 0.545,0.361,0.965). Normal: 1px dim gray
-    // (Mac white 0.5 @ 0.3).
+    // width lands. Selected: 2px in the user's accent. Hovered: 1px in a
+    // softer step of the same accent — Mac paints a second hue here
+    // (0.416,0.416,1.0 vs 0.545,0.361,0.965), which was ported as two raw
+    // literals and read as an unrelated purple once the accent stopped being
+    // blue (T305). Normal: 1px dim gray (Mac white 0.5 @ 0.3).
     if (rgn) |r| {
         _ = w32.SelectClipRgn(dc, null);
         _ = w32.DeleteObject(r);
@@ -242,10 +279,11 @@ fn paintTile(
         @max(@as(i32, @intFromFloat(@round(2.0 * win.scale))), 2)
     else
         @max(@as(i32, @intFromFloat(@round(1.0 * win.scale))), 1);
+    const ba = bandAccent(win);
     const border_color = if (selected)
-        w32.RGB(106, 106, 255)
+        w32.RGB(ba.on.r, ba.on.g, ba.on.b)
     else if (hovered)
-        w32.RGB(139, 92, 246)
+        w32.RGB(ba.soft.r, ba.soft.g, ba.soft.b)
     else
         w32.RGB(110, 110, 110);
     const pen = w32.CreatePen(0, border_w, border_color) orelse return;

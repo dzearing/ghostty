@@ -111,6 +111,38 @@ fn washChannel(c: u8, toward: f32, a: f32) u8 {
     return @intFromFloat(std.math.clamp(@round(v + (toward - v) * a), 0.0, 255.0));
 }
 
+/// Alpha-composite `fg` over `bg` at `alpha`. The sibling of `wash`: `wash`
+/// picks its own destination from the background's luminance, `mix` is told
+/// one. GDI has no alpha for flat fills, so every such blend is resolved up
+/// front and drawn as an opaque color.
+///
+/// Hoisted here in T305 for the same reason `wash` was in T304 — it was a
+/// private copy in `chooser_rows.blend`, and the carousel needed a second one.
+pub fn mix(bg: Rgb, fg: Rgb, alpha: f64) Rgb {
+    const a = std.math.clamp(alpha, 0.0, 1.0);
+    return .{
+        .r = mixChannel(bg.r, fg.r, a),
+        .g = mixChannel(bg.g, fg.g, a),
+        .b = mixChannel(bg.b, fg.b, a),
+    };
+}
+
+fn mixChannel(bg: u8, fg: u8, a: f64) u8 {
+    const v = @as(f64, @floatFromInt(bg)) * (1.0 - a) + @as(f64, @floatFromInt(fg)) * a;
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 255.0)));
+}
+
+test "mix: the endpoints are the endpoints, and the midpoint is between them" {
+    const black: Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    const white: Rgb = .{ .r = 255, .g = 255, .b = 255 };
+    try testing.expectEqual(black, mix(black, white, 0.0));
+    try testing.expectEqual(white, mix(black, white, 1.0));
+    try testing.expectEqual(Rgb{ .r = 128, .g = 128, .b = 128 }, mix(black, white, 0.5));
+    // Out-of-range alphas clamp rather than wrap a channel.
+    try testing.expectEqual(black, mix(black, white, -1.0));
+    try testing.expectEqual(white, mix(black, white, 2.0));
+}
+
 pub const Hsb = struct { h: f64, s: f64, b: f64 };
 
 pub fn rgbToHsb(rgb: Rgb) Hsb {

@@ -5400,3 +5400,60 @@ P1-P3 ALL PASS. Because `wash` changed two shipping call sites, the two pixel
 scripts that render them ran too: `tab-strip.ps1` ALL PASS (56),
 `pane-banner.ps1` ALL PASS (67). No surface consumes the palette yet - that is
 T305, and it is what makes any of this visible.
+
+## 2026-08-01 - T305 (T203 split): the chrome consumes the palette, and the test that measured a color nobody picked
+
+T304 landed `chrome_theme.zig` with nothing consuming it. This turn wired every
+win32 chrome surface to it: `Window.chromePalette()` is the one resolution site,
+and `paintTabBar` / `paintCaption` both read a single `Palette` instead of the
+eight literals they held between them. `chooser_rows.accent` (`#3D8EF8`) and
+`ActivityMonitor.COLOR_ACCENT` (`RGB(80,160,235)`) - two files, two different
+blues, neither the user's - are gone, along with the carousel's ported
+`RGB(106,106,255)` / `RGB(139,92,246)` pair. Accent changes arrive as
+`WM_DWMCOLORIZATIONCOLORCHANGED`, which drops the cache and invalidates the
+chrome; `WM_SETTINGCHANGE` was extended rather than duplicated.
+
+**T274 is discharged by it and marked done.** That task asked for exactly this
+module and named its own failure case: at `background = ffffff` the `+ 20`
+arithmetic clamps the band to pure white and the frozen `RGB(230,230,230)` title
+measures 1.25:1. Measured after: band `#EBEBEB`, title **14.89:1**. Scored at
+`#f3f3f3` and `#1e1e1e` too, each against the value the app's own rule derives
+rather than a pasted constant.
+
+Two findings are worth more than the wiring.
+
+**The task's validation asked for a pixel that does not exist.** T305 specified
+sampling the ACTIVE-TAB INDICATOR and asserting it tracks the accent. The tab
+strip paints no accent at all - a tab's fill is `tab_shape.fillColor` off the
+strip and content backgrounds - and adding one is precisely what T304's "the
+dark strip must not visibly move" note forbids. Satisfying the step as written
+would have meant inventing the pixel to measure. The claim is scored on a
+surface that really does paint the accent (the Activity Monitor's active card)
+and the correction is recorded in the task and in the script header, because a
+validation step a correct build cannot satisfy is a defect in the task.
+
+**A test asserted a color nobody picked, and only a personalized box could tell.**
+`ipc-machine-chooser.ps1` probes the selection pill with `b - r >= 25` - a BLUE
+tint - which silently depended on `chooser_rows.accent` being `#3D8EF8`. The
+moment the accent became a system setting the probe read `b - r = 6` against
+this box's real `#680081` and failed a correct build. The fix is not a looser
+threshold: the script now PINS the accent it measures and restores it in a
+`finally`. An oracle for a system-derived pixel has to state its input, which is
+the T174 rule reaching an input that only became one today.
+
+The new script is `test/win32/chrome-theme.ps1` (ALL PASS, 34). Its strongest
+pair is the cache: the registry is moved with NO notification and the panel must
+still paint the OLD accent, and only then does the posted message make the next
+one paint the new one. Without that first half, B3 would pass just as well
+against a per-paint registry read that never needed invalidating.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0, `test-agent` exit 0.
+P1-P3 ALL PASS. Regression across every script that renders the touched chrome:
+`tab-strip` (56), `caption-bar` (17), `pane-banner` (67), `chrome-merged-row`
+(19), `menu-bar` (71), `tab-color` (16), `activity-monitor` (82), `hero-mode`
+(63), `ipc-machine-chooser` (45). `-NegativeControl` fails 1 of 34, and the
+box's accent is verified restored after every run including that one.
+Follow-ups: T307 (an open panel does not repaint on an accent change), T308 (the
+panels are still hardcoded dark), T309 (two derivations of the light/dark
+decision).

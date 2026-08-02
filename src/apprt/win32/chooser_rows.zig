@@ -17,7 +17,8 @@ const std = @import("std");
 
 /// Re-exported so callers get the row palette and its color type from one
 /// import.
-pub const Rgb = @import("color_math.zig").Rgb;
+const color_math = @import("color_math.zig");
+pub const Rgb = color_math.Rgb;
 
 /// Shape-coded reachability of a row, mirroring Mac's `statusIndicator`:
 /// online is a filled dot, offline a hollow ring, and `none` reserves the
@@ -214,55 +215,50 @@ pub fn clampHintLines(measured: i32) i32 {
 /// the blend is done up front and drawn as an opaque color (the same trick
 /// `banner_card.zig` uses for the glass card).
 pub fn blend(bg: Rgb, fg: Rgb, alpha: f64) Rgb {
-    const a = std.math.clamp(alpha, 0.0, 1.0);
-    return .{
-        .r = mix(bg.r, fg.r, a),
-        .g = mix(bg.g, fg.g, a),
-        .b = mix(bg.b, fg.b, a),
-    };
+    return color_math.mix(bg, fg, alpha);
 }
 
-fn mix(bg: u8, fg: u8, a: f64) u8 {
-    const v = @as(f64, @floatFromInt(bg)) * (1.0 - a) + @as(f64, @floatFromInt(fg)) * a;
-    return @intFromFloat(@round(std.math.clamp(v, 0.0, 255.0)));
-}
-
-/// The app's accent blue — the same value the tab bar's active-tab line uses,
-/// so the chooser's selection matches the rest of the window chrome.
-pub const accent: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
 /// Mac's `.green` for an online device.
 pub const online_green: Rgb = .{ .r = 0x34, .g = 0xC7, .b = 0x59 };
 /// The "secondary" gray Mac uses for offline rings, glyphs and sublines.
 pub const secondary_gray: Rgb = .{ .r = 0x99, .g = 0x99, .b = 0x99 };
 
-/// Selection fill: accent at Mac's 0.25 over the row background.
-pub fn selectionFill(bg: Rgb) Rgb {
+/// Selection fill: the accent at Mac's 0.25 over the row background.
+///
+/// `accent` is a PARAMETER since T305. It used to be a `pub const` here
+/// spelling `#3D8EF8` — a blue nobody picked, and a second one
+/// (`RGB(80,160,235)`) lived in `ActivityMonitor.zig`. Callers pass
+/// `system_colors.accentCached()`, already floored to 3:1 against the surface
+/// by `chrome_theme.resolve`, so this module composites and never clamps.
+pub fn selectionFill(bg: Rgb, accent: Rgb) Rgb {
     return blend(bg, accent, 0.25);
 }
 
 /// Selection border — a stronger accent so the highlighted row still reads as
 /// selected against a dark background at low fill opacity.
-pub fn selectionBorder(bg: Rgb) Rgb {
+pub fn selectionBorder(bg: Rgb, accent: Rgb) Rgb {
     return blend(bg, accent, 0.7);
 }
 
-/// Hover wash: Mac's `Color.primary.opacity(0.06)`, which on a dark surface is
-/// white at 6%.
+/// Hover wash: Mac's `Color.primary.opacity(0.06)`. `Color.primary` is white
+/// on a dark surface and BLACK on a light one, so this is `color_math.wash`,
+/// not a blend toward a hardcoded white — that literal was the same defect as
+/// the strip's `background + 20`, one surface further in.
 pub fn hoverFill(bg: Rgb) Rgb {
-    return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.06);
+    return color_math.wash(bg, 0.06);
 }
 
 /// The master column's backing wash — Mac's `Color.primary.opacity(0.035)`
 /// behind the machine list (MachineChooserView.swift:260). Faint on purpose:
 /// it separates the column from the detail pane without becoming a panel.
 pub fn columnWash(bg: Rgb) Rgb {
-    return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.035);
+    return color_math.wash(bg, 0.035);
 }
 
 /// The hairline rules between the account row, the two columns and the footer
 /// (Mac's `Divider()`).
 pub fn dividerColor(bg: Rgb) Rgb {
-    return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.14);
+    return color_math.wash(bg, 0.14);
 }
 
 // ---------------------------------------------------------------------
@@ -404,12 +400,32 @@ test "dividerColor reads above the wash it separates" {
 
 test "selection and hover sit between the background and their source color" {
     const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
-    const sel = selectionFill(bg);
+    const accent: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
+    const sel = selectionFill(bg, accent);
     try testing.expect(sel.b > bg.b and sel.b < accent.b);
     // The border is more accent than the fill, so the row reads as selected.
-    try testing.expect(selectionBorder(bg).b > sel.b);
+    try testing.expect(selectionBorder(bg, accent).b > sel.b);
     // The hover wash is a nudge, not a highlight: dimmer than the selection.
     const hov = hoverFill(bg);
     try testing.expect(hov.r > bg.r);
     try testing.expect(hov.b < sel.b);
+}
+
+test "selection tracks the accent it is given, and the washes follow luminance" {
+    // The whole point of T305's parameterization: two different accents must
+    // produce two different selections. A module that still held its own blue
+    // would pass every test above and none of this one.
+    const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
+    const blue: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
+    const purple: Rgb = .{ .r = 0x68, .g = 0x00, .b = 0x81 };
+    try testing.expect(!selectionFill(bg, blue).eql(selectionFill(bg, purple)));
+    try testing.expect(selectionFill(bg, purple).r > selectionFill(bg, blue).r);
+    try testing.expect(selectionFill(bg, purple).g < selectionFill(bg, blue).g);
+
+    // And the three washes reverse direction on a light surface instead of
+    // heading for white regardless, which is what `blend(bg, white, a)` did.
+    const light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
+    try testing.expect(hoverFill(light).r < light.r);
+    try testing.expect(columnWash(light).r < light.r);
+    try testing.expect(dividerColor(light).r < columnWash(light).r);
 }

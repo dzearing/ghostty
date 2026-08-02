@@ -113,6 +113,8 @@ const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
 const icon_button = @import("icon_button.zig");
 const icon_button_paint = @import("icon_button_paint.zig");
+const chrome_theme = @import("chrome_theme.zig");
+const system_colors = @import("system_colors.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const NewProcessDialog = @import("NewProcessDialog.zig");
 const Scrollbar = @import("Scrollbar.zig");
@@ -211,7 +213,25 @@ const COLOR_CARD_BORDER = w32.RGB(130, 130, 130);
 /// The active card: Mac's accent fill + accent border. The border reads 3.1:1
 /// against its own fill and 5.9:1 against the panel.
 const COLOR_CARD_SELECT_BG = COLOR_SELECT;
-const COLOR_ACCENT = w32.RGB(80, 160, 235);
+
+/// The user's accent, read once per painted card (T305). This was
+/// `w32.RGB(80, 160, 235)` — the SECOND invented blue in the tree, differing
+/// from `chooser_rows.accent`'s `#3D8EF8` by enough to see when the chooser
+/// and this panel were open together, and neither of them the color the user
+/// picked in Settings.
+///
+/// A function rather than a `const` because the value is a registry read and
+/// container-level consts are comptime; `system_colors` caches it and drops
+/// the cache on `WM_DWMCOLORIZATIONCOLORCHANGED`. Floored to 3:1 against the
+/// card it outlines, so a dark accent on this panel's dark card still reads as
+/// a border.
+fn accentColor() u32 {
+    const a = chrome_theme.accentOn(
+        .{ .r = 44, .g = 44, .b = 44 }, // COLOR_CARD_BG, as an Rgb
+        system_colors.accentCached(),
+    );
+    return w32.RGB(a.r, a.g, a.b);
+}
 /// Secondary text has to brighten on the accent fill: `COLOR_SECONDARY` is
 /// 4.7:1 on the resting card but only 2.9:1 on the selected one, which is under
 /// the 4.5:1 floor. Same role, two surfaces, two values.
@@ -2140,7 +2160,7 @@ fn paintCard(
         COLOR_CARD_HOVER
     else
         COLOR_CARD_BG;
-    const border_color: u32 = if (is_active) COLOR_ACCENT else COLOR_CARD_BORDER;
+    const border_color: u32 = if (is_active) accentColor() else COLOR_CARD_BORDER;
     const border_w: i32 = if (is_active) @max(2, px(2, self.scale)) else @max(1, px(1, self.scale));
 
     roundRect(hdc, r, radius, fill_color, border_color, border_w);
@@ -2157,7 +2177,7 @@ fn paintCard(
             .right = r.right + pad,
             .bottom = r.bottom + pad,
         };
-        strokeRoundRect(hdc, ring, radius + pad, COLOR_ACCENT, @max(2, px(2, self.scale)));
+        strokeRoundRect(hdc, ring, radius + pad, accentColor(), @max(2, px(2, self.scale)));
     }
 
     const c = layout_mod.cardContent(r, self.scale);

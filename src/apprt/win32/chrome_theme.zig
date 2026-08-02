@@ -138,24 +138,40 @@ pub const Palette = struct {
     on_danger: Rgb,
 };
 
+/// Primary chrome text for a surface that is NOT the bar — the owner-drawn
+/// STATIC popups (hovered-URL preview, resize overlay) sit directly on the
+/// terminal background, so clamping their label against `bar` would be
+/// clamping it against a surface it does not touch.
+///
+/// Exported so those callers ask this module rather than re-deriving the ramp
+/// and the floor; `resolve` answers the bar's own text with the same function,
+/// which is what keeps the two from drifting.
+pub fn textOn(surface: Rgb) Rgb {
+    return color_math.contrastAdjusted(color_math.wash(surface, text_wash), surface);
+}
+
+/// The accent as drawn on a surface that is NOT the bar — the chooser's row
+/// pill, the Activity Monitor's active card. Same floor and the same search as
+/// `resolve`, so a surface that is not the tab strip still gets the user's
+/// color clamped exactly once, in this module.
+pub fn accentOn(surface: Rgb, accent: Rgb) Rgb {
+    return color_math.contrastAdjustedTo(accent, surface, ui_contrast_target);
+}
+
 pub fn resolve(chrome_bg: Rgb, accent: Rgb) Palette {
     const bar = color_math.wash(chrome_bg, bar_wash);
     return .{
         .bar = bar,
         .hover = color_math.wash(bar, hover_wash),
-        .text = color_math.contrastAdjusted(color_math.wash(bar, text_wash), bar),
+        .text = textOn(bar),
         .text_secondary = color_math.contrastAdjusted(
             color_math.wash(bar, text_secondary_wash),
             bar,
         ),
-        .accent = color_math.contrastAdjustedTo(accent, bar, ui_contrast_target),
-        .on_accent = color_math.contrastForeground(
-            color_math.contrastAdjustedTo(accent, bar, ui_contrast_target),
-        ),
-        .danger = color_math.contrastAdjustedTo(danger_base, bar, ui_contrast_target),
-        .on_danger = color_math.contrastForeground(
-            color_math.contrastAdjustedTo(danger_base, bar, ui_contrast_target),
-        ),
+        .accent = accentOn(bar, accent),
+        .on_accent = color_math.contrastForeground(accentOn(bar, accent)),
+        .danger = accentOn(bar, danger_base),
+        .on_danger = color_math.contrastForeground(accentOn(bar, danger_base)),
     };
 }
 

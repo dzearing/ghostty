@@ -50,6 +50,8 @@ const ConfirmDialog = @import("ConfirmDialog.zig");
 const HostSettingsDialog = @import("HostSettingsDialog.zig");
 const host_defaults = @import("host_defaults.zig");
 const chooser_rows = @import("chooser_rows.zig");
+const chrome_theme = @import("chrome_theme.zig");
+const system_colors = @import("system_colors.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
@@ -1335,13 +1337,16 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
 
     if (selected or hovered) {
+        // The user's accent, floored to 3:1 against the row it composites over
+        // (T305). It used to be `chooser_rows.accent`, the literal `#3D8EF8`.
+        const accent = chrome_theme.accentOn(ROW_BG, system_colors.accentCached());
         const fill = if (selected)
-            chooser_rows.selectionFill(ROW_BG)
+            chooser_rows.selectionFill(ROW_BG, accent)
         else
             chooser_rows.hoverFill(ROW_BG);
         const brush = w32.CreateSolidBrush(rgb(fill));
         const pen = if (selected)
-            w32.CreatePen(w32.PS_SOLID, 1, rgb(chooser_rows.selectionBorder(ROW_BG)))
+            w32.CreatePen(w32.PS_SOLID, 1, rgb(chooser_rows.selectionBorder(ROW_BG, accent)))
         else
             w32.CreatePen(w32.PS_SOLID, 1, rgb(fill));
         if (brush != null and pen != null) {

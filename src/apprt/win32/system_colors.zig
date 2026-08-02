@@ -54,6 +54,46 @@ pub fn accentOrDefault() Rgb {
     return accent() orelse chrome_theme.default_accent;
 }
 
+/// The cached accent, and the only entry point a PAINT path should call.
+///
+/// Two registry opens per painted control is the wrong shape for a value that
+/// changes when the user visits Settings and never otherwise, and T305's
+/// instruction is explicit: invalidate the chrome on the change notification
+/// rather than re-read it on every paint. `invalidate()` is called from
+/// `WM_DWMCOLORIZATIONCOLORCHANGED` (the accent itself) and
+/// `WM_SETTINGCHANGE` (the light/dark flip, which arrives separately and can
+/// carry an accent change with it).
+///
+/// Single-threaded by construction: every caller is on the UI thread, inside a
+/// window procedure or a paint it drives. There is no lock because there is no
+/// second thread that may read it, and adding one would imply otherwise.
+var cached_accent: ?Rgb = null;
+
+pub fn accentCached() Rgb {
+    if (cached_accent) |c| return c;
+    const c = accentOrDefault();
+    cached_accent = c;
+    return c;
+}
+
+pub fn invalidate() void {
+    cached_accent = null;
+}
+
+test "accentCached: first read populates, invalidate forces a re-read" {
+    const testing = std.testing;
+    invalidate();
+    try testing.expect(cached_accent == null);
+    const first = accentCached();
+    try testing.expectEqual(first, cached_accent.?);
+    // Same answer from the cache as from the live read — the cache may not be
+    // a different value, only a cheaper one.
+    try testing.expectEqual(accentOrDefault(), accentCached());
+    invalidate();
+    try testing.expect(cached_accent == null);
+    try testing.expectEqual(first, accentCached());
+}
+
 test "accentOrDefault falls back exactly when the system does not answer" {
     // Runs on the box, so it exercises the real registry read — but it cannot
     // assert a PARTICULAR accent without failing on anyone else's machine.

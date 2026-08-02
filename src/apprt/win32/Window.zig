@@ -89,6 +89,8 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const tab_shape = @import("tab_shape.zig");
 const color_math = @import("color_math.zig");
+const chrome_theme = @import("chrome_theme.zig");
+const system_colors = @import("system_colors.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
 const window_memory = @import("window_memory.zig");
@@ -434,6 +436,47 @@ pub fn systemUsesLightTheme() bool {
         w32.ERROR_SUCCESS) return true;
     if (kind != w32.REG_DWORD) return true;
     return val != 0; // 0 = dark, nonzero = light
+}
+
+/// Every flat color this window's chrome paints, resolved once per paint from
+/// the same two inputs the OS has: the surface the chrome sits on (per
+/// `window-theme`) and the accent the user picked (T305).
+///
+/// One call site per paint, deliberately. The colors in a `chrome_theme.
+/// Palette` are only correct relative to each other, so a painter that
+/// resolved half of them here and half from a literal is back to the three
+/// disagreeing answers T203 was filed against.
+///
+/// The accent read is `system_colors.accentCached()` — the registry is not
+/// touched per paint; `WM_DWMCOLORIZATIONCOLORCHANGED` and `WM_SETTINGCHANGE`
+/// drop the cache and invalidate the chrome instead.
+fn chromePalette(self: *const Window) chrome_theme.Palette {
+    const bg = self.app.config.background;
+    return chrome_theme.resolve(
+        chrome_theme.chromeBase(
+            self.app.config.@"window-theme",
+            .{ .r = bg.r, .g = bg.g, .b = bg.b },
+            systemUsesLightTheme(),
+        ),
+        system_colors.accentCached(),
+    );
+}
+
+/// Repaint every chrome surface this window owns, after the palette's inputs
+/// moved under it. Invalidate rather than paint: the caption and the strip are
+/// two disjoint blits of one row (T205), and re-entering both painters from a
+/// notification handler would run them outside the WM_PAINT ordering they were
+/// written for.
+fn invalidateChrome(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &r) == 0) return;
+    // The whole chrome row: the caption band plus the strip under it. Both
+    // heights are 0 when the surface in question is not shown, so this is the
+    // correct rect on a caption-less or strip-less window too.
+    r.bottom = @min(r.bottom, self.captionHeight() + self.tabBarHeight());
+    if (r.bottom <= r.top) return;
+    _ = w32.InvalidateRect(hwnd, &r, 0);
 }
 
 /// Apply the DWM dark/light title bar, honoring `window-theme`: dark/light
@@ -3215,13 +3258,15 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         _ = w32.DeleteObject(mem_bmp);
     }
 
-    // Same derivation as the strip's `bar_*`: terminal background + 20 per
-    // channel. Not a second constant — a caption that shaded from its own
-    // number would be a visibly different grey one row above the strip.
-    const bg = self.app.config.background;
-    const cap_r: u8 = @min(@as(u16, bg.r) + 20, 255);
-    const cap_g: u8 = @min(@as(u16, bg.g) + 20, 255);
-    const cap_b: u8 = @min(@as(u16, bg.b) + 20, 255);
+    // Same source as the strip's band: `chromePalette().bar`. Not a second
+    // constant and no longer a second derivation — a caption that shaded from
+    // its own number would be a visibly different grey one row above the
+    // strip, which is what `background + 20` computed here and there used to
+    // risk on every edit.
+    const pal = self.chromePalette();
+    const cap_r: u8 = pal.bar.r;
+    const cap_g: u8 = pal.bar.g;
+    const cap_b: u8 = pal.bar.b;
 
     var band = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = cap_h };
     if (w32.CreateSolidBrush(w32.RGB(cap_r, cap_g, cap_b))) |brush| {
@@ -3243,7 +3288,7 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
             // background matches the strip's: one chrome surface, one text
             // color. A caption that picked its own grey would read as a
             // different app's titlebar.
-            _ = w32.SetTextColor(mem_dc, w32.RGB(230, 230, 230));
+            _ = w32.SetTextColor(mem_dc, w32.RGB(pal.text.r, pal.text.g, pal.text.b));
             var tr = stripRect(l.title);
             _ = w32.DrawTextW(
                 mem_dc,
@@ -3293,17 +3338,20 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         // the desktop that does not warn. The glyph flips to white on it,
         // which clears 4.5:1 against #C42B1C.
         const red_hover = btn.b == .close and state != .normal;
-        const base_r: u8 = if (red_hover) 196 else cap_r;
-        const base_g: u8 = if (red_hover) 43 else cap_g;
-        const base_b: u8 = if (red_hover) 28 else cap_b;
-        const glyph_color = if (red_hover) w32.RGB(255, 255, 255) else w32.RGB(230, 230, 230);
+        const base_r: u8 = if (red_hover) pal.danger.r else cap_r;
+        const base_g: u8 = if (red_hover) pal.danger.g else cap_g;
+        const base_b: u8 = if (red_hover) pal.danger.b else cap_b;
+        const glyph_color = if (red_hover)
+            w32.RGB(pal.on_danger.r, pal.on_danger.g, pal.on_danger.b)
+        else
+            w32.RGB(pal.text.r, pal.text.g, pal.text.b);
 
         // The red fill has to land BEFORE the glyph, and it is not a shade of
         // the caption background, so it cannot come out of `fillDelta`. The
         // glyph pass is still the shared one — the fill is the only thing
         // that differs, which is the smallest divergence that expresses the
         // rule.
-        if (red_hover) paintCaptionRedFill(mem_dc, m, btn.rect, state == .pressed);
+        if (red_hover) paintCaptionRedFill(mem_dc, m, btn.rect, state == .pressed, pal.danger);
         paintIconButton(
             mem_dc,
             m.ib,
@@ -3332,17 +3380,23 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
 /// The close button's red hover/pressed fill: the same rounded rect
 /// `paintIconButton` draws, in Windows' close red (#C42B1C, darkened for
 /// pressed the way every other button firms up).
+///
+/// `danger` comes from the palette rather than the literal that used to be
+/// spelled here, so this fill and the tab strip's close-hover glyph are the
+/// same red — they were `#C42B1C` and `RGB(232,65,65)` — and so the one
+/// destructive color in the chrome still clears 3:1 against a light bar.
 fn paintCaptionRedFill(
     mem_dc: w32.HDC,
     m: caption_layout.Metrics,
     box: caption_layout.Rect,
     pressed: bool,
+    danger: chrome_theme.Rgb,
 ) void {
     const d: i32 = if (pressed) -25 else 0;
     const color = w32.RGB(
-        icon_button.shadeChannel(196, d),
-        icon_button.shadeChannel(43, d),
-        icon_button.shadeChannel(28, d),
+        icon_button.shadeChannel(danger.r, d),
+        icon_button.shadeChannel(danger.g, d),
+        icon_button.shadeChannel(danger.b, d),
     );
     const rr = icon_button.fillRegion(m.ib, box);
     const rgn = w32.CreateRoundRectRgn(rr.left, rr.top, rr.right, rr.bottom, rr.ellipse, rr.ellipse) orelse return;
@@ -3478,18 +3532,24 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         return;
 
     // --- Colors ---
+    //
+    // All of them from ONE `chrome_theme.Palette` (T305). The strip used to
+    // derive its band as `background + 20` per channel and then spell four
+    // greys and a red as literals — an arithmetic that clamps toward white on
+    // a light background (band, hover and active converge) and a text ramp
+    // that cannot follow it. The wash direction now follows the chrome
+    // background's own luminance and every color carries a contrast floor.
     const bg = self.app.config.background;
-    // Bar background: terminal bg + 20 brightness per channel (slightly lighter).
-    const bar_r: u8 = @min(@as(u16, bg.r) + 20, 255);
-    const bar_g: u8 = @min(@as(u16, bg.g) + 20, 255);
-    const bar_b: u8 = @min(@as(u16, bg.b) + 20, 255);
-    // Hover background: bar bg + 15 more (total +35 from terminal bg). Still
-    // the base an icon button's fill shades from; the TABS' own hover is
-    // `tab_shape.Surface.hovered` now, which lifts a surface rather than
-    // swapping a flat color.
-    const hover_r: u8 = @min(@as(u16, bar_r) + 15, 255);
-    const hover_g: u8 = @min(@as(u16, bar_g) + 15, 255);
-    const hover_b: u8 = @min(@as(u16, bar_b) + 15, 255);
+    const pal = self.chromePalette();
+    const bar_r: u8 = pal.bar.r;
+    const bar_g: u8 = pal.bar.g;
+    const bar_b: u8 = pal.bar.b;
+    // The base an icon button's fill shades from; the TABS' own hover is
+    // `tab_shape.Surface.hovered`, which lifts a surface rather than swapping
+    // a flat color.
+    const hover_r: u8 = pal.hover.r;
+    const hover_g: u8 = pal.hover.g;
+    const hover_b: u8 = pal.hover.b;
 
     // NOTE: the selected tab's fill and the inter-tab hairline used to be
     // computed here. T206 moved both into `tab_shape.zig` — the fill because
@@ -3497,12 +3557,17 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // hairline because gaps replaced it.
 
     // Text colors.
-    const active_text_color = w32.RGB(230, 230, 230);
-    const inactive_text_color = w32.RGB(150, 150, 150);
+    const active_text_color = w32.RGB(pal.text.r, pal.text.g, pal.text.b);
+    const inactive_text_color = w32.RGB(
+        pal.text_secondary.r,
+        pal.text_secondary.g,
+        pal.text_secondary.b,
+    );
 
-    // Close button colors.
-    const close_normal_color = w32.RGB(150, 150, 150);
-    const close_hover_color = w32.RGB(232, 65, 65);
+    // Close button colors. The hover red is the palette's `danger`, i.e. the
+    // same red the caption's close button fills with.
+    const close_normal_color = inactive_text_color;
+    const close_hover_color = w32.RGB(pal.danger.r, pal.danger.g, pal.danger.b);
 
     // --- Fill bar background ---
     // Straight into the DIB rather than FillRect: the tab compositing below
@@ -4984,7 +5049,25 @@ pub fn windowWndProc(
                 window.app.config.@"window-theme",
                 window.app.config.background,
             );
+            // The client-painted chrome derives from the same light/dark
+            // signal (`chrome_theme.chromeBase` under `window-theme = system`),
+            // and a personalization change can carry the accent with it — so
+            // drop the cached accent and repaint rather than waiting for the
+            // next thing that happens to invalidate the row (T305).
+            system_colors.invalidate();
+            window.invalidateChrome();
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // The accent itself changed. DWM hands the new color in wparam,
+            // but as the COMPOSED colorization value (blended with the
+            // afterglow and the opacity slider) — a different quantity from
+            // the accent, and the reason `system_colors` reads the registry
+            // instead. So this message is used only as the SIGNAL: drop the
+            // cache, let the next paint read the authoritative value.
+            system_colors.invalidate();
+            window.invalidateChrome();
+            return 0;
         },
         w32.WM_GETOBJECT => {
             // Opt out of MSAA accessibility for OBJID_CLIENT on the
@@ -5022,12 +5105,22 @@ pub fn windowWndProc(
         },
 
         w32.WM_CTLCOLORSTATIC => {
-            // Dark theming for the STATIC popups owned by this window
-            // (hovered-URL link preview, resize overlay). Static controls
-            // send this to their owner, i.e. here — not to surfaceWndProc.
+            // Theming for the STATIC popups owned by this window (hovered-URL
+            // link preview, resize overlay). Static controls send this to
+            // their owner, i.e. here — not to surfaceWndProc.
+            //
+            // The colors used to be the literals `RGB(220,220,220)` on
+            // `RGB(45,45,45)` — hardcoded dark, and worse, a background that
+            // DISAGREED with the brush actually returned below (the terminal
+            // background). On a light terminal the label was pale grey on the
+            // light pane, i.e. invisible. Both now come from the surface the
+            // control really sits on (T305).
             const hdc_static: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_static, w32.RGB(220, 220, 220));
-            _ = w32.SetBkColor(hdc_static, w32.RGB(45, 45, 45));
+            const sbg = window.app.config.background;
+            const surface: chrome_theme.Rgb = .{ .r = sbg.r, .g = sbg.g, .b = sbg.b };
+            const fg = chrome_theme.textOn(surface);
+            _ = w32.SetTextColor(hdc_static, w32.RGB(fg.r, fg.g, fg.b));
+            _ = w32.SetBkColor(hdc_static, w32.RGB(surface.r, surface.g, surface.b));
             if (window.app.bg_brush) |brush| {
                 return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
             }

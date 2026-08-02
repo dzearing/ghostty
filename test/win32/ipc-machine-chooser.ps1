@@ -254,6 +254,31 @@ Remove-Item $errlog -ErrorAction SilentlyContinue
 $acctDir = Join-Path $env:TEMP "ghoztty-mc-acct-$PID"
 $acctDir2 = Join-Path $env:TEMP "ghoztty-mc-acct2-$PID"
 
+# --- Pin the accent the selection pill is drawn from (T305) -----------------
+#
+# The pill is `chooser_rows.selectionFill(ROW_BG, accent)` and `accent` is the
+# USER'S, read from HKCU\...\DWM\AccentColor. So a probe of the pill is a probe
+# of a system setting, and it has to state its input: #3D8EF8 is the literal
+# `chooser_rows.accent` used to hold, it clears the 3:1 floor against ROW_BG
+# unassisted (so `chrome_theme.accentOn` hands it back untouched), and it is
+# what the b-r assertions below were written against.
+#
+# Restored - the original value, or its ABSENCE - in the `finally`, so a
+# mid-script failure cannot leave the box repainted (T179). PS5.1 reads a
+# REG_DWORD with the top bit set as a value that does not fit Int32, hence the
+# byte round-trip rather than a cast.
+$DWM_KEY = 'HKCU:\Software\Microsoft\Windows\DWM'
+$origAccent = $null
+$hadAccent = $false
+$p = Get-ItemProperty -Path $DWM_KEY -Name AccentColor -ErrorAction SilentlyContinue
+if ($null -ne $p) {
+    $hadAccent = $true
+    $origAccent = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$p.AccentColor), 0)
+}
+# ABGR, little-endian: bytes R,G,B,FF IS the 0xAABBGGRR DWORD.
+Set-ItemProperty -Path $DWM_KEY -Name AccentColor -Type DWord `
+    -Value ([BitConverter]::ToInt32([byte[]]@(0x3D, 0x8E, 0xF8, 0xFF), 0))
+
 Stop-DebugGhoztty
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
@@ -323,6 +348,12 @@ try {
         $pill = Get-ShotPixel $shot ($lr.Left + 14) $yRow0
         $unsel = Get-ShotPixel $shot ($lr.Left + 14) $yRow1
 
+        # The tint is measured as b-r because the accent this run SET (below)
+        # is blue. Before T305 the accent was a literal in `chooser_rows.zig`
+        # and this probe silently depended on it; now it is a system setting,
+        # so the script pins the input it measures instead of scoring whatever
+        # this box happens to be personalized to (which is #680081 here, and
+        # made b-r = 6 - a correct build reading as a failure).
         $gutterTint = $gutter[2] - $gutter[0]
         $pillTint = $pill[2] - $pill[0]
         $unselTint = $unsel[2] - $unsel[0]
@@ -487,6 +518,11 @@ try {
         Assert (-not ($g2.App.Process -and $g2.App.Process.HasExited)) 'app survived the signed-out chooser'
     }
 } finally {
+    if ($hadAccent) {
+        Set-ItemProperty -Path $DWM_KEY -Name AccentColor -Value $origAccent -Type DWord
+    } else {
+        Remove-ItemProperty -Path $DWM_KEY -Name AccentColor -ErrorAction SilentlyContinue
+    }
     Remove-TestDesktop
     Stop-DebugGhoztty
     Stop-Job $dirJob -ErrorAction SilentlyContinue
