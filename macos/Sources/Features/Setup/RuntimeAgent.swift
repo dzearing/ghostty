@@ -22,19 +22,6 @@ enum RuntimeAgent: String, CaseIterable, Sendable {
         }
     }
 
-    /// Whether Ghoztty offers to set this runtime up in first-launch and the
-    /// manage UI. Copilot's per-turn instruction envelope and normalizer keys
-    /// are unverified against a live hook (see agent-integration review H3), so
-    /// it is gated off until a real payload is captured and the fix is verified.
-    /// Existing installs are unaffected — they still surface in the manage panel
-    /// and can be removed.
-    var isOffered: Bool {
-        switch self {
-        case .claude: true
-        case .copilot: false
-        }
-    }
-
     func configDirectoryURL(homeDirectoryURL: URL) -> URL {
         homeDirectoryURL.appendingPathComponent(configDirectoryName, isDirectory: true)
     }

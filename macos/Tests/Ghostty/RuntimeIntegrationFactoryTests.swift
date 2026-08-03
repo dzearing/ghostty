@@ -10,16 +10,11 @@ struct RuntimeIntegrationFactoryTests {
         return url
     }
 
-    @Test func availabilityFollowsConfigDirAndOfferGate() throws {
+    @Test func availabilityFollowsConfigDir() throws {
         let home = try tempHome()
         #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default).isEmpty)
-        // Copilot is detectable but gated off (isOffered == false), so it is
-        // never offered even when its config dir exists (H3).
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default).isEmpty)
-        // Claude is offered once its config dir exists.
-        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
-        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default) == [.claude])
+        #expect(RuntimeIntegrationFactory.availableAgents(homeDirectoryURL: home, fileManager: .default) == [.copilot])
     }
 
     // H2: the banner must be ordered before the hooks component, and hooks must

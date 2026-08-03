@@ -7,7 +7,6 @@ enum RuntimeIntegrationFactory {
 
     static func availableAgents(homeDirectoryURL: URL, fileManager: FileManager) -> [RuntimeAgent] {
         RuntimeAgent.allCases.filter { agent in
-            guard agent.isOffered else { return false }
             var isDir: ObjCBool = false
             let exists = fileManager.fileExists(atPath: agent.configDirectoryURL(homeDirectoryURL: homeDirectoryURL).path, isDirectory: &isDir)
             return exists && isDir.boolValue

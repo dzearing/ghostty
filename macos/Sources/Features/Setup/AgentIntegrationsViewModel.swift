@@ -28,10 +28,6 @@ final class AgentIntegrationsViewModel: ObservableObject {
         let prior = Dictionary(rows.map { ($0.agent, $0) }, uniquingKeysWith: { a, _ in a })
         rows = AgentIntegrationService
             .allAgentStatuses(homeDirectoryURL: homeDirectoryURL)
-            // Gated runtimes (isOffered == false) are hidden unless already
-            // installed, so an existing install stays manageable (updatable /
-            // removable) but no new setup is offered for it.
-            .filter { $0.agent.isOffered || $0.state != .notInstalled }
             .map { status in
                 Row(agent: status.agent,
                     status: status,
