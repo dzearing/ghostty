@@ -110,7 +110,7 @@ Ghoztty registers itself with AI coding agents (Claude Code and Copilot CLI) via
 3. Wire it into `RuntimeIntegrationFactory`.
 4. Add tests (skills install/drift, hook install/drift/marker-safety, install gate, and for `mergedFragment` the fragment-scoped uninstall).
 
-A `dedicatedFile` runtime (its own hooks dir, like Copilot) needs no `HookComponent` changes; a second `mergedFragment` runtime (sharing one settings file, like Claude) currently does, because the merge logic still lives on the concrete `ClaudeHookSpec`.
+A `dedicatedFile` runtime (its own hooks dir, like Copilot) needs no `HookComponent` changes. A second `mergedFragment` runtime (sharing one settings file, like Claude) currently does, because the merge/state/remove logic still lives on the concrete `ClaudeHookSpec` rather than on the `HookSpec` protocol. Generalizing that seam (moving those operations onto `HookSpec`, and making external-plugin ownership a spec capability) is a **deliberately deferred refactor** — it has no user-visible effect while only one `mergedFragment` runtime exists, so it is left until a second one is actually needed. See the `HookComponent` doc comment for the specifics.
 
 ## Logging
 

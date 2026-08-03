@@ -9,6 +9,18 @@ enum HookComponentError: Error, Equatable {
     case unparseableConfig(URL)
 }
 
+/// Installs a runtime's hook automation per its `HookSpec` ownership strategy.
+///
+/// NOTE (deferred refactor — review item H9): the `.mergedFragment` branch below
+/// calls the concrete `ClaudeHookSpec.merge/removeFragment/fragmentState` statics
+/// rather than dispatching through `spec`, and the factory downcasts `spec as?
+/// ClaudeHookSpec` for plugin detection. The `HookSpec` protocol therefore only
+/// truly abstracts the `.dedicatedFile` path. This is intentional debt, not a
+/// bug: both shipped runtimes work, and a new `.dedicatedFile` runtime needs no
+/// changes here. Only a SECOND `.mergedFragment` runtime forces generalizing
+/// this — at which point move merge/state/remove onto `HookSpec` (and make
+/// external-plugin ownership a spec capability) rather than adding another
+/// concrete branch. Deferred until that runtime actually exists.
 struct HookComponent {
     let spec: HookSpec
     let homeDirectoryURL: URL
