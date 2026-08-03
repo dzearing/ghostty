@@ -2,7 +2,9 @@
 # session-persistence agent. Launches the real debug ghoztty GUI, lets its
 # find-or-spawn stand up a local ghoztty-agent, and asserts via the IPC CLI
 # that the initial window's pane is agent-backed (its shell is a child of the
-# agent), that typing round-trips through the agent, that persistence=off falls
+# agent -- asserted through the reported pid since T98, plus the stronger
+# survives-app-quit claim), that typing round-trips through the agent, that
+# `+list --pid` finds the pane from that pid, that persistence=off falls
 # back to a plain exec pane (no agent session), and that an unreachable agent
 # binary falls back to exec within the bounded wait. Non-interactive; asserts
 # and exits nonzero on any failure. Fully hermetic: a per-run $env:LOCALAPPDATA
@@ -116,6 +118,26 @@ function Test-Typing($tmp, $paneId, $timeoutSec = 15) {
     return $false
 }
 
+# True when $procId is a STRICT descendant of $ancestor (walk ParentProcessId).
+# Bounded, and it stops at the system pids (0/4) so a bogus pid can never look
+# related. This is the T98 oracle: the agent-reported session pid must name the
+# agent's OWN ConPTY child. The defect it locks out reported the child's HANDLE
+# value as a pid -- 428 was observed, which is "Secure System" and walks to
+# System(4) -> 0, never to the agent.
+function Is-DescendantOf($procId, $ancestor, $maxDepth = 12) {
+    if ([int]$procId -le 0 -or [int]$ancestor -le 0) { return $false }
+    if ([int]$procId -eq [int]$ancestor) { return $false }
+    $cur = [int]$procId
+    for ($i = 0; $i -lt $maxDepth; $i++) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+        if ($null -eq $p) { return $false }
+        $cur = [int]$p.ParentProcessId
+        if ($cur -eq [int]$ancestor) { return $true }
+        if ($cur -le 4) { return $false }
+    }
+    return $false
+}
+
 # One hermetic GUI launch. Sets a fresh LOCALAPPDATA + optional agent-bin
 # override, launches the GUI with $extraArgs, returns @{ Tmp; Proc }.
 function Start-Gui($label, $agentBin, $extraArgs) {
@@ -165,8 +187,30 @@ $sess = if ($null -ne $rows) { @($rows)[0] } else { $null }
 Assert "A5 session is alive and attached" ($null -ne $sess -and $sess.alive -eq $true -and $sess.attached -eq $true)
 Assert "A6 session pinned (survives the viewer quitting)" ($null -ne $sess -and $sess.pinned -eq $true)
 
+# --- the pid assertion T89d dropped, restored by T98 -------------------------
+# T89d could not assert pid ancestry because the agent reported a number that
+# named nothing (the ConPTY child's HANDLE value, not its pid), so it proved
+# agent-ownership by survives-app-quit instead (A12-A14 below, still the
+# stronger claim). The capture is fixed, so the ancestry claim is checkable
+# again -- and it is the only thing that covers `+list --pid` self-ID and every
+# other pid-based tool pointed at an agent-backed pane.
+$sessPid = if ($null -ne $sess) { [int]$sess.pid } else { 0 }
+Assert "A7 session pid names a live process" (
+    $sessPid -gt 0 -and $null -ne (Get-Process -Id $sessPid -ErrorAction SilentlyContinue))
+Assert "A8 session pid is a descendant of the agent" (Is-DescendantOf $sessPid $agentPid)
+# The app reports the same pid for the pane it is showing: `+sessions` (dialled
+# at the agent) and `+list` (answered by the app) must agree, or one of them is
+# naming a process the other does not know about.
+Assert "A9 +list reports the same pid for the pane" (
+    $null -ne $pane -and $sessPid -gt 0 -and [int]$pane.pid -eq $sessPid)
+# The user-facing payoff: a process inside the pane finds its own pane by pid
+# (Windows' stand-in for the Mac's `+list --tty`).
+$code = Run-Cli "+list --pid=$sessPid" "$($a.Tmp)\bypid.txt" 12
+$byPid = (Out-Text "$($a.Tmp)\bypid.txt").Trim()
+Assert "A10 +list --pid resolves back to the pane" ($code -eq 0 -and $byPid -eq $paneId)
+
 # Typing round-trips through the agent-backed pane.
-Assert "A7 typing round-trips (send-keys -> +read echo)" (Test-Typing $a.Tmp $paneId 18)
+Assert "A11 typing round-trips (send-keys -> +read echo)" (Test-Typing $a.Tmp $paneId 18)
 
 # The definitive proof the pane is AGENT-owned, not app-owned: kill ONLY the
 # GUI and confirm the agent still lists the session alive (now detached). The
@@ -176,14 +220,14 @@ Assert "A7 typing round-trips (send-keys -> +read echo)" (Test-Typing $a.Tmp $pa
 $sidA = if ($null -ne $sess) { $sess.id } else { '' }
 Stop-GuiOnly
 $agentStillAlive = ($agentPid -gt 0 -and $null -ne (Get-Process -Id $agentPid -ErrorAction SilentlyContinue))
-Assert "A8 local agent still running after the GUI quit" $agentStillAlive
+Assert "A12 local agent still running after the GUI quit" $agentStillAlive
 $code = Run-Cli '+sessions --json' "$($a.Tmp)\survive.json"
 $rowsS = $null
 try { $rowsS = Out-Text "$($a.Tmp)\survive.json" | ConvertFrom-Json } catch {}
 $survivor = if ($null -ne $rowsS) { @($rowsS) | Where-Object { $_.id -eq $sidA } | Select-Object -First 1 } else { $null }
-Assert "A9 session survived the app quit (still alive, agent-owned)" (
+Assert "A13 session survived the app quit (still alive, agent-owned)" (
     $null -ne $survivor -and $survivor.alive -eq $true)
-Assert "A10 surviving session is now detached (no viewer)" (
+Assert "A14 surviving session is now detached (no viewer)" (
     $null -ne $survivor -and $survivor.attached -eq $false)
 
 Stop-TestProcs

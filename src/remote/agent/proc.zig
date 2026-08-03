@@ -720,7 +720,11 @@ test "ProcSampler: enumerates own pid with a name; second sample yields cpu_pct 
     for (out2.items) |p| try testing.expect(p.cpu_pct >= 0);
 }
 
-fn freeProc(alloc: Allocator, p: protocol.Proc) void {
+/// Free one row's caller-owned strings. Public because `sample` hands ownership
+/// of `name`/`user`/`cmd` to the caller, so every caller — the agent's PROC_LIST
+/// handler, and tests in sibling modules (`pty_child.zig`, T98) — needs the
+/// matching free.
+pub fn freeProc(alloc: Allocator, p: protocol.Proc) void {
     alloc.free(p.name);
     if (p.user) |u| alloc.free(u);
     if (p.cmd) |c| alloc.free(c);

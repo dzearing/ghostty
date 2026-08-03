@@ -7149,3 +7149,35 @@ ALL PASS (17). Follow-ups: T401 (an acceptance script run concurrently with
 alone; nearly mis-filed as a third test-agent flake), T402 (Mac-seat
 verification of the chooser Kill - the fix is shared Zig), T403 (nothing
 structurally guarantees every A->C reply type has a dispatch arm).
+
+## 2026-08-03 - T98: the pid was already fixed; what was missing was the proof
+
+T98 filed a real defect - the local agent reporting the ConPTY child's HANDLE
+value where a pid belongs, seen as `428` ("Secure System") - and **T41 fixed it
+at the source a day earlier** (`1968b0581`), because its close-confirmation idle
+check needed a real shell pid: `spawnFn` now asks `GetProcessId` for the pid
+behind the handle, and `Surface.shellPid` replaced the `IpcHandlers` copy that
+returned 0 for every remote-backed pane (i.e. every local pane, persistence
+being on by default). Nothing linked the two tasks, so `next` handed out an
+already-fixed todo 14 days later - filed as **T404**, because the same gap is
+expensive for a todo a later fix only *half* covers. The suspected cause in
+T98's summary was wrong, incidentally: the ConPTY child is created by the agent
+and parented by it; `428` was just a HANDLE value small enough to look like a
+pid.
+
+Measured on box: session pid 44396 = `cmd.exe`, parent 40636 =
+`ghoztty-agent.exe`; `+list --json` agrees; `+list --pid=44396` answers with the
+pane id. So the deliverable was T98's own stated second half - the validation:
+`session-open.ps1` A7-A10 (the ancestry assertion T89d had to drop when the
+number named nothing; `Is-DescendantOf` stops at the system pids, so `428 ->
+System(4) -> 0` can never pass it), and an agent-lane test in `pty_child.zig`
+driven through the `Spawner` vtable rather than `spawnChild`, since the
+conversion under test lives in `spawnFn`. Its oracle is `ProcSampler` (pid ->
+ppid), so it guards the POSIX arm too.
+
+The one method note worth keeping: the new test was **confirmed to run by
+breaking it first** (`expected 46273, found 46272`). `test-agent` runs 3852
+tests, and a test that silently never executes reads exactly like a passing one.
+
+Validation: `session-open.ps1` ALL PASS (A-D), `-Dapp-runtime=none`,
+`-Dapp-runtime=win32`, `test-agent`, P1-P3 ALL PASS.

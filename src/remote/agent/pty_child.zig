@@ -50,6 +50,7 @@ const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const server = @import("server.zig");
 const proc_spawn = @import("proc_spawn.zig");
+const proc = @import("proc.zig");
 
 /// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
 /// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
@@ -1476,6 +1477,60 @@ test "PtyChild: real pty spawn → input echoes back → exit/tombstone" {
     // terminate is idempotent + frees the child (and joins the reader).
     pc.child().terminate();
     terminated = true;
+}
+
+test "PtySpawner: the reported pid is a real process parented by the agent (T98)" {
+    const alloc = testing.allocator;
+
+    var state = try PtySpawner.init(alloc);
+    defer state.deinit();
+
+    // Go through the Spawner vtable, not `spawnChild`: the pid conversion under
+    // test lives in `spawnFn`, and on Windows `posix.pid_t` is the process
+    // HANDLE, so the number that reaches `+sessions`/`+list` is only correct if
+    // that arm ran. Reporting the HANDLE's integer value named nothing in the
+    // process table — the T98 report saw 428, a low system pid.
+    const sp = state.spawner();
+    const res = try sp.spawn(.{
+        .rows = 24,
+        .cols = 80,
+        // Same shell choice as the real-pty roundtrip test above: `cat` is not a
+        // given on Windows, so drive the default interactive shell there.
+        .command = if (is_windows) null else "cat",
+    });
+    defer res.child.terminate();
+
+    try testing.expect(res.pid > 0);
+
+    // The definitive check: the reported pid must NAME the child we just
+    // spawned, and the child's parent is this process (the agent). A HANDLE
+    // value either names nothing or names an unrelated process, and neither is
+    // parented by us.
+    var sampler = proc.ProcSampler.init(alloc);
+    defer sampler.deinit();
+    var rows: std.ArrayListUnmanaged(protocol.Proc) = .empty;
+    defer {
+        for (rows.items) |p| proc.freeProc(alloc, p);
+        rows.deinit(alloc);
+    }
+    // A generous cap: the default (512) can truncate a real desktop's process
+    // table, and a truncated table would fail this as "pid not found".
+    _ = try sampler.sample(alloc, &rows, 65535);
+
+    const my_pid: i64 = @intCast(switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        .linux => std.os.linux.getpid(),
+        else => std.c.getpid(),
+    });
+    var ppid: ?i64 = null;
+    for (rows.items) |p| {
+        if (p.pid == res.pid) {
+            ppid = p.ppid;
+            break;
+        }
+    }
+    try testing.expect(ppid != null);
+    try testing.expectEqual(my_pid, ppid.?);
 }
 
 test "PtyChild: SIGNAL terminates the child via its process group" {
