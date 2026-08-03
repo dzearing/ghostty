@@ -82,18 +82,23 @@ struct HookComponent {
         let data = try JSONSerialization.data(
             withJSONObject: json,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try fileManager.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true)
         // One-time safety net: back up the user's original shared config before
         // the FIRST Ghoztty rewrite, so a future merge regression stays
-        // recoverable. (Symlink refusal / O_NOFOLLOW for this shared-file path
-        // is tracked separately as review item H10.)
+        // recoverable.
         let backupURL = fileURL.appendingPathExtension("ghoztty.bak")
         if fileManager.fileExists(atPath: fileURL.path),
            !fileManager.fileExists(atPath: backupURL.path) {
+            try? fileManager.createDirectory(
+                at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? fileManager.copyItem(at: fileURL, to: backupURL)
         }
-        try data.write(to: fileURL, options: .atomic)
+        // Route through the shared symlink-refusing atomic writer (no marker
+        // requirement — settings.json is user-owned and unmarked) so the shared
+        // config gets the same dotfiles-safety and atomicity as our own files,
+        // rather than Data.write(.atomic) silently replacing a symlinked config.
+        guard let text = String(bytes: data, encoding: .utf8) else {
+            throw HookComponentError.unparseableConfig(fileURL)
+        }
+        try ManagedFile.writeAtomicNoFollow(text, to: fileURL, mode: 0o600, fileManager: fileManager)
     }
 }

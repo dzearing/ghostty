@@ -25,6 +25,15 @@ enum ManagedFile {
             let existing = try String(contentsOf: url, encoding: .utf8)
             guard existing.contains(marker) else { throw ManagedFileError.notManaged(url) }
         }
+        try writeAtomicNoFollow(contents, to: url, mode: mode, fileManager: fileManager)
+    }
+
+    /// Atomic, symlink-refusing write with NO ownership-marker requirement — for
+    /// a shared, user-owned file (e.g. Claude's `settings.json`) that legitimately
+    /// carries no Ghoztty marker but must still never be written through a symlink
+    /// (dotfiles hazard) or left half-written. Same symlink/atomicity guarantees
+    /// as `write`, without the marker guard the caller enforces (or doesn't).
+    static func writeAtomicNoFollow(_ contents: String, to url: URL, mode: mode_t, fileManager: FileManager) throws {
         // Refuse a symlink at the final path (dotfiles hazard).
         if let attrs = try? fileManager.attributesOfItem(atPath: url.path),
            (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
