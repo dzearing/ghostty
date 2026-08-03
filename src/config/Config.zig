@@ -3870,6 +3870,22 @@ _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
 
+/// True when `command` was EXPLICITLY asked for — a `command` in the config
+/// file, `--command=…` on the CLI, or an apprt override — as opposed to the
+/// default shell that `finalize` looks up and fills in when nothing did.
+///
+/// Nullness cannot answer that question: after `finalize` the field is never
+/// null, so "the user's login shell" and "the user asked for `pwsh`" look
+/// identical downstream. The distinction matters to anything that forwards a
+/// command to another process: an agent-backed pane must run an explicit
+/// command but must NOT be handed a default shell path resolved for a
+/// different machine (see `Surface.init`, T104).
+///
+/// Recorded by `finalize` and therefore recomputed on every rebuild
+/// (`changeConditionalState` replays the original steps and re-finalizes), so
+/// it always describes the config it ships with.
+@"_command-explicit": bool = false,
+
 pub fn deinit(self: *Config) void {
     if (self._arena) |arena| arena.deinit();
     self.* = undefined;
@@ -4634,6 +4650,10 @@ pub fn finalize(self: *Config) !void {
         // HACK: See comment above at definition
         self.term = "xterm-ghostty";
     }
+
+    // Whether a command was asked for, recorded BEFORE the default-shell
+    // lookup below fills the field in. See `_command-explicit`.
+    self.@"_command-explicit" = self.command != null;
 
     // The default for the working directory depends on the system.
     var wd: WorkingDirectory = self.@"working-directory" orelse if (probable_cli)
@@ -10745,6 +10765,57 @@ test "parse e: command and args" {
     try testing.expectEqualStrings(cmd.direct[0], "echo");
     try testing.expectEqualStrings(cmd.direct[1], "foo");
     try testing.expectEqualStrings(cmd.direct[2], "bar baz");
+}
+
+// T104: a command the user ASKED for and the default shell `finalize` falls
+// back to are indistinguishable by nullness once finalize has run, and anything
+// that forwards a command to another process (an agent-backed pane) has to tell
+// them apart. `_command-explicit` is that answer, recorded by `finalize`.
+test "finalize: _command-explicit is false when no command was configured" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.command == null);
+    try cfg.finalize();
+    try testing.expect(!cfg.@"_command-explicit");
+}
+
+test "finalize: _command-explicit is true for a configured command" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const alloc = cfg._arena.?.allocator();
+
+    var it: TestIterator = .{ .data = &.{"--command=nvim foo"} };
+    try cfg.loadIter(alloc, &it);
+    try testing.expect(cfg.command != null);
+
+    try cfg.finalize();
+    try testing.expect(cfg.@"_command-explicit");
+}
+
+test "finalize: _command-explicit survives a conditional-state rebuild" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // A theme conditional is what makes `changeConditionalState` rebuild the
+    // config by replaying the original steps — the path an apprt takes at
+    // startup to seed light/dark. The flag must be re-derived there, not lost.
+    var it: TestIterator = .{ .data = &.{
+        "--command=nvim foo",
+        "--theme=light:foo,dark:bar",
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+    try testing.expect(cfg.@"_command-explicit");
+
+    var rebuilt = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer rebuilt.deinit();
+    try testing.expect(rebuilt.command != null);
+    try testing.expect(rebuilt.@"_command-explicit");
 }
 
 // T154: on Windows the plain-ctrl clipboard mirrors MUST be performable.

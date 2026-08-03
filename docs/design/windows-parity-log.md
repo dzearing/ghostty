@@ -9,6 +9,49 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-03 - **T104 done - `-e` was never the parser's fault; it was the agent
+  gate.** The task said "implement `-e` arg collection in the win32 CLI". Nothing
+  needed implementing: `parseManuallyHook` has always built `initial-command`,
+  and core `Surface.init` has always preferred it for the first surface. What
+  dropped the command was one condition in the REMOTE branch - session
+  persistence is on by default on Windows, so every local pane is agent-backed,
+  and that branch forwarded a command only when `wait-after-command` was set. That
+  flag is set by the APPRT when it builds a command (embedded/IPC `--command`);
+  the app's own config never sets it, so the whole GUI launch path matched
+  nothing and sent nothing.
+  - The diagnosis was one table: same command, two backends.
+    `--session-persistence=false` (exec) ran `-e cmd /k echo T104MARKER` fine;
+    the default (agent) gave a bare prompt. `--command=` and a config `command`
+    were dropped by the SAME line, so all three are fixed by it.
+  - `Config._command-explicit` is the missing signal. Nullness cannot answer it:
+    `finalize` fills `command` with the default shell, so afterwards "the login
+    shell" and "the user asked for pwsh" are identical. The flag is recorded at
+    the TOP of `finalize`, before the fill, and re-derived on every
+    `changeConditionalState` replay. The new gate term is **LOCAL-agent only**,
+    which keeps the stall-fix invariant: a command resolved for THIS machine
+    still never reaches a cross-machine agent.
+  - `test/win32/gui-launch-command.ps1` (new, hermetic) ALL PASS, and the
+    **negative control was run**: the new term forced to `false` and rebuilt
+    fails exactly A2/A3/B2/B3 with C still green.
+  - Two harness traps cost most of the turn, both now in T104. `Start-Process
+    -ArgumentList` does not quote its elements, so `'--command=cmd /k echo X'`
+    arrived as four argv entries and `command` became `cmd` - a convincing false
+    "the fix does not work". And a leftover session layout RESTORES over the
+    window under test, which is real behavior, filed as **T406**.
+  - **The win32 lane hung three times, and it was not T258.** Pinned to
+    `apprt.win32.ViewerPane.test."host floor: a real controller on a real
+    window"`, which builds a WebView2 controller against the app's OWN debug
+    profile (`EBWebView-debug`) and waits with no timeout. A debug `ghoztty.exe`
+    from the acceptance runs held that single-owner directory, so the callback
+    never fired. Killing the holders and re-running the same source: exit 0.
+    Filed as **T407**; the binary itself passes 3798/3798 standalone, twice.
+  - Also filed **T405**: `session-persistence` is documented `off|on` everywhere
+    but `parseBool` takes only `true/false`, so the documented spelling is
+    rejected into diagnostics and the option keeps its default. That cost one
+    wrong conclusion here before `=false` isolated the backend.
+  - Floor: none lane, win32 lane (after clearing the profile holder), test-agent
+    all exit 0; P1-P3 ALL PASS.
+
 - 2026-08-02 - **T60 done - the title jitter was not the braille and not
   centering.** The filed guess named Claude Code's braille pane spinner and a
   re-centering title; both are wrong. Measured in the app's own font at the

@@ -873,6 +873,16 @@ pub fn init(
         break :command config.command;
     };
 
+    // Whether that command was EXPLICITLY asked for rather than being the
+    // default shell `Config.finalize` fills in when nothing asked. An
+    // `initial-command` is only ever set explicitly (`-e`, or the config key
+    // itself), so it needs no flag; `config.command` does — see
+    // `Config._command-explicit`.
+    const command_explicit: bool = explicit: {
+        if (app.first and config.@"initial-command" != null) break :explicit true;
+        break :explicit config.@"_command-explicit";
+    };
+
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
@@ -942,11 +952,32 @@ pub fn init(
                 // thread forever in `openChannel` (blank surface + hung quit).
                 // A remote window must use the remote's OWN default shell, so we
                 // only forward a command that was EXPLICITLY requested for this
-                // surface (apprt sets `wait-after-command` on an explicit `-e` /
-                // `--command`); otherwise we send null and the agent picks its
+                // surface; otherwise we send null and the agent picks its
                 // default shell — matching the proven `remote-test-client` path.
+                //
+                // Two signals say "explicit", and both are needed:
+                //
+                //   - `wait-after-command`, which the apprt sets when IT built
+                //     the command (the embedded `--command` / IPC override
+                //     paths). It says nothing about the app's own config.
+                //   - `command_explicit`, which covers the GUI LAUNCH path —
+                //     `ghoztty -e cmd…`, `--command=…`, or a `command` in the
+                //     config file. None of those set `wait-after-command`, so
+                //     before T104 every one of them was silently dropped on
+                //     Windows, where session-persistence makes the local agent
+                //     the default backend for every pane.
+                //
+                // The second is LOCAL-agent only. A command configured for THIS
+                // machine names a binary on THIS machine; handing it to a
+                // cross-machine agent (possibly a different OS) is the spawn
+                // failure that never replies OPENED and wedges the IO thread —
+                // the same reason the default shell must never be forwarded.
                 if (command) |c| {
-                    if (config.@"wait-after-command") remote_command = try c.string(alloc);
+                    if (config.@"wait-after-command" or
+                        (rb.local_shell_integration and command_explicit))
+                    {
+                        remote_command = try c.string(alloc);
+                    }
                 }
                 errdefer if (remote_command) |rc| alloc.free(rc);
 
