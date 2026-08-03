@@ -57,6 +57,7 @@ const type_ramp = @import("type_ramp.zig");
 const error_card = @import("viewer_error_card.zig");
 const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
+const viewer_watcher = @import("viewer_watcher.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const PaneView = @import("PaneView.zig");
@@ -68,6 +69,24 @@ const log = std.log.scoped(.viewer_pane);
 /// `App.init`; the name is what an acceptance script keys off to tell a viewer
 /// pane from a terminal one.
 pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewer");
+
+/// The watcher thread's "your file changed" post (T391).
+///
+/// `WM_APP` numbers are per-window-class, and this one is delivered to a
+/// `GhozttyViewer` host window, whose `wndProc` is the one below — it cannot
+/// collide with `App.zig`'s assignments. The number is nonetheless taken clear
+/// of that list so a post that lands on the wrong window is obviously wrong
+/// rather than plausibly right.
+pub const WM_APP_VIEWER_RELOAD: u32 = w32.WM_APP + 20;
+
+/// The debounce timer's id, in the host window's own timer space.
+const reload_timer_id: usize = 1;
+
+/// How long the pane waits for the writes to stop before re-reading, matching
+/// Mac's 0.1s (`ViewerView.scheduleReload`). An editor's save is several
+/// notifications inside a few milliseconds — a truncate, a write, a rename —
+/// and re-rendering on the first of them shows the reader a half-written file.
+const reload_debounce_ms: u32 = 100;
 
 /// One heading the page reported, with its strings owned by the pane.
 /// `viewer_bridge.Heading` is the same thing borrowed from a parse arena; this
@@ -229,6 +248,12 @@ bg: color_math.Rgb = .{ .r = 0x28, .g = 0x2C, .b = 0x34 },
 /// `auto` is also the degrade for a runtime too old to have a profile.
 color_scheme: iface.PreferredColorScheme = .auto,
 
+/// Live reload (T391): watches `file_path`'s directory and posts
+/// `WM_APP_VIEWER_RELOAD` at this pane's host window when the document
+/// changes. Idle in web mode, and idle for a pane that has no host window yet
+/// — which is the whole of the unit-test population that never opens one.
+watcher: viewer_watcher.Watcher = .{},
+
 // -------------------------------------------------------------------------
 // Construction
 // -------------------------------------------------------------------------
@@ -255,6 +280,10 @@ pub fn create(alloc: Allocator, parent: *Window) Allocator.Error!*ViewerPane {
 }
 
 pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
+    // Before anything else: the watcher owns a THREAD that posts at this pane's
+    // host window, and `stop` joins it. Every teardown below — the host window,
+    // `file_path` — is something that thread's message would arrive at.
+    self.watcher.stop();
     // Drop out of any in-flight callback FIRST: a controller that completes
     // after this point must find a dead token, not a half-freed pane. The
     // token itself outlives this call — every handler that borrowed it holds a
@@ -501,6 +530,28 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
 
     self.applyNavigation();
+    self.syncWatcher(alloc);
+}
+
+/// Point the live-reload watcher at wherever the pane now IS (T391).
+///
+/// Driven off `navigate` alone, because `navigate` is the only thing that
+/// changes `file_path` — a pane that moves from a file to a website stops
+/// watching, one that moves the other way starts, and one that re-opens the
+/// same file re-arms harmlessly.
+///
+/// Unlike Mac, nothing else has to call this: `ReadDirectoryChangesW` reports
+/// by name within a directory, so an atomic save arrives as a notification for
+/// the same basename rather than orphaning the watch (see `viewer_watcher`).
+/// There is no equivalent of `reloadNeedsRearm` to drive from the reload path.
+fn syncWatcher(self: *ViewerPane, alloc: Allocator) void {
+    self.watcher.stop();
+    const path = self.file_path orelse return;
+    // No host window means nothing to post at. That is the pre-`createHostWindow`
+    // moment and every unit test that drives a bare pane, both of which want a
+    // pane that simply does not watch rather than one that fails to open.
+    const hwnd = self.hwnd orelse return;
+    self.watcher.start(alloc, hwnd, WM_APP_VIEWER_RELOAD, path);
 }
 
 /// Everything a freshly-created viewer pane is opened WITH. One struct rather
@@ -1694,6 +1745,27 @@ pub fn wndProc(
             return 0;
         },
 
+        // The watcher thread saw the document change (T391). Do NOT re-render
+        // here — restart the debounce. `SetTimer` with an id that already has a
+        // timer RESETS it, which is exactly Mac's cancel-and-reschedule, so a
+        // burst of notifications collapses into one render after the writes
+        // stop.
+        WM_APP_VIEWER_RELOAD => {
+            _ = w32.SetTimer(hwnd, reload_timer_id, reload_debounce_ms, null);
+            return 0;
+        },
+
+        w32.WM_TIMER => {
+            if (wparam != reload_timer_id) {
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            // One-shot: killed BEFORE the render, so a slow render cannot be
+            // re-entered by its own timer still firing underneath it.
+            _ = w32.KillTimer(hwnd, reload_timer_id);
+            self.reloadContent();
+            return 0;
+        },
+
         // Every pixel is painted in WM_PAINT; erasing first is one full-window
         // fill of flicker per resize.
         w32.WM_ERASEBKGND => return 1,
@@ -2291,6 +2363,66 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqual(@as(usize, 2), pane.headings.len);
     try testing.expectEqualStrings("Delta", pane.headings[0].text);
     try testing.expectEqualStrings("Epsilon", pane.headings[1].text);
+
+    // ------------------------------------------------------------------
+    // T391: live reload — the same re-render, with NOBODY asking for it
+    // ------------------------------------------------------------------
+    //
+    // Everything above called `reloadContent`. From here the test only touches
+    // the FILE, so what is under test is the whole chain the user has: watcher
+    // thread → `WM_APP_VIEWER_RELOAD` → debounce → render. The pane is at
+    // `md_path`, so the watcher `navigate` armed is the one that must fire.
+    try testing.expect(pane.watcher.isRunning());
+
+    // An ordinary in-place save. Three headings, none of them the two on
+    // screen, so a render that did not re-read the file is not mistakable for a
+    // render that did.
+    try tmp.dir.writeFile(.{
+        .sub_path = "t90e.md",
+        .data = "# Zeta\n\n## Eta\n\n## Theta\n",
+    });
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.headings.len == 3 and std.mem.eql(u8, p.headings[0].text, "Zeta");
+        }
+    }.ready, &pane);
+    log.warn("watch: in-place save -> headings={d} first={?s}", .{
+        pane.headings.len,
+        if (pane.headings.len > 0) pane.headings[0].text else null,
+    });
+    try testing.expectEqual(@as(usize, 3), pane.headings.len);
+    try testing.expectEqualStrings("Zeta", pane.headings[0].text);
+
+    // The ATOMIC save — write a scratch file, rename it over the target — which
+    // is what every real editor does and the case that orphans a watch bound to
+    // a file handle. On Windows the notification is for the NAME, so this must
+    // work with no re-arm anywhere; if it ever needs one, this is what says so.
+    try tmp.dir.writeFile(.{
+        .sub_path = "t90e.md.tmp",
+        .data = "# Iota\n\n## Kappa\n",
+    });
+    try tmp.dir.rename("t90e.md.tmp", "t90e.md");
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.headings.len == 2 and std.mem.eql(u8, p.headings[0].text, "Iota");
+        }
+    }.ready, &pane);
+    log.warn("watch: atomic save -> headings={d} first={?s}", .{
+        pane.headings.len,
+        if (pane.headings.len > 0) pane.headings[0].text else null,
+    });
+    try testing.expectEqual(@as(usize, 2), pane.headings.len);
+    try testing.expectEqualStrings("Iota", pane.headings[0].text);
+    try testing.expectEqualStrings("Kappa", pane.headings[1].text);
+
+    // A website has no file to watch, and leaving the previous file's watch
+    // running would re-render a document the pane is no longer showing.
+    try pane.navigate(alloc, reload_url);
+    try testing.expect(!pane.watcher.isRunning());
+    // ...and coming back re-arms it, which is the only re-arm this platform
+    // needs.
+    try pane.navigate(alloc, md_path);
+    try testing.expect(pane.watcher.isRunning());
 }
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.

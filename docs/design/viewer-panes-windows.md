@@ -314,6 +314,12 @@ Unchanged in intent; stated here so the boundaries are explicit.
   (`viewer_content.reloadPlan`), the two new vtable slots are `Reload` (31) and
   `CallDevToolsProtocolMethod` (36), and the cache bypass is proven live rather
   than assumed -- see `docs/design/windows-parity-tasks/T390.md`.
+  **T391 is done as of 2026-08-02** (`src/apprt/win32/viewer_watcher.zig`). The
+  translation worth knowing: Windows watches the **directory**, not the file, so
+  the atomic-save re-arm Mac needs (`reloadNeedsRearm`) has no counterpart here
+  -- a rename over the target arrives as an ordinary notification for the same
+  basename. Debounce is a `WM_TIMER` on the pane's host window, since `SetTimer`
+  on an existing id resets it, which is Mac's cancel-and-reschedule exactly.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add

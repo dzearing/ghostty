@@ -7065,3 +7065,47 @@ viewer-only window still needs a local agent connection to be REACHED -
 `restoreSessionLayout` bails before the probe that would keep it) and T399
 (in-place recovery destroys and re-opens viewer panes it has no reason to
 touch).
+
+## 2026-08-02 - T391: the file changes and nobody had to ask
+
+Live reload for file viewers. `src/apprt/win32/viewer_watcher.zig` is the new
+module; the wiring is four small edits to `ViewerPane.zig` - a `watcher` field,
+`syncWatcher` off `navigate`, `stop` first in `deinit`, and two `wndProc` arms.
+
+**Windows watches the DIRECTORY, not the file, and that is the whole
+translation.** Mac's kqueue source is bound to an open file DESCRIPTOR, so an
+atomic save - write a scratch file, rename it over the target - leaves the watch
+holding an inode nobody will write to again, and that platform has to notice
+`.delete`/`.rename` and re-arm onto the new one (`reloadNeedsRearm`).
+`ReadDirectoryChangesW` reports changes by NAME within a directory, so the
+replacement arrives as an ordinary notification for the same basename. The
+Windows equivalent of Mac's re-arm logic is its absence: `syncWatcher` hangs off
+`navigate` alone, because `navigate` is the only thing that changes
+`file_path`. Debounce is a `WM_TIMER` on the pane's own host window, since
+`SetTimer` on an existing id resets it - cancel-and-reschedule exactly.
+
+The read is overlapped rather than synchronous for a reason that is not
+performance. A synchronous read plus a cross-thread `CancelIoEx` has a real
+race: stop can land between the thread's last check and its next read, and then
+it blocks forever. Parked in `WaitForMultipleObjects([io, stop])` there is no
+such window, and on the stop path the read is cancelled AND drained before the
+thread's stack buffer goes away. Zero bytes returned means the kernel's own
+buffer overflowed and threw the detail away, so that case reloads
+unconditionally - a spurious re-render costs a repaint, a missed one costs the
+feature.
+
+The interesting part is that proving it took two mutations, and the second is
+the one that carries the claim. `syncWatcher` returning before `start` turns the
+whole T391 section red - at its FIRST assertion, which leaves the atomic-save
+case riding on the in-place one rather than proven. Dropping
+`FILE_NOTIFY_CHANGE_FILE_NAME` from the filter is the discriminating run: the
+in-place save still reloads and the atomic save does not (`watch: atomic save ->
+headings=3 first=Zeta`, still showing the previous document). **A mutation that
+kills the first assertion says nothing about the ones behind it** - the same
+shape as T90h's late-failing mutation, seen from the other end.
+
+Validation: `zig build test -Dapp-runtime=win32` (three `mentions` unit tests
+plus the live half appended to the real-WebView2 `host floor` test, where
+nobody calls `reloadContent`), `-Dapp-runtime=none`, `test-agent`, P1-P3 ALL
+PASS, `viewer-panes.ps1` ALL PASS (111). Follow-up: T400 (a pending debounce
+timer survives navigation and re-fetches the new page).

@@ -873,6 +873,70 @@ pub extern "kernel32" fn CloseHandle(
     hObject: HANDLE,
 ) callconv(.winapi) i32;
 
+pub const WAIT_FAILED: u32 = 0xFFFFFFFF;
+
+pub extern "kernel32" fn WaitForMultipleObjects(
+    nCount: u32,
+    lpHandles: [*]const HANDLE,
+    bWaitAll: i32,
+    dwMilliseconds: u32,
+) callconv(.winapi) u32;
+
+// -----------------------------------------------------------------------
+// Directory change notifications (T391, the viewer's live reload)
+// -----------------------------------------------------------------------
+
+pub const OVERLAPPED = std.os.windows.OVERLAPPED;
+pub const INVALID_HANDLE_VALUE = std.os.windows.INVALID_HANDLE_VALUE;
+
+pub const FILE_LIST_DIRECTORY: u32 = 0x0001;
+pub const FILE_SHARE_READ: u32 = 0x0000_0001;
+pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+pub const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+pub const OPEN_EXISTING: u32 = 3;
+/// Required to open a DIRECTORY with `CreateFileW` at all.
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+pub const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
+pub const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+pub const FILE_NOTIFY_CHANGE_CREATION: u32 = 0x0000_0040;
+
+pub extern "kernel32" fn CreateFileW(
+    lpFileName: [*:0]const u16,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?HANDLE,
+) callconv(.winapi) HANDLE;
+
+pub extern "kernel32" fn ReadDirectoryChangesW(
+    hDirectory: HANDLE,
+    lpBuffer: *anyopaque,
+    nBufferLength: u32,
+    bWatchSubtree: i32,
+    dwNotifyFilter: u32,
+    lpBytesReturned: ?*u32,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*const anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "kernel32" fn CancelIoEx(
+    hFile: HANDLE,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) i32;
+
+pub extern "kernel32" fn GetOverlappedResult(
+    hFile: HANDLE,
+    lpOverlapped: *OVERLAPPED,
+    lpNumberOfBytesTransferred: *u32,
+    bWait: i32,
+) callconv(.winapi) i32;
+
 // Stock object indices for GetStockObject
 pub const BLACK_BRUSH: i32 = 4;
 /// A pen that draws nothing, so `Polygon` fills its interior WITHOUT also
