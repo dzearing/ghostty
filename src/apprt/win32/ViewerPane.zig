@@ -120,6 +120,18 @@ location: ?[:0]u8 = null,
 /// the session manifest persists separately from `location`. Owned.
 home_location: ?[:0]u8 = null,
 
+/// The directory this pane was opened FROM — `--working-directory`, which the
+/// CLI seeds with the caller's cwd for every `--view=` open
+/// (`cli/split.zig:seedViewWorkingDirectory`). Owned; null when nothing said.
+///
+/// Kept even though nothing on win32 consumes it yet (worktree feedback capture
+/// is deferred — design P10): it is the provenance fallback for a pane whose
+/// location names no directory of its own, a website or a blank page, so it can
+/// never be re-derived later. The manifest persists it (P12) for the same
+/// reason it persists `home_location` — a value that cannot be recomputed is
+/// exactly the kind that has to be written down.
+origin_directory: ?[]u8 = null,
+
 /// Which renderer `location` gets (T90e). Derived from the location on every
 /// `navigate`, because a pane can move between a file and the web.
 mode: content.Mode = .web,
@@ -292,11 +304,13 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.title) |t| alloc.free(t);
     if (self.location) |l| alloc.free(l);
     if (self.home_location) |l| alloc.free(l);
+    if (self.origin_directory) |d| alloc.free(d);
     if (self.file_path) |p| alloc.free(p);
     if (self.resources_dir) |d| alloc.free(d);
     self.title = null;
     self.location = null;
     self.home_location = null;
+    self.origin_directory = null;
     self.file_path = null;
     self.resources_dir = null;
     self.state = .idle;
@@ -479,7 +493,58 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     // what it was showing.
     self.setTitle(alloc, content.initialTitle(self.mode, url, self.file_path)) catch {};
 
+    // Where a viewer IS is restore state (T90h), so moving it is a layout
+    // change in exactly the way a new split is. Routed through `pane_view`
+    // rather than `parent_window`: the back-pointer is null until the pane is
+    // in a tree, which is both the pre-insert half of its own construction (the
+    // insert marks the layout dirty itself) and every unit test.
+    if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
+
     self.applyNavigation();
+}
+
+/// Everything a freshly-created viewer pane is opened WITH. One struct rather
+/// than a growing parameter list because all three values travel together
+/// through the same three call sites (`+new-window --view`, `+split --view`,
+/// and session restore), and only restore ever sets the last two.
+///
+/// Strings are BORROWED for the duration of the open call; the pane dupes what
+/// it keeps.
+pub const Open = struct {
+    /// Where to navigate. Required.
+    location: []const u8,
+
+    /// Override for the pane's home (the Home button's target). Null ⇒ the
+    /// first `navigate` sets home from `location`, which is what a NEW pane
+    /// wants. Restore passes the recorded home, because a restored pane's
+    /// location may be somewhere it navigated to later and re-homing it there
+    /// would quietly lose where it started (T90h).
+    home_location: ?[]const u8 = null,
+
+    /// The directory the pane was opened from (`--working-directory`).
+    origin_directory: ?[]const u8 = null,
+};
+
+/// Apply the non-location half of an `Open` — the two values `navigate` cannot
+/// derive. Call AFTER `navigate`, so the home override lands on top of the home
+/// that navigation seeds rather than under it.
+///
+/// Non-fatal: a pane that fails to record its home still shows its content, so
+/// this degrades to "Home returns to where you are" rather than failing the
+/// open. Same rule `navigate` already applies to its own home seed.
+pub fn applyOpenMetadata(self: *ViewerPane, alloc: Allocator, opts: Open) void {
+    if (opts.home_location) |home| {
+        if (alloc.dupeZ(u8, home)) |dup| {
+            if (self.home_location) |l| alloc.free(l);
+            self.home_location = dup;
+        } else |_| log.warn("viewer home location could not be recorded", .{});
+    }
+    if (opts.origin_directory) |dir| {
+        if (alloc.dupe(u8, dir)) |dup| {
+            if (self.origin_directory) |d| alloc.free(d);
+            self.origin_directory = dup;
+        } else |_| log.warn("viewer origin directory could not be recorded", .{});
+    }
 }
 
 fn applyNavigation(self: *ViewerPane) void {
@@ -2562,4 +2627,44 @@ test "visibility is recorded even before a controller exists" {
     try testing.expect(!pane.focused);
     pane.focus();
     try testing.expect(pane.focused);
+}
+
+test "a restored open re-homes the pane; a fresh open homes it where it went" {
+    // The T90h round-trip, with no browser in it: a pane restored at the place
+    // it had NAVIGATED to must keep the home it was OPENED with, or the Home
+    // button quietly starts meaning "wherever you last were".
+    const alloc = testing.allocator;
+
+    var restored: ViewerPane = .{};
+    defer restored.deinit(alloc);
+    const open: Open = .{
+        .location = "https://example.com/",
+        .home_location = "D:\\git\\ghoztty\\README.md",
+        .origin_directory = "D:\\git\\ghoztty",
+    };
+    try restored.navigate(alloc, open.location);
+    // Navigation seeds home from the location — the fresh-open behavior — and
+    // the override has to land ON TOP of it, which is the whole reason
+    // `applyOpenMetadata` runs after `navigate` and not before.
+    try testing.expectEqualStrings("https://example.com/", restored.home_location.?);
+    restored.applyOpenMetadata(alloc, open);
+    try testing.expectEqualStrings("https://example.com/", restored.location.?);
+    try testing.expectEqualStrings("D:\\git\\ghoztty\\README.md", restored.home_location.?);
+    try testing.expectEqualStrings("D:\\git\\ghoztty", restored.origin_directory.?);
+
+    // A FRESH open says nothing about home or origin, so navigation's own seed
+    // stands and the pane records no origin at all.
+    var fresh: ViewerPane = .{};
+    defer fresh.deinit(alloc);
+    const plain: Open = .{ .location = "about:blank" };
+    try fresh.navigate(alloc, plain.location);
+    fresh.applyOpenMetadata(alloc, plain);
+    try testing.expectEqualStrings("about:blank", fresh.home_location.?);
+    try testing.expect(fresh.origin_directory == null);
+
+    // And a later navigation still moves only `location`: the override is not a
+    // new rule, it is the same one restore has to be able to state explicitly.
+    try fresh.navigate(alloc, "https://example.org/");
+    try testing.expectEqualStrings("https://example.org/", fresh.location.?);
+    try testing.expectEqualStrings("about:blank", fresh.home_location.?);
 }

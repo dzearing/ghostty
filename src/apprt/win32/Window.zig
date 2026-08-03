@@ -437,11 +437,11 @@ pub const InitOptions = struct {
     ipc_name: ?[]const u8 = null,
 
     /// `+new-window --view=<url>` (T374): the window's first (and only) pane is
-    /// a VIEWER pointed here rather than a terminal. Borrowed; the pane dupes
-    /// it. Mutually exclusive with `surface_overrides`, which describe a shell
-    /// a viewer does not have — the IPC layer rejects `--view` with
-    /// `--command`/`-e` before either is built.
-    viewer_location: ?[]const u8 = null,
+    /// a VIEWER opened with this, rather than a terminal. Borrowed; the pane
+    /// dupes what it keeps. Mutually exclusive with `surface_overrides`, which
+    /// describe a shell a viewer does not have — the IPC layer rejects `--view`
+    /// with `--command`/`-e` before either is built.
+    viewer_open: ?ViewerPane.Open = null,
 
     /// The stable layout identity to ADOPT instead of generating a fresh one
     /// (T338): `session_layout.Window.uuid` for the window being restored,
@@ -1325,7 +1325,7 @@ pub fn addTab(self: *Window) !*Surface {
 /// it in the tree. (`addTab` returns its `*Surface` for the opposite reason —
 /// its callers tint and configure the terminal, and `Surface.pane_view` gets
 /// them back to the leaf.)
-pub fn addViewerTab(self: *Window, location: []const u8) !*PaneView {
+pub fn addViewerTab(self: *Window, open: ViewerPane.Open) !*PaneView {
     if (self.closing) return error.WindowClosing;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
     self.cancelTabRename();
@@ -1335,7 +1335,7 @@ pub fn addViewerTab(self: *Window, location: []const u8) !*PaneView {
     // Cleanup hands off in one direction, exactly as it does for a terminal:
     // once the tree owns the pane, ITS deinit is the only thing that frees the
     // viewer underneath.
-    const viewer = try self.createViewerPane(location);
+    const viewer = try self.createViewerPane(open);
     const pane = PaneView.createViewer(alloc, viewer) catch |err| {
         viewer.deinit(alloc);
         alloc.destroy(viewer);
@@ -1354,7 +1354,7 @@ pub fn addViewerTab(self: *Window, location: []const u8) !*PaneView {
 /// start its web view. The host window is born at the surface rect, which is
 /// only somewhere to BE — the layout pass moves it to its real slot as soon as
 /// the tab is up.
-fn createViewerPane(self: *Window, location: []const u8) !*ViewerPane {
+fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
     const alloc = self.app.core_app.alloc;
     const hwnd = self.hwnd orelse return error.WindowClosing;
     const viewer = try ViewerPane.create(alloc, self);
@@ -1366,7 +1366,10 @@ fn createViewerPane(self: *Window, location: []const u8) !*ViewerPane {
     // Before `start`, so the location is already recorded when the controller
     // arrives and `adoptController` replays it. A viewer that is told where to
     // go only after its browser process is up would race its own creation.
-    try viewer.navigate(alloc, location);
+    try viewer.navigate(alloc, open.location);
+    // After `navigate`: a restore's recorded home has to land ON TOP of the
+    // home that navigation seeds from the location, not under it.
+    viewer.applyOpenMetadata(alloc, open);
     viewer.start(alloc, &self.app.webview2_host);
     return viewer;
 }
@@ -1448,8 +1451,17 @@ fn insertPaneAsTab(self: *Window, pane: *PaneView, tree: SplitTree(PaneView)) vo
     self.app.markLayoutDirty(); // T89f: tab added → re-persist the layout
 }
 
-/// Replace a tab's ENTIRE split tree with a single fresh surface built from
-/// `overrides`, and return it (T145, in-place local-agent crash recovery).
+/// What a replacement tab root should BE. The two arms mirror the two ways a
+/// tab's first pane comes into existence at all (`addTab` / `addViewerTab`), so
+/// a rebuild reproduces the KIND the manifest recorded instead of turning every
+/// tab into a terminal (T90h).
+pub const RootSpec = union(PaneView.Kind) {
+    terminal: *Surface.Overrides,
+    viewer: ViewerPane.Open,
+};
+
+/// Replace a tab's ENTIRE split tree with a single fresh pane built from
+/// `spec`, and return it (T145, in-place local-agent crash recovery).
 ///
 /// This is a SWAP, not a close. The departing surfaces are released by the old
 /// tree's `deinit` with their default teardown intent — DETACH, keep-alive —
@@ -1462,29 +1474,41 @@ fn insertPaneAsTab(self: *Window, pane: *PaneView, tree: SplitTree(PaneView)) vo
 /// The tab's presentation state (title, pin, color, hero) is untouched — it
 /// lives on the window and was never lost. On failure the old tree is left
 /// exactly as it was.
-pub fn replaceTabRootSurface(
+pub fn replaceTabRoot(
     self: *Window,
     tab_index: usize,
-    overrides: *Surface.Overrides,
-) !*Surface {
+    spec: RootSpec,
+) !*PaneView {
     if (self.closing) return error.WindowClosing;
     if (tab_index >= self.tab_count) return error.InvalidTabIndex;
     const alloc = self.app.core_app.alloc;
 
-    // Build the replacement FIRST: if it fails, the tab keeps the surfaces it
-    // has (frozen, but present) rather than being emptied.
-    self.pending_surface_overrides = overrides;
-    defer self.pending_surface_overrides = null;
+    // Build the replacement FIRST: if it fails, the tab keeps the panes it has
+    // (frozen, but present) rather than being emptied.
+    const pane: *PaneView = switch (spec) {
+        .terminal => |overrides| term: {
+            self.pending_surface_overrides = overrides;
+            defer self.pending_surface_overrides = null;
 
-    const surface = try alloc.create(Surface);
-    surface.init(self.app, self, .tab) catch |err| {
-        alloc.destroy(surface);
-        return err;
-    };
-    const pane = PaneView.createTerminal(alloc, surface) catch |err| {
-        surface.deinit();
-        alloc.destroy(surface);
-        return err;
+            const surface = try alloc.create(Surface);
+            surface.init(self.app, self, .tab) catch |err| {
+                alloc.destroy(surface);
+                return err;
+            };
+            break :term PaneView.createTerminal(alloc, surface) catch |err| {
+                surface.deinit();
+                alloc.destroy(surface);
+                return err;
+            };
+        },
+        .viewer => |open| view: {
+            const viewer = try self.createViewerPane(open);
+            break :view PaneView.createViewer(alloc, viewer) catch |err| {
+                viewer.deinit(alloc);
+                alloc.destroy(viewer);
+                return err;
+            };
+        },
     };
     var tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
         pane.destroyUnowned(alloc);
@@ -1502,7 +1526,7 @@ pub fn replaceTabRootSurface(
     self.tab_hero_index[tab_index] = 0;
     old_tree.deinit();
 
-    return surface;
+    return pane;
 }
 
 /// Show or hide every surface in one tab. Fresh surfaces start visible, so a
@@ -2825,14 +2849,14 @@ pub fn newViewerSplitAt(
     at: *PaneView,
     direction: SplitTree(PaneView).Split.Direction,
     ratio: f16,
-    location: []const u8,
+    open: ViewerPane.Open,
 ) !?*PaneView {
     if (self.tab_count == 0) return null;
     const alloc = self.app.core_app.alloc;
     const tab = self.findTabIndex(at) orelse return null;
     const handle = self.findHandle(tab, at) orelse return null;
 
-    const viewer = try self.createViewerPane(location);
+    const viewer = try self.createViewerPane(open);
     const new_pane = PaneView.createViewer(alloc, viewer) catch |err| {
         viewer.deinit(alloc);
         alloc.destroy(viewer);

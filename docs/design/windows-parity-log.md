@@ -7010,3 +7010,58 @@ Validation: both lanes, `test-agent`, P1-P3, and `viewer-panes.ps1` ALL PASS
 is discovered rather than silently absent. The script runs with persistence
 OFF by design, so the agent path was checked by a separate live probe with it
 ON.
+
+## 2026-08-02 - T90h: a viewer pane survives a restart because it re-opens, not because it re-attaches
+
+A terminal restores by ATTACHing to the session the agent kept alive. A viewer
+has no session, so re-opening its recorded location IS its restore - which
+makes the manifest, not the agent, the whole of its memory. Design P12's four
+additive per-leaf fields all land: `kind`, `viewer_location`,
+`viewer_home_location`, `viewer_origin_directory`, with `Leaf.isViewer()` as
+the ONE place "absent kind means terminal" is stated.
+
+Two of the four exist because they cannot be recomputed later, and that is the
+argument for persisting them at all. `viewer_home_location` diverges from
+`viewer_location` the moment the pane navigates, and restore points the pane at
+the LOCATION - so without the recorded home, Home quietly starts meaning
+"wherever you last were". `viewer_origin_directory` is the provenance fallback
+for a pane whose location names no directory (a website, `about:blank`); there
+is nothing to derive it from afterwards. The shared CLI already seeds it, which
+is why this needed no new flag: `+new-window` inserts the caller's cwd
+unconditionally and `seedViewWorkingDirectory` does it for `--view=` splits, so
+`--working-directory` arrives on the win32 IPC path as an ORIGIN, not as a cwd
+for a shell that does not exist.
+
+The blocker in the restore walk was a narrowing, not a missing feature:
+`restoreBuildSubtree`'s anchor was a `*Surface`, so a tab whose first pane was
+a viewer failed the WHOLE window on a null. It takes a `*PaneView` now, and
+three sites branch on kind - the window root, an extra tab, and a split whose
+new pane is a viewer. `replaceTabRootSurface` became `replaceTabRoot` over a
+`RootSpec` union for the same reason, so T145's in-place recovery rebuilds the
+kind it recorded rather than turning every tab into a terminal. A viewer leaf
+is unconditionally "attachable" in the reachability probe: nothing about it can
+be gone from a roster it was never on, which is what lets an all-viewer window
+come back and stops a mixed tree from being dropped when every terminal in it
+died.
+
+`applyOpenMetadata` runs AFTER `navigate`, deliberately: navigation seeds home
+from the location, and a restored home has to land on top of that seed instead
+of under it.
+
+The interesting part is the validation. `viewer-restore.ps1` (ALL PASS, 38) was
+proven discovered by TWO mutations because one could not do it. Reinstating the
+`*Surface` narrowing turned D1/I1-I3 red - and left F1/G1/G2 GREEN BY ACCIDENT,
+because `createWindow` had already built the viewer tab before `restoreTab`
+failed, so a one-pane window still looked complete. The second mutation
+(disabling the window root's viewer arm) is what turns those red, restoring the
+viewer-only window as a terminal. **A mutation that fails late can leave the
+assertions before it green for free; the fix is another mutation, not a
+stronger claim about the first.** `-NegativeControl` inverts the re-ATTACH
+control and fails, so H1 is real too.
+
+Validation: `viewer-restore.ps1` ALL PASS (38), `viewer-panes.ps1` ALL PASS
+(111) x3, P1-P3 ALL PASS, both test lanes, `test-agent`. Follow-ups: T398 (a
+viewer-only window still needs a local agent connection to be REACHED -
+`restoreSessionLayout` bails before the probe that would keep it) and T399
+(in-place recovery destroys and re-opens viewer panes it has no reason to
+touch).

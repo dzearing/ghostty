@@ -15,6 +15,7 @@ const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
 const PaneView = @import("PaneView.zig");
+const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(PaneView);
 const w32 = @import("win32.zig");
@@ -225,7 +226,17 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // returning early because everything AFTER the create is kind-agnostic:
     // `--title`, `--no-activate`, and the inline split (whose own pane is still
     // a terminal) all mean the same thing for a viewer window.
-    const viewer_location: ?[]const u8 = if (args.view) |v| nonEmpty(v) else null;
+    // `--working-directory` rides along as the pane's ORIGIN DIRECTORY (T90h):
+    // for a viewer it is not a spawn's cwd — there is no spawn — but the
+    // provenance fallback for a pane whose location names no directory of its
+    // own, and `+new-window` seeds it with the caller's cwd unconditionally.
+    const viewer_open: ?ViewerPane.Open = if (args.view) |v|
+        if (nonEmpty(v)) |location| .{
+            .location = location,
+            .origin_directory = nonEmpty(args.working_directory),
+        } else null
+    else
+        null;
 
     // T99: with `session-persistence` on, route the first pane through the
     // local agent so its process survives this app (quit/crash/upgrade) and can
@@ -275,8 +286,8 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const window = app.createWindow(.{
         // A viewer first pane has no shell for these to configure; passing them
         // anyway would describe a spawn that is not happening.
-        .surface_overrides = if (viewer_location != null) null else &overrides,
-        .viewer_location = viewer_location,
+        .surface_overrides = if (viewer_open != null) null else &overrides,
+        .viewer_open = viewer_open,
         .ipc_name = args.target,
     }) catch |err| {
         log.warn("IPC new-window failed err={}", .{err});
@@ -632,7 +643,14 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // a terminal reads against — and a viewer has none of it.
     if (args.view) |view| {
         if (nonEmpty(view)) |location| {
-            const pane = window.newViewerSplitAt(at, direction, ratio, location) catch |err| {
+            // `--working-directory` is the ORIGIN DIRECTORY here, not a cwd:
+            // `+split --view=` seeds it with the caller's cwd for exactly this
+            // (`cli/split.zig:seedViewWorkingDirectory`), and a viewer has no
+            // shell to hand a cwd to.
+            const pane = window.newViewerSplitAt(at, direction, ratio, .{
+                .location = location,
+                .origin_directory = nonEmpty(args.working_directory),
+            }) catch |err| {
                 log.warn("IPC viewer split failed err={}", .{err});
                 return try errorResponse(ctx.alloc, "failed to create split", .{});
             } orelse return try errorResponse(ctx.alloc, "failed to create split", .{});

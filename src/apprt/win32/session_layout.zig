@@ -71,12 +71,27 @@ pub const Frame = struct {
     h: i32,
 };
 
-/// One split-tree leaf: a terminal (or, reserved for T90h, a viewer) pane.
+/// One split-tree leaf: a terminal or a viewer pane.
 /// `session_id` is the agent session to re-ATTACH to on restore (null when the
 /// pane was not agent-backed — it restores as an exited pane, tree shape
-/// preserved, matching the Mac null-sessionID behavior). `kind`/`viewer_location`
-/// are RESERVED for viewer panes (T90a pinned this reservation); terminal
-/// leaves leave them null.
+/// preserved, matching the Mac null-sessionID behavior).
+///
+/// The four `kind`/`viewer_*` fields describe a VIEWER leaf (T90h, design P12);
+/// a terminal leaf leaves all four null, so an ABSENT `kind` means terminal and
+/// a manifest written before viewers existed keeps loading unchanged. They are
+/// what a viewer restores from — it has no agent session to attach to, so
+/// re-opening its location IS its restore:
+///
+///   * `viewer_location` — where the pane currently IS (it may have navigated
+///     away from where it was opened).
+///   * `viewer_home_location` — where it was OPENED, the Home button's target.
+///     Persisted separately because restore navigates to `viewer_location` and
+///     would otherwise silently re-home the pane to wherever it had wandered.
+///   * `viewer_origin_directory` — the directory the pane was opened FROM
+///     (`--working-directory`, which `+split --view=`/`+new-window --view=`
+///     seed with the caller's cwd). This is the worktree-provenance fallback
+///     for a pane whose location names no directory of its own — a website or a
+///     blank page — so it cannot be re-derived from the location on restore.
 ///
 /// `pane_id` is the pane's stable ghoztty-owned identity (T113) — the value
 /// baked into its shell as `$GHOZTTY_PANE_ID`. It MUST round-trip: the
@@ -91,7 +106,22 @@ pub const Leaf = struct {
     pane_id: ?[]const u8 = null,
     kind: ?[]const u8 = null,
     viewer_location: ?[]const u8 = null,
+    viewer_home_location: ?[]const u8 = null,
+    viewer_origin_directory: ?[]const u8 = null,
+
+    /// Whether this leaf describes a VIEWER pane. Absent `kind` ⇒ terminal, so
+    /// this is also the compatibility rule for a pre-viewer manifest. One
+    /// reader for it, rather than an `eql` at every restore site that would
+    /// each have to remember which spelling is the viewer one.
+    pub fn isViewer(self: Leaf) bool {
+        const k = self.kind orelse return false;
+        return std.mem.eql(u8, k, kind_viewer);
+    }
 };
+
+/// The `Leaf.kind` value for a viewer pane. Written by capture, matched by
+/// restore; the terminal kind has no spelling at all (absent means terminal).
+pub const kind_viewer = "viewer";
 
 /// One split-tree internal node. `layout` is `"horizontal"` / `"vertical"`
 /// (the `SplitTree.Split.Layout` tag name); `ratio` is the left/top child's
@@ -399,6 +429,80 @@ test "writeAtomic + load round-trip; no .tmp leftover; missing file loads null" 
         "abcabcabcabcabcabcabcabcabcabcab",
         loaded.value.windows[0].tabs[0].nodes[0].leaf.?.session_id.?,
     );
+}
+
+test "viewer leaf round-trips all four fields; a terminal leaf emits none of them" {
+    const alloc = testing.allocator;
+
+    // A mixed tab: a terminal leaf beside a viewer leaf that has navigated away
+    // from where it was opened (location != home) and carries an origin
+    // directory its location could never be re-derived from.
+    const nodes = [_]Node{
+        .{ .split = .{ .layout = "vertical", .ratio = 0.6, .left = 1, .right = 2 } },
+        .{ .leaf = .{ .session_id = "abcabcabcabcabcabcabcabcabcabcab", .pane_id = "t-1" } },
+        .{ .leaf = .{
+            .pane_id = "v-1",
+            .ipc_name = "doc",
+            .kind = kind_viewer,
+            .viewer_location = "https://example.com/",
+            .viewer_home_location = "D:\\git\\ghoztty\\README.md",
+            .viewer_origin_directory = "D:\\git\\ghoztty",
+        } },
+    };
+    const tabs = [_]Tab{.{ .nodes = &nodes, .active = true }};
+    const windows = [_]Window{.{ .id = "w1", .tabs = &tabs }};
+
+    const body = try serialize(alloc, .{ .windows = &windows });
+    defer alloc.free(body);
+
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const out = parsed.value.windows[0].tabs[0].nodes;
+
+    // The terminal leaf keeps its session and stays kind-less — that ABSENCE is
+    // the compatibility rule (absent kind ⇒ terminal), so it is asserted on the
+    // bytes and not just on the parsed value.
+    const term = out[1].leaf.?;
+    try testing.expect(!term.isViewer());
+    try testing.expect(term.kind == null);
+    try testing.expect(term.viewer_home_location == null);
+    try testing.expect(term.viewer_origin_directory == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"pane_id\":\"t-1\",\"kind\"") == null);
+
+    const view = out[2].leaf.?;
+    try testing.expect(view.isViewer());
+    try testing.expect(view.session_id == null);
+    try testing.expectEqualStrings("doc", view.ipc_name.?);
+    try testing.expectEqualStrings("v-1", view.pane_id.?);
+    try testing.expectEqualStrings("https://example.com/", view.viewer_location.?);
+    try testing.expectEqualStrings("D:\\git\\ghoztty\\README.md", view.viewer_home_location.?);
+    try testing.expectEqualStrings("D:\\git\\ghoztty", view.viewer_origin_directory.?);
+}
+
+test "a pre-viewer manifest still loads: absent kind reads as a terminal leaf" {
+    const alloc = testing.allocator;
+
+    // Bytes as a build that predates viewer panes wrote them — no `kind`, and
+    // an unknown future field beside it to prove `ignore_unknown_fields` still
+    // covers the other direction of the same contract.
+    const body =
+        \\{"version":1,"windows":[{"id":"w1","tabs":[{"nodes":[
+        \\{"leaf":{"session_id":"abcabcabcabcabcabcabcabcabcabcab","future_field":7}}
+        \\],"active":true}]}]}
+    ;
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const leaf = parsed.value.windows[0].tabs[0].nodes[0].leaf.?;
+    try testing.expect(!leaf.isViewer());
+    try testing.expectEqualStrings("abcabcabcabcabcabcabcabcabcabcab", leaf.session_id.?);
+}
+
+test "an unrecognized kind is not a viewer, so a newer kind degrades to terminal" {
+    // The additive-evolution rule applied to `kind` itself: a manifest from a
+    // build that grows a third leaf kind must not have its leaves silently
+    // treated as viewers here (which would try to navigate a null location).
+    const leaf: Leaf = .{ .kind = "hologram", .session_id = null };
+    try testing.expect(!leaf.isViewer());
 }
 
 test "window uuid round-trips, is dropped when absent, and falls back to id" {

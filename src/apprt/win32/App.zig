@@ -1305,6 +1305,40 @@ fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.
     };
 }
 
+/// Capture one VIEWER leaf's restore metadata (T90h). A viewer owns no agent
+/// session, so `session_id` stays null and the four additive `kind`/`viewer_*`
+/// fields carry everything a restore needs: what to navigate to, what Home
+/// means, and which directory the pane came from.
+///
+/// The IPC name is captured for the same reason a terminal's is — a pane opened
+/// as `+split --name=doc` must still answer to `doc` after a relaunch.
+///
+/// The TITLE is deliberately NOT captured: a viewer derives its name from its
+/// location (file basename, or the document title a website reports), so
+/// re-opening produces it again, and a recorded one would only go stale.
+fn captureViewerLeaf(
+    self: *App,
+    arena: Allocator,
+    pane: *PaneView,
+) !session_layout.Leaf {
+    const view = pane.viewer().?;
+    const ipc_name = self.ipcNameOf(.{ .pane = pane });
+    return .{
+        .kind = session_layout.kind_viewer,
+        .pane_id = try arena.dupe(u8, pane.paneId()),
+        .ipc_name = if (ipc_name) |n| try arena.dupe(u8, n) else null,
+        .viewer_location = if (view.location) |loc| try arena.dupe(u8, loc) else null,
+        .viewer_home_location = if (view.home_location) |loc|
+            try arena.dupe(u8, loc)
+        else
+            null,
+        .viewer_origin_directory = if (view.origin_directory) |dir|
+            try arena.dupe(u8, dir)
+        else
+            null,
+    };
+}
+
 /// A pinned tab title (T92) as UTF-8, or null when there is none to record.
 fn captureTabTitle(arena: Allocator, win: *Window, ti: usize) !?[]const u8 {
     const len = win.tab_title_lens[ti];
@@ -1331,17 +1365,12 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
             for (tree.nodes, 0..) |node, ni| {
                 nodes[ni] = switch (node) {
                     .leaf => |pane| leaf: {
-                        // A viewer leaf has no agent session to capture; it is
-                        // described by the T89f-reserved additive fields
-                        // instead. T90h owns restoring them.
-                        const surface = pane.surface() orelse break :leaf .{ .leaf = .{
-                            .kind = "viewer",
-                            .pane_id = try arena.dupe(u8, pane.paneId()),
-                            .viewer_location = if (pane.viewer().?.location) |loc|
-                                try arena.dupe(u8, loc)
-                            else
-                                null,
-                        } };
+                        // A viewer leaf has no agent session to capture: what
+                        // restores it is its own location, so the four additive
+                        // viewer fields ARE its restore metadata (T90h).
+                        const surface = pane.surface() orelse break :leaf .{
+                            .leaf = try captureViewerLeaf(self, arena, pane),
+                        };
                         const leaf = try self.captureLeaf(arena, surface);
                         // No id yet but this leaf is EXPECTED to be agent-backed
                         // (its window rides the local agent, or the surface's
@@ -1568,6 +1597,12 @@ fn restoreWindowHasAttachableLeaf(
     for (win.tabs) |tab| {
         for (tab.nodes) |node| {
             const leaf = node.leaf orelse continue;
+            // A VIEWER leaf always restores: it owns no agent session, so
+            // nothing about it can be "gone from the roster". This is what
+            // keeps a mixed tree from being dropped wholesale when every
+            // terminal in it died — and what lets an all-viewer window come
+            // back at all (T90h).
+            if (leaf.isViewer()) return true;
             const sid = leaf.session_id orelse {
                 // A leaf with no session id re-opens fresh — a reason to keep
                 // the window (its layout is intact) even if nothing attaches.
@@ -1612,6 +1647,27 @@ fn restoreAttachOverride(
     };
 }
 
+/// How to re-open one recorded VIEWER leaf (T90h). A viewer has no session to
+/// ATTACH to — re-opening its location IS its restore — so this is the viewer
+/// twin of `restoreAttachOverride`.
+///
+/// A leaf that says `kind: viewer` but records no location still opens, as a
+/// blank browser pane: the tree shape and the pane's identity are the parts a
+/// restore must not silently drop, and `about:blank` is a real product state
+/// (design P11) rather than an error placeholder. A location whose FILE has
+/// since been deleted needs nothing special here — the file viewer renders its
+/// in-page error card, exactly as it does when `--view` first names a missing
+/// path.
+fn restoreViewerOpen(leaf: session_layout.Leaf) ViewerPane.Open {
+    return .{
+        .location = leaf.viewer_location orelse "about:blank",
+        // Restore-only: without this the pane would re-home to wherever it had
+        // navigated by capture time, quietly moving what Home means.
+        .home_location = leaf.viewer_home_location,
+        .origin_directory = leaf.viewer_origin_directory,
+    };
+}
+
 /// The first (leftmost-deepest) leaf reachable from `idx` in a flat manifest
 /// node array — the leaf whose session the surface occupying that subtree's
 /// position ATTACHes to. Null on a corrupt array (out-of-range index or a cycle).
@@ -1647,9 +1703,14 @@ fn restoreWindow(
         if (tr.dialed) |d| d.deinitDestroy(self.core_app.alloc);
         return error.CorruptLayout;
     };
+    // A viewer first pane takes the viewer arm of createWindow and NO surface
+    // overrides — they describe a shell it does not have, the same split the
+    // `+new-window --view` path makes.
+    const first_viewer = first_leaf.isViewer();
     var ov0 = restoreAttachOverride(first_leaf, tr, attach);
     const window = self.createWindow(.{
-        .surface_overrides = &ov0,
+        .surface_overrides = if (first_viewer) null else &ov0,
+        .viewer_open = if (first_viewer) restoreViewerOpen(first_leaf) else null,
         .ipc_name = win.ipc_name,
         // Re-adopt the layout identity (T338) so the rebuilt window keeps
         // pushing to the key its predecessor used, instead of orphaning that
@@ -1678,12 +1739,16 @@ fn restoreWindow(
     // window-new-tab-position).
     for (win.tabs[1..], 1..) |tab, ti| {
         const lf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
-        var ov = restoreAttachOverride(lf, tr, attach);
-        window.pending_surface_overrides = &ov;
-        _ = window.addTab() catch |err| {
-            window.pending_surface_overrides = null;
-            return err;
-        };
+        if (lf.isViewer()) {
+            _ = try window.addViewerTab(restoreViewerOpen(lf));
+        } else {
+            var ov = restoreAttachOverride(lf, tr, attach);
+            window.pending_surface_overrides = &ov;
+            _ = window.addTab() catch |err| {
+                window.pending_surface_overrides = null;
+                return err;
+            };
+        }
         try self.restoreTab(window, ti, tab, tr, attach);
     }
 
@@ -1707,9 +1772,11 @@ fn restoreTab(
     attach: ?*const std.StringHashMap(void),
 ) !void {
     if (tab.nodes.len == 0) return error.CorruptLayout;
+    // The anchor is the LEAF, not a surface: a tab's first pane is a viewer
+    // whenever its first recorded leaf was one, and narrowing to `*Surface`
+    // here would fail the whole tab on a null (T90h).
     const first_pane = window.tab_active_pane[tab_index];
-    const first_surface = first_pane.surface() orelse return error.CorruptLayout;
-    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, tr, attach, 0);
+    try self.restoreBuildSubtree(window, tab.nodes, 0, first_pane, tr, attach, 0);
 
     if (tab.color) |c| {
         if (std.meta.stringToEnum(tab_color.TabColor, c)) |tc| window.tab_colors[tab_index] = tc;
@@ -1719,17 +1786,18 @@ fn restoreTab(
 }
 
 /// Recursively reproduce a manifest subtree by splitting. `anchor` is the live
-/// surface currently occupying this subtree's whole region (the first leaf of
-/// the subtree). A leaf node registers its IPC pane name on `anchor`; a split
-/// node creates the right subtree's first surface via `newSplitAt` (ATTACHing it
-/// to that subtree's first leaf), then recurses into both children. Bounded by
-/// `nodes.len` against a corrupt (cyclic / out-of-range) manifest.
+/// pane currently occupying this subtree's whole region (the first leaf of the
+/// subtree). A leaf node registers its IPC pane name on `anchor`; a split node
+/// creates the right subtree's first pane — `newSplitAt` for a terminal
+/// (ATTACHing it to that subtree's first leaf), `newViewerSplitAt` for a viewer
+/// (re-opening its recorded location) — then recurses into both children.
+/// Bounded by `nodes.len` against a corrupt (cyclic / out-of-range) manifest.
 fn restoreBuildSubtree(
     self: *App,
     window: *Window,
     nodes: []const session_layout.Node,
     idx: usize,
-    anchor: *Surface,
+    anchor: *PaneView,
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
     depth: usize,
@@ -1737,36 +1805,45 @@ fn restoreBuildSubtree(
     if (depth > nodes.len or idx >= nodes.len) return error.CorruptLayout;
     const node = nodes[idx];
     if (node.leaf) |lf| {
-        if (lf.ipc_name) |n| if (anchor.pane_view) |pv|
-            self.ipcRegister(n, .{ .pane = pv }) catch |err|
-            log.warn("session-restore: pane IPC register '{s}' failed err={}", .{ n, err });
+        if (lf.ipc_name) |n|
+            self.ipcRegister(n, .{ .pane = anchor }) catch |err|
+                log.warn("session-restore: pane IPC register '{s}' failed err={}", .{ n, err });
         return;
     }
     const sp = node.split orelse return error.CorruptLayout;
     if (sp.left >= nodes.len or sp.right >= nodes.len) return error.CorruptLayout;
 
-    // The NEW surface takes the right/bottom position — attach it to the first
-    // leaf of the right subtree.
-    const right_leaf = restoreFirstLeaf(nodes, sp.right) orelse return error.CorruptLayout;
-    var ov = restoreAttachOverride(right_leaf, tr, attach);
-    window.pending_surface_overrides = &ov;
-
-    // `.right`/`.down` put the OLD (anchor) surface on the left/top with `ratio`
+    // `.right`/`.down` put the OLD (anchor) pane on the left/top with `ratio`
     // as its share — the exact inverse of the capture (which stored the left
     // child's ratio). horizontal → right, vertical → down.
     const dir: SplitTree(PaneView).Split.Direction =
         if (std.mem.eql(u8, sp.layout, "vertical")) .down else .right;
-    const anchor_pane = anchor.pane_view orelse return error.CorruptLayout;
-    const new_surface = window.newSplitAt(anchor_pane, dir, @floatCast(sp.ratio)) catch |err| {
-        window.pending_surface_overrides = null;
-        return err;
-    } orelse {
-        window.pending_surface_overrides = null;
-        return error.CorruptLayout;
+
+    // The NEW pane takes the right/bottom position — restore it from the first
+    // leaf of the right subtree.
+    const right_leaf = restoreFirstLeaf(nodes, sp.right) orelse return error.CorruptLayout;
+    const new_pane: *PaneView = if (right_leaf.isViewer())
+        try window.newViewerSplitAt(
+            anchor,
+            dir,
+            @floatCast(sp.ratio),
+            restoreViewerOpen(right_leaf),
+        ) orelse return error.CorruptLayout
+    else pane: {
+        var ov = restoreAttachOverride(right_leaf, tr, attach);
+        window.pending_surface_overrides = &ov;
+        const new_surface = window.newSplitAt(anchor, dir, @floatCast(sp.ratio)) catch |err| {
+            window.pending_surface_overrides = null;
+            return err;
+        } orelse {
+            window.pending_surface_overrides = null;
+            return error.CorruptLayout;
+        };
+        break :pane new_surface.pane_view orelse return error.CorruptLayout;
     };
 
     try self.restoreBuildSubtree(window, nodes, sp.left, anchor, tr, attach, depth + 1);
-    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, tr, attach, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.right, new_pane, tr, attach, depth + 1);
 }
 
 // =============================================================================
@@ -2335,7 +2412,13 @@ fn rebuildTabInPlace(
     // the window and is torn down with it, never recovered here.
     const tr: RestoreTransport = .local(conn);
     var ov = restoreAttachOverride(first_leaf, tr, attach);
-    const root = try window.replaceTabRootSurface(tab_index, &ov);
+    // Rebuild the root as the KIND it was. A viewer rides no agent connection,
+    // so recovery has nothing to re-bind for it — but the tab still has to come
+    // back holding a viewer, not a terminal wearing its slot (T90h).
+    const root = try window.replaceTabRoot(tab_index, if (first_leaf.isViewer())
+        .{ .viewer = restoreViewerOpen(first_leaf) }
+    else
+        .{ .terminal = &ov });
 
     // Everything below the root is the ordinary restore walk. `restoreTab`
     // would re-apply color/hero/title too, but those live on the WINDOW and
@@ -2454,8 +2537,8 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
     // `--view` (T374): the window's one pane is a viewer, not a terminal. It
     // goes through the same `addTab` bookkeeping — a viewer is a normal tab, so
     // there is no second tab-creation path to keep in step.
-    if (opts.viewer_location) |location| {
-        _ = try window.addViewerTab(location);
+    if (opts.viewer_open) |open| {
+        _ = try window.addViewerTab(open);
     } else {
         _ = try window.addTab();
     }
