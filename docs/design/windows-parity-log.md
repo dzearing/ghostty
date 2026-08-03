@@ -7431,8 +7431,9 @@ control (clear the baked var in the same pane, same command, and it fails and
 sees nothing). `-Dapp-runtime=none` exit 0, P1-P3 ALL PASS, and both agent test
 binaries run directly at 3787/76/0 and 3715/68/0.
 
-The full `-Dapp-runtime=win32` lane is the gap, and not because of this change:
-it wedged three times today in the `ViewerPane` WebView2 host-floor test, at
+The full `-Dapp-runtime=win32` lane finally went green on a fourth attempt
+(exit 0, final tree) - and the three attempts before it are the reason **T416**
+exists rather than a footnote: it wedged in the `ViewerPane` WebView2 host-floor test, at
 frozen CPU with a live msedgewebview2 tree - **including once with no build
 runner at all**, which runs T409's own discriminator and refutes its
 `--listen=-` hypothesis. Filed as **T416** with the stacks and the last lines
