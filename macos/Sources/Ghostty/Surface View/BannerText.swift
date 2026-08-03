@@ -286,22 +286,15 @@ final class BannerTextView: NSView {
             dequeue: true) {
             guard next.type == .leftMouseUp else { continue }
             if let url = linkURL(at: convert(next.locationInWindow, from: nil)) {
-                // Modifier-click routing: Cmd → new Ghoztty window, Cmd-Shift →
-                // hand it to the system. A plain click opens a web URL in a
-                // side pane, but only *reveals* a file path — clicking a path
-                // shouldn't launch whatever app claims that extension. Keep
-                // this in step with `BannerLinkOpener.menu(for:)`, whose first
-                // item is by contract the left-click default.
-                let mods = next.modifierFlags
-                if mods.contains(.command) && mods.contains(.shift) {
-                    linkOpener.openWithSystem(url)
-                } else if mods.contains(.command) {
-                    linkOpener.openInNewWindow(url)
-                } else if url.isFileURL {
-                    linkOpener.revealInFinder(url)
-                } else {
-                    linkOpener.openInSidePane(url)
-                }
+                // The modifier scheme lives in `BannerLinkOpener.action(for:
+                // modifiers:)` so this, the right-click menu, and the docs
+                // can't drift: a plain click hands the link out of Ghoztty (the
+                // browser for a URL, Finder for a path — clicking a path
+                // shouldn't launch whatever app claims that extension), Cmd
+                // opens a side pane, Cmd-Shift gives it a surface of its own.
+                linkOpener.perform(
+                    BannerLinkOpener.action(for: url, modifiers: next.modifierFlags),
+                    on: url)
             }
             break
         }
