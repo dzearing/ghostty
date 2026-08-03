@@ -7481,3 +7481,28 @@ exit 0.
 Validation: both `zig build test` lanes + `test-agent` exit 0,
 `window-color.ps1` ALL PASS (33), P1-P3 ALL PASS. Also committed three task
 files a previous turn left untracked (T417, T418, T419).
+
+## 2026-08-03 - user bug report on the T120 upgrade: T421-T425 filed
+
+The user took the delivery and every step after the click disappointed them.
+Filed as five tasks and put at the top of Current priorities, in a deliberate
+order that is NOT the order reported:
+
+**T421** the app shut down and never came back (manual relaunch) - first,
+because nothing else is observable if the windows do not return, and because
+**T229** is the same shape marked done, so regression-vs-new-path is the first
+question. **T425** the dead session's recorded command AND cwd never reach the
+fresh shell - second, because it is the only one that loses information the
+user cannot recover; both read the same `outcome` at `Remote.zig:568-572`, so
+one task until they prove to have different causes. **T423** the notice belongs
+inline in the scrollback - ahead of T422 because the in-stream copy already
+exists (`Remote.zig:784`) and is erased by ConPTY's startup repaint, which is
+the measured reason the banner copy exists; fix the inline copy and the banner
+copy may not need to exist. **T422** the notice banner replaces the user's own
+pane banner, and titles do not rehydrate - N distinct banners overwritten by N
+copies of one sentence, against a CLAUDE.md paragraph promising banners survive
+"an agent-restart relaunch alike". **T424** wording: colon, not em dash - and
+it should absorb the "Previous prompt:" vs "previous command:" label question
+T425 raises, rather than rewording the same surface twice.
+
+Nothing built this turn beyond the filing; T120 shipped separately above.

@@ -98,6 +98,39 @@ recommended approaches where they exist.
 
 Work these first, in order, before falling back to first-todo-in-table:
 
+000000. **AHEAD OF EVERYTHING as of 2026-08-03 (user bug report, live, while
+    taking the T120 delivery).** The user upgraded, and every step after the
+    click disappointed them. Five tasks, and the order is not the order they
+    were reported in:
+
+    **T421 → T425 → T423 → T422 → T424.**
+
+    - **T421** — *"when i clicked upgrade, it shut down. It did not reopen
+      ghoztty like i expected. i had to manually rerun it."* First because
+      nothing else on this list is observable if the app does not come back,
+      and because this is the second time this shape has bitten (**T229**,
+      marked done — establish regression vs. new path before fixing).
+    - **T425** — the dead session's recorded **command and cwd** never reach
+      the fresh shell: no "previous command" line in the notice, and the pane
+      opens in the wrong directory. Ranked second because it is the only one of
+      the four that loses *information the user cannot get back* — the rest are
+      presentation. Both symptoms read the same `outcome` at
+      `Remote.zig:568-572`; split the task if they turn out to have different
+      causes.
+    - **T423** — the notice belongs **inline in the scrollback**, above the
+      shell content. It is already written there (`Remote.zig:784`) and already
+      erased by ConPTY's startup repaint, which is the measured reason the
+      banner copy exists at all. Ordered ahead of T422 because if the inline
+      copy lands properly, the banner copy may not need to exist — which would
+      resolve half of T422 for free.
+    - **T422** — the notice banner **replaces the user's own pane banner**, and
+      window titles do not come back either. N distinct banners overwritten by
+      N copies of one sentence, against a CLAUDE.md paragraph that promises
+      banners survive "an agent-restart relaunch alike".
+    - **T424** — wording: `Session interrupted: <reason>`, a colon and not an
+      em dash. Smallest, purest, last — one module with unit tests, and it
+      should absorb the label question T425 raises rather than reword twice.
+
 00000. **LOOP RELIABILITY, 2026-07-31 — T241.** Ahead of the UI block because
     the loop's own reliability gates every other item on this list (the same
     reasoning that kept T208/T210 in the top block).
