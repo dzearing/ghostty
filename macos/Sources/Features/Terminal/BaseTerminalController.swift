@@ -912,6 +912,20 @@ class BaseTerminalController: NSWindowController,
         for view in plan.spared { view.setSessionCloseIntent(false) }
         for view in plan.close { view.setSessionCloseIntent(true) }
 
+        // Hide the closed panes' sessions from the chooser NOW rather than when
+        // the agent finally frees them. A closed pane's session stays alive for
+        // the undo window (the view is retained so the close can be undone), so
+        // LIST_SESSIONS keeps reporting it and it renders as a "Resume" row for a
+        // window the user just closed. Offering to resume it is wrong, and it
+        // makes a working close look like a leak.
+        //
+        // Symmetrically, a leaf that is BACK in the tree (an undone close, or a
+        // pane moved between windows) is live again and must be un-hidden --
+        // which is the same set `keepAlive`/`spared` clear the close intent for.
+        for view in plan.close { ClosingSessions.shared.mark(view.surfaceView?.boundRemoteSessionID) }
+        for view in plan.keepAlive { ClosingSessions.shared.unmark(view.surfaceView?.boundRemoteSessionID) }
+        for view in plan.spared { ClosingSessions.shared.unmark(view.surfaceView?.boundRemoteSessionID) }
+
         // Session persistence (T05): the split topology is the heart of the
         // layout manifest — re-sync on every tree change (new split, close,
         // resize-equalize, ...). Debounced; each sync also restarts the
