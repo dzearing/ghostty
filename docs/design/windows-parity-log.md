@@ -7257,3 +7257,56 @@ tests, and a test that silently never executes reads exactly like a passing one.
 
 Validation: `session-open.ps1` ALL PASS (A-D), `-Dapp-runtime=none`,
 `-Dapp-runtime=win32`, `test-agent`, P1-P3 ALL PASS.
+
+## 2026-08-03 - T108: both anomalies are gone, and the log cannot tell me when
+
+T108 asked whether two 2026-07-20 restore anomalies still happen on the user's
+release install. Measured there, not in a harness: the manifest was **90 s old**
+and matched the live topology field for field (2 windows, 3 leaves, the current
+`title_override`, the split ratio, all three `pane_id`s), and **all 3 leaves
+carried a `session_id`**. So (b) stale capture: no. (a) id-less leaves: no.
+
+The 7-session leak is down to **one** orphan, and it is not the ratchet still
+turning - the app log's last launch shows `restored 2 window(s)` next to
+`4 live session(s)`, so the orphan predates that relaunch and restore attached
+the other three. More usefully, the mechanism is now guarded rather than merely
+absent: `session-reattach.ps1` A4/B6 are anomaly (a)'s oracle, F3 is (b)'s, and
+**F7 is the leak's** - a restore that re-OPENed would leave 6 sessions alive and
+F7 counts them. 34 passed / 2 failed, both the documented T223 reds.
+
+I did **not** prune the orphan, which the task asked for. One live shell sitting
+in the repo directory, resumable from the chooser roster, is not worth killing
+to tidy a number that has stopped growing - and the general problem deserves a
+task rather than a one-off `kill`. That is **T411**: `pinned` is exactly what
+exempts a session from the idle-TTL reaper, and nothing anywhere compares the
+agent's live set against the set a restore attached, so an orphan is invisible
+and permanent. The app had both numbers in the same second, in adjacent log
+lines, and said nothing. Log the gap at restore; don't reap what the pin exists
+to protect.
+
+The real find is **T410**, and it is the reason this turn is a verdict rather
+than a root cause. `logFn` writes `level(scope): msg` and nothing else - **no
+timestamp, no pid** - into a file whose own doc comment calls it a shared sink
+for the GUI app, the agent, and every one-shot CLI. The orphan's creation time
+came from `Win32_Process.CreationDate`; there is no way to find that moment in
+9.4 MB of log, or to attribute any line in it to a program. T229's atomic-append
+fix made the writers stop clobbering each other and left the lines
+unattributable. The release build has no console, so this file is the only thing
+a user-reported failure leaves behind.
+
+Two smaller notes. The pids in `+sessions` (472/556/596/896 - every one a
+multiple of 4, none naming a live process) are the pre-T41 HANDLE-as-pid
+lineage, confirmed by `merge-base --is-ancestor`; the agent is still
+`20260731-467417e96` because the app logs `agent upgrade check: stale with live
+sessions, confirmation required`. Old agent, new app, degrading to one wrong
+field - the contract skew working as designed. And **T407 hangs with nobody else
+holding the WebView2 profile**: at hang time the only claimants were the test
+binary's own children, flat at 48.98 s CPU with a 0-delta 10 s sample. That
+reverses T407's stated priority - a per-run profile cannot save a run whose only
+claimant is itself, so the unbounded wait is the load-bearing half.
+
+Validation: `session-reattach.ps1` 34/2 (both reds T223), `-Dapp-runtime=none`
+exit 0, `-Dapp-runtime=win32` exit 0 (after the T407 recovery: kill the hung
+test + its WebView2 hosts, re-run unchanged), `test-agent` - the LANE hangs
+(T409), both binaries run directly are green (3707/0 and 3779/0), P1-P3 ALL
+PASS. New: T410, T411.
