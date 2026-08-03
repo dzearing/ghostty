@@ -131,6 +131,22 @@ Work these first, in order, before falling back to first-todo-in-table:
       em dash. Smallest, purest, last — one module with unit tests, and it
       should absorb the label question T425 raises rather than reword twice.
 
+00000. **LOOP RELIABILITY, 2026-08-03 — T428.** Same gate as T241 below, and
+    the same shape as T210: `/reset-context` cleared the session, typed the
+    continuation, and the prompt sat **unsent** in the composer — **the user
+    had to press Enter by hand.** Not the T210 argv drop and not the T261
+    false-FAIL: the helper's log shows the `Enter` was delivered with rc=0, and
+    a human keypress on that same composer submitted fine. The TUI's paste
+    detection ate the synthetic one as a newline, because `+send-keys` hands the
+    pane a single burst of bytes ending in `\r`.
+
+    Mac fixed exactly this on 2026-07-30 (`9bac0250f`): argument boundaries
+    survive to the pty write as `--segments=`, and each text run is framed in
+    bracketed paste so the trailing `\r` is unambiguously a keypress. The
+    Windows apprt got no half of it — `git grep segments origin/main --
+    src/apprt/win32/` is empty, and this branch does not even carry the shared
+    CLI/Surface half. Merging main is necessary but not sufficient.
+
 00000. **LOOP RELIABILITY, 2026-07-31 — T241.** Ahead of the UI block because
     the loop's own reliability gates every other item on this list (the same
     reasoning that kept T208/T210 in the top block).

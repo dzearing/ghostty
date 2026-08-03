@@ -53,10 +53,47 @@ Concretely, in order, with no stops in between:
    `scripts\parity-tasks.ps1 new -Title "…"`. Loose threads are how work gets
    lost. Never hand-pick an id; `new` allocates atomically so a second agent
    filing at the same moment cannot collide with you.
+5b. **File any judgement call as a decision.** You never stop to ask (THE
+   CONTEXT RULE), and that stays true — but a call the user might want to
+   overturn gets a receipt, so it reaches them without blocking you:
+
+   ```
+   powershell -NoProfile -File scripts\parity-decisions.ps1 new ^
+       -Title "<the question, phrased as a question>" -Task T123 ^
+       -Assumed "<what you did meanwhile, so work continued>" ^
+       -Options "Do X::what it costs;;Do Y::what it costs" ^
+       -Why "<what forced the choice, in two or three sentences>"
+   ```
+
+   It surfaces at the top of the dashboard's Activity feed
+   (`scripts\task-dashboard.ps1`). When the user picks an option, the answer
+   is folded into the linked task automatically — so the reply lands where
+   whoever picks that task up will see it.
+
+   **What belongs here:** a fork you resolved by assumption and could not
+   verify (which of two designs, how far to widen a fix, whether a surprise
+   is in scope). **What does not:** anything you can settle by reading the
+   code or running something — investigate instead; a decision is not a way
+   to outsource work. Anything the tracker already answers. And never file
+   one and then wait: keep going, exactly as before.
+
+   Write it for someone who has not seen the code. `-Why` states what forced
+   the choice; each option states **what it costs**, not just what it is. An
+   option list without costs is not a choice, it is a quiz.
 6. **Update the tracker** — `scripts\parity-tasks.ps1 set-status <id> -Status
    done -Commit <sha>`, evidence into that task's own file, ONE log entry in
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
-   validate` before committing. Commit and push. Refresh the lock while you are here
+   validate` before committing. Commit and push.
+
+   **Your commit message is the activity feed.** The dashboard builds each
+   feed item from the commit that finished the work: the subject becomes the
+   headline, the first paragraph of the body becomes "what changed", and the
+   tasks completed and filed in that commit hang off it. Write the subject as
+   a plain statement of what now behaves differently, and open the body with a
+   paragraph a reader can understand without the diff. That is already the
+   house style — this is just what depends on it.
+
+   Refresh the lock while you are here
    (`scripts\go-loop-lock.ps1 heartbeat`) — a long task is the one case where
    a turn can outlive the watchdog's staleness window.
 7. **`/reset-context read go.md and go`, and end the turn there.**
@@ -152,6 +189,28 @@ line did not fail — re-run it unfiltered before believing it.
    (`windows-parity-audit.md`), and the spec (`windows-parity-spec.md`) are
    unchanged — open at most the one section you actually need, never all of
    them "for background".
+   **The live status dashboard** answers "where is this project" without
+   reading any task file. It renders in a Ghoztty viewer pane and refreshes
+   itself as task and decision files change:
+
+   ```
+   powershell -NoProfile -File scripts\task-dashboard.ps1
+   ```
+
+   Three views behind a side nav: **Activity** (open decisions that need the
+   user, then a timeline of what landed), **Data** (the charts), **Tasks**
+   (lookup and filtering, newest first). Decisions are filed by step 5b below
+   and live in `docs/design/windows-parity-decisions/`.
+
+   That starts a small localhost server (detached, survives the session) and
+   splits a viewer pane **off the pane you ran it from** — it defaults
+   `--target` to `$GHOZTTY_PANE_ID`, because a bare `+split` targets the most
+   recently focused window and lands somewhere else. Both halves are
+   idempotent: re-running reuses the server and focuses the existing pane.
+   `-Stop` kills the server, `-NoPane` skips the split, `-Port` moves it off
+   7788. It is served over http and NOT written to a `.html` file on purpose:
+   a viewer renders `.md` and treats every other extension as code, so a local
+   `.html` would display its own source. After a reboot, run it again.
 2. Work **one** task, per the context rule above. At the boundary, record
    status and evidence in the task's own file, and append ONE short entry to
    `windows-parity-log.md` (no build output, no diffs). Run
