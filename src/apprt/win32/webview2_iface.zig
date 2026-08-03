@@ -204,6 +204,17 @@ pub const IID_NavigationCompletedHandler: GUID = .{
     .Data4 = .{ 0x93, 0xAB, 0x00, 0x6E, 0x05, 0x33, 0xFE, 0x1C },
 };
 
+// {F5F2B923-953E-4042-9F95-F3A118E1AFD4}
+// `ICoreWebView2DocumentTitleChangedEventHandler`. Its `Invoke` takes
+// `(sender, args)` where the args are a bare `IUnknown` — the event carries no
+// payload, and the title is read back off the sender.
+pub const IID_DocumentTitleChangedHandler: GUID = .{
+    .Data1 = 0xF5F2B923,
+    .Data2 = 0x953E,
+    .Data3 = 0x4042,
+    .Data4 = .{ 0x9F, 0x95, 0xF3, 0xA1, 0x18, 0xE1, 0xAF, 0xD4 },
+};
+
 // {49511172-CC67-4BCA-9923-137112F4C4CC}
 // `ICoreWebView2ExecuteScriptCompletedHandler`.
 pub const IID_ExecuteScriptCompletedHandler: GUID = .{
@@ -529,9 +540,10 @@ pub const ICoreWebView2Profile = extern struct {
 /// `ExecuteScript` (29), `add_WebResourceRequested` (55) and
 /// `AddWebResourceRequestedFilter` (57) — which is why the opaque runs are
 /// shorter again. T390 added `+reload`'s two: `Reload` (31) and
-/// `CallDevToolsProtocolMethod` (36). Every block's LENGTH is what holds the
-/// named slots in place, and `@offsetOf` asserts all of them at the bottom of
-/// this file.
+/// `CallDevToolsProtocolMethod` (36), and T383 the title pair
+/// `add_DocumentTitleChanged` (46) and `get_DocumentTitle` (48). Every block's
+/// LENGTH is what holds the named slots in place, and `@offsetOf` asserts all
+/// of them at the bottom of this file.
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
@@ -550,9 +562,13 @@ pub const ICoreWebView2 = extern struct {
     pub const remove_message_slots = 1;
     /// Slots 37..43: `get_BrowserProcessId` through `Stop`.
     pub const post_devtools_slots = 7;
-    /// Slots 45..54: `remove_NewWindowRequested` through
+    /// Slot 45: `remove_NewWindowRequested`.
+    pub const remove_new_window_slots = 1;
+    /// Slot 47: `remove_DocumentTitleChanged`.
+    pub const remove_title_slots = 1;
+    /// Slots 49..54: `AddHostObjectToScript` through
     /// `get_ContainsFullScreenElement`.
-    pub const window_slots = 10;
+    pub const post_title_slots = 6;
     /// Slot 56: `remove_WebResourceRequested`.
     pub const remove_resource_slots = 1;
 
@@ -582,7 +598,11 @@ pub const ICoreWebView2 = extern struct {
         ) callconv(.winapi) HRESULT,
         post_devtools: [post_devtools_slots]*const anyopaque,
         add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
-        window: [window_slots]*const anyopaque,
+        remove_new_window: [remove_new_window_slots]*const anyopaque,
+        add_DocumentTitleChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        remove_title: [remove_title_slots]*const anyopaque,
+        get_DocumentTitle: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
+        post_title: [post_title_slots]*const anyopaque,
         add_WebResourceRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         remove_resource: [remove_resource_slots]*const anyopaque,
         AddWebResourceRequestedFilter: *const fn (*ICoreWebView2, [*:0]const u16, WebResourceContext) callconv(.winapi) HRESULT,
@@ -615,6 +635,24 @@ pub const ICoreWebView2 = extern struct {
     pub fn addNewWindowRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
         var token: EventRegistrationToken = .{};
         return !com.failed(self.vtable.add_NewWindowRequested(self, handler, &token));
+    }
+
+    /// Subscribe to `document.title` changing — including the title a page
+    /// carries when it first loads, which arrives as a change from the empty
+    /// string. This is the ONLY way a viewer learns a website's name; there is
+    /// no "the load finished, go read the title" moment that beats it, because
+    /// a page can retitle itself long after `NavigationCompleted`.
+    pub fn addDocumentTitleChanged(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_DocumentTitleChanged(self, handler, &token));
+    }
+
+    /// The page's current `document.title`. Caller frees it with
+    /// `CoTaskMemFree`, like every other string the runtime hands back.
+    pub fn documentTitleRaw(self: *ICoreWebView2) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_DocumentTitle(self, &raw))) return null;
+        return raw;
     }
 
     /// Run `js` at document-created time in every page this view loads, from
@@ -1050,6 +1088,13 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
     try testing.expectEqual(36 * ptr, @offsetOf(ICoreWebView2.Vtbl, "CallDevToolsProtocolMethod"));
     try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
+    // T383's pair, carved out of what used to be one 10-slot `window` run.
+    // `get_DocumentTitle` (48) is a getter with an out-parameter, so calling it
+    // at the wrong index writes a COM-heap pointer into whatever that slot's
+    // real second argument is — silence, then a `CoTaskMemFree` on a value the
+    // runtime never allocated.
+    try testing.expectEqual(46 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_DocumentTitleChanged"));
+    try testing.expectEqual(48 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_DocumentTitle"));
     try testing.expectEqual(55 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebResourceRequested"));
     try testing.expectEqual(57 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddWebResourceRequestedFilter"));
 

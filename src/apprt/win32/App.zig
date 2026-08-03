@@ -3500,10 +3500,10 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.onTabTitleChanged(
-                        core_surface.rt_surface,
-                        value.title,
-                    );
+                    const rt = core_surface.rt_surface;
+                    if (rt.pane_view) |pv| {
+                        rt.parent_window.onPaneTitleChanged(pv, value.title);
+                    }
                 },
             }
             return true;

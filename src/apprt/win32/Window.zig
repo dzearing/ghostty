@@ -1411,6 +1411,13 @@ fn insertPaneAsTab(self: *Window, pane: *PaneView, tree: SplitTree(PaneView)) vo
     const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty");
     @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
     self.tab_title_lens[pos] = @intCast(default_title.len);
+    // ...then let a pane that ALREADY has a name overwrite it (T383). A viewer
+    // is named the moment it is pointed at a location, which is before the tree
+    // or this tab exists — so its `setTitle` had no leaf to notify and the
+    // default would otherwise stand for the pane's whole life. A terminal has
+    // no title yet here, so this is a no-op on that path and the shell's first
+    // OSC still drives it.
+    self.refreshTabTitle(pos);
 
     if (self.tab_count == 1) {
         // First tab — show the parent window now that the pane is ready.
@@ -2824,8 +2831,12 @@ fn insertPaneAsSplit(
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
 
-    // Focus the new pane.
+    // Focus the new pane...
     self.tab_active_pane[tab] = new_pane;
+    // ...and relabel the tab after it, for the reason `insertPaneAsTab` does:
+    // the focused pane drives the tab title (T92), and a viewer was named
+    // before this tree existed so its own `setTitle` had nobody to tell (T383).
+    self.refreshTabTitle(tab);
     self.heroOnTreeChanged(tab);
     if (self.tab_hero_active[tab]) {
         if (self.leafIndexOf(tab, new_pane)) |index| {
@@ -3185,8 +3196,11 @@ pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
 /// user-pinned tab title ignores pane-driven updates, and only the
 /// tab's focused pane drives the tab title (Mac parity — background
 /// panes keep their own pane title without relabeling the tab).
-pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
-    const pane = surface.pane_view orelse return;
+///
+/// Takes the LEAF, not a Surface: a viewer names itself too (T383), and it was
+/// the `*Surface` in this signature that made "pane" and "terminal" the same
+/// word here — the exact thing `PaneView` exists to separate.
+pub fn onPaneTitleChanged(self: *Window, pane: *PaneView, title: [:0]const u8) void {
     const tab_idx = self.findTabIndex(pane) orelse return;
     if (self.tab_title_pinned[tab_idx]) return;
     if (self.tab_active_pane[tab_idx] != pane) return;

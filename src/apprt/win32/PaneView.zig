@@ -60,10 +60,13 @@ pub fn createTerminal(alloc: Allocator, s: *Surface) Allocator.Error!*PaneView {
     return self;
 }
 
-/// Wrap an existing ViewerPane. Takes ownership outright.
+/// Wrap an existing ViewerPane. Takes ownership outright. The back-pointer is
+/// set here for the reason the terminal arm's is: a title arriving at the pane
+/// has to name a LEAF to the window (T383).
 pub fn createViewer(alloc: Allocator, v: *ViewerPane) Allocator.Error!*PaneView {
     const self = try alloc.create(PaneView);
     self.* = .{ .kind = .{ .viewer = v } };
+    v.pane_view = self;
     return self;
 }
 

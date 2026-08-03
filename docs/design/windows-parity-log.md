@@ -6933,3 +6933,41 @@ The acceptance script made the same class of mistake in the other direction -
 it aimed the "focused pane is a terminal" rejection at a window that had since
 grown viewer splits, so the focused pane was a viewer and the case passed for
 the wrong reason.
+
+## 2026-08-02 - T383: a viewer pane says what it is showing
+
+`+list` printed `view:` and an empty title, and the tab caption read `Ghoztty`,
+for a pane that knew exactly what document it held. `ViewerPane.title` was
+allocated, freed, and never set.
+
+The contract is copied from `ViewerView.swift` rather than invented. A file is
+named by its basename, a website by its host, and a location with neither by
+itself. The load-bearing half is Mac's `isWebURL` guard on the title observer:
+a file pane loads the BUNDLED TEMPLATE, so `document.title` there names the
+RENDERER - without the guard every markdown pane in the app would share one
+name. `viewer_content.urlHost`/`initialTitle` are the pure half and are unit
+tested (an `@` inside a password, an IPv6 literal whose inner colons are not a
+port, a port with no path after it, a percent-encoded `file://` basename).
+
+Two more vtable slots came out of an opaque run: `add_DocumentTitleChanged` (46)
+and `get_DocumentTitle` (48), `@offsetOf`-asserted, with the order re-derived
+from the SDK's own `ICoreWebView2Vtbl` rather than recalled. `onTabTitleChanged`
+became `onPaneTitleChanged(*PaneView, ...)` - that `*Surface` parameter was the
+last place on this path where "pane" and "terminal" were the same word.
+
+The bug the first run found was ORDERING, not the ABI. A viewer is named the
+moment it is pointed at a location, which is BEFORE the tree or the tab exists
+(`createViewerPane` navigates, then its caller wraps the pane in a `PaneView`),
+so its `setTitle` had no leaf to notify and the `Ghoztty` default stood for the
+pane's life. `insertPaneAsTab`/`insertPaneAsSplit` now refresh the tab title
+once the pane is in place - a no-op for a terminal, which has no title yet. The
+same class of gap sat on focus: a viewer's `WM_SETFOCUS` never claimed
+`tab_active_pane`, so clicking into one left the tab named after the pane the
+user had just left, and `onPaneTitleChanged`'s active-pane guard then dropped
+every later title the page reported.
+
+Validation: both lanes, `test-agent`, P1-P3, and `viewer-panes.ps1` ALL PASS
+(96) x3. The live oracle is the win32 lane's host-floor test against a real
+WebView2: `document title: t375`, read back on a pane that was called
+`127.0.0.1` one line earlier - the fallback being replaced by the document is
+the only thing that proves both new slots landed where they were declared.

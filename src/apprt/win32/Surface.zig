@@ -1493,7 +1493,7 @@ pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     }
     if (self.title) |old| alloc.free(old);
     self.title = copy;
-    self.parent_window.onTabTitleChanged(self, title);
+    if (self.pane_view) |pv| self.parent_window.onPaneTitleChanged(pv, title);
 }
 
 /// Cache the pane's working directory (core `.pwd` action, or the one-time
@@ -1529,7 +1529,9 @@ pub fn setUserTitle(self: *Surface, title: ?[]const u8) void {
         if (self.title) |old| alloc.free(old);
         self.title = remembered;
     }
-    if (self.title) |t| self.parent_window.onTabTitleChanged(self, t);
+    if (self.title) |t| {
+        if (self.pane_view) |pv| self.parent_window.onPaneTitleChanged(pv, t);
+    }
 }
 
 /// Toggle fullscreen mode. Delegates to the parent Window.

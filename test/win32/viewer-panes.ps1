@@ -19,6 +19,12 @@
 #     CONTENT reaches the page is the win32 lane's live "host floor" test,
 #     which reads a two-heading markdown file's headings back up T375's
 #     bridge.
+#   - a viewer NAMES itself (T383): the leaf's `title` is the file's basename
+#     (or the location, for a host-less URL like `about:blank`), that name
+#     reaches the window caption through the T92 pane->tab->titlebar chain, and
+#     the human `view:` row prints it. A website's real `document.title`
+#     arriving over `DocumentTitleChanged` is the win32 lane's live test --
+#     nothing out here can see inside a WebView2.
 #   - `+reload` (T390) reloads a viewer pane and a viewer-focused window, and
 #     refuses a terminal pane and a terminal-focused window with the Mac's two
 #     DIFFERENT strings. That it really re-rendered (and did not just return
@@ -219,6 +225,10 @@ try {
         # A viewer has no shell: the terminal-only fields must be empty rather
         # than carrying a terminal's leftovers.
         Assert ($webLeaves[0].pid -eq 0) "its leaf reports pid=0 (got '$($webLeaves[0].pid)')"
+        # T383: a viewer NAMES itself. `about:blank` has no host, so the
+        # location is its own name -- and an empty title here is the defect
+        # this replaces (`+list` printed a nameless `view:` row).
+        Assert ($webLeaves[0].title -eq $blank) "its leaf reports title=$blank (got '$($webLeaves[0].title)')"
     }
 
     # The pane is a real HOST WINDOW, not just a registry entry: `GhozttyViewer`
@@ -308,6 +318,47 @@ try {
         Assert ($fileLeaves[0].type -eq 'viewer') "its leaf reports type=viewer (got '$($fileLeaves[0].type)')"
         Assert ($fileLeaves[0].url -eq $viewFile) "its leaf reports url=<the file> (got '$($fileLeaves[0].url)')"
     }
+
+    # --- 8a. titles (T383) ---------------------------------------------------
+    # A file viewer is named by its FILE, and that name walks the whole T92
+    # chain the same way a shell-reported terminal title does: pane -> tab ->
+    # titlebar. Before this the pane's title was allocated, freed, and never
+    # set, so `+list` printed an empty `view:` row and the caption read
+    # "Ghoztty" for a pane that knew exactly what it was showing.
+    #
+    # The window title is the load-bearing half: the JSON field alone could be
+    # right while nothing reached the window, which is the only place the user
+    # sees it. `vpfile` is a single-pane viewer window, so its caption can only
+    # mean one thing.
+    $viewLeafName = Split-Path $viewFile -Leaf
+    $fileLeaf = $null
+    if ($fileLeaves.Count -eq 1) { $fileLeaf = $fileLeaves[0] }
+    Assert ($fileLeaf -and $fileLeaf.title -eq $viewLeafName) `
+        "the file viewer's leaf reports title=$viewLeafName (got '$($fileLeaf.title)')"
+
+    # The caption, read off a top-level window of the app. GetWindowTextW is
+    # the right reader here and not the T175 cache trap: this is a TOP-LEVEL
+    # window whose text the owning app sets with SetWindowTextW, which is
+    # exactly the value the cross-process read returns (the stale-cache hazard
+    # is for controls whose text only ever answers WM_GETTEXT).
+    $titled = $false
+    for ($t = 0; $t -lt 25 -and -not $titled; $t++) {
+        foreach ($top in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            $caption = Get-TestWindowText -Window ([IntPtr]$top.Hwnd)
+            if ($caption -match ('^' + [regex]::Escape($viewLeafName) + '( \[DEBUG\])?$')) { $titled = $true }
+        }
+        if (-not $titled) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert $titled "a window caption reads '$viewLeafName' (the pane title reached the titlebar)"
+
+    # And the human `+list` prints it: the row used to be `view:` followed by a
+    # location and nothing else where the Mac prints the document's name.
+    $human = (& $exe +list 2>&1 | Out-String)
+    # Anchored right after `view:` -- the row is `view: <title>  <url>`, so a
+    # loose match would be satisfied by the URL's own basename and pass with the
+    # title still empty.
+    Assert ($human -match ('(?m)^\s*view:\s+' + [regex]::Escape($viewLeafName) + '\s')) `
+        '+list (human) prints the viewer title on its view: row'
 
     # A CODE file, split beside a terminal: the two file modes take different
     # branches of the injection (`setMarkdown` vs `setCode` + a language id), so

@@ -138,6 +138,54 @@ pub fn baseDirectory(path: []const u8) ?[]const u8 {
     return std.fs.path.dirname(path);
 }
 
+/// The host part of a `scheme://` URL — `https://user@example.com:8080/x` is
+/// `example.com`. Null when the location has no authority at all
+/// (`about:blank`, a bare path), which is the case the caller falls back on.
+///
+/// This is `Foundation.URL.host` narrowed to what a viewer location can be, and
+/// it exists because that is the property Mac titles a website with. An IPv6
+/// literal keeps its brackets: the port has to be found AFTER the authority, or
+/// the first colon inside `[::1]` reads as one.
+pub fn urlHost(location: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOf(u8, location, "://") orelse return null;
+    var rest = location[sep + 3 ..];
+    // The authority ends at the first path, query or fragment delimiter.
+    for ([_]u8{ '/', '?', '#' }) |c| {
+        if (std.mem.indexOfScalar(u8, rest, c)) |i| rest = rest[0..i];
+    }
+    // `user:password@host` — the LAST '@' wins, since a password may contain one.
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |i| rest = rest[i + 1 ..];
+    if (rest.len == 0) return null;
+    if (rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return rest;
+        return rest[0 .. close + 1];
+    }
+    if (std.mem.indexOfScalar(u8, rest, ':')) |i| rest = rest[0..i];
+    if (rest.len == 0) return null;
+    return rest;
+}
+
+/// The name a pane carries before — or without — a document title of its own
+/// (Mac's `ViewerView.initialTitle`): a file is named by its basename, a
+/// website by its host, and anything with neither by the location itself.
+///
+/// A file's name is ALSO its final title: Mac's title observer ignores
+/// `document.title` while the pane is showing a file, because the bundled
+/// template's own title is not the document's name. So this is the whole answer
+/// in file mode, and only the pre-load answer in web mode.
+///
+/// Borrowed from the inputs. Non-empty for every location a pane can actually
+/// have — a nameless pane is the defect this replaces — with the empty string
+/// the one degenerate input, which nothing constructs a pane from.
+pub fn initialTitle(mode: Mode, location: []const u8, file_path: ?[]const u8) []const u8 {
+    if (!mode.isFile()) return urlHost(location) orelse location;
+    // The decoded path when the pane has one (a `file://` location's basename
+    // would otherwise still be percent-encoded), else the location as typed.
+    const p = file_path orelse location;
+    const base = std.fs.path.basename(stripQuery(p));
+    return if (base.len == 0) location else base;
+}
+
 // -------------------------------------------------------------------------
 // Resource requests
 // -------------------------------------------------------------------------
@@ -830,4 +878,46 @@ test "baseDirectory is the viewed file's own" {
     const want = if (builtin.os.tag == .windows) "D:\\docs" else "/docs";
     try testing.expectEqualStrings(want, baseDirectory(path).?);
     try testing.expect(baseDirectory("a.md") == null);
+}
+
+test "urlHost strips scheme, userinfo and port" {
+    try testing.expectEqualStrings("example.com", urlHost("https://example.com").?);
+    try testing.expectEqualStrings("example.com", urlHost("https://example.com/a/b?q=1#f").?);
+    try testing.expectEqualStrings("localhost", urlHost("http://localhost:3000/").?);
+    // The port is stripped even with no path after it — the authority ends at
+    // end-of-string as readily as at a slash.
+    try testing.expectEqualStrings("localhost", urlHost("http://localhost:3000").?);
+    // The LAST '@' delimits userinfo: a password may contain one.
+    try testing.expectEqualStrings("example.com", urlHost("https://user:p@ss@example.com:8080/x").?);
+    // An IPv6 literal keeps its brackets, and its inner colons are not a port.
+    try testing.expectEqualStrings("[::1]", urlHost("http://[::1]:8080/x").?);
+
+    // No authority at all: these are the fallback cases, not hosts.
+    try testing.expect(urlHost("about:blank") == null);
+    try testing.expect(urlHost("D:\\docs\\a.md") == null);
+    try testing.expect(urlHost("https:///just-a-path") == null);
+}
+
+test "initialTitle: a file is its basename, a website its host" {
+    // File modes name the pane after the file, and the DECODED path wins over
+    // the location when they differ — a `file://` basename would otherwise
+    // still carry its percent escapes.
+    try testing.expectEqualStrings("README.md", initialTitle(.markdown, "docs/README.md", "docs/README.md"));
+    try testing.expectEqualStrings("main.zig", initialTitle(.code, "src/main.zig", null));
+    try testing.expectEqualStrings(
+        "my notes.md",
+        initialTitle(.markdown, "file:///D:/docs/my%20notes.md", "D:/docs/my notes.md"),
+    );
+    // A query on a file location is not part of its name.
+    try testing.expectEqualStrings("a.md", initialTitle(.markdown, "a.md?v=2", null));
+
+    // Web mode: the host, and the location itself when there is none. The
+    // second is what a blank browser pane shows before it is pointed anywhere.
+    try testing.expectEqualStrings("example.com", initialTitle(.web, "https://example.com/x", null));
+    try testing.expectEqualStrings("about:blank", initialTitle(.web, "about:blank", null));
+
+    // A path that names no file still yields something rather than nothing —
+    // going nameless is the defect T383 exists to remove. (An EMPTY location
+    // is the one input with no answer, and no pane ever has one.)
+    try testing.expect(initialTitle(.markdown, "docs/", "docs/").len > 0);
 }

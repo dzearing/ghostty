@@ -59,6 +59,7 @@ const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
+const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
 
 const log = std.log.scoped(.viewer_pane);
@@ -179,6 +180,17 @@ resource_handler: ?*WebResourceRequestedHandler = null,
 /// Our reference on the `NavigationCompleted` handler (T90e), same rule.
 navigation_handler: ?*NavigationCompletedHandler = null,
 
+/// Our reference on the `DocumentTitleChanged` handler (T383), same rule.
+title_handler: ?*DocumentTitleChangedHandler = null,
+
+/// Back-pointer to the split-tree leaf that owns this pane, set by
+/// `PaneView.createViewer`. It is `Surface.pane_view`'s twin and exists for the
+/// same reason: a title change has to name a LEAF to the window, and the pane
+/// is what the title arrives at. Null for a pane that is not in a tree — which
+/// is every pane in a unit test, and the reason `notifyTitle` is a no-op rather
+/// than a dereference there.
+pane_view: ?*PaneView = null,
+
 /// The app's shared environment, kept for the life of the pane because
 /// `CreateWebResourceResponse` lives on it and the resource handler needs one
 /// per intercepted request. Our own reference; released in `deinit`.
@@ -263,6 +275,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         h.release();
         self.navigation_handler = null;
     }
+    if (self.title_handler) |h| {
+        h.release();
+        self.title_handler = null;
+    }
     if (self.env) |e| {
         e.release();
         self.env = null;
@@ -291,11 +307,28 @@ pub fn paneId(self: *const ViewerPane) []const u8 {
     return &self.pane_id;
 }
 
-/// Replace the pane title. Dupes; the pane owns the copy.
+/// Replace the pane title and push it up the T92 chain — pane → tab label →
+/// titlebar — which is the same chain `Surface.setTitle` drives for a terminal.
+/// Dupes; the pane owns the copy.
+///
+/// An unchanged title returns early rather than re-notifying: a website fires
+/// `DocumentTitleChanged` more than once for one page, and each notification
+/// walks the tab strip and repaints it.
 pub fn setTitle(self: *ViewerPane, alloc: Allocator, value: []const u8) Allocator.Error!void {
+    if (self.title) |t| if (std.mem.eql(u8, t, value)) return;
     const dup = try alloc.dupeZ(u8, value);
     if (self.title) |t| alloc.free(t);
     self.title = dup;
+    self.notifyTitle();
+}
+
+/// Tell the owning window this pane's title changed. A no-op for a pane that is
+/// not in a split tree yet (every pane under unit test, and a pane between
+/// `create` and the tree taking it).
+fn notifyTitle(self: *ViewerPane) void {
+    const pv = self.pane_view orelse return;
+    const t = self.title orelse return;
+    self.parent_window.onPaneTitleChanged(pv, t);
 }
 
 // -------------------------------------------------------------------------
@@ -437,6 +470,14 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
             log.warn("viewer location is not a usable file path", .{});
         }
     }
+
+    // Name the pane NOW, from the location alone. A website's real title
+    // arrives later over `DocumentTitleChanged`; a file's never does (the
+    // template's `<title>` is not the document's name), so in file mode this is
+    // the whole answer. Either way the pane is never nameless while it loads —
+    // the T383 defect, where a tab read "Ghoztty" for a pane that knew exactly
+    // what it was showing.
+    self.setTitle(alloc, content.initialTitle(self.mode, url, self.file_path)) catch {};
 
     self.applyNavigation();
 }
@@ -1278,6 +1319,7 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     _ = c.setVisible(self.visible);
     self.applyColorScheme();
     self.subscribeNewWindowRequested();
+    self.subscribeDocumentTitle();
     // Before the navigation below, and that ordering is the contract: a script
     // registered after a page has started loading does not reach that page, so
     // the very first document a pane shows would be the one without a toolbar.
@@ -1320,6 +1362,62 @@ fn subscribeNewWindowRequested(self: *ViewerPane) void {
         return;
     }
     self.new_window_handler = handler;
+}
+
+/// `ICoreWebView2DocumentTitleChangedEventHandler`: a website naming itself.
+const DocumentTitleChangedHandler = com.CallbackOwning(
+    iface.IID_DocumentTitleChangedHandler,
+    onDocumentTitleChanged,
+    releasePendingToken,
+);
+
+/// Subscribe to `document.title`. Registered for EVERY pane, file panes
+/// included, for the reason the resource interception is: a file pane becomes a
+/// web pane the moment the user types an address, and a subscription installed
+/// only for the starting mode would be dead by then (Mac observes `\.title` on
+/// every viewer for exactly this).
+fn subscribeDocumentTitle(self: *ViewerPane) void {
+    std.debug.assert(self.title_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const handler = DocumentTitleChangedHandler.create(p.alloc, p) catch return;
+    p.refs += 1;
+    if (!web.addDocumentTitleChanged(@ptrCast(handler))) {
+        log.warn("add_DocumentTitleChanged failed; this pane keeps its location as its name", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.title_handler = handler;
+}
+
+fn onDocumentTitleChanged(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*anyopaque,
+) com.HRESULT {
+    _ = args; // the event carries no payload; the title is read off the sender
+    const self = p.pane orelse return com.S_OK;
+    // A file's name is its basename, not its page's `<title>` — the bundled
+    // template supplies that, and it names the renderer rather than the
+    // document. Mac guards the identical observer with `isWebURL`.
+    if (self.mode.isFile()) return com.S_OK;
+    const web = sender orelse return com.S_OK;
+
+    const raw = web.documentTitleRaw() orelse return com.S_OK;
+    // The runtime allocated it on the COM heap; we free it on ours.
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+    const wide = std.mem.span(raw);
+    // An empty title is what a page has before it declares one. Falling back to
+    // the location keeps the pane named rather than blanking a tab mid-load.
+    if (wide.len == 0) return com.S_OK;
+
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(p.alloc, wide) catch return com.S_OK;
+    defer p.alloc.free(utf8);
+    self.setTitle(p.alloc, utf8) catch {};
+    return com.S_OK;
 }
 
 fn fail(self: *ViewerPane, reason: webview2.Failure) void {
@@ -1507,6 +1605,22 @@ pub fn wndProc(
 
         w32.WM_SETFOCUS => {
             self.focus();
+            // The tab label follows its FOCUSED pane (T92), so a viewer taking
+            // focus has to become the tab's active pane and relabel it — the
+            // same two lines the terminal's WndProc runs. Without them, clicking
+            // from a terminal into a viewer leaves the tab named after the pane
+            // the user just left, and a later `DocumentTitleChanged` is filtered
+            // out by `onPaneTitleChanged`'s active-pane guard.
+            //
+            // The other two things that path does — `heroOnPaneFocused` and
+            // `updateDimOverlays` — are deliberately NOT here: hero excludes
+            // viewers (T90g) and the viewer dim overlay is T380.
+            if (self.pane_view) |pv| {
+                const win = self.parent_window;
+                const tab = win.active_tab;
+                win.tab_active_pane[tab] = pv;
+                win.refreshTabTitle(tab);
+            }
             return 0;
         },
 
@@ -1826,6 +1940,13 @@ test "host floor: a real controller on a real window, on this box" {
     // called `Stop` or `GoForward` with two pointers instead.
     try testing.expect(pane.new_window_handler != null);
 
+    // T383's `add_DocumentTitleChanged` (46), same argument: a recorded handler
+    // is the runtime saying it accepted a subscription at that index. The slot
+    // one before it is `remove_NewWindowRequested`, whose signature takes a
+    // TOKEN rather than a handler — subscribing there would hand it a pointer
+    // as if it were an i64.
+    try testing.expect(pane.title_handler != null);
+
     // ------------------------------------------------------------------
     // T374/T90e: navigation, and the whole file-mode chain behind it
     // ------------------------------------------------------------------
@@ -1901,6 +2022,13 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqualStrings(md_path, pane.location.?);
     try testing.expectEqualStrings(md_path, pane.home_location.?);
 
+    // T383: a file pane is named by its file, and stays that way. The template
+    // it actually loaded has a `<title>` of its own, and `DocumentTitleChanged`
+    // has certainly fired by now (the document rendered) — so this assertion is
+    // the file-mode GUARD, not just the fallback: without it the tab would read
+    // whatever the bundled renderer calls itself.
+    try testing.expectEqualStrings("t90e.md", pane.title.?);
+
     // CODE mode, on the same template: `setCode` clears the heading index, and
     // the page posts the empty list up the same bridge. Headings falling back
     // to zero is the page saying `window.__viewer.setCode` ran — a template
@@ -1918,6 +2046,7 @@ test "host floor: a real controller on a real window, on this box" {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 0), pane.headings.len);
+    try testing.expectEqualStrings("t90e.zig", pane.title.?);
 
     // A missing file must not take the pane down: it renders the page's own
     // error card and the pane stays a live, navigable citizen.
@@ -1940,6 +2069,8 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqual(content.Mode.web, pane.mode);
     try testing.expectEqualStrings("about:blank", pane.location.?);
     try testing.expectEqualStrings(md_path, pane.home_location.?);
+    // A location with no host is its own name — the blank browser pane's case.
+    try testing.expectEqualStrings("about:blank", pane.title.?);
 
     // ------------------------------------------------------------------
     // T375: the bridge, on a real http:// page
@@ -1964,6 +2095,11 @@ test "host floor: a real controller on a real window, on this box" {
     defer alloc.free(page_url);
 
     try pane.navigate(alloc, page_url);
+    // Before a byte of the page arrives the pane is already named — by its host,
+    // which is what the address alone can say. This is the pre-load half of
+    // T383, and it is asserted HERE because one line later the real title
+    // overwrites it.
+    try testing.expectEqualStrings("127.0.0.1", pane.title.?);
     var bridge_timer = try std.time.Timer.start();
     while (bridge_timer.read() < 30 * std.time.ns_per_s) {
         while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
@@ -1987,6 +2123,18 @@ test "host floor: a real controller on a real window, on this box" {
     // here would mean the shim was injected and the toolbar was not — the exact
     // split the single-blob rule exists to make impossible.
     try testing.expectEqualStrings("toolbar-ran", pane.active_heading.?);
+
+    // T383's live round trip: `add_DocumentTitleChanged` (46) delivered the
+    // event and `get_DocumentTitle` (48) handed back the string, on a page we
+    // did not author. The pane was called "127.0.0.1" a moment ago, so this is
+    // the document renaming it — not the fallback still standing.
+    try waitFor(&msg, 30, struct {
+        fn named(p: *ViewerPane) bool {
+            return p.title != null and std.mem.eql(u8, p.title.?, "t375");
+        }
+    }.named, &pane);
+    log.warn("document title: {?s}", .{pane.title});
+    try testing.expectEqualStrings("t375", pane.title.?);
 
     // ------------------------------------------------------------------
     // T390: `+reload`, both modes
