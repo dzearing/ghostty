@@ -1,6 +1,6 @@
 #!/bin/bash
 # ghoztty-managed
-# ghoztty-banner.sh — keep a Ghoztty pane banner current for a Claude Code session.
+# ghoztty-banner.sh — keep a Ghoztty pane banner current for a coding-agent session.
 #
 # Banner layout: the title as an `## ` h2 heading on its own line (larger than
 # the body text), then a key/value table (empty header row so the label column
@@ -87,7 +87,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # Walk up the process tree until we find an ancestor with a controlling tty.
-# (The hook shell and the Bash-tool shell have no tty; the claude process does.)
+# (The hook shell and the Bash-tool shell have no tty; the agent process does.)
 find_tty() {
     local pid=$$ t
     while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
@@ -426,7 +426,7 @@ prompt-hook)
     pairs=(activity "working" did "")
     [ -n "$asked" ] && pairs+=(asked "$asked")
 
-    # The state file is keyed by tty, so a fresh Claude session starting in a
+    # The state file is keyed by tty, so a fresh agent session starting in a
     # pane inherits the PREVIOUS session's task fields (title/goal/status/pr).
     # Detect a new session by its id and wipe the stale task identity, so a
     # fresh context begins with a blank banner instead of another session's
