@@ -7109,3 +7109,43 @@ plus the live half appended to the real-WebView2 `host floor` test, where
 nobody calls `reloadContent`), `-Dapp-runtime=none`, `test-agent`, P1-P3 ALL
 PASS, `viewer-panes.ps1` ALL PASS (111). Follow-up: T400 (a pending debounce
 timer survives navigation and re-fetches the new page).
+
+## 2026-08-03 - T96: a session-scoped CLOSE never returned, and it was never the pty
+
+`closeSession` (CLOSE_SESSION by id) always burned its full RPC timeout and then
+reported failure over a session the agent had already killed. `close_session_result`
+was the one A->C reply frame type with no arm in the client's
+`handleControlInternal`, so the reply reached the control reader and stopped
+there. One arm, delivered the same same-channel way as `cwd`/`sessions`/`layouts`.
+No wire change: the agent had been answering correctly the whole time.
+
+The filed diagnosis (from T89c) was wrong in every part - it blamed the
+production pty teardown for hanging the serving thread, but `terminateFn` had
+carried T89b's two-phase `closeConsole` since a day BEFORE T96 was filed, and
+instrumented on box the entire close path (unlink, terminate a live ConPTY
+child, join the reader, free, persist, send) runs in **30 ms**. The tell was in
+the original report and was read as corroboration: *"reproduces over TCP too,
+exactly 10s"*. A pty teardown does not take the same 10.000 s over two
+transports. **10 s was the CLIENT's own RPC budget** - the number belonged to
+the waiter, not the worker, and pointed at the client from the start.
+
+Blast radius was user-facing, not test-only: the chooser's **Kill** on both
+platforms stalled for the RPC budget and then reported failure. Worse,
+`chooser-sessions.ps1` carried a comment declaring `confirmed=true` unassertable
+and blaming a slow agent teardown - the same wrong diagnosis, propagated into a
+deliberately weakened oracle. **A workaround that records a cause is a claim,
+and an unverified one rots into the thing that stops anyone looking.** Two
+scripts carried it; both now assert the answer, `agent-pipe.ps1` with a LATENCY
+bound, since a re-broken dispatch fails by taking the timeout.
+
+Measured: `remote-test-client --close-session` 10054 ms/exit 1 -> **59 ms/exit 0,
+ok=true**. Negative control: the new unit test fails with `error.Timeout` when
+the arm is commented out.
+
+Validation: `-Dapp-runtime=none` (3 new tests), `-Dapp-runtime=win32`,
+`test-agent`, P1-P3 ALL PASS, `agent-pipe.ps1` ALL PASS, `chooser-sessions.ps1`
+ALL PASS (17). Follow-ups: T401 (an acceptance script run concurrently with
+`test-agent` wedged the lane - both test exes spinning 11+ min, green when run
+alone; nearly mis-filed as a third test-agent flake), T402 (Mac-seat
+verification of the chooser Kill - the fix is shared Zig), T403 (nothing
+structurally guarantees every A->C reply type has a dispatch arm).

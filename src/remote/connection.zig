@@ -2670,6 +2670,21 @@ pub const Connection = struct {
                 // is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
+            .close_session_result => {
+                // Reply to a CLOSE_SESSION RPC (T96). Same-channel correlation, like
+                // CWD/SESSIONS: the agent echoes CLOSE_SESSION_RESULT on the request
+                // channel. Dropped if no caller is parked — which is the normal case
+                // for `closeSessionNoWait`, whose reply lands on a channel nobody
+                // claimed by design.
+                //
+                // This arm is what makes `closeSession` an RPC at all. Without it the
+                // reply reached the reader and stopped there, so EVERY close-by-id
+                // burned the caller's full timeout and then reported failure over a
+                // session the agent had already killed ~30 ms in — the chooser's Kill
+                // and `remote-test-client --close-session` both. It read like a hang
+                // in the agent's pty teardown; it was a missing dispatch arm here.
+                _ = self.deliverRpcReply(frame);
+            },
             .relaunched => {
                 // Reply to a RELAUNCH RPC (§5.4 reboot floor, T12c). The agent echoes
                 // RELAUNCHED on the SESSION's channel (the relaunchable path), which is
@@ -3215,13 +3230,21 @@ const MockAgent = struct {
     /// Read the client HELLO and reply with an agent HELLO in the same encoding.
     /// Returns the parsed client HELLO's encoding for assertions.
     fn handshake(self: *MockAgent) !protocol.TransferEncoding {
+        return self.handshakeCaps(&.{});
+    }
+
+    /// `handshake`, but the agent HELLO advertises `caps`. Capability-gated
+    /// opcodes (`close_session`) are refused client-side unless the peer
+    /// advertised them, so a test that drives one must hand the mock its
+    /// capability set — an empty set models an older agent.
+    fn handshakeCaps(self: *MockAgent, caps: []const []const u8) !protocol.TransferEncoding {
         const frame = (try self.nextFrame()) orelse return error.NoHello;
         try testing.expectEqual(protocol.FrameType.hello, frame.type);
         var parsed = try protocol.Hello.parse(self.alloc, frame.payload);
         defer parsed.deinit();
         const enc = parsed.value.transfer_encoding;
 
-        const reply: protocol.Hello = .{ .transfer_encoding = enc };
+        const reply: protocol.Hello = .{ .transfer_encoding = enc, .capabilities = caps };
         const json = try reply.encode(self.alloc);
         defer self.alloc.free(json);
         try self.sendFrame(.{
@@ -4122,6 +4145,17 @@ const LifecycleAgent = struct {
     kill_fail_pid: i64 = -424242, // a sentinel no real test pid uses
     spawn_pid: i64 = 99001,
 
+    // CLOSE_SESSION reply config (T96). A CLOSE_SESSION for `close_session_miss_id`
+    // replies found=false/ok=false (models an unknown/stale id); any other id is
+    // closed. `advertise_close_session = false` models an OLDER agent that never
+    // announced the opcode, so the client refuses to send it. `silent_close_session`
+    // models an agent that receives the request and never answers — the shape the
+    // client saw for the whole life of the T96 defect.
+    advertise_close_session: bool = true,
+    silent_close_session: bool = false,
+    close_session_miss_id: []const u8 = "ffffffffffffffffffffffffffffffff",
+    saw_close_session: std.atomic.Value(bool) = .{ .raw = false },
+
     // Observations (atomics / events so the test thread can read them safely).
     // The channel id is u128 and x86_64 has no 128-bit atomics, so it is
     // mutex-guarded instead (setSeenChannel/seenChannel).
@@ -4165,7 +4199,8 @@ const LifecycleAgent = struct {
     }
 
     fn body(self: *LifecycleAgent) !void {
-        _ = try self.ctrl.handshake();
+        const caps = [_][]const u8{protocol.capability.close_session};
+        _ = try self.ctrl.handshakeCaps(if (self.advertise_close_session) &caps else &.{});
         while (true) {
             const frame = (try self.ctrl.nextFrame()) orelse return; // EOF: done
             switch (frame.type) {
@@ -4242,6 +4277,21 @@ const LifecycleAgent = struct {
                 .close => {
                     self.saw_close.store(true, .monotonic);
                     self.close_detach_seen.set();
+                },
+                .close_session => {
+                    // Reply CLOSE_SESSION_RESULT on the SAME request channel (T96),
+                    // exactly as the agent's `handleCloseSession` does.
+                    self.saw_close_session.store(true, .monotonic);
+                    if (self.silent_close_session) continue;
+                    var parsed = protocol.parseJson(protocol.CloseSession, self.alloc, frame.payload) catch continue;
+                    defer parsed.deinit();
+                    const sid = parsed.value.session_id;
+                    const found = !std.mem.eql(u8, sid, self.close_session_miss_id);
+                    try self.ctrl.sendJson(.close_session_result, frame.channel, protocol.CloseSessionResult{
+                        .session_id = sid,
+                        .ok = found,
+                        .found = found,
+                    });
                 },
                 .detach => {
                     self.saw_detach.store(true, .monotonic);
@@ -4810,6 +4860,61 @@ test "spawnProc: round-trips ok with the agent-reported pid" {
     try testing.expect(out.ok);
     try testing.expectEqual(@as(i64, 99001), out.pid.?);
     try testing.expect(out.error_msg == null);
+    try testing.expect(a.err == null);
+}
+
+test "closeSession: the agent's CLOSE_SESSION_RESULT wakes the RPC (T96)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    try h.start();
+
+    // The whole point of the test is that this returns on the REPLY, not on the
+    // timeout: a generous bound would pass either way, so the bound is far below
+    // any plausible round trip over a loopback.
+    const ok = try h.conn.closeSession("0123456789abcdef0123456789abcdef", 2 * std.time.ns_per_s);
+    try testing.expect(a.saw_close_session.load(.monotonic));
+    try testing.expect(ok);
+
+    // An id the agent doesn't have answers definitively (found=false ⇒ ok=false)
+    // rather than going quiet — the caller must be able to tell "already gone"
+    // from "never answered".
+    try testing.expect(!try h.conn.closeSession(a.close_session_miss_id, 2 * std.time.ns_per_s));
+    try testing.expect(a.err == null);
+}
+
+test "closeSession: a silent agent times out instead of wedging the caller (T96)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.silent_close_session = true;
+    try h.start();
+
+    try testing.expectError(
+        error.Timeout,
+        h.conn.closeSession("0123456789abcdef0123456789abcdef", 50 * std.time.ns_per_ms),
+    );
+    try testing.expect(a.saw_close_session.load(.monotonic));
+    try testing.expect(a.err == null);
+}
+
+test "closeSession: an agent that never advertised the capability is refused (T96)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.advertise_close_session = false;
+    try h.start();
+
+    // Gate the opcode rather than emit one an older agent would treat as a fatal
+    // framing error — and fail INSTANTLY, without burning the RPC timeout.
+    try testing.expectError(
+        error.Unsupported,
+        h.conn.closeSession("0123456789abcdef0123456789abcdef", 2 * std.time.ns_per_s),
+    );
+    try testing.expect(!a.saw_close_session.load(.monotonic));
     try testing.expect(a.err == null);
 }
 

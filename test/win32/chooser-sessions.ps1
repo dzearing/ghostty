@@ -249,12 +249,20 @@ try {
         $killedId = ''
         if ($killLine -match 'id=([0-9a-f]+)') { $killedId = $Matches[1] }
 
-        # The oracle is the REFETCH, not the close's own reply. Measured on box
-        # (T323): closing a session with a live child makes the agent terminate
-        # + free it BEFORE it sends CLOSE_SESSION_RESULT, which can take longer
-        # than the 5s RPC budget - so `confirmed=true` is not reliably
-        # observable even when the close plainly worked. What IS reliable is
-        # that the session is gone afterwards, from two independent sources.
+        # Three independent oracles: the agent's own answer, the refetch, and
+        # `+sessions` from outside the app.
+        #
+        # `confirmed=` used to be unassertable here, and the reason written down
+        # was wrong: the guess was that the agent's terminate+free outran the 5s
+        # RPC budget. It does not - measured at ~30 ms (T96). The reply was
+        # arriving and being DROPPED, because `close_session_result` was the one
+        # A->C reply type with no arm in the client's control dispatch, so the
+        # RPC always died on its timeout with `ok=false` over a session that had
+        # in fact been killed. Assert it now: a re-broken dispatch would make
+        # every Kill report failure again, and only this line would say so.
+        $confirmLine = Wait-LogLine $errlog 'chooser roster: close session confirmed=' 8000
+        Assert ($null -ne $confirmLine -and $confirmLine -match 'confirmed=true') `
+            'the agent confirmed the close (T96)'
         $reload = Wait-LogCount $errlog 'chooser roster: loaded \d+ session' 2 10000
         Assert ($null -ne $reload) 'the roster refetched itself after the kill'
         $reloaded = -1

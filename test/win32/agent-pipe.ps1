@@ -11,7 +11,8 @@
 # Covers: pipe bind + port.json {pipe} shape, +sessions over the pipe with no
 # sessions (text + --json), a held scratch session enumerated alive+attached,
 # session SURVIVES the viewer detaching (still listed, detached), session-scoped
-# CLOSE removes it, agent death => +sessions fails gracefully (no hang/crash).
+# CLOSE removes it AND answers inside the RPC timeout (T96), agent death =>
+# +sessions fails gracefully (no hang/crash).
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
@@ -128,19 +129,34 @@ Assert "session survived the viewer leaving" ($null -ne $rows -and @($rows).Coun
 Assert "session still alive but now detached" (
     $null -ne $rows -and @($rows)[0].alive -eq $true -and @($rows)[0].attached -eq $false)
 
-"== 5: session-scoped CLOSE (over the pipe) removes it"
-# CLOSE_SESSION unlinks the session from the store, then terminates its ConPTY
-# child, then replies. On Windows that pty teardown currently hangs the serving
-# thread (pre-existing, transport-independent — reproduces over TCP too; the T89b
-# teardown class in the production close path — filed as T96), so the client's
-# RESULT reply times out. That does NOT affect the T89c claim: the CLOSE_SESSION
-# frame was delivered over the pipe and the session IS removed. Assert removal
-# (the observable effect), not the client's exit code.
+"== 5: session-scoped CLOSE (over the pipe) removes it AND answers (T96)"
+# CLOSE_SESSION unlinks the session from the store, terminates its ConPTY child,
+# then replies CLOSE_SESSION_RESULT on the request channel. Both halves are
+# asserted: the session is gone, AND the client got its answer.
+#
+# T96 was the second half missing. The reply reached the client's control reader
+# and stopped there — `close_session_result` was the one A→C reply type with no
+# arm in `handleControlInternal`, so the parked RPC never woke and every
+# close-by-id burned the full 10 s timeout and then reported failure over a
+# session the agent had already killed ~30 ms in. Hence the LATENCY bound below,
+# not just an exit code: a re-broken dispatch fails the same way it did before,
+# by taking the timeout, and only a bound catches that.
+$sw = [Diagnostics.Stopwatch]::StartNew()
 $closer = Start-Process -FilePath $ClientExe -PassThru -WindowStyle Hidden `
     -ArgumentList "--pipe=$pipe", "--close-session=$sid" `
     -RedirectStandardOutput "$tmp\close.out" -RedirectStandardError "$tmp\close.err"
-# The RESULT reply times out at ~10s (T96); give it a moment past that, then move on.
-if (-not $closer.WaitForExit(15000)) { Stop-Process -Id $closer.Id -Force -ErrorAction SilentlyContinue }
+$null = $closer.Handle   # cache the handle or ExitCode reads back empty (PS 5.1)
+$closerExited = $closer.WaitForExit(15000)
+$sw.Stop()
+if (-not $closerExited) { Stop-Process -Id $closer.Id -Force -ErrorAction SilentlyContinue }
+$closeErr = if (Test-Path "$tmp\close.err") { Get-Content "$tmp\close.err" -Raw } else { '' }
+Assert "close-session client exited" $closerExited
+Assert "close-session reported ok=true" ($closeErr -match "close-session $([regex]::Escape($sid)): ok=true")
+# The client's own RPC timeout is 10 s, so anything at or past it is the T96
+# shape. Measured after the fix: ~60 ms.
+Assert "CLOSE_SESSION_RESULT arrived well inside the RPC timeout (T96)" (
+    $closerExited -and $sw.ElapsedMilliseconds -lt 5000)
+if ($sw.ElapsedMilliseconds -ge 5000) { "  NOTE: close-session took $($sw.ElapsedMilliseconds) ms" }
 Start-Sleep -Seconds 1
 $code = Run-Cli '+sessions --json' 'closed.txt'
 $rows = $null
