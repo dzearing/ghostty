@@ -6851,3 +6851,44 @@ win32 feedback composer had no task at all), **T385** (the shim hard-codes one
 handler name; a second Mac handler would silently no-op, and the rename test
 cannot see an addition) and **T386** (`selection.js`'s font stack has no Windows
 entry, so the popover renders in Arial next to Segoe UI chrome).
+
+## 2026-08-02 - T90e: file viewers render, offline, from an origin that does not exist
+
+`+split --view=README.md` renders markdown on Windows and `--view=build.zig`
+renders highlighted code, entirely offline. The arithmetic half is a new pure
+module (`src/apprt/win32/viewer_content.zig`, none lane): mode by extension,
+Mac's highlight.js and MIME tables byte-for-byte, `file://` unwrapping, the
+3-tier resolver's path math, and the `window.__viewer` calls. `ICoreWebView2`
+grew from a 45-slot prefix to 58 (`add_NavigationCompleted`, `ExecuteScript`,
+`add_WebResourceRequested`, `AddWebResourceRequestedFilter`), plus `IStream`
+and the environment's response factory. The interim
+`view_file_unsupported_error` is deleted, not disabled.
+
+Two decisions worth keeping. The escape guard is **lexical**
+(`std.fs.path.resolve`, no disk) where Mac resolves symlinks - deliberate,
+because the attack it stops (`![](../../../secrets.txt)`) is lexical and a
+check needing a live filesystem is a check no unit test runs. And
+`appendJsString` escapes **U+2028/U+2029**, which JSON need not and JavaScript
+must: both END a JS string literal, so one in a document would turn
+`setMarkdown("...` into a syntax error and the pane would render nothing with no
+error anywhere.
+
+Validation: both lanes, `test-agent`, P1-P3 ALL PASS, `viewer-panes.ps1`
+ALL PASS (78) x3. The live oracle is one number in the win32 lane -
+`file mode: headings=2` - which only appears if the interception, the rewound
+`IStream`, the resolver, `NavigationCompleted`, `ExecuteScript` and T375's
+bridge ALL ran. That test overrides the assets path, so the acceptance script
+carries the other half: it reads the GUI's own stderr for the missing-file
+pane's `viewer file error`, which is written from the NavigationCompleted
+handler and therefore proves the REAL app served its own template.
+
+Cost, and the T375 lesson holding: the `ExecuteScriptCompletedHandler` IID
+recalled from memory was plausible and WRONG. Every IID and every vtable order
+came out of the SDK's own `WebView2.h`; the three slots T374/T375 had already
+pinned are what made the rest cheap to check.
+
+Follow-ups: **T387** (Mac keeps a UTF-8 BOM and has no size cap - Windows now
+strips and caps, so the divergence is filed rather than left), **T388** (a
+leading `~` in `--view` resolves to `<cwd>\~\x.md`; upstream, in
+`view_args.zig`) and **T389** (the injection holds three copies of the file at
+once).

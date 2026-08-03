@@ -298,7 +298,14 @@ Unchanged in intent; stated here so the boundaries are explicit.
   rejections) and **T375** (P1 shim + P2 blob), all done as of 2026-08-02.
   P1/P2 live in `src/apprt/win32/viewer_bridge.zig`; the shared JS is embedded
   verbatim and a test asserts it byte-for-byte.
-- **T90e** File viewers. Unchanged. TOC is NOT here (own task).
+- **T90e** File viewers. **Done 2026-08-02.** Mode by extension, the
+  `WebResourceRequested` 3-tier resolver with a **lexical** escape guard (the
+  one deliberate divergence from `ViewerSchemeHandler`, and the reason the
+  guard is unit-testable at all), `window.__viewer` injection from
+  `NavigationCompleted`, and the in-page error card. Pure half:
+  `src/apprt/win32/viewer_content.zig`. The interim
+  `view_file_unsupported_error` is deleted. TOC is still NOT here (T160), and
+  neither is live reload (T90f).
 - **T90f** Live reload + link routing. Unchanged, plus the `+reload` verb (P8)
   -- it is the same code path as the watcher's re-render.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,

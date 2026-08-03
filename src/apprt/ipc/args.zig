@@ -177,14 +177,6 @@ fn hasSchemePrefix(value: []const u8, comptime prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-/// The interim answer while FILE viewers are Mac-only. Web-mode `--view` opens
-/// a real pane as of T374; a file still has no renderer here until T90e, and
-/// `--view` used to fall into the unknown-flag drop and silently open a
-/// TERMINAL — the wrong pane, with no hint that anything was ignored. Explicit
-/// failure beats silent wrong behavior; delete this (and its two call sites)
-/// when file mode lands.
-pub const view_file_unsupported_error = "file viewers are not yet supported on Windows; --view needs an http(s) or about: URL";
-
 /// Whether `--view` was given alongside a command. `-e` counts: the Mac
 /// parser folds trailing `-e` argv into `config.command` before the check,
 /// so the two platforms reject the same command lines.

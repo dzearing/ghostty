@@ -12,15 +12,16 @@
 #     `+set-banner`) refuse a viewer target with the Mac's string and exit 1,
 #     while `+close` takes it silently -- the line between "this pane has no
 #     shell" and "this pane is a normal tree citizen".
-#   - a FILE `--view` is still answered EXPLICITLY (T90e brings the renderer).
-#     It used to fall into the verb parser's unknown-flag drop, so
-#     `+new-window --view=README.md` opened a plain TERMINAL and reported
-#     success. Silently doing the wrong thing is the defect; the interim error
-#     is the fix, and handing a markdown file to a browser would be the same
-#     defect one level down.
-#   - `--view` + `--command`/`-e` is rejected with the MAC string, and it is
-#     checked FIRST -- that check is permanent, while the file-mode one is
-#     deleted by T90e.
+#   - a FILE `--view` (T90e) builds a pane too -- markdown, code, and a path
+#     that does not exist, which opens a pane carrying the error IN the page
+#     rather than refusing. `+list` cannot see inside a WebView2, so what is
+#     asserted here is the pane's identity and location; that the file's
+#     CONTENT reaches the page is the win32 lane's live "host floor" test,
+#     which reads a two-heading markdown file's headings back up T375's
+#     bridge.
+#   - `--view` + `--command`/`-e` is rejected with the MAC string. That is the
+#     only remaining `--view` refusal; the interim "file viewers are not yet
+#     supported on Windows" error was deleted with T90e.
 #   - `+list --json` carries the additive `"type"` / `"url"` pane fields on
 #     every leaf, which is what `src/cli/list.zig` reads to render a `view:`
 #     row. Terminals report `"terminal"` / null, exactly as the Mac server
@@ -140,7 +141,6 @@ function Wait-Leaf($target, $name) {
 
 $viewFile = Join-Path $repo 'README.md'
 $blank = 'about:blank'
-$fileUnsupported = 'file viewers are not yet supported on Windows'
 $conflict = '--view cannot be combined with --command/-e'
 $notTerminal = 'is a viewer pane, not a terminal'
 
@@ -279,29 +279,88 @@ try {
     Assert $shrank "+close removed the viewer pane (now $(Get-PaneCount 'vp'))"
     Assert ($null -eq (Get-Leaf 'vp' 'vpsplit')) 'the closed viewer is gone from +list'
 
-    # --- 8. a FILE --view is still refused, and creates nothing (T90e) -------
-    $winsBefore = @((Get-Data).windows).Count
+    # --- 8. a FILE --view BUILDS a viewer pane (T90e) ------------------------
+    # The exact inverse of the assertion it replaces. Until T90e a `--view`
+    # naming a file was refused explicitly, because handing markdown to a
+    # browser renders it as raw text; the offline renderer exists now, so the
+    # same command line has to build a pane instead.
+    #
+    # What is checkable from OUT HERE is the pane's identity and location --
+    # `+list` cannot see inside a WebView2. That the file's CONTENT reaches the
+    # page is proven live in the win32 lane's "host floor" test, which opens a
+    # two-heading markdown file and reads the headings back up T375's bridge:
+    # nothing short of the interception, the resolver, the template load and
+    # the `window.__viewer.setMarkdown` injection produces them.
     $panesNow = Get-PaneCount 'vp'
     $r = Invoke-Verb @('+new-window', '--target=vpfile', "--view=$viewFile")
-    Assert ($r.Code -ne 0) "+new-window --view=<file> exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape($fileUnsupported)) '+new-window --view=<file> reports the interim error'
-    Start-Sleep -Seconds 2
-    Assert (@((Get-Data).windows).Count -eq $winsBefore) 'no window was created for the file view'
-    Assert ($null -eq (Get-Win 'vpfile')) 'the rejected target is NOT registered'
+    Assert ($r.Code -eq 0) "+new-window --view=<file> exits 0 (got $($r.Code))"
+    $vpfile = Wait-Win 'vpfile'
+    Assert ($null -ne $vpfile) '+new-window --view=<file> creates a window'
+    $fileLeaves = @()
+    if ($vpfile) { $fileLeaves = @(Get-Leaves $vpfile.tabs[0].splits) }
+    Assert ($fileLeaves.Count -eq 1) "the file viewer window has exactly one pane (got $($fileLeaves.Count))"
+    if ($fileLeaves.Count -eq 1) {
+        Assert ($fileLeaves[0].type -eq 'viewer') "its leaf reports type=viewer (got '$($fileLeaves[0].type)')"
+        Assert ($fileLeaves[0].url -eq $viewFile) "its leaf reports url=<the file> (got '$($fileLeaves[0].url)')"
+    }
 
-    $r = Invoke-Verb @('+split', '--target=vp', '--name=vpfilesplit', "--view=$viewFile")
-    Assert ($r.Code -ne 0) "+split --view=<file> exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape($fileUnsupported)) '+split --view=<file> reports the interim error'
-    Start-Sleep -Seconds 2
-    Assert ((Get-PaneCount 'vp') -eq $panesNow) "no pane was created for the file view (still $panesNow)"
+    # A CODE file, split beside a terminal: the two file modes take different
+    # branches of the injection (`setMarkdown` vs `setCode` + a language id), so
+    # one of them working says nothing about the other.
+    $codeFile = Join-Path $repo 'build.zig'
+    $r = Invoke-Verb @('+split', '--target=vp', '--name=vpcode', "--view=$codeFile")
+    Assert ($r.Code -eq 0) "+split --view=<code file> exits 0 (got $($r.Code))"
+    $codeLeaf = Wait-Leaf 'vp' 'vpcode'
+    Assert ($null -ne $codeLeaf) '+split --view=<code file> registers the pane'
+    if ($codeLeaf) {
+        Assert ($codeLeaf.type -eq 'viewer') "the code leaf reports type=viewer (got '$($codeLeaf.type)')"
+        Assert ($codeLeaf.url -eq $codeFile) "the code leaf reports url=<the file> (got '$($codeLeaf.url)')"
+    }
+    Assert ((Get-PaneCount 'vp') -eq ($panesNow + 1)) "the file split grew the window by one pane (now $(Get-PaneCount 'vp'))"
 
-    # --- 9. --view + --command / -e: the Mac string, and it wins the race ----
-    # Ordering matters: the conflict check is permanent and the file-mode one is
-    # deleted by T90e, so an ambiguous command line must report the conflict on
-    # both platforms rather than the interim Windows-only error. Checked with a
-    # WEB url too, where there is no interim error left to hide behind -- a
-    # conflict that only fires for files would be a conflict check that stopped
-    # existing the moment T374 made the pane real.
+    # A FILE viewer is not a second class of viewer: the terminal-only verbs
+    # refuse it with the same string a web one gets.
+    $r = Invoke-Verb @('+read', '--name=vpcode', '--lines=1')
+    Assert ($r.Code -ne 0) "+read against a file viewer exits nonzero (got $($r.Code))"
+    Assert ($r.Out -match [regex]::Escape($notTerminal)) "+read against a file viewer reports '$notTerminal'"
+
+    # A MISSING file still opens a pane. The error belongs IN the page, where
+    # the user can read the path that failed, not in a refusal that leaves
+    # nothing on screen to correct.
+    $missing = Join-Path $repo 'no-such-file-t90e.md'
+    $r = Invoke-Verb @('+new-window', '--target=vpmissing', "--view=$missing")
+    Assert ($r.Code -eq 0) "+new-window --view=<missing file> exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Win 'vpmissing')) 'a missing file still opens a viewer window'
+
+    # And the human renderer prints the file on its view: row, the same way it
+    # prints a URL.
+    $human = (& $exe +list 2>&1 | Out-String)
+    Assert ($human -match [regex]::Escape((Split-Path $viewFile -Leaf))) '+list (human) prints the viewed file on a view: row'
+
+    # The GUI's OWN log is the only oracle out here for whether the page
+    # actually loaded, and one line carries the whole chain. "viewer file
+    # error" is written from the NavigationCompleted handler, which fires only
+    # after the template has been SERVED -- through an interception, from a
+    # synthetic origin that does not exist in DNS, out of the bundled assets
+    # the app resolved for itself. So the missing-file pane reporting its error
+    # says the REAL app (not just the unit test, which overrides the assets
+    # path) got all the way to the injection.
+    $applog = ''
+    for ($t = 0; $t -lt 25; $t++) {
+        $applog = (Get-Content $errlog -Raw -ErrorAction SilentlyContinue)
+        if ($applog -match 'viewer file error') { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Assert ($applog -match 'viewer file error: Cannot read file') 'the missing file reached the in-page error card, so the template loaded in the GUI'
+    Assert ($applog -notmatch 'no bundled viewer assets found') 'the app resolved its own bundled viewer assets'
+    Assert ($applog -notmatch 'viewer resource not found: (viewer\.|vendor/)') 'every template asset the page asked for was served'
+    Assert ($applog -notmatch 'ExecuteScript failed') 'the content injection was accepted'
+
+    # --- 9. --view + --command / -e: the Mac string -------------------------
+    # The one permanent check. Asserted with a FILE and a URL both: it is the
+    # command line that is ambiguous, not the destination, and a conflict that
+    # only fired for one mode would be a conflict check that quietly stopped
+    # covering the other.
     foreach ($case in @(
             @{ Label = '--command (file)'; Args = @('+new-window', '--target=vpx', "--view=$viewFile", '--command=cmd.exe') },
             @{ Label = '-e (file)'; Args = @('+new-window', '--target=vpx', "--view=$viewFile", '-e', 'cmd.exe') },
@@ -312,7 +371,6 @@ try {
         $r = Invoke-Verb $case.Args
         Assert ($r.Code -ne 0) "--view with $($case.Label) exits nonzero (got $($r.Code))"
         Assert ($r.Out -match [regex]::Escape($conflict)) "--view with $($case.Label) reports the Mac conflict string"
-        Assert ($r.Out -notmatch [regex]::Escape($fileUnsupported)) "--view with $($case.Label) does NOT report the interim error instead"
     }
     Assert ($null -eq (Get-Win 'vpx')) 'no window was created by any conflicting command line'
 

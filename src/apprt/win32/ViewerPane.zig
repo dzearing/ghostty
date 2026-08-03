@@ -56,6 +56,8 @@ const chrome_theme = @import("chrome_theme.zig");
 const type_ramp = @import("type_ramp.zig");
 const error_card = @import("viewer_error_card.zig");
 const bridge = @import("viewer_bridge.zig");
+const content = @import("viewer_content.zig");
+const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const Window = @import("Window.zig");
 
@@ -117,6 +119,21 @@ location: ?[:0]u8 = null,
 /// the session manifest persists separately from `location`. Owned.
 home_location: ?[:0]u8 = null,
 
+/// Which renderer `location` gets (T90e). Derived from the location on every
+/// `navigate`, because a pane can move between a file and the web.
+mode: content.Mode = .web,
+
+/// The filesystem path `location` names, for the two file modes; null in web
+/// mode. Owned, and kept separately from `location` because the two differ
+/// whenever the location is a `file://` URL.
+file_path: ?[]u8 = null,
+
+/// The bundled viewer assets directory (`…/share/ghostty/viewer`), resolved
+/// once when the pane starts. Owned. Null on an installation whose resources
+/// cannot be found — the pane then renders nothing and says so, rather than
+/// serving the viewed file's directory as if it were the template.
+resources_dir: ?[]u8 = null,
+
 /// Mirrors `Surface.visible`: false while the pane's tab is not selected or
 /// the window is minimized.
 visible: bool = true,
@@ -148,6 +165,17 @@ new_window_handler: ?*NewWindowRequestedHandler = null,
 /// Our reference on the `WebMessageReceived` handler, held for the same reason
 /// and released the same way (T375).
 web_message_handler: ?*WebMessageReceivedHandler = null,
+
+/// Our reference on the `WebResourceRequested` handler (T90e), same rule.
+resource_handler: ?*WebResourceRequestedHandler = null,
+
+/// Our reference on the `NavigationCompleted` handler (T90e), same rule.
+navigation_handler: ?*NavigationCompletedHandler = null,
+
+/// The app's shared environment, kept for the life of the pane because
+/// `CreateWebResourceResponse` lives on it and the resource handler needs one
+/// per intercepted request. Our own reference; released in `deinit`.
+env: ?*iface.ICoreWebView2Environment = null,
 
 /// The document's headings, as the page last reported them. Owned — both the
 /// slice and every string in it. This is Mac's `setTOCItems` input; T160 draws
@@ -220,6 +248,18 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         h.release();
         self.web_message_handler = null;
     }
+    if (self.resource_handler) |h| {
+        h.release();
+        self.resource_handler = null;
+    }
+    if (self.navigation_handler) |h| {
+        h.release();
+        self.navigation_handler = null;
+    }
+    if (self.env) |e| {
+        e.release();
+        self.env = null;
+    }
     self.clearHeadings(alloc);
     if (self.hwnd) |h| {
         _ = w32.SetWindowLongPtrW(h, w32.GWLP_USERDATA, 0);
@@ -229,9 +269,13 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.title) |t| alloc.free(t);
     if (self.location) |l| alloc.free(l);
     if (self.home_location) |l| alloc.free(l);
+    if (self.file_path) |p| alloc.free(p);
+    if (self.resources_dir) |d| alloc.free(d);
     self.title = null;
     self.location = null;
     self.home_location = null;
+    self.file_path = null;
+    self.resources_dir = null;
     self.state = .idle;
 }
 
@@ -365,12 +409,37 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     if (self.home_location == null) {
         self.home_location = alloc.dupeZ(u8, url) catch null;
     }
+
+    // Re-derived on EVERY navigation rather than fixed at construction: the
+    // same pane moves between a file and the web over its life (the address
+    // bar, an in-page link), and a stale mode would render a website through
+    // the markdown template.
+    self.mode = content.modeFor(url);
+    if (self.file_path) |p| alloc.free(p);
+    self.file_path = null;
+    if (self.mode.isFile()) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (content.filePath(&buf, url)) |path| {
+            self.file_path = try alloc.dupe(u8, path);
+        } else {
+            log.warn("viewer location is not a usable file path", .{});
+        }
+    }
+
     self.applyNavigation();
 }
 
 fn applyNavigation(self: *ViewerPane) void {
     const c = self.controller orelse return;
-    const loc = self.location orelse return;
+    // A file-mode pane navigates to the BUNDLED TEMPLATE, not to the file: the
+    // file's bytes arrive afterwards through `window.__viewer` (T90a design
+    // §6). Navigating to the file itself would hand markdown to Chromium's
+    // plain-text viewer, which is the "renders as raw text" defect the whole
+    // offline renderer exists to avoid.
+    const loc: []const u8 = if (self.mode.isFile())
+        content.page_url
+    else
+        self.location orelse return;
     // UTF-16 units never outnumber UTF-8 bytes (a 4-byte sequence becomes two
     // units, every shorter one becomes a single unit), so a length check on the
     // input is a real bound on the output — not the after-the-fact check that
@@ -611,6 +680,316 @@ fn subscribeBridge(self: *ViewerPane) void {
     self.web_message_handler = handler;
 }
 
+// -------------------------------------------------------------------------
+// File mode (T90e, design §5/§6)
+//
+// A file-mode pane loads the BUNDLED TEMPLATE from a synthetic origin and gets
+// its content injected afterwards. Two subscriptions make that work:
+//
+//   * `WebResourceRequested` serves every request the template makes —
+//     `viewer.html` itself, its stylesheets, its vendored scripts, and any
+//     image the rendered markdown references — out of the three tiers
+//     `viewer_content.zig` computes. Nothing reaches the network; the origin
+//     does not exist in DNS.
+//   * `NavigationCompleted` is when `window.__viewer` exists, so it is when
+//     the file's bytes can be handed over.
+// -------------------------------------------------------------------------
+
+/// `ICoreWebView2WebResourceRequestedEventHandler`.
+const WebResourceRequestedHandler = com.CallbackOwning(
+    iface.IID_WebResourceRequestedHandler,
+    onWebResourceRequested,
+    releasePendingToken,
+);
+
+/// `ICoreWebView2NavigationCompletedEventHandler`.
+const NavigationCompletedHandler = com.CallbackOwning(
+    iface.IID_NavigationCompletedHandler,
+    onNavigationCompleted,
+    releasePendingToken,
+);
+
+/// `ICoreWebView2ExecuteScriptCompletedHandler`. Nothing to do on success; the
+/// slot exists so a failure to inject is a log line rather than a blank pane
+/// with no explanation.
+const ExecuteScriptCompletedHandler = com.CallbackOwning(
+    iface.IID_ExecuteScriptCompletedHandler,
+    onExecuteScriptCompleted,
+    releasePendingToken,
+);
+
+fn onExecuteScriptCompleted(p: *Pending, result: com.HRESULT, value: ?[*:0]const u16) com.HRESULT {
+    _ = p;
+    _ = value;
+    if (com.failed(result)) log.warn(
+        "ExecuteScript failed hr=0x{X:0>8}; the pane will show an empty document",
+        .{@as(u32, @bitCast(result))},
+    );
+    return com.S_OK;
+}
+
+/// Register the resource interception and the navigation hook on a freshly
+/// adopted controller.
+///
+/// Both are registered for EVERY pane, web mode included, rather than only for
+/// file panes: a pane navigates between the two over its life, and a
+/// subscription that has to be added later would have to be added from inside
+/// a navigation. The filter matches only our synthetic origin, so a pane
+/// showing a website never sees a resource event.
+fn subscribeFileMode(self: *ViewerPane) void {
+    std.debug.assert(self.resource_handler == null);
+    std.debug.assert(self.navigation_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    resources: {
+        const handler = WebResourceRequestedHandler.create(p.alloc, p) catch break :resources;
+        p.refs += 1;
+        // The filter FIRST: with no filter registered the event never fires,
+        // and a handler added to an unfiltered view is a silent no-op rather
+        // than an error.
+        const filter = std.unicode.utf8ToUtf16LeStringLiteral(content.resource_filter);
+        if (!web.addWebResourceRequestedFilter(filter, .all)) {
+            log.warn("AddWebResourceRequestedFilter failed; file viewers cannot load", .{});
+            handler.release();
+            break :resources;
+        }
+        if (!web.addWebResourceRequested(@ptrCast(handler))) {
+            log.warn("add_WebResourceRequested failed; file viewers cannot load", .{});
+            handler.release();
+            break :resources;
+        }
+        self.resource_handler = handler;
+    }
+
+    const handler = NavigationCompletedHandler.create(p.alloc, p) catch return;
+    p.refs += 1;
+    if (!web.addNavigationCompleted(@ptrCast(handler))) {
+        log.warn("add_NavigationCompleted failed; file content cannot be injected", .{});
+        handler.release();
+        return;
+    }
+    self.navigation_handler = handler;
+}
+
+fn onNavigationCompleted(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*iface.ICoreWebView2NavigationCompletedEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const self = p.pane orelse return com.S_OK;
+    // Web mode has nothing to inject — the page IS the content.
+    if (!self.mode.isFile()) return com.S_OK;
+    // A failed load has no `window.__viewer` to call, and injecting into
+    // Chromium's own error page would throw in someone else's document.
+    if (args) |a| if (!a.isSuccess()) {
+        log.warn("viewer template failed to load; no content injected", .{});
+        return com.S_OK;
+    };
+    self.renderFileContent();
+    return com.S_OK;
+}
+
+/// Read the viewed file and hand it to the page. Every failure below ends in
+/// the page's own error card rather than a blank pane: a viewer that shows
+/// nothing and says nothing is indistinguishable from one that is still
+/// loading.
+fn renderFileContent(self: *ViewerPane) void {
+    const p = self.pending orelse return;
+    const alloc = p.alloc;
+    const path = self.file_path orelse {
+        self.injectError(alloc, content.error_unreadable, self.location orelse "");
+        return;
+    };
+
+    const bytes = std.fs.cwd().readFileAlloc(alloc, path, content.max_file_bytes) catch |err| {
+        self.injectError(alloc, switch (err) {
+            error.FileTooBig => content.error_too_large,
+            else => content.error_unreadable,
+        }, path);
+        return;
+    };
+    defer alloc.free(bytes);
+
+    // A UTF-8 BOM is invisible to the reader and NOT invisible to the
+    // renderer: left in place it becomes a stray glyph ahead of the first
+    // heading, and Windows editors write one routinely. Dropped here rather
+    // than in the page, so both platforms' renderers stay one file.
+    var text = bytes;
+    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
+
+    // Mac's `String(data:encoding:.utf8)` returning nil is exactly this check;
+    // a binary file opened by mistake gets a card, not mojibake.
+    if (!std.unicode.utf8ValidateSlice(text)) {
+        self.injectError(alloc, content.error_not_text, path);
+        return;
+    }
+
+    const js = switch (self.mode) {
+        .markdown => content.setMarkdownCall(alloc, text),
+        .code => content.setCodeCall(
+            alloc,
+            text,
+            content.highlightLanguage(content.extension(path)),
+        ),
+        .web => return,
+    } catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+}
+
+fn injectError(self: *ViewerPane, alloc: Allocator, title: []const u8, detail: []const u8) void {
+    log.warn("viewer file error: {s} ({s})", .{ title, detail });
+    const js = content.setErrorCall(alloc, title, detail) catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+}
+
+fn executeScript(self: *ViewerPane, alloc: Allocator, js: []const u8) void {
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, js) catch {
+        log.warn("could not widen the viewer content script", .{});
+        return;
+    };
+    defer alloc.free(wide);
+
+    const handler = ExecuteScriptCompletedHandler.create(alloc, p) catch return;
+    p.refs += 1;
+    defer handler.release();
+    _ = web.executeScript(wide.ptr, @ptrCast(handler));
+}
+
+/// Serve one request the bundled template made. Runs on the GUI thread, off
+/// the message loop, and is synchronous by design — every answer is a file
+/// read off local disk, so there is nothing worth a deferral.
+fn onWebResourceRequested(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*iface.ICoreWebView2WebResourceRequestedEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const a = args orelse return com.S_OK;
+    const self = p.pane orelse return com.S_OK;
+    const env = self.env orelse return com.S_OK;
+    const alloc = p.alloc;
+
+    const req = a.request() orelse return com.S_OK;
+    defer req.release();
+    const raw = req.uriRaw() orelse return com.S_OK;
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+
+    var uri_buf: [4096]u8 = undefined;
+    const uri_len = std.unicode.utf16LeToUtf8(&uri_buf, std.mem.span(raw)) catch return com.S_OK;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = content.requestPath(&path_buf, uri_buf[0..uri_len]) orelse {
+        // Not ours after all: leave the request alone rather than answering it
+        // with a 404 we have no business sending.
+        return com.S_OK;
+    };
+
+    const resolved = self.resolveResource(alloc, rel) orelse {
+        // Chromium asks every origin for a favicon it was never offered, so
+        // that one miss is expected and would otherwise put a warning in the
+        // log on every single page load.
+        if (!std.mem.eql(u8, rel, "favicon.ico")) {
+            log.warn("viewer resource not found: {s}", .{rel});
+        }
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason);
+        return com.S_OK;
+    };
+    defer alloc.free(resolved);
+
+    const bytes = std.fs.cwd().readFileAlloc(alloc, resolved, content.max_file_bytes) catch {
+        log.warn("viewer resource is unreadable: {s}", .{resolved});
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason);
+        return com.S_OK;
+    };
+    defer alloc.free(bytes);
+
+    self.respond(env, a, alloc, bytes, content.mimeType(content.extension(rel)), 200, ok_reason);
+    return com.S_OK;
+}
+
+const ok_reason = std.unicode.utf8ToUtf16LeStringLiteral("OK");
+const not_found_reason = std.unicode.utf8ToUtf16LeStringLiteral("Not Found");
+
+/// The 3-tier resolution (design §6, Mac's `ViewerSchemeHandler.resolve`):
+/// bundled assets, then the viewed file's directory, then an absolute
+/// reference the document wrote itself. Returns the first candidate that is a
+/// readable FILE — a directory is not a resource, and answering with one would
+/// be a read error dressed up as a hit. Caller owns the result.
+fn resolveResource(self: *ViewerPane, alloc: Allocator, rel: []const u8) ?[]u8 {
+    if (self.resources_dir) |root| {
+        if (self.takeIfFile(alloc, content.candidateUnder(alloc, root, rel) catch null)) |hit| return hit;
+    }
+    const base = if (self.file_path) |p| content.baseDirectory(p) else null;
+    if (base) |root| {
+        if (self.takeIfFile(alloc, content.candidateUnder(alloc, root, rel) catch null)) |hit| return hit;
+        if (self.takeIfFile(alloc, content.rootedCandidate(alloc, root, rel) catch null)) |hit| return hit;
+    }
+    return null;
+}
+
+fn takeIfFile(self: *ViewerPane, alloc: Allocator, candidate: ?[]u8) ?[]u8 {
+    _ = self;
+    const path = candidate orelse return null;
+    const stat = std.fs.cwd().statFile(path) catch {
+        alloc.free(path);
+        return null;
+    };
+    if (stat.kind != .file) {
+        alloc.free(path);
+        return null;
+    }
+    return path;
+}
+
+/// Answer an intercepted request with `bytes`.
+///
+/// The body has to be an `IStream`, which is what `CreateWebResourceResponse`
+/// takes, and `CreateStreamOnHGlobal` leaves the seek pointer where `Write`
+/// left it — at the END. Rewinding is not tidiness: without it the response is
+/// a zero-byte body that reports success, which renders as a blank page with
+/// no error anywhere.
+fn respond(
+    self: *ViewerPane,
+    env: *iface.ICoreWebView2Environment,
+    args: *iface.ICoreWebView2WebResourceRequestedEventArgs,
+    alloc: Allocator,
+    bytes: []const u8,
+    mime: []const u8,
+    status: i32,
+    reason: [*:0]const u16,
+) void {
+    _ = self;
+    var stream_ptr: ?*anyopaque = null;
+    if (com.failed(w32.CreateStreamOnHGlobal(null, 1, &stream_ptr))) return;
+    const stream: *iface.IStream = @ptrCast(@alignCast(stream_ptr orelse return));
+    defer stream.release();
+    if (!stream.writeAll(bytes)) return;
+    if (!stream.rewind()) return;
+
+    // The runtime parses a CRLF-joined header block, not a single header.
+    const headers = std.fmt.allocPrint(alloc, "Content-Type: {s}", .{mime}) catch return;
+    defer alloc.free(headers);
+    const headers_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, headers) catch return;
+    defer alloc.free(headers_w);
+
+    const response = env.createWebResourceResponse(stream, status, reason, headers_w.ptr) orelse {
+        log.warn("CreateWebResourceResponse failed", .{});
+        return;
+    };
+    defer response.release();
+    _ = args.setResponse(response);
+}
+
 /// Push the OS color scheme into the page (T90a design §14). Called for every
 /// pane by `Window.reportColorScheme`, and again for this pane as soon as its
 /// controller arrives.
@@ -721,6 +1100,24 @@ pub fn start(self: *ViewerPane, alloc: Allocator, host: *webview2.Host) void {
     self.pending = p;
     self.state = .waiting_env;
 
+    // Resolved once, here, rather than per request: it is a directory walk
+    // from the exe outward and the resource handler runs dozens of times for
+    // one page. A null result is not fatal — the pane still comes up, and its
+    // template request 404s with a log line naming the cause.
+    if (self.resources_dir == null) {
+        if (internal_os.resourcesDir(alloc)) |*found| {
+            var dirs = found.*;
+            defer dirs.deinit(alloc);
+            if (dirs.app()) |dir| {
+                self.resources_dir = std.fs.path.join(alloc, &.{ dir, "viewer" }) catch null;
+            }
+        } else |_| {}
+        if (self.resources_dir == null) log.warn(
+            "no bundled viewer assets found; file viewers will not render",
+            .{},
+        );
+    }
+
     // May answer synchronously when the environment is already up or already
     // known to be unavailable, which is why `pending`/`state` are set first.
     host.request(.{ .ctx = p, .func = onEnvironmentReady });
@@ -745,6 +1142,13 @@ fn onEnvironmentReady(ctx: *anyopaque, result: webview2.Host.Result) void {
                 p.release();
                 return;
             };
+            // Kept for the pane's life: `CreateWebResourceResponse` lives on
+            // the environment, and the resource handler needs one per request.
+            // The Host's reference is the Host's; this is ours.
+            if (self.env == null) {
+                env.addRef();
+                self.env = env;
+            }
             const handler = ControllerCompletedHandler.create(p.alloc, p) catch {
                 self.fail(.environment_unavailable);
                 p.release();
@@ -827,6 +1231,10 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     // registered after a page has started loading does not reach that page, so
     // the very first document a pane shows would be the one without a toolbar.
     self.subscribeBridge();
+    // Also before the navigation, and for a sharper reason: a file-mode pane's
+    // very first request IS the template's document, so an interception
+    // registered after `Navigate` would miss the page it exists to serve.
+    self.subscribeFileMode();
     if (self.focused) _ = c.moveFocus(.programmatic);
 
     // Last, so the page starts loading into a view that is already the right
@@ -1092,6 +1500,63 @@ test "viewer pane id is a valid pane id" {
     try std.testing.expect(pane_id_mod.isValid(id));
 }
 
+test "the 3-tier resolver picks the right tier, against a real tree" {
+    // `viewer_content.zig` owns the PATH math and tests it exhaustively without
+    // a filesystem. What can only be checked here is the part that stats: the
+    // tiers are tried in order, a directory is not a resource, and a name that
+    // exists in two tiers resolves to the bundled one.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("assets");
+    try tmp.dir.makePath("doc/pics");
+    try tmp.dir.makePath("assets/sub");
+    try tmp.dir.writeFile(.{ .sub_path = "assets/viewer.html", .data = "bundled" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc/viewer.html", .data = "shadow" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc/pics/a.png", .data = "img" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc/README.md", .data = "# x" });
+    try tmp.dir.writeFile(.{ .sub_path = "secret.txt", .data = "no" });
+
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    var pane: ViewerPane = .{};
+    pane.resources_dir = try std.fs.path.join(alloc, &.{ root, "assets" });
+    defer alloc.free(pane.resources_dir.?);
+    pane.file_path = try std.fs.path.join(alloc, &.{ root, "doc", "README.md" });
+    defer alloc.free(pane.file_path.?);
+
+    // Tier 1 wins over tier 2 for the same name: the template must never be
+    // shadowed by a file that happens to sit beside the document.
+    {
+        const hit = pane.resolveResource(alloc, "viewer.html").?;
+        defer alloc.free(hit);
+        const want = try std.fs.path.join(alloc, &.{ root, "assets", "viewer.html" });
+        defer alloc.free(want);
+        try testing.expectEqualStrings(want, hit);
+    }
+
+    // Tier 2: a relative image beside the document.
+    {
+        const hit = pane.resolveResource(alloc, "pics/a.png").?;
+        defer alloc.free(hit);
+        const want = try std.fs.path.join(alloc, &.{ root, "doc", "pics", "a.png" });
+        defer alloc.free(want);
+        try testing.expectEqualStrings(want, hit);
+    }
+
+    // A DIRECTORY is not a resource. Answering with one would be a read error
+    // dressed up as a hit, and the page would show a broken image with a
+    // success status.
+    try testing.expect(pane.resolveResource(alloc, "sub") == null);
+
+    // The escape the guard exists for, all the way through the stat: the file
+    // is really there and must still not be served.
+    try testing.expect(pane.resolveResource(alloc, "../secret.txt") == null);
+    try testing.expect(pane.resolveResource(alloc, "nope.png") == null);
+}
+
 test "a pane closed mid-creation leaves a token the callback can survive" {
     // The hazard the `Pending` token exists for, exercised without a runtime:
     // the pane goes away between `start` and the controller callback, and the
@@ -1206,6 +1671,15 @@ test "host floor: a real controller on a real window, on this box" {
     try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 640, .bottom = 480 });
     pane.start(alloc, &host);
 
+    // The test binary is not an installed ghoztty, so `resourcesDir`'s walk up
+    // from the exe finds nothing and file mode would 404 its own template.
+    // Point the pane at the SOURCE tree's copy of the assets — byte-identical
+    // to what the installer stages — so the file-mode chain below is exercised
+    // rather than quietly skipped. `zig build` runs test binaries from the
+    // build root, and this failing loudly if that ever changes is the point.
+    if (pane.resources_dir) |d| alloc.free(d);
+    pane.resources_dir = try std.fs.cwd().realpathAlloc(alloc, "src/viewer");
+
     // Both completed handlers arrive on THIS thread's message loop, so the
     // test has to be one. Bounded: a hang would wedge the lane, and a silent
     // timeout would make the test green and empty.
@@ -1301,74 +1775,120 @@ test "host floor: a real controller on a real window, on this box" {
     // called `Stop` or `GoForward` with two pointers instead.
     try testing.expect(pane.new_window_handler != null);
 
-    // `Navigate` (slot 5) is only verifiable by reading `get_Source` back:
+    // ------------------------------------------------------------------
+    // T374/T90e: navigation, and the whole file-mode chain behind it
+    // ------------------------------------------------------------------
+    //
+    // `Navigate` (slot 5) is only verifiable by reading something back:
     // navigating at the WRONG slot can still return S_OK, and the page not
     // moving is the only thing that says so.
     //
-    // The destination is a real local FILE, and that choice is the whole
-    // oracle. A freshly created web view already reports `about:blank` as its
-    // source, so navigating THERE and finding it would be a green and empty
-    // assertion — true before the call ran. (A `data:` URL was the first
-    // attempt and is wrong for a different reason: Chromium blocks top-level
-    // navigation to one, so the source came back empty.) A file needs no
-    // network, so this holds on a box with no route out.
+    // T374 pointed this at a local `.html` file and read `get_Source` back.
+    // T90e makes that destination FILE mode, so the source is now the bundled
+    // template — and the oracle moves to something much stronger. A markdown
+    // file with two headings, opened here, comes back as `pane.headings` only
+    // if EVERY link in the chain ran:
+    //
+    //   * `AddWebResourceRequestedFilter` (57) + `add_WebResourceRequested`
+    //     (55) intercepted a request for an origin that does not resolve in
+    //     DNS, so a miss is a hard failure and not a slow network;
+    //   * `CreateWebResourceResponse` (environment slot 4) built a body from a
+    //     rewound `IStream`, four times over — the document, its CSS, its
+    //     vendored markdown-it, and `viewer.js`;
+    //   * the 3-tier resolver found all four under the bundled assets;
+    //   * `add_NavigationCompleted` (15) fired;
+    //   * `ExecuteScript` (29) ran `window.__viewer.setMarkdown` with the file
+    //     escaped as a JS literal;
+    //   * and the page rendered it and posted its headings back up T375's
+    //     bridge.
+    //
+    // A wrong slot index anywhere in that list produces silence, which is why
+    // the assertion is on CONTENT arriving. None of it needs a network.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "t374.html", .data = "<title>ghoztty</title>" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "t90e.md",
+        .data = "# Alpha\n\nsome text\n\n## Beta\n",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "t90e.zig", .data = "const x = 1;\n" });
     const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(dir_path);
-    const target = try std.fmt.allocPrint(alloc, "file:///{s}/t374.html", .{dir_path});
-    defer alloc.free(target);
-    std.mem.replaceScalar(u8, target["file:///".len..], '\\', '/');
+    const md_path = try std.fs.path.join(alloc, &.{ dir_path, "t90e.md" });
+    defer alloc.free(md_path);
 
-    const before = source: {
-        const raw = web.sourceRaw() orelse break :source @as(?[]u8, null);
-        defer w32.CoTaskMemFree(@ptrCast(raw));
-        break :source std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw)) catch null;
-    };
-    defer if (before) |prev| alloc.free(prev);
-    try testing.expect(!std.mem.eql(u8, before orelse "", target));
+    try pane.navigate(alloc, md_path);
+    try testing.expectEqual(content.Mode.markdown, pane.mode);
 
-    try pane.navigate(alloc, target);
     var nav_timer = try std.time.Timer.start();
-    var source: ?[]u8 = null;
-    defer if (source) |s| alloc.free(s);
-    while (nav_timer.read() < 30 * std.time.ns_per_s) {
+    while (nav_timer.read() < 30 * std.time.ns_per_s and pane.headings.len < 2) {
         while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
             _ = w32.TranslateMessage(&msg);
             _ = w32.DispatchMessageW(&msg);
         }
-        if (web.sourceRaw()) |raw| {
-            defer w32.CoTaskMemFree(@ptrCast(raw));
-            const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw)) catch null;
-            if (utf8) |u| {
-                if (source) |s| alloc.free(s);
-                source = u;
-                if (std.mem.endsWith(u8, u, "/t374.html")) break;
-            }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    log.warn("file mode: headings={d}", .{pane.headings.len});
+    try testing.expectEqual(@as(usize, 2), pane.headings.len);
+    try testing.expectEqualStrings("Alpha", pane.headings[0].text);
+    try testing.expectEqualStrings("Beta", pane.headings[1].text);
+
+    // And the page really did load the TEMPLATE rather than the file: a
+    // file-mode pane never navigates Chromium at the document itself, which is
+    // what stops markdown from rendering as raw text.
+    {
+        const raw = web.sourceRaw();
+        try testing.expect(raw != null);
+        defer w32.CoTaskMemFree(@ptrCast(raw.?));
+        const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw.?));
+        defer alloc.free(utf8);
+        try testing.expectEqualStrings(content.page_url, utf8);
+    }
+
+    // The pane recorded the place it was SENT, which is what `+list --json`'s
+    // `url` and the session manifest read. `home_location` is the FIRST
+    // location and does not move with it.
+    try testing.expectEqualStrings(md_path, pane.location.?);
+    try testing.expectEqualStrings(md_path, pane.home_location.?);
+
+    // CODE mode, on the same template: `setCode` clears the heading index, and
+    // the page posts the empty list up the same bridge. Headings falling back
+    // to zero is the page saying `window.__viewer.setCode` ran — a template
+    // that reloaded and was never injected would leave the host's copy alone.
+    const code_path = try std.fs.path.join(alloc, &.{ dir_path, "t90e.zig" });
+    defer alloc.free(code_path);
+    try pane.navigate(alloc, code_path);
+    try testing.expectEqual(content.Mode.code, pane.mode);
+    var code_timer = try std.time.Timer.start();
+    while (code_timer.read() < 30 * std.time.ns_per_s and pane.headings.len != 0) {
+        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(&msg);
+            _ = w32.DispatchMessageW(&msg);
         }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
-    log.warn("navigated: source={s}", .{source orelse "<none>"});
-    // Asserted by SHAPE, not by string equality: the browser normalizes a file
-    // URL (drive-letter case, percent-encoding), and pinning the exact spelling
-    // would be asserting Chromium's formatting rather than our navigation.
-    // "it moved, and it moved THERE" is the whole claim.
-    const got = source orelse "";
-    try testing.expect(!std.mem.eql(u8, got, before orelse ""));
-    try testing.expect(std.mem.startsWith(u8, got, "file:///"));
-    try testing.expect(std.mem.endsWith(u8, got, "/t374.html"));
-    // And the pane recorded the place it was SENT, which is what
-    // `+list --json`'s `url` and the session manifest read. `home_location` is
-    // the FIRST location and does not move with it.
-    try testing.expectEqualStrings(target, pane.location.?);
-    try testing.expectEqualStrings(target, pane.home_location.?);
+    try testing.expectEqual(@as(usize, 0), pane.headings.len);
+
+    // A missing file must not take the pane down: it renders the page's own
+    // error card and the pane stays a live, navigable citizen.
+    const missing = try std.fs.path.join(alloc, &.{ dir_path, "nope.md" });
+    defer alloc.free(missing);
+    try pane.navigate(alloc, missing);
+    var miss_timer = try std.time.Timer.start();
+    while (miss_timer.read() < 5 * std.time.ns_per_s) {
+        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(&msg);
+            _ = w32.DispatchMessageW(&msg);
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(State.ready, pane.state);
 
     // A second navigation moves `location` and leaves `home` where it was —
     // the pane's half of the Home button's contract.
     try pane.navigate(alloc, "about:blank");
+    try testing.expectEqual(content.Mode.web, pane.mode);
     try testing.expectEqualStrings("about:blank", pane.location.?);
-    try testing.expectEqualStrings(target, pane.home_location.?);
+    try testing.expectEqualStrings(md_path, pane.home_location.?);
 
     // ------------------------------------------------------------------
     // T375: the bridge, on a real http:// page

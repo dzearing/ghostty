@@ -76,6 +76,17 @@ pub const PreferredColorScheme = enum(i32) {
     dark = 2,
 };
 
+/// `COREWEBVIEW2_WEB_RESOURCE_CONTEXT`. Only `all` is used: the bundled
+/// template asks for a document, stylesheets, scripts and images, and one
+/// filter that covers every kind is a smaller contract than five that have to
+/// stay in sync with the page.
+pub const WebResourceContext = enum(i32) {
+    all = 0,
+    document = 1,
+    stylesheet = 2,
+    image = 3,
+};
+
 // ------------------------------------------------------------------- IIDs
 
 // {B96D755E-0319-4E92-A296-23436F46A1FC}
@@ -175,6 +186,33 @@ pub const IID_ICoreWebView2WebMessageReceivedEventArgs: GUID = .{
     .Data4 = .{ 0x9E, 0x92, 0xE3, 0xD5, 0x42, 0xEF, 0xF8, 0x49 },
 };
 
+// {AB00B74C-15F1-4646-80E8-E76341D25D71}
+// `ICoreWebView2WebResourceRequestedEventHandler`.
+pub const IID_WebResourceRequestedHandler: GUID = .{
+    .Data1 = 0xAB00B74C,
+    .Data2 = 0x15F1,
+    .Data3 = 0x4646,
+    .Data4 = .{ 0x80, 0xE8, 0xE7, 0x63, 0x41, 0xD2, 0x5D, 0x71 },
+};
+
+// {D33A35BF-1C49-4F98-93AB-006E0533FE1C}
+// `ICoreWebView2NavigationCompletedEventHandler`.
+pub const IID_NavigationCompletedHandler: GUID = .{
+    .Data1 = 0xD33A35BF,
+    .Data2 = 0x1C49,
+    .Data3 = 0x4F98,
+    .Data4 = .{ 0x93, 0xAB, 0x00, 0x6E, 0x05, 0x33, 0xFE, 0x1C },
+};
+
+// {49511172-CC67-4BCA-9923-137112F4C4CC}
+// `ICoreWebView2ExecuteScriptCompletedHandler`.
+pub const IID_ExecuteScriptCompletedHandler: GUID = .{
+    .Data1 = 0x49511172,
+    .Data2 = 0xCC67,
+    .Data3 = 0x4BCA,
+    .Data4 = .{ 0x99, 0x23, 0x13, 0x71, 0x12, 0xF4, 0xC4, 0xCC },
+};
+
 /// `EventRegistrationToken` (winrt's `eventtoken.h`), the out-parameter every
 /// `add_*` writes. We keep no tokens — a handler lives exactly as long as the
 /// web view it was added to, and `Close` tears both down — but the slot has to
@@ -257,6 +295,182 @@ pub const ICoreWebView2WebMessageReceivedEventArgs = extern struct {
     }
 };
 
+// ------------------------------------------------------------------ IStream
+
+/// `IStream`, the only shape `CreateWebResourceResponse` accepts for a
+/// response body. Declared here rather than in `win32.zig` because this is the
+/// only thing on the box that needs one, and it exists purely to hand bytes to
+/// the browser process.
+///
+/// Fourteen slots: `IUnknown`, then `ISequentialStream`'s `Read`/`Write`, then
+/// `IStream`'s own nine. Only `Write`, `Seek` and `Release` are called.
+pub const IStream = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*IStream, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*IStream) callconv(.winapi) u32,
+        Release: *const fn (*IStream) callconv(.winapi) u32,
+        Read: *const anyopaque,
+        Write: *const fn (*IStream, [*]const u8, u32, ?*u32) callconv(.winapi) HRESULT,
+        /// `(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newPosition)`.
+        /// The 64-bit displacement is a single register under the x64 ABI.
+        Seek: *const fn (*IStream, i64, u32, ?*u64) callconv(.winapi) HRESULT,
+        SetSize: *const anyopaque,
+        CopyTo: *const anyopaque,
+        Commit: *const anyopaque,
+        Revert: *const anyopaque,
+        LockRegion: *const anyopaque,
+        UnlockRegion: *const anyopaque,
+        Stat: *const anyopaque,
+        Clone: *const anyopaque,
+    };
+
+    /// `STREAM_SEEK_SET`.
+    pub const seek_set: u32 = 0;
+
+    pub fn release(self: *IStream) void {
+        _ = self.vtable.Release(self);
+    }
+
+    /// Append `bytes`. Partial writes are a failure here: a truncated response
+    /// body renders as a corrupt page, which is worse than no page.
+    pub fn writeAll(self: *IStream, bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        if (bytes.len > std.math.maxInt(u32)) return false;
+        var written: u32 = 0;
+        if (com.failed(self.vtable.Write(self, bytes.ptr, @intCast(bytes.len), &written))) return false;
+        return written == bytes.len;
+    }
+
+    /// Rewind to the start. Non-optional: `CreateStreamOnHGlobal` leaves the
+    /// seek pointer where `Write` left it — at the END — and a response whose
+    /// stream starts there is a zero-byte body that reports success.
+    pub fn rewind(self: *IStream) bool {
+        return !com.failed(self.vtable.Seek(self, 0, seek_set, null));
+    }
+};
+
+// ------------------------------------------ ICoreWebView2WebResourceRequest
+
+/// The request being intercepted. We read the URI and nothing else — the
+/// template only ever issues GETs for its own origin.
+pub const ICoreWebView2WebResourceRequest = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2WebResourceRequest, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2WebResourceRequest) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2WebResourceRequest) callconv(.winapi) u32,
+        get_Uri: *const fn (*ICoreWebView2WebResourceRequest, *?[*:0]u16) callconv(.winapi) HRESULT,
+        put_Uri: *const anyopaque,
+        get_Method: *const anyopaque,
+        put_Method: *const anyopaque,
+        get_Content: *const anyopaque,
+        put_Content: *const anyopaque,
+        get_Headers: *const anyopaque,
+    };
+
+    pub fn release(self: *ICoreWebView2WebResourceRequest) void {
+        _ = self.vtable.Release(self);
+    }
+
+    /// The requested URL. Caller frees it with `CoTaskMemFree`.
+    pub fn uriRaw(self: *ICoreWebView2WebResourceRequest) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_Uri(self, &raw))) return null;
+        return raw;
+    }
+};
+
+// ----------------------------------------- ICoreWebView2WebResourceResponse
+
+/// A response we built with `ICoreWebView2Environment::CreateWebResourceResponse`
+/// and are about to hand back. Nothing is read off it; it is carried from the
+/// factory to `put_Response` and released.
+pub const ICoreWebView2WebResourceResponse = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2WebResourceResponse, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2WebResourceResponse) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2WebResourceResponse) callconv(.winapi) u32,
+        get_Content: *const anyopaque,
+        put_Content: *const anyopaque,
+        get_Headers: *const anyopaque,
+        get_StatusCode: *const anyopaque,
+        put_StatusCode: *const anyopaque,
+        get_ReasonPhrase: *const anyopaque,
+        put_ReasonPhrase: *const anyopaque,
+    };
+
+    pub fn release(self: *ICoreWebView2WebResourceResponse) void {
+        _ = self.vtable.Release(self);
+    }
+};
+
+// ------------------------------- ICoreWebView2WebResourceRequestedEventArgs
+
+/// One intercepted request. `GetDeferral` is declared opaque deliberately, for
+/// the reason the new-window args give: an unused slot with a guessed
+/// signature is a crash waiting for the day somebody calls it, and everything
+/// this handler does is synchronous (read a file, build a response) so there
+/// is nothing to defer.
+pub const ICoreWebView2WebResourceRequestedEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2WebResourceRequestedEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2WebResourceRequestedEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2WebResourceRequestedEventArgs) callconv(.winapi) u32,
+        get_Request: *const fn (*ICoreWebView2WebResourceRequestedEventArgs, *?*ICoreWebView2WebResourceRequest) callconv(.winapi) HRESULT,
+        get_Response: *const anyopaque,
+        put_Response: *const fn (*ICoreWebView2WebResourceRequestedEventArgs, *ICoreWebView2WebResourceResponse) callconv(.winapi) HRESULT,
+        GetDeferral: *const anyopaque,
+        get_ResourceContext: *const anyopaque,
+    };
+
+    /// The request. Caller owns the reference.
+    pub fn request(self: *ICoreWebView2WebResourceRequestedEventArgs) ?*ICoreWebView2WebResourceRequest {
+        var out: ?*ICoreWebView2WebResourceRequest = null;
+        if (com.failed(self.vtable.get_Request(self, &out))) return null;
+        return out;
+    }
+
+    /// Answer the request ourselves. Leaving this unset lets the request go to
+    /// the network, which for our synthetic origin means a DNS failure.
+    pub fn setResponse(
+        self: *ICoreWebView2WebResourceRequestedEventArgs,
+        response: *ICoreWebView2WebResourceResponse,
+    ) bool {
+        return !com.failed(self.vtable.put_Response(self, response));
+    }
+};
+
+// -------------------------------- ICoreWebView2NavigationCompletedEventArgs
+
+/// Whether the navigation that just finished actually loaded. Three slots
+/// past `IUnknown`; only the first is read, because the file content injection
+/// must not run on a page that failed to load.
+pub const ICoreWebView2NavigationCompletedEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2NavigationCompletedEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2NavigationCompletedEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2NavigationCompletedEventArgs) callconv(.winapi) u32,
+        get_IsSuccess: *const fn (*ICoreWebView2NavigationCompletedEventArgs, *BOOL) callconv(.winapi) HRESULT,
+        get_WebErrorStatus: *const anyopaque,
+        get_NavigationId: *const anyopaque,
+    };
+
+    pub fn isSuccess(self: *ICoreWebView2NavigationCompletedEventArgs) bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_IsSuccess(self, &out))) return false;
+        return out != 0;
+    }
+};
+
 // ------------------------------------------------------- ICoreWebView2Profile
 
 /// The per-profile settings object. We reach it only for
@@ -304,22 +518,37 @@ pub const ICoreWebView2Profile = extern struct {
 /// `add_WebMessageReceived` (slot 34), which is why what used to be one
 /// 38-slot opaque block is now three shorter ones.
 ///
-/// Declaring 45 slots of an interface that has 61 is safe and deliberate: the
+/// Declaring 58 slots of an interface that has 61 is safe and deliberate: the
 /// vtable pointer is the runtime's, we only ever index the ones named here,
 /// and a slot that is not declared cannot be called by mistake. The ones we do
 /// not call are opaque — individually where a named neighbor makes the
 /// position readable, and as one length-only block where there are dozens in a
 /// row (`ICoreWebView2_13`'s rule, applied here).
+///
+/// T90e added the four file-mode slots — `add_NavigationCompleted` (15),
+/// `ExecuteScript` (29), `add_WebResourceRequested` (55) and
+/// `AddWebResourceRequestedFilter` (57) — which is why the opaque runs are
+/// shorter again. Every block's LENGTH is what holds the named slots in place,
+/// and `@offsetOf` asserts all of them at the bottom of this file.
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
-    /// Slots 6..26: `NavigateToString` through `remove_ProcessFailed`.
-    pub const nav_events_slots = 21;
-    /// Slots 28..33: `RemoveScriptToExecuteOnDocumentCreated` through
-    /// `PostWebMessageAsString`.
-    pub const script_slots = 6;
+    /// Slots 6..14: `NavigateToString` through `remove_HistoryChanged`.
+    pub const pre_nav_slots = 9;
+    /// Slots 16..26: `remove_NavigationCompleted` through
+    /// `remove_ProcessFailed`.
+    pub const post_nav_slots = 11;
+    /// Slot 28: `RemoveScriptToExecuteOnDocumentCreated`.
+    pub const remove_script_slots = 1;
+    /// Slots 30..33: `CapturePreview` through `PostWebMessageAsString`.
+    pub const post_script_slots = 4;
     /// Slots 35..43: `remove_WebMessageReceived` through `Stop`.
     pub const history_slots = 9;
+    /// Slots 45..54: `remove_NewWindowRequested` through
+    /// `get_ContainsFullScreenElement`.
+    pub const window_slots = 10;
+    /// Slot 56: `remove_WebResourceRequested`.
+    pub const remove_resource_slots = 1;
 
     pub const Vtbl = extern struct {
         QueryInterface: *const fn (*ICoreWebView2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -328,12 +557,20 @@ pub const ICoreWebView2 = extern struct {
         get_Settings: *const anyopaque,
         get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
         Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
-        nav_events: [nav_events_slots]*const anyopaque,
+        pre_nav: [pre_nav_slots]*const anyopaque,
+        add_NavigationCompleted: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        post_nav: [post_nav_slots]*const anyopaque,
         AddScriptToExecuteOnDocumentCreated: *const fn (*ICoreWebView2, [*:0]const u16, *anyopaque) callconv(.winapi) HRESULT,
-        script: [script_slots]*const anyopaque,
+        remove_script: [remove_script_slots]*const anyopaque,
+        ExecuteScript: *const fn (*ICoreWebView2, [*:0]const u16, ?*anyopaque) callconv(.winapi) HRESULT,
+        post_script: [post_script_slots]*const anyopaque,
         add_WebMessageReceived: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         history: [history_slots]*const anyopaque,
         add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        window: [window_slots]*const anyopaque,
+        add_WebResourceRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        remove_resource: [remove_resource_slots]*const anyopaque,
+        AddWebResourceRequestedFilter: *const fn (*ICoreWebView2, [*:0]const u16, WebResourceContext) callconv(.winapi) HRESULT,
     };
 
     pub fn release(self: *ICoreWebView2) void {
@@ -384,6 +621,38 @@ pub const ICoreWebView2 = extern struct {
     pub fn addWebMessageReceived(self: *ICoreWebView2, handler: *anyopaque) bool {
         var token: EventRegistrationToken = .{};
         return !com.failed(self.vtable.add_WebMessageReceived(self, handler, &token));
+    }
+
+    /// Subscribe to "a navigation finished". File mode injects the viewed
+    /// file's content from here: the page's `window.__viewer` API does not
+    /// exist until its own script has run.
+    pub fn addNavigationCompleted(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_NavigationCompleted(self, handler, &token));
+    }
+
+    /// Subscribe to intercepted resource requests. Only requests matching a
+    /// filter added by `addWebResourceRequestedFilter` are delivered — with no
+    /// filter the event never fires, which is a silent no-op rather than an
+    /// error, so the two calls belong together.
+    pub fn addWebResourceRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_WebResourceRequested(self, handler, &token));
+    }
+
+    /// Ask for `uri` (a `*` wildcard pattern) to be routed to the handler.
+    pub fn addWebResourceRequestedFilter(
+        self: *ICoreWebView2,
+        uri: [*:0]const u16,
+        context: WebResourceContext,
+    ) bool {
+        return !com.failed(self.vtable.AddWebResourceRequestedFilter(self, uri, context));
+    }
+
+    /// Run `js` in the current document. Asynchronous; `handler` may be null
+    /// when the result and the failure are both uninteresting.
+    pub fn executeScript(self: *ICoreWebView2, js: [*:0]const u16, handler: ?*anyopaque) bool {
+        return !com.failed(self.vtable.ExecuteScript(self, js, handler));
     }
 
     /// The `ICoreWebView2_13` view of this object, or null on a runtime that
@@ -601,7 +870,16 @@ pub const ICoreWebView2Environment = extern struct {
         /// so the parameter is typed as the opaque pointer it is — that keeps
         /// this module from having to know the handler's Zig type.
         CreateCoreWebView2Controller: *const fn (*ICoreWebView2Environment, HWND, *anyopaque) callconv(.winapi) HRESULT,
-        CreateWebResourceResponse: *const anyopaque,
+        /// `(IStream *content, int statusCode, LPCWSTR reasonPhrase,
+        /// LPCWSTR headers, ICoreWebView2WebResourceResponse **response)`.
+        CreateWebResourceResponse: *const fn (
+            *ICoreWebView2Environment,
+            ?*IStream,
+            i32,
+            [*:0]const u16,
+            [*:0]const u16,
+            *?*ICoreWebView2WebResourceResponse,
+        ) callconv(.winapi) HRESULT,
         get_BrowserVersionString: *const fn (*ICoreWebView2Environment, *?[*:0]u16) callconv(.winapi) HRESULT,
         add_NewBrowserVersionAvailable: *const anyopaque,
         remove_NewBrowserVersionAvailable: *const anyopaque,
@@ -613,6 +891,28 @@ pub const ICoreWebView2Environment = extern struct {
 
     pub fn release(self: *ICoreWebView2Environment) void {
         _ = self.vtable.Release(self);
+    }
+
+    /// Build a response for an intercepted request. `headers` is a CRLF-joined
+    /// block ("Content-Type: text/css"), which is the shape the runtime parses
+    /// — not a single header and not a JSON object. Caller owns the result.
+    pub fn createWebResourceResponse(
+        self: *ICoreWebView2Environment,
+        content: ?*IStream,
+        status: i32,
+        reason: [*:0]const u16,
+        headers: [*:0]const u16,
+    ) ?*ICoreWebView2WebResourceResponse {
+        var out: ?*ICoreWebView2WebResourceResponse = null;
+        if (com.failed(self.vtable.CreateWebResourceResponse(
+            self,
+            content,
+            status,
+            reason,
+            headers,
+            &out,
+        ))) return null;
+        return out;
     }
 
     /// Start creating a controller parented to `hwnd`. Success means
@@ -651,12 +951,18 @@ test "vtable slot counts match the SDK's own layout" {
     // one place the numbers live.
     const ptr = @sizeOf(*const anyopaque);
     try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2Profile.Vtbl));
-    // 45 of ICoreWebView2's 61: everything through `add_NewWindowRequested`.
-    // Declaring a PREFIX is the point — the runtime's vtable is longer and the
-    // slots past the last one we name are simply never indexed.
-    try testing.expectEqual(45 * ptr, @sizeOf(ICoreWebView2.Vtbl));
+    // 58 of ICoreWebView2's 61: everything through
+    // `AddWebResourceRequestedFilter`. Declaring a PREFIX is the point — the
+    // runtime's vtable is longer and the slots past the last one we name are
+    // simply never indexed.
+    try testing.expectEqual(58 * ptr, @sizeOf(ICoreWebView2.Vtbl));
     try testing.expectEqual(7 * ptr, @sizeOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl));
     try testing.expectEqual(6 * ptr, @sizeOf(ICoreWebView2WebMessageReceivedEventArgs.Vtbl));
+    try testing.expectEqual(8 * ptr, @sizeOf(ICoreWebView2WebResourceRequestedEventArgs.Vtbl));
+    try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2WebResourceRequest.Vtbl));
+    try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2WebResourceResponse.Vtbl));
+    try testing.expectEqual(6 * ptr, @sizeOf(ICoreWebView2NavigationCompletedEventArgs.Vtbl));
+    try testing.expectEqual(14 * ptr, @sizeOf(IStream.Vtbl));
     try testing.expectEqual(106 * ptr, @sizeOf(ICoreWebView2_13.Vtbl));
     try testing.expectEqual(26 * ptr, @sizeOf(ICoreWebView2Controller.Vtbl));
     try testing.expectEqual(36 * ptr, @sizeOf(ICoreWebView2Controller3.Vtbl));
@@ -687,9 +993,30 @@ test "the slots we actually call sit where the header puts them" {
     // check that says the split did not move anything.
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_Source"));
     try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Navigate"));
+    try testing.expectEqual(15 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationCompleted"));
     try testing.expectEqual(27 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddScriptToExecuteOnDocumentCreated"));
+    try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2.Vtbl, "ExecuteScript"));
     try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
     try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
+    try testing.expectEqual(55 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebResourceRequested"));
+    try testing.expectEqual(57 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddWebResourceRequestedFilter"));
+
+    // The resource-request trio: read the URI off the request, then hand back
+    // a response built by the environment's factory (slot 4, right after the
+    // controller factory).
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2WebResourceRequestedEventArgs.Vtbl, "get_Request"));
+    try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2WebResourceRequestedEventArgs.Vtbl, "put_Response"));
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2WebResourceRequest.Vtbl, "get_Uri"));
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2Environment.Vtbl, "CreateWebResourceResponse"));
+
+    // Navigation-completed: only "did it load" is read, and it is slot 3.
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NavigationCompletedEventArgs.Vtbl, "get_IsSuccess"));
+
+    // IStream: `Write` is ISequentialStream's second method, `Seek` is
+    // IStream's first. Getting these two the wrong way round would call Read
+    // with write arguments.
+    try testing.expectEqual(4 * ptr, @offsetOf(IStream.Vtbl, "Write"));
+    try testing.expectEqual(5 * ptr, @offsetOf(IStream.Vtbl, "Seek"));
 
     // The new-window args: read the URI, then say we handled it.
     try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "get_Uri"));
@@ -719,6 +1046,11 @@ test "every interface puts its vtable pointer first" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Environment, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NewWindowRequestedEventArgs, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebMessageReceivedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceRequestedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceRequest, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceResponse, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NavigationCompletedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(IStream, "vtable"));
 }
 
 test "EventRegistrationToken is the 64-bit value the add_* slots write" {
@@ -743,4 +1075,8 @@ test "the enums carry the values the runtime expects" {
     try testing.expectEqual(@as(i32, 0), @intFromEnum(PreferredColorScheme.auto));
     try testing.expectEqual(@as(i32, 1), @intFromEnum(PreferredColorScheme.light));
     try testing.expectEqual(@as(i32, 2), @intFromEnum(PreferredColorScheme.dark));
+    // `all` is the value the pane's one filter is registered with; a nonzero
+    // value here would filter the document out of its own interception.
+    try testing.expectEqual(@as(i32, 0), @intFromEnum(WebResourceContext.all));
+    try testing.expectEqual(@as(i32, 1), @intFromEnum(WebResourceContext.document));
 }

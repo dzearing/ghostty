@@ -143,6 +143,11 @@ test {
     // Pure win32 viewer error-card geometry (T373), same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_error_card.zig");
 
+    // Pure win32 file-viewer content logic — mode by extension, the 3-tier
+    // resource resolver's path math, and the `window.__viewer` calls (T90e),
+    // same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_content.zig");
+
     // Pure win32 machine-chooser row model + geometry (T172), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");

@@ -91,19 +91,15 @@ const VerbArgs = verb_args.VerbArgs;
 const parseVerbArgs = verb_args.parseVerbArgs;
 const dropPrefix = verb_args.dropPrefix;
 
-/// `--view` on `+new-window`/`+split`. Two answers, in the Mac server's own
-/// order: an ambiguous `--view` + command is rejected the same way on both
-/// platforms (that check is permanent), and then — until FILE viewers land
-/// here (T90e) — a `--view` naming a file is refused explicitly rather than
-/// rendered as raw text in a browser. Web mode returns null and builds a pane.
+/// `--view` on `+new-window`/`+split`. One answer left, and it is permanent:
+/// an ambiguous `--view` + command is rejected the same way on both platforms.
+/// The interim "file viewers are not supported here" refusal that used to sit
+/// beside it is gone — T90e renders files, so both modes build a real pane.
 ///
 /// Returns the error response to send, or null to carry on.
 fn viewArgResponse(ctx: Context, args: VerbArgs) Allocator.Error!?[]u8 {
     if (verb_args.viewConflictsWithCommand(args))
         return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_command_conflict_error});
-    const view = args.view orelse return null;
-    if (verb_args.viewMode(view) == .file)
-        return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_file_unsupported_error});
     return null;
 }
 

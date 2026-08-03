@@ -2054,6 +2054,19 @@ pub extern "ole32" fn CoCreateInstance(
     ppv: *?*anyopaque,
 ) callconv(.winapi) HRESULT;
 
+/// Create a growable in-memory `IStream`. `hGlobal` null + `fDeleteOnRelease`
+/// TRUE means "allocate as I write, and free it with the stream" — the shape a
+/// viewer response body wants, since the bytes are read once by the browser
+/// process and then thrown away (T90e).
+///
+/// Typed as an opaque out-pointer because `IStream` itself is declared in
+/// `webview2_iface.zig`, which this module must not depend on.
+pub extern "ole32" fn CreateStreamOnHGlobal(
+    hGlobal: ?*anyopaque,
+    fDeleteOnRelease: BOOL,
+    ppstm: *?*anyopaque,
+) callconv(.winapi) HRESULT;
+
 // {56FDF344-FD6D-11D0-958A-006097C9A090}
 pub const CLSID_TaskbarList: GUID = .{
     .Data1 = 0x56FDF344,
