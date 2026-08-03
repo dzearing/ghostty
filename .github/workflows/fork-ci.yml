@@ -65,6 +65,22 @@ jobs:
         with:
           version: ${{ steps.zig.outputs.version }}
 
+      # Temporary: locate why Zig cannot resolve libSystem on this image.
+      # Non-fatal so the real steps still run and one round trip yields both.
+      - name: Diagnose Zig libSystem resolution
+        continue-on-error: true
+        run: |
+          echo "--- CommandLineTools ---"
+          ls -d /Library/Developer/CommandLineTools 2>/dev/null || echo "ABSENT"
+          ls /Library/Developer/CommandLineTools/SDKs/ 2>/dev/null || echo "no CLT SDKs"
+          echo "--- tbd targets ---"
+          sed -n '1,3p' "$SDKROOT/usr/lib/libSystem.B.tbd" || echo "no libSystem.B.tbd"
+          echo "--- zig env ---"
+          zig env
+          echo "--- minimal native link ---"
+          printf 'pub fn main() void {}\n' > /tmp/t.zig
+          zig build-exe /tmp/t.zig -femit-bin=/tmp/t.out && echo "MINIMAL LINK OK" || echo "MINIMAL LINK FAILED"
+
       # On macOS `zig build test` covers BOTH halves of the codebase: the Zig
       # unit tests and `xcodebuild test -scheme Ghostty -skip-testing
       # GhosttyUITests` (build.zig wires the xctest step into the test step via
