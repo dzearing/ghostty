@@ -6,7 +6,7 @@ import Foundation
 /// ownership by the banner-script invocation signature.
 struct ClaudeHookSpec: HookSpec {
     let ownership: HookOwnership = .mergedFragment
-    let marker = "ghoztty-managed"
+    let marker = GhosttyManagedMarker.token
 
     func hookFileURL(homeDirectoryURL: URL) -> URL {
         homeDirectoryURL.appendingPathComponent(".claude/settings.json")

@@ -4,7 +4,7 @@ import Foundation
 /// Copies the bundled banner script to a STABLE owned path so generated hooks
 /// never reference a volatile `Ghoztty.app` bundle path.
 struct BannerScriptInstaller {
-    static let marker = "# ghoztty-managed"
+    static let marker = GhosttyManagedMarker.shellComment
 
     let homeDirectoryURL: URL
     let fileManager: FileManager

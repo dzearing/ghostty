@@ -4,7 +4,7 @@ import Foundation
 /// Installs the bundled `ghoztty` and `process-feedback` skills into a runtime's
 /// `skills/` directory. Portable: only the config dir differs per runtime.
 struct SkillComponent {
-    static let marker = "<!-- ghoztty-managed -->"
+    static let marker = GhosttyManagedMarker.htmlComment
     static let skillNames = ["ghoztty", "process-feedback"]
 
     let agent: RuntimeAgent
