@@ -496,6 +496,18 @@ pub fn threadEnter(
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
         const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
         const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
+        // WHICH re-attach this is, at info: the two paths look identical from
+        // outside and behave very differently (a delta attach paints our own
+        // snapshot and asks for a small gap; a full-ring attach re-parses the
+        // agent's whole geometry-bound ring). Without this line the only way to
+        // tell them apart on box is to eyeball the pane. `snapshot=` is the
+        // decoded VT byte count, so a manifest whose snapshot was dropped or
+        // failed to decode reads as `offset=0 snapshot=0`.
+        log.info("attach: session={s} offset={d} snapshot={d}", .{
+            sid,
+            self.attach_offset,
+            if (self.restore_snapshot) |s| s.len else 0,
+        });
         var outcome = try self.conn.attachChannelCancellable(
             sid,
             rows,

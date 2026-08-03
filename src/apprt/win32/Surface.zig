@@ -281,6 +281,14 @@ remote_shell: ?[]const u8 = null,
 /// what it keeps and `remoteBackend()` is called exactly once, during init).
 remote_session_id: ?[]const u8 = null,
 
+/// WP-D3 fast re-attach (T109): the decoded screen repaint to paint on ATTACH
+/// and the absolute stream offset it reflects. Same borrow contract as
+/// `remote_working_directory` — valid for `core_surface.init` only, cleared
+/// right after — because the App's decode scratch is reused by the NEXT leaf
+/// this restore builds. Null/0 ⇒ full-ring replay.
+remote_restore_snapshot: ?[]const u8 = null,
+remote_restore_offset: u64 = 0,
+
 /// Hero-mode thumbnail snapshot pipeline (T58 design / T59a). The renderer
 /// thread captures its own presented frame (blit of the offscreen render
 /// target — never an HWND capture, which can't see hidden panes) into
@@ -402,6 +410,17 @@ pub const Overrides = struct {
         /// must outlive the consuming `Surface.init` (the manifest `Parsed`
         /// that owns it stays alive for the whole restore). Null ⇒ OPEN new.
         session_id: ?[]const u8 = null,
+
+        /// WP-D3 fast re-attach (T109): the DECODED structured VT screen repaint
+        /// the manifest recorded for this leaf, and the absolute agent-stream
+        /// byte offset it reflects. The surface paints the snapshot on ATTACH
+        /// and hands the offset to the agent as the ATTACH `last_byte_offset`,
+        /// so only `(offset, S]` is replayed instead of the whole retained ring.
+        /// Borrowed for the duration of the consuming `Surface.init` only
+        /// (`termio.Remote.init` dupes it into the backend arena). Null/0 ⇒ the
+        /// pre-T109 full-ring replay.
+        restore_snapshot: ?[]const u8 = null,
+        restore_offset: u64 = 0,
     };
 };
 
@@ -581,6 +600,10 @@ pub fn init(
             self.remote_shell = r.shell;
             // Non-null ⇒ ATTACH to a restored session (T89f2) rather than OPEN.
             self.remote_session_id = r.session_id;
+            // T109: the persisted screen + the offset it reflects, so the ATTACH
+            // asks for a delta instead of the whole ring.
+            self.remote_restore_snapshot = r.restore_snapshot;
+            self.remote_restore_offset = r.restore_offset;
             // An explicit remote command travels through the same surface
             // config seam Exec uses; the core only forwards it into the
             // agent OPEN when `wait-after-command` marks it as explicitly
@@ -644,6 +667,11 @@ pub fn init(
     // it is owned by the parent Window and outlives this surface.
     self.remote_working_directory = null;
     self.remote_shell = null;
+    // T109: same rule, and here it is not merely tidy — the App reuses one
+    // decode scratch buffer per restored leaf, so a pointer left behind would
+    // name the NEXT pane's screen.
+    self.remote_restore_snapshot = null;
+    self.remote_restore_offset = 0;
 
     // Mark the surface as ready. Before this point, Win32 messages
     // (triggered by ShowWindow, wglCreateContext, etc.) must be ignored.
@@ -4045,6 +4073,14 @@ pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
             (if (s.len > 0) s else null)
         else
             null,
+        // WP-D3 (T109). An empty snapshot is treated as none: `termio.Remote`
+        // only honors an offset that comes WITH a screen to paint, and passing
+        // a bare offset would attach past content nothing ever drew.
+        .restore_snapshot = if (self.remote_restore_snapshot) |s|
+            (if (s.len > 0) s else null)
+        else
+            null,
+        .restore_offset = self.remote_restore_offset,
     };
 }
 

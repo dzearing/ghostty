@@ -7310,3 +7310,65 @@ exit 0, `-Dapp-runtime=win32` exit 0 (after the T407 recovery: kill the hung
 test + its WebView2 hosts, re-run unchanged), `test-agent` - the LANE hangs
 (T409), both binaries run directly are green (3707/0 and 3779/0), P1-P3 ALL
 PASS. New: T410, T411.
+
+## 2026-08-03 - T109: the machinery was already there; Windows was not wired to it
+
+T109 is the WP-D3 fast re-attach on Windows, and the striking thing is how
+little of it was new. `Surface.sessionSnapshot` (the 600-row structured VT
+repaint), `CoreSurface.RemoteBackend.restore_snapshot/offset`, and the entire
+client half of `termio/Remote.zig` - paint the snapshot, ATTACH at its offset,
+let the agent gap-fill only `(offset, S]` - are platform-agnostic core code,
+written with the Mac apprt and sitting unused on this side. The win32 apprt
+simply never passed the pair down, so every Windows restore took the full-ring
+path. The work was the two ENDS: `session_layout.Leaf` gains `screen_snapshot`
+(base64) + `screen_snapshot_offset`, `captureLeaf` fills them, and
+`restoreAttachOverride` decodes them back into `Surface.Overrides.Remote`.
+
+Two decisions are worth more than the wiring.
+
+**The budget belongs in the schema, not in a comment.** A 600-row VT dump of a
+wide, heavily-styled pane is not small, and the manifest has a hard 8 MiB read
+ceiling. The failure mode if snapshots crowd past it is not "no snapshot" - it
+is a manifest that will not load AT ALL, costing the user every window, which
+would make an optimization capable of destroying the thing it optimizes. So
+`SnapshotBudget` caps a pane at 256 KiB encoded and the file at 3 MiB, spends in
+tree order, and refuses without spending so one huge pane cannot starve the
+panes behind it. It is pure arithmetic, so the none lane asserts both ceilings
+and the fact that the file budget leaves room for the topology.
+
+**Snapshots are stripped from the agent layout blobs**, and that is the
+interesting constraint rather than an oversight. A blob is a topology record
+re-serialized and pushed on every layout mutation, and `blobHash` skipping
+unchanged windows is the whole reason that mirror is cheap. A snapshot changes
+on every capture, so carrying one would make every window re-upload forever, at
+a hundred times the size. Cross-machine "Restore All" therefore still replays
+the ring - filed as **T413** with three candidate shapes, so the asymmetry is
+recorded as a decision instead of read later as a bug.
+
+The `attach: session=<sid> offset=<N> snapshot=<M>` line at info is part of the
+change, not decoration, and it is the lesson worth keeping: **the two re-attach
+paths are indistinguishable from outside.** Both end with a pane full of the
+right text. Content assertions alone cannot tell a delta attach from a
+full-ring replay, so an acceptance script built only on "is the marker still
+there?" would have passed just as happily on a build that silently fell back.
+The new `test/win32/session-snapshot-reattach.ps1` reads that log line, and its
+`-NegativeControl` arm - which inverts exactly that claim and scores exactly one
+failure on this build - is what proves the oracle discriminates.
+
+Two test-side races cost a first run: the poll accepted "a leaf has a snapshot",
+which the STARTUP capture already satisfied, so it scored a pre-marker blob and
+then compared the wrong offsets; and the marker did not match because a
+per-cell repaint shoots SGR through the middle of a word. Fixed by polling for
+the capture that post-dates the marker, stripping CSI/OSC before matching, and
+re-reading the manifest AFTER the app is dead - that file is what restore
+actually consumes, and anything earlier races a later debounced write.
+
+Left unmeasured, and filed rather than hand-waved: a window frame change marks
+the layout dirty, so a drag now re-arms a per-pane VT dump every 250 ms and
+nobody has timed it (**T412**, with the flooded-pane case named as the one that
+matters, since the dump takes the renderer mutex the IO thread holds).
+
+Validation: `session-snapshot-reattach.ps1` ALL PASS (27), `-NegativeControl`
+exactly 1 failure (C3, as designed), `-Dapp-runtime=none` exit 0,
+`-Dapp-runtime=win32` exit 0, `test-agent` per the T409 workaround, P1-P3 ALL
+PASS. New: T412, T413.

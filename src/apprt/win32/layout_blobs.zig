@@ -42,10 +42,45 @@ const session_layout = @import("session_layout.zig");
 /// same additive-evolution contract the manifest file itself uses — a reader
 /// that doesn't know a field ignores it, and a reader that expects one it can't
 /// find falls back. Caller frees.
+///
+/// The WP-D3 screen snapshots (T109) are STRIPPED on the way out. A blob is a
+/// TOPOLOGY record: it is re-serialized and pushed to the agent on every layout
+/// mutation, and `blobHash` skipping the unchanged ones is what keeps that
+/// mirror cheap. A per-pane VT screen dump would both multiply a blob's size by
+/// a hundred and change its bytes on every single push, so every window would
+/// re-upload forever. Restore-from-blob therefore uses the pre-WP-D3 full-ring
+/// replay; the local manifest — which is not pushed anywhere — carries the
+/// snapshots for the same-machine re-attach they were built for.
 pub fn serializeWindow(alloc: Allocator, win: session_layout.Window) ![]u8 {
-    return std.json.Stringify.valueAlloc(alloc, win, .{
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const stripped = try stripSnapshots(arena_state.allocator(), win);
+    return std.json.Stringify.valueAlloc(alloc, stripped, .{
         .emit_null_optional_fields = false,
     });
+}
+
+/// A copy of `win` whose every leaf has its WP-D3 snapshot fields cleared.
+/// Everything else — including every string — is BORROWED from `win`; only the
+/// tab/node spines are rebuilt, which is all that is needed to change a value
+/// field on a leaf. Allocated in `arena`, so the caller frees the lot at once.
+fn stripSnapshots(arena: Allocator, win: session_layout.Window) !session_layout.Window {
+    var out = win;
+    const tabs = try arena.alloc(session_layout.Tab, win.tabs.len);
+    for (win.tabs, 0..) |tab, ti| {
+        const nodes = try arena.alloc(session_layout.Node, tab.nodes.len);
+        for (tab.nodes, 0..) |node, ni| {
+            nodes[ni] = node;
+            if (nodes[ni].leaf) |*leaf| {
+                leaf.screen_snapshot = null;
+                leaf.screen_snapshot_offset = null;
+            }
+        }
+        tabs[ti] = tab;
+        tabs[ti].nodes = nodes;
+    }
+    out.tabs = tabs;
+    return out;
 }
 
 /// Every agent session id `win` references, in tree order, deduped. The slices
@@ -165,6 +200,46 @@ fn twoPaneWindow() session_layout.Window {
         .active_tab = 0,
         .tabs = &S.tabs,
     };
+}
+
+test "T109: serializeWindow strips screen snapshots but keeps everything else" {
+    const alloc = testing.allocator;
+    const nodes = [_]session_layout.Node{
+        .{ .split = .{ .layout = "horizontal", .ratio = 0.5, .left = 1, .right = 2 } },
+        .{ .leaf = .{
+            .session_id = "aaaa",
+            .pane_id = "pane-a",
+            .title = "left",
+            .screen_snapshot = "SU5WSVNJQkxF",
+            .screen_snapshot_offset = 9001,
+        } },
+        .{ .leaf = .{ .session_id = "bbbb", .pane_id = "pane-b" } },
+    };
+    const tabs = [_]session_layout.Tab{.{ .nodes = &nodes, .active = true }};
+    const win: session_layout.Window = .{ .id = "win-0", .active_tab = 0, .tabs = &tabs };
+
+    const blob = try serializeWindow(alloc, win);
+    defer alloc.free(blob);
+    try testing.expect(std.mem.indexOf(u8, blob, "screen_snapshot") == null);
+    try testing.expect(std.mem.indexOf(u8, blob, "SU5WSVNJQkxF") == null);
+    try testing.expect(std.mem.indexOf(u8, blob, "9001") == null);
+    // The topology is untouched: same tree, same ids, same titles.
+    try testing.expect(std.mem.indexOf(u8, blob, "\"pane-a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "\"bbbb\"") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "\"left\"") != null);
+
+    // ...and the caller's window is NOT mutated — the strip works on a copy.
+    try testing.expectEqualStrings("SU5WSVNJQkxF", win.tabs[0].nodes[1].leaf.?.screen_snapshot.?);
+
+    // Two panes' worth of snapshot churn must not move the hash: that is what
+    // keeps the per-mutation mirror from re-uploading every window forever.
+    var quiet = nodes;
+    quiet[1].leaf.?.screen_snapshot = "RElGRkVSRU5U";
+    quiet[1].leaf.?.screen_snapshot_offset = 424242;
+    const quiet_tabs = [_]session_layout.Tab{.{ .nodes = &quiet, .active = true }};
+    const blob2 = try serializeWindow(alloc, .{ .id = "win-0", .active_tab = 0, .tabs = &quiet_tabs });
+    defer alloc.free(blob2);
+    try testing.expectEqual(blobHash(blob), blobHash(blob2));
 }
 
 test "serializeWindow round-trips through the manifest parser" {

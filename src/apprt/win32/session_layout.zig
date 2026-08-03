@@ -61,6 +61,39 @@ pub const format_version: u32 = 1;
 /// file as corrupt rather than reading it into memory.
 pub const max_file_bytes: usize = 8 * 1024 * 1024;
 
+/// Per-pane ceiling on an encoded WP-D3 screen snapshot (T109). A 600-row VT
+/// repaint of an ordinary pane is a few tens of KiB; a pane full of per-cell SGR
+/// at a huge width can be much more. Anything past this is dropped for that pane
+/// (it falls back to the full-ring replay) rather than allowed to dominate the file.
+pub const screen_snapshot_max_pane_bytes: usize = 256 * 1024;
+
+/// Whole-file ceiling on encoded snapshots, well under `max_file_bytes` so the
+/// TOPOLOGY always fits. This is the load-bearing half of the budget: the
+/// snapshot is an optimization, but a manifest that grew past `max_file_bytes`
+/// would fail to load at all and cost the user every window. Snapshots are
+/// therefore taken first-come (tree order) until the budget runs out; the panes
+/// that miss out restore exactly as they did before T109.
+pub const screen_snapshot_total_bytes: usize = 3 * 1024 * 1024;
+
+/// Tracks encoded-snapshot bytes across ONE capture pass. Pure arithmetic so the
+/// none-runtime lane can assert the two ceilings without a live surface.
+pub const SnapshotBudget = struct {
+    used: usize = 0,
+
+    /// Claim `encoded_len` bytes for one pane's snapshot. True ⇒ the caller may
+    /// record it (and the bytes are now spent); false ⇒ the pane is over the
+    /// per-pane ceiling or the file budget is exhausted, so it records nothing.
+    /// A rejected claim spends nothing, so a single huge pane cannot starve the
+    /// smaller ones behind it.
+    pub fn take(self: *SnapshotBudget, encoded_len: usize) bool {
+        if (encoded_len == 0) return false;
+        if (encoded_len > screen_snapshot_max_pane_bytes) return false;
+        if (encoded_len > screen_snapshot_total_bytes - self.used) return false;
+        self.used += encoded_len;
+        return true;
+    }
+};
+
 /// Outer window rectangle in screen pixels (matches the Mac `Frame`). For a
 /// maximized window this is the restored ("normal") rect; `maximized` records
 /// that it should come back maximized (T85 parity).
@@ -93,6 +126,19 @@ pub const Frame = struct {
 ///     for a pane whose location names no directory of its own — a website or a
 ///     blank page — so it cannot be re-derived from the location on restore.
 ///
+/// `screen_snapshot` + `screen_snapshot_offset` are the WP-D3 fast re-attach
+/// pair (T109): the pane's own structured VT repaint of its screen (base64) and
+/// the absolute agent-stream byte offset that repaint reflects. On restore the
+/// pane paints the snapshot for an instant, correctly-sized frame and ATTACHes
+/// at the offset, so the agent gap-fills only `(offset, S]` instead of replaying
+/// its whole retained ring. The ring is a CONCATENATION of segments drawn at
+/// different geometries (every attach resize makes conhost append a fresh paint
+/// at the new size), so a full-ring replay parsed at any single geometry is
+/// faithful only to its own segments — which is the loss this pair removes.
+/// Additive and optional in the usual way: a pre-T109 manifest, a viewer leaf, a
+/// pane that never produced output, or a snapshot the budget below dropped all
+/// decode as null and fall back to the full-ring replay.
+///
 /// `pane_id` is the pane's stable ghoztty-owned identity (T113) — the value
 /// baked into its shell as `$GHOZTTY_PANE_ID`. It MUST round-trip: the
 /// re-attached (or agent-RELAUNCHed) process keeps the env it was spawned
@@ -108,6 +154,8 @@ pub const Leaf = struct {
     viewer_location: ?[]const u8 = null,
     viewer_home_location: ?[]const u8 = null,
     viewer_origin_directory: ?[]const u8 = null,
+    screen_snapshot: ?[]const u8 = null,
+    screen_snapshot_offset: ?u64 = null,
 
     /// Whether this leaf describes a VIEWER pane. Absent `kind` ⇒ terminal, so
     /// this is also the compatibility rule for a pre-viewer manifest. One
@@ -385,6 +433,74 @@ test "serialize + parse round-trip preserves windows, tabs, tree, order" {
     try testing.expectEqualStrings("win-1", w1.id);
     try testing.expect(w1.maximized);
     try testing.expect(w1.title_override == null);
+}
+
+test "T109: screen snapshot + offset round-trip, and are absent when unset" {
+    const alloc = testing.allocator;
+
+    const nodes = [_]Node{
+        .{ .leaf = .{
+            .session_id = "0123456789abcdef0123456789abcdef",
+            .screen_snapshot = "G1tIG1tKaGVsbG8=",
+            .screen_snapshot_offset = 4_294_967_296, // > u32, so u64 is load-bearing
+        } },
+        .{ .leaf = .{ .session_id = "fedcba9876543210fedcba9876543210" } },
+    };
+    const tabs = [_]Tab{.{ .nodes = &nodes, .active = true }};
+    const windows = [_]Window{.{ .id = "win-0", .tabs = &tabs }};
+
+    const body = try serialize(alloc, .{ .windows = &windows });
+    defer alloc.free(body);
+
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const leaves = parsed.value.windows[0].tabs[0].nodes;
+    try testing.expectEqualStrings("G1tIG1tKaGVsbG8=", leaves[0].leaf.?.screen_snapshot.?);
+    try testing.expectEqual(@as(u64, 4_294_967_296), leaves[0].leaf.?.screen_snapshot_offset.?);
+    // A leaf that recorded none stays null — that is the full-ring fallback.
+    try testing.expect(leaves[1].leaf.?.screen_snapshot == null);
+    try testing.expect(leaves[1].leaf.?.screen_snapshot_offset == null);
+}
+
+test "T109: a pre-snapshot manifest still loads, with null snapshot fields" {
+    const alloc = testing.allocator;
+    const body =
+        \\{"version":1,"windows":[{"id":"win-0","active_tab":0,
+        \\"tabs":[{"nodes":[{"leaf":{"session_id":"aaaa","pane_id":"p"}}],"active":true}]}]}
+    ;
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const leaf = parsed.value.windows[0].tabs[0].nodes[0].leaf.?;
+    try testing.expectEqualStrings("aaaa", leaf.session_id.?);
+    try testing.expect(leaf.screen_snapshot == null);
+    try testing.expect(leaf.screen_snapshot_offset == null);
+}
+
+test "T109: snapshot budget rejects an oversized pane and stops at the file ceiling" {
+    var budget: SnapshotBudget = .{};
+
+    // Nothing to record is not a claim.
+    try testing.expect(!budget.take(0));
+    try testing.expectEqual(@as(usize, 0), budget.used);
+
+    // Over the per-pane ceiling ⇒ refused, and it spends nothing, so the panes
+    // behind it are unaffected.
+    try testing.expect(!budget.take(screen_snapshot_max_pane_bytes + 1));
+    try testing.expectEqual(@as(usize, 0), budget.used);
+    try testing.expect(budget.take(screen_snapshot_max_pane_bytes));
+    try testing.expectEqual(screen_snapshot_max_pane_bytes, budget.used);
+
+    // Fill the file budget exactly, then refuse the next byte.
+    var full: SnapshotBudget = .{};
+    var taken: usize = 0;
+    while (taken + screen_snapshot_max_pane_bytes <= screen_snapshot_total_bytes) : (taken += screen_snapshot_max_pane_bytes) {
+        try testing.expect(full.take(screen_snapshot_max_pane_bytes));
+    }
+    try testing.expectEqual(screen_snapshot_total_bytes, full.used);
+    try testing.expect(!full.take(1));
+
+    // The ceiling leaves room for the topology itself.
+    try testing.expect(screen_snapshot_total_bytes < max_file_bytes);
 }
 
 test "serialize an empty window set is a present empty array" {

@@ -178,6 +178,14 @@ pushed_layouts: std.StringHashMapUnmanaged(u64) = .empty,
 /// dropped and the whole topology re-pushed rather than assumed present.
 pushed_layouts_conn: ?*remote_connection.Connection = null,
 
+/// Decode scratch for the WP-D3 screen snapshot of the leaf currently being
+/// restored (T109). ONE buffer, not one per leaf: `restoreAttachOverride` hands
+/// out a borrowed slice that `Surface.init` consumes synchronously (the surface
+/// is constructed before the next leaf's override is built), so the next call
+/// can free it and reuse the slot. That keeps the peak cost at a single pane's
+/// screen no matter how many windows a restore rebuilds. Freed in `deinit`.
+restore_snapshot_scratch: ?[]u8 = null,
+
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
 
@@ -1024,6 +1032,13 @@ pub fn terminate(self: *App) void {
     self.pushed_layouts.deinit(alloc);
     self.pushed_layouts_conn = null;
 
+    // T109: the last restored leaf's decoded screen. Every surface that
+    // borrowed it is long gone by now (they dupe what they keep).
+    if (self.restore_snapshot_scratch) |s| {
+        alloc.free(s);
+        self.restore_snapshot_scratch = null;
+    }
+
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
         self.bg_brush = null;
@@ -1286,15 +1301,21 @@ fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
 
 /// Capture one leaf's restore metadata: the agent session id to re-ATTACH to
 /// (null when the pane is not agent-backed — it restores as an exited pane),
-/// the pane's stable id (T113), the current title, and any registered IPC
-/// name. `kind`/`viewer_location` stay null (reserved for viewer panes, T90h).
-/// Strings dupe into `arena`.
-fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.Leaf {
+/// the pane's stable id (T113), the current title, any registered IPC name, and
+/// the WP-D3 screen snapshot (T109). `kind`/`viewer_location` stay null
+/// (reserved for viewer panes, T90h). Strings dupe into `arena`.
+fn captureLeaf(
+    self: *App,
+    arena: Allocator,
+    surface: *Surface,
+    budget: *session_layout.SnapshotBudget,
+) !session_layout.Leaf {
     const sid: ?[]const u8 = if (surface.core_surface_ready)
         surface.core_surface.remoteSessionId()
     else
         null;
     const ipc_name = if (surface.pane_view) |pv| self.ipcNameOf(.{ .pane = pv }) else null;
+    const snap = try captureLeafSnapshot(arena, surface, budget);
     return .{
         .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
         .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
@@ -1302,7 +1323,47 @@ fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.
         // Recorded unconditionally: it must survive even for a leaf with no
         // session (a fresh OPEN still keeps the id its shell was baked with).
         .pane_id = try arena.dupe(u8, surface.paneId()),
+        .screen_snapshot = snap.data,
+        .screen_snapshot_offset = snap.offset,
     };
+}
+
+/// One leaf's captured WP-D3 pair, base64'd and ready for the manifest. Both
+/// null ⇒ this pane records no snapshot and restores the pre-T109 way.
+const CapturedSnapshot = struct { data: ?[]const u8 = null, offset: ?u64 = null };
+
+/// The WP-D3 snapshot pair for one terminal leaf (T109): the pane's structured
+/// VT screen repaint, base64'd into `arena`, plus the absolute agent-stream byte
+/// offset it reflects.
+///
+/// Both null is the normal, harmless answer for a local exec pane, a pane whose
+/// core surface is not up yet, and a fresh pane that has applied nothing — the
+/// core's `sessionSnapshot` decides all three, so this stays the one place that
+/// asks. Both null is ALSO the answer when the capture errors or the budget
+/// refuses the pane: a snapshot is an optimization on top of a restore that
+/// already works, so it must never be able to fail the capture it rides in.
+fn captureLeafSnapshot(
+    arena: Allocator,
+    surface: *Surface,
+    budget: *session_layout.SnapshotBudget,
+) !CapturedSnapshot {
+    const none: CapturedSnapshot = .{};
+    if (!surface.core_surface_ready) return none;
+    const snap = surface.core_surface.sessionSnapshot(arena) catch |err| {
+        log.warn("session-layout: screen snapshot failed err={}", .{err});
+        return none;
+    } orelse return none;
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(snap.data.len);
+    if (!budget.take(encoded_len)) {
+        log.info(
+            "session-layout: screen snapshot dropped, over budget bytes={d}",
+            .{encoded_len},
+        );
+        return none;
+    }
+    const buf = try arena.alloc(u8, encoded_len);
+    return .{ .data = encoder.encode(buf, snap.data), .offset = snap.byte_offset };
 }
 
 /// Capture one VIEWER leaf's restore metadata (T90h). A viewer owns no agent
@@ -1353,6 +1414,10 @@ fn captureTabTitle(arena: Allocator, win: *Window, ti: usize) !?[]const u8 {
 /// handles carry over as indices unchanged. Caller frees `arena` after writing.
 fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_layout.File {
     var windows: std.ArrayList(session_layout.Window) = .empty;
+    // T109: one budget for the WHOLE file, spent in tree order, so the encoded
+    // snapshots can never crowd the topology past `max_file_bytes` (which would
+    // fail the next load outright and cost the user every window).
+    var snapshot_budget: session_layout.SnapshotBudget = .{};
     for (self.windows.items, 0..) |win, wi| {
         if (win.is_quick_terminal) continue;
         if (win.remote_dialed != null) continue;
@@ -1371,7 +1436,7 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
                         const surface = pane.surface() orelse break :leaf .{
                             .leaf = try captureViewerLeaf(self, arena, pane),
                         };
-                        const leaf = try self.captureLeaf(arena, surface);
+                        const leaf = try self.captureLeaf(arena, surface, &snapshot_budget);
                         // No id yet but this leaf is EXPECTED to be agent-backed
                         // (its window rides the local agent, or the surface's
                         // remote backend is already wired) ⇒ the OPEN is still in
@@ -1625,6 +1690,7 @@ fn restoreWindowHasAttachableLeaf(
 /// genuinely-gone / id-less leaf gets a null session_id — the surface OPENs a
 /// fresh agent-backed pane.
 fn restoreAttachOverride(
+    self: *App,
     leaf: session_layout.Leaf,
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
@@ -1633,6 +1699,11 @@ fn restoreAttachOverride(
         const ok = if (attach) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
         break :blk if (ok) s else null;
     } else null;
+    // T109: the recorded screen goes with the SESSION we are re-attaching to.
+    // A leaf whose session is gone OPENs a fresh shell, and painting the dead
+    // session's last screen over it would be a lie about what the pane is —
+    // exactly the case `termio.Remote` refuses on the relaunch path.
+    const snap: ?Snapshot = if (sid != null) self.decodeLeafSnapshot(leaf) else null;
     return .{
         // T113: hand back the RECORDED pane id. The process we are re-attaching
         // to still holds it in `$GHOZTTY_PANE_ID`; generating a fresh one here
@@ -1643,8 +1714,46 @@ fn restoreAttachOverride(
             .connection = tr.conn,
             .local_agent = tr.local_agent,
             .session_id = sid,
+            .restore_snapshot = if (snap) |s| s.data else null,
+            .restore_offset = if (snap) |s| s.offset else 0,
         },
     };
+}
+
+/// A decoded WP-D3 pair, pointing into the App's single decode scratch.
+const Snapshot = struct { data: []const u8, offset: u64 };
+
+/// Decode one leaf's recorded screen snapshot into the App's scratch buffer
+/// (T109), replacing whatever the previous restored leaf left there. Null for a
+/// leaf that recorded none, recorded only half the pair, or whose base64 does
+/// not decode — every one of which just means "restore this pane the pre-T109
+/// way", never an error: the snapshot is a speed/fidelity win layered on a
+/// restore that already works without it.
+///
+/// The two fields travel together on purpose. An offset with no screen would
+/// have the agent skip everything at or below it with nothing painted in its
+/// place — a pane blank above the gap — so a missing half voids the pair.
+fn decodeLeafSnapshot(self: *App, leaf: session_layout.Leaf) ?Snapshot {
+    const encoded = leaf.screen_snapshot orelse return null;
+    const offset = leaf.screen_snapshot_offset orelse return null;
+    if (encoded.len == 0 or offset == 0) return null;
+
+    const gpa = self.core_app.alloc;
+    const decoder = std.base64.standard.Decoder;
+    const len = decoder.calcSizeForSlice(encoded) catch |err| {
+        log.warn("session-restore: snapshot length invalid err={}", .{err});
+        return null;
+    };
+    if (len == 0) return null;
+    const buf = gpa.alloc(u8, len) catch return null;
+    decoder.decode(buf, encoded) catch |err| {
+        log.warn("session-restore: snapshot decode failed err={}", .{err});
+        gpa.free(buf);
+        return null;
+    };
+    if (self.restore_snapshot_scratch) |old| gpa.free(old);
+    self.restore_snapshot_scratch = buf;
+    return .{ .data = buf, .offset = offset };
 }
 
 /// How to re-open one recorded VIEWER leaf (T90h). A viewer has no session to
@@ -1707,7 +1816,7 @@ fn restoreWindow(
     // overrides — they describe a shell it does not have, the same split the
     // `+new-window --view` path makes.
     const first_viewer = first_leaf.isViewer();
-    var ov0 = restoreAttachOverride(first_leaf, tr, attach);
+    var ov0 = self.restoreAttachOverride(first_leaf, tr, attach);
     const window = self.createWindow(.{
         .surface_overrides = if (first_viewer) null else &ov0,
         .viewer_open = if (first_viewer) restoreViewerOpen(first_leaf) else null,
@@ -1742,7 +1851,7 @@ fn restoreWindow(
         if (lf.isViewer()) {
             _ = try window.addViewerTab(restoreViewerOpen(lf));
         } else {
-            var ov = restoreAttachOverride(lf, tr, attach);
+            var ov = self.restoreAttachOverride(lf, tr, attach);
             window.pending_surface_overrides = &ov;
             _ = window.addTab() catch |err| {
                 window.pending_surface_overrides = null;
@@ -1830,7 +1939,7 @@ fn restoreBuildSubtree(
             restoreViewerOpen(right_leaf),
         ) orelse return error.CorruptLayout
     else pane: {
-        var ov = restoreAttachOverride(right_leaf, tr, attach);
+        var ov = self.restoreAttachOverride(right_leaf, tr, attach);
         window.pending_surface_overrides = &ov;
         const new_surface = window.newSplitAt(anchor, dir, @floatCast(sp.ratio)) catch |err| {
             window.pending_surface_overrides = null;
@@ -2411,7 +2520,7 @@ fn rebuildTabInPlace(
     // agent link dropped (T145). A cross-machine window's transport belongs to
     // the window and is torn down with it, never recovered here.
     const tr: RestoreTransport = .local(conn);
-    var ov = restoreAttachOverride(first_leaf, tr, attach);
+    var ov = self.restoreAttachOverride(first_leaf, tr, attach);
     // Rebuild the root as the KIND it was. A viewer rides no agent connection,
     // so recovery has nothing to re-bind for it — but the tab still has to come
     // back holding a viewer, not a terminal wearing its slot (T90h).
