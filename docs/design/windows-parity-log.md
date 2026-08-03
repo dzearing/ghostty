@@ -7545,3 +7545,43 @@ a clean box is not passing.
 Root cause of the death is still open as **T426** - what changed is that the
 next occurrence names the call it stopped in, and the user gets their terminal
 back either way.
+
+## 2026-08-03 - T425: the restored pane lands where the user IS, not where the shell started
+
+Second of the five from the user's upgrade report. Filed with two symptoms and
+an instruction to split them the moment they stopped sharing a cause; they did,
+and the file that proves it is the live agent's `sessions.json` - **every
+session carries a `cwd`, not one carries an `argv`**. One shared cause does not
+produce that asymmetry.
+
+So the cwd half is T425 and is fixed here; the "previous command" half is
+**T429**, which needs a design decision before it needs code (recording the
+resolved shell would print `previous command: C:\WINDOWS\system32\cmd.exe`,
+which is worse than the current silence) and an additive wire change to carry
+the foreground command instead.
+
+The cwd was **write-once**: `handleOpen` recorded `OPEN.cwd` at spawn and
+nothing wrote it again. `handleGetCwd` already reads the child's live directory
+for new splits - and discards it. So a pane the user had `cd`'d out of came back
+where the shell STARTED, which reads as "the wrong directory" rather than "no
+directory" precisely because the recorded answer is plausible. `refreshCwds()`
+now samples every live session on a 10s reaper tick, outside the store mutex
+(a cwd read is not the cheap single syscall the neighbouring fg-pid sampler's
+contract promises), re-looking-up by id before writing because a concurrent
+CLOSE can free the session while unlocked. A failed query keeps the last known
+value - forgetting it would put the respawn in the agent's own
+`C:\WINDOWS\system32`, which is the T132 failure the record exists to prevent.
+
+Two things worth carrying forward. The new acceptance arm was run **with the fix
+disabled**, and exactly the two assertions that measure it failed while its
+positive controls still passed - a green script proves nothing until you have
+watched it go red. And arm A's long-standing comment claimed the agent records
+the resolved shell when there is no explicit command; it does not, and the only
+reason the arm never noticed is that every pane it opens carries an explicit
+`--command=`. Corrected in place.
+
+`zig build test-agent` also **hung** three times (after passing twice on the
+same source), with a real WebView2 host running under the test binary against
+the user's own `EBWebView-debug` profile. Unrelated to this task, pre-existing,
+and now **T430**; the agent modules were verified individually with
+`-Dtest-filter` in the meantime.

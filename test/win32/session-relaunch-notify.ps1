@@ -25,6 +25,10 @@
 #      simply broke restore.
 #   C: a pane whose recorded cwd was DELETED while the agent was down still
 #      comes up on a working prompt (a missing directory must not kill a pane).
+#   D: the recorded cwd TRACKS the shell (T425) - a pane the user `cd`'d out of
+#      restores where they actually were, not where the shell was spawned.
+#      Scored on the agent's own sessions.json AND on what the restored shell
+#      prints for `cd`.
 #
 # The commands are `ping -n <unique> 127.0.0.1`: long-lived, harmless, and each
 # carries a unique count that makes it findable in Win32_Process.CommandLine -
@@ -168,6 +172,21 @@ function Wait-Leaves($tag, $target, $timeoutSec = 45) {
 function Read-Pane($id, $tag, $lines = 300) {
     Run-CliArgs @('+read', "--name=$id", "--lines=$lines") "$tmp\read-$tag.txt" 12 | Out-Null
     return ((Out-Text "$tmp\read-$tag.txt") -replace "`0", '')
+}
+# Like Wait-PaneText, but whitespace-insensitive and counted. A path is the
+# thing being matched below and a pane WRAPS one across lines, so the raw text
+# never contains it verbatim; and `want = 2` distinguishes "the user typed this
+# path" from "the shell is actually AT this path" (the echoed input line is the
+# first hit, the new prompt is the second) - the same two-hit trick
+# Test-PaneResponsive uses to tell a live shell from a dead line editor.
+function Wait-PaneTextTight($id, $tag, $needle, $want = 1, $timeoutSec = 30) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $txt = (Read-Pane $id $tag) -replace '\s', ''
+        if (([regex]::Matches($txt, [regex]::Escape($needle))).Count -ge $want) { return $true }
+        Start-Sleep -Milliseconds 700
+    }
+    return $false
 }
 function Wait-PaneText($id, $tag, $pattern, $timeoutSec = 30) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -322,10 +341,13 @@ Assert "A5 both commanded panes show the interrupted notice" ($sawNotice -ge 2)
 Assert "A6 a pane names '$CMD_A' as its previous command" ($sawA -ge 1)
 Assert "A7 a pane names '$CMD_B' as its previous command" ($sawB -ge 1)
 Assert "A8 no pane shows the OTHER pane's command" ($crossTalk -eq 0)
-# The no-recorded-command case (a null `argv`, or an agent too old to report
-# one) is NOT reachable from here: the agent records the resolved shell when
-# there is no explicit command, so every pane in this layout has one. It is
-# covered by the pure `session_notice` tests in the none-runtime lane instead.
+# The no-recorded-command case (a null `argv`) is NOT reachable from here, and
+# the reason is worth knowing: every pane in this layout is opened with an
+# EXPLICIT `--command=`, which is the one field that makes the agent record a
+# label at all. A plain shell pane - the shape the user actually runs - records
+# NOTHING, so its notice names nothing. That is T429, and it is invisible to
+# this arm by construction. The null-label rendering itself is covered by the
+# pure `session_notice` tests in the none-runtime lane.
 
 # The point of the whole exercise: a usable shell, not a corpse.
 $respA = 0
@@ -367,6 +389,68 @@ Assert "C4 every pane is interactive despite the missing cwd ($respC/$($leavesC.
     ($respC -eq $leavesC.Count)
 Assert "C5 still nothing was re-executed" `
     (((Count-MarkerPings $MARK_A) + (Count-MarkerPings $MARK_B)) -eq 0)
+Stop-TestProcs
+
+# ============================================================================
+Say "== D: the recorded cwd FOLLOWS the shell, so a restore lands where the user IS (T425)"
+# ============================================================================
+# The other half of the user's 2026-08-03 report: "I expected ... the last known
+# CWD to be restored in the shell." The agent recorded `OPEN.cwd` once, at spawn,
+# and nothing ever updated it - so a pane the user had `cd`'d out of came back in
+# the directory it STARTED in. This arm moves the shell, then proves the move
+# survives an agent restart. Arm C pins the opposite corner (a recorded cwd that
+# no longer exists), so between them the recorded value is held from both sides.
+Reset-State 'd'
+$workD = Join-Path $root 'workD'
+$deepD = Join-Path $workD 'deeper-cwd'
+New-Item -ItemType Directory -Force $deepD | Out-Null
+
+$appPidD = Start-App 'cwdtrack' @("--working-directory=$workD")
+Assert "D1 the GUI came up" ($appPidD -ne 0)
+$leavesD0 = All-Leaves (Wait-Leaves 'd0' 1 45)
+Assert "D2 there is a pane to work with" ($leavesD0.Count -ge 1)
+$paneD = $leavesD0[0].id
+# Positive control: the pane takes input at all. Without it, a later FAIL cannot
+# be told apart from "nothing was ever typed into anything".
+Assert "D3 the pane is interactive before we move it" (Test-PaneResponsive $paneD 'd-pre')
+
+# Move the shell. `/d` so the arm still works if $TEMP is on another drive.
+Run-CliArgs @('+send-keys', "--target=$paneD", "cd /d $deepD", 'Enter') "$tmp\keys-d.txt" 12 | Out-Null
+Assert "D4 the shell actually moved to the deeper directory" `
+    (Wait-PaneTextTight $paneD 'd-moved' 'deeper-cwd' 2 30)
+
+# THE oracle for the fix: the agent's OWN on-disk record. That file is the only
+# thing a restart has to work from, so asserting on it is asserting on exactly
+# what was broken - and it cannot say `deeper-cwd` unless the shell really moved
+# AND the refresh really ran. The refresh rides a 10s reaper tick.
+$metaD = Join-Path $tmp 'ghoztty\local-agent-debug\sessions.json'
+$sawDeep = $false
+$deadlineD = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadlineD) {
+    if ((Test-Path $metaD) -and ((Out-Text $metaD) -match 'deeper-cwd')) { $sawDeep = $true; break }
+    Start-Sleep -Milliseconds 700
+}
+Assert "D5 the agent recorded the LAST KNOWN cwd, not the spawn cwd" $sawDeep
+
+# Take the app AND the agent down: the reboot / agent-upgrade shape.
+$agentD = Wait-AgentPid $tmp 25
+Assert "D6 an agent is running for this run" ($agentD -ne 0)
+Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
+Stop-AppOnly
+Stop-Process -Id $agentD -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+$appPidD2 = Start-App 'cwdrestore'
+Assert "D7 the GUI came back" ($appPidD2 -ne 0)
+$leavesD1 = All-Leaves (Wait-Leaves 'd2' 1 60)
+Assert "D8 the pane restored" ($leavesD1.Count -ge 1)
+$paneD2 = $leavesD1[0].id
+# `cd` with no argument makes cmd.exe PRINT its working directory, so the
+# assertion is on what the shell says it is - not on what the prompt happened to
+# paint before the restore notice scrolled past.
+Run-CliArgs @('+send-keys', "--target=$paneD2", 'cd', 'Enter') "$tmp\keys-d2.txt" 12 | Out-Null
+Assert "D9 the restored fresh shell is in the LAST KNOWN directory" `
+    (Wait-PaneTextTight $paneD2 'd-after' $deepD 1 40)
 Stop-TestProcs
 
 } finally {

@@ -1008,10 +1008,18 @@ pub const SessionStore = struct {
     /// ticks (§5.4 "every 30 s"). The reaper wakes once a second, so 30 ticks.
     const snapshot_every_ticks: u32 = 30;
 
+    /// Recorded-cwd refresh cadence, in reaper ticks (T425). Ten seconds: the
+    /// value is only ever READ when the agent restarts, so the cost of being a
+    /// few seconds stale is nil, while the cost of each sample is a `cd`-sized
+    /// OS read per LIVE session (a cross-process PEB read on Windows) — cheap,
+    /// but not something to do every second on an idle box for no reason.
+    const cwd_every_ticks: u32 = 10;
+
     fn reaperLoop(self: *SessionStore) void {
         // Wake at most once a second (or on stop) to check for idle orphans.
         const tick_ns: u64 = 1 * std.time.ns_per_s;
         var ticks: u32 = 0;
+        var cwd_ticks: u32 = 0;
         while (true) {
             self.reaper_mutex.lock();
             if (!self.reaper_stop) self.reaper_cond.timedWait(&self.reaper_mutex, tick_ns) catch {};
@@ -1025,6 +1033,16 @@ pub const SessionStore = struct {
             // tracks the running program (Exec `tcgetpgrp` parity) instead of
             // reporting the shell forever.
             self.sampleForegroundPids();
+            // Track each live session's CURRENT working directory (T425) so the
+            // value that outlives the agent is where the user actually IS, not
+            // where the shell was spawned. Separate cadence from the ring
+            // snapshot below because it is a different kind of cost (an OS query
+            // per session vs. a disk write) and wants its own dial.
+            cwd_ticks +%= 1;
+            if (cwd_ticks >= cwd_every_ticks) {
+                cwd_ticks = 0;
+                self.refreshCwds();
+            }
             // Periodic ring disk snapshot (T13): catch dirty rings whose viewer is
             // still attached / recently detached (the connection-drop trigger only
             // fires on disconnect). No-op when ring snapshots are disabled or
@@ -1077,6 +1095,72 @@ pub const SessionStore = struct {
         self.mutex.unlock();
 
         for (pushes.items) |p| p.f(p.ctx, p.channel, p.fg);
+    }
+
+    /// Refresh every LIVE session's recorded working directory from its child, so
+    /// the value that survives an agent restart is the LAST KNOWN cwd rather than
+    /// the one the child happened to be spawned in (T425).
+    ///
+    /// Why this exists: `handleOpen` records `OPEN.cwd` once and nothing ever
+    /// updated it again, so a session the user had `cd`'d out of came back — on a
+    /// reboot or an agent upgrade — in the directory it STARTED in. `GET_CWD`
+    /// already reads the live value on demand for new splits; this puts the same
+    /// answer where the reboot floor can find it.
+    ///
+    /// The OS query runs OUTSIDE `store.mutex`. Unlike `queryForegroundPid` it is
+    /// explicitly NOT a cheap single syscall (macOS `proc_pidinfo`, a cross-process
+    /// Windows PEB read), so holding the store lock across it would stall every
+    /// OPEN/ATTACH/DATA frame behind a directory read. Same collect-then-act shape
+    /// as `handleGetCwd` and `reapIdle`: snapshot `(id, child)` under the lock,
+    /// query unlocked, then re-look-up **by id** before writing — a concurrent
+    /// CLOSE may have unlinked and freed the session while we were unlocked, so
+    /// the pointer we started from must not be dereferenced afterwards.
+    pub fn refreshCwds(self: *SessionStore) void {
+        const Probe = struct { id: u128, child: Child };
+        var probes: std.ArrayList(Probe) = .empty;
+        defer probes.deinit(self.table.alloc);
+
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            // A tombstone is skipped, not queried: its child is gone, and the cwd
+            // already recorded is exactly the one the notify restore is about to
+            // place the fresh shell in.
+            if (!s.alive) continue;
+            probes.append(self.table.alloc, .{
+                .id = s.id,
+                .child = s.child,
+            }) catch break; // OOM: take the rest next tick
+        }
+        self.mutex.unlock();
+
+        var changed = false;
+        for (probes.items) |p| {
+            // A null/empty answer (unsupported, access denied, a child on its way
+            // out) KEEPS the last known value. Forgetting it is strictly worse
+            // than a stale one: with no recorded cwd the respawn inherits the
+            // AGENT's own directory — `C:\WINDOWS\system32` on the win32 autostart
+            // path, which is the T132 failure this record exists to prevent.
+            const cwd = p.child.queryCwd(self.table.alloc) orelse continue;
+            defer self.table.alloc.free(cwd);
+            if (cwd.len == 0) continue;
+
+            self.mutex.lock();
+            if (self.table.getById(p.id)) |s| {
+                const same = if (s.cwd) |c| std.mem.eql(u8, c, cwd) else false;
+                if (!same) {
+                    s.setCwd(cwd);
+                    changed = true;
+                }
+            }
+            self.mutex.unlock();
+        }
+
+        // Only touch the disk when something actually moved. This runs on the
+        // reaper's tick, and an unconditional rewrite would put a periodic write
+        // on an idle box for no gain.
+        if (changed) self.persistMeta();
     }
 
     /// Evict any session whose `bound` connection is gone (orphaned) AND whose
@@ -1730,6 +1814,13 @@ const FakeChild = struct {
     last_signal: ?[]const u8 = null,
     exit_code: ?i64 = null,
     terminated: bool = false,
+    /// What `queryCwd` answers (models the OS read of the child's CURRENT cwd).
+    /// Null = the query is unsupported or failed, which is the case the refresh
+    /// must treat as "keep what we recorded", never as "forget it".
+    fake_cwd: ?[]const u8 = null,
+    /// How many times `queryCwd` was asked — so a test can prove the refresh
+    /// skips dead sessions instead of merely finding their value unchanged.
+    cwd_queries: usize = 0,
     alloc: Allocator,
 
     fn child(self: *FakeChild) Child {
@@ -1741,7 +1832,14 @@ const FakeChild = struct {
         .signal = sg,
         .tryWait = tw,
         .terminate = tm,
+        .queryCwd = qcwd,
     };
+    fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.cwd_queries += 1;
+        const c = self.fake_cwd orelse return null;
+        return alloc.dupe(u8, c) catch null;
+    }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         try self.input.appendSlice(self.alloc, bytes);
@@ -2128,6 +2226,85 @@ test "SessionStore.persistMeta: writes alive set, excludes tombstones, refreshes
     // A null meta_path disables persistence: no crash, file untouched.
     store.meta_path = null;
     store.persistMeta();
+}
+
+test "SessionStore.refreshCwds: a live session's recorded cwd follows the child, and lands in sessions.json (T425)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x425A);
+    var fake: FakeChild = .{ .alloc = alloc, .fake_cwd = "/work/ghoztty" };
+    defer fake.deinit();
+
+    var clock: MutClock = .{ .ms = 100 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(path);
+    store.meta_path = path;
+
+    // The session as OPEN recorded it: the directory it was SPAWNED in.
+    const s = try store.table.create(fake.child(), 700, 24, 80, 1024, 100);
+    s.pinned = true;
+    s.setCwd("/work/ghoztty");
+
+    // The user cds somewhere else. Nothing in the session record knows yet —
+    // this is the whole bug: before T425 the spawn-time value was the only one
+    // ever written, so a restore put the pane back where it STARTED rather
+    // than where the user actually was.
+    fake.fake_cwd = "/work/ghoztty/src/apprt";
+    store.refreshCwds();
+
+    try testing.expectEqualStrings("/work/ghoztty/src/apprt", s.cwd.?);
+
+    // And it is durable: a refresh that changed something must reach disk, or
+    // an agent restart (the only time this value is ever read back) still
+    // materializes the stale one.
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len);
+        try testing.expectEqualStrings("/work/ghoztty/src/apprt", p.value.sessions[0].cwd.?);
+    }
+}
+
+test "SessionStore.refreshCwds: a failed query, an unchanged cwd, and a dead session all keep the record (T425)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x425B);
+    var live: FakeChild = .{ .alloc = alloc, .fake_cwd = "/work/a" };
+    var dead: FakeChild = .{ .alloc = alloc, .fake_cwd = "/work/should-never-be-read" };
+    defer live.deinit();
+    defer dead.deinit();
+
+    var clock: MutClock = .{ .ms = 100 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    const s_live = try store.table.create(live.child(), 701, 24, 80, 1024, 100);
+    s_live.setCwd("/work/a");
+    const s_dead = try store.table.create(dead.child(), 702, 24, 80, 1024, 100);
+    s_dead.setCwd("/work/b");
+    s_dead.markExited(0, 150);
+
+    store.refreshCwds();
+
+    // A dead session is never queried: its child is gone, and its recorded cwd
+    // is precisely what the notify restore is about to place the fresh shell in.
+    try testing.expectEqual(@as(usize, 0), dead.cwd_queries);
+    try testing.expectEqualStrings("/work/b", s_dead.cwd.?);
+    // Unchanged is a no-op, not a rewrite.
+    try testing.expectEqualStrings("/work/a", s_live.cwd.?);
+
+    // A query that FAILS (unsupported OS, denied, transient) must leave the
+    // last known value alone. Forgetting it would put the restored pane in the
+    // agent's own inherited cwd — `C:\WINDOWS\system32` on the win32 autostart
+    // path, which is the T132 failure this record exists to prevent.
+    live.fake_cwd = null;
+    store.refreshCwds();
+    try testing.expectEqualStrings("/work/a", s_live.cwd.?);
 }
 
 test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" {
