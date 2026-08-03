@@ -150,6 +150,31 @@ pub const IID_ICoreWebView2NewWindowRequestedEventArgs: GUID = .{
     .Data4 = .{ 0x91, 0x32, 0xF9, 0xC2, 0x1D, 0x1E, 0xAF, 0xB9 },
 };
 
+// {B99369F3-9B11-47B5-BC6F-8E7895FCEA17}
+// `ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler`.
+pub const IID_AddScriptCompletedHandler: GUID = .{
+    .Data1 = 0xB99369F3,
+    .Data2 = 0x9B11,
+    .Data3 = 0x47B5,
+    .Data4 = .{ 0xBC, 0x6F, 0x8E, 0x78, 0x95, 0xFC, 0xEA, 0x17 },
+};
+
+// {57213F19-00E6-49FA-8E07-898EA01ECBD2}
+pub const IID_WebMessageReceivedHandler: GUID = .{
+    .Data1 = 0x57213F19,
+    .Data2 = 0x00E6,
+    .Data3 = 0x49FA,
+    .Data4 = .{ 0x8E, 0x07, 0x89, 0x8E, 0xA0, 0x1E, 0xCB, 0xD2 },
+};
+
+// {0F99A40C-E962-4207-9E92-E3D542EFF849}
+pub const IID_ICoreWebView2WebMessageReceivedEventArgs: GUID = .{
+    .Data1 = 0x0F99A40C,
+    .Data2 = 0xE962,
+    .Data3 = 0x4207,
+    .Data4 = .{ 0x9E, 0x92, 0xE3, 0xD5, 0x42, 0xEF, 0xF8, 0x49 },
+};
+
 /// `EventRegistrationToken` (winrt's `eventtoken.h`), the out-parameter every
 /// `add_*` writes. We keep no tokens — a handler lives exactly as long as the
 /// web view it was added to, and `Close` tears both down — but the slot has to
@@ -190,6 +215,45 @@ pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
     /// "We dealt with it; do not open a WebView2 popup window."
     pub fn setHandled(self: *ICoreWebView2NewWindowRequestedEventArgs, handled: bool) bool {
         return !com.failed(self.vtable.put_Handled(self, if (handled) 1 else 0));
+    }
+};
+
+// ------------------------- ICoreWebView2WebMessageReceivedEventArgs
+
+/// What `window.chrome.webview.postMessage(obj)` arrives as. Six slots, all
+/// declared because there are so few.
+///
+/// `get_WebMessageAsJson` is the one T375 calls, and the choice matters:
+/// `TryGetWebMessageAsString` fails outright unless the page posted a bare
+/// string, and every message the shared viewer JS posts is an OBJECT. The JSON
+/// it returns is the same shape Mac's `WKScriptMessage.body` dictionary carries,
+/// which is what lets `viewer_bridge.parse` be a straight port of
+/// `handleTOCMessage` rather than a second protocol.
+pub const ICoreWebView2WebMessageReceivedEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2WebMessageReceivedEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2WebMessageReceivedEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2WebMessageReceivedEventArgs) callconv(.winapi) u32,
+        get_Source: *const fn (*ICoreWebView2WebMessageReceivedEventArgs, *?[*:0]u16) callconv(.winapi) HRESULT,
+        get_WebMessageAsJson: *const fn (*ICoreWebView2WebMessageReceivedEventArgs, *?[*:0]u16) callconv(.winapi) HRESULT,
+        TryGetWebMessageAsString: *const anyopaque,
+    };
+
+    /// The message, as JSON. Caller frees it with `CoTaskMemFree`.
+    pub fn jsonRaw(self: *ICoreWebView2WebMessageReceivedEventArgs) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_WebMessageAsJson(self, &raw))) return null;
+        return raw;
+    }
+
+    /// The URI of the document that posted it. Caller frees it with
+    /// `CoTaskMemFree`.
+    pub fn sourceRaw(self: *ICoreWebView2WebMessageReceivedEventArgs) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_Source(self, &raw))) return null;
+        return raw;
     }
 };
 
@@ -234,9 +298,11 @@ pub const ICoreWebView2Profile = extern struct {
 
 /// The web view itself. T373 needed exactly one thing from it — a
 /// `QueryInterface` to `ICoreWebView2_13` for the profile — and declared only
-/// `IUnknown`. T374 adds the two slots web mode calls: `Navigate` (slot 5) and
-/// `add_NewWindowRequested` (slot 44). Script injection and the web-message
-/// bridge arrive in T375, and each will add the slots it actually calls.
+/// `IUnknown`. T374 added the two slots web mode calls: `Navigate` (slot 5) and
+/// `add_NewWindowRequested` (slot 44). T375 adds the bridge's two:
+/// `AddScriptToExecuteOnDocumentCreated` (slot 27) and
+/// `add_WebMessageReceived` (slot 34), which is why what used to be one
+/// 38-slot opaque block is now three shorter ones.
 ///
 /// Declaring 45 slots of an interface that has 61 is safe and deliberate: the
 /// vtable pointer is the runtime's, we only ever index the ones named here,
@@ -247,9 +313,13 @@ pub const ICoreWebView2Profile = extern struct {
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
-    /// Slots 6..43: `NavigateToString` through `Stop`. We call none of them.
-    /// Its LENGTH is the whole contract, and `@offsetOf` asserts it below.
-    pub const middle_slots = 38;
+    /// Slots 6..26: `NavigateToString` through `remove_ProcessFailed`.
+    pub const nav_events_slots = 21;
+    /// Slots 28..33: `RemoveScriptToExecuteOnDocumentCreated` through
+    /// `PostWebMessageAsString`.
+    pub const script_slots = 6;
+    /// Slots 35..43: `remove_WebMessageReceived` through `Stop`.
+    pub const history_slots = 9;
 
     pub const Vtbl = extern struct {
         QueryInterface: *const fn (*ICoreWebView2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -258,7 +328,11 @@ pub const ICoreWebView2 = extern struct {
         get_Settings: *const anyopaque,
         get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
         Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
-        middle: [middle_slots]*const anyopaque,
+        nav_events: [nav_events_slots]*const anyopaque,
+        AddScriptToExecuteOnDocumentCreated: *const fn (*ICoreWebView2, [*:0]const u16, *anyopaque) callconv(.winapi) HRESULT,
+        script: [script_slots]*const anyopaque,
+        add_WebMessageReceived: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        history: [history_slots]*const anyopaque,
         add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
     };
 
@@ -289,6 +363,27 @@ pub const ICoreWebView2 = extern struct {
     pub fn addNewWindowRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
         var token: EventRegistrationToken = .{};
         return !com.failed(self.vtable.add_NewWindowRequested(self, handler, &token));
+    }
+
+    /// Run `js` at document-created time in every page this view loads, from
+    /// the next navigation on (design P2). `handler` is one of OUR objects and
+    /// is NOT optional: the runtime dereferences it to report the script id.
+    ///
+    /// Success here means "the request was accepted", not "the script is
+    /// installed" — the completed handler is what says that, and a navigation
+    /// started before it fires may load without the script.
+    pub fn addScriptToExecuteOnDocumentCreated(
+        self: *ICoreWebView2,
+        js: [*:0]const u16,
+        handler: *anyopaque,
+    ) bool {
+        return !com.failed(self.vtable.AddScriptToExecuteOnDocumentCreated(self, js, handler));
+    }
+
+    /// Subscribe to `window.chrome.webview.postMessage` (design P1).
+    pub fn addWebMessageReceived(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_WebMessageReceived(self, handler, &token));
     }
 
     /// The `ICoreWebView2_13` view of this object, or null on a runtime that
@@ -561,6 +656,7 @@ test "vtable slot counts match the SDK's own layout" {
     // slots past the last one we name are simply never indexed.
     try testing.expectEqual(45 * ptr, @sizeOf(ICoreWebView2.Vtbl));
     try testing.expectEqual(7 * ptr, @sizeOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl));
+    try testing.expectEqual(6 * ptr, @sizeOf(ICoreWebView2WebMessageReceivedEventArgs.Vtbl));
     try testing.expectEqual(106 * ptr, @sizeOf(ICoreWebView2_13.Vtbl));
     try testing.expectEqual(26 * ptr, @sizeOf(ICoreWebView2Controller.Vtbl));
     try testing.expectEqual(36 * ptr, @sizeOf(ICoreWebView2Controller3.Vtbl));
@@ -583,17 +679,27 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_RasterizationScale"));
     try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_ShouldDetectMonitorScaleChanges"));
 
-    // ICoreWebView2: the two web mode calls. `Navigate` sits third among the
-    // interface's own methods (after get_Settings/get_Source), and
-    // `add_NewWindowRequested` after the 38-slot block — the numbers the
-    // `middle` block's length exists to hold in place.
+    // ICoreWebView2: the four slots we call. `Navigate` sits third among the
+    // interface's own methods (after get_Settings/get_Source); the other three
+    // sit behind opaque blocks whose LENGTHS exist to hold these numbers in
+    // place. `add_NewWindowRequested` at 44 is the load-bearing one — it was
+    // already asserted before the block was split into three, so it is the
+    // check that says the split did not move anything.
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_Source"));
     try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Navigate"));
+    try testing.expectEqual(27 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddScriptToExecuteOnDocumentCreated"));
+    try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
     try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
 
     // The new-window args: read the URI, then say we handled it.
     try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "get_Uri"));
     try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "put_Handled"));
+
+    // The web-message args: the source URI, then the JSON. Reading the JSON out
+    // of slot 4 is the whole bridge; slot 5 (`TryGetWebMessageAsString`) fails
+    // on an object payload and would look like "the page sent nothing".
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2WebMessageReceivedEventArgs.Vtbl, "get_Source"));
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2WebMessageReceivedEventArgs.Vtbl, "get_WebMessageAsJson"));
 
     // The one slot in ICoreWebView2_13 that is not opaque is its last.
     try testing.expectEqual(105 * ptr, @offsetOf(ICoreWebView2_13.Vtbl, "get_Profile"));
@@ -612,6 +718,7 @@ test "every interface puts its vtable pointer first" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Controller3, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Environment, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NewWindowRequestedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebMessageReceivedEventArgs, "vtable"));
 }
 
 test "EventRegistrationToken is the 64-bit value the add_* slots write" {

@@ -293,7 +293,11 @@ Unchanged in intent; stated here so the boundaries are explicit.
   (`Window.zig:117`), so the retype is mechanical.
 - **T90d** WebView2 host floor, web mode. Unchanged, plus the P1 bridge and
   the P2 injection blob land here (the TOC and quoting both need them, and
-  they are host plumbing).
+  they are host plumbing). SPLIT into T372 (COM floor + probe + env), T373
+  (host window + controller + error card), T374 (`--view` E2E + verb
+  rejections) and **T375** (P1 shim + P2 blob), all done as of 2026-08-02.
+  P1/P2 live in `src/apprt/win32/viewer_bridge.zig`; the shared JS is embedded
+  verbatim and a test asserts it byte-for-byte.
 - **T90e** File viewers. Unchanged. TOC is NOT here (own task).
 - **T90f** Live reload + link routing. Unchanged, plus the `+reload` verb (P8)
   -- it is the same code path as the watcher's re-render.
@@ -310,7 +314,9 @@ New v1 tasks (filed by this refresh):
 - markdown TOC card (P5)
 - zoom + pane-scoped chords (P6, P7)
 - selection toolbar Copy + shim/injection verification on a real website (P1,
-  P2, #17)
+  P2, #17) — **done in T375**: the win32 lane's live test serves a loopback
+  `http://` page whose script posts through `window.webkit.messageHandlers`
+  and reports back whether `selection.js` ran from the same blob.
 
 Deferred, filed as rows so the cuts stay visible:
 

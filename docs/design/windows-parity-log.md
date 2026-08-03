@@ -6795,3 +6795,59 @@ row can be green while nothing ever reached the screen. Both lanes, `test-agent`
 Follow-ups: **T382** (`parity-tasks next` resolves deps through a
 `skipped(split)` parent, so it offered T90e while T374/T375 were still todo -
 this turn picked its task by hand) and **T383** (a viewer pane has no title).
+
+## 2026-08-02 - T375: the shared JS talks to Windows without being forked
+
+P1 and P2 of the viewer design, and the whole task is one rule: **do not fork
+`selection.js`.** It and `viewer.js` post to native through
+`window.webkit.messageHandlers.viewerTOC.postMessage` because they were written
+against a `WKWebView`. So win32 gets a ten-line shim that defines that path in
+terms of `window.chrome.webview.postMessage`, and the shared file goes in
+`@embedFile`d and byte-for-byte - asserted by LENGTH as well as substring, so a
+patched copy cannot pass. A Windows copy of that file would mean every future
+Mac viewer commit needs a Windows translation, and it is the one part of the
+viewer that came free with the upstream merge.
+
+Both halves ship as ONE `AddScriptToExecuteOnDocumentCreated` blob, whose
+outermost statement is `if (window.top !== window) return;` - Mac's user script
+is `forMainFrameOnly`, WebView2 injects into every frame, and the toolbar
+positions itself in viewport coordinates a subframe does not share.
+
+`viewer_bridge.zig` also parses what comes back, porting Mac's normalization
+field by field: `compactMap` on headings (one malformed entry must not blank a
+document's TOC), trimmed quote text, empty strings and negative offsets to null,
+and "ignore anything else" as the default - the blob runs on arbitrary websites,
+so a page can post whatever it likes through this bridge.
+
+The oracle is one line: `bridge: headings=2 active=toolbar-ran`, from the live
+win32-lane test extended with a **loopback HTTP server**. It proves three
+undocumented slot indices and both design pins at once - slot 27 ran our blob in
+a page we did not author, the shim translated a WebKit `postMessage`, slot 34
+delivered it, args slot 4 returned parseable JSON - and `toolbar-ran` is the
+page reading back `window.__ghozttySelection`, i.e. `selection.js` ran from the
+SAME blob. `toolbar-missing` would mean the shim was injected and the toolbar
+was not, which is the exact split the single-blob rule exists to prevent. It had
+to be `http://`: `file://` and the bundled template are both pages we author,
+and P2's claim is about the ones we do not.
+
+Two lessons. **`std.net.Stream.read`/`writeAll` cannot be used on a Windows
+socket** - they go through `ReadFile`/`WriteFile` with a null `OVERLAPPED` and
+zig's sockets are `WSA_FLAG_OVERLAPPED`, so every call is
+`ERROR_INVALID_PARAMETER (87)`. The house answer already existed with the same
+diagnosis written down at T89b (`remote/socket_rw.zig`), so the test uses it
+rather than growing a fourth private `recv`. And **the IIDs were checked, not
+recalled**: two of three remembered values were right and the third was
+plausible and wrong. What made checking cheap was T374 having already pinned
+`add_NewWindowRequested` at slot 44 - any ordering that puts it elsewhere is
+wrong by construction.
+
+Validation: both lanes, `test-agent`, P1-P3 ALL PASS, `viewer-panes.ps1`
+ALL PASS (71). No new IPC assertion, deliberately: nothing the bridge does is
+observable from any verb until T160 draws the card, so the live test IS the
+on-box validation.
+
+Follow-ups: **T384** (quotes now arrive fully populated and are dropped - the
+win32 feedback composer had no task at all), **T385** (the shim hard-codes one
+handler name; a second Mac handler would silently no-op, and the rename test
+cannot see an addition) and **T386** (`selection.js`'s font stack has no Windows
+entry, so the popover renders in Arial next to Segoe UI chrome).

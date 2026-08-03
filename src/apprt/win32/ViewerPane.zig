@@ -55,6 +55,7 @@ const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const type_ramp = @import("type_ramp.zig");
 const error_card = @import("viewer_error_card.zig");
+const bridge = @import("viewer_bridge.zig");
 const pane_id_mod = @import("pane_id.zig");
 const Window = @import("Window.zig");
 
@@ -64,6 +65,15 @@ const log = std.log.scoped(.viewer_pane);
 /// `App.init`; the name is what an acceptance script keys off to tell a viewer
 /// pane from a terminal one.
 pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewer");
+
+/// One heading the page reported, with its strings owned by the pane.
+/// `viewer_bridge.Heading` is the same thing borrowed from a parse arena; this
+/// is the copy that outlives it.
+pub const Heading = struct {
+    id: []u8,
+    text: []u8,
+    level: u8,
+};
 
 /// How far along the two-hop creation chain this pane is.
 pub const State = enum {
@@ -135,6 +145,19 @@ pending: ?*Pending = null,
 /// when this one does.
 new_window_handler: ?*NewWindowRequestedHandler = null,
 
+/// Our reference on the `WebMessageReceived` handler, held for the same reason
+/// and released the same way (T375).
+web_message_handler: ?*WebMessageReceivedHandler = null,
+
+/// The document's headings, as the page last reported them. Owned — both the
+/// slice and every string in it. This is Mac's `setTOCItems` input; T160 draws
+/// the card from it.
+headings: []Heading = &.{},
+
+/// The heading the reader is currently in, or null when the page says there is
+/// none. Mac's `activeHeadingID`. Owned.
+active_heading: ?[]u8 = null,
+
 /// Physical pixels per DIP for this pane's monitor. Re-read from the host
 /// window on every bounds sync.
 scale: f32 = 1.0,
@@ -193,6 +216,11 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         h.release();
         self.new_window_handler = null;
     }
+    if (self.web_message_handler) |h| {
+        h.release();
+        self.web_message_handler = null;
+    }
+    self.clearHeadings(alloc);
     if (self.hwnd) |h| {
         _ = w32.SetWindowLongPtrW(h, w32.GWLP_USERDATA, 0);
         _ = w32.DestroyWindow(h);
@@ -412,6 +440,177 @@ fn onNewWindowRequested(
     return com.S_OK;
 }
 
+// -------------------------------------------------------------------------
+// The page bridge (T375, design P1/P2)
+// -------------------------------------------------------------------------
+
+/// `ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler`. It has
+/// nothing to do on success — the script is installed either way — but the slot
+/// is not optional: the runtime dereferences the handler to hand back the
+/// script's id, so a null there is a crash in someone else's process.
+const AddScriptCompletedHandler = com.CallbackOwning(
+    iface.IID_AddScriptCompletedHandler,
+    onAddScriptCompleted,
+    releasePendingToken,
+);
+
+fn onAddScriptCompleted(p: *Pending, result: com.HRESULT, id: ?[*:0]const u16) com.HRESULT {
+    _ = p;
+    _ = id;
+    // Only the failure is worth a word. A page that loads without the blob
+    // still renders; it just has no selection toolbar and posts nothing back,
+    // which is a degradation the user can see and a log line can explain.
+    if (com.failed(result)) log.warn(
+        "AddScriptToExecuteOnDocumentCreated failed hr=0x{X:0>8}; no quoting in this pane",
+        .{@as(u32, @bitCast(result))},
+    );
+    return com.S_OK;
+}
+
+/// `ICoreWebView2WebMessageReceivedEventHandler`: everything the page posts
+/// through the shim. Carries the `Pending` token for the same reason the
+/// new-window handler does — an event handler outlives the pane.
+const WebMessageReceivedHandler = com.CallbackOwning(
+    iface.IID_WebMessageReceivedHandler,
+    onWebMessageReceived,
+    releasePendingToken,
+);
+
+fn onWebMessageReceived(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*iface.ICoreWebView2WebMessageReceivedEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const a = args orelse return com.S_OK;
+    // A pane that is already gone does not get to act on its page's messages.
+    const self = p.pane orelse return com.S_OK;
+
+    const raw = a.jsonRaw() orelse return com.S_OK;
+    // The runtime allocated it on the COM heap; we free it on ours.
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+
+    // The JSON is UTF-16 and everything downstream is UTF-8. A payload that is
+    // not valid UTF-16 came from a page, not from us, so it is dropped rather
+    // than fatal.
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(raw)) catch return com.S_OK;
+    defer p.alloc.free(utf8);
+
+    const parsed = bridge.parse(p.alloc, utf8) orelse return com.S_OK;
+    defer parsed.deinit();
+    self.applyMessage(p.alloc, parsed.message);
+    return com.S_OK;
+}
+
+/// Act on one parsed page message. Split out from the COM callback so it is
+/// reachable from a unit test without a browser process.
+fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) void {
+    switch (message) {
+        .headings => |items| self.setHeadings(alloc, items),
+        .active => |id| self.setActiveHeading(alloc, id),
+        // The composer that consumes a quote is not built yet (design P10); the
+        // bridge that carries it is, and dropping it silently here would make
+        // the two indistinguishable from the outside.
+        .quote => |q| log.debug(
+            "viewer quote ({d} bytes) from heading={s}; no composer yet",
+            .{ q.text.len, q.heading_id orelse "-" },
+        ),
+    }
+}
+
+/// Replace the pane's heading list with its own copy of `items`.
+///
+/// All-or-nothing: the new list is built before the old one is freed, so an
+/// allocation failure part-way leaves the pane showing the headings it already
+/// had rather than half a document's worth.
+fn setHeadings(self: *ViewerPane, alloc: Allocator, items: []const bridge.Heading) void {
+    const owned = alloc.alloc(Heading, items.len) catch return;
+    var filled: usize = 0;
+    for (items, 0..) |item, i| {
+        const id = alloc.dupe(u8, item.id) catch return freeOwned(alloc, owned, filled);
+        const text = alloc.dupe(u8, item.text) catch {
+            alloc.free(id);
+            return freeOwned(alloc, owned, filled);
+        };
+        owned[i] = .{ .id = id, .text = text, .level = item.level };
+        filled += 1;
+    }
+    self.clearHeadings(alloc);
+    self.headings = owned;
+}
+
+fn freeOwned(alloc: Allocator, owned: []Heading, filled: usize) void {
+    for (owned[0..filled]) |h| {
+        alloc.free(h.id);
+        alloc.free(h.text);
+    }
+    alloc.free(owned);
+}
+
+/// Drop the heading list AND the active id. They go together on purpose: the
+/// active id names a heading in this list, so keeping it across a new document
+/// would highlight a row that no longer exists. The page re-reports it
+/// immediately anyway — `indexHeadings` posts `headings` then `active`.
+fn clearHeadings(self: *ViewerPane, alloc: Allocator) void {
+    for (self.headings) |h| {
+        alloc.free(h.id);
+        alloc.free(h.text);
+    }
+    if (self.headings.len > 0) alloc.free(self.headings);
+    self.headings = &.{};
+    if (self.active_heading) |id| alloc.free(id);
+    self.active_heading = null;
+}
+
+fn setActiveHeading(self: *ViewerPane, alloc: Allocator, id: ?[]const u8) void {
+    const dup: ?[]u8 = if (id) |v| (alloc.dupe(u8, v) catch return) else null;
+    if (self.active_heading) |old| alloc.free(old);
+    self.active_heading = dup;
+}
+
+/// Install the P2 blob and subscribe to what it posts back.
+///
+/// Non-fatal in both halves, and for the same reason `subscribeNewWindowRequested`
+/// is: a pane that cannot inject still shows its page, it just has no selection
+/// toolbar. Called from `adoptController` BEFORE the first navigation — a script
+/// added after a page has started loading does not reach that page.
+fn subscribeBridge(self: *ViewerPane) void {
+    std.debug.assert(self.web_message_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const alloc = p.alloc;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    // The blob is ~12 KB of ASCII and the API wants UTF-16. Converted here
+    // rather than at comptime so the pure module stays free of a 12 k-iteration
+    // comptime loop; it runs once per pane and the buffer is transient because
+    // `AddScriptToExecuteOnDocumentCreated` copies the string.
+    if (std.unicode.utf8ToUtf16LeAllocZ(alloc, bridge.injected_js)) |wide| {
+        defer alloc.free(wide);
+        if (AddScriptCompletedHandler.create(alloc, p)) |handler| {
+            p.refs += 1;
+            defer handler.release(); // takes the borrowed token reference if it was the last
+            if (!web.addScriptToExecuteOnDocumentCreated(wide.ptr, @ptrCast(handler))) {
+                log.warn("AddScriptToExecuteOnDocumentCreated was refused; no quoting in this pane", .{});
+            }
+        } else |_| {}
+    } else |_| {
+        log.warn("could not widen the viewer bridge script; no quoting in this pane", .{});
+    }
+
+    const handler = WebMessageReceivedHandler.create(alloc, p) catch return;
+    // The token reference the handler borrows. Taken BEFORE the object can
+    // reach a runtime that might release it.
+    p.refs += 1;
+    if (!web.addWebMessageReceived(@ptrCast(handler))) {
+        log.warn("add_WebMessageReceived failed; the page cannot talk back", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.web_message_handler = handler;
+}
+
 /// Push the OS color scheme into the page (T90a design §14). Called for every
 /// pane by `Window.reportColorScheme`, and again for this pane as soon as its
 /// controller arrives.
@@ -624,6 +823,10 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     _ = c.setVisible(self.visible);
     self.applyColorScheme();
     self.subscribeNewWindowRequested();
+    // Before the navigation below, and that ordering is the contract: a script
+    // registered after a page has started loading does not reach that page, so
+    // the very first document a pane shows would be the one without a toolbar.
+    self.subscribeBridge();
     if (self.focused) _ = c.moveFocus(.programmatic);
 
     // Last, so the page starts loading into a view that is already the right
@@ -877,6 +1080,9 @@ pub fn wndProc(
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
+/// Test-only: the loopback page server below. See `TestPage.serve` for why
+/// `std.net.Stream`'s own read/write cannot be used on Windows.
+const socket_rw = @import("../../remote/socket_rw.zig");
 
 test "viewer pane id is a valid pane id" {
     // Constructing needs a Window, which needs an app runtime; the id
@@ -1163,6 +1369,229 @@ test "host floor: a real controller on a real window, on this box" {
     try pane.navigate(alloc, "about:blank");
     try testing.expectEqualStrings("about:blank", pane.location.?);
     try testing.expectEqualStrings(target, pane.home_location.?);
+
+    // ------------------------------------------------------------------
+    // T375: the bridge, on a real http:// page
+    // ------------------------------------------------------------------
+    //
+    // Three undocumented slots and two design pins, all proven by one round
+    // trip: `AddScriptToExecuteOnDocumentCreated` (slot 27) ran our blob in a
+    // page we did not author, the shim (P1) turned a WebKit `postMessage` into
+    // a WebView2 one, `add_WebMessageReceived` (slot 34) delivered it, and
+    // `get_WebMessageAsJson` (args slot 4) handed back the JSON the parser
+    // expects. A wrong index in any of them produces silence, not a wrong
+    // answer, which is why the assertion is on CONTENT arriving.
+    //
+    // It has to be `http://`, not the local file above: the file already proved
+    // navigation, and P2's whole point is that the toolbar reaches pages the
+    // bundled template never touches. The server is a socket on loopback, so
+    // this still holds on a box with no route out.
+    var page: TestPage = undefined;
+    try page.start();
+    defer page.stop();
+    const page_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/t375.html", .{page.port});
+    defer alloc.free(page_url);
+
+    try pane.navigate(alloc, page_url);
+    var bridge_timer = try std.time.Timer.start();
+    while (bridge_timer.read() < 30 * std.time.ns_per_s) {
+        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(&msg);
+            _ = w32.DispatchMessageW(&msg);
+        }
+        if (pane.active_heading != null and pane.headings.len > 0) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    log.warn("bridge: headings={d} active={?s}", .{ pane.headings.len, pane.active_heading });
+
+    try testing.expectEqual(@as(usize, 2), pane.headings.len);
+    try testing.expectEqualStrings("one", pane.headings[0].id);
+    try testing.expectEqualStrings("One", pane.headings[0].text);
+    try testing.expectEqual(@as(u8, 1), pane.headings[0].level);
+    try testing.expectEqualStrings("two", pane.headings[1].id);
+    try testing.expectEqual(@as(u8, 2), pane.headings[1].level);
+
+    // The page reports whether `selection.js` ran alongside the shim, which is
+    // P2's claim: ONE blob, both halves, on a real website. "toolbar-missing"
+    // here would mean the shim was injected and the toolbar was not — the exact
+    // split the single-blob rule exists to make impossible.
+    try testing.expectEqualStrings("toolbar-ran", pane.active_heading.?);
+}
+
+/// A loopback HTTP server serving one page, for the live bridge test.
+///
+/// A real `http://` origin is the point — `file://` and the bundled template
+/// are both pages we author, and P2's claim is about the ones we do not. A
+/// socket on 127.0.0.1 gives that without a network.
+const TestPage = struct {
+    server: std.net.Server,
+    port: u16,
+    thread: std.Thread,
+
+    /// The page posts through the WebKit path the SHARED viewer JS uses, so
+    /// this is the shim under test rather than a WebView2 call written to pass.
+    /// The second message carries `selection.js`'s own install guard, which is
+    /// how one round trip proves both halves of the blob arrived.
+    const html =
+        \\<!doctype html><meta charset="utf-8"><title>t375</title>
+        \\<p id="p">the quick brown fox</p>
+        \\<script>
+        \\(function () {
+        \\  var w = window.webkit && window.webkit.messageHandlers
+        \\    && window.webkit.messageHandlers.viewerTOC;
+        \\  if (!w) return;
+        \\  w.postMessage({ type: "headings", items: [
+        \\    { id: "one", text: "One", level: 1 },
+        \\    { id: "two", text: "Two", level: 2 }] });
+        \\  w.postMessage({ type: "active",
+        \\    id: window.__ghozttySelection ? "toolbar-ran" : "toolbar-missing" });
+        \\})();
+        \\</script>
+        \\
+    ;
+
+    /// Initializes IN PLACE: the serving thread is handed `&self.server`, so
+    /// the struct has to already be at its final address. Returning one by
+    /// value would leave that pointer aimed at a dead stack slot.
+    fn start(self: *TestPage) !void {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.server = try addr.listen(.{ .reuse_address = true });
+        errdefer self.server.deinit();
+        self.port = self.server.listen_address.getPort();
+        self.thread = try std.Thread.spawn(.{}, serve, .{&self.server});
+    }
+
+    fn stop(self: *TestPage) void {
+        // Closing the listener is what unblocks the accept the thread is
+        // sitting in; there is no other way to interrupt it portably.
+        self.server.deinit();
+        self.thread.join();
+    }
+
+    /// `socket_rw`, not `Stream.read`/`Stream.writeAll`.
+    ///
+    /// Those go through `ReadFile`/`WriteFile` with a null `OVERLAPPED`, and
+    /// zig creates its sockets with `WSA_FLAG_OVERLAPPED` — which makes every
+    /// call fail with `ERROR_INVALID_PARAMETER (87)`. That is T89b's finding
+    /// and `socket_rw.readStream`/`writeAllStream` are the house answer to it;
+    /// this test hit the same wall and uses them rather than growing a fourth
+    /// private copy of `recv`.
+    fn serve(server: *std.net.Server) void {
+        while (true) {
+            const conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            // Drain the request line and headers. A socket closed with unread
+            // data in its receive buffer is RESET rather than shut down, and
+            // the reset takes our response with it.
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = socket_rw.readStream(conn.stream, buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            var head_buf: [160]u8 = undefined;
+            const head = std.fmt.bufPrint(&head_buf,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
+                    "Content-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{html.len},
+            ) catch return;
+            socket_rw.writeAllStream(conn.stream, head) catch continue;
+            socket_rw.writeAllStream(conn.stream, html) catch continue;
+            // `Connection: close` means the client waits for a FIN, so send one
+            // explicitly rather than leaving it to the close above.
+            _ = std.os.windows.ws2_32.shutdown(
+                conn.stream.handle,
+                std.os.windows.ws2_32.SD_SEND,
+            );
+        }
+    }
+};
+
+test "page messages land on the pane, in the pane's own memory" {
+    // The bridge's native half without a browser: what `onWebMessageReceived`
+    // does once the JSON is parsed. The oracle that matters is OWNERSHIP — the
+    // parse arena is freed the moment the COM callback returns, so a pane that
+    // kept the arena's slices would be reading freed memory on the next repaint.
+    const alloc = testing.allocator;
+    var pane: ViewerPane = .{};
+    defer pane.deinit(alloc);
+
+    {
+        const parsed = bridge.parse(alloc,
+            \\{"type":"headings","items":[
+            \\  {"id":"one","text":"One","level":1},
+            \\  {"id":"two","text":"Two","level":2}]}
+        ).?;
+        pane.applyMessage(alloc, parsed.message);
+        // Freed HERE, before a single assertion: the pane's copies have to
+        // stand on their own from this line on.
+        parsed.deinit();
+    }
+    try testing.expectEqual(@as(usize, 2), pane.headings.len);
+    try testing.expectEqualStrings("one", pane.headings[0].id);
+    try testing.expectEqualStrings("One", pane.headings[0].text);
+    try testing.expectEqual(@as(u8, 1), pane.headings[0].level);
+    try testing.expectEqualStrings("two", pane.headings[1].id);
+    try testing.expectEqual(@as(u8, 2), pane.headings[1].level);
+
+    {
+        const parsed = bridge.parse(alloc, "{\"type\":\"active\",\"id\":\"two\"}").?;
+        pane.applyMessage(alloc, parsed.message);
+        parsed.deinit();
+    }
+    try testing.expectEqualStrings("two", pane.active_heading.?);
+
+    // A second document replaces the first outright rather than appending, and
+    // the testing allocator is the oracle for the old list being freed.
+    {
+        const parsed = bridge.parse(alloc,
+            "{\"type\":\"headings\",\"items\":[{\"id\":\"x\",\"text\":\"X\",\"level\":1}]}").?;
+        pane.applyMessage(alloc, parsed.message);
+        parsed.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), pane.headings.len);
+    try testing.expectEqualStrings("x", pane.headings[0].id);
+    // Replacing the headings clears the active id with them: it named a heading
+    // in a document that is gone.
+    try testing.expectEqual(@as(?[]u8, null), pane.active_heading);
+
+    // An empty list is a real message (the page cleared its document), and it
+    // has to empty the pane rather than be ignored.
+    {
+        const parsed = bridge.parse(alloc, "{\"type\":\"headings\",\"items\":[]}").?;
+        pane.applyMessage(alloc, parsed.message);
+        parsed.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), pane.headings.len);
+
+    // A quote has no consumer yet (design P10) and must not disturb what does.
+    {
+        const parsed = bridge.parse(alloc, "{\"type\":\"quote\",\"text\":\"hello\"}").?;
+        pane.applyMessage(alloc, parsed.message);
+        parsed.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), pane.headings.len);
+}
+
+test "a page message that arrives after the pane is gone is dropped" {
+    // Same hazard as the new-window handler: the runtime can invoke an event
+    // handler after the pane it was registered for has been closed. The token
+    // is what makes that survivable, and the testing allocator is the oracle.
+    const alloc = testing.allocator;
+    const p = try alloc.create(Pending);
+    var pane: ViewerPane = .{};
+    p.* = .{ .pane = &pane, .refs = 2, .alloc = alloc };
+    pane.pending = p;
+
+    pane.deinit(alloc);
+    try testing.expectEqual(@as(?*ViewerPane, null), p.pane);
+    // No args object either, which is the other null this path has to tolerate.
+    try testing.expectEqual(com.S_OK, onWebMessageReceived(p, null, null));
+    p.release();
 }
 
 test "visibility is recorded even before a controller exists" {
