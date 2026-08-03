@@ -1,0 +1,65 @@
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+name: Fork CI
+
+# We only want the latest commit to test for any non-main ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# This workflow is owned by the fork. Upstream's test.yml/nix.yml are
+# deliberately left untouched: every one of their jobs is gated on
+# `github.repository == 'ghostty-org/ghostty'` and pinned to
+# `namespace-profile-ghostty-*` runners that only exist in upstream's
+# Namespace fleet, so they are inert here by design. Editing them to run on
+# the fork would mean re-resolving 15 guards and 48 runner labels on every
+# upstream merge. This file runs on GitHub-hosted runners instead.
+jobs:
+  build-test:
+    # Stay inert if someone forks the fork, matching the guard style upstream
+    # uses throughout test.yml.
+    if: github.repository == 'dzearing/ghoztty'
+    runs-on: macos-latest
+    # Nothing here should take an hour. The inherited vouch-* workflows had no
+    # timeout and no reachable runner, so each one sat queued for a full 24h
+    # before GitHub killed it — a red X on every PR that meant nothing.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The Swift sources use macOS 26 APIs behind @available guards, so the
+      # runner image has to carry the macOS 26 SDK. Logged rather than asserted
+      # so a runner-image bump shows up here instead of as a confusing compile
+      # error a hundred lines down.
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Get required Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> $GITHUB_OUTPUT
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # On macOS `zig build test` covers BOTH halves of the codebase: the Zig
+      # unit tests and `xcodebuild test -scheme Ghostty -skip-testing
+      # GhosttyUITests` (build.zig wires the xctest step into the test step via
+      # GhosttyXcodebuild.zig). So this single step exercises the Zig core and
+      # the Swift GhosttyTests suites.
+      - name: Test
+        run: zig build test
+
+      # Proves the artifact the project actually ships from — the same command
+      # CLAUDE.md tells contributors to run — still builds end to end.
+      - name: Build debug app
+        run: zig build -Doptimize=Debug
