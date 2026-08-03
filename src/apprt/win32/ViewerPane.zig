@@ -128,6 +128,13 @@ controller: ?*iface.ICoreWebView2Controller = null,
 /// pane holds one of its two references for its whole life.
 pending: ?*Pending = null,
 
+/// Our reference on the `NewWindowRequested` handler, held for the pane's life
+/// so the same object can be un-registered — and, more to the point, so there
+/// is a named owner for it. The handler holds a token reference of its own,
+/// which it gives back when its LAST reference dies (`com.CallbackOwning`), not
+/// when this one does.
+new_window_handler: ?*NewWindowRequestedHandler = null,
+
 /// Physical pixels per DIP for this pane's monitor. Re-read from the host
 /// window on every bounds sync.
 scale: f32 = 1.0,
@@ -167,7 +174,9 @@ pub fn create(alloc: Allocator, parent: *Window) Allocator.Error!*ViewerPane {
 
 pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     // Drop out of any in-flight callback FIRST: a controller that completes
-    // after this point must find a dead token, not a half-freed pane.
+    // after this point must find a dead token, not a half-freed pane. The
+    // token itself outlives this call — every handler that borrowed it holds a
+    // reference — so a late EVENT reads a null pane rather than freed memory.
     if (self.pending) |p| {
         p.pane = null;
         p.release();
@@ -179,6 +188,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         c.close();
         c.release();
         self.controller = null;
+    }
+    if (self.new_window_handler) |h| {
+        h.release();
+        self.new_window_handler = null;
     }
     if (self.hwnd) |h| {
         _ = w32.SetWindowLongPtrW(h, w32.GWLP_USERDATA, 0);
@@ -254,7 +267,13 @@ pub fn createHostWindow(
         // WS_CLIPCHILDREN: WebView2 parents its own Chromium windows inside
         // this one, and painting the background over them is a flicker the
         // user reads as a flash on every resize.
-        w32.WS_CHILD | w32.WS_CLIPCHILDREN,
+        //
+        // WS_VISIBLE because the pane is born `visible = true` and
+        // `setVisible` is a no-op for a value it already holds — a host window
+        // created hidden would depend on a layout pass to appear, which is a
+        // second source of truth for the same bit. `Surface.init` shows its
+        // child window for the same reason.
+        w32.WS_CHILD | w32.WS_CLIPCHILDREN | w32.WS_VISIBLE_STYLE,
         rect.left,
         rect.top,
         @max(rect.right - rect.left, 1),
@@ -287,6 +306,110 @@ pub fn setVisible(self: *ViewerPane, visible: bool) void {
 pub fn focus(self: *ViewerPane) void {
     self.focused = true;
     if (self.controller) |c| _ = c.moveFocus(.programmatic);
+}
+
+// -------------------------------------------------------------------------
+// Navigation
+// -------------------------------------------------------------------------
+
+/// The longest location this pane will carry, in UTF-16 units. Chrome's own
+/// omnibox limit is 2 MB and no real address comes near either number; the
+/// cap exists so navigation can format into a stack buffer at a point (a
+/// controller arriving) where there is no allocator and no way to fail.
+const location_cap = 4096;
+
+/// Point this pane at `url` and record it as the pane's current location.
+///
+/// The FIRST location is also the pane's home — where the nav bar's Home
+/// button returns to, kept separately from where the user has since navigated
+/// (CLAUDE.md's viewer contract, and P12's manifest fields). Later navigations
+/// move `location` only.
+///
+/// Safe before there is a controller: the pane is the one holding this truth,
+/// and `adoptController` replays it — the same rule `visible` and `focused`
+/// already follow. That is not an edge case here, it is the NORMAL path: a
+/// pane is constructed and told where to go long before a browser process
+/// finishes starting.
+pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.Error!void {
+    const dup = try alloc.dupeZ(u8, url);
+    if (self.location) |l| alloc.free(l);
+    self.location = dup;
+    if (self.home_location == null) {
+        self.home_location = alloc.dupeZ(u8, url) catch null;
+    }
+    self.applyNavigation();
+}
+
+fn applyNavigation(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    const loc = self.location orelse return;
+    // UTF-16 units never outnumber UTF-8 bytes (a 4-byte sequence becomes two
+    // units, every shorter one becomes a single unit), so a length check on the
+    // input is a real bound on the output — not the after-the-fact check that
+    // would already have overrun.
+    if (loc.len >= location_cap) {
+        log.warn("viewer location is too long to navigate to ({d} bytes)", .{loc.len});
+        return;
+    }
+    var buf: [location_cap]u16 = undefined;
+    const len = std.unicode.utf8ToUtf16Le(&buf, loc) catch {
+        log.warn("viewer location is not valid UTF-8", .{});
+        return;
+    };
+    buf[len] = 0;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    if (!web.navigate(buf[0..len :0])) log.warn("Navigate failed for this pane", .{});
+}
+
+/// `ICoreWebView2NewWindowRequestedEventHandler`: `window.open()` and
+/// `target=_blank`.
+///
+/// Its context is the pane's `Pending` token, not the pane — an event handler
+/// outlives the pane that registered it, and the token is the codebase's
+/// existing answer to that (`com.CallbackOwning` is what lets it give the
+/// reference back when the runtime finally drops the object).
+const NewWindowRequestedHandler = com.CallbackOwning(
+    iface.IID_NewWindowRequestedHandler,
+    onNewWindowRequested,
+    releasePendingToken,
+);
+
+fn releasePendingToken(p: *Pending) void {
+    p.release();
+}
+
+fn onNewWindowRequested(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*iface.ICoreWebView2NewWindowRequestedEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const a = args orelse return com.S_OK;
+
+    // Handled FIRST, and unconditionally: whatever else goes wrong below, a
+    // popup must not open a chrome-less WebView2 window we do not own and
+    // cannot close. This is also the line T163 replaces — it will adopt the
+    // request as a real ghoztty window instead of handing it to the browser —
+    // which is why the deferral is left untaken rather than taken and dropped.
+    _ = a.setHandled(true);
+
+    // A pane that is already gone does not get to open browser tabs: the token
+    // outlives it precisely so this check can be made.
+    if (p.pane == null) return com.S_OK;
+
+    const raw = a.uriRaw() orelse return com.S_OK;
+    // The runtime allocated it on the COM heap; we free it on ours.
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        raw,
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+    return com.S_OK;
 }
 
 /// Push the OS color scheme into the page (T90a design §14). Called for every
@@ -500,11 +623,41 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     self.syncBounds();
     _ = c.setVisible(self.visible);
     self.applyColorScheme();
+    self.subscribeNewWindowRequested();
     if (self.focused) _ = c.moveFocus(.programmatic);
+
+    // Last, so the page starts loading into a view that is already the right
+    // size, scale and scheme — a navigation that begins before the bounds are
+    // set lays the document out twice and the user sees the reflow.
+    self.applyNavigation();
 
     // Stop painting the empty background: from here the controller owns the
     // pixels.
     if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 1);
+}
+
+/// Register the popup handler on a freshly adopted controller. Non-fatal: a
+/// pane that fails to subscribe still shows its page, it just lets WebView2
+/// open its own popup window for a `target=_blank` — a degradation, not a
+/// broken pane, so it must not take the navigation down with it.
+fn subscribeNewWindowRequested(self: *ViewerPane) void {
+    std.debug.assert(self.new_window_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const handler = NewWindowRequestedHandler.create(p.alloc, p) catch return;
+    // The token reference the handler borrows. Taken BEFORE the object can
+    // reach a runtime that might release it, so the hook can never give back a
+    // reference that was never taken.
+    p.refs += 1;
+    if (!web.addNewWindowRequested(@ptrCast(handler))) {
+        log.warn("add_NewWindowRequested failed; popups will open their own window", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.new_window_handler = handler;
 }
 
 fn fail(self: *ViewerPane, reason: webview2.Failure) void {
@@ -933,6 +1086,83 @@ test "host floor: a real controller on a real window, on this box" {
     // back — the crash a wrong slot index would produce is the real oracle.
     _ = c.moveFocus(.programmatic);
     c.notifyParentWindowPositionChanged();
+
+    // T374's two new slots, round-tripped the same way.
+    //
+    // `add_NewWindowRequested` (slot 44, the far side of the 38-slot opaque
+    // block) already ran inside `adoptController`; a handler recorded here is
+    // the runtime saying it accepted the subscription. A wrong index would have
+    // called `Stop` or `GoForward` with two pointers instead.
+    try testing.expect(pane.new_window_handler != null);
+
+    // `Navigate` (slot 5) is only verifiable by reading `get_Source` back:
+    // navigating at the WRONG slot can still return S_OK, and the page not
+    // moving is the only thing that says so.
+    //
+    // The destination is a real local FILE, and that choice is the whole
+    // oracle. A freshly created web view already reports `about:blank` as its
+    // source, so navigating THERE and finding it would be a green and empty
+    // assertion — true before the call ran. (A `data:` URL was the first
+    // attempt and is wrong for a different reason: Chromium blocks top-level
+    // navigation to one, so the source came back empty.) A file needs no
+    // network, so this holds on a box with no route out.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t374.html", .data = "<title>ghoztty</title>" });
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const target = try std.fmt.allocPrint(alloc, "file:///{s}/t374.html", .{dir_path});
+    defer alloc.free(target);
+    std.mem.replaceScalar(u8, target["file:///".len..], '\\', '/');
+
+    const before = source: {
+        const raw = web.sourceRaw() orelse break :source @as(?[]u8, null);
+        defer w32.CoTaskMemFree(@ptrCast(raw));
+        break :source std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw)) catch null;
+    };
+    defer if (before) |prev| alloc.free(prev);
+    try testing.expect(!std.mem.eql(u8, before orelse "", target));
+
+    try pane.navigate(alloc, target);
+    var nav_timer = try std.time.Timer.start();
+    var source: ?[]u8 = null;
+    defer if (source) |s| alloc.free(s);
+    while (nav_timer.read() < 30 * std.time.ns_per_s) {
+        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(&msg);
+            _ = w32.DispatchMessageW(&msg);
+        }
+        if (web.sourceRaw()) |raw| {
+            defer w32.CoTaskMemFree(@ptrCast(raw));
+            const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw)) catch null;
+            if (utf8) |u| {
+                if (source) |s| alloc.free(s);
+                source = u;
+                if (std.mem.endsWith(u8, u, "/t374.html")) break;
+            }
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    log.warn("navigated: source={s}", .{source orelse "<none>"});
+    // Asserted by SHAPE, not by string equality: the browser normalizes a file
+    // URL (drive-letter case, percent-encoding), and pinning the exact spelling
+    // would be asserting Chromium's formatting rather than our navigation.
+    // "it moved, and it moved THERE" is the whole claim.
+    const got = source orelse "";
+    try testing.expect(!std.mem.eql(u8, got, before orelse ""));
+    try testing.expect(std.mem.startsWith(u8, got, "file:///"));
+    try testing.expect(std.mem.endsWith(u8, got, "/t374.html"));
+    // And the pane recorded the place it was SENT, which is what
+    // `+list --json`'s `url` and the session manifest read. `home_location` is
+    // the FIRST location and does not move with it.
+    try testing.expectEqualStrings(target, pane.location.?);
+    try testing.expectEqualStrings(target, pane.home_location.?);
+
+    // A second navigation moves `location` and leaves `home` where it was —
+    // the pane's half of the Home button's contract.
+    try pane.navigate(alloc, "about:blank");
+    try testing.expectEqualStrings("about:blank", pane.location.?);
+    try testing.expectEqualStrings(target, pane.home_location.?);
 }
 
 test "visibility is recorded even before a controller exists" {

@@ -2451,7 +2451,14 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
 
     try self.windows.append(alloc, window);
     errdefer _ = self.windows.pop();
-    _ = try window.addTab();
+    // `--view` (T374): the window's one pane is a viewer, not a terminal. It
+    // goes through the same `addTab` bookkeeping — a viewer is a normal tab, so
+    // there is no second tab-creation path to keep in step.
+    if (opts.viewer_location) |location| {
+        _ = try window.addViewerTab(location);
+    } else {
+        _ = try window.addTab();
+    }
     return window;
 }
 

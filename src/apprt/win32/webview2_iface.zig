@@ -134,6 +134,65 @@ pub const IID_ICoreWebView2Profile: GUID = .{
     .Data4 = .{ 0x8B, 0xC3, 0xC6, 0x06, 0x58, 0xF1, 0x7A, 0x5F },
 };
 
+// {D4C185FE-C81C-4989-97AF-2D3FA7AB5651}
+pub const IID_NewWindowRequestedHandler: GUID = .{
+    .Data1 = 0xD4C185FE,
+    .Data2 = 0xC81C,
+    .Data3 = 0x4989,
+    .Data4 = .{ 0x97, 0xAF, 0x2D, 0x3F, 0xA7, 0xAB, 0x56, 0x51 },
+};
+
+// {34ACB11C-FC37-4418-9132-F9C21D1EAFB9}
+pub const IID_ICoreWebView2NewWindowRequestedEventArgs: GUID = .{
+    .Data1 = 0x34ACB11C,
+    .Data2 = 0xFC37,
+    .Data3 = 0x4418,
+    .Data4 = .{ 0x91, 0x32, 0xF9, 0xC2, 0x1D, 0x1E, 0xAF, 0xB9 },
+};
+
+/// `EventRegistrationToken` (winrt's `eventtoken.h`), the out-parameter every
+/// `add_*` writes. We keep no tokens — a handler lives exactly as long as the
+/// web view it was added to, and `Close` tears both down — but the slot has to
+/// be the right SIZE and the pointer non-null, or the runtime writes eight
+/// bytes somewhere we did not intend.
+pub const EventRegistrationToken = extern struct { value: i64 = 0 };
+
+// ---------------------------- ICoreWebView2NewWindowRequestedEventArgs
+/// The `window.open()` / target=_blank request. We answer exactly two of its
+/// eight slots: read the URI, and mark the request handled.
+///
+/// **`GetDeferral` is deliberately NOT declared.** Taking a deferral and
+/// dropping it wedges the requesting page forever, and T163 (adopting popups
+/// as real ghoztty windows) is the task that will need one — declaring it now
+/// would be an unused slot with a guessed signature, which this file's header
+/// calls a crash waiting for the day somebody calls it. Handing the URL to the
+/// default browser needs no deferral at all: it is synchronous.
+pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2NewWindowRequestedEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2NewWindowRequestedEventArgs) callconv(.winapi) u32,
+        get_Uri: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?[*:0]u16) callconv(.winapi) HRESULT,
+        put_NewWindow: *const anyopaque,
+        get_NewWindow: *const anyopaque,
+        put_Handled: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, BOOL) callconv(.winapi) HRESULT,
+    };
+
+    /// The requested URL. Caller frees it with `CoTaskMemFree`.
+    pub fn uriRaw(self: *ICoreWebView2NewWindowRequestedEventArgs) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_Uri(self, &raw))) return null;
+        return raw;
+    }
+
+    /// "We dealt with it; do not open a WebView2 popup window."
+    pub fn setHandled(self: *ICoreWebView2NewWindowRequestedEventArgs, handled: bool) bool {
+        return !com.failed(self.vtable.put_Handled(self, if (handled) 1 else 0));
+    }
+};
+
 // ------------------------------------------------------- ICoreWebView2Profile
 
 /// The per-profile settings object. We reach it only for
@@ -173,25 +232,63 @@ pub const ICoreWebView2Profile = extern struct {
 
 // ------------------------------------------------------------ ICoreWebView2
 
-/// The web view itself. This band needs exactly one thing from it — a
-/// `QueryInterface` to `ICoreWebView2_13` for the profile — so only `IUnknown`
-/// is declared. Navigation, script injection and the event handlers arrive in
-/// T374/T375, and each will add the slots it actually calls.
+/// The web view itself. T373 needed exactly one thing from it — a
+/// `QueryInterface` to `ICoreWebView2_13` for the profile — and declared only
+/// `IUnknown`. T374 adds the two slots web mode calls: `Navigate` (slot 5) and
+/// `add_NewWindowRequested` (slot 44). Script injection and the web-message
+/// bridge arrive in T375, and each will add the slots it actually calls.
 ///
-/// Declaring THREE slots of an interface that has 61 is safe and deliberate:
-/// the vtable pointer is the runtime's, we only ever index the first three,
-/// and a slot that is not declared cannot be called by mistake.
+/// Declaring 45 slots of an interface that has 61 is safe and deliberate: the
+/// vtable pointer is the runtime's, we only ever index the ones named here,
+/// and a slot that is not declared cannot be called by mistake. The ones we do
+/// not call are opaque — individually where a named neighbor makes the
+/// position readable, and as one length-only block where there are dozens in a
+/// row (`ICoreWebView2_13`'s rule, applied here).
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
+
+    /// Slots 6..43: `NavigateToString` through `Stop`. We call none of them.
+    /// Its LENGTH is the whole contract, and `@offsetOf` asserts it below.
+    pub const middle_slots = 38;
 
     pub const Vtbl = extern struct {
         QueryInterface: *const fn (*ICoreWebView2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
         AddRef: *const fn (*ICoreWebView2) callconv(.winapi) u32,
         Release: *const fn (*ICoreWebView2) callconv(.winapi) u32,
+        get_Settings: *const anyopaque,
+        get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
+        Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
+        middle: [middle_slots]*const anyopaque,
+        add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
     };
 
     pub fn release(self: *ICoreWebView2) void {
         _ = self.vtable.Release(self);
+    }
+
+    /// Point the view at `uri`. Asynchronous: success means the navigation
+    /// STARTED, and the page arrives later on the message loop.
+    pub fn navigate(self: *ICoreWebView2, uri: [*:0]const u16) bool {
+        return !com.failed(self.vtable.Navigate(self, uri));
+    }
+
+    /// Where the view actually IS — the browser's answer, not ours. Caller
+    /// frees it with `CoTaskMemFree`. This is what makes `navigate` verifiable:
+    /// a `Navigate` at the wrong vtable slot can still return `S_OK`, and only
+    /// reading the source back proves the page moved.
+    pub fn sourceRaw(self: *ICoreWebView2) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_Source(self, &raw))) return null;
+        return raw;
+    }
+
+    /// Subscribe to `window.open()` / target=_blank. `handler` is one of OUR
+    /// objects (a `com.Callback` instantiation), so it is typed as the opaque
+    /// pointer COM needs and nothing more — same rule as
+    /// `CreateCoreWebView2Controller`.
+    pub fn addNewWindowRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_NewWindowRequested(self, handler, &token));
     }
 
     /// The `ICoreWebView2_13` view of this object, or null on a runtime that
@@ -459,7 +556,11 @@ test "vtable slot counts match the SDK's own layout" {
     // one place the numbers live.
     const ptr = @sizeOf(*const anyopaque);
     try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2Profile.Vtbl));
-    try testing.expectEqual(3 * ptr, @sizeOf(ICoreWebView2.Vtbl));
+    // 45 of ICoreWebView2's 61: everything through `add_NewWindowRequested`.
+    // Declaring a PREFIX is the point — the runtime's vtable is longer and the
+    // slots past the last one we name are simply never indexed.
+    try testing.expectEqual(45 * ptr, @sizeOf(ICoreWebView2.Vtbl));
+    try testing.expectEqual(7 * ptr, @sizeOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl));
     try testing.expectEqual(106 * ptr, @sizeOf(ICoreWebView2_13.Vtbl));
     try testing.expectEqual(26 * ptr, @sizeOf(ICoreWebView2Controller.Vtbl));
     try testing.expectEqual(36 * ptr, @sizeOf(ICoreWebView2Controller3.Vtbl));
@@ -482,6 +583,18 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_RasterizationScale"));
     try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_ShouldDetectMonitorScaleChanges"));
 
+    // ICoreWebView2: the two web mode calls. `Navigate` sits third among the
+    // interface's own methods (after get_Settings/get_Source), and
+    // `add_NewWindowRequested` after the 38-slot block — the numbers the
+    // `middle` block's length exists to hold in place.
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_Source"));
+    try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Navigate"));
+    try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
+
+    // The new-window args: read the URI, then say we handled it.
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "get_Uri"));
+    try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "put_Handled"));
+
     // The one slot in ICoreWebView2_13 that is not opaque is its last.
     try testing.expectEqual(105 * ptr, @offsetOf(ICoreWebView2_13.Vtbl, "get_Profile"));
 
@@ -498,6 +611,14 @@ test "every interface puts its vtable pointer first" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Controller, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Controller3, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Environment, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NewWindowRequestedEventArgs, "vtable"));
+}
+
+test "EventRegistrationToken is the 64-bit value the add_* slots write" {
+    // The runtime writes through this pointer. Eight bytes, and nothing else
+    // in the struct to shift them.
+    try testing.expectEqual(@as(usize, 8), @sizeOf(EventRegistrationToken));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(EventRegistrationToken, "value"));
 }
 
 test "RECT is layout-compatible with the OS one" {

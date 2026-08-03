@@ -153,12 +153,37 @@ pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
 /// (`IPCServer.swift:387` for `+new-window`, `:574` for `+split`).
 pub const view_command_conflict_error = "--view cannot be combined with --command/-e";
 
-/// The interim answer while viewer panes are Mac-only (design §10). Until
-/// T90d lands the WebView2 host, `--view` on win32 used to fall into the
-/// unknown-flag drop and silently open a TERMINAL — the wrong pane, with no
-/// hint that anything was ignored. Explicit failure beats silent wrong
-/// behavior; delete this (and its two call sites) when viewers land.
-pub const view_unsupported_error = "viewers are not yet supported on Windows";
+/// Which kind of viewer a `--view=` value asks for. The split is the one the
+/// Phase K band is built on: T374 ships WEB mode (the pane navigates to the URL
+/// directly) and T90e ships FILE mode (render the file's content offline).
+pub const ViewMode = enum { web, file };
+
+/// Classify a `--view=` value. Deliberately NOT "does it contain `://`":
+/// `file:///c:/src/README.md` names a file, and handing it to a browser would
+/// render a markdown document as raw text — the silently-wrong-pane defect that
+/// the interim error below exists to prevent, one level down.
+///
+/// Scheme comparison is ASCII case-insensitive because URL schemes are
+/// (RFC 3986 §3.1), and a pasted `HTTPS://…` is a URL by any reading.
+pub fn viewMode(value: []const u8) ViewMode {
+    if (hasSchemePrefix(value, "about:")) return .web;
+    if (hasSchemePrefix(value, "http://")) return .web;
+    if (hasSchemePrefix(value, "https://")) return .web;
+    return .file;
+}
+
+fn hasSchemePrefix(value: []const u8, comptime prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+/// The interim answer while FILE viewers are Mac-only. Web-mode `--view` opens
+/// a real pane as of T374; a file still has no renderer here until T90e, and
+/// `--view` used to fall into the unknown-flag drop and silently open a
+/// TERMINAL — the wrong pane, with no hint that anything was ignored. Explicit
+/// failure beats silent wrong behavior; delete this (and its two call sites)
+/// when file mode lands.
+pub const view_file_unsupported_error = "file viewers are not yet supported on Windows; --view needs an http(s) or about: URL";
 
 /// Whether `--view` was given alongside a command. `-e` counts: the Mac
 /// parser folds trailing `-e` argv into `config.command` before the check,
@@ -523,6 +548,36 @@ test "viewConflictsWithCommand: --command and -e both conflict, alone neither do
         "--view=README.md", "--split-command=pwsh",
     });
     try testing.expect(!viewConflictsWithCommand(split_command));
+}
+
+test "viewMode: web is http(s)/about, and everything else is a file" {
+    // The three the win32 server builds a live pane for as of T374.
+    try testing.expectEqual(ViewMode.web, viewMode("http://localhost:3000"));
+    try testing.expectEqual(ViewMode.web, viewMode("https://example.com/a/b?c=d"));
+    try testing.expectEqual(ViewMode.web, viewMode("about:blank"));
+
+    // Schemes are case-insensitive (RFC 3986 §3.1); a pasted address is a URL
+    // however the user's clipboard capitalized it.
+    try testing.expectEqual(ViewMode.web, viewMode("HTTPS://example.com"));
+    try testing.expectEqual(ViewMode.web, viewMode("Http://example.com"));
+
+    // The reason this is not "does it contain `://`". A `file://` URL NAMES A
+    // FILE: handing it to a browser renders markdown as raw text, which is the
+    // silently-wrong-pane defect one level down from the unknown-flag drop.
+    try testing.expectEqual(ViewMode.file, viewMode("file:///c:/src/README.md"));
+
+    // Plain paths, in both platforms' spellings, plus a bare host (which the
+    // omnibox will complete later — it is not a URL yet).
+    try testing.expectEqual(ViewMode.file, viewMode("README.md"));
+    try testing.expectEqual(ViewMode.file, viewMode("C:\\src\\repo\\README.md"));
+    try testing.expectEqual(ViewMode.file, viewMode("/usr/share/doc/x.md"));
+    try testing.expectEqual(ViewMode.file, viewMode("\\\\server\\share\\x.md"));
+    try testing.expectEqual(ViewMode.file, viewMode("example.com"));
+
+    // A prefix of a scheme is not a scheme, and an empty value is not a URL.
+    try testing.expectEqual(ViewMode.file, viewMode("http"));
+    try testing.expectEqual(ViewMode.file, viewMode("about"));
+    try testing.expectEqual(ViewMode.file, viewMode(""));
 }
 
 test "parseVerbArgs: -e captures everything after, no flag parsing" {

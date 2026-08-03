@@ -96,6 +96,28 @@ pub fn guidEql(a: *const GUID, b: *const GUID) bool {
 /// proxy's thread, and this is now the ONE implementation — paying for the
 /// interlocked op once here is cheaper than reasoning about it per handler.
 pub fn Callback(comptime iid: GUID, comptime impl: anytype) type {
+    return CallbackOwning(iid, impl, {});
+}
+
+/// `Callback`, plus a hook that runs when the LAST reference is dropped —
+/// immediately before the object frees itself, and only ever once.
+///
+/// It exists because of an ownership question a one-shot completed-handler
+/// never has to answer. A completed handler is invoked once and released; an
+/// EVENT handler is registered on a web view and lives as long as the runtime
+/// keeps it, which is not a moment our code can name. So a handler whose
+/// context is refcounted (T373's `Pending` token, shared by every hop and
+/// nulled when the pane dies) cannot have that reference dropped by the pane:
+/// the runtime might still invoke the handler afterwards and read a freed
+/// token. The reference has to die WITH the object that borrowed it, and this
+/// is the only place that can be.
+///
+/// Pass `{}` for none, which is what `Callback` does.
+pub fn CallbackOwning(
+    comptime iid: GUID,
+    comptime impl: anytype,
+    comptime on_zero: anytype,
+) type {
     const fn_info = switch (@typeInfo(@TypeOf(impl))) {
         .@"fn" => |f| f,
         else => @compileError("com.Callback needs a function: fn (*Ctx, A0, A1) HRESULT"),
@@ -204,6 +226,9 @@ pub fn Callback(comptime iid: GUID, comptime impl: anytype) type {
             const prev = @atomicRmw(i32, &self.refs, .Sub, 1, .acq_rel);
             const remaining = prev - 1;
             if (remaining <= 0) {
+                // Before the free, and inside the branch that can only be
+                // taken once: whatever this object borrowed goes back here.
+                if (@TypeOf(on_zero) != void) on_zero(self.ctx);
                 const alloc = self.allocator();
                 alloc.destroy(self);
                 return 0;
@@ -362,6 +387,37 @@ test "each instantiation has its own IID and its own Invoke signature" {
     try testing.expectEqual(E_NOINTERFACE, h.vtable.QueryInterface(h, &IID_TestCompleted, &out));
     try testing.expectEqual(S_OK, h.vtable.QueryInterface(h, &IID_TestEvent, &out));
     try testing.expectEqual(@as(u32, 1), h.vtable.Release(h));
+}
+
+test "CallbackOwning drops what it borrowed exactly once, at zero" {
+    // The hazard it exists for: an EVENT handler outlives the pane that
+    // registered it, so the refcounted context it borrowed must be released by
+    // the handler's own death — not by the pane's.
+    const Borrowed = struct {
+        var released: u32 = 0;
+        fn give(ctx: *TestCtx) void {
+            _ = ctx;
+            released += 1;
+        }
+    };
+    Borrowed.released = 0;
+
+    const Owning = CallbackOwning(IID_TestEvent, onEvent, Borrowed.give);
+    var ctx: TestCtx = .{};
+    const h = try Owning.create(testing.allocator, &ctx);
+
+    // Intermediate releases do NOT run it: only the transition to zero does.
+    h.addRef();
+    h.release();
+    try testing.expectEqual(@as(u32, 0), Borrowed.released);
+
+    h.release();
+    try testing.expectEqual(@as(u32, 1), Borrowed.released);
+
+    // And a plain Callback has no hook at all, which is why `{}` compiles.
+    const h2 = try TestEvent.create(testing.allocator, &ctx);
+    h2.release();
+    try testing.expectEqual(@as(u32, 1), Borrowed.released);
 }
 
 test "the object frees through the allocator it was created with" {

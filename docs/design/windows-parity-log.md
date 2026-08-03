@@ -6741,3 +6741,57 @@ before this) and **T381** (the card's geometry is asserted at four scales but
 its paint has never been rendered here, because this box HAS the runtime; the
 `GHOZTTY_WEBVIEW2_BROWSER_DIR` drill makes it reachable once T374 can construct
 a viewer).
+
+## 2026-08-02 - T374: the viewer pane opens, and the oracle for it took three tries
+
+`ghoztty +new-window --view=https://...` opens a window whose one pane is a web
+view, and `ghoztty +split --view=about:blank --name=doc` puts one beside a
+terminal. It resizes, focuses, closes and lists like any other leaf.
+
+**Half the task was already standing**, which reading it against the code found
+before writing any of it. `+list`'s viewer branch (`type`/`url`, the `view:`
+row, auto-registration) and all four terminal-only rejections landed with
+T90b/T90c and had only ever run against zero viewers. What was missing was the
+two ends: something to CONSTRUCT a viewer leaf from IPC, and `Navigate` to point
+it somewhere.
+
+**The interim error moved down a level rather than being deleted.**
+`--view=README.md` still fails, now with `file viewers are not yet supported on
+Windows`. WebView2 will happily navigate to a `file://` URL - the live test
+proves it - and that is exactly why the error stays: rendering a markdown
+document as raw text is the same silently-wrong-pane defect T90b fixed, one
+level down. The classifier deliberately does NOT key on `://`, because
+`file:///c:/src/README.md` names a FILE.
+
+**The `Navigate` oracle was green and empty twice before it was real.** Version
+one navigated to `about:blank` and asserted `get_Source` came back
+`about:blank` - which is what a freshly created web view reports ANYWAY, so it
+passed before the call under test ever ran. Version two used a `data:` URL and
+came back empty, because Chromium blocks top-level navigation to one. What works
+is a real local file in a temp dir: no network, definitely not the default
+source, asserted by SHAPE (`file:///.../t374.html`) rather than string equality,
+since pinning the spelling would assert Chromium's URL normalization instead of
+our navigation.
+
+**An event handler outlives the pane that registered it**, and that is a
+different ownership problem from T373's one-shot completed handlers. A completed
+handler is invoked once and released; `NewWindowRequested` lives as long as the
+runtime keeps it, which is not a moment our code can name. So its context is the
+pane's refcounted `Pending` token - already nulled when the pane dies, so a late
+popup from a closing view cannot open a browser tab - and the token reference
+dies WITH the handler object via a new `com.CallbackOwning` hook, not with the
+pane. The testing allocator is the oracle: the live test would report a leak if
+the runtime kept the object past `Close`.
+
+`Handled = TRUE` is set FIRST and unconditionally, before anything that can
+fail. The deferral is left UNTAKEN rather than taken and dropped - taking one
+and dropping it wedges the requesting page forever, and T163 needs it.
+
+Validation: `viewer-panes.ps1` rewritten around live viewers, ALL PASS (71) x3 -
+including a `GhozttyViewer` host window with a non-empty rect, because a JSON
+row can be green while nothing ever reached the screen. Both lanes, `test-agent`
+(green on re-run past the known T258 ConPTY flake), P1-P3 ALL PASS.
+
+Follow-ups: **T382** (`parity-tasks next` resolves deps through a
+`skipped(split)` parent, so it offered T90e while T374/T375 were still todo -
+this turn picked its task by hand) and **T383** (a viewer pane has no title).

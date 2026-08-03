@@ -17,6 +17,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
 const PaneView = @import("PaneView.zig");
+const ViewerPane = @import("ViewerPane.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
@@ -433,6 +434,13 @@ pub const InitOptions = struct {
     /// Canonical IPC name for this window (`+new-window --target`).
     /// Borrowed; duped at registration. Null → auto-generated `window-N`.
     ipc_name: ?[]const u8 = null,
+
+    /// `+new-window --view=<url>` (T374): the window's first (and only) pane is
+    /// a VIEWER pointed here rather than a terminal. Borrowed; the pane dupes
+    /// it. Mutually exclusive with `surface_overrides`, which describe a shell
+    /// a viewer does not have — the IPC layer rejects `--view` with
+    /// `--command`/`-e` before either is built.
+    viewer_location: ?[]const u8 = null,
 
     /// The stable layout identity to ADOPT instead of generating a fresh one
     /// (T338): `session_layout.Window.uuid` for the window being restored,
@@ -1298,12 +1306,77 @@ pub fn addTab(self: *Window) !*Surface {
         alloc.destroy(surface);
         return err;
     };
-    var tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
+    const tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
         pane.destroyUnowned(alloc);
         return err;
     };
-    errdefer tree.deinit(); // tree.deinit() calls unref() which frees pane+surface
 
+    self.insertPaneAsTab(pane, tree);
+    return surface;
+}
+
+/// Add a new tab whose single pane is a VIEWER showing `location` (T374,
+/// `+new-window --view`). Mirrors `addTab` exactly — same guards, same
+/// insertion, same focus — with a viewer leaf in place of a terminal one.
+///
+/// Returns the LEAF, not the `ViewerPane`, because that is what a caller
+/// actually does something with: register it under an IPC name, focus it, find
+/// it in the tree. (`addTab` returns its `*Surface` for the opposite reason —
+/// its callers tint and configure the terminal, and `Surface.pane_view` gets
+/// them back to the leaf.)
+pub fn addViewerTab(self: *Window, location: []const u8) !*PaneView {
+    if (self.closing) return error.WindowClosing;
+    if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
+    self.cancelTabRename();
+
+    const alloc = self.app.core_app.alloc;
+
+    // Cleanup hands off in one direction, exactly as it does for a terminal:
+    // once the tree owns the pane, ITS deinit is the only thing that frees the
+    // viewer underneath.
+    const viewer = try self.createViewerPane(location);
+    const pane = PaneView.createViewer(alloc, viewer) catch |err| {
+        viewer.deinit(alloc);
+        alloc.destroy(viewer);
+        return err;
+    };
+    const tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
+        pane.destroyUnowned(alloc);
+        return err;
+    };
+
+    self.insertPaneAsTab(pane, tree);
+    return pane;
+}
+
+/// Build a viewer pane parented to this window, point it at `location`, and
+/// start its web view. The host window is born at the surface rect, which is
+/// only somewhere to BE — the layout pass moves it to its real slot as soon as
+/// the tab is up.
+fn createViewerPane(self: *Window, location: []const u8) !*ViewerPane {
+    const alloc = self.app.core_app.alloc;
+    const hwnd = self.hwnd orelse return error.WindowClosing;
+    const viewer = try ViewerPane.create(alloc, self);
+    errdefer {
+        viewer.deinit(alloc);
+        alloc.destroy(viewer);
+    }
+    try viewer.createHostWindow(self.app.hinstance, hwnd, self.surfaceRect());
+    // Before `start`, so the location is already recorded when the controller
+    // arrives and `adoptController` replays it. A viewer that is told where to
+    // go only after its browser process is up would race its own creation.
+    try viewer.navigate(alloc, location);
+    viewer.start(alloc, &self.app.webview2_host);
+    return viewer;
+}
+
+/// Shared tail of `addTab`/`addViewerTab`: place a ready single-leaf tree at
+/// the configured position and bring the tab up.
+///
+/// Takes ownership of `tree` and cannot fail. That is the point of the split —
+/// every fallible step happens before it, so each constructor owns its own
+/// cleanup and there is exactly one copy of the tab bookkeeping.
+fn insertPaneAsTab(self: *Window, pane: *PaneView, tree: SplitTree(PaneView)) void {
     // Determine insert position based on config.
     const pos: usize = switch (self.app.config.@"window-new-tab-position") {
         .current => if (self.tab_count > 0) self.active_tab + 1 else 0,
@@ -1340,7 +1413,7 @@ pub fn addTab(self: *Window) !*Surface {
     self.tab_title_lens[pos] = @intCast(default_title.len);
 
     if (self.tab_count == 1) {
-        // First tab — show the parent window now that the terminal is ready.
+        // First tab — show the parent window now that the pane is ready.
         // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
         if (!self.is_quick_terminal) {
             if (self.hwnd) |h| {
@@ -1356,16 +1429,15 @@ pub fn addTab(self: *Window) !*Surface {
         }
         self.active_tab = pos;
         self.updateWindowTitle();
-        // Set keyboard focus to the child surface so it receives input.
+        // Set keyboard focus to the child pane so it receives input.
         if (!self.is_quick_terminal) {
-            if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+            if (pane.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         }
     } else {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
     self.app.markLayoutDirty(); // T89f: tab added → re-persist the layout
-    return surface;
 }
 
 /// Replace a tab's ENTIRE split tree with a single fresh surface built from
@@ -2684,13 +2756,61 @@ pub fn newSplitAt(
         alloc.destroy(new_surface);
         return err;
     };
+    try self.insertPaneAsSplit(tab, handle, direction, ratio, new_pane);
+    return new_surface;
+}
+
+/// Split at `at` with a VIEWER pane showing `location` (T374, `+split
+/// --view`). The terminal path's command/cwd inheritance has no meaning for a
+/// viewer — it runs no shell — so none of that machinery runs here; what is
+/// shared is the tree surgery, which `insertPaneAsSplit` owns.
+pub fn newViewerSplitAt(
+    self: *Window,
+    at: *PaneView,
+    direction: SplitTree(PaneView).Split.Direction,
+    ratio: f16,
+    location: []const u8,
+) !?*PaneView {
+    if (self.tab_count == 0) return null;
+    const alloc = self.app.core_app.alloc;
+    const tab = self.findTabIndex(at) orelse return null;
+    const handle = self.findHandle(tab, at) orelse return null;
+
+    const viewer = try self.createViewerPane(location);
+    const new_pane = PaneView.createViewer(alloc, viewer) catch |err| {
+        viewer.deinit(alloc);
+        alloc.destroy(viewer);
+        return err;
+    };
+    try self.insertPaneAsSplit(tab, handle, direction, ratio, new_pane);
+    return new_pane;
+}
+
+/// Shared tail of `newSplitAt`/`newViewerSplitAt`: insert `new_pane` into
+/// `tab`'s tree beside `handle`, then focus or hide it depending on whether its
+/// tab is the active one. Takes ownership of `new_pane` on success AND on
+/// failure — the single-node tree it wraps it in cleans up either way.
+fn insertPaneAsSplit(
+    self: *Window,
+    tab: usize,
+    handle: SplitTree(PaneView).Node.Handle,
+    direction: SplitTree(PaneView).Split.Direction,
+    ratio: f16,
+    new_pane: *PaneView,
+) !void {
+    const alloc = self.app.core_app.alloc;
+
+    // Cleanup hands off in one direction and is never doubled up: once
+    // `insert_tree` owns the pane, ITS deinit is the only thing that frees the
+    // leaf underneath. (An `errdefer` covering the leaf for the whole function
+    // would run on top of that `defer` and free it twice if `split` failed.)
     var insert_tree = SplitTree(PaneView).init(alloc, new_pane) catch |err| {
         new_pane.destroyUnowned(alloc);
         return err;
     };
     defer insert_tree.deinit();
 
-    // Split the current tree at the target surface.
+    // Split the current tree at the target pane.
     const new_tree = try self.tab_trees[tab].split(
         alloc,
         handle,
@@ -2704,7 +2824,7 @@ pub fn newSplitAt(
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
 
-    // Focus the new surface.
+    // Focus the new pane.
     self.tab_active_pane[tab] = new_pane;
     self.heroOnTreeChanged(tab);
     if (self.tab_hero_active[tab]) {
@@ -2715,14 +2835,13 @@ pub fn newSplitAt(
 
     if (tab == self.active_tab) {
         self.layoutSplits();
-        if (new_surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
+        if (new_pane.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     } else {
-        // Surface.init shows its child hwnd; this pane belongs to a
-        // background tab, so hide it until its tab is selected.
-        if (new_surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+        // Both leaf kinds create their child hwnd visible; this pane belongs to
+        // a background tab, so hide it until its tab is selected.
+        if (new_pane.hwnd()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
     self.app.markLayoutDirty(); // T89f: split added → re-persist the layout
-    return new_surface;
 }
 
 /// Navigate to a split in the given direction.

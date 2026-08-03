@@ -93,16 +93,17 @@ const dropPrefix = verb_args.dropPrefix;
 
 /// `--view` on `+new-window`/`+split`. Two answers, in the Mac server's own
 /// order: an ambiguous `--view` + command is rejected the same way on both
-/// platforms (that check outlives this function), and then — until viewer
-/// panes land here (T90c–T90h) — `--view` is refused explicitly rather than
-/// dropped as an unknown flag, which used to open a TERMINAL and say nothing.
+/// platforms (that check is permanent), and then — until FILE viewers land
+/// here (T90e) — a `--view` naming a file is refused explicitly rather than
+/// rendered as raw text in a browser. Web mode returns null and builds a pane.
 ///
 /// Returns the error response to send, or null to carry on.
 fn viewArgResponse(ctx: Context, args: VerbArgs) Allocator.Error!?[]u8 {
     if (verb_args.viewConflictsWithCommand(args))
         return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_command_conflict_error});
-    if (args.view != null)
-        return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_unsupported_error});
+    const view = args.view orelse return null;
+    if (verb_args.viewMode(view) == .file)
+        return try errorResponse(ctx.alloc, "{s}", .{verb_args.view_file_unsupported_error});
     return null;
 }
 
@@ -220,6 +221,14 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         try env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = t });
     }
 
+    // T374: `--view` makes the window's one pane a VIEWER, so none of the shell
+    // plumbing below applies to it — no command to wrap, no agent session to
+    // open, nothing to bake into an environment. It stays here rather than
+    // returning early because everything AFTER the create is kind-agnostic:
+    // `--title`, `--no-activate`, and the inline split (whose own pane is still
+    // a terminal) all mean the same thing for a viewer window.
+    const viewer_location: ?[]const u8 = if (args.view) |v| nonEmpty(v) else null;
+
     // T99: with `session-persistence` on, route the first pane through the
     // local agent so its process survives this app (quit/crash/upgrade) and can
     // re-attach — exactly like the startup window. Resolve the shared
@@ -227,6 +236,10 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // set `window.local_agent_conn` for later tabs/splits). A null result
     // (persistence off, or an unreachable/unspawnable agent) falls back to a
     // plain exec pane, so window creation never hangs on a broken agent.
+    //
+    // Resolved for a viewer window too: its FIRST pane needs no agent, but its
+    // later tabs and splits are ordinary terminals and inherit the connection
+    // `createWindow` records from this same call.
     const agent_conn: ?*remote_connection.Connection = if (app.config.@"session-persistence")
         app.local_agent.sharedConnection()
     else
@@ -262,7 +275,10 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     };
 
     const window = app.createWindow(.{
-        .surface_overrides = &overrides,
+        // A viewer first pane has no shell for these to configure; passing them
+        // anyway would describe a spawn that is not happening.
+        .surface_overrides = if (viewer_location != null) null else &overrides,
+        .viewer_location = viewer_location,
         .ipc_name = args.target,
     }) catch |err| {
         log.warn("IPC new-window failed err={}", .{err});
@@ -610,6 +626,21 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         if (window.tab_count == 0)
             return try errorResponse(ctx.alloc, "no surface to split", .{});
         at = window.tab_active_pane[window.active_tab];
+    }
+
+    // `--view` (T374): a VIEWER split. Returns here rather than falling through
+    // like `+new-window` does, because everything below this line describes a
+    // shell — the overrides, the remote/agent inheritance, the background tint
+    // a terminal reads against — and a viewer has none of it.
+    if (args.view) |view| {
+        if (nonEmpty(view)) |location| {
+            const pane = window.newViewerSplitAt(at, direction, ratio, location) catch |err| {
+                log.warn("IPC viewer split failed err={}", .{err});
+                return try errorResponse(ctx.alloc, "failed to create split", .{});
+            } orelse return try errorResponse(ctx.alloc, "failed to create split", .{});
+            if (args.name) |name| app.ipcRegister(name, .{ .pane = pane }) catch {};
+            return try ctx.alloc.dupe(u8, "{\"success\":true}");
+        }
     }
 
     // Surface overrides for the new pane.
