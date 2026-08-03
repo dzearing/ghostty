@@ -32,9 +32,14 @@ enum RuntimeIntegrationFactory {
     /// invokes the banner, so when none are present it is safe to remove. A
     /// plugin-managed Claude has no Ghoztty hooks component (nil) and correctly
     /// contributes nothing — its external plugin ships its own banner path.
-    static func anyHooksReferenceBanner(homeDirectoryURL: URL, fileManager: FileManager) -> Bool {
+    /// Pass `excluding` to ask "would the banner survive uninstalling that agent?"
+    /// (i.e. does any OTHER agent's hooks still reference it).
+    static func anyHooksReferenceBanner(homeDirectoryURL: URL,
+                                        fileManager: FileManager,
+                                        excluding: RuntimeAgent? = nil) -> Bool {
         RuntimeAgent.allCases.contains { agent in
-            guard let hooks = hooksComponent(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+            guard agent != excluding,
+                  let hooks = hooksComponent(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
             else { return false }
             return hooks.state() != .notInstalled
         }

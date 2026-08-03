@@ -22,13 +22,17 @@ struct AgentIntegrationsView: View {
                     if index > 0 { Divider() }
                     AgentIntegrationRow(
                         row: row,
+                        jqMissing: viewModel.jqMissing,
                         onSetUp: { Task { await viewModel.setUp(row.agent) } },
                         onUpdate: { Task { await viewModel.update(row.agent) } },
                         onUninstall: { confirmingUninstall = row.agent })
                 }
             }
 
-            if viewModel.jqMissing {
+            // Only nag about jq when a banner actually depends on it — i.e. an
+            // integration is installed (or needs updating). With nothing set up,
+            // the missing dependency isn't yet the user's problem.
+            if viewModel.jqMissing && viewModel.rows.contains(where: { $0.status.state != .notInstalled }) {
                 Label("The status banner needs jq — install it with: brew install jq",
                       systemImage: "exclamationmark.triangle")
                     .font(.footnote)
@@ -58,13 +62,28 @@ struct AgentIntegrationsView: View {
             }
             Button("Cancel", role: .cancel) { confirmingUninstall = nil }
         } message: { agent in
-            Text("This removes the banner script, skills, and hooks Ghoztty installed. Your \(agent.displayName) configuration is otherwise untouched.")
+            Text(uninstallMessage(for: agent))
         }
+    }
+
+    /// Honest, per-situation uninstall copy: the shared banner is kept when
+    /// another agent still uses it, and plugin-managed hooks are never touched.
+    private func uninstallMessage(for agent: RuntimeAgent) -> String {
+        let status = viewModel.rows.first { $0.agent == agent }?.status
+        let name = agent.displayName
+        if status?.pluginManaged == true {
+            return "This removes the skills Ghoztty added for \(name). Its hooks are managed by the Claude plugin and won't be changed. Your \(name) configuration is otherwise untouched."
+        }
+        if status?.bannerSharedWithOther == true {
+            return "This removes the skills and hooks Ghoztty added for \(name). The shared status-banner script stays because another agent still uses it. Your \(name) configuration is otherwise untouched."
+        }
+        return "This removes the banner script, skills, and hooks Ghoztty installed. Your \(name) configuration is otherwise untouched."
     }
 }
 
 private struct AgentIntegrationRow: View {
     let row: AgentIntegrationsViewModel.Row
+    let jqMissing: Bool
     let onSetUp: () -> Void
     let onUpdate: () -> Void
     let onUninstall: () -> Void
@@ -96,8 +115,11 @@ private struct AgentIntegrationRow: View {
         guard row.status.detected else { return "Not detected — install \(row.agent.displayName) to enable" }
         switch row.status.state {
         case .notInstalled: return "Not set up"
-        case .installed: return "Installed"
-        case .outdated: return "Update available"
+        // When jq is missing the banner script exits without painting, so an
+        // "Installed" row would be misleading — say so on the row itself rather
+        // than relying on the separate footnote.
+        case .installed: return jqMissing ? "Installed — banner inactive (install jq)" : "Installed"
+        case .outdated: return jqMissing ? "Update available — banner inactive (install jq)" : "Update available"
         }
     }
 

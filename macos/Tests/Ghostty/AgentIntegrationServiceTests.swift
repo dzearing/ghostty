@@ -111,6 +111,25 @@ struct AgentIntegrationServiceTests {
         #expect(IntegrationOutcome.uninstalled.label == "removed")
     }
 
+    // H15: allAgentStatuses reports whether the shared banner would survive
+    // uninstalling each agent (another agent's hooks still reference it), so the
+    // uninstall dialog can tell the user the truth.
+    @Test func bannerSharedFlagReflectsSiblingHooks() throws {
+        let home = try tempHome()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
+        // Only Claude installed → neither agent shares the banner with another.
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
+        var statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(try #require(statuses.first { $0.agent == .claude }).bannerSharedWithOther == false)
+
+        // Both installed → each agent's banner is shared with the other.
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(try #require(statuses.first { $0.agent == .claude }).bannerSharedWithOther == true)
+        #expect(try #require(statuses.first { $0.agent == .copilot }).bannerSharedWithOther == true)
+    }
+
     @Test func allAgentStatusesCoversEveryRuntime() throws {
         let home = try tempHome()
         let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)

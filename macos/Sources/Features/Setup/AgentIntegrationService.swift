@@ -9,6 +9,10 @@ struct AgentStatus: Equatable, Sendable {
     let state: RuntimeIntegrationState
     /// Claude only: an external `ghoztty` plugin already owns the hooks.
     let pluginManaged: Bool
+    /// Another installed agent's hooks also reference the shared banner script,
+    /// so uninstalling THIS agent will leave the banner in place. Drives honest
+    /// uninstall copy.
+    let bannerSharedWithOther: Bool
 }
 
 enum IntegrationOutcome: Equatable {
@@ -92,7 +96,10 @@ enum AgentIntegrationService {
             let integ = RuntimeIntegrationFactory.make(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
             let pluginManaged = agent == .claude
                 && ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
-            return AgentStatus(agent: agent, detected: detected, state: integ.state(), pluginManaged: pluginManaged)
+            let bannerSharedWithOther = RuntimeIntegrationFactory.anyHooksReferenceBanner(
+                homeDirectoryURL: homeDirectoryURL, fileManager: fileManager, excluding: agent)
+            return AgentStatus(agent: agent, detected: detected, state: integ.state(),
+                               pluginManaged: pluginManaged, bannerSharedWithOther: bannerSharedWithOther)
         }
     }
 }
