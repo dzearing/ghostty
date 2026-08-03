@@ -19,70 +19,18 @@ struct CopilotHookSpecTests {
         #expect(!file.contains("jq "))
     }
 
-    // I2: the per-runtime awk normalizer must map Copilot's (unverified,
-    // likely camelCase) payload keys AND Claude-shaped snake_case keys to the
-    // canonical {prompt, session_id} the shared script consumes. Runs the real
-    // normalizer segment of the composed hook command through a shell.
-    @Test func copilotNormalizerYieldsCanonicalForBothShapes() throws {
-        let cmd = HookCommand.perEvent(
-            purpose: .promptSubmit,
-            bannerScriptPath: "/Users/x/.config/ghoztty/hooks/ghoztty-banner.sh",
-            runtime: .copilot)
-        // The command is "<awk normalizer> | bash SCRIPT prompt-hook"; run just
-        // the normalizer segment so the test doesn't depend on the banner script.
-        let normalizer = try #require(cmd.components(separatedBy: " | bash").first)
-        #expect(normalizer.contains("awk"))
-
-        for payload in [#"{"prompt":"hi","sessionId":"abc"}"#,   // Copilot-shaped
-                        #"{"prompt":"hi","session_id":"abc"}"#] { // Claude-shaped
-            let out = try runShell(normalizer, stdin: payload)
-            let parsed = try JSONSerialization.jsonObject(with: Data(out.utf8))
-            let json = try #require(parsed as? [String: Any])
-            #expect(json["prompt"] as? String == "hi")
-            #expect(json["session_id"] as? String == "abc")
-        }
-    }
-
-    // H3: the sessionStart normalizer must carry Copilot's `source` (and
-    // initialPrompt) through to the shared script so it can gate the wipe on
-    // resume. Verified field names against a live Copilot hook.
-    @Test func copilotSessionStartNormalizerCarriesSource() throws {
-        let cmd = HookCommand.perEvent(
-            purpose: .sessionStart,
-            bannerScriptPath: "/Users/x/.config/ghoztty/hooks/ghoztty-banner.sh",
-            runtime: .copilot)
-        let normalizer = try #require(cmd.components(separatedBy: " | bash").first)
-        let payload = #"{"sessionId":"abc","source":"resume","initialPrompt":"hi","cwd":"/x"}"#
-        let out = try runShell(normalizer, stdin: payload)
-        let json = try #require(try JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any])
-        #expect(json["source"] as? String == "resume")
-        #expect(json["session_id"] as? String == "abc")
-        #expect(json["prompt"] as? String == "hi")
-    }
-
-    // H3: the generated hook command tells the shared script which runtime
-    // invoked it, so prompt-hook can emit the correct additionalContext envelope.
-    @Test func perEventThreadsRuntimeFlag() {
+    // H3/H8: the generated hook command is just the shared script with the
+    // event mode and the invoking runtime — no embedded awk/jq normalizer (the
+    // script parses the payload itself), and no pipe.
+    @Test func perEventIsScriptInvocationWithRuntimeFlag() {
         let copilot = HookCommand.perEvent(purpose: .promptSubmit,
                                            bannerScriptPath: "/x/banner.sh", runtime: .copilot)
-        #expect(copilot.contains("prompt-hook --runtime=copilot"))
+        #expect(copilot == "bash '/x/banner.sh' prompt-hook --runtime=copilot")
         let claude = HookCommand.perEvent(purpose: .sessionStart,
                                           bannerScriptPath: "/x/banner.sh", runtime: .claude)
-        #expect(claude.contains("session-start-hook --runtime=claude"))
-    }
-
-    private func runShell(_ command: String, stdin: String) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
-        let inPipe = Pipe(), outPipe = Pipe()
-        process.standardInput = inPipe
-        process.standardOutput = outPipe
-        try process.run()
-        inPipe.fileHandleForWriting.write(Data(stdin.utf8))
-        inPipe.fileHandleForWriting.closeFile()
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+        #expect(claude == "bash '/x/banner.sh' session-start-hook --runtime=claude")
+        // No hand-rolled parser embedded in the hook command anymore.
+        #expect(!copilot.contains("awk"))
+        #expect(!copilot.contains(" | "))
     }
 }
