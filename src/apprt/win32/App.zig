@@ -486,6 +486,15 @@ pub fn init(
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+    // T118: an app launched from inside ANOTHER instance's pane inherits that
+    // instance's `$GHOZTTY_IPC_SOCKET` (running `zig-out\bin\ghoztty.exe` from
+    // a pane of the installed release is the everyday case). That value names
+    // someone else's endpoint, so drop it here — before the bind below, before
+    // the AlreadyRunning forward, and before we spawn anything that would
+    // inherit our environment. Every pane we open is baked with OUR endpoint
+    // explicitly (see Surface.init), so nothing depends on the inherited one.
+    _ = internal_os.unsetenv(apprt.ipc.socket_env);
+
     // Bind the IPC pipe and become the master instance. If another process
     // already owns the pipe, forward a `new-window` request to it and exit
     // (Mac single-app behavior).
@@ -3251,6 +3260,17 @@ fn showRemoteOpenFailed(self: *App, owner: *Window) void {
     });
 }
 
+/// The IPC endpoint this app's server actually BOUND, or null when the bind
+/// failed and we serve no IPC at all (T118). Every pane is baked with this as
+/// `$GHOZTTY_IPC_SOCKET` so a CLI run inside it drives THIS instance instead
+/// of whichever build `ghoztty` on `$PATH` happens to be. Null leaves the pane
+/// unbaked, i.e. on the CLI's own derivation — the pre-T118 behavior, which is
+/// also the only sensible answer when we own no endpoint to name.
+pub fn ipcEndpoint(self: *const App) ?[]const u8 {
+    if (self.ipc_server) |*server| return server.path;
+    return null;
+}
+
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
 pub fn ipcNextWindowName(self: *App) Allocator.Error![]u8 {
     return self.ipc_registry.nextWindowName(self.core_app.alloc);
@@ -3288,6 +3308,15 @@ pub fn performIpc(
                     alloc,
                     apprt.ipc.args.autoLaunchDirectory(value.arguments),
                 );
+                // T118: the instance we just launched is OUR exe, so it binds
+                // the DERIVED endpoint — never the one baked into this pane by
+                // some other app. Drop the baked value for the retry, or a
+                // command run from a surviving pane whose app is gone (session
+                // persistence outlives the app by design) would spend the whole
+                // backoff dialing a pipe nothing will ever answer on again.
+                // Safe to mutate: this is a one-shot CLI process.
+                _ = internal_os.unsetenv(apprt.ipc.socket_env);
+
                 // The new instance needs to create its window and bind the
                 // pipe; a cold debug start on a busy box can take a while.
                 var attempt: usize = 0;

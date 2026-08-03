@@ -111,6 +111,13 @@
 # desktop they cannot see. It is for debugging by hand only - it steals focus,
 # so it is never how an acceptance run is scored.
 
+# T118: never inherit an IPC endpoint. A script started from one of the user's
+# own panes inherits $GHOZTTY_IPC_SOCKET naming the USER'S app, and the CLI
+# prefers a baked endpoint over the derivation - so leaving it set would aim
+# the run at their terminal instead of the build under test. Same drop as
+# CleanSlate.ps1, repeated here because not every GUI script sources both.
+Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
+
 Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
 if (-not ('GhozttyTestDesktop' -as [type])) {

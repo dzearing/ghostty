@@ -119,7 +119,23 @@ pub fn setenv(key: [:0]const u8, value: [:0]const u8) c_int {
 
 pub fn unsetenv(key: [:0]const u8) c_int {
     return switch (builtin.os.tag) {
-        .windows => c._putenv_s(key.ptr, ""),
+        // Two environments to clear, not one. `_putenv_s` clears the CRT's
+        // copy; `std.process.getEnvVarOwned` reads the PEB environment block
+        // instead, which only `SetEnvironmentVariableW` touches — so clearing
+        // just the CRT would leave every Zig-side reader still seeing the
+        // variable. Asserted by the round-trip test at the bottom of this file.
+        .windows => win: {
+            const crt = c._putenv_s(key.ptr, "");
+            var buf: [256]u16 = undefined;
+            const len = std.unicode.wtf8ToWtf16Le(buf[0 .. buf.len - 1], key) catch
+                break :win crt;
+            buf[len] = 0;
+            _ = std.os.windows.kernel32.SetEnvironmentVariableW(
+                buf[0..len :0].ptr,
+                null,
+            );
+            break :win crt;
+        },
         else => c.unsetenv(key.ptr),
     };
 }
@@ -132,6 +148,30 @@ const c = struct {
     // Windows
     extern "c" fn _putenv_s(varname: ?[*]const u8, value_string: ?[*]const u8) c_int;
 };
+
+test "unsetenv clears what std.process actually reads" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const name = "GHOZTTY_UNSETENV_ROUNDTRIP";
+
+    // Set it the way the Win32 API does (which is what an inherited
+    // environment looks like), then assert the Zig-side reader sees it...
+    _ = std.os.windows.kernel32.SetEnvironmentVariableW(
+        std.unicode.utf8ToUtf16LeStringLiteral(name),
+        std.unicode.utf8ToUtf16LeStringLiteral("someone-elses-pipe"),
+    );
+    const before = try std.process.getEnvVarOwned(testing.allocator, name);
+    testing.allocator.free(before);
+
+    // ...and that unsetenv makes it disappear from THAT view, not just the
+    // CRT's. T118's App.init depends on exactly this.
+    _ = unsetenv(name);
+    try testing.expectError(
+        error.EnvironmentVariableNotFound,
+        std.process.getEnvVarOwned(testing.allocator, name),
+    );
+}
 
 test "appendEnv empty" {
     const testing = std.testing;

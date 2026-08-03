@@ -368,6 +368,23 @@ the release binary (before this, it silently drove the release app).
   command at a specific instance.
 - One resolution site each side: `apprt.ipc.socketPath()` (`src/apprt/ipc.zig`)
   for the CLI, `IPCSocket.path` (Swift) for the server.
+- **Windows uses the same var for a pipe name** (T118): the value is
+  `\\.\pipe\ghoztty[-debug]-<user>`, not a socket path, and the name was kept
+  identical rather than adding a sibling — the var is baked into long-lived
+  panes that outlive the app, and neither side ever parses the value. The CLI
+  resolves it in `ipc_client.clientEndpointPath()`
+  (`src/os/ipc_client.zig`), which `apprt.ipc.socketPath()` delegates to there.
+- **An explicit `GHOZTTY_PIPE_SUFFIX` outranks the baked value** on Windows.
+  The suffix is how a harness aims at the instance it just launched, and a
+  script inherits the environment of the pane it was started from — without
+  this rule every `test\win32\*.ps1` run from one of the user's panes would
+  drive the user's terminal. Precedence: suffix → baked → derivation.
+- **Only clients read it.** The IPC *server* binds `ipc_client.endpointPath()`,
+  the pure derivation, and the win32 App drops any inherited
+  `$GHOZTTY_IPC_SOCKET` from its own environment at startup — otherwise a dev
+  build launched from a pane of the installed release would try to bind (or
+  forward its startup `new-window` to) that release instance's endpoint.
+  Acceptance: `test/win32/ipc-instance-addressability.ps1`.
 
 ### Example: three-pane layout
 

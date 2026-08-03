@@ -22,9 +22,13 @@ const internal_os = @import("../os/main.zig");
 /// It holds a full absolute path rather than a build-flavor hint so it keeps
 /// working if the socket name ever gains an instance discriminator.
 ///
+/// On Windows the endpoint is a named PIPE, not a socket path, and the same
+/// var carries it (T118) — one spelling for both platforms, aliased from the
+/// transport helper below so the name cannot drift between them.
+///
 /// Absent (a plain non-Ghoztty shell, or a pane baked by an app/agent that
 /// predates this var) means "derive it" — see `socketPath`.
-pub const socket_env = "GHOZTTY_IPC_SOCKET";
+pub const socket_env = internal_os.ipc_client.endpoint_env;
 
 /// Resolve the IPC socket to dial: `$GHOZTTY_IPC_SOCKET` when the caller runs
 /// inside a pane, else this build's own `<tmp>/ghostty[-debug]-<uid>.sock`
@@ -35,15 +39,12 @@ pub const socket_env = "GHOZTTY_IPC_SOCKET";
 ///
 /// Caller owns the returned path.
 pub fn socketPath(alloc: Allocator) Allocator.Error![:0]u8 {
-    // `std.posix.getenv` is not available on Windows; read the value owned
-    // there and hand the same slice to the shared resolution rule.
+    // Windows: `std.posix.getenv` does not exist there, and the win32 CLI
+    // dials through `ipc_client` — which owns the identical preference rule
+    // for every one of its callers. Defer to it rather than keeping a second
+    // copy of the rule that only one of the two client stacks would exercise.
     if (comptime builtin.os.tag == .windows) {
-        const baked: ?[]u8 = std.process.getEnvVarOwned(alloc, socket_env) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        defer if (baked) |b| alloc.free(b);
-        return socketPathFrom(alloc, baked);
+        return internal_os.ipc_client.clientEndpointPath(alloc);
     }
 
     return socketPathFrom(alloc, std.posix.getenv(socket_env));

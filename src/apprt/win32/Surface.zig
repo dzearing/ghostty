@@ -638,6 +638,27 @@ pub fn init(
         };
     }
 
+    // T118: bake this app's own IPC endpoint too, through the same seam and
+    // for the same reason — so an IPC command run inside the pane drives THIS
+    // instance rather than whichever build `ghoztty` on `$PATH` resolves to.
+    // On Windows the value is a pipe name, but the var keeps the documented
+    // `GHOZTTY_IPC_SOCKET` spelling (see `apprt.ipc.socket_env`). Riding the
+    // `env` overrides carries it to all three spawn paths for free: plain
+    // exec applies it as `env_override`, the agent forwards it in the OPEN
+    // (and replays it on RELAUNCH), and a remote pane gets it too — a remote
+    // pane's IPC still belongs to the LOCAL app.
+    if (app.ipcEndpoint()) |endpoint| {
+        const carena = config._arena.?.allocator();
+        const kv = try std.fmt.allocPrint(
+            carena,
+            "{s}={s}",
+            .{ apprt.ipc.socket_env, endpoint },
+        );
+        config.env.parseCLI(carena, kv) catch |err| {
+            log.warn("ipc endpoint env bake failed err={}", .{err});
+        };
+    }
+
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.
     try self.core_surface.init(

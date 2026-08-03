@@ -43,6 +43,15 @@
 
 Set-StrictMode -Off
 
+# T118: a script aims by ENDPOINT, and it inherits the environment of the pane
+# it was started from - which, once the installed release bakes its own IPC
+# endpoint into every pane, means $GHOZTTY_IPC_SOCKET names the USER'S app.
+# The CLI prefers that over the derivation, so leaving it set would point this
+# whole suite at the user's terminal. An explicit GHOZTTY_PIPE_SUFFIX already
+# outranks it in the CLI, but 32 of the 96 scripts here set no suffix, so drop
+# it at the source: a test never wants to inherit an endpoint.
+Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
+
 # Repo root, derived from this file's location (test\win32\lib -> repo).
 $script:CleanSlateRepo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 

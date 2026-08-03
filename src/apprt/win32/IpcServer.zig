@@ -109,6 +109,13 @@ pipes: [instance_count]windows.HANDLE,
 /// UTF-16 pipe path, kept for the shutdown dummy-connect.
 path_w: [:0]u16,
 
+/// The same pipe path in UTF-8: the endpoint this app actually BOUND, which
+/// is what every pane it opens gets baked with as `$GHOZTTY_IPC_SOCKET`
+/// (T118). Read it through `App.ipcEndpoint()`, never re-derive it — a pane
+/// must name its own app's endpoint, not whatever the deriving process would
+/// have guessed.
+path: [:0]u8,
+
 threads: [instance_count]?std.Thread = @splat(null),
 shutdown: std.atomic.Value(bool) = .{ .raw = false },
 
@@ -152,8 +159,11 @@ pub const BindError = error{
 pub fn init(self: *IpcServer, app: *App) BindError!void {
     const alloc = app.core_app.alloc;
 
+    // The DERIVATION, never `clientEndpointPath`: an app launched from another
+    // instance's pane inherits that instance's `$GHOZTTY_IPC_SOCKET`, and
+    // binding it would make this app try to own the other app's endpoint.
     const path = try ipc_client.endpointPath(alloc);
-    defer alloc.free(path);
+    errdefer alloc.free(path);
     const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BindFailed,
@@ -207,6 +217,7 @@ pub fn init(self: *IpcServer, app: *App) BindError!void {
         .alloc = alloc,
         .pipes = @splat(windows.INVALID_HANDLE_VALUE),
         .path_w = path_w,
+        .path = path,
         .perf = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF"),
     };
     self.pipes[0] = first;
@@ -300,6 +311,7 @@ pub fn deinit(self: *IpcServer) void {
         pipe.* = windows.INVALID_HANDLE_VALUE;
     }
     self.alloc.free(self.path_w);
+    self.alloc.free(self.path);
 }
 
 /// Listener thread body for one pipe instance: serve one framed request per

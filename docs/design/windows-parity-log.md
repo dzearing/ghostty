@@ -7372,3 +7372,73 @@ Validation: `session-snapshot-reattach.ps1` ALL PASS (27), `-NegativeControl`
 exactly 1 failure (C3, as designed), `-Dapp-runtime=none` exit 0,
 `-Dapp-runtime=win32` exit 0, `test-agent` per the T409 workaround, P1-P3 ALL
 PASS. New: T412, T413.
+
+## 2026-08-03 - T118: the CLI can now name an instance, and the test suite must not inherit one
+
+An IPC command run inside a pane targeted whatever `ghoztty` on `$PATH`
+derived, so a `+split` from a debug pane drove the installed release. Half the
+CLI side already existed and was simply off Windows' path: `apprt.ipc.socketPath`
+read `$GHOZTTY_IPC_SOCKET`, but every win32 verb dials
+`ipc_client.connect`/`connectWithReset`, which called the derivation. Splitting
+that one function in two is the whole fix - `endpointPath` stays the pure
+derivation that the SERVER binds, `clientEndpointPath` is what clients dial -
+and every verb that dials the app inherits it at once. The app bakes its **bound** endpoint
+(`IpcServer.path`, not a re-derivation) through the same `config.env` seam as
+`GHOZTTY_PANE_ID`, which reaches exec, agent-OPEN/RELAUNCH and remote panes for
+one edit. One spelling on both platforms, pipe name and socket path alike, with
+`apprt.ipc.socket_env` aliasing the constant so they cannot drift.
+
+Both of the day's real decisions came from asking **who may read the var**,
+because an app launched from another instance's pane inherits it:
+
+- The server must never bind it, the `AlreadyRunning` forward must not use it
+  (`App.init` drops it from its own env), and the `+new-window` auto-launch
+  retry must not either - the instance we just spawned is our exe and binds the
+  derivation, so a baked endpoint would spend the whole backoff dialing a pipe
+  nobody will answer on again. That last case is ordinary, not exotic:
+  session-persistence panes outlive their app by design.
+- **An explicit `GHOZTTY_PIPE_SUFFIX` outranks the baked value.** Not in the
+  task, and the most consequential line in it. An acceptance script aims by
+  ENDPOINT and inherits the environment of the pane it was started from. The
+  moment the installed release bakes one, `test\win32\*.ps1` would inherit the
+  USER'S endpoint and drive their terminal - the T116 accident arriving through
+  the fix for T116. 32 of the 96 scripts set no suffix, so both `CleanSlate.ps1`
+  and `TestDesktop.ps1` also drop the var at dot-source time: a test never wants
+  to inherit an endpoint.
+
+`internal_os.unsetenv` needed a second half for any of that to be real: on
+Windows it only cleared the CRT's copy, while `std.process.getEnvVarOwned` reads
+the PEB environment block, which only `SetEnvironmentVariableW` touches. The
+App.init drop would have compiled, run, and done nothing. Pinned by a round-trip
+test instead of trusted.
+
+Three test-side lessons, all of which produced confident wrong readings first.
+`echo %ERRORLEVEL%> file` is `echo 0> file`: cmd reads the digit before a
+redirection operator as a HANDLE, so every probe reported "never ran" while
+running fine. A `[string]` parameter silently joins a multi-line `[string[]]`
+body with spaces, turning `set X=` + `set Y=` + a command into one assignment
+that runs nothing - exit 0 and an empty capture, which reads exactly like a
+product failure. And `--session-persistence=off` is **not** a valid bool
+(`parseBool` takes only 1/t/T/true/0/f/F/false): the flag was ignored, the
+second instance restored the first one's manifest and attached its panes, and
+`+list` against B returned A's windows. That one is filed as **T414**, since
+CLAUDE.md documents the spelling a user cannot use.
+
+Validation: `test/win32/ipc-instance-addressability.ps1` **ALL PASS (16)** -
+two instances of the same exe on different suffixes, one with persistence on
+(agent-backed panes) and one off (exec panes), with the built-in negative
+control (clear the baked var in the same pane, same command, and it fails and
+sees nothing). `-Dapp-runtime=none` exit 0, P1-P3 ALL PASS, and both agent test
+binaries run directly at 3787/76/0 and 3715/68/0.
+
+The full `-Dapp-runtime=win32` lane is the gap, and not because of this change:
+it wedged three times today in the `ViewerPane` WebView2 host-floor test, at
+frozen CPU with a live msedgewebview2 tree - **including once with no build
+runner at all**, which runs T409's own discriminator and refutes its
+`--listen=-` hypothesis. Filed as **T416** with the stacks and the last lines
+before each freeze; the lane filtered to this change's tests is exit 0. A
+second flake on the way through was a real product race with a stack -
+`stopMetricsPump` reads and clears `metrics_thread` outside its mutex, so a
+concurrent UNSUB and shutdown double-join and crash the agent - filed as
+**T420**. New: T414, T415 (Mac-seat verification: the CLI split is shared Zig,
+so `+list`/`+read` on macOS now prefer the baked socket too), T416, T420.

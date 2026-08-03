@@ -73,11 +73,84 @@ pub const Conn = struct {
     }
 };
 
+/// Environment variable naming the IPC endpoint of the app instance that owns
+/// the calling process's pane, baked into every pane's environment by the app
+/// that created it. See `apprt.ipc.socket_env` (which aliases this constant so
+/// there is exactly one spelling) and CLAUDE.md "Instance addressability".
+///
+/// T118: the same name is used on Windows even though the value there is a
+/// PIPE NAME (`\\.\pipe\ghoztty[-debug]-<user>`), not a socket path. One
+/// spelling was chosen deliberately over a Windows-only sibling: the var is
+/// baked into long-lived panes that outlive the app, both platforms resolve it
+/// through the same rule, and a second name would be one more thing to keep in
+/// sync for a value neither side ever parses.
+pub const endpoint_env = "GHOZTTY_IPC_SOCKET";
+
+/// Test hook naming the endpoint SUFFIX to derive (see `endpointPath`). When
+/// it is set the caller is aiming at a specific instance on purpose, so it
+/// beats the baked value — see `clientEndpointPathFrom`.
+pub const suffix_env = "GHOZTTY_PIPE_SUFFIX";
+
+/// The endpoint a CLIENT should dial. Precedence: an explicit
+/// `$GHOZTTY_PIPE_SUFFIX` (a caller aiming on purpose) → the pane's baked
+/// endpoint → this build's own derivation (`endpointPath`).
+///
+/// The SERVER must never use this. An app launched from ANOTHER instance's
+/// pane inherits that instance's value, so binding it would make the new app
+/// try to own the other app's endpoint; the server binds `endpointPath`, and
+/// the win32 App drops the inherited value from its own environment at startup
+/// so nothing it spawns or dials picks it up by accident.
+pub fn clientEndpointPath(alloc: Allocator) Allocator.Error![:0]u8 {
+    const baked: ?[]u8 = std.process.getEnvVarOwned(alloc, endpoint_env) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    defer if (baked) |b| alloc.free(b);
+
+    const suffix: ?[]u8 = std.process.getEnvVarOwned(alloc, suffix_env) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    defer if (suffix) |s| alloc.free(s);
+
+    return clientEndpointPathFrom(alloc, baked, suffix != null);
+}
+
+/// `clientEndpointPath` with the environment injected, so the preference rule
+/// is testable without mutating the process environment.
+fn clientEndpointPathFrom(
+    alloc: Allocator,
+    baked: ?[]const u8,
+    suffix_set: bool,
+) Allocator.Error![:0]u8 {
+    // An explicit `GHOZTTY_PIPE_SUFFIX` OUTRANKS the baked value, and this is
+    // load-bearing rather than a nicety: the suffix is the test hook that says
+    // "aim at THIS instance", and an acceptance script inherits the env of the
+    // pane it was started from. Once the installed release bakes an endpoint,
+    // every `test\win32\*.ps1` launched from one of the user's own panes would
+    // otherwise inherit the USER'S endpoint and drive their terminal instead of
+    // the build under test — precisely the T116 accident, arriving through the
+    // fix for it. Most explicit wins; the suffix is set by a caller, the baked
+    // value by the app.
+    if (!suffix_set) {
+        // Empty means the same as absent: derive it. (A pane baked by an app or
+        // agent that predates this var leaves it absent entirely, and overriding
+        // it to "" is how a caller asks for the derivation explicitly.)
+        if (baked) |path| {
+            if (path.len > 0) return alloc.dupeZ(u8, path);
+        }
+    }
+    return endpointPath(alloc);
+}
+
 /// Build the endpoint path of the running instance's IPC server. Debug
 /// builds get a distinct endpoint so a debug instance can run beside the
 /// release app. Note the historical spelling split: the Unix socket kept
 /// the upstream `ghostty` name, while the Windows pipe uses the fork's
 /// `ghoztty` name (pinned in the parity spec).
+///
+/// This is the DERIVATION only: it never reads `$GHOZTTY_IPC_SOCKET`. The
+/// server binds this; clients go through `clientEndpointPath`.
 pub fn endpointPath(alloc: Allocator) Allocator.Error![:0]u8 {
     // Test hook: GHOZTTY_PIPE_SUFFIX overrides the debug/release endpoint
     // suffix so an instrumented release build (and its CLI invocations,
@@ -85,7 +158,7 @@ pub fn endpointPath(alloc: Allocator) Allocator.Error![:0]u8 {
     // Used by the perf/acceptance harnesses in test/win32/.
     const env_suffix: ?[]u8 = std.process.getEnvVarOwned(
         alloc,
-        "GHOZTTY_PIPE_SUFFIX",
+        suffix_env,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => null,
@@ -122,7 +195,7 @@ pub fn endpointPath(alloc: Allocator) Allocator.Error![:0]u8 {
 /// Connect to the running instance. Fails with NoRunningInstance if nothing
 /// is listening; emits no diagnostics (callers own the messaging).
 pub fn connect(alloc: Allocator) Error!Conn {
-    const path = try endpointPath(alloc);
+    const path = try clientEndpointPath(alloc);
     defer alloc.free(path);
     return connectPath(alloc, path);
 }
@@ -133,7 +206,7 @@ pub fn connect(alloc: Allocator) Error!Conn {
 /// watches for (the Mac server's recovery protocol). On Windows a dead pipe
 /// simply stops existing, so a plain connect is equivalent.
 pub fn connectWithReset(alloc: Allocator, stderr: *std.Io.Writer) Error!Conn {
-    const path = try endpointPath(alloc);
+    const path = try clientEndpointPath(alloc);
     defer alloc.free(path);
 
     if (comptime is_windows) return connectPath(alloc, path);
@@ -360,6 +433,56 @@ pub fn sendAction(
     }
 
     return true;
+}
+
+test "clientEndpointPath: the pane's baked endpoint beats the derivation" {
+    const testing = std.testing;
+    const baked = if (comptime is_windows)
+        "\\\\.\\pipe\\ghoztty-debug-someone-else"
+    else
+        "/tmp/gz-test/ghostty-debug-501.sock";
+
+    const path = try clientEndpointPathFrom(testing.allocator, baked, false);
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings(baked, path);
+
+    // ...and it must NOT be what the server binds, or an app launched from
+    // another instance's pane would try to own that instance's endpoint.
+    const derived = try endpointPath(testing.allocator);
+    defer testing.allocator.free(derived);
+    try testing.expect(!std.mem.eql(u8, derived, baked));
+}
+
+test "clientEndpointPath: unset and empty both mean derive it" {
+    const testing = std.testing;
+    const derived = try endpointPath(testing.allocator);
+    defer testing.allocator.free(derived);
+
+    const unset = try clientEndpointPathFrom(testing.allocator, null, false);
+    defer testing.allocator.free(unset);
+    const empty = try clientEndpointPathFrom(testing.allocator, "", false);
+    defer testing.allocator.free(empty);
+
+    try testing.expectEqualStrings(derived, unset);
+    try testing.expectEqualStrings(derived, empty);
+}
+
+test "clientEndpointPath: an explicit suffix outranks the baked endpoint" {
+    // A test harness sets GHOZTTY_PIPE_SUFFIX to aim at the instance it just
+    // launched, and it inherits the env of the pane it was started from. If
+    // the pane's baked endpoint won, the harness would drive the USER'S app.
+    const testing = std.testing;
+    const baked = if (comptime is_windows)
+        "\\\\.\\pipe\\ghoztty-the-users-instance"
+    else
+        "/tmp/gz-test/ghostty-the-users-instance.sock";
+
+    const derived = try endpointPath(testing.allocator);
+    defer testing.allocator.free(derived);
+    const aimed = try clientEndpointPathFrom(testing.allocator, baked, true);
+    defer testing.allocator.free(aimed);
+
+    try testing.expectEqualStrings(derived, aimed);
 }
 
 test "buildRequest: action only omits arguments" {
