@@ -40,6 +40,20 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version
+          echo "xcode-select -p: $(xcode-select -p)"
+          echo "sdk path: $(xcrun --sdk macosx --show-sdk-path)"
+
+      # Zig links the native macOS target against libSystem from the SDK it
+      # locates via xcrun. Upstream never exercises this path — their CI runs
+      # zig inside `nix develop`, which supplies an SDK — so on a bare runner
+      # Zig can fail to resolve one and the link dies on undefined libSystem
+      # symbols (_free, _malloc_size, __availability_version_check ...) while
+      # building nothing more than the build runner itself. Pin SDKROOT and
+      # DEVELOPER_DIR explicitly rather than relying on that detection.
+      - name: Export macOS SDK paths
+        run: |
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
 
       - name: Get required Zig version
         id: zig
