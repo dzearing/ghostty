@@ -50,6 +50,11 @@ set -u
 STATE_DIR="$HOME/.config/ghoztty/banner-state"
 mkdir -p "$STATE_DIR"
 
+# Stop-hook PR staleness check: hard time budget for the network call, and how
+# long a result is trusted before re-checking (so it doesn't run every turn).
+PR_CHECK_TIMEOUT=5
+PR_CHECK_TTL=300
+
 # Extract a top-level string field (the first non-empty of the given keys) from
 # a JSON object on stdin. jq is guaranteed present (hard-required below) and it
 # DECODES JSON string escapes (\n, \") — unlike a raw substring scan — so values
@@ -210,6 +215,18 @@ valid_url() {
 # as plain escaped text — a crafted value can never forge a link.
 pr_render() {
     if valid_url "$1"; then pr_link "$1"; else esc_md "$1"; fi
+}
+
+# Run a command with a hard time budget so a hung network call can't stall the
+# hook on the agent's turn-end hot path. Prefers coreutils `timeout`/`gtimeout`,
+# falls back to perl's alarm (always present on macOS; the timer survives exec
+# and kills the child), and as a last resort runs unbounded.
+with_timeout() { # seconds cmd...
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+    elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+    else "$@"; fi
 }
 
 send_osc() { # single-line text
@@ -381,6 +398,9 @@ set)
         [ "$did_set" = 1 ]  || pairs+=(did "")
         [ "$bugs_set" = 1 ] || pairs+=(bugs "")
     fi
+    # A newly-set PR should be verified promptly, not suppressed by the previous
+    # PR's TTL — clear the last-checked stamp whenever the PR field is touched.
+    [ "$pr_set" = 1 ] && pairs+=(pr_checked_at "")
     [ ${#pairs[@]} -gt 0 ] && jq_merge "${pairs[@]}"
     render
     ;;
@@ -464,20 +484,28 @@ session-start-hook)
 stop-hook)
     jq_merge activity "idle"
     render
-    # Best-effort: drop a PR link once it's no longer open (closed/merged),
-    # so the banner never shows a stale PR. GitHub + gh only; silent on any
-    # failure (no gh, not authed, non-GitHub host, network error).
+    # Best-effort: drop a PR link once it's no longer open (closed/merged), so
+    # the banner never shows a stale PR. This is a network call on the turn-end
+    # hot path, so it is BOUNDED by a hard timeout and THROTTLED to at most once
+    # per TTL (recorded in the state file). GitHub + gh only; the `--` and the
+    # https-scheme guard keep an attacker-influenced $pr from becoming a gh flag.
+    # Silent on any failure (no gh, not authed, non-GitHub host, network error).
     pr=$(read_field pr)
     if [ -n "$pr" ] && command -v gh >/dev/null 2>&1; then
-        case "$pr" in
-        *github.com*)
-            state=$(gh pr view "$pr" --json state -q .state 2>/dev/null)
-            if [ -n "$state" ] && [ "$state" != "OPEN" ]; then
-                jq_merge pr ""
-                render
-            fi
-            ;;
-        esac
+        now=$(date +%s 2>/dev/null || echo 0)
+        last=$(read_field pr_checked_at)
+        if [ "$now" = 0 ] || [ -z "$last" ] || [ "$((now - last))" -ge "$PR_CHECK_TTL" ]; then
+            case "$pr" in
+            https://*github.com/*)
+                jq_merge pr_checked_at "$now"
+                state=$(with_timeout "$PR_CHECK_TIMEOUT" gh pr view --json state -q .state -- "$pr" 2>/dev/null)
+                if [ -n "$state" ] && [ "$state" != "OPEN" ]; then
+                    jq_merge pr ""
+                    render
+                fi
+                ;;
+            esac
+        fi
     fi
     ;;
 clear)

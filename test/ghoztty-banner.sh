@@ -44,6 +44,14 @@ fi
 exit 0
 STUB
     chmod +x "$TMP/bin/ghoztty"
+    # Stub gh: log the args it was called with and echo the canned PR state.
+    cat > "$TMP/bin/gh" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$HOME/gh-calls.log"
+cat "$HOME/gh-out" 2>/dev/null || true
+exit 0
+STUB
+    chmod +x "$TMP/bin/gh"
     export PATH="$TMP/bin:$PATH"
 }
 teardown() { rm -rf "$TMP"; }
@@ -119,6 +127,31 @@ for i in 1 2 3 4 5 6; do bash "$BANNER" set --status "s$i" >/dev/null 2>&1 & don
 wait
 valid=$(state | jq empty >/dev/null 2>&1 && echo 1 || echo 0)
 assert_eq "state is valid JSON after concurrent writes" "1" "$valid"
+teardown
+
+echo "== stop-hook PR staleness: bounded, throttled, injection-safe =="
+setup
+printf 'MERGED' > "$TMP/gh-out"
+bash "$BANNER" set --title T --pr "https://github.com/o/r/pull/1" >/dev/null 2>&1
+bash "$BANNER" stop-hook --runtime=claude </dev/null >/dev/null 2>&1
+assert_eq  "merged PR link is dropped" "" "$(sfield pr)"
+assert_has "gh gets -- before the url (no flag injection)" "$(cat "$TMP/gh-calls.log" 2>/dev/null)" "-- https://github.com/o/r/pull/1"
+teardown
+
+setup
+printf 'OPEN' > "$TMP/gh-out"
+bash "$BANNER" set --title T --pr "https://github.com/o/r/pull/2" >/dev/null 2>&1
+bash "$BANNER" stop-hook --runtime=claude </dev/null >/dev/null 2>&1
+bash "$BANNER" stop-hook --runtime=claude </dev/null >/dev/null 2>&1
+assert_eq "gh called once within TTL" "1" "$(wc -l < "$TMP/gh-calls.log" 2>/dev/null | tr -d ' ')"
+assert_eq "open PR link is retained" "https://github.com/o/r/pull/2" "$(sfield pr)"
+teardown
+
+setup
+printf 'MERGED' > "$TMP/gh-out"
+bash "$BANNER" set --title T --pr "git@github.com:o/r.git" >/dev/null 2>&1
+bash "$BANNER" stop-hook --runtime=claude </dev/null >/dev/null 2>&1
+assert_eq "gh not called for a non-https PR value" "0" "$([ -f "$TMP/gh-calls.log" ] && wc -l < "$TMP/gh-calls.log" | tr -d ' ' || echo 0)"
 teardown
 
 echo

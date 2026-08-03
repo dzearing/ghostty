@@ -25,14 +25,20 @@ struct ClaudeHookSpec: HookSpec {
 
     /// Ghoztty's contribution to the shared `hooks` map: one element per event.
     /// The map is keyed by event name; each value is the array of hook elements
-    /// Ghoztty appends for that event.
+    /// Ghoztty appends for that event. Each command carries a `timeout` (seconds)
+    /// so a hook — notably Stop's best-effort `gh pr view` — can never stall the
+    /// agent's turn; Claude reads the `timeout` key (Copilot uses `timeoutSec`).
     static func hooksBlock(bannerScriptPath: String) -> [String: [[String: Any]]] {
+        func command(_ purpose: HookPurpose) -> [String: Any] {
+            ["type": "command",
+             "command": HookCommand.perEvent(purpose: purpose, bannerScriptPath: bannerScriptPath, runtime: .claude),
+             "timeout": 10]
+        }
         func entry(_ purpose: HookPurpose) -> [[String: Any]] {
-            [["hooks": [["type": "command",
-                         "command": HookCommand.perEvent(purpose: purpose, bannerScriptPath: bannerScriptPath, runtime: .claude)]]]]
+            [["hooks": [command(purpose)]]]
         }
         return [
-            "SessionStart": [["matcher": "startup|clear", "hooks": [["type": "command", "command": HookCommand.perEvent(purpose: .sessionStart, bannerScriptPath: bannerScriptPath, runtime: .claude)]]]],
+            "SessionStart": [["matcher": "startup|clear", "hooks": [command(.sessionStart)]]],
             "UserPromptSubmit": entry(.promptSubmit),
             "Stop": entry(.stop),
         ]

@@ -6,6 +6,19 @@ import Testing
 struct ClaudeHookSpecTests {
     private let scriptPath = "/Users/x/.config/ghoztty/hooks/ghoztty-banner.sh"
 
+    // H11: every Ghoztty hook command carries a `timeout` so a hook — notably
+    // Stop's best-effort `gh pr view` — can never stall the agent's turn.
+    @Test func mergedFragmentCarriesTimeoutOnEveryCommand() {
+        let merged = ClaudeHookSpec.merge(into: [:], bannerScriptPath: scriptPath)
+        let hooks = hooksDict(merged)
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            let elements = hooks[event] as? [[String: Any]] ?? []
+            let commands = elements.flatMap { ($0["hooks"] as? [[String: Any]]) ?? [] }
+            #expect(!commands.isEmpty)
+            #expect(commands.allSatisfy { ($0["timeout"] as? Int) == 10 })
+        }
+    }
+
     @Test func mergePreservesUnrelatedKeysAndIsDetectable() {
         let existing: [String: Any] = ["theme": "dark", "model": "opus"]
         let merged = ClaudeHookSpec.merge(into: existing, bannerScriptPath: scriptPath)
