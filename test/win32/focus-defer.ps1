@@ -30,6 +30,15 @@
 # `+new-window` auto-spawn it: auto-spawn puts the GUI on the USER's desktop,
 # which is the whole thing this migration fixes (batch-1 lesson).
 #
+# T107: the tail of this script used to fail on the box (+list timing out,
+# focus not moving) and the verdict was HARNESS, not product - both causes
+# were removed by the T218 migration above (posted input needs no foreground,
+# and CleanSlate + --session-persistence=false removed the split-vs-agent
+# race that intermittently yielded 1 surface). What T107 leaves behind is the
+# load-shape assertions below: the flood and the storm are now measured, so
+# this script can no longer report an idle app's responsiveness as the T48
+# regression holding.
+#
 # -NegativeControl inverts the deferred-focus assertion and MUST fail.
 #
 # Only ever touches ghoztty processes from the repo zig-out.
@@ -69,6 +78,17 @@ function Stop-DebugGhoztty {
         Where-Object { $_.CommandLine -like '*FD-LOAD*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 800
+}
+
+# How far the FD-LOAD flood has counted, read out of the pane itself (-1 when
+# no FD-LOAD line is in the tail at all). T107: this is what turns "under heavy
+# terminal output" from a comment into an assertion - see the load-shape block
+# below for why a green run without it proves nothing.
+function Get-FloodCounter {
+    $tail = (& $Exe +read --name=fdb --lines=400 2>&1 | Out-String)
+    $m = [regex]::Matches($tail, 'FD-LOAD-(\d+)')
+    if ($m.Count -eq 0) { return -1 }
+    return [int]$m[$m.Count - 1].Groups[1].Value
 }
 
 # Click a pane, then wait for the GUI thread's real keyboard focus to land on
@@ -132,9 +152,35 @@ Write-Host '== rapid click churn under heavy terminal output'
 # Flood one pane with output (the deadlock's load shape), then storm the
 # mouse WndProc SetFocus path across all panes. Pre-fix, a re-entrant
 # IME/CTF SetFocus on this stack could wedge the GUI thread here.
+#
+# T107: every assertion below this line is about behaviour UNDER LOAD, so the
+# load itself is asserted, not assumed. Without that, a flood that never
+# started (a +send-keys failure, a renamed pane, a shell that does not speak
+# `for /L`) and a storm that posted nothing both leave this whole section
+# green - the responsiveness of an idle app, reported as the deadlock
+# regression holding.
 & $Exe +send-keys --target=fdb "for /L %i in (1,1,150000) do @echo FD-LOAD-%i" Enter 2>&1 | Out-Null
+Assert ($LASTEXITCODE -eq 0) "+send-keys delivered the flood command (exit $LASTEXITCODE)"
 Start-Sleep -Milliseconds 500
-[void](Send-TestClickStorm -Targets $surfaces -Rounds 500)   # 500 * 3 panes = 1500 focus changes
+$floodStart = Get-FloodCounter
+Assert ($floodStart -gt 0) "flood is producing output before the storm (counter $floodStart)"
+
+# Park focus off the storm's last target so "focus is on the last target"
+# afterwards cannot be true by accident.
+[void](Test-ClickFocuses $surfaces[0] 1500)
+$rounds = 500                                     # 500 * 3 panes = 1500 focus changes
+$expectedPosts = 2 * $rounds * $surfaces.Count    # a down + an up per click
+$posted = Send-TestClickStorm -Targets $surfaces -Rounds $rounds
+Assert ($posted -eq $expectedPosts) "click storm posted all $expectedPosts messages (got $posted)"
+
+# ... and the app ACTED on them: the storm ends every round on the last
+# target, so real GUI focus must arrive there. Posting is not processing.
+$stormActed = $false
+for ($t = 0; $t -lt 5000; $t += 100) {
+    Start-Sleep -Milliseconds 100
+    if ([IntPtr](Get-TestFocusedWindow -Window $script:top) -eq $surfaces[-1]) { $stormActed = $true; break }
+}
+Assert $stormActed 'storm clicks were processed (focus moved to the storm target)'
 
 Write-Host '== still responsive after the storm'
 $resp = $false
@@ -154,6 +200,14 @@ Assert $ipcOk '+list answers within 8s (GUI-thread IPC listener alive)'
 
 # Focus still controllable after the storm (thread not wedged mid-dispatch).
 Assert (Test-ClickFocuses $surfaces[0] 2000) 'focus still moves after storm'
+
+# The flood outlives the assertions it is the load for - measured ~2.5k
+# lines/s on this box, so 150k lines runs about a minute while the block above
+# takes a few seconds. Asserting that closes the window in which the counter
+# could have been read from a flood that had already finished.
+$floodEnd = Get-FloodCounter
+Assert ($floodEnd -gt $floodStart) "flood was still producing across the assertions ($floodStart -> $floodEnd)"
+Assert ($floodEnd -gt 0 -and $floodEnd -lt 150000) "flood had not run out before the assertions ended (counter $floodEnd)"
 
 } finally {
     Write-Host '== teardown'

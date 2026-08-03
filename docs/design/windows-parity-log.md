@@ -9,6 +9,39 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-03 - **T107 done - the verdict was HARNESS, and T218 had already fixed
+  it; what shipped is the load shape becoming an assertion.** Measured on box
+  with the flood running: `+list` answers in **73 ms** against an 8,000 ms
+  assertion while the pane emits ~2,500 lines/s, so there is no IPC-listener
+  starvation to find. Both 2026-07-20 causes belonged to the pre-T218 harness -
+  posted input needs no foreground, and CleanSlate + `--session-persistence=false`
+  removed the split-vs-fresh-agent race that yielded 1 surface. `focus-defer.ps1`
+  was ALL PASS x3 before any change.
+  Closing it there would have left the script unable to distinguish green from
+  green-and-empty: every assertion after the flood is a claim about behaviour
+  UNDER LOAD, and the load was unmeasured - `+send-keys | Out-Null` with its exit
+  code dropped, the storm's return `[void]`. Both failing silently leaves the
+  section green, reporting an idle app's responsiveness as the T48 regression
+  holding. It now asserts the flood started, the storm posted all 3000 messages,
+  the app ACTED on them, and the flood was still producing across the assertions
+  (11 -> 17). Each new assertion was confirmed able to fail by breaking it.
+  The keeper: **`PostMessageW(NULL, ...)` SUCCEEDS** - it posts to the calling
+  thread's own queue - so a storm aimed at nobody still counts 3000 accepted
+  posts, and only the app-acted-on-it oracle catches it. A post count is a floor,
+  never the oracle; the note lives in `Send-TestClickStorm`'s header.
+  Running the floor for it turned up **T409**, which is the more expensive
+  find: `zig build test-agent` **HANGS** - both its test binaries blocked at
+  zero CPU, reproduced twice on an otherwise idle box, killed at 30 and 20
+  min. Run each binary directly and sequentially and both pass completely
+  (3707/0 and 3779/0), so the tests are fine and the CONCURRENCY is not -
+  `test-agent` starts its two binaries a second apart. Very likely the real
+  root cause of T401, which blamed a concurrent acceptance script; nothing was
+  concurrent here. A floor gate that hangs stalls every turn with no output
+  and no failure, which is the worst shape a gate can fail in.
+  Validation: `focus-defer.ps1` ALL PASS (17) x4, `-NegativeControl` red as
+  designed, both `zig build test` lanes exit 0, P1-P3 ALL PASS; agent lane
+  verified binary-by-binary per T409.
+
 - 2026-08-03 - **T104 done - `-e` was never the parser's fault; it was the agent
   gate.** The task said "implement `-e` arg collection in the win32 CLI". Nothing
   needed implementing: `parseManuallyHook` has always built `initial-command`,

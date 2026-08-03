@@ -1245,16 +1245,23 @@ public class GhozttyTestDesktop {
     // of focus changes arriving faster than the GUI thread drains them, which
     // MouseEvent's per-click settling sleeps (~100ms) deliberately prevent.
     // Client coordinates, since every target is a different window.
-    public bool ClickStorm(IntPtr[] targets, int rounds, int cx, int cy) {
-        return (bool)Run(delegate() {
+    //
+    // Returns the number of messages ACCEPTED (T107): PostMessageW fails when
+    // the target thread's queue is full (the default cap is ~10000 posted
+    // messages) or the window has died, and the whole point of this call is a
+    // load shape - one that silently posted nothing would leave every
+    // "under load" assertion downstream passing against no load at all.
+    public int ClickStorm(IntPtr[] targets, int rounds, int cx, int cy) {
+        return (int)Run(delegate() {
             IntPtr lp = PackPoint(cx, cy);
+            int posted = 0;
             for (int r = 0; r < rounds; r++) {
                 foreach (IntPtr t in targets) {
-                    PostMessageW(t, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, lp);
-                    PostMessageW(t, WM_LBUTTONUP, IntPtr.Zero, lp);
+                    if (PostMessageW(t, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, lp)) posted++;
+                    if (PostMessageW(t, WM_LBUTTONUP, IntPtr.Zero, lp)) posted++;
                 }
             }
-            return true;
+            return posted;
         });
     }
 
@@ -2140,6 +2147,18 @@ than the GUI thread drains them, which the same 1500 clicks through
 Send-TestMouse would stretch to about four minutes. -X/-Y are CLIENT
 coordinates (every target is a different window) and default to a point that
 is inside any surface.
+
+Returns the number of messages ACCEPTED, which is 2 * Rounds * Targets.Count
+when every post landed. ASSERT IT (T107): a storm that posted nothing - dead
+window, full queue - returns instantly and leaves every "under load"
+assertion after it passing against no load.
+
+But the count is a floor, not the oracle, and it was MEASURED not assumed
+(T107 break-tests): an INVALID handle makes PostMessageW fail and the count
+catches it, while a NULL handle SUCCEEDS - Windows posts to the calling
+thread's own queue - so 3000 messages can be accepted by nobody. Always pair
+the count with an oracle that the APP acted on the clicks: focus landing on
+the storm's last target, which the storm ends every round on.
 #>
 function Send-TestClickStorm {
     param(
