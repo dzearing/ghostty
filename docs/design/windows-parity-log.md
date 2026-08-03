@@ -6971,3 +6971,42 @@ Validation: both lanes, `test-agent`, P1-P3, and `viewer-panes.ps1` ALL PASS
 WebView2: `document title: t375`, read back on a pane that was called
 `127.0.0.1` one line earlier - the fallback being replaced by the document is
 the only thing that proves both new slots landed where they were declared.
+
+## 2026-08-02 - T90g split, and T395: a split off a viewer starts where the file is
+
+T90g came up as `next` with four legs left in it, and they are not one context:
+a WebView2 COM event-sink build-out, a decision that has gone stale against the
+Mac, and two independent features. Split into **T394** (accelerator forwarding
+for app chords - a focused viewer swallows every app keybind today, since
+`ViewerPane.zig` has no key path at all), **T395** (this one), **T396** (the
+three palette entries) and **T397** (the hero tile).
+
+T397 is worth the row on its own. T90a S13 pinned "viewer leaves are EXCLUDED
+from hero mode, Mac parity". **Mac has since changed**: `HeroModeView.swift:11`
+now reads "Every pane participates: terminals and viewers alike", and
+`HeroCarouselView.swift:398` snapshots a viewer with `WKWebView.takeSnapshot`.
+Meanwhile win32 counts a viewer as a tile slot and paints nothing into it - a
+hole, which is neither answer. Decision before code.
+
+T395 itself: `Window.newSplitAt` had two ways to hand a new pane a cwd and
+neither could see a viewer - `buildRemoteInherit` asks the split-parent
+SURFACE, which is null for a viewer, and the plain local path has no cwd
+machinery at all. Now `viewer_content.splitWorkingDirectory` (pure, dirname of
+the viewed file, null for a website) fills the gap on all three baton paths,
+and an explicit `--working-directory` still wins.
+
+The lesson is in the negative control. "No override" is NOT "no cwd": the core
+already seeds a new surface from the last focused TERMINAL's pwd
+(`apprt/surface.zig:194-201`), and focusing a viewer does not change that,
+because a viewer is not a core surface. So the first control - "a web viewer
+split does not land in the file's directory" - FAILED, on correct code: the
+last focused terminal happened to be the pane the file case had just created
+there. Rewritten so the fallback is a KNOWN third directory, the two cases are
+told apart by which of two REAL answers wins, and both halves are now
+assertions instead of one being an accident.
+
+Validation: both lanes, `test-agent`, P1-P3, and `viewer-panes.ps1` ALL PASS
+(111, up from 96). The none-lane unit was made to fail on purpose first, so it
+is discovered rather than silently absent. The script runs with persistence
+OFF by design, so the agent path was checked by a separate live probe with it
+ON.

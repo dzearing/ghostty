@@ -138,6 +138,28 @@ pub fn baseDirectory(path: []const u8) ?[]const u8 {
     return std.fs.path.dirname(path);
 }
 
+/// The working directory a TERMINAL split created FROM a viewer pane starts
+/// in (T395; Mac `splitConfigFromViewer`,
+/// `BaseTerminalController.swift:3048-3054`): the viewed FILE's own directory.
+///
+/// A viewer runs no shell, so a split off one has no parent cwd to inherit —
+/// without this it lands in whatever the agent or the app process happens to
+/// call home, which is never where the user is looking. The file's directory
+/// is the only cwd a viewer actually knows.
+///
+/// Null means "no override", and every non-file case says that: a website has
+/// no directory to speak of (Mac's `fileURL` is nil there), and neither does a
+/// pane whose location did not resolve to a usable path. Borrowed from
+/// `file_path`.
+pub fn splitWorkingDirectory(file_path: ?[]const u8) ?[]const u8 {
+    const path = file_path orelse return null;
+    const dir = baseDirectory(path) orelse return null;
+    // A dirname can come back empty for a bare relative name ("README.md").
+    // Handing "" to the surface config would be a cwd of nowhere, so it is the
+    // same answer as having none.
+    return if (dir.len == 0) null else dir;
+}
+
 /// The host part of a `scheme://` URL — `https://user@example.com:8080/x` is
 /// `example.com`. Null when the location has no authority at all
 /// (`about:blank`, a bare path), which is the case the caller falls back on.
@@ -637,6 +659,31 @@ test "extension: no dot, no query, and a dotfile has none" {
     try testing.expectEqualStrings("", extension("Makefile"));
     try testing.expectEqualStrings("", extension(".gitignore"));
     try testing.expectEqualStrings("", extension("/a.b/c"));
+}
+
+test "splitWorkingDirectory: the viewed file's directory, and nothing else" {
+    // The whole point: a terminal split off a file viewer starts where the
+    // file is (Mac `splitConfigFromViewer`).
+    try testing.expectEqualStrings(
+        "C:\\src\\docs",
+        splitWorkingDirectory("C:\\src\\docs\\design.md").?,
+    );
+    try testing.expectEqualStrings(
+        "C:/src/docs",
+        splitWorkingDirectory("C:/src/docs/design.md").?,
+    );
+
+    // A web viewer has no `file_path` at all, which is Mac's nil `fileURL`:
+    // no override, so the split keeps whatever it would have inherited.
+    try testing.expect(splitWorkingDirectory(null) == null);
+
+    // A bare name has no directory part. `dirname` answers "" or null
+    // depending on the shape; either way a cwd of nowhere must not be
+    // forwarded as if it were a real one.
+    try testing.expect(splitWorkingDirectory("README.md") == null);
+
+    // A drive root still names a directory, so it is a legitimate answer.
+    try testing.expectEqualStrings("C:\\", splitWorkingDirectory("C:\\a.md").?);
 }
 
 test "filePath: file:// unwrapping and percent decoding" {

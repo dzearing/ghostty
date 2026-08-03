@@ -18,6 +18,7 @@ const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
+const viewer_content = @import("viewer_content.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
@@ -2719,16 +2720,64 @@ pub fn newSplitAt(
     const tab = self.findTabIndex(at) orelse return null;
     const handle = self.findHandle(tab, at) orelse return null;
 
+    // T395: a viewer parent has no shell, so there is no parent cwd to
+    // inherit — Mac takes the viewed FILE's own directory instead
+    // (`splitConfigFromViewer`). Borrowed from the viewer, which outlives this
+    // call; null (a website, or no usable path) means "no override".
+    const viewer_cwd: ?[]const u8 = if (at.viewer()) |v|
+        viewer_content.splitWorkingDirectory(v.file_path)
+    else
+        null;
+
     // T68: a plain split in a remote window opens a fresh session on the
     // SAME machine/connection, inheriting the split-parent pane's command +
     // cwd (Mac parity). IPC-provided overrides (the pending baton) win.
     var inherit: ?RemoteInherit = null;
     defer if (inherit) |*i| i.deinit(alloc);
-    if (self.pending_surface_overrides == null) {
+    // Backs the baton whenever THIS function is the one that supplies it.
+    // Declared here so it outlives the (synchronous) surface init that reads
+    // it. The baton itself is `*const`, so the viewer cwd is filled into a copy
+    // rather than into whatever the IPC handler still owns.
+    var viewer_overrides: Surface.Overrides = .{};
+    var baton_ours = false;
+    if (self.pending_surface_overrides) |existing| {
+        // An IPC baton is already on the table (`+split`, which carries the
+        // pane/window name env even with nothing else explicit). An explicit
+        // `--working-directory` wins; a null one is the same "nothing said"
+        // the no-baton path below treats as inheritable, so a viewer parent
+        // still gets to answer it.
+        if (viewer_cwd) |dir| fill: {
+            viewer_overrides = existing.*;
+            if (viewer_overrides.remote) |*r| {
+                if (r.working_directory != null) break :fill;
+                r.working_directory = dir;
+            } else {
+                if (viewer_overrides.working_directory != null) break :fill;
+                viewer_overrides.working_directory = dir;
+            }
+            self.pending_surface_overrides = &viewer_overrides;
+            baton_ours = true;
+        }
+    } else {
         inherit = self.buildRemoteInherit(at.surface());
-        if (inherit) |*i| self.pending_surface_overrides = &i.overrides;
+        if (inherit) |*i| {
+            // The agent/remote OPEN takes its cwd here. `RemoteInherit.deinit`
+            // frees only what IT allocated (`.cwd`), so a borrowed slice is
+            // safe to hand it.
+            if (viewer_cwd) |dir| {
+                if (i.overrides.remote) |*r| r.working_directory = dir;
+            }
+            self.pending_surface_overrides = &i.overrides;
+            baton_ours = true;
+        } else if (viewer_cwd) |dir| {
+            // Plain local ConPTY pane: the same value, through the config seam
+            // `Surface.init` already applies for an IPC `--working-directory`.
+            viewer_overrides.working_directory = dir;
+            self.pending_surface_overrides = &viewer_overrides;
+            baton_ours = true;
+        }
     }
-    defer if (inherit != null) {
+    defer if (baton_ours) {
         self.pending_surface_overrides = null;
     };
 

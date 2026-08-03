@@ -499,7 +499,91 @@ try {
         Assert (@($vpyLeaves | Where-Object { $_.type -eq 'terminal' }).Count -eq 1) 'the inline split stayed a terminal'
     }
 
-    # --- 11. app survived all of it ------------------------------------------
+    # --- 11. a terminal split FROM a viewer starts where the file is (T395) --
+    # A viewer runs no shell, so there is no parent cwd to inherit; Mac takes
+    # the viewed FILE's own directory (`splitConfigFromViewer`). The fixture
+    # dir is deliberately somewhere the app was NEVER started from, so "it
+    # matched" cannot be the app's own cwd leaking through.
+    #
+    # The control needs care, because "no override" is NOT "no cwd": the core
+    # already seeds a new surface from the last focused TERMINAL's pwd
+    # (`apprt/surface.zig:194-201`), and focusing a viewer does not change that
+    # -- a viewer is not a core surface. So the fallback is a REAL directory,
+    # and the two cases are told apart by making it a KNOWN one: a base pane in
+    # `$t395other`. The file viewer must beat it; the web viewer must not.
+    $t395dir = Join-Path $env:TEMP 'ghoztty-t395-splitcwd'
+    $t395other = Join-Path $env:TEMP 'ghoztty-t395-other'
+    New-Item -ItemType Directory -Force -Path $t395dir | Out-Null
+    New-Item -ItemType Directory -Force -Path $t395other | Out-Null
+    Set-Content -Path (Join-Path $t395dir 'doc.md') -Value "# T395`n" -Encoding utf8
+    $t395doc = Join-Path $t395dir 'doc.md'
+
+    # Normalizes for comparison: `+list` reports the cwd as the shell sees it,
+    # which can differ from the fixture path in separator and case only.
+    function Test-SameDir([string]$a, [string]$b) {
+        if (-not $a -or -not $b) { return $false }
+        $na = $a.Replace('/', '\').TrimEnd('\')
+        $nb = $b.Replace('/', '\').TrimEnd('\')
+        return $na -ieq $nb
+    }
+
+    # Reads a leaf's cwd, retrying: it lands on the leaf a moment after the
+    # pane does (seeded from termio by the first `+list` that sees it).
+    function Get-LeafCwd($target, $name, $want) {
+        $cwd = ''
+        for ($t = 0; $t -lt 25; $t++) {
+            $leaf = Get-Leaf $target $name
+            if ($leaf) {
+                $cwd = $leaf.working_directory
+                if (Test-SameDir $cwd $want) { break }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        return $cwd
+    }
+
+    # The known fallback: a terminal in a directory that is NOT the file's.
+    # It is the last focused core surface from here on, so it is what a split
+    # gets when the viewer contributes nothing.
+    $r = Invoke-Verb @('+split', '--target=vp', '--name=t395base', "--working-directory=$t395other")
+    Assert ($r.Code -eq 0) "+split --working-directory=<other dir> exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Leaf 'vp' 't395base')) 'the base terminal exists'
+    Assert (Test-SameDir (Get-LeafCwd 'vp' 't395base' $t395other) $t395other) 'the base terminal is in the other dir'
+
+    # NEGATIVE CONTROL first, while the fallback is unambiguous: a WEB viewer
+    # has no file (Mac's `fileURL` is nil), so it must contribute nothing and
+    # the split must land on the fallback. Without this, the assertion below
+    # passes for a fix that hands every split off a viewer some fixed path.
+    $r = Invoke-Verb @('+split', '--target=vp', '--name=t395web', "--view=$blank")
+    Assert ($r.Code -eq 0) "+split --view=$blank exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Leaf 'vp' 't395web')) 'the web viewer pane exists'
+    $r = Invoke-Verb @('+split', '--pane=t395web', '--name=t395webterm')
+    Assert ($r.Code -eq 0) "+split off the web viewer exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Leaf 'vp' 't395webterm')) 'the terminal split off the web viewer exists'
+    $wcwd = Get-LeafCwd 'vp' 't395webterm' $t395other
+    Assert (Test-SameDir $wcwd $t395other) "a web viewer contributes no cwd, so the fallback stands (got '$wcwd')"
+
+    # And the case under test: a FILE viewer's directory beats that fallback.
+    $r = Invoke-Verb @('+split', '--target=vp', '--name=t395doc', "--view=$t395doc")
+    Assert ($r.Code -eq 0) "+split --view=<file in the fixture dir> exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Leaf 'vp' 't395doc')) 'the file viewer pane exists'
+    # No `--working-directory`, so nothing but the viewer parent can answer.
+    $r = Invoke-Verb @('+split', '--pane=t395doc', '--name=t395term')
+    Assert ($r.Code -eq 0) "+split off the file viewer exits 0 (got $($r.Code))"
+    $t395term = Wait-Leaf 'vp' 't395term'
+    Assert ($null -ne $t395term) 'the terminal split off the file viewer exists'
+    if ($t395term) {
+        Assert ($t395term.type -eq 'terminal') "the split off a viewer is a terminal (got $($t395term.type))"
+        $cwd = Get-LeafCwd 'vp' 't395term' $t395dir
+        Assert (Test-SameDir $cwd $t395dir) "it starts in the viewed file's directory (got '$cwd', want '$t395dir')"
+        Assert (-not (Test-SameDir $cwd $t395other)) 'and NOT in the last-focused-terminal fallback'
+    }
+
+    # The fixture dirs are left in %TEMP% on purpose: a terminal pane's cwd IS
+    # one of them, so Windows would refuse to remove it anyway, and the next
+    # run recreates them idempotently.
+
+    # --- 12. app survived all of it ------------------------------------------
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
 } finally {
