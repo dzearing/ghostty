@@ -67,7 +67,16 @@ extension AppDelegate {
                 checkboxes.append((agent, box))
                 stack.addArrangedSubview(box)
             }
-            stack.frame = NSRect(x: 0, y: 0, width: 320, height: CGFloat(agents.count) * 22)
+            let note = NSTextField(wrappingLabelWithString:
+                "Integrations add Ghoztty's status banner, skills, and hooks under each agent's config folder (e.g. ~/.claude). You can remove them anytime from Set Up Agent Integrations…")
+            note.font = .preferredFont(forTextStyle: .caption1)
+            note.textColor = .secondaryLabelColor
+            stack.addArrangedSubview(note)
+            note.widthAnchor.constraint(equalToConstant: 320).isActive = true
+            // Size the accessory to its content so long agent names, the note,
+            // and larger Dynamic Type / bold-text settings are never clipped.
+            stack.layoutSubtreeIfNeeded()
+            stack.frame = NSRect(origin: .zero, size: stack.fittingSize)
             alert.accessoryView = stack
         }
 
@@ -90,8 +99,10 @@ extension AppDelegate {
 
             DispatchQueue.main.async {
                 if let cliFailure {
+                    let agentNote = chosen.isEmpty ? "" :
+                        " The agent integrations you selected were not set up either — run Set Up Agent Integrations… to add them."
                     Self.showSetupAlert(title: "Command Setup Failed",
-                        message: "\(cliFailure) You can try again from the Ghoztty menu.", style: .warning)
+                        message: "\(cliFailure) You can try again from the Ghoztty menu.\(agentNote)", style: .warning)
                 } else if results.contains(where: { if case .failed = $0.1 { return true } else { return false } }) {
                     Self.showSetupAlert(title: "Some Integrations Failed",
                         message: AgentIntegrationService.summary(results) + ". Re-run Set Up Agent Integrations… to try again.", style: .warning)
