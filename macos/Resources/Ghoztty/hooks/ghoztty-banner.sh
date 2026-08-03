@@ -131,10 +131,30 @@ read_field() { # field
     [ -f "$STATE_FILE" ] && jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null
 }
 
-# Merge key/value pairs into the state file with a single jq call.
+# Merge key/value pairs into the state file. Serialized with a mkdir mutex (the
+# script is invoked BOTH by event hooks and directly by the agent against the
+# same pane, so concurrent read-modify-writes would otherwise lose updates), a
+# UNIQUE temp (a shared temp name let two writers corrupt the file), and a
+# self-heal: a corrupt/unreadable state file resets to `{}` instead of wedging
+# the banner blank forever.
 jq_merge() { # k1 v1 [k2 v2 ...]
-    local cur='{}'
-    [ -f "$STATE_FILE" ] && cur=$(cat "$STATE_FILE" 2>/dev/null) && [ -n "$cur" ] || cur='{}'
+    local lock="$STATE_FILE.lock" tmp cur='{}' locked=0 tries=0
+    while :; do
+        if mkdir "$lock" 2>/dev/null; then locked=1; break; fi
+        # Reclaim a stale lock left behind by a killed holder (>1 min old).
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$lock" 2>/dev/null; continue
+        fi
+        tries=$((tries + 1)); [ "$tries" -gt 30 ] && break  # ~3s cap, then best-effort
+        sleep 0.1 2>/dev/null || true
+    done
+    if [ -f "$STATE_FILE" ]; then
+        cur=$(cat "$STATE_FILE" 2>/dev/null)
+        # Self-heal: never merge into unparseable state — reset it instead.
+        if [ -z "$cur" ] || ! printf '%s' "$cur" | jq empty >/dev/null 2>&1; then
+            cur='{}'
+        fi
+    fi
     local prog='.' i=0 jqargs=()
     while [ $# -ge 2 ]; do
         i=$((i + 1))
@@ -143,9 +163,17 @@ jq_merge() { # k1 v1 [k2 v2 ...]
         shift 2
     done
     # printf, not echo: banner text carries literal `\n`, which some shells'
-    # echo would expand into real newlines and corrupt the JSON.
-    printf '%s\n' "$cur" | jq "${jqargs[@]}" "$prog" > "$STATE_FILE.tmp" &&
-        mv "$STATE_FILE.tmp" "$STATE_FILE"
+    # echo would expand into real newlines and corrupt the JSON. Unique temp in
+    # the state dir (same filesystem) keeps the final rename atomic.
+    if tmp=$(mktemp "$STATE_DIR/.merge.XXXXXX" 2>/dev/null); then
+        if printf '%s\n' "$cur" | jq "${jqargs[@]}" "$prog" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$STATE_FILE"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+    [ "$locked" = 1 ] && rmdir "$lock" 2>/dev/null
+    return 0
 }
 
 # Strip control characters that would corrupt an OSC sequence or IPC payload.
@@ -161,6 +189,27 @@ esc_cell() {
 # Render a PR URL as a clickable markdown link whose visible text is the URL.
 pr_link() {
     printf '[%s](%s)' "$1" "$1"
+}
+
+# Escape markdown-active characters so untrusted text (e.g. the auto-seeded
+# prompt paraphrase) can't inject a clickable link or emphasis into the banner.
+# The banner renderer treats backslash as an escape, so `\[` renders a literal [.
+esc_md() {
+    printf '%s' "$1" | sed 's/[][()`*_~\\]/\\&/g'
+}
+
+# True only for a plain http(s) URL containing no characters that could break
+# out of a markdown ()/[] link — guards the PR link against a crafted --pr value.
+valid_url() {
+    case "$1" in http://*|https://*) ;; *) return 1 ;; esac
+    case "$1" in *[\ \"\<\>\`\(\)\[\]]*) return 1 ;; esac
+    return 0
+}
+
+# Render the PR field as a clickable link ONLY when it is a safe URL, otherwise
+# as plain escaped text — a crafted value can never forge a link.
+pr_render() {
+    if valid_url "$1"; then pr_link "$1"; else esc_md "$1"; fi
 }
 
 send_osc() { # single-line text
@@ -244,7 +293,7 @@ render() {
         }
         add_row "Goal" "$goal"
         add_row "Bugs fixed" "$bugs"
-        add_row "Prompt" "$asked"
+        add_row "Prompt" "$(esc_md "$asked")"
         add_row "Status" "$statline"
 
         # Title as an `## ` h2 heading on its own line above the table, so it
@@ -258,15 +307,15 @@ render() {
         fi
         # "Last result" lives below the table as its own block: it may be a
         # multi-line checklist/bullet list (items joined with \n by the model),
-        # which a single-line table cell can't hold. Passed raw so its own \n
-        # line breaks survive to the renderer.
+        # which a single-line table cell can't hold. Its own `\n` line breaks
+        # survive to the renderer; esc_cell only neutralizes a stray `|`.
         if [ -n "$did" ]; then
             [ -n "$text" ] && text="$text\n"
-            text="$text**Last result**\n$did"
+            text="$text**Last result**\n$(esc_cell "$did")"
         fi
         if [ -n "$pr" ]; then
             [ -n "$text" ] && text="$text\n"
-            text="$text**PR** $(pr_link "$pr")"
+            text="$text**PR** $(pr_render "$pr")"
         fi
         ghoztty +set-banner --target="$pane" "$text" >/dev/null 2>&1 && return 0
     fi
@@ -281,10 +330,10 @@ render() {
     }
     add_seg "Goal" "$goal"
     add_seg "Bugs fixed" "$bugs"
-    add_seg "Prompt" "$asked"
+    add_seg "Prompt" "$(esc_md "$asked")"
     add_seg "Status" "$statline"
     add_seg "Last result" "$did"
-    [ -n "$pr" ] && { [ -n "$line" ] && line="$line$sep"; line="$line**PR:** $(pr_link "$pr")"; }
+    [ -n "$pr" ] && { [ -n "$line" ] && line="$line$sep"; line="$line**PR:** $(pr_render "$pr")"; }
     send_osc "$line"
 }
 
