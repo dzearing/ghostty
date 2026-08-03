@@ -5,36 +5,33 @@ import Foundation
 /// dedicated file. camelCase event names; version 1 envelope.
 struct CopilotHookSpec: HookSpec {
     let ownership: HookOwnership = .dedicatedFile
-    let marker = "ghoztty-managed"
+    let marker = GhosttyManagedMarker.token
 
     func hookFileURL(homeDirectoryURL: URL) -> URL {
         homeDirectoryURL.appendingPathComponent(".copilot/hooks/ghoztty.json")
     }
 
     func renderedFile(bannerScriptPath: String) -> String {
-        func hook(_ cmd: String, _ timeout: Int) -> String {
-            "[ { \"type\": \"command\", \"bash\": \(jsonString(cmd)), \"timeoutSec\": \(timeout) } ]"
+        // Build the document as a dictionary and serialize with JSONSerialization
+        // (deterministic sorted keys) — the same idiom ClaudeHookSpec/HookComponent
+        // use — rather than hand-templating JSON and re-implementing escaping.
+        func hook(_ purpose: HookPurpose) -> [[String: Any]] {
+            [["type": "command",
+              "bash": HookCommand.perEvent(purpose: purpose, bannerScriptPath: bannerScriptPath, runtime: .copilot),
+              "timeoutSec": 10]]
         }
-        let start = HookCommand.perEvent(purpose: .sessionStart, bannerScriptPath: bannerScriptPath, runtime: .copilot)
-        let prompt = HookCommand.perEvent(purpose: .promptSubmit, bannerScriptPath: bannerScriptPath, runtime: .copilot)
-        let stop = HookCommand.perEvent(purpose: .stop, bannerScriptPath: bannerScriptPath, runtime: .copilot)
-        return """
-        {
-          "version": 1,
-          "_comment": "\(marker)",
-          "hooks": {
-            "sessionStart": \(hook(start, 10)),
-            "userPromptSubmitted": \(hook(prompt, 10)),
-            "agentStop": \(hook(stop, 10))
-          }
-        }
-        """
-    }
-
-    private func jsonString(_ s: String) -> String {
-        let escaped = s
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"\(escaped)\""
+        let object: [String: Any] = [
+            "version": 1,
+            "_comment": marker,
+            "hooks": [
+                "sessionStart": hook(.sessionStart),
+                "userPromptSubmitted": hook(.promptSubmit),
+                "agentStop": hook(.stop),
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+            let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
     }
 }

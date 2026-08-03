@@ -33,4 +33,20 @@ struct CopilotHookSpecTests {
         #expect(!copilot.contains("awk"))
         #expect(!copilot.contains(" | "))
     }
+
+    // H20/H32: the rendered file must be valid JSON that round-trips to the
+    // expected structure — not just contain the right substrings.
+    @Test func renderedFileIsValidJSON() throws {
+        let spec = CopilotHookSpec()
+        let path = "/Users/x/.config/ghoztty/hooks/ghoztty-banner.sh"
+        let file = spec.renderedFile(bannerScriptPath: path)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(file.utf8)) as? [String: Any])
+        #expect(json["version"] as? Int == 1)
+        #expect(json["_comment"] as? String == spec.marker)
+        let hooks = try #require(json["hooks"] as? [String: Any])
+        let prompt = try #require(hooks["userPromptSubmitted"] as? [[String: Any]])
+        #expect(prompt.first?["bash"] as? String
+            == HookCommand.perEvent(purpose: .promptSubmit, bannerScriptPath: path, runtime: .copilot))
+        #expect(prompt.first?["timeoutSec"] as? Int == 10)
+    }
 }
