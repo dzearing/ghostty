@@ -144,6 +144,13 @@ focused: bool = false,
 
 state: State = .idle,
 
+/// Whether a navigation has COMPLETED at the current location (Mac's
+/// `pageLoaded`). Cleared by every `navigate` and set from
+/// `onNavigationCompleted`, so it means "there is a document here to act on"
+/// rather than "a controller exists". `+reload` reads it to tell a reload from
+/// a first load (T390).
+page_loaded: bool = false,
+
 /// Why there will be no content. Set with `.failed`, and the error card's text.
 failure: ?webview2.Failure = null,
 
@@ -406,6 +413,11 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     const dup = try alloc.dupeZ(u8, url);
     if (self.location) |l| alloc.free(l);
     self.location = dup;
+    // The document that WAS here is not the document being asked for, so the
+    // pane has no completed load again until `onNavigationCompleted` says so.
+    // Left stale, a `+reload` arriving during a navigation would re-render the
+    // OLD file into the NEW page (T390).
+    self.page_loaded = false;
     if (self.home_location == null) {
         self.home_location = alloc.dupeZ(u8, url) catch null;
     }
@@ -781,16 +793,55 @@ fn onNavigationCompleted(
 ) com.HRESULT {
     _ = sender;
     const self = p.pane orelse return com.S_OK;
-    // Web mode has nothing to inject — the page IS the content.
-    if (!self.mode.isFile()) return com.S_OK;
     // A failed load has no `window.__viewer` to call, and injecting into
-    // Chromium's own error page would throw in someone else's document.
+    // Chromium's own error page would throw in someone else's document. It is
+    // also not a page `+reload` may re-render into, which is why the flag is
+    // set AFTER this check and for both modes (T390).
     if (args) |a| if (!a.isSuccess()) {
         log.warn("viewer template failed to load; no content injected", .{});
         return com.S_OK;
     };
+    self.page_loaded = true;
+    // Web mode has nothing to inject — the page IS the content.
+    if (!self.mode.isFile()) return com.S_OK;
     self.renderFileContent();
     return com.S_OK;
+}
+
+/// Reload this pane's content in place: the `+reload` verb, and (T391) the
+/// file watcher's re-render. Mac's `ViewerView.reloadContent`, whose three-way
+/// branch lives in `viewer_content.reloadPlan` so it is checkable without a
+/// browser.
+///
+/// Safe to call in any state — a pane with no controller has no completed load
+/// either, so it takes the `full_load` branch, and `applyNavigation` is already
+/// a no-op until there is something to navigate.
+pub fn reloadContent(self: *ViewerPane) void {
+    switch (content.reloadPlan(self.mode, self.page_loaded)) {
+        .full_load => self.applyNavigation(),
+        .rerender => self.renderFileContent(),
+        .refetch => self.refetchFromOrigin(),
+    }
+}
+
+/// Re-fetch the current web page from its ORIGIN, bypassing caches.
+///
+/// `Reload()` is a normal reload and may serve the cache, which is the answer
+/// the user ran `+reload` to get rid of; DevTools' `Page.reload` with
+/// `ignoreCache` is the only way to say it through this API. The plain reload
+/// stays as the fallback because a refused DevTools call must still reload the
+/// page rather than do nothing (design P8).
+fn refetchFromOrigin(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const method = std.unicode.utf8ToUtf16LeStringLiteral(content.devtools_reload_method);
+    const params = std.unicode.utf8ToUtf16LeStringLiteral(content.devtools_reload_params);
+    if (web.callDevToolsProtocolMethod(method, params, null)) return;
+
+    log.warn("Page.reload was refused; falling back to a cache-allowed reload", .{});
+    if (!web.reload()) log.warn("Reload failed for this pane", .{});
 }
 
 /// Read the viewed file and hand it to the page. Every failure below ends in
@@ -1936,6 +1987,119 @@ test "host floor: a real controller on a real window, on this box" {
     // here would mean the shim was injected and the toolbar was not — the exact
     // split the single-blob rule exists to make impossible.
     try testing.expectEqualStrings("toolbar-ran", pane.active_heading.?);
+
+    // ------------------------------------------------------------------
+    // T390: `+reload`, both modes
+    // ------------------------------------------------------------------
+    //
+    // Two vtable slots that were inside opaque runs until now — `Reload` (31)
+    // and `CallDevToolsProtocolMethod` (36) — plus the branch that chooses
+    // between them. A wrong index in either is silence or a corrupt call, and
+    // nothing but a live runtime can tell.
+
+    // WEB. The page reports which fetch it came from, so "req2" is the
+    // document in front of the user having been re-fetched. The response is
+    // cacheable and still fresh, so a cache-allowed reload would legitimately
+    // have shown "req1" again — that is the failure this asserts against, and
+    // `no_cache` is the same claim seen from the request side (Chromium sends
+    // `no-cache` for a bypassing reload, `max-age=0` for an ordinary one).
+    var reload_page: ReloadPage = undefined;
+    try reload_page.start();
+    defer reload_page.stop();
+    const reload_url = try std.fmt.allocPrint(
+        alloc,
+        "http://127.0.0.1:{d}" ++ ReloadPage.path,
+        .{reload_page.port},
+    );
+    defer alloc.free(reload_url);
+
+    try pane.navigate(alloc, reload_url);
+    try testing.expect(!pane.page_loaded);
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.active_heading != null and std.mem.eql(u8, p.active_heading.?, "req1");
+        }
+    }.ready, &pane);
+    try testing.expectEqualStrings("req1", pane.active_heading.?);
+    // The completed load is what makes the next call a RELOAD rather than a
+    // first load, and it is set for web mode too (nothing is injected there,
+    // so the flag is the only thing that navigation-completed leaves behind).
+    try testing.expect(pane.page_loaded);
+
+    pane.reloadContent();
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.active_heading != null and std.mem.eql(u8, p.active_heading.?, "req2");
+        }
+    }.ready, &pane);
+    log.warn("reload: active={?s} requests={d} no_cache={}", .{
+        pane.active_heading,
+        reload_page.requests.load(.acquire),
+        reload_page.no_cache.load(.acquire),
+    });
+    try testing.expectEqualStrings("req2", pane.active_heading.?);
+    try testing.expectEqual(@as(u32, 2), reload_page.requests.load(.acquire));
+    try testing.expect(reload_page.no_cache.load(.acquire));
+
+    // FILE. The oracle is the FILE ON DISK changing under a pane that is
+    // already showing it: a re-render that did not re-read would report the
+    // two headings it already had. (`viewer.js` restores scroll across the
+    // swap; that is the shared renderer's half and is not re-proven here.)
+    try tmp.dir.writeFile(.{
+        .sub_path = "t90e.md",
+        .data = "# Alpha\n\n## Beta\n\n## Gamma\n",
+    });
+    try pane.navigate(alloc, md_path);
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.headings.len == 3;
+        }
+    }.ready, &pane);
+    log.warn("reload: file grew to headings={d}", .{pane.headings.len});
+    try testing.expectEqual(@as(usize, 3), pane.headings.len);
+
+    // The reloaded file has TWO headings, not one: the page reports a table of
+    // contents only from two headings up ("one heading is a title" —
+    // `viewer.js:indexHeadings`), so a one-heading file would report zero and
+    // be indistinguishable from a render that failed outright. The names change
+    // as well as the count, which is what separates "re-read the file" from
+    // "re-showed the two headings it already had".
+    try tmp.dir.writeFile(.{ .sub_path = "t90e.md", .data = "# Delta\n\n## Epsilon\n" });
+    pane.reloadContent();
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.headings.len == 2 and std.mem.eql(u8, p.headings[0].text, "Delta");
+        }
+    }.ready, &pane);
+    log.warn("reload: file re-rendered to headings={d} first={?s}", .{
+        pane.headings.len,
+        if (pane.headings.len > 0) pane.headings[0].text else null,
+    });
+    try testing.expectEqual(@as(usize, 2), pane.headings.len);
+    try testing.expectEqualStrings("Delta", pane.headings[0].text);
+    try testing.expectEqualStrings("Epsilon", pane.headings[1].text);
+}
+
+/// Pump the message loop until `ready` says so or `timeout_s` elapses.
+///
+/// A viewer test's every oracle is something a browser process does on the
+/// message loop, so "wait" here can never be a sleep: the callbacks that
+/// deliver the answer only run while messages are being dispatched.
+fn waitFor(
+    msg: *w32.MSG,
+    timeout_s: u64,
+    ready: *const fn (*ViewerPane) bool,
+    pane: *ViewerPane,
+) !void {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < timeout_s * std.time.ns_per_s) {
+        while (w32.PeekMessageW(msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(msg);
+            _ = w32.DispatchMessageW(msg);
+        }
+        if (ready(pane)) return;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
 }
 
 /// A loopback HTTP server serving one page, for the live bridge test.
@@ -2023,6 +2187,126 @@ const TestPage = struct {
             socket_rw.writeAllStream(conn.stream, html) catch continue;
             // `Connection: close` means the client waits for a FIN, so send one
             // explicitly rather than leaving it to the close above.
+            _ = std.os.windows.ws2_32.shutdown(
+                conn.stream.handle,
+                std.os.windows.ws2_32.SD_SEND,
+            );
+        }
+    }
+};
+
+/// A loopback HTTP server whose page CHANGES on every request, for the
+/// `+reload` test (T390).
+///
+/// The page reports the request number it was built from, so the pane's
+/// `active_heading` says which fetch the document in front of the user came
+/// from. That is the only way to tell a real re-fetch from a reload the
+/// browser answered out of its cache — the two are pixel-identical from
+/// outside, which is exactly why P8 pins the DevTools call.
+///
+/// The response is deliberately CACHEABLE (`max-age=600`): with a fresh cache
+/// entry available, a cache-allowed reload is entitled to skip the network
+/// entirely, so a stale answer here is a genuine possibility rather than a
+/// hypothetical.
+const ReloadPage = struct {
+    /// The one path this server answers, lowercase because the request line is
+    /// matched against a lowercased copy.
+    const path = "/t390.html";
+
+    server: std.net.Server,
+    port: u16,
+    thread: std.Thread,
+    /// Requests served so far. Written by the serving thread, read by the
+    /// test — atomically, because they are different threads.
+    requests: std.atomic.Value(u32) = .init(0),
+    /// Whether the LAST request asked for a cache bypass. Chromium sends
+    /// `Cache-Control: no-cache` for a hard reload and `max-age=0` for a
+    /// normal one, so this is the request-side proof that `ignoreCache`
+    /// reached the wire.
+    no_cache: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *ReloadPage) !void {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.server = try addr.listen(.{ .reuse_address = true });
+        errdefer self.server.deinit();
+        self.port = self.server.listen_address.getPort();
+        self.requests = .init(0);
+        self.no_cache = .init(false);
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *ReloadPage) void {
+        self.server.deinit();
+        self.thread.join();
+    }
+
+    fn serve(self: *ReloadPage) void {
+        while (true) {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = socket_rw.readStream(conn.stream, buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            // ASCII-insensitive: header VALUES are not case-normalized by
+            // anyone, and matching only the lowercase spelling would make the
+            // oracle depend on Chromium's capitalization.
+            var lower_buf: [4096]u8 = undefined;
+            const lower = std.ascii.lowerString(lower_buf[0..total], buf[0..total]);
+
+            // Only the PAGE counts. Chromium asks every origin it visits for a
+            // `/favicon.ico` that was never offered, so a server that counted
+            // every request reported four fetches for two loads — and served
+            // the favicon request an HTML body carrying the next number, which
+            // put the page one ahead of the truth. Counting the document alone
+            // is what makes "requests == 2" mean "loaded twice".
+            if (std.mem.indexOf(u8, lower, "get " ++ path ++ " ") == null) {
+                socket_rw.writeAllStream(
+                    conn.stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ) catch {};
+                _ = std.os.windows.ws2_32.shutdown(
+                    conn.stream.handle,
+                    std.os.windows.ws2_32.SD_SEND,
+                );
+                continue;
+            }
+
+            self.no_cache.store(
+                std.mem.indexOf(u8, lower, "no-cache") != null,
+                .release,
+            );
+            const n = self.requests.fetchAdd(1, .acq_rel) + 1;
+
+            var body_buf: [512]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf,
+                \\<!doctype html><meta charset="utf-8"><title>t390</title>
+                \\<p>request {d}</p>
+                \\<script>
+                \\(function () {{
+                \\  var w = window.webkit && window.webkit.messageHandlers
+                \\    && window.webkit.messageHandlers.viewerTOC;
+                \\  if (!w) return;
+                \\  w.postMessage({{ type: "active", id: "req{d}" }});
+                \\}})();
+                \\</script>
+                \\
+            , .{ n, n }) catch continue;
+
+            var head_buf: [220]u8 = undefined;
+            const head = std.fmt.bufPrint(&head_buf,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
+                    "Cache-Control: max-age=600\r\n" ++
+                    "Content-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{body.len},
+            ) catch continue;
+            socket_rw.writeAllStream(conn.stream, head) catch continue;
+            socket_rw.writeAllStream(conn.stream, body) catch continue;
             _ = std.os.windows.ws2_32.shutdown(
                 conn.stream.handle,
                 std.os.windows.ws2_32.SD_SEND,

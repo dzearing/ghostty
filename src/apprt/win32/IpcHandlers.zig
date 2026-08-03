@@ -78,6 +78,8 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleVersion(ctx);
     } else if (std.mem.eql(u8, request.action, "set-banner")) {
         return try handleSetBanner(ctx, request);
+    } else if (std.mem.eql(u8, request.action, "reload")) {
+        return try handleReload(ctx, request);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});
@@ -1047,6 +1049,53 @@ fn handleSetBanner(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target});
 
     surface.setPaneBanner(if (args.clear) null else args.text);
+    return try ctx.alloc.dupe(u8, "{\"success\":true}");
+}
+
+/// `+reload` (T390): reload a named VIEWER pane's content in place. Website
+/// viewers re-fetch from origin bypassing caches; file viewers re-render
+/// preserving scroll. A window target reloads its focused pane.
+///
+/// The two terminal refusals are Mac's `handleReload` strings and they are
+/// DIFFERENT from each other on purpose: naming a terminal pane is a mistake
+/// about that pane, while naming a window whose focused pane happens to be a
+/// terminal is a mistake about which pane has focus, and the fix for each is
+/// not the same. Neither is the `is a viewer pane, not a terminal` string the
+/// terminal-only verbs use — that one points the opposite way.
+fn handleReload(ctx: Context, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try errorResponse(ctx.alloc, "--target is required for +reload", .{});
+
+    const entry = ctx.app.ipcLookup(target) orelse
+        return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
+
+    const view = switch (entry) {
+        .pane => |pane| pane.viewer() orelse return try errorResponse(
+            ctx.alloc,
+            "target '{s}' is a terminal pane, nothing to reload",
+            .{target},
+        ),
+        .window => w: {
+            const pane = targetPane(entry) orelse return try errorResponse(
+                ctx.alloc,
+                "target '{s}' is no longer alive",
+                .{target},
+            );
+            break :w pane.viewer() orelse return try errorResponse(
+                ctx.alloc,
+                "focused pane of '{s}' is a terminal pane, nothing to reload",
+                .{target},
+            );
+        },
+    };
+
+    view.reloadContent();
+    log.info("IPC: reloaded viewer '{s}'", .{target});
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 

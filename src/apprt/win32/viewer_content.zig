@@ -466,6 +466,44 @@ pub fn appendJsString(
 }
 
 // -------------------------------------------------------------------------
+// Reload (T390, design P8)
+// -------------------------------------------------------------------------
+
+/// What `+reload` should DO to a pane, given only what the pane knows about
+/// itself. Mac's `reloadContent` switch, lifted out of the COM plumbing so the
+/// three-way decision is checkable without a browser: the branch it picks is
+/// the whole behavioral contract of the verb, and the rest is one API call
+/// each.
+pub const ReloadPlan = enum {
+    /// Navigate from scratch, the same way the pane's first load did. The
+    /// answer whenever there is no completed page to reload — reloading
+    /// nothing is what leaves a pane blank forever.
+    full_load,
+    /// Web mode: re-fetch from ORIGIN, bypassing caches. An explicit reload
+    /// exists to pick up server-side changes, so a cache hit is a wrong
+    /// answer that looks exactly like a right one.
+    refetch,
+    /// File mode: re-read the file and re-render it in place (the page
+    /// preserves scroll for us — `viewer.js`'s `restoreScroll`).
+    rerender,
+};
+
+/// `mode` is where the pane currently points; `page_loaded` is whether a
+/// navigation has COMPLETED there. Deliberately a function of those two and
+/// nothing else — a plan that also depended on the controller's liveness would
+/// be untestable, and "no controller" is already "no completed load".
+pub fn reloadPlan(mode: Mode, page_loaded: bool) ReloadPlan {
+    if (!page_loaded) return .full_load;
+    return if (mode.isFile()) .rerender else .refetch;
+}
+
+/// The DevTools method that re-fetches bypassing caches, and its parameters.
+/// `Reload()` alone is a normal reload: it revalidates, and a 200-with-cache
+/// answer renders the bytes the user is trying to get rid of.
+pub const devtools_reload_method = "Page.reload";
+pub const devtools_reload_params = "{\"ignoreCache\":true}";
+
+// -------------------------------------------------------------------------
 // Error-card text
 // -------------------------------------------------------------------------
 
@@ -506,6 +544,41 @@ test "modeFor: the Mac extension table, and web wins over it" {
     // `file://` is a FILE, not a web page — the whole reason viewMode does not
     // key on "://".
     try testing.expectEqual(Mode.markdown, modeFor("file:///c:/src/README.md"));
+}
+
+test "reloadPlan: the branch is the verb's whole contract" {
+    // A completed page reloads in the way its mode can: the web re-fetches,
+    // a file re-renders. These two are the ordinary cases.
+    try testing.expectEqual(ReloadPlan.refetch, reloadPlan(.web, true));
+    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.markdown, true));
+    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.code, true));
+
+    // Nothing has finished loading yet — a pane whose first navigation failed
+    // or is still in flight. Re-rendering into a page that has no
+    // `window.__viewer` yet, or asking DevTools to reload a document that was
+    // never fetched, both end in a pane that stays blank and says nothing; the
+    // recovery is to load it again from scratch. This is the case `+reload`
+    // exists for on a pane the user is staring at BECAUSE it is empty.
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.web, false));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.markdown, false));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.code, false));
+}
+
+test "the DevTools reload really asks to bypass the cache" {
+    // The parameter is the entire point of using DevTools over `Reload()`, and
+    // it is a JSON string that no compiler checks. A typo here is a reload that
+    // succeeds, looks right, and serves the stale page — so the literal is
+    // asserted, and it is asserted as PARSEABLE JSON with the flag set rather
+    // than as a matching byte string, which would only prove it equals itself.
+    const parsed = try std.json.parseFromSlice(
+        struct { ignoreCache: bool },
+        testing.allocator,
+        devtools_reload_params,
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expect(parsed.value.ignoreCache);
+    try testing.expectEqualStrings("Page.reload", devtools_reload_method);
 }
 
 test "extension: no dot, no query, and a dotfile has none" {

@@ -306,8 +306,14 @@ Unchanged in intent; stated here so the boundaries are explicit.
   `src/apprt/win32/viewer_content.zig`. The interim
   `view_file_unsupported_error` is deleted. TOC is still NOT here (T160), and
   neither is live reload (T90f).
-- **T90f** Live reload + link routing. Unchanged, plus the `+reload` verb (P8)
-  -- it is the same code path as the watcher's re-render.
+- **T90f** Live reload + link routing. SPLIT into **T390** (the `+reload` verb,
+  P8), **T391** (the `ReadDirectoryChangesW` watcher + debounce) and **T392**
+  (the `NavigationStarting` link policy). T390 is done as of 2026-08-02 and is
+  first because the other two go through its `ViewerPane.reloadContent`: the
+  watcher's re-render IS a file-mode reload. The three-way branch is pure
+  (`viewer_content.reloadPlan`), the two new vtable slots are `Reload` (31) and
+  `CallDevToolsProtocolMethod` (36), and the cache bypass is proven live rather
+  than assumed -- see `docs/design/windows-parity-tasks/T390.md`.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add

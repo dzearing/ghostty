@@ -19,6 +19,11 @@
 #     CONTENT reaches the page is the win32 lane's live "host floor" test,
 #     which reads a two-heading markdown file's headings back up T375's
 #     bridge.
+#   - `+reload` (T390) reloads a viewer pane and a viewer-focused window, and
+#     refuses a terminal pane and a terminal-focused window with the Mac's two
+#     DIFFERENT strings. That it really re-rendered (and did not just return
+#     success) is read out of the GUI's own log: the missing-file viewer files
+#     a second "cannot read file" line when its content is re-rendered.
 #   - `--view` + `--command`/`-e` is rejected with the MAC string. That is the
 #     only remaining `--view` refusal; the interim "file viewers are not yet
 #     supported on Windows" error was deleted with T90e.
@@ -355,6 +360,61 @@ try {
     Assert ($applog -notmatch 'no bundled viewer assets found') 'the app resolved its own bundled viewer assets'
     Assert ($applog -notmatch 'viewer resource not found: (viewer\.|vendor/)') 'every template asset the page asked for was served'
     Assert ($applog -notmatch 'ExecuteScript failed') 'the content injection was accepted'
+
+    # --- 8b. +reload (T390) --------------------------------------------------
+    # The verb's contract is entirely about WHICH pane it accepts and what it
+    # says about the ones it does not, so every rejection is asserted on its
+    # exact text: the two terminal refusals are different strings on purpose
+    # (a named terminal is a mistake about that pane; a window is a mistake
+    # about which pane has focus) and neither is the `is a viewer pane, not a
+    # terminal` string the terminal-only verbs use.
+    $r = Invoke-Verb @('+reload', '--target=vpcode')
+    Assert ($r.Code -eq 0) "+reload on a viewer pane exits 0 (got $($r.Code))"
+    Assert ($r.Out.Trim() -eq '') "+reload on a viewer prints nothing (got '$($r.Out.Trim())')"
+
+    $r = Invoke-Verb @('+reload', '--target=vpfile')
+    Assert ($r.Code -eq 0) "+reload on a WINDOW whose focused pane is a viewer exits 0 (got $($r.Code))"
+
+    $r = Invoke-Verb @('+reload', '--target=vpterm')
+    Assert ($r.Code -ne 0) "+reload on a terminal pane exits nonzero (got $($r.Code))"
+    Assert ($r.Out -match [regex]::Escape("target 'vpterm' is a terminal pane, nothing to reload")) `
+        '+reload on a terminal pane reports the Mac string'
+
+    # A window target resolves to its FOCUSED pane, so this case needs a window
+    # whose focus is unambiguous. `vp` is not one: it has grown viewer splits,
+    # and the last split created is the focused one -- pointing at it here
+    # asserted the wrong pane and passed for the wrong reason. A window with a
+    # single terminal in it can only mean one thing.
+    Invoke-Verb @('+new-window', '--target=vpterms') | Out-Null
+    Assert ($null -ne (Wait-Win 'vpterms')) 'a terminal-only window exists to aim at'
+    $r = Invoke-Verb @('+reload', '--target=vpterms')
+    Assert ($r.Code -ne 0) "+reload on a terminal-focused WINDOW exits nonzero (got $($r.Code))"
+    Assert ($r.Out -match [regex]::Escape("focused pane of 'vpterms' is a terminal pane, nothing to reload")) `
+        '+reload on a terminal-focused window reports the OTHER Mac string'
+
+    $r = Invoke-Verb @('+reload', '--target=no-such-pane')
+    Assert ($r.Code -ne 0) "+reload on an unknown target exits nonzero (got $($r.Code))"
+    Assert ($r.Out -match 'not found in registry') '+reload on an unknown target says so'
+
+    $r = Invoke-Verb @('+reload')
+    Assert ($r.Code -ne 0) "+reload with no --target exits nonzero (got $($r.Code))"
+    Assert ($r.Out -match [regex]::Escape('--target is required for +reload')) `
+        '+reload with no --target says which flag is missing'
+
+    # And it RELOADED, rather than returning success from a handler that found
+    # the pane and did nothing. The missing-file viewer re-renders its file on
+    # reload, which means it re-reads a path that is still not there and writes
+    # a SECOND `viewer file error` line -- an oracle inside the GUI process, on
+    # the same code path the file watcher will use (T391).
+    $before = @(Select-String -Path $errlog -Pattern 'viewer file error: Cannot read file' -ErrorAction SilentlyContinue).Count
+    $r = Invoke-Verb @('+reload', '--target=vpmissing')
+    Assert ($r.Code -eq 0) "+reload on the missing-file viewer exits 0 (got $($r.Code))"
+    $after = $before
+    for ($t = 0; $t -lt 25 -and $after -le $before; $t++) {
+        Start-Sleep -Milliseconds 200
+        $after = @(Select-String -Path $errlog -Pattern 'viewer file error: Cannot read file' -ErrorAction SilentlyContinue).Count
+    }
+    Assert ($after -gt $before) "+reload re-rendered the file in the GUI (error lines $before -> $after)"
 
     # --- 9. --view + --command / -e: the Mac string -------------------------
     # The one permanent check. Asserted with a FILE and a URL both: it is the

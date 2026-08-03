@@ -6892,3 +6892,44 @@ strips and caps, so the divergence is filed rather than left), **T388** (a
 leading `~` in `--view` resolves to `<cwd>\~\x.md`; upstream, in
 `view_args.zig`) and **T389** (the injection holds three copies of the file at
 once).
+
+## 2026-08-02 - T390: reload means re-fetch, and the test knows the difference
+
+T90f was three features in one row - the `+reload` verb, the file watcher and
+link routing - so it was split into **T390/T391/T392** and T390 taken first:
+the other two both re-render through its `ViewerPane.reloadContent`, because a
+watcher firing IS a file-mode reload.
+
+`ghoztty +reload --target=<viewer>` now works on Windows. The branch it takes
+is the whole contract, so the branch is the pure part:
+`viewer_content.reloadPlan(mode, page_loaded)` returns full_load / refetch /
+rerender and is tested in the none lane - including the case that matters most
+and is easiest to skip, a pane with no completed load, which reloads by loading
+from scratch. That is precisely when a user reaches for `+reload`: the pane is
+empty. `page_loaded` is Mac's `pageLoaded`, cleared by every `navigate` and set
+from `onNavigationCompleted` - for WEB mode too, which meant hoisting it above
+the `isFile` early return.
+
+Two vtable slots came out of opaque runs: `Reload` (31) and
+`CallDevToolsProtocolMethod` (36), both asserted with `@offsetOf`. `Page.reload`
+with `{"ignoreCache":true}` is the only way to say "bypass the cache" through
+this API, with `Reload()` kept as the fallback - a refused DevTools call must
+still reload something.
+
+Validation: both lanes, `test-agent`, P1-P3 ALL PASS, `viewer-panes.ps1`
+ALL PASS (92) x3. The cache bypass is PROVEN rather than assumed: a second
+loopback server serves a page that reports which fetch it came from, with
+`Cache-Control: max-age=600` so a cache-allowed reload would be entitled to
+skip the network. After the reload the pane reports `req2`, the server counted
+exactly two page requests, and the second carried `no-cache`.
+
+Both test lessons were about oracles, not about reload. **Chromium asks every
+origin for a `/favicon.ico` it was never offered** - the first server counted
+every request (4 for 2 loads) and answered the favicon with an HTML body
+carrying the next number, putting the page one ahead of the truth. And **one
+heading is not a table of contents**: `viewer.js` reports nothing below two, so
+a one-heading re-render read as zero and was indistinguishable from a failure.
+The acceptance script made the same class of mistake in the other direction -
+it aimed the "focused pane is a terminal" rejection at a window that had since
+grown viewer splits, so the focused pane was a viewer and the case passed for
+the wrong reason.

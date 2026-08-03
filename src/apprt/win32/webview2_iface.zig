@@ -528,8 +528,10 @@ pub const ICoreWebView2Profile = extern struct {
 /// T90e added the four file-mode slots — `add_NavigationCompleted` (15),
 /// `ExecuteScript` (29), `add_WebResourceRequested` (55) and
 /// `AddWebResourceRequestedFilter` (57) — which is why the opaque runs are
-/// shorter again. Every block's LENGTH is what holds the named slots in place,
-/// and `@offsetOf` asserts all of them at the bottom of this file.
+/// shorter again. T390 added `+reload`'s two: `Reload` (31) and
+/// `CallDevToolsProtocolMethod` (36). Every block's LENGTH is what holds the
+/// named slots in place, and `@offsetOf` asserts all of them at the bottom of
+/// this file.
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
@@ -540,10 +542,14 @@ pub const ICoreWebView2 = extern struct {
     pub const post_nav_slots = 11;
     /// Slot 28: `RemoveScriptToExecuteOnDocumentCreated`.
     pub const remove_script_slots = 1;
-    /// Slots 30..33: `CapturePreview` through `PostWebMessageAsString`.
-    pub const post_script_slots = 4;
-    /// Slots 35..43: `remove_WebMessageReceived` through `Stop`.
-    pub const history_slots = 9;
+    /// Slot 30: `CapturePreview`.
+    pub const capture_slots = 1;
+    /// Slots 32..33: `PostWebMessageAsJson`, `PostWebMessageAsString`.
+    pub const post_reload_slots = 2;
+    /// Slot 35: `remove_WebMessageReceived`.
+    pub const remove_message_slots = 1;
+    /// Slots 37..43: `get_BrowserProcessId` through `Stop`.
+    pub const post_devtools_slots = 7;
     /// Slots 45..54: `remove_NewWindowRequested` through
     /// `get_ContainsFullScreenElement`.
     pub const window_slots = 10;
@@ -563,9 +569,18 @@ pub const ICoreWebView2 = extern struct {
         AddScriptToExecuteOnDocumentCreated: *const fn (*ICoreWebView2, [*:0]const u16, *anyopaque) callconv(.winapi) HRESULT,
         remove_script: [remove_script_slots]*const anyopaque,
         ExecuteScript: *const fn (*ICoreWebView2, [*:0]const u16, ?*anyopaque) callconv(.winapi) HRESULT,
-        post_script: [post_script_slots]*const anyopaque,
+        capture: [capture_slots]*const anyopaque,
+        Reload: *const fn (*ICoreWebView2) callconv(.winapi) HRESULT,
+        post_reload: [post_reload_slots]*const anyopaque,
         add_WebMessageReceived: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
-        history: [history_slots]*const anyopaque,
+        remove_message: [remove_message_slots]*const anyopaque,
+        CallDevToolsProtocolMethod: *const fn (
+            *ICoreWebView2,
+            [*:0]const u16,
+            [*:0]const u16,
+            ?*anyopaque,
+        ) callconv(.winapi) HRESULT,
+        post_devtools: [post_devtools_slots]*const anyopaque,
         add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         window: [window_slots]*const anyopaque,
         add_WebResourceRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
@@ -653,6 +668,35 @@ pub const ICoreWebView2 = extern struct {
     /// when the result and the failure are both uninteresting.
     pub fn executeScript(self: *ICoreWebView2, js: [*:0]const u16, handler: ?*anyopaque) bool {
         return !com.failed(self.vtable.ExecuteScript(self, js, handler));
+    }
+
+    /// A NORMAL reload — the browser revalidates and may serve its cache. Kept
+    /// as the FALLBACK for `callDevToolsProtocolMethod` (design P8) rather than
+    /// as the reload: `+reload` exists to pick up changes at the origin, and a
+    /// cache hit is a wrong answer that is indistinguishable from a right one.
+    pub fn reload(self: *ICoreWebView2) bool {
+        return !com.failed(self.vtable.Reload(self));
+    }
+
+    /// Call one Chrome DevTools Protocol method (`Page.reload`, …) with its
+    /// parameters as a JSON object. Asynchronous, and `handler` is optional the
+    /// way `ExecuteScript`'s is — every caller here wants the side effect, not
+    /// the return object.
+    ///
+    /// A failed HRESULT means the CALL was refused (an unknown method, a
+    /// malformed parameter object); it is the caller's cue to fall back.
+    pub fn callDevToolsProtocolMethod(
+        self: *ICoreWebView2,
+        method: [*:0]const u16,
+        params_json: [*:0]const u16,
+        handler: ?*anyopaque,
+    ) bool {
+        return !com.failed(self.vtable.CallDevToolsProtocolMethod(
+            self,
+            method,
+            params_json,
+            handler,
+        ));
     }
 
     /// The `ICoreWebView2_13` view of this object, or null on a runtime that
@@ -996,7 +1040,15 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(15 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationCompleted"));
     try testing.expectEqual(27 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddScriptToExecuteOnDocumentCreated"));
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2.Vtbl, "ExecuteScript"));
+    // T390's two. `Reload` (31) is one slot past `CapturePreview`, and
+    // `CallDevToolsProtocolMethod` (36) one past `remove_WebMessageReceived` —
+    // both were inside opaque runs until now, so these two numbers are exactly
+    // what the run-splitting had to preserve. Calling `Reload` at 36's index
+    // would hand the runtime a method name and a JSON string as if they were
+    // nothing, which is the kind of mistake that corrupts rather than fails.
+    try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Reload"));
     try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
+    try testing.expectEqual(36 * ptr, @offsetOf(ICoreWebView2.Vtbl, "CallDevToolsProtocolMethod"));
     try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
     try testing.expectEqual(55 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebResourceRequested"));
     try testing.expectEqual(57 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddWebResourceRequestedFilter"));
