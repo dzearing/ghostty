@@ -19,11 +19,12 @@ protocol HookSpec {
 enum HookCommand {
     static func perEvent(purpose: HookPurpose, bannerScriptPath: String, runtime: RuntimeAgent) -> String {
         let s = shellQuote(bannerScriptPath)
+        let flag = "--runtime=\(runtime.rawValue)"
         let mode: String
         switch purpose {
-        case .sessionStart: mode = "session-start-hook"
-        case .promptSubmit: mode = "prompt-hook"
-        case .stop: mode = "stop-hook"
+        case .sessionStart: mode = "session-start-hook \(flag)"
+        case .promptSubmit: mode = "prompt-hook \(flag)"
+        case .stop: mode = "stop-hook \(flag)"
         }
         // The Stop event carries no stdin fields the script reads, so it never
         // needs normalization. Otherwise pipe stdin through the runtime's
@@ -36,35 +37,43 @@ enum HookCommand {
 
     /// The runtime's jq-free stdin normalizer, or nil when the payload is already
     /// canonical (identity). Maps that runtime's key names to the canonical
-    /// `{prompt, session_id}` the shared script consumes.
+    /// `{prompt, session_id, source}` the shared script consumes.
     private static func normalizer(for runtime: RuntimeAgent, purpose: HookPurpose) -> String? {
         switch runtime {
         case .claude:
-            // Claude's hook payload is already flat `{prompt, session_id}`, so its
-            // normalizer is the identity — no rewrite needed.
+            // Claude's hook payload is already flat `{prompt, session_id, source}`,
+            // so its normalizer is the identity — no rewrite needed.
             return nil
         case .copilot:
-            // Copilot userPromptSubmitted payload keys are unverified against a
-            // live hook — confirm and tighten. Until then, accept BOTH
-            // snake_case and camelCase for the session id, and try several
-            // likely prompt keys, so a key mismatch degrades to an empty field
-            // rather than a broken banner.
-            let promptKeys = purpose == .promptSubmit
-                ? ["prompt", "userPrompt", "content", "message"]
-                : ["prompt"]
-            return awkNormalizer(promptKeys: promptKeys, sessionKeys: ["session_id", "sessionId"])
+            // Verified against a live Copilot hook (copilot 1.0.78): payloads are
+            // flat camelCase. userPromptSubmitted carries {prompt, sessionId};
+            // sessionStart carries {source, initialPrompt, sessionId}. Bridge
+            // them to the canonical snake_case shape the shared script reads,
+            // carrying `source` through so session-start-hook can gate its wipe.
+            switch purpose {
+            case .promptSubmit:
+                return awkNormalizer(promptKeys: ["prompt"],
+                                     sessionKeys: ["sessionId", "session_id"])
+            case .sessionStart:
+                return awkNormalizer(promptKeys: ["initialPrompt", "prompt"],
+                                     sessionKeys: ["sessionId", "session_id"],
+                                     sourceKeys: ["source"])
+            case .stop:
+                return nil
+            }
         }
     }
 
     /// A single-line, jq-free awk program that reassembles stdin, extracts the
     /// raw JSON-escaped string value for the first matching key from each list,
-    /// and re-emits a canonical one-line `{"prompt":..,"session_id":..}` object.
-    /// Single-line so it embeds safely inside a JSON hooks file.
-    static func awkNormalizer(promptKeys: [String], sessionKeys: [String]) -> String {
+    /// and re-emits a canonical one-line `{"prompt":..,"session_id":..,"source":..}`
+    /// object. Single-line so it embeds safely inside a JSON hooks file.
+    static func awkNormalizer(promptKeys: [String], sessionKeys: [String], sourceKeys: [String] = []) -> String {
         let pk = promptKeys.joined(separator: " ")
         let sk = sessionKeys.joined(separator: " ")
+        let srck = sourceKeys.joined(separator: " ")
         let program = "{ rec = rec $0 } "
-            + "END { printf \"{\\\"prompt\\\":\\\"%s\\\",\\\"session_id\\\":\\\"%s\\\"}\\n\", g(\"\(pk)\"), g(\"\(sk)\") } "
+            + "END { printf \"{\\\"prompt\\\":\\\"%s\\\",\\\"session_id\\\":\\\"%s\\\",\\\"source\\\":\\\"%s\\\"}\\n\", g(\"\(pk)\"), g(\"\(sk)\"), g(\"\(srck)\") } "
             + "function g(keys,   a,n,ki,i,c,o,e,p) { "
             + "n = split(keys, a, \" \"); "
             + "for (ki=1; ki<=n; ki++) { "

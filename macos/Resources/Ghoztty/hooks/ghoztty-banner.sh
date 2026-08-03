@@ -178,6 +178,16 @@ send_osc() { # single-line text
     printf '\033]7778;%s\007' "$1" > "/dev/$TTY_NAME" 2>/dev/null
 }
 
+# The "keep the banner current" instruction handed to the model as
+# additionalContext by the prompt-hook. Single-quoted heredoc: the backticks,
+# apostrophes and literal `\n` sequences are meant to reach the model verbatim
+# (jq JSON-encodes them for whichever envelope the runtime needs).
+banner_help() {
+    cat <<'EOF'
+This session runs in a Ghoztty pane with a persistent status banner. Keep it current: run `~/.config/ghoztty/hooks/ghoztty-banner.sh set --title '<short task title>' --goal '<current goal>' --status '<one-line progress note>' [--asked '<plain-language paraphrase of the user's last prompt, NOT a verbatim quote>'] [--did '<the actual code fix/feature that landed>'] [--bugs '<markdown link(s) to the bug(s) being fixed>'] [--pr <url>]` when a task starts, whenever the goal/status meaningfully changes, and when a PR is created. --asked shows as 'Prompt' and --did as 'Last result'; keep both as short human-readable paraphrases (never raw tool names or quotes). IMPORTANT: --did is for ACTUAL fixes/features applied to the code, set it only once real changes have landed — never for exploration, reads, or intermediate tool calls (those are steps, not results); leave it alone until then. When more than one fix landed, pass a checklist with one item per line using \n, e.g. --did '- [x] Renamed Last prompt to Prompt\n- [x] Stopped auto-seeding Last result from tool calls'. When the prompt is fixing a specific bug (an issue link, a bug id, or a clearly identified defect), set --bugs to a clickable markdown link to it, e.g. --bugs '[#123](https://github.com/org/repo/issues/123)' (comma-separate multiple); it shows as a 'Bugs fixed' row under Goal. Omit --bugs entirely when the task is not a bug fix. Fields persist between calls, so pass only what changed.
+EOF
+}
+
 # Resolve the pane this session runs in. $GHOZTTY_PANE_ID is authoritative and
 # needs no lookup or cache, so it wins outright. Older app builds don't bake it:
 # those fall back to a cached name, then to +list --tty.
@@ -291,6 +301,15 @@ render() {
 cmd="${1:-}"
 shift 2>/dev/null || true
 
+# Which agent invoked us (passed by the generated hook as --runtime=<name>).
+# Selects the additionalContext envelope the prompt-hook emits and unifies the
+# session-start wipe decision across runtimes. Defaults to claude for backward
+# compatibility with hooks generated before this flag existed.
+runtime="claude"
+for _arg in "$@"; do
+    case "$_arg" in --runtime=*) runtime="${_arg#*=}" ;; esac
+done
+
 case "$cmd" in
 set)
     pairs=()
@@ -360,26 +379,48 @@ prompt-hook)
 
     jq_merge "${pairs[@]}"
     render
-    cat <<'EOF'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"This session runs in a Ghoztty pane with a persistent status banner. Keep it current: run `~/.config/ghoztty/hooks/ghoztty-banner.sh set --title '<short task title>' --goal '<current goal>' --status '<one-line progress note>' [--asked '<plain-language paraphrase of the user's last prompt, NOT a verbatim quote>'] [--did '<the actual code fix/feature that landed>'] [--bugs '<markdown link(s) to the bug(s) being fixed>'] [--pr <url>]` when a task starts, whenever the goal/status meaningfully changes, and when a PR is created. --asked shows as 'Prompt' and --did as 'Last result'; keep both as short human-readable paraphrases (never raw tool names or quotes). IMPORTANT: --did is for ACTUAL fixes/features applied to the code, set it only once real changes have landed — never for exploration, reads, or intermediate tool calls (those are steps, not results); leave it alone until then. When more than one fix landed, pass a checklist with one item per line using \\n, e.g. --did '- [x] Renamed Last prompt to Prompt\\n- [x] Stopped auto-seeding Last result from tool calls'. When the prompt is fixing a specific bug (an issue link, a bug id, or a clearly identified defect), set --bugs to a clickable markdown link to it, e.g. --bugs '[#123](https://github.com/org/repo/issues/123)' (comma-separate multiple); it shows as a 'Bugs fixed' row under Goal. Omit --bugs entirely when the task is not a bug fix. Fields persist between calls, so pass only what changed."}}
-EOF
+    # Tell the model to keep the banner current, delivered as additionalContext.
+    # Claude processes UserPromptSubmit output as a NESTED hookSpecificOutput
+    # envelope; Copilot processes it only as a FLAT {"additionalContext":...}
+    # object (verified against a live Copilot hook — the nested form is silently
+    # dropped, which is why the Copilot banner never populated). jq (guaranteed
+    # present past the gate above) builds the right shape and escapes the text.
+    if [ "$runtime" = copilot ]; then
+        jq -cn --arg ctx "$(banner_help)" '{additionalContext: $ctx}'
+    else
+        jq -cn --arg ctx "$(banner_help)" \
+            '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'
+    fi
     ;;
 session-start-hook)
-    # Fires on SessionStart. `/clear` (source=clear) and a fresh launch
-    # (source=startup) begin a new task in this pane, so wipe the previous
-    # session's task identity AND clear the on-screen banner immediately —
-    # don't wait for the next prompt to blank stale data. `resume`/`compact`
-    # continue the same task, so their banners are left untouched (this hook
-    # is registered with a `startup|clear` matcher, so it isn't called then).
+    # Fires on SessionStart. A fresh launch (source=startup), `/clear`
+    # (source=clear), or a brand-new session (source=new) begins a new task in
+    # this pane, so wipe the previous session's task identity AND clear the
+    # on-screen banner immediately — don't wait for the next prompt to blank
+    # stale data. `resume`/`compact` continue the SAME task, so their banner is
+    # left untouched. Claude restricts this hook to a `startup|clear` matcher
+    # upstream; Copilot cannot express a matcher, so the decision is made here
+    # from the `source` field (normalized through for Copilot, native for
+    # Claude) — the two runtimes then behave identically.
     input=$(cat)
     session=$(printf '%s' "$input" | json_str_field session_id)
-    pane=$(resolve_pane)
-    [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
-    # Reset task fields but keep the resolved pane cache; record the new id so
-    # the prompt-hook doesn't re-wipe on this session's first prompt.
-    pairs=(title "" goal "" status "" asked "" did "" pr "" bugs "" activity "")
-    [ -n "$session" ] && pairs+=(session "$session")
-    jq_merge "${pairs[@]}"
+    source=$(printf '%s' "$input" | json_str_field source)
+    case "$source" in
+    resume|compact)
+        # Same task continues in this pane: keep the live banner, just record
+        # the session id so the prompt-hook doesn't treat it as new.
+        [ -n "$session" ] && jq_merge session "$session"
+        ;;
+    *)
+        pane=$(resolve_pane)
+        [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
+        # Reset task fields but keep the resolved pane cache; record the new id
+        # so the prompt-hook doesn't re-wipe on this session's first prompt.
+        pairs=(title "" goal "" status "" asked "" did "" pr "" bugs "" activity "")
+        [ -n "$session" ] && pairs+=(session "$session")
+        jq_merge "${pairs[@]}"
+        ;;
+    esac
     ;;
 stop-hook)
     jq_merge activity "idle"

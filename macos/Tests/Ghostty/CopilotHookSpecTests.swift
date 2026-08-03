@@ -43,6 +43,34 @@ struct CopilotHookSpecTests {
         }
     }
 
+    // H3: the sessionStart normalizer must carry Copilot's `source` (and
+    // initialPrompt) through to the shared script so it can gate the wipe on
+    // resume. Verified field names against a live Copilot hook.
+    @Test func copilotSessionStartNormalizerCarriesSource() throws {
+        let cmd = HookCommand.perEvent(
+            purpose: .sessionStart,
+            bannerScriptPath: "/Users/x/.config/ghoztty/hooks/ghoztty-banner.sh",
+            runtime: .copilot)
+        let normalizer = try #require(cmd.components(separatedBy: " | bash").first)
+        let payload = #"{"sessionId":"abc","source":"resume","initialPrompt":"hi","cwd":"/x"}"#
+        let out = try runShell(normalizer, stdin: payload)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any])
+        #expect(json["source"] as? String == "resume")
+        #expect(json["session_id"] as? String == "abc")
+        #expect(json["prompt"] as? String == "hi")
+    }
+
+    // H3: the generated hook command tells the shared script which runtime
+    // invoked it, so prompt-hook can emit the correct additionalContext envelope.
+    @Test func perEventThreadsRuntimeFlag() {
+        let copilot = HookCommand.perEvent(purpose: .promptSubmit,
+                                           bannerScriptPath: "/x/banner.sh", runtime: .copilot)
+        #expect(copilot.contains("prompt-hook --runtime=copilot"))
+        let claude = HookCommand.perEvent(purpose: .sessionStart,
+                                          bannerScriptPath: "/x/banner.sh", runtime: .claude)
+        #expect(claude.contains("session-start-hook --runtime=claude"))
+    }
+
     private func runShell(_ command: String, stdin: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
