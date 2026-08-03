@@ -45,6 +45,9 @@
 
 set -u
 
+# NOTE: the env var value is "ghostty" (the upstream value Ghoztty inherits, set
+# in src/Surface.zig / src/termio/Exec.zig), NOT "ghoztty" — do not "fix" this
+# spelling to match the project name or every banner silently no-ops.
 [ "${TERM_PROGRAM:-}" = "ghostty" ] || exit 0
 
 STATE_DIR="$HOME/.config/ghoztty/banner-state"
