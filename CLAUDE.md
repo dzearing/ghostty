@@ -145,7 +145,14 @@ Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic
 
 **Autolinking.** Bare URLs and bare file paths become clickable without `[text](url)` syntax. A URL must carry a scheme — only `http://` and `https://` linkify, never a bare `www.example.com` or `config.io`, so prose is never falsely linked. A file path must start with `/`, `~/`, `./`, or `../`; the sigil is the whole signal (there is no filesystem check), which is why a bare relative `macos/Sources/Foo.swift` stays plain text. `~/` expands to the home directory and `./`/`../` resolve against **the pane's current working directory** at render time — a dot-relative path in a pane with no known cwd stays plain text rather than resolving against a guess. Trailing sentence punctuation stays outside the link (`See https://x.com.` links `https://x.com`), while brackets balanced *inside* the link are kept (`…/Foo_(bar)`). Autolinking never fires inside a `` `code` `` span, after a `\` escape, or inside an explicit `[label](url)` — the explicit link always owns its whole label.
 
-Clicking a **file** link **reveals it in Finder** rather than opening it; Cmd-click opens a viewer window and Cmd-Shift-click hands it to the file's default app, and the right-click menu adds Open in Side Pane (the viewer renders local files) and Copy Path. URL links are unchanged: plain click → side pane, Cmd → new window, Cmd-Shift → default browser.
+**Link clicks.** A plain click hands the link *out* of Ghoztty; the modifiers bring it back in. Cmd opens a **viewer side pane** for either kind of link, and Cmd-Shift gives the link a surface of its own.
+
+| | plain click | Cmd | Cmd-Shift |
+|---|---|---|---|
+| **URL** | default browser | side pane | new Ghoztty window |
+| **file path** | reveal in Finder | side pane | open with default app |
+
+A URL goes to the real browser by default because Ghoztty's `WKWebView` keeps its own cookie store with no relationship to Safari/Chrome — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
 
 **Lists.** Consecutive lines that begin with a list marker render as a list block with table-like row spacing and a **shared marker gutter**, so every item's content left-aligns regardless of marker kind (bullets, numbers, and checkboxes in one run all line up). Supported markers:
 
@@ -345,6 +352,16 @@ ghoztty +close --target=doc
 - **Links** in file viewers: http(s) opens the default browser; a relative
   `.md` link opens another viewer split; other local files open in their
   default app.
+- **Links that open a new surface** in a website viewer — `target="_blank"` or
+  `window.open()` — go to the **system default browser**, not a new Ghoztty
+  window, for the same cookie-store reason banner URLs do. Same-pane
+  navigation is untouched: a website viewer follows ordinary links in place.
+  **Cmd-click** keeps the popup in Ghoztty as its own viewer window (honoring
+  the size the opener asked for), and so does a popup the browser can't be
+  handed — a bare `window.open()` with no URL, or a non-web scheme. The
+  tradeoff: a popup that lands in the browser can't `window.close()` itself
+  back to the Ghoztty page that opened it, so an OAuth flow finishes in the
+  browser. That flow wasn't authenticating in Ghoztty anyway.
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a
