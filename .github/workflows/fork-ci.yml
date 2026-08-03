@@ -80,6 +80,17 @@ jobs:
           echo "--- minimal native link ---"
           printf 'pub fn main() void {}\n' > /tmp/t.zig
           zig build-exe /tmp/t.zig -femit-bin=/tmp/t.out && echo "MINIMAL LINK OK" || echo "MINIMAL LINK FAILED"
+          echo "=== A: local-equivalent env (no SDKROOT, default HOME cache) ==="
+          ( cd /tmp && env -u SDKROOT -u DEVELOPER_DIR -u ZIG_GLOBAL_CACHE_DIR -u ZIG_LOCAL_CACHE_DIR \
+              zig build-exe /tmp/t.zig -femit-bin=/tmp/a.out ) >/dev/null 2>&1 && echo "A OK" || echo "A FAIL"
+          echo "=== B: CommandLineTools SDK ==="
+          ( cd /tmp && SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+              zig build-exe /tmp/t.zig -femit-bin=/tmp/b.out ) >/dev/null 2>&1 && echo "B OK" || echo "B FAIL"
+          echo "=== C: explicit -lc ==="
+          ( cd /tmp && zig build-exe /tmp/t.zig -lc -femit-bin=/tmp/c.out ) >/dev/null 2>&1 && echo "C OK" || echo "C FAIL"
+          echo "=== D: cache outside the workspace ==="
+          ( cd /tmp && ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig" ZIG_LOCAL_CACHE_DIR="$HOME/.cache/zig-local" \
+              zig build-exe /tmp/t.zig -femit-bin=/tmp/d.out ) >/dev/null 2>&1 && echo "D OK" || echo "D FAIL"
 
       # On macOS `zig build test` covers BOTH halves of the codebase: the Zig
       # unit tests and `xcodebuild test -scheme Ghostty -skip-testing
