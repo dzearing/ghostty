@@ -224,17 +224,36 @@ Assert ($tint -eq '#204060') "inline split --split-color applied (got $tint)"
 $tint = Wait-Tint 'cw2' 0 'NONE'
 Assert ($tint -eq '(absent)') "no --color: first pane reports no tint (got $tint)"
 
-# --- 5. --color=random: dark muted color ---------------------------------
-& $exe +new-window --target=cw3 --color=random | Out-Null
-$tint = Wait-Tint 'cw3' 0 'ANY'
-Assert ($tint -match '^#[0-9a-f]{6}$') "random: well-formed hex tint (got $tint)"
-if ($tint -match '^#[0-9a-f]{6}$') {
-    $r = [Convert]::ToInt32($tint.Substring(1, 2), 16)
-    $g = [Convert]::ToInt32($tint.Substring(3, 2), 16)
-    $b = [Convert]::ToInt32($tint.Substring(5, 2), 16)
-    $lum = (0.299 * $r + 0.587 * $g + 0.114 * $b) / 255.0
-    Assert ($lum -lt 0.2) "random: dark color (luminance $([math]::Round($lum,3)))"
+# --- 5. --color=random: dark, and TELLABLE APART -------------------------
+# T120: the darkness assertion alone was green through the whole defect. The
+# retired ranges (sat 0.2-0.3, bri 0.1-0.15) put every window on the same
+# near-black, and what a viewer actually sees is the CHROMA (max - min
+# channel = b * s * 255), which those ranges capped at ~11 and typically left
+# near 8. So assert the floor the old code could not clear, on more than one
+# window - a single sample cannot show that two windows differ.
+$randomTints = @()
+foreach ($n in 1..3) {
+    $t = "cw3$n"
+    & $exe +new-window --target=$t --color=random | Out-Null
+    $tint = Wait-Tint $t 0 'ANY'
+    Assert ($tint -match '^#[0-9a-f]{6}$') "random ${n}: well-formed hex tint (got $tint)"
+    if ($tint -match '^#[0-9a-f]{6}$') {
+        $randomTints += $tint
+        $r = [Convert]::ToInt32($tint.Substring(1, 2), 16)
+        $g = [Convert]::ToInt32($tint.Substring(3, 2), 16)
+        $b = [Convert]::ToInt32($tint.Substring(5, 2), 16)
+        $lum = (0.299 * $r + 0.587 * $g + 0.114 * $b) / 255.0
+        Assert ($lum -lt 0.2) "random ${n}: dark color (luminance $([math]::Round($lum,3)))"
+
+        $hi = [math]::Max($r, [math]::Max($g, $b))
+        $lo = [math]::Min($r, [math]::Min($g, $b))
+        Assert (($hi - $lo) -ge 10) "random ${n}: hue reads - chroma $($hi - $lo) >= 10 (was <= 11, typ. 8)"
+        Assert ($hi -ge 32) "random ${n}: lifted off black - peak channel $hi >= 32 (was ~26)"
+    }
 }
+Assert (($randomTints | Select-Object -Unique).Count -gt 1) `
+    "random: three windows are not all the same tint ($($randomTints -join ' '))"
+foreach ($n in 1..3) { & $exe +close --target="cw3$n" | Out-Null }
 
 # --- 6. invalid --color is rejected by the CLI (shared Mac behavior) -----
 # (PS 5.1 wraps redirected native stderr in ErrorRecords that terminate

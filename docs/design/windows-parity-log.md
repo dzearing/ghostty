@@ -7443,3 +7443,41 @@ second flake on the way through was a real product race with a stack -
 concurrent UNSUB and shutdown double-join and crash the agent - filed as
 **T420**. New: T414, T415 (Mac-seat verification: the CLI split is shared Zig,
 so `+list`/`+read` on macOS now prefer the baked socket too), T416, T420.
+
+## 2026-08-03 - T119 (superseded), T120 `--color=random`
+
+**T119** closed as bookkeeping: `+reload` shipped whole under **T390**
+(`cc11777d9`), so the placeholder error string it asked for is moot. Verified
+against the tree, not inferred - `IpcHandlers.zig:82` has the `"reload"`
+branch, `:1098`/`:1109` carry both Mac-exact terminal refusals, and
+`viewer-panes.ps1:431,443` assert them on box.
+
+**T120** ports Mac's `randomDarkColor` ranges (sat 0.33-0.46, bri 0.13-0.18,
+`IPCServer.swift:2042`) into `color_math.randomDark`, as four named constants.
+The numbers were the easy half. The point is that the existing oracle - "dark
+and muted" - was GREEN through the whole defect and would stay green under
+ranges *worse* than the ones retired: darkness was never the complaint,
+sameness was. What a viewer sees between two tints is the CHROMA (`b * s * 255`),
+which the retired ranges capped at ~11 and typically left near 8; the new floor
+is 11-21. So the test asserts `chroma >= 10` and `peak >= 32`, a floor the old
+code could reach only at one corner of its box. `window-color.ps1` had the same
+hole in a second form - it opened ONE window and checked its luminance, and one
+sample cannot show that two windows differ (T235's "a one-title window cannot
+test a width rule"); it now opens three.
+
+The negative control earned its keep twice: it failed both new tests under the
+retired constants (2 of 3807), and it exposed the range check's `+/- 0.02` as
+*smaller than one quantization step* - saturation reads back as
+`(peak - trough) / peak` at a peak of ~26-33, so one rounding moves it 0.03-0.04.
+Green on 1000 samples, latently flaky; widened with the arithmetic written down.
+
+The turn's first `zig build test-agent` **wedged** - both binaries resident, all
+9 threads in `Wait` (4 `EventPairLow`), CPU byte-identical across three samples,
+no children at all. That evidence went to **T416** and sharpens it: the agent
+lane builds no `ViewerPane` and spawned no browser, so the hang does NOT require
+the WebView2 host-floor test and T416's title is too narrow. A clean re-run was
+exit 0.
+
+Validation: both `zig build test` lanes + `test-agent` exit 0,
+`window-color.ps1` ALL PASS (33), P1-P3 ALL PASS. Also committed three task
+files a previous turn left untracked (T417, T418, T419).

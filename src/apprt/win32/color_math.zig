@@ -230,13 +230,26 @@ pub fn shiftedTint(rgb: Rgb) Rgb {
         lighten(rgb, shift_amount);
 }
 
-/// `--color=random`: dark muted color (hue anywhere, sat 0.2–0.3,
-/// brightness 0.1–0.15 — IPCServer.randomDarkColor parity).
+/// `--color=random`: dark muted color (hue anywhere, sat 0.33–0.46,
+/// brightness 0.13–0.18 — IPCServer.randomDarkColor parity).
+///
+/// The floors were raised from 0.2–0.3 / 0.1–0.15 for the same reason Mac
+/// raised them (IPCServer.swift `randomDarkColor`): the old ranges landed
+/// every window on the same near-black and the hue was imperceptible, so
+/// `--color=random` produced tints you could not tell apart. What actually
+/// carries the hue is the CHROMA — `max - min` channel, which is `b * s * 255`
+/// — and the old ranges capped it at ~11/255 while typically sitting near 8.
+/// These keep windows comfortably dark but lift them off pure black.
+pub const random_dark_sat_min: f64 = 0.33;
+pub const random_dark_sat_max: f64 = 0.46;
+pub const random_dark_bri_min: f64 = 0.13;
+pub const random_dark_bri_max: f64 = 0.18;
+
 pub fn randomDark(rand: std.Random) Rgb {
     return hsbToRgb(.{
         .h = rand.float(f64),
-        .s = 0.2 + rand.float(f64) * 0.1,
-        .b = 0.1 + rand.float(f64) * 0.05,
+        .s = random_dark_sat_min + rand.float(f64) * (random_dark_sat_max - random_dark_sat_min),
+        .b = random_dark_bri_min + rand.float(f64) * (random_dark_bri_max - random_dark_bri_min),
     });
 }
 
@@ -600,12 +613,47 @@ test "shiftedTint: pure black still lightens" {
 test "randomDark: always dark and muted" {
     var prng = std.Random.DefaultPrng.init(0x7667);
     const rand = prng.random();
-    for (0..100) |_| {
+    for (0..1000) |_| {
         const c = randomDark(rand);
         try testing.expect(!isLight(c));
         const hsb = rgbToHsb(c);
-        try testing.expect(hsb.b <= 0.16);
+        // Mac's ranges, both ends, read back through 8-bit RGB — so the
+        // epsilons are quantization, not slop, and they are NOT the same size.
+        // Brightness is `peak / 255`, one step = 0.004. Saturation is
+        // `(peak - trough) / peak` at a peak of only ~33, so one step is
+        // 1/33 = 0.030 and a single rounding of the trough moves it that far.
+        // (Found by the negative control: at the RETIRED brightness the peak
+        // is ~26, the step is 0.038, and saturation cannot be represented
+        // faithfully at all -- itself a symptom of the defect.)
+        try testing.expect(hsb.b >= random_dark_bri_min - 0.005);
+        try testing.expect(hsb.b <= random_dark_bri_max + 0.005);
+        try testing.expect(hsb.s >= random_dark_sat_min - 0.04);
+        try testing.expect(hsb.s <= random_dark_sat_max + 0.04);
     }
+}
+
+test "randomDark: tints are distinguishable from each other" {
+    // The defect this guards (T120, Mac 45f4f2250) is NOT "too bright" or
+    // "not dark enough" — the old ranges passed a darkness assertion happily.
+    // It is that every window came out the same near-black: what a viewer can
+    // actually see is the chroma (`max - min` channel = b * s * 255), and the
+    // retired sat 0.2-0.3 / bri 0.1-0.15 could only ever reach ~11 levels of
+    // it, sitting near 8. So assert the floor no old sample could clear.
+    var prng = std.Random.DefaultPrng.init(0xC010);
+    const rand = prng.random();
+    var min_chroma: u8 = 255;
+    var min_peak: u8 = 255;
+    for (0..1000) |_| {
+        const c = randomDark(rand);
+        const hi = @max(c.r, @max(c.g, c.b));
+        const lo = @min(c.r, @min(c.g, c.b));
+        min_chroma = @min(min_chroma, hi - lo);
+        min_peak = @min(min_peak, hi);
+    }
+    // Old worst case ~5, old best case ~11; new floor is 0.33 * 0.13 * 255.
+    try testing.expect(min_chroma >= 10);
+    // Lifted off pure black: old floor was ~26/255.
+    try testing.expect(min_peak >= 32);
 }
 
 test "contrastAdjusted: passing colors unchanged" {
