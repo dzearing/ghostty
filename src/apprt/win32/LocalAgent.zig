@@ -495,7 +495,7 @@ pub fn restartForUpgrade(self: *LocalAgent) bool {
     self.last_failure_ms = null;
 
     log.info("agent restart: terminating agent pid {d}", .{pid});
-    const killed = if (pid > 0) terminateProcess(pid) else false;
+    const killed = if (pid > 0) self.terminateAgent(pid) else false;
     if (killed) {
         log.info("terminated local agent pid {d} to adopt the bundled build", .{pid});
     } else {
@@ -508,17 +508,68 @@ pub fn restartForUpgrade(self: *LocalAgent) bool {
 /// respawn can't race the dying agent's still-bound pipe. Best-effort: a
 /// process we cannot open (gone already, or access-denied) reports false and
 /// the caller carries on — the spawn path re-dials before spawning anyway.
-fn terminateProcess(pid: i64) bool {
+///
+/// **The pid is VERIFIED to be the agent before it is killed (T421).** It comes
+/// out of `port.json`, so nothing about it is guaranteed to still name the
+/// agent: Windows recycles pids and a stale info file outlives its writer. On
+/// 2026-08-03 the app died inside this function with no crash record and no
+/// further log line — the signature of a clean self-terminate — and an
+/// unguarded `TerminateProcess(pid-from-a-file)` is a defect on its own terms
+/// whether or not that is what happened. Two gates, cheapest first: never our
+/// own pid, and never a pid whose image is not the agent binary.
+///
+/// Each step announces itself for the same reason the caller's step trail
+/// exists: the next occurrence must say WHICH call it stopped in.
+fn terminateAgent(self: *LocalAgent, pid: i64) bool {
     if (comptime builtin.os.tag != .windows) return false;
     if (pid <= 0 or pid > std.math.maxInt(u32)) return false;
     const windows = std.os.windows;
 
+    if (pid == @as(i64, w32.GetCurrentProcessId())) {
+        log.err(
+            "agent restart: REFUSING to terminate pid {d} — that is THIS process, " ++
+                "not the agent (stale port.json or a recycled pid)",
+            .{pid},
+        );
+        return false;
+    }
+
     const h = OpenProcess(
-        PROCESS_TERMINATE | SYNCHRONIZE,
+        PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
         windows.FALSE,
         @intCast(pid),
-    ) orelse return false;
+    ) orelse {
+        log.warn("agent restart: cannot open pid {d} (already gone, or access denied)", .{pid});
+        return false;
+    };
     defer windows.CloseHandle(h);
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const expected: ?[]const u8 = self.agentBinary(arena) catch null;
+
+    if (processImagePath(h, arena)) |image| {
+        if (!agent_upgrade.imageIsAgent(image, expected)) {
+            log.err(
+                "agent restart: REFUSING to terminate pid {d} — its image is '{s}', " ++
+                    "which is not the local agent ('{s}', with or without a delivery's " ++
+                    "rename suffix)",
+                .{ pid, image, agent_upgrade.baseName(expected orelse agent_upgrade.default_agent_image) },
+            );
+            return false;
+        }
+        log.info("agent restart: pid {d} verified as '{s}'", .{ pid, image });
+    } else {
+        // Unverifiable is not the same as wrong. The self-pid gate above still
+        // holds, and refusing here would break the refresh on any box where the
+        // query is denied — so proceed, out loud.
+        log.warn(
+            "agent restart: could not read the image path of pid {d}; " ++
+                "terminating on the info file's word alone",
+            .{pid},
+        );
+    }
 
     if (windows.kernel32.TerminateProcess(h, 0) == 0) {
         log.warn("TerminateProcess(agent pid {d}) failed err={}", .{ pid, windows.kernel32.GetLastError() });
@@ -526,8 +577,21 @@ fn terminateProcess(pid: i64) bool {
     }
     // The pipe name only frees when the agent's last handle closes; waiting
     // here is what keeps `findOrSpawn` from dialing the corpse.
-    _ = w32.WaitForSingleObject(h, agent_exit_wait_ms);
+    const waited = w32.WaitForSingleObject(h, agent_exit_wait_ms);
+    log.info("agent restart: pid {d} terminate returned, exit wait={d}", .{ pid, waited });
     return true;
+}
+
+/// `QueryFullProcessImageNameW` for an already-open handle, as UTF-8 in
+/// `arena`. Null on any failure — the caller treats that as "unverifiable",
+/// never as "not the agent".
+fn processImagePath(h: std.os.windows.HANDLE, arena: Allocator) ?[]const u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    var buf: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
+    var len: std.os.windows.DWORD = buf.len;
+    if (QueryFullProcessImageNameW(h, 0, &buf, &len) == 0) return null;
+    if (len == 0 or len > buf.len) return null;
+    return std.unicode.utf16LeToUtf8Alloc(arena, buf[0..len]) catch null;
 }
 
 /// How long to wait for a terminated agent to actually exit. Generous relative
@@ -537,6 +601,15 @@ const agent_exit_wait_ms: u32 = 3000;
 
 const PROCESS_TERMINATE: std.os.windows.DWORD = 0x0001;
 const SYNCHRONIZE: std.os.windows.DWORD = 0x00100000;
+
+/// Declared here for the same reason `OpenProcess` is: `std.os.windows.kernel32`
+/// does not export it.
+extern "kernel32" fn QueryFullProcessImageNameW(
+    hProcess: std.os.windows.HANDLE,
+    dwFlags: std.os.windows.DWORD,
+    lpExeName: [*]u16,
+    lpdwSize: *std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
 
 /// Write/refresh the HKCU Run autostart entry for the local agent (T89h) —
 /// the Windows analog of the Mac's per-user LaunchAgent. At sign-in the agent

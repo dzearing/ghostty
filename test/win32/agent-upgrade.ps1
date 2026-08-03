@@ -79,10 +79,20 @@ function Assert($name, $cond) {
 }
 function Say($m) { Write-Host $m }
 
+# Arm I runs its agent from a COPY under this script's temp root, so its command
+# line never mentions zig-out and the `*zig-out*` filter alone left it running
+# after the script exited. A leftover agent owns the agent pipe name (which is
+# NOT namespaced by GHOZTTY_PIPE_SUFFIX), so the NEXT run's app dials the corpse
+# instead of spawning its own: measured 2026-08-03 as 33 failures on a re-run of
+# a script that had just passed 85. Match the temp root too.
+$script:TestProcRoot = Join-Path $env:TEMP 'ghoztty-agent-upgrade-'
 function Stop-TestProcs {
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
         Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
+            Where-Object {
+                $_.CommandLine -like '*zig-out*' -or
+                $_.ExecutablePath -like "$script:TestProcRoot*"
+            } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     }
     Start-Sleep -Milliseconds 700
@@ -537,6 +547,24 @@ Assert "H14 the refresh reports its OUTCOME, not just its intent" `
     (Wait-LogMatch $logH 'destructive agent refresh finished: \d+ window\(s\) rebuilt' 30)
 Assert "H15 the in-place rebuild logged how many windows it rebuilt" `
     (Wait-LogMatch $logH 'in-place recovery: rebuilt \d+ window\(s\)' 30)
+# T421. H9 asserts the app survived; these assert that it would have been
+# BROUGHT BACK if it had not. The guard is armed inside the confirmed path
+# itself, so this is the only place the arming half is exercised end to end -
+# `test\win32\relaunch-guard.ps1` drives the watching half directly.
+Assert "H16 T421: the destructive window is SUPERVISED (guard armed)" `
+    (Wait-LogMatch $logH 'relaunch guard: ARMED \(guard pid \d+ watching app pid \d+' 30)
+Assert "H17 T421: ... and disarmed once the rebuild finished" `
+    (Wait-LogMatch $logH 'relaunch guard: disarmed' 30)
+# The marker is what a guard keys on; a leaked one would make the NEXT app exit
+# look like a death inside a refresh.
+$markerH = Join-Path $tmp 'ghoztty\agent-refresh-debug.marker'
+Assert "H18 T421: the guard marker is gone afterwards" (-not (Test-Path $markerH))
+# The identity gate (T421): the pid out of port.json is verified to be the agent
+# before it is killed, so a stale/recycled pid can never make this a self-kill.
+Assert "H19 T421: the kill target was VERIFIED as the agent binary first" `
+    (Wait-LogMatch $logH "agent restart: pid \d+ verified as '.*ghoztty-agent\.exe'" 30)
+Assert "H20 T421: ... and the terminate step reports that it returned" `
+    (Wait-LogMatch $logH 'agent restart: pid \d+ terminate returned' 30)
 Stop-TestProcs
 
 # ============================================================================

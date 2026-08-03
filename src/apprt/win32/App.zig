@@ -44,6 +44,7 @@ const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
 const agent_recovery = @import("agent_recovery.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
+const relaunch_guard = @import("relaunch_guard.zig");
 const host_defaults = @import("host_defaults.zig");
 const w32 = @import("win32.zig");
 
@@ -2078,6 +2079,11 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
         .none => return,
         .refresh_now => {
             self.agent_upgrade_attempts += 1;
+            // Supervised for the same reason the confirmed path is (T421): this
+            // one asks nobody, so an app that ended here would be even harder to
+            // explain than one that ended after a dialog.
+            var guard = relaunch_guard.arm(self.core_app.alloc);
+            defer if (guard) |*g| g.disarm();
             _ = self.local_agent.restartForUpgrade();
             // Re-dial straight away so the fresh agent is warm before the next
             // window asks — and through the recovery path, not a bare re-dial:
@@ -2174,6 +2180,14 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
     // the way out (see `endAgentRefresh`).
     self.beginAgentRefresh();
     defer self.endAgentRefresh();
+
+    // …and if it ends anyway, something outside this process has to notice
+    // (T421). Twice the app has simply stopped between here and the rebuild —
+    // no crash record, no further log line, no windows — and the user was left
+    // relaunching Ghoztty by hand. The guard is a detached watcher that starts
+    // the app again if this process ends before the marker below is cleared.
+    var guard = relaunch_guard.arm(alloc);
+    defer if (guard) |*g| g.disarm();
 
     _ = self.local_agent.restartForUpgrade();
     const rebuilt = self.recoverLocalAgentInPlace();
@@ -4963,6 +4977,15 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
     const ver = update_check.findLatestWinVersion(body.items) orelse
         return error.NoWinRelease;
     return try alloc.dupe(u8, ver);
+}
+
+/// Was this process started as the agent-refresh relaunch guard (T421)? If so,
+/// run it and hand `main` the exit code — a guard never becomes a terminal.
+///
+/// A DECL on the apprt so `main_ghostty.zig` reaches it the same way it reaches
+/// `startQuitTimer`, instead of importing a win32 module directly.
+pub fn runRelaunchGuard(alloc: Allocator) ?u8 {
+    return relaunch_guard.runFromEnv(alloc);
 }
 
 /// Start the quit timer. Called when the last surface closes.

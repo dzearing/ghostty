@@ -669,6 +669,9 @@ pub extern "kernel32" fn GetProcessId(
     Process: std.os.windows.HANDLE,
 ) callconv(.winapi) u32;
 
+/// Our own pid. Cannot fail.
+pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
 pub extern "user32" fn ToUnicode(
     wVirtKey: u32,
     wScanCode: u32,

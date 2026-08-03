@@ -192,6 +192,55 @@ pub fn formatConfirmText(buf: []u8, live_sessions: usize) ![]const u8 {
 /// Title for the same dialog.
 pub const confirm_title = "Restart the Ghoztty background terminal process?";
 
+/// The image name a pid must carry before the destructive refresh is allowed to
+/// terminate it (T421).
+pub const default_agent_image = "ghoztty-agent.exe";
+
+/// Last path component of `path`, accepting either separator. `""` when the
+/// path ends in one.
+pub fn baseName(path: []const u8) []const u8 {
+    var start: usize = 0;
+    for (path, 0..) |c, i| if (c == '\\' or c == '/') {
+        start = i + 1;
+    };
+    return path[start..];
+}
+
+/// The name up to the first `.` — `ghoztty-agent.exe` ⇒ `ghoztty-agent`.
+fn stem(name: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return name;
+    return name[0..dot];
+}
+
+/// Is `image` (the full path `QueryFullProcessImageNameW` reported for a pid)
+/// the local agent we are about to kill?
+///
+/// The pid comes out of `port.json`, a FILE — nothing about it is guaranteed to
+/// still name the agent. Windows recycles pids, a stale info file outlives its
+/// writer, and `TerminateProcess` on the wrong pid is unrecoverable and silent.
+/// T421's app died inside that call with no crash record and no further log
+/// line, which is exactly the signature a self-terminate leaves, so the kill is
+/// gated on identity rather than on the file being trustworthy.
+///
+/// Matched on the BASE NAME's STEM, as a prefix, case-insensitively — NOT on the
+/// full name, and this is load-bearing rather than sloppy. **Every delivery
+/// renames the running agent's own image**: `upgrade-ghoztty-windows.ps1` cannot
+/// delete a running exe, so it does `Move-Item ghoztty-agent.exe
+/// ghoztty-agent.exe.bak` and copies the new build into place. By the time the
+/// app decides that agent is stale, `QueryFullProcessImageNameW` reports the
+/// `.bak` path — a full-name match would refuse to kill the very agent this
+/// whole feature exists to replace. (Measured: `agent-upgrade.ps1` arm I, which
+/// reproduces that rename, failed exactly that way.)
+///
+/// `expected` is the path this build would spawn (`GHOSTTY_LOCAL_AGENT_BIN` can
+/// move or rename it); null falls back to `default_agent_image`.
+pub fn imageIsAgent(image: []const u8, expected: ?[]const u8) bool {
+    const want = stem(baseName(expected orelse default_agent_image));
+    const got = baseName(image);
+    if (want.len == 0 or got.len < want.len) return false;
+    return std.ascii.eqlIgnoreCase(got[0..want.len], want);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -353,4 +402,57 @@ test "formatConfirmText pluralizes and names the count" {
     // The "you can defer" half is what makes the dialog honest about the
     // decline path; it must never be dropped.
     try testing.expect(std.mem.indexOf(u8, many, "next time no sessions are open") != null);
+}
+
+test "baseName takes the last component with either separator" {
+    try testing.expectEqualStrings("ghoztty-agent.exe", baseName("C:\\a b\\ghoztty-agent.exe"));
+    try testing.expectEqualStrings("ghoztty-agent.exe", baseName("/tmp/ghoztty-agent.exe"));
+    try testing.expectEqualStrings("ghoztty-agent.exe", baseName("ghoztty-agent.exe"));
+    try testing.expectEqualStrings("", baseName("C:\\a\\"));
+    try testing.expectEqualStrings("", baseName(""));
+}
+
+test "imageIsAgent accepts the agent by base name, case-insensitively" {
+    try testing.expect(imageIsAgent(
+        "C:\\Users\\d\\AppData\\Local\\Programs\\Ghoztty\\ghoztty-agent.exe",
+        null,
+    ));
+    // Windows paths are case-insensitive and the loader reports whatever case
+    // the caller used; a case difference must not read as a different program.
+    try testing.expect(imageIsAgent("C:\\X\\GHOZTTY-AGENT.EXE", null));
+    // A copy somewhere else is still the agent: the test harness runs one from
+    // a temp dir, and the delivery runs one from the install dir.
+    try testing.expect(imageIsAgent("D:\\tmp\\ghoztty-agent.exe", "C:\\p\\ghoztty-agent.exe"));
+}
+
+test "imageIsAgent accepts the agent the delivery renamed out of the way" {
+    // THE production shape, not an edge case: `upgrade-ghoztty-windows.ps1`
+    // renames the running agent's own image on every upgrade, because a running
+    // exe cannot be deleted. A gate that missed this would refuse to replace any
+    // agent that had ever been upgraded past — i.e. all of them.
+    try testing.expect(imageIsAgent("C:\\p\\Ghoztty\\ghoztty-agent.exe.bak", null));
+    try testing.expect(imageIsAgent("C:\\p\\Ghoztty\\ghoztty-agent.exe.bak-20260803-090358", null));
+    // The acceptance harness's own rename (agent-upgrade.ps1 arm I).
+    try testing.expect(imageIsAgent("C:\\t\\agentcopy\\ghoztty-agent.bak", null));
+}
+
+test "imageIsAgent refuses anything that is not the agent" {
+    // The app itself. This is the one that matters: a stale pid that has been
+    // recycled onto ghoztty.exe turns the refresh into a silent self-kill.
+    try testing.expect(!imageIsAgent("C:\\p\\Ghoztty\\ghoztty.exe", null));
+    try testing.expect(!imageIsAgent("C:\\Windows\\System32\\svchost.exe", null));
+    // A PREFIX of the stem, not a substring of the name: a program that merely
+    // ends in the agent's name is a different program.
+    try testing.expect(!imageIsAgent("C:\\p\\my-ghoztty-agent.exe", null));
+    try testing.expect(!imageIsAgent("C:\\p\\ghoztty-age.exe", null));
+    // Nothing to compare against on either side.
+    try testing.expect(!imageIsAgent("", null));
+    try testing.expect(!imageIsAgent("C:\\p\\ghoztty-agent.exe", "C:\\p\\"));
+}
+
+test "imageIsAgent honors a relocated expected binary (GHOSTTY_LOCAL_AGENT_BIN)" {
+    const expected = "D:\\build\\old-agent.exe";
+    try testing.expect(imageIsAgent("D:\\build\\old-agent.exe", expected));
+    try testing.expect(imageIsAgent("D:\\build\\old-agent.exe.bak", expected));
+    try testing.expect(!imageIsAgent("D:\\build\\ghoztty-agent.exe", expected));
 }

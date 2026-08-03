@@ -7506,3 +7506,42 @@ it should absorb the "Previous prompt:" vs "previous command:" label question
 T425 raises, rather than rewording the same surface twice.
 
 Nothing built this turn beyond the filing; T120 shipped separately above.
+
+## 2026-08-03 - T421: the upgrade shut Ghoztty down and it never came back
+
+The user's own log settles the question T421 was filed to ask. "When i clicked
+upgrade" was the **in-app mandatory agent-restart dialog**, six seconds after
+the upgraded app relaunched and restored two windows - not the upgrade script,
+whose half finished cleanly. So this is a **third occurrence of T229**, after
+T229 shipped, not a new path.
+
+The step trail T229 added is what paid: `agent restart: terminating agent pid
+38152` is the last line the process ever wrote, both branches after that call
+log, and neither appeared - so `terminateProcess` did not return. No WER event
+exists for it. Nothing brought the app back: the next process started at
+09:18:44, fourteen minutes later, which was the user launching it by hand.
+
+T229 attacked the cause and could not reproduce it in four shapes. This turn
+takes the half the user feels. **`relaunch_guard.zig`**: before the destructive
+step the app writes a marker and spawns a detached copy of itself holding its
+own process handle; if the app ENDS with the marker still there, the guard
+starts it again. An env var, not a `+verb`, so the CLI stays identical on both
+platforms - Mac half filed as **T427**. Armed on both destructive callers.
+And **the kill target is verified before it is killed**: the pid comes out of
+`port.json`, and nothing gated it - not our own pid, not the image.
+
+Two lessons. The identity gate's first cut matched the agent's full filename;
+it compiled, passed its unit tests, and **would have broken every upgrade** -
+the delivery script cannot delete a running exe, so it renames the agent to
+`ghoztty-agent.exe.bak`, and by the time the app judges that agent stale its
+image path IS the `.bak`. `agent-upgrade.ps1` arm I caught it because arm I
+models the delivery rather than the happy path. And the same script went
+85-passed/2-failed then 49-passed/33-failed with no code change in between:
+arm I's agent runs from a copy outside `zig-out`, survived `Stop-TestProcs`,
+and poisoned the next run through the agent pipe name (which the test's
+`GHOZTTY_PIPE_SUFFIX` does not namespace). Fixed; a script that only passes on
+a clean box is not passing.
+
+Root cause of the death is still open as **T426** - what changed is that the
+next occurrence names the call it stopped in, and the user gets their terminal
+back either way.

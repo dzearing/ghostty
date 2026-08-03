@@ -57,6 +57,23 @@ pub fn main() !MainReturn {
     defer state.deinit();
     const alloc = state.alloc;
 
+    // T421: this process may be a relaunch guard rather than a terminal — a
+    // detached watcher armed by the app for the seconds it spends restarting
+    // the local agent. Asked FIRST, before any window, IPC endpoint or
+    // single-instance guard exists, because a guard must never look like a
+    // second instance of the app it is watching.
+    //
+    // Gated on there being no `+action`: the app sets the variable on ITSELF for
+    // the instant it takes to spawn the guard (that is how the child inherits
+    // it), so a pane started in exactly that window would carry it too — and a
+    // `ghoztty +list` from that pane must stay a `+list`, not become a watcher.
+    if (@hasDecl(apprt.App, "runRelaunchGuard") and state.action == null) {
+        if (apprt.App.runRelaunchGuard(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     if (comptime builtin.mode == .Debug) {
         std.log.warn("This is a debug build. Performance will be very poor.", .{});
         std.log.warn("You should only use a debug build for developing Ghostty.", .{});
