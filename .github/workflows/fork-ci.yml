@@ -68,15 +68,37 @@ jobs:
             exit 1
           fi
 
-      # On macOS `zig build test` covers BOTH halves of the codebase: the Zig
-      # unit tests and `xcodebuild test -scheme Ghostty -skip-testing
-      # GhosttyUITests` (build.zig wires the xctest step into the test step via
-      # GhosttyXcodebuild.zig). So this single step exercises the Zig core and
-      # the Swift GhosttyTests suites.
-      - name: Test
-        run: zig build test
+      # The two halves are run as separate steps ON PURPOSE. A plain
+      # `zig build test` covers both — build.zig wires the xctest step into the
+      # test step via GhosttyXcodebuild.zig — but then a red X cannot tell you
+      # whether the Zig core or the Swift app broke, and the first real run hit
+      # exactly that ambiguity. `-Dapp-runtime=none` keeps this step off the
+      # xcodebuild path entirely.
+      - name: Test (Zig core)
+        run: zig build -Dapp-runtime=none test
 
       # Proves the artifact the project actually ships from — the same command
-      # CLAUDE.md tells contributors to run — still builds end to end.
+      # CLAUDE.md tells contributors to run — still builds end to end. Also
+      # produces the GhosttyKit xcframework the Swift tests link against.
       - name: Build debug app
         run: zig build -Doptimize=Debug
+
+      # Kept separate from the Zig step so its failures are attributable, and
+      # given a result bundle because xcodebuild's plain stdout does not say
+      # why a test host failed to come up — it just lists every test as failed.
+      - name: Test (Swift app)
+        run: |
+          cd macos
+          xcodebuild test \
+            -scheme Ghostty \
+            -skip-testing GhosttyUITests \
+            -arch arm64 \
+            -resultBundlePath "${RUNNER_TEMP}/GhosttyTests.xcresult"
+
+      - name: Upload xcresult on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xcresult
+          path: ${{ runner.temp }}/GhosttyTests.xcresult
+          retention-days: 7
