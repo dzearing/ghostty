@@ -40,57 +40,33 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version
-          echo "xcode-select -p: $(xcode-select -p)"
-          echo "sdk path: $(xcrun --sdk macosx --show-sdk-path)"
 
-      # Zig links the native macOS target against libSystem from the SDK it
-      # locates via xcrun. Upstream never exercises this path — their CI runs
-      # zig inside `nix develop`, which supplies an SDK — so on a bare runner
-      # Zig can fail to resolve one and the link dies on undefined libSystem
-      # symbols (_free, _malloc_size, __availability_version_check ...) while
-      # building nothing more than the build runner itself. Pin SDKROOT and
-      # DEVELOPER_DIR explicitly rather than relying on that detection.
-      - name: Export macOS SDK paths
+      # Zig comes from Homebrew, NOT the official tarball that setup-zig
+      # installs. This is load-bearing, so it is worth writing down: the
+      # official aarch64-macos 0.15.2 binary cannot link ANYTHING on this
+      # runner image — a bare `pub fn main() void {}` dies with ~25 undefined
+      # libSystem symbols (_free, _malloc_size, __availability_version_check).
+      # It is not the SDK. Pinning SDKROOT, pointing at the CommandLineTools
+      # SDK, passing -lc, and moving the Zig cache out of the workspace were
+      # all tried and all failed identically, against an SDK whose
+      # libSystem.B.tbd does carry an arm64-macos slice. Homebrew's zig@0.15
+      # is the same 0.15.2 with Apple SDK resolution patched, and it is what
+      # the project is developed against locally. Upstream never hits this
+      # because their macOS CI runs zig inside `nix develop`.
+      - name: Setup Zig (Homebrew)
         run: |
-          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
-          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          brew install zig@0.15
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
 
-      - name: Get required Zig version
-        id: zig
+      - name: Verify Zig satisfies build.zig.zon
         run: |
-          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> $GITHUB_OUTPUT
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: ${{ steps.zig.outputs.version }}
-
-      # Temporary: locate why Zig cannot resolve libSystem on this image.
-      # Non-fatal so the real steps still run and one round trip yields both.
-      - name: Diagnose Zig libSystem resolution
-        continue-on-error: true
-        run: |
-          echo "--- CommandLineTools ---"
-          ls -d /Library/Developer/CommandLineTools 2>/dev/null || echo "ABSENT"
-          ls /Library/Developer/CommandLineTools/SDKs/ 2>/dev/null || echo "no CLT SDKs"
-          echo "--- tbd targets ---"
-          sed -n '1,3p' "$SDKROOT/usr/lib/libSystem.B.tbd" || echo "no libSystem.B.tbd"
-          echo "--- zig env ---"
-          zig env
-          echo "--- minimal native link ---"
-          printf 'pub fn main() void {}\n' > /tmp/t.zig
-          zig build-exe /tmp/t.zig -femit-bin=/tmp/t.out && echo "MINIMAL LINK OK" || echo "MINIMAL LINK FAILED"
-          echo "=== A: local-equivalent env (no SDKROOT, default HOME cache) ==="
-          ( cd /tmp && env -u SDKROOT -u DEVELOPER_DIR -u ZIG_GLOBAL_CACHE_DIR -u ZIG_LOCAL_CACHE_DIR \
-              zig build-exe /tmp/t.zig -femit-bin=/tmp/a.out ) >/dev/null 2>&1 && echo "A OK" || echo "A FAIL"
-          echo "=== B: CommandLineTools SDK ==="
-          ( cd /tmp && SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-              zig build-exe /tmp/t.zig -femit-bin=/tmp/b.out ) >/dev/null 2>&1 && echo "B OK" || echo "B FAIL"
-          echo "=== C: explicit -lc ==="
-          ( cd /tmp && zig build-exe /tmp/t.zig -lc -femit-bin=/tmp/c.out ) >/dev/null 2>&1 && echo "C OK" || echo "C FAIL"
-          echo "=== D: cache outside the workspace ==="
-          ( cd /tmp && ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig" ZIG_LOCAL_CACHE_DIR="$HOME/.cache/zig-local" \
-              zig build-exe /tmp/t.zig -femit-bin=/tmp/d.out ) >/dev/null 2>&1 && echo "D OK" || echo "D FAIL"
+          required="$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)"
+          actual="$(zig version)"
+          echo "required >= ${required}, have ${actual}"
+          if [ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -1)" != "$required" ]; then
+            echo "::error::Zig ${actual} is older than the required ${required}"
+            exit 1
+          fi
 
       # On macOS `zig build test` covers BOTH halves of the codebase: the Zig
       # unit tests and `xcodebuild test -scheme Ghostty -skip-testing
