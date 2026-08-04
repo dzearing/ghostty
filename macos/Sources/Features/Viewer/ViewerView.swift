@@ -5,13 +5,15 @@ import SwiftUI
 import WebKit
 
 /// A non-terminal pane content view that renders a markdown file, a text/code
-/// file, or a website inside a WKWebView.
+/// file, an HTML file, or a website inside a WKWebView.
 ///
-/// File modes are fully offline: the page template and renderer libraries are
-/// bundled app resources served through a custom URL scheme
-/// (`ghoztty-viewer://`), which also grants the page read access to the viewed
-/// file's directory so relative images resolve. Websites load directly over
-/// the network. View-only — no editing.
+/// Template-backed modes (markdown, code, diff) are fully offline: the page
+/// template and renderer libraries are bundled app resources served through a
+/// custom URL scheme (`ghoztty-viewer://`), which also grants the page read
+/// access to the viewed file's directory so relative images resolve. An HTML
+/// file skips the template entirely — the web view loads the file itself, so
+/// the page is the document. Websites load directly over the network.
+/// View-only — no editing.
 final class ViewerView: NSView, Codable, ObservableObject {
     fileprivate static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.dzearing.ghoztty",
@@ -61,6 +63,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
         case code(URL)
         /// A git diff, rendered through the same page (see ViewerDiffSpec).
         case diff(ViewerDiffSpec)
+        /// A local HTML file, loaded straight into the web view as a live
+        /// page. There is no template and nothing to inject: the file IS the
+        /// document, so its own CSS/JS/images run exactly as they would if it
+        /// were served over http — which is the point, since hosting a static
+        /// file behind `python3 -m http.server` was the only way to see it
+        /// before.
+        case html(URL)
         /// A website; the web view navigates to it directly.
         case web(URL)
     }
@@ -75,6 +84,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// `mode` because the web view's URL while a file is displayed is the
     /// template's `ghoztty-viewer://` address, not the file's — this is what
     /// lets Back cross from a website into the file view and land correctly.
+    ///
+    /// An HTML file is deliberately NOT recorded here: the web view loads it
+    /// directly, so its own URL already names it, and overwriting this would
+    /// lose the document the template still holds behind it in history.
     private var fileLocation: URL?
 
     /// The diff the template page is showing, if any. The other half of
@@ -227,6 +240,25 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return false
     }
 
+    /// True while the web view is showing a page it loaded itself — a website
+    /// or a local HTML file — rather than our render template. Such a page
+    /// owns its own navigation, history, and media, so the swipe gestures and
+    /// the media pause apply to both.
+    var isLivePage: Bool {
+        switch mode {
+        case .web, .html: return true
+        case .markdown, .code, .diff: return false
+        }
+    }
+
+    /// True while the bundled template page is what the web view is actually
+    /// displaying. Derived from the committed URL rather than tracked, so it
+    /// stays right across Back/Forward, which move between the template and
+    /// directly-loaded pages without going through `openLocation`.
+    private var showingTemplatePage: Bool {
+        webView?.url?.scheme == ViewerSchemeHandler.scheme
+    }
+
     /// True while this pane is rendering a git diff. Drives which side panel
     /// the card shows, which controls the nav bar carries, and whether the
     /// bar may auto-hide.
@@ -238,7 +270,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// The file URL for file-backed modes, nil for websites and diffs.
     var fileURL: URL? {
         switch mode {
-        case .markdown(let url), .code(let url): return url
+        case .markdown(let url), .code(let url), .html(let url): return url
         case .web, .diff: return nil
         }
     }
@@ -268,7 +300,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         self.originDirectory = originDirectory
         let mode = Self.mode(for: location)
         self.mode = mode
-        self.fileLocation = mode.fileURL
+        self.fileLocation = mode.templateFileURL
         self.diffSpec = mode.diffSpec
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
@@ -362,7 +394,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // is kept, so an undo re-attaches a pane that is already populated
             // and simply resumes refreshing.
             stopWatchingDiff()
-            if isWebURL {
+            if isLivePage {
                 webView.pauseAllMediaPlayback()
             }
         } else {
@@ -412,6 +444,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
         switch url.pathExtension.lowercased() {
         case "md", "markdown", "mdown", "mkd", "mdwn":
             return .markdown(url)
+        case "html", "htm":
+            return .html(url)
         default:
             return .code(url)
         }
@@ -427,10 +461,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return (path as NSString).expandingTildeInPath
     }
 
+    /// A file viewer is titled by its file, INCLUDING a rendered HTML page:
+    /// the pane names the thing on disk the user asked for, the same way every
+    /// other `--view=<path>` pane does. Only a website supplies its own title.
     private static func initialTitle(for location: String) -> String {
         switch mode(for: location) {
         case .web(let url): return url.host ?? location
-        case .markdown(let url), .code(let url): return url.lastPathComponent
+        case .markdown(let url), .code(let url), .html(let url): return url.lastPathComponent
         case .diff(let spec): return spec.title
         }
     }
@@ -499,7 +536,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // drops them), and it lets a popup itself spawn further popups. Weak,
         // like `navigationDelegate`, so assigning `self` is not a retain cycle.
         webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = isWebURL
+        webView.allowsBackForwardNavigationGestures = isLivePage
         // Trackpad pinch magnifies the pane (native pixel zoom, like Safari's
         // two-finger pinch), for every viewer kind — web, markdown, and code all
         // render in this one web view. This is independent of keyboard page zoom
@@ -580,6 +617,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
             } else {
                 load()
             }
+        case .html:
+            // Re-arm the watcher like the other file modes, then re-fetch the
+            // page from disk. `reloadFromOrigin` rather than `reload` because
+            // an explicit reload is also how you pick up an edited sibling
+            // stylesheet or script — the watcher only sees the HTML file
+            // itself, and those subresources sit in WebKit's memory cache.
+            startWatchingFile()
+            if pageLoaded, !showingTemplatePage {
+                webView.reloadFromOrigin()
+            } else {
+                load()
+            }
         case .diff:
             // Re-runs git, so an explicit reload picks up commits, staging,
             // and edits made since the pane was opened. The selected file and
@@ -642,6 +691,20 @@ final class ViewerView: NSView, Codable, ObservableObject {
             webView.allowsBackForwardNavigationGestures = true
             webView.load(URLRequest(url: url))
             stopWatchingDiff()
+        case .html(let url):
+            // Structurally a website — the web view loads it and owns its
+            // navigation — so `fileLocation`/`diffSpec` are left alone and
+            // Back still lands on whatever the template was rendering. What it
+            // adds over `.web` is the file watcher, since it has a file.
+            mode = newMode
+            location = url.path
+            title = url.lastPathComponent
+            currentURL = addressText(for: url)
+            webView.allowsBackForwardNavigationGestures = true
+            pageLoaded = false
+            stopWatchingDiff()
+            startWatchingFile()
+            load()
         case .markdown(let url), .code(let url):
             mode = newMode
             fileLocation = url
@@ -681,6 +744,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// "Enter URL" placeholder visible to type into.
     private func addressText(for url: URL?) -> String {
         guard let url else { return "" }
+        if Self.sameFile(url, as: fileURL), let known = fileURL {
+            // A directly-loaded HTML file: show the path the pane was opened
+            // with rather than WebKit's symlink-resolved rewrite of it, so the
+            // field matches `location` and what the user typed.
+            return known.absoluteString
+        }
         if url.scheme == ViewerSchemeHandler.scheme {
             // The template renders either a file or a diff; the address shows
             // whichever it currently holds, in the form the user can retype.
@@ -2020,7 +2089,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// instead of the markdown page's, leaving a visible seam down the edge
     /// of the gutter in both light and dark.
     private func pushSidePanelGutter() {
-        guard pageLoaded else { return }
+        // Only our own template has a `window.__viewer` to talk to; a website
+        // or a rendered HTML file has no panel and no gutter to reserve.
+        guard pageLoaded, showingTemplatePage else { return }
         webView.evaluateJavaScript("window.__viewer.setGutter(\(sidePanelGutterWidth))")
     }
 
@@ -2412,11 +2483,32 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private func load() {
         switch mode {
         case .markdown, .code, .diff:
-            guard let pageURL = URL(string: "\(ViewerSchemeHandler.scheme)://page/viewer.html") else { return }
-            webView.load(URLRequest(url: pageURL))
+            loadTemplatePage()
+        case .html(let url):
+            // Read access is scoped to the file's own directory: that is what
+            // makes sibling (and nested) CSS, JS, images, and fonts resolve,
+            // which is the whole point of rendering the file rather than its
+            // source. It is deliberately not widened to the repo root — the
+            // grant lets the page's subresource loads read anything beneath
+            // it, and a scaffolded mock keeps its assets next to itself. A
+            // page reaching UP out of its folder (`../shared/app.css`) is the
+            // documented cost of that.
+            guard FileManager.default.isReadableFile(atPath: url.path) else {
+                // Fall back to the template so a missing file gets the same
+                // in-page error card every other file mode gets, instead of
+                // WebKit's blank failure page (see renderFileContent).
+                loadTemplatePage()
+                return
+            }
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         case .web(let url):
             webView.load(URLRequest(url: url))
         }
+    }
+
+    private func loadTemplatePage() {
+        guard let pageURL = URL(string: "\(ViewerSchemeHandler.scheme)://page/viewer.html") else { return }
+        webView.load(URLRequest(url: pageURL))
     }
 
     /// (Re-)inject the file's content into the loaded page. Safe to call
@@ -2434,6 +2526,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
         guard let fileURL else { return }
 
+        if case .html = mode {
+            // An HTML file has no content to inject — the web view loaded it
+            // directly. Reaching here means `load()` could not open it and
+            // fell back to the template, which is now up and waiting for its
+            // error card.
+            webView.evaluateJavaScript(
+                "window.__viewer.setError(\(Self.js("Cannot read file")), \(Self.js(fileURL.path)))")
+            return
+        }
+
         let call: String
         do {
             let data = try Data(contentsOf: fileURL)
@@ -2448,7 +2550,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             case .code:
                 let lang = Self.highlightLanguage(forExtension: fileURL.pathExtension.lowercased())
                 call = "window.__viewer.setCode(\(Self.js(text)), \(Self.js(lang ?? "")))"
-            case .web, .diff:
+            case .html, .web, .diff:
                 return
             }
         } catch {
@@ -2498,10 +2600,33 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 // The path was atomically replaced; track the new inode.
                 self.startWatchingFile()
             }
-            self.renderFileContent()
+            self.reloadAfterFileChange()
         }
         reloadDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
+    /// The watched file changed on disk. Template-backed modes re-inject the
+    /// new text; an HTML file is the page itself, so re-fetching it from disk
+    /// IS its render.
+    ///
+    /// `reload()` rather than a fresh `loadFileURL`: it replaces the current
+    /// history entry instead of pushing one (so live-saving does not fill the
+    /// Back stack), and WebKit restores the scroll offset across it, which is
+    /// what keeps a save from throwing you back to the top of a long page.
+    private func reloadAfterFileChange() {
+        guard case .html = mode else {
+            renderFileContent()
+            return
+        }
+        // Showing the error card means the file was unreadable when we last
+        // looked; go through `load()` so it gets re-checked and the real page
+        // takes over once it is back.
+        if showingTemplatePage || !pageLoaded {
+            load()
+        } else {
+            webView.reload()
+        }
     }
 
     /// Encode a string as a JS string literal (JSON is a subset of JS).
@@ -2803,8 +2928,17 @@ extension ViewerView.Mode {
     /// The file this mode renders, nil for a website or a diff.
     var fileURL: URL? {
         switch self {
-        case .markdown(let url), .code(let url): return url
+        case .markdown(let url), .code(let url), .html(let url): return url
         case .web, .diff: return nil
+        }
+    }
+
+    /// The file the TEMPLATE page renders, nil for everything the web view
+    /// loads itself. An HTML file is excluded on purpose — see `fileLocation`.
+    var templateFileURL: URL? {
+        switch self {
+        case .markdown(let url), .code(let url): return url
+        case .html, .web, .diff: return nil
         }
     }
 
@@ -2847,23 +2981,50 @@ extension ViewerView: WKNavigationDelegate {
             title = fileLocation.lastPathComponent
             webView.allowsBackForwardNavigationGestures = false
             pageLoaded = false
+        } else if url.isFileURL {
+            // A local file the web view loaded itself: the HTML page this pane
+            // was opened with, or one its links led to. Whatever the extension
+            // says, WebKit — not our template — is what is rendering it, so
+            // the pane is in `.html` mode by definition.
+            let file = Self.sameFile(url, as: fileURL) ? (fileURL ?? url) : url
+            mode = .html(file)
+            location = file.path
+            title = file.lastPathComponent
+            webView.allowsBackForwardNavigationGestures = true
+            leftTemplatePage()
+            // Follow the file the pane actually landed on, so a link from one
+            // local page to another keeps live-reloading the right one.
+            startWatchingFile()
         } else if url.scheme == "http" || url.scheme == "https" || url.scheme == "about" {
             mode = .web(url)
             location = url.absoluteString
             webView.allowsBackForwardNavigationGestures = true
-            // A website is not a rendered document: whatever headings the
-            // template page last reported are gone with it. (Nothing will
-            // arrive to clear them — the bridge only exists in our template.)
-            clearTOC()
-            // Same for a diff pane the user has navigated off: stop polling
-            // git and empty the file tree. `diffSpec` survives, so Back over
-            // this boundary re-renders the diff.
-            stopWatchingDiff()
-            diffFiles = []
-            diffRows = []
-            activeDiffFileID = nil
+            leftTemplatePage()
         }
         currentURL = addressText(for: url)
+    }
+
+    /// The template page is off screen. Whatever it was rendering — a
+    /// document's headings, a diff's file tree — is not what the pane is
+    /// showing any more, and nothing will arrive to say so (the bridge only
+    /// exists inside our template). `fileLocation`/`diffSpec` survive, so
+    /// Back over this boundary re-renders it.
+    private func leftTemplatePage() {
+        clearTOC()
+        stopWatchingDiff()
+        diffFiles = []
+        diffRows = []
+        activeDiffFileID = nil
+    }
+
+    /// Whether two file URLs name the same file on disk. WebKit hands back a
+    /// symlink-resolved URL for a file load (`/var/…` becomes `/private/var/…`
+    /// on macOS), and letting that churn `location` would follow the pane into
+    /// the session manifest and out of `+list`.
+    private static func sameFile(_ lhs: URL?, as rhs: URL?) -> Bool {
+        guard let lhs, let rhs, lhs.isFileURL, rhs.isFileURL else { return false }
+        return lhs.resolvingSymlinksInPath().standardizedFileURL
+            == rhs.resolvingSymlinksInPath().standardizedFileURL
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2873,6 +3034,11 @@ extension ViewerView: WKNavigationDelegate {
         if zoomFactor != 1.0 { pushZoomToWebView() }
         if case .web = mode { return }
         pageLoaded = true
+        // An HTML file IS the page — there is no template to inject into, and
+        // calling into `window.__viewer` on someone else's document would only
+        // throw. (Unless the load failed and we fell back to the template, in
+        // which case it is up and waiting for its error card.)
+        if case .html = mode, !showingTemplatePage { return }
         renderFileContent()
         // A reload/renavigation resets the document, taking the body padding
         // the TOC gutter relies on with it.
@@ -2889,8 +3055,11 @@ extension ViewerView: WKNavigationDelegate {
             return
         }
 
-        // Websites navigate freely within the pane.
-        if case .web = mode {
+        // Websites navigate freely within the pane — and so does a local HTML
+        // file, which is a page in every way that matters. Its links behave
+        // exactly as they would if the folder were served over http, which is
+        // how these mocks and prototypes had to be viewed before.
+        if isLivePage {
             decisionHandler(.allow)
             return
         }
@@ -2907,7 +3076,8 @@ extension ViewerView: WKNavigationDelegate {
 
     /// Route a clicked link in a markdown/code viewer:
     /// - http(s) → default browser
-    /// - relative/local markdown file → new viewer split next to this pane
+    /// - relative/local markdown or HTML file → new viewer split next to this
+    ///   pane (both are things a viewer can now render)
     /// - other local files → open with the default app
     private func handleFileModeLink(_ url: URL) {
         if url.scheme == "http" || url.scheme == "https" {
@@ -2930,7 +3100,7 @@ extension ViewerView: WKNavigationDelegate {
         guard let fileURL else { return }
 
         switch Self.mode(for: fileURL.path) {
-        case .markdown:
+        case .markdown, .html:
             openViewerSplit(location: fileURL.path)
         default:
             NSWorkspace.shared.open(fileURL)
