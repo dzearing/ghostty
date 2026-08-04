@@ -8664,3 +8664,31 @@ every run, because its cdb filters are blind to `STATUS_BREAKPOINT`; a crash
 detector that lies is the most expensive kind of bug in a diagnostic.
 **D10** asks the user how far to chase the vanished repro. T443 and T474 are
 blocked until it comes back.
+
+## 2026-08-04 — T407: the WebView2 host floor ends, and it says why when it does
+
+The win32 lane no longer goes quiet when something else is holding the debug
+WebView2 profile — but the interesting part is that the task's own premise was
+wrong, and correcting it is most of the value here. T407 was titled "waits with
+no timeout"; that wait has had a 60s deadline since T373. The indefinite hang it
+was filed for was downstream of the wait (close-then-join on a blocking `accept`,
+plus Chromium preconnects), and **T430 already root-caused and fixed it**, along
+with landing `webview2.TestProfile` — T407's fix 2 verbatim.
+
+What was actually missing: a bound that fires could not say so. Both live tests
+used to `break` out of their loop and fall through to `expectEqual(.ready, …)`,
+so a timeout reported `expected .ready, found .creating` — which reads as a
+broken pane rather than a wait that ran out. That misreading is exactly how this
+task came to be opened against a bound that already existed. Both sites now fail
+with `no controller within the deadline (still creating)`, through one shared
+`webview2.pumpUntil` so "is this wait bounded?" has one answer instead of five.
+`GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS` overrides the deadline, which is the only way
+to read the timeout's message without waiting a real minute for it — and is what
+makes the timeout path unit-testable at 50ms.
+
+And the criterion the task was written around got run for the first time: with a
+debug `ghoztty.exe` deliberately alive and five `msedgewebview2.exe` on the
+`EBWebView-debug` profile, `floor-lane.ps1 -Lane win32` **PASSed in 291s** with
+both live tests confirmed running (not skipped) in the log. Forced to a 1ms
+deadline it goes red in seconds with the named reason. Floor: none 285s, win32
+291s, agent 291s, P1–P3 ALL PASS.

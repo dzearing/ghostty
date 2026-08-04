@@ -754,15 +754,22 @@ test "host: creates a real environment on this box, and it reports its version" 
     // The completed handler arrives on THIS thread's message loop, so the
     // test has to be one. Bounded: a hang here would wedge the lane, and a
     // silent timeout would make the test green and empty.
-    var timer = try std.time.Timer.start();
-    var msg: w32.MSG = undefined;
-    while (host.state == .creating) {
-        if (timer.read() > 60 * std.time.ns_per_s) break;
-        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
-            _ = w32.TranslateMessage(&msg);
-            _ = w32.DispatchMessageW(&msg);
+    const settled = pumpUntil(&host, struct {
+        fn f(ctx: *const anyopaque) bool {
+            const h: *const Host = @alignCast(@ptrCast(ctx));
+            return h.state != .creating;
         }
-        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }.f);
+    if (!settled) {
+        // Say TIMEOUT, not `expected .ready, found .creating` — the second
+        // reads as a broken environment rather than as a wait that ran out,
+        // and that misreading is what T407 was filed over.
+        log.err(
+            "live environment did not settle within the deadline (still {s}); " ++
+                "something is probably holding the WebView2 profile",
+            .{@tagName(host.state)},
+        );
+        return error.WebView2EnvironmentTimeout;
     }
 
     try testing.expectEqual(Host.State.ready, host.state);
@@ -846,6 +853,93 @@ pub const TestProfile = struct {
         self.alloc.free(self.root);
     }
 };
+
+/// The deadline every live-runtime wait in the test lanes runs under (T407),
+/// in nanoseconds.
+///
+/// 60s by default. `GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS` overrides it, and that
+/// override is the only way to exercise the timeout PATH without waiting a
+/// real minute for it — which is why it exists: a deadline whose failure
+/// message nobody has ever read is a deadline nobody can trust.
+pub fn testDeadlineNs() u64 {
+    const ms = std.process.getEnvVarOwned(
+        std.heap.page_allocator,
+        "GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS",
+    ) catch return 60 * std.time.ns_per_s;
+    defer std.heap.page_allocator.free(ms);
+    const parsed = std.fmt.parseInt(u64, std.mem.trim(u8, ms, " \t\r\n"), 10) catch
+        return 60 * std.time.ns_per_s;
+    return parsed * std.time.ns_per_ms;
+}
+
+/// Pump THIS thread's message loop until `done` reports true or the deadline
+/// passes; returns false when the deadline won.
+///
+/// Every WebView2 completion handler arrives on the calling thread's message
+/// loop, so a test that waits on one has to be that loop. Routing all of those
+/// waits through here is what makes "is this wait bounded?" a question with one
+/// answer instead of one per test — T407 was filed on the belief that a wait
+/// here was unbounded, and reading five hand-rolled loops to find out otherwise
+/// is exactly the cost this removes.
+pub fn pumpUntil(ctx: *const anyopaque, done: *const fn (*const anyopaque) bool) bool {
+    const deadline = testDeadlineNs();
+    var timer = std.time.Timer.start() catch return done(ctx);
+    var msg: w32.MSG = undefined;
+    while (!done(ctx)) {
+        if (timer.read() > deadline) return false;
+        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(&msg);
+            _ = w32.DispatchMessageW(&msg);
+        }
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }
+    return true;
+}
+
+test "pumpUntil: a wait that never completes ends on the deadline, fast" {
+    const prev = std.process.getEnvVarOwned(testing.allocator, "GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS") catch null;
+    defer if (prev) |p| testing.allocator.free(p);
+    try setEnvForTest("GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS", "50");
+    defer restoreEnvForTest("GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS", prev);
+
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), testDeadlineNs());
+
+    const never = struct {
+        fn f(_: *const anyopaque) bool {
+            return false;
+        }
+    }.f;
+    const always = struct {
+        fn f(_: *const anyopaque) bool {
+            return true;
+        }
+    }.f;
+    const dummy: u8 = 0;
+
+    var timer = try std.time.Timer.start();
+    try testing.expect(!pumpUntil(&dummy, never));
+    // It really waited, and it really stopped: a deadline that returns
+    // instantly is not bounding anything, and one that overruns is the hang.
+    const elapsed = timer.read();
+    try testing.expect(elapsed >= 50 * std.time.ns_per_ms);
+    try testing.expect(elapsed < 10 * std.time.ns_per_s);
+
+    try testing.expect(pumpUntil(&dummy, always));
+}
+
+test "testDeadlineNs: the default is a minute, and junk does not shorten it" {
+    const prev = std.process.getEnvVarOwned(testing.allocator, "GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS") catch null;
+    defer if (prev) |p| testing.allocator.free(p);
+    defer restoreEnvForTest("GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS", prev);
+
+    try setEnvForTest("GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS", "");
+    try testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), testDeadlineNs());
+
+    // A typo must not silently turn the bound into zero — that would make
+    // every live test fail on a deadline it never actually waited for.
+    try setEnvForTest("GHOZTTY_WEBVIEW2_TEST_TIMEOUT_MS", "soon");
+    try testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), testDeadlineNs());
+}
 
 test "TestProfile: the live tests derive their folder from a private root" {
     // The whole point is that `userDataFolder` — the real derivation — lands

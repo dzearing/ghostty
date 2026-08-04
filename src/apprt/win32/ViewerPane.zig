@@ -1991,15 +1991,23 @@ test "host floor: a real controller on a real window, on this box" {
     // Both completed handlers arrive on THIS thread's message loop, so the
     // test has to be one. Bounded: a hang would wedge the lane, and a silent
     // timeout would make the test green and empty.
-    var timer = try std.time.Timer.start();
     var msg: w32.MSG = undefined;
-    while (pane.state == .waiting_env or pane.state == .creating) {
-        if (timer.read() > 60 * std.time.ns_per_s) break;
-        while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
-            _ = w32.TranslateMessage(&msg);
-            _ = w32.DispatchMessageW(&msg);
+    const settled = webview2.pumpUntil(&pane, struct {
+        fn f(ctx: *const anyopaque) bool {
+            const p: *const ViewerPane = @alignCast(@ptrCast(ctx));
+            return p.state != .waiting_env and p.state != .creating;
         }
-        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }.f);
+    if (!settled) {
+        // Say TIMEOUT, not `expected .ready, found .creating` — the second
+        // reads as a broken pane rather than as a wait that ran out, and that
+        // misreading is what T407 was filed over.
+        log.err(
+            "host floor: no controller within the deadline (still {s}); " ++
+                "something is probably holding the WebView2 profile",
+            .{@tagName(pane.state)},
+        );
+        return error.WebView2ControllerTimeout;
     }
 
     if (pane.state == .failed) {
