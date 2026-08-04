@@ -49,7 +49,12 @@ function Task-Run {
 # Write one fixture task file. $SeatLine is emitted verbatim, so passing ''
 # reproduces a pre-T344 file (no seat field at all).
 function New-FixtureTask {
-    param([string]$Id, [string]$Status = 'todo', [string]$SeatLine = '', [string]$Deps = '[]')
+    param(
+        [string]$Id, [string]$Status = 'todo', [string]$SeatLine = '',
+        [string]$Deps = '[]',
+        # Emitted verbatim like $SeatLine, so '' reproduces a pre-priority file.
+        [string]$PriorityLine = ''
+    )
     $lines = @(
         '---'
         "id: $Id"
@@ -60,6 +65,7 @@ function New-FixtureTask {
         'commits: []'
     )
     if ($SeatLine) { $lines += $SeatLine }
+    if ($PriorityLine) { $lines += $PriorityLine }
     $lines += @('---', '', "# $Id - fixture", '')
     $path = Join-Path $fixture "$Id.md"
     [System.IO.File]::WriteAllText($path, ($lines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
@@ -85,7 +91,8 @@ Assert 'next reports the seat it resolved to' ($r.Out -match 'seat=win')
 
 $r = Task-Run @('list')
 Assert 'list shows a Seat column' ($r.Out -match 'Seat')
-Assert 'list reports T1 as win' ($r.Out -match '(?m)^T1\s+todo\s+K\s+win\b')
+# The Pri column sits between Id and Status, and an untriaged task shows '--'.
+Assert 'list reports T1 as win' ($r.Out -match '(?m)^T1\s+--\s+todo\s+K\s+win\b')
 
 # --- B. next skips mac, loudly ----------------------------------------------
 ""
@@ -196,6 +203,66 @@ Assert 'and it says which mac todos it passed over' ($r.Out -match 'another seat
 
 $r = Task-Run @('next', '-Seat', 'mac') $realDir
 Assert 'the Mac seat gets T30 as its head' ($r.Out -match 'NEXT: T30\b')
+
+# --- J. priority outranks id ------------------------------------------------
+""
+"J. next orders by priority before id"
+Reset-Fixture
+# Deliberately inverted: the lowest id is the LEAST important, so an ordering
+# that still works in id order cannot pass this section by accident.
+New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P2"'
+New-FixtureTask -Id 'T2'                                   # untriaged
+New-FixtureTask -Id 'T3' -PriorityLine 'priority: "P1"'
+New-FixtureTask -Id 'T4' -PriorityLine 'priority: "P0"'
+New-FixtureTask -Id 'T5' -PriorityLine 'priority: "P0"'
+
+$r = Task-Run @('next')
+Assert 'next takes a P0 over three lower ids' ($r.Out -match 'NEXT: T4\b')
+Assert 'next reports the priority it picked on' ($r.Out -match 'priority=P0')
+
+# Id is the tiebreaker INSIDE a band, so removing T4 must yield T5 - not T1.
+Remove-Item (Join-Path $fixture 'T4.md') -Force
+$r = Task-Run @('next')
+Assert 'id still breaks ties inside a band' ($r.Out -match 'NEXT: T5\b')
+
+# An untriaged task sorts AFTER P2: it must not outrank a deliberate P2.
+Remove-Item (Join-Path $fixture 'T5.md') -Force
+Remove-Item (Join-Path $fixture 'T3.md') -Force
+$r = Task-Run @('next')
+Assert 'an untriaged task does not outrank a P2' ($r.Out -match 'NEXT: T1\b')
+Assert 'and next names the untriaged one it passed over' ($r.Out -notmatch 'NEXT: T2\b')
+
+$r = Task-Run @('list', '-Priority', 'P2')
+Assert 'list -Priority filters to that band' ($r.Out -match '1 task\(s\)')
+Assert 'list shows the Pri column value' ($r.Out -match '(?m)^T1\s+P2\s+todo\b')
+
+$r = Task-Run @('set-priority', 'T2', '-Priority', 'P0', '-Summary', 'it wedges the app')
+Assert 'set-priority exits 0' ($r.Code -eq 0)
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
+Assert 'set-priority writes the field on a file that lacked one' ($txt -match '(?m)^priority: "P0"$')
+Assert 'set-priority records why' ($txt -match '(?m)^triage-reason: "it wedges the app"$')
+$r = Task-Run @('next')
+Assert 'and the newly-ranked task takes the head' ($r.Out -match 'NEXT: T2\b')
+Assert 'next prints the reason for the rank' ($r.Out -match 'why: it wedges the app')
+
+$r = Task-Run @('validate')
+Assert 'a fixture with priorities still validates' ($r.Code -eq 0)
+
+# Read the id back out of `new`'s own output rather than predicting it: ids are
+# allocated from the highest one present, and this section has been deleting
+# files. A hardcoded id makes ReadAllText throw, $txt keep its PREVIOUS value,
+# and the assertion pass against the wrong file.
+function New-AndRead {
+    param([string[]]$ExtraArgs)
+    $res = Task-Run (@('new', '-Title', 'a fixture thing') + $ExtraArgs)
+    if ($res.Out -notmatch 'created (T\d+[a-z]?\d*):') { return @{ Code = $res.Code; Text = '' } }
+    return @{ Code = $res.Code; Text = [System.IO.File]::ReadAllText((Join-Path $fixture ($Matches[1] + '.md'))) }
+}
+$n = New-AndRead @('-Priority', 'P0')
+Assert 'new -Priority exits 0' ($n.Code -eq 0)
+Assert 'new -Priority writes the field' ($n.Text -match '(?m)^priority: "P0"$')
+$n = New-AndRead @()
+Assert 'new without -Priority defaults to P1' ($n.Text -match '(?m)^priority: "P1"$')
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }
