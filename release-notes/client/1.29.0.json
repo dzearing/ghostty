@@ -1,0 +1,17 @@
+{
+  "version": "1.29.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "Git diffs in a viewer pane", "text": "`ghoztty +split --view=git-status:` opens a real diff review pane — a native changed-files tree with a filter on the left, red/green syntax-highlighted hunks on the right, and next/previous-change plus unified⇄side-by-side controls in the nav bar. Point it at a range (`git-diff:main...HEAD`), a single commit (`git-diff:a1b2c3d`), or just `git-diff:` for \"this branch vs. main\". A `git-status:` pane re-checks the working tree every couple of seconds, so edits and `git add`s show up without a reload. Everything a viewer already does works here — `+reload`, the address bar, back/forward, and session restore, which re-runs the diff rather than restoring a stale snapshot." },
+        { "title": "See what your sessions are actually doing", "text": "The machine chooser now shows a live per-session CPU meter, including for machines reached over the relay, and the Activity Monitor reports true per-core %CPU and tells you which pane owns each process. Both are fed by a pushed stream rather than polling, so the roster updates the moment something changes — window renames included — instead of on a timer." },
+        { "title": "The New Window picker stays out of your way", "text": "It's modeless now, so you can keep working with it open, and its \"See Activity\" button covers This Mac too. The session list stops offering to resume sessions whose pane you just closed, and no longer freezes while the dialog is open." },
+        { "title": "Links leave Ghoztty when they should", "text": "A link that opens a new surface (`target=\"_blank\"`, `window.open()`) now goes to your default browser, where your cookies and logins actually live, instead of a logged-out viewer pane. Cmd-click still keeps the popup in Ghoztty." },
+        { "title": "A window waiting on you reads as \"(question)\"", "text": "The activity-state suffix in the title shows a human label instead of the raw `needs_input` token. The machine tokens behind `+set-state`, OSC 7777, and the accessibility attribute are unchanged, so existing hooks and tools keep working." },
+        { "title": "Auto-named windows are targetable right away", "text": "A window opened with Cmd-N gets a name like `window-7`, and `+set-state`/`+send-keys`/`+close --target=window-7` now find it without something having run `+list` first. Previously those calls failed silently for anything that discards stderr." },
+        { "title": "Help and About point at Ghoztty", "text": "The version link opens this fork's release page instead of upstream Ghostty's docs, and the Help menu links follow suit. Thanks to @ZekeAranyLucas for the Help/About fix." }
+      ]
+    }
+  ]
+}

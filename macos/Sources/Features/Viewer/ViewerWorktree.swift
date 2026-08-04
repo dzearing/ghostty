@@ -192,10 +192,12 @@ enum ViewerWorktreeResolver {
 
     // MARK: - Process plumbing
 
-    private static let gitPaths = [
-        "/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git",
-    ]
-    private static let lsofPaths = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+    /// Shared with the diff loader (see `ViewerProcess`) so there is one
+    /// place that decides how the viewer launches a subprocess — absolute
+    /// paths, no terminal prompts, a watchdog, and stdout drained before the
+    /// wait.
+    private static let gitPaths = ViewerProcess.gitPaths
+    private static let lsofPaths = ViewerProcess.lsofPaths
 
     private static func isDirectory(_ path: String) -> Bool {
         var isDir: ObjCBool = false
@@ -203,53 +205,8 @@ enum ViewerWorktreeResolver {
             && isDir.boolValue
     }
 
-    /// Run the first of `tool` that exists and return its stdout, or nil on a
-    /// non-zero exit / launch failure / timeout. Blocking.
-    ///
-    /// Absolute paths only — never a PATH search: this runs against whatever
-    /// directory the pane happens to be showing, and resolving a tool name
-    /// through an inherited PATH would let a directory decide which binary we
-    /// execute.
     private static func run(tool: [String], arguments: [String]) -> String? {
-        guard let executable = tool.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-        else {
-            logger.warning("no executable found among \(tool, privacy: .public)")
-            return nil
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
-        // A git hook or config that reads the terminal would hang forever;
-        // this makes any such prompt fail immediately instead.
-        var env = ProcessInfo.processInfo.environment
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_OPTIONAL_LOCKS"] = "0"
-        process.environment = env
-
-        do {
-            try process.run()
-        } catch {
-            logger.warning("failed to launch \(executable, privacy: .public): \(error)")
-            return nil
-        }
-
-        let watchdog = DispatchWorkItem {
-            if process.isRunning { process.terminate() }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + 5, execute: watchdog)
-
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        watchdog.cancel()
-
-        guard process.terminationStatus == 0 else { return nil }
-        return String(data: data, encoding: .utf8)
+        ViewerProcess.run(tool: tool, arguments: arguments, timeout: 5)
     }
 }
 

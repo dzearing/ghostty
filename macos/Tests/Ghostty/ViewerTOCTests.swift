@@ -167,17 +167,17 @@ struct ViewerTOCTests {
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
         #expect(await wait { !viewer.tocItems.isEmpty })
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "gutter never reserved")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "gutter never reserved")
 
         // Pin the width: it is a user preference read from defaults, so
         // whatever this machine happens to have dragged it to must not decide
         // whether the test passes.
-        viewer.setTOCCardWidth(240)
+        viewer.setSidePanelWidth(240)
 
         // The card's left margin + the card. The gap on the card's RIGHT is
         // the document's own padding, not part of the gutter.
         let expected = GlassCard.outerMargin + 240
-        #expect(viewer.tocGutterWidth == expected)
+        #expect(viewer.sidePanelGutterWidth == expected)
         // The web view still spans the pane; only the page is padded.
         #expect(viewer.webView.frame.minX == 0)
         #expect(viewer.webView.frame.width == 900)
@@ -201,12 +201,12 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
         viewer.frame = NSRect(x: 0, y: 0, width: 500, height: 700)
         viewer.layoutSubtreeIfNeeded()
 
-        #expect(viewer.tocGutterWidth == 0, "narrow pane must not reserve a gutter")
+        #expect(viewer.sidePanelGutterWidth == 0, "narrow pane must not reserve a gutter")
         // ...and the page dropped the padding with it.
         _ = await wait(upTo: 2) { false }
         let padding = await evaluate(
@@ -216,7 +216,7 @@ struct ViewerTOCTests {
         // And widening restores it.
         viewer.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
         viewer.layoutSubtreeIfNeeded()
-        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + viewer.tocCardWidth)
+        #expect(viewer.sidePanelGutterWidth == GlassCard.outerMargin + viewer.sidePanelWidth)
     }
 
     /// Dragging the card's right edge moves the card AND the document's
@@ -229,11 +229,11 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
-        viewer.setTOCCardWidth(320)
-        #expect(viewer.tocCardWidth == 320)
-        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + 320)
+        viewer.setSidePanelWidth(320)
+        #expect(viewer.sidePanelWidth == 320)
+        #expect(viewer.sidePanelGutterWidth == GlassCard.outerMargin + 320)
         _ = await wait(upTo: 1) { false }
         let padding = await evaluate(
             "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
@@ -242,13 +242,13 @@ struct ViewerTOCTests {
             "body padding was \(padding ?? "nil")")
 
         // Absurd drags clamp instead of doing damage.
-        viewer.setTOCCardWidth(10)
-        let narrow = viewer.tocCardWidth
+        viewer.setSidePanelWidth(10)
+        let narrow = viewer.sidePanelWidth
         #expect(narrow > 100, "card collapsed to \(narrow)")
-        viewer.setTOCCardWidth(5_000)
+        viewer.setSidePanelWidth(5_000)
         #expect(
-            viewer.tocCardWidth < viewer.bounds.width - 300,
-            "card ate the document column: \(viewer.tocCardWidth)")
+            viewer.sidePanelWidth < viewer.bounds.width - 300,
+            "card ate the document column: \(viewer.sidePanelWidth)")
     }
 
     /// The measurement that makes a TOC card and a pane banner look like one
@@ -261,13 +261,13 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
         // Let the gutter round-trip into the page.
         _ = await wait(upTo: 2) { false }
 
         let margin = GlassCard.outerMargin
         // The gutter IS the card's right edge: outerMargin + card width.
-        let cardRight = viewer.tocGutterWidth
+        let cardRight = viewer.sidePanelGutterWidth
 
         // Text left edge = body padding (the gutter) + the column's own
         // padding, with no `margin: auto` slack in between.
@@ -305,7 +305,7 @@ struct ViewerTOCTests {
         // Give the page time to load and report (it reports an empty list).
         _ = await wait(upTo: 4) { false }
         #expect(viewer.tocItems.isEmpty)
-        #expect(viewer.tocGutterWidth == 0)
+        #expect(viewer.sidePanelGutterWidth == 0)
     }
 
     /// Text/code viewers are untouched by the TOC work.
@@ -318,7 +318,7 @@ struct ViewerTOCTests {
 
         _ = await wait(upTo: 4) { false }
         #expect(viewer.tocItems.isEmpty)
-        #expect(viewer.tocGutterWidth == 0)
+        #expect(viewer.sidePanelGutterWidth == 0)
     }
 
     /// Detaching a pane (close, undo) tears the card down and gives the
@@ -328,14 +328,14 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
         viewer.setDetached(true)
         viewer.layoutSubtreeIfNeeded()
         // The gutter collapses over a layout pass, not inside `setDetached`, so
         // reading it straight after the call catches the old width on a loaded
         // machine.
-        #expect(await wait { viewer.tocGutterWidth == 0 },
-                "gutter did not collapse on detach: \(viewer.tocGutterWidth)")
+        #expect(await wait { viewer.sidePanelGutterWidth == 0 },
+                "gutter did not collapse on detach: \(viewer.sidePanelGutterWidth)")
     }
 }

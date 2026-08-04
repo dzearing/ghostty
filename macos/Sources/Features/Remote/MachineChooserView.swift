@@ -1047,9 +1047,11 @@ struct MachineChooserView: View {
             browser.fetchIfNeeded(machine: m)
             sessionCPU.subscribe(machine: m)
         default:
-            // Nothing selected (or a non-browsable row): don't keep a stream
-            // running for a target the user is no longer looking at.
+            // Nothing selected (or a non-browsable row): don't keep a stream —
+            // or a warm connection — running for a target the user is no longer
+            // looking at.
             sessionCPU.stop()
+            browser.standDownRemote()
         }
     }
 

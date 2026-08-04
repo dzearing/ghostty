@@ -145,6 +145,25 @@ final class RemoteActivityMonitorModel: ObservableObject {
     @Published private(set) var truncated = false
     /// Set when the last refresh failed (connection lost / timeout / dial failed).
     @Published private(set) var lastRefreshFailed = false
+
+    /// Whether this source's `% CPU` values may be rendered as fact.
+    ///
+    /// The macOS sampler used to read `pti_total_user`/`pti_total_system` as
+    /// nanoseconds. They are mach absolute time units, so on Apple Silicon
+    /// (timebase 125/3) every per-process percentage came out ~24× low; on Intel
+    /// the timebase is 1:1, which is why it survived so long. The fix lives in the
+    /// AGENT (`src/remote/agent/proc.zig`), and an agent outlives the app talking
+    /// to it — so a current app can find itself reading a pre-fix agent and cannot
+    /// tell from the number alone.
+    ///
+    /// `capability.cpu_units` is how it tells. False ⇒ annotate the column;
+    /// never rescale, because the app cannot know the remote machine's mach
+    /// timebase and assuming 125/3 would be wrong on an Intel (or Linux, or
+    /// Windows) remote whose numbers were always right.
+    ///
+    /// Always true for `.local`: that path samples in-process via
+    /// `ghostty_local_proc_list`, so its units are this build's by construction.
+    @Published private(set) var cpuUnitsTrusted = true
     /// The current data source (drives the switcher binding + the header).
     @Published private(set) var source: MonitorSource
     /// True while a source switch is dialing a fresh remote connection.
@@ -347,6 +366,9 @@ final class RemoteActivityMonitorModel: ObservableObject {
         lastRefreshFailed = false
         isLoading = true
         actionError = nil
+        // Re-derived in `beginCurrentSource` from the new peer's HELLO; assume
+        // nothing about it until then.
+        cpuUnitsTrusted = true
 
         switch newSource {
         case .local:
@@ -391,6 +413,13 @@ final class RemoteActivityMonitorModel: ObservableObject {
     /// Start observing whatever `source`/`remote` is currently set: subscribe
     /// metrics (remote only), kick a refresh, and arm the poll timer.
     private func beginCurrentSource() {
+        // Ask the peer whether its `cpu_pct` means what this build thinks it
+        // means. The dial blocks through the HELLO handshake, so by the time we
+        // hold a handle the capability set is already negotiated.
+        cpuUnitsTrusted = remote.map {
+            ghostty_remote_connection_cpu_units_corrected($0.handle)
+        } ?? true
+
         if case .remote = source, let r = remote {
             let box = MetricsBox(model: self)
             let unmanaged = Unmanaged.passRetained(box)
@@ -972,6 +1001,12 @@ struct RemoteActivityMonitorView: View {
                     .foregroundStyle(.secondary)
                     .help("The agent capped the process table; some rows are not shown.")
             }
+            if !model.cpuUnitsTrusted {
+                Label("% CPU unverified", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help(Self.cpuUnverifiedDetail)
+            }
             if model.lastRefreshFailed && !model.procs.isEmpty {
                 Label("Refresh failed", systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -1054,12 +1089,23 @@ struct RemoteActivityMonitorView: View {
 
             // Per-core %CPU, shown as-is (top / Activity Monitor convention): a
             // fully-busy thread is ~100 and a multithreaded process exceeds it.
-            TableColumn("% CPU", value: \.cpuPctPerCore) { row in
+            //
+            // Against an agent that does not advertise `cpu_units` the value is
+            // marked UNVERIFIED rather than printed as fact: it may be ~24× low
+            // (a pre-fix agent on Apple Silicon) or exactly right (Intel, Linux,
+            // Windows), and nothing on this side can tell which. The number stays
+            // visible because its ORDERING is unaffected — every row on one
+            // machine goes through the same conversion, so "which process is
+            // hottest" is still answerable, which is most of what this panel is
+            // for. What must not happen is a reader taking the magnitude as true.
+            TableColumn(cpuColumnTitle, value: \.cpuPctPerCore) { row in
                 Text(String(format: "%.1f", row.cpuPctPerCore))
                     .monospacedDigit()
+                    .foregroundStyle(model.cpuUnitsTrusted ? Color.primary : Color.secondary)
                     .frame(maxWidth: .infinity, alignment: .trailing)
+                    .help(model.cpuUnitsTrusted ? "" : Self.cpuUnverifiedDetail)
             }
-            .width(min: 60, ideal: 70, max: 90)
+            .width(min: 60, ideal: 80, max: 100)
 
             TableColumn("Memory", value: \.memBytes) { row in
                 Text(memString(row.memBytes))
@@ -1151,6 +1197,23 @@ struct RemoteActivityMonitorView: View {
     }
 
     // MARK: Formatting helpers
+
+    /// The `% CPU` header, marked when the source's agent never told us its
+    /// values are in corrected units. A column title is the only header content
+    /// `TableColumn` accepts, so the mark has to live in the string; the orange
+    /// control-bar label carries the actual explanation.
+    private var cpuColumnTitle: String {
+        model.cpuUnitsTrusted ? "% CPU" : "% CPU (?)"
+    }
+
+    /// Why `% CPU` is marked, in the one place both the header tooltip and the
+    /// control-bar warning read it from.
+    static let cpuUnverifiedDetail = """
+        This machine's agent is older than the CPU-units fix, so it may report \
+        per-process CPU up to ~24× low (on Apple Silicon; correct on Intel — \
+        there is no way to tell from here). Relative ordering is still valid. \
+        Update the agent on that machine for real numbers.
+        """
 
     /// Host CPU% normalized to 0..100 across all cores.
     private var normalizedHostCPU: Float {

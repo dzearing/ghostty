@@ -1692,7 +1692,7 @@ class BaseTerminalController: NSWindowController,
 
         if let termWindow = window as? TerminalWindow,
            termWindow.activityState != .idle {
-            let suffix = " (\(termWindow.activityState.rawValue))"
+            let suffix = " (\(termWindow.activityState.displayLabel))"
             title += suffix
             tabTitle += suffix
         }
