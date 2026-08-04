@@ -15,7 +15,7 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
-- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
+- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
 - `--title`: Set the **window title**. A window title pins the titlebar — it wins over any tab or pane title and survives pane focus changes and shell OSC title updates — until cleared. The titlebar falls back to window title → active tab's title → active pane's title. Interactive equivalents: Cmd+Shift+R ("Change Window Title", also sets/clears it), plus separate "Change Tab Title" and "Change Pane Title" commands in the menu and command palette. `ghoztty +rename --target=<name> --title=<title>` changes it later (`--title=""` clears the pin).
 
 ### `ghoztty +split`
@@ -29,7 +29,7 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 - `--direction`: Split direction. Default: `right`.
 - `--target`: Named window to split in (default: most recently focused).
 - `--name`: Register the new pane with a name for later targeting.
-- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
+- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
 ### `ghoztty +close`
 
@@ -184,7 +184,9 @@ Banners are persisted per pane in the session-layout manifest (keyed to the stab
 Reload a named **viewer pane** (see Viewer Panes below) in place — no
 close/reopen. Website viewers re-fetch the page from origin (bypassing
 caches); file viewers re-render the file preserving scroll position (they
-already live-reload on their own, so this mainly matters for URL viewers);
+already live-reload on their own, so this mainly matters for URL viewers —
+and for an **HTML** pane, whose save-watcher covers the HTML file but not the
+sibling CSS/JS it pulls in, which this bypasses the cache for);
 **diff viewers re-run their git command**, picking up commits, staging, and
 edits, and keeping the open file and its scroll position.
 
@@ -311,13 +313,14 @@ ghoztty +close --target=ide
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a
-markdown file, a plain text/code file, a website, or a **git diff**. Viewers
-live in the normal split tree — they resize, focus, zoom, close, and persist
-like any pane. View-only, no editing.
+markdown file, an HTML file (as a live page), a plain text/code file, a
+website, or a **git diff**. Viewers live in the normal split tree — they
+resize, focus, zoom, close, and persist like any pane. View-only, no editing.
 
 ```bash
 ghoztty +new-window --view=README.md                 # viewer window
 ghoztty +split --target=dev --name=doc --view=docs/design.md
+ghoztty +split --target=dev --name=mock --view=mock/index.html   # a live page
 ghoztty +split --pane=doc --direction=down --view=https://example.com
 ghoztty +split --target=dev --name=diff --view=git-status:   # a git diff
 ghoztty +close --target=doc
@@ -364,12 +367,26 @@ ghoztty +close --target=doc
   pane next door line up at their corners, and the text starts exactly one
   margin right of the card. Per-component fudges are what break that; there
   are none. Enforced by `documentAlignsToTheCard` in `ViewerTOCTests`.
+- **HTML files** (`.html`, `.htm`): loaded into the web view as a **live
+  page**, never as highlighted source. Its own CSS, JS, images, and fonts run,
+  so a scaffolded mock or prototype is viewable straight from disk —
+  `--view=mock/index.html` instead of standing up a `python3 -m http.server`
+  first. The web view is granted read access to the file's **own directory**
+  (recursively), which is what makes relative assets resolve; a page reaching
+  UP out of its folder (`../shared/app.css`) is the deliberate cost of keeping
+  that grant narrow — put shared assets under the page's directory, or serve
+  the project over http. Rendering is unconditional: there is no source-view
+  toggle. Because the page is the document, an HTML pane is navigable like a
+  website — its links follow **in the pane**, exactly as they would if the
+  folder were hosted — and Back/Forward cross into and out of it. A file
+  that cannot be opened shows the usual in-page error card.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
-- **Links** in file viewers: http(s) opens the default browser; a relative
-  `.md` link opens another viewer split; other local files open in their
-  default app.
+- **Links** in markdown/code viewers: http(s) opens the default browser; a
+  relative `.md` or `.html` link opens another viewer split (both are things a
+  viewer renders); other local files open in their default app. An HTML pane
+  is the exception — being a page, it follows every link in place.
 - **Links that open a new surface** in a website viewer — `target="_blank"` or
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane
@@ -381,7 +398,13 @@ ghoztty +close --target=doc
   back to the Ghoztty page that opened it, so an OAuth flow finishes in the
   browser. That flow wasn't authenticating in Ghoztty anyway.
 - **Live reload**: file viewers watch the file (including atomic saves) and
-  re-render preserving scroll position.
+  re-render preserving scroll position — an HTML pane re-fetches the page from
+  disk, and WebKit restores the scroll offset across it, so a save does not
+  throw you back to the top. Only the viewed file is watched: editing a
+  sibling `style.css` does not trigger a reload, and a saved HTML file may
+  still serve that stylesheet from WebKit's memory cache. `+reload`/Cmd+R
+  bypasses the cache (`reloadFromOrigin`) and is the way to pick up a changed
+  subresource.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a
   bar with back / forward / reload / **home** and an **editable address
   field** — in every mode, files included. Typing an `http(s)` address (or a
