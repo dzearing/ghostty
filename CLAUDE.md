@@ -244,6 +244,15 @@ default shell too (their cwd inherits from the parent pane).
 - `+split --name=<name>` registers a **pane**
 - `+split --target`, `+close --target`, and `+send-keys --target` reference either kind
 
+A window opened without an explicit `--target=` (Cmd-N, or a bare
+`+new-window`) still gets an **auto name** — `window-1`, `window-2`, … — which
+is exported to its panes as `$GHOZTTY_WINDOW_NAME` and shown as `target` in
+`+list`. That name is targetable immediately: `resolveTarget` falls back to
+scanning live windows by name, so no `+list` is needed first. (It used to be
+registry-only, so every `--target=window-N` failed with `not found in
+registry` until something walked the tree — invisibly, for the many callers
+that discard stderr.)
+
 ### Pane identity
 
 Every pane has a **stable, ghoztty-owned pane id** (a UUID):
