@@ -56,11 +56,30 @@ const grid_snapshot = @import("grid_snapshot.zig");
 // Caps (§7.1 "Resource caps & TTL")
 // -----------------------------------------------------------------------------
 
-/// Maximum concurrent sessions per agent. Raised 64 → 256 (T11) so a heavy
+/// Maximum concurrent LIVE sessions per agent. Raised 64 → 256 (T11) so a heavy
 /// session-persistence user with many restored windows/panes plus fresh ones
 /// isn't refused new `OPEN`s; each idle session still costs a pty child + its
 /// output ring, so the cap is bounded. An `OPEN` past this is refused.
+///
+/// LIVE, and that word is the whole of T278. This used to count every entry in
+/// the table, tombstones included — and a tombstone is exactly what a restored
+/// persistent pane leaves behind, `pinned` (which is what keeps a live pane from
+/// being idle-reaped while its viewer is away) and therefore exempt from the
+/// reaper. The set only ever grew. Measured on box 2026-08-01: 256 records, every
+/// one `alive=false pid=0`, and from then on EVERY `OPEN` was refused — so every
+/// new pane came up with no child and nothing said so. A dead session owns no
+/// pty and no process; it can never be the reason a user is denied a shell.
+/// Tombstones are bounded separately by `max_dead_sessions`.
 pub const max_sessions: usize = 256;
+
+/// Maximum DEAD sessions (tombstones) the table retains alongside the live ones.
+/// Deliberately the same number as `max_sessions` rather than something smaller:
+/// every one of them is a pane a user may still Resume, so trimming harder would
+/// trade the T278 wedge for a quieter regression (a restore that silently drops
+/// somebody's sessions). It bounds the split caps at the same total the single
+/// cap already allowed, and `loadPersisted` keeps the NEWEST when a file carries
+/// more than this.
+pub const max_dead_sessions: usize = 256;
 
 /// Default per-session raw-output ring size (§7.1: default 2 MB scrollback). Holds
 /// the most recent child-output bytes so `(last_byte_offset, S]` gap-fill is
@@ -699,7 +718,7 @@ pub const SessionTable = struct {
     /// default; tests may inject a deterministic one.
     rng: std.Random,
 
-    pub const Error = error{ TooManySessions, IdCollision } || Allocator.Error;
+    pub const Error = error{ TooManySessions, TooManyTombstones, IdCollision } || Allocator.Error;
 
     pub fn init(alloc: Allocator, rng: std.Random) SessionTable {
         return .{ .alloc = alloc, .rng = rng };
@@ -721,6 +740,25 @@ pub const SessionTable = struct {
 
     pub fn count(self: *const SessionTable) usize {
         return self.by_id.count();
+    }
+
+    /// How many sessions still own a child process — the ones `max_sessions`
+    /// actually bounds (T278). O(n) over at most a few hundred entries, walked
+    /// once per `OPEN`; a cached counter would have to be kept in step with
+    /// every alive→dead transition in the store and the server, and a drifting
+    /// counter here is the wedge this exists to prevent.
+    pub fn liveCount(self: *SessionTable) usize {
+        var n: usize = 0;
+        var it = self.by_id.valueIterator();
+        while (it.next()) |sp| if (sp.*.alive) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// How many sessions are tombstones — the ones `max_dead_sessions` bounds.
+    pub fn deadCount(self: *SessionTable) usize {
+        return self.by_id.count() - self.liveCount();
     }
 
     /// Mint a fresh, never-before-used crypto-random non-zero u128 not already in
@@ -749,7 +787,9 @@ pub const SessionTable = struct {
         ring_bytes: usize,
         now_ms: i64,
     ) Error!*Session {
-        if (self.by_id.count() >= max_sessions) return error.TooManySessions;
+        // LIVE sessions only (T278). A tombstone owns no process and must never
+        // be the reason a user's next pane comes up without a shell.
+        if (self.liveCount() >= max_sessions) return error.TooManySessions;
 
         const id = self.mintId(&self.by_id);
         if (id == protocol.control_channel) return error.IdCollision;
@@ -776,14 +816,17 @@ pub const SessionTable = struct {
     /// original `created_ms`, but sets `last_activity_ms = now_ms` so a just-loaded
     /// session isn't instantly idle-reaped. Allocates a full `ring_bytes` output ring
     /// (used once relaunched). Returns null (skips) on a malformed id or one already
-    /// present — idempotent across a double load. Enforces `max_sessions`.
+    /// present — idempotent across a double load. Enforces `max_dead_sessions`.
     pub fn materialize(
         self: *SessionTable,
         rec: session_meta.Record,
         ring_bytes: usize,
         now_ms: i64,
     ) Error!?*Session {
-        if (self.by_id.count() >= max_sessions) return error.TooManySessions;
+        // Tombstones have their own cap (T278) — they must not eat into the live
+        // allowance, and a file that somehow carries thousands of them must not
+        // be able to allocate a ring for every one.
+        if (self.deadCount() >= max_dead_sessions) return error.TooManyTombstones;
         const id = parseId(rec.id) orelse return null; // malformed hex → skip
         if (self.by_id.contains(id)) return null; // already present → skip
 
@@ -1306,11 +1349,38 @@ pub const SessionStore = struct {
         }) orelse return 0; // absent → nothing to restore
         defer parsed.deinit();
 
+        // Newest first (T278). A file may carry more records than
+        // `max_dead_sessions` allows us to materialize, and the ones a user is
+        // most likely to want back are the ones they opened most recently — file
+        // order is `persistMeta`'s hash-map iteration order, i.e. arbitrary, so
+        // without this "which sessions survive an over-full file" would be a coin
+        // toss. Sorted on a local index array; the parsed slice is const.
+        const order = alloc.alloc(u32, parsed.value.sessions.len) catch null;
+        defer if (order) |o| alloc.free(o);
+        if (order) |o| {
+            for (o, 0..) |*slot, i| slot.* = @intCast(i);
+            const Ctx = struct {
+                recs: []const session_meta.Record,
+                fn gt(ctx: @This(), a: u32, b: u32) bool {
+                    return ctx.recs[a].created_ms > ctx.recs[b].created_ms;
+                }
+            };
+            std.mem.sort(u32, o, Ctx{ .recs = parsed.value.sessions }, Ctx.gt);
+        }
+
         var n: usize = 0;
+        var refused: usize = 0;
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (parsed.value.sessions) |rec| {
+        for (parsed.value.sessions, 0..) |_, i| {
+            const rec = parsed.value.sessions[if (order) |o| o[i] else i];
             const s = self.table.materialize(rec, ring_bytes, self.now()) catch |err| {
+                if (err == error.TooManyTombstones) {
+                    // Expected once past the cap, and per-record warnings would
+                    // be a wall of identical lines. Count them and say it once.
+                    refused += 1;
+                    continue;
+                }
                 std.log.warn("session_meta: materialize {s} failed: {s}", .{ rec.id, @errorName(err) });
                 continue;
             };
@@ -1324,6 +1394,10 @@ pub const SessionStore = struct {
                 self.preloadRingSnapshot(sess);
             }
         }
+        if (refused > 0) std.log.warn(
+            "session_meta: {d} of {d} recorded sessions dropped — more than max_dead_sessions ({d}); kept the newest",
+            .{ refused, parsed.value.sessions.len, max_dead_sessions },
+        );
         return n;
     }
 
@@ -1996,6 +2070,124 @@ test "SessionTable: create mints unique ids/channels, enforces cap, frees cleanl
     table.remove(s0.id);
     try testing.expect(fakes[0].terminated);
     try testing.expectEqual(@as(usize, 1), table.count());
+}
+
+test "SessionTable: a table full of TOMBSTONES still opens a live session (T278)" {
+    // THE wedge, in miniature. Measured on box 2026-08-01: the agent's table held
+    // 256 records, every one `alive=false pid=0 pinned=true`, and from then on
+    // every `OPEN` was refused — so every new pane came up with no shell and
+    // nothing said so. A dead session owns no process; it must never be the
+    // reason a user is denied one.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7278);
+    // Before the table: `table.deinit()` terminates every child, so the fake must
+    // outlive it (defers unwind LIFO).
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    // Fill the table to `max_sessions` with dead-but-relaunchable tombstones,
+    // exactly what a restored persistent pane leaves behind.
+    var id_buf: [32]u8 = undefined;
+    for (0..max_sessions) |i| {
+        const id = try std.fmt.bufPrint(&id_buf, "{x:0>32}", .{i + 1});
+        const s = (try table.materialize(.{ .id = id, .pinned = true }, 64, 0)).?;
+        try testing.expect(!s.alive and s.relaunchable);
+    }
+    try testing.expectEqual(max_sessions, table.count());
+    try testing.expectEqual(@as(usize, 0), table.liveCount());
+    try testing.expectEqual(max_sessions, table.deadCount());
+
+    // The whole point: the next OPEN still gets a session.
+    const live = try table.create(fake.child(), 4242, 24, 80, 64, 0);
+    try testing.expect(live.alive);
+    try testing.expectEqual(@as(usize, 1), table.liveCount());
+
+    // And the tombstone cap is enforced on its own side of the line.
+    const over = try std.fmt.bufPrint(&id_buf, "{x:0>32}", .{max_dead_sessions + 9});
+    try testing.expectError(
+        error.TooManyTombstones,
+        table.materialize(.{ .id = over, .pinned = true }, 64, 0),
+    );
+}
+
+test "SessionTable: a genuinely full LIVE table still refuses (T278)" {
+    // The other half of the same rule: relaxing the cap to live sessions must not
+    // relax it away. Without this, "dead sessions don't count" is indistinguishable
+    // from "nothing counts".
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7279);
+
+    // A small cap would make this cheaper, but `max_sessions` is the number the
+    // product ships and the assertion is about that number. Declared BEFORE the
+    // table so the defers unwind in the right order: `table.deinit()` terminates
+    // every child, and a child whose `FakeChild` had already been freed is a
+    // use-after-free (measured — it segfaulted this test).
+    const fakes = try alloc.alloc(FakeChild, max_sessions);
+    defer alloc.free(fakes);
+    for (fakes) |*f| f.* = .{ .alloc = alloc };
+    defer for (fakes) |*f| f.deinit();
+
+    var extra: FakeChild = .{ .alloc = alloc };
+    defer extra.deinit();
+
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    for (fakes, 0..) |*f, i| _ = try table.create(f.child(), @intCast(i + 1), 24, 80, 64, 0);
+    try testing.expectEqual(max_sessions, table.liveCount());
+
+    try testing.expectError(
+        error.TooManySessions,
+        table.create(extra.child(), 9999, 24, 80, 64, 0),
+    );
+
+    // A session that dies gives its slot back — the cap tracks processes, not rows.
+    var vit = table.by_id.valueIterator();
+    vit.next().?.*.markExited(0, 10);
+    try testing.expectEqual(max_sessions - 1, table.liveCount());
+    _ = try table.create(extra.child(), 9999, 24, 80, 64, 0);
+}
+
+test "SessionStore.loadPersisted: an over-full file keeps the NEWEST sessions (T278)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x727a);
+    var clock: MutClock = .{ .ms = 500 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(path);
+    store.meta_path = path;
+
+    // More records than the tombstone cap allows, written OLDEST first so file
+    // order and the answer disagree — a loader that just took the first N would
+    // keep precisely the wrong ones.
+    const over = 12;
+    const total = max_dead_sessions + over;
+    const ids = try alloc.alloc([32]u8, total);
+    defer alloc.free(ids);
+    const recs = try alloc.alloc(session_meta.Record, total);
+    defer alloc.free(recs);
+    for (recs, 0..) |*r, i| {
+        _ = try std.fmt.bufPrint(&ids[i], "{x:0>32}", .{i + 1});
+        r.* = .{ .id = &ids[i], .pinned = true, .created_ms = @intCast(1000 + i) };
+    }
+    const body = try session_meta.serialize(alloc, recs);
+    defer alloc.free(body);
+    try session_meta.writeAtomic(alloc, path, body);
+
+    try testing.expectEqual(max_dead_sessions, store.loadPersisted(64));
+    // The newest `max_dead_sessions` survived; the `over` oldest did not.
+    for (0..total) |i| {
+        const present = store.table.getByIdStr(&ids[i]) != null;
+        try testing.expectEqual(i >= over, present);
+    }
 }
 
 test "Session: recordOutput advances offset and feeds ring; tombstone retains exit" {

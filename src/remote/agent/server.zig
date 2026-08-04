@@ -800,10 +800,22 @@ pub const Server = struct {
             open.cols,
             self.ring_bytes,
             self.clock.now(),
-        ) catch {
+        ) catch |err| {
             // Cap hit or OOM: terminate the orphaned child OUTSIDE the lock (the
             // terminate→reader-join deadlock rule), then drop.
+            //
+            // SAY SO (T278). The client gets no OPENED and eventually times out
+            // with a pane that has no shell in it; before this, the agent's own
+            // log said nothing either, so the one place that knew WHY kept it to
+            // itself. Counts, not just the error name — "at the live cap" and
+            // "out of memory" are different problems with the same symptom.
+            const live = self.store.table.liveCount();
+            const dead = self.store.table.deadCount();
             self.store.mutex.unlock();
+            std.log.warn(
+                "OPEN refused: {s} (live={d}/{d} dead={d}/{d}) — the pane will come up with no shell",
+                .{ @errorName(err), live, session.max_sessions, dead, session.max_dead_sessions },
+            );
             spawned.child.terminate();
             return;
         };

@@ -8476,3 +8476,38 @@ alive, so `+send-keys` into it does nothing. That contradicts CLAUDE.md's
 per-flavor keep-alive guarantee and breaks every documented `--command`
 workflow; it is invisible for a long-running command and immediate for anything
 that returns.
+
+## 2026-08-04 - T278: a finished pane no longer costs you a working one
+
+The agent's 256-session cap counted DEAD sessions. Every restored persistent
+pane leaves a tombstone behind, and a tombstone is `pinned` (which is what keeps
+a live pane from being idle-reaped while its viewer is away) - exactly what
+exempted it from the reaper. The set only ever grew, and once it hit 256 every
+`OPEN` was refused: each new pane came up with no child process, no prompt, no
+cursor, and nothing anywhere said why. Indistinguishable from a hung shell, and
+the only cure was deleting a file by hand.
+
+`max_sessions` now bounds only sessions that own a child (`liveCount()`);
+tombstones get their own `max_dead_sessions`, deliberately the same 256 so the
+split caps allow the total the single cap already did - trimming harder would
+trade this wedge for a restore that silently drops somebody's sessions. An
+over-full `sessions.json` keeps the NEWEST records rather than whatever
+hash-map order handed over first, and `handleOpen` now logs a refusal with its
+counts instead of returning in silence.
+
+Reproduced first, on the box: `test/win32/agent-session-cap.ps1` (new) seeds 256
+tombstones into a private `LOCALAPPDATA` and demands a typeable pane. Against
+the pre-fix build it failed exactly where the report said it would (pid 0, no
+input); after, ALL PASS (14) with the roster showing 257 rows / 1 alive - the
+tombstones are still there, they just no longer deny anyone a shell.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS** twice back to back with the debug agent's `sessions.json`
+steady at 5 records, `session-relaunch-notify.ps1` **ALL PASS (76)**.
+
+Filed: **T469** - the other half of the report, telling the CLIENT why an OPEN
+was refused instead of a blank pane after a 10 s timeout (measured here:
+`err=error.Timeout` in the log, and `+read` returns not one byte). The design is
+worked out in the task; **D8** records why it is split rather than folded in.
+**T470** - a materialized tombstone eagerly allocates a full 2 MB output ring it
+will never use.
