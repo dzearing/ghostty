@@ -8204,3 +8204,46 @@ the user's windows.
 Filed: **T454** (the logging crash). **D6** asks the user how many minutes a red
 lane should be allowed to spend chasing a stack - 2 attempts caught 2 of the 4
 crashes in this turn's floor run.
+
+## 2026-08-04 — T454: the crash is not the error message, it is a corrupt stack frame
+
+T454 was filed on the T450 stack, which read as "`Page.verifyIntegrity` detects a
+violation, calls `log.warn`, and the log path null-dereferences". **That is
+wrong.** Two new tests in `src/terminal/page.zig` break a page deliberately —
+one from an errorable caller, one from the void `assertIntegrity` shape — and in
+the agent binary both print `[page] (warn): page integrity violation y=0 x=0
+spacer tail at start` and return their error. Reporting a violation was never a
+crash. Minimal `zig test` repros agree, and the `none` lane's existing
+`terminal_apc` warns always did.
+
+What actually dies: `verifyIntegrity` returns `!void`, so Zig hands it a hidden
+**error-return-trace pointer** in `rcx` and it forwards that down
+`warn` → `log` → `test_runner.log` → `std.debug.print`, which reads
+`trace.index` in its prologue with no null check. The pointer is null. Reading
+the T450 dump with matching symbols shows why: **the frame is corrupt.**
+`verifyIntegrity`'s three prologue spill slots hold `alloc` = `0x0cf2` (not a
+pointer), `self` = `0`, trace = `0`, and disassembling the whole function shows
+nothing writes those slots after the prologue. `self` cannot be null in a
+function that had already dereferenced it for 0x19aa bytes. `rbp` is confirmed
+twice over (the call site's `lea rdx,[rbp+860h]` matches the faulting `rdx`, and
+`warn`'s pushed frame pointer holds the same value).
+
+So **T454 and T443 are one bug**, the corruption reaches the **stack** and not
+only `Page`/`PageList` heap structures — every hypothesis so far has been
+heap-shaped — and there is no "make it legible first" step left to do. The
+damage also has a shape worth chasing: things that must be non-null read as
+**zero**, on the stack here and in the 2026-08-03 `none`-lane crash
+(`hash_map.zig:333 header()`, a `self.metadata.?` unwrap from `lookupHyperlink`).
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS**. One green `agent` run proves nothing about the crash — it
+lands on half of runs and this change does not touch the corruption.
+
+Filed: **T458** — catch the wild write in the act with a hardware data
+breakpoint on those spill slots, instead of working backwards from the wreckage
+a fifth time.
+
+Also worth knowing for anyone driving this loop: **`Start-Sleep` is a no-op in
+the harness**, so a polling wait returns instantly. That made a 3-minute build
+look like a 46-minute wedge and cost a killed lane run; wait on the background
+task notification instead.

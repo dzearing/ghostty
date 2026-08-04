@@ -197,13 +197,28 @@ so the fallback is no longer "whatever was logged earliest").
     the binary is **not dying of corruption — it is dying while REPORTING it.**
     `Page.verifyIntegrity` detects an integrity violation, calls `log.warn`, and
     the test runner's log path null-dereferences inside `std.debug.print`'s
-    stderr-writer lock. That is **T454**, and it is why the message naming the
-    violation has never been seen and why the panic handler recurses. The
-    all-thread capture also refutes T443's top-ranked hypothesis: three of the
-    four threads were idle thread-pool workers, so no leaked background thread
-    was writing anything. **T454 → then T443** (the underlying
-    `UnmarkedHyperlinkCell` violation is real and still unexplained, but it is
-    unreadable until T454 lands). A red lane now captures this automatically.
+    stderr-writer lock. That was **T454**. The all-thread capture also refutes
+    T443's top-ranked hypothesis: three of the four threads were idle
+    thread-pool workers, so no leaked background thread was writing anything.
+
+    **T454 is DONE (2026-08-04) and it refuted its own premise. Take T443, now
+    with a much narrower target — or T458, which is how to hit it.** Reporting
+    the violation is *not* a crash: two new tests in `src/terminal/page.zig`
+    break a page on purpose and the `log.warn` comes out intact in the agent
+    binary. Reading the T450 dump with matching symbols shows what actually
+    dies — Zig hands `verifyIntegrity` (`!void`) a hidden **error-return-trace
+    pointer**, it forwards that down to `std.debug.print`, and `print` reads
+    `trace.index` with no null check. The pointer is null because
+    **`verifyIntegrity`'s stack frame is corrupt**: its prologue spill slots
+    hold `self` = 0 and `alloc` = `0x0cf2`, and nothing in the function writes
+    those slots after the prologue. `self` cannot be null in a function that has
+    already dereferenced it for 0x19aa bytes.
+
+    So T454 and T443 are **one bug**, the corruption reaches the **stack** and
+    not just page heap structures, and there is no "make it legible first" step
+    left to do. **T458** proposes catching the write in the act with a hardware
+    data breakpoint rather than working backwards from the wreckage again.
+    A red lane now captures a crash stack automatically.
 
 00000. **THE FLOOR ITSELF IS BROKEN, 2026-08-03 — T430.** Ahead of the rest of
     this list because it is what every other task is validated against. **Two

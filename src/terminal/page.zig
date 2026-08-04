@@ -2357,6 +2357,56 @@ test "Page init" {
     defer page.deinit();
 }
 
+// T454. verifyIntegrity reports every violation it finds with a `log.warn`
+// before returning the error, and on Windows a crash was landing inside that
+// very `log.warn` -- so the one sentence naming the violation was destroyed at
+// the moment it was written and the lane showed only a dead process. These two
+// tests trigger a violation deliberately, from both shapes of caller, so the
+// reporting path itself is exercised on every lane run instead of only when a
+// real corruption happens to occur.
+test "Page verifyIntegrity reports a violation instead of dying" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    // A spacer tail follows a wide cell, so one at x == 0 is impossible.
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.wide = .spacer_tail;
+
+    try testing.expectError(
+        Page.IntegrityError.InvalidSpacerTailLocation,
+        page.verifyIntegrity(testing.allocator),
+    );
+}
+
+test "Page verifyIntegrity reports a violation from a non-errorable caller" {
+    // The shape `assertIntegrity` uses: a void function swallowing the error.
+    // It differs from the test body above in whether the CALLER has an error
+    // return trace to hand down, which is what the crash turned on.
+    const S = struct {
+        fn check(page: *const Page) bool {
+            page.verifyIntegrity(testing.allocator) catch return false;
+            return true;
+        }
+    };
+
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    try testing.expect(S.check(&page));
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.wide = .spacer_tail;
+    try testing.expect(!S.check(&page));
+}
+
 test "Page read and write cells" {
     var page = try Page.init(.{
         .cols = 10,
