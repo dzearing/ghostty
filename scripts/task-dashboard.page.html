@@ -197,7 +197,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .filters input { flex: 1 1 180px; min-width: 130px; }
 .filters input:focus-visible, .filters select:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
 .count { color: var(--muted); font-size: 12px; align-self: center; }
-.tasks td:first-child { font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tasks td:nth-child(2) { font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.ord, .tasks th:first-child { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: var(--ink); }
 th.sortable:focus-visible { outline: 2px solid var(--open); outline-offset: -2px; }
@@ -327,9 +328,9 @@ if (themeParam) document.documentElement.setAttribute('data-theme', themeParam[1
 var VIEWS = ['activity', 'data', 'tasks'];
 var state = {
   data: null, sig: '', busy: false, pageVersion: null,
-  sort: { key: 'id', dir: -1 },   // newest task first
+  sort: { key: 'order', dir: 1 }, // the work queue, head first
   view: VIEWS.indexOf((location.hash || '').slice(1)) >= 0 ? location.hash.slice(1) : 'activity',
-  filters: { q: '', status: '', priority: '', seat: '', phase: '' },
+  filters: { q: '', status: '', priority: '', seat: '' },
   open: {},        // expanded task rows
   notes: {},       // in-progress decision notes, kept across re-renders
   shown: PAGE_SIZE // timeline paging
@@ -576,55 +577,38 @@ function drawDaily(host, data) {
   host.appendChild(svg);
 }
 
-function drawPhases(host, data) {
-  var all = data.phases;
-  var rows = all.filter(function (r) { return r.open > 0; })
-    .sort(function (a, b) { return b.open - a.open || b.total - a.total; });
-  var finished = all.filter(function (r) { return r.open === 0 && r.total > 0; });
+/* Replaced "by phase" (2026-08-04): phases carried no information anybody used.
+   How much OPEN work sits in each severity band is the question the queue
+   actually raises. */
+var PRI_COLOR = { P0: '--critical', P1: '--warning', P2: '--open', untriaged: '--muted' };
+var PRI_LABEL = { P0: 'P0 severe', P1: 'P1 feature + polish', P2: 'P2 infra', untriaged: 'Untriaged' };
+function drawPriorities(host, data) {
+  var rows = (data.priorities || []).filter(function (r) { return r.open > 0; });
   host.innerHTML = '';
-  if (!rows.length) { host.appendChild(h('div', { class: 'empty', text: 'No phase has open work.' })); return; }
+  if (!rows.length) { host.appendChild(h('div', { class: 'empty', text: 'No open work.' })); return; }
 
   var W = Math.max(280, host.clientWidth);
-  var labW = 34, valW = 74, rowH = 26, barH = 14, GAP = 2;
+  var labW = 34, valW = 48, rowH = 26, barH = 14;
   var iw = Math.max(60, W - labW - valW), H = rows.length * rowH + 4;
-  var maxT = Math.max.apply(null, rows.map(function (r) { return r.total; }));
-  var cDone = cssVar('--done'), cOpen = cssVar('--open');
+  var maxT = Math.max.apply(null, rows.map(function (r) { return r.open; }));
 
   var svg = s('svg', { class: 'chart', viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img',
-    'aria-label': 'Stacked bars of done and open tasks for ' + rows.length + ' phases with work left.' });
+    'aria-label': 'Open tasks in each priority band.' });
   rows.forEach(function (r, i) {
     var y = i * rowH + 4, cy = y + barH / 2;
-    svg.appendChild(s('text', { x: 0, y: cy + 4, class: 'lbl', text: r.phase === '—' ? '—' : r.phase }));
-    var full = (r.total / maxT) * iw;
-    var dw = r.total ? (r.done / r.total) * full : 0, ow = full - dw;
-    var split = dw > 0 && ow > 0;
-    if (split) { dw = Math.max(0, dw - GAP / 2); ow = Math.max(0, ow - GAP / 2); }
-    if (dw >= 1.5) svg.appendChild(s('path', { d: barPath(labW, y, dw, barH, split ? 0 : 4), fill: cDone }));
-    if (ow >= 1.5) svg.appendChild(s('path', { d: barPath(labW + dw + (split ? GAP : 0), y, ow, barH, 4), fill: cOpen }));
-    svg.appendChild(s('text', { x: labW + full + 8, y: cy + 4, class: 'tick', text: r.done + '/' + r.total }));
+    var col = cssVar(PRI_COLOR[r.priority] || '--muted');
+    svg.appendChild(s('text', { x: 0, y: cy + 4, class: 'lbl', text: r.priority === 'untriaged' ? '--' : r.priority }));
+    var w = (r.open / maxT) * iw;
+    if (w >= 1.5) svg.appendChild(s('path', { d: barPath(labW, y, w, barH, 4), fill: col }));
+    svg.appendChild(s('text', { x: labW + w + 8, y: cy + 4, class: 'tick', text: String(r.open) }));
     var hit = s('rect', { x: 0, y: y - 4, width: W, height: rowH, fill: 'transparent' });
     hit.addEventListener('mousemove', function (ev) {
-      showTip(ev, r.phase === '—' ? 'Unphased' : 'Phase ' + r.phase, [
-        { color: cDone, label: 'Done', value: r.done },
-        { color: cOpen, label: 'Open', value: r.open },
-        { label: 'Complete', value: pct(r.done, r.total) + '%' }
-      ]);
+      showTip(ev, PRI_LABEL[r.priority] || r.priority, [{ color: col, label: 'Open', value: r.open }]);
     });
     hit.addEventListener('mouseleave', hideTip);
     svg.appendChild(hit);
   });
   host.appendChild(svg);
-  host.appendChild(h('div', { class: 'legend' }, [
-    h('span', null, [h('i', { style: { background: cDone } }), 'Done']),
-    h('span', null, [h('i', { style: { background: cOpen } }), 'Open'])
-  ]));
-  if (finished.length) {
-    var n = finished.reduce(function (a, r) { return a + r.total; }, 0);
-    host.appendChild(h('div', { class: 'sub', style: { margin: '10px 0 0' },
-      text: finished.length + ' phase' + (finished.length === 1 ? '' : 's') + ' complete: ' +
-        finished.map(function (r) { return r.phase === '—' ? 'unphased' : r.phase; }).sort().join(', ') +
-        ' (' + n + ' task' + (n === 1 ? '' : 's') + ')' }));
-  }
 }
 
 function tableView(summary, headers, rows) {
@@ -690,7 +674,7 @@ function decisionCard(d) {
       h('span', { class: 'dec-id', text: d.id }),
       h('span', { class: 'dec-title', text: d.title }),
       d.task ? h('span', { class: 'chip link', title: 'Show this task', text: d.task,
-        onclick: function () { state.filters = { q: d.task, status: '', seat: '', phase: '' }; go('tasks'); } }) : null,
+        onclick: function () { state.filters = { q: d.task, status: '', priority: '', seat: '' }; go('tasks'); } }) : null,
       h('span', { class: 'chip', text: d.kind })
     ]),
     d.why ? h('div', { class: 'dec-why', text: d.why }) : null,
@@ -954,11 +938,11 @@ function dataView(d) {
     [dailyHost, tableView('Table view — all days', ['Day', 'Completed'], d.daily.map(function (x) { return [fDate(x.ts), x.count]; }))]));
   charts.push(function () { drawDaily(dailyHost, d); });
 
-  var phaseHost = h('div');
-  out.push(card('By phase', 'Phases with open work, most remaining first. Bar length is the phase’s size.',
-    [phaseHost, tableView('Table view', ['Phase', 'Done', 'Open', 'Total', '%'],
-      d.phases.map(function (r) { return [r.phase === '—' ? 'Unphased' : r.phase, r.done, r.open, r.total, pct(r.done, r.total) + '%']; }))]));
-  charts.push(function () { drawPhases(phaseHost, d); });
+  var priHost = h('div');
+  out.push(card('Open work by priority', 'What is left, by severity band. P0 is a crash, a hang, or a broken feature.',
+    [priHost, tableView('Table view', ['Priority', 'Open'],
+      (d.priorities || []).map(function (r) { return [PRI_LABEL[r.priority] || r.priority, r.open]; }))]));
+  charts.push(function () { drawPriorities(priHost, d); });
   return out;
 }
 
@@ -979,9 +963,6 @@ function weeklyRows(d) {
    =========================================================================== */
 function tasksView(d) {
   var f = state.filters;
-  var phases = [];
-  d.tasks.forEach(function (t) { var p = t.phase || '—'; if (phases.indexOf(p) < 0) phases.push(p); });
-  phases.sort();
   var sel = function (name, label, opts) {
     return h('select', { 'aria-label': label, onchange: function (e) { f[name] = e.target.value; renderTasks(); } },
       [h('option', { value: '', text: label })].concat(opts.map(function (o) {
@@ -1001,7 +982,6 @@ function tasksView(d) {
       ['P2', 'P2 - infra'], ['untriaged', 'Untriaged']
     ]),
     sel('seat', 'Any seat', d.seats.map(function (x) { return [x.seat, 'Seat: ' + x.seat]; })),
-    sel('phase', 'Any phase', phases.map(function (p) { return [p, p === '—' ? 'Unphased' : 'Phase ' + p]; })),
     h('span', { class: 'count', id: 'tcount' })
   ]);
   // Sortable: clicking a header toggles direction, clicking another switches
@@ -1019,6 +999,7 @@ function tasksView(d) {
   };
   var table = h('table', { class: 'tasks' }, [
     h('thead', null, [h('tr', null, [
+      sortable('#', 'order'),
       sortable('ID', 'id'),
       sortable('Pri', 'priority'),
       h('th', { text: 'Status' }),
@@ -1026,18 +1007,21 @@ function tasksView(d) {
       sortable('Created', 'created', 'hide-sm'),
       sortable('Modified', 'modified'),
       sortable('Finished', 'finished'),
-      h('th', { class: 'hide-sm', text: 'Phase' }),
       h('th', { class: 'hide-sm', text: 'Seat' })
     ])]),
     h('tbody', { id: 'tbody' })
   ]);
-  return [card('All tasks', 'Click a row for the full task, or a header to re-sort.',
+  return [card('All tasks', 'Queue order first — # is what the loop works down. Click a row for the full task, or a header to re-sort.',
     [controls, h('div', { class: 'tv-wrap' }, [table])])];
 }
 
+/* Clicking a header toggles direction; switching keys picks the direction that
+   key is USEFUL in first. Dates and ids read newest-first; the queue and the
+   priority band read best-first, because "1" is the answer to what next. */
+var SORT_FIRST_DIR = { order: 1, priority: 1 };
 function toggleSort(key) {
   if (state.sort.key === key) state.sort.dir = -state.sort.dir;
-  else state.sort = { key: key, dir: -1 };
+  else state.sort = { key: key, dir: SORT_FIRST_DIR[key] || -1 };
   renderView();
 }
 
@@ -1076,11 +1060,11 @@ function openTask(t) {
     ]),
     h('h3', { class: 'td-title', text: t.title }),
     h('div', { class: 'td-meta' }, [
+      metaBit('Queue', t.order == null ? 'unordered' : '#' + t.order),
       metaBit('Created', t.createdAt ? fDate(t.createdAt) : 'unknown'),
       metaBit('Modified', t.modifiedAt ? fDate(t.modifiedAt) : 'unknown'),
       t.completedAt ? metaBit('Finished', fDate(t.completedAt)) : null,
       metaBit('Seat', t.seat),
-      t.phase ? metaBit('Phase', t.phase) : null,
       t.deps && t.deps.length ? metaBit('Deps', t.deps.join(', ')) : null
     ]),
     t.triageReason ? h('div', { class: 'td-why', text: 'Triage: ' + t.triageReason }) : null,
@@ -1116,7 +1100,6 @@ function renderTasks() {
     if (f.status && t.bucket !== f.status) return false;
     if (f.priority && (t.priority || 'untriaged') !== f.priority) return false;
     if (f.seat && t.seat !== f.seat) return false;
-    if (f.phase && (t.phase || '—') !== f.phase) return false;
     if (q && (t.id + ' ' + t.title + ' ' + t.summary).toLowerCase().indexOf(q) < 0) return false;
     return true;
   });
@@ -1127,11 +1110,21 @@ function renderTasks() {
   var DATE_KEY = { finished: 'completedAt', created: 'createdAt', modified: 'modifiedAt' };
   rows.sort(function (a, b) {
     var k = state.sort.key;
+    if (k === 'order') {
+      // Unordered tasks park at the end in BOTH directions: flipping the sort
+      // is meant to show you the tail of the queue, not 300 blanks.
+      var ao = a.order, bo = b.order;
+      if (ao == null && bo == null) return idRank(b.id) - idRank(a.id);
+      if (ao == null) return 1;
+      if (bo == null) return -1;
+      if (ao !== bo) return (ao - bo) * dir;
+      return idRank(a.id) - idRank(b.id);
+    }
     if (k === 'priority') {
       // Untriaged after P2, always — an unranked task must not outrank one
       // somebody deliberately called nice-to-have.
       var ar = priRank(a.priority), br = priRank(b.priority);
-      if (ar !== br) return (ar - br) * (dir < 0 ? 1 : -1);
+      if (ar !== br) return (ar - br) * dir;
       return idRank(b.id) - idRank(a.id);
     }
     if (DATE_KEY[k]) {
@@ -1155,6 +1148,7 @@ function renderTasks() {
       onclick: function () { openTask(t); },
       onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTask(t); } }
     }, [
+      h('td', { class: 'ord', text: t.order == null ? '—' : String(t.order) }),
       h('td', { text: t.id }),
       h('td', null, [h('span', { class: 'pri ' + (t.priority || 'none'), text: pri })]),
       h('td', null, [h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]])]),
@@ -1167,7 +1161,6 @@ function renderTasks() {
       dateCell(t.modifiedAt, ''),
       h('td', { class: 'fin', title: t.completedAt ? fDate(t.completedAt) + ' ' + fTime(t.completedAt) : '',
         text: t.completedAt ? fDay(t.completedAt) : (t.bucket === 'done' ? 'before tracking' : '—') }),
-      h('td', { class: 'hide-sm', text: t.phase || '—' }),
       h('td', { class: 'hide-sm', text: t.seat })
     ]);
     body.appendChild(tr);

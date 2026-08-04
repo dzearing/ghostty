@@ -152,7 +152,9 @@ function loadTasks() {
       title: String(F.title || ''),
       // `seat:` is optional and defaults to win — parity-tasks.ps1 says so.
       seat: F.seat == null ? 'win' : String(F.seat),
-      phase: F.phase == null ? null : String(F.phase),
+      // The work queue's sort key. Fractional on purpose so a task can be
+      // injected between two others without renumbering. Absent sorts last.
+      order: Number.isFinite(Number(F.order)) && F.order !== null && F.order !== '' ? Number(F.order) : null,
       deps: Array.isArray(F.deps) ? F.deps.map(String) : [],
       commits: Array.isArray(F.commits) ? F.commits.map(String) : [],
       status,
@@ -643,13 +645,14 @@ function lastTouched(relPath) {
  *
  * Two wrinkles worth knowing:
  *
- * 1. A bulk triage pass rewrites the frontmatter of every open task in a
- *    single commit. Counting that as a modification would stamp the entire
- *    tracker "modified today" and destroy exactly the signal this column
- *    exists to carry, so commits whose subject starts with `chore(triage)` do
- *    not count as modifications. They still establish `created`, and a file
- *    whose ONLY commit is a triage commit falls back to it — otherwise a task
- *    filed in the same breath as a triage would report no date at all.
+ * 1. A bulk pass rewrites the frontmatter of every task in a single commit —
+ *    a re-triage, a field being added or dropped. Counting that as a
+ *    modification would stamp the entire tracker "modified today" and destroy
+ *    exactly the signal this column exists to carry, so commits whose subject
+ *    starts with `chore(triage)` or `chore(tracker)` do not count as
+ *    modifications. They still establish `created`, and a file whose ONLY
+ *    commit is a bulk one falls back to it — otherwise a task filed in the
+ *    same breath as a bulk pass would report no date at all.
  * 2. A task created but not yet committed has no git dates. The filesystem is
  *    the fallback, so a task filed thirty seconds ago still shows up dated.
  */
@@ -676,7 +679,7 @@ function fileDates() {
     const [tsRaw, subject] = headLine.split('\x1f');
     const ts = Number(tsRaw) * 1000;
     if (!ts) continue;
-    const isTriage = /^chore\(triage\)/.test((subject || '').trim());
+    const isTriage = /^chore\((triage|tracker)\)/.test((subject || '').trim());
     for (const line of (nl < 0 ? '' : rec.slice(nl + 1)).split('\n')) {
       const p = line.trim();
       if (!p.endsWith('.md') || !p.startsWith(REL_TASK_DIR)) continue;
@@ -787,17 +790,6 @@ function buildPayload() {
   }
   const daily = fillDays(perDay, series.length ? series[0].ts : now, now);
 
-  const phases = new Map();
-  for (const t of tasks) {
-    if (t.bucket === 'skipped') continue;
-    const key = t.phase || '—';
-    if (!phases.has(key)) phases.set(key, { phase: key, done: 0, open: 0, total: 0 });
-    const row = phases.get(key);
-    if (t.bucket === 'done') row.done++;
-    else if (OPEN_BUCKETS.has(t.bucket)) row.open++;
-    row.total++;
-  }
-
   const seats = new Map();
   for (const t of tasks) {
     if (t.bucket === 'skipped') continue;
@@ -858,7 +850,6 @@ function buildPayload() {
     historyStart: series.length ? series[0].ts : now,
     series,
     daily,
-    phases: [...phases.values()].sort((a, b) => b.total - a.total || a.phase.localeCompare(b.phase)),
     seats: [...seats.values()].sort((a, b) => b.total - a.total),
     tasks: tasks.map((t) => ({ ...t, completedAt: completedAt[t.id] || null })),
   };

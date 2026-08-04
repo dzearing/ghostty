@@ -35,28 +35,36 @@ Concretely, in order, with no stops in between:
      never wedges the loop.
    - `scripts\go-loop-exec.ps1 list` shows every window and which are marked.
 
-1. **Pick up a task** — first Current-priorities item, else
-   `powershell -NoProfile -File scripts\parity-tasks.ps1 next`. Never ask
-   which one. `next` answers for **this box's seat** (T344): tasks marked
-   `seat: mac` — a Swift fix, a macOS regression run — are the Mac seat's and
-   are listed as skipped rather than handed to you. Do not take one; if you
-   find a task you cannot validate here, mark it `seat: mac` and re-run
-   `next`.
-
-   **Then claim it out loud**, before you build anything:
+1. **Pick up a task — ONE command, which also claims it:**
 
    ```
-   powershell -NoProfile -File scripts\parity-tasks.ps1 set-status <id> -Status in-progress
+   powershell -NoProfile -File scripts\parity-tasks.ps1 next -Claim
    ```
 
-   This is the ONLY thing that says what is being worked right now. The loop
-   lock records the pane, the turn and a heartbeat but NOT the task, so
-   without this the dashboard can see a loop is alive and still cannot say
-   what it is doing — a watching human gets an empty "In flight" while you are
-   mid-task. Step 6 moves it to `done`; if you abandon it instead, set it back
-   to `todo` rather than leaving it in progress. A task left in-progress whose
-   file then goes untouched shows as **stale** on the dashboard and gets
-   offered up for reset, which is the cleanup path for exactly this mistake.
+   Never ask which one. `-Claim` marks the task it hands you `in-progress` in
+   the same breath, and that mark is the ONLY thing that says what is being
+   worked right now: the loop lock records the pane, the turn and a heartbeat
+   but NOT the task. This used to be two commands — `next`, then a separate
+   `set-status` — and a turn that ran the first and forgot the second left a
+   watching human with a dashboard that could see the loop was alive and still
+   could not name what it was doing (user, 2026-08-04: *"why is the loop status
+   not getting updated"*). Picking and claiming are one act; they are now one
+   command, which is the only version that cannot be half-done.
+
+   `next` picks by **`order:`** (the queue, lowest first), then `priority:`,
+   then id — so the head of the queue is one task, not a band of forty.
+   Anything in **Current priorities** below still outranks it; that list is
+   pinned by hand and `order:` is kept in step with it.
+
+   `next` answers for **this box's seat** (T344): tasks marked `seat: mac` — a
+   Swift fix, a macOS regression run — are the Mac seat's and are listed as
+   skipped rather than handed to you. Do not take one; if you find a task you
+   cannot validate here, mark it `seat: mac` and re-run `next`.
+
+   Step 6 moves it to `done`; if you abandon it instead, set it back to `todo`
+   rather than leaving it in progress. A task left in-progress whose file then
+   goes untouched shows as **stale** on the dashboard and gets offered up for
+   reset, which is the cleanup path for exactly this mistake.
 
    **Then make it readable.** Add these two sections to the task file if they
    are not already there — they are what a human watching the dashboard sees

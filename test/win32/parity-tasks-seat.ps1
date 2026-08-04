@@ -53,19 +53,24 @@ function New-FixtureTask {
         [string]$Id, [string]$Status = 'todo', [string]$SeatLine = '',
         [string]$Deps = '[]',
         # Emitted verbatim like $SeatLine, so '' reproduces a pre-priority file.
-        [string]$PriorityLine = ''
+        [string]$PriorityLine = '',
+        [string]$OrderLine = ''
     )
     $lines = @(
         '---'
         "id: $Id"
         ("title: " + (ConvertTo-Json "fixture $Id" -Compress))
-        'phase: "K"'
+        # `order:` is emitted only when asked, so the default fixture is
+        # deliberately unordered - the state most of the tracker was in before
+        # the ranking pass, and the one the fallbacks have to handle.
+
         "deps: $Deps"
         ("status: " + (ConvertTo-Json $Status -Compress))
         'commits: []'
     )
     if ($SeatLine) { $lines += $SeatLine }
     if ($PriorityLine) { $lines += $PriorityLine }
+    if ($OrderLine) { $lines += $OrderLine }
     $lines += @('---', '', "# $Id - fixture", '')
     $path = Join-Path $fixture "$Id.md"
     [System.IO.File]::WriteAllText($path, ($lines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
@@ -91,8 +96,8 @@ Assert 'next reports the seat it resolved to' ($r.Out -match 'seat=win')
 
 $r = Task-Run @('list')
 Assert 'list shows a Seat column' ($r.Out -match 'Seat')
-# The Pri column sits between Id and Status, and an untriaged task shows '--'.
-Assert 'list reports T1 as win' ($r.Out -match '(?m)^T1\s+--\s+todo\s+K\s+win\b')
+# Columns are Ord, Id, Pri, Status, Seat; unset shows '--' in both numeric ones.
+Assert 'list reports T1 as win' ($r.Out -match '(?m)^\s*--\s+T1\s+--\s+todo\s+win\b')
 
 # --- B. next skips mac, loudly ----------------------------------------------
 ""
@@ -234,7 +239,7 @@ Assert 'and next names the untriaged one it passed over' ($r.Out -notmatch 'NEXT
 
 $r = Task-Run @('list', '-Priority', 'P2')
 Assert 'list -Priority filters to that band' ($r.Out -match '1 task\(s\)')
-Assert 'list shows the Pri column value' ($r.Out -match '(?m)^T1\s+P2\s+todo\b')
+Assert 'list shows the Pri column value' ($r.Out -match '(?m)^\s*--\s+T1\s+P2\s+todo\b')
 
 $r = Task-Run @('set-priority', 'T2', '-Priority', 'P0', '-Summary', 'it wedges the app')
 Assert 'set-priority exits 0' ($r.Code -eq 0)
@@ -263,6 +268,59 @@ Assert 'new -Priority exits 0' ($n.Code -eq 0)
 Assert 'new -Priority writes the field' ($n.Text -match '(?m)^priority: "P0"$')
 $n = New-AndRead @()
 Assert 'new without -Priority defaults to P1' ($n.Text -match '(?m)^priority: "P1"$')
+
+# --- K. order outranks priority ---------------------------------------------
+""
+"K. next orders by order before priority"
+Reset-Fixture
+# Inverted again: the BEST priority gets the WORST order, so an ordering that
+# still fell back to priority cannot pass this section by accident.
+New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P0"' -OrderLine 'order: 50'
+New-FixtureTask -Id 'T2' -PriorityLine 'priority: "P2"' -OrderLine 'order: 2'
+New-FixtureTask -Id 'T3' -PriorityLine 'priority: "P1"' -OrderLine 'order: 1'
+New-FixtureTask -Id 'T4' -PriorityLine 'priority: "P0"'          # unordered
+
+$r = Task-Run @('next')
+Assert 'next takes order 1 over a P0 at order 50' ($r.Out -match 'NEXT: T3\b')
+Assert 'next reports the order it picked on' ($r.Out -match 'order=1\b')
+Assert 'an unordered P0 does not jump the queue' ($r.Out -notmatch 'NEXT: T4\b')
+
+$r = Task-Run @('list')
+Assert 'list is printed in queue order' (
+    $r.Out -match '(?s)T3.*T2.*T1.*T4')
+
+# A decimal must be injectable BETWEEN two neighbours without renumbering -
+# the whole reason order is fractional.
+$r = Task-Run @('set-order', 'T4', '-Order', '1.5')
+Assert 'set-order accepts a decimal' ($r.Code -eq 0)
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T4.md'))
+Assert 'set-order writes it invariantly (a dot, never a comma)' ($txt -match '(?m)^order: 1\.5$')
+$r = Task-Run @('list')
+Assert 'the injected task lands between its neighbours' ($r.Out -match '(?s)T3.*T4.*T2.*T1')
+$r = Task-Run @('next')
+Assert 'and next still heads the queue with order 1' ($r.Out -match 'NEXT: T3\b')
+
+# A garbled order must not read as 0 and silently seize the head of the queue.
+New-FixtureTask -Id 'T5' -PriorityLine 'priority: "P2"' -OrderLine 'order: banana'
+$r = Task-Run @('next')
+Assert 'an unparseable order is treated as absent, not as 0' ($r.Out -match 'NEXT: T3\b')
+$r = Task-Run @('validate')
+Assert 'a fixture with orders validates' ($r.Code -eq 0)
+
+# --- L. next -Claim marks the task -------------------------------------------
+""
+"L. next -Claim marks the task in-progress"
+$r = Task-Run @('next')
+Assert 'next alone does NOT change status' (
+    [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md')) -match '(?m)^status: "todo"$')
+
+$r = Task-Run @('next', '-Claim')
+Assert 'next -Claim still names the task' ($r.Out -match 'NEXT: T3\b')
+Assert 'and says it claimed it' ($r.Out -match 'CLAIMED: T3')
+Assert 'the file is now in-progress' (
+    [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md')) -match '(?m)^status: "in-progress"$')
+$r = Task-Run @('next')
+Assert 'a claimed task is no longer offered' ($r.Out -notmatch 'NEXT: T3\b')
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }

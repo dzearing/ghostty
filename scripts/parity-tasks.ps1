@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   Replaces the single-file state table. Each task is <id>.md with YAML
-  frontmatter (id, title, phase, deps, status, commits, seat) plus a Summary
+  frontmatter (id, title, order, deps, status, commits, seat, priority) plus a Summary
   and optional Details body. One file per task means two agents can add and
   edit tasks concurrently without touching the same file.
 
@@ -22,12 +22,14 @@
   scripts\parity-tasks.ps1 next
   scripts\parity-tasks.ps1 next -Seat mac
   scripts\parity-tasks.ps1 show T144
-  scripts\parity-tasks.ps1 new -Title "Fix the thing" -Phase K -Deps T73,T94
+  scripts\parity-tasks.ps1 new -Title "Fix the thing" -Deps T73,T94
+  scripts\parity-tasks.ps1 set-order T377 -Order 2
+  scripts\parity-tasks.ps1 set-order T500 -Order 2.5   # inject without renumbering
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -41,7 +43,10 @@ param(
     # id order and shipped whatever had been logged most recently.
     [ValidateSet('P0', 'P1', 'P2')]
     [string]$Priority,
-    [string]$Phase,
+    # The work queue's sort key: lowest goes first. Fractional on purpose, so a
+    # task can be injected between two others without renumbering the tracker.
+    # Absent means unordered, which sorts last.
+    [Nullable[double]]$Order,
     [string[]]$Deps,
     [string]$Title,
     [string]$Summary,
@@ -51,6 +56,16 @@ param(
     # it as a filter, `new` writes it into the created file.
     [ValidateSet('win', 'mac', 'any', 'all')]
     [string]$Seat,
+
+    # `next -Claim` marks the task it hands out `in-progress` in the same
+    # breath. go.md asked the loop to run `next` and then a separate
+    # `set-status`, and a turn that skipped the second command left the
+    # dashboard unable to name what was being worked on - which is what the
+    # user saw on 2026-08-04 ("why is the loop status not getting updated").
+    # Picking a task and claiming it are one act; making them one command is
+    # the only version that cannot be half-done. Off by default so `next`
+    # stays a read-only question.
+    [switch]$Claim,
 
     # Escape hatch so the acceptance script can drive a fixture directory
     # instead of the real tracker (same idea as GHOSTTY_HOST_DEFAULTS).
@@ -106,6 +121,17 @@ function ConvertFrom-Frontmatter {
         try { return [string]($raw | ConvertFrom-Json) } catch { return $raw.Trim('"') }
     }
 
+    # `order:` is a bare number, not a quoted string, so it parses on its own.
+    # Anything unparseable is treated as absent rather than as 0 — a typo must
+    # not silently promote a task to the head of the queue.
+    $parseOrder = {
+        param($raw)
+        if ([string]::IsNullOrWhiteSpace($raw) -or $raw -eq 'null') { return $null }
+        $d = 0.0
+        if ([double]::TryParse($raw.Trim(), [ref]$d)) { return $d }
+        return $null
+    }
+
     $seat = & $unquote (& $get 'seat')
     if (-not $seat) { $seat = $DefaultSeat }
 
@@ -118,7 +144,7 @@ function ConvertFrom-Frontmatter {
     [PSCustomObject]@{
         Id           = & $get 'id'
         Title        = & $unquote (& $get 'title')
-        Phase        = & $unquote (& $get 'phase')
+        Order        = & $parseOrder (& $get 'order')
         Deps         = & $parseList (& $get 'deps')
         Status       = & $unquote (& $get 'status')
         Commits      = & $parseList (& $get 'commits')
@@ -127,6 +153,14 @@ function ConvertFrom-Frontmatter {
         TriageReason = & $unquote (& $get 'triage-reason')
         Path         = $Path
     }
+}
+
+# Sort key for `order:`. Unordered tasks sort after every ordered one, so
+# adding a task never silently jumps the queue.
+function Get-OrderRank {
+    param($O)
+    if ($null -eq $O) { return [double]::MaxValue }
+    return [double]$O
 }
 
 # Sort key for a priority: P0 first, untriaged last.
@@ -191,18 +225,34 @@ switch ($Command) {
         # view of the tracker, where hiding rows by default would be a lie.
         $wantSeat = if ($Seat) { $Seat } else { 'all' }
         if ($Status) { $tasks = $tasks | Where-Object { $_.Status -like "$Status*" } }
-        if ($Phase) { $tasks = $tasks | Where-Object { $_.Phase -eq $Phase } }
         if ($Priority) { $tasks = $tasks | Where-Object { $_.Priority -eq $Priority } }
         $tasks = @($tasks | Where-Object { Test-SeatMatch $_.Seat $wantSeat })
-        $tasks | Select-Object `
-            Id,
+        # Queue order, so `list` reads the same way `next` picks.
+        $tasks = @($tasks | Sort-Object `
+            @{ Expression = { Get-OrderRank $_.Order } }, `
+            @{ Expression = { Get-PriorityRank $_.Priority } }, `
+            @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
+            @{ Expression = { $_.Id } })
+        # Rendered at a FIXED width, not the host's. Format-Table truncates to
+        # the console window, and it does it silently: in a 62-column pane this
+        # table stopped after Status, so Seat, Deps and Title - the three
+        # columns a human filters on - simply were not there, and adding Ord
+        # made it one column worse. `Out-String -Width` is the only lever that
+        # detaches the layout from whatever pane the loop happens to run in.
+        $rendered = $tasks | Select-Object `
+            @{ N = 'Ord'; E = { if ($null -ne $_.Order) { $_.Order } else { '--' } } },
+        Id,
         @{ N = 'Pri'; E = { if ($_.Priority) { $_.Priority } else { '--' } } },
-        Status,
-        Phase,
+        # Capped like Title. A `skipped(<reason>)` status runs to 166 characters
+        # here, and -AutoSize sizes the column to the longest VALUE, so one such
+        # row shoved Title off the right edge of every other row. The head of a
+        # status is the part that classifies it; the reason lives in the file.
+        @{ N = 'Status'; E = { if ($_.Status.Length -gt 24) { $_.Status.Substring(0, 21) + '...' } else { $_.Status } } },
         Seat,
         @{ N = 'Deps'; E = { ($_.Deps -join ',') } },
         @{ N = 'Title'; E = { if ($_.Title.Length -gt 70) { $_.Title.Substring(0, 67) + '...' } else { $_.Title } } } |
-        Format-Table -AutoSize
+        Format-Table -AutoSize | Out-String -Width 200
+        Write-Host $rendered.TrimEnd()
         Write-Host ""
         Write-Host ("{0} task(s)." -f @($tasks).Count)
     }
@@ -227,13 +277,20 @@ switch ($Command) {
             }
         }
 
-        # PRIORITY FIRST, then id. Before this the selector walked the files in
-        # id order, so the loop worked whatever had been logged earliest and a
-        # crash filed yesterday queued behind two hundred older nice-to-haves -
-        # the user's complaint on 2026-08-04. Id order survives as the
-        # tiebreaker inside a priority band, so the ordering is still total and
-        # still deterministic.
+        # ORDER FIRST, then priority, then id.
+        #
+        # `order:` is the answer to "what next" - one number, so there is one
+        # head of the queue rather than forty things sharing a band. Priority
+        # stays as the band a human reads and filters on, and as the fallback
+        # for anything not yet placed; id remains the last tiebreaker so the
+        # ordering is total and deterministic no matter how little is filled in.
+        #
+        # Before any of this the selector walked the files in id order, so the
+        # loop worked whatever had been logged earliest and a crash filed
+        # yesterday queued behind two hundred older nice-to-haves (user,
+        # 2026-08-04).
         $ordered = $tasks | Sort-Object `
+        @{ Expression = { Get-OrderRank $_.Order } }, `
         @{ Expression = { Get-PriorityRank $_.Priority } }, `
         @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
         @{ Expression = { $_.Id } }
@@ -250,9 +307,16 @@ switch ($Command) {
             if ($unmet.Count -eq 0) {
                 Write-Host ("NEXT: {0} - {1}" -f $t.Id, $t.Title)
                 $pri = if ($t.Priority) { $t.Priority } else { 'untriaged' }
-                Write-Host ("      priority={0} phase={1} deps={2} seat={3}" -f $pri, $t.Phase, ($t.Deps -join ','), $t.Seat)
+                $ord = if ($null -ne $t.Order) { $t.Order } else { 'unordered' }
+                Write-Host ("      order={0} priority={1} deps={2} seat={3}" -f $ord, $pri, ($t.Deps -join ','), $t.Seat)
                 if ($t.TriageReason) { Write-Host ("      why: {0}" -f $t.TriageReason) }
                 Write-Host ("      file: docs/design/windows-parity-tasks/{0}.md" -f $t.Id)
+                if ($Claim) {
+                    $claimText = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
+                    $claimed = [regex]::Replace($claimText, '(?m)^status:\s*.*$', 'status: "in-progress"', 1)
+                    [System.IO.File]::WriteAllText($t.Path, $claimed, (New-Object System.Text.UTF8Encoding $false))
+                    Write-Host ("      CLAIMED: {0} is now in-progress" -f $t.Id)
+                }
                 if ($blocked.Count -gt 0) {
                     Write-Host ""
                     Write-Host ("Skipped {0} earlier todo(s) with unmet deps: {1}" -f $blocked.Count, ($blocked -join ', '))
@@ -292,6 +356,24 @@ switch ($Command) {
         }
         [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
         Write-Host ("{0} -> {1}" -f $tid, $Status)
+    }
+
+    'set-order' {
+        $tid = Get-TaskId $Id
+        if ($null -eq $Order) { throw 'set-order requires -Order (a number; decimals are fine).' }
+        $path = Get-TaskPath $tid
+        $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        # Invariant culture: a machine with a comma decimal separator would
+        # otherwise write "order: 2,5", which reads back as absent.
+        $num = ([double]$Order).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        if ($text -match '(?m)^order:\s*.*$') {
+            $new = [regex]::Replace($text, '(?m)^order:\s*.*$', "order: $num", 1)
+        }
+        else {
+            $new = [regex]::Replace($text, '(?m)^(title:\s*.*)$', "`$1`norder: $num", 1)
+        }
+        [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
+        Write-Host ("{0} -> order {1}" -f $tid, $num)
     }
 
     'set-priority' {
@@ -337,8 +419,12 @@ switch ($Command) {
         if ($depList.Count -gt 0) {
             $depsJson = '[' + (($depList | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ', ') + ']'
         }
-        $phaseJson = 'null'
-        if ($Phase) { $phaseJson = ConvertTo-Json $Phase -Compress }
+        # A new task is UNORDERED unless told otherwise: it joins the tail of
+        # the queue rather than silently landing wherever a default put it.
+        $orderJson = 'null'
+        if ($null -ne $Order) {
+            $orderJson = ([double]$Order).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        }
 
         # `all` is a filter, not a seat a task can hold.
         $seatValue = if ($Seat -and $Seat -ne 'all') { $Seat } else { $DefaultSeat }
@@ -369,7 +455,7 @@ switch ($Command) {
                     '---'
                     "id: $tid"
                     ("title: " + (ConvertTo-Json $Title -Compress))
-                    "phase: $phaseJson"
+                    "order: $orderJson"
                     "deps: $depsJson"
                     'status: "todo"'
                     'commits: []'
