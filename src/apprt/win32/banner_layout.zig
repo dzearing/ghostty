@@ -40,10 +40,55 @@ pub fn bandHeight(card_h: i32, margin: i32) i32 {
 /// columns from the pane instead (T123).
 pub const FALLBACK_CELL_W: f32 = 360.0;
 
-/// Max display lines a wrapped table cell may occupy before it
-/// tail-truncates with an ellipsis (Mac `maxCellWrapLines`), so one nasty
-/// cell cannot blow up the banner height at a skinny pane width.
+/// Max display lines a wrapped run may occupy before it tail-truncates
+/// with an ellipsis (Mac `maxCellWrapLines`), so one nasty cell — or one
+/// nasty paragraph, heading or list row (T377) — cannot blow up the
+/// banner height at a skinny pane width. ONE number for all of them on
+/// purpose: a list row and a table cell wrapping by different rules is
+/// the same class of defect as not wrapping at all.
 pub const MAX_CELL_LINES: usize = 3;
+
+/// Clear space the design system requires between two painted elements
+/// (win32-design-system.md: "nothing touches anything", >= 4 DIP),
+/// unscaled. The gap between the content column and the reserved chevron
+/// column below.
+pub const CHEVRON_GAP: f32 = 4.0;
+
+/// Width available to banner CONTENT inside the card, with the collapse
+/// chevron's column reserved (T377).
+///
+/// Content starts `inner` px in from the band's left edge (the card's
+/// margin plus its padding) and, with no chevron, stops the same `inner`
+/// in from the right. When the banner is collapsible the chevron button
+/// sits in the card's top-right corner — a `chevron_side` px square whose
+/// right edge is `margin` px from the band edge — and the whole strip it
+/// occupies belongs to it: content stops `gap` px short of the chevron's
+/// left edge, for EVERY block, so no paragraph, heading, list row or
+/// table cell can ever paint under it (user, 2026-08-04: "the whole right
+/// side should be dedicated to the chevron column so that text never
+/// overlaps the chevron").
+///
+/// The reservation applies to the whole content column, not just the
+/// first line: reserving only the chevron's own row would make the
+/// content width depend on which line you are on, which no wrap pass can
+/// act on and no test can pin.
+///
+/// Never returns less than 1 — a pane squeezed narrower than its own
+/// chrome still has to lay out rather than divide by zero.
+pub fn contentWidth(
+    client_w: i32,
+    inner: i32,
+    margin: i32,
+    chevron_side: i32,
+    gap: i32,
+) i32 {
+    const plain = client_w - inner;
+    const right = if (chevron_side > 0)
+        @min(plain, client_w - margin - chevron_side - @max(gap, 0))
+    else
+        plain;
+    return @max(right - inner, 1);
+}
 
 /// Size table columns to the width the pane can actually give them (T123,
 /// the port of Mac's `columnWidths(natural:available:)`). `natural[i]` is
@@ -147,6 +192,83 @@ pub fn utf16PrefixBytes(text: []const u8, units: usize) usize {
         u += need;
         if (u == units) return it.i;
     }
+}
+
+// The metrics `BannerOverlay` feeds `contentWidth`, recomputed here the
+// same way it does (`px` = round(v * scale)) so the reservation can be
+// asserted at every scaling the design system requires.
+const TestChrome = struct {
+    inner: i32,
+    margin: i32,
+    chevron: i32,
+    gap: i32,
+
+    fn px(v: f32, scale: f32) i32 {
+        return @intFromFloat(@round(v * scale));
+    }
+
+    fn init(scale: f32) TestChrome {
+        return .{
+            // card.MARGIN + card.PADDING, both 12 unscaled.
+            .inner = px(12.0, scale) + px(12.0, scale),
+            .margin = px(12.0, scale),
+            // icon_button.Metrics.init(scale).target — 28 unscaled.
+            .chevron = px(28.0, scale),
+            .gap = px(CHEVRON_GAP, scale),
+        };
+    }
+};
+
+const TEST_SCALES = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
+
+test "contentWidth: no chevron — symmetric inner margins at every scale" {
+    for (TEST_SCALES) |s| {
+        const c = TestChrome.init(s);
+        const w = 800;
+        try std.testing.expectEqual(w - c.inner * 2, contentWidth(w, c.inner, c.margin, 0, c.gap));
+    }
+}
+
+test "contentWidth: the chevron column is reserved, and never overlapped" {
+    for (TEST_SCALES) |s| {
+        const c = TestChrome.init(s);
+        const w = 800;
+        const got = contentWidth(w, c.inner, c.margin, c.chevron, c.gap);
+        // The content column ends at least `gap` px left of the chevron's
+        // painted left edge — the assertion the user's report reduces to.
+        const chevron_left = w - c.margin - c.chevron;
+        try std.testing.expect(c.inner + got + c.gap <= chevron_left);
+        // ...and it is narrower than the un-reserved width, i.e. the
+        // reservation actually engaged (28 + 4 > 12 padding at every scale).
+        try std.testing.expect(got < w - c.inner * 2);
+    }
+}
+
+test "contentWidth: reservation is exactly the chevron strip, no more" {
+    // 1.0: inner 24, margin 12, chevron 28, gap 4.
+    // right = min(800-24, 800-12-28-4) = 756; width = 756-24 = 732.
+    try std.testing.expectEqual(@as(i32, 732), contentWidth(800, 24, 12, 28, 4));
+    // 2.0: inner 48, margin 24, chevron 56, gap 8.
+    // right = min(1600-48, 1600-24-56-8) = 1512; width = 1512-48 = 1464.
+    try std.testing.expectEqual(@as(i32, 1464), contentWidth(1600, 48, 24, 56, 8));
+}
+
+test "contentWidth: a banner never blocks the pane from shrinking" {
+    for (TEST_SCALES) |s| {
+        const c = TestChrome.init(s);
+        // Narrower than the chrome itself: still positive and finite.
+        for ([_]i32{ 0, 1, 40, 80 }) |w| {
+            const got = contentWidth(w, c.inner, c.margin, c.chevron, c.gap);
+            try std.testing.expect(got >= 1);
+        }
+    }
+}
+
+test "contentWidth: a negative gap is treated as none, not as slack" {
+    try std.testing.expectEqual(
+        contentWidth(800, 24, 12, 28, 0),
+        contentWidth(800, 24, 12, 28, -10),
+    );
 }
 
 test "columnWidths: everything fits — exact natural widths, no cap" {

@@ -74,6 +74,20 @@ const ELLIPSIS = "…";
 /// exactly the 6 section-6g assertions and nothing else; that is how those
 /// assertions were shown to test the fix rather than the harness.
 const T123_NEUTERED = false;
+/// The same negative control for T377: true restores the pre-T377 world
+/// where ONLY table cells wrapped — a paragraph, a heading and a list row
+/// were each drawn as one `drawInlineLine` at a fixed line height, and the
+/// content column ran to one card padding from the band edge, i.e. straight
+/// under the collapse chevron. Flipping it and re-running `pane-banner.ps1`
+/// must fail exactly the section-6h assertions and nothing else.
+const T377_NEUTERED = false;
+
+/// The width a non-table block wraps against. `0` is `layoutInline`'s
+/// "width unknown" signal, which is precisely the pre-T377 single-line
+/// path, so the negative control needs no second code path to drift.
+fn wrapWidth(content_w: i32) i32 {
+    return if (T377_NEUTERED) 0 else content_w;
+}
 /// Collapsed content height: first line fully visible plus a sliver that
 /// fades out (Mac: 24 at 12pt → 30 at 15px).
 const COLLAPSED_H: f32 = 30.0;
@@ -360,12 +374,29 @@ pub const BannerOverlay = struct {
     }
 
     /// Width available to the content INSIDE the card: the pane slot less
-    /// the card's margin and padding on both sides. 0 while the pane width
-    /// is still unknown, which is the signal for the fixed-cap fallback.
+    /// the card's margin and padding on both sides, and less the collapse
+    /// chevron's reserved column when the banner has one (T377). 0 while
+    /// the pane width is still unknown, which is the signal for the
+    /// fixed-cap fallback.
+    ///
+    /// The measuring pass and the paint MUST agree here, so both go
+    /// through `contentWidthFor` — a band reserved from one width and
+    /// painted at another is exactly how a banner ends up over the
+    /// terminal.
     fn contentWidth(self: *const BannerOverlay) i32 {
         if (self.pane_w <= 0) return 0;
-        const inner = self.px(MARGIN) + self.px(PAD);
-        return @max(self.pane_w - inner * 2, 1);
+        return self.contentWidthFor(self.pane_w);
+    }
+
+    fn contentWidthFor(self: *const BannerOverlay, client_w: i32) i32 {
+        const margin = self.px(MARGIN);
+        return banner_layout.contentWidth(
+            client_w,
+            margin + self.px(PAD),
+            margin,
+            if (self.collapsible and !T377_NEUTERED) icon_button.Metrics.init(self.scale).target else 0,
+            self.px(banner_layout.CHEVRON_GAP),
+        );
     }
 
     /// Expanded content height, measured via a window DC when stale. The
@@ -586,12 +617,16 @@ pub const BannerOverlay = struct {
         width: f32 = 0,
     };
 
-    /// Split cell segs into word/space tokens with measured widths.
+    /// Split inline content into word/space tokens with measured widths.
+    /// `size_class` is the font size class the run renders at (0 base,
+    /// 1–6 heading levels) — a heading has to be tokenized in ITS font or
+    /// the wrap breaks at the wrong words (T377).
     fn tokenizeCell(
         self: *BannerOverlay,
         arena: std.mem.Allocator,
         hdc: w32.HDC,
         segs: []const markdown.Inline,
+        size_class: usize,
         force_bold: bool,
     ) std.mem.Allocator.Error![]Token {
         var out: std.ArrayList(Token) = .empty;
@@ -607,7 +642,7 @@ pub const BannerOverlay = struct {
                     var j = i;
                     while (j < s.text.len and (s.text[j] == ' ') == is_space) j += 1;
                     const word = s.text[i..j];
-                    const size = self.measureSeg(hdc, word, s.style, 0, force_bold);
+                    const size = self.measureSeg(hdc, word, s.style, size_class, force_bold);
                     try out.append(arena, .{
                         .text = word,
                         .style = s.style,
@@ -622,11 +657,17 @@ pub const BannerOverlay = struct {
         return out.items;
     }
 
-    /// Natural (single-line) width of a cell's inline content.
-    fn cellNaturalWidth(self: *BannerOverlay, hdc: w32.HDC, segs: []const markdown.Inline, force_bold: bool) i32 {
+    /// Natural (single-line) width of a run of inline content.
+    fn cellNaturalWidth(
+        self: *BannerOverlay,
+        hdc: w32.HDC,
+        segs: []const markdown.Inline,
+        size_class: usize,
+        force_bold: bool,
+    ) i32 {
         var total: i32 = 0;
         for (segs) |inl| switch (inl) {
-            .seg => |s| total += self.measureSeg(hdc, s.text, s.style, 0, force_bold).cx,
+            .seg => |s| total += self.measureSeg(hdc, s.text, s.style, size_class, force_bold).cx,
             .checkbox => total += self.px(CHECK_SIDE),
         };
         return total;
@@ -644,6 +685,7 @@ pub const BannerOverlay = struct {
         hdc: w32.HDC,
         tokens: []const Token,
         max_w: i32,
+        size_class: usize,
     ) std.mem.Allocator.Error![]const Token {
         if (max_w <= 0) return tokens;
         const limit: f32 = @floatFromInt(max_w);
@@ -669,7 +711,7 @@ pub const BannerOverlay = struct {
             }
             var rest = t.text;
             while (rest.len > 0) {
-                const fit = self.prefixFitting(hdc, rest, t.style, max_w);
+                const fit = self.prefixFitting(hdc, rest, t.style, max_w, size_class);
                 // Always consume at least one codepoint: a column too
                 // narrow for even a single glyph must still terminate.
                 const take = if (fit > 0)
@@ -681,7 +723,7 @@ pub const BannerOverlay = struct {
                     .text = chunk,
                     .style = t.style,
                     .link = t.link,
-                    .width = @floatFromInt(self.measureSeg(hdc, chunk, t.style, 0, false).cx),
+                    .width = @floatFromInt(self.measureSeg(hdc, chunk, t.style, size_class, false).cx),
                 });
                 rest = rest[chunk.len..];
             }
@@ -697,11 +739,12 @@ pub const BannerOverlay = struct {
         text: []const u8,
         style: markdown.Style,
         max_w: i32,
+        size_class: usize,
     ) usize {
         var wbuf: [1024]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
         if (wlen == 0) return 0;
-        const font = self.fontFor(style, 0);
+        const font = self.fontFor(style, size_class);
         const prev = w32.SelectObject(hdc, font);
         defer _ = w32.SelectObject(hdc, prev);
         var fit: i32 = 0;
@@ -714,15 +757,140 @@ pub const BannerOverlay = struct {
         return banner_layout.utf16PrefixBytes(text, units);
     }
 
-    const CellLayout = struct {
+    /// One run of inline content laid out into display lines. Used by
+    /// EVERY block that holds inline content — paragraphs, headings, list
+    /// rows and table cells (T377) — so they cannot wrap by different
+    /// rules.
+    const InlineLayout = struct {
         tokens: []const Token = &.{},
         lines: []markdown.WrapLine = &.{},
-        /// Single-line fast path when the cell fits (or holds a checkbox).
+        /// Single-line fast path when the run fits (or holds a checkbox).
         single: bool = true,
-        /// The cell ran past MAX_CELL_LINES and its last visible line
+        /// The run went past MAX_CELL_LINES and its last visible line
         /// tail-truncates with an ellipsis.
         truncated: bool = false,
+
+        /// Display lines this run occupies.
+        fn lineCount(self: InlineLayout) i32 {
+            return if (self.single) 1 else @intCast(self.lines.len);
+        }
     };
+
+    /// Wrap `segs` into at most `MAX_CELL_LINES` display lines within
+    /// `max_w` px. Returns the single-line fast path when the run already
+    /// fits, when the width is not known yet, or when the run holds an
+    /// inline checkbox — a native checkbox box cannot reflow around
+    /// wrapping text, so such a run stays on one line (a LIST checkbox is
+    /// the item's marker, drawn in the gutter, and never lands here, so a
+    /// task-list row wraps like any other).
+    fn layoutInline(
+        self: *BannerOverlay,
+        arena: std.mem.Allocator,
+        hdc: w32.HDC,
+        segs: []const markdown.Inline,
+        max_w: i32,
+        size_class: usize,
+        force_bold: bool,
+    ) InlineLayout {
+        if (T123_NEUTERED) return .{};
+        if (max_w <= 0) return .{};
+        if (hasCheckbox(segs)) return .{};
+        if (self.cellNaturalWidth(hdc, segs, size_class, force_bold) <= max_w) return .{};
+
+        const raw = self.tokenizeCell(arena, hdc, segs, size_class, force_bold) catch return .{};
+        const tokens = self.breakWideTokens(arena, hdc, raw, max_w, size_class) catch return .{};
+        const tw = arena.alloc(f32, tokens.len) catch return .{};
+        const ts = arena.alloc(bool, tokens.len) catch return .{};
+        for (tokens, 0..) |t, ti| {
+            tw[ti] = t.width;
+            ts[ti] = t.is_space;
+        }
+        var lines = markdown.wrapTokens(arena, tw, ts, @floatFromInt(max_w)) catch return .{};
+        // Capped at MAX_CELL_LINES display lines; past that the last
+        // visible line tail-truncates, so one nasty run can't blow up the
+        // banner height (Mac parity).
+        const truncated = lines.len > banner_layout.MAX_CELL_LINES;
+        if (truncated) lines = lines[0..banner_layout.MAX_CELL_LINES];
+        return .{
+            .tokens = tokens,
+            .lines = lines,
+            .single = false,
+            .truncated = truncated,
+        };
+    }
+
+    /// Paint (or just measure) a laid-out run in a `slot_w`-wide slot at
+    /// (`x0`, `y0`). Returns the height it occupies, which is what the
+    /// caller must report upward — the band height, the pane inset and the
+    /// display cap all derive from it, so a wrap that does not report its
+    /// height paints over the terminal.
+    fn drawWrapped(
+        self: *BannerOverlay,
+        arena: std.mem.Allocator,
+        hdc: w32.HDC,
+        lay: InlineLayout,
+        segs: []const markdown.Inline,
+        x0: i32,
+        y0: i32,
+        line_h: i32,
+        slot_w: i32,
+        alignment: ?markdown.ColumnAlignment,
+        size_class: usize,
+        force_bold: bool,
+        draw: bool,
+    ) i32 {
+        if (lay.single) {
+            const cw = self.cellNaturalWidth(hdc, segs, size_class, force_bold);
+            _ = self.drawInlineLine(
+                hdc,
+                alignedX(x0, slot_w, cw, alignment),
+                y0,
+                line_h,
+                segs,
+                size_class,
+                force_bold,
+                draw,
+            );
+            return line_h;
+        }
+
+        for (lay.lines, 0..) |wl, li| {
+            var run = lay.tokens[wl.start..wl.end];
+            // Tail-truncate the last visible line of a capped run: drop
+            // whatever no longer fits beside the ellipsis, then draw the
+            // ellipsis itself.
+            const ellipsis = lay.truncated and li + 1 == lay.lines.len;
+            var ell_w: i32 = 0;
+            if (ellipsis) {
+                ell_w = self.measureSeg(hdc, ELLIPSIS, .{}, size_class, force_bold).cx;
+                if (arena.alloc(f32, run.len)) |tw2| {
+                    for (run, 0..) |t, ti| tw2[ti] = t.width;
+                    const keep = banner_layout.fitWithEllipsis(
+                        tw2,
+                        @floatFromInt(ell_w),
+                        @floatFromInt(slot_w),
+                    );
+                    run = run[0..keep];
+                    while (run.len > 0 and run[run.len - 1].is_space) run = run[0 .. run.len - 1];
+                } else |_| {}
+            }
+            var lw: f32 = @floatFromInt(ell_w);
+            for (run) |t| lw += t.width;
+            var tx = alignedX(x0, slot_w, @intFromFloat(@round(lw)), alignment);
+            const ly = y0 + @as(i32, @intCast(li)) * line_h;
+            for (run) |t| {
+                if (t.checkbox) |checked| {
+                    tx += self.drawCheckbox(hdc, tx, ly, line_h, checked, draw);
+                } else {
+                    tx += self.drawSegText(hdc, tx, ly, line_h, t.text, t.style, t.link, size_class, force_bold, draw);
+                }
+            }
+            if (ellipsis) {
+                _ = self.drawSegText(hdc, tx, ly, line_h, ELLIPSIS, .{}, null, size_class, force_bold, draw);
+            }
+        }
+        return @as(i32, @intCast(lay.lines.len)) * line_h;
+    }
 
     /// Height + draw of one table block in `avail_w` px of content width.
     /// Column widths come from the widest cell's natural width (+slack)
@@ -730,12 +898,18 @@ pub const BannerOverlay = struct {
     /// labels never force-wrap — divided against the PANE's width rather
     /// than a fixed cap (T123), so a wide pane is used and a narrow one
     /// rewraps instead of being blocked from shrinking.
-    fn renderTable(self: *BannerOverlay, hdc: w32.HDC, table: markdown.Table, x0: i32, y0: i32, avail_w: i32, draw: bool) i32 {
+    fn renderTable(
+        self: *BannerOverlay,
+        arena: std.mem.Allocator,
+        hdc: w32.HDC,
+        table: markdown.Table,
+        x0: i32,
+        y0: i32,
+        avail_w: i32,
+        draw: bool,
+    ) i32 {
         const columns = table.header.len;
         if (columns == 0) return 0;
-        var scratch = std.heap.ArenaAllocator.init(self.alloc);
-        defer scratch.deinit();
-        const arena = scratch.allocator();
 
         const line_h = self.px(LINE_H);
         const row_gap = self.px(ROW_GAP);
@@ -747,13 +921,13 @@ pub const BannerOverlay = struct {
         @memset(natural, 0);
         if (show_header) {
             for (table.header, 0..) |cell, col| {
-                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, true))));
+                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, 0, true))));
             }
         }
         for (table.rows) |row| {
             for (row, 0..) |cell, col| {
                 if (col >= columns) break;
-                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, false))));
+                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, 0, false))));
             }
         }
         for (natural) |*n| n.* += @floatFromInt(slack);
@@ -769,34 +943,12 @@ pub const BannerOverlay = struct {
         for (shares, 0..) |s, col| widths[col] = @max(1, @as(i32, @intFromFloat(@floor(s))));
 
         // Wrap layout per body cell (checkbox cells stay single-line).
-        const layouts = arena.alloc(CellLayout, table.rows.len * columns) catch return 0;
+        const layouts = arena.alloc(InlineLayout, table.rows.len * columns) catch return 0;
         @memset(layouts, .{});
         for (table.rows, 0..) |row, r| {
             for (row, 0..) |cell, col| {
                 if (col >= columns) break;
-                const lay = &layouts[r * columns + col];
-                if (hasCheckbox(cell)) continue;
-                if (self.cellNaturalWidth(hdc, cell, false) <= widths[col]) continue;
-                const raw = self.tokenizeCell(arena, hdc, cell, false) catch continue;
-                const tokens = if (T123_NEUTERED) raw else self.breakWideTokens(arena, hdc, raw, widths[col]) catch continue;
-                const tw = arena.alloc(f32, tokens.len) catch continue;
-                const ts = arena.alloc(bool, tokens.len) catch continue;
-                for (tokens, 0..) |t, ti| {
-                    tw[ti] = t.width;
-                    ts[ti] = t.is_space;
-                }
-                var lines = markdown.wrapTokens(arena, tw, ts, @floatFromInt(widths[col])) catch continue;
-                // A cell is capped at MAX_CELL_LINES display lines; past
-                // that the last visible line tail-truncates, so one nasty
-                // cell can't blow up the banner height (Mac parity).
-                const truncated = !T123_NEUTERED and lines.len > banner_layout.MAX_CELL_LINES;
-                if (truncated) lines = lines[0..banner_layout.MAX_CELL_LINES];
-                lay.* = .{
-                    .tokens = tokens,
-                    .lines = lines,
-                    .single = false,
-                    .truncated = truncated,
-                };
+                layouts[r * columns + col] = self.layoutInline(arena, hdc, cell, widths[col], 0, false);
             }
         }
 
@@ -825,60 +977,25 @@ pub const BannerOverlay = struct {
         for (table.rows, 0..) |row, r| {
             var row_h: i32 = line_h;
             for (0..columns) |col| {
-                const lay = layouts[r * columns + col];
-                if (!lay.single) {
-                    const n: i32 = @intCast(lay.lines.len);
-                    row_h = @max(row_h, n * line_h);
-                }
+                row_h = @max(row_h, layouts[r * columns + col].lineCount() * line_h);
             }
             var cx = x0;
             for (0..columns) |col| {
                 const cell: []const markdown.Inline = if (col < row.len) row[col] else &.{};
-                const lay = layouts[r * columns + col];
-                if (lay.single) {
-                    const cw = self.inlineLineWidth(hdc, cell, false);
-                    _ = self.drawInlineLine(hdc, alignedX(cx, widths[col], cw, table.alignments[col]), y, line_h, cell, 0, false, draw);
-                } else {
-                    for (lay.lines, 0..) |wl, li| {
-                        var run = lay.tokens[wl.start..wl.end];
-                        // Tail-truncate the last visible line of a capped
-                        // cell: drop whatever no longer fits beside the
-                        // ellipsis, then draw the ellipsis itself.
-                        const ellipsis = lay.truncated and li + 1 == lay.lines.len;
-                        var ell_w: i32 = 0;
-                        if (ellipsis) {
-                            ell_w = self.measureSeg(hdc, ELLIPSIS, .{}, 0, false).cx;
-                            var tw2: []f32 = &.{};
-                            if (arena.alloc(f32, run.len)) |buf| {
-                                tw2 = buf;
-                            } else |_| {}
-                            if (tw2.len == run.len) {
-                                for (run, 0..) |t, ti| tw2[ti] = t.width;
-                                const keep = banner_layout.fitWithEllipsis(
-                                    tw2,
-                                    @floatFromInt(ell_w),
-                                    @floatFromInt(widths[col]),
-                                );
-                                run = run[0..keep];
-                                while (run.len > 0 and run[run.len - 1].is_space) run = run[0 .. run.len - 1];
-                            }
-                        }
-                        var lw: f32 = @floatFromInt(ell_w);
-                        for (run) |t| lw += t.width;
-                        var tx = alignedX(cx, widths[col], @intFromFloat(@round(lw)), table.alignments[col]);
-                        const ly = y + @as(i32, @intCast(li)) * line_h;
-                        for (run) |t| {
-                            if (t.checkbox) |checked| {
-                                tx += self.drawCheckbox(hdc, tx, ly, line_h, checked, draw);
-                            } else {
-                                tx += self.drawSegText(hdc, tx, ly, line_h, t.text, t.style, t.link, 0, false, draw);
-                            }
-                        }
-                        if (ellipsis) {
-                            _ = self.drawSegText(hdc, tx, ly, line_h, ELLIPSIS, .{}, null, 0, false, draw);
-                        }
-                    }
-                }
+                _ = self.drawWrapped(
+                    arena,
+                    hdc,
+                    layouts[r * columns + col],
+                    cell,
+                    cx,
+                    y,
+                    line_h,
+                    widths[col],
+                    table.alignments[col],
+                    0,
+                    false,
+                    draw,
+                );
                 cx += widths[col] + col_gap;
             }
             y += row_h;
@@ -889,7 +1006,7 @@ pub const BannerOverlay = struct {
     }
 
     fn inlineLineWidth(self: *BannerOverlay, hdc: w32.HDC, segs: []const markdown.Inline, force_bold: bool) i32 {
-        return self.cellNaturalWidth(hdc, segs, force_bold);
+        return self.cellNaturalWidth(hdc, segs, 0, force_bold);
     }
 
     fn alignedX(x0: i32, col_w: i32, content_w: i32, alignment: ?markdown.ColumnAlignment) i32 {
@@ -913,8 +1030,20 @@ pub const BannerOverlay = struct {
     }
 
     /// Height + draw of one list block: markers share a gutter sized to
-    /// the widest marker so all item content left-aligns.
-    fn renderList(self: *BannerOverlay, hdc: w32.HDC, items: []const markdown.ListItem, x0: i32, y0: i32, draw: bool) i32 {
+    /// the widest marker so all item content left-aligns. An item whose
+    /// content is wider than what is left of `avail_w` wraps, and its
+    /// continuation lines start at the SAME gutter-relative x as its first
+    /// line — never back under the marker (T377).
+    fn renderList(
+        self: *BannerOverlay,
+        arena: std.mem.Allocator,
+        hdc: w32.HDC,
+        items: []const markdown.ListItem,
+        x0: i32,
+        y0: i32,
+        avail_w: i32,
+        draw: bool,
+    ) i32 {
         const line_h = self.px(LINE_H);
         const row_gap = self.px(ROW_GAP);
         const dot = self.px(5.0);
@@ -933,6 +1062,10 @@ pub const BannerOverlay = struct {
             };
             gutter = @max(gutter, wd);
         }
+
+        // Content column: everything right of the shared marker gutter.
+        const content_x = x0 + gutter + self.px(GUTTER_GAP);
+        const content_w = @max(avail_w - (content_x - x0), 0);
 
         var y = y0;
         for (items, 0..) |item, idx| {
@@ -981,8 +1114,21 @@ pub const BannerOverlay = struct {
                     },
                 }
             }
-            _ = self.drawInlineLine(hdc, x0 + gutter + self.px(GUTTER_GAP), y, line_h, item.content, 0, false, draw);
-            y += line_h;
+            const lay = self.layoutInline(arena, hdc, item.content, wrapWidth(content_w), 0, false);
+            y += self.drawWrapped(
+                arena,
+                hdc,
+                lay,
+                item.content,
+                content_x,
+                y,
+                line_h,
+                content_w,
+                .leading,
+                0,
+                false,
+                draw,
+            );
             if (idx + 1 < items.len) y += row_gap;
         }
         return y - y0;
@@ -1004,26 +1150,34 @@ pub const BannerOverlay = struct {
         const block_gap = self.px(BLOCK_GAP);
         _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
+        // One scratch arena for the whole walk: every block's wrap pass
+        // allocates its tokens and line ranges here and they only have to
+        // outlive this call.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
         var y: i32 = y0;
         for (self.blocks, 0..) |block, bi| {
             if (bi > 0) y += block_gap;
             const h: i32 = switch (block) {
                 .text => |segs| blk: {
-                    _ = self.drawInlineLine(hdc, x0, y, line_h, segs, 0, false, draw);
-                    break :blk line_h;
+                    const lay = self.layoutInline(arena, hdc, segs, wrapWidth(content_w), 0, false);
+                    break :blk self.drawWrapped(arena, hdc, lay, segs, x0, y, line_h, content_w, .leading, 0, false, draw);
                 },
                 .heading => |h| blk: {
                     const hpx = heading_px[@min(h.level - 1, 5)];
                     const hl = self.px(hpx * 4.0 / 3.0);
-                    _ = self.drawInlineLine(hdc, x0, y, hl, h.content, @min(h.level, 6), false, draw);
-                    break :blk hl;
+                    const sc = @min(h.level, 6);
+                    const lay = self.layoutInline(arena, hdc, h.content, wrapWidth(content_w), sc, false);
+                    break :blk self.drawWrapped(arena, hdc, lay, h.content, x0, y, hl, content_w, .leading, sc, false, draw);
                 },
                 .rule => blk: {
                     if (draw) self.drawHLine(hdc, x0, x0 + content_w, y);
                     break :blk 1;
                 },
-                .list => |items| self.renderList(hdc, items, x0, y, draw),
-                .table => |t| self.renderTable(hdc, t, x0, y, content_w, draw),
+                .list => |items| self.renderList(arena, hdc, items, x0, y, content_w, draw),
+                .table => |t| self.renderTable(arena, hdc, t, x0, y, content_w, draw),
             };
             y += h;
         }
@@ -1064,9 +1218,10 @@ pub const BannerOverlay = struct {
 
         self.links.clearRetainingCapacity();
 
-        // Content lives inside the card: one margin, then one padding.
+        // Content lives inside the card: one margin, then one padding —
+        // and stops short of the chevron's reserved column (T377).
         const inner = self.px(MARGIN) + self.px(PAD);
-        const content_w = @max(client.right - inner * 2, 1);
+        const content_w = self.contentWidthFor(client.right);
 
         // Clip everything the content walker draws to the card's own
         // rounded shape, so a collapsed banner's overflow (and any block

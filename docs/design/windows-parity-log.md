@@ -8325,3 +8325,49 @@ relaunchable tombstone is left over, which is T466.
 
 Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
 P1-P3 **ALL PASS**, `validate` **ALL PASS** (496 tasks).
+
+## 2026-08-04 (T377) - the banner wraps every kind of line now, and the chevron gets its own column
+
+Only table cells wrapped. `markdown.wrapTokens` had existed and been correct
+since T123, and it had exactly ONE call site in `BannerOverlay.zig` - inside
+`renderTable`. A paragraph, a heading and a list row were each drawn with one
+`drawInlineLine` at a fixed line height, so they ran straight off the card edge
+and under the collapse chevron. The user reported it twice with screenshots
+(2026-08-02, then 2026-08-04 as one of the things they "keep coming back to"),
+and the second screenshot is what named the mechanism: the `Goal` and `Status`
+rows of that banner wrapped correctly - they are table cells - while the
+checklist rows beside them were cut mid-word, no ellipsis. Same banner, two
+rules.
+
+There is one rule now. The wrap machinery came out of `renderTable` into
+`layoutInline` + `drawWrapped`, and `.text`, `.heading`, list rows and table
+cells all go through the pair: greedy word wrap against the pane's current
+width, long unbroken tokens broken mid-string, capped at 3 display lines with a
+tail ellipsis, and - the part that matters structurally - the WRAPPED height is
+what gets returned, so the band, the pane inset and the 10-line cap all follow
+it rather than a wrap painting over the terminal. Every measuring helper that
+had been pinned to the base font now takes a size class, so a heading breaks in
+its own font instead of at the body font's word boundaries. A list checkbox is
+the row's marker, drawn in the gutter, so a task-list row wraps like any other;
+only an inline checkbox still pins a run to one line, and CLAUDE.md was
+narrowed to say that.
+
+The chevron reservation is pure geometry - `banner_layout.contentWidth`, next
+to `bandHeight` and `columnWidths`, asserted at 1.0/1.25/1.5/2.0 - and both the
+measuring pass and the paint call it, so the band cannot be reserved from one
+width and painted at another. Content stops a clear 4 DIP short of the
+chevron's box, for every block, not just the first line.
+
+Evidence: `pane-banner.ps1` **ALL PASS (77)** with a new section 6h, whose
+`PrintWindow` probe reads each row's own card color as its reference (immune to
+the card's vertical sheen) and finds 0 ink px in the reserved gap while the
+wrapped line still reaches within 13 px of the column's end. A `T377_NEUTERED`
+negative control was added beside `T123_NEUTERED`, flipped, rebuilt and re-run:
+exactly 5 failures, all of them section 6h, and the probe reported 13 ink px of
+ClearType-fringed text sitting in the gap - the screenshot in numbers.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS**. The agent lane's first run failed on `zig.exe` itself
+taking an access violation at `+0x37ddea2` - the compiler, not the code, and
+the same offset already recorded in **T451**, where the recurrence is logged; a
+bare re-run passed.

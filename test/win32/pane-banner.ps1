@@ -636,6 +636,121 @@ try {
     Assert ($cap8 -le ($wideShortH + 2 * $oneRow)) "capped cell stays within header + 3 lines ($cap8 px, 1-row $wideShortH px, row ~$oneRow px)"
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'reflow section: GUI alive'
 
+    # --- 6h. T377: EVERY block wraps, caps at 3 lines, clears the chevron -----
+    # Table cells were the only thing that wrapped: `wrapTokens` had exactly one
+    # call site. A paragraph, a heading and a list row were each drawn with one
+    # `drawInlineLine` at a fixed line height, so they ran off the card edge and
+    # under the collapse chevron - the user's two screenshots (2026-08-02,
+    # 2026-08-04). Same oracle as 6g: the BAND HEIGHT, which is the number of
+    # display rows the content produced.
+    Set-TestWindowPos -Window $top -X 100 -Y 100 -Width 760 -Height 700 | Out-Null
+    Start-Sleep -Milliseconds 900
+
+    # Short words on purpose: a greedy wrap then leaves only a few px of slack
+    # at each line end, which the chevron-column probe below depends on.
+    $para2 = ($sentence * 2).Trim()
+    $wrapOne = Get-BandH 'wrap me'
+    $wrapTwo = Get-BandH $para2
+    Assert ($wrapOne -gt 0 -and $wrapTwo -gt 0) "wrap: bands measured ($wrapOne / $wrapTwo px)"
+    Assert (($wrapTwo - $wrapOne) -ge [int]($oneRow * 0.6)) `
+        "T377: a plain paragraph wraps instead of clipping (+$($wrapTwo - $wrapOne) px, row ~$oneRow px)"
+
+    # ...and is capped at 3 display lines, like a table cell: 12x the text is
+    # no taller than 8x, and both stay within one line plus two.
+    $wrap8 = Get-BandH ($sentence * 8).Trim()
+    $wrap12 = Get-BandH ($sentence * 12).Trim()
+    Assert ($wrap12 -eq $wrap8) "T377: a paragraph caps at 3 wrapped lines (8x $wrap8 == 12x $wrap12 px)"
+    Assert ($wrap8 -le ($wrapOne + 2 * $oneRow)) `
+        "T377: the capped paragraph stays within 3 lines ($wrap8 px, 1-line $wrapOne px, row ~$oneRow px)"
+
+    # A heading wraps in ITS font (the tokenizer used to measure every run in
+    # the base font, which breaks a heading at the wrong words).
+    $headOne = Get-BandH '# head'
+    $headTwo = Get-BandH ('# ' + $para2)
+    Assert (($headTwo - $headOne) -ge [int]($oneRow * 0.6)) `
+        "T377: a heading wraps (+$($headTwo - $headOne) px, row ~$oneRow px)"
+
+    # List rows wrap too - bullet AND checkbox. The leading "-" would bind as a
+    # flag on the CLI, so both forms carry a one-line prefix block; that prefix
+    # is in the baseline as well, so the delta is the wrap and nothing else.
+    $bulOne = Get-BandH "list:\n- item"
+    $bulTwo = Get-BandH ("list:\n- " + $para2)
+    Assert (($bulTwo - $bulOne) -ge [int]($oneRow * 0.6)) `
+        "T377: a bullet list row wraps (+$($bulTwo - $bulOne) px, row ~$oneRow px)"
+    # A task-list row used to be pinned to one line on the grounds that its
+    # native checkbox cannot reflow. The checkbox is the item's MARKER, drawn in
+    # the shared gutter - the content beside it wraps like any other row.
+    $chkOne = Get-BandH "list:\n- [x] item"
+    $chkTwo = Get-BandH ("list:\n- [x] " + $para2)
+    Assert (($chkTwo - $chkOne) -ge [int]($oneRow * 0.6)) `
+        "T377: a checkbox list row wraps, keeping its box in the gutter (+$($chkTwo - $chkOne) px)"
+
+    # The chevron owns the whole right strip: NOTHING may paint into the clear
+    # gap left of its box. Pre-fix the content column ran to one card PADDING
+    # (12 DIP) from the band edge, which is 20 DIP inside the chevron's own
+    # column - so text crossed this gap on every long line.
+    & $exe +set-banner --target=bw "$para2\ntail" | Out-Null
+    $null = Wait-Banner 'bw' 0 "$para2`ntail"
+    Start-Sleep -Milliseconds 800
+    $ovW = Get-Overlay $appPid $top
+    if (-not $ovW) {
+        $script:fail += 2
+        Write-Host 'FAIL  T377 chevron-column probe: no overlay' -ForegroundColor Red
+    } else {
+        $wHwnd = [IntPtr]$ovW.Hwnd
+        $wScale = (Get-TestWindowDpi -Window $wHwnd) / 96.0
+        $wSide = Get-TestChromeDip -Dip 28.0 -Scale $wScale
+        $wMargin = Get-TestChromeDip -Dip 12.0 -Scale $wScale
+        $wPad = Get-TestChromeDip -Dip 12.0 -Scale $wScale
+        $wLine = Get-TestChromeDip -Dip 20.0 -Scale $wScale
+        $wGap = Get-TestChromeDip -Dip 4.0 -Scale $wScale
+        $chL = $ovW.Width - $wMargin - $wSide
+        $rowTop = $wMargin + $wPad
+        $refX = $wMargin + [int][Math]::Truncate($wPad / 2)
+        Write-Host "INFO  T377 probe: chevronL=$chL gap=$wGap row=$rowTop..$($rowTop + $wLine) ref=$refX (overlay $($ovW.Width)x$($ovW.Height))"
+
+        $shotW = Get-TestWindowPixels -Window $wHwnd
+        try {
+            if ((Get-TestDistinctColors -Shot $shotW) -lt 8) {
+                $script:fail += 2
+                Write-Host 'FAIL  T377 chevron-column probe: capture holds no content' -ForegroundColor Red
+            } else {
+                # "Ink" = a pixel that differs from its OWN row's empty-card
+                # color. Reading the reference per row is what makes this
+                # immune to the card's vertical sheen ramp.
+                $yLo = $rowTop + 3
+                $yHi = $rowTop + $wLine - 3
+                $gapInk = 0
+                $gapPx = ''
+                $rightMost = -1
+                for ($py = $yLo; $py -le $yHi; $py++) {
+                    $ref = $shotW.Bitmap.GetPixel($refX, $py)
+                    # The clear gap, minus one column of antialias slack at
+                    # each end.
+                    for ($px = ($chL - $wGap + 1); $px -lt $chL; $px++) {
+                        $c = $shotW.Bitmap.GetPixel($px, $py)
+                        if ([Math]::Abs([int]$c.R - [int]$ref.R) -gt 12) {
+                            $gapInk++
+                            if ($gapPx -eq '') { $gapPx = "($px,$py)=$($c.R),$($c.G),$($c.B) vs $($ref.R),$($ref.G),$($ref.B)" }
+                        }
+                    }
+                    # ...and how far right the text actually got, so this
+                    # cannot pass just because the line came up empty.
+                    for ($px = ($wMargin + $wPad); $px -lt ($chL - $wGap); $px++) {
+                        $c = $shotW.Bitmap.GetPixel($px, $py)
+                        if ([Math]::Abs([int]$c.R - [int]$ref.R) -gt 12 -and $px -gt $rightMost) { $rightMost = $px }
+                    }
+                }
+                Write-Host "INFO  T377 probe: gapInk=$gapInk rightmostInk=$rightMost $gapPx"
+                Assert ($rightMost -ge ($chL - $wGap - 5 * $wLine)) `
+                    "T377: the wrapped line really fills the content column (rightmost ink $rightMost, column ends $($chL - $wGap))"
+                Assert ($gapInk -eq 0) `
+                    "T377: nothing paints into the chevron's reserved column ($gapInk ink px$(if($gapPx){" first $gapPx"}))"
+            }
+        } finally { Close-TestWindowPixels -Shot $shotW }
+    }
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T377 section: GUI alive'
+
     & $exe +set-banner --target=bw --clear | Out-Null
     $null = Wait-Banner 'bw' 0 'NONE'
     Set-TestWindowPos -Window $top -X 100 -Y 100 -Width 1100 -Height 700 | Out-Null
