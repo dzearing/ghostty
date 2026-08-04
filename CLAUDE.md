@@ -920,6 +920,18 @@ WebView2 hosts, log tail) instead of hanging forever with nothing to read. Exit
 0 pass / 1 fail / 2 wedged / 3 wall-clock cap; `-Lane <one>`, `-Repeat N`,
 `-Filter <test-filter>`, `-SelfTest` to prove the detector itself.
 
+**A red lane never ends on a bare exit code** (T444). `std.process.Child`
+truncates a Windows exit code to a byte, so a *crashed* child reaches `zig build`
+as `NTSTATUS & 0xFF` — `0xC0000005` (access violation) arrives as
+`error code 5`, `0x80000003` (Zig's segfault handler aborting) as `code 3` —
+which reads as a compile step failing for no reason at all.
+`scripts/lib/CrashDiag.ps1` decodes it back and correlates it with the Windows
+`Application Error` log, so a FAIL ends with a `-- crash diagnostics --` block
+naming the process, exception, module and fault offset. The decode alone is only
+a suspicion (a program really can `exit(5)`), so with no crash record behind it
+the block says so rather than asserting. Acceptance:
+`test\win32\crash-diagnostics.ps1`.
+
 **Tests must never touch live user state.** The WebView2 live-runtime tests run
 under `webview2.TestProfile`, which points `LOCALAPPDATA` at a private per-run
 root so they cannot contend with — or corrupt — the `EBWebView[-debug]` profile

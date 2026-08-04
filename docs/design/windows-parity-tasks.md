@@ -151,6 +151,19 @@ Work these first, in order, before falling back to first-todo-in-table:
     failure as `compile test ... failure`, exit 5, no diagnostic — so the lane
     misattributes the crash it is trying to show you.
 
+    **T444 is DONE (2026-08-04) and it changed the shape of T443.** There was no
+    mis-attribution: `5` is `0xC0000005 STATUS_ACCESS_VIOLATION` truncated to a
+    byte by `std.process.Child`, and the process taking that access violation is
+    **`zig.exe` itself** — three times in two days at three different fault
+    offsets. The compiler shares no code with the win32 and agent lanes, which is
+    the premise T443 has been bisecting against. So the live successor is
+    **T449** (is this the machine, a security product, or the toolchain?), and
+    **D5** asks whether T449 should outrank T443 rather than the other way
+    round — that ordering is the user's call and is still open. Every red lane
+    now prints a `-- crash diagnostics --` block naming the crashed process,
+    exception, module and fault offset, so the next attempt starts with evidence
+    the last two did not have.
+
 00000. **THE FLOOR ITSELF IS BROKEN, 2026-08-03 — T430.** Ahead of the rest of
     this list because it is what every other task is validated against. **Two
     of the four standing-floor lanes can now hang forever with no output and no

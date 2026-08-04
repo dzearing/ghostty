@@ -8000,3 +8000,71 @@ Enter` into whatever pane the fallback picks. Nothing in this turn touched
 code, so P1-P3 could not regress from it, and typing into the user's live
 terminal to prove that is a bad trade. Noting it as a skipped floor step rather
 than claiming a green one. T441 is the fix and is still todo.
+
+## 2026-08-04 - T444: "exit code 5" was never a silent compiler - it is an access violation with its top three bytes cut off
+
+The one lane failure nobody could read is readable now, and the answer moves
+T443's ground rather than only serving it.
+
+`zig build` has been ending steps with nothing but `error: the following command
+exited with error code 5:` - no compiler diagnostic, no test name. Two
+investigations read that as a compile error whose message went missing. It is
+neither a missing message nor a mis-attribution: **the step's child process
+crashed, and `5` is what survives of `0xC0000005 STATUS_ACCESS_VIOLATION`.**
+`std.process.Child` keeps only the low byte of a Windows exit code
+(`lib/std/process/Child.zig:462`, `@as(u8, @truncate(exit_code))`), so every
+NTSTATUS arrives at the build runner shredded: `0xC0000005` becomes 5,
+`0x80000003 STATUS_BREAKPOINT` - Zig's own segfault handler firing - becomes 3,
+`0xC00000FD STATUS_STACK_OVERFLOW` becomes 253. Measured, not inferred: a
+ReleaseFast Zig program that writes through `0x10` returns `0xC0000005`, and its
+low byte is 5. So T444's title premise was wrong in a useful way - `zig build`
+and `floor-lane.ps1` were both reporting faithfully, and the run step really was
+a transitive failure behind a compile step that really did fail.
+
+**The process taking that access violation is `zig.exe` itself.** The Windows
+Application log has three of them in two days, at three different fault offsets,
+one of them a jump into no loaded module at all; the 02:43:54 crash sits inside
+the very floor run T443 and T444 were filed from. The compiler shares no code
+with the win32 and agent lanes, which is the premise T443 has been bisecting
+against - so **T449** is filed to settle whether this is the machine, a security
+product, or the toolchain before anyone spends another context on our own
+source, and **D5** puts that ordering question in front of the user rather than
+silently reordering the priority list.
+
+Shipped so a red lane never prints a bare number again: `scripts/lib/CrashDiag.ps1`
+decodes a truncated exit code back to the NTSTATUS values whose low byte matches
+and correlates them with `Application Error` records for the run's window;
+`floor-lane.ps1` prints a `-- crash diagnostics --` block on any FAIL, naming the
+process, exception, module and fault offset. The decode alone is a suspicion - a
+program really can call `exit(5)` - so when no crash record backs it up the block
+says so instead of letting the guess read as a confirmation, and it only waits on
+Windows Error Reporting when the code already looks like a crash.
+
+Validated the way the task asked: a failing test, a compile error and a real
+crash injected into the agent lane in turn, each reported as what it is both bare
+and through the wrapper. `test/win32/crash-diagnostics.ps1` (new, 21 checks, ALL
+PASS) proves the decode and the whole correlation against a real access violation
+it compiles and runs, with negative controls both ways.
+
+Two side findings worth more than the fix. The corruption repro has gone from
+roughly 4-in-6 to **6/6**, and lands in **16-58 s** against a warm cache - cheap
+enough for controlled experiments at last. And in one run **both** agent test
+binaries, separate processes, crashed on the *same* test
+(`terminal.PageList.test.PageList resize reflow grapheme map capacity exceeded`),
+which "a different victim every run" does not predict.
+
+P1-P3 skipped again for the T441 reason, not haste: those three scripts never set
+`GHOZTTY_PIPE_SUFFIX`, so run from a pane they resolve through the baked
+`GHOZTTY_IPC_SOCKET` and would type into the user's live terminal. This turn
+changed only PowerShell under `scripts/` and `test/win32/` and no app code, so
+they cannot have regressed from it. T441 is the fix and is still todo.
+
+Floor at the boundary: `none` **PASS** (154s), `win32` **FAIL**, `agent` **FAIL**
+— the pre-existing T443 crashes, unchanged by this turn (nothing here touches
+zig code). What is different is that both red lanes now end by naming what died:
+`ghostty-test.exe+0x000cc49e` and `ghoztty-agent-core-test.exe` /
+`ghoztty-agent-test.exe`, all `0x80000003 STATUS_BREAKPOINT`. And
+`ghoztty-agent-test.exe+0x1cb84e` came up **twice**, in two separate runs six
+minutes apart — a repeated fault site, which "a different victim every run" also
+does not predict, and which is now a concrete address for T443/T449 to
+symbolise.

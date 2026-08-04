@@ -74,6 +74,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Decodes a crashed child's truncated exit code and reads the Windows crash log
+# (T444). Without it a lane can end on a bare "exited with error code 5".
+. "$PSScriptRoot\lib\CrashDiag.ps1"
+
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
 $EXIT_FAIL = 1
@@ -348,6 +352,10 @@ function Invoke-Lane {
         Write-Host "-- errors --"
         Select-String -Path $log -Pattern 'error:' -ErrorAction SilentlyContinue |
             Select-Object -First 15 | ForEach-Object { Write-Host "  $($_.Line)" }
+        # A lane can fail with nothing but "exited with error code 5" -- which is
+        # a CRASHED child, not a silent compiler (T444). Decode the code and name
+        # the process that died, so a red lane is never a bare number.
+        $null = Write-CrashDiagnostic -Since $started -LogPath $log
     }
     return $result
 }
