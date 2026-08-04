@@ -131,6 +131,26 @@ Work these first, in order, before falling back to first-todo-in-table:
       em dash. Smallest, purest, last — one module with unit tests, and it
       should absorb the label question T425 raises rather than reword twice.
 
+000000. **THE FLOOR IS STILL BROKEN, 2026-08-04 — T443 → T444.** The direct
+    successor of the T430 entry below, and it inherits that entry's ranking for
+    the same reason: a floor that is not trustworthy is not evidence, and every
+    other task on this list is validated against it. T430 gave the hanging lanes
+    a timeout and a diagnostic; what it uncovered underneath is worse. **The
+    `win32` and `test-agent` lanes now CRASH intermittently** — always inside
+    `Page.assertIntegrity`, in whatever `terminal.*` test happens to be running,
+    a different victim every run against a deterministic test order. The
+    2026-08-03 floor run closed with `win32` FAIL and `test-agent` PASS, which
+    killed T442's founding assumption that this was agent-lane-specific.
+
+    Take **T443 with a full, fresh context** — a previous turn spent one whole
+    context on it and came back with four dead hypotheses rather than a cause.
+    Its own first instruction is not more bisection: **install `cdb`**, which is
+    absent on this box and is why the culprit's stack has never once been
+    captured. Chasing a 50%-flaky signal without a stack is what burned the last
+    attempt. **T444** rides behind it: `zig build` reports a test-binary *run*
+    failure as `compile test ... failure`, exit 5, no diagnostic — so the lane
+    misattributes the crash it is trying to show you.
+
 00000. **THE FLOOR ITSELF IS BROKEN, 2026-08-03 — T430.** Ahead of the rest of
     this list because it is what every other task is validated against. **Two
     of the four standing-floor lanes can now hang forever with no output and no

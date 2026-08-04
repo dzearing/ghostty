@@ -7923,3 +7923,80 @@ which was T442's founding assumption and the reason it was scoped to the agent
 binary. T443 is re-pointed accordingly: the two lanes that fail are the two that
 run `apprt.win32`/WebView2 tests alongside the terminal suite, the `none` lane
 does not, and the victim set is the same in both. P1-P3 ALL PASS.
+
+## 2026-08-04 - T28 split: "minor action no-ops" was four overlay ports, and one of its four items was already done
+
+Picked T28 off `next` (every Current-priorities chain above it is discharged:
+T421/T425/T423/T422/T424, T430, T428, T241, the UI quality block, T229/T230,
+the test-infra chain, T226's children through T295/T296, T318/T320/T322, T146).
+Split it rather than starting it.
+
+The title promised a bundle of cheap `return true`-but-do-nothing gaps. Read
+against the Mac source, three of the four survivors are per-pane overlay ports,
+each with its own geometry module, four-DPI-scale assertions and acceptance
+script:
+
+- **T445** read-only badge - Mac's `ReadonlyBadge` (`SurfaceView.swift:1249`)
+  is a corner badge with a click-to-disable popover. Win32 has no visual at all;
+  `.readonly` falls through the acknowledged-no-op arm at `App.zig:4040`. T28's
+  own suggestion of a tab-title glyph is recorded in the task as the cheaper
+  option that cannot say WHICH pane in a split is read-only - a decision to file
+  at implementation time, not to settle here.
+- **T446** key-state indicator - `KeyStateIndicator` (`SurfaceView.swift:958`)
+  renders a *stack* of key tables with chevrons plus pending keycaps and an
+  animated ellipsis, and is draggable between the pane's top and bottom. The
+  stack shape is the part most likely to be missed: `.key_table` pushes, pops
+  and clears (`SurfaceView_AppKit.swift:845-849`), it is not a single value.
+- **T447** pwd in the chrome - Mac's counterpart is `pwdDidChange`
+  (`BaseTerminalController.swift:1712`) setting `window.representedURL`, i.e.
+  the AppKit titlebar proxy icon. Windows has no such control, so this is a
+  translate-the-feature case with three costed options in the task file.
+- **T448** notification click-to-focus - a verification, not a port.
+
+**One item was already done and the tracker said otherwise.** T28 listed the
+`pwd` action as "not yet done (now that OSC 7 works on Windows via T27)". It has
+been handled since T111b: `App.zig:4024-4033` caches it through
+`Surface.setPwd` (`Surface.zig:1572`) specifically so `+list` need not take the
+pane's renderer mutex. Only the chrome-surfacing half was ever missing, which is
+why T447 is scoped to that and not to the action. Worth noting as a tracker
+hazard: a stale in-progress note outlived the work that made it false.
+
+Also promoted **T443 -> T444** into Current priorities as the successor of the
+T430 entry, with the same ranking argument T430 made for itself. T430 gave the
+hanging lanes a timeout; underneath it the `win32` and `test-agent` lanes crash
+intermittently in `Page.assertIntegrity`, and the 2026-08-03 floor closed with
+`win32` FAIL. The note says to take T443 with a fresh context and to install
+`cdb` first rather than resume bisecting a 50%-flaky signal without a stack -
+that is what cost the previous attempt a whole context.
+
+Docs-only turn, no code changed. Floor run anyway, as another sample for T443,
+and it paid: **none PASS (160s), win32 FAIL (103s), agent FAIL (180s)** - the
+first run where BOTH suspect lanes failed together, so neither is the specific
+one. Two findings recorded on the tasks.
+
+**T443's premise is too narrow.** The `win32` victim was
+`terminal.PageList.test.PageList resize reflow grapheme map capacity exceeded`
+(a new name, as expected) but it died as `Segmentation fault at address
+0xffffffffffffffff`, not as a `Page.assertIntegrity` panic. `assertIntegrity`
+is one place the damage is *detected*, not the only one, and an all-ones
+pointer reads as a freed/poisoned-sentinel deref - which favors the
+use-after-free hypothesis over a bad index.
+
+**And half of T443's evidence arrives through a channel known to lie.** The
+`agent` lane failed with no test name and no crash text: the failing step is
+`compile test ghoztty-agent-core-test ... failure`, exit code 5, which is
+exactly T444's signature. Until T444 establishes whether an exit-5 "compile"
+step is a compile at all, the agent lane cannot be counted for or against the
+corruption hypothesis. Noted on both files that T444 should therefore run
+before or alongside the hunt, not after it. The contrast is the lead: same
+tree, same wrapper, `win32` reported a named victim and a segfault while
+`agent` reported nothing.
+
+**P1-P3 deliberately NOT run this turn**, and the reason is T441 rather than
+haste: `ipc-p1`, `ipc-p2` and `ipc-p3` are three of the 22 scripts that never
+set `GHOZTTY_PIPE_SUFFIX`, so run from a pane they resolve through the baked
+`GHOZTTY_IPC_SOCKET` and drive the USER'S installed Ghoztty - `+send-keys ...
+Enter` into whatever pane the fallback picks. Nothing in this turn touched
+code, so P1-P3 could not regress from it, and typing into the user's live
+terminal to prove that is a bad trade. Noting it as a skipped floor step rather
+than claiming a green one. T441 is the fix and is still todo.
