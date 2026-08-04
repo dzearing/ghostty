@@ -8623,3 +8623,44 @@ exotic idea). **T474** - the complement: arm a hardware write breakpoint on
 the stack slot from cdb and name the instruction that truncates it. Both are
 ordered ahead of T443 itself, because T443 cannot move until one of them
 answers.
+
+## 2026-08-04 — T473: the codegen discriminator could not be run, and the T443 crash went quiet
+
+Both arms of the T473 experiment failed, for unrelated reasons, and then the
+control arm did something worse than fail: it stopped reproducing. Twenty-six
+consecutive clean runs at HEAD — 10 bare on the win32 lane's `ghostty-test.exe`,
+6 more under cdb, 10 bare on the none lane's, plus a clean full `test-agent` —
+using the same binary and the same debugger that caught three crashes this
+morning between 06:27 and 07:14. Nothing landed that could fix it; the likely
+cause is that yesterday's `ptrInPage` diagnostic perturbed the layout, which is
+exactly what T443's own half-a-pointer model predicts a small change would do.
+
+The self-hosted arm is not merely unhelpful, it is impossible: `zig.exe`
+access-violates compiling the test binary, four attempts out of four, always at
+`zig.exe+0xfcb364`, in under 12 seconds. Deterministic, so not the T451 flake,
+and `-Dtest-filter` cannot narrow it — a filter changes which tests run, not
+what gets analysed. The ReleaseSafe arm built fine and then crashed 10 runs out
+of 10 on a *different* problem: a Zig panic at `renderer.cell.test.Contents with
+zero-sized screen`, test 1401 of 3878, long before the tests this hunt is about.
+
+Landed so the next attempt is cheap: `-Dtest-optimize` and `-Dtest-llvm` in
+`build.zig`, because the three test binaries pinned Debug and LLVM in source and
+"rebuild the lane a different way" should not mean editing the build; and
+`scripts/test-binary-soak.ps1`, which runs a built test binary N times and
+reports pass/fail/**crash** with a rate and the victim test, so a claim about a
+~50%-flaky signal always has a run count behind it. Writing it turned up two
+traps worth the ink: WER writes the `Application Error` record asynchronously,
+so the correlation needs a retry, and PowerShell 5.1 unrolls the array an `if`
+expression returns — a single-candidate NTSTATUS decode arrived as a bare object
+whose `.Count` is `$null`, and ten consecutive crashes were filed as red tests
+until `[array]` fixed it.
+
+Filed: **T475** — plain `zig build` is red on Windows (libghostty drags
+ssh_transport's unguarded `posix.pipe2`/`posix.kill` into an msvc compile).
+**T476** — the self-hosted compiler AV. **T477** — the ReleaseSafe panic, which
+is 100% reproducible and may be worth more than another coin-flip hunt.
+**T478** — `crash-catch` reported "ran clean, exit 0" for the binary that dies
+every run, because its cdb filters are blind to `STATUS_BREAKPOINT`; a crash
+detector that lies is the most expensive kind of bug in a diagnostic.
+**D10** asks the user how far to chase the vanished repro. T443 and T474 are
+blocked until it comes back.

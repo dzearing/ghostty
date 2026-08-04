@@ -45,6 +45,25 @@ pub fn build(b: *std.Build) !void {
         "Filter for test. Only applies to Zig tests.",
     ) orelse &[0][]const u8{};
 
+    // Two diagnostic knobs for the test binaries (T473). The test exes pin
+    // their own optimize mode and codegen backend rather than following
+    // `-Doptimize`, which is deliberate — but it also means a crash that looks
+    // like a codegen bug cannot be rebuilt a different way to rule the
+    // toolchain in or out. These let a lane be rebuilt with the self-hosted
+    // x86_64 backend or at a release optimize mode WITHOUT editing build.zig.
+    // Both default to exactly what the lanes have always built, so `zig build
+    // test` / `test-agent` are unchanged.
+    const test_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "test-optimize",
+        "Optimize mode for the Zig test binaries. Default Debug (what every lane builds).",
+    ) orelse .Debug;
+    const test_llvm = b.option(
+        bool,
+        "test-llvm",
+        "Use the LLVM backend for the Zig test binaries. Default true; false selects Zig's self-hosted backend.",
+    ) orelse true;
+
     // Ghostty dependencies used by many artifacts.
     const deps = try buildpkg.SharedDeps.init(b, &config);
 
@@ -108,9 +127,9 @@ pub fn build(b: *std.Build) !void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/agent_main.zig"),
                 .target = config.target,
-                .optimize = .Debug,
+                .optimize = test_optimize,
             }),
-            .use_llvm = true,
+            .use_llvm = test_llvm,
         });
         // The agent test roots at `src/agent_main.zig` too, so it reaches
         // main.zig's `@import("agent_build_options")` — reuse the exe's module.
@@ -145,9 +164,9 @@ pub fn build(b: *std.Build) !void {
                 // via its relative import (grid_snapshot.zig).
                 .root_source_file = b.path("src/agent_core_test.zig"),
                 .target = config.target,
-                .optimize = .Debug,
+                .optimize = test_optimize,
             }),
-            .use_llvm = true,
+            .use_llvm = test_llvm,
         });
         // The grid-snapshot emulator pulls src/terminal into this aggregator, so
         // it needs the shared terminal deps (terminal_options, unicode tables,
@@ -472,13 +491,13 @@ pub fn build(b: *std.Build) !void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = config.baselineTarget(),
-                .optimize = .Debug,
+                .optimize = test_optimize,
                 .strip = false,
                 .omit_frame_pointer = false,
                 .unwind_tables = .sync,
             }),
             // Crash on x86_64 without this
-            .use_llvm = true,
+            .use_llvm = test_llvm,
         });
         if (config.emit_test_exe) b.installArtifact(test_exe);
         _ = try deps.add(test_exe);
