@@ -114,6 +114,8 @@ Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own 
 
 Set the activity state of a named window or pane. The state is aggregated across all panes in a window (priority: `needs_input` > `busy` > `idle`) and shown as a title suffix and custom `AXWindowActivityState` accessibility attribute.
 
+`idle`/`busy`/`needs_input` are the **machine tokens** — the vocabulary of this flag, of the OSC 7777 payload, and of `AXWindowActivityState`. They are a public API (hooks call the CLI, external tools like ztabby read the attribute) and do not change for readability. The **title suffix** shows a human label instead, and the two differ for one state: `needs_input` renders as `(question)`. Consumers must read the accessibility attribute rather than parsing the title.
+
 ```
 ghoztty +set-state --target=<name> --state=<idle|busy|needs_input>
 ```
