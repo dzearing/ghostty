@@ -937,11 +937,16 @@ pub const Connection = struct {
     /// the chooser's meters render; an older agent never advertises it, the
     /// negotiated flag stays false, and we never send the opcode (which that agent
     /// would treat as a fatal framing error) — the meters just don't appear.
+    /// `cpu_units` says this client understands (and itself produces) corrected
+    /// `cpu_pct` units; the half that matters is the AGENT's matching string,
+    /// whose absence tells the Activity Monitor that a remote `% CPU` may be
+    /// ~24× low and must not be rendered as fact.
     pub const client_capabilities = [_][]const u8{
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
         protocol.capability.session_cpu,
         protocol.capability.sessions_push,
+        protocol.capability.cpu_units,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -2199,6 +2204,18 @@ pub const Connection = struct {
     /// a fatal framing error.
     pub fn supportsCloseSession(self: *Connection) bool {
         if (self.negotiated) |n| return n.close_session else |_| return false;
+    }
+
+    /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`
+    /// it reports is in CORRECTED units and may be shown as fact.
+    ///
+    /// False for a pre-fix agent (whose macOS per-process percentages are ~24×
+    /// low on Apple Silicon) AND for a handshake that hasn't completed or failed,
+    /// which is the safe direction: the caller marks the number unverifiable
+    /// rather than printing it. Never rescale on a false — the app cannot know
+    /// the remote machine's mach timebase.
+    pub fn cpuUnitsCorrected(self: *Connection) bool {
+        if (self.negotiated) |n| return n.cpu_units else |_| return false;
     }
 
     /// End a session on the agent BY SESSION ID (the session-scoped equivalent of

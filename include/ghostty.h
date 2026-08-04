@@ -1446,6 +1446,16 @@ GHOSTTY_API const char* ghostty_remote_connection_hostname(
 GHOSTTY_API const char* ghostty_remote_connection_build_version(
     ghostty_remote_connection_t);
 
+// True iff the agent advertised the "cpu_units" capability, i.e. every cpu_pct
+// it reports (the proc_list table and the session_cpu stream alike) is in
+// CORRECTED units. False means the agent predates the macOS mach-ticks ->
+// nanoseconds fix, so its per-process percentages may be ~24x low on Apple
+// Silicon (correct on Intel, which the app cannot distinguish); false too
+// before/after a failed handshake. Callers must MARK such a value unverifiable
+// rather than rescale it -- the app cannot know the remote mach timebase.
+GHOSTTY_API bool ghostty_remote_connection_cpu_units_corrected(
+    ghostty_remote_connection_t);
+
 // Shut down and free the connection. Detaches all panes (sessions survive on
 // the remote for later re-attach by session_id). Caller must ensure no surface
 // still references this connection.
