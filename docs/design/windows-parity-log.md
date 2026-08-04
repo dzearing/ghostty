@@ -7874,3 +7874,52 @@ P1–P3 ALL PASS, run with `GHOZTTY_PIPE_SUFFIX` set per T441 — which is the f
 time they have been aimed at the built exe rather than the installed release on
 this box. `upgrade-resume-readiness.ps1` (new, 33 asserts),
 `upgrade-no-fork.ps1` and `upgrade-staleness.ps1` ALL PASS.
+
+## 2026-08-04 - T420: a push pump can no longer outlive the connection it belongs to; T442 split after a full context on the corruption hunt
+
+Took **T442** (the agent test lane is red). It reproduces on demand and it is
+memory corruption, exactly as filed - but the corrupter was not found inside one
+context, so the hunt is split to **T443** with everything learned, and the
+"a run failure is reported as a compile failure" half to **T444**.
+
+What did land is a real use-after-free, and it is the one **T420** already had a
+stack for. The agent server has three per-connection push pumps (metrics,
+session-cpu, roster) with identical lifetime code, and all three assigned their
+`std.Thread` handle **outside** the mutex guarding their stop flag, while
+`stop*Pump` read and cleared it outside the mutex too. Two consequences, on a
+connection whose control reader is still running when `shutdown()` starts:
+a stop that reads a still-null handle skips the join and leaves the pump running
+past the `Server` - a live thread writing into freed memory forever - and two
+concurrent stops can both see the same handle and join it twice, which is
+T420's `NtClose` crash. Both are now structurally impossible: the handle is
+taken out of the field under the lock (so exactly one caller can ever own the
+join), the spawn and the assignment happen under the same lock, and `shutdown()`
+latches a new `pumps_closed` flag **before** stopping the pumps so a `*_sub`
+arriving in the window between the stops and the reader join cannot start a
+fourth pump behind it. `destroy()` now asserts all three handles, not just one.
+
+Two tests: a `METRICS_UNSUB`-against-`shutdown()` race driven on its own thread
+for 8 rounds (the concurrency T420's Validation asked for), and a deterministic
+one proving every `*_sub` handler is inert after shutdown.
+
+**It did not make the agent lane green**, which is the honest headline. Three
+full `test-agent` runs after the fix still failed twice. What T442 did establish,
+and T443 carries: the crash is always inside `Page.assertIntegrity` in whatever
+`terminal.*` test is running; the same seed crashes at a different test every
+run while test *order* is deterministic, so the variable is asynchronous rather
+than the RNG; and four hypotheses are dead with the experiment that killed each
+(native-CPU codegen - `-Dcpu=baseline` fails identically; the terminal tests
+alone - `-Dtest-filter="terminal."` passes; thread-count growth - 2-5 threads
+for the whole run; memory exhaustion - 6-26 MB private bytes). T443 also records
+that `cdb` is not installed on this box, which is why the culprit's stack was
+never obtained, and says to fix that first rather than keep bisecting a
+50%-flaky signal.
+
+And the floor run at the end of the turn moved the target. `none` PASS (160s),
+**`win32` FAIL (165s)** - crashing in `terminal.search.screen.test.reloadActive
+partial history cleanup on loop append error`, one of the same victims - and
+**`test-agent` PASS (191s)**. So the corruption is *not* agent-lane-specific,
+which was T442's founding assumption and the reason it was scoped to the agent
+binary. T443 is re-pointed accordingly: the two lanes that fail are the two that
+run `apprt.win32`/WebView2 tests alongside the terminal suite, the `none` lane
+does not, and the victim set is the same in both. P1-P3 ALL PASS.

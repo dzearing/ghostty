@@ -250,6 +250,16 @@ pub const Server = struct {
     control_thread: ?std.Thread = null,
     data_thread: ?std.Thread = null,
 
+    /// Latched true by `shutdown()` BEFORE it stops the pumps, and read by every
+    /// `*_sub` handler while holding that pump's mutex. Without it, a `*_sub`
+    /// arriving on the control reader thread can spawn a pump AFTER shutdown has
+    /// already taken the handle — the pump then outlives the Server and writes
+    /// into freed memory forever (T442: the corruption that made the agent test
+    /// binary segfault in whatever ran next, usually an unrelated terminal test).
+    /// Atomic rather than mutex-guarded because the three pumps have three
+    /// different mutexes and one flag has to be visible under all of them.
+    pumps_closed: std.atomic.Value(bool) = .init(false),
+
     /// Host-metrics push pump (§9.3). A per-connection thread, lazily spawned on the
     /// first `metrics_sub` and torn down on `metrics_unsub` or shutdown. It samples
     /// the host every `metrics_interval_ms` and pushes a `metrics` frame on the
@@ -418,6 +428,11 @@ pub const Server = struct {
         // is a per-connection thread that frames onto our writer, so it must never
         // outlive the Server (the just-fixed UAF class). Signalling stop wakes its
         // timed cond wait immediately rather than waiting out the interval.
+        // Latch BEFORE the stops: the control reader is still running here and can
+        // be mid-`*_sub`. Once this is set, no handler will spawn another pump, so
+        // the three stops below are final rather than a snapshot a later subscribe
+        // can undo (T442).
+        self.pumps_closed.store(true, .release);
         self.stopMetricsPump();
         self.stopSessionCpuPump();
         self.stopRosterPump();
@@ -474,6 +489,7 @@ pub const Server = struct {
     pub fn destroy(self: *Server, alloc: Allocator) void {
         assert(self.control_thread == null and self.data_thread == null and self.writer_thread == null);
         assert(self.metrics_thread == null);
+        assert(self.session_cpu_thread == null and self.roster_thread == null);
         self.proc_sampler.deinit();
         self.bound_channels.deinit(self.alloc);
         for (self.write_queue.items) |f| self.alloc.free(f.payload);
@@ -1252,11 +1268,15 @@ pub const Server = struct {
     /// next change.
     fn handleSessionsSub(self: *Server) void {
         self.sessions_push = true;
-        if (self.roster_thread == null) {
+        {
+            // Under the mutex, and never after shutdown — same lifetime
+            // discipline as the metrics pump (see `pumps_closed`).
             self.roster_mutex.lock();
-            self.roster_stop = false;
-            self.roster_mutex.unlock();
-            self.roster_thread = std.Thread.spawn(.{}, rosterPumpLoop, .{self}) catch null;
+            defer self.roster_mutex.unlock();
+            if (self.roster_thread == null and !self.pumps_closed.load(.acquire)) {
+                self.roster_stop = false;
+                self.roster_thread = std.Thread.spawn(.{}, rosterPumpLoop, .{self}) catch null;
+            }
         }
         // Send one immediately so the subscriber starts from truth rather than
         // waiting for the next change.
@@ -1308,11 +1328,10 @@ pub const Server = struct {
         self.roster_mutex.lock();
         self.roster_stop = true;
         self.roster_cond.signal();
+        const t = self.roster_thread;
+        self.roster_thread = null;
         self.roster_mutex.unlock();
-        if (self.roster_thread) |t| {
-            t.join();
-            self.roster_thread = null;
-        }
+        if (t) |th| th.join();
     }
 
     /// Serialize the whole roster and send it on `channel` as a `sessions` frame
@@ -1661,16 +1680,18 @@ pub const Server = struct {
         // Clamp to a sane floor so a hostile/zero interval can't busy-spin the pump.
         const interval = @max(parsed.value.interval_ms, 50);
 
+        // The spawn and the handle assignment happen UNDER the mutex, together
+        // with the stop flag they pair with. Assigning outside it (as this used
+        // to) let `stopMetricsPump` read a still-null handle, skip the join, and
+        // leave a pump running past the Server's death — see `pumps_closed`.
         self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics_interval_ms = interval;
-        const need_spawn = self.metrics_thread == null;
-        if (need_spawn) self.metrics_stop = false;
         self.metrics_cond.signal(); // wake an existing pump to pick up a new interval
-        self.metrics_mutex.unlock();
-
-        if (need_spawn) {
-            self.metrics_thread = std.Thread.spawn(.{}, metricsPumpLoop, .{self}) catch null;
-        }
+        if (self.metrics_thread != null) return;
+        if (self.pumps_closed.load(.acquire)) return;
+        self.metrics_stop = false;
+        self.metrics_thread = std.Thread.spawn(.{}, metricsPumpLoop, .{self}) catch null;
     }
 
     /// `METRICS_UNSUB`: stop + join the pump (idempotent).
@@ -1685,11 +1706,13 @@ pub const Server = struct {
         self.metrics_stop = true;
         self.metrics_interval_ms = 0;
         self.metrics_cond.signal();
+        // TAKE the handle under the lock: exactly one caller can ever see it, so
+        // two concurrent stops cannot both join the same thread and a concurrent
+        // sub cannot slip a new one in behind us.
+        const t = self.metrics_thread;
+        self.metrics_thread = null;
         self.metrics_mutex.unlock();
-        if (self.metrics_thread) |t| {
-            t.join();
-            self.metrics_thread = null;
-        }
+        if (t) |th| th.join();
     }
 
     /// The metrics pump: own a `metrics.Sampler`, and until stopped, sample the host
@@ -1758,16 +1781,16 @@ pub const Server = struct {
         var parsed = protocol.parseJson(protocol.SessionCpuSub, self.alloc, payload) catch return;
         defer parsed.deinit();
 
+        // Spawn + assign under the mutex, and never after shutdown latched
+        // `pumps_closed` — same lifetime discipline as the metrics pump.
         self.session_cpu_mutex.lock();
+        defer self.session_cpu_mutex.unlock();
         self.session_cpu_interval_ms = parsed.value.interval_ms;
-        const need_spawn = self.session_cpu_thread == null;
-        if (need_spawn) self.session_cpu_stop = false;
         self.session_cpu_cond.signal(); // wake an existing pump for the new hint
-        self.session_cpu_mutex.unlock();
-
-        if (need_spawn) {
-            self.session_cpu_thread = std.Thread.spawn(.{}, sessionCpuPumpLoop, .{self}) catch null;
-        }
+        if (self.session_cpu_thread != null) return;
+        if (self.pumps_closed.load(.acquire)) return;
+        self.session_cpu_stop = false;
+        self.session_cpu_thread = std.Thread.spawn(.{}, sessionCpuPumpLoop, .{self}) catch null;
     }
 
     /// `SESSION_CPU_UNSUB`: stop + join the pump (idempotent).
@@ -1783,11 +1806,10 @@ pub const Server = struct {
         self.session_cpu_stop = true;
         self.session_cpu_interval_ms = 0;
         self.session_cpu_cond.signal();
+        const t = self.session_cpu_thread;
+        self.session_cpu_thread = null;
         self.session_cpu_mutex.unlock();
-        if (self.session_cpu_thread) |t| {
-            t.join();
-            self.session_cpu_thread = null;
-        }
+        if (t) |th| th.join();
     }
 
     /// The per-session CPU pump: sample the process table, roll each session's
@@ -2803,6 +2825,67 @@ test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
         std.Thread.yield() catch {};
     }
     try testing.expect(h.server.metrics_thread == null);
+}
+
+test "concurrent METRICS_UNSUB and shutdown: exactly one of them joins the pump (T420)" {
+    const alloc = testing.allocator;
+    const Racer = struct {
+        fn unsub(s: *Server) void {
+            s.handleMetricsUnsub();
+        }
+    };
+
+    // The window is a few instructions wide, so one pass proves nothing —
+    // loop. Before the fix this crashed inside `NtClose` on the second join of
+    // an already-joined handle (T420's stack), or left the pump running past
+    // the Server (T442).
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        var clock: TestClock = .{};
+        var sp: FakeSpawner = .{ .children = &.{} };
+        var prng = std.Random.DefaultPrng.init(32 + round);
+
+        var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+        try h.server.start();
+        try h.client.handshake();
+        _ = try h.server.waitHandshake();
+
+        h.server.handleMetricsSub("{\"interval_ms\":50}");
+        const t = try std.Thread.spawn(.{}, Racer.unsub, .{h.server});
+        h.server.shutdown();
+        t.join();
+        try testing.expect(h.server.metrics_thread == null);
+
+        h.deinit();
+    }
+}
+
+test "a *_sub racing shutdown never spawns a pump that would outlive the Server (T442)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(31);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Shutdown runs while the control reader can still be inside a `*_sub`
+    // handler — it joins the reader threads only AFTER stopping the pumps. So a
+    // subscribe landing here used to spawn a pump the stop had already walked
+    // past, and that pump then wrote into the freed Server forever.
+    h.server.shutdown();
+    try testing.expect(h.server.pumps_closed.load(.acquire));
+
+    h.server.handleMetricsSub("{\"interval_ms\":10}");
+    h.server.handleSessionCpuSub("{\"interval_ms\":10}");
+    h.server.handleSessionsSub();
+
+    try testing.expect(h.server.metrics_thread == null);
+    try testing.expect(h.server.session_cpu_thread == null);
+    try testing.expect(h.server.roster_thread == null);
 }
 
 test "throttledIntervalMs: the agent, not the client, decides the cadence" {
