@@ -446,6 +446,24 @@ while ((Get-Date) -lt $deadline) {
 }
 Assert "F1 marker is in the split pane's scrollback before quit" $preOk
 
+# T422: the pane's sticky banner is APP-SIDE overlay state - it never enters the
+# PTY, so the agent's replay cannot bring it back and the manifest is its only
+# way home. Without the manifest field every restored pane came up bannerless.
+# Space-free for the same reason the marker is (Run-Cli builds one command line);
+# the `**` proves the raw markdown SOURCE round-trips, not a rendering of it.
+$bannerText = "**T422BANNER$($PID)XYZ**"
+Run-Cli "+set-banner --target=f89sib $bannerText" "$tmp\setban.txt" 12 | Out-Null
+$banPre = $false
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    if ((Run-Cli '+list --json' "$tmp\ban-pre.json" 10) -eq 0 -and
+        (Out-Text "$tmp\ban-pre.json") -match [regex]::Escape("T422BANNER$($PID)XYZ")) {
+        $banPre = $true; break
+    }
+    Start-Sleep -Milliseconds 500
+}
+Assert "F1b the banner is set on the split pane before quit (positive control)" $banPre
+
 # The live session ids the agent is keeping (must all come back on re-attach).
 $beforeIds = @(Alive-Ids (Wait-AliveCount $tmp 'f-before' 3 15))
 Assert "F2 three agent sessions are alive before quit" ($beforeIds.Count -eq 3)
@@ -528,6 +546,22 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 400
 }
 Assert "F9 the restored window's title pin came back" $f9
+
+# T422: the pane's own banner rehydrates. `+list --json`'s `banner` field reads
+# the LIVE overlay, not the manifest, so a pass means the restored pane really is
+# showing it again - which is what the user asked for ("I expected banners to be
+# rehydrated"). F1b is its positive control: without that, a build that never set
+# the banner at all would score this the same way a broken restore does.
+$f9b = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    if ((Run-Cli '+list --json' "$tmp\ban-post.json" 10) -eq 0 -and
+        (Out-Text "$tmp\ban-post.json") -match [regex]::Escape("T422BANNER$($PID)XYZ")) {
+        $f9b = $true; break
+    }
+    Start-Sleep -Milliseconds 700
+}
+Assert "F9b the restored pane's sticky banner came back" $f9b
 
 # ============================================================================
 Say "== F10: restore-time focus settling across a second relaunch (T105, RED on T223)"

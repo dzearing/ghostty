@@ -198,6 +198,11 @@ restore_snapshot: ?[]const u8 = null,
 attach_offset: u64 = 0,
 applied_bytes: std.atomic.Value(u64) = .init(0),
 
+/// T422: the app restored this pane's own sticky banner before bring-up, so the
+/// session-interrupted notice keeps only its in-stream copy. See
+/// `Config.pane_banner_restored`.
+pane_banner_restored: bool = false,
+
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
 /// machinery here (that all lives on the agent side), but the connection handle
@@ -272,6 +277,19 @@ pub const Config = struct {
     /// behavior). `restore_snapshot` is borrowed; `init` dupes it into the arena.
     restore_snapshot: ?[]const u8 = null,
     restore_offset: u64 = 0,
+
+    /// True ⇒ the app already put this pane's own sticky banner back from its
+    /// session-layout manifest (T422), so the banner slot is SPOKEN FOR. The
+    /// session-interrupted notice then writes only its in-stream copy and does
+    /// not emit the OSC 7778 second carrier, which would otherwise replace a
+    /// banner carrying that pane's own live state with a sentence identical in
+    /// every restored pane — the reported loss.
+    ///
+    /// False is the safe default and covers everything else: a fresh OPEN, a
+    /// re-attach to a live session, and a restored pane that had no banner. In
+    /// that last case the slot really is empty, so the notice may use it and
+    /// stays visible without the user scrolling back for it.
+    pane_banner_restored: bool = false,
 };
 
 /// Which working directory an OPEN should carry (T144).
@@ -369,6 +387,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         // without painting the prior content would leave the screen blank above
         // the gap-fill. No snapshot ⇒ offset 0 ⇒ full-ring replay.
         .attach_offset = if (restore_snapshot != null) cfg.restore_offset else 0,
+        .pane_banner_restored = cfg.pane_banner_restored,
         .arena = arena,
     };
 }
@@ -791,11 +810,17 @@ pub fn threadEnter(
         io.armNoticeFold();
 
         // The second carrier: on screen without the user having to scroll for
-        // it. See `session_notice.formatBanner` — whether it still earns its
-        // keep now that the in-stream copy survives is T422's call.
-        var banner_buf: [session_notice.max_len]u8 = undefined;
-        const banner = session_notice.formatBanner(&banner_buf, notice_command);
-        @call(.always_inline, termio.Termio.processOutput, .{ io, banner });
+        // it — but ONLY into a banner slot nobody else owns (T422). The user's
+        // own banner carries that pane's live state (goal, status, PR links);
+        // this sentence is identical in every restored pane, so replacing N
+        // distinct banners with N copies of it is strictly negative. When the
+        // restore brought a banner back, the notice settles for the scrollback
+        // copy T423 made durable.
+        if (!self.pane_banner_restored) {
+            var banner_buf: [session_notice.max_len]u8 = undefined;
+            const banner = session_notice.formatBanner(&banner_buf, notice_command);
+            @call(.always_inline, termio.Termio.processOutput, .{ io, banner });
+        }
     } else if (did_relaunch and !relaunch_replayed) {
         const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ io, divider });

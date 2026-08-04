@@ -7638,3 +7638,32 @@ The banner carrier stays. The in-stream copy lives above the viewport, so a user
 who does not scroll still never sees it; whether the second copy earns the pane's
 own banner is T422's call, and T422 now gets to make it against a working
 in-stream copy instead of as the only carrier.
+
+## 2026-08-03 — T422: a pane's banner and title come back, and the notice stops taking a slot it does not own
+
+Third of the five 2026-08-03 report items. The user's complaint was that the
+session-interrupted notice REPLACED their banners; the cause turned out to be
+one field earlier than that. The win32 session-layout leaf had no `banner`
+field at all — the Mac leaf has had one since it was written — so Windows never
+persisted a banner and every restored pane came up with an empty slot, on the
+app-restart path as much as the agent-restart one. The notice was not
+overwriting anything. It was moving into a vacancy a bug had created. The same
+walk found `Leaf.title` captured but never applied on restore.
+
+So: `banner` joins the leaf, captured from `Surface.banner_text` as raw markdown
+source and applied on restore alongside the title; `setPaneBanner` now marks the
+layout dirty, because nothing in a banner change touches the topology and the
+field would otherwise be dead weight in exactly the crash case that matters; and
+the precedence T423 handed over is settled as *the banner slot belongs to the
+pane* — the notice always folds into the scrollback, and takes the banner slot
+only when the pane has none. One plumbed signal, `pane_banner_restored`, from
+the win32 restore through the shared core to `termio.Remote`, so the Mac half is
+one assignment away (T432, `seat: mac`; decision D2 records the alternative).
+
+The new acceptance arm is the mixed case on purpose: two restored panes keep
+their own banners, the third takes the notice, all three still carry the notice
+in their scrollback. Arm A — which asserts the notice DOES reach the banner —
+was left green, and that is what proves the new arm scores precedence rather
+than a deleted carrier. `zig build test-agent` hung again with zero output on a
+turn that touched no agent source; that is T430's third sighting, recorded
+there.

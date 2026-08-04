@@ -109,6 +109,20 @@ pub const RemoteBackend = struct {
     /// is borrowed for the construction call only (duped by `termio.Remote.init`).
     restore_snapshot: ?[]const u8 = null,
     restore_offset: u64 = 0,
+
+    /// True ⇒ the apprt has already restored this pane's own sticky banner from
+    /// its session-layout manifest (T422). It is the one signal `termio.Remote`
+    /// cannot work out for itself: the banner is app-side overlay state, so from
+    /// the backend's side an occupied slot and an empty one look identical.
+    ///
+    /// It gates only the session-interrupted notice's SECOND carrier. The notice
+    /// is written into the scrollback either way (T423); what this suppresses is
+    /// the copy that would take the banner slot — because a pane's own banner
+    /// carries state unique to it, and the notice is the same sentence in every
+    /// pane. False (every non-restore path, and a restored pane that had no
+    /// banner) leaves the slot empty, so the notice may use it and stays visible
+    /// without the user scrolling.
+    pane_banner_restored: bool = false,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -1106,6 +1120,10 @@ pub fn init(
                     // visually-correct re-attach (null/0 ⇒ full-ring replay).
                     .restore_snapshot = rb.restore_snapshot,
                     .restore_offset = rb.restore_offset,
+                    // T422: the pane's own banner is already back, so the
+                    // session-interrupted notice stays in the scrollback
+                    // instead of also claiming the banner slot.
+                    .pane_banner_restored = rb.pane_banner_restored,
                 });
                 break :backend .{ .remote = io_remote };
             }

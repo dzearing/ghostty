@@ -1311,9 +1311,10 @@ fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
 
 /// Capture one leaf's restore metadata: the agent session id to re-ATTACH to
 /// (null when the pane is not agent-backed — it restores as an exited pane),
-/// the pane's stable id (T113), the current title, any registered IPC name, and
-/// the WP-D3 screen snapshot (T109). `kind`/`viewer_location` stay null
-/// (reserved for viewer panes, T90h). Strings dupe into `arena`.
+/// the pane's stable id (T113), the current title, the sticky banner (T422),
+/// any registered IPC name, and the WP-D3 screen snapshot (T109).
+/// `kind`/`viewer_location` stay null (reserved for viewer panes, T90h).
+/// Strings dupe into `arena`.
 fn captureLeaf(
     self: *App,
     arena: Allocator,
@@ -1330,6 +1331,12 @@ fn captureLeaf(
         .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
         .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
         .ipc_name = if (ipc_name) |n| try arena.dupe(u8, n) else null,
+        // T422: the banner's raw markdown source. App-side overlay state that
+        // no PTY replay carries, so the manifest is its only way back.
+        .banner = if (surface.banner_text) |b|
+            (if (b.len > 0) try arena.dupe(u8, b) else null)
+        else
+            null,
         // Recorded unconditionally: it must survive even for a leaf with no
         // session (a fresh OPEN still keeps the id its shell was baked with).
         .pane_id = try arena.dupe(u8, surface.paneId()),
@@ -1726,6 +1733,12 @@ fn restoreAttachOverride(
             .session_id = sid,
             .restore_snapshot = if (snap) |s| s.data else null,
             .restore_offset = if (snap) |s| s.offset else 0,
+            // T422: `restoreLeafPresentation` puts this banner back on the GUI
+            // thread; telling the backend keeps the session-interrupted notice
+            // from claiming the same slot from the IO thread moments later.
+            // Independent of `sid` — the notice only ever fires on the path
+            // where the recorded session is GONE.
+            .pane_banner_restored = if (leaf.banner) |b| b.len > 0 else false,
         },
     };
 }
@@ -1927,6 +1940,7 @@ fn restoreBuildSubtree(
         if (lf.ipc_name) |n|
             self.ipcRegister(n, .{ .pane = anchor }) catch |err|
                 log.warn("session-restore: pane IPC register '{s}' failed err={}", .{ n, err });
+        restoreLeafPresentation(anchor, lf);
         return;
     }
     const sp = node.split orelse return error.CorruptLayout;
@@ -1963,6 +1977,45 @@ fn restoreBuildSubtree(
 
     try self.restoreBuildSubtree(window, nodes, sp.left, anchor, tr, attach, depth + 1);
     try self.restoreBuildSubtree(window, nodes, sp.right, new_pane, tr, attach, depth + 1);
+}
+
+/// Put back the app-side presentation a restored terminal pane carries in the
+/// manifest and NOWHERE else (T422): its last title and its sticky banner.
+///
+/// Neither rides the agent's PTY replay — the banner is a native overlay the
+/// viewer owns, and the title is the app's cached copy of the last OSC 0/2 — so
+/// a restore that skipped this left every pane blank-titled and bannerless.
+/// That is the reported loss: the user's banners carry live task state (goal,
+/// status, PR links) and came back replaced by the session-interrupted notice,
+/// which had simply found the slot empty.
+///
+/// Terminal leaves only: `+set-banner` rejects viewers, and a viewer's title
+/// comes from the content it re-opens. The title goes in on the
+/// terminal-reported path, so the first OSC title the restored shell emits
+/// takes over normally (Mac `SessionLayoutRestore` does the same).
+fn restoreLeafPresentation(pane: *PaneView, lf: session_layout.Leaf) void {
+    const surface = switch (pane.kind) {
+        .terminal => |s| s,
+        .viewer => return,
+    };
+    const alloc = surface.app.core_app.alloc;
+
+    if (lf.title) |t| {
+        if (t.len > 0) {
+            // `setTitle` wants a sentinel-terminated slice and dupes it itself,
+            // so this copy is scratch: freed as soon as the call returns.
+            if (alloc.dupeZ(u8, t)) |z| {
+                defer alloc.free(z);
+                surface.setTitle(z);
+            } else |err| {
+                log.warn("session-restore: pane title restore failed err={}", .{err});
+            }
+        }
+    }
+
+    if (lf.banner) |b| {
+        if (b.len > 0) surface.setPaneBanner(b);
+    }
 }
 
 // =============================================================================

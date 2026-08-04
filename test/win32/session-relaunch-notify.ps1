@@ -77,6 +77,12 @@ $MARK_A = 9700 + ($PID % 89)
 $MARK_B = 8700 + ($PID % 89)
 $CMD_A = "ping -n $MARK_A 127.0.0.1"
 $CMD_B = "ping -n $MARK_B 127.0.0.1"
+# T422: per-pane banners and a window title pin for arm E. Distinguishable from
+# each other so "each pane kept ITS OWN banner" is a real claim rather than "some
+# banner survived", and space-free so `Run-CliArgs` cannot re-tokenize them.
+$BAN_A = "T422banA$MARK_A"
+$BAN_B = "T422banB$MARK_B"
+$WIN_TITLE = "T422title$MARK_A"
 
 function Stop-TestProcs {
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
@@ -252,7 +258,7 @@ function Start-App($title, $extraArgs = @()) {
 # Build the 2-pane layout, then take the app AND the agent down so the next
 # launch finds dead-but-relaunchable tombstones - exactly the reboot / agent-
 # upgrade shape.
-function Build-AndKill($cwdA) {
+function Build-AndKill($cwdA, $withBanners = $false) {
     $appPid = Start-App 'build' @("--working-directory=$cwdA")
     Assert "setup: the GUI came up" ($appPid -ne 0)
     Wait-Leaves 'b0' 1 | Out-Null
@@ -264,13 +270,33 @@ function Build-AndKill($cwdA) {
     # this reason - the product was fine.)
     Run-CliArgs @('+new-window', '--target=nA', "--command=`"$CMD_A`"", "--working-directory=$cwdA") "$tmp\nwA.txt" 25 | Out-Null
     Start-Sleep -Seconds 2
+    # T422: banner A goes on BEFORE the split. A banner set on a WINDOW target
+    # lands on that window's FOCUSED pane, and after the split that is nB - so
+    # setting both afterwards would put both banners on the same pane and leave
+    # pane A bare. Space-free tokens: `Run-CliArgs` joins its array with spaces
+    # and quotes nothing, so a multi-word banner arrives as positional junk.
+    if ($withBanners) {
+        Run-CliArgs @('+set-banner', '--target=nA', $BAN_A) "$tmp\banA.txt" 12 | Out-Null
+    }
     Run-CliArgs @('+split', '--target=nA', '--name=nB', '--direction=right', "--command=`"$CMD_B`"") "$tmp\spB.txt" 25 | Out-Null
+    if ($withBanners) {
+        Start-Sleep -Seconds 1
+        Run-CliArgs @('+set-banner', '--target=nB', $BAN_B) "$tmp\banB.txt" 12 | Out-Null
+    }
     $tree = Wait-Leaves 'b1' 3 45
     Assert "setup: both commanded panes exist" ((All-Leaves $tree).Count -ge 3)
     Assert "setup: '$CMD_A' is actually running" (Wait-MarkerPings $MARK_A 1 30)
     Assert "setup: '$CMD_B' is actually running" (Wait-MarkerPings $MARK_B 1 30)
     $agent = Wait-AgentPid $tmp 25
     Assert "setup: an agent is running for this run" ($agent -ne 0)
+
+    # T422: pin the window's title so arm E can score the other half of the
+    # user's report ("window titles too"). `+rename` sets the WINDOW title
+    # override whichever kind of target it is given.
+    if ($withBanners) {
+        Run-CliArgs @('+rename', '--target=nA', "--title=$WIN_TITLE") "$tmp\renA.txt" 12 | Out-Null
+        Start-Sleep -Seconds 1
+    }
 
     Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
     Stop-AppOnly
@@ -511,6 +537,69 @@ $paneD2 = $leavesD1[0].id
 Run-CliArgs @('+send-keys', "--target=$paneD2", 'cd', 'Enter') "$tmp\keys-d2.txt" 12 | Out-Null
 Assert "D9 the restored fresh shell is in the LAST KNOWN directory" `
     (Wait-PaneTextTight $paneD2 'd-after' $deepD 1 40)
+Stop-TestProcs
+
+# ============================================================================
+Say "== E: the notice never takes a banner slot the PANE already owns (T422)"
+# ============================================================================
+# The third of the user's 2026-08-03 symptoms: "When windows were reopened, all
+# the previous banners were replaced with [the session-interrupted notice]. I
+# expected banners to be rehydrated, window titles too."
+#
+# Their banners carry state unique to each pane (goal, status, PR links); the
+# notice is the SAME sentence in every pane, so replacing N banners with N copies
+# of it is strictly negative. Since T423 the notice also lives in the scrollback,
+# which is what makes dropping the second carrier safe - so the rule is: the
+# banner slot belongs to the pane, and the notice only ever uses one that is free.
+#
+# This arm is the mixed case on purpose. Two of the three restored panes carry a
+# banner (E1/E2) and one does not (E4), so it scores the precedence rule rather
+# than a blanket "notices are gone" or "banners are gone".
+Reset-State 'e'
+Build-AndKill $workA $true | Out-Null
+
+$appPidE = Start-App 'notifyban'
+Assert "E0 the GUI came back" ($appPidE -ne 0)
+$leavesE = All-Leaves (Wait-Leaves 'e0' 3 60)
+Assert "E0b the layout restored (3 panes)" ($leavesE.Count -ge 3)
+
+$ownA = 0; $ownB = 0; $noticed = 0; $bannerless = 0
+foreach ($leaf in $leavesE) {
+    $b = [string]$leaf.banner
+    if ($b -match [regex]::Escape($BAN_A)) { $ownA++ }
+    if ($b -match [regex]::Escape($BAN_B)) { $ownB++ }
+    if ($b -match 'Session interrupted') { $noticed++ }
+    if ($b -eq '') { $bannerless++ }
+}
+Assert "E1 the pane that had banner '$BAN_A' still shows it" ($ownA -eq 1)
+Assert "E2 the pane that had banner '$BAN_B' still shows it" ($ownB -eq 1)
+Assert "E3 neither of those panes had its banner replaced by the notice" `
+    ($noticed -le 1 -and $bannerless -eq 0)
+Assert "E4 the bannerless pane DID take the notice (the slot was free)" ($noticed -eq 1)
+
+# Nothing is lost by yielding the slot: the notice is still in the scrollback of
+# every pane, which is where the user asked for it (T423). Without this, E1-E3
+# would also pass against a build that simply stopped emitting the notice.
+$textE = 0
+foreach ($leaf in $leavesE) {
+    $place = Get-NoticePlacement $leaf.id "etxt$($leaf.id.Substring(0,4))"
+    if ($place.notice -ge 0) { $textE++ }
+}
+Assert "E5 every restored pane still carries the notice in its scrollback ($textE/$($leavesE.Count))" `
+    ($textE -eq $leavesE.Count)
+
+# The other half of the report: the window title pin comes back too.
+$titleE = $false
+$deadline = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadline) {
+    $tree = Get-List 'e-title'
+    $wins = @(Windows-Of $tree)
+    if (@($wins | Where-Object { [string]$_.title -match [regex]::Escape($WIN_TITLE) }).Count -ge 1) {
+        $titleE = $true; break
+    }
+    Start-Sleep -Milliseconds 700
+}
+Assert "E6 the restored window's title pin came back" $titleE
 Stop-TestProcs
 
 } finally {

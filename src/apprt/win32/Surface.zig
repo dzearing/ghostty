@@ -289,6 +289,12 @@ remote_session_id: ?[]const u8 = null,
 remote_restore_snapshot: ?[]const u8 = null,
 remote_restore_offset: u64 = 0,
 
+/// T422: this restored pane brought its OWN sticky banner back from the
+/// manifest, so the session-interrupted notice must not take the slot. Set
+/// from `Overrides.Remote.pane_banner_restored` at init and read once by
+/// `remoteBackend()`; false for every non-restore path.
+remote_pane_banner_restored: bool = false,
+
 /// Hero-mode thumbnail snapshot pipeline (T58 design / T59a). The renderer
 /// thread captures its own presented frame (blit of the offscreen render
 /// target — never an HWND capture, which can't see hidden panes) into
@@ -421,6 +427,13 @@ pub const Overrides = struct {
         /// pre-T109 full-ring replay.
         restore_snapshot: ?[]const u8 = null,
         restore_offset: u64 = 0,
+
+        /// T422: the restore is putting this pane's own sticky banner back
+        /// (the manifest leaf carried one). The session-interrupted notice
+        /// then keeps its in-stream copy but does NOT also claim the banner
+        /// slot — a pane's own banner outranks a sentence that is identical
+        /// in every pane. False ⇒ the slot is empty and the notice may use it.
+        pane_banner_restored: bool = false,
     };
 };
 
@@ -604,6 +617,9 @@ pub fn init(
             // asks for a delta instead of the whole ring.
             self.remote_restore_snapshot = r.restore_snapshot;
             self.remote_restore_offset = r.restore_offset;
+            // T422: this pane's own banner is coming back, so the
+            // session-interrupted notice must not overwrite it.
+            self.remote_pane_banner_restored = r.pane_banner_restored;
             // An explicit remote command travels through the same surface
             // config seam Exec uses; the core only forwards it into the
             // agent OPEN when `wait-after-command` marks it as explicitly
@@ -1034,6 +1050,12 @@ pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
         alloc.free(old);
         self.banner_text = null;
     }
+
+    // T422: the banner is persisted per pane in the session-layout manifest, and
+    // nothing else in a banner change touches the topology — so without this the
+    // manifest only learns about it if some unrelated mutation happens to write
+    // afterwards. A banner set hours before a crash has to be on disk.
+    self.app.markLayoutDirty();
 
     const t = text orelse "";
     if (t.len == 0) {
@@ -4102,6 +4124,9 @@ pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
         else
             null,
         .restore_offset = self.remote_restore_offset,
+        // T422: the restore already put this pane's sticky banner back, so a
+        // dead-tombstone ATTACH keeps the notice to its in-stream copy.
+        .pane_banner_restored = self.remote_pane_banner_restored,
     };
 }
 

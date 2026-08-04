@@ -23,7 +23,7 @@
 //!      "tabs":[{"nodes":[{"split":{"layout":"horizontal","ratio":0.5,
 //!                                  "left":1,"right":2}},
 //!                        {"leaf":{"session_id":"<32hex>","pane_id":"<uuid>",
-//!                                 "title":..?}},
+//!                                 "title":..?,"banner":..?}},
 //!                        {"leaf":{"session_id":"<32hex>"}}],
 //!               "color":"blue"?,"hero_ratio":..?,"title":..?,"active":true}]}]}
 //!
@@ -145,11 +145,21 @@ pub const Frame = struct {
 /// with, so a restore that generated a fresh id would leave the pane unable to
 /// address itself. Additive and optional — a manifest written by a pre-T113
 /// build simply has none and its restored panes get fresh ids.
+///
+/// `banner` is the pane's sticky banner as its raw markdown-subset SOURCE text
+/// (T422 — the win32 half of the Mac leaf's `banner`). It is app-side overlay
+/// state: it lives in the viewer, not in the PTY, so the agent's replay cannot
+/// bring it back and this field is its ONLY way home. Without it every restored
+/// pane came up bannerless, and on the agent-restart path the session-interrupted
+/// notice then filled the vacant slot — N distinct banners replaced by N copies
+/// of one sentence, which is what the user reported. Always null for a viewer
+/// leaf (`+set-banner` rejects viewers). Additive and optional in the usual way.
 pub const Leaf = struct {
     session_id: ?[]const u8 = null,
     title: ?[]const u8 = null,
     ipc_name: ?[]const u8 = null,
     pane_id: ?[]const u8 = null,
+    banner: ?[]const u8 = null,
     kind: ?[]const u8 = null,
     viewer_location: ?[]const u8 = null,
     viewer_home_location: ?[]const u8 = null,
@@ -474,6 +484,45 @@ test "T109: a pre-snapshot manifest still loads, with null snapshot fields" {
     try testing.expectEqualStrings("aaaa", leaf.session_id.?);
     try testing.expect(leaf.screen_snapshot == null);
     try testing.expect(leaf.screen_snapshot_offset == null);
+}
+
+test "T422: a pane's sticky banner round-trips, markdown source intact" {
+    const alloc = testing.allocator;
+
+    // The banner's raw markdown SOURCE, not its rendering — a restore re-runs
+    // the same parser the user's `+set-banner` did, so the delimiters, the pipe
+    // table and the escaped newlines all have to survive the JSON verbatim.
+    const banner = "**T422** _in progress_\\n| job | state |\\n|---|---:|\\n| lint | `ok` |";
+    const nodes = [_]Node{
+        .{ .leaf = .{ .session_id = "0123456789abcdef0123456789abcdef", .banner = banner } },
+        .{ .leaf = .{ .session_id = "fedcba9876543210fedcba9876543210" } },
+    };
+    const tabs = [_]Tab{.{ .nodes = &nodes, .active = true }};
+    const windows = [_]Window{.{ .id = "win-0", .tabs = &tabs }};
+
+    const body = try serialize(alloc, .{ .windows = &windows });
+    defer alloc.free(body);
+
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const leaves = parsed.value.windows[0].tabs[0].nodes;
+    try testing.expectEqualStrings(banner, leaves[0].leaf.?.banner.?);
+    // A pane with no banner records none, so restore leaves the slot free for
+    // the session-interrupted notice rather than setting an empty banner.
+    try testing.expect(leaves[1].leaf.?.banner == null);
+}
+
+test "T422: a pre-banner manifest still loads, with a null banner" {
+    const alloc = testing.allocator;
+    const body =
+        \\{"version":1,"windows":[{"id":"win-0","active_tab":0,
+        \\"tabs":[{"nodes":[{"leaf":{"session_id":"aaaa","title":"zsh"}}],"active":true}]}]}
+    ;
+    var parsed = try parse(alloc, body);
+    defer parsed.deinit();
+    const leaf = parsed.value.windows[0].tabs[0].nodes[0].leaf.?;
+    try testing.expectEqualStrings("zsh", leaf.title.?);
+    try testing.expect(leaf.banner == null);
 }
 
 test "T109: snapshot budget rejects an oversized pane and stops at the file ceiling" {

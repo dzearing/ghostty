@@ -162,9 +162,14 @@ pub fn holdAbove(t: *terminal.Terminal, pin: *terminal.Pin) void {
 /// text is real, selectable scrollback the user can COPY the old command out of
 /// (which is the point of naming it at all), but it is ABOVE the viewport, so a
 /// user who does not scroll never sees it. The banner is the copy that is on
-/// screen without being asked. Whether that second copy still earns its keep —
-/// it costs the pane's own banner, which is the T422 complaint — is T422's
-/// call, not this module's.
+/// screen without being asked.
+///
+/// T422 settled what it costs: the banner slot belongs to the PANE, and the
+/// caller only emits this when that slot is genuinely free. A restored pane
+/// whose own banner came back from the session-layout manifest keeps it — its
+/// banner carries state unique to that pane, while this sentence is identical in
+/// every one of them — and a pane that had no banner still gets the notice on
+/// screen for free. See `termio.Remote.Config.pane_banner_restored`.
 pub fn formatBanner(buf: []u8, command: ?[]const u8) []const u8 {
     var w: Writer = .{ .buf = buf };
     w.put("\x1b]7778;**Session interrupted** — the background terminal process was restarted, so this session was closed. Nothing was re-run.");
