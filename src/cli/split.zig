@@ -6,6 +6,7 @@ const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const lib = @import("../lib/main.zig");
+const view_arg = @import("view_arg.zig");
 
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
@@ -116,11 +117,18 @@ pub const Options = struct {
 ///     inherits the SAME machine/connection plus the parent's command and
 ///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
 ///
-///   * `--view=<path-or-url>`: Open a VIEWER pane instead of a terminal:
-///     a rendered markdown file, a syntax-highlighted text/code file, or a
-///     website (http/https URL). Relative paths resolve against
-///     `--working-directory` if given, else the caller's cwd. Mutually
-///     exclusive with `--command`/`-e`.
+///   * `--view=<path-or-url-or-diff>`: Open a VIEWER pane instead of a
+///     terminal: a rendered markdown file, a syntax-highlighted text/code
+///     file, a website (http/https URL), or a GIT DIFF. Relative paths
+///     resolve against `--working-directory` if given, else the caller's
+///     cwd. Mutually exclusive with `--command`/`-e`.
+///
+///     Diff forms (the repository is the one containing
+///     `--working-directory`, else the caller's cwd):
+///       - `git-status:` — working tree: staged, unstaged and untracked
+///       - `git-diff:<a>...<b>` — a range (three-dot = merge base)
+///       - `git-diff:<sha>` — that commit's own changes
+///       - `git-diff:` — this branch against main/master/origin HEAD
 ///
 ///   * `--command=<command>`: The command to run in the split pane.
 ///
@@ -173,7 +181,7 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try resolveViewArgument(alloc, opts._arguments.items);
+    try view_arg.resolve(alloc, opts._arguments.items);
     try seedViewWorkingDirectory(alloc, &opts._arguments);
 
     if (apprt.App.performIpc(
@@ -198,31 +206,6 @@ fn runArgs(
     // sendIpc already printed the server's error text (if any) to stderr.
     try stderr.print("+split failed.\n", .{});
     return 1;
-}
-
-/// Rewrite a relative `--view=` path to an absolute one, resolved against
-/// `--working-directory=` when present (else the caller's cwd). The app
-/// process can't know the caller's cwd, so this must happen CLI-side.
-/// URLs (containing "://"), `about:` pages such as the blank browser start
-/// page, and absolute paths pass through untouched.
-fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
-    for (arguments, 0..) |arg, i| {
-        const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
-        if (rest.len == 0) return;
-        if (rest[0] == '/') return;
-        if (std.mem.indexOf(u8, rest, "://") != null) return;
-        if (std.mem.startsWith(u8, rest, "about:")) return;
-
-        var base: ?[]const u8 = null;
-        for (arguments) |a| {
-            if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
-        }
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
-        const resolved = try std.fs.path.resolve(alloc, &.{ cwd, rest });
-        arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
-        return;
-    }
 }
 
 /// For a `--view=` split with no explicit `--working-directory=`, insert the

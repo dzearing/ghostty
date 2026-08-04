@@ -1,0 +1,385 @@
+/* Ghoztty viewer — git diff styling.
+ *
+ * Colors follow GitHub's diff palette (which is what "green means add, red
+ * means delete" means to most people) rather than being invented, and the
+ * status-badge hues match ViewerDiffPanel.swift so the badge beside a file in
+ * the native tree and the lines inside it agree.
+ *
+ * The 12px margin on the diff root is the SAME `GlassCard.outerMargin` the TOC
+ * card, the pane banner, and the markdown column all leave — see viewer.css.
+ * One number, everywhere; do not add a per-component fudge here. */
+
+:root {
+  --d-add-bg: #e6ffec;
+  --d-add-word: #abf2bc;
+  --d-del-bg: #ffebe9;
+  --d-del-word: #ffc1bf;
+  --d-add-fg: #1a7f37;
+  --d-del-fg: #cf222e;
+  --d-gutter-fg: #59636e;
+  --d-gutter-bg: #ffffff;
+  --d-border: #d1d9e0;
+  --d-hunk-bg: #f6f8fa;
+  --d-hunk-fg: #59636e;
+  --d-muted: #59636e;
+  --d-surface: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --d-add-bg: #12261e;
+    --d-add-word: #1f6f3f;
+    --d-del-bg: #25171c;
+    --d-del-word: #7c2d34;
+    --d-add-fg: #3fb950;
+    --d-del-fg: #f85149;
+    --d-gutter-fg: #6e7681;
+    --d-gutter-bg: #0d1117;
+    --d-border: #3d444d;
+    --d-hunk-bg: #161b22;
+    --d-hunk-fg: #9198a1;
+    --d-muted: #9198a1;
+    --d-surface: #0d1117;
+  }
+}
+
+/* The diff replaces the markdown column entirely: a diff wants the pane's
+ * whole width, not an 880px reading measure. */
+.viewer-diff-root {
+  box-sizing: border-box;
+  padding: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color-scheme: light dark;
+}
+
+/* ---------------------------------------------------------------- summary */
+
+.d-summary {
+  margin: 0 0 12px;
+}
+
+.d-summary h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  word-break: break-all;
+}
+
+.d-summary-meta {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--d-muted);
+}
+
+.d-count-add { color: var(--d-add-fg); font-weight: 600; }
+.d-count-del { color: var(--d-del-fg); font-weight: 600; margin-left: 6px; }
+
+/* ------------------------------------------------------------------ file */
+
+.d-file {
+  border: 1px solid var(--d-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--d-surface);
+}
+
+/* Sticky so the path stays visible while you scroll a long file — the one
+ * thing you always need to know inside a diff is which file you are in. */
+.d-file-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: var(--d-hunk-bg);
+  border-bottom: 1px solid var(--d-border);
+  font-size: 12px;
+}
+
+.d-status {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+.d-status-added { color: var(--d-add-fg); background: color-mix(in srgb, var(--d-add-fg) 16%, transparent); }
+.d-status-deleted { color: var(--d-del-fg); background: color-mix(in srgb, var(--d-del-fg) 16%, transparent); }
+.d-status-renamed,
+.d-status-copied { color: #3b6fd9; background: color-mix(in srgb, #3b6fd9 16%, transparent); }
+.d-status-modified,
+.d-status-typeChanged { color: #b8800d; background: color-mix(in srgb, #b8800d 16%, transparent); }
+.d-status-unmerged,
+.d-status-unknown { color: var(--d-muted); background: color-mix(in srgb, var(--d-muted) 16%, transparent); }
+
+/* The directory gives up space first and the filename never truncates: a
+ * header that ellipsizes as one string drops the filename, which is the one
+ * part of a path you always need to see. */
+.d-path {
+  display: flex;
+  min-width: 0;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.d-path .d-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--d-muted);
+}
+
+.d-path .d-name {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+.d-section {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--d-muted);
+  border: 1px solid var(--d-border);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+.d-file-counts {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ body */
+
+.d-body {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco,
+    "Liberation Mono", monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  tab-size: 4;
+}
+
+.d-code {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* -------------------------------------------------------------- unified */
+
+/* Traditional unified layout: one column, no wrapping, the whole body
+ * scrolling horizontally as a unit so code keeps its shape. The line-number
+ * gutter is sticky, so it does not scroll off with the text — the numbers are
+ * the thing you are cross-referencing when you scroll right. */
+.d-unified {
+  overflow-x: auto;
+}
+
+.d-unified .d-line {
+  display: flex;
+  align-items: flex-start;
+  width: max-content;
+  min-width: 100%;
+  white-space: pre;
+}
+
+.d-unified .d-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  display: flex;
+  user-select: none;
+  background: inherit;
+  box-shadow: inset -1px 0 0 var(--d-border);
+}
+
+.d-unified .d-num {
+  display: inline-block;
+  min-width: 42px;
+  padding: 0 8px;
+  text-align: right;
+  color: var(--d-gutter-fg);
+  font-size: 10.5px;
+}
+
+.d-unified .d-mark {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  user-select: none;
+  color: var(--d-gutter-fg);
+}
+
+.d-unified .d-code {
+  flex: 1 1 auto;
+  padding-right: 12px;
+}
+
+.d-unified .d-line { background: var(--d-gutter-bg); }
+.d-unified .d-add { background: var(--d-add-bg); }
+.d-unified .d-del { background: var(--d-del-bg); }
+.d-unified .d-add .d-mark { color: var(--d-add-fg); }
+.d-unified .d-del .d-mark { color: var(--d-del-fg); }
+
+.d-unified .d-hunk,
+.d-unified .d-note {
+  background: var(--d-hunk-bg);
+  color: var(--d-hunk-fg);
+  border-top: 1px solid var(--d-border);
+  border-bottom: 1px solid var(--d-border);
+}
+
+.d-unified .d-hunk .d-code,
+.d-unified .d-note .d-code {
+  padding-left: 8px;
+  font-size: 10.5px;
+}
+
+/* ------------------------------------------------------------ side by side
+ *
+ * A four-column grid rather than two flex columns: the left and right halves
+ * of a pair are cells of the same grid ROW, so they stay aligned even when a
+ * long line wraps — which is the case a two-column layout gets wrong. Wrapping
+ * (rather than horizontal scroll) is the right call here because each side has
+ * half the pane. */
+.d-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.d-split .d-pair {
+  display: contents;
+}
+
+.d-split .d-half {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  background: var(--d-gutter-bg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.d-split .d-half-old {
+  border-right: 1px solid var(--d-border);
+}
+
+.d-split .d-num {
+  flex: 0 0 auto;
+  min-width: 42px;
+  padding: 0 8px;
+  text-align: right;
+  color: var(--d-gutter-fg);
+  font-size: 10.5px;
+  user-select: none;
+  white-space: pre;
+}
+
+.d-split .d-code {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-right: 10px;
+}
+
+.d-split .d-add { background: var(--d-add-bg); }
+.d-split .d-del { background: var(--d-del-bg); }
+.d-split .d-empty { background: var(--d-hunk-bg); opacity: 0.5; }
+
+.d-split .d-banner {
+  display: grid;
+  grid-column: 1 / -1;
+  background: var(--d-hunk-bg);
+  color: var(--d-hunk-fg);
+  border-top: 1px solid var(--d-border);
+  border-bottom: 1px solid var(--d-border);
+  font-size: 10.5px;
+  padding-left: 8px;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+/* ------------------------------------------------------------- word diff */
+
+.d-word {
+  background: var(--d-del-word);
+  border-radius: 2px;
+}
+
+.d-add .d-word {
+  background: var(--d-add-word);
+}
+
+/* ---------------------------------------------------------------- stubs */
+
+.d-stub {
+  padding: 14px 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: 12px;
+  color: var(--d-muted);
+}
+
+.d-stub strong {
+  color: inherit;
+  font-weight: 600;
+}
+
+.d-cap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--d-border);
+  background: var(--d-hunk-bg);
+}
+
+.d-cap-button {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--d-border);
+  background: var(--d-surface);
+  color: inherit;
+  cursor: pointer;
+}
+
+.d-cap-button:hover {
+  background: var(--d-hunk-bg);
+}
+
+.d-notice {
+  margin: 24px 0;
+  padding: 20px 22px;
+  border: 1px solid var(--d-border);
+  border-radius: 8px;
+  max-width: 640px;
+}
+
+.d-notice h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.d-notice p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--d-muted);
+}

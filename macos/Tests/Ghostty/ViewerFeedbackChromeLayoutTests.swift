@@ -92,19 +92,19 @@ struct ViewerFeedbackChromeLayoutTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "TOC gutter never appeared")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "TOC gutter never appeared")
         #expect(await wait { viewer.worktree != nil }, "worktree never resolved")
 
         viewer.setFeedbackOpen(true)
         viewer.layoutSubtreeIfNeeded()
 
         let composer = layerIndex(in: viewer) { $0 is NSHostingView<ViewerFeedbackBar> }
-        let toc = layerIndex(in: viewer) { $0 is NSHostingView<ViewerTOCPanel> }
+        let panel = layerIndex(in: viewer) { $0 is NSHostingView<ViewerSidePanel> }
         let composerIndex = try #require(composer, "composer never mounted")
-        let tocIndex = try #require(toc, "TOC card never mounted")
+        let panelIndex = try #require(panel, "side panel card never mounted")
 
-        #expect(composerIndex > tocIndex,
-                "composer (layer \(composerIndex)) must draw above the TOC card (layer \(tocIndex))")
+        #expect(composerIndex > panelIndex,
+                "composer (layer \(composerIndex)) must draw above the side panel card (layer \(panelIndex))")
     }
 
     /// Order holds regardless of which was created first: here the composer
@@ -132,14 +132,14 @@ struct ViewerFeedbackChromeLayoutTests {
 
         // Now let the TOC card arrive (it mounts `.above webView`, i.e. beneath
         // the already-present composer).
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "TOC gutter never appeared")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "TOC gutter never appeared")
         viewer.layoutSubtreeIfNeeded()
 
         let composer = layerIndex(in: viewer) { $0 is NSHostingView<ViewerFeedbackBar> }
-        let toc = layerIndex(in: viewer) { $0 is NSHostingView<ViewerTOCPanel> }
+        let panel = layerIndex(in: viewer) { $0 is NSHostingView<ViewerSidePanel> }
         let composerIndex = try #require(composer)
-        let tocIndex = try #require(toc)
-        #expect(composerIndex > tocIndex)
+        let panelIndex = try #require(panel)
+        #expect(composerIndex > panelIndex)
     }
 
     // MARK: - Bug 2: content inset tracks the composer height both ways
