@@ -96,7 +96,31 @@ recommended approaches where they exist.
 
 ## Current priorities (user directive 2026-07-15, overrides table order)
 
-Work these first, in order, before falling back to first-todo-in-table:
+Work these first, in order, before falling back to first-todo-in-table
+(and note that `parity-tasks.ps1 next` now orders by `priority:` before id,
+so the fallback is no longer "whatever was logged earliest").
+
+0000000. **AHEAD OF EVERYTHING as of 2026-08-04 (user, live, listing the
+    things they "keep coming back to").** Three tasks, in this order:
+
+    **T457 → T377 → T456.**
+
+    - **T457** — rebase onto `origin/main`, 20 commits behind, and fold the
+      Mac new-window-dialog work (per-session CPU, dead-session cleanup, the
+      diff viewer) into Windows tasks. **First** because every parity
+      judgement made before it lands is made against a Mac that no longer
+      exists — including the two below. Do the rebase at the very start of the
+      turn, with a clean tree.
+    - **T377** — banner text and list rows still do not wrap, and now also run
+      under the collapse chevron. Reported 2026-08-02 with a screenshot, filed,
+      and never picked up; reported again 2026-08-04 with a second screenshot.
+      Second because it is the one the user has to look at all day.
+    - **T456** — pane resize leaves unpainted gaps around the banner. Same
+      file, same afternoon; keep it a separate change with its own test.
+
+    The user's fourth point that day was the priority ordering itself, which is
+    why this list is no longer the only thing standing between the loop and
+    id order: every open task now carries a `priority:` and `next` respects it.
 
 000000. **AHEAD OF EVERYTHING as of 2026-08-03 (user bug report, live, while
     taking the T120 delivery).** The user upgraded, and every step after the
