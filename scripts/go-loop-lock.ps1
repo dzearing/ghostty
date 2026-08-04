@@ -26,6 +26,12 @@
 #     -StaleMinutes (30)
 #   - otherwise               -> BUSY, exit 3
 #
+# `status` answers the same question the pane does, not just the pid (T440):
+# when the recorded claude is gone but the owning pane still holds a live claude
+# - the whole window after an upgrade relaunch, before the fresh session runs
+# step 0 - it reports `held` with `owner_alive_by=pane` rather than
+# `stale-dead`. See Test-PaneHoldsClaude.
+#
 # Actions: acquire | heartbeat | release | status | adopt
 # Exit codes: 0 ok, 2 usage/error, 3 BUSY (another live owner), 4 not owner.
 #
@@ -49,7 +55,13 @@ param(
     [int]$ClaudePid = 0,
     [int]$StaleMinutes = 30,
     [switch]$Json,
-    [switch]$Force
+    [switch]$Force,
+    # `status` only (T440): when the recorded pid is dead, ask the OWNING PANE
+    # whether a claude is sitting in it before calling the loop dead. Skip the
+    # probe with -NoPaneProbe (it costs one `ghoztty +read`, and a test that is
+    # asserting the dead-pid path does not want the pane to answer for it).
+    [switch]$NoPaneProbe,
+    [string]$GhozttyExe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -125,6 +137,29 @@ function Test-OwnerAlive($lock) {
         if ([math]::Abs(($stamp.Start - $recorded).TotalSeconds) -gt 2) { return $false }
     }
     return $true
+}
+
+# The pid is not the loop; the PANE is (T440). The upgrade script kills claude
+# and relaunches it in the same pane, and nothing updates the lock until that
+# fresh session reaches go.md step 0 - an entire turn later, and unbounded if
+# the resume failed. For that whole window `status` answered `stale-dead` about
+# a session that was working, which is what a human and the dashboard both read
+# as "nothing is running" (user, 2026-08-03: "the status page isn't reporting
+# what's running").
+#
+# So when the recorded pid is a corpse, ask the pane. A claude in the owning
+# pane IS the owner - that is already how `acquire` decides ownership, and this
+# just teaches the readers the same rule. Only `status` does this: acquire's
+# takeover rules stay pid-based on purpose, because a probe that misreads must
+# never be able to wedge the loop.
+function Test-PaneHoldsClaude($lock) {
+    if ($NoPaneProbe) { return $false }
+    if (-not $lock -or -not $lock.pane_id) { return $false }
+    if (-not (Test-Path $GhozttyExe)) { return $false }
+    try {
+        . (Join-Path $PSScriptRoot 'go-loop-pane-probe.ps1')
+        return ((Read-PaneOccupant -PaneId $lock.pane_id -GhozttyExe $GhozttyExe) -eq 'claude')
+    } catch { return $false }
 }
 
 function Get-AgeMinutes($lock) {
@@ -262,14 +297,18 @@ switch ($Action) {
         }
         $age = Get-AgeMinutes $lock
         $alive = Test-OwnerAlive $lock
+        $aliveBy = 'pid'
+        if (-not $alive -and (Test-PaneHoldsClaude $lock)) { $alive = $true; $aliveBy = 'pane' }
+        if (-not $alive) { $aliveBy = 'none' }
         $state = 'held'
         if (-not $alive) { $state = 'stale-dead' }
         elseif ($age -gt $StaleMinutes) { $state = 'stale-heartbeat' }
         $lock | Add-Member -NotePropertyName state -NotePropertyValue $state -Force
         $lock | Add-Member -NotePropertyName owner_alive -NotePropertyValue $alive -Force
+        $lock | Add-Member -NotePropertyName owner_alive_by -NotePropertyValue $aliveBy -Force
         $lock | Add-Member -NotePropertyName age_minutes -NotePropertyValue ([math]::Round($age, 2)) -Force
         $lock | Add-Member -NotePropertyName mine -NotePropertyValue (Test-Mine $lock) -Force
-        Emit $lock ("$state pane=$($lock.pane_id) pid=$($lock.claude_pid) alive=$alive " +
+        Emit $lock ("$state pane=$($lock.pane_id) pid=$($lock.claude_pid) alive=$alive(by=$aliveBy) " +
                     "age=$([math]::Round($age, 1))m turn=$($lock.turn) mine=$(Test-Mine $lock)")
         exit 0
     }

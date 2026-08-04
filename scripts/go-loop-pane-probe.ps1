@@ -31,7 +31,10 @@
 #      prompt down there beats any amount of Claude output in the scrollback
 #      above it (that is exactly the "claude ran and exited" case).
 #   2. Otherwise, a Claude Code chrome marker anywhere in the tail -> claude.
-#   3. Otherwise -> unknown (an unreadable or blank pane; the caller decides).
+#   3. Otherwise, one of Claude Code's own transcript glyphs -> claude. Chrome
+#      WORDING is version-specific and has already drifted twice; the glyphs
+#      have not.
+#   4. Otherwise -> unknown (an unreadable or blank pane; the caller decides).
 #
 # Dot-source it for the pure classifier, or run it:
 #   . scripts\go-loop-pane-probe.ps1 ; Get-PaneOccupant -Tail $text
@@ -57,12 +60,31 @@ param(
 # So the markers are the TUI's words, never its border characters.
 $script:ClaudeMarkers = @(
     'esc to interrupt',
+    'to interrupt',
     'for shortcuts',
     'bypass permissions',
     'shift+tab to cycle',
     'Welcome to Claude Code',
-    'Claude Code'
+    'Claude Code',
+    # The busy screen's token counter, e.g. "(15m 9s - 47.1k tokens)". Every
+    # marker above belongs to the IDLE composer, and a working Claude Code
+    # scrolls all of them off: measured on this box 2026-08-04, a pane with a
+    # live session mid-task classified as 'unknown', which is the answer that
+    # makes the watchdog type a shell command at it (the T241 failure).
+    'tokens)'
 )
+
+# Claude Code's own transcript glyphs, built from code points so this file stays
+# ASCII (see the encoding note above): U+25CF is the bullet on every
+# assistant/tool line, U+23BF the connector under a tool result. Between them
+# they are on screen for any pane that has Claude Code output in it, whatever
+# the version's chrome wording happens to be this month - and wording is what
+# has drifted twice now.
+#
+# Matching SCROLLBACK is safe here only because rule 1 outranks this: a claude
+# that ran and exited leaves its glyphs behind, but it also leaves a shell
+# prompt at the bottom, and that is what the pane gets classified by.
+$script:ClaudeGlyphs = @(0x25CF, 0x23BF) | ForEach-Object { [string][char]$_ }
 
 # Anchored whole-line prompts. Loose ones ("ends with >") would match the
 # composer border, which is the failure this file exists to prevent.
@@ -89,6 +111,9 @@ function Get-PaneOccupant {
     }
     foreach ($m in $script:ClaudeMarkers) {
         if ($Tail -like "*$m*") { return 'claude' }
+    }
+    foreach ($g in $script:ClaudeGlyphs) {
+        if ($Tail.Contains($g)) { return 'claude' }
     }
     return 'unknown'
 }

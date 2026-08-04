@@ -34,11 +34,25 @@
 #     '-NoProfile','-ExecutionPolicy','Bypass','-File',
 #     'D:\git\ghoztty\scripts\go-loop-watchdog.ps1'
 #
-# Or register it to start at sign-in (per-user scheduled task, no elevation):
+# Or register it to autostart (no elevation needed):
 #   powershell -NoProfile -File scripts\go-loop-watchdog.ps1 -Install
 #   powershell -NoProfile -File scripts\go-loop-watchdog.ps1 -Uninstall
+#   powershell -NoProfile -File scripts\go-loop-watchdog.ps1 -Status
 #
-# Every action is appended to %TEMP%\ghoztty-go-loop-watchdog.log.
+# -Install registers TWO things, because one of them is not enough (T440). The
+# HKCU Run entry starts it at sign-in and that is all it ever does: on
+# 2026-08-03 this process died at 09:14 and stayed dead for thirteen hours,
+# because nothing between one logon and the next re-runs a Run entry. So
+# -Install also creates a per-user scheduled task that re-launches this script
+# every -ReviveMinutes. Re-launching is safe to do forever: the single-instance
+# mutex makes it a no-op while the watchdog is alive, so the task is a revival
+# trigger rather than a second supervisor.
+#
+# Every action is appended to %TEMP%\ghoztty-go-loop-watchdog.log, and every
+# TICK - including the ticks where the right answer is to do nothing - stamps a
+# heartbeat into the state file so a reader can tell "supervising quietly" from
+# "gone" without reading a log to find out whether the silence-watcher is
+# silent.
 param(
     [string]$Repo = 'D:\git\ghoztty',
     [string]$LockPath,
@@ -71,8 +85,17 @@ param(
     # nudge" - -Force says the heartbeat is not evidence, not that nothing is.
     [switch]$Force,
     [switch]$DryRun,        # decide and log, but take no action
+    # How often the revival scheduled task re-launches this script (T440). The
+    # launch is a no-op whenever the watchdog is already alive, so this is the
+    # WORST-CASE dead time after a crash, not a polling cost.
+    [int]$ReviveMinutes = 10,
+    # Test seam only. The single-instance mutex is global by design; an
+    # acceptance script that needs its own short-lived watchdog (hermetic state
+    # file, 2s poll) would otherwise be refused by the user's real one.
+    [string]$MutexName = 'Global\GhozttyGoLoopWatchdog',
     [switch]$Install,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Status         # report autostart + liveness, change nothing
 )
 
 $ErrorActionPreference = 'Continue'
@@ -117,17 +140,33 @@ if ($ResumePromptFile) {
 
 # --- install / uninstall --------------------------------------------------
 
-# Autostart uses an HKCU Run entry, the same mechanism T89h gave the local
-# agent. A scheduled task would be tidier, but /SC ONLOGON needs elevation and
-# this loop must be installable from an ordinary session.
+# Autostart is an HKCU Run entry (the mechanism T89h gave the local agent) PLUS
+# a repeating per-user scheduled task. Neither alone is enough: a Run entry
+# fires at sign-in only, so a watchdog that dies at 09:14 is gone until the next
+# logon - which is exactly what happened on 2026-08-03 (T440). `/sc ONLOGON`
+# needs elevation, but `/sc MINUTE` does not, and this loop must stay
+# installable from an ordinary session.
 function Get-RunCommand {
     return "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Repo `"$Repo`""
+}
+
+# schtasks wants the whole command as ONE /tr argument with its inner quotes
+# backslash-escaped; anything else silently loses the arguments after the first
+# space (verified on the box before shipping this).
+function Get-ReviveTaskCommand {
+    return '\"powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden' +
+           " -File \`"$PSCommandPath\`" -Repo \`"$Repo\`""
+}
+
+function Test-ReviveTask {
+    & schtasks /query /tn $runValue *> $null
+    return ($LASTEXITCODE -eq 0)
 }
 
 # Ask the single-instance mutex, not the process list: a command-line match on
 # the script name also matches the shell that is running -Install right now.
 function Test-WatchdogRunning {
-    $m = New-Object System.Threading.Mutex($false, 'Global\GhozttyGoLoopWatchdog')
+    $m = New-Object System.Threading.Mutex($false, $MutexName)
     try {
         if ($m.WaitOne(0)) { $m.ReleaseMutex(); return $false }
         return $true
@@ -141,6 +180,7 @@ function Get-WatchdogProcs {
         $_.CommandLine -like '*go-loop-watchdog.ps1*' -and
         $_.CommandLine -notlike '*-Install*' -and
         $_.CommandLine -notlike '*-Uninstall*' -and
+        $_.CommandLine -notlike '*-Status*' -and
         $_.CommandLine -notlike '*-Once*'
     })
 }
@@ -149,6 +189,12 @@ if ($Install) {
     $cmd = Get-RunCommand
     Set-ItemProperty -Path $runKey -Name $runValue -Value $cmd
     Log "installed Run entry $runValue -> $cmd"
+
+    $tr = Get-ReviveTaskCommand
+    $out = (& schtasks /create /tn $runValue /tr "$tr" /sc MINUTE /mo $ReviveMinutes /f 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) { Log "installed revive task $runValue (every ${ReviveMinutes}m)" }
+    else { Log "WARNING: could not install the revive task (exit $LASTEXITCODE): $out" }
+
     if (Test-WatchdogRunning) {
         Log "watchdog already running (pid $((Get-WatchdogProcs).ProcessId -join ', '))"
         exit 0
@@ -160,8 +206,9 @@ if ($Install) {
 }
 if ($Uninstall) {
     Remove-ItemProperty -Path $runKey -Name $runValue -ErrorAction SilentlyContinue
+    & schtasks /delete /tn $runValue /f *> $null
     Get-WatchdogProcs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Log "uninstalled Run entry $runValue and stopped any running watchdog"
+    Log "uninstalled Run entry + revive task $runValue and stopped any running watchdog"
     exit 0
 }
 
@@ -173,9 +220,18 @@ function Get-RemainingTasks {
     return @(Select-String -Path $Tracker -Pattern $pattern).Count
 }
 
+# -NoPaneProbe is load-bearing (T440). `status` now answers "is the loop alive"
+# with the PANE's opinion when the recorded pid is dead, which is right for
+# every reader - and wrong for this one. "The recorded pid is a corpse but a
+# claude is sitting in the pane" is not a healthy loop to the watchdog, it is
+# its single most important cue: that is the relaunched-but-idle session (T241,
+# T439), and the whole nudge path below exists to re-enter it. Reading it as
+# `held` would make the watchdog do nothing in exactly the case it was built
+# for. So it asks the pid question here and decides about the pane itself,
+# further down, with a probe it can act on.
 function Get-Lock {
     $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $lockScript status `
-        -Repo $Repo -LockPath $LockPath -StaleMinutes $StaleMinutes -Json 2>&1 | Out-String
+        -Repo $Repo -LockPath $LockPath -StaleMinutes $StaleMinutes -NoPaneProbe -Json 2>&1 | Out-String
     try { return ($raw | ConvertFrom-Json) } catch { return $null }
 }
 
@@ -249,13 +305,45 @@ function Read-State {
     if (-not (Test-Path $StatePath)) { return $null }
     try { return (Get-Content $StatePath -Raw | ConvertFrom-Json) } catch { return $null }
 }
-function Write-State($action) {
+
+# Merge rather than overwrite: the state file now carries two independent
+# stories - the last RE-ENTRY (for the rearm hold-off) and the last TICK (for
+# anyone asking whether this process still exists). Writing one must not erase
+# the other.
+function Update-State($fields) {
     $dir = Split-Path -Parent $StatePath
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-    ([ordered]@{
-        last_action    = $action
-        last_action_at = (Get-Date).ToString('o')
-    } | ConvertTo-Json) | Out-File -FilePath $StatePath -Encoding utf8
+    $obj = [ordered]@{}
+    $cur = Read-State
+    if ($cur) { foreach ($p in $cur.PSObject.Properties) { $obj[$p.Name] = $p.Value } }
+    foreach ($k in $fields.Keys) { $obj[$k] = $fields[$k] }
+    $tmp = "$StatePath.$PID.tmp"
+    ($obj | ConvertTo-Json -Depth 5) | Out-File -FilePath $tmp -Encoding utf8
+    Move-Item -Force $tmp $StatePath
+}
+
+function Write-State($action) {
+    Update-State @{ last_action = $action; last_action_at = (Get-Date).ToString('o') }
+}
+
+# The beacon this watchdog is judged by (T440). A supervisor that is doing its
+# job writes no actions at all, so "last action" cannot distinguish healthy from
+# gone - and the only other evidence was a log that stops, which nobody reads
+# until they already suspect. Every tick stamps this instead.
+#
+# ONLY the long-running daemon writes it. A -Once tick (the acceptance harness,
+# and the upgrade script's -Force handoff) is a process that exits seconds
+# later; stamping its pid here would report the supervisor as dead moments after
+# a handoff that worked.
+function Write-Health($tickAction) {
+    if ($Once) { return }
+    Update-State @{
+        watchdog_pid  = $PID
+        watchdog_host = $env:COMPUTERNAME
+        tick_at       = (Get-Date).ToString('o')
+        poll_seconds  = $PollSeconds
+        last_tick     = $tickAction
+    }
 }
 function Get-MinutesSinceAction {
     $s = Read-State
@@ -263,6 +351,31 @@ function Get-MinutesSinceAction {
     try { return ((Get-Date) - [datetime]::Parse($s.last_action_at, [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::RoundtripKind)).TotalMinutes }
     catch { return [double]::PositiveInfinity }
+}
+
+# --- status ---------------------------------------------------------------
+
+if ($Status) {
+    $s = Read-State
+    $tickAge = 'never'
+    if ($s -and $s.tick_at) {
+        try {
+            $t = [datetime]::Parse($s.tick_at, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind)
+            $tickAge = '{0:N1}m ago' -f ((Get-Date) - $t).TotalMinutes
+        } catch { $tickAge = 'unparseable' }
+    }
+    $run = (Get-ItemProperty -Path $runKey -Name $runValue -ErrorAction SilentlyContinue)
+    $lines = @(
+        "running:    $(Test-WatchdogRunning)",
+        "pids:       $((Get-WatchdogProcs).ProcessId -join ', ')",
+        "last tick:  $tickAge (action=$(if ($s) { $s.last_tick } else { '-' }))",
+        "run entry:  $(if ($run) { 'present' } else { 'MISSING' })",
+        "revive task:$(if (Test-ReviveTask) { " present (every ${ReviveMinutes}m)" } else { ' MISSING' })",
+        "state file: $StatePath"
+    )
+    $lines
+    exit 0
 }
 
 # --- one tick -------------------------------------------------------------
@@ -366,12 +479,19 @@ if ($Once) {
     exit 0
 }
 
-# Single instance: a second watchdog would double every re-entry.
-$mutex = New-Object System.Threading.Mutex($false, 'Global\GhozttyGoLoopWatchdog')
+# Single instance: a second watchdog would double every re-entry. This is also
+# what makes the revive scheduled task safe to fire every few minutes forever.
+$mutex = New-Object System.Threading.Mutex($false, $MutexName)
 if (-not $mutex.WaitOne(0)) { Log 'another go-loop watchdog is running; exiting'; exit 0 }
 
 Log "=== go-loop watchdog start (poll=${PollSeconds}s, stale=${StaleMinutes}m, rearm=${RearmMinutes}m, repo=$Repo)"
+Write-Health 'start'
 while ($true) {
-    try { Invoke-Tick | Out-Null } catch { Log "tick error: $_" }
+    $action = 'error'
+    try { $action = Invoke-Tick } catch { Log "tick error: $_" }
+    if ($action -is [array]) { $action = $action[-1] }
+    # After the tick, not before: the beacon should mean "a tick completed",
+    # so a watchdog wedged inside one goes stale exactly like a dead one.
+    try { Write-Health $action } catch { Log "health write failed: $_" }
     Start-Sleep -Seconds $PollSeconds
 }

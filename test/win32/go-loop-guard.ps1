@@ -23,6 +23,13 @@
 #   J. Watchdog REAL nudge: lock owned by a live process with a stale
 #      heartbeat, its pane alive and quiet => the resume prompt is typed into
 #      that pane instead of opening a second window.
+#   P. The supervisor's own liveness is observable (T440): a running watchdog
+#      stamps a beacon on every tick including the quiet ones, a -Once tick
+#      never does, -Status reports both autostart hooks, and the every-10-minute
+#      revive task is registered so a dead watchdog cannot wait for a logon.
+#   Q. `status` asks the PANE when the recorded pid is dead (T440), so a claude
+#      relaunched in the owning pane reads as held rather than stale-dead -
+#      while `acquire` stays pid-based, on purpose.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -563,6 +570,151 @@ Assert 'M9 the composer line is not a shell prompt' `
 Assert 'M10 a path with \t survives send-keys escaping' `
     ((ConvertTo-SendKeysLiteral 'C:\Users\tom\AppData\Local\Temp\go.cmd') -eq 'C:\\Users\\tom\\AppData\\Local\\Temp\\go.cmd')
 Assert 'M11 a path with no backslash is unchanged' ((ConvertTo-SendKeysLiteral 'go.cmd') -eq 'go.cmd')
+# T440: a WORKING Claude Code scrolls every idle-composer marker off the screen.
+# Measured on the box 2026-08-04, a pane with a live session mid-task came back
+# 'unknown' - the answer that makes the watchdog type a shell command at it.
+Assert 'M12 a busy session is claude' `
+    ((Get-PaneOccupant -Tail "Kneading... (15m 9s - 47.1k tokens)") -eq 'claude')
+# Chrome wording has drifted twice; the transcript glyphs have not. Built from
+# code points because this file must stay ASCII.
+$bullet = [string][char]0x25CF
+$connector = [string][char]0x23BF
+Assert 'M13 a transcript bullet is claude' `
+    ((Get-PaneOccupant -Tail "$bullet Reading go.md") -eq 'claude')
+Assert 'M14 a tool-result connector is claude' `
+    ((Get-PaneOccupant -Tail "  $connector  Read 373 lines") -eq 'claude')
+# ...and rule 1 still outranks all of it, which is what makes matching
+# scrollback safe: a claude that EXITED leaves its glyphs AND a shell prompt.
+Assert 'M15 glyphs above a shell prompt are still a shell' `
+    ((Get-PaneOccupant -Tail "$bullet Reading go.md`r`n  $connector  Read 373 lines`r`nD:\git\ghoztty>") -eq 'shell')
+
+# --- P. the supervisor's own liveness is observable (T440) ----------------
+# The watchdog died at 09:14 on 2026-08-03 and nothing noticed for thirteen
+# hours, because the only evidence it was gone was a log that stopped. It now
+# stamps a beacon on every tick - healthy ticks included - so "the supervisor is
+# missing" is a state a reader can see.
+""
+"P. watchdog health beacon"
+$pState = Join-Path $root 'go-loop.watchdog-beacon.json'
+$pLog = Join-Path $root 'watchdog-beacon.log'
+# A private mutex name, or the user's real watchdog refuses this one on sight.
+$pMutex = "Global\GhozttyGoLoopWatchdogTest$PID"
+# The empty tracker makes every tick decide 'none' immediately, so this daemon
+# never reads a pane, opens a window, or types anything.
+$dog = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
+    '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $pState,
+    '-Tracker', $emptyTracker, '-LogPath', $pLog, '-MutexName', $pMutex,
+    '-PollSeconds', '2', '-DryRun')
+$beacon = $null
+foreach ($i in 1..40) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $pState) {
+        $beacon = Get-Content $pState -Raw | ConvertFrom-Json
+        if ($beacon.tick_at) { break }
+    }
+}
+Assert 'P1 a running watchdog stamps a beacon' ($null -ne $beacon -and $null -ne $beacon.tick_at)
+Assert 'P2 the beacon names the live watchdog pid' ($beacon -and [int]$beacon.watchdog_pid -eq $dog.Id)
+Assert 'P3 the beacon records the tick that ran' ($beacon -and $beacon.last_tick -eq 'none')
+Assert 'P4 the beacon carries the poll interval' ($beacon -and [int]$beacon.poll_seconds -eq 2)
+# It must keep beating while nothing happens - that is the whole point.
+$firstTick = $beacon.tick_at
+Start-Sleep -Seconds 4
+$beacon2 = Get-Content $pState -Raw | ConvertFrom-Json
+Assert 'P5 the beacon advances on a quiet tick' ($beacon2.tick_at -ne $firstTick)
+Stop-Process -Id $dog.Id -Force -ErrorAction SilentlyContinue
+
+# A -Once tick must NOT stamp it. The upgrade script's handoff runs -Once, and a
+# process that exits two seconds later stamping its pid here would report the
+# supervisor as dead moments after a handoff that worked.
+$onceState = Join-Path $root 'go-loop.watchdog-once.json'
+'{"last_action":"nudge","last_action_at":"2026-01-01T00:00:00.0000000+00:00"}' |
+    Out-File -FilePath $onceState -Encoding utf8
+$argsOnce = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
+    '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $onceState,
+    '-Tracker', $emptyTracker, '-LogPath', $pLog, '-Once')
+& powershell @argsOnce | Out-Null
+$onceObj = Get-Content $onceState -Raw | ConvertFrom-Json
+Assert 'P6 a -Once tick writes no beacon' ($null -eq $onceObj.tick_at)
+Assert 'P7 a -Once tick leaves the action history alone' ($onceObj.last_action -eq 'nudge')
+
+# -Status is the human-readable version of the same question.
+$argsStatus = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
+    '-Repo', $Repo, '-StatePath', $pState, '-Status')
+$statusOut = (& powershell @argsStatus 2>&1 | Out-String)
+Assert 'P8 -Status reports liveness' ($statusOut -match 'running:')
+Assert 'P9 -Status reports the last tick' ($statusOut -match 'last tick:\s+\d')
+Assert 'P10 -Status reports both autostart hooks' `
+    ($statusOut -match 'run entry:' -and $statusOut -match 'revive task:')
+
+# The fix for "gone until the next logon": a repeating per-user task that
+# re-launches the watchdog, which the single-instance mutex makes a no-op while
+# it is alive. Read-only here - installing/uninstalling would touch the real
+# supervisor this box is running.
+$taskQuery = (& schtasks /query /tn 'GhozttyGoLoopWatchdog' /fo LIST /v 2>&1 | Out-String)
+Assert 'P11 the revive task is registered (run -Install if this fails)' ($LASTEXITCODE -eq 0)
+Assert 'P12 the revive task launches the watchdog' ($taskQuery -match 'go-loop-watchdog\.ps1')
+
+# The READ side of the same beacon: the dashboard's own rule, asserted by the
+# dashboard's own code (a rule re-implemented here would drift from it).
+$dash = Join-Path $Repo 'scripts\task-dashboard.js'
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    $dashOut = (& node $dash --selftest 2>&1 | Out-String)
+    Assert 'P13 the dashboard reads the beacon correctly' ($LASTEXITCODE -eq 0 -and $dashOut -match 'ALL PASS')
+    if ($dashOut -notmatch 'ALL PASS') { $dashOut.Trim() }
+} else {
+    "  SKIP P13 (node not on PATH)"
+}
+
+# --- Q. the lock follows a relaunch, not a pid (T440) ---------------------
+# The upgrade kills claude and relaunches it in the SAME pane; nothing updates
+# the lock until that session reaches go.md step 0. For that whole window
+# `status` said stale-dead about a session that was working, and the dashboard
+# said "nothing running" (user, 2026-08-03).
+""
+"Q. status asks the pane when the recorded pid is dead"
+# A stand-in ghoztty whose +read answers like a pane with Claude Code in it.
+$fakeExe = Join-Path $root 'fake-ghoztty-claude.cmd'
+@('@echo off', 'echo   bypass permissions on (shift+tab to cycle)', 'exit /b 0') -join "`r`n" |
+    Out-File -FilePath $fakeExe -Encoding ascii
+$fakeShell = Join-Path $root 'fake-ghoztty-shell.cmd'
+@('@echo off', 'echo D:\git\ghoztty^>', 'exit /b 0') -join "`r`n" |
+    Out-File -FilePath $fakeShell -Encoding ascii
+
+Remove-Item $lock -Force -ErrorAction SilentlyContinue
+Lock-Run @('acquire', '-PaneId', 'PANE-Q', '-ClaudePid', $PID) | Out-Null
+# Kill the recorded owner by hand: a pid that never existed is as dead as one
+# that exited, and does not require killing something real.
+$L = Read-LockFile
+$L.claude_pid = 999999
+$L.claude_name = 'claude'
+$L.claude_start = ''
+Write-LockFile $L
+
+$r = Lock-Run @('status', '-PaneId', 'PANE-Q', '-NoPaneProbe')
+Assert 'Q1 without the probe a dead pid is still stale-dead' ($r.Out -match '^stale-dead')
+$r = Lock-Run @('status', '-PaneId', 'PANE-Q', '-GhozttyExe', $fakeExe)
+Assert 'Q2 a claude in the owning pane keeps the lock held' ($r.Out -match '^held')
+Assert 'Q3 and says the pane is what answered' ($r.Out -match 'by=pane')
+$r = Lock-Run @('status', '-PaneId', 'PANE-Q', '-GhozttyExe', $fakeShell)
+Assert 'Q4 a shell prompt in the pane does not count as alive' ($r.Out -match '^stale-dead')
+$r = Lock-Run @('status', '-PaneId', 'PANE-Q', '-GhozttyExe', (Join-Path $root 'no-such.exe'))
+Assert 'Q5 an unreachable ghoztty never invents a live loop' ($r.Out -match '^stale-dead')
+# The probe must not paper over a genuinely absent owner process either: with a
+# LIVE recorded pid the fast path answers and the pane is never read.
+$qAlive = Start-Sleeper; $sleepers += $qAlive
+Lock-Run @('adopt', '-PaneId', 'PANE-Q', '-ClaudePid', $qAlive.Id) | Out-Null
+$r = Lock-Run @('status', '-PaneId', 'PANE-Q', '-GhozttyExe', $fakeShell)
+Assert 'Q6 a live recorded pid is held on its own evidence' ($r.Out -match '^held' -and $r.Out -match 'by=pid')
+
+# acquire is deliberately NOT pane-aware: a probe that misreads must never be
+# able to wedge the loop, so a dead recorded owner is still taken over.
+$L = Read-LockFile
+$L.claude_pid = 999999
+Write-LockFile $L
+$r = Lock-Run @('acquire', '-PaneId', 'PANE-Q-OTHER', '-ClaudePid', $PID)
+Assert 'Q7 acquire still takes over a dead owner' ($r.Code -eq 0 -and $r.Out -match 'reason=dead-owner')
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

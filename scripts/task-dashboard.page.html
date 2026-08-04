@@ -717,12 +717,41 @@ function copyBtn(text) {
     } });
 }
 
+/**
+ * Is the thing that restarts the loop itself alive? (T440.)
+ *
+ * This row is here even when everything is fine, and deliberately so: the
+ * failure it reports is thirteen hours of nothing happening, and a supervisor
+ * that only appears once it is missing is a supervisor nobody knows to look
+ * for. The healthy case is one quiet line.
+ */
+function watchdogRows(d) {
+  var W = d.watchdog;
+  if (!W) return [];   // an older server that does not report it yet
+  if (W.running) {
+    return [h('div', { class: 'loop-task muted',
+      text: 'Supervisor: watching (last check ' + (W.tickAgeMs == null ? '?' : fDur(W.tickAgeMs)) + ' ago).' })];
+  }
+  var why = !W.present
+    ? 'The watchdog has never checked in on this box.'
+    : 'The watchdog last checked in ' + (W.tickAgeMs == null ? 'at an unreadable time' : fDur(W.tickAgeMs) + ' ago') + ' and is not running now.';
+  return [
+    h('div', { class: 'loop-line' }, [
+      h('span', { class: 'dot-live stale' }),
+      h('b', { text: 'Supervisor is down' })
+    ]),
+    h('div', { class: 'loop-task muted',
+      text: why + ' Nothing will restart the loop if it stops. Re-installing also registers the every-10-minute revival task, so this cannot go unnoticed for a day again.' }),
+    h('div', { class: 'dec-note' }, [copyBtn('powershell -NoProfile -File scripts\\go-loop-watchdog.ps1 -Install')])
+  ];
+}
+
 /** What the loop is doing right now — or that it has stopped. */
 function loopCard(d) {
   var L = d.loop;
   if (!L) {
     return card('The loop', null, [h('div', { class: 'empty',
-      text: 'No lock file — the go-loop is not running. Start it in a Ghoztty pane with: read go.md and go' })]);
+      text: 'No lock file — the go-loop is not running. Start it in a Ghoztty pane with: read go.md and go' })].concat(watchdogRows(d)));
   }
   var inflight = d.tasks.filter(function (t) { return t.bucket === 'in_progress' && !t.stale; });
   var age = L.heartbeatAgeMs == null ? '?' : fDur(L.heartbeatAgeMs);
@@ -748,9 +777,10 @@ function loopCard(d) {
   }
   if (!L.running) {
     rows.push(h('div', { class: 'loop-task muted',
-      text: 'The claude process named in the lock is gone. Check which windows are marked, then re-enter the loop from a Ghoztty pane.' }));
+      text: 'The claude process named in the lock is gone, and the pane it owned is not running one either — so this is a stopped loop rather than a session that was relaunched under a new pid. Check which windows are marked, then re-enter the loop from a Ghoztty pane.' }));
     rows.push(h('div', { class: 'dec-note' }, [copyBtn('powershell -NoProfile -File scripts\\go-loop-exec.ps1 list')]));
   }
+  rows = rows.concat(watchdogRows(d));
   return card('The loop', null, rows);
 }
 

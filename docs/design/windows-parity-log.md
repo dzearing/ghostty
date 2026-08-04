@@ -8692,3 +8692,42 @@ debug `ghoztty.exe` deliberately alive and five `msedgewebview2.exe` on the
 both live tests confirmed running (not skipped) in the log. Forced to a 1ms
 deadline it goes red in seconds with the named reason. Floor: none 285s, win32
 291s, agent 291s, P1–P3 ALL PASS.
+
+## 2026-08-04 — T440: the loop's supervisor can be seen, comes back on its own, and stops mistaking a relaunch for a death
+
+Three silent failures behind one report ("the status page isn't reporting what's
+running"), and a fourth found on the way.
+
+The watchdog now stamps a heartbeat on **every** tick, including the quiet ones —
+because a supervisor doing its job takes no actions, so its only evidence of life
+used to be a log that stops, and reading a log to find out whether the
+silence-watcher is silent is the wrong shape. The dashboard shows that beacon as
+a supervisor line, present when healthy and loud when not. `-Install` now also
+registers a per-user `schtasks /sc MINUTE /mo 10` revival trigger, safe to fire
+forever because the single-instance mutex makes it a no-op while the watchdog is
+alive: worst-case dead time drops from "until the next logon" — thirteen hours,
+on the day this was filed — to ten minutes.
+
+And `go-loop-lock.ps1 status` stops confusing a relaunch with a death: when the
+recorded pid is a corpse it asks the owning **pane**, and a claude sitting there
+reports `held ... by=pane`. `acquire` deliberately stays pid-based, and so does
+the watchdog — that one was caught by the existing N4/N5 assertions failing, not
+by inspection: "dead pid, live claude in the pane" is not a healthy loop to the
+supervisor, it is its single most important cue.
+
+The fourth: probing a real pane returned `unknown`, because every marker in the
+classifier belonged to Claude Code's **idle** composer and a session that is
+working scrolls all of them off. That is not a harmless answer — with a dead
+recorded pid the watchdog would have typed a shell command path into a live TUI,
+which is T241 silently back. Now matched by the busy line's token counter and by
+Claude Code's own transcript glyphs (built from code points so the file stays
+ASCII), with the shell-prompt rule still outranking both.
+
+Evidence: `go-loop-guard.ps1` ALL PASS with 21 new assertions,
+`task-dashboard.js --selftest` ALL PASS (7). Live on the box: killing the
+watchdog flipped the dashboard to `running:false` on the next request, and
+`schtasks /run` on the registered task brought it back — the exact registered
+command line, so goal 2 is measured rather than assumed. Floor:
+`floor-lane.ps1 -Lane all` PASS, P1–P3 ALL PASS. Filed T479 (the watchdog counts
+remaining work from the FROZEN tracker table — fiction today, an off-switch the
+day someone tidies it) and decision D11.

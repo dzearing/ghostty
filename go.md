@@ -158,9 +158,20 @@ success leaves the loop dead — that already cost six days (2026-07-21 →
 reason to stop; finishing IS the trigger to reset and take the next one.
 
 Since T139 there IS a supervisor, but do not lean on it: the watchdog
-(`scripts\go-loop-watchdog.ps1`, a per-user scheduled task) only notices the
-step-0 heartbeat going stale, and only re-enters after up to ~45 min of dead
-time. It is the safety net for a crash, not a substitute for step 7.
+(`scripts\go-loop-watchdog.ps1`) only notices the step-0 heartbeat going stale,
+and only re-enters after up to ~45 min of dead time. It is the safety net for a
+crash, not a substitute for step 7.
+
+The supervisor has its own supervision (T440): it stamps a heartbeat on every
+tick, the dashboard shows a "Supervisor is down" line when that stops, and a
+per-user scheduled task re-launches it every 10 minutes (a no-op while it is
+alive — the single-instance mutex sees to that). Before T440 it was an HKCU Run
+entry alone, which fires at logon and never again; it died at 09:14 one morning
+and nothing noticed for thirteen hours. Ask it directly with:
+
+```
+powershell -NoProfile -File scripts\go-loop-watchdog.ps1 -Status
+```
 
 The one allowed exception: if the reset probe finds this session is not in a
 Ghoztty pane, say so plainly and ask the user to run `/clear`.

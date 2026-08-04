@@ -604,9 +604,87 @@ function loopState() {
     // for an hour while working perfectly — reading that as "not responding"
     // cried wolf on a loop that was 46 minutes into a task. The heartbeat
     // still matters, but as "last checkpoint", not as a pulse.
-    running: pidAlive(j.claude_pid),
+    running: pidAlive(j.claude_pid) || paneHoldsClaude(j),
     // Kept for the watchdog's own framing: past this it WILL re-enter.
     checkpointStale: age != null && age >= 45 * 60 * 1000,
+  };
+}
+
+/**
+ * Second opinion for `running`, for the window where the lock names a corpse
+ * (T440). The upgrade script kills claude and relaunches it in the SAME pane,
+ * and nothing re-points the lock until that session reaches go.md step 0 — a
+ * whole turn later, unbounded if the resume failed. This card read "Not
+ * running" through all of it while work was happening, which is the complaint
+ * that filed T440.
+ *
+ * The rule lives in scripts\go-loop-lock.ps1 (`status` → `owner_alive_by`) and
+ * is asked for rather than reimplemented, so the two readers cannot drift.
+ * Only reached when the pid is already dead, and cached, because it costs a
+ * PowerShell start and the page polls every 5s.
+ */
+let paneProbe = { at: 0, alive: false, key: null };
+const PANE_PROBE_TTL = 30 * 1000;
+
+function paneHoldsClaude(j) {
+  if (!j || !j.pane_id) return false;
+  const key = j.pane_id + '|' + j.claude_pid;
+  if (paneProbe.key === key && Date.now() - paneProbe.at < PANE_PROBE_TTL) return paneProbe.alive;
+  let alive = false;
+  try {
+    const out = execFileSync(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        path.join(REPO, 'scripts', 'go-loop-lock.ps1'), 'status', '-Json'],
+      { cwd: REPO, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    const st = JSON.parse(out.replace(/^﻿/, ''));
+    alive = st.owner_alive_by === 'pane';
+  } catch {
+    alive = false; // an unreadable probe must never invent a running loop
+  }
+  paneProbe = { at: Date.now(), alive, key };
+  return alive;
+}
+
+/**
+ * Is the loop's supervisor itself alive? (T440.)
+ *
+ * The watchdog died at 09:14 on 2026-08-03 and nothing noticed for thirteen
+ * hours: its HKCU Run entry only fires at logon, and the only evidence it was
+ * gone was a log that stopped — which nobody reads until they already suspect.
+ * It now stamps a heartbeat on every tick, healthy ticks included, so the
+ * absence of a supervisor is a state this page can SHOW.
+ *
+ * Absent file ⇒ `present: false`, not an error: a box that has never installed
+ * the watchdog is a real, reportable state too.
+ */
+function watchdogState(file) {
+  let j;
+  try {
+    j = JSON.parse(
+      fs.readFileSync(file || path.join(REPO, 'temp', 'go-loop.watchdog.json'), 'utf8').replace(/^﻿/, '')
+    );
+  } catch {
+    return { present: false, running: false };
+  }
+  if (!j || !j.tick_at) return { present: false, running: false };
+  const tick = Date.parse(j.tick_at);
+  const age = isNaN(tick) ? null : Date.now() - tick;
+  // Two consecutive missed ticks, floored at 15 min so a hand-run watchdog with
+  // a long poll is not reported dead for being slow.
+  const poll = (Number(j.poll_seconds) || 300) * 1000;
+  const allowed = Math.max(poll * 3, 15 * 60 * 1000);
+  return {
+    present: true,
+    pid: j.watchdog_pid || null,
+    tickAt: isNaN(tick) ? null : tick,
+    tickAgeMs: age,
+    lastTick: j.last_tick || null,
+    pollSeconds: Number(j.poll_seconds) || null,
+    // Both must hold. A live pid whose ticks stopped is wedged, which supervises
+    // exactly as much as a dead one does.
+    running: pidAlive(j.watchdog_pid) && age != null && age < allowed,
   };
 }
 
@@ -804,6 +882,7 @@ function buildPayload() {
   const taskById = new Map(tasks.map((t) => [t.id, t]));
   const activity = buildActivity(history.points, taskById, decisions);
   const loop = loopState();
+  const watchdog = watchdogState();
 
   // Date the file was last touched, for in-progress and blocked tasks only —
   // that is what tells a 20-minute-old "in progress" apart from a five-day-old
@@ -841,6 +920,7 @@ function buildPayload() {
     branch: branchName(),
     taskDir: REL_TASK_DIR,
     loop,
+    watchdog,
     decisions,
     openDecisions: decisions.filter((d) => d.status !== 'resolved').length,
     activity,
@@ -1033,8 +1113,64 @@ function send(res, code, type, body) {
   res.end(body);
 }
 
+/**
+ * `--selftest`: assert how this page reads the watchdog beacon (T440).
+ *
+ * Kept here rather than in the PowerShell acceptance script because the rule is
+ * this file's, and a rule asserted from outside drifts. The beacon's WRITE side
+ * is covered by go-loop-guard.ps1 section P; this is the READ side.
+ */
+function selfTest() {
+  const tmp = path.join(REPO, 'temp', 'dashboard-selftest-' + process.pid + '.json');
+  let failures = 0;
+  const check = (name, cond) => {
+    console.log((cond ? '  PASS ' : '  FAIL ') + name);
+    if (!cond) failures++;
+  };
+  const write = (o) => {
+    fs.mkdirSync(path.dirname(tmp), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(o), 'utf8');
+    return tmp;
+  };
+  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+
+  try {
+    fs.rmSync(tmp, { force: true });
+    let w = watchdogState(tmp);
+    check('W1 a box with no beacon reports absent, not an error', w.present === false && w.running === false);
+
+    w = watchdogState(write({ watchdog_pid: process.pid, tick_at: iso(30e3), poll_seconds: 300 }));
+    check('W2 a live pid ticking now is running', w.present === true && w.running === true);
+
+    // A dead pid is the 2026-08-03 failure itself: thirteen hours of a beacon
+    // that stopped advancing while nobody looked.
+    w = watchdogState(write({ watchdog_pid: 999999, tick_at: iso(30e3), poll_seconds: 300 }));
+    check('W3 a beacon from a dead process is not running', w.present === true && w.running === false);
+
+    // Wedged supervises exactly as much as dead does.
+    w = watchdogState(write({ watchdog_pid: process.pid, tick_at: iso(60 * 60e3), poll_seconds: 300 }));
+    check('W4 a live pid whose ticks stopped is not running', w.running === false);
+
+    // ...but a quiet gap inside the allowance is not a fault: three polls, with
+    // a 15-minute floor so a hand-run watchdog is not called dead for being slow.
+    w = watchdogState(write({ watchdog_pid: process.pid, tick_at: iso(10 * 60e3), poll_seconds: 300 }));
+    check('W5 a gap within the allowance is still running', w.running === true);
+
+    w = watchdogState(write({ watchdog_pid: process.pid, poll_seconds: 300 }));
+    check('W6 a beacon with no tick time is absent', w.present === false);
+
+    w = watchdogState(write({ watchdog_pid: process.pid, tick_at: iso(30e3), poll_seconds: 300, last_tick: 'nudge' }));
+    check('W7 the last tick action is reported', w.lastTick === 'nudge');
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  console.log(failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)');
+  process.exit(failures === 0 ? 0 : 1);
+}
+
 function main() {
   const argv = process.argv.slice(2);
+  if (argv.includes('--selftest')) return selfTest();
   if (argv.includes('--once')) {
     process.stdout.write(JSON.stringify(buildPayload(), null, 2) + '\n');
     return;
