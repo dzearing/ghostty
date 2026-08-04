@@ -8140,3 +8140,67 @@ P1-P3 skipped for the standing T441 reason — those scripts never set
 `GHOZTTY_PIPE_SUFFIX`, so run from a pane they would type into the user's live
 terminal. This turn added three PowerShell scripts and edited docs; no app or
 zig code, so they cannot have regressed from it.
+
+## 2026-08-04 (T450) - a crashing test binary finally leaves a stack, and the stack says the crash is in the ERROR REPORTING
+
+`cdb` was on this box the whole time. T443 said it was not installed, T449
+repeated it, T450 was filed on the strength of it, and two whole contexts were
+spent bisecting a 50%-flaky crash with no stack - while the Microsoft Store
+WinDbg package sat there shipping a console `cdbX64.exe` that needs no install
+and no elevation. The recipe had even been written down in July during T48. One
+`Test-Path` would have saved days; the lesson is that a stated absence in a task
+file is a claim, not a fact.
+
+Shipped `scripts\lib\CrashCatch.ps1` + `scripts\crash-catch.ps1`: run a binary
+(or `-Lane none|win32|agent`, which finds the newest test exe that lane built)
+under cdb with the fatal exception filters armed, and on a hit keep a full
+minidump plus `~*kv` for **every** thread with source lines. `-Attempts N`
+re-runs until it catches one, because a single clean run of an intermittent
+crash proves nothing. `floor-lane.ps1` now does this automatically whenever the
+Windows crash log shows one of our test binaries died, printing a
+`-- crash stack --` block under T444's `-- crash diagnostics --` one; it reads
+the exact failing binary out of the lane log rather than guessing by write-time,
+and prunes captures to the newest 3 (a `/ma` dump is 120-450 MB). Acceptance
+`test\win32\crash-stacks.ps1`, 42 checks, ALL PASS - including that the capture
+contains the thread that did NOT fault, which Zig's own handler can never show.
+
+**And it immediately moved T443.** First use caught the agent crash on attempt 1
+in 24 s:
+
+```
+print__anon_430783+0x26   std/debug.zig:227     <-- FAULT, null read
+log__anon_417474+0x31     compiler/test_runner.zig:280
+log__anon_410253+0xf      std/log.zig:124
+warn__anon_406518+0xf     std/log.zig:181
+verifyIntegrity+0x19aa    src/terminal/page.zig:482
+```
+
+The binary is not dying of memory corruption. It is dying **while reporting** a
+page integrity violation - `verifyIntegrity` calls `log.warn`, and the test
+runner's log path null-dereferences inside `std.debug.print`'s stderr-writer
+lock. That is why the message naming the violation has never once been seen, and
+why the panic handler recurses. Filed as **T454**; take it before T443.
+
+The all-thread capture also refutes T443's top-ranked hypothesis: three of the
+four threads were idle Windows thread-pool workers, so no leaked background
+thread was writing anything.
+
+Floor at the boundary: `none` **FAIL**, `win32` **FAIL**, `agent` **FAIL** - all
+three, which has not happened before, and `none` had never failed at all (this
+file and T443 both say it was "never implicated"; it is now). The working tree
+was PowerShell and markdown only, no `.zig` and no app code, so none of it is
+from this turn. The `none` failure auto-captured a second, different stack:
+`c000001d` at `src\terminal\hash_map.zig:333` - `header()`, whose one line
+carries both a `self.metadata.?` null-optional unwrap and an `@alignCast` -
+reached from `lookupHyperlink`. Which of the two safety checks failed is not
+determined; the dump is on disk.
+
+**P1-P3 ALL PASS, and actually run this time.** The previous turn skipped them
+for the T441 hazard. Setting `GHOZTTY_PIPE_SUFFIX` in the caller's environment
+before invoking them is enough - verified read-only first: under the suffix,
+`ghoztty +list` answers "No running Ghoztty instance found" rather than listing
+the user's windows.
+
+Filed: **T454** (the logging crash). **D6** asks the user how many minutes a red
+lane should be allowed to spend chasing a stack - 2 attempts caught 2 of the 4
+crashes in this turn's floor run.

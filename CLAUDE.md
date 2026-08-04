@@ -932,6 +932,27 @@ a suspicion (a program really can `exit(5)`), so with no crash record behind it
 the block says so rather than asserting. Acceptance:
 `test\win32\crash-diagnostics.ps1`.
 
+**And a red lane captures a real stack** (T450). Zig's segfault handler dies in
+a recursive panic here, and even when it works it only ever walks the thread
+that faulted — never the one that did the damage. So a crash in one of our test
+binaries makes `floor-lane.ps1` re-run that binary under **cdb**, which takes
+the exception on first chance and writes a full minidump plus `~*kv` for every
+thread into `.dumps\`; the console gets a `-- crash stack --` block with source
+lines and the name of the test that was running. `-NoCatch` skips it,
+`-CatchAttempts` tunes it. Run it by hand against an intermittent crash with
+
+```powershell
+powershell -NoProfile -File scripts\crash-catch.ps1 -Lane agent -Attempts 6
+```
+
+which runs the lane's built test binary directly (~20–110 s a go, no build).
+`cdb` needs no install and no elevation on this box — the Store WinDbg package
+ships a console `cdbX64.exe` under `%LOCALAPPDATA%\Microsoft\WindowsApps\`.
+Library: `scripts/lib/CrashCatch.ps1`, which documents the three cdb traps
+(backslashes eaten inside quoted commands, filters must be armed at the loader
+break, cdb echoes its own command back). Acceptance:
+`test\win32\crash-stacks.ps1`.
+
 **Tests must never touch live user state.** The WebView2 live-runtime tests run
 under `webview2.TestProfile`, which points `LOCALAPPDATA` at a private per-run
 root so they cannot contend with — or corrupt — the `EBWebView[-debug]` profile

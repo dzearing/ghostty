@@ -69,6 +69,12 @@ param(
     [string]$Repo = 'D:\git\ghoztty',
     [string]$CacheDir,
     [switch]$NoSweep,
+    # A crashed lane re-runs its test binary under cdb to capture a stack (T450).
+    # On by default: the crash it exists for is intermittent, so "remember to
+    # pass a flag next time" means the evidence is gone until it happens again.
+    [switch]$NoCatch,
+    [int]$CatchAttempts = 2,
+    [int]$CatchTimeoutSeconds = 600,
     [switch]$SelfTest
 )
 
@@ -77,6 +83,10 @@ $ErrorActionPreference = 'Stop'
 # Decodes a crashed child's truncated exit code and reads the Windows crash log
 # (T444). Without it a lane can end on a bare "exited with error code 5".
 . "$PSScriptRoot\lib\CrashDiag.ps1"
+# Re-runs a crashed test binary under cdb for a dump and every thread's stack
+# (T450). Zig's own handler dies in a recursive panic, so without this a crash
+# leaves no stack at all -- see scripts/lib/CrashCatch.ps1.
+. "$PSScriptRoot\lib\CrashCatch.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -356,8 +366,61 @@ function Invoke-Lane {
         # a CRASHED child, not a silent compiler (T444). Decode the code and name
         # the process that died, so a red lane is never a bare number.
         $null = Write-CrashDiagnostic -Since $started -LogPath $log
+
+        # T444 names the crashed process and its fault offset. That is a
+        # suspect, not a stack -- and Zig's segfault handler cannot supply one
+        # here, because it dies in a recursive panic while walking the stack.
+        # So re-run the binary that died under cdb: first-chance, every thread,
+        # full dump. The thread that corrupted memory is usually not the thread
+        # that faulted, which is the whole reason this is worth the minutes.
+        if (-not $NoCatch) { Invoke-LaneCrashCatch -Since $started -LaneLog $log }
     }
     return $result
+}
+
+function Invoke-LaneCrashCatch {
+    <#
+    .SYNOPSIS
+        Capture a stack for whichever of OUR test binaries just crashed.
+    .DESCRIPTION
+        Deliberately narrow: it only fires when the Windows Application log
+        recorded a crash in a binary this repo builds. A lane that failed on a
+        compile error, or one where the compiler itself died (T451), gets
+        nothing and costs nothing.
+    #>
+    param([Parameter(Mandatory)][datetime]$Since, [string]$LaneLog)
+
+    $cdb = Get-CdbPath
+    if (-not $cdb) {
+        Write-Host '-- crash stack --'
+        Write-Host '  no cdb.exe found, so no stack was captured (scripts\crash-catch.ps1 explains where it is looked for)'
+        return
+    }
+    $ours = @(Get-ProcessCrashEvent -Since $Since | Where-Object { $TEST_EXE_NAMES -contains $_.App })
+    if ($ours.Count -eq 0) { return }
+
+    $name = $ours[0].App
+    # The lane log names the exact binary zig was running; newest-by-write-time
+    # is only the fallback, and it can point at the other lane's copy of the
+    # same exe name.
+    $exe = $null
+    if ($LaneLog) { $exe = Get-FailingTestBinaryFromLog -LogPath $LaneLog -Repo $Repo }
+    if ($exe -and ((Split-Path -Leaf $exe) -ne $name)) { $exe = $null }
+    if (-not $exe) { $exe = Get-NewestBuiltBinary -Name $name -Repo $Repo }
+    if (-not $exe) {
+        Write-Host "-- crash stack --"
+        Write-Host "  $name crashed but no built copy was found under $Repo\.zig-cache\o"
+        return
+    }
+    Write-Host "-- capturing a stack for $name under cdb (up to $CatchAttempts attempt(s); -NoCatch to skip) --"
+    try {
+        $r = Invoke-CrashCatch -Exe $exe -Attempts $CatchAttempts `
+            -TimeoutSeconds $CatchTimeoutSeconds -Repo $Repo
+        $null = Write-CrashStack -Result $r
+    }
+    catch {
+        Write-Host "  crash-catch failed: $($_.Exception.Message)"
+    }
 }
 
 # --------------------------------------------------------------------- main

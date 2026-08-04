@@ -164,6 +164,23 @@ Work these first, in order, before falling back to first-todo-in-table:
     exception, module and fault offset, so the next attempt starts with evidence
     the last two did not have.
 
+    **T450 is DONE (2026-08-04) and there is finally a stack. Take T454 next,
+    not T443.** `cdb` was on this box all along (the Store WinDbg package ships
+    a console `cdbX64.exe`; the "not installed" line in T443/T449/T450 was never
+    checked). `scripts\crash-catch.ps1` now runs a lane's test binary under it
+    and caught the agent crash on the first attempt, in 24 s, with every thread:
+
+    the binary is **not dying of corruption — it is dying while REPORTING it.**
+    `Page.verifyIntegrity` detects an integrity violation, calls `log.warn`, and
+    the test runner's log path null-dereferences inside `std.debug.print`'s
+    stderr-writer lock. That is **T454**, and it is why the message naming the
+    violation has never been seen and why the panic handler recurses. The
+    all-thread capture also refutes T443's top-ranked hypothesis: three of the
+    four threads were idle thread-pool workers, so no leaked background thread
+    was writing anything. **T454 → then T443** (the underlying
+    `UnmarkedHyperlinkCell` violation is real and still unexplained, but it is
+    unreadable until T454 lands). A red lane now captures this automatically.
+
 00000. **THE FLOOR ITSELF IS BROKEN, 2026-08-03 — T430.** Ahead of the rest of
     this list because it is what every other task is validated against. **Two
     of the four standing-floor lanes can now hang forever with no output and no
