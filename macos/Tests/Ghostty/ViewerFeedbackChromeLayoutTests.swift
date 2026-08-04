@@ -52,11 +52,20 @@ struct ViewerFeedbackChromeLayoutTests {
         return (window, viewer)
     }
 
-    private func wait(upTo seconds: TimeInterval = 10, for condition: () -> Bool) async -> Bool {
+    /// A failure deadline, not a delay — it returns the moment the condition
+    /// holds. Sized for the slowest thing behind these conditions: a real page
+    /// load, and a worktree resolution that shells out to `git` off the main
+    /// thread. Both have been measured past 10s on a loaded CI runner.
+    private func wait(upTo seconds: TimeInterval = 60, for condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if condition() { return true }
-            try? await Task.sleep(nanoseconds: 25_000_000)
+            // WebKit only makes progress while the run loop turns, and the
+            // gutter these tests wait on is downstream of a real page load.
+            // Sleeping alone is enough on an idle machine and stalls when the
+            // main actor is contended by the target's parallel runners.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return condition()
     }
