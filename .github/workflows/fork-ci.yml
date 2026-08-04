@@ -69,13 +69,20 @@ jobs:
           fi
 
       # The two halves are run as separate steps ON PURPOSE. A plain
-      # `zig build test` covers both — build.zig wires the xctest step into the
-      # test step via GhosttyXcodebuild.zig — but then a red X cannot tell you
-      # whether the Zig core or the Swift app broke, and the first real run hit
-      # exactly that ambiguity. `-Dapp-runtime=none` keeps this step off the
-      # xcodebuild path entirely.
+      # `zig build test` covers both — build.zig's `run:` block hands the test
+      # step an xctest dependency via `addTestStepDependencies` — but then a
+      # red X cannot tell you whether the Zig core or the Swift app broke.
+      #
+      # The flag that detaches it is `-Demit-xcframework=false`, NOT
+      # `-Dapp-runtime=none`. On macOS `emit_xcframework` DEFAULTS to
+      # `app_runtime == .none` (src/build/Config.zig), so `-Dapp-runtime=none`
+      # is what switches the xcodebuild path ON — the first attempt at this
+      # split passed it and still ran both halves in this one step, which is
+      # how a Swift failure came back labeled "Test (Zig core)".
+      # `emit_macos_app` derives from `emit_xcframework`, so the single flag
+      # detaches the whole chain.
       - name: Test (Zig core)
-        run: zig build -Dapp-runtime=none test
+        run: zig build test -Demit-xcframework=false
 
       # Proves the artifact the project actually ships from — the same command
       # CLAUDE.md tells contributors to run — still builds end to end. Also
