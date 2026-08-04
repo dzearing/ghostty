@@ -8068,3 +8068,75 @@ zig code). What is different is that both red lanes now end by naming what died:
 minutes apart — a repeated fault site, which "a different victim every run" also
 does not predict, and which is now a concrete address for T443/T449 to
 symbolise.
+
+## 2026-08-04 — T449: the box is not the problem, and the crash has an address
+
+**T449 done.** It asked whether the crashes wrecking the floor lanes are a
+machine fault, a security product, or a toolchain bug. Answer: none of the
+three — the corrupter is ours, and T443 should resume.
+
+The claim that started T449 was that `zig.exe` crashes too, so whatever is
+scribbling on memory cannot be picking victims by module. Measurement does not
+support it:
+
+- **The machine computes correctly.** New `scripts/hw-integrity-stress.ps1` ran
+  28 threads for 4 minutes over freshly-allocated buffers, hashing each one with
+  SHA-256 plus an independent integer checksum and re-deriving it to compare:
+  **23054 iterations, 1440.9 GB verified, 0 mismatches.** The DIMMs are at
+  4200 MT/s with no XMP/EXPO, and the i9-13900K is on microcode 0x12F, so the
+  Raptor Lake mitigations are applied.
+- **The rates are not comparable.** `zig build test-agent` crashed **3/3** this
+  turn. `zig.exe` has faulted **8 times in 21 days** across weeks of continuous
+  building. The 08-03/04 cluster of compiler crashes is exposure — that was the
+  night someone looped the build dozens of times — not the box changing.
+- **Nothing injects into our processes.** `LoadAppInit_DLLs=0`, Windows Defender
+  and no third-party AV.
+- **Commit exhaustion is out**, though it was worth measuring: new
+  `scripts/commit-pressure-probe.ps1` recorded peak commit of **49.4 GB against
+  a 67.7 GB limit** across three lane runs. 18 GB of headroom, so no failing
+  `VirtualAlloc` — but the page file is 4 GB on a 64 GB box, which is thin
+  enough to file (T453).
+
+**The finding that matters for T443: the faulting offsets repeat.** These are
+Debug builds under ASLR, so a repeated module-relative offset is a repeated
+*instruction*, and random hardware corruption does not do that:
+`ghoztty-agent-core-test.exe+0x11a830` twice, and
+`ghoztty-agent-test.exe+0x1cb84e` **four** times — twice in the previous turn,
+once in this turn's probe, and once more in the floor run at this boundary. The
+victim set is also tighter than "anywhere in `terminal.*`": three of four
+crashes this turn landed in `terminal.search.*`, on the address
+`0xffffffffffffffff` — an all-ones pointer rather than a wild index — though
+the boundary floor run then faulted at a plausible heap address
+(`0x1d12c29de28`), so the poison value is a tendency, not an invariant. T443 now
+has two addresses to symbolise.
+
+One correction to T443 while doing it: its note that "the Zig segfault handler
+prints a full, symbolised stack" no longer holds. Running the test binary
+directly, outside the build runner, still produced only `Segmentation fault at
+address 0xffffffffffffffff` / `aborting due to recursive panic` — the handler
+faults while walking the stack. So every crash investigation on this box starts
+blind, which is now **T450** and belongs before more bisection.
+
+Also corrected: T449's own evidence said "zero WHEA events in 14 days". False —
+there are **6369** in 30 days, missed because WHEA id 17 logs at *Warning*
+level. All 6369 are corrected PCIe errors on one root port, whose device
+resolves to a **Samsung NVMe controller**. Corrected, so not the cause, but 200
+a day is worth the user knowing (T452).
+
+Filed: **T450** (a crash must leave a readable stack), **T451** (the compiler's
+own repeating-offset bug, and a lane that can tell a compiler crash from a test
+failure — `scripts/zig-crash-repro.ps1` is started but both arms still need
+work), **T452** (the PCIe error storm), **T453** (commit headroom). **D5**
+resolved as `o1` by events: this turn took T449 first and it ruled, so the
+question no longer has a consequence.
+
+Floor at the boundary: `none` **PASS** (175s), `win32` **PASS** (170s), `agent`
+**FAIL** (129s). The win32 lane passing is worth noting — it failed in each of
+the last two turns' boundary runs, which is more evidence for "intermittent"
+than for "this lane is broken". The agent lane died at
+`ghoztty-agent-test.exe+0x1cb84e`, the fourth sighting of that one offset.
+
+P1-P3 skipped for the standing T441 reason — those scripts never set
+`GHOZTTY_PIPE_SUFFIX`, so run from a pane they would type into the user's live
+terminal. This turn added three PowerShell scripts and edited docs; no app or
+zig code, so they cannot have regressed from it.
