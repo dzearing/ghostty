@@ -20,6 +20,7 @@ const internal_os = @import("../os/main.zig");
 const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const session_notice = @import("session_notice.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -92,6 +93,21 @@ closing: std.atomic.Value(bool) = .init(false),
 /// `pending_resize_mutex`; null = nothing pending.
 pending_resize: ?renderer.Size = null,
 pending_resize_mutex: std.Thread.Mutex = .{},
+
+/// T423: a session-interrupted notice has been written to this pane's terminal
+/// and has not been folded above the viewport yet. Armed by the backend right
+/// after the notice is written, consumed by `settleNotice` on the last tick
+/// before the child's first bytes reach the parser — which is the only moment
+/// no resize can interleave. Keeping it there afterwards is `notice_guard`'s
+/// job, not this flag's. Touched only on the IO thread.
+notice_fold_armed: bool = false,
+
+/// T423: tracks the row just BELOW a settled session-interrupted notice, for
+/// the pane's whole life. A tracked pin is the only handle that survives a
+/// reflow, which is exactly the event that drags the notice back into the
+/// active area where the child's repaint erases it. Null when this pane never
+/// showed a notice, which is the overwhelming majority of panes.
+notice_guard: ?*terminalpkg.Pin = null,
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -336,6 +352,11 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
 
 pub fn deinit(self: *Termio) void {
     self.backend.deinit();
+    // Before the terminal, which owns the pin's storage (T423).
+    if (self.notice_guard) |p| {
+        self.terminal.screens.active.pages.untrackPin(p);
+        self.notice_guard = null;
+    }
     self.terminal.deinit(self.alloc);
     self.config.deinit();
     self.mailbox.deinit(self.alloc);
@@ -575,6 +596,10 @@ pub fn resize(
         // immediately for a resize. This is allowed by the spec.
         self.terminal.modes.set(.synchronized_output, false);
 
+        // T423: the reflow above may have dragged a session-interrupted notice
+        // back out of the scrollback and into the active area.
+        self.holdNoticeAboveLocked();
+
         // If we have size reporting enabled we need to send a report.
         if (self.terminal.modes.get(.in_band_size_reports)) {
             try self.sizeReportLocked(td, .mode_2048);
@@ -602,9 +627,35 @@ pub fn reflowLocalGrid(self: *Termio, cols: u16, rows: u16) void {
             return;
         };
         self.terminal.modes.set(.synchronized_output, false);
+        self.holdNoticeAboveLocked();
     }
     _ = self.renderer_mailbox.push(.{ .resize = self.size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+}
+
+/// Arm the notice guard. Call immediately after writing the notice.
+pub fn armNoticeFold(self: *Termio) void {
+    self.notice_fold_armed = true;
+}
+
+/// Fold the notice above the viewport and start holding it there. The caller
+/// must be about to parse the child's first bytes ON THIS THREAD, with no
+/// chance for a resize to interleave. No-op unless a notice is armed.
+pub fn settleNotice(self: *Termio) void {
+    if (!self.notice_fold_armed) return;
+    self.notice_fold_armed = false;
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    session_notice.foldIntoScrollback(&self.terminal);
+    self.notice_guard = session_notice.trackFold(&self.terminal);
+}
+
+/// Put a settled notice back above the viewport if a reflow dragged it down
+/// into the active area. Called with the renderer mutex already held, from
+/// every path that resizes the terminal. See `session_notice.holdAbove`.
+fn holdNoticeAboveLocked(self: *Termio) void {
+    const guard = self.notice_guard orelse return;
+    session_notice.holdAbove(&self.terminal, guard);
 }
 
 /// Make a size report.

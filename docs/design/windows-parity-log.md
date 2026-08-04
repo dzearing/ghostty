@@ -7585,3 +7585,56 @@ same source), with a real WebView2 host running under the test binary against
 the user's own `EBWebView-debug` profile. Unrelated to this task, pre-existing,
 and now **T430**; the agent modules were verified individually with
 `-Dtest-filter` in the meantime.
+
+## 2026-08-03 - T423: the session-interrupted notice is in the scrollback now, above the shell
+
+The user asked for it by name after the T120 upgrade: *"I expected the session
+interrupted message to be displayed inline, above the shell content but within
+the console logging."* The in-stream copy already existed and was already being
+written; the banner existed only because a fresh `cmd.exe` under ConPTY erased
+it microseconds later. The fallback had become the only carrier, which is not
+what was asked for.
+
+The task guessed this was an ordering problem - print the notice after the
+shell's repaint instead of before it. It is not, and the reason kills that whole
+family of fixes: a ConPTY child does not print into our terminal, it hands us
+conhost's entire screen buffer as absolutely positioned VT. Text left on the
+active screen is erased by the opening `ESC[H ESC[2J` or painted over, and text
+inserted above it shifts conhost's coordinate frame out from under everything
+that follows. **Above the viewport is the one region conhost never addresses**,
+and `ESC[2J` cannot reach it - which is also exactly where the user pointed.
+So the notice is written and then scrolled off the top, by `cursor.y` rows,
+which is its real height with wrapping included because it ends every line with
+CRLF. The re-home afterwards is load-bearing too: conhost believes the cursor is
+at (1,1) when the child starts, so a shell that does not repaint at all would
+otherwise paint offset from conhost's model of the same screen. That also
+retires the "what do the other shell flavors do" question - the fix does not
+care.
+
+The measurements were in the second half. Folding once is not enough at any
+moment, and two half-fixes shipped before the acceptance arm was satisfied. A
+ConPTY pane's viewport is mostly trailing blank rows, and ghostty's reflow
+refills those out of the scrollback: at 64x20 -> 31x20 the notice's last two
+lines came back onto the active screen, where conhost's post-resize repaint
+erased them. That IS the reported shape - creating the sibling of a split
+narrows a restored pane, so the pane alone in its window kept the whole notice
+and both panes of the split kept only its first line. Folding later, from the
+drain on the last tick before the child's first bytes, rescued the pane narrowed
+before its child spoke and left the one narrowed after (0 of 2 panes -> 1 of 2).
+What holds is a **tracked pin** on the row below the notice: a pin is the only
+handle that survives a reflow, so after every resize, for the pane's life, the
+guard asks where that row is now and scrolls it back out of the active area if
+the reflow dragged it in. No timers, no arming window, one `pointFromPin` in the
+case where nothing moved.
+
+Two things worth carrying forward. The bug was found by DUMPING the panes, after
+three rounds of theorising from a whitespace-stripped 300-character excerpt got
+it wrong twice; the script now carries `-DumpPanesTo <dir>` so the next person
+looks at bytes instead. And the new arm's four assertions were each watched to
+fail first - A13 sat at 0, then 1, as the half-fixes landed - which is the only
+reason "ALL PASS (60)" means anything.
+
+The banner carrier stays. The in-stream copy lives above the viewport, so a user
+who does not scroll still never sees it; whether the second copy earns the pane's
+own banner is T422's call, and T422 now gets to make it against a working
+in-stream copy instead of as the only carrier.

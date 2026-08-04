@@ -218,6 +218,23 @@ td.fin { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular
 .att-row.in_progress .bar { background: var(--warning); }
 .att-row.blocked .bar { background: var(--critical); }
 .att-why { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.if-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.if-title { font-size: 14px; font-weight: 600; margin-top: 5px; line-height: 1.35; }
+.if-plain { font-size: 13px; color: var(--ink-2); margin-top: 6px; }
+.if-plain.muted { color: var(--muted); }
+.if-note { font-size: 11px; color: var(--muted); margin-top: 6px; font-style: italic; }
+.goals { margin-top: 10px; }
+.goals-head { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 5px; }
+.goal { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--ink-2); padding: 2px 0; }
+.goal .box { width: 13px; height: 13px; flex: none; margin-top: 2px; border: 1px solid var(--axis); border-radius: 3px; font-size: 10px; line-height: 12px; text-align: center; color: transparent; }
+.goal.done .box { background: rgba(12, 163, 12, .16); border-color: var(--done); color: var(--done); }
+.goal.done { color: var(--muted); }
+.loop-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.loop-task { font-size: 13px; margin-top: 8px; }
+.loop-task.muted, .dec-why.muted { color: var(--muted); font-size: 12px; }
+.chip.warn { background: rgba(250, 178, 25, .18); color: var(--ink); }
+.dec.blocked-dec { border-left-color: var(--critical); }
+pre.cmd { margin: 10px 0 0; padding: 9px 11px; background: var(--surface-2); border-radius: 6px; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
 
 #tip { position: fixed; z-index: 40; pointer-events: none; opacity: 0; transition: opacity .08s linear; background: var(--surface-1); color: var(--ink); border: 1px solid var(--hairline); border-radius: 6px; padding: 7px 9px; font-size: 12px; line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,.16); max-width: 260px; }
 #tip .tt { font-weight: 600; margin-bottom: 3px; }
@@ -315,7 +332,9 @@ function fDur(ms) {
   var min = Math.round(sec / 60);
   if (min < 60) return min + 'm';
   var hr = Math.floor(min / 60);
-  return hr + 'h ' + (min % 60) + 'm';
+  if (hr < 24) return hr + 'h ' + (min % 60) + 'm';
+  var day = Math.floor(hr / 24);
+  return day + 'd ' + (hr % 24) + 'h';
 }
 function fAgo(ts) {
   var d = Date.now() - ts;
@@ -653,6 +672,139 @@ function decisionCard(d) {
   ]);
 }
 
+function setStatus(t, status, label) {
+  if (state.busy) return;
+  state.busy = true;
+  post('api/status', { id: t.id, status: status })
+    .then(function () { toast(t.id + ' ' + label + '.'); return refresh(true); })
+    .catch(function (e) { toast('Could not update ' + t.id + ': ' + e.message, true); })
+    .finally(function () { state.busy = false; });
+}
+
+function copyBtn(text) {
+  return h('button', { class: 'btn', type: 'button', text: 'Copy command',
+    onclick: function (e) {
+      var done = function () { toast('Command copied.'); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { toast('Could not copy — select it by hand.', true); });
+      } else {
+        // http://localhost is a secure context in Chromium, but keep a path
+        // for the case where it is not rather than failing silently.
+        var ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch (x) { toast('Could not copy.', true); }
+        document.body.removeChild(ta);
+      }
+    } });
+}
+
+/** What the loop is doing right now — or that it has stopped. */
+function loopCard(d) {
+  var L = d.loop;
+  if (!L) {
+    return card('The loop', null, [h('div', { class: 'empty',
+      text: 'No lock file — the go-loop is not running. Start it in a Ghoztty pane with: read go.md and go' })]);
+  }
+  var inflight = d.tasks.filter(function (t) { return t.bucket === 'in_progress' && !t.stale; });
+  var age = L.heartbeatAgeMs == null ? '?' : fDur(L.heartbeatAgeMs);
+  var rows = [
+    h('div', { class: 'loop-line' }, [
+      h('span', { class: 'dot-live' + (L.running ? '' : ' stale') }),
+      h('b', { text: L.running ? (L.checkpointStale ? 'Running — long turn' : 'Running') : 'Not running' }),
+      h('span', { class: 'chip', text: 'turn ' + L.turn }),
+      h('span', { class: 'chip', text: 'last checkpoint ' + age + ' ago' })
+    ])
+  ];
+  if (inflight.length) {
+    rows.push(h('div', { class: 'loop-task' }, ['Working on ', h('b', { text: inflight[0].id }), ' — ' + inflight[0].title]));
+  } else if (L.running) {
+    // Straight about the gap rather than implying idleness: the loop does not
+    // record what it picked up, so "nothing marked" is not "nothing happening".
+    rows.push(h('div', { class: 'loop-task muted',
+      text: 'The loop is alive but no task is marked in progress, so this card cannot name it. go.md step 1 now asks the loop to mark a task when it picks it up; turns that started before that rule stay invisible here.' }));
+  }
+  if (L.running && L.checkpointStale) {
+    rows.push(h('div', { class: 'loop-task muted',
+      text: 'The lock is only refreshed at task boundaries, so ' + age + ' without one means a long turn, not a dead loop — the process is alive. Past 45 minutes the watchdog may re-enter anyway.' }));
+  }
+  if (!L.running) {
+    rows.push(h('div', { class: 'loop-task muted',
+      text: 'The claude process named in the lock is gone. Check which windows are marked, then re-enter the loop from a Ghoztty pane.' }));
+    rows.push(h('div', { class: 'dec-note' }, [copyBtn('powershell -NoProfile -File scripts\\go-loop-exec.ps1 list')]));
+  }
+  return card('The loop', null, rows);
+}
+
+/** Goals as a read-only checklist, with how far along it is. */
+function goalList(t) {
+  var done = t.goals.filter(function (g) { return g.done; }).length;
+  return h('div', { class: 'goals' }, [
+    h('div', { class: 'goals-head', text: 'Goals — ' + done + ' of ' + t.goals.length + ' done' })
+  ].concat(t.goals.map(function (g) {
+    return h('div', { class: 'goal' + (g.done ? ' done' : '') }, [
+      h('span', { class: 'box', 'aria-hidden': 'true', text: g.done ? '✓' : '' }),
+      h('span', { text: g.text })
+    ]);
+  })));
+}
+
+function inflightRow(t) {
+  var kids = [
+    h('div', { class: 'if-head' }, [
+      h('span', { class: 'dec-id', text: t.id }),
+      h('span', { class: 'pill in_progress' }, [h('i'), 'In progress']),
+      t.stale ? h('span', { class: 'chip warn', text: 'stale — untouched ' + fDur(t.staleMs) } ) : null
+    ]),
+    h('div', { class: 'if-title', text: t.title })
+  ];
+  if (t.plain) {
+    kids.push(h('div', { class: 'if-plain', text: t.plain }));
+  } else if (!t.stale) {
+    // Show the raw summary rather than nothing, but say what it is — a
+    // silent fallback would let the missing plain-language section look like
+    // the intended output, and it would never get written.
+    if (t.summary) kids.push(h('div', { class: 'if-plain muted', text: t.summary }));
+    kids.push(h('div', { class: 'if-note',
+      text: 'No plain-language summary yet. go.md step 1 asks the loop to write an “In plain terms” section when it claims a task.' }));
+  }
+  if (t.goals && t.goals.length) kids.push(goalList(t));
+  if (t.stale) {
+    kids.push(h('div', { class: 'att-why',
+      text: 'Marked in progress but its file has not changed in ' + fDur(t.staleMs) +
+        '. Almost certainly abandoned rather than active — resetting it puts it back in the queue.' }));
+    kids.push(h('div', { class: 'dec-note' }, [
+      h('button', { class: 'btn', type: 'button', text: 'Reset to to-do',
+        onclick: function () { setStatus(t, 'todo', 'reset to to-do'); } })
+    ]));
+  }
+  return h('div', { class: 'att-row in_progress' }, [h('i', { class: 'bar' }), h('div', null, kids)]);
+}
+
+/** A blocked task with the step that unblocks it — never a dead end. */
+function blockedCard(t) {
+  var kids = [
+    h('div', { class: 'dec-top' }, [
+      h('span', { class: 'dec-id', text: t.id }),
+      h('span', { class: 'dec-title', text: t.title }),
+      h('span', { class: 'pill blocked' }, [h('i'), 'Blocked'])
+    ])
+  ];
+  if (t.reason) kids.push(h('div', { class: 'dec-assumed' }, [h('b', { text: 'Why: ' }), t.reason]));
+  if (t.unblock) {
+    kids.push(h('div', { class: 'dec-why' }, [h('b', { text: 'To unblock: ' }), t.unblock]));
+  } else {
+    kids.push(h('div', { class: 'dec-why muted',
+      text: 'No unblock steps recorded. Add an `unblock:` line to ' + t.file + ' so this is actionable next time.' }));
+  }
+  if (t.unblockCommand) kids.push(h('pre', { class: 'cmd', text: t.unblockCommand }));
+  var actions = [];
+  if (t.unblockCommand) actions.push(copyBtn(t.unblockCommand));
+  actions.push(h('button', { class: 'btn primary', type: 'button', text: 'Mark unblocked',
+    onclick: function () { setStatus(t, 'todo', 'is unblocked and back in the queue'); } }));
+  kids.push(h('div', { class: 'dec-note' }, actions));
+  return h('div', { class: 'dec blocked-dec' }, kids);
+}
+
 function activityView(d) {
   var out = [];
   var open = d.decisions.filter(function (x) { return x.status !== 'resolved'; });
@@ -666,23 +818,18 @@ function activityView(d) {
   var decBody = open.length ? open.map(decisionCard) : [h('div', { class: 'empty', text: 'No open decisions.' })];
   out.push(h('section', { class: 'card' }, decHead.concat(decBody)));
 
-  // Attention: in-progress and blocked tasks belong in the feed, not buried
-  // in a chart view — they are the other thing a human might need to unstick.
-  var att = d.tasks.filter(function (t) { return t.bucket === 'in_progress' || t.bucket === 'blocked'; });
-  if (att.length) {
-    out.push(card('In flight and blocked', null, [h('div', { class: 'att' }, att.map(function (t) {
-      return h('div', { class: 'att-row ' + t.bucket }, [
-        h('i', { class: 'bar' }),
-        h('div', null, [
-          h('div', null, [
-            h('span', { style: { fontWeight: '600', fontSize: '12px' }, text: t.id + ' ' }),
-            h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]])
-          ]),
-          h('div', { style: { fontSize: '12px' }, text: t.title }),
-          t.reason ? h('div', { class: 'att-why', text: t.reason }) : null
-        ])
-      ]);
-    }))]));
+  out.push(loopCard(d));
+
+  var inflight = d.tasks.filter(function (t) { return t.bucket === 'in_progress'; });
+  if (inflight.length) {
+    out.push(card('In flight', 'Tasks marked in progress. The loop marks one when it picks it up and clears it when it lands.',
+      [h('div', { class: 'att' }, inflight.map(inflightRow))]));
+  }
+
+  var blocked = d.tasks.filter(function (t) { return t.bucket === 'blocked'; });
+  if (blocked.length) {
+    out.push(card('Blocked — needs you', 'Each one says what unblocks it. Do the step, then mark it to-do so the loop can pick it up.',
+      blocked.map(blockedCard)));
   }
 
   // Timeline

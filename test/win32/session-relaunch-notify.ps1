@@ -19,7 +19,9 @@
 #      commands, agent killed, app relaunched. Neither command is running
 #      afterwards (the process table is the oracle), each pane shows the notice
 #      naming ITS OWN command and not the other's, and each pane accepts input
-#      on a live shell.
+#      on a live shell. Since T423 it also proves the notice is in the pane's
+#      own SCROLLBACK, above the shell's output - not only in the banner
+#      overlay, which is all that used to survive.
 #   B: negative control / opt-in - `--session-relaunch=auto` still respawns the
 #      recorded command. Without this, A would also pass against a build that
 #      simply broke restore.
@@ -45,6 +47,10 @@
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    # Where to leave per-pane raw `+read` dumps for a failure that needs eyes on
+    # the actual bytes. Off by default: the run's own temp tree is deleted at the
+    # end, deliberately, so this has to be somewhere else.
+    [string]$DumpPanesTo = '',
     [switch]$NegativeControl,
     [switch]$Interactive
 )
@@ -196,6 +202,26 @@ function Wait-PaneText($id, $tag, $pattern, $timeoutSec = 30) {
     }
     return $false
 }
+# T423: where the notice sits in the pane's OWN scrollback, relative to the
+# fresh shell's first output. Returns character offsets into the whitespace-
+# stripped dump, which is what makes the answer wrap-proof: these panes are
+# splits, narrow enough that the notice line wraps, and a line-index comparison
+# would score a real pass as a FAIL. `>` is the shell's prompt terminator and
+# appears nowhere in the notice or in a `ping -n N 127.0.0.1` label, so the
+# first one marks where the shell's content begins.
+function Get-NoticePlacement($id, $tag, $timeoutSec = 40) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $out = @{ notice = -1; shell = -1 }
+    while ((Get-Date) -lt $deadline) {
+        $tight = (Read-Pane $id $tag 400) -replace '\s', ''
+        $out.notice = $tight.IndexOf('sessioninterrupted')
+        $out.shell = $tight.IndexOf('>')
+        if ($out.notice -ge 0 -and $out.shell -ge 0) { break }
+        Start-Sleep -Milliseconds 700
+    }
+    return $out
+}
+
 # THE liveness oracle for a pane: type a unique marker and read it back.
 function Test-PaneResponsive($id, $tag, $timeoutSec = 30) {
     $marker = "T230x$($tag)x$(Get-Random -Maximum 999999)"
@@ -319,13 +345,9 @@ if ($NegativeControl) {
 
 # Each commanded pane must SAY what happened, and name its OWN command.
 #
-# Scored on the PANE BANNER (`+list --json`'s `banner` field), not on the pane
-# text. The notice is written to both, but on Windows only the banner is
-# guaranteed to still be there: a fresh cmd.exe under ConPTY opens with a
-# full-screen repaint that erases whatever the notice printed a moment earlier
-# (measured on box - the first version of this script asserted on pane text and
-# failed here against a build that was working). The banner is a native overlay
-# a screen clear cannot reach, which is exactly why it is the second carrier.
+# Scored first on the PANE BANNER (`+list --json`'s `banner` field), which is a
+# native overlay a screen clear cannot reach. A5-A8 below are the banner's arm;
+# A10-A13 are the in-stream copy's, added by T423.
 $leavesA = All-Leaves (Wait-Leaves 'a1' 3 30)
 $sawNotice = 0; $sawA = 0; $sawB = 0; $crossTalk = 0
 foreach ($leaf in $leavesA) {
@@ -348,6 +370,44 @@ Assert "A8 no pane shows the OTHER pane's command" ($crossTalk -eq 0)
 # NOTHING, so its notice names nothing. That is T429, and it is invisible to
 # this arm by construction. The null-label rendering itself is covered by the
 # pure `session_notice` tests in the none-runtime lane.
+
+# T423: the user asked for the notice "displayed inline, above the shell content
+# but within the console logging" - the banner was never what they wanted, it
+# was the only carrier that survived. A fresh cmd.exe under ConPTY opens with a
+# full-screen repaint (`ESC[H ESC[2J`) that erased the in-stream copy, so the
+# notice is now folded into the SCROLLBACK before the child's first byte lands:
+# above the viewport is the one region conhost's repaint never addresses.
+#
+# A10 is the positive control for A12: without proof that the shell painted at
+# all, "the notice is above the shell content" is satisfied by a pane where
+# there IS no shell content.
+$textNotice = 0; $textAbove = 0; $shellPainted = 0; $textCmd = 0
+foreach ($leaf in $leavesA) {
+    $short = $leaf.id.Substring(0, 4)
+    $place = Get-NoticePlacement $leaf.id "atxt$short"
+    if ($place.notice -ge 0) { $textNotice++ }
+    if ($place.shell -ge 0) { $shellPainted++ }
+    if ($place.notice -ge 0 -and $place.shell -ge 0 -and $place.notice -lt $place.shell) { $textAbove++ }
+    $tight = (Read-Pane $leaf.id "acmd$short" 400) -replace '\s', ''
+    if ($tight.Contains("-n$MARK_A") -or $tight.Contains("-n$MARK_B")) { $textCmd++ }
+}
+Assert "A10 the fresh shell actually painted in every pane (positive control)" `
+    ($shellPainted -eq $leavesA.Count)
+Assert "A11 the notice is in the pane's OWN scrollback, not only in the banner ($textNotice)" `
+    ($textNotice -ge 2)
+Assert "A12 every pane showing the notice shows it ABOVE the shell content ($textAbove/$textNotice)" `
+    ($textNotice -ge 2 -and $textAbove -eq $textNotice)
+Assert "A13 the commanded panes name their previous command in the TEXT ($textCmd)" `
+    ($textCmd -ge 2)
+if ($DumpPanesTo -ne '') {
+    New-Item -ItemType Directory -Force $DumpPanesTo | Out-Null
+    foreach ($leaf in $leavesA) {
+        Set-Content -Encoding utf8 -Path (Join-Path $DumpPanesTo "pane-$($leaf.id.Substring(0,8)).txt") `
+            -Value (Read-Pane $leaf.id "dump$($leaf.id.Substring(0,4))" 400)
+    }
+    Copy-Item $script:AppLog (Join-Path $DumpPanesTo 'app.err.txt') -ErrorAction SilentlyContinue
+    Say "  dumped $($leavesA.Count) pane(s) to $DumpPanesTo"
+}
 
 # The point of the whole exercise: a usable shell, not a corpse.
 $respA = 0

@@ -131,6 +131,26 @@ Work these first, in order, before falling back to first-todo-in-table:
       em dash. Smallest, purest, last — one module with unit tests, and it
       should absorb the label question T425 raises rather than reword twice.
 
+00000. **THE FLOOR ITSELF IS BROKEN, 2026-08-03 — T430.** Ahead of the rest of
+    this list because it is what every other task is validated against. **Two
+    of the four standing-floor lanes can now hang forever with no output and no
+    timeout** — `zig build test-agent` (the original sighting) and, as of
+    T423's validation, `zig build test -Dapp-runtime=win32`. The win32 lane
+    hung twice out of two clean single-instance attempts, reaching 3799/3828
+    tests before stalling in a WebView2 `ViewerPane` host test that passes
+    78/78 in 20s when run alone.
+
+    Why it outranks feature work: a lane that hangs is worse than a lane that
+    fails. There is no failure text, so a turn either waits indefinitely or
+    kills its own run and reads the kill as a regression it caused — and the
+    floor stops being evidence for anything. T423 shipped with the win32 lane
+    covered only in slices (`-Dtest-filter`) for exactly this reason.
+
+    Give these lanes a timeout with a diagnostic, then chase the hang. T430
+    also records two decoys that cost three runs there: a missing/space-padded
+    `ZIG_GLOBAL_CACHE_DIR` in a detached launch reports as a corrupt cache, and
+    PowerShell buffering hides the log of a run you then kill.
+
 00000. **LOOP RELIABILITY, 2026-08-03 — T428.** Same gate as T241 below, and
     the same shape as T210: `/reset-context` cleared the session, typed the
     continuation, and the prompt sat **unsent** in the composer — **the user

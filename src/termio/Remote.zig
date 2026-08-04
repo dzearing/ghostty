@@ -775,15 +775,24 @@ pub fn threadEnter(
         // command back on a CPU. Say so, name what it was, and leave the user on
         // the fresh prompt below to decide.
         //
-        // TWO carriers, for the reason spelled out in `session_notice`: the
-        // in-stream text is selectable scrollback the user can copy the old
-        // command out of, but a ConPTY shell's startup repaint (cmd.exe's
-        // `ESC[H ESC[2J`, measured) erases it — so the same notice also goes up
-        // as a sticky pane banner, which a screen clear cannot touch.
+        // The in-stream text is written here and folded into the scrollback by
+        // the drain, on the last tick before the child's first bytes are parsed
+        // (T423). Not here, because bring-up is not finished: the fresh shell is
+        // about to hand us conhost's whole screen buffer as absolutely-positioned
+        // VT and erase anything left on the active screen (cmd.exe's
+        // `ESC[H ESC[2J`, measured), and this pane may still be narrowed by the
+        // creation of a split's sibling. Above the viewport is the one region
+        // that repaint never reaches — and it is where the user asked for the
+        // notice to be: inline, above the shell content, in the console logging.
+        // `Termio.holdNoticeAboveLocked` is what keeps it there afterwards.
         var notice_buf: [session_notice.max_len]u8 = undefined;
         const notice = session_notice.format(&notice_buf, notice_command);
         @call(.always_inline, termio.Termio.processOutput, .{ io, notice });
+        io.armNoticeFold();
 
+        // The second carrier: on screen without the user having to scroll for
+        // it. See `session_notice.formatBanner` — whether it still earns its
+        // keep now that the in-stream copy survives is T422's call.
         var banner_buf: [session_notice.max_len]u8 = undefined;
         const banner = session_notice.formatBanner(&banner_buf, notice_command);
         @call(.always_inline, termio.Termio.processOutput, .{ io, banner });
@@ -1275,6 +1284,12 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
 
         const res = ch.pop(&buf);
         if (res.read == 0) break;
+
+        // T423: the child's first bytes are in hand and nothing else can run on
+        // this thread before we parse them, so this is the last — and the only
+        // guaranteed — moment to put the session-interrupted notice above the
+        // viewport. No-op unless a notice is pending.
+        rd.io.settleNotice();
 
         // WP-D3: feed via the tracked path so `applied_bytes` advances under the
         // renderer mutex in lockstep with the parse — a snapshot reader then sees

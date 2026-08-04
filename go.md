@@ -42,6 +42,46 @@ Concretely, in order, with no stops in between:
    are listed as skipped rather than handed to you. Do not take one; if you
    find a task you cannot validate here, mark it `seat: mac` and re-run
    `next`.
+
+   **Then claim it out loud**, before you build anything:
+
+   ```
+   powershell -NoProfile -File scripts\parity-tasks.ps1 set-status <id> -Status in-progress
+   ```
+
+   This is the ONLY thing that says what is being worked right now. The loop
+   lock records the pane, the turn and a heartbeat but NOT the task, so
+   without this the dashboard can see a loop is alive and still cannot say
+   what it is doing — a watching human gets an empty "In flight" while you are
+   mid-task. Step 6 moves it to `done`; if you abandon it instead, set it back
+   to `todo` rather than leaving it in progress. A task left in-progress whose
+   file then goes untouched shows as **stale** on the dashboard and gets
+   offered up for reset, which is the cleanup path for exactly this mistake.
+
+   **Then make it readable.** Add these two sections to the task file if they
+   are not already there — they are what a human watching the dashboard sees
+   while you work:
+
+   ```markdown
+   ## In plain terms
+
+   Two or three sentences, no jargon: what is wrong or missing right now,
+   what will be different when this lands, and who notices. Name the symptom
+   a user would describe, not the mechanism.
+
+   ## Goals
+
+   - [ ] the first concrete outcome
+   - [ ] the second
+   - [x] tick them off as they land
+   ```
+
+   A task title is a defect sentence written for whoever will fix it — "the
+   session-interrupted notice never survives the ConPTY repaint" is precise
+   and tells a watching human nothing. `## In plain terms` is the version
+   they can read: no ConPTY, no repaint, no task ids. Write it for someone
+   who has never opened this repo. Tick the goals as you go, so the card
+   shows progress rather than a frozen list.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
    `zig build test` lanes, `zig build test-agent`, P1–P3).

@@ -12,9 +12,11 @@
 //! exists, and nobody asked for it a second time.
 //!
 //! So the pane comes up on a FRESH shell and prints this notice above it. This
-//! module is the notice itself and nothing else: bytes in, bytes out, no
-//! allocator, no I/O — so the exact text is unit-testable in the none-runtime
-//! lane rather than only observable by driving a GUI.
+//! module is the notice AND the terminal moves that keep it above the shell:
+//! bytes in, bytes out, plus `foldIntoScrollback` / `trackFold` / `holdAbove`
+//! (T423), which need a `Terminal` but still no allocator and no I/O — so both
+//! the exact text and its placement are unit-testable in the none-runtime lane
+//! rather than only observable by driving a GUI.
 //!
 //! SANITIZING IS THE POINT, not a nicety. The command text is DATA that came
 //! off a disk file written by another process, and we are about to write it
@@ -25,6 +27,7 @@
 //! anything.
 
 const std = @import("std");
+const terminal = @import("../terminal/main.zig");
 
 /// Longest command text rendered into the notice. A recorded command is
 /// normally a shell path or a short argv label, but nothing guarantees that, and
@@ -63,23 +66,105 @@ pub fn format(buf: []u8, command: ?[]const u8) []const u8 {
     return w.written();
 }
 
+/// Move everything above the cursor off the active screen and into the
+/// SCROLLBACK, then re-home. Call it on the last tick before the child's first
+/// bytes are parsed — NOT where the notice is written, since a pane is still
+/// being resized during bring-up and only `trackFold`/`holdAbove` defend
+/// against what a resize does afterwards.
+///
+/// T423 — this is what makes the in-stream notice actually survive, and the
+/// user asked for it by name: *"I expected the session interrupted message to
+/// be displayed inline, above the shell content but within the console
+/// logging."*
+///
+/// The scrollback is the only place it can live. A ConPTY child does not print
+/// into our terminal, it hands conhost's whole 80x25 screen buffer to us as
+/// ABSOLUTELY POSITIONED VT — a fresh `cmd.exe` opens with `ESC[H ESC[2J`
+/// (measured on box), and every later repaint addresses rows from the top of
+/// the viewport. So notice text left on the active screen is erased by that
+/// first clear, and notice text that somehow survived would only shift conhost's
+/// coordinate frame down and get painted over anyway. Above the viewport is the
+/// one region conhost never addresses, and `ESC[2J` does not reach it.
+///
+/// `cursor.y` is the exact row count the notice occupied, wrapping included —
+/// the notice ends every line with CRLF, so the cursor sits on the first row
+/// below it. Scrolling by that much puts the notice directly above the shell's
+/// first line with no blank filler between them.
+///
+/// Re-homing afterwards is not cosmetic. Conhost believes the cursor is at
+/// (1,1) when the child starts; a shell flavor that does NOT open with a
+/// repaint (the measurement is `cmd.exe`-specific) would otherwise paint from
+/// wherever the notice left us, offset from conhost's model of the same screen.
+pub fn foldIntoScrollback(t: *terminal.Terminal) void {
+    const rows_used = t.screens.active.cursor.y;
+    if (rows_used > 0) t.scrollUp(rows_used) catch |err| {
+        // Out of memory growing the scrollback. The notice is a courtesy and
+        // the pane is the product: leave the text where it is (the shell's
+        // repaint will take it) rather than fail the bring-up.
+        std.log.warn("session notice: fold into scrollback failed err={}", .{err});
+    };
+    t.setCursorPos(1, 1);
+}
+
+/// Start tracking the first row BELOW a just-folded notice, so `holdAbove` can
+/// keep it there. Returns null if the pin cannot be made; the notice is a
+/// courtesy and must never be a reason a pane fails to come up.
+///
+/// A tracked pin is the only handle that survives a reflow — it is what ghostty
+/// tracks selections with — and a reflow is precisely the event this exists to
+/// defend against. Row counts, history depths and byte offsets are all re-wrapped
+/// out from under you when the pane changes width; the pin is not.
+pub fn trackFold(t: *terminal.Terminal) ?*terminal.Pin {
+    const p = t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
+    return t.screens.active.pages.trackPin(p) catch |err| {
+        std.log.warn("session notice: could not track the fold err={}", .{err});
+        return null;
+    };
+}
+
+/// Put the notice back above the viewport if a resize dragged it down into it,
+/// and do nothing otherwise. Call after every reflow for the pane's lifetime.
+///
+/// A ConPTY pane's viewport is mostly trailing blank rows — the shell paints
+/// four lines into twenty — and ghostty's reflow refills those out of the
+/// scrollback. So narrowing a pane pulls history DOWN into the active area,
+/// where the child's next full repaint (conhost sends one after every resize)
+/// erases it. Measured at 64x20 -> 31x20: the notice's last two lines came back
+/// onto the screen and were gone a moment later. That is the reported bug — the
+/// unsplit pane kept its whole notice, the split panes kept only the first line,
+/// because only the split panes were narrowed.
+///
+/// `pin` marks the row after the notice, so its offset within the active area
+/// is exactly how far the notice has been dragged in.
+pub fn holdAbove(t: *terminal.Terminal, pin: *terminal.Pin) void {
+    const pt = t.screens.active.pages.pointFromPin(.active, pin.*) orelse return;
+    const rows = pt.coord().y;
+    if (rows == 0) return;
+
+    const old_x = t.screens.active.cursor.x;
+    const old_y = t.screens.active.cursor.y;
+    t.scrollUp(rows) catch |err| {
+        std.log.warn("session notice: could not hold the notice above err={}", .{err});
+        return;
+    };
+    // `scrollUp` restores the cursor to the row it was on, but every row moved
+    // up by `rows` — leaving the cursor that far below its own content. Follow
+    // the content instead.
+    t.setCursorPos(@as(usize, if (old_y > rows) old_y - rows else 0) + 1, @as(usize, old_x) + 1);
+}
+
 /// Render the same notice as a **sticky pane banner**, as an OSC 7778 sequence
 /// ready to be written into the pane's own stream (the app's stream handler
 /// turns it into the native overlay).
 ///
-/// This exists because the in-stream notice alone does not survive on Windows.
-/// MEASURED on box: a fresh `cmd.exe` under ConPTY opens with its copyright
-/// banner and a full-screen repaint (`ESC[H ESC[2J`), which erases everything
-/// already on the pane — including a notice printed microseconds earlier. And
-/// printing it AFTER the shell's paint would put it below the prompt, i.e.
-/// below where the user is typing. The banner has neither problem: it is a
-/// native overlay above the terminal content, so a screen clear cannot touch
-/// it, and it stays put until it is replaced or cleared.
-///
-/// The two carriers are complementary, not redundant: the in-stream text is
-/// real, selectable scrollback the user can COPY the old command out of (which
-/// is the point of naming it at all), and the banner is the copy that is
-/// guaranteed to still be on screen once the shell has finished painting.
+/// The second carrier, and deliberately still here after T423 made the
+/// in-stream copy survive. They are complementary, not redundant: the in-stream
+/// text is real, selectable scrollback the user can COPY the old command out of
+/// (which is the point of naming it at all), but it is ABOVE the viewport, so a
+/// user who does not scroll never sees it. The banner is the copy that is on
+/// screen without being asked. Whether that second copy still earns its keep —
+/// it costs the pane's own banner, which is the T422 complaint — is T422's
+/// call, not this module's.
 pub fn formatBanner(buf: []u8, command: ?[]const u8) []const u8 {
     var w: Writer = .{ .buf = buf };
     w.put("\x1b]7778;**Session interrupted** — the background terminal process was restarted, so this session was closed. Nothing was re-run.");
@@ -301,6 +386,269 @@ test "formatBanner: a command cannot break out of its code span or inject OSC" {
     try testing.expectEqual(@as(usize, 1), bel); // only the terminator
     try testing.expectEqual(@as(usize, 1), esc); // only the introducer
     try testing.expect(std.mem.indexOf(u8, out, "\\`\\*\\*x\\*\\*\\[a\\](b)\\`") != null);
+}
+
+test "foldIntoScrollback: the notice lands above the viewport, not on it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 24, .rows = 6, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    try t.printString("session interrupted\nprevious command: x\nnothing was re-run\n");
+    // The notice ends every line with CRLF, so the cursor sits one row below it
+    // and its row count is exact.
+    try testing.expectEqual(@as(usize, 3), @as(usize, t.screens.active.cursor.y));
+
+    foldIntoScrollback(&t);
+
+    const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(view);
+    try testing.expect(std.mem.indexOf(u8, view, "session interrupted") == null);
+
+    // Gone from the screen the shell is about to repaint, still in the
+    // scrollback the user scrolls back through.
+    const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(all);
+    try testing.expect(std.mem.indexOf(u8, all, "session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "previous command: x") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "nothing was re-run") != null);
+
+    // Homed, so a shell that does not open with a repaint still agrees with
+    // conhost about where (1,1) is.
+    try testing.expectEqual(@as(usize, 0), @as(usize, t.screens.active.cursor.x));
+    try testing.expectEqual(@as(usize, 0), @as(usize, t.screens.active.cursor.y));
+}
+
+test "foldIntoScrollback: a wrapped line is folded by its REAL height" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 6, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    // Twenty columns of text in a ten-column pane: two rows, not one. A fold
+    // that counted notice LINES instead of reading the cursor would leave the
+    // second half on screen for the shell's clear to eat.
+    try t.printString("0123456789abcdefghij\n");
+    try testing.expectEqual(@as(usize, 2), @as(usize, t.screens.active.cursor.y));
+
+    foldIntoScrollback(&t);
+
+    const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(view);
+    try testing.expect(std.mem.indexOf(u8, view, "abcdefghij") == null);
+    try testing.expect(std.mem.indexOf(u8, view, "0123456789") == null);
+}
+
+test "foldIntoScrollback: the whole notice survives the child's full-screen erase" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // Narrow enough that every notice line wraps — the shape of a split pane,
+    // which is where the first version of this fix lost the last two lines.
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 34, .rows = 8, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    // The notice's own text, minus the SGR runs (printString has no parser and
+    // would print a bare CR as a glyph; its `\n` is the same CR+LF the notice
+    // emits). Layout is what is under test, not the escapes.
+    try t.printString(
+        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
+            "    previous command: ping -n 9717 127.0.0.1\n" ++
+            "    nothing was re-run; this is a fresh shell.\n",
+    );
+    foldIntoScrollback(&t);
+
+    // What the fresh ConPTY shell does microseconds later.
+    t.eraseDisplay(.complete, false);
+
+    const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(all);
+    const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
+    defer alloc.free(tight);
+    try testing.expect(std.mem.indexOf(u8, tight, "session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "ping -n 9717 127.0.0.1") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null);
+}
+
+test "foldIntoScrollback: survives the erase at every plausible pane geometry" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const body =
+        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
+        "    previous command: ping -n 9717 127.0.0.1\n" ++
+        "    nothing was re-run; this is a fresh shell.\n";
+
+    // A restored pane can be any shape, and the notice is several wrapped rows
+    // in the narrow ones — including shapes where it is TALLER than the pane,
+    // so rows scroll into the scrollback while it is still being printed and
+    // `cursor.y` saturates. Every one of these must still keep the last line.
+    for ([_]u16{ 12, 20, 34, 40, 60, 80, 120 }) |cols| {
+        for ([_]u16{ 3, 4, 5, 8, 12, 24, 40 }) |rows| {
+            var t = try terminal.Terminal.init(alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .max_scrollback = 4096,
+            });
+            defer t.deinit(alloc);
+
+            try t.printString(body);
+            foldIntoScrollback(&t);
+            t.eraseDisplay(.complete, false);
+
+            const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+            defer alloc.free(all);
+            const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
+            defer alloc.free(tight);
+            testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null) catch |err| {
+                std.debug.print("lost the notice at {d}x{d}: '{s}'\n", .{ cols, rows, all });
+                return err;
+            };
+        }
+    }
+}
+
+test "foldIntoScrollback: a bring-up resize BEFORE the fold is harmless" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // This is the ordering rule the caller has to honour, and it is not
+    // cosmetic. A restored pane is not done resizing when the notice is
+    // written: creating the sibling of a split NARROWS it, and a narrowing
+    // reflow re-wraps scrollback rows back onto the active screen, where the
+    // fresh shell's `ESC[H ESC[2J` erases them. Measured on box at 100x12 ->
+    // 40x12: fold-then-reflow lost the last two lines of the notice (which is
+    // exactly what the split panes showed and the unsplit pane did not).
+    //
+    // Reflow-then-fold cannot lose anything, because the notice is still on the
+    // active screen when the re-wrap happens and `cursor.y` is read afterwards.
+    // So `Remote` folds from the drain, on the last tick before the child's
+    // first bytes are parsed.
+    for ([_][4]u16{
+        .{ 40, 6, 40, 24 }, // grow rows
+        .{ 40, 24, 40, 6 }, // shrink rows
+        .{ 40, 12, 100, 12 }, // widen (reflow)
+        .{ 100, 12, 40, 12 }, // narrow (reflow) — the measured failure
+        .{ 34, 5, 120, 40 }, // both, hard
+    }) |g| {
+        var t = try terminal.Terminal.init(alloc, .{
+            .cols = g[0],
+            .rows = g[1],
+            .max_scrollback = 4096,
+        });
+        defer t.deinit(alloc);
+
+        try t.printString(
+            "\n--- session interrupted: the background terminal process was restarted ---\n" ++
+                "    previous command: ping -n 9717 127.0.0.1\n" ++
+                "    nothing was re-run; this is a fresh shell.\n",
+        );
+        try t.resize(alloc, g[2], g[3]);
+        foldIntoScrollback(&t);
+        t.eraseDisplay(.complete, false);
+
+        const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(all);
+        const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
+        defer alloc.free(tight);
+        testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null) catch |err| {
+            std.debug.print("lost the notice across {d}x{d} -> {d}x{d}\n", .{ g[0], g[1], g[2], g[3] });
+            return err;
+        };
+    }
+}
+
+test "holdAbove: a narrowing reflow drags the notice back, and the guard puts it away" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // THE measured bug, at the measured geometry. Restore opens the pane at the
+    // window's full width and writes the notice; creating the split's sibling
+    // then narrows it. Ghostty's reflow refills a blank viewport out of the
+    // scrollback, so the tail of the notice lands back on the active screen -
+    // and the shell's next full repaint (conhost sends one after every resize)
+    // erases it. On box that showed up as the unsplit pane keeping the whole
+    // notice while the split panes kept only its first line.
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 64, .rows = 20, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    try t.printString(
+        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
+            "    previous command: ping -n 9778 127.0.0.1\n" ++
+            "    nothing was re-run; this is a fresh shell.\n",
+    );
+    foldIntoScrollback(&t);
+    const guard = trackFold(&t).?;
+    defer t.screens.active.pages.untrackPin(guard);
+    {
+        const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(view);
+        try testing.expectEqualStrings("", view);
+    }
+
+    // The child paints, the way it does after every bring-up.
+    try t.printString("Microsoft Windows [Version 10.0.26200.8973]\nC:\\work>");
+
+    try t.resize(alloc, 31, 20);
+    {
+        // Not an aspiration - this is what the terminal DOES, and the whole
+        // reason the guard exists rather than a single well-timed fold.
+        const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(view);
+        try testing.expect(std.mem.indexOf(u8, view, "nothing was re-run") != null);
+    }
+
+    holdAbove(&t, guard);
+    {
+        const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(view);
+        try testing.expect(std.mem.indexOf(u8, view, "nothing was re-run") == null);
+        // The child's own content stays where the child can see it.
+        try testing.expect(std.mem.indexOf(u8, view, "Microsoft Windows") != null);
+    }
+
+    // And what the child does next cannot reach it.
+    t.eraseDisplay(.complete, false);
+    const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(all);
+    const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
+    defer alloc.free(tight);
+    try testing.expect(std.mem.indexOf(u8, tight, "session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "ping -n 9778 127.0.0.1") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null);
+}
+
+test "holdAbove: does nothing when the notice is already above the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 40, .rows = 10, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    try t.printString("--- session interrupted ---\n");
+    foldIntoScrollback(&t);
+    const guard = trackFold(&t).?;
+    defer t.screens.active.pages.untrackPin(guard);
+
+    try t.printString("C:\\work>dir\nvolume label\nC:\\work>");
+    const before = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(before);
+
+    // The guard runs after every resize for the pane's whole life, so the case
+    // that must cost nothing is the one that happens every time.
+    holdAbove(&t, guard);
+    const after = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "foldIntoScrollback: an empty screen is a homing no-op" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 24, .rows = 6, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    t.setCursorPos(1, 5);
+    foldIntoScrollback(&t);
+    try testing.expectEqual(@as(usize, 0), @as(usize, t.screens.active.cursor.x));
+    try testing.expectEqual(@as(usize, 0), @as(usize, t.screens.active.cursor.y));
 }
 
 test "format: a short buffer truncates instead of overflowing" {

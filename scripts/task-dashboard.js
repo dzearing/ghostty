@@ -114,7 +114,7 @@ function extractSummary(body) {
   const stop = rest.search(/^\s*#{2,}\s/m);
   const block = (stop < 0 ? rest : rest.slice(0, stop)).trim();
   const para = block.split(/\n\s*\n/)[0] || '';
-  return para.replace(/\s+/g, ' ').trim();
+  return stripMarkdown(para);
 }
 
 /** T01 < T89b < T89f1 < T90b < T111a < T428 — number first, then suffix. */
@@ -158,7 +158,18 @@ function loadTasks() {
       status,
       bucket: bucketOf(status),
       reason: statusReason(status),
+      // How a human gets this unblocked. Free text, plus an optional command
+      // to copy. A blocked task with no `unblock:` is a dead end on a board,
+      // which is the complaint this field exists to answer.
+      unblock: F.unblock == null ? null : String(F.unblock),
+      unblockCommand: F['unblock-command'] == null ? null : String(F['unblock-command']),
       summary: extractSummary(text.slice(fm.bodyStart)),
+      // Written by the loop when it claims a task (go.md step 1). Task titles
+      // are defect sentences aimed at whoever will fix them — "the notice
+      // never survives the ConPTY repaint" tells a watching human nothing.
+      // These two sections are the readable version.
+      plain: extractSection(text.slice(fm.bodyStart), 'In plain terms'),
+      goals: parseGoals(extractSection(text.slice(fm.bodyStart), 'Goals')),
       file: REL_TASK_DIR + '/' + f,
     });
   }
@@ -227,6 +238,30 @@ function parseOptions(fmText) {
     if (m && out.length) { out[out.length - 1].detail = parseValue(m[1]) || ''; }
   }
   return out;
+}
+
+/** A markdown checklist -> [{done, text}]. Anything else in the section is ignored. */
+function parseGoals(section) {
+  const out = [];
+  for (const line of String(section || '').split(/\r?\n/)) {
+    const m = /^\s*[-*]\s*\[([ xX])\]\s*(.+?)\s*$/.exec(line);
+    if (m) out.push({ done: m[1] !== ' ', text: stripMarkdown(m[2]) });
+  }
+  return out;
+}
+
+/**
+ * Flatten inline markdown to plain text. The page renders with textContent, so
+ * `**bold**` would otherwise show its asterisks.
+ */
+function stripMarkdown(s) {
+  return String(s || '')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(^|\W)[*_]([^*_]+)[*_](?=\W|$)/g, '$1$2')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function extractSection(body, heading) {
@@ -525,6 +560,78 @@ function branchName() {
 }
 
 /**
+ * What the go-loop is doing right now, from its lock file.
+ *
+ * The lock records the pane, the turn number and a heartbeat, but NOT which
+ * task is being worked — so "in flight" has to come from tasks marked
+ * in-progress (go.md step 1). The heartbeat is what separates "a task is
+ * marked in-progress because work is happening" from "someone left it that
+ * way in July": the watchdog treats ~45 min of silence as dead, so this does
+ * too.
+ */
+function loopState() {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(REPO, 'temp', 'go-loop.lock.json'), 'utf8');
+  } catch {
+    return null;
+  }
+  let j;
+  try {
+    j = JSON.parse(raw.replace(/^﻿/, '')); // PowerShell writes a BOM
+  } catch {
+    return null;
+  }
+  if (!j || j.state === 'free') return null;
+  const beat = j.heartbeat ? Date.parse(j.heartbeat) : null;
+  const age = beat ? Date.now() - beat : null;
+  return {
+    paneId: j.pane_id || null,
+    claudePid: j.claude_pid || null,
+    turn: j.turn == null ? null : j.turn,
+    acquired: j.acquired ? Date.parse(j.acquired) : null,
+    heartbeat: beat,
+    heartbeatAgeMs: age,
+    // LIVENESS IS THE PROCESS, NOT THE HEARTBEAT. The lock is only refreshed
+    // at task boundaries (go.md step 6), so a genuinely long turn goes quiet
+    // for an hour while working perfectly — reading that as "not responding"
+    // cried wolf on a loop that was 46 minutes into a task. The heartbeat
+    // still matters, but as "last checkpoint", not as a pulse.
+    running: pidAlive(j.claude_pid),
+    // Kept for the watchdog's own framing: past this it WILL re-enter.
+    checkpointStale: age != null && age >= 45 * 60 * 1000,
+  };
+}
+
+/**
+ * Does this pid still exist? Signal 0 tests for the process without touching
+ * it; EPERM means it exists and is not ours to signal.
+ */
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+/**
+ * Git's last-commit time for a file. Used only for the handful of in-progress
+ * and blocked tasks, so one `git log` each is fine; doing it for all 460 would
+ * not be.
+ */
+function lastTouched(relPath) {
+  try {
+    const out = git(['log', '-1', '--format=%at', '--', relPath]).trim();
+    return out ? Number(out) * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Identity of the code currently being served. The page compares it against
  * the value it loaded with and reloads itself when it changes.
  *
@@ -606,6 +713,18 @@ function buildPayload() {
   const decisions = loadDecisions();
   const taskById = new Map(tasks.map((t) => [t.id, t]));
   const activity = buildActivity(history.points, taskById, decisions);
+  const loop = loopState();
+
+  // Date the file was last touched, for in-progress and blocked tasks only —
+  // that is what tells a 20-minute-old "in progress" apart from a five-day-old
+  // one nobody ever reset.
+  const STALE_MS = 24 * 3600 * 1000;
+  for (const t of tasks) {
+    if (t.bucket !== 'in_progress' && t.bucket !== 'blocked') continue;
+    t.touchedAt = lastTouched(t.file);
+    t.staleMs = t.touchedAt ? now - t.touchedAt : null;
+    t.stale = t.bucket === 'in_progress' && t.staleMs != null && t.staleMs > STALE_MS;
+  }
 
   const week = now - 7 * 864e5;
   return {
@@ -613,6 +732,7 @@ function buildPayload() {
     pageVersion: pageVersion(),
     branch: branchName(),
     taskDir: REL_TASK_DIR,
+    loop,
     decisions,
     openDecisions: decisions.filter((d) => d.status !== 'resolved').length,
     activity,
@@ -714,6 +834,14 @@ function handlePost(url, body) {
     if (body.note) args.push('-Note', String(body.note).slice(0, 2000));
     if (!body.answer && !body.note) throw new Error('pick an option or write a note');
     return { ok: true, message: ps('parity-decisions.ps1', args) };
+  }
+  if (url === '/api/status') {
+    const id = must(body.id, /^T\d+[a-z0-9]*$/i, 'task id');
+    // Only the transitions a human makes from this page. Marking something
+    // `done` is the loop's job and needs evidence + a commit sha, so it is
+    // deliberately not offered here.
+    const status = must(body.status, /^(todo|in-progress|blocked)$/, 'status');
+    return { ok: true, message: ps('parity-tasks.ps1', ['set-status', id, '-Status', status]) };
   }
   if (url === '/api/task') {
     const title = String(body.title || '').trim();
