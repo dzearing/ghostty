@@ -163,6 +163,11 @@ function loadTasks() {
       // which is the complaint this field exists to answer.
       unblock: F.unblock == null ? null : String(F.unblock),
       unblockCommand: F['unblock-command'] == null ? null : String(F['unblock-command']),
+      // Triage rank (P0 severe / P1 feature+polish / P2 infra) and the one-line
+      // reason for it. Absent means untriaged, which sorts AFTER P2 — a task
+      // nobody ranked should not outrank one somebody deliberately called P2.
+      priority: /^P[012]$/.test(String(F.priority || '')) ? String(F.priority) : null,
+      triageReason: F['triage-reason'] == null ? null : String(F['triage-reason']),
       summary: extractSummary(text.slice(fm.bodyStart)),
       // Written by the loop when it claims a task (go.md step 1). Task titles
       // are defect sentences aimed at whoever will fix them — "the notice
@@ -632,6 +637,99 @@ function lastTouched(relPath) {
 }
 
 /**
+ * Created / last-modified time for EVERY task file, from ONE
+ * `git log --name-only` walk over the tasks directory rather than 485
+ * `git log -1` calls (which takes minutes on this box).
+ *
+ * Two wrinkles worth knowing:
+ *
+ * 1. A bulk triage pass rewrites the frontmatter of every open task in a
+ *    single commit. Counting that as a modification would stamp the entire
+ *    tracker "modified today" and destroy exactly the signal this column
+ *    exists to carry, so commits whose subject starts with `chore(triage)` do
+ *    not count as modifications. They still establish `created`, and a file
+ *    whose ONLY commit is a triage commit falls back to it — otherwise a task
+ *    filed in the same breath as a triage would report no date at all.
+ * 2. A task created but not yet committed has no git dates. The filesystem is
+ *    the fallback, so a task filed thirty seconds ago still shows up dated.
+ */
+let dateCache = { head: null, map: null };
+function fileDates() {
+  let head = '';
+  try {
+    head = git(['rev-parse', 'HEAD']).trim();
+  } catch {}
+  if (dateCache.head === head && dateCache.map) return dateCache.map;
+
+  const map = new Map();
+  let out = '';
+  try {
+    // %x1e record separator, then "<ts> <subject>" and the file list.
+    out = git(['log', '--name-only', '--format=%x1e%at\x1f%s', '--', REL_TASK_DIR]);
+  } catch {
+    out = '';
+  }
+  for (const rec of out.split('\x1e')) {
+    if (!rec.trim()) continue;
+    const nl = rec.indexOf('\n');
+    const headLine = nl < 0 ? rec : rec.slice(0, nl);
+    const [tsRaw, subject] = headLine.split('\x1f');
+    const ts = Number(tsRaw) * 1000;
+    if (!ts) continue;
+    const isTriage = /^chore\(triage\)/.test((subject || '').trim());
+    for (const line of (nl < 0 ? '' : rec.slice(nl + 1)).split('\n')) {
+      const p = line.trim();
+      if (!p.endsWith('.md') || !p.startsWith(REL_TASK_DIR)) continue;
+      const id = path.basename(p, '.md');
+      let e = map.get(id);
+      if (!e) {
+        e = { created: ts, modified: null, modifiedAny: ts };
+        map.set(id, e);
+      }
+      // git log walks newest-first, so every later record is older.
+      e.created = Math.min(e.created, ts);
+      e.modifiedAny = Math.max(e.modifiedAny, ts);
+      if (!isTriage) e.modified = Math.max(e.modified || 0, ts);
+    }
+  }
+  for (const e of map.values()) if (!e.modified) e.modified = e.modifiedAny;
+
+  dateCache = { head, map };
+  return map;
+}
+
+/**
+ * Task files with uncommitted changes. For those the git date is stale by
+ * definition, so the filesystem mtime is the newer truth. Everywhere else the
+ * git date wins, because a fresh clone gives every file the same checkout
+ * mtime and would report the whole tracker as modified today.
+ */
+function dirtyTasks() {
+  const set = new Set();
+  let out = '';
+  try {
+    out = git(['status', '--porcelain', '--', REL_TASK_DIR]);
+  } catch {
+    return set;
+  }
+  for (const line of out.split('\n')) {
+    const p = line.slice(3).trim().replace(/^"|"$/g, '');
+    if (p.endsWith('.md')) set.add(path.basename(p, '.md'));
+  }
+  return set;
+}
+
+/** Filesystem fallback for a task that git has never seen. */
+function statDates(relPath) {
+  try {
+    const s = fs.statSync(path.join(REPO, relPath));
+    return { created: Math.round(s.birthtimeMs || s.mtimeMs), modified: Math.round(s.mtimeMs) };
+  } catch {
+    return { created: null, modified: null };
+  }
+}
+
+/**
  * Identity of the code currently being served. The page compares it against
  * the value it loaded with and reloads itself when it changes.
  *
@@ -726,8 +824,26 @@ function buildPayload() {
     t.stale = t.bucket === 'in_progress' && t.staleMs != null && t.staleMs > STALE_MS;
   }
 
+  // Created / modified for every task, so the table can sort on them.
+  const dates = fileDates();
+  const dirty = dirtyTasks();
+  for (const t of tasks) {
+    const g = dates.get(t.id);
+    const fsd = g && !dirty.has(t.id) ? null : statDates(t.file);
+    t.createdAt = g ? g.created : fsd.created;
+    t.modifiedAt = g ? (fsd ? Math.max(g.modified, fsd.modified || 0) : g.modified) : fsd.modified;
+  }
+
+  const priorities = new Map();
+  for (const t of tasks) {
+    if (!OPEN_BUCKETS.has(t.bucket)) continue;
+    const key = t.priority || 'untriaged';
+    priorities.set(key, (priorities.get(key) || 0) + 1);
+  }
+
   const week = now - 7 * 864e5;
   return {
+    priorities: ['P0', 'P1', 'P2', 'untriaged'].map((p) => ({ priority: p, open: priorities.get(p) || 0 })),
     generatedAt: now,
     pageVersion: pageVersion(),
     branch: branchName(),
@@ -870,6 +986,30 @@ function serve(port) {
       }
       if (url === '/api/data') {
         return send(res, 200, 'application/json; charset=utf-8', JSON.stringify(buildPayload()));
+      }
+      // Full task text, on demand. The detail popup wants the whole file, and
+      // 485 whole files in every poll payload would be megabytes on the wire
+      // every five seconds.
+      if (url === '/api/task') {
+        const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+        // Path traversal: the id is echoed into a filename, so it is matched
+        // against the id grammar rather than sanitised.
+        if (!/^T\d+[a-z]?\d*$/i.test(id)) {
+          return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad id' }));
+        }
+        const file = path.join(TASK_DIR, id + '.md');
+        let text;
+        try {
+          text = fs.readFileSync(file, 'utf8');
+        } catch {
+          return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'no such task' }));
+        }
+        const fm = parseFrontmatter(text);
+        return send(res, 200, 'application/json; charset=utf-8', JSON.stringify({
+          id,
+          file: REL_TASK_DIR + '/' + id + '.md',
+          body: fm ? text.slice(fm.bodyStart) : text,
+        }));
       }
       if (url === '/' || url === '/index.html') {
         return send(res, 200, 'text/html; charset=utf-8', fs.readFileSync(PAGE, 'utf8'));

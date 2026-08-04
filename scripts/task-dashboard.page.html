@@ -202,14 +202,49 @@ th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: var(--ink); }
 th.sortable:focus-visible { outline: 2px solid var(--open); outline-offset: -2px; }
 th.sortable.active { color: var(--ink); font-weight: 600; }
-td.fin { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+td.fin, td.when { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
 .tasks tr.t-row { cursor: pointer; }
 .tasks tr.t-row:hover td { background: var(--surface-2); }
+.tasks tr.t-row:focus-visible { outline: 2px solid var(--open); outline-offset: -2px; }
 .t-title { color: var(--ink); }
 .t-sum { color: var(--muted); margin-top: 3px; display: none; }
-.tasks tr.open .t-sum { display: block; }
 .t-deps { color: var(--muted); font-size: 11px; margin-top: 3px; }
 @media (max-width: 700px) { .hide-sm { display: none; } }
+
+/* Priority badge. Severity is never colour alone — the rank is written in the
+   badge — so it survives a colour-blind reader and a greyscale screenshot. */
+.pri { display: inline-block; min-width: 24px; text-align: center; padding: 1px 5px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums;
+  border: 1px solid var(--hairline); color: var(--muted); background: var(--surface-2); }
+.pri.P0 { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent);
+  background: color-mix(in srgb, var(--critical) 12%, transparent); }
+.pri.P1 { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  background: color-mix(in srgb, var(--warning) 12%, transparent); }
+.pri.P2 { color: var(--ink-2); }
+
+/* Task detail dialog */
+dialog.taskdlg { width: min(820px, 92vw); max-height: 86vh; padding: 0; border: 1px solid var(--hairline);
+  border-radius: 10px; background: var(--surface-1); color: var(--ink);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .38); overflow: hidden;
+  display: flex; flex-direction: column; }
+dialog.taskdlg::backdrop { background: rgba(0, 0, 0, .5); }
+dialog.taskdlg header { display: flex; align-items: center; gap: 10px; padding: 12px 14px 0 14px; }
+.td-head { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+.td-id { color: var(--muted); font-size: 12px; }
+.td-x { margin-left: auto; font-size: 20px; line-height: 1; width: 28px; height: 28px; flex: none;
+  border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+.td-x:hover { background: var(--surface-2); color: var(--ink); }
+.td-x:focus-visible { outline: 2px solid var(--open); outline-offset: -2px; }
+.td-title { margin: 8px 14px 0 14px; font-size: 15px; font-weight: 600; line-height: 1.35; }
+.td-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 10px 14px 0 14px; font-size: 12px; }
+.td-bit b { color: var(--muted); font-weight: 500; margin-right: 5px; }
+.td-why { margin: 10px 14px 0 14px; padding: 8px 10px; border-radius: 6px; font-size: 12px;
+  color: var(--ink-2); background: var(--surface-2); }
+.td-body { margin: 12px 14px; overflow: auto; flex: 1; min-height: 0; }
+.td-md { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.55;
+  color: var(--ink-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+dialog.taskdlg footer { padding: 10px 14px; border-top: 1px solid var(--hairline); background: var(--surface-2); }
+.td-path { font-size: 11px; color: var(--muted); }
 
 .empty { color: var(--muted); font-size: 12px; }
 .att { display: flex; flex-direction: column; gap: 10px; }
@@ -294,7 +329,7 @@ var state = {
   data: null, sig: '', busy: false, pageVersion: null,
   sort: { key: 'id', dir: -1 },   // newest task first
   view: VIEWS.indexOf((location.hash || '').slice(1)) >= 0 ? location.hash.slice(1) : 'activity',
-  filters: { q: '', status: '', seat: '', phase: '' },
+  filters: { q: '', status: '', priority: '', seat: '', phase: '' },
   open: {},        // expanded task rows
   notes: {},       // in-progress decision notes, kept across re-renders
   shown: PAGE_SIZE // timeline paging
@@ -961,6 +996,10 @@ function tasksView(d) {
   var controls = h('div', { class: 'filters' }, [
     input,
     sel('status', 'Any status', Object.keys(STATUS_LABEL).map(function (k) { return [k, STATUS_LABEL[k]]; })),
+    sel('priority', 'Any priority', [
+      ['P0', 'P0 - severe'], ['P1', 'P1 - feature + polish'],
+      ['P2', 'P2 - infra'], ['untriaged', 'Untriaged']
+    ]),
     sel('seat', 'Any seat', d.seats.map(function (x) { return [x.seat, 'Seat: ' + x.seat]; })),
     sel('phase', 'Any phase', phases.map(function (p) { return [p, p === '—' ? 'Unphased' : 'Phase ' + p]; })),
     h('span', { class: 'count', id: 'tcount' })
@@ -981,15 +1020,18 @@ function tasksView(d) {
   var table = h('table', { class: 'tasks' }, [
     h('thead', null, [h('tr', null, [
       sortable('ID', 'id'),
+      sortable('Pri', 'priority'),
       h('th', { text: 'Status' }),
       h('th', { text: 'Task' }),
+      sortable('Created', 'created', 'hide-sm'),
+      sortable('Modified', 'modified'),
       sortable('Finished', 'finished'),
       h('th', { class: 'hide-sm', text: 'Phase' }),
       h('th', { class: 'hide-sm', text: 'Seat' })
     ])]),
     h('tbody', { id: 'tbody' })
   ]);
-  return [card('All tasks', 'Newest first. Click a row for its summary, or a header to re-sort.',
+  return [card('All tasks', 'Click a row for the full task, or a header to re-sort.',
     [controls, h('div', { class: 'tv-wrap' }, [table])])];
 }
 
@@ -1005,12 +1047,74 @@ function idRank(id) {
   return m ? Number(m[1]) * 1000 + (m[2] ? m[2].charCodeAt(0) - 96 : 0) : 0;
 }
 
+/** P0 first, untriaged last. */
+function priRank(p) { return p === 'P0' ? 0 : p === 'P1' ? 1 : p === 'P2' ? 2 : 9; }
+
+/** A date cell: short label, full date + time on hover, em dash when unknown. */
+function dateCell(ts, cls) {
+  return h('td', {
+    class: 'when ' + (cls || ''),
+    title: ts ? fDate(ts) + ' ' + fTime(ts) : '',
+    text: ts ? fDay(ts) : '—'
+  });
+}
+
+/* --- task detail dialog ---------------------------------------------------
+   The row list shows a one-line summary; the whole task file is a fetch away
+   rather than in every poll payload, because 485 whole files every five
+   seconds is megabytes on the wire for content nobody is looking at. */
+function openTask(t) {
+  var body = h('div', { class: 'td-body', text: 'Loading…' });
+  var dlg = h('dialog', { class: 'taskdlg' }, [
+    h('header', null, [
+      h('div', { class: 'td-head' }, [
+        h('span', { class: 'pri ' + (t.priority || 'none'), text: t.priority || '--' }),
+        h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]]),
+        h('code', { class: 'td-id', text: t.id })
+      ]),
+      h('button', { class: 'td-x', 'aria-label': 'Close', text: '×', onclick: function () { dlg.close(); } })
+    ]),
+    h('h3', { class: 'td-title', text: t.title }),
+    h('div', { class: 'td-meta' }, [
+      metaBit('Created', t.createdAt ? fDate(t.createdAt) : 'unknown'),
+      metaBit('Modified', t.modifiedAt ? fDate(t.modifiedAt) : 'unknown'),
+      t.completedAt ? metaBit('Finished', fDate(t.completedAt)) : null,
+      metaBit('Seat', t.seat),
+      t.phase ? metaBit('Phase', t.phase) : null,
+      t.deps && t.deps.length ? metaBit('Deps', t.deps.join(', ')) : null
+    ]),
+    t.triageReason ? h('div', { class: 'td-why', text: 'Triage: ' + t.triageReason }) : null,
+    body,
+    h('footer', null, [h('code', { class: 'td-path', text: 'docs/design/windows-parity-tasks/' + t.id + '.md' })])
+  ]);
+  document.body.appendChild(dlg);
+  // Clicking the backdrop (i.e. the dialog element itself, outside its
+  // content box) closes — the standard <dialog> idiom.
+  dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+  dlg.addEventListener('close', function () { dlg.remove(); });
+  dlg.showModal();
+
+  fetch('/api/task?id=' + encodeURIComponent(t.id))
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      body.textContent = '';
+      // textContent, not innerHTML: the task body is markdown authored by a
+      // loop, and it is rendered as preformatted text rather than parsed.
+      body.appendChild(h('pre', { class: 'td-md', text: (j.body || '').trim() }));
+    })
+    .catch(function (e) { body.textContent = 'Could not load: ' + e.message; });
+}
+function metaBit(label, value) {
+  return h('span', { class: 'td-bit' }, [h('b', { text: label }), h('span', { text: String(value) })]);
+}
+
 function renderTasks() {
   var d = state.data;
   if (!d) return;
   var f = state.filters, q = f.q.trim().toLowerCase();
   var rows = d.tasks.filter(function (t) {
     if (f.status && t.bucket !== f.status) return false;
+    if (f.priority && (t.priority || 'untriaged') !== f.priority) return false;
     if (f.seat && t.seat !== f.seat) return false;
     if (f.phase && (t.phase || '—') !== f.phase) return false;
     if (q && (t.id + ' ' + t.title + ' ' + t.summary).toLowerCase().indexOf(q) < 0) return false;
@@ -1018,11 +1122,20 @@ function renderTasks() {
   });
 
   var dir = state.sort.dir;
+  // A date key sorts on its own value; rows with no date park at the end in
+  // BOTH directions rather than letting a null sort as "oldest".
+  var DATE_KEY = { finished: 'completedAt', created: 'createdAt', modified: 'modifiedAt' };
   rows.sort(function (a, b) {
-    if (state.sort.key === 'finished') {
-      // Unfinished tasks have no date; park them after everything dated,
-      // whichever direction is active, rather than letting 0 sort as "oldest".
-      var av = a.completedAt, bv = b.completedAt;
+    var k = state.sort.key;
+    if (k === 'priority') {
+      // Untriaged after P2, always — an unranked task must not outrank one
+      // somebody deliberately called nice-to-have.
+      var ar = priRank(a.priority), br = priRank(b.priority);
+      if (ar !== br) return (ar - br) * (dir < 0 ? 1 : -1);
+      return idRank(b.id) - idRank(a.id);
+    }
+    if (DATE_KEY[k]) {
+      var av = a[DATE_KEY[k]], bv = b[DATE_KEY[k]];
       if (av == null && bv == null) return (idRank(b.id) - idRank(a.id)) * (dir < 0 ? 1 : -1);
       if (av == null) return 1;
       if (bv == null) return -1;
@@ -1035,15 +1148,23 @@ function renderTasks() {
   if (!body) return;
   body.innerHTML = '';
   rows.forEach(function (t) {
-    var tr = h('tr', { class: 't-row' + (state.open[t.id] ? ' open' : ''),
-      onclick: function () { state.open[t.id] = !state.open[t.id]; tr.classList.toggle('open'); } }, [
+    var pri = t.priority || '--';
+    var tr = h('tr', {
+      class: 't-row', role: 'button', tabindex: '0',
+      title: t.triageReason || '',
+      onclick: function () { openTask(t); },
+      onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTask(t); } }
+    }, [
       h('td', { text: t.id }),
+      h('td', null, [h('span', { class: 'pri ' + (t.priority || 'none'), text: pri })]),
       h('td', null, [h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]])]),
       h('td', null, [
         h('div', { class: 't-title', text: t.title }),
         t.summary ? h('div', { class: 't-sum', text: t.summary }) : null,
         t.deps.length ? h('div', { class: 't-deps', text: 'deps: ' + t.deps.join(', ') }) : null
       ]),
+      dateCell(t.createdAt, 'hide-sm'),
+      dateCell(t.modifiedAt, ''),
       h('td', { class: 'fin', title: t.completedAt ? fDate(t.completedAt) + ' ' + fTime(t.completedAt) : '',
         text: t.completedAt ? fDay(t.completedAt) : (t.bucket === 'done' ? 'before tracking' : '—') }),
       h('td', { class: 'hide-sm', text: t.phase || '—' }),
@@ -1145,6 +1266,22 @@ function refresh(force) {
 }
 
 function poll() { refresh(false).finally(function () { setTimeout(poll, POLL_MS); }); }
+
+/* `?task=T377` opens that task's dialog once the data has loaded, so a task is
+   linkable — and so the dialog is reachable from a headless screenshot, which
+   is how it gets checked. Fires once, not on every poll. */
+var deepLink = /[?&]task=([A-Za-z]\d+[a-z]?\d*)/.exec(location.search);
+if (deepLink) {
+  var wanted = deepLink[1].toUpperCase(), fired = false;
+  var openWhenReady = setInterval(function () {
+    if (fired || !state.data) return;
+    var t = state.data.tasks.filter(function (x) { return x.id.toUpperCase() === wanted; })[0];
+    fired = true;
+    clearInterval(openWhenReady);
+    if (t) openTask(t);
+  }, 120);
+}
+
 renderNav();
 poll();
 </script>

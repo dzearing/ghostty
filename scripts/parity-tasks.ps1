@@ -27,13 +27,20 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
     [string]$Id,
 
     [string]$Status,
+
+    # P0 severe (crash, hang, data loss, a broken feature) | P1 feature work and
+    # UX polish | P2 infra and nice-to-have. `next` picks P0 before P1 before
+    # P2, which is the whole point of the field: without it the loop worked in
+    # id order and shipped whatever had been logged most recently.
+    [ValidateSet('P0', 'P1', 'P2')]
+    [string]$Priority,
     [string]$Phase,
     [string[]]$Deps,
     [string]$Title,
@@ -66,6 +73,12 @@ if (-not (Test-Path $TaskDir)) {
 $DefaultSeat = 'win'
 $ValidSeats = @('win', 'mac', 'any')
 
+# The priority a `new` task gets when none is given. P1 is "feature work and
+# polish", which is what most parity tasks are; something severe or something
+# merely nice gets said out loud with -Priority.
+$DefaultPriority = 'P1'
+$ValidPriorities = @('P0', 'P1', 'P2')
+
 # ---------------------------------------------------------------- parsing ---
 
 function ConvertFrom-Frontmatter {
@@ -96,15 +109,34 @@ function ConvertFrom-Frontmatter {
     $seat = & $unquote (& $get 'seat')
     if (-not $seat) { $seat = $DefaultSeat }
 
+    # Absent priority means untriaged. It sorts AFTER P2 rather than defaulting
+    # to the middle: a task nobody has ranked should not outrank one somebody
+    # deliberately called P2.
+    $priority = & $unquote (& $get 'priority')
+    if ($priority -notin $ValidPriorities) { $priority = '' }
+
     [PSCustomObject]@{
-        Id      = & $get 'id'
-        Title   = & $unquote (& $get 'title')
-        Phase   = & $unquote (& $get 'phase')
-        Deps    = & $parseList (& $get 'deps')
-        Status  = & $unquote (& $get 'status')
-        Commits = & $parseList (& $get 'commits')
-        Seat    = $seat
-        Path    = $Path
+        Id           = & $get 'id'
+        Title        = & $unquote (& $get 'title')
+        Phase        = & $unquote (& $get 'phase')
+        Deps         = & $parseList (& $get 'deps')
+        Status       = & $unquote (& $get 'status')
+        Commits      = & $parseList (& $get 'commits')
+        Seat         = $seat
+        Priority     = $priority
+        TriageReason = & $unquote (& $get 'triage-reason')
+        Path         = $Path
+    }
+}
+
+# Sort key for a priority: P0 first, untriaged last.
+function Get-PriorityRank {
+    param([string]$P)
+    switch ($P) {
+        'P0' { return 0 }
+        'P1' { return 1 }
+        'P2' { return 2 }
+        default { return 9 }
     }
 }
 
@@ -160,9 +192,11 @@ switch ($Command) {
         $wantSeat = if ($Seat) { $Seat } else { 'all' }
         if ($Status) { $tasks = $tasks | Where-Object { $_.Status -like "$Status*" } }
         if ($Phase) { $tasks = $tasks | Where-Object { $_.Phase -eq $Phase } }
+        if ($Priority) { $tasks = $tasks | Where-Object { $_.Priority -eq $Priority } }
         $tasks = @($tasks | Where-Object { Test-SeatMatch $_.Seat $wantSeat })
         $tasks | Select-Object `
             Id,
+        @{ N = 'Pri'; E = { if ($_.Priority) { $_.Priority } else { '--' } } },
         Status,
         Phase,
         Seat,
@@ -193,8 +227,19 @@ switch ($Command) {
             }
         }
 
+        # PRIORITY FIRST, then id. Before this the selector walked the files in
+        # id order, so the loop worked whatever had been logged earliest and a
+        # crash filed yesterday queued behind two hundred older nice-to-haves -
+        # the user's complaint on 2026-08-04. Id order survives as the
+        # tiebreaker inside a priority band, so the ordering is still total and
+        # still deterministic.
+        $ordered = $tasks | Sort-Object `
+        @{ Expression = { Get-PriorityRank $_.Priority } }, `
+        @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
+        @{ Expression = { $_.Id } }
+
         $blocked = @()
-        foreach ($t in $tasks) {
+        foreach ($t in $ordered) {
             if ($t.Status -notmatch '^todo') { continue }
             if (-not (Test-SeatMatch $t.Seat $wantSeat)) { continue }
             $unmet = @()
@@ -204,7 +249,9 @@ switch ($Command) {
             }
             if ($unmet.Count -eq 0) {
                 Write-Host ("NEXT: {0} - {1}" -f $t.Id, $t.Title)
-                Write-Host ("      phase={0} deps={1} seat={2}" -f $t.Phase, ($t.Deps -join ','), $t.Seat)
+                $pri = if ($t.Priority) { $t.Priority } else { 'untriaged' }
+                Write-Host ("      priority={0} phase={1} deps={2} seat={3}" -f $pri, $t.Phase, ($t.Deps -join ','), $t.Seat)
+                if ($t.TriageReason) { Write-Host ("      why: {0}" -f $t.TriageReason) }
                 Write-Host ("      file: docs/design/windows-parity-tasks/{0}.md" -f $t.Id)
                 if ($blocked.Count -gt 0) {
                     Write-Host ""
@@ -247,6 +294,33 @@ switch ($Command) {
         Write-Host ("{0} -> {1}" -f $tid, $Status)
     }
 
+    'set-priority' {
+        $tid = Get-TaskId $Id
+        if (-not $Priority) { throw 'set-priority requires -Priority (P0|P1|P2).' }
+        $path = Get-TaskPath $tid
+        $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        $json = ConvertTo-Json $Priority -Compress
+        if ($text -match '(?m)^priority:\s*.*$') {
+            $new = [regex]::Replace($text, '(?m)^priority:\s*.*$', "priority: $json", 1)
+        }
+        else {
+            # A file written before priorities existed has no line to replace,
+            # so put one directly under status: where every triaged file has it.
+            $new = [regex]::Replace($text, '(?m)^(status:\s*.*)$', "`$1`npriority: $json", 1)
+        }
+        if ($Summary) {
+            $why = ConvertTo-Json $Summary -Compress
+            if ($new -match '(?m)^triage-reason:\s*.*$') {
+                $new = [regex]::Replace($new, '(?m)^triage-reason:\s*.*$', "triage-reason: $why", 1)
+            }
+            else {
+                $new = [regex]::Replace($new, '(?m)^(priority:\s*.*)$', "`$1`ntriage-reason: $why", 1)
+            }
+        }
+        [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
+        Write-Host ("{0} -> {1}" -f $tid, $Priority)
+    }
+
     'new' {
         if (-not $Title) { throw 'new requires -Title.' }
 
@@ -268,6 +342,7 @@ switch ($Command) {
 
         # `all` is a filter, not a seat a task can hold.
         $seatValue = if ($Seat -and $Seat -ne 'all') { $Seat } else { $DefaultSeat }
+        $priorityValue = if ($Priority) { $Priority } else { $DefaultPriority }
 
         # Allocate the next free id by CREATING the file atomically. A racing
         # agent that picked the same number loses the CreateNew and we retry,
@@ -299,6 +374,7 @@ switch ($Command) {
                     'status: "todo"'
                     'commits: []'
                     ("seat: " + (ConvertTo-Json $seatValue -Compress))
+                    ("priority: " + (ConvertTo-Json $priorityValue -Compress))
                     '---'
                     ''
                     "# $tid - $Title"
