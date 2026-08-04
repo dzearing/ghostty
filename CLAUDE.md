@@ -114,6 +114,8 @@ Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own 
 
 Set the activity state of a named window or pane. The state is aggregated across all panes in a window (priority: `needs_input` > `busy` > `idle`) and shown as a title suffix and custom `AXWindowActivityState` accessibility attribute.
 
+`idle`/`busy`/`needs_input` are the **machine tokens** — the vocabulary of this flag, of the OSC 7777 payload, and of `AXWindowActivityState`. They are a public API (hooks call the CLI, external tools like ztabby read the attribute) and do not change for readability. The **title suffix** shows a human label instead, and the two differ for one state: `needs_input` renders as `(question)`. Consumers must read the accessibility attribute rather than parsing the title.
+
 ```
 ghoztty +set-state --target=<name> --state=<idle|busy|needs_input>
 ```
@@ -243,6 +245,15 @@ default shell too (their cwd inherits from the parent pane).
 - `+new-window --target=<name>` registers a **window**
 - `+split --name=<name>` registers a **pane**
 - `+split --target`, `+close --target`, and `+send-keys --target` reference either kind
+
+A window opened without an explicit `--target=` (Cmd-N, or a bare
+`+new-window`) still gets an **auto name** — `window-1`, `window-2`, … — which
+is exported to its panes as `$GHOZTTY_WINDOW_NAME` and shown as `target` in
+`+list`. That name is targetable immediately: `resolveTarget` falls back to
+scanning live windows by name, so no `+list` is needed first. (It used to be
+registry-only, so every `--target=window-N` failed with `not found in
+registry` until something walked the tree — invisibly, for the many callers
+that discard stderr.)
 
 ### Pane identity
 
