@@ -45,6 +45,11 @@ param(
     [string]$Tracker,
     [string]$GhozttyExe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe",
     [string]$ResumePrompt = 'read go.md and go',
+    # The same text, out of a FILE. Callers whose prompt is caller-authored (the
+    # upgrade's resume prompt routinely carries quotes) must use this: passing it
+    # as `powershell -File ... -ResumePrompt "<text>"` is the argv hop T210
+    # exists to close. Wins over -ResumePrompt when the file is readable.
+    [string]$ResumePromptFile,
     [string]$ClaudeCommand = 'claude --dangerously-skip-permissions --continue',
     [string]$WindowTarget = 'main',
     [int]$PollSeconds = 300,
@@ -55,6 +60,16 @@ param(
     [string]$LogPath,
     [string]$StatePath,
     [switch]$Once,          # single tick then exit (used by the acceptance test)
+    # Re-enter even though the lock looks healthy (T439). The two gates this
+    # skips - "state is held" and the rearm hold-off - both exist to keep the
+    # watchdog from interrupting a session that is working. A caller that KNOWS
+    # the loop is broken while the lock still looks fine (the upgrade script,
+    # whose resume prompt never landed) is the case they get wrong: the lock was
+    # beaten minutes ago by the turn that launched the upgrade, so without this
+    # the loop stays dead for up to -StaleMinutes. Everything downstream of the
+    # gates still applies, including "the pane is still producing output, do not
+    # nudge" - -Force says the heartbeat is not evidence, not that nothing is.
+    [switch]$Force,
     [switch]$DryRun,        # decide and log, but take no action
     [switch]$Install,
     [switch]$Uninstall
@@ -82,6 +97,22 @@ function Log($m) {
     # Write-Host, not the pipeline: Invoke-Tick returns its action string and a
     # log line leaking into that stream would make the return value an array.
     Write-Host $line
+}
+
+# -ResumePromptFile wins over -ResumePrompt, but only when it actually reads: an
+# unreadable or empty file must fall back to the default prompt rather than
+# re-enter the loop with an empty message. Which one won is logged, because a
+# re-entry that types the wrong prompt is the failure this whole file exists to
+# catch.
+if ($ResumePromptFile) {
+    $fromFile = ''
+    try { $fromFile = (Get-Content -LiteralPath $ResumePromptFile -Raw -ErrorAction Stop) } catch { $fromFile = '' }
+    if ($fromFile -and $fromFile.Trim()) {
+        $ResumePrompt = $fromFile.Trim()
+        Log "resume prompt read from file ($($ResumePrompt.Length) chars): $ResumePromptFile"
+    } else {
+        Log "WARNING: -ResumePromptFile '$ResumePromptFile' is missing or empty; falling back to -ResumePrompt"
+    }
 }
 
 # --- install / uninstall --------------------------------------------------
@@ -243,13 +274,14 @@ function Invoke-Tick {
     $lock = Get-Lock
     $state = 'free'
     if ($lock -and $lock.state) { $state = $lock.state }
-    if ($state -eq 'held') {
+    if ($state -eq 'held' -and -not $Force) {
         Log "healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) age=$($lock.age_minutes)m remaining=$remaining"
         return 'none'
     }
+    if ($Force) { Log "forced: re-entry requested despite state=$state (caller knows the loop is broken; T439)" }
 
     $since = Get-MinutesSinceAction
-    if ($since -lt $RearmMinutes) {
+    if ($since -lt $RearmMinutes -and -not $Force) {
         Log ("stale ($state) but rearm not elapsed ({0:N1}m < {1}m); waiting" -f $since, $RearmMinutes)
         return 'none'
     }

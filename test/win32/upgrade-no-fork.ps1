@@ -664,11 +664,23 @@ $savedTemp = $env:TEMP
 $savedTmp = $env:TMP
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedUser = $env:USERNAME
+$savedSuffix = $env:GHOZTTY_PIPE_SUFFIX
 $env:LOCALAPPDATA = $stateDir
 $env:TEMP = $tempDir
 $env:TMP = $tempDir
 $env:GHOSTTY_LOCAL_AGENT_BIN = (Join-Path $installDir 'ghoztty-agent.exe')
 $env:USERNAME = "nofork$PID"   # own agent pipe lineage; see the header
+# T441 - the load-bearing one, and the USERNAME override above is NOT a
+# substitute for it. USERNAME only moves the DERIVED endpoint, and derivation is
+# the LAST of three sources: `$GHOZTTY_PIPE_SUFFIX` (a caller aiming on purpose)
+# beats the pane's baked `$GHOZTTY_IPC_SOCKET`, which beats derivation
+# (src/os/ipc_client.zig clientEndpointPathFrom). Run from one of the user's own
+# Ghoztty panes - which is how this suite is always run - every CLI call here
+# inherits the user's baked endpoint and drives the user's INSTALLED release.
+# Measured 2026-08-03: sections B and E typed their fixture prompts, and E1's
+# `powershell -File ...\swallow.ps1`, into the loop's live Claude pane, where
+# they arrived as chat messages.
+$env:GHOZTTY_PIPE_SUFFIX = "-nofork$PID"
 
 try {
     # ========================================================================
@@ -682,6 +694,21 @@ try {
     Assert "B2 the loop's pane exists and is addressable" ($null -ne $paneB -and $paneB.id)
     $paneId = if ($paneB) { [string]$paneB.id } else { '' }
     $windowsBefore = (Windows-Of $treeB).Count
+
+    # T441 - the isolation assert, and it comes BEFORE anything is typed. Every
+    # later section drives `$paneId` with `+send-keys`, including a line that
+    # starts a process; if the instance answering is the user's, those land in
+    # the user's terminal. The caller's own pane is the tell: it can only be in
+    # this tree if we are talking to the app the caller is sitting in.
+    $callerPane = $env:GHOZTTY_PANE_ID
+    [void](Get-Tree 'b0iso')
+    $isoRaw = Out-Text (Join-Path $root 'list-b0iso.json')
+    $leak = $callerPane -and ($isoRaw -match [regex]::Escape($callerPane))
+    Assert "B2a the answering instance is the SANDBOX, not the caller's own app" (-not $leak)
+    if ($leak) {
+        "  ABORTING: the sandbox is not isolated; refusing to type into a live pane"
+        throw 'isolation check failed'
+    }
 
     # Guard against a silently non-persistent sandbox: without an agent the
     # pane dies with the app, "no fork" would pass for the wrong reason, and
@@ -887,6 +914,8 @@ while ((Get-Date) -lt $deadline) {
     Stop-SandboxProcs
     if ($loop) { Stop-Process -Id $loop.Id -Force -ErrorAction SilentlyContinue }
     $env:USERNAME = $savedUser
+    if ($null -eq $savedSuffix) { Remove-Item Env:\GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue }
+    else { $env:GHOZTTY_PIPE_SUFFIX = $savedSuffix }
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:TEMP = $savedTemp
     $env:TMP = $savedTmp

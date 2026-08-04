@@ -498,6 +498,62 @@ function Wait-Instance([int]$timeoutSec, $appProc = $null) {
     return ''
 }
 
+# Hand the stall to the watchdog NOW instead of leaving it for the heartbeat to
+# go stale (tracker T439).
+#
+# The turn that launched this script is long gone by the time the resume runs -
+# `launch-upgrade.ps1` only waits for the first log line - so a failure here is
+# not observed by anyone. The watchdog is the supervisor, but its own gates are
+# written for a session that stopped on its own: the lock is still HELD with a
+# fresh heartbeat (the launching turn beat it minutes ago), so its next tick
+# reports "healthy" and the loop stays dead until the heartbeat ages out, up to
+# 45 minutes later. This is the one caller that KNOWS the loop is broken while
+# the lock still looks fine, so it says so with -Force and the watchdog re-enters
+# on the spot.
+#
+# The prompt goes by FILE, never on the command line: it is caller text that
+# routinely contains quotes, and `powershell -File ... -ResumePrompt "<text>"`
+# is the exact argv hop T210 exists to close.
+function Invoke-WatchdogNow {
+    param([string]$Why = '', [string]$PromptFile = '')
+    $wd = Join-Path $PSScriptRoot 'go-loop-watchdog.ps1'
+    if (-not (Test-Path $wd)) { Log "  watchdog handoff SKIPPED: $wd not found"; return }
+
+    # Only hand off when the lock is HELD BY THIS PANE. That is the exact state
+    # this exists for - a live session whose heartbeat is fresh and whose resume
+    # nevertheless failed - and requiring it structurally rules out the
+    # dangerous neighbour: with no lock and no pane, a forced tick falls through
+    # to `+new-window --command="claude --continue"`, which is the T138 fork.
+    # An upgrade run in a sandbox (the acceptance suite) has no such lock, so it
+    # skips here rather than opening a window.
+    $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
+    $lock = $null
+    if (Test-Path $lockScript) {
+        try {
+            $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $lockScript status `
+                -Repo $WorkingDirectory -Json 2>&1 | Out-String
+            $lock = $raw | ConvertFrom-Json
+        } catch { $lock = $null }
+    }
+    if (-not $lock -or $lock.state -ne 'held' -or $lock.pane_id -ne $LoopPaneId) {
+        $st = if ($lock) { "state=$($lock.state) pane=$($lock.pane_id)" } else { 'no lock' }
+        Log "  watchdog handoff SKIPPED: the loop lock is not held by this pane ($st); leaving re-entry to the watchdog's own schedule"
+        return
+    }
+
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wd,
+        '-Repo', $WorkingDirectory, '-GhozttyExe', $oldExe, '-Once', '-Force')
+    if ($PromptFile -and (Test-Path $PromptFile)) { $a += @('-ResumePromptFile', $PromptFile) }
+    Log "  watchdog handoff: re-entering now ($Why)"
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList $a
+        if ($p.WaitForExit(120000)) { Log "  watchdog handoff: exited $($p.ExitCode) (see ghoztty-go-loop-watchdog.log)" }
+        else { Log '  watchdog handoff: still running after 120s; left to finish on its own' }
+    } catch {
+        Log "  watchdog handoff FAILED: $($_.Exception.Message)"
+    }
+}
+
 # ---- reuse: the launching session outlived the kill ------------------------
 # Its pane is still owned by the agent, so the relaunched app re-attaches it
 # (T89f2) and the session is sitting idle at its prompt. Type the prompt into
@@ -551,6 +607,21 @@ if ($action -eq 'reuse') {
     }
     Log "reuse: pane $LoopPaneId re-attached"
 
+    # T439: being IN `+list` is not being ready to receive. The pane's surface
+    # exists the moment restore builds it, but the agent is still replaying the
+    # session ring into it and the TUI has not repainted - and on 2026-08-03
+    # this line was logged 0-1s after the app was started, three deliveries in a
+    # row, each followed by RESUME-REUSE FAIL 10-16s later. Wait for the pane to
+    # stop changing before typing into it. `--when-idle` cannot substitute: an
+    # un-replayed pane reads as empty and unchanged, which is exactly what it
+    # calls idle.
+    $ready = Wait-LoopPaneReady -ReadTail { (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String }
+    # Not fatal. A pane that never settles may just be one whose session is
+    # printing, and the arrival gate below is the real evidence either way -
+    # refusing to type here would trade a recoverable miss for a certain stall.
+    if ($ready.Ready) { Log "reuse: pane ready ($($ready.Why))" }
+    else { Log "WARNING: reuse: pane $LoopPaneId not settled ($($ready.Why)); typing anyway - the arrival gate below is what protects the run" }
+
     # T210: the prompt goes through a FILE, never argv - this was the LAST argv
     # hop in the whole delivery. T200 moved the launch onto -ResumePromptFile and
     # the identical defect survived one hop downstream, right here. See the
@@ -583,42 +654,46 @@ if ($action -eq 'reuse') {
     #
     # --when-idle: the session may still be finishing the turn that launched
     # this script. Polling for idle beats racing it.
-    & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" @($keys.Args) 2>&1 |
-        ForEach-Object { Log "reuse send-keys: $_" }
-    $sendOk = ($LASTEXITCODE -eq 0)
-    if (-not $sendOk) {
-        Log "RESUME-REUSE FAIL: +send-keys to $LoopPaneId exited $LASTEXITCODE; the session is alive but was not nudged (watchdog will re-enter)."
-        exit 1
-    }
-
     # Compare through Get-LoopPromptNeedle: the input box wraps the prompt, so
     # the tail holds the same characters with newlines and box borders injected.
     # Without that normalization a long prompt can never match - which is the
     # other reason the old check was written as a shrug.
     $want = Get-LoopPromptNeedle $prompt
-    $echoed = $false
-    for ($i = 0; $i -lt 12; $i++) {
-        Start-Sleep -Milliseconds 700
-        try {
-            $tail = (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String
-            if (Test-LoopPromptArrived -Tail $tail -Text $prompt) { $echoed = $true; break }
-        } catch {}
-    }
-    if (-not $echoed) {
+    # T439: retry the whole type-and-verify cycle. One miss is not evidence the
+    # send is impossible, it is usually evidence the pane was not ready yet, and
+    # the old one-shot gate turned that into a dead loop three times in one day.
+    # The composer is cleared between attempts so attempt N+1 cannot append to
+    # attempt N's fragment.
+    $verified = Send-LoopPromptVerified -Text $prompt `
+        -SendText {
+            & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" @($keys.Args) 2>&1 |
+                ForEach-Object { Log "reuse send-keys: $_" }
+            return ($LASTEXITCODE -eq 0)
+        } `
+        -ReadTail { (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String } `
+        -Clear {
+            & $oldExe +send-keys "--target=$LoopPaneId" Escape 2>&1 | ForEach-Object { Log "reuse clear: $_" }
+        } `
+        -Log { param($m) Log $m }
+    if (-not $verified.Arrived) {
         # Do not submit a fragment: a half-arrived prompt is a chat message, and
         # a leftover fragment would concatenate with the watchdog's next nudge.
-        & $oldExe +send-keys "--target=$LoopPaneId" Escape 2>&1 | ForEach-Object { Log "reuse clear: $_" }
+        # (Send-LoopPromptVerified has already cleared the composer.)
+        #
         # Deliberately does not spell the success tag: a log grep for it must
         # never match a failure line (the acceptance test's E4 caught exactly
         # that when this message said "NOT UPGRADE OK").
-        Log "RESUME-REUSE FAIL: the prompt did not arrive intact in pane $LoopPaneId - it is NOT being submitted, and this run is NOT a successful upgrade (the watchdog will re-enter). Wanted: '$want'"
+        Log "RESUME-REUSE FAIL: the prompt did not arrive intact in pane $LoopPaneId after $($verified.Attempts) attempt(s) / $($verified.Reads) read(s) - it is NOT being submitted, and this run is NOT a successful upgrade. Wanted: '$want'"
         if ($promptFile) { Log "  prompt file kept for diagnosis: $promptFile" }
+        Invoke-WatchdogNow -Why 'the resume prompt never arrived intact' -PromptFile $promptFile
         exit 1
     }
+    Log "reuse: prompt verified in pane $LoopPaneId ($($verified.Why))"
 
     & $oldExe +send-keys "--target=$LoopPaneId" Enter 2>&1 | ForEach-Object { Log "reuse submit: $_" }
     if ($LASTEXITCODE -ne 0) {
         Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the Enter exited $LASTEXITCODE, so it was never submitted."
+        Invoke-WatchdogNow -Why 'the prompt arrived but the Enter failed' -PromptFile $promptFile
         exit 1
     }
     if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }

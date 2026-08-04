@@ -258,6 +258,117 @@ function Test-LoopPromptArrived {
     return ((Get-LoopPromptNeedle $Tail).IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
+# Wait until a pane is ready to RECEIVE typed input (tracker T439).
+#
+# Presence in `+list --json` is NOT readiness. A re-attached pane appears there
+# the moment its surface exists, while the agent is still replaying the
+# session's ring into it and the TUI has not repainted. The upgrade's reuse path
+# used `+list` presence as its only gate and then typed - measured three times
+# on 2026-08-03, each run logging "pane re-attached" 0-1s after the app was
+# started and RESUME-REUSE FAIL 10-16s later. `--when-idle` does not cover this
+# either: it returns as soon as two consecutive reads match, and a pane whose
+# content has not been replayed yet reads as empty, unchanged and therefore
+# perfectly "idle" (src/cli/send_keys.zig waitForIdle).
+#
+# Ready = the tail is NON-EMPTY and UNCHANGED across $StableReads consecutive
+# reads. Non-empty rules out "nothing has been replayed yet" - the state that
+# reads as most stable of all. Stability rules out a replay in flight.
+#
+# $ReadTail is injected so this is testable without a pane; it returns the
+# pane's rendered tail (or throws / returns empty, which counts as not ready).
+# The loop is bounded by POLL COUNT rather than a clock so a test can run it
+# with -PollMs 0. Returns @{ Ready; Why; Polls; Tail }.
+function Wait-LoopPaneReady {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ReadTail,
+        [int]$MaxPolls = 60,
+        [int]$StableReads = 3,
+        [int]$PollMs = 700
+    )
+    $prev = $null
+    $stable = 0
+    $last = ''
+    for ($i = 1; $i -le $MaxPolls; $i++) {
+        $tail = ''
+        try { $tail = [string](& $ReadTail) } catch { $tail = '' }
+        if ($null -eq $tail) { $tail = '' }
+        $last = $tail
+        # Compare through the same normalization the arrival gate uses, so a
+        # repainting cursor or a shifting box border is not mistaken for the
+        # replay still running.
+        $norm = Get-LoopPromptNeedle $tail
+        if (-not $norm) { $stable = 0 }
+        elseif ($null -ne $prev -and $prev -eq $norm) { $stable++ }
+        else { $stable = 1 }
+        $prev = $norm
+        if ($stable -ge $StableReads) {
+            return @{ Ready = $true; Why = "tail settled after $i read(s)"; Polls = $i; Tail = $tail }
+        }
+        if ($PollMs -gt 0) { Start-Sleep -Milliseconds $PollMs }
+    }
+    $why = if ($last) { "tail never settled in $MaxPolls read(s)" } else { "pane produced no text in $MaxPolls read(s)" }
+    return @{ Ready = $false; Why = $why; Polls = $MaxPolls; Tail = $last }
+}
+
+# Type $Text into a pane and confirm it ARRIVED, retrying the whole cycle
+# (tracker T439).
+#
+# The gate itself is T210's and is not negotiable: never submit text that was
+# not read back intact, because a half-arrived prompt becomes a chat message and
+# a leftover fragment concatenates with whatever is typed next. What T439 adds
+# is that ONE missed cycle is not evidence the send is impossible - it is
+# usually evidence the pane was not ready yet - so the cycle is retried, with
+# the composer cleared in between so attempt N+1 cannot append to attempt N's
+# fragment.
+#
+# All three effects are injected so this is testable without a pane:
+#   $SendText  type the text; return $true when the send itself succeeded
+#   $ReadTail  the pane's rendered tail
+#   $Clear     clear the composer (Escape) between attempts and after a miss
+# Returns @{ Arrived; Attempts; Reads; Why; Tail }. Submitting is the caller's
+# job: this function deliberately never presses Enter.
+function Send-LoopPromptVerified {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$SendText,
+        [Parameter(Mandatory = $true)][scriptblock]$ReadTail,
+        [Parameter(Mandatory = $true)][scriptblock]$Clear,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [int]$Attempts = 3,
+        [int]$ReadsPerAttempt = 12,
+        [int]$PollMs = 700,
+        [scriptblock]$Log = $null
+    )
+    $say = { param($m) if ($Log) { & $Log $m } }
+    $reads = 0
+    $tail = ''
+    for ($a = 1; $a -le $Attempts; $a++) {
+        if ($a -gt 1) {
+            & $say "resume send: attempt $a of $Attempts (clearing the composer first)"
+            try { [void](& $Clear) } catch { }
+        }
+        $sent = $false
+        try { $sent = [bool](& $SendText) } catch { $sent = $false }
+        if (-not $sent) {
+            & $say "resume send: attempt $a - the send itself failed"
+            continue
+        }
+        for ($i = 0; $i -lt $ReadsPerAttempt; $i++) {
+            if ($PollMs -gt 0) { Start-Sleep -Milliseconds $PollMs }
+            $reads++
+            try { $tail = [string](& $ReadTail) } catch { $tail = '' }
+            if ($null -eq $tail) { $tail = '' }
+            if (Test-LoopPromptArrived -Tail $tail -Text $Text) {
+                return @{ Arrived = $true; Attempts = $a; Reads = $reads; Why = "arrived on attempt $a"; Tail = $tail }
+            }
+        }
+        & $say "resume send: attempt $a - the prompt did not read back intact after $ReadsPerAttempt read(s)"
+    }
+    # Leave nothing behind: an unverified fragment sitting in the composer is
+    # what the watchdog's next nudge would concatenate onto.
+    try { [void](& $Clear) } catch { }
+    return @{ Arrived = $false; Attempts = $Attempts; Reads = $reads; Why = "never read back intact in $Attempts attempt(s)"; Tail = $tail }
+}
+
 # One BOUNDED `ghoztty +list --json` probe (tracker T187).
 #
 # Why this is not just `& $exe +list --json`: that call has no timeout of its

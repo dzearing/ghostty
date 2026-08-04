@@ -7811,3 +7811,66 @@ byte-for-byte, since the reported defect is fixed either way.
 
 Floor: none, win32 and agent lanes ALL PASS through `floor-lane.ps1 -Lane all`;
 P1–P3 ALL PASS; `ipc-send-keys-fidelity.ps1` (T210) still ALL PASS.
+
+## 2026-08-03 - T439: the resume waits for the pane now, and retries; T441 filed after the tests typed into the user's terminal
+
+T439. The upgrade's reuse path failed **three times on 2026-08-03**, not once —
+09:04, 10:44 and 20:51, every reuse-path delivery that day, each with the
+identical signature in `%TEMP%\ghoztty-upgrade.log`: `reuse: pane <id>
+re-attached` logged **0–1 seconds** after the app was started, then
+`RESUME-REUSE FAIL` 13–16s later. `Wait-Instance` only logs "answered after N
+failed poll(s)" when N > 0 and never did, so the first `+list` probe answered —
+the pane was listed within a second of launch.
+
+That is the defect in one line: **`+list` presence was the only readiness gate**,
+and a pane is listed the moment restore builds its surface, while the agent is
+still replaying the session ring into it. `--when-idle` cannot cover the gap
+either — `waitForIdle` returns as soon as two consecutive reads match, and a
+pane whose content has not arrived reads as empty, unchanged, and therefore
+perfectly idle. The most convincing "settled" pane there is, is one that has not
+received anything yet.
+
+`Wait-LoopPaneReady` adds the missing half: ready means the tail is **non-empty**
+AND unchanged across N reads. `Send-LoopPromptVerified` retries the whole
+type-and-verify cycle rather than exiting on the first miss, clearing the
+composer between attempts so a retry cannot append to a fragment — the T210 gate
+itself is untouched, text that did not read back intact is still never
+submitted. And the failure no longer waits for the watchdog to notice on its own
+schedule: the watchdog reads `healthy` after a failed resume (the lock was
+beaten minutes earlier by the launching turn), so the loop used to stay dead for
+up to 45 minutes. A new `-Force` skips the held-state and rearm gates for the
+one caller that knows the loop is broken while the lock looks fine, gated on the
+lock being held by THIS pane — with no lock and no pane a forced tick falls
+through to `+new-window --command="claude --continue"`, which is the T138 fork.
+
+**T441 came out of validating it, and it is the bigger finding.**
+`upgrade-no-fork.ps1` typed its section B and E fixture prompts — and E1's
+`powershell -NoProfile -File …\swallow.ps1` line — into this loop's live Claude
+pane, where they arrived as user messages. The suite isolates by
+`$env:USERNAME`, which only moves the *derived* endpoint, and the pane's baked
+`$GHOZTTY_IPC_SOCKET` outranks derivation. Measured directly: `zig-out\bin\
+ghoztty.exe +list --json` from a loop pane is answered by the **installed
+release** and returns that pane; with `GHOZTTY_PIPE_SUFFIX` set it correctly
+finds no instance. `ipc_client.zig`'s own comment predicts this incident word
+for word — the rule is implemented, the scripts just never set the suffix. 21
+more do the same, **including the P1–P3 floor**, which means a P1–P3 run from a
+pane has been exercising the installed release rather than the build under test.
+`upgrade-no-fork.ps1` is fixed here (suffix + a `B2a` assert that refuses to
+type if the caller's own pane id shows up in the sandbox's `+list`); the sweep
+is T441.
+
+**The floor is NOT green, and not because of this work.** `none` (160s) and
+`win32` (176s) PASS; **`test-agent` is red** and is filed as **T442**. It is
+memory corruption, not a broken assertion: the crash lands on a different test
+each run — `PageList resize … backfill` with `reached unreachable code`, then two
+`formatter` tests with an outright `Segmentation fault at address
+0x1b830c9de28` on a re-run with the *same* seed — while the same tests pass in
+the `none` lane both filtered and unfiltered. `floor-lane.ps1` reported the
+first two runs as a *compile* failure with no compiler diagnostic, which sent
+two investigations at the build instead of at a test; that is T442's second
+half. Nothing in this turn touched Zig.
+
+P1–P3 ALL PASS, run with `GHOZTTY_PIPE_SUFFIX` set per T441 — which is the first
+time they have been aimed at the built exe rather than the installed release on
+this box. `upgrade-resume-readiness.ps1` (new, 33 asserts),
+`upgrade-no-fork.ps1` and `upgrade-staleness.ps1` ALL PASS.
