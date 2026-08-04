@@ -196,6 +196,14 @@ New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug')
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
+# T441: a private IPC endpoint. The LOCALAPPDATA redirect above does not cover
+# it — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it, so without this the
+# +new-window calls below land in the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'autocwd')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # ============================================================================
 "== A: auto-launch honors --working-directory"
 # ============================================================================
@@ -211,6 +219,7 @@ Assert "A1 +new-window auto-launched an instance and succeeded (exit 0)" ($codeA
 $treeA = Wait-WindowCount $tmp 'a' 2 40
 Assert "A2 two windows exist: the startup window plus the requested one" `
     ((Windows-Of $treeA).Count -ge 2)
+Assert-GhozttyIsolated -Exe $Exe
 
 $paneA = Pane-In $treeA 'alc'
 Assert "A3 the requested window is registered as 'alc'" ($null -ne $paneA)

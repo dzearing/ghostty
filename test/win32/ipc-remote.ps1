@@ -27,6 +27,12 @@ function Assert($name, $cond) {
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: this run's own IPC endpoint, before any CLI call — otherwise every
+# `& $Exe` inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` and the
+# +new-remote-window calls below open windows in the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'ipcrem')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # Same app+agent kill as before, but exact-exe (a '*zig-out*' CommandLine
 # match also catches a detached zig-out-release instance, T53b) and with the
@@ -46,6 +52,7 @@ function Read-Pane($name, $outfile) {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 0: start a loopback agent + a base window"
 # GHOSTTY_AGENT_LOCK: unique lock path so this harness agent never fights an
@@ -58,6 +65,8 @@ Assert "agent is running" (-not $agent.HasExited)
 & $Exe +new-window --target=rembase 2>&1 | Out-Null
 Assert "base window exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 2
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 
 "== 1: +new-remote-window dial + open"
 cmd /c "`"$Exe`" +new-remote-window --host=127.0.0.1 --port=$Port --name=rem > `"$tmp\open.txt`" 2>&1"

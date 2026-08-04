@@ -153,7 +153,17 @@ function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs) {
     return $got
 }
 
+# T441: this run's own IPC endpoint. CleanSlate drops the caller pane's baked
+# `$GHOZTTY_IPC_SOCKET` (T118), which already keeps a Debug zig-out off the
+# user's release pipe — but every debug script still shares the ONE derived
+# `-debug` endpoint, so two runs (or a developer's own debug instance) collide,
+# and a non-Debug zig-out puts the whole suite back on the user's endpoint. The
+# suffix makes the endpoint per-run, and the asserts make it checked.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'skbrk')
+
 Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: app + host window (no persistence, no activation)"
 Start-Process -FilePath $Exe -ArgumentList '--session-persistence=false' | Out-Null
@@ -161,6 +171,8 @@ Start-Sleep -Seconds 4
 & $Exe +new-window "--target=$win" --no-activate 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 Assert "window $win exists" (((& $Exe +list 2>&1) | Out-String) -match [regex]::Escape($win))
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 
 $msg = 'hello world'
 $msgHex = To-Hex $msg

@@ -159,12 +159,21 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 
+# T441: a private IPC endpoint, which the per-section LOCALAPPDATA redirect does
+# NOT cover — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it, so without this every
+# +list/+split below answers from the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'sessopen')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # ============================================================================
 "== A: persistence ON -> initial pane is agent-backed"
 # ============================================================================
 $a = Start-Gui 'on' $AgentExe @()
 $pane = Wait-FirstPane $a.Tmp 25
 Assert "A1 GUI opened a pane" ($null -ne $pane)
+Assert-GhozttyIsolated -Exe $Exe
 $paneId = if ($null -ne $pane) { $pane.id } else { '' }
 
 # The agent should have been found-or-spawned and written its port.json.

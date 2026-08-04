@@ -161,11 +161,21 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 
+# T441: a private IPC endpoint, which the per-section LOCALAPPDATA redirect does
+# NOT cover — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it. This script's verbs are
+# +close: pointed at the user's installed release it would close their panes.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'sessclose')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # ============================================================================
 "== A: +close the startup PANE ends its agent session"
 # ============================================================================
 $a = Start-Backed 'close-pane'
 Assert "A1 startup pane is agent-backed (one live session)" $a.Ok
+# Before the first +close: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 Run-Cli "+close --target=$($a.PaneId)" "$($a.Tmp)\closepane.txt" 12 | Out-Null
 $rowsA = Wait-AliveCount $a.Tmp 'after' 0 15
 Assert "A2 the session ended after the pane close (0 alive)" ((Count-Alive $rowsA) -eq 0)

@@ -33,6 +33,12 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: a per-run IPC endpoint on top of CleanSlate's T118 unbaking. This script
+# is ABOUT stale targets, and every debug script sharing one derived `-debug`
+# endpoint is the largest source of them.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'tstale')
+
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
@@ -87,8 +93,10 @@ function New-Fixture($marker) {
 try {
     "== 0: clean slate, then run fixture A"
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1500 | Out-Null
+    Assert-GhozttyPrivateEndpoint -Exe $Exe
     Assert "fixture A launched" ((New-Fixture 'T248-MARKER-A') -eq 0)
     Assert "driving the build under test" ((Assert-GhozttyUnderTest -Exe $Exe) -eq $Exe)
+    Assert-GhozttyIsolated -Exe $Exe
     $a = Read-Pane
     Assert "pane shows marker A" ($a -match 'T248-MARKER-A')
 

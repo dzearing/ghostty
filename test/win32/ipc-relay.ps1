@@ -62,6 +62,13 @@ function Stop-TestProcs {
 
 Stop-TestProcs
 
+# T441: this run's own IPC endpoint, before any CLI call — otherwise the
+# Run-Cli calls below inherit the caller pane's baked `$GHOZTTY_IPC_SOCKET` and
+# open relay windows in (and +send-keys into) the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'ipcrelay')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 "== 0a: build + start a local relay (DEV_AUTH)"
 Push-Location $RelaySrc
 & go build -o "$tmp\ghoztty-relay-e2e.exe" . 2>&1 | Select-Object -Last 3
@@ -116,6 +123,8 @@ Assert "agent is running" (-not $agent.HasExited)
 $code = Run-Cli '+new-window --target=relbase' 'base.txt'
 Assert "base window exit 0" ($code -eq 0)
 Start-Sleep -Seconds 2
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 
 "== 1: relay dial + open (happy path)"
 $code = Run-Cli "+new-remote-window --relay=$RelayBase --device=$($dev.id) --token=$DevToken --name=relwin" 'open.txt' 30

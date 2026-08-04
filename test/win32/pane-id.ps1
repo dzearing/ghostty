@@ -237,6 +237,16 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 
+# T441: a private IPC endpoint FIRST. Without it the pre-flight below was not
+# just unhelpful but actively misleading: run from one of the user's own panes,
+# the inherited `$GHOZTTY_IPC_SOCKET` means their installed release always
+# answers, so the pre-flight aborted every run on this box with exit 2 — a
+# harness that can never run reads as a broken build. The suffix moves BOTH
+# ends (the CLI dials it and the instance we launch binds it), which is what
+# makes the pre-flight mean what its comment says.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'paneid')
+
 # T116 pre-flight: anything already answering means this exe's endpoints are
 # shared with a live instance (a release-build exe collides with the user's).
 # Abort before a single window is touched.
@@ -256,6 +266,8 @@ $tmpA = Join-Path $root 'a'
 Launch $tmpA 't113-a' $false
 $leavesA = @(Wait-Leaves $tmpA 'a1' 1 30)
 Assert "A1 GUI opened a pane" ($leavesA.Count -ge 1)
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 $leaf0 = if ($leavesA.Count -ge 1) { $leavesA[0] } else { $null }
 $listId = if ($null -ne $leaf0) { [string]$leaf0.id } else { '' }
 

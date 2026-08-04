@@ -223,6 +223,15 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 
+# T441: a private IPC endpoint, which the per-section LOCALAPPDATA redirect does
+# NOT cover — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it. This script kills agents
+# and drives relaunches; aimed at the user's release it would do that to their
+# live sessions.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'sessrelaunch')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # ============================================================================
 "== A: session-relaunch=auto - agent restart auto-RELAUNCHes with divider + ring scrollback"
 # ============================================================================
@@ -230,6 +239,7 @@ $tmpA = Join-Path $root 'auto'
 Launch $tmpA 't89g-auto' 'auto' $false
 $paneA = Wait-FirstPane $tmpA 25
 Assert "A1 startup pane came up under the local agent" ($null -ne $paneA)
+Assert-GhozttyIsolated -Exe $Exe
 
 # A named second pane so we can target its ring / +read / relaunch precisely.
 Run-Cli '+split --direction=right --name=relp' "$tmpA\split.txt" 15 | Out-Null

@@ -27,6 +27,12 @@ function Assert($name, $cond) {
 }
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: this run's own IPC endpoint, set before any CLI call. Without it every
+# `& $Exe` below inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` and
+# drives the user's INSTALLED release instead of $Exe.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'conf')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # It kills the sibling agent too and drops the debug session-layout manifest,
 # so a pane from a previous run cannot be focused in place of the fixture.
@@ -52,11 +58,13 @@ function Read-Pane($name, $lines) {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== S8.1: +new-window --target=ide --command='vim .' from cold (auto-launch)"
 & $Exe +new-window --target=ide "--command=vim ." --working-directory=$work 2>&1 | Out-Null
 Assert "exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 4
+Assert-GhozttyIsolated -Exe $Exe
 $list = Get-List
 Assert "window registered [target: ide]" ($list -match '\[target: ide\]')
 # The editor is really running: its pane shows the netrw directory listing.

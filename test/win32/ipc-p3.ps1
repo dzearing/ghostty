@@ -17,6 +17,13 @@ function Assert($name, $cond) {
 }
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: give this run its OWN IPC endpoint before any CLI call. Without it every
+# `& $Exe` below inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` — this
+# floor would measure the user's INSTALLED release, and `+send-keys` would type
+# into their live panes.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'ipcp3')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # Exact-exe matching is still the rule (T53b); the reset now also kills the
 # sibling agent and drops the debug session-layout manifest. This script's
@@ -37,10 +44,13 @@ function Get-P3Json {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: window + named panes"
 & $Exe +new-window --target=p3 2>&1 | Out-Null
 Start-Sleep -Seconds 3
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 & $Exe +split --target=p3 --name=p3a --direction=right 2>&1 | Out-Null
 Start-Sleep -Seconds 1
 & $Exe +split --target=p3 --name=p3b --direction=down 2>&1 | Out-Null

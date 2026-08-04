@@ -72,11 +72,21 @@ $wheelLines = 3
 # script scrolls a pane and counts lines against what it just wrote — a pane
 # RESTORED from the previous run arrives with a scrollback nobody here filled.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
+# T441: a per-run IPC endpoint on top of CleanSlate's T118 unbaking, so this run
+# cannot collide with another debug instance (they all share the one derived
+# `-debug` endpoint) and cannot fall back onto the user's release if zig-out
+# ever holds a non-Debug build.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'wheel')
+
 Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
+Assert-GhozttyPrivateEndpoint -Exe $exe
 
 $proc = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 3
 if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+Assert-GhozttyIsolated -Exe $exe
 $top = [WheelDrv]::FindTop([uint32]$proc.Id)
 $surface = [WheelDrv]::FindWindowExW($top, [IntPtr]::Zero, 'GhozttyTerminal', $null)
 if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: windows not found'; exit 1 }

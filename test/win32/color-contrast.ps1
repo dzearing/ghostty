@@ -191,6 +191,13 @@ function Read-Step([IntPtr]$hwnd, [string]$name, [string]$step, [string]$hex) {
 
 Kill-RepoInstances
 
+# T441: this run's own IPC endpoint, before any `& $exe` call. Without it the
+# +new-window / +list calls below inherit the caller pane's baked
+# `$GHOZTTY_IPC_SOCKET` and read pixels out of the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'cc')
+Assert-GhozttyPrivateEndpoint -Exe $exe
+
 # Run-unique so a leftover file from an earlier run can never be mistaken
 # for this run's fixture reporting in.
 $step1 = Join-Path $env:TEMP "ghoztty-t150-$PID-step1.txt"
@@ -202,6 +209,7 @@ $step2 = Join-Path $env:TEMP "ghoztty-t150-$PID-step2.txt"
 $proc = Start-Process $exe -ArgumentList '--background=#101014', '--session-persistence=off' -PassThru
 Start-Sleep -Seconds 3
 if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+Assert-GhozttyIsolated -Exe $exe
 
 # --- 1. light background: every content class stays readable --------------
 $LIGHT = '#f0f0f0'

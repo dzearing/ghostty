@@ -48,6 +48,13 @@ function Assert($name, $cond) {
 }
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: this run's own IPC endpoint, before any CLI call — otherwise every
+# `& $Exe` inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` and this
+# script's whole point (what bytes reach a PTY) is measured on the user's
+# installed release, typing its fixtures into their live panes.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'skfid')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # Same app+agent kill as before, but exact-exe (a '*zig-out*' CommandLine
 # match also catches a detached zig-out-release instance, T53b) and with the
@@ -119,6 +126,7 @@ function Invoke-Capture([string]$payload, [string]$mode) {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: app + named pane (no persistence, no activation)"
 Start-Process -FilePath $Exe -ArgumentList '--session-persistence=false' | Out-Null
@@ -126,6 +134,8 @@ Start-Sleep -Seconds 4
 & $Exe +new-window "--target=$pane" --no-activate 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 Assert "pane $pane exists" (((& $Exe +list 2>&1) | Out-String) -match [regex]::Escape($pane))
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 
 # The real 2026-07-30 shape: a slash command, a quoted phrase, a prose tail.
 $real = '/reset-context settle the "DWM/PrintWindow" capture question first, it decides the shape of the whole task. Then read go.md and go'

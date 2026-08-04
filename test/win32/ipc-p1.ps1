@@ -23,6 +23,12 @@ function Assert($name, $cond) {
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: give this run its OWN IPC endpoint before any CLI call. Without it every
+# `& $Exe` below inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` and this
+# floor measures the user's INSTALLED release rather than $Exe.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'ipcp1')
+
 # T248: one shared reset instead of a private copy. Exact-exe matching is still
 # the rule ('*zig-out*' also matched a detached soak instance running from
 # zig-out-release, T53b), and the reset now also kills the sibling agent and
@@ -41,11 +47,13 @@ function Get-List {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: +new-window auto-launch from cold, all basic flags"
 & $Exe +new-window --target=p1win --title=P1Title "--command=echo p1-marker" 2>&1 | Out-Null
 Assert "exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 2
+Assert-GhozttyIsolated -Exe $Exe
 $list = Get-List
 Assert "window registered under target" ($list -match '\[target: p1win\]')
 Assert "title override shows" ($list -match 'P1Title')

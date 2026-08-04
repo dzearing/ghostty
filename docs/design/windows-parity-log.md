@@ -8438,3 +8438,41 @@ P1-P3 **ALL PASS**, plus `pane-banner.ps1` **ALL PASS (77)** and
 second because `lib\TestDesktop.ps1` gained a `Get-TestWindowClassStyle`
 helper. Filed **T467**: `Scrollbar` computes its thumb from the track height
 and carries the same `.style = 0`, so the whole class list wants the same audit.
+
+## 2026-08-04 (T441) - the acceptance suite was driving the user's terminal, and now it proves it isn't
+
+22 acceptance scripts resolved their IPC endpoint from whatever the calling
+pane had baked into `$GHOZTTY_IPC_SOCKET` - which, on this box, is the user's
+installed release. All 22 now set a per-run `$GHOZTTY_PIPE_SUFFIX` through a
+new `test\win32\lib\Isolation.ps1` and, more to the point, **assert** that they
+are isolated: nothing may answer on the private endpoint before launch, and
+after launch the answering instance's own `"exe"` must be the exe under test
+with the caller's `$GHOZTTY_PANE_ID` absent from its tree. Both asserts throw,
+so a script whose isolation stops working dies rather than quietly typing into
+a live pane.
+
+Correcting this task's own blast-radius list, which crossed with T118 by two
+hours: `lib\CleanSlate.ps1` has dropped the inherited endpoint since
+f84754940, and exactly 11 of the 22 load it - so those 11 were already off the
+user's pipe *given a Debug zig-out*. The other 11 had nothing. The sweep still
+earns its place three ways: every debug script shared the ONE derived `-debug`
+endpoint (runs collide), a non-Debug zig-out put the suite back on the user's
+endpoint (the T248 accident), and none of it was checked. Negative control run
+and seen to fail: with no suffix, `Assert-GhozttyIsolated` finds the caller's
+own pane in the tree and aborts.
+
+`pane-id.ps1` is the case that shows the cost. Its T116 pre-flight aborts if
+anything answers - so run from one of the user's panes it aborted with exit 2
+every time, and a harness that can never run reads as a broken build.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS** - and the exe assert is what makes that last one a statement
+about `zig-out\bin\ghoztty.exe` rather than about whatever answered.
+`target-staleness.ps1` and `ipc-when-idle.ps1` ALL PASS; all 23 changed files
+parse clean. `conformance.ps1` fails one assertion, which is a real defect this
+surfaced rather than one it caused - filed as **T468**: a `--command=` pane
+exits and parks on "Process exited. Press any key" instead of keeping its shell
+alive, so `+send-keys` into it does nothing. That contradicts CLAUDE.md's
+per-flavor keep-alive guarantee and breaks every documented `--command`
+workflow; it is invisible for a long-running command and immediate for anything
+that returns.

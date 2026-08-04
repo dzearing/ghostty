@@ -196,9 +196,19 @@ function Run-Helper([string]$script, [string]$paneId, [string]$contText) {
 }
 
 Kill-RepoInstances
+
+# T441: this run's own IPC endpoint, before any `& $exe` call. This script
+# drives a helper that TYPES `/clear` and a continuation into a pane — pointed
+# at the user's installed release by an inherited `$GHOZTTY_IPC_SOCKET` it
+# would clear a live Claude session.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'resetctx')
+Assert-GhozttyPrivateEndpoint -Exe $exe
+
 $proc = Start-Process $exe -ArgumentList '--session-persistence=false' -PassThru
 Start-Sleep -Seconds 3
 if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+Assert-GhozttyIsolated -Exe $exe
 
 try {
     # --- A. fixed helper wipes the composer, verifies both sends ----------

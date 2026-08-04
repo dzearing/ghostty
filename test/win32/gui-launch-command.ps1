@@ -146,6 +146,14 @@ New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 
+# T441: this run's own IPC endpoint, and the LOCALAPPDATA redirect in Launch()
+# does not cover it — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it, so without this the +list
+# and +read calls below answer from the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'guilaunch')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 
@@ -167,6 +175,7 @@ $tmpA = Join-Path $root 'a'
 Launch $tmpA @('-e', $script, 'alpha', 'beta')
 $paneA = First-Pane $tmpA 'a' 60
 Assert "A1 the launch opened a window with a pane" ($paneA -ne '')
+Assert-GhozttyIsolated -Exe $Exe
 
 $textA = [string](Wait-PaneText $tmpA 'a' $paneA 'T104ARGS=' 60)
 Assert "A2 the -e command RAN (pre-fix: a bare shell prompt)" ($textA.Contains('T104ARGS='))

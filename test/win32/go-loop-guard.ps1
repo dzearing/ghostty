@@ -94,6 +94,13 @@ function Kill-Sleepers { foreach ($s in $sleepers) { Stop-Process -Id $s.Id -For
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: this run's own IPC endpoint, before any CLI call. Sections I/J drive a
+# live GUI and this script's whole subject is a watchdog that CLOSES windows —
+# pointed at the user's installed release by an inherited `$GHOZTTY_IPC_SOCKET`
+# it would close theirs.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'gloop')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # Exact-exe rather than a '*zig-out*' CommandLine match (T53b), plus the
 # sibling agent and the debug session-layout manifest, so a previous run's
@@ -301,6 +308,7 @@ Remove-Item $state -Force -ErrorAction SilentlyContinue
 ""
 "I. real re-entry (new window)"
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 # T211 desktop: every window these sections open is driven over IPC, never by
 # SendInput or screen capture, so this migrates off the interactive desktop
 # cleanly - and a watchdog test that yanks the user's foreground while they
@@ -323,6 +331,8 @@ for ($i = 0; $i -lt 40; $i++) {
     if ((Ghoz @('+list')).Code -eq 0) { $ready = $true; break }
 }
 Assert 'I0 the debug GUI is up' $ready
+# Before the watchdog is pointed at anything: prove it is ours.
+if ($ready) { Assert-GhozttyIsolated -Exe $Exe }
 
 if ($ready) {
     Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue

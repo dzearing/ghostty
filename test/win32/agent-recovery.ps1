@@ -201,6 +201,14 @@ New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug')
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
+# T441: a private IPC endpoint, and it is NOT covered by the LOCALAPPDATA
+# redirect above. The endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it, so without this every
+# Run-Cli below would answer from the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'agentrec')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # ============================================================================
 "== A: baseline - a 2-pane agent-backed window, both panes responsive"
 # ============================================================================
@@ -224,6 +232,7 @@ if ($null -eq $appProc) {
     exit 1
 }
 $appPid = [int]$appProc.ProcessId
+Assert-GhozttyIsolated -Exe $Exe
 
 # Name the first pane, then split it so the topology under test is a real tree.
 $firstLeaf = (All-Leaves (Get-List $tmp 'a1' 10))[0]

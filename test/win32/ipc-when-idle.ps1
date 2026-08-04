@@ -25,6 +25,12 @@ function Assert($name, $cond) {
 }
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T441: this run's own IPC endpoint, before any CLI call — otherwise every
+# `& $Exe` inherits the caller pane's baked `$GHOZTTY_IPC_SOCKET` and the
+# +send-keys below types into the user's live terminal.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'whenidle')
+
 # T248: one shared reset instead of a private copy — see lib\CleanSlate.ps1.
 # The old filter matched any CommandLine containing 'zig-out', which also
 # catches a detached instance running from zig-out-release (T53b); the shared
@@ -44,10 +50,13 @@ function Pane-HasOutput([string]$marker) {
 }
 
 Stop-DebugGhoztty
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: window + named pane"
 & $Exe +new-window --target=wi 2>&1 | Out-Null
 Start-Sleep -Seconds 3
+# Before the first +send-keys: prove the instance answering is ours.
+Assert-GhozttyIsolated -Exe $Exe
 & $Exe +split --target=wi --name=wia --direction=right 2>&1 | Out-Null
 Start-Sleep -Seconds 2
 

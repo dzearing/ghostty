@@ -183,6 +183,14 @@ New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug')
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
+# T441: a private IPC endpoint. The LOCALAPPDATA redirect above does not cover
+# it — the endpoint a CLI dials comes from the pane's baked
+# `$GHOZTTY_IPC_SOCKET` unless a suffix outranks it, so without this the +split
+# and +close calls below act on the user's installed release.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'blobs')
+Assert-GhozttyPrivateEndpoint -Exe $Exe
+
 # T267: control the window's own size rather than inheriting whatever the last
 # GUI script left in window_placement-debug. Nothing here measures pixels, but a
 # window restored offscreen by a stale placement cannot be driven either.
@@ -193,6 +201,7 @@ Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
 "== A: one startup window mirrors as one record with its session id"
 # ============================================================================
 $rowsA = Wait-AliveCount $tmp 'a' 1 25
+Assert-GhozttyIsolated -Exe $Exe
 $aliveA = @(Alive-Ids $rowsA)
 Assert "A1 startup pane is agent-backed (one live session)" ($aliveA.Count -eq 1)
 
