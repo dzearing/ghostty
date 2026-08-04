@@ -1919,6 +1919,12 @@ test "host floor: a real controller on a real window, on this box" {
     // never did — T372's lesson).
     const alloc = testing.allocator;
 
+    // Never against the user's own browser profile (T430): a test lane that
+    // shares `%LOCALAPPDATA%\ghoztty\EBWebView-debug` with a live debug Ghoztty
+    // contends with the user's browser process tree for it.
+    var test_profile = try webview2.TestProfile.begin(alloc);
+    defer test_profile.end();
+
     // WebView2 wants an apartment on the calling thread; the app initializes
     // one at startup, the test harness has not.
     _ = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED);
@@ -2452,10 +2458,38 @@ fn waitFor(
 /// A real `http://` origin is the point — `file://` and the bundled template
 /// are both pages we author, and P2's claim is about the ones we do not. A
 /// socket on 127.0.0.1 gives that without a network.
+/// Give an accepted test-server connection a bounded receive timeout (T430).
+///
+/// Chromium **preconnects**: it opens sockets to an origin speculatively and
+/// may send nothing on them at all. A serving loop that blocks in `recv` on one
+/// of those is stuck until Chromium's own idle timer closes it — measured at
+/// ~3 minutes of a completely blocked wait (zero CPU) in the agent lane, and
+/// unbounded if the browser process itself is wedged. While it is stuck it is
+/// not in `accept()`, so the shutdown poke in `stop()` cannot reach it either
+/// and `join()` waits with it.
+///
+/// A timeout turns all of that into "no request arrived, close it, loop".
+/// `SOL_SOCKET`/`SO_RCVTIMEO` are not in zig's `ws2_32` bindings; on Windows
+/// the value is a `DWORD` of milliseconds (not a `timeval`).
+fn setRecvTimeout(handle: std.posix.socket_t, ms: u32) void {
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_RCVTIMEO: i32 = 0x1006;
+    _ = std.os.windows.ws2_32.setsockopt(
+        handle,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        @ptrCast(&ms),
+        @sizeOf(u32),
+    );
+}
+
 const TestPage = struct {
     server: std.net.Server,
     port: u16,
     thread: std.Thread,
+    /// Set before the wake-up connection below, so the serving thread knows the
+    /// connection it just accepted is the shutdown poke and not a request.
+    stopping: std.atomic.Value(bool) = .init(false),
 
     /// The page posts through the WebKit path the SHARED viewer JS uses, so
     /// this is the shim under test rather than a WebView2 call written to pass.
@@ -2487,14 +2521,25 @@ const TestPage = struct {
         self.server = try addr.listen(.{ .reuse_address = true });
         errdefer self.server.deinit();
         self.port = self.server.listen_address.getPort();
-        self.thread = try std.Thread.spawn(.{}, serve, .{&self.server});
+        self.stopping = .init(false);
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
     }
 
+    /// T430: **wake the accept, then close** — never close and hope.
+    ///
+    /// Closing a listening socket that another thread is blocked in `accept()`
+    /// on is explicitly unsupported on Windows: `closesocket` is documented not
+    /// to signal a blocking call pending on the socket in a different thread,
+    /// so the accept can sit there forever and `join()` never returns. That is
+    /// a hang with zero CPU and no output — the exact shape that made two
+    /// standing-floor lanes unreadable. Sending it a real connection is what
+    /// makes the wake-up deterministic, and it is already the house idiom
+    /// (`keepalive.zig`, `link_control.zig`, `self_update.zig` all do this).
     fn stop(self: *TestPage) void {
-        // Closing the listener is what unblocks the accept the thread is
-        // sitting in; there is no other way to interrupt it portably.
-        self.server.deinit();
+        self.stopping.store(true, .monotonic);
+        if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
         self.thread.join();
+        self.server.deinit();
     }
 
     /// `socket_rw`, not `Stream.read`/`Stream.writeAll`.
@@ -2505,10 +2550,12 @@ const TestPage = struct {
     /// and `socket_rw.readStream`/`writeAllStream` are the house answer to it;
     /// this test hit the same wall and uses them rather than growing a fourth
     /// private copy of `recv`.
-    fn serve(server: *std.net.Server) void {
+    fn serve(self: *TestPage) void {
         while (true) {
-            const conn = server.accept() catch return;
+            const conn = self.server.accept() catch return;
             defer conn.stream.close();
+            if (self.stopping.load(.monotonic)) return;
+            setRecvTimeout(conn.stream.handle, 2000);
 
             // Drain the request line and headers. A socket closed with unread
             // data in its receive buffer is RESET rather than shut down, and
@@ -2521,6 +2568,10 @@ const TestPage = struct {
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
             }
+            // A preconnect that never asked for anything: close it and go back
+            // to waiting for a real request, rather than answering a question
+            // nobody put.
+            if (total == 0) continue;
 
             var head_buf: [160]u8 = undefined;
             const head = std.fmt.bufPrint(&head_buf,
@@ -2569,6 +2620,8 @@ const ReloadPage = struct {
     /// normal one, so this is the request-side proof that `ignoreCache`
     /// reached the wire.
     no_cache: std.atomic.Value(bool) = .init(false),
+    /// See `TestPage.stopping` — same reason, same shutdown handshake.
+    stopping: std.atomic.Value(bool) = .init(false),
 
     fn start(self: *ReloadPage) !void {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
@@ -2577,18 +2630,25 @@ const ReloadPage = struct {
         self.port = self.server.listen_address.getPort();
         self.requests = .init(0);
         self.no_cache = .init(false);
+        self.stopping = .init(false);
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
     }
 
+    /// Wake the accept with a real connection before closing the listener — see
+    /// `TestPage.stop` (T430).
     fn stop(self: *ReloadPage) void {
-        self.server.deinit();
+        self.stopping.store(true, .monotonic);
+        if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
         self.thread.join();
+        self.server.deinit();
     }
 
     fn serve(self: *ReloadPage) void {
         while (true) {
             const conn = self.server.accept() catch return;
             defer conn.stream.close();
+            if (self.stopping.load(.monotonic)) return;
+            setRecvTimeout(conn.stream.handle, 2000);
 
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
@@ -2598,6 +2658,8 @@ const ReloadPage = struct {
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
             }
+            // A preconnect that never asked for anything — see `TestPage.serve`.
+            if (total == 0) continue;
             // ASCII-insensitive: header VALUES are not case-normalized by
             // anyone, and matching only the lowercase spelling would make the
             // oracle depend on Chromium's capitalization.

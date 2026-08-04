@@ -724,6 +724,10 @@ test "host: creates a real environment on this box, and it reports its version" 
     try setEnvForTest("GHOZTTY_WEBVIEW2_BROWSER_DIR", "");
     defer restoreEnvForTest("GHOZTTY_WEBVIEW2_BROWSER_DIR", prev);
 
+    // Never against the user's own browser profile (T430).
+    var profile = try TestProfile.begin(testing.allocator);
+    defer profile.end();
+
     var expected_version: []u8 = undefined;
     {
         var rt = probe(testing.allocator) catch |err| {
@@ -785,4 +789,102 @@ fn setEnvForTest(name: []const u8, value: []const u8) !void {
 
 fn restoreEnvForTest(name: []const u8, prev: ?[]const u8) void {
     setEnvForTest(name, prev orelse "") catch {};
+}
+
+/// A private, per-run WebView2 user-data folder for the live-runtime tests
+/// (T430).
+///
+/// Without this a test binary drives the runtime against
+/// `%LOCALAPPDATA%\ghoztty\EBWebView-debug` — the SAME profile a debug Ghoztty
+/// uses. That is live user state, and a test lane must not touch it: at best
+/// the test contends with the user's own browser process tree for the profile's
+/// singleton lock, at worst it corrupts a profile the user then has to
+/// discover is broken. It is also why a hung lane could not be reasoned about:
+/// the browser process a test attached to was not necessarily one that run had
+/// started.
+///
+/// The override is applied to `LOCALAPPDATA` rather than to the folder path,
+/// because that variable is the single input `userDataFolderW` derives the
+/// folder from — so the private profile cannot drift away from the real
+/// derivation the app uses.
+///
+/// One directory per process, not per test: the two live-runtime tests in this
+/// binary then share one browser process tree, exactly as the app's panes do,
+/// instead of paying a cold profile start each. The directory is left behind on
+/// purpose — the browser process outlives the test that started it, so removing
+/// it here would race — and is swept by `scripts\floor-lane.ps1`.
+pub const TestProfile = struct {
+    prev: ?[]const u8,
+    root: []const u8,
+    alloc: Allocator,
+
+    pub fn begin(alloc: Allocator) !TestProfile {
+        const tmp = std.process.getEnvVarOwned(alloc, "TEMP") catch
+            try alloc.dupe(u8, "C:\\Windows\\Temp");
+        defer alloc.free(tmp);
+
+        const root = try std.fmt.allocPrint(
+            alloc,
+            "{s}\\ghoztty-wv2test-{d}",
+            .{ tmp, w32.GetCurrentProcessId() },
+        );
+        errdefer alloc.free(root);
+        std.fs.makeDirAbsolute(root) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const prev = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch null;
+        errdefer if (prev) |p| alloc.free(p);
+        try setEnvForTest("LOCALAPPDATA", root);
+        return .{ .prev = prev, .root = root, .alloc = alloc };
+    }
+
+    pub fn end(self: *TestProfile) void {
+        restoreEnvForTest("LOCALAPPDATA", self.prev);
+        if (self.prev) |p| self.alloc.free(p);
+        self.alloc.free(self.root);
+    }
+};
+
+test "TestProfile: the live tests derive their folder from a private root" {
+    // The whole point is that `userDataFolder` — the real derivation — lands
+    // somewhere that is not the user's profile while the override is in force,
+    // and lands back on it afterwards.
+    const alloc = testing.allocator;
+
+    const before = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch null;
+    defer if (before) |b| alloc.free(b);
+
+    // The real folder, resolved BEFORE the override, is the thing the private
+    // one must not be. (`%TEMP%` itself usually lives under `%LOCALAPPDATA%`,
+    // so "not a prefix of LOCALAPPDATA" would be the wrong assertion — what
+    // matters is that it is not the `ghoztty\EBWebView*` profile.)
+    const real_folder: ?[]u8 = if (before) |b|
+        try paths.userDataFolder(alloc, b, build_config.is_debug)
+    else
+        null;
+    defer if (real_folder) |f| alloc.free(f);
+
+    var profile = try TestProfile.begin(alloc);
+    {
+        errdefer profile.end();
+        const local = try std.process.getEnvVarOwned(alloc, "LOCALAPPDATA");
+        defer alloc.free(local);
+        try testing.expectEqualStrings(profile.root, local);
+
+        const folder = try paths.userDataFolder(alloc, local, build_config.is_debug);
+        defer alloc.free(folder);
+        try testing.expect(std.mem.startsWith(u8, folder, profile.root));
+        if (real_folder) |f| try testing.expect(!std.mem.eql(u8, f, folder));
+    }
+    profile.end();
+
+    const after = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch null;
+    defer if (after) |a| alloc.free(a);
+    if (before) |b| {
+        try testing.expectEqualStrings(b, after.?);
+    } else {
+        try testing.expect(after == null);
+    }
 }

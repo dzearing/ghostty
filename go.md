@@ -84,7 +84,12 @@ Concretely, in order, with no stops in between:
    shows progress rather than a frozen list.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
-   `zig build test` lanes, `zig build test-agent`, P1–P3).
+   `zig build test` lanes, `zig build test-agent`, P1–P3). Run the three zig
+   lanes through `scripts\floor-lane.ps1 -Lane all` (T430) rather than bare: a
+   bare lane can wedge with no output and no timeout, and a wedge you cannot
+   tell from a slow run is worse than a red test. The wrapper watches CPU as
+   well as the clock, so it always ends with `PASS`, `FAIL` or `STALL` plus a
+   diagnostic.
 4. **Make sure it's right** — validation must actually pass, on the box. A
    clean build is not evidence, and neither is a passing script you did not
    read the last line of.

@@ -7703,3 +7703,62 @@ measurement that the hang is a **blocked wait, not a spin** — two CPU samples
 45s apart were bit-identical — which points at a stack dump rather than a
 profiler, and suggests a zero-CPU-delta watchdog that can tell a slow test from
 a wedged one.
+
+## 2026-08-03 — T430: the floor lanes always finish now, and one of them is 3x faster
+
+Two of the four standing-floor lanes could hang forever with no output and no
+timeout, which made the floor stop being evidence for anything: a turn either
+waited indefinitely, or killed its own run and read the kill as a regression it
+had caused. Both hangs are fixed at the source, and both lanes now come back
+with an answer either way.
+
+The site was `ViewerPane.zig`'s two loopback page servers, and there were two
+separate blocking waits stacked on each other. First, `stop()` closed the
+listening socket and then `join()`ed the serving thread — but on Windows
+`closesocket` is documented not to signal a blocking call pending on that socket
+in another thread, so the accept could sit there forever. The repo already had
+the right idiom in three other places (`keepalive.zig`, `link_control.zig`,
+`self_update.zig`): set a flag, send the listener a real connection, join, then
+close. These two were the outliers. Second — and this is what the live capture
+showed — the thread was usually blocked in `recv`, not `accept`: **Chromium
+preconnects**, opening sockets speculatively and sending nothing on them, and
+the serve loop read from one until the browser's own idle timer closed it. A
+`netstat` of the wedged process caught it exactly: a request-less ESTABLISHED
+connection, and the shutdown poke queued behind it in CLOSE_WAIT, unaccepted.
+Accepted connections now carry a 2s `SO_RCVTIMEO` and a connection that asked
+for nothing is closed rather than answered. That wait was measured at ~173
+seconds of completely blocked time in one run that then went green — which is
+why this read as intermittent rather than as a hang.
+
+The live-runtime WebView2 tests also ran against
+`%LOCALAPPDATA%\ghoztty\EBWebView-debug`, the profile a debug Ghoztty uses.
+`webview2.TestProfile` now points `LOCALAPPDATA` itself at a private per-run
+root, so the real derivation lands somewhere the user's browser tree is not —
+overriding the input rather than the folder path, so the private profile cannot
+drift from what the app actually does.
+
+`scripts\floor-lane.ps1` is the lane wrapper the task asked for. Its one idea is
+that **a lane that is computing burns CPU and a lane that is wedged does not**,
+so zero CPU delta across the process tree with no new log output is reported as
+`STALL` — with the process tree, every thread's wait reason, the WebView2 hosts
+and the log tail — rather than as silence. It also folds in the three decoys
+this investigation kept re-paying for: `ZIG_GLOBAL_CACHE_DIR` set (and quoted)
+inside the launched command, cmd.exe redirection so a killed run still has its
+log, and a sweep that matches leaked browser hosts on `--webview-exe-name=`
+instead of on a path under zig-out. `-SelfTest` proves all three verdicts on
+synthetic commands.
+
+Results: win32 398s → 282s, agent 430s → ~150s, none unchanged, P1–P3 ALL PASS.
+Four new tasks came out of it. **T434**: `test-agent` runs the same ~600 tests
+twice concurrently in two binaries, and one of them links the WebView2 viewer —
+the agent is a headless daemon and its test binary should not be able to open a
+browser (T430 asked that question of the *core* binary, where the answer is no;
+the exe-rooted binary is where it is yes). **T436**: eleven assertions in
+`server.zig` sit between a hand-written `mutex.lock()` and its `unlock()`, so a
+failure returns still holding the lock and the test's own `deinit` reports it as
+a mutex deadlock in a part of the code that is working correctly. **T437**: with
+three minutes of idle wait gone the agent lane is denser, and two unrelated
+timing-sensitive tests now fail intermittently — 2 fails then 4 passes over six
+runs. **T435** (mac seat) asks whether the Mac floor wants the same wrapper; the
+root cause fixed here is Windows-specific and no macOS hang has been reported,
+so it is a question rather than a defect.

@@ -865,6 +865,30 @@ zig build test-agent                   # ghoztty-agent, incl. real-pty tests
 `win32` lane on Windows, so **name the lane explicitly** rather than assuming
 the bare command covers both.
 
+On Windows, run them through the watchdog rather than bare (T430):
+
+```powershell
+powershell -NoProfile -File scripts\floor-lane.ps1 -Lane all
+```
+
+It sets `ZIG_GLOBAL_CACHE_DIR` on the repo's drive inside the launched command,
+logs unbuffered through `cmd.exe`, and — the reason it exists — **tells a slow
+lane from a wedged one**: a lane that is computing burns CPU, a lane that is
+blocked does not, so zero CPU delta across the process tree with no new output
+is reported as `STALL` with a diagnostic (process tree, per-thread wait reasons,
+WebView2 hosts, log tail) instead of hanging forever with nothing to read. Exit
+0 pass / 1 fail / 2 wedged / 3 wall-clock cap; `-Lane <one>`, `-Repeat N`,
+`-Filter <test-filter>`, `-SelfTest` to prove the detector itself.
+
+**Tests must never touch live user state.** The WebView2 live-runtime tests run
+under `webview2.TestProfile`, which points `LOCALAPPDATA` at a private per-run
+root so they cannot contend with — or corrupt — the `EBWebView[-debug]` profile
+a real Ghoztty is using. And a test server thread blocked in `accept()` is woken
+with a **real connection** before its listener is closed: on Windows
+`closesocket` does not signal a blocking call pending in another thread, so
+close-then-`join()` is an indefinite hang (`TestPage`/`ReloadPage` in
+`ViewerPane.zig`, `keepalive.zig`, `link_control.zig`, `self_update.zig`).
+
 On Windows, behavior that unit tests cannot reach is covered by non-interactive
 PowerShell acceptance scripts in `test/win32/` (80+ of them). The standing
 regression floor is P1–P3, which must stay ALL PASS:
