@@ -183,7 +183,7 @@ Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own 
 
 Set the activity state of a named window or pane. The state is aggregated across all panes in a window (priority: `needs_input` > `busy` > `idle`) and shown as a title suffix and custom `AXWindowActivityState` accessibility attribute.
 
-`idle`/`busy`/`needs_input` are the **machine tokens** — the vocabulary of this flag, of the OSC 7777 payload, and of `AXWindowActivityState`. They are a public API (hooks call the CLI, external tools like ztabby read the attribute) and do not change for readability. The **title suffix** shows a human label instead, and the two differ for one state: `needs_input` renders as `(question)`. Consumers must read the accessibility attribute rather than parsing the title.
+`idle`/`busy`/`needs_input` are the **machine tokens** — the vocabulary of this flag, of the OSC 7777 payload, and of `AXWindowActivityState`. They are a public API (hooks call the CLI, external tools like ztabby read the attribute) and do not change for readability. The **title suffix** shows a human label instead, and the two differ for one state: `needs_input` renders as `(question)`. Consumers must read the accessibility attribute rather than parsing the title. (The win32 title still interpolates the raw token — T465.)
 
 ```
 ghoztty +set-state --target=<name> --state=<idle|busy|needs_input>
@@ -572,6 +572,14 @@ ghoztty +close --target=doc
 git diff: a native file tree on the left, traditional red/green
 syntax-highlighted hunks on the right, and next/previous-change +
 unified⇄side-by-side controls in the nav bar.
+
+**macOS only so far.** The CLI half is shared — `cli/view_arg.zig` knows both
+schemes and passes them through path resolution untouched, mirroring
+`ViewerDiffSpec.parse` — and so are the page assets (`src/viewer/diff.js`,
+`diff.css`), but the win32 viewer has no diff mode yet, so the command is
+accepted here and draws nothing usable. That is the divergence this project
+does not ship, and it is filed rather than left undocumented: **T463** (render
+the diff) and **T464** (the file-tree side panel).
 
 ```bash
 # changes in this branch against main (three-dot: the merge base, which is

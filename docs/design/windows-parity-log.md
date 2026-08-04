@@ -8274,3 +8274,54 @@ crash the one that yields the stack.
 Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
 P1-P3 **ALL PASS**, `parity-tasks-seat.ps1` **ALL PASS** (73 assertions,
 sections A-L), `validate` **ALL PASS** (490 tasks).
+
+## 2026-08-04 (T457) - the branch caught up with main, and two seats turned out to have written the same file twice
+
+**Merged, not rebased** (decision **D7**). T457 asked for a rebase; the branch
+is **521 commits ahead** of the merge base and `go.md` says both seats work
+this same branch, so a rebase rewrites all 521 shas under the Mac seat. The
+branch's own precedent is a merge (`c91b42777`), and `git log HEAD..origin/main`
+is empty either way — which is what T457's validation actually asks for.
+
+Five conflicts. The interesting two were **parallel invention**, and both
+resolved as a union rather than a pick:
+
+- **`--view=` resolution.** Both seats independently noticed the two verbs were
+  carrying byte-identical private copies, and both extracted it — main as
+  `cli/view_arg.zig`, this branch as `cli/view_args.zig`, one letter apart. But
+  each copy had learned something the other had not: main's knows the
+  `git-diff:`/`git-status:` revspec schemes must skip path resolution, ours
+  knows that `std.fs.path.isAbsolute` — not `value[0] == '/'` — is what makes
+  `C:\src\README.md` absolute. Taking either side whole would have re-broken the
+  other's bug. `view_arg.zig` now carries both rules and both test sets;
+  `view_args.zig` is gone. Main's filename won so a later merge does not
+  re-fight it.
+- **The per-session CPU pump.** Main added a generation counter (a pump whose
+  `stop` was flipped back by a re-subscribe still exits); this branch added a
+  `pumps_closed` latch (no pump spawns after shutdown latched). Different ends
+  of the same lifetime, so both are kept.
+
+**Inventory closed out — six tasks, and two items that needed none.** T457's
+table has the full accounting. Filed: **T461** (the chooser re-dials a remote
+machine on every roster fetch; only the local agent has a warm connection — and
+this is the likely cause of T328's lost Kill), **T462** (nothing under
+`src/apprt/win32/` references `session_cpu`, so the agent's pushed per-session
+CPU arrived here unused), **T463**/**T464** (the CLI and the page assets for git
+diff panes are shared and now present, so `--view=git-diff:` is accepted on
+Windows and draws nothing usable — noted in CLAUDE.md rather than left silent),
+**T465** (`Window.zig:3231` still interpolates `(needs_input)` where the Mac now
+reads `(question)`), **T466** (a dead-but-relaunchable session is listed in the
+roster and cannot be resumed).
+
+Two items needed no task, and the reasons are worth keeping. **Auto-named
+window targeting** — the Mac bug was a lazily-populated registry; win32
+registers every non-quick-terminal window's auto-name in `Window.init`
+(`:886-897`), so `--target=window-N` resolves from the moment the window exists.
+**Dead-session cleanup** — the premise in the task file was wrong: no filtering
+landed in those 20 commits at all. Windows already does both halves, the agent
+reaping dead+unbound tombstones (`agent/server.zig:470-493`) and
+`chooser_sessions.isConnectable` filtering them client-side. Only the
+relaunchable tombstone is left over, which is T466.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS**, `validate` **ALL PASS** (496 tasks).
