@@ -8247,3 +8247,30 @@ Also worth knowing for anyone driving this loop: **`Start-Sleep` is a no-op in
 the harness**, so a polling wait returns instantly. That made a 3-minute build
 look like a 46-minute wedge and cost a killed lane run; wait on the background
 task notification instead.
+
+## 2026-08-04 - the task list stopped hiding its own columns, and a red lane costs half as long
+
+**T459** closed. The two assertions that went red when the `Ord` column landed
+were not stale expectations - `list` had been **truncating its own output to the
+width of whatever pane it ran in**. `Format-Table` sizes to the host console, so
+in the loop's 62-column pane the table stopped after `Status` and `Seat`, `Deps`
+and `Title` were never printed at all. Rendering through `Out-String -Width 200`
+detaches the layout from the pane; capping the displayed `Status` at 24
+characters stops one 166-character `skipped(<reason>)` row from shoving `Title`
+off the right edge of every other row. Full width 201 -> 132.
+
+**Decision D6 actioned.** The user chose "on by default, but 1 attempt", so
+`floor-lane.ps1 -CatchAttempts` now defaults to **1**: a red lane spends ~10
+extra minutes capturing a stack rather than ~20, and one attempt still catches
+roughly half of a 50%-flaky crash. `-CatchAttempts 2` is there when you are
+hunting a specific one and want the odds.
+
+Filed: **T460** - the other half of that answer. Crash details still cost a
+whole red lane to obtain, because nothing captures a stack on the FIRST crash;
+we only ever re-run and hope it reproduces. Always-on first-chance capture
+(WER LocalDumps or AeDebug scoped to our test binaries) would make the first
+crash the one that yields the stack.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS**, `parity-tasks-seat.ps1` **ALL PASS** (73 assertions,
+sections A-L), `validate` **ALL PASS** (490 tasks).

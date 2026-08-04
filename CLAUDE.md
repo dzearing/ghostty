@@ -938,8 +938,10 @@ that faulted — never the one that did the damage. So a crash in one of our tes
 binaries makes `floor-lane.ps1` re-run that binary under **cdb**, which takes
 the exception on first chance and writes a full minidump plus `~*kv` for every
 thread into `.dumps\`; the console gets a `-- crash stack --` block with source
-lines and the name of the test that was running. `-NoCatch` skips it,
-`-CatchAttempts` tunes it. Run it by hand against an intermittent crash with
+lines and the name of the test that was running. It gets **one** attempt by
+default, so a red lane costs ~10 extra minutes at worst; `-NoCatch` skips it and
+`-CatchAttempts 2` buys better odds on a specific intermittent crash. Run it by
+hand against an intermittent crash with
 
 ```powershell
 powershell -NoProfile -File scripts\crash-catch.ps1 -Lane agent -Attempts 6

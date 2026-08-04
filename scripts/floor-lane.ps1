@@ -73,7 +73,12 @@ param(
     # On by default: the crash it exists for is intermittent, so "remember to
     # pass a flag next time" means the evidence is gone until it happens again.
     [switch]$NoCatch,
-    [int]$CatchAttempts = 2,
+    # ONE attempt by default, not two (user, decision D6, 2026-08-04). A red
+    # lane may spend ~10 minutes capturing a stack, not ~20: one attempt still
+    # catches roughly half of a 50%-flaky crash, and the user would rather have
+    # the lane back sooner and catch it on the next red run. `-CatchAttempts 2`
+    # when you are hunting a specific intermittent crash and want the odds.
+    [int]$CatchAttempts = 1,
     [int]$CatchTimeoutSeconds = 600,
     [switch]$SelfTest
 )
