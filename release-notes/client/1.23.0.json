@@ -1,0 +1,17 @@
+{
+  "version": "1.23.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "Table of contents for markdown panes", "text": "Markdown viewers with two or more headings get a native contents card that tracks the section you're reading and jumps you to any heading — in a left gutter on wide panes, a slide-in overlay on narrow ones." },
+        { "title": "Markdown reads like macOS content", "text": "Body text is now set in the system font (SF Pro) and code in SF Mono, instead of GitHub's web font stack." },
+        { "title": "Viewer panes browse like a browser", "text": "Every viewer, files included, has an editable address bar plus back / forward / reload / home. Type a URL to go to the web or a path to point back at a file; Home and history survive a session restore." },
+        { "title": "IPC commands hit the right app", "text": "Each pane knows the socket of the app instance that owns it, so `ghoztty +split` run inside a debug-build pane splits the debug window instead of the release app." },
+        { "title": "Hero mode follows the live layout", "text": "Splits created or closed after entering hero mode are now reachable, and a single keystroke moves only the window you're aiming at." },
+        { "text": "`+split --target=<window>` now works with a viewer focused (it used to exit 0 and do nothing)." },
+        { "text": "`--color=random` windows stay dark but now lift off pure black, so the hue actually reads." }
+      ]
+    }
+  ]
+}

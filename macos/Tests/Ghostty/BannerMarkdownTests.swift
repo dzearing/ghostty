@@ -480,4 +480,186 @@ struct BannerMarkdownTests {
         #expect(plain(Ghostty.BannerMarkdown.parse("[x] a")) == "\u{2611} a")
         #expect(plain(Ghostty.BannerMarkdown.parse("[ ] a")) == "\u{2610} a")
     }
+
+    // MARK: Autolinking (bare URLs and file paths)
+
+    private func segs(_ s: String, cwd: String?) -> [Inline] {
+        Ghostty.BannerMarkdown.segments(Substring(s), cwd: cwd)
+    }
+
+    /// The (visible text, destination) of every linked run, in order.
+    private func links(_ segments: [Inline]) -> [(text: String, url: URL)] {
+        let a = attr(segments)
+        return a.runs.compactMap { run in
+            guard let url = run.link else { return nil }
+            return (String(a[run.range].characters), url)
+        }
+    }
+
+    // URLs: scheme-only, so prose never accidentally links.
+
+    @Test func autolinkBareHTTPSURL() {
+        let s = segs("see https://example.com now")
+        #expect(plain(s) == "see https://example.com now")
+        let found = links(s)
+        #expect(found.count == 1)
+        #expect(found.first?.text == "https://example.com")
+        #expect(found.first?.url == URL(string: "https://example.com"))
+    }
+
+    @Test func autolinkBareHTTPURL() {
+        let found = links(segs("http://localhost:3000/x"))
+        #expect(found.map(\.text) == ["http://localhost:3000/x"])
+    }
+
+    @Test func autolinkBareDomainIsNotLinked() {
+        // Deliberately no bare-domain matching: banner text is prose.
+        #expect(links(segs("see www.example.com and config.io and foo.md")).isEmpty)
+    }
+
+    @Test func autolinkOtherSchemesAreNotLinked() {
+        #expect(links(segs("ftp://x.com and mailto:a@b.com")).isEmpty)
+    }
+
+    @Test func autolinkSchemeWithNoBodyIsNotLinked() {
+        #expect(links(segs("https:// and http://")).isEmpty)
+    }
+
+    @Test func autolinkRequiresAWordBoundary() {
+        // "shttps://x.com" is one word, not a URL preceded by text.
+        #expect(links(segs("xhttps://example.com")).isEmpty)
+    }
+
+    @Test func autolinkTrailingSentencePunctuationStaysOutsideTheLink() {
+        for (source, expected) in [
+            ("See https://x.com.", "https://x.com"),
+            ("See https://x.com, then", "https://x.com"),
+            ("See https://x.com; ok", "https://x.com"),
+            ("See https://x.com: ok", "https://x.com"),
+            ("See <https://x.com>", "https://x.com"),
+            ("See \"https://x.com\"", "https://x.com"),
+            ("(see https://x.com)", "https://x.com"),
+        ] {
+            #expect(links(segs(source)).map(\.text) == [expected], "source: \(source)")
+        }
+    }
+
+    @Test func autolinkKeepsBalancedParensInsideTheURL() {
+        // Wiki-style paths carry parens; only an unmatched closer is shed.
+        let found = links(segs("(see https://en.wikipedia.org/wiki/Foo_(bar))"))
+        #expect(found.map(\.text) == ["https://en.wikipedia.org/wiki/Foo_(bar)"])
+    }
+
+    @Test func autolinkNeverFiresInsideACodeSpan() {
+        #expect(links(segs("`https://x.com`")).isEmpty)
+        #expect(plain(segs("`https://x.com`")) == "https://x.com")
+    }
+
+    @Test func autolinkEscapeSuppressesIt() {
+        let s = segs("\\https://x.com")
+        #expect(plain(s) == "https://x.com")
+        #expect(links(s).isEmpty)
+    }
+
+    @Test func autolinkInsideStyleSpanStillLinks() {
+        let found = links(segs("**https://x.com**"))
+        #expect(found.map(\.text) == ["https://x.com"])
+    }
+
+    @Test func autolinkDoesNotDoubleLinkAnExplicitLink() {
+        let found = links(segs("[a](https://x.com)"))
+        #expect(found.count == 1)
+        #expect(found.first?.text == "a")
+    }
+
+    @Test func autolinkInsideALinkLabelDoesNotNest() {
+        // The explicit link owns its whole label — the inner URL must not
+        // become a second destination.
+        let s = segs("[see https://x.com](https://y.com)")
+        #expect(plain(s) == "see https://x.com")
+        #expect(links(s).allSatisfy { $0.url == URL(string: "https://y.com") })
+    }
+
+    // File paths: only `/`, `~/`, `./`, `../` — the sigil is the signal.
+
+    @Test func autolinkAbsolutePath() {
+        let found = links(segs("open /Users/dz/git/README.md now"))
+        #expect(found.count == 1)
+        #expect(found.first?.text == "/Users/dz/git/README.md")
+        #expect(found.first?.url.isFileURL == true)
+        #expect(found.first?.url.path == "/Users/dz/git/README.md")
+    }
+
+    @Test func autolinkHomeRelativePathExpandsTilde() {
+        let found = links(segs("~/.claude/scripts/ghoztty-banner.sh"))
+        #expect(found.first?.text == "~/.claude/scripts/ghoztty-banner.sh")
+        #expect(found.first?.url.path
+            == ("~/.claude/scripts/ghoztty-banner.sh" as NSString).expandingTildeInPath)
+    }
+
+    @Test func autolinkDotRelativePathResolvesAgainstCwd() {
+        let found = links(segs("edit ./src/main.zig", cwd: "/tmp/proj"))
+        #expect(found.first?.text == "./src/main.zig")
+        #expect(found.first?.url.path == "/tmp/proj/src/main.zig")
+    }
+
+    @Test func autolinkDotDotRelativePathResolvesAgainstCwd() {
+        let found = links(segs("../foo/bar.swift", cwd: "/tmp/proj/sub"))
+        #expect(found.first?.url.path == "/tmp/proj/foo/bar.swift")
+    }
+
+    @Test func autolinkDotRelativePathWithoutCwdStaysPlainText() {
+        // Nothing to resolve against — guessing would be worse than plain text.
+        let s = segs("./src/main.zig")
+        #expect(plain(s) == "./src/main.zig")
+        #expect(links(s).isEmpty)
+    }
+
+    @Test func autolinkBareRelativePathIsNotLinked() {
+        #expect(links(segs("macos/Sources/Foo.swift", cwd: "/tmp")).isEmpty)
+    }
+
+    @Test func autolinkSlashMidWordIsNotAPath() {
+        #expect(links(segs("and/or, 24/7")).isEmpty)
+    }
+
+    @Test func autolinkLoneSigilIsNotAPath() {
+        // A sigil with no path body after it links nothing.
+        #expect(links(segs("cd / then")).isEmpty)
+        #expect(links(segs("./ and ../ and ~/", cwd: "/tmp")).isEmpty)
+    }
+
+    @Test func autolinkPathTrailingPunctuationStaysOutsideTheLink() {
+        #expect(links(segs("see ./README.md.", cwd: "/tmp")).map(\.text) == ["./README.md"])
+        #expect(links(segs("(see /etc/hosts)")).map(\.text) == ["/etc/hosts"])
+    }
+
+    @Test func autolinkPathInsideACodeSpanIsLiteral() {
+        #expect(links(segs("`./src/main.zig`", cwd: "/tmp")).isEmpty)
+    }
+
+    // Block level: the cwd threads through `parseBlocks` so a dot-relative
+    // path in a real banner resolves.
+
+    @Test func autolinkThroughParseBlocks() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("edit ./a.md", cwd: "/tmp/proj")
+        guard case .text(let str, _) = blocks.first else {
+            Issue.record("expected text block, got \(blocks)")
+            return
+        }
+        #expect(plain(str) == "edit ./a.md")
+        let urls = str.runs.compactMap { $0.link }
+        #expect(urls.map { $0.path } == ["/tmp/proj/a.md"])
+    }
+
+    @Test func autolinkInsideTableCell() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks(
+            "| Where | Link |\n|---|---|\n| pr | https://x.com/1 |"
+        )
+        guard case .table(let table) = blocks.first else {
+            Issue.record("expected table block, got \(blocks)")
+            return
+        }
+        #expect(links(table.rows[0][1]).map(\.text) == ["https://x.com/1"])
+    }
 }

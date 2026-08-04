@@ -1412,6 +1412,54 @@ class IPCServer {
         return IPCResponse(success: true, data: data)
     }
 
+    /// One run of `+send-keys` bytes, tagged with how the receiving program
+    /// should understand it.
+    struct SendKeysSegment: Equatable {
+        enum Kind { case text, key }
+        let kind: Kind
+        let bytes: [UInt8]
+    }
+
+    /// Decode a `--segments=` payload: comma-separated runs, each a kind tag
+    /// (`t` for text, `k` for a key) followed by that run's bytes in hex.
+    ///
+    /// Hex because the payload reaches us as a JSON string while the bytes it
+    /// carries are arbitrary — control characters and non-UTF-8 sequences are
+    /// exactly what `+send-keys` exists to deliver.
+    ///
+    /// Returns nil for anything malformed, which the caller treats as "use
+    /// the flat `--keys=` payload" rather than as a failure.
+    static func decodeSendKeysSegments(_ encoded: String) -> [SendKeysSegment]? {
+        var segments: [SendKeysSegment] = []
+
+        for field in encoded.split(separator: ",", omittingEmptySubsequences: false) {
+            guard let tag = field.first else { return nil }
+            let kind: SendKeysSegment.Kind
+            switch tag {
+            case "t": kind = .text
+            case "k": kind = .key
+            default: return nil
+            }
+
+            let hex = field.dropFirst()
+            guard !hex.isEmpty, hex.count % 2 == 0 else { return nil }
+
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(hex.count / 2)
+            var index = hex.startIndex
+            while index < hex.endIndex {
+                let next = hex.index(index, offsetBy: 2)
+                guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+                bytes.append(byte)
+                index = next
+            }
+
+            segments.append(.init(kind: kind, bytes: bytes))
+        }
+
+        return segments.isEmpty ? nil : segments
+    }
+
     private func handleSendKeys(_ request: IPCRequest) -> IPCResponse {
         guard let arguments = request.arguments, !arguments.isEmpty else {
             return IPCResponse(success: false, error: "arguments required for +send-keys")
@@ -1419,12 +1467,15 @@ class IPCServer {
 
         var target: String?
         var text: String?
+        var encodedSegments: String?
 
         for arg in arguments {
             if let value = arg.dropPrefix("--target=") {
                 target = String(value)
             } else if let value = arg.dropPrefix("--keys=") {
                 text = String(value)
+            } else if let value = arg.dropPrefix("--segments=") {
+                encodedSegments = String(value)
             }
         }
 
@@ -1435,6 +1486,13 @@ class IPCServer {
         guard let text, !text.isEmpty else {
             return IPCResponse(success: false, error: "text is required for +send-keys")
         }
+
+        // `--segments=` splits the same bytes at their text↔key boundaries so
+        // text can be written as a paste and keys bare. The CLI only sends it
+        // when there is a boundary to preserve, and an older CLI never sends
+        // it at all, so falling back to the flat `--keys=` payload is the
+        // normal path for a single-kind send rather than an error case.
+        let segments = encodedSegments.flatMap(Self.decodeSendKeysSegments)
 
         pruneStaleTargets()
 
@@ -1459,7 +1517,16 @@ class IPCServer {
                 sendError = "target '\(target)' has no surface model"
                 return
             }
-            surfaceModel.writePtyRaw(text)
+            guard let segments else {
+                surfaceModel.writePtyRaw(text)
+                return
+            }
+            for segment in segments {
+                switch segment.kind {
+                case .text: surfaceModel.writePtyBracketed(segment.bytes)
+                case .key: surfaceModel.writePtyRaw(segment.bytes)
+                }
+            }
         }
         semaphore.wait()
 

@@ -136,8 +136,14 @@ pub const args = @import("ipc/args.zig");
 /// server's encoder and pinned by golden tests.
 pub const List = @import("ipc/list.zig").List;
 
+/// The `+send-keys` `--segments=` wire format. One definition for both the
+/// CLI that writes it and the IPC server that reads it, so the two halves of
+/// the format cannot drift apart.
+pub const segments = @import("ipc/segments.zig");
+
 test {
     _ = args;
+    _ = segments;
     _ = @import("ipc/list.zig");
 }
 

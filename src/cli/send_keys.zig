@@ -104,6 +104,18 @@ pub const Options = struct {
 /// resume prompt reached a pane as a fragment of prose and the reset
 /// silently never fired (T210). Use `--keys-file=` there.
 ///
+/// Argument boundaries are preserved. When a send mixes text with
+/// keys, the text runs are delivered to the pane as a bracketed
+/// paste and the keys are delivered bare, so a program that treats
+/// pasted input differently from typed input — most full-screen
+/// TUIs do — can tell them apart. That is what makes the trailing
+/// `Enter` in `"some message" Enter` submit rather than land in the
+/// buffer as a newline. Panes whose program has not enabled
+/// bracketed paste receive the bytes unwrapped, exactly as before.
+/// A `--keys-file=` payload is a text run like any other, so
+/// `--keys-file=p.txt Enter` is the reliable shape for "send this
+/// generated prompt, then submit it".
+///
 /// Examples:
 ///
 ///   ghoztty +send-keys --target=term "ls -la" Enter
@@ -149,15 +161,15 @@ fn runArgs(
     // the positional arguments contributes its bytes where it appears, so
     // `--keys-file=p.txt Enter` sends the file and then the newline.
     var target_arg: ?[:0]const u8 = null;
-    var keys_buf: std.ArrayList(u8) = .empty;
     var bad_file: ?[]const u8 = null;
+    var text_count: usize = 0;
 
-    const text_count = resolveArguments(
+    const resolved = resolveArguments(
         alloc,
-        &keys_buf,
         opts._arguments.items,
         &target_arg,
         &bad_file,
+        &text_count,
     ) catch |err| {
         if (bad_file) |path| {
             try stderr.print(
@@ -181,19 +193,30 @@ fn runArgs(
         return 1;
     }
 
-    if (keys_buf.items.len == 0) {
+    if (resolved.bytes.len == 0) {
         try stderr.print("+send-keys: resolved text is empty\n", .{});
         return 1;
     }
 
     // Build the IPC arguments: --target=<name> --keys=<processed bytes>
     const prefix = "--keys=";
-    const keys_arg = try alloc.allocSentinel(u8, prefix.len + keys_buf.items.len, 0);
+    const keys_arg = try alloc.allocSentinel(u8, prefix.len + resolved.bytes.len, 0);
     @memcpy(keys_arg[0..prefix.len], prefix);
-    @memcpy(keys_arg[prefix.len..][0..keys_buf.items.len], keys_buf.items);
+    @memcpy(keys_arg[prefix.len..][0..resolved.bytes.len], resolved.bytes);
 
-    var ipc_args_buf: [2][:0]const u8 = .{ target_arg.?, keys_arg };
-    const ipc_args: [][:0]const u8 = &ipc_args_buf;
+    var ipc_args_buf: [3][:0]const u8 = .{ target_arg.?, keys_arg, undefined };
+    var ipc_args: [][:0]const u8 = ipc_args_buf[0..2];
+
+    // Only send the segmented payload when there is a boundary worth
+    // preserving. A send that is all text or all keys has nothing to
+    // disambiguate, so it stays byte-for-byte what it has always been —
+    // and `--keys=` alone is what an older Ghoztty build understands, so
+    // a CLI newer than the app it is driving degrades to that behaviour
+    // rather than failing.
+    if (resolved.segments.len > 1) {
+        ipc_args_buf[2] = try encodeSegments(alloc, resolved.segments);
+        ipc_args = ipc_args_buf[0..3];
+    }
 
     if (opts.when_idle) {
         waitForIdle(
@@ -284,77 +307,141 @@ fn appendFile(alloc: Allocator, buf: *std.ArrayList(u8), path: []const u8) !void
     try buf.appendSlice(alloc, bytes);
 }
 
-/// Resolve the whole argument list into PTY bytes, IN ORDER, and pull the
-/// `--target=` argument out along the way. Returns the number of text
-/// arguments seen (everything that is not `--target=`); on a `--keys-file=`
-/// read failure, `bad_file` names the path so the caller can say which one.
+/// A run of resolved bytes, tagged with how the receiving program should
+/// understand it. The wire format lives with the IPC server that reads it
+/// (`apprt.ipc.segments`) so the encoder and the decoder cannot drift.
+const segments_wire = apprt.ipc.segments;
+const Segment = segments_wire.Segment;
+const Kind = segments_wire.Kind;
+
+const Resolved = struct {
+    /// Every resolved byte, concatenated in argument order.
+    bytes: []const u8,
+
+    /// The same bytes, split at every text↔key boundary.
+    segments: []const Segment,
+};
+
+/// Resolve the whole argument list into ordered segments, IN ORDER, pulling
+/// the `--target=` argument out along the way. A `--keys-file=` among the
+/// positional arguments contributes its bytes where it appears — as a TEXT
+/// run, since it is content the caller did not type — so
+/// `--keys-file=p.txt Enter` sends the file and then the newline.
+///
+/// The boundary between a text run and the key run after it is the whole
+/// point: flattening `"some message" Enter` into one buffer hands the
+/// receiving program a single burst of bytes ending in `\r`, which paste
+/// detection reads as a pasted newline instead of a submit.
+///
+/// `text_count` receives the number of arguments that were not `--target=`;
+/// on a `--keys-file=` read failure, `bad_file` names the path so the caller
+/// can say which one. The returned segments point into the returned `bytes`,
+/// and the scratch used along the way is never freed, so pass an arena.
 fn resolveArguments(
     alloc: Allocator,
-    buf: *std.ArrayList(u8),
     arguments: []const [:0]const u8,
     target: *?[:0]const u8,
     bad_file: *?[]const u8,
-) !usize {
-    var text_count: usize = 0;
+    text_count: *usize,
+) !Resolved {
+    // Record spans rather than slices while filling `buf`: appending to it
+    // can reallocate, which would dangle any slice taken earlier.
+    const Span = struct { kind: Kind, start: usize, end: usize };
+
+    var buf: std.ArrayList(u8) = .empty;
+    var spans: std.ArrayList(Span) = .empty;
+
+    text_count.* = 0;
     for (arguments) |arg| {
         if (std.mem.startsWith(u8, arg, "--target=")) {
             target.* = arg;
             continue;
         }
-        text_count += 1;
-        if (std.mem.startsWith(u8, arg, "--keys-file=")) {
+        text_count.* += 1;
+
+        const start = buf.items.len;
+        const kind: Kind = if (std.mem.startsWith(u8, arg, "--keys-file=")) kind: {
             const path = arg["--keys-file=".len..];
-            appendFile(alloc, buf, path) catch |err| {
+            appendFile(alloc, &buf, path) catch |err| {
                 bad_file.* = path;
                 return err;
             };
-            continue;
+            break :kind .text;
+        } else try resolveArgument(alloc, &buf, arg);
+
+        // An empty argument resolves to no bytes and so is not a segment.
+        if (buf.items.len == start) continue;
+
+        if (spans.items.len > 0) {
+            const prev = &spans.items[spans.items.len - 1];
+            if (prev.kind == kind) {
+                prev.end = buf.items.len;
+                continue;
+            }
         }
-        try resolveArgument(alloc, buf, arg);
+
+        try spans.append(alloc, .{
+            .kind = kind,
+            .start = start,
+            .end = buf.items.len,
+        });
     }
-    return text_count;
+
+    const segments = try alloc.alloc(Segment, spans.items.len);
+    for (spans.items, segments) |span, *segment| segment.* = .{
+        .kind = span.kind,
+        .bytes = buf.items[span.start..span.end],
+    };
+
+    return .{ .bytes = buf.items, .segments = segments };
 }
 
+/// Encode segments as the `--segments=` IPC argument. The format itself
+/// lives in `apprt.ipc.segments` next to the decoder that reads it.
+const encodeSegments = segments_wire.encode;
+
 /// Resolve a single argument: if it matches a key name, append its byte(s);
-/// otherwise process escape sequences in the text.
-fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!void {
+/// otherwise process escape sequences in the text. Returns which of the two
+/// it was.
+fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!Kind {
     // Ctrl key notation: C-a through C-z (case insensitive)
     if (arg.len == 3 and arg[0] == 'C' and arg[1] == '-') {
         const ch = arg[2];
         if (ch >= 'a' and ch <= 'z') {
             try buf.append(alloc, ch - 'a' + 1);
-            return;
+            return .key;
         }
         if (ch >= 'A' and ch <= 'Z') {
             try buf.append(alloc, ch - 'A' + 1);
-            return;
+            return .key;
         }
     }
 
     // Named keys
     if (eqlIgnoreCase(arg, "Enter") or eqlIgnoreCase(arg, "Return") or eqlIgnoreCase(arg, "CR")) {
         try buf.append(alloc, '\r');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Tab")) {
         try buf.append(alloc, '\t');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Escape") or eqlIgnoreCase(arg, "Esc")) {
         try buf.append(alloc, 0x1b);
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Space")) {
         try buf.append(alloc, ' ');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "BSpace") or eqlIgnoreCase(arg, "Backspace")) {
         try buf.append(alloc, 0x7f);
-        return;
+        return .key;
     }
 
     // Not a key name — process escape sequences in the text
     try processEscapes(alloc, buf, arg);
+    return .text;
 }
 
 /// Process escape sequences within a text string.
@@ -414,7 +501,7 @@ test "resolveArgument C-c" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "C-c");
+    try std.testing.expectEqual(Kind.key, try resolveArgument(alloc, &buf, "C-c"));
     try std.testing.expectEqual(@as(usize, 1), buf.items.len);
     try std.testing.expectEqual(@as(u8, 3), buf.items[0]);
 }
@@ -424,7 +511,7 @@ test "resolveArgument Enter" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "Enter");
+    try std.testing.expectEqual(Kind.key, try resolveArgument(alloc, &buf, "Enter"));
     try std.testing.expectEqualStrings("\r", buf.items);
 }
 
@@ -433,7 +520,7 @@ test "resolveArgument plain text with escapes" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "hello\\nworld");
+    try std.testing.expectEqual(Kind.text, try resolveArgument(alloc, &buf, "hello\\nworld"));
     try std.testing.expectEqualStrings("hello\nworld", buf.items);
 }
 
@@ -461,8 +548,19 @@ fn testKeysFile(alloc: Allocator, dir: std.fs.Dir, name: []const u8, contents: [
     return try alloc.dupeZ(u8, path);
 }
 
+/// Resolve an argument list the way `runArgs` does, for tests that do not
+/// care about the target or the failure paths.
+fn testResolve(alloc: Allocator, arguments: []const [:0]const u8) !Resolved {
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+    var n: usize = 0;
+    return try resolveArguments(alloc, arguments, &target, &bad, &n);
+}
+
 test "keys-file: bytes are verbatim, not escape-processed or key-matched" {
-    const alloc = std.testing.allocator;
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -470,99 +568,186 @@ test "keys-file: bytes are verbatim, not escape-processed or key-matched" {
         "/reset-context settle the \"DWM\\PrintWindow\" question. " ++
         "Literal \\n stays two chars, Enter and C-c stay words, trailing slash: \\";
     const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", contents);
-    defer alloc.free(path);
+    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
     var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
-    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
-    defer alloc.free(keys_arg);
+    var n: usize = 0;
+    const resolved = try resolveArguments(alloc, &.{ "--target=x", keys_arg }, &target, &bad, &n);
 
-    const n = try resolveArguments(alloc, &buf, &.{ "--target=x", keys_arg }, &target, &bad);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqualStrings("--target=x", target.?);
     try std.testing.expect(bad == null);
-    try std.testing.expectEqualStrings(contents, buf.items);
+    try std.testing.expectEqualStrings(contents, resolved.bytes);
+
+    // A file payload is CONTENT, so it is a text run — which is what makes
+    // `--keys-file=p.txt Enter` frame the prompt and leave the CR outside it.
+    try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
 }
 
 test "keys-file: keeps its position among positional arguments" {
-    const alloc = std.testing.allocator;
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", "hello");
-    defer alloc.free(path);
     const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
-    defer alloc.free(keys_arg);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
     var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
+    var n: usize = 0;
 
     // `pre` then the file then Enter: the CR must land LAST, or the prompt is
     // submitted before its own text arrives.
-    const n = try resolveArguments(
+    const resolved = try resolveArguments(
         alloc,
-        &buf,
         &.{ "pre-", keys_arg, "--target=x", "Enter" },
         &target,
         &bad,
+        &n,
     );
     try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqualStrings("pre-hello\r", buf.items);
+    try std.testing.expectEqualStrings("pre-hello\r", resolved.bytes);
+
+    // The text before the file and the file itself are one run; the CR is its
+    // own. This is the /reset-context shape (T428).
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("pre-hello", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
 }
 
 test "keys-file: an unreadable path names itself in bad_file" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
     var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
+    var n: usize = 0;
 
     const missing = "--keys-file=t210-no-such-file-8fbb1c.txt";
     try std.testing.expectError(
         error.FileNotFound,
-        resolveArguments(alloc, &buf, &.{ "--target=x", missing }, &target, &bad),
+        resolveArguments(alloc, &.{ "--target=x", missing }, &target, &bad, &n),
     );
     try std.testing.expectEqualStrings("t210-no-such-file-8fbb1c.txt", bad.?);
 }
 
 test "keys-file: an empty file contributes nothing but still counts as text" {
-    const alloc = std.testing.allocator;
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testKeysFile(alloc, tmp.dir, "empty.txt", "");
-    defer alloc.free(path);
     const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
-    defer alloc.free(keys_arg);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
     var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
+    var n: usize = 0;
 
-    const n = try resolveArguments(alloc, &buf, &.{ "--target=x", keys_arg }, &target, &bad);
+    const resolved = try resolveArguments(alloc, &.{ "--target=x", keys_arg }, &target, &bad, &n);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved.segments.len);
 }
 
 test "positional text is still key-matched and escape-processed" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
     var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
+    var n: usize = 0;
 
-    const n = try resolveArguments(
+    const resolved = try resolveArguments(
         alloc,
-        &buf,
         &.{ "--target=x", "a\\tb", "Enter", "C-c" },
         &target,
         &bad,
+        &n,
     );
     try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqualStrings("a\tb\r\x03", buf.items);
+    try std.testing.expectEqualStrings("a\tb\r\x03", resolved.bytes);
+}
+
+// The invariant this whole change exists to protect: a text argument
+// followed by a key argument must survive as two ordered segments. Flatten
+// them and the receiving program cannot tell the trailing `\r` apart from a
+// newline inside a paste, so `"some message" Enter` never submits.
+test "resolveArguments keeps text and a following key apart" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{ "some message", "Enter" });
+
+    try std.testing.expectEqualStrings("some message\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("some message", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+}
+
+test "resolveArguments merges runs of the same kind" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Adjacent text args concatenate, as do adjacent keys, so the segment
+    // list alternates and single-kind sends stay a single segment.
+    const resolved = try testResolve(alloc, &.{ "vim", " -p", "Enter", "Escape", "iabc" });
+
+    try std.testing.expectEqualStrings("vim -p\r\x1biabc", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 3), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("vim -p", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r\x1b", resolved.segments[1].bytes);
+    try std.testing.expectEqual(Kind.text, resolved.segments[2].kind);
+    try std.testing.expectEqualStrings("iabc", resolved.segments[2].bytes);
+}
+
+test "resolveArguments single-argument forms stay one segment" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // These are the forms that must keep working byte-for-byte. One segment
+    // means the CLI sends only `--keys=`, which is exactly the old payload.
+    for ([_][:0]const u8{ "text", "Enter", "C-c" }) |arg| {
+        const resolved = try testResolve(alloc, &.{arg});
+        try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    }
+}
+
+test "resolveArguments skips arguments that resolve to nothing" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{ "", "hi", "", "Enter" });
+
+    try std.testing.expectEqualStrings("hi\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+}
+
+test "encodeSegments" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{ "hi", "Enter" });
+    try std.testing.expectEqualStrings(
+        "--segments=t6869,k0d",
+        try encodeSegments(alloc, resolved.segments),
+    );
 }

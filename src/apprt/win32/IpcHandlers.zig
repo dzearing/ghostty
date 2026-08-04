@@ -90,6 +90,10 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
 // normalization, layout validation) lives in apprt/ipc/args.zig where it
 // is unit tested in the none-runtime build.
 const verb_args = apprt.ipc.args;
+
+// The `+send-keys` `--segments=` wire format, shared with the CLI that
+// writes it (src/cli/send_keys.zig) so encoder and decoder cannot drift.
+const verb_segments = apprt.ipc.segments;
 const VerbArgs = verb_args.VerbArgs;
 const parseVerbArgs = verb_args.parseVerbArgs;
 const dropPrefix = verb_args.dropPrefix;
@@ -1147,12 +1151,23 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // The CLI resolves all key notation (C-x, Enter, \n escapes) before
     // sending; the server receives `--target=` and raw `--keys=` bytes and
     // just writes them to the pane's PTY (Mac writePtyRaw semantics).
+    //
+    // `--segments=` rides ALONGSIDE `--keys=` when the send mixes text with
+    // keys, carrying where the argument boundaries were. With it we can frame
+    // the text runs as a bracketed paste and write the key runs bare, which
+    // is what makes the trailing `Enter` of `"some message" Enter` submit
+    // instead of landing in the composer as a pasted newline (T428). Without
+    // it — an older CLI, or a send with nothing to disambiguate — the flat
+    // payload is written exactly as it always was.
     var target: ?[]const u8 = null;
     var text: ?[]const u8 = null;
+    var segments_value: ?[]const u8 = null;
     if (request.arguments) |arguments| {
         for (arguments) |arg| {
             if (dropPrefix(arg, "--target=")) |v| {
                 target = v;
+            } else if (dropPrefix(arg, verb_segments.prefix)) |v| {
+                segments_value = v;
             } else if (dropPrefix(arg, "--keys=")) |v| {
                 text = v;
             }
@@ -1173,6 +1188,34 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target_name});
     if (!surface.core_surface_ready)
         return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
+
+    // Segmented send: one write per run, framed by kind. A `--segments=` we
+    // cannot parse is not a reason to fail the request — the same bytes are
+    // in `--keys=`, so fall through and lose only the framing.
+    if (segments_value) |value| decode: {
+        const runs = verb_segments.decode(ctx.alloc, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => {
+                log.warn("+send-keys: ignoring malformed --segments=, sending flat", .{});
+                break :decode;
+            },
+        };
+        defer verb_segments.freeSegments(ctx.alloc, runs);
+        if (runs.len == 0) break :decode;
+
+        for (runs) |run| {
+            if (run.bytes.len == 0) continue;
+            const run_bytes = try verb_args.normalizeConptyInput(ctx.alloc, run.bytes);
+            defer ctx.alloc.free(run_bytes);
+            const written = switch (run.kind) {
+                .text => surface.core_surface.writePtyBracketed(run_bytes),
+                .key => surface.core_surface.writePtyRaw(run_bytes),
+            };
+            written catch return try errorResponse(ctx.alloc, "failed to queue input", .{});
+        }
+
+        return try ctx.alloc.dupe(u8, "{\"success\":true}");
+    }
 
     const normalized = try verb_args.normalizeConptyInput(ctx.alloc, bytes);
     defer ctx.alloc.free(normalized);

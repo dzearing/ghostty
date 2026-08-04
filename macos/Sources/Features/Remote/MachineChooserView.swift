@@ -47,11 +47,24 @@ struct MachineChooserView: View {
     /// T16). Drives each row's disclosure: a session-count badge + an expandable
     /// read-only list of that machine's active sessions.
     @ObservedObject var browser: SessionBrowserProbe
+    /// Live per-session CPU for the SELECTED target, from the agent's pushed
+    /// `session_cpu` stream.
+    ///
+    /// Owned by the PRESENTER, not by this view, and torn down in its `finish`
+    /// alongside `probe`/`browser`. A `@StateObject` here relying on
+    /// `.onDisappear` does not work: the chooser is an NSPanel that gets
+    /// `orderOut`, which hides the window without removing the SwiftUI view from
+    /// its hosting controller — so `.onDisappear` never fires and the stream (and
+    /// the agent-side pump enumerating every process behind it) runs forever.
+    @ObservedObject var sessionCPU: SessionCPUProbe
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
-    /// Secondary action: open the Remote Activity Monitor for a machine instead of
-    /// a window. Triggered by the per-row chart button.
-    var onActivityMonitor: (Machine) -> Void
+    /// Secondary action: open the Activity Monitor for the selected row instead of
+    /// a window. Triggered by the detail header's "See Activity" button.
+    ///
+    /// `nil` means **this Mac** — the monitor's in-process Local source, which
+    /// needs no connection. A non-nil machine is dialed.
+    var onActivityMonitor: (Machine?) -> Void
 
     /// Signed-in Google account state for the footer row (WP-B2). Observed so
     /// the row flips between "Sign in with Google…" and "<email> · Sign Out"
@@ -82,7 +95,24 @@ struct MachineChooserView: View {
     /// Drives the live-refresh poll: while the chooser is open, re-fetch the
     /// relevant rosters every couple seconds so new/closed panes and pane
     /// renames show without reopening. Bounded to local + the selected remote.
-    private let rosterRefreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    ///
+    /// Fires in `.modalPanel` as well as `.common`, and that is load-bearing:
+    /// the chooser is shown with `NSApp.runModal(for:)`, which pumps the run
+    /// loop in `NSModalPanelRunLoopMode` — a mode that is NOT a member of
+    /// `.common`. A `.common`-only timer therefore never fires for as long as
+    /// the dialog is up, so the roster froze at whatever it held when it opened:
+    /// closed sessions lingered as "Resume" rows indefinitely, and reopening the
+    /// dialog was the only way to see the truth. Exactly the staleness this timer
+    /// exists to prevent. (`pollTask` alongside it kept working because a Swift
+    /// `Task` is not run-loop-mode dependent — only this timer was affected.)
+    ///
+    /// Only one run loop mode is active at a time, so the merge cannot
+    /// double-fire; it just means the poll survives whether or not the dialog is
+    /// modal.
+    private let rosterRefreshTimer = Publishers.Merge(
+        Timer.publish(every: 2, on: .main, in: .common).autoconnect(),
+        Timer.publish(every: 2, on: .main, in: .modalPanel).autoconnect()
+    )
 
     /// The background for row `idx`: accent when selected, a faint wash on hover,
     /// else clear. Drives the manual selection/hover highlight.
@@ -173,7 +203,7 @@ struct MachineChooserView: View {
     /// loaded (hidden while loading/failed or when zero).
     @ViewBuilder
     private func countBadge(for target: WindowTarget) -> some View {
-        if let key = browseKey(for: target), let n = browser.count(for: key), n > 0 {
+        if let key = browseKey(for: target), let n = actionableCount(for: key), n > 0 {
             Text("\(n)")
                 .font(.caption2)
                 .monospacedDigit()
@@ -282,6 +312,13 @@ struct MachineChooserView: View {
         }
         .onReceive(rosterRefreshTimer) { _ in
             refreshRosters()
+        }
+        .onDisappear {
+            // Belt-and-braces for hosts that really do remove the view. The
+            // authoritative teardown is the presenter's `finish` — see the
+            // note on `sessionCPU`; this alone would never fire for the modal
+            // NSPanel the chooser actually uses. `stop()` is idempotent.
+            sessionCPU.stop()
         }
     }
 
@@ -472,14 +509,23 @@ struct MachineChooserView: View {
                     .help("Rebuild this machine's full window layout here")
                 }
 
-                if case .remote(let machine) = target {
-                    Button {
-                        onActivityMonitor(machine)
-                    } label: {
-                        Label("Activity", systemImage: "chart.bar.xaxis")
-                    }
-                    .help("Open Activity Monitor for \(machine.name)")
+                // Push the inspect action to the trailing edge, away from the
+                // open actions. "See Activity" doesn't open a window, so
+                // grouping it with the buttons that do invites misclicks — and
+                // a right-aligned slot keeps it on this row rather than adding
+                // a second row of chrome to an already compact dialog.
+                Spacer(minLength: 12)
 
+                switch target {
+                case .local:
+                    seeActivityButton(machine: nil, named: detailTitle(target))
+                case .remote(let machine):
+                    seeActivityButton(machine: machine, named: machine.name)
+                default:
+                    EmptyView()
+                }
+
+                if case .remote(let machine) = target {
                     Menu {
                         managementActions(for: machine)
                     } label: {
@@ -490,7 +536,10 @@ struct MachineChooserView: View {
                     .fixedSize()
                     .help("Manage \(machine.name)")
                 }
-                Spacer()
+                // NOTE: no trailing Spacer. The one above is what pushes the
+                // inspect action to the trailing edge; a second Spacer here
+                // would split the free space evenly between them and park the
+                // button in the middle instead of flush right.
             }
         }
         .padding(16)
@@ -519,7 +568,7 @@ struct MachineChooserView: View {
     @ViewBuilder
     private func detailSubtitle(_ target: WindowTarget) -> some View {
         HStack(spacing: 8) {
-            if let key = browseKey(for: target), let n = browser.count(for: key) {
+            if let key = browseKey(for: target), let n = actionableCount(for: key) {
                 Text("\(n) session\(n == 1 ? "" : "s")")
             }
             switch target {
@@ -554,7 +603,7 @@ struct MachineChooserView: View {
                         // unreconnectable `exited` dead-end). Protects against an
                         // OLDER agent that doesn't reap, and the brief window a
                         // still-bound tombstone exists. Alive + relaunchable stay.
-                        let sessions = allSessions.filter { $0.isConnectable }
+                        let sessions = actionable(allSessions)
                         if sessions.isEmpty {
                             sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
                         } else {
@@ -589,6 +638,22 @@ struct MachineChooserView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
         }
+    }
+
+    /// The trailing "See Activity" action in the detail header.
+    ///
+    /// Offered for **This Mac** as well as remote machines: the Activity Monitor
+    /// has had a Local source all along, but the button was gated to remote rows,
+    /// so the most common case — inspecting your own machine — had no entry point
+    /// here at all. `machine == nil` opens that Local source directly (no dial).
+    @ViewBuilder
+    private func seeActivityButton(machine: Machine?, named name: String) -> some View {
+        Button {
+            onActivityMonitor(machine)
+        } label: {
+            Label("See Activity", systemImage: "chart.bar.xaxis")
+        }
+        .help("Open Activity Monitor for \(name)")
     }
 
     /// A centered placeholder card for the empty / failed session states.
@@ -626,6 +691,13 @@ struct MachineChooserView: View {
                 .foregroundStyle(session.alive ? Color.green : Color.secondary)
                 .padding(.top, 4)
 
+            // CPU sits in its own fixed-width column ahead of the title so the
+            // meters stack into a scannable vertical strip. Inline after the
+            // title it moved with every label's length, which is precisely what
+            // stops you comparing rows at a glance.
+            cpuMeterColumn(session)
+                .padding(.top, 2)
+
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(session.label(liveTitle: liveTitle, persistedTitle: persistedTitle))
@@ -636,15 +708,17 @@ struct MachineChooserView: View {
                     } else {
                         pill(exitedLabel(session), .secondary)
                     }
-                    // Note: no "pinned" badge — every persistent local session is
-                    // pinned (protected from the idle reaper), so it's noise, not
-                    // signal. "open" is what the user cares about; show it (and
-                    // keep "attached" only for attached-ELSEWHERE sessions).
-                    if isOpenLocally {
-                        pill("open", .green)
-                    } else if session.attached {
-                        pill("attached", .secondary)
-                    }
+                    // No "open"/"attached"/"pinned" chips. A chip should mark the
+                    // EXCEPTION, and none of these are: every persistent local
+                    // session is pinned, and since the list now hides sessions this
+                    // viewer cannot resume, every remaining row is either open here
+                    // or genuinely detached — so "open" sat on nearly all of them
+                    // and "attached" on none. They cost a column of chrome to say
+                    // nothing, and the row's own button already draws the
+                    // distinction: "Show" for a session on screen, "Resume" for one
+                    // that is not. Only genuinely exceptional states get a chip —
+                    // the activity badge (busy / needs input), and how a dead
+                    // session exited.
                 }
                 if let cwd = session.cwd, !cwd.isEmpty {
                     Text(cwd)
@@ -699,6 +773,96 @@ struct MachineChooserView: View {
         .contentShape(Rectangle())
         .onTapGesture { browseCursor = index }
         .simultaneousGesture(TapGesture(count: 2).onEnded { resume(session, parent: target) })
+    }
+
+    /// A compact CPU meter for a live session: a small bar plus the percentage.
+    ///
+    /// The number is per-core over the session's WHOLE process tree, so a session
+    /// running four busy threads reads ~400% — the same convention as top(1), and
+    /// the honest one here, because "is this agent runaway?" is exactly a question
+    /// about how many cores it is eating.
+    ///
+    /// Shown for every live session once a reading arrives, INCLUDING 0%.
+    /// Hiding idle rows seemed tidier, but it makes "idle" and "the meter isn't
+    /// working" look identical — and it removes the baseline that makes a busy
+    /// row obvious, since 400% only reads as alarming next to neighbours sitting
+    /// at 0. A missing meter now means exactly one thing: the agent can't serve
+    /// the stream.
+    private static let cpuBarWidth: CGFloat = 26
+
+    /// Width reserved for the percentage. Fixed, so the number can never resize
+    /// and shove the titles — the list must not twitch just because a session got
+    /// busy.
+    ///
+    /// Sized for three digits ("999%"), not for the theoretical maximum. Per-core
+    /// CPU is uncapped, so a fully busy 16-core box could read "1600%" — but
+    /// reserving for that bought a guarantee nobody exercises and left a visible
+    /// gap on EVERY row, since the common reading is "0%". Three digits covers up
+    /// to ten fully-busy cores in a single session; beyond that the value simply
+    /// runs into its slack, which is the right thing to degrade.
+    private static let cpuValueWidth: CGFloat = 27
+
+    /// Width of the whole CPU column, reserved even when there is no meter to
+    /// draw, so every row's title starts at the same x — a column that collapses
+    /// on some rows isn't a column.
+    private static let cpuColumnWidth: CGFloat = cpuBarWidth + 4 + cpuValueWidth
+
+    @ViewBuilder
+    private func cpuMeterColumn(_ session: BrowsedSession) -> some View {
+        Group {
+            if session.alive, sessionCPU.supported, let pct = sessionCPU.cpuBySession[session.id] {
+                // The bar saturates at one full core; beyond that the number
+                // carries the magnitude. A bar scaled to ncpu would leave the
+                // common one-busy-core case as a barely visible sliver.
+                let fill = min(Double(pct) / 100.0, 1.0)
+                // An idle row stays visually quiet — a drawn-but-empty track —
+                // so the busy one still pops without the idle ones vanishing.
+                let tint: Color = pct >= 100 ? .red : (pct >= 40 ? .orange : .secondary)
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.secondary.opacity(0.22))
+                        .frame(width: Self.cpuBarWidth, height: 4)
+                        .overlay(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(tint)
+                                .frame(width: Self.cpuBarWidth * fill, height: 4)
+                        }
+                    // Leading-aligned in a FIXED-width slot: the number belongs
+                    // to the bar, so it sits right after it and the slack falls on
+                    // its right, against the title. Pushing it to the trailing
+                    // edge instead put the gap between bar and number and parked
+                    // the number against the title, which read as if it belonged
+                    // to the title. Monospaced digits so it does not shimmer as
+                    // the value changes.
+                    Text("\(Int(pct.rounded()))%")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+                        .fixedSize()
+                        .frame(width: Self.cpuValueWidth, alignment: .leading)
+                }
+                .help(cpuMeterHelp(pct))
+            } else {
+                // Dead session, or no reading yet: hold the space open.
+                Color.clear
+            }
+        }
+        .frame(width: Self.cpuColumnWidth, alignment: .leading)
+    }
+
+    /// Tooltip for the CPU meter. Names the units (a number over 100 is
+    /// confusing without them) and, when the agent has throttled itself, says so
+    /// — otherwise a slow-moving meter reads as a broken one.
+    private func cpuMeterHelp(_ pct: Float) -> String {
+        var text = String(
+            format: "%.0f%% CPU across this session's whole process tree (100%% = one core).",
+            pct)
+        let ms = sessionCPU.agentIntervalMs
+        if ms > 2000 {
+            text += String(format: "\nUpdating every %.0fs — the agent is throttling itself under load.",
+                           Double(ms) / 1000.0)
+        }
+        return text
     }
 
     /// A small activity badge for a live session: busy / needs-input are shown;
@@ -786,15 +950,64 @@ struct MachineChooserView: View {
         var titles: [String: String] = [:]
     }
 
+    /// The sessions the user can actually act on — what the list renders, and
+    /// what every count must agree with.
+    ///
+    /// Beyond the dead-tombstone backstop (`isConnectable`), this drops any
+    /// session the agent reports as ATTACHED that we have no open pane for.
+    /// In practice that is a pane just closed: its session stays alive for the
+    /// undo window (5s) and is still bound to us, so it rendered as a "Resume"
+    /// row for a window the user deliberately closed — which reads as a leak and
+    /// invites reviving it. It also covers a session attached to some OTHER
+    /// viewer, which this one equally cannot resume.
+    ///
+    /// Keyed on our own open panes rather than a "closing" marker, so it holds by
+    /// construction: if it is not on screen here and something else holds it, we
+    /// cannot offer it. Genuinely detached sessions — the real Resume case — are
+    /// untouched.
+    private func actionable(_ sessions: [BrowsedSession]) -> [BrowsedSession] {
+        let live = liveSessionInfo
+        return sessions.filter { session in
+            guard session.isConnectable else { return false }
+            if session.attached && !live.openIDs.contains(session.id) { return false }
+            return true
+        }
+    }
+
+    /// The count shown on a row badge / in the detail header. Derived from the
+    /// SAME filter as the list, so the number can never disagree with the rows.
+    private func actionableCount(for key: String) -> Int? {
+        guard let all = browser.loadedSessions(for: key) else { return nil }
+        return actionable(all).count
+    }
+
     private var liveSessionInfo: LiveSessionInfo {
         var info = LiveSessionInfo()
         for controller in TerminalController.all {
+            // A PINNED window title is the most intentional name the window has
+            // -- the user typed it -- and it wins in the titlebar (window title →
+            // tab title → pane title). The row used only `pane.title`, so
+            // renaming a window left the picker showing the old shell-derived
+            // name: the rename appeared to do nothing here.
+            let windowTitle = controller.effectiveWindowTitleOverride?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let panes = controller.surfaceTree.root?.leaves() ?? []
             for pane in controller.surfaceTree {
                 guard let view = pane.surfaceView,
                       let sid = view.liveRemoteSessionID
                 else { continue }
                 info.openIDs.insert(sid)
-                if !pane.title.isEmpty { info.titles[sid] = pane.title }
+                let paneTitle = pane.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Prefer the window title, but keep the pane title as a
+                // disambiguator when the window holds several panes -- otherwise
+                // every pane of a renamed window collapses to one identical row.
+                if let windowTitle, !windowTitle.isEmpty {
+                    info.titles[sid] = (panes.count > 1 && !paneTitle.isEmpty && paneTitle != windowTitle)
+                        ? "\(windowTitle) › \(paneTitle)"
+                        : windowTitle
+                } else if !paneTitle.isEmpty {
+                    info.titles[sid] = paneTitle
+                }
             }
         }
         return info
@@ -827,9 +1040,16 @@ struct MachineChooserView: View {
     /// can render it (fetch-on-select; lazy for remote machines).
     private func ensureFetched(_ target: WindowTarget?) {
         switch target {
-        case .local: browser.fetchIfNeededLocal()
-        case .remote(let m): browser.fetchIfNeeded(machine: m)
-        default: break
+        case .local:
+            browser.fetchIfNeededLocal()
+            sessionCPU.subscribeLocal()
+        case .remote(let m):
+            browser.fetchIfNeeded(machine: m)
+            sessionCPU.subscribe(machine: m)
+        default:
+            // Nothing selected (or a non-browsable row): don't keep a stream
+            // running for a target the user is no longer looking at.
+            sessionCPU.stop()
         }
     }
 
@@ -1430,7 +1650,7 @@ struct MachineChooserView: View {
     }
 }
 
-/// Presents the window-target chooser as an application-modal panel centered on
+/// Presents the window-target chooser as a MODELESS floating panel centered on
 /// the active (key) window — or the main screen if there is none — and calls
 /// `completion` with the chosen target, or nil if the user cancelled.
 ///
@@ -1441,12 +1661,38 @@ struct MachineChooserView: View {
 /// status and may appear/disappear as devices come and go. Callers should
 /// special-case the nothing-to-choose case (no machines AND no relay account)
 /// before calling this (e.g. just open a local window directly).
+/// Reports a user-initiated close (close button, Cmd-W) so the presenter can
+/// tear its probes down. A modeless panel has no modal session to end, so this
+/// is the only signal that the picker went away.
+@MainActor
+private final class MachineChooserPanelDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
+    nonisolated func windowWillClose(_ notification: Notification) {
+        MainActor.assumeIsolated { onClose() }
+    }
+}
+
 @MainActor
 enum MachineChooser {
+    /// The open panel and its delegate. `NSApp.runModal` used to retain the
+    /// panel AND block `present` until it closed; modeless, nothing else holds
+    /// it, so the presenter must.
+    private static var openPanel: NSWindow?
+    private static var openPanelDelegate: MachineChooserPanelDelegate?
+
     static func present(
         registry: MachineRegistry = .shared,
         completion: @escaping (WindowTarget?) -> Void
     ) {
+        // Modeless means a second invocation would stack a second panel -- the
+        // modal session used to make that impossible. Focus the open one.
+        if let existing = Self.openPanel {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
         // Capture the window we're presenting over BEFORE we activate/raise our
         // own panel, so we can center on it.
         let anchorWindow = NSApp.keyWindow ?? NSApp.mainWindow
@@ -1466,16 +1712,30 @@ enum MachineChooser {
         // T16). Torn down in `finish` like the metrics probe.
         let browser = SessionBrowserProbe()
 
+        // Pushed per-session CPU for the selected row. Owned here, NOT by the
+        // view, for the same reason as the two probes above: the view's
+        // `.onDisappear` never fires for this modal panel.
+        let sessionCPU = SessionCPUProbe()
+
+        // Runs exactly once, however the picker goes away: a pick, Cancel, or the
+        // user closing the panel (which arrives via the delegate and re-enters
+        // here), so the guard is load-bearing.
+        var finished = false
         let finish: (WindowTarget?) -> Void = { target in
+            if finished { return }
+            finished = true
             // Tear down all probe connections BEFORE handing control back, so
             // no probe connection outlives the picker no matter the choice.
             probe.stop()
             browser.stop()
+            sessionCPU.stop()
             pollTask?.cancel()
             if let windowRef {
-                NSApp.stopModal()
-                windowRef.orderOut(nil)
+                windowRef.delegate = nil   // don't re-enter via windowWillClose
+                windowRef.close()
             }
+            Self.openPanel = nil
+            Self.openPanelDelegate = nil
             completion(target)
         }
 
@@ -1483,23 +1743,40 @@ enum MachineChooser {
             registry: registry,
             probe: probe,
             browser: browser,
+            sessionCPU: sessionCPU,
             onSelect: { finish($0) },
             onCancel: { finish(nil) },
             onActivityMonitor: { machine in
-                // Dismiss the chooser (tearing down its probes via `finish`) and
-                // open the Activity Monitor on a freshly-dialed connection.
+                // Dismiss the chooser (tearing down its probes via `finish`),
+                // then open the monitor. This Mac uses the in-process Local
+                // source — dialing a connection to ourselves would be pointless
+                // and would fail whenever no agent is listening.
                 finish(nil)
-                RemoteActivityMonitor.presentDialing(machine: machine)
+                if let machine {
+                    RemoteActivityMonitor.presentDialing(machine: machine)
+                } else {
+                    RemoteActivityMonitor.presentLocal()
+                }
             },
             account: .shared
         )
 
         let hosting = NSHostingController(rootView: view)
         let window = NSPanel(contentViewController: hosting)
-        window.styleMask = [.titled]
+        // Modeless needs its own way out -- under runModal the buttons were the
+        // only exits. Floating + not hiding on deactivate means the picker stays
+        // visible while you work behind it, which is the whole point: you can
+        // close a terminal window and watch the roster update.
+        window.styleMask = [.titled, .closable]
+        window.level = .floating
+        window.hidesOnDeactivate = false
         window.title = "New Window"
         window.isReleasedWhenClosed = false
         window.isMovableByWindowBackground = true
+        let panelDelegate = MachineChooserPanelDelegate { finish(nil) }
+        window.delegate = panelDelegate
+        Self.openPanel = window
+        Self.openPanelDelegate = panelDelegate
         windowRef = window
 
         // Size the window to the SwiftUI content's natural size BEFORE centering.
@@ -1526,9 +1803,14 @@ enum MachineChooser {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         // Refresh the account device list from the relay on open (WP-C2). The
-        // continuation runs during the modal session (the modal panel runloop
-        // mode is a common mode, so main-queue work is delivered — the probe
-        // relies on the same behavior). Rows update in place as it lands.
+        // Rows update in place as it lands.
+        //
+        // NOTE: this comment used to claim the modal-panel runloop mode is a
+        // common mode "so main-queue work is delivered". It is not. Under
+        // `runModal` every `DispatchQueue.main.async` completion — the
+        // session-roster refresh included — sat undelivered until the panel
+        // closed, which froze the roster and left closed sessions showing as
+        // "Resume" rows. The panel is modeless now, so the main queue drains.
         Task { @MainActor in
             await registry.refreshFromRelay()
         }
@@ -1557,6 +1839,10 @@ enum MachineChooser {
         // collapsed row (cheap: reuses the warm shared connection, no dial).
         // Remote machines are browsed lazily on expand.
         browser.primeLocal()
-        NSApp.runModal(for: window)
+        // Prefer a live subscription over the 2s poll: the agent tells us the
+        // moment a session is created, exits, is closed, attaches or detaches.
+        // Falls back to polling by itself against an older agent, so there is no
+        // branch here.
+        browser.subscribeLocalPush()
     }
 }

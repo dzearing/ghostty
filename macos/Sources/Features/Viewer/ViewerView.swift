@@ -2418,12 +2418,46 @@ extension ViewerView: WKNavigationDelegate {
 // MARK: - WKUIDelegate
 
 extension ViewerView: WKUIDelegate {
-    /// A page called `window.open()` or activated a `target="_blank"` link.
-    /// The decision (see the task brief) is that a popup opens as its own new
-    /// Ghoztty viewer window — so it can be focused, persisted, and, crucially,
-    /// self-close via `window.close()` the way an OAuth sign-in popup expects.
+    /// Where a `window.open()` / `target="_blank"` request ends up.
+    enum PopupDestination: Equatable {
+        /// Hand the URL to the system default browser and cancel the popup.
+        case defaultBrowser(URL)
+        /// Open it as its own Ghoztty viewer window.
+        case ghosttyWindow
+    }
+
+    /// A popup carrying an `http(s)` URL leaves for the default browser. Two
+    /// things keep it in Ghoztty: a Cmd-held click (the deliberate escape
+    /// hatch), and anything the browser could not be handed — a bare
+    /// `window.open()` with no URL, where the script writes into the returned
+    /// window itself, or a non-web scheme, which `NSWorkspace` would resolve to
+    /// some arbitrary handler.
+    static func popupDestination(
+        for url: URL?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> PopupDestination {
+        guard !modifiers.contains(.command),
+              let url,
+              url.scheme == "http" || url.scheme == "https"
+        else { return .ghosttyWindow }
+        return .defaultBrowser(url)
+    }
+
+    /// A page called `window.open()` or activated a `target="_blank"` link. A
+    /// web URL goes to the **system default browser** and the popup is
+    /// cancelled: Ghoztty's `WKWebView` has its own cookie store with no
+    /// relationship to Safari or Chrome, so an authenticated site opened here
+    /// renders logged-out and a sign-in flow never completes.
     ///
-    /// The returned web view MUST be one built from `configuration` (WebKit's
+    /// This reverses the earlier decision that a popup should become its own
+    /// Ghoztty window precisely so an OAuth popup could `window.close()` itself
+    /// and hand a session back to the opener page. The tradeoff is accepted: a
+    /// popup that lands in the browser can no longer return a session to the
+    /// Ghoztty page that opened it — but that flow was not authenticating in
+    /// the first place, so there was never a session to hand back.
+    ///
+    /// `popupDestination(for:modifiers:)` decides; on its `.ghosttyWindow` path
+    /// the returned web view MUST be one built from `configuration` (WebKit's
     /// own object): WebKit drives the navigation on it and keeps the
     /// opener↔popup relationship. Building our own web view and loading the
     /// request ourselves would break `window.close()`. Returning nil cancels
@@ -2434,6 +2468,13 @@ extension ViewerView: WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
+        if case .defaultBrowser(let url) = Self.popupDestination(
+            for: navigationAction.request.url,
+            modifiers: navigationAction.modifierFlags) {
+            NSWorkspace.shared.open(url)
+            return nil
+        }
+
         // Without a host controller there is nowhere to put a window; drop the
         // popup rather than leak an unparented web view.
         guard let controller = window?.windowController as? BaseTerminalController

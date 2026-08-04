@@ -34,6 +34,10 @@ enum UpdateSimulator {
     /// Simulates auto-update flow: goes directly to installing state without showing intermediate UI
     case autoUpdate
 
+    /// Update available WITH inline client release notes, for verifying the
+    /// pre-update dialog's notes rendering offline.
+    case updateAvailableWithNotes
+
     func simulate(with viewModel: UpdateViewModel) {
         switch self {
         case .happyPath:
@@ -54,7 +58,23 @@ enum UpdateSimulator {
             simulateInstalling(viewModel)
         case .autoUpdate:
             simulateAutoUpdate(viewModel)
+        case .updateAvailableWithNotes:
+            simulateUpdateAvailableWithNotes(viewModel)
         }
+    }
+
+    private func simulateUpdateAvailableWithNotes(_ viewModel: UpdateViewModel) {
+        let notes = VersionNotes(version: "1.24.0", sections: [
+            ReleaseNoteSection(title: "Fork Changes", items: [
+                ReleaseNote(title: "Viewer panes", text: "Open a rendered **markdown** file, a code file, or a website in a side pane."),
+                ReleaseNote(title: "Pane banners", text: "Pin a sticky status banner — lists, tables, and links — above any pane."),
+                ReleaseNote(title: nil, text: "Assorted UI polish across the app."),
+            ]),
+        ])
+        viewModel.state = .updateAvailable(.init(
+            appcastItem: SUAppcastItem.empty(),
+            reply: { _ in viewModel.state = .idle },
+            clientNotes: notes))
     }
 
     private func simulateHappyPath(_ viewModel: UpdateViewModel) {

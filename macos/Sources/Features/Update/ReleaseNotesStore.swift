@@ -56,6 +56,28 @@ struct ReleaseNotesStore {
             .appendingPathComponent("agent", isDirectory: true)
     }
 
+    /// The bundled CLIENT release-notes directory inside the app Resources, or
+    /// nil if absent. Scoped to app/UI/viewer/banner changes (NOT the
+    /// session-persistence/agent items under `agentNotesDirectory`).
+    static var clientNotesDirectory: URL? {
+        Bundle.main.resourceURL?
+            .appendingPathComponent("ghostty", isDirectory: true)
+            .appendingPathComponent("release-notes", isDirectory: true)
+            .appendingPathComponent("client", isDirectory: true)
+    }
+
+    /// Decode a single version's notes from an appcast item's `<description>`
+    /// (embedded JSON, delivered over the network). Returns nil for nil, empty,
+    /// or non-JSON input (e.g. an HTML description) so callers degrade to
+    /// showing no notes rather than failing.
+    static func versionNotes(fromAppcastDescription description: String?) -> VersionNotes? {
+        guard let description,
+              let data = description.data(using: .utf8),
+              let notes = try? JSONDecoder().decode(VersionNotes.self, from: data)
+        else { return nil }
+        return notes
+    }
+
     /// True iff dotted-numeric version `a` is strictly newer than `b`
     /// (`.numeric` handles `1.10.0` > `1.9.0`).
     static func isNewer(_ a: String, than b: String) -> Bool {

@@ -149,7 +149,15 @@ ghoztty +send-keys --target=<name> <text|key>...
   positional argument with its quotes stripped, re-tokenized and concatenated
   without separators, or broken outright. Length is not the hazard — the
   transport is byte-exact at 10,000 characters (T210).
-- Positional arguments are text or key names, concatenated and written to the PTY.
+- Positional arguments are text or key names, written to the PTY in order.
+  Adjacent arguments of the same kind merge into one **run**, and the run
+  boundaries survive to the PTY write: a text run is framed as a **bracketed
+  paste** (`ESC[200~` … `ESC[201~`, one write) when the program in the pane has
+  mode 2004 enabled, and key runs are written bare, outside the frame. That is
+  what makes `+send-keys --target=t "a long prompt" Enter` submit — an unframed
+  trailing `\r` reads to a TUI as a newline *inside* pasted text, and the
+  message sits in the composer unsent. Framing is a property of the bytes, not
+  of their timing, so no sleep in the path substitutes for it.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`
 - Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
@@ -159,6 +167,17 @@ ghoztty +send-keys --target=term "ls -la" Enter
 ghoztty +send-keys --target=term C-c
 ghoztty +send-keys --target=term "hello\tworld\n"
 ```
+
+**Text and keys stay distinguishable.** Argument boundaries survive all the way to the write. When a call mixes text with keys, adjacent arguments of the same kind merge into a run, and each **text** run is written to the pane as a **bracketed paste** (`ESC[200~` … `ESC[201~`) while each **key** run is written bare, outside the frame.
+
+This is what makes `+send-keys --target=t "some message" Enter` actually submit. Flattened into one burst of bytes ending in `\r`, a TUI's paste detection reads that `\r` as a newline inside pasted text — correctly, since that is exactly how a real multi-line paste looks — and the message sits unsent in the composer. Framing states which bytes were pasted, so the `\r` after the closing fencepost is unambiguously a keypress. It is a property of the bytes, not of their timing, so there is no delay anywhere in the path.
+
+Two consequences worth knowing:
+
+- A text run is framed **in a single PTY write**. Splitting the frame across writes lets the opening fencepost land in its own `read()` on the far side, and a receiver that sees a lone `ESC[200~` does not reliably associate it with the content after it (measured against Claude Code, which then falls back to its length heuristic and swallows the `\r` again).
+- Framing only happens when the program running in the pane has **enabled bracketed paste** (DEC mode 2004) — which every modern TUI and interactive shell does. A pane running something that has not (`cat`, a shell script's `read`) gets the bytes verbatim, so nothing can inject literal `[200~` junk into a program that would not understand it. Text containing `ESC[201~` is also sent unframed, rather than emitting a frame that would close early.
+
+Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own — have no boundary to disambiguate and are sent byte-for-byte as they always were.
 
 ### `ghoztty +set-state`
 
@@ -192,6 +211,17 @@ ghoztty +set-banner --target=<name> [--clear] [text...]
 - All other arguments are treated as the banner text (multiple are joined with spaces).
 
 Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and `[text](url)` clickable links (URL must include a scheme, e.g. `https://`). Note `__underline__` intentionally differs from CommonMark (where `__` is bold). `\` escapes the next character. Unterminated delimiters render literally. A literal `\n` in CLI banner text becomes a line break — banners can span multiple lines (display is capped at 10 lines).
+
+**Autolinking.** Bare URLs and bare file paths become clickable without `[text](url)` syntax. A URL must carry a scheme — only `http://` and `https://` linkify, never a bare `www.example.com` or `config.io`, so prose is never falsely linked. A file path must start with `/`, `~/`, `./`, or `../`; the sigil is the whole signal (there is no filesystem check), which is why a bare relative `macos/Sources/Foo.swift` stays plain text. `~/` expands to the home directory and `./`/`../` resolve against **the pane's current working directory** at render time — a dot-relative path in a pane with no known cwd stays plain text rather than resolving against a guess. Trailing sentence punctuation stays outside the link (`See https://x.com.` links `https://x.com`), while brackets balanced *inside* the link are kept (`…/Foo_(bar)`). Autolinking never fires inside a `` `code` `` span, after a `\` escape, or inside an explicit `[label](url)` — the explicit link always owns its whole label.
+
+**Link clicks.** A plain click hands the link *out* of Ghoztty; the modifiers bring it back in. Cmd opens a **viewer side pane** for either kind of link, and Cmd-Shift gives the link a surface of its own.
+
+| | plain click | Cmd | Cmd-Shift |
+|---|---|---|---|
+| **URL** | default browser | side pane | new Ghoztty window |
+| **file path** | reveal in Finder | side pane | open with default app |
+
+A URL goes to the real browser by default because Ghoztty's `WKWebView` keeps its own cookie store with no relationship to Safari/Chrome — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
 
 **Lists.** Consecutive lines that begin with a list marker render as a list block with table-like row spacing and a **shared marker gutter**, so every item's content left-aligns regardless of marker kind (bullets, numbers, and checkboxes in one run all line up). Supported markers:
 
@@ -457,6 +487,16 @@ ghoztty +close --target=doc
 - **Links** in file viewers: http(s) opens the default browser; a relative
   `.md` link opens another viewer split; other local files open in their
   default app.
+- **Links that open a new surface** in a website viewer — `target="_blank"` or
+  `window.open()` — go to the **system default browser**, not a new Ghoztty
+  window, for the same cookie-store reason banner URLs do. Same-pane
+  navigation is untouched: a website viewer follows ordinary links in place.
+  **Cmd-click** keeps the popup in Ghoztty as its own viewer window (honoring
+  the size the opener asked for), and so does a popup the browser can't be
+  handed — a bare `window.open()` with no URL, or a non-web scheme. The
+  tradeoff: a popup that lands in the browser can't `window.close()` itself
+  back to the Ghoztty page that opened it, so an OAuth flow finishes in the
+  browser. That flow wasn't authenticating in Ghoztty anyway.
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a

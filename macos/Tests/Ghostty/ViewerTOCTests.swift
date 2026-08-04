@@ -332,6 +332,10 @@ struct ViewerTOCTests {
 
         viewer.setDetached(true)
         viewer.layoutSubtreeIfNeeded()
-        #expect(viewer.tocGutterWidth == 0)
+        // The gutter collapses over a layout pass, not inside `setDetached`, so
+        // reading it straight after the call catches the old width on a loaded
+        // machine.
+        #expect(await wait { viewer.tocGutterWidth == 0 },
+                "gutter did not collapse on detach: \(viewer.tocGutterWidth)")
     }
 }

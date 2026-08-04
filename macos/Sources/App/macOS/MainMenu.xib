@@ -89,6 +89,12 @@
                                     <action selector="showAbout:" target="-1" id="tGt-68-tLn"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="What’s New in Ghoztty…" id="WhN-01-itm">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="showWhatsNew:" target="bbz-4X-AYv" id="WhN-01-act"/>
+                                </connections>
+                            </menuItem>
                             <menuItem title="Check for Updates..." id="GEA-5y-yzH">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>

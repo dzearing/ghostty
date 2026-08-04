@@ -172,6 +172,9 @@ class AppDelegate: NSObject,
         updateController.viewModel
     }
 
+    /// The reusable "What's New" window (created lazily, kept for reuse).
+    private var whatsNewWindow: NSWindow?
+
     /// The elapsed time since the process was started
     var timeSinceLaunch: TimeInterval {
         return ProcessInfo.processInfo.systemUptime - applicationLaunchTime
@@ -1168,6 +1171,28 @@ class AppDelegate: NSObject,
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
+    @IBAction func showWhatsNew(_ sender: Any?) {
+        if let win = whatsNewWindow {
+            win.makeKeyAndOrderFront(sender)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let previousSeen = WhatsNewTracking.previousSeenVersion
+        let current = WhatsNewTracking.currentAppVersion
+        let client = ReleaseNotesStore(directory: ReleaseNotesStore.clientNotesDirectory)
+            .partitioned(previousSeen: previousSeen, current: current)
+        let agent = ReleaseNotesStore(directory: ReleaseNotesStore.agentNotesDirectory)
+            .partitioned(previousSeen: previousSeen, current: current)
+
+        let window = WhatsNewWindowView.makeWindow(WhatsNewWindowView(
+            clientNew: client.new, clientInstalled: client.installed,
+            agentNew: agent.new, agentInstalled: agent.installed))
+        whatsNewWindow = window
+        window.makeKeyAndOrderFront(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @IBAction func newWindow(_ sender: Any?) {
         _ = TerminalController.newWindow(ghostty)
     }
@@ -1900,7 +1925,7 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func showHelp(_ sender: Any) {
-        guard let url = URL(string: "https://ghostty.org/docs") else { return }
+        guard let url = URL(string: "https://dzearing.github.io/ghoztty/") else { return }
         NSWorkspace.shared.open(url)
     }
 

@@ -3,8 +3,11 @@ import SwiftUI
 struct AboutView: View {
     @Environment(\.openURL) var openURL
 
-    private let githubURL = URL(string: "https://github.com/ghostty-org/ghostty")
-    private let docsURL = URL(string: "https://ghostty.org/docs")
+    /// The one place the repo lives. Every link that points into it (the GitHub
+    /// button, the commit link, the release-notes link) derives from this, so
+    /// they can't drift apart. `static` so the nested `VersionConfig` can reach it.
+    private static let githubURL = URL(string: "https://github.com/dzearing/ghoztty")
+    private let docsURL = URL(string: "https://dzearing.github.io/ghoztty/")
 
     /// Read the commit from the bundle.
     private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
@@ -33,8 +36,7 @@ struct AboutView: View {
         var url: URL? {
             switch self {
             case .stable(let version):
-                let slug = version.replacingOccurrences(of: ".", with: "-")
-                return URL(string: "https://ghostty.org/docs/install/release-notes/\(slug)")
+                return AboutView.githubURL?.appendingPathComponent("/releases/tag/v\(version)")
             default:
                 return nil
             }
@@ -82,7 +84,7 @@ struct AboutView: View {
                         PropertyRow(label: "Build", text: build)
                     }
                     if let commit, commit != "",
-                       let url = githubURL?.appendingPathComponent("/commits/\(commit)") {
+                       let url = Self.githubURL?.appendingPathComponent("/commits/\(commit)") {
                         PropertyRow(label: "Commit", text: commit, url: url)
                     }
                 }
@@ -94,7 +96,7 @@ struct AboutView: View {
                             openURL(url)
                         }
                     }
-                    if let url = githubURL {
+                    if let url = Self.githubURL {
                         Button("GitHub") {
                             openURL(url)
                         }

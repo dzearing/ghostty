@@ -56,10 +56,6 @@ struct ViewerAddressBarEditingSelectorTests {
 @MainActor
 @Suite(.serialized)
 struct ViewerAddressBarClipboardRoutingTests {
-    private func wait(_ seconds: TimeInterval) async {
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-    }
-
     private func keyEvent(
         _ chars: String, _ flags: NSEvent.ModifierFlags
     ) -> NSEvent {
@@ -80,12 +76,13 @@ struct ViewerAddressBarClipboardRoutingTests {
         window.makeKeyAndOrderFront(nil)
         viewer.focusAddressBar()
         var editor: NSText?
-        for _ in 0..<100 {
-            await wait(0.02)
+        await poll {
             viewer.layoutSubtreeIfNeeded()
-            guard let field = ViewerView.firstTextField(in: viewer) else { continue }
+            guard let field = ViewerView.firstTextField(in: viewer) else { return false }
             window.makeFirstResponder(field)
-            if let e = field.currentEditor() { editor = e; break }
+            guard let current = field.currentEditor() else { return false }
+            editor = current
+            return true
         }
         guard let editor else { return nil }
         editor.string = text
@@ -162,10 +159,6 @@ struct ViewerAddressBarClipboardRoutingTests {
 @MainActor
 @Suite(.serialized)
 struct ViewerAddressBarFocusClickTests {
-    private func wait(_ seconds: TimeInterval) async {
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-    }
-
     @Test func clickSelectsAddressWhenGainingFocusFromWebContent() async {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
@@ -180,14 +173,22 @@ struct ViewerAddressBarFocusClickTests {
         }
 
         // Mount + lay out the chrome bar so the address field has a real frame.
+        // Poll for the mounted bar rather than sleeping a fixed span: an
+        // offscreen window is never key, so the field loses focus shortly
+        // after taking it and the bar's 2s auto-hide follows — which would
+        // leave `addressClickSelectsAll` (it requires visible chrome)
+        // answering false for reasons that have nothing to do with clicks.
+        var field: NSTextField?
         window.makeKeyAndOrderFront(nil)
         viewer.focusAddressBar()
-        var field: NSTextField?
-        for _ in 0..<100 {
-            await wait(0.02)
+        await poll {
             viewer.layoutSubtreeIfNeeded()
-            field = ViewerView.firstTextField(in: viewer)
-            if field != nil { break }
+            guard viewer.chromeVisible,
+                  let mounted = ViewerView.firstTextField(in: viewer),
+                  mounted.convert(mounted.bounds, to: viewer).width > 0
+            else { return false }
+            field = mounted
+            return true
         }
         guard let field else { #expect(Bool(false), "address field never mounted"); return }
         let frame = field.convert(field.bounds, to: viewer)

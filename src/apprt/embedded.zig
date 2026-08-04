@@ -594,6 +594,33 @@ const ghostty_host_metrics_s = extern struct {
 /// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
 const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
 
+/// One session's CPU roll-up, pushed on the `session_cpu` stream. `id` is a
+/// NUL-terminated session id; `cpu_pct` is per-core over the session's WHOLE
+/// process tree (so a session running four busy threads reads ~400).
+const ghostty_session_cpu_s = extern struct {
+    id: [*:0]const u8,
+    cpu_pct: f32,
+};
+
+/// Callback for one pushed per-session CPU sample. `rows`/`rows_len` and every
+/// string they point at are valid ONLY for the duration of the call — the
+/// decode arena is released as soon as it returns, so copy anything you keep.
+/// `interval_ms` is the cadence the AGENT chose, which may be longer than the
+/// one requested (it throttles itself under load); a client can use it to tell a
+/// slow stream from a dead one. Fires on the connection's control-reader thread.
+const GhosttySessionCpuCallback = *const fn (
+    ?[*]const ghostty_session_cpu_s,
+    usize,
+    u32,
+    ?*anyopaque,
+) callconv(.c) void;
+
+/// Callback for a pushed session ROSTER. `json` is the raw `SESSIONS` payload —
+/// the same bytes a `LIST_SESSIONS` reply carries, so the caller decodes it with
+/// one path and pushed/polled rosters can never drift. NUL-terminated and valid
+/// only for the duration of the call. Fires on the control-reader thread.
+const GhosttySessionsCallback = *const fn (?[*:0]const u8, ?*anyopaque) callconv(.c) void;
+
 /// Callback invoked on every connection link-state transition (§5.1 FSM;
 /// WP-D1 connection-status surface). `state` is a `GHOSTTY_REMOTE_CONN_*`
 /// value (the integer mirror of `connection.LinkState.State`). NOTE: it fires
@@ -604,11 +631,11 @@ const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyo
 const GhosttyRemoteStateCallback = *const fn (i32, ?*anyopaque) callconv(.c) void;
 
 /// One process-table row (activity monitor, §9.3 process view). Mirrors the wire
-/// `Proc`. `name`/`user`/`cmd` are always non-null NUL-terminated C strings — an
-/// empty string means "unavailable" (the agent left `user`/`cmd` null), NEVER a
+/// `Proc`. `name`/`user`/`cmd`/`tty` are always non-null NUL-terminated C strings —
+/// an empty string means "unavailable" (the agent left the field null), NEVER a
 /// NULL pointer (so the Swift side can read them unconditionally). `cpu_pct` is
 /// per-core: a fully-busy single thread reads ~100; a multithreaded process can
-/// exceed 100. Normalize by `ghostty_host_metrics_s.ncpu` for a 0..100 total.
+/// exceed 100 — the top(1) / Activity Monitor convention, displayed as-is.
 const ghostty_proc_s = extern struct {
     pid: i64,
     ppid: i64,
@@ -617,6 +644,9 @@ const ghostty_proc_s = extern struct {
     name: [*:0]const u8,
     user: [*:0]const u8,
     cmd: [*:0]const u8,
+    /// Controlling terminal without the `/dev/` prefix ("ttys004"), "" when the
+    /// process has none. Keys pane attribution in the activity monitor.
+    tty: [*:0]const u8,
 };
 
 /// A snapshot of the remote host's process table returned by
@@ -659,6 +689,19 @@ pub const RemoteConnectionHandle = struct {
         userdata: ?*anyopaque,
     };
 
+    /// Trampoline state for the per-session CPU callback. Same pinning
+    /// discipline as `metrics_cb`.
+    pub const SessionCpuTrampoline = struct {
+        cb: GhosttySessionCpuCallback,
+        userdata: ?*anyopaque,
+    };
+
+    /// Trampoline state for the pushed session roster. Same pinning discipline.
+    pub const SessionsTrampoline = struct {
+        cb: GhosttySessionsCallback,
+        userdata: ?*anyopaque,
+    };
+
     /// Trampoline state for the link-state callback (WP-D1): the C callback +
     /// the caller's opaque `userdata`. Stored inline on the handle (stable for
     /// the handle's life) so its address can serve as the Zig `StateHandler`
@@ -690,6 +733,13 @@ pub const RemoteConnectionHandle = struct {
     /// `&self.metrics_cb.?` as the handler ctx, so it must stay pinned for the
     /// life of the subscription (the handle is heap-allocated and stable).
     metrics_cb: ?MetricsTrampoline = null,
+
+    /// Trampoline for the pushed per-session CPU stream, or null when not
+    /// subscribed. Pinned inline like `metrics_cb`.
+    session_cpu_cb: ?SessionCpuTrampoline = null,
+
+    /// Trampoline for the pushed session roster, or null when not subscribed.
+    sessions_cb: ?SessionsTrampoline = null,
 
     /// Trampoline state for the link-state observer (WP-D1), or null when not
     /// registered. Same pinning discipline as `metrics_cb`: lives inline on the
@@ -2980,6 +3030,119 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Bridge one pushed per-session CPU sample to the C callback.
+    ///
+    /// The wire rows carry Zig slices (pointer+length, NOT NUL-terminated), so the
+    /// ids must be re-materialized as C strings. That needs an allocation, and this
+    /// runs on the control-reader thread on every push — so it uses one stack
+    /// buffer with a bounded row count rather than touching the heap on a hot,
+    /// non-main thread. A machine with more sessions than the cap reports the first
+    /// `max_rows`; the meter is a glanceable indicator, not an inventory (that's
+    /// what `+sessions` is for).
+    fn sessionCpuTrampoline(
+        ctx: *anyopaque,
+        rows: []const remote_protocol.SessionCpuRow,
+        interval_ms: u32,
+    ) void {
+        const tramp: *const RemoteConnectionHandle.SessionCpuTrampoline = @ptrCast(@alignCast(ctx));
+
+        const max_rows = 128;
+        const max_id = 64;
+        var c_rows: [max_rows]ghostty_session_cpu_s = undefined;
+        var id_buf: [max_rows][max_id]u8 = undefined;
+
+        var n: usize = 0;
+        for (rows) |r| {
+            if (n >= max_rows) break;
+            // Skip (rather than truncate) an id that cannot round-trip: a
+            // truncated id would silently address the WRONG session.
+            if (r.id.len == 0 or r.id.len >= max_id) continue;
+            @memcpy(id_buf[n][0..r.id.len], r.id);
+            id_buf[n][r.id.len] = 0;
+            c_rows[n] = .{ .id = @ptrCast(&id_buf[n]), .cpu_pct = r.cpu_pct };
+            n += 1;
+        }
+
+        tramp.cb(&c_rows, n, interval_ms, tramp.userdata);
+    }
+
+    /// Bridge a pushed session roster to the C callback. The payload is a JSON
+    /// slice (not NUL-terminated) so it is copied into a stack buffer and
+    /// terminated. A roster larger than the buffer is DROPPED rather than
+    /// truncated: half a JSON document would fail to parse anyway, and the next
+    /// change pushes a fresh one.
+    fn sessionsTrampoline(ctx: *anyopaque, json: []const u8) void {
+        const tramp: *const RemoteConnectionHandle.SessionsTrampoline = @ptrCast(@alignCast(ctx));
+        var buf: [64 * 1024]u8 = undefined;
+        if (json.len >= buf.len) return;
+        @memcpy(buf[0..json.len], json);
+        buf[json.len] = 0;
+        tramp.cb(@ptrCast(&buf), tramp.userdata);
+    }
+
+    /// Subscribe to the pushed session roster. The agent sends one immediately
+    /// and then on every change (create, exit, close, attach, detach), so the
+    /// client never polls and cannot render a session that has already exited.
+    ///
+    /// Returns false when the agent did not advertise `sessions_push` (an older
+    /// build); the caller then keeps its LIST_SESSIONS poll.
+    export fn ghostty_remote_connection_sessions_subscribe(
+        handle: *RemoteConnectionHandle,
+        callback: GhosttySessionsCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        handle.sessions_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeSessions(&handle.sessions_cb.?, sessionsTrampoline) catch {
+            handle.sessions_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed session roster and clear the callback. Safe when not
+    /// subscribed and against an older agent.
+    export fn ghostty_remote_connection_sessions_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeSessions();
+        handle.sessions_cb = null;
+    }
+
+    /// Subscribe to the pushed per-session CPU stream (§9.3 chooser meters).
+    ///
+    /// Returns false when the agent did not advertise the `session_cpu`
+    /// capability — an older agent that would treat the opcode as a fatal framing
+    /// error. Callers render no meter in that case rather than falling back to a
+    /// poll the agent never agreed to.
+    ///
+    /// `interval_ms` is a HINT. The agent floors it and stretches it under load,
+    /// and reports the cadence it actually used in every callback.
+    export fn ghostty_remote_connection_session_cpu_subscribe(
+        handle: *RemoteConnectionHandle,
+        interval_ms: u32,
+        callback: GhosttySessionCpuCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        handle.session_cpu_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeSessionCpu(interval_ms, &handle.session_cpu_cb.?, sessionCpuTrampoline) catch {
+            handle.session_cpu_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed per-session CPU stream and clear the callback. After this
+    /// returns no further callback fires. Safe when not subscribed (no-op), and
+    /// safe against an older agent (the gated opcode is simply never sent).
+    export fn ghostty_remote_connection_session_cpu_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeSessionCpu();
+        handle.session_cpu_cb = null;
+    }
+
     /// Stop the pushed metrics stream and clear the callback. After this returns no
     /// further metrics callback fires (the connection clears the handler slot under
     /// its write mutex). Safe to call when not subscribed (no-op).
@@ -3038,6 +3201,12 @@ pub const CAPI = struct {
                 a.free(user);
                 break;
             };
+            const tty = a.dupeZ(u8, p.tty orelse "") catch {
+                a.free(name);
+                a.free(user);
+                a.free(cmd);
+                break;
+            };
             arr[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -3046,6 +3215,7 @@ pub const CAPI = struct {
                 .name = name.ptr,
                 .user = user.ptr,
                 .cmd = cmd.ptr,
+                .tty = tty.ptr,
             };
             filled = i + 1;
         }
@@ -3055,6 +3225,7 @@ pub const CAPI = struct {
                 a.free(std.mem.sliceTo(r.name, 0));
                 a.free(std.mem.sliceTo(r.user, 0));
                 a.free(std.mem.sliceTo(r.cmd, 0));
+                a.free(std.mem.sliceTo(r.tty, 0));
             }
             a.free(arr);
             return empty;
@@ -3091,6 +3262,7 @@ pub const CAPI = struct {
             a.free(std.mem.sliceTo(r.name, 0));
             a.free(std.mem.sliceTo(r.user, 0));
             a.free(std.mem.sliceTo(r.cmd, 0));
+            a.free(std.mem.sliceTo(r.tty, 0));
         }
         a.free(rows);
     }
@@ -3211,11 +3383,45 @@ pub const CAPI = struct {
         }
     };
 
+    /// Host metrics for THIS machine ONLY — no process enumeration.
+    ///
+    /// Exists because the two local consumers want different things: the machine
+    /// CARD needs just the host gauges, while the process TABLE needs the full
+    /// table. Serving the card from `ghostty_local_proc_list` was doubly wrong:
+    ///
+    ///   1. Correctness. The proc sampler derives per-process CPU% from deltas
+    ///      against its own prev-sample baselines, and each call REPLACES them.
+    ///      With the card polling at 5.0s and the table at 1.5s against one shared
+    ///      sampler, a card tick landing just before a table tick left the table
+    ///      measuring a delta over a near-zero wall window — every row read 0.
+    ///   2. Cost. The card discarded the process rows it paid to enumerate
+    ///      (hundreds of pids × 3 syscalls each) every 5 seconds, forever.
+    ///
+    /// Touches ONLY `host_sampler`, so it can never perturb the table's baselines.
+    /// Returns `cpu_pct == 0` on the very first call (no baseline yet), like any
+    /// delta sampler. Scalars only — nothing to free.
+    export fn ghostty_local_host_metrics() ghostty_host_metrics_s {
+        LocalSamplers.mutex.lock();
+        defer LocalSamplers.mutex.unlock();
+        const host = LocalSamplers.host_sampler.sample();
+        return .{
+            .cpu_pct = host.cpu_pct,
+            .mem_used = host.mem_used,
+            .mem_total = host.mem_total,
+            .ncpu = host.ncpu,
+            .uptime_s = host.uptime_s orelse 0,
+            .load1 = host.load1 orelse -1,
+        };
+    }
+
     /// A one-shot snapshot of THIS machine's process table (§9.3, the "Local"
     /// machine). SYNCHRONOUS but cheap (a local OS enumeration). The host metrics
     /// come from a persistent local `Sampler`, so host CPU% is a real delta after
     /// the first poll. `timeout_ms` is accepted for API symmetry with the remote
     /// call but unused (there is no RPC). Free with `ghostty_local_proc_list_free`.
+    ///
+    /// Callers that need ONLY the host gauges must use
+    /// `ghostty_local_host_metrics` instead — see the note there.
     export fn ghostty_local_proc_list(timeout_ms: u32) ghostty_proc_list_s {
         _ = timeout_ms;
         const a = global.alloc;
@@ -3253,6 +3459,7 @@ pub const CAPI = struct {
                 a.free(@constCast(p.name));
                 if (p.user) |u| a.free(@constCast(u));
                 if (p.cmd) |c| a.free(@constCast(c));
+                if (p.tty) |t| a.free(@constCast(t));
             }
             procs.deinit(a);
         }
@@ -3273,6 +3480,12 @@ pub const CAPI = struct {
                 a.free(user);
                 break;
             };
+            const tty = a.dupeZ(u8, p.tty orelse "") catch {
+                a.free(name);
+                a.free(user);
+                a.free(cmd);
+                break;
+            };
             arr[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -3281,6 +3494,7 @@ pub const CAPI = struct {
                 .name = name.ptr,
                 .user = user.ptr,
                 .cmd = cmd.ptr,
+                .tty = tty.ptr,
             };
             filled = i + 1;
         }
@@ -3289,6 +3503,7 @@ pub const CAPI = struct {
                 a.free(std.mem.sliceTo(r.name, 0));
                 a.free(std.mem.sliceTo(r.user, 0));
                 a.free(std.mem.sliceTo(r.cmd, 0));
+                a.free(std.mem.sliceTo(r.tty, 0));
             }
             a.free(arr);
             return empty;
@@ -3323,6 +3538,7 @@ pub const CAPI = struct {
             a.free(std.mem.sliceTo(r.name, 0));
             a.free(std.mem.sliceTo(r.user, 0));
             a.free(std.mem.sliceTo(r.cmd, 0));
+            a.free(std.mem.sliceTo(r.tty, 0));
         }
         a.free(rows);
     }
@@ -3635,6 +3851,20 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.core_surface.writePtyRaw(ptr[0..len]) catch |err| {
+            log.warn("failed to write to pty: {}", .{err});
+        };
+    }
+
+    /// Write bytes to the pty as pasted content: framed in bracketed-paste
+    /// fenceposts if the running program has enabled them, verbatim if not.
+    /// Unlike `ghostty_surface_text` this does no control character
+    /// stripping, so escape sequences pass through intact.
+    export fn ghostty_surface_write_pty_bracketed(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.core_surface.writePtyBracketed(ptr[0..len]) catch |err| {
             log.warn("failed to write to pty: {}", .{err});
         };
     }

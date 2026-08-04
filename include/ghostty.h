@@ -1293,6 +1293,7 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_write_pty(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_write_pty_bracketed(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
@@ -1534,10 +1535,13 @@ GHOSTTY_API void ghostty_remote_connection_metrics_unsubscribe(
     ghostty_remote_connection_t);
 
 // One row of the remote host's process table (activity monitor process view).
-// name/user/cmd are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
+// name/user/cmd/tty are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
 // string ("") means "unavailable", never a NULL pointer. cpu_pct is PER-CORE: a
-// fully-busy single thread is ~100; a multithreaded process can exceed 100.
-// Divide by host.ncpu for a Task-Manager-style 0..100 total.
+// fully-busy single thread is ~100; a multithreaded process can exceed 100 — the
+// same convention as top(1) and macOS Activity Monitor's "% CPU" column, and the
+// value is displayed as-is. (Dividing by host.ncpu would yield a Task-Manager-style
+// share of the whole machine, which is a DIFFERENT quantity — see host.cpu_pct,
+// which already reports exactly that for the host as a whole.)
 typedef struct {
   int64_t pid;
   int64_t ppid;
@@ -1546,6 +1550,12 @@ typedef struct {
   const char* name;   // process name (never NULL; "" if unknown)
   const char* user;   // owning user (never NULL; "" if unavailable)
   const char* cmd;    // command line (never NULL; "" if unavailable)
+  // Controlling terminal WITHOUT the /dev/ prefix ("ttys004", "pts/4"); "" when
+  // the process has no controlling terminal (a daemon, or a setsid'd child) or
+  // the platform has none (Windows). Used to attribute a process to the pane it
+  // runs in: processes inherit their pane's tty, so a tty match seeds attribution
+  // and the ppid chain carries it to setsid'd descendants.
+  const char* tty;
 } ghostty_proc_s;
 
 // A one-shot snapshot of the remote host's process table. ok == false means the
@@ -1607,6 +1617,68 @@ GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
     ghostty_remote_connection_t, const char* cmd, const char* cwd,
     uint32_t timeout_ms);
 
+// One session's CPU roll-up, pushed on the session-CPU stream. cpu_pct is
+// PER-CORE and covers the session's WHOLE process tree (shell + every
+// descendant), because a session is busy when the agent running in it is busy,
+// not when its shell is. So a session running four busy threads reads ~400.
+typedef struct {
+  const char* id;  // session id, matching ghostty_remote_connection_list_sessions
+  float cpu_pct;
+} ghostty_session_cpu_s;
+
+// Callback for one pushed per-session CPU sample.
+//
+// rows/rows_len and every string they point at are valid ONLY for the duration
+// of the call — copy anything you keep. Fires on the connection's control-reader
+// thread, so hop to your own queue before touching UI.
+//
+// interval_ms is the cadence the AGENT chose, which may be LONGER than the one
+// requested: the agent throttles itself when the machine is loaded. Use it to
+// distinguish a deliberately slow stream from a dead one.
+typedef void (*ghostty_session_cpu_cb)(
+    const ghostty_session_cpu_s* rows, size_t rows_len, uint32_t interval_ms,
+    void* userdata);
+
+// Callback for a pushed session roster. `json` is the raw SESSIONS payload --
+// the same bytes a LIST_SESSIONS reply carries, so you decode it with one path
+// and pushed/polled rosters can never drift. Valid only for the duration of the
+// call. Fires on the connection's control-reader thread; hop to your own queue
+// before touching UI.
+typedef void (*ghostty_sessions_cb)(const char* json, void* userdata);
+
+// Subscribe to the pushed session roster: the agent sends one immediately and
+// then on every change (create, exit, close, attach, detach). Event-driven, so
+// the client never polls and cannot show a session that has already exited.
+//
+// Returns false if the agent did not advertise the "sessions_push" capability
+// (an older build) -- keep polling LIST_SESSIONS in that case.
+GHOSTTY_API bool ghostty_remote_connection_sessions_subscribe(
+    ghostty_remote_connection_t, ghostty_sessions_cb, void* userdata);
+
+// Stop the pushed session roster and clear the callback. Safe when not
+// subscribed.
+GHOSTTY_API void ghostty_remote_connection_sessions_unsubscribe(
+    ghostty_remote_connection_t);
+
+// Subscribe to the pushed per-session CPU stream.
+//
+// Returns false if the agent did not advertise the "session_cpu" capability
+// (an agent older than this feature — remember the agent outlives the app and
+// is frequently a different build). Show no meter in that case: the opcode is
+// NOT sent to such an agent, because an unknown opcode is a fatal framing error
+// that would kill an otherwise healthy connection.
+//
+// interval_ms is a HINT, not a mandate — the agent floors it, may stretch it
+// under load, and reports what it actually used in every callback.
+GHOSTTY_API bool ghostty_remote_connection_session_cpu_subscribe(
+    ghostty_remote_connection_t, uint32_t interval_ms,
+    ghostty_session_cpu_cb, void* userdata);
+
+// Stop the pushed per-session CPU stream and clear the callback. After this
+// returns no further callback fires. Safe when not subscribed.
+GHOSTTY_API void ghostty_remote_connection_session_cpu_unsubscribe(
+    ghostty_remote_connection_t);
+
 // ---------------------------------------------------------------------------
 // LOCAL (in-process) activity-monitor provider — the "Local" machine in the
 // panel's switcher. These take NO connection handle: they sample / kill / spawn
@@ -1616,6 +1688,17 @@ GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
 // deltas. All are SYNCHRONOUS; the proc-list is cheap (a local OS enumeration)
 // but should still be called off the main thread, consistent with the remote API.
 // ---------------------------------------------------------------------------
+
+// Host gauges for THIS machine only — NO process enumeration, nothing to free.
+//
+// Use this, not ghostty_local_proc_list, when you only want the host CPU/memory
+// numbers. The proc list computes per-process CPU% from deltas against baselines
+// that each call REPLACES, so a second caller polling it on a different interval
+// silently destroys the first caller's deltas (and pays for a full process
+// enumeration it then discards). This entry point touches only the host sampler.
+//
+// Returns cpu_pct == 0 on the first call (a delta sampler has no baseline yet).
+GHOSTTY_API ghostty_host_metrics_s ghostty_local_host_metrics(void);
 
 // A one-shot snapshot of THIS machine's process table. Reuses the SAME
 // ghostty_proc_list_s struct as the remote path (host is filled from the local

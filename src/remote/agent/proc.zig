@@ -47,9 +47,24 @@ pub const ProcSampler = struct {
     /// pruned each `sample()` (a fresh map is swapped in), so the map never grows
     /// without bound across a long-lived connection.
     prev: std.AutoHashMapUnmanaged(i64, PrevCpu) = .empty,
+    /// macOS `mach_timebase_info` ratio (ns = ticks * numer / denom), queried once
+    /// at construction — it is constant for the life of the machine. 1/1 on every
+    /// other OS (and on Intel Macs), where it is an identity. See `machTicksToNs`.
+    tb_numer: u32 = 1,
+    tb_denom: u32 = 1,
 
     pub fn init(alloc: Allocator) ProcSampler {
-        return .{ .alloc = alloc };
+        var self: ProcSampler = .{ .alloc = alloc };
+        if (builtin.os.tag == .macos) {
+            var info: macos.mach_timebase_info_data_t = .{ .numer = 1, .denom = 1 };
+            // KERN_SUCCESS == 0. On the (impossible) failure path we keep 1/1,
+            // which is the pre-existing behavior rather than a zero divide.
+            if (macos.mach_timebase_info(&info) == 0 and info.numer != 0 and info.denom != 0) {
+                self.tb_numer = info.numer;
+                self.tb_denom = info.denom;
+            }
+        }
+        return self;
     }
 
     pub fn deinit(self: *ProcSampler) void {
@@ -156,15 +171,20 @@ pub const ProcSampler = struct {
             const name_z = std.mem.sliceTo(&bsd.pbi_comm, 0);
             const name = alloc.dupe(u8, name_z) catch continue;
 
-            // cpu busy + mem: PROC_PIDTASKINFO. total_user+total_system (ns) → busy;
-            // resident_size → mem. Best-effort (0s on failure).
+            // cpu busy + mem: PROC_PIDTASKINFO. resident_size → mem;
+            // total_user+total_system → busy, converted from MACH ABSOLUTE TIME
+            // UNITS to ns (they are NOT nanoseconds — see `machTicksToNs`) so
+            // `busy` shares the ns unit `cpuForPid`/`perCorePct` require, matching
+            // the Windows (100ns ticks) and Linux (jiffies) paths.
+            // Best-effort (0s on failure).
             var mem_bytes: u64 = 0;
             var busy_ns: u64 = 0;
             var ti: c.proc_taskinfo = undefined;
             const ti_sz: c_int = @sizeOf(c.proc_taskinfo);
             if (c.proc_pidinfo(pid32, c.PROC_PIDTASKINFO, 0, &ti, ti_sz) == ti_sz) {
                 mem_bytes = ti.pti_resident_size;
-                busy_ns = ti.pti_total_user +% ti.pti_total_system;
+                const busy_ticks = ti.pti_total_user +% ti.pti_total_system;
+                busy_ns = machTicksToNs(busy_ticks, self.tb_numer, self.tb_denom);
             }
 
             // cmd: full executable image path via libproc `proc_pidpath`. One extra
@@ -177,6 +197,19 @@ pub const ProcSampler = struct {
                 break :blk alloc.dupe(u8, path_buf[0..@intCast(n)]) catch null;
             };
 
+            // Controlling terminal name (e.g. "ttys004") from the `e_tdev` we
+            // already read above — no extra syscall. `NODEV` (all bits set) means
+            // no controlling terminal: a daemon, or a child that called setsid.
+            const tty: ?[]const u8 = blk: {
+                if (bsd.e_tdev == std.math.maxInt(u32)) break :blk null;
+                var tbuf: [64]u8 = undefined;
+                const r = c.devname_r(@bitCast(bsd.e_tdev), c.S_IFCHR, &tbuf, tbuf.len);
+                if (r == null) break :blk null;
+                const n = std.mem.sliceTo(&tbuf, 0);
+                if (n.len == 0) break :blk null;
+                break :blk alloc.dupe(u8, n) catch null;
+            };
+
             const cpu_pct = self.cpuForPid(&next, pid, busy_ns, now);
 
             out.append(alloc, .{
@@ -187,9 +220,11 @@ pub const ProcSampler = struct {
                 .mem_bytes = mem_bytes,
                 .user = null,
                 .cmd = cmd,
+                .tty = tty,
             }) catch {
                 alloc.free(name);
                 if (cmd) |x| alloc.free(x);
+                if (tty) |x| alloc.free(x);
                 break;
             };
         }
@@ -282,6 +317,9 @@ pub const ProcSampler = struct {
                 .mem_bytes = mem_bytes,
                 .user = null, // token lookup is fiddly; left null for v1 (per brief)
                 .cmd = cmd,
+                // Windows has no controlling-terminal concept, so pane attribution
+                // has no tty to key on here. Explicitly null (not "unimplemented").
+                .tty = null,
             }) catch {
                 alloc.free(name);
                 if (cmd) |x| alloc.free(x);
@@ -345,6 +383,14 @@ pub const ProcSampler = struct {
             // (null for kernel threads / permission-denied). The UI "Path" column.
             const cmd: ?[]const u8 = readLinuxExe(alloc, ent.name);
 
+            // Controlling terminal (e.g. "pts/4") from the tty_nr we already
+            // parsed — no extra file read. Null for a process with no ctty.
+            const tty: ?[]const u8 = blk: {
+                var tty_buf: [32]u8 = undefined;
+                const n = linuxTtyName(&tty_buf, parsed.tty_nr) orelse break :blk null;
+                break :blk alloc.dupe(u8, n) catch null;
+            };
+
             const cpu_pct = self.cpuForPid(&next, pid, busy_ns, now);
             out.append(alloc, .{
                 .pid = pid,
@@ -354,9 +400,11 @@ pub const ProcSampler = struct {
                 .mem_bytes = mem_bytes,
                 .user = null,
                 .cmd = cmd,
+                .tty = tty,
             }) catch {
                 alloc.free(name);
                 if (cmd) |x| alloc.free(x);
+                if (tty) |x| alloc.free(x);
                 break;
             };
         }
@@ -366,6 +414,104 @@ pub const ProcSampler = struct {
         return truncated;
     }
 };
+
+/// Sum `cpu_pct` over `root` and every transitive descendant of it in `procs`.
+///
+/// Used for the per-session CPU roll-up: a session is busy because the agent
+/// running inside it is busy, not because its shell is, so the number the chooser
+/// wants covers the whole tree hanging off the session's child pid.
+///
+/// Walks a ppid→children adjacency map built once per call by the caller (see
+/// `childMap`), so rolling up N sessions over one snapshot stays linear rather
+/// than rescanning the table per session. Robust to cycles (a visited set — a
+/// corrupt/racy ppid must not hang the pump) and to a root that isn't present
+/// (returns 0).
+fn subtreeCpu(
+    children: *const std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(i64)),
+    cpu_by_pid: *const std.AutoHashMapUnmanaged(i64, f32),
+    root: i64,
+    scratch: *std.ArrayListUnmanaged(i64),
+    seen: *std.AutoHashMapUnmanaged(i64, void),
+    alloc: Allocator,
+) f32 {
+    scratch.clearRetainingCapacity();
+    seen.clearRetainingCapacity();
+    if (cpu_by_pid.get(root) == null) return 0;
+    scratch.append(alloc, root) catch return 0;
+    seen.put(alloc, root, {}) catch return 0;
+
+    var total: f32 = 0;
+    while (scratch.pop()) |pid| {
+        total += cpu_by_pid.get(pid) orelse 0;
+        const kids = children.get(pid) orelse continue;
+        for (kids.items) |kid| {
+            if (seen.contains(kid)) continue;
+            seen.put(alloc, kid, {}) catch continue;
+            scratch.append(alloc, kid) catch continue;
+        }
+    }
+    return total;
+}
+
+/// Per-session CPU totals for `roots`, computed over one process snapshot.
+///
+/// `out` is filled in the same order as `roots` (0 for a root that isn't in the
+/// snapshot — an exited session, or one clipped by the row cap). Caller owns
+/// `out`, which must already have `roots.len` capacity.
+pub fn rollUpByRoot(
+    alloc: Allocator,
+    procs: []const protocol.Proc,
+    roots: []const i64,
+    out: []f32,
+) void {
+    @memset(out, 0);
+    if (roots.len == 0 or procs.len == 0) return;
+
+    var children: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(i64)) = .empty;
+    var cpu_by_pid: std.AutoHashMapUnmanaged(i64, f32) = .empty;
+    defer {
+        var it = children.valueIterator();
+        while (it.next()) |list| list.deinit(alloc);
+        children.deinit(alloc);
+        cpu_by_pid.deinit(alloc);
+    }
+
+    for (procs) |p| {
+        cpu_by_pid.put(alloc, p.pid, p.cpu_pct) catch continue;
+        const gop = children.getOrPut(alloc, p.ppid) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(alloc, p.pid) catch {};
+    }
+
+    var scratch: std.ArrayListUnmanaged(i64) = .empty;
+    var seen: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    defer {
+        scratch.deinit(alloc);
+        seen.deinit(alloc);
+    }
+
+    for (roots, 0..) |root, i| {
+        out[i] = subtreeCpu(&children, &cpu_by_pid, root, &scratch, &seen, alloc);
+    }
+}
+
+/// Convert a mach-absolute-time tick count to nanoseconds given a
+/// `mach_timebase_info` ratio (`ns = ticks * numer / denom`).
+///
+/// macOS reports `pti_total_user`/`pti_total_system` in MACH ABSOLUTE TIME UNITS,
+/// **not** nanoseconds, despite the widespread assumption otherwise. On Intel the
+/// timebase is 1/1 so the two are indistinguishable — which is exactly why reading
+/// them as ns went unnoticed. On Apple Silicon the timebase is 125/3 (a 24 MHz
+/// counter, ≈41.67 ns per tick), so treating ticks as ns undercounts CPU by ~24x:
+/// a fully-pinned core measures ~4% instead of ~100%.
+///
+/// The multiply is widened to u128 because a long-lived process's cumulative tick
+/// count times `numer` can exceed u64.
+fn machTicksToNs(ticks: u64, numer: u32, denom: u32) u64 {
+    if (numer == denom or denom == 0) return ticks; // 1:1 (Intel) — exact, no math
+    const wide = (@as(u128, ticks) * @as(u128, numer)) / @as(u128, denom);
+    return std.math.cast(u64, wide) orelse std.math.maxInt(u64);
+}
 
 /// Per-core busy fraction (0..) as a percent: busy-delta / wall-delta * 100, where
 /// both deltas are in the SAME unit (ns). NOT clamped to 100 — a multithreaded proc
@@ -469,6 +615,15 @@ const macos = struct {
         pw_expire: c_long,
     };
 
+    // mach_timebase_info (mach/mach_time.h): the rational ratio converting mach
+    // absolute time units to nanoseconds. Constant per machine; 1/1 on Intel,
+    // 125/3 on Apple Silicon's 24MHz counter.
+    const mach_timebase_info_data_t = extern struct {
+        numer: u32,
+        denom: u32,
+    };
+    extern "c" fn mach_timebase_info(info: *mach_timebase_info_data_t) c_int;
+
     extern "c" fn proc_listpids(
         type: u32,
         typeinfo: u32,
@@ -483,6 +638,15 @@ const macos = struct {
         buffersize: c_int,
     ) c_int;
     extern "c" fn getpwuid(uid: uid_t) ?*passwd;
+    // devname_r(dev, type, buf, len): the device NAME for a dev_t (e.g. "ttys004"),
+    // written into the caller's buffer — the `_r` form because `devname` returns a
+    // shared static buffer and the sampler may run off the main thread. Returns
+    // null when the dev has no name (notably `NODEV`, i.e. no controlling tty).
+    // macOS `dev_t` is int32_t and `mode_t` is uint16_t.
+    const dev_t = i32;
+    const mode_t = u16;
+    const S_IFCHR: mode_t = 0o020000;
+    extern "c" fn devname_r(dev: dev_t, mode: mode_t, buf: [*]u8, len: c_int) ?[*:0]u8;
     // proc_pidpath(pid, buffer, buffersize): fills `buffer` with the process's full
     // executable image path, returns the byte length (0 / -1 on failure). Stable
     // libproc API (sys/proc_info.h).
@@ -579,10 +743,12 @@ const LinuxStat = struct {
     comm: []const u8, // borrows the input buffer
     utime: u64,
     stime: u64,
+    /// Raw `tty_nr` (field 7). 0 ⇒ no controlling terminal.
+    tty_nr: i64,
 };
 
 /// Parse the fields we need out of /proc/<pid>/stat. The format is:
-///   pid (comm) state ppid pgrp ... utime(14) stime(15) ...
+///   pid (comm) state ppid pgrp session tty_nr(7) ... utime(14) stime(15) ...
 /// `comm` can contain spaces/parens, so we anchor on the LAST ')' and split the
 /// remainder by spaces. Returns null on a malformed line.
 fn parseLinuxStat(text: []const u8) ?LinuxStat {
@@ -592,15 +758,18 @@ fn parseLinuxStat(text: []const u8) ?LinuxStat {
     const comm = text[open + 1 .. close];
 
     // After ')' the remaining fields are space-separated starting at "state".
-    // Indices (0-based on the post-comm tokens): 0=state 1=ppid ... 11=utime 12=stime
+    // Indices (0-based on the post-comm tokens):
+    //   0=state 1=ppid 2=pgrp 3=session 4=tty_nr ... 11=utime 12=stime
     var it = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
     var idx: usize = 0;
     var ppid: i64 = 0;
     var utime: u64 = 0;
     var stime: u64 = 0;
+    var tty_nr: i64 = 0;
     while (it.next()) |tok| : (idx += 1) {
         switch (idx) {
             1 => ppid = std.fmt.parseInt(i64, tok, 10) catch 0,
+            4 => tty_nr = std.fmt.parseInt(i64, tok, 10) catch 0,
             11 => utime = std.fmt.parseInt(u64, tok, 10) catch 0,
             12 => {
                 stime = std.fmt.parseInt(u64, tok, 10) catch 0;
@@ -609,7 +778,27 @@ fn parseLinuxStat(text: []const u8) ?LinuxStat {
             else => {},
         }
     }
-    return .{ .ppid = ppid, .comm = comm, .utime = utime, .stime = stime };
+    return .{ .ppid = ppid, .comm = comm, .utime = utime, .stime = stime, .tty_nr = tty_nr };
+}
+
+/// Render a Linux `tty_nr` as a device name without the `/dev/` prefix, matching
+/// the macOS path's convention. Returns null when there is no controlling
+/// terminal (`tty_nr == 0`) or the device isn't a UNIX98 pty.
+///
+/// `tty_nr` packs major/minor: major = bits 8..19, minor = low 8 bits OR'd with
+/// bits 20..31. Majors 136..143 are UNIX98 pty slaves (`/dev/pts/N`), which is
+/// what an agent's sessions always run on; anything else (a legacy `/dev/ttyN`
+/// console) is reported as null rather than guessed at, since only pts names
+/// can be matched against a pane.
+fn linuxTtyName(buf: []u8, tty_nr: i64) ?[]const u8 {
+    if (tty_nr <= 0) return null;
+    const n: u32 = @intCast(tty_nr);
+    const major = (n >> 8) & 0xfff;
+    const minor = (n & 0xff) | ((n >> 12) & 0xfff00);
+    if (major < 136 or major > 143) return null;
+    // UNIX98 pty minors are numbered per-major from 136.
+    const index = (major - 136) * 256 + minor;
+    return std.fmt.bufPrint(buf, "pts/{d}", .{index}) catch null;
 }
 
 /// Read RSS (resident pages) from /proc/<pid>/statm (field 2). 0 on any failure.
@@ -659,13 +848,145 @@ test "perCorePct: per-core busy fraction" {
     try testing.expectEqual(@as(f32, 0.0), perCorePct(1000, 500, 100 * std.time.ns_per_ms));
 }
 
-test "parseLinuxStat: extracts ppid/comm/utime/stime, comm with spaces+parens" {
+test "rollUpByRoot: sums a session's whole process tree" {
+    const alloc = testing.allocator;
+    // A pane's shell (100) with claude (200) under it, claude's node worker (300),
+    // and a setsid'd Bash-tool grandchild (400 → 500). Plus an unrelated tree (900)
+    // that must NOT leak into the total.
+    const procs = [_]protocol.Proc{
+        .{ .pid = 100, .ppid = 1, .name = "zsh", .cpu_pct = 1 },
+        .{ .pid = 200, .ppid = 100, .name = "claude", .cpu_pct = 10 },
+        .{ .pid = 300, .ppid = 200, .name = "node", .cpu_pct = 100 },
+        .{ .pid = 400, .ppid = 200, .name = "bash", .cpu_pct = 2 },
+        .{ .pid = 500, .ppid = 400, .name = "jq", .cpu_pct = 50 },
+        .{ .pid = 900, .ppid = 1, .name = "other", .cpu_pct = 77 },
+    };
+    var out: [3]f32 = undefined;
+    // Root 100 = the whole session; root 200 = just claude's side; root 12345 is
+    // absent from the snapshot (an exited session) and must read 0, not garbage.
+    rollUpByRoot(alloc, &procs, &.{ 100, 200, 12345 }, &out);
+    try testing.expectEqual(@as(f32, 163), out[0]); // 1+10+100+2+50
+    try testing.expectEqual(@as(f32, 162), out[1]); // 10+100+2+50
+    try testing.expectEqual(@as(f32, 0), out[2]);
+}
+
+test "rollUpByRoot: a ppid cycle terminates instead of hanging the pump" {
+    const alloc = testing.allocator;
+    // 100 → 200 → 300 → 100. A corrupt or racy ppid read must not spin forever;
+    // each pid is counted exactly once.
+    const procs = [_]protocol.Proc{
+        .{ .pid = 100, .ppid = 300, .name = "a", .cpu_pct = 1 },
+        .{ .pid = 200, .ppid = 100, .name = "b", .cpu_pct = 2 },
+        .{ .pid = 300, .ppid = 200, .name = "c", .cpu_pct = 4 },
+    };
+    var out: [1]f32 = undefined;
+    rollUpByRoot(alloc, &procs, &.{100}, &out);
+    try testing.expectEqual(@as(f32, 7), out[0]);
+}
+
+test "machTicksToNs: converts mach absolute time units to nanoseconds" {
+    // Intel / already-ns timebase (1:1) — identity, and must not lose precision.
+    try testing.expectEqual(@as(u64, 12_345), machTicksToNs(12_345, 1, 1));
+
+    // Apple Silicon 24MHz timebase: numer=125 denom=3 ⇒ 41.666… ns per tick.
+    // 24_000_000 ticks is one second of a fully-busy core ⇒ 1e9 ns.
+    try testing.expectEqual(@as(u64, std.time.ns_per_s), machTicksToNs(24_000_000, 125, 3));
+
+    // The intermediate must be widened: a cumulative tick count near u64 max
+    // would overflow a u64 multiply by `numer` before the divide.
+    const huge: u64 = std.math.maxInt(u64) / 2;
+    try testing.expect(machTicksToNs(huge, 125, 3) > huge);
+}
+
+test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct" {
+    // Guards the UNIT of the macOS busy reading, which is what made every row
+    // read ~0. `pti_total_user`/`pti_total_system` are mach absolute time units,
+    // not nanoseconds; reading them as ns undercounts by the timebase ratio
+    // (~24x on Apple Silicon), so a fully-pinned core reports ~4 instead of ~100.
+    //
+    // We spin ONE thread (this one) for the whole sample window, so our own pid
+    // must read near 100% of one core. The 50 floor is far below the correct
+    // ~100 and far above the ~4 a unit bug produces, so the test is decisive
+    // without being timing-flaky.
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var s = ProcSampler.init(alloc);
+    defer s.deinit();
+
+    const my_pid: i64 = @intCast(switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => std.c.getpid(),
+    });
+
+    // Baseline sample (every pid reads 0 — no prior baseline).
+    var out1: std.ArrayListUnmanaged(protocol.Proc) = .empty;
+    defer {
+        for (out1.items) |p| freeProc(alloc, p);
+        out1.deinit(alloc);
+    }
+    _ = try s.sample(alloc, &out1, 0);
+
+    // Burn one core for the sample window. `volatile` so the spin can't be
+    // optimized away into a no-op (which would make the test vacuously pass a
+    // buggy build by reporting ~0 for a genuinely idle process).
+    var sink: u64 = 0;
+    const spin_ns = 400 * std.time.ns_per_ms;
+    const start = std.time.nanoTimestamp();
+    while (std.time.nanoTimestamp() - start < spin_ns) {
+        var i: u32 = 0;
+        while (i < 20_000) : (i += 1) {
+            const p: *volatile u64 = &sink;
+            p.* = p.* +% i;
+        }
+    }
+
+    var out2: std.ArrayListUnmanaged(protocol.Proc) = .empty;
+    defer {
+        for (out2.items) |p| freeProc(alloc, p);
+        out2.deinit(alloc);
+    }
+    _ = try s.sample(alloc, &out2, 0);
+
+    var mine: ?f32 = null;
+    for (out2.items) |p| {
+        if (p.pid == my_pid) mine = p.cpu_pct;
+    }
+    try testing.expect(mine != null);
+    try testing.expect(mine.? >= 50.0);
+}
+
+test "parseLinuxStat: extracts ppid/comm/utime/stime/tty_nr, comm with spaces+parens" {
+    // Post-comm tokens: state ppid pgrp session tty_nr tpgid ... utime stime
+    //                     S   1000 1234  1234    0     -1    ...  50    70
     const line = "1234 (my (weird) proc) S 1000 1234 1234 0 -1 4194560 200 0 0 0 50 70 0 0 20 0 1 0 1\n";
     const p = parseLinuxStat(line).?;
     try testing.expectEqual(@as(i64, 1000), p.ppid);
     try testing.expectEqualStrings("my (weird) proc", p.comm);
     try testing.expectEqual(@as(u64, 50), p.utime);
     try testing.expectEqual(@as(u64, 70), p.stime);
+    try testing.expectEqual(@as(i64, 0), p.tty_nr); // this proc has no ctty
+
+    // Same line with a real pts tty_nr (major 136, minor 4 ⇒ 136<<8 | 4 = 34820).
+    // utime/stime must still land on the right tokens once tty_nr is non-zero.
+    const line2 = "1234 (sh) S 1000 1234 1234 34820 1234 4194560 200 0 0 0 50 70 0 0 20 0 1 0 1\n";
+    const q = parseLinuxStat(line2).?;
+    try testing.expectEqual(@as(i64, 34820), q.tty_nr);
+    try testing.expectEqual(@as(u64, 50), q.utime);
+    try testing.expectEqual(@as(u64, 70), q.stime);
+}
+
+test "linuxTtyName: renders UNIX98 pty device names, null for anything else" {
+    var buf: [32]u8 = undefined;
+    // major 136, minor 4 ⇒ pts/4
+    try testing.expectEqualStrings("pts/4", linuxTtyName(&buf, (136 << 8) | 4).?);
+    // major 137 continues the numbering past 255 ⇒ pts/256
+    try testing.expectEqualStrings("pts/256", linuxTtyName(&buf, (137 << 8) | 0).?);
+    // No controlling terminal.
+    try testing.expectEqual(@as(?[]const u8, null), linuxTtyName(&buf, 0));
+    // A legacy console (major 4) is not a pts and can't be matched to a pane, so
+    // we report null rather than inventing a name.
+    try testing.expectEqual(@as(?[]const u8, null), linuxTtyName(&buf, (4 << 8) | 1));
 }
 
 test "ProcSampler: enumerates own pid with a name; second sample yields cpu_pct >= 0" {
@@ -705,6 +1026,15 @@ test "ProcSampler: enumerates own pid with a name; second sample yields cpu_pct 
             }
         }
         try testing.expect(p.cpu_pct >= 0);
+        // `tty`, when present, is a bare device NAME — no "/dev/" prefix and
+        // never an empty string (absent is spelled null). The Swift side
+        // compares it against a pane's tty, so the shape has to be exact.
+        // (Whether ANY process has one depends on how the tests were launched,
+        // so presence itself isn't asserted here — the live panel covers that.)
+        if (p.tty) |t| {
+            try testing.expect(t.len > 0);
+            try testing.expect(t[0] != '/');
+        }
     }
     try testing.expect(found);
 
@@ -728,4 +1058,5 @@ pub fn freeProc(alloc: Allocator, p: protocol.Proc) void {
     alloc.free(p.name);
     if (p.user) |u| alloc.free(u);
     if (p.cmd) |c| alloc.free(c);
+    if (p.tty) |t| alloc.free(t);
 }

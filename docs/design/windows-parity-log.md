@@ -7762,3 +7762,52 @@ timing-sensitive tests now fail intermittently — 2 fails then 4 passes over si
 runs. **T435** (mac seat) asks whether the Mac floor wants the same wrapper; the
 root cause fixed here is Windows-specific and no macOS hang has been reported,
 so it is a question rather than a defect.
+
+## 2026-08-03 — T428: a typed prompt and the Enter after it are two things again
+
+`/reset-context` typed a 706-character continuation into the pane, sent Enter,
+logged rc=0 for both — and the prompt sat unsent until the user pressed Enter by
+hand. `+send-keys` flattened every positional into one `--keys=` payload, so the
+pane received a single burst of bytes ending in `\r`, and paste detection read
+that CR as a newline inside pasted text. Correctly, for an unframed burst: that
+is exactly what a real multi-line paste looks like.
+
+Fixed where the defect is, in the byte stream. `origin/main` merged (44 commits;
+only `CLAUDE.md` and `src/cli/send_keys.zig` conflicted) to bring the shared half
+across — `--segments=` carrying the argument boundaries, and
+`Surface.writePtyBracketed`. The Windows half is new: `handleSendKeys` decodes
+`--segments=` and writes one run at a time, framing text runs in `ESC[200~` /
+`ESC[201~` and writing key runs bare, so the CR lands outside the closing
+fencepost and is unambiguously a keypress. The wire format moved into
+`src/apprt/ipc/segments.zig` so the CLI that writes it and the server that reads
+it cannot drift — main had the encoder inline in the CLI with no decoder beside
+it. Degradation is deliberate at both ends: no `--segments=` takes the original
+flat path untouched, and one that fails to parse falls back to `--keys=` with a
+warning rather than failing the request.
+
+Merging is necessary but not sufficient at the caller, too: `reset-context.sh`
+sent the prompt and the Enter as two invocations, and the CLI can only preserve a
+boundary it can see. It now sends `--keys-file=<tmp> Enter` in one call, which
+also retires the `sed 's/\/\\/g'` backslash-doubling hack.
+
+Evidence is byte-exact and taken from raw VT input:
+`test/win32/send-keys-bracketed.ps1` puts an in-pane helper's stdin into
+`ENABLE_VIRTUAL_TERMINAL_INPUT` with no line input and no echo — the console mode
+a real TUI uses — because a screen read cannot see a fencepost at all. With mode
+2004 on, `"hello world" Enter` arrives as `1b5b3230307e`…`1b5b3230317e` `0d`;
+with it off, the same send arrives as the exact bytes it always did. A lone text
+argument stays unframed, so `+send-keys "cmd\n"` keeps executing in a shell, and
+text carrying a closing fencepost is sent unframed rather than as a malformed
+frame. ConPTY turned out to pass DECSET 2004 through both ways.
+
+Two threads came out of it. **T438**: the upgrade script's resume splits typing
+from Enter on purpose — it verifies the prompt arrived before submitting, since a
+post-submit check would race `/reset-context` clearing the pane — so the framing
+cannot reach it and its Enter is still the bare one that failed. **D4** asks the
+question that would close T438 for free: whether a lone `--keys-file=` run should
+be framed as a paste even with no Enter after it, at the cost of breaking anyone
+using that flag to feed a shell commands to execute. Assumed no, matching Mac
+byte-for-byte, since the reported defect is fixed either way.
+
+Floor: none, win32 and agent lanes ALL PASS through `floor-lane.ps1 -Lane all`;
+P1–P3 ALL PASS; `ipc-send-keys-fidelity.ps1` (T210) still ALL PASS.

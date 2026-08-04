@@ -3982,11 +3982,6 @@ fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     return opts;
 }
 
-/// Sends text as-is to the terminal without triggering any keyboard
-/// protocol. This will treat the input text as if it was pasted
-/// from the clipboard so the same logic will be applied. Namely,
-/// if bracketed mode is on this will do a bracketed paste. Otherwise,
-/// this will filter newlines to '\r'.
 /// Write raw bytes directly to the PTY without paste encoding or
 /// control character stripping. Used by +send-keys.
 pub fn writePtyRaw(self: *Surface, data: []const u8) !void {
@@ -3996,6 +3991,58 @@ pub fn writePtyRaw(self: *Surface, data: []const u8) !void {
         self.alloc,
         data,
     ), .unlocked);
+}
+
+/// Bracketed paste (DEC mode 2004) fenceposts.
+const paste_start = "\x1b[200~";
+const paste_end = "\x1b[201~";
+
+/// Write bytes to the PTY as pasted content: framed in bracketed-paste
+/// fenceposts when the running program has asked for them (mode 2004), and
+/// verbatim when it hasn't. Used by `+send-keys` for its text arguments.
+///
+/// The frame is what lets a receiving TUI tell a text argument apart from
+/// the key argument after it. Without it, `+send-keys "msg" Enter` arrives
+/// as one burst of bytes ending in `\r`, and paste detection — correctly,
+/// since that is how a real multi-line paste looks — reads the `\r` as a
+/// newline in the buffer rather than a submit. Framing states which bytes
+/// were pasted, so the bare `\r` written after the closing fencepost is
+/// unambiguously a keypress. That is a property of the bytes, not of their
+/// timing, so it holds however the writes happen to be coalesced.
+///
+/// Unlike a clipboard paste this does NOT strip control bytes: `+send-keys`
+/// is a byte-level channel whose callers deliberately send escape sequences
+/// inside text arguments.
+pub fn writePtyBracketed(self: *Surface, data: []const u8) !void {
+    if (data.len == 0) return;
+
+    const bracketed = bracketed: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        break :bracketed input.paste.Options.fromTerminal(&self.io.terminal).bracketed;
+    };
+
+    // Data carrying the closing fencepost would end the frame early and
+    // leave the remainder outside it. Send it unframed rather than emit a
+    // malformed one — the caller is no worse off than before framing.
+    if (!bracketed or std.mem.indexOf(u8, data, paste_end) != null) {
+        return self.writePtyRaw(data);
+    }
+
+    // One write, not three. Each write becomes its own pty write and so can
+    // land in its own read() on the far side, and a receiver that gets a
+    // lone `ESC[200~` does not reliably associate it with the content that
+    // follows — measured against Claude Code, which then falls back to its
+    // length heuristic and swallows the trailing `\r` again. Framing only
+    // helps if the frame arrives whole.
+    const framed = try self.alloc.alloc(u8, paste_start.len + data.len + paste_end.len);
+    defer self.alloc.free(framed);
+    @memcpy(framed[0..paste_start.len], paste_start);
+    @memcpy(framed[paste_start.len..][0..data.len], data);
+    @memcpy(framed[paste_start.len + data.len ..], paste_end);
+
+    // `writeReq` copies, so freeing `framed` on return is safe.
+    try self.writePtyRaw(framed);
 }
 
 pub fn textCallback(self: *Surface, text: []const u8) !void {
