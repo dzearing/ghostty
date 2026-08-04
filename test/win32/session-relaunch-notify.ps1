@@ -220,7 +220,12 @@ function Get-NoticePlacement($id, $tag, $timeoutSec = 40) {
     $out = @{ notice = -1; shell = -1 }
     while ((Get-Date) -lt $deadline) {
         $tight = (Read-Pane $id $tag 400) -replace '\s', ''
-        $out.notice = $tight.IndexOf('sessioninterrupted')
+        # Ordinal-ignore-case on purpose: String.IndexOf(string) is case
+        # SENSITIVE, and T424 recapitalized the in-stream copy to
+        # "Session interrupted:" to match the banner. The placement assertions
+        # are about WHERE the notice is, not how it is cased - pin the wording
+        # in the pure session_notice tests, not here.
+        $out.notice = $tight.IndexOf('sessioninterrupted', [System.StringComparison]::OrdinalIgnoreCase)
         $out.shell = $tight.IndexOf('>')
         if ($out.notice -ge 0 -and $out.shell -ge 0) { break }
         Start-Sleep -Milliseconds 700

@@ -7667,3 +7667,39 @@ was left green, and that is what proves the new arm scores precedence rather
 than a deleted carrier. `zig build test-agent` hung again with zero output on a
 turn that touched no agent source; that is T430's third sighting, recorded
 there.
+
+## 2026-08-03 — T424: the restart notice says one sentence, with a colon
+
+The user asked for a colon instead of a long dash. Underneath that was a
+smaller, worse thing: the two carriers of the same message were worded
+differently from each other, so which sentence you read depended on whether you
+looked at the sticky banner or scrolled back through the pane's history. Both
+now open with `Session interrupted: the background terminal process was
+restarted, so this session was closed.` and close the same way. The `prompt`
+policy's `[ Session ended ] — press any key to relaunch` was folded into the
+same shape (`Session ended: press any key to relaunch`) rather than left as the
+one survivor of the em-dash family; the `--- session restarted ---` divider is
+untouched, being a rule rather than a labelled sentence.
+
+A new unit test asserts on **both** carriers at once that no em dash, en dash or
+`---` run is present and that both carry the same labels — the divergence is
+what made this a bug rather than a typo, so that is what the test pins. The
+existing assertions were rewritten to the new text, not loosened. D3 records the
+one judgement call: the user wrote "Previous prompt:" this time and "the
+previous command executed" the time the line was created, and the existing word
+was kept.
+
+Two harness facts came out of validating it. `session-relaunch-notify.ps1`
+matched the notice with a case-**sensitive** `String.IndexOf`, which the
+recapitalization would have silently broken, so it is ordinal-ignore-case now.
+And `session-relaunch.ps1` reported 13 failures that had nothing to do with the
+change: it sets no `GHOZTTY_PIPE_SUFFIX`, so run from a Ghoztty pane its CLI
+calls resolved the pane's baked socket and **split the user's live terminal**
+while counting sessions on the test agent. The stray panes were closed, the
+script is ALL PASS with a suffix exported, and the gap is filed as T433 — with
+an audit of the rest of `test/win32/` for the same two-arm shape (state
+redirected, IPC not). Both floor lanes hung again (T430); T430 gained the new
+measurement that the hang is a **blocked wait, not a spin** — two CPU samples
+45s apart were bit-identical — which points at a stack dump rather than a
+profiler, and suggests a zero-CPU-delta watchdog that can tell a slow test from
+a wedged one.

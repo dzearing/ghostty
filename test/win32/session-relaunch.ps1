@@ -14,7 +14,7 @@
 #               divider, so +read shows the pre-kill marker FOLLOWED BY the divider,
 #               and the SAME session id is alive again (respawned, not re-OPENed).
 #   B (prompt): restore ATTACHes the tombstone but does NOT respawn - the pane shows
-#               "[ Session ended ] - press any key to relaunch" and the session stays
+#               "Session ended: press any key to relaunch" and the session stays
 #               a dead tombstone (alive=false). The first keystroke (via +send-keys)
 #               fires the deferred RELAUNCH: the id goes alive and the divider prints.
 #
@@ -353,7 +353,7 @@ while ((Get-Date) -lt $deadline) {
     }
     Start-Sleep -Milliseconds 700
 }
-Assert "B5 the pane shows '[ Session ended ] press any key to relaunch'" $promptOk
+Assert "B5 the pane shows 'Session ended: press any key to relaunch'" $promptOk
 
 # The first keystroke fires the deferred RELAUNCH: the id goes alive.
 Run-Cli '+send-keys --target=prp Enter' "$tmpB\key.txt" 12 | Out-Null

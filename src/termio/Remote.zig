@@ -827,8 +827,12 @@ pub fn threadEnter(
     } else if (self.awaiting_relaunch) {
         // Prompt policy (T12c2): the pane is a dead tombstone with no child. Show
         // an interactive affordance — `queueWrite` respawns it on the first key.
+        //
+        // Same `Label:` shape as the notice next door, and for the same reason
+        // (T424): the user asked for a colon rather than an em dash, and this is
+        // the same voice on a sibling path. Keep the two in step.
         const prompt =
-            "\r\n\x1b[1m[ Session ended ]\x1b[0m \x1b[2m— press any key to relaunch\x1b[0m\r\n";
+            "\r\n\x1b[1mSession ended:\x1b[0m \x1b[2mpress any key to relaunch\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ io, prompt });
     }
 

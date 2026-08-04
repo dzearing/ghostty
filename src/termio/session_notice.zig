@@ -43,9 +43,22 @@ pub const max_command_len: usize = 240;
 pub const max_len: usize = 512 + max_command_len * 2;
 
 /// Render the notice for a session whose process is gone and whose command we
-/// refused to re-run. `command` is the agent's recorded label, or null when the
+/// refused to re-run.
+///
+/// WORDING IS PART OF THE CONTRACT (T424). Both carriers open with the same
+/// sentence, in the same shape: a `Label:` — a **colon**, never an em dash —
+/// followed by the reason in lower case. The user asked for it by name
+/// (*"I expected the messaging to NOT have a long emdash in it, but rather a
+/// colon (Session interrupted: <reason>)"*), and the two carriers previously
+/// said the same thing two different ways: `--- session interrupted: … ---`
+/// in the stream, `**Session interrupted** — …` in the banner. If you change
+/// one of these strings, change the other, and keep the tests below pinned to
+/// the exact user-visible text rather than loosening them — pinning it is the
+/// reason this module is pure.
+///
+/// `command` is the agent's recorded label, or null when the
 /// agent never recorded one / is too old to report it — in which case the
-/// "previous command" line is simply omitted rather than printed empty.
+/// "Previous command" line is simply omitted rather than printed empty.
 ///
 /// Returns a slice of `buf`. `buf` must be at least `max_len` bytes; a shorter
 /// buffer yields as much of the notice as fits (never a partial escape
@@ -53,16 +66,16 @@ pub const max_len: usize = 512 + max_command_len * 2;
 pub fn format(buf: []u8, command: ?[]const u8) []const u8 {
     var w: Writer = .{ .buf = buf };
 
-    w.put("\r\n\x1b[2m--- session interrupted: the background terminal process was restarted ---\x1b[0m\r\n");
+    w.put("\r\n\x1b[2mSession interrupted: the background terminal process was restarted, so this session was closed.\x1b[0m\r\n");
 
     if (sanitizedCommand(command)) |cmd| {
         var cmd_buf: [max_command_len + 3]u8 = undefined;
-        w.put("\x1b[2m    previous command:\x1b[0m ");
+        w.put("\x1b[2m    Previous command:\x1b[0m ");
         w.put(sanitize(&cmd_buf, cmd));
         w.put("\r\n");
     }
 
-    w.put("\x1b[2m    nothing was re-run; this is a fresh shell.\x1b[0m\r\n");
+    w.put("\x1b[2m    Nothing was re-run; this is a fresh shell.\x1b[0m\r\n");
     return w.written();
 }
 
@@ -172,7 +185,7 @@ pub fn holdAbove(t: *terminal.Terminal, pin: *terminal.Pin) void {
 /// screen for free. See `termio.Remote.Config.pane_banner_restored`.
 pub fn formatBanner(buf: []u8, command: ?[]const u8) []const u8 {
     var w: Writer = .{ .buf = buf };
-    w.put("\x1b]7778;**Session interrupted** — the background terminal process was restarted, so this session was closed. Nothing was re-run.");
+    w.put("\x1b]7778;**Session interrupted:** the background terminal process was restarted, so this session was closed. Nothing was re-run; this is a fresh shell.");
     if (sanitizedCommand(command)) |cmd| {
         var cmd_buf: [max_command_len + 3]u8 = undefined;
         var esc_buf: [(max_command_len + 3) * 2]u8 = undefined;
@@ -206,7 +219,7 @@ fn escapeMarkdown(buf: []u8, src: []const u8) []const u8 {
 }
 
 /// The command text to render, or null when there is nothing worth printing.
-/// Whitespace-only is treated as absent: a line reading "previous command:"
+/// Whitespace-only is treated as absent: a line reading "Previous command:"
 /// followed by nothing is worse than no line at all.
 fn sanitizedCommand(command: ?[]const u8) ?[]const u8 {
     const cmd = command orelse return null;
@@ -266,11 +279,30 @@ test "format: names the command and says nothing was re-run" {
     var buf: [max_len]u8 = undefined;
     const out = format(&buf, "zig build -Doptimize=Debug");
 
-    try testing.expect(std.mem.indexOf(u8, out, "session interrupted") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "background terminal process was restarted") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "previous command:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Session interrupted: the background terminal process was restarted") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Previous command:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "zig build -Doptimize=Debug") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "nothing was re-run") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Nothing was re-run") != null);
+}
+
+test "format: the label is a colon, never an em dash" {
+    // T424, verbatim from the user: "I expected the messaging to NOT have a long
+    // emdash in it, but rather a colon (Session interrupted: <reason>)." Asserted
+    // on BOTH carriers here, because the bug was that they diverged.
+    const testing = std.testing;
+    var buf: [max_len]u8 = undefined;
+    var banner_buf: [max_len]u8 = undefined;
+
+    for ([_][]const u8{
+        format(&buf, "zig build"),
+        formatBanner(&banner_buf, "zig build"),
+    }) |out| {
+        try testing.expect(std.mem.indexOf(u8, out, "—") == null); // em dash
+        try testing.expect(std.mem.indexOf(u8, out, "–") == null); // en dash
+        try testing.expect(std.mem.indexOf(u8, out, "---") == null); // the old divider rule
+        try testing.expect(std.mem.indexOf(u8, out, "Session interrupted:") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Previous command:") != null);
+    }
 }
 
 test "format: no recorded command omits the command line entirely" {
@@ -278,16 +310,16 @@ test "format: no recorded command omits the command line entirely" {
     var buf: [max_len]u8 = undefined;
     const out = format(&buf, null);
 
-    try testing.expect(std.mem.indexOf(u8, out, "session interrupted") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "previous command") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "nothing was re-run") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Session interrupted:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Previous command") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Nothing was re-run") != null);
 }
 
 test "format: a whitespace-only command counts as no command" {
     const testing = std.testing;
     var buf: [max_len]u8 = undefined;
     const out = format(&buf, "   \t\r\n ");
-    try testing.expect(std.mem.indexOf(u8, out, "previous command") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Previous command") == null);
 }
 
 test "format: control bytes in the command never reach the terminal" {
@@ -340,7 +372,7 @@ test "format: truncation never splits a UTF-8 codepoint" {
     for (0..max_command_len) |_| try long.appendSlice(testing.allocator, "→");
 
     const out = format(&buf, long.items);
-    // Everything between "previous command: " and the trailing "..." must be
+    // Everything between "Previous command: " and the trailing "..." must be
     // valid UTF-8 — a split codepoint would fail this.
     const start = std.mem.indexOf(u8, out, "\x1b[0m ").? + 5;
     const end = std.mem.indexOf(u8, out[start..], "...").? + start;
@@ -399,7 +431,7 @@ test "foldIntoScrollback: the notice lands above the viewport, not on it" {
     var t = try terminal.Terminal.init(alloc, .{ .cols = 24, .rows = 6, .max_scrollback = 4096 });
     defer t.deinit(alloc);
 
-    try t.printString("session interrupted\nprevious command: x\nnothing was re-run\n");
+    try t.printString("Session interrupted:\nPrevious command: x\nNothing was re-run\n");
     // The notice ends every line with CRLF, so the cursor sits one row below it
     // and its row count is exact.
     try testing.expectEqual(@as(usize, 3), @as(usize, t.screens.active.cursor.y));
@@ -408,15 +440,15 @@ test "foldIntoScrollback: the notice lands above the viewport, not on it" {
 
     const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
     defer alloc.free(view);
-    try testing.expect(std.mem.indexOf(u8, view, "session interrupted") == null);
+    try testing.expect(std.mem.indexOf(u8, view, "Session interrupted") == null);
 
     // Gone from the screen the shell is about to repaint, still in the
     // scrollback the user scrolls back through.
     const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
     defer alloc.free(all);
-    try testing.expect(std.mem.indexOf(u8, all, "session interrupted") != null);
-    try testing.expect(std.mem.indexOf(u8, all, "previous command: x") != null);
-    try testing.expect(std.mem.indexOf(u8, all, "nothing was re-run") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "Session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "Previous command: x") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "Nothing was re-run") != null);
 
     // Homed, so a shell that does not open with a repaint still agrees with
     // conhost about where (1,1) is.
@@ -456,9 +488,9 @@ test "foldIntoScrollback: the whole notice survives the child's full-screen eras
     // would print a bare CR as a glyph; its `\n` is the same CR+LF the notice
     // emits). Layout is what is under test, not the escapes.
     try t.printString(
-        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
-            "    previous command: ping -n 9717 127.0.0.1\n" ++
-            "    nothing was re-run; this is a fresh shell.\n",
+        "\nSession interrupted: the background terminal process was restarted, so this session was closed.\n" ++
+            "    Previous command: ping -n 9717 127.0.0.1\n" ++
+            "    Nothing was re-run; this is a fresh shell.\n",
     );
     foldIntoScrollback(&t);
 
@@ -469,18 +501,18 @@ test "foldIntoScrollback: the whole notice survives the child's full-screen eras
     defer alloc.free(all);
     const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
     defer alloc.free(tight);
-    try testing.expect(std.mem.indexOf(u8, tight, "session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "Session interrupted") != null);
     try testing.expect(std.mem.indexOf(u8, tight, "ping -n 9717 127.0.0.1") != null);
-    try testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "Nothing was re-run") != null);
 }
 
 test "foldIntoScrollback: survives the erase at every plausible pane geometry" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const body =
-        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
-        "    previous command: ping -n 9717 127.0.0.1\n" ++
-        "    nothing was re-run; this is a fresh shell.\n";
+        "\nSession interrupted: the background terminal process was restarted, so this session was closed.\n" ++
+        "    Previous command: ping -n 9717 127.0.0.1\n" ++
+        "    Nothing was re-run; this is a fresh shell.\n";
 
     // A restored pane can be any shape, and the notice is several wrapped rows
     // in the narrow ones — including shapes where it is TALLER than the pane,
@@ -503,7 +535,7 @@ test "foldIntoScrollback: survives the erase at every plausible pane geometry" {
             defer alloc.free(all);
             const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
             defer alloc.free(tight);
-            testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null) catch |err| {
+            testing.expect(std.mem.indexOf(u8, tight, "Nothing was re-run") != null) catch |err| {
                 std.debug.print("lost the notice at {d}x{d}: '{s}'\n", .{ cols, rows, all });
                 return err;
             };
@@ -542,9 +574,9 @@ test "foldIntoScrollback: a bring-up resize BEFORE the fold is harmless" {
         defer t.deinit(alloc);
 
         try t.printString(
-            "\n--- session interrupted: the background terminal process was restarted ---\n" ++
-                "    previous command: ping -n 9717 127.0.0.1\n" ++
-                "    nothing was re-run; this is a fresh shell.\n",
+            "\nSession interrupted: the background terminal process was restarted, so this session was closed.\n" ++
+                "    Previous command: ping -n 9717 127.0.0.1\n" ++
+                "    Nothing was re-run; this is a fresh shell.\n",
         );
         try t.resize(alloc, g[2], g[3]);
         foldIntoScrollback(&t);
@@ -554,7 +586,7 @@ test "foldIntoScrollback: a bring-up resize BEFORE the fold is harmless" {
         defer alloc.free(all);
         const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
         defer alloc.free(tight);
-        testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null) catch |err| {
+        testing.expect(std.mem.indexOf(u8, tight, "Nothing was re-run") != null) catch |err| {
             std.debug.print("lost the notice across {d}x{d} -> {d}x{d}\n", .{ g[0], g[1], g[2], g[3] });
             return err;
         };
@@ -576,9 +608,9 @@ test "holdAbove: a narrowing reflow drags the notice back, and the guard puts it
     defer t.deinit(alloc);
 
     try t.printString(
-        "\n--- session interrupted: the background terminal process was restarted ---\n" ++
-            "    previous command: ping -n 9778 127.0.0.1\n" ++
-            "    nothing was re-run; this is a fresh shell.\n",
+        "\nSession interrupted: the background terminal process was restarted, so this session was closed.\n" ++
+            "    Previous command: ping -n 9778 127.0.0.1\n" ++
+            "    Nothing was re-run; this is a fresh shell.\n",
     );
     foldIntoScrollback(&t);
     const guard = trackFold(&t).?;
@@ -598,14 +630,14 @@ test "holdAbove: a narrowing reflow drags the notice back, and the guard puts it
         // reason the guard exists rather than a single well-timed fold.
         const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(view);
-        try testing.expect(std.mem.indexOf(u8, view, "nothing was re-run") != null);
+        try testing.expect(std.mem.indexOf(u8, view, "Nothing was re-run") != null);
     }
 
     holdAbove(&t, guard);
     {
         const view = try t.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(view);
-        try testing.expect(std.mem.indexOf(u8, view, "nothing was re-run") == null);
+        try testing.expect(std.mem.indexOf(u8, view, "Nothing was re-run") == null);
         // The child's own content stays where the child can see it.
         try testing.expect(std.mem.indexOf(u8, view, "Microsoft Windows") != null);
     }
@@ -616,9 +648,9 @@ test "holdAbove: a narrowing reflow drags the notice back, and the guard puts it
     defer alloc.free(all);
     const tight = try std.mem.replaceOwned(u8, alloc, all, "\n", "");
     defer alloc.free(tight);
-    try testing.expect(std.mem.indexOf(u8, tight, "session interrupted") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "Session interrupted") != null);
     try testing.expect(std.mem.indexOf(u8, tight, "ping -n 9778 127.0.0.1") != null);
-    try testing.expect(std.mem.indexOf(u8, tight, "nothing was re-run") != null);
+    try testing.expect(std.mem.indexOf(u8, tight, "Nothing was re-run") != null);
 }
 
 test "holdAbove: does nothing when the notice is already above the viewport" {
