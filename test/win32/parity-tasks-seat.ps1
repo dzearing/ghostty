@@ -18,6 +18,14 @@
 #   H. `new -Seat mac` writes the field; `new` without it writes `win`.
 #   I. Against the REAL tracker: `validate` ALL PASS, and `next` no longer
 #      returns a Mac-seat task.
+#   J. `next` orders by PRIORITY before id, and an untriaged task loses to a
+#      deliberate P2. `set-priority` writes the field and the reason.
+#   K. `order:` outranks priority - one number, so there is one head of the
+#      queue. A decimal injects between two neighbours without renumbering, an
+#      unordered task joins the tail, and an unparseable order reads as absent
+#      rather than as 0 (which would silently seize the head).
+#   L. `next -Claim` marks the picked task in-progress in the same breath;
+#      plain `next` stays a read-only question.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -60,10 +68,10 @@ function New-FixtureTask {
         '---'
         "id: $Id"
         ("title: " + (ConvertTo-Json "fixture $Id" -Compress))
-        # `order:` is emitted only when asked, so the default fixture is
-        # deliberately unordered - the state most of the tracker was in before
-        # the ranking pass, and the one the fallbacks have to handle.
-
+        # `order:` and `priority:` are emitted only when asked, so the default
+        # fixture is deliberately unordered and untriaged - the state most of
+        # the tracker was in before the ranking pass, and the one the fallbacks
+        # have to handle.
         "deps: $Deps"
         ("status: " + (ConvertTo-Json $Status -Compress))
         'commits: []'
