@@ -312,15 +312,32 @@ pub const BannerOverlay = struct {
         // the strip is never lost.
         const height = if (self.inset > 0) @min(self.inset, strip) else strip;
         const top = rect.top - @max(self.inset, 0);
-        _ = w32.SetWindowPos(
-            self.hwnd,
-            null,
-            rect.left,
-            top,
-            @max(rect.right - rect.left, 1),
-            @max(height, 1),
-            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
-        );
+        const new_w = @max(rect.right - rect.left, 1);
+        const new_h = @max(height, 1);
+
+        // Is this a RESIZE or just a move? (T456) A resize restyles every
+        // pixel of the card; a move restyles none of them.
+        var old: w32.RECT = undefined;
+        const resized = w32.GetWindowRect(self.hwnd, &old) == 0 or
+            (old.right - old.left) != new_w or (old.bottom - old.top) != new_h;
+
+        // SWP_NOCOPYBITS on a resize: the class already invalidates the whole
+        // client (CS_HREDRAW|CS_VREDRAW), so blitting the old bits into the
+        // new rect only buys a frame of stretched, stale card before the
+        // repaint lands over it.
+        var flags: u32 = w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW;
+        if (resized) flags |= w32.SWP_NOCOPYBITS;
+
+        _ = w32.SetWindowPos(self.hwnd, null, rect.left, top, new_w, new_h, flags);
+
+        // Repaint NOW, not on the next pumped WM_PAINT (T456). This runs
+        // inside the layout pass that just moved the owner pane, and a
+        // divider drag re-runs that pass per mouse-move — so a deferred
+        // paint puts the card a whole drag frame behind the pane it is
+        // glued to, which is what "the overlay lags the drag" describes.
+        // Painting synchronously costs nothing extra overall: it is the
+        // same card render, moved earlier in the same frame.
+        if (resized) _ = w32.UpdateWindow(self.hwnd);
         // Every reposition re-checks the z-order instead of leaving it to
         // whatever last touched it (T142).
         w32.healOverlayZOrder(self.hwnd, self.owner);
@@ -1464,7 +1481,17 @@ fn registerClassOnce(hinstance: w32.HINSTANCE) !void {
 
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // CS_HREDRAW | CS_VREDRAW (T456): every pixel of the card is laid
+        // out against the CURRENT band size — the rounded rim and its
+        // shadow sit on the edges, the chevron column is measured in from
+        // the right, and each block is word-wrapped to the content width.
+        // So a size change makes the whole card stale, and repainting only
+        // the sliver Windows uncovers leaves the rest drawn at the old
+        // geometry. That is the "unpainted gap around the banner" a
+        // divider drag shows. DimOverlay gets away with `.style = 0`
+        // because it is a flat fill, where a partial repaint is
+        // indistinguishable from a full one; a card is not.
+        .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = bannerWndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -1584,5 +1611,129 @@ fn bannerWndProc(
         },
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+// T456: a WIDTH change makes the whole card stale, not just the strip
+// Windows uncovers. The card's rounded rim, its shadow, its chevron column
+// and every wrapped line are laid out against the full width — repaint the
+// exposed sliver only, as a class with no CS_HREDRAW/CS_VREDRAW does, and
+// the rest of the card keeps the geometry it had before the drag. That is
+// the "unpainted gap around the banner" a divider drag shows.
+//
+// Asserted against a real window because this IS window-class behavior:
+// the thing under test is what Windows invalidates, which no pure function
+// can stand in for.
+test "banner class: a resize invalidates the whole card, not the exposed strip" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    // ON-SCREEN and shown, at layered alpha 0. Both halves are load-bearing:
+    // a window parked outside every monitor has an empty visible region, so
+    // Windows invalidates nothing on a resize and the test passes for the
+    // wrong reason (measured — that is what this test did first). Alpha 0
+    // keeps it genuinely visible to the window manager while painting
+    // nothing a user could see, so a test run never flashes a card.
+    const hwnd = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        0,
+        400,
+        200,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(hwnd);
+    _ = w32.SetLayeredWindowAttributes(hwnd, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+
+    // Start from a clean slate: nothing pending, so whatever the resize
+    // invalidates is the only thing in the update region afterwards.
+    _ = w32.ValidateRect(hwnd, null);
+    try std.testing.expectEqual(@as(i32, 0), w32.GetUpdateRect(hwnd, null, 0));
+
+    // Widen by 40px — the amount a divider drag moves in a few frames.
+    _ = w32.SetWindowPos(
+        hwnd,
+        null,
+        0,
+        0,
+        440,
+        200,
+        w32.SWP_NOMOVE | w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+    );
+
+    var upd: w32.RECT = undefined;
+    try std.testing.expect(w32.GetUpdateRect(hwnd, &upd, 0) != 0);
+    var client: w32.RECT = undefined;
+    try std.testing.expect(w32.GetClientRect(hwnd, &client) != 0);
+    // The whole client, not the 40px sliver.
+    try std.testing.expectEqual(client.right - client.left, upd.right - upd.left);
+    try std.testing.expectEqual(client.bottom - client.top, upd.bottom - upd.top);
+}
+
+// T456, second half: the repaint must land in the SAME layout pass that
+// resized the strip. `updatePosition` runs inside `Window.layoutSplits`,
+// which a divider drag re-runs per mouse-move — so a card left waiting for
+// the next pumped WM_PAINT is drawn a whole drag frame behind the pane it
+// is glued to. Asserting "nothing still pending" is how you check that from
+// the outside: an update region surviving the call IS the lag.
+test "banner overlay: a size-changing updatePosition repaints in the same pass" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    // Stand-in owner — `updatePosition` reads only its visibility and rect.
+    // Alpha 0, on-screen, for the reason the class test documents.
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        200,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    // Claim the alpha slot before updatePosition can set STRIP_ALPHA, so the
+    // card stays invisible to a human watching the test run.
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    overlay.setText("**Build status**\nA paragraph long enough that its wrap point moves when the pane width does.");
+
+    // Every scale the win32 design system requires: the band height is
+    // scale-derived, so a resize at 2.0 moves far more pixels than one at
+    // 1.0 and is the case a partial repaint disfigures worst.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        overlay.inset = @intFromFloat(120.0 * scale);
+        _ = w32.SetWindowPos(owner, null, 0, 300, 600, 200, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+        overlay.updatePosition(scale);
+        _ = w32.UpdateWindow(overlay.hwnd); // settle the first paint
+
+        // The divider-drag case: the owner pane's WIDTH changes.
+        _ = w32.SetWindowPos(owner, null, 0, 300, 380, 200, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+        overlay.updatePosition(scale);
+
+        try std.testing.expectEqual(@as(i32, 0), w32.GetUpdateRect(overlay.hwnd, null, 0));
     }
 }

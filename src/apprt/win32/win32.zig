@@ -635,6 +635,16 @@ pub extern "user32" fn InvalidateRect(
     bErase: i32,
 ) callconv(.winapi) i32;
 
+/// Non-zero when the window has a non-empty update region; fills `lpRect`
+/// with its bounding box in client coordinates. Reading it is how a test
+/// asserts what a resize actually invalidated, rather than what it looked
+/// like it invalidated.
+pub extern "user32" fn GetUpdateRect(
+    hWnd: HWND,
+    lpRect: ?*RECT,
+    bErase: i32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn LoadCursorW(
     hInstance: ?HINSTANCE,
     lpCursorName: usize,
@@ -1787,6 +1797,10 @@ pub const HWND_TOPMOST: ?HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))
 pub const HWND_NOTOPMOST: ?HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
+/// Suppress the bit-block copy of the client area's old contents into the
+/// new position. Correct whenever the whole surface is about to be
+/// repainted anyway: the copy is what smears a stale image across a resize.
+pub const SWP_NOCOPYBITS: u32 = 0x0100;
 pub const WS_EX_TOPMOST: u32 = 0x00000008;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
 

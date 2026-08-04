@@ -8371,3 +8371,70 @@ P1-P3 **ALL PASS**. The agent lane's first run failed on `zig.exe` itself
 taking an access violation at `+0x37ddea2` - the compiler, not the code, and
 the same offset already recorded in **T451**, where the recurrence is logged; a
 bare re-run passed.
+
+## 2026-08-04 (T456) - the banner repainted nothing on a resize, which is why it lagged every drag
+
+Dragging a split divider across a pane with a banner left unpainted patches
+around the card until you let go. Reported more than once, filed with four
+candidate causes and none confirmed.
+
+It was the first candidate's opposite: not "the moves are not batched" but
+"the card is never asked to redraw at all". `BannerOverlay` registered its
+window class with `.style = 0` - no `CS_HREDRAW | CS_VREDRAW`. Measured
+directly, and the number is worse than the hypothesis: create a window of that
+class, `SetWindowPos` it 40 px wider, and `GetUpdateRect` returns **0**. Not
+"only the newly exposed sliver". Nothing. So while a drag moved and resized the
+band, the card kept whatever geometry it was last painted at - and every pixel
+of it is derived from the band size: the rounded rim and its shadow sit on the
+edges, the chevron column is measured in from the right, and since T377 *every*
+block is word-wrapped to the content width. T377 landing first is what made
+this worse rather than better.
+
+That also explains why only the banner shows it. `DimOverlay` carries the same
+`.style = 0` and is fine, because it is a flat fill: a partial repaint of one
+color is indistinguishable from a full one. A card is not.
+
+The fix is the class style plus one ordering detail. `updatePosition` now tells
+a genuine resize from a move, and on a resize passes `SWP_NOCOPYBITS` (so
+Windows does not blit a stale card into the new rect for a frame) and calls
+`UpdateWindow` - repainting inside the same layout pass. Without that last
+call the card does repaint, but one pumped `WM_PAINT` later, which during a
+drag is a whole frame behind the pane it is glued to. That is the "overlay lags
+the drag" half of the title, and it is separately negative-controlled.
+
+The candidates that were NOT the cause are recorded in the task file rather
+than left open: the pane and banner moves really are two separate calls, but
+the tiling arithmetic was already correct at every settled point - 0 violations
+across a 14-step drag *before* the fix - so batching them would have changed
+nothing visible, and the parent's `WM_ERASEBKGND => return 1` is still right
+for the reason T155 gives.
+
+**The Validation section asked for something not worth asserting, and that is
+recorded too.** It asked for a mid-drag pixel sample. Off the input desktop,
+layered popups do not come back from `PrintWindow` - the only capture that
+works there - and the banner is a layered popup. On the interactive desktop,
+where `CopyFromScreen` does see it, the window between the pane's `MoveWindow`
+and the popup's `SetWindowPos` is sub-frame, so an external probe at ~10 ms
+catches it essentially never. A pixel assertion would have been a coin flip
+dressed as a test. What replaced it asserts the cause and the geometry, and
+neither is timing-dependent.
+
+Evidence: two new win32-lane tests in `BannerOverlay.zig` - the update region
+after a widen, and "no update region survives `updatePosition`" at
+**1.0/1.25/1.5/2.0** - each with its negative control run and seen to fail.
+New `test\win32\banner-resize-repaint.ps1`: **ALL PASS (10 assertions)**,
+`-NegativeControl` fails as required; it reads `CS_HREDRAW|CS_VREDRAW` off the
+*live* banner window and checks the band-to-pane tiling invariant at every step
+of a posted divider drag in both directions and across five whole-window
+resizes. One test-design trap worth keeping: the unit test's window must be
+**on-screen at layered alpha 0** - parked off every monitor it has an empty
+visible region, Windows invalidates nothing, and the test passes for the wrong
+reason. That is what the first draft did, and the negative control is what
+caught it.
+
+Floor at the boundary: `none` **PASS**, `win32` **PASS**, `agent` **PASS**,
+P1-P3 **ALL PASS**, plus `pane-banner.ps1` **ALL PASS (77)** and
+`split-divider.ps1` **ALL PASS (38)** - the two scripts nearest the change, the
+second because `lib\TestDesktop.ps1` gained a `Get-TestWindowClassStyle`
+helper. Filed **T467**: `Scrollbar` computes its thumb from the track height
+and carries the same `.style = 0`, so the whole class list wants the same audit.

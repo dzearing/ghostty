@@ -692,6 +692,18 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // The registered CLASS style (GCL_STYLE), not the per-window style that
+    // WindowLong returns. CS_HREDRAW/CS_VREDRAW live here, and they decide
+    // what a resize invalidates - which is a product decision a script can
+    // read back off the live window (T456).
+    public long ClassStyle(IntPtr h) {
+        return (long)Run(delegate() {
+            return (long)((IntPtr.Size == 8)
+                ? (uint)GetClassLongPtr64(h, GCL_STYLE).ToUInt64()
+                : GetClassLong32(h, GCL_STYLE));
+        });
+    }
+
     // The focused HWND of `top`'s GUI thread. No attach needed, so it is safe
     // to poll (the T48 deferred-SetFocus path makes focus asynchronous).
     public long FocusedHwnd(IntPtr top) {
@@ -1839,6 +1851,14 @@ function Get-TestWindowStyle {
 function Get-TestWindowClass {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).ClassName($Window)
+}
+
+# Registered CLASS style (GCL_STYLE) of $Window - CS_HREDRAW (0x2),
+# CS_VREDRAW (0x1), CS_DBLCLKS (0x8), CS_OWNDC (0x20). Not the same thing as
+# Get-TestWindowStyle, which reads the per-window GWL_STYLE.
+function Get-TestWindowClassStyle {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ClassStyle($Window)
 }
 
 # The focused HWND of $Window's GUI thread (GetGUIThreadInfo, no attach). Poll
