@@ -8580,3 +8580,46 @@ history and a Windows app attached to a POSIX agent gets a guard it does not
 need. Closing it means carrying the flavour across the agent HELLO handshake,
 which is a protocol change and belongs in its own task. **T472** - the flaky
 lane above.
+
+## 2026-08-04 - T443: the intermittent test-lane crash is half a pointer, not a wild write
+
+Read the three crash dumps `crash-catch.ps1` had already left in `.dumps\`
+back under cdb, disassembled the faulting code, and traced the bad value. The
+crash that has cost this project several contexts is a pointer arriving at the
+page's hyperlink hash map with its **low 32 bits arithmetically exact and its
+high 32 bits replaced**: page base `0x00000216cca60000` plus map offset
+`0x70f40` should be `0x00000216ccad0f40`, and `header()` was handed
+`0x0003d3d0ccad0f40`. The replacement value is itself page-offset-shaped, as
+are the other mangled high halves in the same frames.
+
+That shape is why the crash looked random for so long. A page pointer's high
+half is the same for every page in the process, so a slot that keeps stale
+bytes there is usually still correct **by accident** - it only faults when the
+leftovers happen to be an offset rather than a previous pointer. Coin flip per
+run, victim wherever the integrity walk had got to. It also retires the
+standing hypotheses: a use-after-free does not preserve 32 bits of a pointer
+verbatim, and the earlier "everything reads as zero" reading was reading Debug
+stack slots that this path simply never writes.
+
+Landed `Page.ptrInPage` and `assertMapPtrInPage`, called from
+`lookupHyperlink` and `lookupGrapheme` under `slow_runtime_safety`. The next
+occurrence stops being a wild fault ten frames deep in a hash map and becomes
+one line naming the page, its range and the bad pointer - including the
+half-clobbered case, which a null-or-alignment check waves straight through.
+Unit test `Page ptrInPage bounds` covers exactly that case.
+
+Also measured, and it corrects this file's own record: the terminal-only
+binary (`-Dtest-filter=terminal.`) ran **20 consecutive times with 0
+failures** in 39 minutes. T443 had listed "terminal-only passes" as an
+eliminated hypothesis on the strength of one run of a ~50%-flaky signal, which
+proved nothing. Twenty runs make it real - and the conclusion is the
+unwelcome one: there is no small repro, so the remaining experiments have to
+run against a full lane.
+
+Filed: **T473** - settle whether this is a Zig/LLVM codegen fault by
+rebuilding the lane with the self-hosted x86_64 backend and at ReleaseSafe
+(`zig.exe` itself takes access violations on this box, T451, so it is not an
+exotic idea). **T474** - the complement: arm a hardware write breakpoint on
+the stack slot from cdb and name the instruction that truncates it. Both are
+ordered ahead of T443 itself, because T443 cannot move until one of them
+answers.

@@ -1269,10 +1269,51 @@ pub const Page = struct {
         @memset(@as([]u64, @ptrCast(cells)), 0);
     }
 
+    /// Returns true if `ptr` (an address, not an offset) lands inside this
+    /// page's backing memory.
+    ///
+    /// Every map and allocator a page owns lives inside that memory, reached
+    /// by adding a u32 offset to `memory.ptr`. So a reified pointer that
+    /// falls outside this range can only mean the page struct or the pointer
+    /// derived from it is damaged.
+    pub inline fn ptrInPage(self: *const Page, ptr: usize) bool {
+        const base = @intFromPtr(self.memory.ptr);
+        return ptr >= base and ptr < base + self.memory.len;
+    }
+
+    /// Panic, naming the damage, if a map's metadata pointer has left this
+    /// page's memory.
+    ///
+    /// This exists because of T443: an intermittent crash lands deep inside
+    /// the hash map (`getIndex` reading `header().size`) with a metadata
+    /// pointer whose LOW 32 bits are exactly right and whose HIGH 32 bits
+    /// have been replaced by an unrelated page offset. From inside the hash
+    /// map that is indistinguishable from an empty or misaligned map, which
+    /// is why the crash has been misread for several sessions. Checking it
+    /// here — where the page is still in hand — turns a wild fault into a
+    /// message that names the page, the expected range and the bad pointer.
+    inline fn assertMapPtrInPage(
+        self: *const Page,
+        comptime name: []const u8,
+        metadata: anytype,
+    ) void {
+        const ptr: usize = if (metadata) |m| @intFromPtr(m) else 0;
+        if (self.ptrInPage(ptr)) return;
+        log.err(
+            "page " ++ name ++ " metadata pointer outside page memory " ++
+                "ptr=0x{x} page_base=0x{x} page_len=0x{x}",
+            .{ ptr, @intFromPtr(self.memory.ptr), self.memory.len },
+        );
+        @panic("page map metadata pointer corrupted");
+    }
+
     /// Returns the hyperlink ID for the given cell.
     pub inline fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.hyperlink_map.map(self.memory);
+        if (build_options.slow_runtime_safety) {
+            self.assertMapPtrInPage("hyperlink_map", map.metadata);
+        }
         return map.get(cell_offset);
     }
 
@@ -1587,6 +1628,9 @@ pub const Page = struct {
     pub inline fn lookupGrapheme(self: *const Page, cell: *const Cell) ?[]u21 {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.grapheme_map.map(self.memory);
+        if (build_options.slow_runtime_safety) {
+            self.assertMapPtrInPage("grapheme_map", map.metadata);
+        }
         const slice = map.get(cell_offset) orelse return null;
         return slice.slice(self.memory);
     }
@@ -2245,6 +2289,29 @@ test "Cell is zero by default" {
     // The zero value should be output type for semantic content.
     // This is very important for our assumptions elsewhere.
     try std.testing.expectEqual(Cell.SemanticContent.output, cell.semantic_content);
+}
+
+test "Page ptrInPage bounds" {
+    var page = try Page.init(std_capacity);
+    defer page.deinit();
+
+    const base = @intFromPtr(page.memory.ptr);
+    const len = page.memory.len;
+
+    try testing.expect(page.ptrInPage(base));
+    try testing.expect(page.ptrInPage(base + len - 1));
+    try testing.expect(!page.ptrInPage(base + len));
+    try testing.expect(!page.ptrInPage(base - 1));
+    try testing.expect(!page.ptrInPage(0));
+
+    // The T443 signature: the low 32 bits of a page pointer are exactly
+    // right and the high 32 bits have been replaced. This is the case the
+    // check exists for, and it is the one a naive "is it null / is it
+    // aligned" test would let through.
+    const in_page = base + (len / 2);
+    const half_clobbered = (in_page & 0xffff_ffff) | (0x0003_d3d0 << 32);
+    try testing.expect(page.ptrInPage(in_page));
+    try testing.expect(!page.ptrInPage(half_clobbered));
 }
 
 test "Page capacity adjust cols down" {
