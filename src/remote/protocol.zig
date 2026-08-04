@@ -513,9 +513,14 @@ pub const Hello = struct {
     /// ignore it when absent. Never load-bearing for the protocol itself.
     build_version: ?[]const u8 = null,
 
-    /// Serialize to a JSON byte slice owned by `alloc`.
+    /// Serialize to a JSON byte slice owned by `alloc`. Null optionals are
+    /// elided rather than emitted as `"field":null`, matching every other
+    /// encoder here, so a HELLO that sets none of them is byte-identical to
+    /// one from a peer built before the field existed.
     pub fn encode(self: Hello, alloc: Allocator) Allocator.Error![]u8 {
-        return std.json.Stringify.valueAlloc(alloc, self, .{});
+        return std.json.Stringify.valueAlloc(alloc, self, .{
+            .emit_null_optional_fields = false,
+        });
     }
 
     /// Parse a `HELLO` payload. The returned `Parsed` owns its backing memory;
