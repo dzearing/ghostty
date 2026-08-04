@@ -52,11 +52,20 @@ struct ViewerFeedbackChromeLayoutTests {
         return (window, viewer)
     }
 
-    private func wait(upTo seconds: TimeInterval = 10, for condition: () -> Bool) async -> Bool {
+    /// A failure deadline, not a delay — it returns the moment the condition
+    /// holds. Sized for the slowest thing behind these conditions: a real page
+    /// load, and a worktree resolution that shells out to `git` off the main
+    /// thread. Both have been measured past 10s on a loaded CI runner.
+    private func wait(upTo seconds: TimeInterval = 60, for condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if condition() { return true }
-            try? await Task.sleep(nanoseconds: 25_000_000)
+            // WebKit only makes progress while the run loop turns, and the
+            // gutter these tests wait on is downstream of a real page load.
+            // Sleeping alone is enough on an idle machine and stalls when the
+            // main actor is contended by the target's parallel runners.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return condition()
     }
@@ -92,19 +101,19 @@ struct ViewerFeedbackChromeLayoutTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "TOC gutter never appeared")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "TOC gutter never appeared")
         #expect(await wait { viewer.worktree != nil }, "worktree never resolved")
 
         viewer.setFeedbackOpen(true)
         viewer.layoutSubtreeIfNeeded()
 
         let composer = layerIndex(in: viewer) { $0 is NSHostingView<ViewerFeedbackBar> }
-        let toc = layerIndex(in: viewer) { $0 is NSHostingView<ViewerTOCPanel> }
+        let panel = layerIndex(in: viewer) { $0 is NSHostingView<ViewerSidePanel> }
         let composerIndex = try #require(composer, "composer never mounted")
-        let tocIndex = try #require(toc, "TOC card never mounted")
+        let panelIndex = try #require(panel, "side panel card never mounted")
 
-        #expect(composerIndex > tocIndex,
-                "composer (layer \(composerIndex)) must draw above the TOC card (layer \(tocIndex))")
+        #expect(composerIndex > panelIndex,
+                "composer (layer \(composerIndex)) must draw above the side panel card (layer \(panelIndex))")
     }
 
     /// Order holds regardless of which was created first: here the composer
@@ -132,14 +141,14 @@ struct ViewerFeedbackChromeLayoutTests {
 
         // Now let the TOC card arrive (it mounts `.above webView`, i.e. beneath
         // the already-present composer).
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "TOC gutter never appeared")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "TOC gutter never appeared")
         viewer.layoutSubtreeIfNeeded()
 
         let composer = layerIndex(in: viewer) { $0 is NSHostingView<ViewerFeedbackBar> }
-        let toc = layerIndex(in: viewer) { $0 is NSHostingView<ViewerTOCPanel> }
+        let panel = layerIndex(in: viewer) { $0 is NSHostingView<ViewerSidePanel> }
         let composerIndex = try #require(composer)
-        let tocIndex = try #require(toc)
-        #expect(composerIndex > tocIndex)
+        let panelIndex = try #require(panel)
+        #expect(composerIndex > panelIndex)
     }
 
     // MARK: - Bug 2: content inset tracks the composer height both ways

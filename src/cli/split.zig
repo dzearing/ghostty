@@ -6,7 +6,7 @@ const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const lib = @import("../lib/main.zig");
-const view_args = @import("view_args.zig");
+const view_arg = @import("view_arg.zig");
 
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
@@ -117,11 +117,18 @@ pub const Options = struct {
 ///     inherits the SAME machine/connection plus the parent's command and
 ///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
 ///
-///   * `--view=<path-or-url>`: Open a VIEWER pane instead of a terminal:
-///     a rendered markdown file, a syntax-highlighted text/code file, or a
-///     website (http/https URL). Relative paths resolve against
-///     `--working-directory` if given, else the caller's cwd. Mutually
-///     exclusive with `--command`/`-e`.
+///   * `--view=<path-or-url-or-diff>`: Open a VIEWER pane instead of a
+///     terminal: a rendered markdown file, a syntax-highlighted text/code
+///     file, a website (http/https URL), or a GIT DIFF. Relative paths
+///     resolve against `--working-directory` if given, else the caller's
+///     cwd. Mutually exclusive with `--command`/`-e`.
+///
+///     Diff forms (the repository is the one containing
+///     `--working-directory`, else the caller's cwd):
+///       - `git-status:` — working tree: staged, unstaged and untracked
+///       - `git-diff:<a>...<b>` — a range (three-dot = merge base)
+///       - `git-diff:<sha>` — that commit's own changes
+///       - `git-diff:` — this branch against main/master/origin HEAD
 ///
 ///   * `--command=<command>`: The command to run in the split pane.
 ///
@@ -174,7 +181,7 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try view_args.resolve(alloc, opts._arguments.items);
+    try view_arg.resolve(alloc, opts._arguments.items);
     try seedViewWorkingDirectory(alloc, &opts._arguments);
 
     if (apprt.App.performIpc(

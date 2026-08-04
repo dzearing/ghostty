@@ -2001,14 +2001,23 @@ class IPCServer {
         targetRegistry = targetRegistry.filter { $0.value.isAlive }
     }
 
-    /// Resolve a `--target`/`--name` argument: the name registry first, then —
-    /// when the string parses as a UUID — a scan of every live pane for a
-    /// matching STABLE surface uuid (wp3 pane identity: the `+list` leaf `id`
-    /// and the pane's own `$GHOZTTY_PANE_ID`). UUID parsing normalizes case, so
-    /// the env value matches regardless of casing. A uuid hit is registered on
-    /// the way out so later lookups are O(1). This makes the pane id targetable
-    /// even before any `+list` auto-registration has run, and independent of
-    /// (renameable) registry names.
+    /// Resolve a `--target`/`--name` argument: the name registry first, then a
+    /// scan of live windows — by STABLE pane uuid when the string parses as one
+    /// (wp3 pane identity: the `+list` leaf `id` and the pane's own
+    /// `$GHOZTTY_PANE_ID`), and otherwise by the window's own `windowName`.
+    /// UUID parsing normalizes case, so the env value matches regardless of
+    /// casing; window names match exactly, like the registry itself. A hit is
+    /// registered on the way out so later lookups are O(1).
+    ///
+    /// The `windowName` scan is what makes an AUTO-NAMED window ("window-7",
+    /// minted for every Cmd-N window and exported as `$GHOZTTY_WINDOW_NAME`)
+    /// targetable. Registration otherwise only happens at `+new-window
+    /// --target=` time or when `+list` walks the tree, so until something ran
+    /// `+list` every `+set-state`/`+send-keys`/`+close --target=window-7`
+    /// failed with "not found in registry" — and the registry is per-process,
+    /// so it emptied again on every app relaunch. Callers that swallow stderr
+    /// (the activity-state hooks in `~/.claude/settings.json` do: `2>/dev/null
+    /// || true`) saw the window simply never update, with no error anywhere.
     ///
     /// Callable from the IPC queue OR the main thread (handlers are split
     /// across both): the window scan touches AppKit state, so it hops to main
@@ -2016,27 +2025,38 @@ class IPCServer {
     /// `handleList` already performs per request.
     private func resolveTarget(_ target: String) -> TargetEntry? {
         if let entry = targetRegistry[target], entry.isAlive { return entry }
-        guard let uuid = UUID(uuidString: target) else { return nil }
+        let uuid = UUID(uuidString: target)
         let scan = { () -> TargetEntry? in
             MainActor.assumeIsolated {
-                for scriptWindow in NSApp.scriptWindows {
-                    for tab in scriptWindow.tabs {
-                        guard let controller = tab.parentController as? TerminalController else { continue }
-                        for pane in controller.surfaceTree.root?.leaves() ?? [] where pane.id == uuid {
-                            let entry: TargetEntry
-                            if let surface = pane.surfaceView {
-                                entry = .pane(
-                                    controller: WeakRef(controller),
-                                    surface: WeakRef(surface))
-                            } else {
-                                entry = .viewerPane(
-                                    controller: WeakRef(controller),
-                                    pane: WeakRef(pane))
+                if let uuid {
+                    for scriptWindow in NSApp.scriptWindows {
+                        for tab in scriptWindow.tabs {
+                            guard let controller = tab.parentController as? TerminalController else { continue }
+                            for pane in controller.surfaceTree.root?.leaves() ?? [] where pane.id == uuid {
+                                let entry: TargetEntry
+                                if let surface = pane.surfaceView {
+                                    entry = .pane(
+                                        controller: WeakRef(controller),
+                                        surface: WeakRef(surface))
+                                } else {
+                                    entry = .viewerPane(
+                                        controller: WeakRef(controller),
+                                        pane: WeakRef(pane))
+                                }
+                                self.targetRegistry[pane.id.uuidString] = entry
+                                return entry
                             }
-                            self.targetRegistry[pane.id.uuidString] = entry
-                            return entry
                         }
                     }
+                    // A well-formed uuid is a pane id or nothing; no window
+                    // carries one as its name.
+                    return nil
+                }
+
+                for controller in TerminalController.all where controller.windowName == target {
+                    let entry = TargetEntry.window(WeakRef(controller))
+                    self.targetRegistry[target] = entry
+                    return entry
                 }
                 return nil
             }

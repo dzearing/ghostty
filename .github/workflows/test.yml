@@ -79,7 +79,13 @@ jobs:
 
   required:
     name: "Required Checks: Test"
-    if: always()
+    # The `always()` is what makes this aggregate job report a red X when a
+    # dependency fails instead of silently skipping with it. It also means the
+    # repository guard on every other job does NOT hold it back, so on a fork
+    # this is the one test.yml job that dispatches — and then queues forever
+    # against a namespace-profile-* runner that only exists upstream. Keep the
+    # always() (it is the point of the job) and add the guard alongside it.
+    if: always() && github.repository == 'ghostty-org/ghostty'
     runs-on: namespace-profile-ghostty-xsm
     needs:
       - skip

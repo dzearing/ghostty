@@ -94,7 +94,12 @@ struct ViewerNavigationTests {
         try "<html><body><script>history.pushState({},'','/pushed')</script></body></html>"
             .write(to: dir.appendingPathComponent("push.html"), atomically: true, encoding: .utf8)
 
-        let port = Int.random(in: 18000...18999)
+        // Ask the kernel for the port instead of guessing one. These tests run
+        // in parallel with each other, and two picking the same number means
+        // the second python exits "address already in use" while its viewer is
+        // handed a base URL served out of the FIRST test's directory — which
+        // does not contain its pages.
+        let port = try Self.reserveFreePort()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         proc.arguments = ["-m", "http.server", "\(port)", "--bind", "127.0.0.1"]
@@ -102,8 +107,85 @@ struct ViewerNavigationTests {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         try proc.run()
-        await settle(1.0)
+
+        // Wait for the socket to actually accept, rather than assuming a fixed
+        // budget covers interpreter startup. This is the one wait in the file
+        // that nothing downstream can rescue: a WebKit load against a port with
+        // no listener is refused immediately and stays refused, so `arrive`'s
+        // 15s poll would spin out against a dead connection instead of a slow
+        // page. Per PollUntil's own rule, something you expect to BECOME true
+        // belongs in `poll` — `settle` was the wrong tool here.
+        let up = await poll(timeout: 30) {
+            !proc.isRunning || Self.isListening(on: port)
+        }
+        guard up, proc.isRunning, Self.isListening(on: port) else {
+            proc.terminate()
+            throw ServerError.neverCameUp(port: port, exited: !proc.isRunning)
+        }
         return (proc, "http://127.0.0.1:\(port)")
+    }
+
+    private enum ServerError: Error, CustomStringConvertible {
+        case neverCameUp(port: Int, exited: Bool)
+
+        var description: String {
+            switch self {
+            case let .neverCameUp(port, exited):
+                return "python3 -m http.server never accepted on 127.0.0.1:\(port)"
+                    + (exited ? " (the process exited)" : " (still running)")
+            }
+        }
+    }
+
+    /// Bind port 0, note what the kernel assigned, and hand the number on.
+    ///
+    /// There is a small window between the close here and python's bind, but
+    /// the kernel does not hand the same ephemeral port to two callers in that
+    /// window, which is strictly better than picking from a 1000-wide range and
+    /// hoping.
+    private static func reserveFreePort() throws -> Int {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw ServerError.neverCameUp(port: 0, exited: true) }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { throw ServerError.neverCameUp(port: 0, exited: true) }
+        var assigned = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &assigned) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &len)
+            }
+        }
+        guard named == 0 else { throw ServerError.neverCameUp(port: 0, exited: true) }
+        return Int(UInt16(bigEndian: assigned.sin_port))
+    }
+
+    /// Whether anything is accepting on `port`. A loopback connect either
+    /// completes or is refused at once, so this is safe inside a `poll`
+    /// condition — it never parks the run loop waiting on a network round trip.
+    private static func isListening(on port: Int) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        } == 0
     }
 
     private func makeMarkdownFile(named name: String = "home.md") throws -> URL {

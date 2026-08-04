@@ -282,6 +282,11 @@ pub const Server = struct {
     session_cpu_cond: std.Thread.Condition = .{},
     session_cpu_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
     session_cpu_stop: bool = false,
+    /// Identity of the CURRENT pump. Bumped on every start and every stop, and
+    /// checked by the pump each iteration, so a predecessor always terminates
+    /// even when a re-subscribe resets `session_cpu_stop` before it woke up.
+    /// Guarded by `session_cpu_mutex`, like every field above it.
+    session_cpu_generation: u64 = 0,
 
     /// True while this connection has subscribed to the pushed session roster
     /// (`sessions_sub`). Plain bool, no pump: the roster is EVENT-driven — the
@@ -319,6 +324,11 @@ pub const Server = struct {
             protocol.capability.grid_snapshot,
             protocol.capability.session_cpu,
             protocol.capability.sessions_push,
+            // This build's `proc.zig` converts macOS mach ticks to nanoseconds,
+            // so every `cpu_pct` it reports is in corrected units. Advertising it
+            // is what lets a new app distinguish us from a pre-fix agent whose
+            // numbers are ~24× low on Apple Silicon.
+            protocol.capability.cpu_units,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -1777,6 +1787,14 @@ pub const Server = struct {
     }
 
     /// `SESSION_CPU_SUB`: start (or re-interval) the per-session CPU pump.
+    ///
+    /// The spawn happens UNDER `session_cpu_mutex`, together with the
+    /// `thread == null` test it depends on. Outside the lock, a concurrent
+    /// `stopSessionCpuPump` could read the handle between the test and the
+    /// assignment and either miss the new pump (it outlives the Server) or race
+    /// the store. Spawning while holding the mutex does not deadlock: the new
+    /// thread's first act is to take the same mutex, so it simply waits for the
+    /// unlock below.
     fn handleSessionCpuSub(self: *Server, payload: []const u8) void {
         var parsed = protocol.parseJson(protocol.SessionCpuSub, self.alloc, payload) catch return;
         defer parsed.deinit();
@@ -1786,11 +1804,19 @@ pub const Server = struct {
         self.session_cpu_mutex.lock();
         defer self.session_cpu_mutex.unlock();
         self.session_cpu_interval_ms = parsed.value.interval_ms;
-        self.session_cpu_cond.signal(); // wake an existing pump for the new hint
+        self.session_cpu_cond.broadcast(); // wake an existing pump for the new hint
         if (self.session_cpu_thread != null) return;
         if (self.pumps_closed.load(.acquire)) return;
+
+        // A fresh pump gets a fresh generation, so any PREDECESSOR still winding
+        // down exits on its own even though `stop` has just gone back to false.
+        self.session_cpu_generation +%= 1;
         self.session_cpu_stop = false;
-        self.session_cpu_thread = std.Thread.spawn(.{}, sessionCpuPumpLoop, .{self}) catch null;
+        self.session_cpu_thread = std.Thread.spawn(
+            .{},
+            sessionCpuPumpLoop,
+            .{ self, self.session_cpu_generation },
+        ) catch null;
     }
 
     /// `SESSION_CPU_UNSUB`: stop + join the pump (idempotent).
@@ -1801,15 +1827,35 @@ pub const Server = struct {
     /// Signal the per-session CPU pump to stop, wake its timed wait, and join it.
     /// Idempotent and safe with no pump running. Called by `session_cpu_unsub` and
     /// `shutdown` — the pump MUST NOT outlive the Server.
+    ///
+    /// The handle is TAKEN under the mutex and joined outside it. Both halves
+    /// matter:
+    ///
+    ///   * Taking it under the lock means two concurrent stoppers cannot both see
+    ///     the same non-null handle. `Thread.join` on an already-joined handle
+    ///     returns `EINVAL`, which std maps to `unreachable` — an agent PANIC, in a
+    ///     process whose whole job is to outlive the app. The two stoppers are
+    ///     real and adjacent: `session_cpu_unsub` arrives on the control-reader
+    ///     thread while `shutdown` runs on the serve thread, which is exactly what
+    ///     a client does when it unsubscribes and then drops the connection.
+    ///   * Joining outside the lock is required for progress: the pump takes this
+    ///     same mutex every iteration, so joining while holding it would deadlock.
     fn stopSessionCpuPump(self: *Server) void {
         self.session_cpu_mutex.lock();
         self.session_cpu_stop = true;
         self.session_cpu_interval_ms = 0;
-        self.session_cpu_cond.signal();
-        const t = self.session_cpu_thread;
+        // Retire this generation too, so a pump that somehow misses the `stop`
+        // flag (a re-subscribe flipping it back to false before the old pump has
+        // observed it) still terminates.
+        self.session_cpu_generation +%= 1;
+        const thread = self.session_cpu_thread;
         self.session_cpu_thread = null;
+        // `broadcast`, not `signal`: during a stop/re-subscribe overlap there can
+        // briefly be two pumps waiting, and waking only one leaves the other
+        // sleeping out its full interval before it notices it must exit.
+        self.session_cpu_cond.broadcast();
         self.session_cpu_mutex.unlock();
-        if (t) |th| th.join();
+        if (thread) |t| t.join();
     }
 
     /// The per-session CPU pump: sample the process table, roll each session's
@@ -1821,14 +1867,21 @@ pub const Server = struct {
     /// silently destroy each other's deltas whenever their timings interleaved —
     /// the exact bug that made the local activity monitor report 0% for every row.
     /// `metricsPumpLoop` owns its own `metrics.Sampler` for the same reason.
-    fn sessionCpuPumpLoop(self: *Server) void {
+    ///
+    /// `generation` is the pump's identity. A stop retires the generation, so a
+    /// pump whose `stop` flag was flipped back to false by a re-subscribe landing
+    /// before it woke still exits — otherwise it would keep pushing frames beside
+    /// its replacement, and the `join` waiting on it would never return.
+    fn sessionCpuPumpLoop(self: *Server, generation: u64) void {
         var sampler = proc.ProcSampler.init(self.alloc);
         defer sampler.deinit();
         var host_sampler = metrics.Sampler.init();
 
         while (true) {
             self.session_cpu_mutex.lock();
-            if (self.session_cpu_stop or self.closed) {
+            if (self.session_cpu_stop or self.closed or
+                self.session_cpu_generation != generation)
+            {
                 self.session_cpu_mutex.unlock();
                 return;
             }
@@ -1842,13 +1895,16 @@ pub const Server = struct {
             self.pushSessionCpu(&sampler, interval_ms);
 
             self.session_cpu_mutex.lock();
-            if (!self.session_cpu_stop and !self.closed) {
+            if (!self.session_cpu_stop and !self.closed and
+                self.session_cpu_generation == generation)
+            {
                 self.session_cpu_cond.timedWait(
                     &self.session_cpu_mutex,
                     @as(u64, interval_ms) * std.time.ns_per_ms,
                 ) catch {};
             }
-            const stop = self.session_cpu_stop or self.closed;
+            const stop = self.session_cpu_stop or self.closed or
+                self.session_cpu_generation != generation;
             self.session_cpu_mutex.unlock();
             if (stop) return;
         }
@@ -2231,7 +2287,38 @@ const FakeChild = struct {
     }
     fn tm(ctx: *anyopaque) void {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        // Under the mutex like `tw`/`setExit`: `terminate` runs on whichever
+        // thread handled CLOSE, while the test thread reads the flag.
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.terminated = true;
+    }
+
+    /// Read `terminated` under the mutex. Tests must use this rather than
+    /// touching the field: the writer is a different thread.
+    fn wasTerminated(self: *FakeChild) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.terminated;
+    }
+
+    /// Spin (bounded) until the child has been terminated.
+    ///
+    /// The reason this exists rather than tests asserting straight after the
+    /// session disappears from the store: `handleClose` is deliberately
+    /// two-phase — it UNLINKS under the store lock and terminates the child
+    /// OUTSIDE it, because `terminate` joins the pty reader whose sink takes
+    /// that same lock. So "the session is gone" becomes true STRICTLY BEFORE
+    /// "the child was terminated", and a test that waits for the first and
+    /// asserts the second fails whenever it wins that gap (~1 run in 8 here).
+    /// The product ordering is correct; the tests were watching the wrong edge.
+    fn waitTerminated(self: *FakeChild) bool {
+        var spins: usize = 0;
+        while (spins < 10_000) : (spins += 1) {
+            if (self.wasTerminated()) return true;
+            std.Thread.yield() catch {};
+        }
+        return self.wasTerminated();
     }
     fn inputCopy(self: *FakeChild, alloc: Allocator) ![]u8 {
         self.mutex.lock();
@@ -3020,6 +3107,66 @@ test "session_cpu: an OLDER client that never advertises it leaves the stream of
     try testing.expect(neg.close_session);
 }
 
+test "session_cpu: stopping the pump twice does not double-join (agent panic)" {
+    // The crash this guards: `stopSessionCpuPump` used to read
+    // `session_cpu_thread` OUTSIDE its mutex, so two stoppers could both see the
+    // same non-null handle and both `join` it. The second join returns EINVAL,
+    // which std maps to `unreachable` — a PANIC in the daemon that is supposed to
+    // outlive the app.
+    //
+    // It is not a theoretical interleaving: a client unsubscribes (control-reader
+    // thread) and then drops the connection (serve thread → `shutdown`), which is
+    // exactly what the chooser does every time the user moves off a machine.
+    // Sharing one warm connection between the roster and the CPU meter made that
+    // pair land back-to-back on every selection change.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(77);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.session_cpu};
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.session_cpu);
+
+    // Two stoppers AT THE SAME TIME, repeatedly. Sequential calls would not
+    // reproduce it — the first stop nulls the handle, so the second is already a
+    // no-op. The bug lives strictly in the window between reading the handle and
+    // nulling it, so the test has to put two threads in that window.
+    const Racer = struct {
+        fn stop(srv: *Server, gate: *std.Thread.ResetEvent) void {
+            gate.wait();
+            srv.stopSessionCpuPump();
+        }
+    };
+
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        try h.client.sendControlJson(
+            .session_cpu_sub,
+            protocol.control_channel,
+            protocol.SessionCpuSub{ .interval_ms = 500 },
+        );
+        // Wait for a frame, so a pump thread definitely exists to be joined.
+        _ = try h.client.waitControl(.session_cpu);
+
+        var gate: std.Thread.ResetEvent = .{};
+        const a = try std.Thread.spawn(.{}, Racer.stop, .{ h.server, &gate });
+        const b = try std.Thread.spawn(.{}, Racer.stop, .{ h.server, &gate });
+        gate.set();
+        a.join();
+        b.join();
+
+        // Whichever stopper won, the pump is gone and a re-subscribe on the next
+        // round must still get a live one — the generation bookkeeping must not
+        // leave the stream permanently retired.
+        try testing.expect(h.server.session_cpu_thread == null);
+    }
+}
+
 test "PROC_LIST→PROC_SNAPSHOT: agent enumerates real processes on the request channel" {
     const alloc = testing.allocator;
     var clock: TestClock = .{};
@@ -3577,19 +3724,15 @@ test "child exit emits EXIT after final DATA; reattach → dead+exit_code; CLOSE
 
     // CLOSE frees the tombstone + terminates the child handle.
     try h.client.sendControlRaw(.close, o.channel, "");
-    // Spin until the session is gone.
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
+    // Wait for the LAST of CLOSE's two phases (see `FakeChild.waitTerminated`):
+    // the unlink lands under the store lock, the terminate after it, so waiting
+    // only for the session to vanish would race the terminate assertion below.
+    try testing.expect(fc.waitTerminated());
+    {
         h.server.store.mutex.lock();
-        const gone = h.server.store.table.getByChannel(o.channel) == null;
-        h.server.store.mutex.unlock();
-        if (gone) break;
-        std.Thread.yield() catch {};
+        defer h.server.store.mutex.unlock();
+        try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
     }
-    h.server.store.mutex.lock();
-    try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
-    h.server.store.mutex.unlock();
-    try testing.expect(fc.terminated);
 }
 
 test "CLOSE_SESSION by id: frees the session + terminates the child; unknown id → found=false" {
@@ -3628,19 +3771,14 @@ test "CLOSE_SESSION by id: frees the session + terminates the child; unknown id 
     try testing.expect(rp.value.ok);
     try testing.expectEqualStrings(o.id[0..], rp.value.session_id);
 
-    // The session is gone and the child was terminated (same as a CLOSE).
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
+    // The session is gone and the child was terminated (same as a CLOSE) — and
+    // the terminate is the LATER of the two, so wait on that one.
+    try testing.expect(fc.waitTerminated());
+    {
         h.server.store.mutex.lock();
-        const gone = h.server.store.table.getByChannel(o.channel) == null;
-        h.server.store.mutex.unlock();
-        if (gone) break;
-        std.Thread.yield() catch {};
+        defer h.server.store.mutex.unlock();
+        try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
     }
-    h.server.store.mutex.lock();
-    try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
-    h.server.store.mutex.unlock();
-    try testing.expect(fc.terminated);
 
     // CLOSE_SESSION for an unknown id → found=false, ok=false (definitive answer).
     const bogus = "ffffffffffffffffffffffffffffffff";
@@ -4416,7 +4554,7 @@ test "stale CLOSE from a superseded connection must not kill the new owner's ses
     try testing.expect(s != null);
     try testing.expect(s.?.alive and s.?.bound and s.?.streaming);
     h.store.mutex.unlock();
-    try testing.expect(!fc.terminated);
+    try testing.expect(!fc.wasTerminated());
 
     // ...and live output must still reach conn 2.
     h.server.onChildOutput(o.channel, "+live");
@@ -4459,21 +4597,16 @@ test "CLOSE from the bridge owner still frees the session (guard is not a blanke
     try h.client.sendControlRaw(.ping, protocol.control_channel, "close-sync");
     _ = try h.client.waitControl(.pong);
 
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
+    // Both terminates land AFTER their unlinks (see `FakeChild.waitTerminated`),
+    // so waiting on the terminates covers both phases for both sessions.
+    try testing.expect(fc.waitTerminated());
+    try testing.expect(fc2.waitTerminated());
+    {
         h.store.mutex.lock();
-        const gone = h.store.table.getByChannel(owned.channel) == null and
-            h.store.table.getByChannel(orphan.channel) == null;
-        h.store.mutex.unlock();
-        if (gone) break;
-        std.Thread.yield() catch {};
+        defer h.store.mutex.unlock();
+        try testing.expect(h.store.table.getByChannel(owned.channel) == null);
+        try testing.expect(h.store.table.getByChannel(orphan.channel) == null);
     }
-    h.store.mutex.lock();
-    try testing.expect(h.store.table.getByChannel(owned.channel) == null);
-    try testing.expect(h.store.table.getByChannel(orphan.channel) == null);
-    h.store.mutex.unlock();
-    try testing.expect(fc.terminated);
-    try testing.expect(fc2.terminated);
 }
 
 test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
@@ -4509,5 +4642,5 @@ test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
     clock.ms = 10_200; // 200ms idle (> 100ms TTL) ⇒ reaped + child terminated
     store.reapIdle();
     try testing.expect(store.table.getByChannel(channel) == null);
-    try testing.expect(fc.terminated);
+    try testing.expect(fc.wasTerminated());
 }

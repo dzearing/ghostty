@@ -59,6 +59,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
         case markdown(URL)
         /// Plain text / code file rendered through the same page.
         case code(URL)
+        /// A git diff, rendered through the same page (see ViewerDiffSpec).
+        case diff(ViewerDiffSpec)
         /// A website; the web view navigates to it directly.
         case web(URL)
     }
@@ -74,6 +76,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// template's `ghoztty-viewer://` address, not the file's — this is what
     /// lets Back cross from a website into the file view and land correctly.
     private var fileLocation: URL?
+
+    /// The diff the template page is showing, if any. The other half of
+    /// `fileLocation`: both name what the TEMPLATE page is rendering, and
+    /// exactly one of them is set at a time, so Back out of a website lands
+    /// on whichever kind of content the pane was showing before it.
+    private var diffSpec: ViewerDiffSpec?
 
     /// A blank start page. The browser palette command opens here so the user
     /// can just type an address (the field shows its placeholder, not
@@ -120,47 +128,55 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// edge (clipped away); 0 is fully slid in. Animated for the slide.
     private var chromeTopConstraint: NSLayoutConstraint?
 
-    // Table of contents. The page (viewer.js) extracts headings from the
+    // The side panel: one card in the pane's left gutter, whose CONTENTS
+    // depend on what the pane is showing — a markdown document's table of
+    // contents, or a diff's changed-file tree. Everything below is shared by
+    // both (see ViewerSidePanel): the card, the gutter/overlay switch, the
+    // drag-to-resize handle, and the width preference.
+    //
+    // The TOC's data comes from the page: viewer.js extracts headings from the
     // rendered markdown and reports them — plus the section currently at the
-    // top of the pane — over the `viewerTOC` script-message bridge; the card
-    // itself is drawn natively (ViewerTOCPanel) so it is the same glass card
-    // as the pane banner rather than a CSS lookalike.
+    // top of the pane — over the `viewerTOC` script-message bridge. The card
+    // itself is drawn natively so it is the same glass card as the pane banner
+    // rather than a CSS lookalike. The file tree's data comes from git (see
+    // "Git diff" below).
     @Published private(set) var tocItems: [ViewerTOCItem] = []
     @Published private(set) var activeHeadingID: String?
     /// Narrow-layout panel state. Deliberately ephemeral: it is an overlay
     /// covering the document, so restoring a session with it open would hide
     /// the content the user actually asked to see.
-    @Published private(set) var tocPanelOpen = false
-    private var tocPanelHost: NSHostingView<ViewerTOCPanel>?
-    private var tocPanelConstraints: [NSLayoutConstraint] = []
+    @Published private(set) var sidePanelOpen = false
+    private var sidePanelHost: NSHostingView<ViewerSidePanel>?
+    private var sidePanelConstraints: [NSLayoutConstraint] = []
     /// Layer-backed wrapper around the panel's hosting view. The slide is a
     /// Core Animation transform on THIS layer: animating the panel's leading
     /// constraint instead re-runs Auto Layout every frame, and every one of
     /// those frames re-lays-out the SwiftUI list inside — which is CPU work
     /// per frame rather than compositing, and visibly stutters.
-    private var tocPanelContainer: NSView?
+    private var sidePanelContainer: NSView?
     /// Set for the duration of a user-driven toggle so the slide animates —
     /// `layout()` reaches the same code every frame of a divider drag and
     /// must never start an animation.
-    private var animatingTOCPanel = false
+    private var animatingSidePanel = false
     /// Left gutter the page reserves for the TOC card, in CSS px. 0 unless
     /// the card is in gutter layout. Pushed to the page (not applied as a
     /// native inset) so the strip behind the card is the document's own
-    /// background — see `pushTOCGutter()`.
-    private(set) var tocGutterWidth: CGFloat = 0
-    @Published private(set) var tocLayout: TOCLayout = .hidden
-    private var tocPanelSignature: TOCPanelSignature?
+    /// background — see `pushSidePanelGutter()`.
+    private(set) var sidePanelGutterWidth: CGFloat = 0
+    @Published private(set) var sidePanelLayout: SidePanelLayout = .hidden
+    private var sidePanelSignature: SidePanelSignature?
 
     /// The size-dependent inputs of the mounted panel, so `layout()` can skip
     /// re-pushing an identical root view.
-    private struct TOCPanelSignature: Equatable {
+    private struct SidePanelSignature: Equatable {
         let width: CGFloat
         let maxHeight: CGFloat
     }
 
-    /// How the table of contents is presented, decided by pane width.
-    enum TOCLayout {
-        /// No TOC: not a markdown document, or fewer than two headings.
+    /// How the side panel is presented, decided by pane width.
+    enum SidePanelLayout {
+        /// No panel: nothing to list — not a markdown document (or fewer than
+        /// two headings), and not a diff with files in it.
         case hidden
         /// Wide pane: a card in a left gutter, content inset beside it.
         case gutter
@@ -173,32 +189,36 @@ final class ViewerView: NSView, Codable, ObservableObject {
 
     /// Pane width at or above which the TOC gets its own gutter. Below it
     /// the gutter would squeeze the document column too far to read.
-    private static let tocGutterMinWidth: CGFloat = 720
+    private static let sidePanelGutterMinWidth: CGFloat = 720
 
     /// Card width, and the range the user may drag it to. One width serves
     /// both layouts (the compact overlay just clamps it to the pane), so
     /// there is a single number to reason about and to persist.
-    private static let tocCardDefaultWidth: CGFloat = 240
-    private static let tocCardMinWidth: CGFloat = 170
-    private static let tocCardMaxWidth: CGFloat = 460
+    private static let sidePanelDefaultWidth: CGFloat = 240
+    private static let sidePanelMinWidth: CGFloat = 170
+    private static let sidePanelMaxWidth: CGFloat = 460
 
     /// The user's chosen card width. A chrome preference rather than a
     /// property of any one document, so it lives in defaults and applies to
     /// every viewer pane — the same way a sidebar width behaves in a document
     /// app, and unlike a split ratio, which is per-window by nature.
-    private static let tocCardWidthDefaultsKey = "ViewerTOCCardWidth"
+    ///
+    /// The KEY still says "TOC" from when the card only ever held a table of
+    /// contents. It stays that way on purpose: renaming it would silently
+    /// reset the width every existing user has already dragged to.
+    private static let sidePanelWidthDefaultsKey = "ViewerTOCCardWidth"
 
-    private(set) var tocCardWidth: CGFloat = {
-        let stored = UserDefaults.standard.double(forKey: tocCardWidthDefaultsKey)
-        guard stored > 0 else { return tocCardDefaultWidth }
-        return min(tocCardMaxWidth, max(tocCardMinWidth, CGFloat(stored)))
+    private(set) var sidePanelWidth: CGFloat = {
+        let stored = UserDefaults.standard.double(forKey: sidePanelWidthDefaultsKey)
+        guard stored > 0 else { return sidePanelDefaultWidth }
+        return min(sidePanelMaxWidth, max(sidePanelMinWidth, CGFloat(stored)))
     }()
 
     /// Thin drag target straddling the card's right edge, mounted only in the
     /// gutter layout (the compact card floats over the document like a menu —
     /// there is no gutter for a resize to redistribute).
-    private var tocResizeHandle: TOCResizeHandle?
-    private var tocResizeHandleCenterX: NSLayoutConstraint?
+    private var sidePanelResizeHandle: SidePanelResizeHandle?
+    private var sidePanelResizeHandleCenterX: NSLayoutConstraint?
 
     /// True when the displayed page is a website (network allowed) rather
     /// than a rendered local file.
@@ -207,11 +227,19 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return false
     }
 
-    /// The file URL for file-backed modes, nil for websites.
+    /// True while this pane is rendering a git diff. Drives which side panel
+    /// the card shows, which controls the nav bar carries, and whether the
+    /// bar may auto-hide.
+    var isDiffMode: Bool {
+        if case .diff = mode { return true }
+        return false
+    }
+
+    /// The file URL for file-backed modes, nil for websites and diffs.
     var fileURL: URL? {
         switch mode {
         case .markdown(let url), .code(let url): return url
-        case .web: return nil
+        case .web, .diff: return nil
         }
     }
 
@@ -238,8 +266,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
         self.location = location
         self.homeLocation = homeLocation
         self.originDirectory = originDirectory
-        self.mode = Self.mode(for: location)
-        self.fileLocation = Self.mode(for: location).fileURL
+        let mode = Self.mode(for: location)
+        self.mode = mode
+        self.fileLocation = mode.fileURL
+        self.diffSpec = mode.diffSpec
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
         // The chrome bar parks above the top edge between reveals; without
@@ -253,6 +283,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
         if adoptedWebView == nil {
             load()
             startWatchingFile()
+            // Ask git NOW rather than waiting for the page: the file tree is
+            // native and owes the web view nothing, so the panel fills in
+            // while the template is still loading. Whatever the page missed is
+            // pushed to it on `didFinish`.
+            if isDiffMode { refreshDiff(preservingSelection: false) }
         }
         refreshWorktree()
     }
@@ -281,6 +316,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         fileMonitor?.cancel()
         reloadDebounce?.cancel()
         chromeHideTimer?.invalidate()
+        diffRefreshTimer?.invalidate()
         if let chromeMonitor { NSEvent.removeMonitor(chromeMonitor) }
     }
 
@@ -315,18 +351,23 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // Same reasoning as the chrome bar: these hosting views' root
             // views strongly reference us, so a detached pane sitting in the
             // undo stack would never let go of its web view.
-            tocPanelContainer?.removeFromSuperview()
-            tocPanelContainer = nil
-            tocPanelHost = nil
-            tocPanelConstraints = []
-            tocPanelSignature = nil
-            tocLayout = .hidden
-            tocGutterWidth = 0
+            sidePanelContainer?.removeFromSuperview()
+            sidePanelContainer = nil
+            sidePanelHost = nil
+            sidePanelConstraints = []
+            sidePanelSignature = nil
+            sidePanelLayout = .hidden
+            sidePanelGutterWidth = 0
+            // A detached diff pane must stop polling git. The listing itself
+            // is kept, so an undo re-attaches a pane that is already populated
+            // and simply resumes refreshing.
+            stopWatchingDiff()
             if isWebURL {
                 webView.pauseAllMediaPlayback()
             }
         } else {
             installEventMonitor()
+            startWatchingDiff()
         }
     }
 
@@ -351,9 +392,17 @@ final class ViewerView: NSView, Codable, ObservableObject {
             forMainFrameOnly: true)
     }
 
-    /// Classify a location as a website or a file to render. `about:` pages
-    /// (the blank start page) count as web — they are navigable, not files.
+    /// Classify a location as a diff, a website, or a file to render.
+    /// `about:` pages (the blank start page) count as web — they are
+    /// navigable, not files.
+    ///
+    /// The diff schemes come FIRST: `git-status:` and `git-diff:<revspec>`
+    /// carry a colon, and every other branch here would happily read one of
+    /// them as a relative file path.
     static func mode(for location: String) -> Mode {
+        if let spec = ViewerDiffSpec.parse(location) {
+            return .diff(spec)
+        }
         if location.hasPrefix("http://") || location.hasPrefix("https://")
             || location.hasPrefix("about:"),
            let url = URL(string: location) {
@@ -382,13 +431,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         switch mode(for: location) {
         case .web(let url): return url.host ?? location
         case .markdown(let url), .code(let url): return url.lastPathComponent
+        case .diff(let spec): return spec.title
         }
     }
 
     // MARK: - Web view setup
 
     private func setupWebView(adopting adopted: WKWebView? = nil) {
-        self.currentURL = addressText(for: fileLocation ?? URL(string: location))
+        self.currentURL = diffSpec?.location
+            ?? addressText(for: fileLocation ?? URL(string: location))
 
         let webView: WKWebView
         if let adopted {
@@ -529,6 +580,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
             } else {
                 load()
             }
+        case .diff:
+            // Re-runs git, so an explicit reload picks up commits, staging,
+            // and edits made since the pane was opened. The selected file and
+            // scroll position survive it (see refreshDiff).
+            if pageLoaded {
+                refreshDiff(preservingSelection: true)
+            } else {
+                load()
+            }
         }
     }
 
@@ -539,7 +599,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
     func navigate(to input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        openLocation(Self.isFilePath(trimmed) ? trimmed : Self.completeAddress(trimmed))
+        // A diff spec is neither a path nor a hostname: without this, omnibox
+        // completion would turn `git-diff:main...HEAD` into an https:// URL.
+        if ViewerDiffSpec.isDiffLocation(trimmed) {
+            openLocation(trimmed)
+        } else {
+            openLocation(Self.isFilePath(trimmed) ? trimmed : Self.completeAddress(trimmed))
+        }
         // Submitting an address hands keyboard focus to the page body, the way a
         // browser omnibox does: you can immediately scroll/interact, and — just
         // as important — the address field genuinely resigns first responder, so
@@ -575,9 +641,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
             currentURL = addressText(for: url)
             webView.allowsBackForwardNavigationGestures = true
             webView.load(URLRequest(url: url))
+            stopWatchingDiff()
         case .markdown(let url), .code(let url):
             mode = newMode
             fileLocation = url
+            diffSpec = nil
             location = url.path
             title = url.lastPathComponent
             currentURL = addressText(for: url)
@@ -585,7 +653,23 @@ final class ViewerView: NSView, Codable, ObservableObject {
             schemeHandler?.baseDirectory = url.deletingLastPathComponent()
             webView.allowsBackForwardNavigationGestures = false
             pageLoaded = false
+            stopWatchingDiff()
+            clearDiffState()
             startWatchingFile()
+            load()
+        case .diff(let spec):
+            mode = newMode
+            diffSpec = spec
+            fileLocation = nil
+            location = spec.location
+            title = spec.title
+            currentURL = spec.location
+            webView.allowsBackForwardNavigationGestures = false
+            pageLoaded = false
+            fileMonitor?.cancel()
+            fileMonitor = nil
+            clearTOC()
+            clearDiffState()
             load()
         }
     }
@@ -598,6 +682,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private func addressText(for url: URL?) -> String {
         guard let url else { return "" }
         if url.scheme == ViewerSchemeHandler.scheme {
+            // The template renders either a file or a diff; the address shows
+            // whichever it currently holds, in the form the user can retype.
+            if let diffSpec { return diffSpec.location }
             return fileLocation?.absoluteString ?? ""
         }
         if url.absoluteString == Self.blankPage { return "" }
@@ -689,22 +776,34 @@ final class ViewerView: NSView, Codable, ObservableObject {
     }
 
     /// A key event this pane wants before the focused element sees it (from the
-    /// pane's local event monitor). Today: Escape while the address field is
-    /// being edited. Returns true when the event was consumed.
+    /// pane's local event monitor). Today: Escape while a chrome text field —
+    /// the address bar, or the diff panel's filter — is being edited. Returns
+    /// true when the event was consumed.
     ///
     /// AppKit-level rather than a SwiftUI `.onExitCommand` for the same reason
     /// the rest of the chrome's focus handling is: @FocusState does not
     /// propagate reliably inside an NSHostingView, and the field editor — not
     /// the SwiftUI view — is what actually holds the keystroke.
     func handleChromeKeyDown(_ event: NSEvent) -> Bool {
-        guard event.window === window, chromeTextFieldFocused else { return false }
+        guard event.window === window else { return false }
+        let editingAddress = chromeTextFieldFocused
+        let editingFilter = sidePanelTextFieldFocused
+        guard editingAddress || editingFilter else { return false }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard event.keyCode == 53,  // Escape
               !mods.contains(.command),
               !mods.contains(.control),
               !mods.contains(.option)
         else { return false }
-        cancelAddressEditing()
+        if editingAddress {
+            cancelAddressEditing()
+        } else {
+            // Escape in the filter puts the whole list back and hands focus to
+            // the diff — the same "throw the edit away" contract the address
+            // field has.
+            setDiffFilter("")
+            window?.makeFirstResponder(webView)
+        }
         return true
     }
 
@@ -805,11 +904,17 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// feedback composer pins it for the same reason — and because the
     /// composer hangs off the bar's bottom edge, so retracting the bar would
     /// drag the toolbar the user is typing into off screen with it.
-    private var chromeAlwaysVisible: Bool { tocLayout == .compact || feedbackOpen }
+    /// A diff pane pins the bar too: it is where next/previous-change and the
+    /// unified⇄side-by-side toggle live, and a control you have to go hunting
+    /// for with the mouse before every use is not a control. It also keeps the
+    /// revspec visible, which is the one thing a diff pane's chrome should say.
+    private var chromeAlwaysVisible: Bool {
+        sidePanelLayout == .compact || feedbackOpen || isDiffMode
+    }
 
     /// Toggle the contents panel (the chrome bar's leading button).
-    func toggleTOCPanel() {
-        setTOCPanelOpen(!tocPanelOpen)
+    func toggleSidePanel() {
+        setSidePanelOpen(!sidePanelOpen)
     }
 
     /// The chrome bar calls this while hovered or while the URL field is
@@ -841,13 +946,25 @@ final class ViewerView: NSView, Codable, ObservableObject {
         window?.firstResponder is NSText && chromeKeyboardFocused
     }
 
+    /// True when the side panel's own text field (the diff filter) holds
+    /// keyboard focus. Separate from the chrome bar's because the two live in
+    /// different hosting views, and both have to be able to claim the standard
+    /// editing chords — a filter field you cannot paste into is broken in
+    /// exactly the way the address field used to be.
+    private var sidePanelTextFieldFocused: Bool {
+        guard let sidePanelHost, window?.firstResponder is NSText,
+              let responder = window?.firstResponder as? NSView
+        else { return false }
+        return responder === sidePanelHost || responder.isDescendant(of: sidePanelHost)
+    }
+
     /// True when keyboard focus is on an element inside THIS viewer pane that
     /// should receive the standard editing chords: the address field's editor or
     /// the web content. Deliberately excludes the bar's buttons and the feedback
     /// composer (which handles the chords itself). Gates the editing routing in
     /// `performKeyEquivalent`.
     private var paneHoldsEditingFocus: Bool {
-        chromeTextFieldFocused || isViewerContentFocused
+        chromeTextFieldFocused || sidePanelTextFieldFocused || isViewerContentFocused
     }
 
     private func scheduleChromeHide(after delay: TimeInterval = 2.0) {
@@ -1192,7 +1309,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // was created first. (The chrome bar is lifted back on top just below.)
         addSubview(
             host, positioned: .above,
-            relativeTo: tocResizeHandle ?? tocPanelContainer ?? webView)
+            relativeTo: sidePanelResizeHandle ?? sidePanelContainer ?? webView)
         // The chrome bar has to stay on top: the composer parks BEHIND it and
         // slides out from under it.
         if let chromeHost {
@@ -1555,6 +1672,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
             activeHeadingID = payload["id"] as? String
         case "quote":
             handleQuoteMessage(payload)
+        case "diffNavOverflow":
+            // The open file has no further hunk in that direction; the next
+            // change is in the next FILE.
+            handleDiffNavOverflow((payload["direction"] as? Int) ?? 1)
         default:
             break
         }
@@ -1600,9 +1721,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         tocItems = items
         if items.isEmpty {
             activeHeadingID = nil
-            tocPanelOpen = false
+            sidePanelOpen = false
         }
-        updateTOCLayout()
+        updateSidePanelLayout()
     }
 
     /// Scroll the page to a heading (a TOC row was clicked). The panel is an
@@ -1610,22 +1731,22 @@ final class ViewerView: NSView, Codable, ObservableObject {
     func scrollToHeading(id: String) {
         webView.evaluateJavaScript("window.__viewer.scrollToAnchor(\(Self.js(id)))")
         activeHeadingID = id
-        if tocLayout == .compact { setTOCPanelOpen(false) }
+        if sidePanelLayout == .compact { setSidePanelOpen(false) }
     }
 
-    func setTOCPanelOpen(_ open: Bool) {
-        guard tocPanelOpen != open else { return }
-        tocPanelOpen = open
+    func setSidePanelOpen(_ open: Bool) {
+        guard sidePanelOpen != open else { return }
+        sidePanelOpen = open
         // Only a deliberate toggle animates. Layout passes reach the same
         // code and must stay silent.
-        animatingTOCPanel = true
-        updateTOCLayout()
-        animatingTOCPanel = false
+        animatingSidePanel = true
+        updateSidePanelLayout()
+        animatingSidePanel = false
     }
 
     /// Mount the panel inside a layer-backed container, so the slide can be
     /// a transform on one layer rather than a relayout of the whole card.
-    private func mountTOCPanel(_ panel: ViewerTOCPanel, parked: Bool, cardWidth: CGFloat) {
+    private func mountSidePanel(_ panel: ViewerSidePanel, parked: Bool, cardWidth: CGFloat) {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
@@ -1641,18 +1762,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
         ])
 
         addSubview(container, positioned: .above, relativeTo: webView)
-        tocPanelConstraints = [
+        sidePanelConstraints = [
             container.topAnchor.constraint(equalTo: webView.topAnchor),
             container.leadingAnchor.constraint(equalTo: leadingAnchor),
         ]
-        NSLayoutConstraint.activate(tocPanelConstraints)
-        tocPanelContainer = container
-        tocPanelHost = host
+        NSLayoutConstraint.activate(sidePanelConstraints)
+        sidePanelContainer = container
+        sidePanelHost = host
 
         if parked {
             // Realize the parked position before the first slide, so opening
             // animates in from off-edge instead of from nowhere.
-            applyTOCPanelState(parked: true, cardWidth: cardWidth, animated: false)
+            applySidePanelState(parked: true, cardWidth: cardWidth, animated: false)
         }
     }
 
@@ -1661,8 +1782,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// Runs entirely on the compositor: the layer's contents are already
     /// rendered, so translating and fading it costs no layout and no SwiftUI
     /// work per frame. The panel's constraints never move.
-    private func applyTOCPanelState(parked: Bool, cardWidth: CGFloat, animated: Bool) {
-        guard let container = tocPanelContainer, let layer = container.layer else { return }
+    private func applySidePanelState(parked: Bool, cardWidth: CGFloat, animated: Bool) {
+        guard let container = sidePanelContainer, let layer = container.layer else { return }
 
         let offset = parked ? -(cardWidth + GlassCard.outerMargin * 2) : 0
         let targetTransform = CATransform3DMakeTranslation(offset, 0, 0)
@@ -1694,7 +1815,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             guard let self, let container else { return }
             // Re-read the state: a fast double-toggle can land here after the
             // opposite animation has already started.
-            container.isHidden = self.tocLayout == .compact && !self.tocPanelOpen
+            container.isHidden = self.sidePanelLayout == .compact && !self.sidePanelOpen
         }
 
         let move = CABasicAnimation(keyPath: "transform")
@@ -1716,28 +1837,33 @@ final class ViewerView: NSView, Codable, ObservableObject {
         CATransaction.commit()
     }
 
-    /// Which TOC presentation the pane's current width calls for.
-    private var desiredTOCLayout: TOCLayout {
-        guard !tocItems.isEmpty else { return .hidden }
-        return bounds.width >= Self.tocGutterMinWidth ? .gutter : .compact
+    /// Which side-panel presentation the pane's current width calls for.
+    ///
+    /// A diff pane lists files, every other pane lists headings; either way an
+    /// empty list means no card, because a card with nothing in it is a strip
+    /// of the document taken away for nothing.
+    private var desiredSidePanelLayout: SidePanelLayout {
+        let hasContent = isDiffMode ? !diffFiles.isEmpty : !tocItems.isEmpty
+        guard hasContent else { return .hidden }
+        return bounds.width >= Self.sidePanelGutterMinWidth ? .gutter : .compact
     }
 
     override func layout() {
         super.layout()
         // Panes are resized constantly by split-tree drags, so the gutter ⇄
         // compact switch has to ride layout rather than any one-shot setup.
-        updateTOCLayout()
+        updateSidePanelLayout()
     }
 
     /// Mount, size, or tear down the TOC views for the current pane width,
     /// and tell the page how much gutter to reserve.
-    private func updateTOCLayout() {
+    private func updateSidePanelLayout() {
         // layout() can run before setupWebView has assigned the web view.
         guard webView != nil else { return }
 
-        let layout = desiredTOCLayout
-        if tocLayout != layout {
-            tocLayout = layout
+        let layout = desiredSidePanelLayout
+        if sidePanelLayout != layout {
+            sidePanelLayout = layout
             // The compact layout puts the only control that opens the
             // contents panel in the chrome bar, so the bar has to stop
             // auto-hiding. Leaving compact hands it back to hover.
@@ -1754,46 +1880,46 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let available = webView.frame.height > 0 ? webView.frame.height : bounds.height
         let maxCardHeight = max(80, available - GlassCard.outerMargin * 2)
         let cardWidth = layout == .gutter
-            ? tocCardWidth
-            : min(tocCardWidth,
+            ? sidePanelWidth
+            : min(sidePanelWidth,
                   max(120, bounds.width - GlassCard.outerMargin * 2))
 
         // Mounted in both layouts. A closed compact panel is PARKED off the
         // left edge rather than unmounted: a view that is destroyed on close
         // has nothing to animate, so it could only ever pop.
         let showsPanel = layout != .hidden
-        let parked = layout == .compact && !tocPanelOpen
+        let parked = layout == .compact && !sidePanelOpen
 
         if showsPanel {
-            let panel = ViewerTOCPanel(
+            let panel = ViewerSidePanel(
                 viewerView: self, width: cardWidth, maxHeight: maxCardHeight)
-            let signature = TOCPanelSignature(width: cardWidth, maxHeight: maxCardHeight)
-            if let host = tocPanelHost {
+            let signature = SidePanelSignature(width: cardWidth, maxHeight: maxCardHeight)
+            if let host = sidePanelHost {
                 // Only push a new root view when its inputs actually moved.
                 // This runs from layout(), and re-assigning rootView marks
                 // the hosting view dirty — doing that unconditionally would
                 // re-enter layout every frame of a divider drag.
-                if signature != tocPanelSignature {
-                    tocPanelSignature = signature
+                if signature != sidePanelSignature {
+                    sidePanelSignature = signature
                     host.rootView = panel
                 }
             } else {
-                tocPanelSignature = signature
-                mountTOCPanel(panel, parked: parked, cardWidth: cardWidth)
+                sidePanelSignature = signature
+                mountSidePanel(panel, parked: parked, cardWidth: cardWidth)
             }
-            applyTOCPanelState(
+            applySidePanelState(
                 parked: parked,
                 cardWidth: cardWidth,
-                animated: animatingTOCPanel && window?.isVisible == true)
+                animated: animatingSidePanel && window?.isVisible == true)
         } else {
-            tocPanelContainer?.removeFromSuperview()
-            tocPanelContainer = nil
-            tocPanelHost = nil
-            tocPanelConstraints = []
-            tocPanelSignature = nil
+            sidePanelContainer?.removeFromSuperview()
+            sidePanelContainer = nil
+            sidePanelHost = nil
+            sidePanelConstraints = []
+            sidePanelSignature = nil
         }
 
-        updateTOCResizeHandle(layout: layout, cardWidth: cardWidth)
+        updateSidePanelResizeHandle(layout: layout, cardWidth: cardWidth)
 
         // Only the gutter reserves space; the compact panel floats over the
         // document the way a menu does.
@@ -1807,9 +1933,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let gutter = layout == .gutter
             ? GlassCard.outerMargin + cardWidth
             : 0
-        if gutter != tocGutterWidth {
-            tocGutterWidth = gutter
-            pushTOCGutter()
+        if gutter != sidePanelGutterWidth {
+            sidePanelGutterWidth = gutter
+            pushSidePanelGutter()
         }
     }
 
@@ -1821,68 +1947,68 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// SwiftUI hosting view) for the same reason the split divider is an
     /// AppKit view — the hosting view and the web view both out-hit-test a
     /// SwiftUI gesture area.
-    private func updateTOCResizeHandle(layout: TOCLayout, cardWidth: CGFloat) {
-        guard layout == .gutter, let container = tocPanelContainer else {
-            tocResizeHandle?.removeFromSuperview()
-            tocResizeHandle = nil
-            tocResizeHandleCenterX = nil
+    private func updateSidePanelResizeHandle(layout: SidePanelLayout, cardWidth: CGFloat) {
+        guard layout == .gutter, let container = sidePanelContainer else {
+            sidePanelResizeHandle?.removeFromSuperview()
+            sidePanelResizeHandle = nil
+            sidePanelResizeHandleCenterX = nil
             return
         }
 
-        let handle: TOCResizeHandle
-        if let existing = tocResizeHandle {
+        let handle: SidePanelResizeHandle
+        if let existing = sidePanelResizeHandle {
             handle = existing
         } else {
-            handle = TOCResizeHandle()
+            handle = SidePanelResizeHandle()
             handle.translatesAutoresizingMaskIntoConstraints = false
             handle.onDrag = { [weak self] delta, startWidth in
-                self?.setTOCCardWidth(startWidth + delta)
+                self?.setSidePanelWidth(startWidth + delta)
             }
             handle.widthAtDragStart = { [weak self] in
-                self?.tocCardWidth ?? Self.tocCardDefaultWidth
+                self?.sidePanelWidth ?? Self.sidePanelDefaultWidth
             }
             handle.onDragEnded = { [weak self] in
                 guard let self else { return }
                 UserDefaults.standard.set(
-                    Double(self.tocCardWidth), forKey: Self.tocCardWidthDefaultsKey)
+                    Double(self.sidePanelWidth), forKey: Self.sidePanelWidthDefaultsKey)
             }
             addSubview(handle, positioned: .above, relativeTo: container)
             let centerX = handle.centerXAnchor.constraint(
                 equalTo: container.leadingAnchor, constant: 0)
             NSLayoutConstraint.activate([
                 centerX,
-                handle.widthAnchor.constraint(equalToConstant: TOCResizeHandle.grabWidth),
+                handle.widthAnchor.constraint(equalToConstant: SidePanelResizeHandle.grabWidth),
                 handle.topAnchor.constraint(
                     equalTo: container.topAnchor, constant: GlassCard.outerMargin),
                 handle.bottomAnchor.constraint(
                     equalTo: container.bottomAnchor, constant: -GlassCard.outerMargin),
             ])
-            tocResizeHandle = handle
-            tocResizeHandleCenterX = centerX
+            sidePanelResizeHandle = handle
+            sidePanelResizeHandleCenterX = centerX
         }
 
         let edge = GlassCard.outerMargin + cardWidth
-        if tocResizeHandleCenterX?.constant != edge {
-            tocResizeHandleCenterX?.constant = edge
+        if sidePanelResizeHandleCenterX?.constant != edge {
+            sidePanelResizeHandleCenterX?.constant = edge
         }
     }
 
     /// Apply a dragged card width, clamped to the allowed range and to what
     /// the pane can actually give the document beside it.
-    func setTOCCardWidth(_ proposed: CGFloat) {
+    func setSidePanelWidth(_ proposed: CGFloat) {
         // Never let the card starve the document: cap it so the text column
         // keeps at least the width the gutter layout is predicated on.
         let paneCap = max(
-            Self.tocCardMinWidth,
-            bounds.width - Self.tocGutterMinWidth / 2)
+            Self.sidePanelMinWidth,
+            bounds.width - Self.sidePanelGutterMinWidth / 2)
         let clamped = min(
-            min(Self.tocCardMaxWidth, paneCap),
-            max(Self.tocCardMinWidth, proposed))
-        guard clamped != tocCardWidth else { return }
-        tocCardWidth = clamped
+            min(Self.sidePanelMaxWidth, paneCap),
+            max(Self.sidePanelMinWidth, proposed))
+        guard clamped != sidePanelWidth else { return }
+        sidePanelWidth = clamped
         // The card, the handle, and the page's gutter all derive from this —
         // one layout pass moves all three together.
-        updateTOCLayout()
+        updateSidePanelLayout()
     }
 
     /// Hand the gutter width to the page, which reserves it as padding on
@@ -1893,22 +2019,399 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// but was not: the reserved strip then painted this view's background
     /// instead of the markdown page's, leaving a visible seam down the edge
     /// of the gutter in both light and dark.
-    private func pushTOCGutter() {
+    private func pushSidePanelGutter() {
         guard pageLoaded else { return }
-        webView.evaluateJavaScript("window.__viewer.setGutter(\(tocGutterWidth))")
+        webView.evaluateJavaScript("window.__viewer.setGutter(\(sidePanelGutterWidth))")
     }
 
     /// Drop the TOC entirely (leaving a file view, or tearing the pane down).
     private func clearTOC() {
         setTOCItems([])
-        updateTOCLayout()
+        updateSidePanelLayout()
+    }
+
+    // MARK: - Git diff
+
+    /// How a diff's lines are laid out.
+    ///
+    /// A chrome preference rather than a property of any one diff, so — like
+    /// the side panel's width — it lives in defaults and applies to every diff
+    /// pane, instead of being something you re-set every time you open one.
+    enum DiffViewStyle: String {
+        case unified
+        case split
+
+        var next: DiffViewStyle { self == .unified ? .split : .unified }
+    }
+
+    private static let diffViewStyleDefaultsKey = "ViewerDiffViewStyle"
+
+    @Published private(set) var diffViewStyle: DiffViewStyle = {
+        let raw = UserDefaults.standard.string(forKey: diffViewStyleDefaultsKey)
+        return raw.flatMap(DiffViewStyle.init(rawValue:)) ?? .unified
+    }()
+
+    /// Every changed file in the diff, eagerly (one cheap `--numstat` pass);
+    /// each file's PATCH is fetched only when its row is clicked. That split
+    /// is what lets a thousand-file range open instantly.
+    @Published private(set) var diffFiles: [ViewerDiffFile] = []
+    /// The rows the side panel draws — the tree, filtered and folded.
+    @Published private(set) var diffRows: [ViewerDiffTree.Row] = []
+    @Published private(set) var diffFilter: String = ""
+    @Published private(set) var activeDiffFileID: String?
+
+    private var diffCollapsedFolders: Set<String> = []
+    /// The working tree the diff is being taken in, and the spec with a bare
+    /// `git-diff:` already resolved to a real range. Both are answers from
+    /// git, so they exist only once a listing has loaded.
+    private var diffRepo: String?
+    private var resolvedDiffSpec: ViewerDiffSpec?
+    private let diffLoader = ViewerDiffLoader()
+    /// Poll for a working-tree diff (see `startWatchingDiff`).
+    private var diffRefreshTimer: Timer?
+    /// How often a `git-status:` pane re-checks the working tree.
+    private static let diffRefreshInterval: TimeInterval = 2.0
+
+    /// True while the panel is showing filter results rather than the tree.
+    var isDiffFiltered: Bool { !diffFilter.isEmpty }
+
+    /// The count line in the panel header.
+    var diffSummaryText: String {
+        guard !diffFiles.isEmpty else { return "" }
+        let shown = ViewerDiffTree.visibleFiles(in: diffRows).count
+        return shown == diffFiles.count
+            ? "\(diffFiles.count)"
+            : "\(shown)/\(diffFiles.count)"
+    }
+
+    var activeDiffFile: ViewerDiffFile? {
+        diffFiles.first { $0.id == activeDiffFileID }
+    }
+
+    // MARK: Panel interaction
+
+    func setDiffFilter(_ text: String) {
+        guard diffFilter != text else { return }
+        diffFilter = text
+        rebuildDiffRows()
+    }
+
+    func isDiffFolderCollapsed(_ key: String) -> Bool {
+        diffCollapsedFolders.contains(key)
+    }
+
+    func toggleDiffFolder(_ key: String) {
+        if diffCollapsedFolders.contains(key) {
+            diffCollapsedFolders.remove(key)
+        } else {
+            diffCollapsedFolders.insert(key)
+        }
+        rebuildDiffRows()
+    }
+
+    /// Show a file's patch. The panel is an overlay in the narrow layout, so
+    /// using it dismisses it — the same rule a TOC row follows.
+    func selectDiffFile(_ file: ViewerDiffFile, scrollTo hunk: String? = nil) {
+        activeDiffFileID = file.id
+        loadDiffPatch(for: file, scrollTo: hunk)
+        if sidePanelLayout == .compact { setSidePanelOpen(false) }
+    }
+
+    /// Return in the filter field opens the top hit — type a few letters and
+    /// go, rather than type and then reach for the mouse.
+    func openFirstFilteredFile() {
+        guard let first = ViewerDiffTree.visibleFiles(in: diffRows).first else { return }
+        selectDiffFile(first)
+    }
+
+    /// The filter field gained or lost keyboard focus.
+    ///
+    /// A terminal surface sharing this window keeps its `focused` flag set even
+    /// while this field holds keyboard focus, so its `performKeyEquivalent`
+    /// would consume Cmd-C/V before the field editor sees them. Same yield the
+    /// address field performs.
+    func diffFilterFocusChanged(_ focused: Bool) {
+        guard focused else { return }
+        if let controller = window?.windowController as? BaseTerminalController {
+            _ = controller.focusedSurface?.resignFirstResponder()
+        }
+    }
+
+    func setDiffViewStyle(_ style: DiffViewStyle) {
+        guard diffViewStyle != style else { return }
+        diffViewStyle = style
+        UserDefaults.standard.set(style.rawValue, forKey: Self.diffViewStyleDefaultsKey)
+        guard pageLoaded, isDiffMode else { return }
+        webView.evaluateJavaScript(
+            "window.__viewer.setDiffStyle(\(Self.js(style.rawValue)))")
+    }
+
+    func toggleDiffViewStyle() { setDiffViewStyle(diffViewStyle.next) }
+
+    // MARK: Change navigation
+
+    /// Step to the next / previous change.
+    ///
+    /// Within the open file this is a hunk jump, done page-side because only
+    /// the page knows where the hunks landed. When there is no next hunk the
+    /// page says so (`diffNavOverflow`) and we roll over to the adjacent FILE,
+    /// which is what "next change" means across a multi-file diff.
+    func goToNextChange() { navigateDiff(1) }
+    func goToPreviousChange() { navigateDiff(-1) }
+
+    private func navigateDiff(_ direction: Int) {
+        guard isDiffMode else { return }
+        guard activeDiffFileID != nil else {
+            // Nothing open yet: the first change is the first file's.
+            if let first = ViewerDiffTree.visibleFiles(in: diffRows).first {
+                selectDiffFile(first, scrollTo: direction > 0 ? "first" : "last")
+            }
+            return
+        }
+        guard pageLoaded else { return }
+        webView.evaluateJavaScript("window.__viewer.diffNav(\(direction))")
+    }
+
+    /// The page ran out of hunks in `direction`; move to the adjacent file.
+    fileprivate func handleDiffNavOverflow(_ direction: Int) {
+        let files = ViewerDiffTree.visibleFiles(in: diffRows)
+        guard let current = activeDiffFileID,
+              let index = files.firstIndex(where: { $0.id == current })
+        else { return }
+        let next = index + (direction > 0 ? 1 : -1)
+        guard files.indices.contains(next) else { return }
+        // Entering a file backwards lands on its LAST hunk, so walking
+        // backwards through a diff reads in reverse rather than skipping to
+        // each file's top.
+        selectDiffFile(files[next], scrollTo: direction > 0 ? "first" : "last")
+    }
+
+    // MARK: Loading
+
+    /// Whether the pane can currently ask git anything.
+    private var diffDirectory: String? {
+        // The origin directory is the pane's `--working-directory` (or the
+        // caller's cwd), persisted in the session manifest — so a restored
+        // diff pane re-runs against the same repo it was opened for.
+        originDirectory ?? worktree?.path
+    }
+
+    /// Re-run the diff and reconcile the panel with the result.
+    ///
+    /// One path serves the first load, `+reload`/Cmd-R, and the working-tree
+    /// poll. Nothing is pushed to the page when the file list has not moved,
+    /// which is what makes a 2-second poll invisible instead of a flicker.
+    func refreshDiff(preservingSelection: Bool, force: Bool = false) {
+        guard let spec = diffSpec else { return }
+        let previous = diffFiles
+
+        diffLoader.loadListing(spec: spec, directory: diffDirectory) { [weak self] result in
+            guard let self, self.isDiffMode else { return }
+            switch result {
+            case .failure(let error):
+                self.diffRepo = nil
+                self.resolvedDiffSpec = nil
+                self.applyDiffFiles([])
+                self.pushDiffListing(message: error.title, detail: error.detail)
+            case .success(let listing):
+                self.diffRepo = listing.repo
+                self.resolvedDiffSpec = listing.spec
+                let changed = listing.files != previous
+                if changed || force {
+                    self.applyDiffFiles(listing.files)
+                    self.pushDiffListing(message: listing.message, detail: nil)
+                }
+                // The selection is read HERE, not snapshotted when the refresh
+                // was requested: git runs off the main thread, and a click
+                // that lands during a poll's round trip must not be undone by
+                // that poll finishing.
+                self.reconcileDiffSelection(
+                    selection: preservingSelection ? self.activeDiffFileID : nil,
+                    previousFiles: previous,
+                    force: force)
+                self.startWatchingDiff()
+            }
+        }
+    }
+
+    private func applyDiffFiles(_ files: [ViewerDiffFile]) {
+        diffFiles = files
+        // A folder the user closed stays closed across a refresh. Keys the new
+        // listing no longer contains are dropped, so a status pane left open
+        // for an afternoon does not accumulate a set of dead folder names.
+        if !diffCollapsedFolders.isEmpty {
+            let live = Set(ViewerDiffTree.rows(for: files).compactMap(\.folderKey))
+            diffCollapsedFolders.formIntersection(live)
+        }
+        rebuildDiffRows()
+    }
+
+    private func rebuildDiffRows() {
+        diffRows = ViewerDiffTree.rows(
+            for: diffFiles, filter: diffFilter, collapsed: diffCollapsedFolders)
+        updateSidePanelLayout()
+    }
+
+    /// Decide what should be on screen after a refresh: the same file if it is
+    /// still in the diff, its fresh patch if its counts moved, and the first
+    /// file when the pane has nothing open yet.
+    private func reconcileDiffSelection(
+        selection: String?,
+        previousFiles: [ViewerDiffFile],
+        force: Bool
+    ) {
+        let visible = ViewerDiffTree.visibleFiles(in: diffRows)
+        if let selection, let current = diffFiles.first(where: { $0.id == selection }) {
+            activeDiffFileID = selection
+            let before = previousFiles.first { $0.id == selection }
+            if force || before != current {
+                loadDiffPatch(for: current, scrollTo: nil)
+            }
+            return
+        }
+        // The selected file left the diff (staged, reverted, committed), or
+        // this is the first load: open the first thing in the list rather than
+        // leaving the pane blank.
+        guard let first = visible.first else {
+            activeDiffFileID = nil
+            return
+        }
+        activeDiffFileID = first.id
+        loadDiffPatch(for: first, scrollTo: nil)
+    }
+
+    private func loadDiffPatch(for file: ViewerDiffFile, scrollTo hunk: String?) {
+        guard let repo = diffRepo, let spec = resolvedDiffSpec else { return }
+        // Binary files never get a patch; say so immediately rather than
+        // spawning a git process that will produce nothing useful.
+        guard !file.isBinary else {
+            pushDiffFile(file, patch: nil, scrollTo: hunk)
+            return
+        }
+        diffLoader.loadPatch(file: file, spec: spec, repo: repo) { [weak self] file, patch in
+            guard let self, self.activeDiffFileID == file.id else { return }
+            self.pushDiffFile(file, patch: patch, scrollTo: hunk)
+        }
+    }
+
+    // MARK: Page bridge
+
+    private func pushDiffListing(message: String?, detail: String?) {
+        guard pageLoaded, isDiffMode else { return }
+        var payload: [String: Any] = [
+            "title": (resolvedDiffSpec ?? diffSpec)?.title ?? "",
+            "subtitle": diffSubtitle,
+            "fileCount": diffFiles.count,
+            "additions": diffFiles.reduce(0) { $0 + $1.additions },
+            "deletions": diffFiles.reduce(0) { $0 + $1.deletions },
+            "style": diffViewStyle.rawValue,
+        ]
+        if let message { payload["message"] = message }
+        if let detail { payload["detail"] = detail }
+        evaluate("window.__viewer.setDiffListing", payload)
+    }
+
+    /// The line under the diff's title: which repo, and which kind of diff.
+    private var diffSubtitle: String {
+        var parts: [String] = []
+        if let repo = diffRepo { parts.append((repo as NSString).lastPathComponent) }
+        if case .status = (resolvedDiffSpec ?? diffSpec)?.kind {
+            parts.append("staged, unstaged and untracked changes")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func pushDiffFile(_ file: ViewerDiffFile, patch: String?, scrollTo hunk: String?) {
+        guard pageLoaded, isDiffMode else { return }
+        var payload: [String: Any] = [
+            "path": file.path,
+            "status": file.status.rawValue,
+            "statusLetter": file.status.letter,
+            "origin": file.origin.rawValue,
+            "additions": file.additions,
+            "deletions": file.deletions,
+            "binary": file.isBinary,
+            "language": Self.highlightLanguage(
+                forExtension: (file.path as NSString).pathExtension.lowercased()) ?? "",
+            "patch": patch ?? "",
+        ]
+        if let oldPath = file.oldPath { payload["oldPath"] = oldPath }
+        if let hunk { payload["scrollTo"] = hunk }
+        if let section = file.origin.sectionTitle { payload["section"] = section }
+        evaluate("window.__viewer.setDiffFile", payload)
+    }
+
+    /// Call a page function with one JSON argument.
+    private func evaluate(_ function: String, _ payload: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("\(function)(\(json))")
+    }
+
+    // MARK: Live refresh
+
+    /// Poll the working tree so a `git-status:` pane does not go stale the
+    /// moment the user saves a file.
+    ///
+    /// A poll rather than a file watcher because the thing being watched is a
+    /// whole repository: a watcher would have to cover every tracked file, the
+    /// index, and HEAD, and would still miss a `git add` performed in another
+    /// checkout of the same repo. `git status` is cheap, the work happens off
+    /// the main thread, and an unchanged file list pushes nothing to the page —
+    /// so the cost of being wrong here is a couple of milliseconds, not a
+    /// flicker.
+    private func startWatchingDiff() {
+        let spec = resolvedDiffSpec ?? diffSpec
+        guard spec?.tracksWorkingTree == true, window != nil else {
+            stopWatchingDiff()
+            return
+        }
+        guard diffRefreshTimer == nil else { return }
+        diffRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.diffRefreshInterval, repeats: true
+        ) { [weak self] timer in
+            // A pane that has left its window stops polling for good, rather
+            // than waking every two seconds to discover it has nothing to do.
+            // The run loop owns the timer, so a pane that only ever returns
+            // early here would keep it alive for the life of the process.
+            guard let self, self.isDiffMode, self.window != nil else {
+                timer.invalidate()
+                self?.diffRefreshTimer = nil
+                return
+            }
+            self.refreshDiff(preservingSelection: true)
+        }
+    }
+
+    private func stopWatchingDiff() {
+        diffRefreshTimer?.invalidate()
+        diffRefreshTimer = nil
+    }
+
+    /// Drop the panel's contents (leaving diff mode, or retargeting the pane
+    /// at a different revspec). `diffSpec` itself survives, so navigating Back
+    /// to the diff restores it.
+    private func clearDiffState() {
+        stopWatchingDiff()
+        diffFiles = []
+        diffRows = []
+        diffFilter = ""
+        activeDiffFileID = nil
+        diffCollapsedFolders = []
+        diffRepo = nil
+        resolvedDiffSpec = nil
+        // Take the card down NOW rather than at the next layout pass: the old
+        // diff's file list is gone, and a card still showing it while the new
+        // one loads is showing a lie.
+        updateSidePanelLayout()
     }
 
     // MARK: - Loading
 
     private func load() {
         switch mode {
-        case .markdown, .code:
+        case .markdown, .code, .diff:
             guard let pageURL = URL(string: "\(ViewerSchemeHandler.scheme)://page/viewer.html") else { return }
             webView.load(URLRequest(url: pageURL))
         case .web(let url):
@@ -1919,7 +2422,17 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// (Re-)inject the file's content into the loaded page. Safe to call
     /// repeatedly — the page preserves scroll position on re-render.
     func renderFileContent() {
-        guard pageLoaded, let fileURL else { return }
+        guard pageLoaded else { return }
+        if case .diff = mode {
+            // A diff's content comes from git, not from a file on disk;
+            // reloading the listing IS its render (see refreshDiff). Forced,
+            // because this is the page announcing it is ready: the listing may
+            // already be loaded (see init) and would otherwise push nothing,
+            // leaving the freshly-loaded page blank.
+            refreshDiff(preservingSelection: true, force: true)
+            return
+        }
+        guard let fileURL else { return }
 
         let call: String
         do {
@@ -1935,7 +2448,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             case .code:
                 let lang = Self.highlightLanguage(forExtension: fileURL.pathExtension.lowercased())
                 call = "window.__viewer.setCode(\(Self.js(text)), \(Self.js(lang ?? "")))"
-            case .web:
+            case .web, .diff:
                 return
             }
         } catch {
@@ -2287,12 +2800,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
 }
 
 extension ViewerView.Mode {
-    /// The file this mode renders, nil for a website.
+    /// The file this mode renders, nil for a website or a diff.
     var fileURL: URL? {
         switch self {
         case .markdown(let url), .code(let url): return url
-        case .web: return nil
+        case .web, .diff: return nil
         }
+    }
+
+    /// The diff this mode renders, nil for everything else.
+    var diffSpec: ViewerDiffSpec? {
+        if case .diff(let spec) = self { return spec }
+        return nil
     }
 }
 
@@ -2311,6 +2830,17 @@ extension ViewerView: WKNavigationDelegate {
     private func syncMode(toCommitted url: URL?) {
         guard let url else { return }
         if url.scheme == ViewerSchemeHandler.scheme {
+            // The template page is back on screen — restore whichever kind of
+            // content it was rendering. Exactly one of these is ever set.
+            if let diffSpec {
+                mode = .diff(diffSpec)
+                location = diffSpec.location
+                title = diffSpec.title
+                webView.allowsBackForwardNavigationGestures = false
+                pageLoaded = false
+                currentURL = diffSpec.location
+                return
+            }
             guard let fileLocation else { return }
             mode = Self.mode(for: fileLocation.path)
             location = fileLocation.path
@@ -2325,6 +2855,13 @@ extension ViewerView: WKNavigationDelegate {
             // template page last reported are gone with it. (Nothing will
             // arrive to clear them — the bridge only exists in our template.)
             clearTOC()
+            // Same for a diff pane the user has navigated off: stop polling
+            // git and empty the file tree. `diffSpec` survives, so Back over
+            // this boundary re-renders the diff.
+            stopWatchingDiff()
+            diffFiles = []
+            diffRows = []
+            activeDiffFileID = nil
         }
         currentURL = addressText(for: url)
     }
@@ -2339,7 +2876,7 @@ extension ViewerView: WKNavigationDelegate {
         renderFileContent()
         // A reload/renavigation resets the document, taking the body padding
         // the TOC gutter relies on with it.
-        pushTOCGutter()
+        pushSidePanelGutter()
     }
 
     func webView(

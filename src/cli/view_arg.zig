@@ -1,24 +1,54 @@
-//! `--view=` argument handling shared by `+new-window` and `+split`.
+//! Shared handling of `--view=`, used by both `+split` and `+new-window`.
 //!
-//! Both verbs have to rewrite a relative `--view=` path into an absolute one
-//! before the request leaves the CLI: the app process has no idea what the
-//! caller's cwd was. The two verbs used to carry byte-identical private
-//! copies of that logic, and both copies carried the same bug — the T257
-//! lesson (four copies of the chrome datum, four chances to be wrong, no way
-//! to notice) applied to a second subsystem. One copy lives here now.
+//! One implementation on purpose: the two commands must agree exactly on what
+//! counts as a path (and therefore gets resolved CLI-side against the caller's
+//! cwd) versus what is an opaque location the app interprets itself. They used
+//! to carry a copy each — byte-identical, and both carrying the same bug, the
+//! T257 lesson (four copies of the chrome datum, four chances to be wrong, no
+//! way to notice) applied to a second subsystem. A new scheme handled in one
+//! copy and not the other is silently mangled into a path by the other verb.
+//!
+//! The app process has no idea what the caller's cwd was, which is why the
+//! rewrite has to happen CLI-side at all.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lib = @import("../lib/main.zig");
 
+/// The schemes that name a git diff rather than a file.
+///
+/// A diff spec's text is a REVSPEC — `main...HEAD`, a sha, or nothing at all —
+/// so path resolution must never touch it. Which repository it applies to is
+/// decided app-side from `--working-directory` (else the caller's cwd, which
+/// both commands insert), exactly as a relative file path is.
+const diff_schemes = [_][]const u8{ "git-diff", "git-status" };
+
+/// True when `--view=<value>` names a diff.
+///
+/// The colon is what makes this a scheme, and it is optional ONLY when nothing
+/// follows it: `git-diff` and `git-diff:main...HEAD` are diffs, while
+/// `git-diff-notes.md` is a file that merely starts with the same letters. A
+/// bare `startsWith` here would quietly stop resolving that file's path.
+/// Mirrors `ViewerDiffSpec.parse` on the Swift side.
+pub fn isDiffView(value: []const u8) bool {
+    for (diff_schemes) |scheme| {
+        if (std.mem.eql(u8, value, scheme)) return true;
+        if (value.len > scheme.len and
+            std.mem.startsWith(u8, value, scheme) and
+            value[scheme.len] == ':') return true;
+    }
+    return false;
+}
+
 /// Whether a `--view=` value has to be resolved against a base directory.
 ///
 /// Everything that already names its own location passes through untouched:
 /// URLs (`https://…`, and any other scheme — the viewer routes by scheme, not
-/// by a fixed list), `about:` pages such as the blank browser start page, and
-/// absolute paths.
+/// by a fixed list), `about:` pages such as the blank browser start page, git
+/// diff specs (see `isDiffView`), and absolute paths.
 ///
-/// "Absolute" is `std.fs.path.isAbsolute`, which is the whole point of this
+/// "Absolute" is `std.fs.path.isAbsolute`, which is half the point of this
 /// function existing: both call sites used to test `value[0] == '/'`, so on
 /// Windows a real absolute path (`C:\src\README.md`, or a `\\server\share`
 /// UNC) looked RELATIVE and got a cwd glued onto its front.
@@ -27,6 +57,7 @@ pub fn needsResolution(value: []const u8) bool {
     if (std.fs.path.isAbsolute(value)) return false;
     if (std.mem.indexOf(u8, value, "://") != null) return false;
     if (std.mem.startsWith(u8, value, "about:")) return false;
+    if (isDiffView(value)) return false;
     return true;
 }
 
@@ -55,6 +86,20 @@ pub fn resolve(alloc: Allocator, arguments: [][:0]const u8) !void {
 
 const testing = std.testing;
 
+test "diff specs are not treated as paths" {
+    try testing.expect(isDiffView("git-status:"));
+    try testing.expect(isDiffView("git-status"));
+    try testing.expect(isDiffView("git-diff:main...HEAD"));
+    try testing.expect(isDiffView("git-diff:"));
+    // Files that merely start with the same letters are still files.
+    try testing.expect(!isDiffView("git-diff-report.md"));
+    try testing.expect(!isDiffView("git-status.txt"));
+    try testing.expect(!isDiffView("git-statuses:"));
+    try testing.expect(!isDiffView("docs/git-status:notes.md"));
+    try testing.expect(!isDiffView("README.md"));
+    try testing.expect(!isDiffView(""));
+}
+
 test "needsResolution: relative paths resolve, self-locating values do not" {
     // The reason this module exists.
     try testing.expect(needsResolution("README.md"));
@@ -68,6 +113,13 @@ test "needsResolution: relative paths resolve, self-locating values do not" {
     try testing.expect(!needsResolution("http://localhost:3000/x"));
     try testing.expect(!needsResolution("file:///c:/src/README.md"));
     try testing.expect(!needsResolution("about:blank"));
+
+    // Diff specs are revspecs, not paths.
+    try testing.expect(!needsResolution("git-diff"));
+    try testing.expect(!needsResolution("git-diff:main...HEAD"));
+    try testing.expect(!needsResolution("git-status:"));
+    // ...but a file that merely starts with a scheme name still is one.
+    try testing.expect(needsResolution("git-diff-notes.md"));
 
     // Empty is not a path to fix; the flag is effectively absent.
     try testing.expect(!needsResolution(""));
@@ -118,6 +170,8 @@ test "resolve: self-locating values are left byte-for-byte alone" {
     const untouched = [_][]const u8{
         "https://example.com",
         "about:blank",
+        "git-diff:main...HEAD",
+        "git-status:",
         if (builtin.os.tag == .windows) "C:\\other\\README.md" else "/other/README.md",
     };
     for (untouched) |value| {
@@ -128,6 +182,23 @@ test "resolve: self-locating values are left byte-for-byte alone" {
         try resolve(alloc, &arguments);
         try testing.expectEqualStrings(value, lib.cutPrefix(u8, arguments[1], "--view=").?);
     }
+}
+
+test "resolve: a file that starts with a scheme name still gets path-resolved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const base = if (builtin.os.tag == .windows) "C:\\src\\repo" else "/src/repo";
+    var arguments = [_][:0]const u8{
+        try std.fmt.allocPrintSentinel(alloc, "--working-directory={s}", .{base}, 0),
+        try alloc.dupeZ(u8, "--view=git-diff-notes.md"),
+    };
+    try resolve(alloc, &arguments);
+
+    const want = try std.fs.path.resolve(alloc, &.{ base, "git-diff-notes.md" });
+    const got = lib.cutPrefix(u8, arguments[1], "--view=").?;
+    try testing.expectEqualStrings(want, got);
 }
 
 test "resolve: no --view argument is a no-op" {

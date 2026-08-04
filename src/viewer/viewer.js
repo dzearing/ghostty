@@ -38,6 +38,7 @@
    * re-rendering (live reload). */
   function setMarkdown(source) {
     const y = window.scrollY;
+    content.className = "markdown-body";
     // md.render emits raw HTML (html: true); sanitize before inserting so an
     // opened file can't inject <script>, onerror=, javascript: URLs, etc. The
     // default DOMPurify profile keeps the tags/attributes a README header needs
@@ -55,6 +56,7 @@
    * file extension) when highlight.js knows it. */
   function setCode(source, lang) {
     const y = window.scrollY;
+    content.className = "markdown-body";
     const pre = document.createElement("pre");
     pre.className = "viewer-code";
     const code = document.createElement("code");
@@ -76,6 +78,7 @@
 
   /* Show an error card (missing/unreadable file). */
   function setError(title, detail) {
+    content.className = "markdown-body";
     content.replaceChildren();
     const card = document.createElement("div");
     card.className = "viewer-error";
@@ -333,6 +336,31 @@
     scrollToHeading(target);
   });
 
+  /* ---------------------------------------------------------------------
+   * Git diff mode
+   *
+   * The renderer itself lives in diff.js (loaded before this file) and is
+   * wired up here so it shares this page's message bridge and its `#content`
+   * host — a diff is a third thing this one template can render, not a
+   * separate page.
+   *
+   * A diff has no headings, so the heading index is cleared on entry: the
+   * native side then swaps the side panel's contents from the table of
+   * contents to the file tree, using the same card.
+   * ------------------------------------------------------------------- */
+
+  const diff = window.__viewerDiff.init({ root: content, post: post });
+
+  function setDiffListing(payload) {
+    clearHeadingIndex();
+    diff.setListing(payload);
+  }
+
+  function setDiffFile(payload) {
+    clearHeadingIndex();
+    diff.setFile(payload);
+  }
+
   window.__viewer = {
     setMarkdown: setMarkdown,
     setCode: setCode,
@@ -340,5 +368,12 @@
     // Called from the native TOC panel.
     scrollToAnchor: scrollToAnchor,
     setGutter: setGutter,
+    // Called from the native diff panel and toolbar.
+    setDiffListing: setDiffListing,
+    setDiffFile: setDiffFile,
+    setDiffStyle: diff.setStyle,
+    diffNav: diff.nav,
+    // Reached by tests driving the parser/highlighter directly.
+    diff: diff,
   };
 })();

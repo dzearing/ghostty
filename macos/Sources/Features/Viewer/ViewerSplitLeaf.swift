@@ -63,15 +63,19 @@ struct WebChromeBar: View {
             // is nothing to toggle. While this is present the bar stops
             // auto-hiding (see ViewerView.chromeAlwaysVisible) — it would be
             // useless otherwise.
-            if viewerView.tocLayout == .compact {
-                Button(action: { viewerView.toggleTOCPanel() }) {
-                    Image(systemName: "list.bullet")
+            if viewerView.sidePanelLayout == .compact {
+                Button(action: { viewerView.toggleSidePanel() }) {
+                    Image(systemName: viewerView.isDiffMode
+                        ? "sidebar.leading" : "list.bullet")
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
-                .foregroundStyle(viewerView.tocPanelOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
-                .help(viewerView.tocPanelOpen ? "Hide contents" : "Show contents")
-                .accessibilityLabel("Table of contents")
+                .foregroundStyle(viewerView.sidePanelOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .help(viewerView.sidePanelOpen
+                    ? (viewerView.isDiffMode ? "Hide files" : "Hide contents")
+                    : (viewerView.isDiffMode ? "Show files" : "Show contents"))
+                .accessibilityLabel(viewerView.isDiffMode
+                    ? "Changed files" : "Table of contents")
             }
 
             Button(action: { viewerView.goBack() }) {
@@ -103,6 +107,47 @@ struct WebChromeBar: View {
                     .contentShape(Rectangle())
             }
             .help("Home — back to \(viewerView.homeLocation)")
+
+            // Diff controls, in the same 24pt squares as the rest of the bar.
+            // They live HERE rather than in a second toolbar because a diff
+            // pane pins this bar open anyway (see chromeAlwaysVisible), so a
+            // separate strip would be a second permanent row of chrome buying
+            // nothing. The bar is a single flexible row, so a narrow pane just
+            // gives the address field less width.
+            if viewerView.isDiffMode {
+                Divider().frame(height: 16).padding(.horizontal, 2)
+
+                Button(action: { viewerView.goToPreviousChange() }) {
+                    Image(systemName: "chevron.up")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .help("Previous change")
+                .accessibilityLabel("Previous change")
+
+                Button(action: { viewerView.goToNextChange() }) {
+                    Image(systemName: "chevron.down")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .help("Next change")
+                .accessibilityLabel("Next change")
+
+                Button(action: { viewerView.toggleDiffViewStyle() }) {
+                    Image(systemName: viewerView.diffViewStyle == .split
+                        ? "rectangle.split.2x1" : "list.bullet.rectangle")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(viewerView.diffViewStyle == .split
+                    ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .help(viewerView.diffViewStyle == .split
+                    ? "Side-by-side — switch to unified"
+                    : "Unified — switch to side-by-side")
+                .accessibilityLabel("Diff layout")
+
+                Divider().frame(height: 16).padding(.horizontal, 2)
+            }
 
             TextField("Enter URL", text: $urlText)
                 .textFieldStyle(.plain)

@@ -37,21 +37,61 @@ struct ViewerTOCTests {
 
     /// Wait until `condition` holds, or give up.
     ///
-    /// Deliberately NOT spinning `RunLoop.main.run(until:)`: that is
-    /// unavailable from an async context (a hard error under Swift 6) and
-    /// re-entering the runloop here races the continuation in `evaluate`.
-    /// Awaiting a sleep yields the main actor, which lets the runloop turn
-    /// and WebKit deliver its callbacks on its own.
+    /// Turning the run loop is load-bearing, not belt-and-braces: WebKit only
+    /// makes progress while it turns, which is why the shared `PollUntil.poll`
+    /// does the same thing. This suite used to sleep only, on the theory that
+    /// awaiting yields the main actor and the loop turns on its own. It does —
+    /// on an idle machine. With the target's two runners each executing tests
+    /// in parallel, the main actor is contended and the page load simply
+    /// stalls: every test here failed against a 60s deadline under an 8-worker
+    /// local stress run, and the whole suite failed on CI, always on the first
+    /// "has the page loaded yet" wait.
+    ///
+    /// The hazard the old comment was guarding against is real but narrower
+    /// than it claimed: re-entering the loop races the continuation inside
+    /// `evaluate`. Nothing is in flight at THIS point — `condition` is
+    /// synchronous — so turning it here is safe. `waitForPage` keeps the same
+    /// discipline by turning the loop only between attempts.
+    ///
+    /// The ceiling is a FAILURE DEADLINE, not a delay: it returns the moment
+    /// the condition holds, typically in tens of milliseconds.
     private func wait(
-        upTo seconds: TimeInterval = 10,
+        upTo seconds: TimeInterval = 60,
         for condition: () -> Bool
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if condition() { return true }
-            try? await Task.sleep(nanoseconds: 25_000_000)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return condition()
+    }
+
+    /// `wait`, for a condition that has to ask the PAGE. Reading rendered state
+    /// means an `evaluateJavaScript` round trip per attempt, so the condition is
+    /// async; everything else is the same.
+    ///
+    /// This exists because a fixed settle followed by one `evaluate` is a race
+    /// the assertion always loses on a loaded machine: the native side applies
+    /// the gutter, the page picks it up a layout pass later, and reading once at
+    /// an arbitrary moment in between reports the OLD padding. Polling reads
+    /// until the page has caught up.
+    ///
+    /// The run loop is turned only BETWEEN attempts, never while `condition`'s
+    /// `evaluate` continuation is outstanding — that is the one ordering that
+    /// would race its resumption.
+    private func waitForPage(
+        upTo seconds: TimeInterval = 60,
+        for condition: () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if await condition() { return true }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return await condition()
     }
 
     /// Read a value out of the loaded page.
@@ -167,27 +207,28 @@ struct ViewerTOCTests {
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
         #expect(await wait { !viewer.tocItems.isEmpty })
-        #expect(await wait { viewer.tocGutterWidth > 0 }, "gutter never reserved")
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 }, "gutter never reserved")
 
         // Pin the width: it is a user preference read from defaults, so
         // whatever this machine happens to have dragged it to must not decide
         // whether the test passes.
-        viewer.setTOCCardWidth(240)
+        viewer.setSidePanelWidth(240)
 
         // The card's left margin + the card. The gap on the card's RIGHT is
         // the document's own padding, not part of the gutter.
         let expected = GlassCard.outerMargin + 240
-        #expect(viewer.tocGutterWidth == expected)
+        #expect(viewer.sidePanelGutterWidth == expected)
         // The web view still spans the pane; only the page is padded.
         #expect(viewer.webView.frame.minX == 0)
         #expect(viewer.webView.frame.width == 900)
         // And the page actually applied it.
-        _ = await wait(upTo: 1) { false }
-        let padding = await evaluate(
-            "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
-        #expect(
-            padding.flatMap(Double.init) == Double(expected),
-            "body padding was \(padding ?? "nil")")
+        var padding: String?
+        let applied = await waitForPage {
+            padding = await evaluate(
+                "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
+            return padding.flatMap(Double.init) == Double(expected)
+        }
+        #expect(applied, "body padding was \(padding ?? "nil"), expected \(expected)")
         // A hosting view for the card is mounted above the web view.
         let overlays = viewer.subviews.filter { $0 !== viewer.webView }
         #expect(!overlays.isEmpty)
@@ -201,22 +242,25 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
         viewer.frame = NSRect(x: 0, y: 0, width: 500, height: 700)
         viewer.layoutSubtreeIfNeeded()
 
-        #expect(viewer.tocGutterWidth == 0, "narrow pane must not reserve a gutter")
+        #expect(viewer.sidePanelGutterWidth == 0, "narrow pane must not reserve a gutter")
         // ...and the page dropped the padding with it.
-        _ = await wait(upTo: 2) { false }
-        let padding = await evaluate(
-            "getComputedStyle(document.body).paddingLeft", in: viewer)
-        #expect(padding == "0px", "body padding was \(padding ?? "nil")")
+        var padding: String?
+        let dropped = await waitForPage {
+            padding = await evaluate(
+                "getComputedStyle(document.body).paddingLeft", in: viewer)
+            return padding == "0px"
+        }
+        #expect(dropped, "body padding was \(padding ?? "nil")")
 
         // And widening restores it.
         viewer.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
         viewer.layoutSubtreeIfNeeded()
-        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + viewer.tocCardWidth)
+        #expect(viewer.sidePanelGutterWidth == GlassCard.outerMargin + viewer.sidePanelWidth)
     }
 
     /// Dragging the card's right edge moves the card AND the document's
@@ -229,26 +273,27 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
-        viewer.setTOCCardWidth(320)
-        #expect(viewer.tocCardWidth == 320)
-        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + 320)
-        _ = await wait(upTo: 1) { false }
-        let padding = await evaluate(
-            "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
-        #expect(
-            padding.flatMap(Double.init) == Double(GlassCard.outerMargin + 320),
-            "body padding was \(padding ?? "nil")")
+        viewer.setSidePanelWidth(320)
+        #expect(viewer.sidePanelWidth == 320)
+        #expect(viewer.sidePanelGutterWidth == GlassCard.outerMargin + 320)
+        var padding: String?
+        let followed = await waitForPage {
+            padding = await evaluate(
+                "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
+            return padding.flatMap(Double.init) == Double(GlassCard.outerMargin + 320)
+        }
+        #expect(followed, "body padding was \(padding ?? "nil")")
 
         // Absurd drags clamp instead of doing damage.
-        viewer.setTOCCardWidth(10)
-        let narrow = viewer.tocCardWidth
+        viewer.setSidePanelWidth(10)
+        let narrow = viewer.sidePanelWidth
         #expect(narrow > 100, "card collapsed to \(narrow)")
-        viewer.setTOCCardWidth(5_000)
+        viewer.setSidePanelWidth(5_000)
         #expect(
-            viewer.tocCardWidth < viewer.bounds.width - 300,
-            "card ate the document column: \(viewer.tocCardWidth)")
+            viewer.sidePanelWidth < viewer.bounds.width - 300,
+            "card ate the document column: \(viewer.sidePanelWidth)")
     }
 
     /// The measurement that makes a TOC card and a pane banner look like one
@@ -261,28 +306,31 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
-        // Let the gutter round-trip into the page.
-        _ = await wait(upTo: 2) { false }
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
         let margin = GlassCard.outerMargin
         // The gutter IS the card's right edge: outerMargin + card width.
-        let cardRight = viewer.tocGutterWidth
+        let cardRight = viewer.sidePanelGutterWidth
 
         // Text left edge = body padding (the gutter) + the column's own
-        // padding, with no `margin: auto` slack in between.
-        let textLeft = await evaluate(
-            """
-            (function () {
-              var b = document.querySelector('.markdown-body');
-              var r = b.getBoundingClientRect();
-              var p = parseFloat(getComputedStyle(b).paddingLeft);
-              return String(Math.round(r.left + p));
-            })()
-            """, in: viewer)
-        #expect(
-            textLeft == String(Int(cardRight + margin)),
-            "text left was \(textLeft ?? "nil")")
+        // padding, with no `margin: auto` slack in between. Polled rather than
+        // read once after a settle: the gutter reaches the page a layout pass
+        // behind the native side.
+        var textLeft: String?
+        let aligned = await waitForPage {
+            textLeft = await evaluate(
+                """
+                (function () {
+                  var b = document.querySelector('.markdown-body');
+                  if (!b) return '';
+                  var r = b.getBoundingClientRect();
+                  var p = parseFloat(getComputedStyle(b).paddingLeft);
+                  return String(Math.round(r.left + p));
+                })()
+                """, in: viewer)
+            return textLeft == String(Int(cardRight + margin))
+        }
+        #expect(aligned, "text left was \(textLeft ?? "nil")")
 
         // ...and the first line of text starts on the card's top edge.
         let textTop = await evaluate(
@@ -305,7 +353,7 @@ struct ViewerTOCTests {
         // Give the page time to load and report (it reports an empty list).
         _ = await wait(upTo: 4) { false }
         #expect(viewer.tocItems.isEmpty)
-        #expect(viewer.tocGutterWidth == 0)
+        #expect(viewer.sidePanelGutterWidth == 0)
     }
 
     /// Text/code viewers are untouched by the TOC work.
@@ -318,7 +366,7 @@ struct ViewerTOCTests {
 
         _ = await wait(upTo: 4) { false }
         #expect(viewer.tocItems.isEmpty)
-        #expect(viewer.tocGutterWidth == 0)
+        #expect(viewer.sidePanelGutterWidth == 0)
     }
 
     /// Detaching a pane (close, undo) tears the card down and gives the
@@ -328,14 +376,14 @@ struct ViewerTOCTests {
         let (window, viewer) = makeViewer(location: path, width: 900)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        #expect(await wait { viewer.tocGutterWidth > 0 })
+        #expect(await wait { viewer.sidePanelGutterWidth > 0 })
 
         viewer.setDetached(true)
         viewer.layoutSubtreeIfNeeded()
         // The gutter collapses over a layout pass, not inside `setDetached`, so
         // reading it straight after the call catches the old width on a loaded
         // machine.
-        #expect(await wait { viewer.tocGutterWidth == 0 },
-                "gutter did not collapse on detach: \(viewer.tocGutterWidth)")
+        #expect(await wait { viewer.sidePanelGutterWidth == 0 },
+                "gutter did not collapse on detach: \(viewer.sidePanelGutterWidth)")
     }
 }

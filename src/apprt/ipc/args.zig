@@ -497,7 +497,7 @@ test "parseVerbArgs: --view is captured, not dropped as an unknown flag" {
     defer arena.deinit();
 
     // A path and a URL are both just the flag's value here; classification
-    // (and relative-path resolution) happens CLI-side in cli/view_args.zig.
+    // (and relative-path resolution) happens CLI-side in cli/view_arg.zig.
     const file = try parseVerbArgs(arena.allocator(), &[_][]const u8{
         "--target=dev", "--view=D:\\git\\ghoztty\\README.md",
     });
