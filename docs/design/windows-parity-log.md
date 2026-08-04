@@ -8511,3 +8511,72 @@ was refused instead of a blank pane after a 10 s timeout (measured here:
 worked out in the task; **D8** records why it is split rather than folded in.
 **T470** - a materialized tombstone eagerly allocates a full 2 MB output ring it
 will never use.
+
+## 2026-08-04 - T431: making a window taller stopped deleting your scrollback
+
+The report was that NARROWING a pane could destroy history. Measured on box with
+numbered lines, narrowing destroys nothing - not a hard 1400 -> 700 px narrow,
+not a divider-style drag in 20px steps, not widening back. What destroys history
+is the other axis: **growing the pane's row count**. Filling a pane with `line 1`
+.. `line 500` and then dragging the window 480px taller permanently deleted lines
+456-473 - exactly the eighteen rows the viewport gained. Growing height while
+narrowing took 27 more. Making a window taller, maximizing it, un-zooming a
+split, closing a pane below: every one of those was eating that much of your
+output, silently.
+
+Two behaviours that are each right alone. Ghostty's resize deliberately "pulls
+down" scrollback when the row count grows and the cursor is on the bottom row -
+where a shell prompt always is - so a taller window reveals what scrolled off
+instead of showing blank space (`PageList.resizeWithoutReflow`, the `.gt`
+branch). And a ConPTY child owns the viewport absolutely, repainting all of it
+after every resize, opening with `ESC[H ESC[2J`. So the rows ghostty imports are
+erased a moment later by the child - and since the import moves the active-area
+boundary rather than copying anything, they are gone from the scrollback too.
+The width path is innocent because it never takes that branch, and because a
+pane whose viewport is full has no trailing blank rows for a reflow to refill.
+
+The guard is `src/termio/history_guard.zig` (new): pin the first row of the
+active area before the resize, and afterwards, if that pin has ended up `k` rows
+down, scroll exactly those `k` rows back out. The viewport ends the same height
+with `k` blank rows at the bottom - which is precisely what conhost's own buffer
+looks like after the same resize, so the two models stay in step and the
+repaint has nothing of ours to erase. A tracked pin is the only handle that
+survives a reflow, which is why T423's notice guard uses one; this generalises
+that single-block guard to the whole boundary, so the notice is covered by it
+too. It sits in `src/termio` and is gated on `builtin.os.tag == .windows`,
+compiling to nothing on macOS where pulling history down is correct and must
+stay - **D9** records why that fork was taken rather than changing shared
+terminal-core resize semantics.
+
+Reproduced first, then re-measured: `test/win32/scrollback-narrow.ps1` (new,
+background test desktop) failed two assertions against the pre-fix build at the
+exact geometries above, and is ALL PASS after in four configurations - `cmd`,
+`powershell`, git-`bash`, and a session-persistence (agent-owned ConPTY) pane.
+Registering the new module in `src/termio.zig` is load-bearing: without that
+line its unit tests silently do not run, which was proven with a deliberate
+canary failure before any green was believed.
+
+Two adjacent findings, both native rather than bugs: `cls` and `Clear-Host`
+destroy the WHOLE scrollback (they emit `ESC[3J`), matching conhost and Windows
+Terminal - which also means neither flavor can reach the blank-viewport-over-
+deep-history state at all, so git-bash's terminfo `clear` is what covers it. And
+`pwsh` is not installed on this box; the script SKIPs a missing flavor rather
+than reporting its absence as a scrollback bug.
+
+Floor at the boundary: `none` **PASS**, `agent` **PASS**, P1-P3 **ALL PASS**.
+`win32` FAILED its first run and **PASSED** its re-run, in code this change
+cannot reach - `remote.connection`'s "inbound DATA routing" gave up after
+100 000 fruitless spins and then panicked in `destroy` with the writer thread
+still alive. The tell was in the harness's own output: crash-catch re-ran the
+identical binary and reported *"no crash in 1 attempt(s) - the program ran to
+completion (exit 0)"*. Same bits, same box, opposite result. Filed as **T472**
+rather than shrugged at, because a spin count measures scheduler contention
+rather than elapsed time, and laundering a soft timeout into
+`STATUS_BREAKPOINT` costs ~2.5 minutes of cdb chase every time it fires.
+
+Filed: **T471** - the guard picks itself from the LOCAL os rather than the
+child's pty flavour, so a macOS app attached to a Windows agent still loses
+history and a Windows app attached to a POSIX agent gets a guard it does not
+need. Closing it means carrying the flavour across the agent HELLO handshake,
+which is a protocol change and belongs in its own task. **T472** - the flaky
+lane above.

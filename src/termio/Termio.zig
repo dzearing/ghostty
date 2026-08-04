@@ -21,6 +21,7 @@ const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const session_notice = @import("session_notice.zig");
+const history_guard = @import("history_guard.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -581,12 +582,21 @@ pub fn resize(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
+        // T431: a resize can drag SCROLLBACK down into the active area, where
+        // a ConPTY child's post-resize repaint erases it — and the drag is a
+        // move, so it is gone from history too. Pin the boundary across the
+        // resize and push back anything that crossed it.
+        const boundary = self.armHistoryGuardLocked();
+        defer if (boundary) |p| history_guard.disarm(&self.terminal, p);
+
         // Update the size of our terminal state
         try self.terminal.resize(
             self.alloc,
             grid_size.columns,
             grid_size.rows,
         );
+
+        if (boundary) |p| history_guard.hold(&self.terminal, p);
 
         // Update our pixel sizes
         self.terminal.width_px = grid_size.columns * self.size.cell.width;
@@ -622,10 +632,13 @@ pub fn reflowLocalGrid(self: *Termio, cols: u16, rows: u16) void {
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+        const boundary = self.armHistoryGuardLocked();
+        defer if (boundary) |p| history_guard.disarm(&self.terminal, p);
         self.terminal.resize(self.alloc, cols, rows) catch |err| {
             log.warn("reflowLocalGrid resize failed err={}", .{err});
             return;
         };
+        if (boundary) |p| history_guard.hold(&self.terminal, p);
         self.terminal.modes.set(.synchronized_output, false);
         self.holdNoticeAboveLocked();
     }
@@ -648,6 +661,14 @@ pub fn settleNotice(self: *Termio) void {
     defer self.renderer_state.mutex.unlock();
     session_notice.foldIntoScrollback(&self.terminal);
     self.notice_guard = session_notice.trackFold(&self.terminal);
+}
+
+/// Pin the active-area boundary before a resize, on the platforms whose child
+/// repaints the viewport afterwards. See `history_guard`. Null everywhere else,
+/// which makes both call sites a compile-time no-op off Windows.
+fn armHistoryGuardLocked(self: *Termio) ?*terminalpkg.Pin {
+    if (comptime !history_guard.enabled) return null;
+    return history_guard.arm(&self.terminal);
 }
 
 /// Put a settled notice back above the viewport if a reflow dragged it down
