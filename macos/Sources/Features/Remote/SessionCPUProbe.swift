@@ -15,14 +15,26 @@ import GhosttyKit
 /// The chooser is transient master-detail UI, so this follows the SELECTED target
 /// and nothing else: switching rows tears the old subscription down before
 /// starting the new one, and `stop()` on disappear guarantees no stream (and no
-/// dialed connection) outlives the page. Holding one open per machine would mean
-/// N live connections for a panel the user closes in seconds.
+/// borrowed connection) outlives the page. Holding one open per machine would
+/// mean N live connections for a panel the user closes in seconds.
+///
+/// ## Every machine gets a meter, and nobody dials twice
+/// This used to dial its own TCP connection per machine, and to skip relay
+/// machines entirely — the chooser was already dialing relays for
+/// `LIST_SESSIONS`, and doing that dance a second time just to draw a meter was
+/// not worth the connection. `MachineConnectionPool` removes both halves of that
+/// trade: the roster and the meter now BORROW one warm connection per machine, so
+/// relays get a meter and direct-TCP machines stop opening a second socket.
 ///
 /// ## Degrading against an older agent
 /// The stream is capability-gated. When the agent predates it,
 /// `..._session_cpu_subscribe` returns false, `supported` goes false, and the
 /// chooser shows no meter — never a stale or invented number, and never a
 /// fallback poll the agent did not agree to.
+///
+/// The corrected-`cpu_pct` skew (`capability.cpu_units`) needs no gate here:
+/// `session_cpu` was added AFTER the units fix in the same change set, so an
+/// agent that can serve this stream at all necessarily reports corrected units.
 @MainActor
 final class SessionCPUProbe: ObservableObject {
     /// Per-core CPU% keyed by session id, covering each session's whole process
@@ -47,14 +59,24 @@ final class SessionCPUProbe: ObservableObject {
     private var activeKey: String?
 
     /// The connection carrying the current subscription, and whether we own it.
-    /// The local agent's warm shared connection is BORROWED (LocalAgentManager
-    /// owns it for the app's lifetime); a machine connection we dialed ourselves
-    /// is owned and must be freed on teardown.
+    ///
+    /// Every connection this probe uses today is BORROWED — the local agent's
+    /// from `LocalAgentManager` (which owns it for the app's lifetime) and a
+    /// machine's from `MachineConnectionPool` (which owns it for as long as our
+    /// lease lives). The `owned` distinction stays because the invariant it
+    /// encodes is the dangerous one: a borrowed handle must never be freed by
+    /// `teardown()`, and anything that reintroduces a probe-dialed connection
+    /// must say so here rather than inherit the wrong default.
     private var handle: ghostty_remote_connection_t?
     private var ownsHandle = false
 
     /// Retained box handed to C as userdata; released after unsubscribe.
     private var box: Unmanaged<CallbackBox>?
+
+    /// The pool lease keeping the selected machine's connection warm. Released
+    /// on every teardown, so the connection lasts exactly as long as the row is
+    /// selected. Nil for the local agent (no lease — see `handle`).
+    private var lease: MachineConnectionPool.Lease?
 
     /// Generation counter so a dial that completes after we've moved on (or
     /// stopped) drops its connection instead of installing a stale subscription.
@@ -84,8 +106,13 @@ final class SessionCPUProbe: ObservableObject {
         install(handle: warm, owned: false)
     }
 
-    /// Subscribe to a machine's stream, dialing off-main. Any in-flight dial for
-    /// a previous selection is abandoned via the generation check.
+    /// Subscribe to a machine's stream over the pool's warm connection for it.
+    ///
+    /// Works for every transport, relays included: the pool did the dial (and,
+    /// for a relay, the one token round-trip) once for the whole selection, and
+    /// the roster is riding the same socket. Any lease from a previous selection
+    /// is torn down first, and the generation check drops a connection that
+    /// arrives after the user has moved on.
     func subscribe(machine: Machine) {
         let key = machine.id.uuidString
         guard activeKey != key else { return }
@@ -94,37 +121,16 @@ final class SessionCPUProbe: ObservableObject {
         generation += 1
         let gen = generation
 
-        // Relay machines need a token round-trip; the chooser already dials them
-        // for LIST_SESSIONS, and re-doing that dance here would double the
-        // connections against a page the user may close immediately. Direct-TCP
-        // machines are cheap, so those get a meter and relays don't (yet).
-        guard !machine.isRelay else {
-            supported = false
-            return
-        }
-
-        let host = machine.host
-        let port = machine.port
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let dialed = host.withCString { ghostty_remote_connection_new_tcp($0, port) }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let self else {
-                        if let dialed { ghostty_remote_connection_free(dialed) }
-                        return
-                    }
-                    // Selection moved (or we stopped) while dialing: drop it.
-                    guard self.generation == gen, self.activeKey == key else {
-                        if let dialed { ghostty_remote_connection_free(dialed) }
-                        return
-                    }
-                    guard let dialed else {
-                        self.supported = false
-                        return
-                    }
-                    self.install(handle: dialed, owned: true)
-                }
+        lease = MachineConnectionPool.shared.acquire(machine: machine) { [weak self] handle in
+            guard let self, self.generation == gen, self.activeKey == key else { return }
+            guard let handle else {
+                // No connection (dial failed, or the link died under us). Drop
+                // the stream and show no meter rather than a frozen last value.
+                self.uninstall()
+                self.supported = false
+                return
             }
+            self.install(handle: handle, owned: false)
         }
     }
 
@@ -139,6 +145,10 @@ final class SessionCPUProbe: ObservableObject {
     // MARK: Internals
 
     private func install(handle newHandle: ghostty_remote_connection_t, owned: Bool) {
+        // A machine whose connection died and was re-dialed reinstalls on the
+        // same target: drop the old subscription first so its box isn't leaked
+        // and no callback survives against a handle we no longer track.
+        if handle != nil { uninstall() }
         let newBox = CallbackBox(probe: self)
         let unmanaged = Unmanaged.passRetained(newBox)
         let ok = ghostty_remote_connection_session_cpu_subscribe(
@@ -161,10 +171,14 @@ final class SessionCPUProbe: ObservableObject {
         supported = true
     }
 
-    private func teardown() {
+    /// Drop the subscription (and any OWNED connection) without giving the pool
+    /// lease back — the target is unchanged, we just have no live stream on it.
+    private func uninstall() {
         if let handle {
             // Unsubscribe FIRST so no callback can fire against a released box.
             ghostty_remote_connection_session_cpu_unsubscribe(handle)
+            // Borrowed handles (every one today) belong to their owner; only a
+            // handle this probe dialed itself is ours to free.
             if ownsHandle { ghostty_remote_connection_free(handle) }
         }
         handle = nil
@@ -173,6 +187,15 @@ final class SessionCPUProbe: ObservableObject {
         box = nil
         cpuBySession = [:]
         agentIntervalMs = 0
+    }
+
+    private func teardown() {
+        // Unsubscribe before releasing the lease: the pool may free the
+        // connection the moment the last lease goes, and a live callback
+        // registered on it would then fire into freed memory.
+        uninstall()
+        lease?.release()
+        lease = nil
         supported = true
     }
 

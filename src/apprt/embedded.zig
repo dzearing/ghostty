@@ -2748,6 +2748,23 @@ pub const CAPI = struct {
         return v.ptr;
     }
 
+    /// True iff the connected agent advertised `capability.cpu_units` — every
+    /// `cpu_pct` it reports (the `PROC_SNAPSHOT` process table and the
+    /// `session_cpu` stream alike) is in CORRECTED units.
+    ///
+    /// False means the agent predates the macOS mach-ticks→nanoseconds fix, so
+    /// its per-process percentages may be ~24× low on Apple Silicon (1:1 and
+    /// therefore correct on Intel, which the app has no way to distinguish).
+    /// Also false before/after a failed handshake — the safe direction. Callers
+    /// must MARK the value unverifiable rather than rescale it: the app cannot
+    /// know the remote machine's mach timebase.
+    export fn ghostty_remote_connection_cpu_units_corrected(
+        handle: *RemoteConnectionHandle,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        return conn.cpuUnitsCorrected();
+    }
+
     /// Shut down and free the connection handle. Detaches all panes (remote
     /// sessions survive for later re-attach by session_id). The caller must
     /// ensure no surface still references this handle.
