@@ -114,7 +114,7 @@ Concretely, in order, with no stops in between:
    powershell -NoProfile -File scripts\parity-decisions.ps1 new ^
        -Title "<the question, phrased as a question>" -Task T123 ^
        -Assumed "<what you did meanwhile, so work continued>" ^
-       -Options "Do X::what it costs;;Do Y::what it costs" ^
+       -Options "Do X (Recommended)::Pros: ... Cons: ... Mitigation: ...;;Do Y::Pros: ... Cons: ... Mitigation: ..." ^
        -Why "<what forced the choice, in two or three sentences>"
    ```
 
@@ -131,8 +131,22 @@ Concretely, in order, with no stops in between:
    one and then wait: keep going, exactly as before.
 
    Write it for someone who has not seen the code. `-Why` states what forced
-   the choice; each option states **what it costs**, not just what it is. An
-   option list without costs is not a choice, it is a quiz.
+   the choice. Each option carries **Pros:** and **Cons:** — a list without
+   both is not a choice, it is a quiz — and where a con can be reduced, a
+   **Mitigation:** naming the extra work that reduces it ("adds complexity"
+   → a thorough design pass to make sure the shape is the one that scales;
+   "touches shared core" → cross-platform tests on both lanes first). If the
+   mitigation is real work, file it with `parity-tasks.ps1 new` so picking
+   that option does not silently drop its safety net.
+
+   Exactly ONE option's label ends in **"(Recommended)"**: the pick that best
+   balances robustness, performance, user experience, scale over time, and
+   stability, with the fewest sacrifices. **Implementation effort and time
+   are NEVER part of that balance** (user directive, 2026-08-05): we have
+   time to get things right, and what a choice costs in engineering hours is
+   not what it costs the customer. "Cheapest" and "fastest" are not pros;
+   "no named experiment left that could produce information" is a valid con,
+   because that is about evidence, not effort.
 6. **Update the tracker** — `scripts\parity-tasks.ps1 set-status <id> -Status
    done -Commit <sha>`, evidence into that task's own file, ONE log entry in
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
@@ -147,8 +161,13 @@ Concretely, in order, with no stops in between:
    house style — this is just what depends on it.
 
    Refresh the lock while you are here
-   (`scripts\go-loop-lock.ps1 heartbeat`) — a long task is the one case where
-   a turn can outlive the watchdog's staleness window.
+   (`scripts\go-loop-lock.ps1 heartbeat`). Since T253 this is a checkpoint,
+   not the loop's only pulse: the lock also follows the session transcript's
+   mtime, which Claude Code advances on every message and tool result, so a
+   long turn no longer reads as stale just because nobody ran a command. The
+   manual refresh still matters as the fallback for a session whose transcript
+   could not be resolved (`acquire` says which: `pulse=transcript` vs
+   `pulse=heartbeat-only`).
 7. **`/reset-context read go.md and go`, and end the turn there.**
 
 **Ending a turn any other way is a failure, not a pause.** The loop

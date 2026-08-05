@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-05 - **T253 done - the loop's liveness is now automatic, and a
+  watchdog nudge can no longer queue a second task into a working session.**
+  The 45-min staleness window was measured against a heartbeat only a
+  remembered step refreshes, so a 46-minute task read as a dead loop and the
+  watchdog typed a prompt into a session that was working. Three fixes:
+  `go-loop-lock.ps1` now records the session's Claude Code transcript at
+  acquire/heartbeat and freshness everywhere is the newer of heartbeat and
+  transcript-mtime (a pulse Claude Code emits itself, on every message and tool
+  result; fallback when unresolvable is exactly the old behaviour); the
+  watchdog's still-producing probe widened from 5 lines/8s to 60 lines/20s; and
+  its default nudge prompt is reset-first ("Before starting any task, run
+  /reset-context read go.md and go"), so even a wrong nudge costs a context
+  reset rather than a rule violation. Chose transcript-mtime over the sketch's
+  UserPromptSubmit hook (no per-box install, cannot be forgotten) - receipt in
+  D16. go-loop-guard.ps1 ALL PASS incl. new section R (R1-R18); P1-P3 ALL PASS;
+  zig lanes green (scripts-only change). Poetic justice: the pre-fix watchdog
+  nudged THIS turn mid-task, and the queued text that landed was the new
+  reset-first prompt doing its job.
 - 2026-08-03 - **T107 done - the verdict was HARNESS, and T218 had already fixed
   it; what shipped is the load shape becoming an assertion.** Measured on box
   with the flood running: `+list` answers in **73 ms** against an 8,000 ms

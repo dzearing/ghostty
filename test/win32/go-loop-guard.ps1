@@ -30,6 +30,11 @@
 #   Q. `status` asks the PANE when the recorded pid is dead (T440), so a claude
 #      relaunched in the owning pane reads as held rather than stale-dead -
 #      while `acquire` stays pid-based, on purpose.
+#   R. A turn longer than the staleness window is not nudged (T253): the lock's
+#      freshness follows the session TRANSCRIPT, which Claude Code advances by
+#      itself, so a working turn is visibly alive without anybody remembering to
+#      beat the heartbeat - and the nudge, when it does fire, is reset-first so
+#      landing it on a live session cannot queue a second task into that context.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -89,6 +94,20 @@ function Exec-Run([string[]]$extra) {
 
 function Read-LockFile { if (Test-Path $lock) { Get-Content $lock -Raw | ConvertFrom-Json } else { $null } }
 function Write-LockFile($obj) { ($obj | ConvertTo-Json -Depth 5) | Out-File -FilePath $lock -Encoding utf8 }
+
+# "This loop has shown no sign of life for N minutes" - which since T253 means
+# BOTH signals, not just the heartbeat. Every fixture here is acquired from the
+# session running this script, so `acquire` records that session's own live
+# transcript; backdating the heartbeat alone would leave the lock reading fresh
+# off the harness's own pulse, and the assertions below would be measuring this
+# file rather than the code. Section R owns the case where the transcript is
+# deliberately kept moving.
+function Set-LockStale($minutes) {
+    $L = Read-LockFile
+    $L.heartbeat = (Get-Date).AddMinutes(-$minutes).ToString('o')
+    if ($L.PSObject.Properties.Name -contains 'transcript') { $L.transcript = '' }
+    Write-LockFile $L
+}
 
 # A live stand-in for "somebody else's claude": a hidden sleeping powershell.
 function Start-Sleeper {
@@ -236,17 +255,13 @@ Assert 'D4 the turn counter restarts for a new owner' ([int](Read-LockFile).turn
 # --- E. stale heartbeat is taken over ------------------------------------
 ""
 "E. stale heartbeat taken over"
-$L = Read-LockFile
-$L.heartbeat = (Get-Date).AddMinutes(-120).ToString('o')
-Write-LockFile $L
+Set-LockStale 120
 $r = Lock-Run @('status', '-PaneId', 'PANE-C')
 Assert 'E1 status flags a stale heartbeat with the owner alive' ($r.Out -match '^stale-heartbeat' -and $r.Out -match 'alive=True')
 $r = Lock-Run @('acquire', '-PaneId', 'PANE-C', '-ClaudePid', $PID)
 Assert 'E2 a stale lock is taken over' ($r.Code -eq 0 -and $r.Out -match 'reason=stale-heartbeat')
 # ...but not before it is stale: -StaleMinutes is honoured.
-$L = Read-LockFile
-$L.heartbeat = (Get-Date).AddMinutes(-40).ToString('o')
-Write-LockFile $L
+Set-LockStale 40
 $r = Lock-Run @('acquire', '-PaneId', 'PANE-D', '-ClaudePid', $PID, '-StaleMinutes', 90)
 Assert 'E3 a 40m-old heartbeat is NOT stale at -StaleMinutes 90' ($r.Code -eq 3)
 $r = Lock-Run @('acquire', '-PaneId', 'PANE-D', '-ClaudePid', $PID, '-StaleMinutes', 30)
@@ -286,9 +301,7 @@ $r = Dog-Run @('-DryRun')
 Assert 'H1 a healthy lock produces no action' ($r.Out -match 'ACTION none')
 Assert 'H2 the healthy tick is logged' ($r.Out -match 'healthy: pane=PANE-H')
 
-$L = Read-LockFile
-$L.heartbeat = (Get-Date).AddMinutes(-120).ToString('o')
-Write-LockFile $L
+Set-LockStale 120
 $r = Dog-Run @('-DryRun')
 Assert 'H3 a stale lock with a gone pane opens a window' ($r.Out -match 'ACTION new-window')
 Assert 'H4 the re-entry names the remaining task count' ($r.Out -match 'remaining=1')
@@ -382,9 +395,7 @@ if ($ready) {
     if ($pane) {
         $live = Start-Sleeper; $sleepers += $live
         Lock-Run @('acquire', '-PaneId', $pane.id, '-ClaudePid', $live.Id) | Out-Null
-        $L = Read-LockFile
-        $L.heartbeat = (Get-Date).AddMinutes(-120).ToString('o')
-        Write-LockFile $L
+        Set-LockStale 120
         Remove-Item $state -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2   # let the pane settle so its tail stops moving
         $r = Dog-Run @('-GhozttyExe', $Exe, '-ResumePrompt', 'read go.md and go', '-ProbeGapSeconds', 3)
@@ -557,6 +568,90 @@ Assert 'M4 the Claude composer is claude' `
 Assert 'M5 an interrupt hint is claude' ((Get-PaneOccupant -Tail "Determining... (esc to interrupt)") -eq 'claude')
 Assert 'M6 an empty pane is unknown' ((Get-PaneOccupant -Tail '') -eq 'unknown')
 Assert 'M7 unrecognised output is unknown' ((Get-PaneOccupant -Tail "building...`r`nlink ok") -eq 'unknown')
+
+# --- R. a working turn is never nudged (T253, pure) ------------------------
+""
+"R. a long turn beats the staleness window by itself"
+# The 2026-07-31 failure: 46 minutes of build + acceptance run + delivery with
+# nobody refreshing the heartbeat, so the watchdog typed a prompt into a session
+# that was working. The heartbeat is a checkpoint a model has to remember; the
+# transcript is a pulse Claude Code emits on every message and tool result.
+$rPane = 'PANE-R'
+$rTrans = Join-Path $root 'session-R.jsonl'
+'{"type":"user"}' | Out-File -FilePath $rTrans -Encoding utf8
+$rProc = Start-Sleeper; $sleepers += $rProc
+Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
+$r = Lock-Run @('acquire', '-PaneId', $rPane, '-ClaudePid', $rProc.Id, '-TranscriptPath', $rTrans)
+Assert 'R1 acquire records the session transcript' `
+    ($r.Code -eq 0 -and (Read-LockFile).transcript -eq $rTrans)
+Assert 'R2 and says which pulse it got' ($r.Out -match 'pulse=transcript')
+
+# A turn that has been working for two hours without a checkpoint.
+$L = Read-LockFile
+$L.heartbeat = (Get-Date).AddMinutes(-120).ToString('o')
+Write-LockFile $L
+(Get-Item $rTrans).LastWriteTime = Get-Date
+
+$r = Lock-Run @('status', '-PaneId', $rPane)
+Assert 'R3 a moving transcript keeps a 2h-old heartbeat healthy' ($r.Out -match '^held')
+Assert 'R4 and names the transcript as the signal' ($r.Out -match 'by=transcript')
+$S = (Lock-Run @('status', '-PaneId', $rPane, '-Json')).Out | ConvertFrom-Json
+Assert 'R5 the checkpoint age is still reported separately' ([double]$S.heartbeat_age_minutes -gt 100)
+Assert 'R6 the pulse does not rewrite the turn or the pid' `
+    ([int]$S.turn -eq 1 -and [int]$S.claude_pid -eq $rProc.Id)
+
+# The watchdog must therefore do nothing at all - without even reaching the
+# pane probe, which is what made this a false nudge rather than a near miss.
+$r = Dog-Run @('-DryRun')
+Assert 'R7 the watchdog leaves a working turn alone' ($r.Out -match 'ACTION none')
+Assert 'R8 and logs it as healthy, by the transcript' ($r.Out -match 'healthy: .*by=transcript')
+
+# A second session must not be able to take the lock either: "no sign of life"
+# is one rule, and both readers ask the same question.
+$r = Lock-Run @('acquire', '-PaneId', 'PANE-R-RIVAL')
+Assert 'R9 a rival cannot take the lock from a working turn' ($r.Code -eq 3 -and $r.Out -match '^BUSY')
+
+# Positive controls: the transcript rescues nothing once IT goes quiet, and a
+# lock that never had one behaves exactly as it did before T253.
+(Get-Item $rTrans).LastWriteTime = (Get-Date).AddMinutes(-180)
+$r = Lock-Run @('status', '-PaneId', $rPane)
+Assert 'R10 a transcript that stopped moving is stale again' ($r.Out -match '^stale-heartbeat')
+Assert 'R11 and the signal falls back to the heartbeat' ($r.Out -match 'by=heartbeat')
+$r = Dog-Run @('-DryRun')
+Assert 'R12 and the watchdog re-enters, as it always did' ($r.Out -match 'ACTION (nudge|restart-in-pane|new-window)')
+
+$L = Read-LockFile
+$L.transcript = ''
+Write-LockFile $L
+$r = Lock-Run @('status', '-PaneId', $rPane)
+Assert 'R13 a lock with no transcript at all is unchanged behaviour' `
+    ($r.Out -match '^stale-heartbeat' -and $r.Out -match 'by=heartbeat')
+
+# ...and it does not have to stay that way: a lock written before T253 gains the
+# pulse at the next heartbeat, which also runs inside the session.
+$r = Lock-Run @('heartbeat', '-PaneId', $rPane, '-TranscriptPath', $rTrans)
+$L = Read-LockFile
+Assert 'R14 heartbeat adopts the pulse for a lock that had none' `
+    ($r.Code -eq 0 -and $L.transcript -eq $rTrans)
+Assert 'R15 without disturbing the turn or the pid' `
+    ([int]$L.turn -eq 1 -and [int]$L.claude_pid -eq $rProc.Id)
+Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
+
+# The nudge itself, when it does fire. Claude Code QUEUES text typed during a
+# turn and delivers it at the end, so the prompt has to be one that cannot start
+# a second task in a context that already holds one.
+$dogAst = [System.Management.Automation.Language.Parser]::ParseFile($dogScript, [ref]$null, [ref]$null)
+function Get-DogDefault($name) {
+    $p = $dogAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $name }
+    if (-not $p -or -not $p.DefaultValue) { return '' }
+    return $p.DefaultValue.Extent.Text.Trim("'", '"')
+}
+$prompt = Get-DogDefault 'ResumePrompt'
+Assert 'R16 the default nudge resets the context first' ($prompt -match '/reset-context read go\.md and go')
+Assert 'R17 and does not lead with a slash (the command menu eats the first Enter)' `
+    ($prompt -and -not $prompt.StartsWith('/'))
+Assert 'R18 the still-producing backstop samples a screen, not five lines' `
+    ([int](Get-DogDefault 'ProbeLines') -ge 40 -and [int](Get-DogDefault 'ProbeGapSeconds') -ge 15)
 # The whole point of rule 1: claude output in the SCROLLBACK with a shell
 # prompt at the bottom means claude exited. Shim it, do not nudge it.
 Assert 'M8 claude output above a shell prompt is a shell' `

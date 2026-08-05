@@ -22,9 +22,15 @@
 # Takeover rules (so a crash never wedges the loop permanently):
 #   - same pane id            -> refresh, it is our own lock
 #   - owner process is gone   -> take it (reason=dead-owner)
-#   - heartbeat older than    -> take it (reason=stale-heartbeat)
+#   - no sign of life for     -> take it (reason=stale-heartbeat)
 #     -StaleMinutes (30)
 #   - otherwise               -> BUSY, exit 3
+#
+# "Sign of life" is the NEWER of two signals (T253): the heartbeat, which a step
+# in go.md refreshes at task boundaries, and the mtime of the session's own
+# Claude Code transcript, which the harness advances on every message and every
+# tool result. The heartbeat alone is a checkpoint that only exists when a model
+# remembers to emit it, and a 46-minute task therefore read as a dead loop.
 #
 # `status` answers the same question the pane does, not just the pid (T440):
 # when the recorded claude is gone but the owning pane still holds a live claude
@@ -56,6 +62,10 @@ param(
     [int]$StaleMinutes = 30,
     [switch]$Json,
     [switch]$Force,
+    # The session transcript whose mtime is this loop's PULSE (T253). Normally
+    # resolved from $env:CLAUDE_CODE_SESSION_ID; passed explicitly only by tests
+    # and by a caller that already knows it. '-' records no transcript at all.
+    [string]$TranscriptPath,
     # `status` only (T440): when the recorded pid is dead, ask the OWNING PANE
     # whether a claude is sitting in it before calling the loop dead. Skip the
     # probe with -NoPaneProbe (it costs one `ghoztty +read`, and a test that is
@@ -98,6 +108,62 @@ function Resolve-ClaudePid {
         $walk = $proc.ParentProcessId
     }
     return 0
+}
+
+# The session's own transcript - the file Claude Code appends to on every
+# message and every tool result (T253).
+#
+# The heartbeat above is a CHECKPOINT: a step in go.md refreshes it at task
+# boundaries, which means it is emitted only when a model remembers to emit it,
+# and it goes missing exactly when the turn is busiest. On 2026-07-31 a turn
+# spent 46 minutes on a build + acceptance run + delivery without one, the
+# watchdog concluded the loop was stuck, and it typed a prompt into a session
+# that was working - queueing a SECOND task into that context, the one thing the
+# context rule exists to prevent.
+#
+# This is the pulse the checkpoint is not. Claude Code writes the transcript
+# itself, so it advances while the turn works and stops when the turn ends,
+# with nothing to remember and nothing to install. Recorded at `acquire`,
+# because that runs INSIDE the session (go.md step 0) and $env:CLAUDE_CODE_SESSION_ID
+# names it exactly - a watchdog looking in from outside could only guess.
+#
+# It is an ADDITIONAL source, never a replacement: an absent or unreadable
+# transcript falls back to the heartbeat, which is today's behavior.
+function Resolve-Transcript {
+    if ($TranscriptPath) {
+        if ($TranscriptPath -eq '-') { return '' }
+        return $TranscriptPath
+    }
+    $sid = $env:CLAUDE_CODE_SESSION_ID
+    if (-not $sid) { return '' }
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    if (-not (Test-Path $root)) { return '' }
+    # The per-project directory name is the cwd with ':' and '\' punched out to
+    # '-'. Try that first (one stat), and only walk the tree when it misses, so
+    # a mangling rule that changes upstream degrades to slow rather than wrong.
+    $direct = Join-Path (Join-Path $root (($Repo -replace '[:\\/]', '-'))) "$sid.jsonl"
+    if (Test-Path -LiteralPath $direct) { return $direct }
+    $hit = Get-ChildItem -Path $root -Filter "$sid.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+    return ''
+}
+
+# When did this loop last show a sign of life, and which signal said so?
+# The NEWER of the checkpoint and the pulse - a stale heartbeat with a moving
+# transcript is a working turn, not a dead loop.
+function Get-ActivityStamp($lock) {
+    $at = Parse-Iso $lock.heartbeat
+    $by = 'heartbeat'
+    $t = ''
+    if ($lock.PSObject.Properties.Name -contains 'transcript') { $t = [string]$lock.transcript }
+    if ($t -and (Test-Path -LiteralPath $t)) {
+        try {
+            $m = (Get-Item -LiteralPath $t -ErrorAction Stop).LastWriteTime
+            if (-not $at -or $m -gt $at) { $at = $m; $by = 'transcript' }
+        } catch { }
+    }
+    return @{ At = $at; By = $by }
 }
 
 function Get-ProcStamp($procId) {
@@ -162,7 +228,18 @@ function Test-PaneHoldsClaude($lock) {
     } catch { return $false }
 }
 
+# Age of the loop's last sign of life, from whichever signal is newer (T253).
+# Both `acquire`'s takeover rule and `status` read this, so a session that is
+# demonstrably working cannot have its lock taken from under it either.
 function Get-AgeMinutes($lock) {
+    $s = Get-ActivityStamp $lock
+    if (-not $s.At) { return [double]::PositiveInfinity }
+    return ((Get-Date) - $s.At).TotalMinutes
+}
+
+# The raw checkpoint age, for readers that want to say "last checkpoint" rather
+# than "last sign of life".
+function Get-HeartbeatAgeMinutes($lock) {
     $hb = Parse-Iso $lock.heartbeat
     if (-not $hb) { return [double]::PositiveInfinity }
     return ((Get-Date) - $hb).TotalMinutes
@@ -214,12 +291,20 @@ switch ($Action) {
         $name = ''
         if ($myStamp) { $name = $myStamp.Name }
 
+        # Re-resolved on every acquire, not carried over: /reset-context starts a
+        # NEW session id in the SAME pane, so the previous turn's transcript is a
+        # file that will never be appended to again.
+        $transcript = ''
+        try { $transcript = Resolve-Transcript } catch { $transcript = '' }
+
         $new = [ordered]@{
             version      = 1
             pane_id      = $PaneId
             claude_pid   = $myPid
             claude_name  = $name
             claude_start = $startIso
+            session_id   = [string]$env:CLAUDE_CODE_SESSION_ID
+            transcript   = $transcript
             host         = $env:COMPUTERNAME
             repo         = $Repo
             acquired     = $acquired
@@ -236,7 +321,8 @@ switch ($Action) {
             Emit $check "BUSY owner_pane=$($check.pane_id) owner_pid=$($check.claude_pid) (lost acquire race)"
             exit 3
         }
-        Emit $check "ACQUIRED pane=$($new.pane_id) pid=$($new.claude_pid) turn=$turn reason=$reason"
+        Emit $check ("ACQUIRED pane=$($new.pane_id) pid=$($new.claude_pid) turn=$turn reason=$reason " +
+                     "pulse=$(if ($transcript) { 'transcript' } else { 'heartbeat-only' })")
         exit 0
     }
 
@@ -247,7 +333,18 @@ switch ($Action) {
             Emit $lock "NOTOWNER owner_pane=$($lock.pane_id) owner_pid=$($lock.claude_pid)"
             exit 4
         }
-        $lock.heartbeat = Now-Iso
+        $lock | Add-Member -NotePropertyName heartbeat -NotePropertyValue (Now-Iso) -Force
+        # heartbeat also runs INSIDE the session, so it is the second place that
+        # can point the lock at this session's transcript - which is how a lock
+        # written before T253 (or by an older build) gains the pulse without
+        # waiting for the next acquire. Add-Member -Force, not assignment: such a
+        # lock has no `transcript` property to assign to.
+        $t = ''
+        try { $t = Resolve-Transcript } catch { $t = '' }
+        if ($t) {
+            $lock | Add-Member -NotePropertyName transcript -NotePropertyValue $t -Force
+            $lock | Add-Member -NotePropertyName session_id -NotePropertyValue ([string]$env:CLAUDE_CODE_SESSION_ID) -Force
+        }
         Write-Lock $lock
         Emit $lock "HEARTBEAT pane=$($lock.pane_id) pid=$($lock.claude_pid) turn=$($lock.turn)"
         exit 0
@@ -295,7 +392,9 @@ switch ($Action) {
             if ($Json) { '{"state":"free"}' } else { 'FREE lock=' + $LockPath }
             exit 0
         }
+        $activity = Get-ActivityStamp $lock
         $age = Get-AgeMinutes $lock
+        $hbAge = Get-HeartbeatAgeMinutes $lock
         $alive = Test-OwnerAlive $lock
         $aliveBy = 'pid'
         if (-not $alive -and (Test-PaneHoldsClaude $lock)) { $alive = $true; $aliveBy = 'pane' }
@@ -306,10 +405,18 @@ switch ($Action) {
         $lock | Add-Member -NotePropertyName state -NotePropertyValue $state -Force
         $lock | Add-Member -NotePropertyName owner_alive -NotePropertyValue $alive -Force
         $lock | Add-Member -NotePropertyName owner_alive_by -NotePropertyValue $aliveBy -Force
+        # age_minutes is the age of the last SIGN OF LIFE, not of the heartbeat
+        # (T253) - the heartbeat's own age is beside it for anyone who wants to
+        # say "last checkpoint".
         $lock | Add-Member -NotePropertyName age_minutes -NotePropertyValue ([math]::Round($age, 2)) -Force
+        $lock | Add-Member -NotePropertyName heartbeat_age_minutes -NotePropertyValue ([math]::Round($hbAge, 2)) -Force
+        $lock | Add-Member -NotePropertyName activity_by -NotePropertyValue $activity.By -Force
+        $activityIso = ''
+        if ($activity.At) { $activityIso = $activity.At.ToString($IsoFmt) }
+        $lock | Add-Member -NotePropertyName activity_at -NotePropertyValue $activityIso -Force
         $lock | Add-Member -NotePropertyName mine -NotePropertyValue (Test-Mine $lock) -Force
         Emit $lock ("$state pane=$($lock.pane_id) pid=$($lock.claude_pid) alive=$alive(by=$aliveBy) " +
-                    "age=$([math]::Round($age, 1))m turn=$($lock.turn) mine=$(Test-Mine $lock)")
+                    "age=$([math]::Round($age, 1))m(by=$($activity.By)) turn=$($lock.turn) mine=$(Test-Mine $lock)")
         exit 0
     }
 }

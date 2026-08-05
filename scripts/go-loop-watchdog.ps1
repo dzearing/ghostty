@@ -10,11 +10,18 @@
 # Per tick:
 #   1. If the tracker has no remaining todo/in-progress/blocked rows, do
 #      nothing - the loop is finished, not stuck.
-#   2. Read the lock. Healthy (owner alive AND heartbeat fresh) -> do nothing.
+#   2. Read the lock. Healthy (owner alive AND a recent sign of life) -> do
+#      nothing. Since T253 "sign of life" is the newer of the heartbeat and the
+#      session transcript's mtime, so a turn that is working beats it without
+#      anybody remembering to - see scripts\go-loop-lock.ps1.
 #   3. Otherwise re-enter, choosing the cheapest action that fits:
 #        a claude is alive IN THE PANE, pane not producing output
-#                              -> send-keys "read go.md and go" + Enter
-#                                 (the turn ended with a report; nudge it)
+#                              -> send-keys the resume prompt + Enter
+#                                 (the turn ended with a report; nudge it).
+#                                 The default prompt is RESET-FIRST (T253) so
+#                                 that a nudge landing on a session that was
+#                                 alive after all costs a context reset, never
+#                                 a second task in the same context.
 #        pane alive but sitting at a shell prompt
 #                              -> send-keys the resume shim + Enter
 #        no lock / pane gone   -> +new-window running the resume shim
@@ -58,7 +65,20 @@ param(
     [string]$LockPath,
     [string]$Tracker,
     [string]$GhozttyExe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe",
-    [string]$ResumePrompt = 'read go.md and go',
+    # RESET-FIRST, on purpose (T253). This text is typed into a session that may
+    # be alive and mid-task: Claude Code QUEUES input received during a turn and
+    # delivers it when the turn ends, so a bare "read go.md and go" starts a
+    # SECOND task in a context that already holds one - the exact failure the
+    # context rule exists to prevent. Phrased this way, a nudge that turns out to
+    # be unnecessary costs a context reset instead of a rule violation, and a
+    # nudge that was necessary does what step 7 would have done anyway.
+    #
+    # It deliberately does NOT begin with '/'. A leading slash opens Claude
+    # Code's command menu, and the first Enter is then eaten selecting the
+    # completion rather than submitting - the reset-context skill has to send
+    # Enter twice and read the pane back to work around it, which is far too
+    # much ceremony for an unattended safety net.
+    [string]$ResumePrompt = 'Before starting any task, run /reset-context read go.md and go',
     # The same text, out of a FILE. Callers whose prompt is caller-authored (the
     # upgrade's resume prompt routinely carries quotes) must use this: passing it
     # as `powershell -File ... -ResumePrompt "<text>"` is the argv hop T210
@@ -69,7 +89,14 @@ param(
     [int]$PollSeconds = 300,
     [int]$StaleMinutes = 45,
     [int]$RearmMinutes = 20,
-    [int]$ProbeGapSeconds = 8,
+    # The still-producing backstop's sample (T253). It was 5 lines over 8s, which
+    # is too thin to tell "wedged" from "compiling": a session between phases, or
+    # one whose bottom five lines are a static composer box, read as not
+    # producing while the turn was alive. A whole screen over 20s catches the
+    # spinner, the elapsed-time counter and any scrolling output, and 20s is free
+    # here - the poll interval is 300s.
+    [int]$ProbeGapSeconds = 20,
+    [int]$ProbeLines = 60,
     [int]$VerifySeconds = 6,    # how long to give a shim'd pane to paint claude
     [string]$LogPath,
     [string]$StatePath,
@@ -248,13 +275,18 @@ function Test-PaneExists($paneId) {
 }
 
 # A stale heartbeat with a live claude means the turn ended without a reset -
-# unless the session is simply mid-task and slow. Sample the pane's tail twice:
-# output that is still moving means it is working, so leave it alone.
-function Test-PaneProducing($paneId, $gapSeconds = $ProbeGapSeconds) {
-    $a = Invoke-Ghoztty @('+read', "--name=$paneId", '--lines=5')
+# unless the session is simply mid-task and slow. Sample the pane twice: output
+# that is still moving means it is working, so leave it alone.
+#
+# Since T253 this is the SECOND line of defence, not the first - the lock's own
+# freshness now follows the session transcript, so a working turn rarely reaches
+# here at all. It is still widened, because a backstop that cannot tell a
+# compiling session from a wedged one is not a backstop (see -ProbeLines).
+function Test-PaneProducing($paneId, $gapSeconds = $ProbeGapSeconds, $lines = $ProbeLines) {
+    $a = Invoke-Ghoztty @('+read', "--name=$paneId", "--lines=$lines")
     if ($a.Code -ne 0) { return $false }
     Start-Sleep -Seconds $gapSeconds
-    $b = Invoke-Ghoztty @('+read', "--name=$paneId", '--lines=5')
+    $b = Invoke-Ghoztty @('+read', "--name=$paneId", "--lines=$lines")
     if ($b.Code -ne 0) { return $false }
     return ($a.Out -ne $b.Out)
 }
@@ -388,7 +420,8 @@ function Invoke-Tick {
     $state = 'free'
     if ($lock -and $lock.state) { $state = $lock.state }
     if ($state -eq 'held' -and -not $Force) {
-        Log "healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) age=$($lock.age_minutes)m remaining=$remaining"
+        Log ("healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) age=$($lock.age_minutes)m" +
+             "(by=$($lock.activity_by)) remaining=$remaining")
         return 'none'
     }
     if ($Force) { Log "forced: re-entry requested despite state=$state (caller knows the loop is broken; T439)" }
