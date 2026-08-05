@@ -559,6 +559,7 @@ pub fn performDeferredFocus(hwnd: w32.HWND) void {
     if (!shouldPerformDeferredFocus(
         onInputDesktop(),
         w32.GetForegroundWindow(),
+        w32.GetActiveWindow(),
         root,
     )) return;
     _ = w32.SetFocus(hwnd);
@@ -567,22 +568,42 @@ pub fn performDeferredFocus(hwnd: w32.HWND) void {
 /// The `performDeferredFocus` decision, split out so it is unit-testable
 /// (the win32 calls around it are not).
 ///
-/// On the input desktop the rule is the T89f2 one: only forward focus the
-/// window ALREADY holds. Off it — a background desktop created with
-/// `CreateDesktopW`, which is how the acceptance harness runs the GUI
-/// without stealing the user's foreground — there is no foreground window
-/// at all: `GetForegroundWindow` returns null for every window on it. The
-/// guard would then drop every deferred focus, so keyboard focus could
-/// never move (splits, tabs, dialogs), and the guard's own reason for
-/// existing is moot there because a `SetFocus` cannot steal activation
-/// from a window that cannot have it.
+/// The predicate the guard actually wants is "has activation moved since
+/// this assert was queued?" — because `SetFocus` activates the target's
+/// top-level parent when it is not already active, and that steal is what
+/// re-fires the loser's `WM_SETFOCUS` forwarding into a perpetual ping-pong.
+/// Foreground and thread activation are two different proxies for it, and
+/// which one is meaningful depends on the desktop:
+///
+/// - **On the input desktop** the rule is the T89f2 one: only forward focus
+///   the window ALREADY holds, measured with `GetForegroundWindow`. Left
+///   exactly as it was — this is the interactive path the T105 fix shipped
+///   on and it is not what T223 changed.
+/// - **Off it** — a background desktop created with `CreateDesktopW`, which
+///   is how the acceptance harness runs the GUI without stealing the user's
+///   foreground, and equally a locked workstation, a UAC secure desktop or a
+///   disconnected RDP session — `GetForegroundWindow` returns null for every
+///   window, so the foreground proxy carries no information. T211 therefore
+///   waved the guard through unconditionally, which restored the *whole*
+///   T105 live-lock there (measured 43 focus flips in 3s, vs 0 guarded).
+///   `GetActiveWindow` is queue-scoped rather than input-desktop-scoped, so
+///   it still names exactly one of our windows on a background desktop and
+///   is the proxy that survives: it keeps focus moving (T211) while still
+///   dropping the stale assert of a window that activation has moved off
+///   (T105).
+///
+/// A null active window off the input desktop means the query told us
+/// nothing, and forwarding is the safe answer there: dropping every assert
+/// would leave keyboard focus unable to move at all, which is the failure
+/// T211 was fixed to prevent.
 fn shouldPerformDeferredFocus(
     on_input_desktop: bool,
     foreground: ?w32.HWND,
+    active: ?w32.HWND,
     root: w32.HWND,
 ) bool {
-    if (!on_input_desktop) return true;
-    return foreground == root;
+    if (on_input_desktop) return foreground == root;
+    return if (active) |a| a == root else true;
 }
 
 /// Whether this process's GUI thread runs on the INPUT desktop (the one the
@@ -630,21 +651,35 @@ fn queryOnInputDesktop() bool {
 test "shouldPerformDeferredFocus: input desktop forwards only to the foreground window" {
     const root: w32.HWND = @ptrFromInt(0x1000);
     const other: w32.HWND = @ptrFromInt(0x2000);
-    try std.testing.expect(shouldPerformDeferredFocus(true, root, root));
-    try std.testing.expect(!shouldPerformDeferredFocus(true, other, root));
+    try std.testing.expect(shouldPerformDeferredFocus(true, root, root, root));
+    try std.testing.expect(!shouldPerformDeferredFocus(true, other, root, root));
     // No foreground window at all still means "not ours" on the input
     // desktop (a transient state there, e.g. the window being destroyed).
-    try std.testing.expect(!shouldPerformDeferredFocus(true, null, root));
+    try std.testing.expect(!shouldPerformDeferredFocus(true, null, root, root));
+    // The active window is not consulted on the input desktop: foreground
+    // alone decides, exactly as it did before T223.
+    try std.testing.expect(shouldPerformDeferredFocus(true, root, other, root));
+    try std.testing.expect(shouldPerformDeferredFocus(true, root, null, root));
 }
 
-test "shouldPerformDeferredFocus: background desktop always forwards" {
+test "shouldPerformDeferredFocus: background desktop guards on the active window" {
     const root: w32.HWND = @ptrFromInt(0x1000);
     const other: w32.HWND = @ptrFromInt(0x2000);
-    // A background desktop has no foreground window, so the guard cannot
-    // apply — without this, focus never moves anywhere on a test desktop.
-    try std.testing.expect(shouldPerformDeferredFocus(false, null, root));
-    try std.testing.expect(shouldPerformDeferredFocus(false, root, root));
-    try std.testing.expect(shouldPerformDeferredFocus(false, other, root));
+    // Foreground is always null off the input desktop and carries no
+    // information there, so it must not change the answer either way.
+    try std.testing.expect(shouldPerformDeferredFocus(false, null, root, root));
+    try std.testing.expect(shouldPerformDeferredFocus(false, other, root, root));
+    // The stale assert of a window that is no longer this thread's active
+    // window is dropped — that steal is the T105 restore ping-pong.
+    try std.testing.expect(!shouldPerformDeferredFocus(false, null, other, root));
+    try std.testing.expect(!shouldPerformDeferredFocus(false, root, other, root));
+}
+
+test "shouldPerformDeferredFocus: background desktop with no active window still forwards" {
+    const root: w32.HWND = @ptrFromInt(0x1000);
+    // Nothing known about activation: forward, because dropping every
+    // assert would leave keyboard focus unable to move at all (T215).
+    try std.testing.expect(shouldPerformDeferredFocus(false, null, null, root));
 }
 
 /// Re-run the split layout of the window owning the given terminal-surface

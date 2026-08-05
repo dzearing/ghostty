@@ -35,19 +35,22 @@
 # the migration only moves the three GUI LAUNCHES onto the test desktop; those
 # CLI calls stay on cmd.exe, being console-only and windowless.
 #
-# F10/F11 ARE RED ON THE TEST DESKTOP, AND THAT IS A PRODUCT BUG (T223), NOT A
-# HARNESS FAULT. `App.performDeferredFocus` BYPASSES the T105 guard off the input
-# desktop - `shouldPerformDeferredFocus(false, ...)` is unconditionally true,
-# because a background desktop has no foreground window and the guard would
-# otherwise drop every focus change (T215's fix, which this whole harness rests
-# on). The expectation going in was that the storm needed foreground activation
-# and so could not reproduce there. It does: measured focusFlips 43 and 39 in 3s,
-# against a pre-T105 baseline of 36 and a post-fix 0. Since `onInputDesktop()`
-# is also false on a LOCKED workstation, behind a secure desktop, and in a
-# disconnected RDP session, this is a real user-facing path - see T223, which
-# owns the fix and names these two assertions as its oracle. Everything else in
-# this script is green, so the migration itself is done (same shape as
-# `remote-inherit` sitting RED on T178 in T217 batch 3).
+# F10/F11 WERE RED ON THE TEST DESKTOP WHEN THIS SCRIPT WAS MIGRATED, AND THAT
+# WAS A PRODUCT BUG (T223), NOT A HARNESS FAULT. FIXED 2026-08-04; they are green
+# now and must stay that way. `App.performDeferredFocus` used to BYPASS the T105
+# guard off the input desktop - `shouldPerformDeferredFocus(false, ...)` returned
+# true unconditionally, because a background desktop has no foreground window and
+# guarding on one would otherwise drop every focus change (T211's fix, which this
+# whole harness rests on). The expectation going in was that the storm needed
+# foreground activation and so could not reproduce there. It did: measured
+# focusFlips 43 and 39 in 3s, against a pre-T105 baseline of 36 and a post-fix 0.
+# Since `onInputDesktop()` is also false on a LOCKED workstation, behind a secure
+# desktop, and in a disconnected RDP session, that was a real user-facing path.
+# T223 swapped the off-desktop proxy from `GetForegroundWindow` (input-desktop
+# scoped, so always null there) to `GetActiveWindow` (message-queue scoped, so it
+# still names one of our windows), which keeps focus moving AND restores the
+# guard. Both counts read 0 now. These two assertions remain the oracle for that
+# fix: do NOT relax their `-le 2` bound.
 #
 # The old F11b (foreground stays parked) is GONE rather than relabelled:
 # GetForegroundWindow returns null for every window on a background desktop, so
@@ -564,13 +567,13 @@ while ((Get-Date) -lt $deadline) {
 Assert "F9b the restored pane's sticky banner came back" $f9b
 
 # ============================================================================
-Say "== F10: restore-time focus settling across a second relaunch (T105, RED on T223)"
+Say "== F10: restore-time focus settling across a second relaunch (T105/T223)"
 # Do a SECOND app-only kill + relaunch and watch the GUI thread's focus window
 # while restore builds both windows back-to-back. Pre-T105 this live-locked
 # (baseline: fgFlips=38/focusFlips=36 in 3s pre-fix, 0/0 post-fix). Off the
-# input desktop the T105 guard is bypassed (T215), and the storm comes back with
-# it: this assertion is the oracle T223 has to turn green. Do NOT relax the
-# bound to make the suite quiet - the number IS the finding.
+# input desktop the T105 guard used to be bypassed (T211), and the storm came
+# back with it at 43 flips; this assertion is the oracle T223 turned green. Do
+# NOT relax the bound to make the suite quiet - the number IS the finding.
 Stop-AppOnly
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
@@ -589,7 +592,7 @@ Assert "F10a both restored top-level windows enumerated on the test desktop" ($w
 if ($wins.Count -eq 2) {
     $storm = Measure-FocusFlips $wins 3000 40
     Say "  (restore-time focusFlips=$storm)"
-    Assert "F10 restore-time focus does not churn between the two windows (RED on T223)" ($storm -le 2)
+    Assert "F10 restore-time focus does not churn between the two windows (T223 oracle)" ($storm -le 2)
 }
 
 # F11 (T105 floor): seed one pending WM_APP_SETFOCUS (0x8005 = WM_APP+5)
@@ -598,7 +601,7 @@ if ($wins.Count -eq 2) {
 # and works identically on either desktop. The old F11b (foreground stays
 # parked) is gone: GetForegroundWindow is null for every window on a background
 # desktop, so its oracle could only ever have scored zero (see the header).
-Say "== F11: seeded co-pending focus asserts must settle, not ping-pong (T105, RED on T223)"
+Say "== F11: seeded co-pending focus asserts must settle, not ping-pong (T105/T223)"
 if ($wins.Count -eq 2) {
     $surf0 = Get-TestChildWindow -Window $wins[0] -Class 'GhozttyTerminal'
     $surf1 = Get-TestChildWindow -Window $wins[1] -Class 'GhozttyTerminal'
@@ -610,7 +613,7 @@ if ($wins.Count -eq 2) {
         Start-Sleep -Milliseconds 300
         $flips = Measure-FocusFlips $wins 3000 40
         Say "  (post-seed focusFlips=$flips)"
-        Assert "F11 GUI-thread focus settles after seeded asserts (RED on T223)" ($flips -le 2)
+        Assert "F11 GUI-thread focus settles after seeded asserts (T223 oracle)" ($flips -le 2)
     }
 } else {
     Assert "F11 could not run: the restored windows were not enumerated" $false

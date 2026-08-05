@@ -8886,3 +8886,61 @@ T482 is closed by these sections rather than by the separate
 `reset-context-verify.ps1` it proposed — the existing script already boots the
 isolated instance and drives the deployed cache copy, and two files would have to
 agree about the helper's log format forever. Receipt: **D14**.
+
+## 2026-08-05 — T223: two restored windows stop fighting over focus while the screen is locked
+
+The T105 focus live-lock — two windows restored back-to-back each stealing
+activation from the other, dozens of times a second, until the app is
+uncontrollable — was fixed on the input desktop and quietly left running
+everywhere else. `shouldPerformDeferredFocus` returned `true` unconditionally
+whenever the process was not on the input desktop, which is not just the test
+harness's background desktop: it is also a **locked workstation**, a **UAC
+secure desktop**, and a **disconnected RDP session**. Measured on box before
+this change, `session-reattach.ps1` saw 43 focus flips in 3s at restore time
+(F10) and 39 after seeding co-pending asserts (F11), against 0 on the guarded
+path. Both are 0 now.
+
+The bypass came from T211 (`713815f63`, the shared test-desktop harness — T223
+was filed crediting T215, which is only the follow-up audit task) and its reason
+was sound as far as it went: a
+background desktop has **no foreground window at all**, so guarding on
+`GetForegroundWindow` there would drop every deferred focus and keyboard focus
+could never move. The mistake was concluding the guard was therefore moot rather
+than that the *proxy* was. What the guard wants to know is "has activation moved
+since this assert was queued?" — `SetFocus` activates its target's top-level
+parent when that parent is not already active, and that steal is exactly what
+re-fires the loser's `WM_SETFOCUS` forwarding. Queue activation exists on every
+desktop; foreground does not. So the fix swaps in `GetActiveWindow`, which is
+scoped to the calling thread's message queue rather than to the input desktop
+and therefore still names exactly one of our windows off it. `Surface.zig`
+already relies on that same property for focus-follows-mouse.
+
+The input-desktop branch is byte-identical — that is the interactive path T105
+shipped on and it is not what was broken — and a null active window off the
+input desktop still forwards, so a query that answers nothing cannot re-break
+T211's "focus can never move" failure. Four lines:
+
+```zig
+if (on_input_desktop) return foreground == root;
+return if (active) |a| a == root else true;
+```
+
+Evidence: `session-reattach.ps1` ALL PASS (38) with F10/F11 green and both flip
+counts at 0, stable across three consecutive runs. The change narrows what gets
+delivered off-desktop, so T211's property was re-proved rather than assumed, on
+the seven off-desktop scripts most dependent on focus actually moving there:
+`focus-defer.ps1` (17, the direct T48/T211 regression — it posts real clicks and
+asserts focus follows), `confirm-dialogs.ps1` (27, real Tab/Enter/Escape through
+modal dialogs), `kb-actions.ps1` (42), `chooser-menu.ps1` (57),
+`context-menu.ps1` (42), `focus-follows-mouse.ps1` (14) and
+`test-desktop-harness.ps1` (23) — all ALL PASS. Floor: `floor-lane.ps1 -Lane
+all` ALL LANES PASS (none 292s, win32 313s, agent 314s), P1–P3 ALL PASS.
+
+`session-reattach.ps1`'s own header and its F10/F11 labels said "RED on T223",
+which would now read as "expected to fail"; they are relabelled as the oracle
+they became, with the `-le 2` bound and the do-not-relax note kept.
+
+T215 (still open, the wider audit of input-desktop assumptions) gains the
+lesson: its "branch only on `onInputDesktop()`" recipe is what produced this
+regression, so each remaining site has to be asked what its foreground check was
+standing in for before it is waved through off-desktop.
