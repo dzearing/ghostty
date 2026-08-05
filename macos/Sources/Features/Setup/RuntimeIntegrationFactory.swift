@@ -5,12 +5,16 @@ enum RuntimeIntegrationFactory {
     static let bannerComponentName = "banner-script"
     static let hooksComponentName = "hooks"
 
-    static func availableAgents(homeDirectoryURL: URL, fileManager: FileManager) -> [RuntimeAgent] {
-        RuntimeAgent.allCases.filter { agent in
-            var isDir: ObjCBool = false
-            let exists = fileManager.fileExists(atPath: agent.configDirectoryURL(homeDirectoryURL: homeDirectoryURL).path, isDirectory: &isDir)
-            return exists && isDir.boolValue
-        }
+    /// Which runtimes are installed, by probing for their BINARY.
+    ///
+    /// Not the config dir: Ghoztty writes into that, so it would report a
+    /// removed CLI as present for as long as our own artifacts survive, and
+    /// report a just-installed CLI as absent until its first run. See
+    /// `RuntimeProbe`.
+    static func availableAgents(homeDirectoryURL: URL,
+                                fileManager: FileManager,
+                                probe: RuntimeProbe = .binary) -> [RuntimeAgent] {
+        RuntimeAgent.allCases.filter { probe.isInstalled($0, homeDirectoryURL) }
     }
 
     /// The agent's hooks component, or nil when Ghoztty must NOT own the hooks
@@ -45,7 +49,10 @@ enum RuntimeIntegrationFactory {
         }
     }
 
-    static func make(for agent: RuntimeAgent, homeDirectoryURL: URL, fileManager: FileManager) -> RuntimeIntegration {
+    static func make(for agent: RuntimeAgent,
+                     homeDirectoryURL: URL,
+                     fileManager: FileManager,
+                     probe: RuntimeProbe = .binary) -> RuntimeIntegration {
         let banner = BannerScriptInstaller(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
         let skills = SkillComponent(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
 
@@ -77,7 +84,7 @@ enum RuntimeIntegrationFactory {
         return RuntimeIntegration(
             agent: agent,
             components: components,
-            requiredDirectory: agent.configDirectoryURL(homeDirectoryURL: homeDirectoryURL),
+            isAvailable: { probe.isInstalled(agent, homeDirectoryURL) },
             fileManager: fileManager)
     }
 }

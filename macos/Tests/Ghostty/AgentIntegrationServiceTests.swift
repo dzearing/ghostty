@@ -4,6 +4,12 @@ import Testing
 @testable import Ghostty
 
 struct AgentIntegrationServiceTests {
+    /// Both runtimes installed. Availability is a binary probe now, so these
+    /// temp-home tests state it explicitly instead of inheriting whatever CLIs
+    /// happen to be on the machine running them.
+    private let both = RuntimeProbe.stub([.claude, .copilot])
+    private let neither = RuntimeProbe.stub([])
+
     private func tempHome() throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -13,13 +19,13 @@ struct AgentIntegrationServiceTests {
     @Test func installThenUpToDate() throws {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .upToDate)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .upToDate)
     }
 
     @Test func notFoundWhenRuntimeAbsent() throws {
         let home = try tempHome()
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .notFound)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: neither) == .notFound)
     }
 
     @Test func summaryJoinsPerRuntime() {
@@ -34,26 +40,26 @@ struct AgentIntegrationServiceTests {
         try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
         try #"{"plugins":[{"name":"ghoztty"}]}"#
             .write(to: pluginsDir.appendingPathComponent("installed_plugins.json"), atomically: true, encoding: .utf8)
-        let outcome = AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default)
+        let outcome = AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both)
         #expect(outcome == .pluginPresent)
     }
 
     @Test func reinstallAfterDriftReportsUpgraded() throws {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
         // Drift one installed managed file so prior state becomes .outdated.
         let hookFile = home.appendingPathComponent(".copilot/hooks/ghoztty.json")
         // Keep the ownership marker so it stays "managed" (drift, not notInstalled). Marker is "ghoztty-managed".
         try #"{"drifted":true}\n// ghoztty-managed"#.write(to: hookFile, atomically: true, encoding: .utf8)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .upgraded)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .upgraded)
     }
 
     @Test func uninstallRemovesInstalledIntegration() throws {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
-        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .uninstalled)
         // After uninstall the skills file Ghoztty wrote is gone.
         let skill = home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md")
         #expect(!FileManager.default.fileExists(atPath: skill.path))
@@ -67,7 +73,7 @@ struct AgentIntegrationServiceTests {
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
         // Claude is fully installed and its hooks reference the shared banner.
-        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
         let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
         #expect(FileManager.default.fileExists(atPath: banner.path))
 
@@ -78,7 +84,7 @@ struct AgentIntegrationServiceTests {
         try FileManager.default.createDirectory(at: skill.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "not ghoztty owned".write(to: skill, atomically: true, encoding: .utf8)
 
-        let outcome = AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
+        let outcome = AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both)
         guard case .failed = outcome else {
             Issue.record("expected copilot install to fail, got \(outcome)")
             return
@@ -95,14 +101,14 @@ struct AgentIntegrationServiceTests {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
         let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
 
         // Partially-install Claude: remove its skills dir but keep its hooks.
         try FileManager.default.removeItem(at: home.appendingPathComponent(".claude/skills"))
 
-        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .uninstalled)
         // Claude's hooks still call the banner, so it must survive.
         #expect(FileManager.default.fileExists(atPath: banner.path))
     }
@@ -119,26 +125,26 @@ struct AgentIntegrationServiceTests {
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
         // Only Claude installed → neither agent shares the banner with another.
-        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
-        var statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        var statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both)
         #expect(try #require(statuses.first { $0.agent == .claude }).bannerSharedWithOther == false)
 
         // Both installed → each agent's banner is shared with the other.
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
-        statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both)
         #expect(try #require(statuses.first { $0.agent == .claude }).bannerSharedWithOther == true)
         #expect(try #require(statuses.first { $0.agent == .copilot }).bannerSharedWithOther == true)
     }
 
     @Test func allAgentStatusesCoversEveryRuntime() throws {
         let home = try tempHome()
-        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both)
         #expect(statuses.map(\.agent) == RuntimeAgent.allCases)
     }
 
     @Test func undetectedAgentIsNotDetectedAndNotInstalled() throws {
-        let home = try tempHome() // no .copilot / .claude dirs
-        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let home = try tempHome() // neither CLI installed
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: neither)
         let copilot = try #require(statuses.first { $0.agent == .copilot })
         #expect(copilot.detected == false)
         #expect(copilot.state == .notInstalled)
@@ -148,8 +154,8 @@ struct AgentIntegrationServiceTests {
     @Test func detectedInstalledAgentReportsInstalled() throws {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
-        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both)
         let copilot = try #require(statuses.first { $0.agent == .copilot })
         #expect(copilot.detected == true)
         #expect(copilot.state == .installed)
@@ -161,7 +167,7 @@ struct AgentIntegrationServiceTests {
         try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
         try #"{"plugins":[{"name":"ghoztty"}]}"#
             .write(to: pluginsDir.appendingPathComponent("installed_plugins.json"), atomically: true, encoding: .utf8)
-        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default)
+        let statuses = AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both)
         let claude = try #require(statuses.first { $0.agent == .claude })
         #expect(claude.pluginManaged == true)
     }
@@ -170,19 +176,19 @@ struct AgentIntegrationServiceTests {
         let home = try tempHome()
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".copilot"), withIntermediateDirectories: true)
-        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .installed)
-        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .installed)
+        #expect(AgentIntegrationService.install(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
+        #expect(AgentIntegrationService.install(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .installed)
         let banner = BannerScriptInstaller.scriptURL(homeDirectoryURL: home)
         #expect(FileManager.default.fileExists(atPath: banner.path))
 
         // Uninstalling one agent must keep the shared banner (the other still uses it).
-        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(AgentIntegrationService.uninstall(agent: .copilot, homeDirectoryURL: home, fileManager: .default, probe: both) == .uninstalled)
         #expect(FileManager.default.fileExists(atPath: banner.path))
-        let claude = try #require(AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default).first { $0.agent == .claude })
+        let claude = try #require(AgentIntegrationService.allAgentStatuses(homeDirectoryURL: home, fileManager: .default, probe: both).first { $0.agent == .claude })
         #expect(claude.state == .installed)
 
         // Uninstalling the last integrated agent removes the shared banner.
-        #expect(AgentIntegrationService.uninstall(agent: .claude, homeDirectoryURL: home, fileManager: .default) == .uninstalled)
+        #expect(AgentIntegrationService.uninstall(agent: .claude, homeDirectoryURL: home, fileManager: .default, probe: both) == .uninstalled)
         #expect(!FileManager.default.fileExists(atPath: banner.path))
     }
 }

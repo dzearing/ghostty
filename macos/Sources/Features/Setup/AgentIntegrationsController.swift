@@ -28,7 +28,9 @@ final class AgentIntegrationsController: NSWindowController {
     }
 
     func show() {
-        viewModel.refresh()
+        // Fire-and-forget: the refresh shells out, so the window comes up
+        // immediately and fills in rather than blocking the menu action.
+        Task { await viewModel.refresh() }
         if #available(macOS 14.0, *) {
             NSApp.activate()
         } else {
