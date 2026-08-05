@@ -1624,15 +1624,23 @@ const RestoreTransport = struct {
     }
 };
 
-/// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Loads the
-/// session-layout manifest T89f1 wrote, probes the local agent for which of its
-/// sessions are still alive, and rebuilds every restorable window/tab/split —
-/// each leaf ATTACHing to the agent session the `ghoztty-agent` kept alive
-/// across this app's quit/crash/upgrade (same PID, gap-filled scrollback).
+/// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Rebuilds
+/// every restorable window/tab/split, each leaf ATTACHing to the agent session
+/// the `ghoztty-agent` kept alive across this app's quit/crash/upgrade (same
+/// PID, gap-filled scrollback).
+///
+/// TWO sources, unioned (T194, Mac's `20e505aaf`): the app-local session-layout
+/// manifest T89f1 wrote, AND the layout blobs the agent itself holds. The second
+/// is what makes a CRASH survivable — the manifest can regress to nothing (a
+/// relaunch that rebuilt no windows then overwrote it) while the agent still
+/// holds a blob for every window whose PTYs are alive, and the windows were
+/// simply lost. `session_layout.reconcile` states the merge rule; the recovered
+/// entries are ADOPTED back into the manifest at the end so the next launch
+/// needs no round trip.
 ///
 /// Returns TRUE iff at least one window was restored, in which case the caller
-/// (`run`) SUPPRESSES the default blank startup window. Any failure — no
-/// manifest, persistence off, agent unreachable, an all-dead layout — returns
+/// (`run`) SUPPRESSES the default blank startup window. Any failure — persistence
+/// off, no agent, neither source holding anything, an all-dead layout — returns
 /// false so the normal single blank window opens instead. Best-effort by design;
 /// a partial failure restores the windows it can and skips the rest.
 ///
@@ -1658,15 +1666,16 @@ pub fn restoreSessionLayout(self: *App) bool {
     if (!self.config.@"session-persistence") return false;
     const gpa = self.core_app.alloc;
 
-    const path = session_layout.layoutPath(gpa) orelse return false;
-    defer gpa.free(path);
-    var parsed = (session_layout.load(gpa, path) catch |err| {
-        log.warn("session-restore: manifest load failed err={}", .{err});
-        return false;
-    }) orelse return false;
-    defer parsed.deinit();
-    const file = parsed.value;
-    if (file.windows.len == 0) return false;
+    // The app-local manifest. An ABSENT or EMPTY file is no longer the end of
+    // the story (T194): after a CRASH it can have regressed to nothing — a
+    // relaunch that rebuilt no windows then overwrote it with the one blank
+    // window it did open — while the ever-running agent still holds a blob for
+    // every window whose PTYs are alive. So this is one of TWO sources, and a
+    // missing one is an empty set, not a bail-out.
+    var parsed = loadLocalManifest(gpa);
+    defer if (parsed) |*p| p.deinit();
+    const local_windows: []const session_layout.Window =
+        if (parsed) |p| p.value.windows else &.{};
 
     // Resolve (find-or-spawn) the local agent. Without a connection we cannot
     // ATTACH anything, so fall back to a blank window. A cold reboot spawns the
@@ -1680,6 +1689,29 @@ pub fn restoreSessionLayout(self: *App) bool {
         return false;
     };
 
+    // T194: ALWAYS ask the agent what it holds, even with a healthy manifest —
+    // that is the whole point, since the case worth recovering is exactly the
+    // one where the local file cannot tell us about it. A pull failure is not
+    // fatal: it degrades to the manifest-only behaviour this had before.
+    const recovered = self.pullAgentLayouts(conn);
+    defer if (recovered) |d| d.deinit();
+    const agent_windows: []const session_layout.Window =
+        if (recovered) |d| d.windows else &.{};
+
+    const union_set = session_layout.reconcile(gpa, local_windows, agent_windows) catch |err| {
+        log.warn("session-restore: reconcile failed err={}", .{err});
+        return false;
+    };
+    defer gpa.free(union_set.windows);
+    if (union_set.windows.len == 0) return false;
+    if (union_set.adopted > 0) {
+        log.info(
+            "session-restore: recovered {d} crash-orphaned window(s) from the agent " ++
+                "({d} in the local manifest)",
+            .{ union_set.adopted, local_windows.len },
+        );
+    }
+
     // Probe the roster. A null set ⇒ the probe failed (UNKNOWN — attempt every
     // leaf); a present set holds every session we can ATTACH: alive (same-PID
     // re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
@@ -1689,7 +1721,7 @@ pub fn restoreSessionLayout(self: *App) bool {
     const attach_ptr = probe.attachSet();
 
     var restored: usize = 0;
-    for (file.windows) |win| {
+    for (union_set.windows) |win| {
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
         self.restoreWindow(win, .local(conn), attach_ptr) catch |err| {
             log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
@@ -1699,7 +1731,50 @@ pub fn restoreSessionLayout(self: *App) bool {
     }
     if (restored == 0) return false;
     log.info("session-restore: restored {d} window(s)", .{restored});
+
+    // ADOPT (Mac's `SessionLayoutManifest.adopt(_:)`): the agent-recovered
+    // windows are this box's again, so write them into the local manifest —
+    // otherwise the very next launch would have to recover them all over again,
+    // and a launch with no agent would lose them for good. win32 regenerates
+    // the manifest wholesale from the live windows, so arming the debounced sync
+    // IS the adopt; the message loop `run` is about to enter fires it.
+    if (union_set.adopted > 0) self.markLayoutDirty();
     return true;
+}
+
+/// Load the app-local session-layout manifest, or null when there isn't a usable
+/// one (no `%LOCALAPPDATA%`, no file — a first start or persistence was off —
+/// or an unreadable/corrupt one). Every arm is non-fatal by design: since T194
+/// the manifest is one of two restore sources, so its absence costs the caller
+/// the local half and nothing more.
+fn loadLocalManifest(gpa: Allocator) ?session_layout.Parsed {
+    const path = session_layout.layoutPath(gpa) orelse return null;
+    defer gpa.free(path);
+    return session_layout.load(gpa, path) catch |err| {
+        log.warn("session-restore: manifest load failed err={}", .{err});
+        return null;
+    };
+}
+
+/// Pull the layout blobs the LOCAL agent holds (`GET_LAYOUTS`, T334), decoded
+/// into replayable windows. Null on any transport or decode failure — the caller
+/// then restores from the local manifest alone, which is exactly what it did
+/// before T194, rather than losing the launch to a bad round trip.
+fn pullAgentLayouts(self: *App, conn: *remote_connection.Connection) ?layout_blobs.Decoded {
+    const gpa = self.core_app.alloc;
+    const payload = conn.requestLayouts(restore_probe_timeout_ns) catch |err| {
+        log.warn("session-restore: GET_LAYOUTS failed err={}", .{err});
+        return null;
+    };
+    defer gpa.free(payload);
+    const decoded = layout_blobs.decodeLayouts(gpa, payload) catch |err| {
+        log.warn("session-restore: layouts payload unreadable err={}", .{err});
+        return null;
+    };
+    if (decoded.skipped > 0) {
+        log.warn("session-restore: {d} agent blob(s) skipped as unreadable", .{decoded.skipped});
+    }
+    return decoded;
 }
 
 /// Whether the window has at least one leaf we will ATTACH or re-open — i.e. not

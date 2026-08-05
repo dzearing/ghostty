@@ -16,14 +16,25 @@
 #      the button HIDDEN rather than absent - a lookup that cannot see hidden
 #      windows would report "no button" for a bug and for correct behavior
 #      alike. Then panes are added and the same probe finds it shown.
-#   2. the rebuild. The fixture orphans a 3-pane window the way a crash does
-#      (kill the APP, keep the agent, drop the manifest), and Restore All brings
-#      it back: one window, the recorded split topology, every pane ATTACHed to
-#      its original session - cross-checked against `ghoztty +sessions --json`,
-#      which dials the agent directly and never goes through the app.
-#   3. the double-attach guard. Pressing it again must rebuild NOTHING: the
-#      agent rebinds a session to the newest attach, so a second rebuild would
-#      steal the panes out of the window it just made.
+#   2. the recovery. The fixture orphans two multi-pane windows the way a crash
+#      does (kill the APP, keep the agent, drop the manifest) and the relaunch
+#      brings them back from the agent's blobs: the recorded split topologies,
+#      every pane ATTACHed to its original session - cross-checked against
+#      `ghoztty +sessions --json`, which dials the agent directly and never goes
+#      through the app.
+#
+#      T194 MOVED THIS. It used to be the BUTTON that rebuilt here, because
+#      launch-time restore trusted the local manifest alone and did nothing
+#      without it - which is to say the user's windows stayed orphaned until
+#      they thought to open a chooser and press a control they had no reason to
+#      know about. Launch restore now reads the same blobs, so the recovery is
+#      automatic and this section asserts it on the fixture the chooser tests
+#      were built around. session-crash-recover.ps1 is the headless oracle for
+#      the same behaviour; chooser-restore-all-remote.ps1 still drives the
+#      button through a real rebuild, cross-machine.
+#   3. the double-attach guard. Pressing the button with those panes on screen
+#      must rebuild NOTHING: the agent rebinds a session to the newest attach,
+#      so a rebuild would blank the user's own terminal to make a copy of it.
 #
 # The keyboard is the trigger under test, not a shortcut around it: Tab walks to
 # the button and the script asserts FOCUS LANDED ON IT before pressing Return.
@@ -334,10 +345,21 @@ try {
 
     # --- 3. the rebuild -----------------------------------------------------
     Write-Host ''
-    Write-Host '3. after a crash with no manifest, Restore All rebuilds the window'
+    Write-Host '3. after a crash with no manifest, the relaunch recovers the windows itself (T194)'
     # Kill the APP only: the agent keeps the children alive - the whole point of
-    # session persistence - and with the manifest gone the relaunch cannot
-    # re-attach them, so the topology exists ONLY in the agent's blob.
+    # session persistence - and with the manifest gone the topology exists ONLY
+    # in the agent's blobs.
+    #
+    # WHAT THIS SECTION ASSERTS CHANGED WITH T194, and the change is the point.
+    # It used to assert that the relaunched app "restored nothing on its own",
+    # leaving the rebuild for the Restore All button. That WAS the defect: the
+    # windows were orphaned - their processes alive, nothing on screen pointing
+    # at them - until the user thought to open the chooser and press a button
+    # they had no reason to know about. Launch-time restore now consults the
+    # same agent blobs this fixture builds, so the recovery is automatic and
+    # section 4's double-attach guard is what the button has left to do here.
+    # session-crash-recover.ps1 is the headless oracle for the same behaviour;
+    # this one proves it on the fixture the chooser tests were built around.
     Stop-RepoProcesses @('ghoztty')
     Remove-LayoutManifest
     $orphans = @(Get-AliveSessions)
@@ -347,70 +369,51 @@ try {
     if (-not $g) { Write-Host 'SETUP FAIL: GUI died on relaunch'; exit 1 }
     Start-Sleep -Seconds 3
     $shapesBefore = @(Get-WindowShapes)
-    Assert ($shapesBefore.Count -eq 1) `
-        "the relaunched app restored nothing on its own ($($shapesBefore.Count) window)"
-
-    $attachedBefore = @(Get-Sessions | Where-Object { $multiIds -contains $_.id -and $_.attached }).Count
-    Assert ($attachedBefore -eq 0) 'none of the orphaned panes has a viewer yet'
-
-    $chooser = Open-Chooser $g
-    Assert ($chooser -ne [IntPtr]::Zero) 'the chooser opens on the relaunched app'
-    if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser'; exit 1 }
-    $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
-    Assert ($null -ne (Wait-RosterLoaded $errlog2)) 'the roster loaded'
-    Start-Sleep -Milliseconds 800
-    $btn = Get-RestoreAllButton $chooser
-    Assert ($btn -ne [IntPtr]::Zero -and (Test-TestWindowVisible -Window $btn)) `
-        'Restore All is offered for the local machine'
-
-    Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab walks focus onto the Restore All button'
-    # Aimed at the BUTTON: Send-TestKeys focuses its target first, so a Return
-    # aimed at the filter would press the default action instead.
-    Send-TestKeys -Window $chooser -Target $btn -Key Return | Out-Null
-
-    $rebuilt = Wait-LogLine $errlog2 'restore all: rebuilt (\d+) window' 10000
-    Assert ($null -ne $rebuilt) 'Return on the button rebuilds at least one window'
-    Start-Sleep -Seconds 3
-    Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed itself onto the rebuild'
-
-    $shapesAfter = @(Get-WindowShapes)
-    Assert ($shapesAfter.Count -eq ($shapesBefore.Count + 2)) `
-        "both windows came back ($($shapesBefore.Count) -> $($shapesAfter.Count))"
-    $restored = @($shapesAfter | Where-Object { $_.Name -eq 't335-multi' }) | Select-Object -First 1
-    Assert ($null -ne $restored) 'the rebuilt window kept its ipc name'
-    Assert ($null -ne $restored -and $restored.Panes -eq 3) `
-        "and its recorded split topology - three panes ($(if ($restored) { $restored.Panes } else { 0 }))"
+    Assert ($shapesBefore.Count -eq 2) `
+        "the relaunch recovered both windows from the agent ($($shapesBefore.Count) window(s))"
+    $recovered = @($shapesBefore | Where-Object { $_.Name -eq 't335-multi' }) | Select-Object -First 1
+    Assert ($null -ne $recovered) 'the recovered window kept its ipc name'
+    Assert ($null -ne $recovered -and $recovered.Panes -eq 3) `
+        "and its recorded split topology - three panes ($(if ($recovered) { $recovered.Panes } else { 0 }))"
     # The auto-named window is identified by SHAPE, not by name: its recorded
-    # `window-N` collides with the one the relaunched app already handed its own
-    # blank window, and which registration survives that is T121's question, not
-    # this one's. The blank window is single-pane; a 2-pane window can only be
-    # the rebuilt one.
-    $restoredAuto = @($shapesAfter | Where-Object { $_.Panes -eq 2 }) | Select-Object -First 1
-    Assert ($null -ne $restoredAuto) `
+    # `window-N` is a per-run allocation, and which registration it comes back
+    # under is T121's question, not this one's.
+    $recoveredAuto = @($shapesBefore | Where-Object { $_.Panes -eq 2 }) | Select-Object -First 1
+    Assert ($null -ne $recoveredAuto) `
         'the window the user never named came back too, with its two panes (T338)'
+    # No blank startup window beside them: a recovery that opens one has not
+    # actually suppressed the default window, and the user gets a stray pane.
+    Assert (@($shapesBefore | Where-Object { $_.Panes -eq 1 }).Count -eq 0) `
+        'and no blank startup window was opened beside them'
 
-    # The independent oracle: the agent, dialled directly, now reports a viewer
-    # on every one of those sessions. Nothing about this reading goes through
-    # the app, and none of them was attached a moment ago.
-    Start-Sleep -Seconds 1
+    # The independent oracle: the agent, dialled directly, reports a viewer on
+    # every one of those sessions. Nothing about this reading goes through the
+    # app, and none of them had one while it was dead.
     $attachedAfter = @(Get-Sessions | Where-Object { $multiIds -contains $_.id -and $_.attached }).Count
     Assert ($attachedAfter -eq 3) `
         "the agent reports all three original sessions ATTACHED ($attachedAfter of 3)"
     $attachedAuto = @(Get-Sessions | Where-Object { $autoIds -contains $_.id -and $_.attached }).Count
     Assert ($attachedAuto -eq 2) `
         "and both of the auto-named window's sessions ATTACHED ($attachedAuto of 2)"
+    $shapesAfter = $shapesBefore
 
     # --- 4. the double-attach guard ----------------------------------------
     Write-Host ''
-    Write-Host '4. pressing it again rebuilds nothing (the panes are already here)'
+    Write-Host '4. pressing Restore All rebuilds nothing (the panes are already here)'
+    # The guard is what stops the button from being destructive now that the
+    # launch has usually already done the work: the agent rebinds a session to
+    # the NEWEST attach, so rebuilding a window whose panes are on screen would
+    # blank the user's own terminal to make a copy of itself.
     $rebuiltBefore = Count-LogLines $errlog2 'restore all: rebuilt \d+ window'
     $chooser = Open-Chooser $g
-    Assert ($chooser -ne [IntPtr]::Zero) 'the chooser reopens after the rebuild'
+    Assert ($chooser -ne [IntPtr]::Zero) 'the chooser opens on the relaunched app'
     $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
     Assert ($null -ne (Wait-RosterLoaded $errlog2)) 'the roster loaded'
     Start-Sleep -Milliseconds 800
     $btn = Get-RestoreAllButton $chooser
-    Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab reaches the button again (the positive control)'
+    Assert ($btn -ne [IntPtr]::Zero -and (Test-TestWindowVisible -Window $btn)) `
+        'Restore All is still offered for the local machine'
+    Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab reaches the button (the positive control)'
     Send-TestKeys -Window $chooser -Target $btn -Key Return | Out-Null
     $skipped = Wait-LogLine $errlog2 "restore all: 't335-multi' is already open here" 8000
     Assert ($null -ne $skipped) 'the window already on screen is skipped, not attached twice'

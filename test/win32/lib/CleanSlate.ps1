@@ -12,9 +12,13 @@
 # can still be alive - and killing ghoztty.exe does not remove it, because
 # two independent mechanisms bring it back:
 #
-#   1. the agent still owns the PTY, and
+#   1. the agent still owns the PTY,
 #   2. %LOCALAPPDATA%\ghoztty\session-layout-debug.json still describes the
-#      window, so the next launch RESTORES it - name and all.
+#      window, so the next launch RESTORES it - name and all, and
+#   3. since T194, so does the agent's own layout-blob store
+#      (local-agent-debug\layouts.json), which launch-time restore now consults
+#      even when the manifest says nothing. Deleting the manifest alone stopped
+#      being a clean slate that day.
 #
 # From the second run onward, `+new-window --target=X -e <fixture>` then does
 # not run the fixture at all. It focuses last run's pane, complete with last
@@ -131,6 +135,35 @@ function Clear-DebugSessionLayout {
     return (-not (Test-Path $path))
 }
 
+function Clear-DebugAgentLayouts {
+    <#
+    .SYNOPSIS
+    Delete the DEBUG agent's layout-blob store so the next launch recovers
+    nothing from it.
+
+    .DESCRIPTION
+    The SECOND restore source, and since T194 it is a live one: launch-time
+    restore no longer trusts the manifest alone - it pulls the agent's
+    `GET_LAYOUTS` and rebuilds any window the manifest has lost. That is exactly
+    what makes a crash-orphaned window come back, and exactly what would make a
+    PREVIOUS acceptance run's windows come back into a fixture that asked for a
+    known-empty box. Dropping the manifest alone stopped being a clean slate the
+    day that landed.
+
+    Only ever the `-debug` agent's store, for the same reason
+    `Clear-DebugSessionLayout` only touches the `-debug` manifest: the release
+    path belongs to the user's installed Ghoztty. Callers that keep the agent
+    ALIVE must not use this - it owns the file and would simply rewrite it.
+    Returns $true if a file was removed.
+    #>
+    $local = $env:LOCALAPPDATA
+    if (-not $local) { return $false }
+    $path = Join-Path $local 'ghoztty\local-agent-debug\layouts.json'
+    if (-not (Test-Path $path)) { return $false }
+    Remove-Item $path -Force -ErrorAction SilentlyContinue
+    return (-not (Test-Path $path))
+}
+
 function Assert-GhozttyUnderTest {
     <#
     .SYNOPSIS
@@ -192,6 +225,10 @@ function Reset-GhozttyTestState {
     Stop-DebugGhoztty / Kill-RepoInstances copy. -AppOnly keeps the agent
     alive for scripts whose subject IS the running agent (an upgrade or
     re-attach test); the manifest is cleared either way.
+
+    The agent's layout-blob store is cleared only when the agent is being
+    killed with it (T194): with the agent alive that file is its own, and a
+    delete would be both ineffective and a lie about the state it is holding.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
@@ -207,5 +244,10 @@ function Reset-GhozttyTestState {
 
     $killed = Stop-RepoGhoztty -Exe $Exe -AppOnly:$AppOnly -SettleMs $SettleMs
     $cleared = Clear-DebugSessionLayout
-    return [pscustomobject]@{ Killed = $killed; ManifestCleared = $cleared }
+    $layoutsCleared = if ($AppOnly) { $false } else { Clear-DebugAgentLayouts }
+    return [pscustomobject]@{
+        Killed          = $killed
+        ManifestCleared = $cleared
+        LayoutsCleared  = $layoutsCleared
+    }
 }

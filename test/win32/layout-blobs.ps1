@@ -20,10 +20,11 @@
 #   E. hard-kill the GUI (the quit / crash / upgrade class) -> the blobs SURVIVE
 #      in the agent. That is the whole point of the store: the machine stays
 #      restorable while no viewer is running.
-#   F. (T338) relaunch with the local manifest GONE - the crash case Restore All
-#      exists for - and the dead run's record must still be there, intact,
-#      ALONGSIDE the new window's. Keys are per-window uuids, so the new blank
-#      startup window cannot claim the dead run's key.
+#   F. (T338/T194) relaunch with the local manifest GONE - the crash case - and
+#      the dead run's record must still be there, intact, under its own key.
+#      Since T194 that relaunch RECOVERS the window from that record rather than
+#      opening a blank one beside it, so the key it comes back under is the same
+#      uuid; a window opened afterwards still takes a fresh key of its own.
 #
 # Non-interactive and headless-safe: no foreground grabs, no synthetic input, so
 # it does not need the T211 background-desktop harness. Fully hermetic: a
@@ -297,14 +298,23 @@ Assert "E2 it still names the sessions the agent is keeping alive" (
     (@(@($idsE) | Where-Object { $recE.session_ids -contains $_ }).Count -eq 2))
 
 # ============================================================================
-"== F: (T338) a relaunch with no local manifest does not eat the dead run's record"
+"== F: (T338/T194) a relaunch with no local manifest RECOVERS the dead run's window"
 # ============================================================================
 # The exact case Restore All is for: the app died without writing (or with a
-# lost) session-layout manifest, so launch-time restore can do nothing and the
-# only surviving copy of the topology is the agent's. Before T338 the blob key
-# was the manifest's per-run window id, so the relaunched app's blank startup
-# window UPSERTED the dead run's key inside the 250ms layout debounce and the
-# record was gone before anyone could press anything.
+# lost) session-layout manifest, so the only surviving copy of the topology is
+# the agent's. Before T338 the blob key was the manifest's per-run window id, so
+# the relaunched app's blank startup window UPSERTED the dead run's key inside
+# the 250ms layout debounce and the record was gone before anyone could press
+# anything.
+#
+# WHAT F EXPECTS CHANGED WITH T194, and the change is the point: launch-time
+# restore now always consults the agent, so the relaunch REBUILDS the dead run's
+# window instead of opening a blank one beside it. There is therefore no rival
+# window and no third session - one record, still keyed by the same uuid the
+# dead run used, which is T338's claim restated on the path that now depends on
+# it. session-crash-recover.ps1 is the oracle for the recovery itself; this
+# section stays the oracle for the KEY. F6-F8 keep the "a later window takes a
+# fresh key" half under test with a window opened after the recovery.
 Remove-Item (Join-Path $tmp 'ghoztty\session-layout-debug.json') -Force -ErrorAction SilentlyContinue
 Assert "F1 the local manifest really is gone before the relaunch" (
     -not (Test-Path (Join-Path $tmp 'ghoztty\session-layout-debug.json')))
@@ -312,22 +322,31 @@ Assert "F1 the local manifest really is gone before the relaunch" (
 Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
     '--title=t338-relaunch', '--window-width=100', '--window-height=30') | Out-Null
 
-# The new run's blank window is a third session; its push is what used to
-# destroy the record. Two records is the fixed behavior.
-$recsF = Wait-Records $tmp 2 30
-Assert "F2 the store holds TWO records - the dead run's and the new one's" (
-    @($recsF).Count -eq 2)
+$recsF = Wait-Records $tmp 1 30
+Assert "F2 the store holds ONE record - the recovered window, no blank one beside it" (
+    @($recsF).Count -eq 1)
 $recF1 = @($recsF | Where-Object { $_.key -eq $keyA }) | Select-Object -First 1
-Assert "F3 the dead run's record survived under its own key" ($null -ne $recF1)
+Assert "F3 it is still the dead run's key: the recovery ADOPTED the uuid (T338)" (
+    $null -ne $recF1)
 Assert "F4 it still describes the two-leaf window it always did" (
     $null -ne $recF1 -and @(Nodes $recF1).Count -eq 3)
-Assert "F5 it still claims the sessions the agent kept alive" (
+Assert "F5 it still claims the sessions the agent kept alive - a re-ATTACH" (
     $null -ne $recF1 -and @($recF1.session_ids).Count -eq 2 -and
     (@(@($idsE) | Where-Object { $recF1.session_ids -contains $_ }).Count -eq 2))
-$recF2 = @($recsF | Where-Object { $_.key -ne $keyA }) | Select-Object -First 1
-Assert "F6 the new window took a fresh uuid key of its own" (
+$idsF = @(Alive-Ids (Get-Sessions $tmp 'f'))
+Assert "F5b no extra session was opened by the recovery" (
+    $idsF.Count -eq 2 -and (@(@($idsE) | Where-Object { $idsF -contains $_ }).Count -eq 2))
+
+# The T338 key claim, on a window that really is new: it must take a fresh uuid
+# rather than colliding with the recovered run's.
+Run-Cli '+new-window --target=blob-after' "$tmp\afterwin.txt" 20 | Out-Null
+$recsF2 = Wait-Records $tmp 2 30
+Assert "F6 opening a window after the recovery adds a SECOND record" (
+    @($recsF2).Count -eq 2)
+$recF2 = @($recsF2 | Where-Object { $_.key -ne $keyA }) | Select-Object -First 1
+Assert "F7 the new window took a fresh uuid key of its own" (
     $null -ne $recF2 -and (Is-Uuid $recF2.key) -and $recF2.key -ne $keyA)
-Assert "F7 the new record claims a session the old one does not" (
+Assert "F8 the new record claims a session the recovered one does not" (
     $null -ne $recF2 -and @($recF2.session_ids).Count -eq 1 -and
     -not ($idsE -contains $recF2.session_ids[0]))
 

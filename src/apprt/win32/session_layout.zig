@@ -346,6 +346,110 @@ pub fn clear(alloc: Allocator) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
+/// The stable key a window is stored and matched under: its cross-run `uuid`
+/// (T338), falling back to the within-file `id` for a manifest or blob written
+/// by a pre-T338 build. This is the SAME derivation `App.pushLayoutBlobs` uses
+/// for the agent-side key, which is what lets the two sides be unioned at all.
+pub fn windowKey(win: Window) []const u8 {
+    return win.uuid orelse win.id;
+}
+
+/// The result of `reconcile`: the restore set, plus how many of its entries came
+/// from the AGENT alone. `adopted > 0` is the signal that the local manifest has
+/// fallen behind and needs re-writing once the windows are live.
+pub const Reconciled = struct {
+    /// Local entries first (in file order), then the agent-only ones. Every
+    /// `Window` — and every string in it — is BORROWED from the inputs; only the
+    /// outer slice is allocated, and the caller frees it.
+    windows: []const Window,
+    adopted: usize,
+};
+
+/// Union the app-local manifest with the layouts the AGENT holds (T194, Mac's
+/// `reconcileLayoutEntries`). Pure, so it unit-tests in every app-runtime lane.
+///
+/// Why this exists: after an app CRASH the local manifest can REGRESS — a
+/// relaunch that rebuilt nothing then overwrote it with the one blank window it
+/// did open — while the ever-running agent still holds a blob for every window
+/// whose PTYs are alive. Restoring from the local file alone loses those windows
+/// permanently even though nothing about them actually died.
+///
+/// Two rules decide the union:
+///
+///   * **Local wins on key collision.** After a crash the local entry can only
+///     be the fresher of the two: it is rewritten on every layout mutation,
+///     whereas the agent's copy is a mirror of that same file. Keeping local
+///     also keeps the WP-D3 screen snapshots, which are stripped out of a blob
+///     on purpose (`layout_blobs.serializeWindow`).
+///   * **An agent window whose session is already claimed is dropped**, even
+///     when its key is new. One leaf is enough — the same "a window is restored
+///     as a unit" rule `App.windowIsOpenOn` applies — because the agent rebinds
+///     a session to the NEWEST attach, so restoring two windows over one session
+///     would blank the first to make a copy of it.
+pub fn reconcile(
+    alloc: Allocator,
+    local: []const Window,
+    agent: []const Window,
+) Allocator.Error!Reconciled {
+    var out: std.ArrayList(Window) = .empty;
+    errdefer out.deinit(alloc);
+
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer keys.deinit(alloc);
+    var claimed: std.StringHashMapUnmanaged(void) = .empty;
+    defer claimed.deinit(alloc);
+
+    for (local) |win| {
+        const gop = try keys.getOrPut(alloc, windowKey(win));
+        // A duplicate key within one file is malformed, not a second window.
+        if (gop.found_existing) continue;
+        try out.append(alloc, win);
+        try claimSessions(alloc, &claimed, win);
+    }
+
+    var adopted: usize = 0;
+    for (agent) |win| {
+        const gop = try keys.getOrPut(alloc, windowKey(win));
+        if (gop.found_existing) continue;
+        if (sessionsClaimed(&claimed, win)) continue;
+        try out.append(alloc, win);
+        try claimSessions(alloc, &claimed, win);
+        adopted += 1;
+    }
+
+    return .{ .windows = try out.toOwnedSlice(alloc), .adopted = adopted };
+}
+
+/// Record every session id `win` references as spoken for.
+fn claimSessions(
+    alloc: Allocator,
+    claimed: *std.StringHashMapUnmanaged(void),
+    win: Window,
+) Allocator.Error!void {
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            const sid = leaf.session_id orelse continue;
+            if (sid.len == 0) continue;
+            try claimed.put(alloc, sid, {});
+        }
+    }
+}
+
+/// Whether ANY session `win` references is already spoken for by an accepted
+/// window. One is enough — see `reconcile`'s second rule.
+fn sessionsClaimed(claimed: *const std.StringHashMapUnmanaged(void), win: Window) bool {
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            const sid = leaf.session_id orelse continue;
+            if (sid.len == 0) continue;
+            if (claimed.contains(sid)) return true;
+        }
+    }
+    return false;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -730,4 +834,132 @@ test "parse tolerates unknown fields and missing optionals (additive interop)" {
     const leaf = w.tabs[0].nodes[0].leaf.?;
     try testing.expect(leaf.session_id == null);
     try testing.expect(leaf.title == null);
+}
+
+// -- reconcile (T194) ---------------------------------------------------------
+
+/// One single-pane window keyed by `uuid`, holding session `sid`.
+fn reconcileWindow(
+    id: []const u8,
+    uuid: ?[]const u8,
+    sid: ?[]const u8,
+    nodes: *[1]Node,
+    tabs: *[1]Tab,
+) Window {
+    nodes[0] = .{ .leaf = .{ .session_id = sid } };
+    tabs[0] = .{ .nodes = nodes, .active = true };
+    return .{ .id = id, .uuid = uuid, .tabs = tabs };
+}
+
+test "reconcile: agent-only windows are ADDED after the local ones" {
+    const alloc = testing.allocator;
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const local = [_]Window{reconcileWindow("window-1", "uuid-local", "sess-a", &ln, &lt)};
+    const agent = [_]Window{reconcileWindow("window-9", "uuid-agent", "sess-b", &an, &at)};
+
+    const r = try reconcile(alloc, &local, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 2), r.windows.len);
+    try testing.expectEqual(@as(usize, 1), r.adopted);
+    // Local first, in file order; the recovered window trails it.
+    try testing.expectEqualStrings("uuid-local", r.windows[0].uuid.?);
+    try testing.expectEqualStrings("uuid-agent", r.windows[1].uuid.?);
+}
+
+test "reconcile: an empty local manifest recovers the agent's whole set" {
+    const alloc = testing.allocator;
+    var n0: [1]Node = undefined;
+    var t0: [1]Tab = undefined;
+    var n1: [1]Node = undefined;
+    var t1: [1]Tab = undefined;
+    const agent = [_]Window{
+        reconcileWindow("win-0", "uuid-0", "sess-0", &n0, &t0),
+        reconcileWindow("win-1", "uuid-1", "sess-1", &n1, &t1),
+    };
+
+    // This is the crash case the row exists for: the manifest regressed to
+    // nothing while every PTY is still alive in the agent.
+    const r = try reconcile(alloc, &.{}, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 2), r.windows.len);
+    try testing.expectEqual(@as(usize, 2), r.adopted);
+}
+
+test "reconcile: LOCAL wins on a key collision" {
+    const alloc = testing.allocator;
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    // Same uuid, different `id` and title-bearing content: the agent copy is a
+    // mirror of an older write of the same window.
+    const local = [_]Window{reconcileWindow("fresh", "uuid-same", "sess-a", &ln, &lt)};
+    const agent = [_]Window{reconcileWindow("stale", "uuid-same", "sess-a", &an, &at)};
+
+    const r = try reconcile(alloc, &local, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 1), r.windows.len);
+    try testing.expectEqual(@as(usize, 0), r.adopted);
+    try testing.expectEqualStrings("fresh", r.windows[0].id);
+}
+
+test "reconcile: a pre-T338 entry keys on its id, so it still collides" {
+    const alloc = testing.allocator;
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const local = [_]Window{reconcileWindow("win-0", null, "sess-a", &ln, &lt)};
+    const agent = [_]Window{reconcileWindow("win-0", null, "sess-a", &an, &at)};
+
+    const r = try reconcile(alloc, &local, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 1), r.windows.len);
+    try testing.expectEqual(@as(usize, 0), r.adopted);
+}
+
+test "reconcile: an agent window whose session is already claimed is dropped" {
+    const alloc = testing.allocator;
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    // A NEW key but the SAME session: restoring both would hand the agent two
+    // attaches for one PTY and blank the first window to make a copy of it.
+    const local = [_]Window{reconcileWindow("window-1", "uuid-local", "sess-a", &ln, &lt)};
+    const agent = [_]Window{reconcileWindow("window-1", "uuid-other", "sess-a", &an, &at)};
+
+    const r = try reconcile(alloc, &local, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 1), r.windows.len);
+    try testing.expectEqual(@as(usize, 0), r.adopted);
+    try testing.expectEqualStrings("uuid-local", r.windows[0].uuid.?);
+}
+
+test "reconcile: session-less windows never collide with each other" {
+    const alloc = testing.allocator;
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    // A viewer-only / never-agent-backed window claims no session, so the
+    // "already claimed" rule must not fold two of them into one.
+    const local = [_]Window{reconcileWindow("window-1", "uuid-local", null, &ln, &lt)};
+    const agent = [_]Window{reconcileWindow("window-2", "uuid-agent", null, &an, &at)};
+
+    const r = try reconcile(alloc, &local, &agent);
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 2), r.windows.len);
+    try testing.expectEqual(@as(usize, 1), r.adopted);
+}
+
+test "reconcile: both sides empty is an empty answer, not an error" {
+    const alloc = testing.allocator;
+    const r = try reconcile(alloc, &.{}, &.{});
+    defer alloc.free(r.windows);
+    try testing.expectEqual(@as(usize, 0), r.windows.len);
+    try testing.expectEqual(@as(usize, 0), r.adopted);
 }

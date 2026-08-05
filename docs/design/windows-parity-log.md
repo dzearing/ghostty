@@ -8944,3 +8944,55 @@ T215 (still open, the wider audit of input-desktop assumptions) gains the
 lesson: its "branch only on `onInputDesktop()`" recipe is what produced this
 regression, so each remaining site has to be asked what its foreground check was
 standing in for before it is waved through off-desktop.
+
+## 2026-08-05 — T194: a crash no longer loses the windows it left running
+
+Launch-time restore on Windows trusted one file — `session-layout.json` — and
+bailed the instant it was absent or empty. After an app CRASH that file can
+regress to nothing (a relaunch that rebuilt no windows then overwrote it with
+the one blank window it did open) while the ever-running `ghoztty-agent` still
+holds a layout blob for every window whose PTYs are alive. The windows were
+simply lost: their processes running, nothing on screen pointing at them, and
+the only way back a chooser button the user had no reason to know about.
+
+Restore now reads BOTH sources. `session_layout.reconcile` unions them by the
+same key the push uses (`uuid orelse id`): local entries first — after a crash
+the local copy can only be the fresher one, and it still carries the WP-D3
+snapshots a blob deliberately strips — then every window only the agent knows
+about. An agent window whose session is already claimed is dropped even under a
+new key, because the agent rebinds a session to the newest attach and two
+attaches over one PTY would blank the first window to make a copy of it. The
+recovered entries are then adopted back into the manifest (`markLayoutDirty`,
+which on win32 regenerates it from the live windows) so the next launch needs no
+round trip and a launch with no agent does not lose them again.
+
+The push half was already there (T334/T338), which is why this is the reconcile
+plus the adopt and nothing else.
+
+Evidence: new `test\win32\session-crash-recover.ps1` ALL PASS (17) — build a
+2-window/3-pane layout, crash-kill the app, DELETE the manifest, relaunch, and
+every pane comes back on its ORIGINAL shell pid with no fourth session, then the
+manifest goes from ABSENT back to two windows; `-NegativeControl` inverts the
+claim and correctly fails. Seven pure reconcile unit tests in the `none` lane.
+Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, P1–P3 ALL PASS,
+`session-reattach.ps1` (38), `session-relaunch-notify.ps1` (76) and
+`viewer-restore.ps1` (38) ALL PASS.
+
+Two scripts had the OLD behaviour written into them as an expectation, and both
+were corrected rather than relaxed. `layout-blobs.ps1` section F asserted a blank
+window opening beside the dead run's record; it now asserts the recovery, under
+the same uuid key, with no extra session. `chooser-restore-all.ps1` section 3
+asserted "the relaunched app restored nothing on its own" and had the button do
+the rebuild — that sentence WAS the defect — so it now asserts the automatic
+recovery and section 4 keeps the double-attach guard. `lib\CleanSlate.ps1` gained
+`Clear-DebugAgentLayouts`: with a second restore source live, dropping the
+manifest alone had stopped being a clean slate.
+
+Filed: **T484** — `session-persistence.ps1` B2.7/B3.7 (cumulative replayed
+scrollback across repeated crashes) are RED and were green on 2026-07-21. NOT
+from this change: a clean build of `368b7a11b` in a scratch worktree fails the
+same two identically, which is the only reason that claim is in here. **T485** —
+that script aborts from inside a Ghoztty pane because it never drops the
+inherited `$GHOZTTY_IPC_SOCKET`, which is how a red section stayed unseen.
+**T486** — the LOCAL Restore All button now has no on-box rebuild oracle, since
+the launch recovers before it can; decide whether it needs one.
