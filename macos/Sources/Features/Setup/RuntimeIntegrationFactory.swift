@@ -17,18 +17,45 @@ enum RuntimeIntegrationFactory {
         RuntimeAgent.allCases.filter { probe.isInstalled($0, homeDirectoryURL) }
     }
 
+    /// Does an external plugin already own this runtime? Only Claude has one.
+    ///
+    /// The single gate for BOTH components Ghoztty would otherwise write into
+    /// the runtime's config dir. Gating only the hooks would leave the app's
+    /// skill sitting beside the plugin's own copy of the same skill: the two
+    /// differ, and the app's points the agent at
+    /// `~/.config/ghoztty/hooks/ghoztty-banner.sh` while the plugin's hooks keep
+    /// state under `~/.claude/ghoztty-banner/`, so the split-state failure the
+    /// hooks gate prevents is simply reached through the skill instead.
+    static func isPluginManaged(agent: RuntimeAgent,
+                                homeDirectoryURL: URL,
+                                fileManager: FileManager) -> Bool {
+        guard agent == .claude else { return false }
+        return ClaudeHookSpec().isExternalPluginInstalled(
+            homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+    }
+
     /// The agent's hooks component, or nil when Ghoztty must NOT own the hooks
     /// (Claude's external plugin already does). Extracted so the shared-banner
     /// refcount can inspect every agent's hooks state through one path.
     static func hooksComponent(for agent: RuntimeAgent,
                                homeDirectoryURL: URL,
                                fileManager: FileManager) -> IntegrationComponent? {
+        guard !isPluginManaged(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+        else { return nil }
         let spec: HookSpec = agent == .claude ? ClaudeHookSpec() : CopilotHookSpec()
-        let skipHooks = agent == .claude &&
-            (spec as? ClaudeHookSpec)?.isExternalPluginInstalled(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager) == true
-        guard !skipHooks else { return nil }
         let hooks = HookComponent(spec: spec, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
         return IntegrationComponent(name: hooksComponentName, state: hooks.state, install: hooks.install, uninstall: hooks.uninstall)
+    }
+
+    /// The agent's skills component, or nil when the external plugin owns them.
+    /// Same gate as the hooks, for the reason spelled out on `isPluginManaged`.
+    static func skillsComponent(for agent: RuntimeAgent,
+                                homeDirectoryURL: URL,
+                                fileManager: FileManager) -> IntegrationComponent? {
+        guard !isPluginManaged(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+        else { return nil }
+        let skills = SkillComponent(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+        return IntegrationComponent(name: "skills", state: skills.state, install: skills.install, uninstall: skills.uninstall)
     }
 
     /// Refcount for the SHARED banner script: true when ANY agent's hooks
@@ -54,7 +81,6 @@ enum RuntimeIntegrationFactory {
                      fileManager: FileManager,
                      probe: RuntimeProbe = .binary) -> RuntimeIntegration {
         let banner = BannerScriptInstaller(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
-        let skills = SkillComponent(agent: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
 
         // The banner is a SHARED file (one path for every agent), so its uninstall
         // is refcounted: it removes the script only once NO agent's hooks
@@ -72,8 +98,10 @@ enum RuntimeIntegrationFactory {
 
         var components: [IntegrationComponent] = [
             IntegrationComponent(name: bannerComponentName, state: banner.state, install: banner.install, uninstall: bannerUninstall),
-            IntegrationComponent(name: "skills", state: skills.state, install: skills.install, uninstall: skills.uninstall),
         ]
+        if let skills = skillsComponent(for: agent, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager) {
+            components.append(skills)
+        }
 
         // MUST remain last: the banner refcount above relies on hooks being
         // ordered after the banner so reverse-order processing removes them first.

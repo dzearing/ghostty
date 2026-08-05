@@ -116,10 +116,39 @@ struct ClaudeHookSpec: HookSpec {
         return matches ? .installed : .outdated
     }
 
+    /// The plugin's name in Claude's marketplace. The marketplace half of a
+    /// manifest key is deliberately NOT part of the match: the same plugin is
+    /// registered through more than one marketplace in practice
+    /// (`ghoztty@dzearing-claude-marketplace` and `ghoztty@ghoztty-claude-plugin`
+    /// side by side), and either one owns the runtime.
+    static let externalPluginName = "ghoztty"
+
+    /// Is Claude's own `ghoztty` plugin installed — i.e. does something other
+    /// than Ghoztty already own this runtime's skills and hooks?
+    ///
+    /// Parsed, never substring-matched. The manifest records each install's
+    /// `installPath` and (at project scope) its `projectPath`, so a bare
+    /// `contains("ghoztty")` reports true for ANY plugin the user installed
+    /// while sitting in a ghoztty checkout — and Ghoztty would then silently
+    /// decline to install, believing its own plugin was already there.
     func isExternalPluginInstalled(homeDirectoryURL: URL, fileManager: FileManager) -> Bool {
         let url = homeDirectoryURL.appendingPathComponent(".claude/plugins/installed_plugins.json")
         guard let data = fileManager.contents(atPath: url.path),
-              let text = String(data: data, encoding: .utf8) else { return false }
-        return text.contains("ghoztty")
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+
+        // `"version": 2` — `plugins` is an object keyed by `<name>@<marketplace>`.
+        if let byKey = json["plugins"] as? [String: Any] {
+            return byKey.keys.contains { $0.split(separator: "@").first.map(String.init) == Self.externalPluginName }
+        }
+        // Older shape — `plugins` is an array of entries carrying `name`.
+        if let list = json["plugins"] as? [[String: Any]] {
+            return list.contains { ($0["name"] as? String) == Self.externalPluginName }
+        }
+        // A shape we do not recognize: report absent rather than guessing, so a
+        // manifest revision cannot silently suppress the integration. The
+        // coexistence cost of a false negative is a duplicate skill; the cost of
+        // a false positive is Ghoztty refusing to install at all.
+        return false
     }
 }

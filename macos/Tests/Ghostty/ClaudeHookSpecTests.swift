@@ -105,4 +105,49 @@ struct ClaudeHookSpecTests {
         try #"{"plugins":[{"name":"ghoztty"}]}"#.write(to: pluginsDir.appendingPathComponent("installed_plugins.json"), atomically: true, encoding: .utf8)
         #expect(ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: home, fileManager: .default))
     }
+
+    private func manifestHome(_ json: String) throws -> URL {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        let pluginsDir = home.appendingPathComponent(".claude/plugins")
+        try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
+        try json.write(to: pluginsDir.appendingPathComponent("installed_plugins.json"),
+                       atomically: true, encoding: .utf8)
+        return home
+    }
+
+    /// The real manifest is `"version": 2`: `plugins` is an OBJECT keyed by
+    /// `<name>@<marketplace>`, not the array the older shape used.
+    @Test func detectsThePluginInTheVersion2Manifest() throws {
+        let home = try manifestHome(#"""
+        {"version":2,"plugins":{"ghoztty@dzearing-claude-marketplace":[
+          {"scope":"user","installPath":"/Users/x/.claude/plugins/cache/dzearing-claude-marketplace/ghoztty/0.8.0","version":"0.8.0"}]}}
+        """#)
+        #expect(ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: home, fileManager: .default))
+    }
+
+    /// The same plugin is registered through more than one marketplace in
+    /// practice, so the marketplace half of the key cannot be part of the match.
+    @Test func detectsThePluginUnderAnyMarketplace() throws {
+        let home = try manifestHome(#"{"version":2,"plugins":{"ghoztty@ghoztty-claude-plugin":[{"scope":"user"}]}}"#)
+        #expect(ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: home, fileManager: .default))
+    }
+
+    /// A substring match over the whole file false-positives on any OTHER
+    /// plugin installed at project scope from a ghoztty checkout: the manifest
+    /// records that checkout as `projectPath`. Ghoztty would then decline to
+    /// install, believing its own plugin owned the runtime.
+    @Test func ignoresGhosttyAppearingOnlyInAnotherPluginsPaths() throws {
+        let home = try manifestHome(#"""
+        {"version":2,"plugins":{"commit-commands@claude-plugins-official":[
+          {"scope":"project","projectPath":"/Users/x/git/ghoztty",
+           "installPath":"/Users/x/.claude/plugins/cache/claude-plugins-official/commit-commands/unknown"}]}}
+        """#)
+        #expect(!ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: home, fileManager: .default))
+    }
+
+    /// A plugin whose name merely CONTAINS "ghoztty" is a different plugin.
+    @Test func ignoresAPluginWhoseNameMerelyContainsGhoztty() throws {
+        let home = try manifestHome(#"{"version":2,"plugins":{"ghoztty-themes@someone-else":[{"scope":"user"}]}}"#)
+        #expect(!ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: home, fileManager: .default))
+    }
 }

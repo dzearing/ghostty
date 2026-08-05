@@ -95,25 +95,50 @@ struct RuntimeIntegrationFactoryTests {
             atPath: home.appendingPathComponent(".copilot/hooks/ghoztty.json").path))
     }
 
-    @Test func claudeWithExternalPluginSkipsHooks() throws {
+    private func homeWithClaudePlugin() throws -> URL {
         let home = try tempHome()
-        let claudeDir = home.appendingPathComponent(".claude")
-        let pluginsDir = claudeDir.appendingPathComponent("plugins")
+        let pluginsDir = home.appendingPathComponent(".claude/plugins")
         try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
-        try #"{"plugins":[{"name":"ghoztty"}]}"#
+        try #"{"version":2,"plugins":{"ghoztty@dzearing-claude-marketplace":[{"scope":"user"}]}}"#
             .write(to: pluginsDir.appendingPathComponent("installed_plugins.json"), atomically: true, encoding: .utf8)
+        return home
+    }
+
+    /// When the external plugin owns Claude, Ghoztty owns NEITHER half of the
+    /// integration — not the hooks, and not the skills.
+    ///
+    /// Gating only the hooks leaves the app writing `~/.claude/skills/ghoztty/`
+    /// beside the plugin's own copy of the same skill. The two differ, and the
+    /// app's copy points the agent at `~/.config/ghoztty/hooks/ghoztty-banner.sh`
+    /// while the plugin's hooks keep state under `~/.claude/ghoztty-banner/` —
+    /// so the split-state failure the hooks gate exists to prevent is simply
+    /// reached through the skill instead.
+    @Test func claudeWithExternalPluginSkipsHooksAndSkills() throws {
+        let home = try homeWithClaudePlugin()
 
         let integ = RuntimeIntegrationFactory.make(for: .claude, homeDirectoryURL: home, fileManager: .default, probe: .stub([.claude]))
         try integ.install()
 
-        #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/ghoztty/SKILL.md").path))
-        #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".config/ghoztty/hooks/ghoztty-banner.sh").path))
+        #expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/ghoztty/SKILL.md").path))
+        #expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/process-feedback/SKILL.md").path))
         let settings = home.appendingPathComponent(".claude/settings.json")
         if let data = FileManager.default.contents(atPath: settings.path),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             #expect(json["hooks"] == nil)
         }
         #expect(integ.state() == .installed)
+    }
+
+    /// The gate is Claude's alone. Copilot has no such plugin, so a Claude
+    /// plugin sitting in the same home must not suppress Copilot's skills.
+    @Test func theClaudePluginDoesNotGateCopilotsSkills() throws {
+        let home = try homeWithClaudePlugin()
+
+        let integ = RuntimeIntegrationFactory.make(for: .copilot, homeDirectoryURL: home, fileManager: .default, probe: .stub([.copilot]))
+        try integ.install()
+
+        #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md").path))
+        #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".copilot/hooks/ghoztty.json").path))
     }
 
     @Test func claudeWithoutExternalPluginInstallsAll() throws {

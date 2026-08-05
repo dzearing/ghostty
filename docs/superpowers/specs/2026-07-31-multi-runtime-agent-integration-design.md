@@ -354,12 +354,32 @@ pane via `$GHOZTTY_PANE_ID` (falling back to tty), and still surfaces a
 
 ### External-plugin coexistence
 
-Before installing Claude hooks, the Claude `*HookSpec` checks whether the
-external `ghoztty-claude-plugin` is registered (via Claude's plugin catalog /
+Before installing anything into Claude's config dir, the factory checks whether
+the external `ghoztty-claude-plugin` is registered (via
 `installed_plugins.json`). If it is, its hooks already drive the banner, so
-Ghoztty **skips** its own Claude hook install and reports `plugin already
-present` rather than installing a second, racing writer. Skills are still
-installed (they don't race). This case is documented and tested.
+Ghoztty **skips both** its Claude hook install and its Claude skill install, and
+reports `plugin already present` rather than installing a second, racing writer.
+
+Skills are gated too, revised from an earlier "skills don't race, install them
+anyway". They do race, just one level up: the app's skill and the plugin's copy
+of the same skill differ, and the app's directs the agent at
+`~/.config/ghoztty/hooks/ghoztty-banner.sh` while the plugin's hooks keep state
+under `~/.claude/ghoztty-banner/`. Whichever the agent happens to load decides
+which state directory the session writes — the same split-state failure the hook
+gate exists to prevent, reached through the skill instead. One gate
+(`RuntimeIntegrationFactory.isPluginManaged`) now covers both components.
+
+Detection **parses** the manifest and matches the plugin name (the part before
+`@`), rather than substring-matching the file. The manifest records each
+install's `installPath` and, at project scope, its `projectPath`, so
+`contains("ghoztty")` reports true for any *unrelated* plugin the user installed
+from a ghoztty checkout — and Ghoztty would then decline to install, believing
+its own plugin owned the runtime. The marketplace half of the key is
+deliberately excluded from the match: the same plugin is registered through more
+than one marketplace in practice. Both shapes of the manifest (`"version": 2`'s
+keyed object and the older array) are accepted; an unrecognized shape reports
+absent, since a false positive silently disables the integration while a false
+negative merely duplicates a skill. These cases are documented and tested.
 
 ### Adding a runtime (extension checklist)
 
