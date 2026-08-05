@@ -1,0 +1,11 @@
+{
+  "version": "1.30.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        { "title": "Remote handshakes stay compatible across builds", "text": "The agent's HELLO was writing unset fields out as `null` rather than leaving them off, breaking the rule that a handshake from an older agent must look identical to one from a newer agent with the field unset. Mixed app and agent versions — the normal state of things after an app upgrade — now negotiate the way the compatibility contract says they should." }
+      ]
+    }
+  ]
+}

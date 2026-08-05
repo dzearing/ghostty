@@ -1,0 +1,12 @@
+{
+  "version": "1.30.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "HTML files open as real pages", "text": "`ghoztty +split --view=mock/index.html` now renders the page instead of showing you its source. Its own CSS, JavaScript, images, and fonts run, links follow in the pane, and Back/Forward work across it — so a scaffolded mock or prototype is viewable straight from disk, with no `python3 -m http.server` standing in front of it. Saving the file re-renders it in place and keeps your scroll position, so you're not thrown back to the top of a long page. Assets are read from the page's own directory, so keep shared files under it; an edited sibling stylesheet needs `+reload`/Cmd+R to get past WebKit's cache." },
+        { "title": "The fork runs CI again", "text": "Pull requests build and test for real, with the Zig and Swift halves reported as separate steps so a failure points at the right half. Its first real run caught a remote-handshake bug plus two flaky viewer tests, all fixed in this release." }
+      ]
+    }
+  ]
+}
