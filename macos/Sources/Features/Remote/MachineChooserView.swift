@@ -1814,12 +1814,39 @@ struct MachineChooserView: View {
 /// Reports a user-initiated close (close button, Cmd-W) so the presenter can
 /// tear its probes down. A modeless panel has no modal session to end, so this
 /// is the only signal that the picker went away.
+///
+/// Not `private`: the close actions below are a responder-chain contract, and
+/// `MachineChooserPanelTests` asserts they exist.
 @MainActor
-private final class MachineChooserPanelDelegate: NSObject, NSWindowDelegate {
+final class MachineChooserPanelDelegate: NSObject, NSWindowDelegate {
     private let onClose: () -> Void
     init(onClose: @escaping () -> Void) { self.onClose = onClose }
     nonisolated func windowWillClose(_ notification: Notification) {
         MainActor.assumeIsolated { onClose() }
+    }
+
+    // MARK: - First Responder
+
+    /// Cmd-W ("Close") and Cmd-Shift-W ("Close Window") while the chooser holds
+    /// the keyboard.
+    ///
+    /// Both menu items send their action to the FIRST RESPONDER, and the
+    /// chooser's own chain — a hosting controller over a bare `NSPanel` —
+    /// answered neither. AppKit does not stop there: it carries the search on
+    /// into the MAIN window, and a panel cannot become main, so the terminal
+    /// behind the chooser stayed main and took the hit. Cmd-W over the dialog
+    /// closed a pane the user was not even looking at.
+    ///
+    /// A window's delegate sits in that window's action chain, which makes this
+    /// the place to answer — the same reason `AboutController` implements these
+    /// two. Closing IS cancelling here, so both route to the one teardown path
+    /// the close button and Escape already use.
+    @IBAction func close(_ sender: Any) {
+        onClose()
+    }
+
+    @IBAction func closeWindow(_ sender: Any) {
+        onClose()
     }
 }
 
