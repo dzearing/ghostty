@@ -132,23 +132,38 @@ struct ClaudeHookSpec: HookSpec {
     /// while sitting in a ghoztty checkout — and Ghoztty would then silently
     /// decline to install, believing its own plugin was already there.
     func isExternalPluginInstalled(homeDirectoryURL: URL, fileManager: FileManager) -> Bool {
+        !Self.externalPluginRegistrations(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager).isEmpty
+    }
+
+    /// Every manifest key registering the external plugin, e.g.
+    /// `ghoztty@dzearing-claude-marketplace`. Plural because the same plugin is
+    /// registered through more than one marketplace in practice, and each
+    /// registration is separately installed — and separately uninstallable.
+    ///
+    /// One parse site: detection asks whether this is empty, migration asks what
+    /// is in it.
+    static func externalPluginRegistrations(homeDirectoryURL: URL, fileManager: FileManager) -> [String] {
         let url = homeDirectoryURL.appendingPathComponent(".claude/plugins/installed_plugins.json")
         guard let data = fileManager.contents(atPath: url.path),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
+        else { return [] }
 
         // `"version": 2` — `plugins` is an object keyed by `<name>@<marketplace>`.
         if let byKey = json["plugins"] as? [String: Any] {
-            return byKey.keys.contains { $0.split(separator: "@").first.map(String.init) == Self.externalPluginName }
+            return byKey.keys.filter { name(ofRegistration: $0) == externalPluginName }
         }
         // Older shape — `plugins` is an array of entries carrying `name`.
         if let list = json["plugins"] as? [[String: Any]] {
-            return list.contains { ($0["name"] as? String) == Self.externalPluginName }
+            return list.compactMap { $0["name"] as? String }.filter { $0 == externalPluginName }
         }
         // A shape we do not recognize: report absent rather than guessing, so a
         // manifest revision cannot silently suppress the integration. The
         // coexistence cost of a false negative is a duplicate skill; the cost of
         // a false positive is Ghoztty refusing to install at all.
-        return false
+        return []
+    }
+
+    private static func name(ofRegistration key: String) -> String {
+        key.split(separator: "@").first.map(String.init) ?? key
     }
 }

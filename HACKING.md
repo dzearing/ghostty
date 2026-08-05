@@ -108,6 +108,40 @@ Ghoztty registers itself with AI coding agents (Claude Code and Copilot CLI) via
 1. Add a `RuntimeAgent` case with `configDirectoryName` and `displayName`.
 2. Add a `<Name>HookSpec` (event map, hooks-file path, ownership strategy). The shared banner script already reads the payload with `jq`, so no per-runtime payload normalizer is needed — but if the runtime's `additionalContext` reply envelope or session-start semantics differ from the existing two, add a `--runtime` branch in `ghoztty-banner.sh`.
 3. Wire it into `RuntimeIntegrationFactory`.
+
+### Superseding the standalone Claude plugin
+
+These skills previously shipped as a standalone Claude Code plugin
+([dzearing/ghoztty-claude-plugin](https://github.com/dzearing/ghoztty-claude-plugin)),
+which the app now supersedes — one repo for the skill and the CLI it documents,
+so the two cannot drift. Two mechanisms handle the overlap:
+
+- **Coexistence.** `RuntimeIntegrationFactory.isPluginManaged` gates **both**
+  the skills and the hooks component for Claude, so while the plugin is
+  installed Ghoztty writes nothing into `~/.claude` and reports `plugin already
+  present`. Detection **parses** `installed_plugins.json` and matches the plugin
+  name (the part before `@`) across every marketplace it is registered under —
+  never a substring match over the file, which false-positives on any unrelated
+  plugin installed from a ghoztty checkout.
+- **Migration.** `ClaudePluginMigration` hands the integration over on the first
+  launch after updating: one dialog, then it uninstalls each registration via
+  **Claude's own `claude plugin uninstall`** (never by deleting from
+  `~/.claude/plugins/cache`, which is Claude Code's package-manager state),
+  copies the plugin's per-tty banner state from `~/.claude/ghoztty-banner/` into
+  `~/.config/ghoztty/banner-state/` without overwriting, and removes the now-
+  unmaintained `~/.claude/scripts/ghoztty-banner.sh` symlink. Uninstall runs
+  first, so a failure leaves the user exactly where they started. The prompt is
+  retired by being *answered*, not by succeeding, so a failed run cannot become
+  a nag; `AgentIntegrationsController` is the retry path. Debug builds skip the
+  whole thing unless `GHOZTTY_TEST_PLUGIN_MIGRATION` is set, since they run
+  beside the user's real install.
+
+When re-vendoring skills from a newer plugin release, the copy is a **rewrite**:
+the plugin names `~/.claude/scripts/ghoztty-banner.sh` (a symlink its own
+SessionStart hook maintains) where the bundled copy must name
+`~/.config/ghoztty/hooks/ghoztty-banner.sh`, and the bundled copy carries no
+AI-attribution trailer. `GhosttyAssetsTests` asserts both, so a paste fails the
+suite.
 4. Add tests (skills install/drift, hook install/drift/marker-safety, install gate, and for `mergedFragment` the fragment-scoped uninstall).
 
 A `dedicatedFile` runtime (its own hooks dir, like Copilot) needs no `HookComponent` changes. A second `mergedFragment` runtime (sharing one settings file, like Claude) currently does, because the merge/state/remove logic still lives on the concrete `ClaudeHookSpec` rather than on the `HookSpec` protocol. Generalizing that seam (moving those operations onto `HookSpec`, and making external-plugin ownership a spec capability) is a **deliberately deferred refactor** — it has no user-visible effect while only one `mergedFragment` runtime exists, so it is left until a second one is actually needed. See the `HookComponent` doc comment for the specifics.

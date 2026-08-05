@@ -9,6 +9,11 @@ extension AppDelegate {
 
         /// The user accepted CLI setup, so future repairs happen silently.
         static let installAccepted = "CommandLineToolInstallAccepted"
+
+        /// The user answered the one-time "switch off the Claude plugin" prompt
+        /// (either way). Set BEFORE the migration runs, so a failure — or a
+        /// crash mid-migration — cannot turn the prompt into a nag.
+        static let pluginMigrationAnswered = "ClaudePluginMigrationAnswered"
     }
 
     /// Called on every launch. Verifies the CLI in the background and repairs
@@ -171,6 +176,95 @@ extension AppDelegate {
 
     @IBAction func setupAgentIntegrations(_ sender: Any?) {
         AgentIntegrationsController.shared.show()
+    }
+
+    // MARK: - Claude plugin migration
+
+    /// Called on every launch, but asks at most once ever: the app now ships the
+    /// skills the standalone Claude plugin used to, so an existing plugin user
+    /// gets one prompt on their first launch after updating and never sees it
+    /// again — whichever way they answer.
+    ///
+    /// Gated on the CLI prompt already being answered so a genuinely fresh
+    /// install cannot stack two modals on its first launch; for the users this
+    /// is actually aimed at, that flag is long since set.
+    func checkClaudePluginMigrationOnLaunch() {
+        #if DEBUG
+        // A debug build runs alongside the user's real install and would
+        // uninstall their real plugin. Never migrate unless a test opts in.
+        guard ProcessInfo.processInfo.environment["GHOZTTY_TEST_PLUGIN_MIGRATION"] != nil else { return }
+        #endif
+
+        let defaults = UserDefaults.ghostty
+        guard defaults.bool(forKey: SetupDefaults.promptAnswered),
+              !defaults.bool(forKey: SetupDefaults.pluginMigrationAnswered)
+        else { return }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            let migration = ClaudePluginMigration(
+                homeDirectoryURL: URL(fileURLWithPath: LoginShell.homePath),
+                fileManager: .default)
+            guard migration.isNeeded else { return }
+            DispatchQueue.main.async { Self.presentPluginMigrationDialog(migration) }
+        }
+    }
+
+    private static func presentPluginMigrationDialog(_ migration: ClaudePluginMigration) {
+        let alert = NSAlert()
+        alert.messageText = "Ghoztty Now Manages Its Claude Integration"
+        alert.informativeText = """
+            The ghoztty Claude Code plugin is installed. Ghoztty now ships these \
+            skills itself, tied to the version you have installed, so they can \
+            never describe a command your Ghoztty does not have.
+
+            Switching removes the plugin with Claude's own uninstaller and \
+            installs Ghoztty's copy. Your banners keep working.
+            """
+        alert.addButton(withTitle: "Switch Over")
+        alert.addButton(withTitle: "Keep Plugin")
+
+        let switchOver = alert.runModal() == .alertFirstButtonReturn
+        // Recorded either way, and BEFORE the work: answering is what retires
+        // the prompt, not succeeding at it.
+        UserDefaults.ghostty.set(true, forKey: SetupDefaults.pluginMigrationAnswered)
+        guard switchOver else { return }
+
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try migration.run()
+            } catch {
+                DispatchQueue.main.async {
+                    Self.showSetupAlert(
+                        title: "Could Not Remove the Plugin",
+                        message: """
+                            \(error.localizedDescription)
+
+                            Nothing was changed — the plugin still manages Claude. \
+                            You can try again from Ghoztty ▸ Agent Integrations.
+                            """,
+                        style: .warning)
+                }
+                return
+            }
+
+            let outcome = AgentIntegrationService.install(agent: .claude)
+            DispatchQueue.main.async {
+                switch outcome {
+                case .installed, .upgraded, .upToDate:
+                    break // Silent on success: the user already said do it.
+                default:
+                    Self.showSetupAlert(
+                        title: "Claude Integration Needs Attention",
+                        message: """
+                            The plugin was removed, but installing Ghoztty's copy \
+                            reported: \(outcome.label).
+
+                            Open Ghoztty ▸ Agent Integrations to finish setting it up.
+                            """,
+                        style: .warning)
+                }
+            }
+        }
     }
 
     private static func showSetupAlert(
