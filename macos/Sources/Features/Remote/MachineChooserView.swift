@@ -84,12 +84,22 @@ struct MachineChooserView: View {
     @State private var selectedMachineID: UUID?
     /// Index of the row currently under the pointer (for hover feedback).
     @State private var hoveredIndex: Int?
-    /// Keyboard sub-cursor INTO the highlighted row's expanded session list
+    /// Keyboard sub-cursor INTO the highlighted row's session list
     /// (cross-machine resume, T17). `nil` ⇒ the machine row itself is
-    /// highlighted; a value ⇒ that index within the highlighted row's loaded
-    /// sessions is highlighted, and Return resumes it. Cleared whenever the
-    /// machine-row highlight moves or its list collapses.
-    @State private var browseCursor: Int?
+    /// highlighted; a value ⇒ THAT SESSION in the highlighted row's list is
+    /// highlighted, and Return resumes it. Cleared whenever the machine-row
+    /// highlight moves or its list collapses.
+    ///
+    /// A session ID, not an index into the displayed array. The list re-sorts
+    /// underneath the cursor — the moment a column header is clicked, and on
+    /// any live CPU tick that moves a displayed percentage while sorted by CPU
+    /// — and an index would quietly re-point at whatever row slid into that
+    /// slot. Same reason `selectedMachineID` anchors the machine highlight by
+    /// identity rather than by row number.
+    @State private var browseCursorID: String?
+    /// Which column the session list is sorted by, and which way. Seeded from
+    /// the persisted preference so it survives closing the chooser.
+    @State private var sortOrder: MachineChooserSessionSort.Order = MachineChooserSessionSort.load()
     @FocusState private var isFilterFocused: Bool
 
     /// Drives the live-refresh poll: while the chooser is open, re-fetch the
@@ -139,16 +149,39 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The loaded session roster of the currently-highlighted machine row when
-    /// it is expanded, else `[]`. Drives the keyboard session sub-cursor (T17).
-    private var highlightedSessions: [BrowsedSession] {
-        guard let target = resolvedSelection, let key = browseKey(for: target),
-              browser.isExpanded(key), case .loaded(let sessions) = browser.states[key]
+    /// The sessions the detail list RENDERS for `target`, in the order it
+    /// renders them: the actionable roster, sorted by the active column.
+    ///
+    /// One definition, shared by the rows, the keyboard cursor, and the header
+    /// row's visibility, so the three can never disagree about what is on
+    /// screen or in what order. (They already had drifted: the cursor's list
+    /// filtered on `isConnectable` alone while the rows also dropped
+    /// attached-elsewhere sessions, so on a machine with any of those, Return
+    /// resumed a different session than the one highlighted.)
+    ///
+    /// `actionable` is a defense-in-depth backstop to the agent's own immediate
+    /// reap: never render a dead, non-relaunchable tombstone (an unreconnectable
+    /// `exited` dead-end). It protects against an OLDER agent that doesn't reap,
+    /// and the brief window a still-bound tombstone exists. Alive + relaunchable
+    /// stay.
+    private func displayedSessions(_ target: WindowTarget) -> [BrowsedSession] {
+        guard let key = browseKey(for: target),
+              let all = browser.loadedSessions(for: key)
         else { return [] }
-        // Only connectable rows are rendered (see `detailSessions`); keep the
-        // keyboard sub-cursor's index space identical so Return resumes the row
-        // the highlight is actually on.
-        return sessions.filter { $0.isConnectable }
+        let titles = persistedTitles
+        let live = liveSessionInfo
+        return MachineChooserSessionSort.sorted(
+            actionable(all),
+            by: sortOrder,
+            label: { $0.label(liveTitle: live.titles[$0.id], persistedTitle: titles[$0.id]) },
+            cpu: { sessionCPU.cpuBySession[$0.id] })
+    }
+
+    /// The displayed session list of the currently-highlighted machine row,
+    /// else `[]`. Drives the keyboard session sub-cursor (T17).
+    private var highlightedSessions: [BrowsedSession] {
+        guard let target = resolvedSelection else { return [] }
+        return displayedSessions(target)
     }
 
     /// Build the `resumeSession` target for `session` under its parent row
@@ -217,10 +250,10 @@ struct MachineChooserView: View {
     }
 
     /// Whether the keyboard session sub-cursor (T17) currently points at
-    /// session `index` under the row keyed `key` — i.e. that row is the
-    /// highlighted machine row AND its list is where the cursor lives.
-    private func isSessionCursor(key: String, index: Int) -> Bool {
-        guard browseCursor == index,
+    /// `session` under the row keyed `key` — i.e. that row is the highlighted
+    /// machine row AND its list is where the cursor lives.
+    private func isSessionCursor(key: String, session: BrowsedSession) -> Bool {
+        guard browseCursorID == session.id,
               let target = resolvedSelection,
               browseKey(for: target) == key
         else { return false }
@@ -271,11 +304,17 @@ struct MachineChooserView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Top header: the account area (avatar + email + Sign Out, or Sign
-            // In) right-aligned. Account state is a global affordance, so it
-            // sits above the master-detail split rather than in the footer.
+            // Top header: the selected machine's identity flush LEFT, the
+            // account area (avatar + email + Sign Out, or Sign In) flush right.
+            // Account state is a global affordance, so it sits above the
+            // master-detail split rather than in the footer — and that left an
+            // entire band of empty space next to it, which is now where the
+            // identity lives.
             HStack(spacing: 0) {
-                Spacer()
+                if let target = resolvedSelection {
+                    headerIdentity(target)
+                }
+                Spacer(minLength: 16)
                 accountRow
             }
             .padding(.horizontal, 16)
@@ -451,7 +490,7 @@ struct MachineChooserView: View {
     private var detailColumn: some View {
         if let target = resolvedSelection {
             VStack(alignment: .leading, spacing: 0) {
-                detailHeader(target)
+                detailActionBar(target)
                 Divider()
                 detailSessions(target)
             }
@@ -470,83 +509,95 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The detail header: the machine's glyph + name + subtitle, then an action
-    /// bar. The prominent primary button (New Window / Restore) is the default
-    /// action (Return); Restore-all / Activity / management sit beside it.
+    /// The selected machine's identity — glyph, name, session-count subtitle —
+    /// rendered flush LEFT in the top header band.
+    ///
+    /// It used to open the detail column, stacked above the action bar, where
+    /// it cost ~50pt of the one thing that column is short of: rows. The band
+    /// above it already carried a whole row of empty space beside the account
+    /// block, and an identity line is exactly what a header band is for.
     @ViewBuilder
-    private func detailHeader(_ target: WindowTarget) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                Image(systemName: detailGlyph(target))
-                    .font(.system(size: 22))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 30)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(detailTitle(target))
-                        .font(.title3).fontWeight(.semibold)
-                        .lineLimit(1)
-                    detailSubtitle(target)
-                }
-                Spacer()
-            }
-
-            HStack(spacing: 8) {
-                Button {
-                    submit()
-                } label: {
-                    Label(primaryButtonTitle, systemImage: primaryButtonIcon)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .help("Open a new window on \(detailTitle(target))")
-
-                if resumeAllAvailable {
-                    Button {
-                        resumeAll(parent: target)
-                    } label: {
-                        Label("Restore All", systemImage: "rectangle.3.group")
-                    }
-                    .help("Rebuild this machine's full window layout here")
-                }
-
-                // Push the inspect action to the trailing edge, away from the
-                // open actions. "See Activity" doesn't open a window, so
-                // grouping it with the buttons that do invites misclicks — and
-                // a right-aligned slot keeps it on this row rather than adding
-                // a second row of chrome to an already compact dialog.
-                Spacer(minLength: 12)
-
-                switch target {
-                case .local:
-                    seeActivityButton(machine: nil, named: detailTitle(target))
-                case .remote(let machine):
-                    seeActivityButton(machine: machine, named: machine.name)
-                default:
-                    EmptyView()
-                }
-
-                if case .remote(let machine) = target {
-                    Menu {
-                        managementActions(for: machine)
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .help("Manage \(machine.name)")
-                }
-                // NOTE: no trailing Spacer. The one above is what pushes the
-                // inspect action to the trailing edge; a second Spacer here
-                // would split the free space evenly between them and park the
-                // button in the middle instead of flush right.
+    private func headerIdentity(_ target: WindowTarget) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: detailGlyph(target))
+                .font(.system(size: 22))
+                .foregroundStyle(.secondary)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(detailTitle(target))
+                    .font(.title3).fontWeight(.semibold)
+                    .lineLimit(1)
+                detailSubtitle(target)
             }
         }
-        .padding(16)
     }
 
-    /// The glyph for the detail header — laptop for the local/this-Mac machine,
-    /// server otherwise.
+    /// The detail column's action bar, and now its first row. The prominent
+    /// primary button (New Window / Restore) is the default action (Return);
+    /// Restore-all / Activity / management sit beside it.
+    ///
+    /// Vertical padding is 12, not the 16 this block used to carry: the point
+    /// of moving the identity out was to give the session list the space, and
+    /// padding is the obvious way to lose it again on the way down.
+    @ViewBuilder
+    private func detailActionBar(_ target: WindowTarget) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                submit()
+            } label: {
+                Label(primaryButtonTitle, systemImage: primaryButtonIcon)
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+            .help("Open a new window on \(detailTitle(target))")
+
+            if resumeAllAvailable {
+                Button {
+                    resumeAll(parent: target)
+                } label: {
+                    Label("Restore All", systemImage: "rectangle.3.group")
+                }
+                .help("Rebuild this machine's full window layout here")
+            }
+
+            // Push the inspect action to the trailing edge, away from the
+            // open actions. "See Activity" doesn't open a window, so
+            // grouping it with the buttons that do invites misclicks — and
+            // a right-aligned slot keeps it on this row rather than adding
+            // a second row of chrome to an already compact dialog.
+            Spacer(minLength: 12)
+
+            switch target {
+            case .local:
+                seeActivityButton(machine: nil, named: detailTitle(target))
+            case .remote(let machine):
+                seeActivityButton(machine: machine, named: machine.name)
+            default:
+                EmptyView()
+            }
+
+            if case .remote(let machine) = target {
+                Menu {
+                    managementActions(for: machine)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Manage \(machine.name)")
+            }
+            // NOTE: no trailing Spacer. The one above is what pushes the
+            // inspect action to the trailing edge; a second Spacer here
+            // would split the free space evenly between them and park the
+            // button in the middle instead of flush right.
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// The glyph for the machine's identity — laptop for the local/this-Mac
+    /// machine, server otherwise.
     private func detailGlyph(_ target: WindowTarget) -> String {
         switch target {
         case .local: return "laptopcomputer"
@@ -555,7 +606,7 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The detail header title — "This Mac" for local, else the machine name.
+    /// The machine's title — "This Mac" for local, else the machine name.
     private func detailTitle(_ target: WindowTarget) -> String {
         switch target {
         case .local: return "This Mac"
@@ -564,7 +615,7 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The detail header subtitle — session count + machine status/metrics.
+    /// The machine's subtitle — session count + machine status/metrics.
     @ViewBuilder
     private func detailSubtitle(_ target: WindowTarget) -> some View {
         HStack(spacing: 8) {
@@ -589,55 +640,149 @@ struct MachineChooserView: View {
         .lineLimit(1)
     }
 
-    /// The detail pane's session list: loading / failed / empty states, else a
-    /// rich, per-session row with liveness, activity, badges, and Resume/Kill.
+    /// The detail pane's session list: sortable column headers over loading /
+    /// failed / empty states, else a rich, per-session row with liveness,
+    /// activity, badges, and Resume/Kill.
     @ViewBuilder
     private func detailSessions(_ target: WindowTarget) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 6) {
-                if let key = browseKey(for: target) {
-                    switch browser.states[key] {
-                    case .some(.loaded(let allSessions)):
-                        // Defense-in-depth backstop to the agent's own immediate reap:
-                        // never render a dead, non-relaunchable tombstone (an
-                        // unreconnectable `exited` dead-end). Protects against an
-                        // OLDER agent that doesn't reap, and the brief window a
-                        // still-bound tombstone exists. Alive + relaunchable stay.
-                        let sessions = actionable(allSessions)
-                        if sessions.isEmpty {
-                            sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
-                        } else {
-                            let titles = persistedTitles
-                            let live = liveSessionInfo
-                            ForEach(Array(sessions.enumerated()), id: \.element) { idx, session in
-                                sessionDetailRow(
-                                    session,
-                                    index: idx,
-                                    target: target,
-                                    persistedTitle: titles[session.id],
-                                    liveTitle: live.titles[session.id],
-                                    isOpenLocally: live.openIDs.contains(session.id),
-                                    highlighted: isSessionCursor(key: key, index: idx))
+        if let key = browseKey(for: target) {
+            // Resolved once and shared by the header and the rows, so the
+            // headers can't advertise an order the rows aren't in.
+            let sessions = displayedSessions(target)
+            VStack(alignment: .leading, spacing: 0) {
+                // OUTSIDE the ScrollView, so the headers stay put while the
+                // rows scroll under them. Only drawn when there is something to
+                // sort — column headers over "No active sessions" are furniture.
+                if !sessions.isEmpty {
+                    sessionListHeader
+                    Divider()
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        switch browser.states[key] {
+                        case .some(.loaded):
+                            if sessions.isEmpty {
+                                sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
+                            } else {
+                                let titles = persistedTitles
+                                let live = liveSessionInfo
+                                ForEach(sessions) { session in
+                                    sessionDetailRow(
+                                        session,
+                                        target: target,
+                                        persistedTitle: titles[session.id],
+                                        liveTitle: live.titles[session.id],
+                                        isOpenLocally: live.openIDs.contains(session.id),
+                                        highlighted: isSessionCursor(key: key, session: session))
+                                }
                             }
+                        case .some(.failed):
+                            sessionsPlaceholder(
+                                icon: "exclamationmark.triangle.fill",
+                                text: "Couldn't reach this machine's agent",
+                                tint: .yellow)
+                        case .some(.loading), .none:
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("Loading sessions…").foregroundStyle(.secondary)
+                            }
+                            .font(.callout)
+                            .padding(.vertical, 8)
                         }
-                    case .some(.failed):
-                        sessionsPlaceholder(
-                            icon: "exclamationmark.triangle.fill",
-                            text: "Couldn't reach this machine's agent",
-                            tint: .yellow)
-                    case .some(.loading), .none:
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                            Text("Loading sessions…").foregroundStyle(.secondary)
-                        }
-                        .font(.callout)
-                        .padding(.vertical, 8)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Self.sessionGutter)
+                    .padding(.top, 10)
+                    .padding(.bottom, 12)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
         }
+    }
+
+    /// The session list's gutter — the inset from the detail column's edge to a
+    /// row's card.
+    private static let sessionGutter: CGFloat = 16
+
+    /// Horizontal inset of a session row's CONTENT: the gutter plus the row
+    /// card's own 12pt padding. The column header lives outside the scroll view
+    /// so it can't scroll away, which means it has to reproduce both to land
+    /// its labels on the columns it sorts.
+    private static let sessionContentInset: CGFloat = sessionGutter + 12
+
+    /// The session list's clickable column headers: CPU and Name, each sorting
+    /// the list and flipping direction when clicked while already active.
+    ///
+    /// Built on the SAME column widths the rows use rather than a grid of its
+    /// own. The CPU meters were deliberately given a fixed-width column so they
+    /// stack into a scannable strip; a header that sat anywhere else would
+    /// introduce a second, competing alignment and undo that.
+    @ViewBuilder
+    private var sessionListHeader: some View {
+        HStack(spacing: 10) {
+            // The liveness dot's slot. Nothing to label — the dot is its own
+            // legend — but the space has to be held or every column after it
+            // shifts left of the rows.
+            Color.clear
+                .frame(width: Self.livenessColumnWidth, height: 1)
+            sessionSortButton(.cpu)
+                .frame(width: Self.cpuColumnWidth, alignment: .leading)
+            sessionSortButton(.name)
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, Self.sessionContentInset)
+        .padding(.top, 9)
+        .padding(.bottom, 6)
+    }
+
+    /// One column header: its title, plus a direction chevron when it is the
+    /// column the list is currently sorted by.
+    @ViewBuilder
+    private func sessionSortButton(_ key: MachineChooserSessionSort.Key) -> some View {
+        let active = sortOrder.key == key
+        Button {
+            setSortOrder(MachineChooserSessionSort.toggled(sortOrder, clicking: key))
+        } label: {
+            HStack(spacing: 3) {
+                Text(key.columnTitle)
+                // The chevron marks the ACTIVE column, so it is drawn only
+                // there. Reserving room for one on every column would push each
+                // label off the column it heads, which is the one thing this
+                // header cannot do.
+                if active {
+                    Image(systemName: sortOrder.ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                }
+            }
+            .font(.caption.weight(active ? .semibold : .regular))
+            .foregroundStyle(active ? Color.primary : Color.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(sessionSortHelp(key))
+        .accessibilityLabel("Sort by \(key.columnTitle)")
+        .accessibilityValue(
+            active ? (sortOrder.ascending ? "Ascending" : "Descending") : "Not sorted")
+    }
+
+    /// Tooltip for a column header: what clicking it will do, or — when it is
+    /// already the active column — what it is doing now.
+    private func sessionSortHelp(_ key: MachineChooserSessionSort.Key) -> String {
+        let column = key.columnTitle.lowercased()
+        guard sortOrder.key == key else { return "Sort by \(column)" }
+        return sortOrder.ascending
+            ? "Sorted by \(column), ascending — click to reverse"
+            : "Sorted by \(column), descending — click to reverse"
+    }
+
+    /// Apply a new sort order and remember it for next time.
+    ///
+    /// The keyboard session cursor needs no fixing up across this: it is
+    /// anchored to a session ID, so it follows its row through the re-sort
+    /// rather than staying on a row number.
+    private func setSortOrder(_ order: MachineChooserSessionSort.Order) {
+        guard order != sortOrder else { return }
+        sortOrder = order
+        MachineChooserSessionSort.save(order)
     }
 
     /// The trailing "See Activity" action in the detail header.
@@ -677,7 +822,6 @@ struct MachineChooserView: View {
     @ViewBuilder
     private func sessionDetailRow(
         _ session: BrowsedSession,
-        index: Int,
         target: WindowTarget,
         persistedTitle: String?,
         liveTitle: String?,
@@ -689,6 +833,7 @@ struct MachineChooserView: View {
             Image(systemName: session.alive ? "circle.fill" : "circle")
                 .font(.system(size: 8))
                 .foregroundStyle(session.alive ? Color.green : Color.secondary)
+                .frame(width: Self.livenessColumnWidth)
                 .padding(.top, 4)
 
             // CPU sits in its own fixed-width column ahead of the title so the
@@ -771,9 +916,15 @@ struct MachineChooserView: View {
                 .stroke(highlighted ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
         )
         .contentShape(Rectangle())
-        .onTapGesture { browseCursor = index }
+        .onTapGesture { browseCursorID = session.id }
         .simultaneousGesture(TapGesture(count: 2).onEnded { resume(session, parent: target) })
     }
+
+    /// Fixed width of the leading liveness-dot column. The two dot glyphs are
+    /// intrinsically sized, so without this the CPU column — and the header
+    /// that has to sit over it — starts at a different x on a live row than on
+    /// a dead one.
+    private static let livenessColumnWidth: CGFloat = 10
 
     /// A compact CPU meter for a live session: a small bar plus the percentage.
     ///
@@ -1026,14 +1177,14 @@ struct MachineChooserView: View {
 
     /// Step the keyboard cursor INTO the detail pane's session list (Right).
     private func enterSessions() {
-        guard browseCursor == nil, !highlightedSessions.isEmpty else { return }
-        browseCursor = 0
+        guard browseCursorID == nil, let first = highlightedSessions.first else { return }
+        browseCursorID = first.id
     }
 
     /// Step the keyboard cursor back OUT of the session list to the machine
     /// (Left).
     private func exitSessions() {
-        browseCursor = nil
+        browseCursorID = nil
     }
 
     /// Ensure the selected target's session roster is fetched so the detail pane
@@ -1525,19 +1676,17 @@ struct MachineChooserView: View {
 
     /// Move the highlighted selection by `delta` rows, clamped to the list.
     /// When the highlighted row is expanded with a loaded session list, Down/Up
-    /// first traverse that list (the `browseCursor` sub-cursor, T17) before
+    /// first traverse that list (the `browseCursorID` sub-cursor, T17) before
     /// stepping to the next/previous machine row, so the whole chooser —
     /// machines and their sessions — is keyboard-navigable.
     private func move(_ delta: Int) {
         guard !targets.isEmpty else { return }
         // With a session cursor active, Up/Down traverse the detail pane's
-        // session list; stepping above the first returns to machine navigation.
-        if let cur = browseCursor {
-            let count = highlightedSessions.count
-            let next = cur + delta
-            if next < 0 { browseCursor = nil; return }
-            if next >= count { browseCursor = max(count - 1, 0); return }
-            browseCursor = next
+        // session list; stepping above the first returns to machine navigation,
+        // as does the anchored session disappearing out from under the cursor.
+        if let id = browseCursorID {
+            browseCursorID = MachineChooserSessionSort.cursorID(
+                steppingBy: delta, from: id, in: highlightedSessions)
             return
         }
         select(min(max(selectedIndex + delta, 0), targets.count - 1))
@@ -1547,7 +1696,7 @@ struct MachineChooserView: View {
     /// list change can re-anchor to the same machine), and fetch that machine's
     /// session roster so the detail pane fills in.
     private func select(_ idx: Int) {
-        if idx != selectedIndex { browseCursor = nil }
+        if idx != selectedIndex { browseCursorID = nil }
         selectedIndex = idx
         selectedMachineID = machineID(at: idx)
         ensureFetched(resolvedSelection)
@@ -1569,7 +1718,7 @@ struct MachineChooserView: View {
     private func reanchorSelection() {
         // The list changed underfoot — drop any session sub-cursor (its roster
         // may have shifted) so the highlight lands cleanly on a machine row.
-        browseCursor = nil
+        browseCursorID = nil
         if let id = selectedMachineID,
            let idx = targets.firstIndex(where: { target in
                if case .remote(let machine) = target { return machine.id == id }
@@ -1591,14 +1740,13 @@ struct MachineChooserView: View {
     }
 
     private func submit() {
-        // A session sub-cursor (T17) resumes that session; otherwise the
-        // selected machine's primary action (New / Restore) fires.
-        if let cur = browseCursor, let target = resolvedSelection {
-            let sessions = highlightedSessions
-            if cur < sessions.count {
-                resume(sessions[cur], parent: target)
-                return
-            }
+        // A session sub-cursor (T17) resumes that session; otherwise — and when
+        // the anchored session has since left the roster — the selected
+        // machine's primary action (New / Restore) fires.
+        if let id = browseCursorID, let target = resolvedSelection,
+           let session = displayedSessions(target).first(where: { $0.id == id }) {
+            resume(session, parent: target)
+            return
         }
         if let target = resolvedSelection {
             activate(target)
