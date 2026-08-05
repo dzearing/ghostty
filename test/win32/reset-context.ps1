@@ -18,6 +18,11 @@
 #   proxy-amnesia  same, but keeps clearing the screen after the clear, so
 #                  the continuation lands and then vanishes - a session that
 #                  cleared but ate the prompt (the T132-class stall).
+#   proxy-working  what a session that ACCEPTS the prompt looks like: no echo
+#                  at all, then a spinner repainting for 15s. The only
+#                  on-screen evidence of delivery is the paint (T182/T261),
+#                  and every line it receives is logged to a file OUTSIDE the
+#                  pane so a success verdict can be checked against the truth.
 #
 # Sections:
 #   A  fixed helper + a stray "nn" pre-typed -> the pane receives "/clear"
@@ -30,9 +35,17 @@
 #        (liveness beats cleanliness).
 #   C  a session that clears and then swallows the prompt -> the clear
 #        verifies, the CONTINUATION check fails loudly, banner set.
-#   D  durability: the active plugin cache carries the wipe, and the source
-#        repo copy is byte-identical to it with a bumped plugin version
-#        (T130's lesson: a plugin release silently reverted a cache-only fix).
+#   D  durability: the active plugin cache carries the wipe AND the repaint
+#        acceptance, and the source repo copy is byte-identical to it with a
+#        bumped plugin version (T130's lesson: a plugin release silently
+#        reverted a cache-only fix).
+#   E  T182: a pane that ACCEPTED the continuation and is working on it is
+#        verified as a success - the repaint is the proof - with no failure
+#        in the log and no banner. An out-of-band receipt file proves the
+#        continuation really arrived, so the verdict is right and not lucky.
+#   F  negative control for E: the same pane driven by a helper copy with the
+#        repaint branch cut out shouts FAILED over that same delivery, which
+#        is the bug as filed. E only means something because F still fails.
 #
 # Oracles are the pane's own output (+read), the helper's log
 # (/tmp/reset-context-last.log), and the banner in +list --json.
@@ -102,6 +115,31 @@ while IFS= read -r -e -p 'rc> ' l; do
   else echo "RC-TEXT[$l]"; fi
 done
 '@
+Write-Sh (Join-Path $work 'proxy-working.sh') @'
+#!/bin/bash
+# The T182 case, modelled on what the real Claude Code TUI does with a prompt
+# it ACCEPTS: nothing is echoed back, and the session immediately starts
+# working, repainting a spinner. The text a naive verifier searches for is
+# destroyed by the very success it is trying to confirm -- so the ONLY on-screen
+# evidence of delivery is that the pane is painting.
+#
+# Echo is off (and the read is a plain one, so no readline echo either),
+# which makes that deterministic rather than a race against the repaint.
+# Every submitted line is appended to $1: an oracle OUTSIDE the pane, so the
+# test can tell "the verifier was right" from "the verifier got lucky".
+R="${1:-$(dirname "$0")/received.txt}"
+stty -echo 2>/dev/null
+printf 'rc-ready\n'
+while IFS= read -r l; do
+  l="${l%$'\r'}"
+  [ -z "$l" ] && continue
+  if [ "$l" = "/clear" ]; then printf '\033[2J\033[3J\033[H'; printf 'RC-CLEARED\n'; continue; fi
+  printf '%s\n' "$l" >> "$R"
+  i=0
+  while [ "$i" -lt 15 ]; do i=$((i + 1)); printf '\r  * Working... (%ss)  ' "$i"; sleep 1; done
+  printf '\n'
+done
+'@
 
 function To-Unix([string]$p) { (& $bash -lc "cygpath -u '$($p -replace "'", "''")'").Trim() }
 $helperU = To-Unix $helper
@@ -113,6 +151,28 @@ $prefixU = To-Unix (Join-Path $work 'reset-context-prefix.sh')
 $prefixWin = Join-Path $work 'reset-context-prefix.sh'
 if ((Get-Content $prefixWin | Select-String -SimpleMatch '--when-idle C-u')) {
     Write-Host 'SETUP FAIL: pre-fix copy still has the C-u line'; exit 1
+}
+# Second negative control (T182): the helper with the T261 repaint branch cut
+# out, i.e. the version that only ever believed an echoed prompt. Section F
+# runs it against the SAME pane section E passes on, so the run proves the fix
+# is load-bearing rather than merely present. The sed program goes in a file:
+# it matches "$cur"/"$prev", which PowerShell would expand inside a "..." arg.
+Write-Sh (Join-Path $work 'drop-repaint.sed') @'
+/elif \[ "$cur" != "$prev" \]; then/,+1d
+'@
+$norepaintWin = Join-Path $work 'reset-context-norepaint.sh'
+$sedU = To-Unix (Join-Path $work 'drop-repaint.sed')
+$norepaintU = To-Unix $norepaintWin
+& $bash -lc "sed -f '$sedU' '$helperU' > '$norepaintU'" | Out-Null
+$nrText = Get-Content $norepaintWin -Raw
+# Match the ASSIGNMENT, not the phrase: the helper's comments explain the
+# repaint branch too, so a bare 'pane is repainting' is true of a copy that
+# no longer has it.
+if ($nrText -match 'verdict="pane is repainting') {
+    Write-Host 'SETUP FAIL: pre-T261 copy still has the repaint branch'; exit 1
+}
+if ($nrText -notmatch 'continuation is on screen') {
+    Write-Host 'SETUP FAIL: pre-T261 copy lost the echoed-prompt branch too'; exit 1
 }
 $logWin = Join-Path (& $bash -lc 'cygpath -w /tmp' | ForEach-Object { $_.Trim() }) 'reset-context-last.log'
 
@@ -177,13 +237,14 @@ function Wait-Tail([string]$paneId, [string]$needle, [int]$secs = 10) {
     }
     return $false
 }
-function New-ProxyWindow([string]$target, [string]$proxy) {
+function New-ProxyWindow([string]$target, [string]$proxy, [string]$proxyArg = '', [string]$ready = 'rc>') {
     $u = To-Unix (Join-Path $work $proxy)
-    & $exe +new-window --target=$target --shell="$bash" --command="bash $u" | Out-Null
+    $cmd = if ($proxyArg) { "bash $u '$proxyArg'" } else { "bash $u" }
+    & $exe +new-window --target=$target --shell="$bash" --command=$cmd | Out-Null
     $pane = $null
     for ($t = 0; $t -lt 40 -and -not $pane; $t++) { $pane = Pane-Of $target; if (-not $pane) { Start-Sleep -Milliseconds 250 } }
     if (-not $pane) { Write-Host "SETUP FAIL: no pane for $target"; exit 1 }
-    if (-not (Wait-Tail $pane 'rc>' 15)) { Write-Host "SETUP FAIL: proxy prompt never appeared in $target"; exit 1 }
+    if (-not (Wait-Tail $pane $ready 15)) { Write-Host "SETUP FAIL: proxy prompt never appeared in $target"; exit 1 }
     return $pane
 }
 function Run-Helper([string]$script, [string]$paneId, [string]$contText) {
@@ -241,21 +302,74 @@ try {
     Assert ($r.log -match 'pane tail at the time of failure') 'B5 log carries the pane tail as evidence'
     $b2 = Banner-Of $p2
     Assert ($b2 -and $b2 -match 'reset-context FAILED') "B6 banner tells the user (got '$b2')"
-    Assert (Wait-Tail $p2 'RC-TEXT[continue-marker-B]' 10) 'B7 continuation still sent despite the failure'
+    # Seen to fail intermittently (T483). The shared helper log is overwritten
+    # by the sections after this one, so print the evidence AT the failure or
+    # it is gone by the time anyone reads the run.
+    $b7 = Wait-Tail $p2 'RC-TEXT[continue-marker-B]' 10
+    if (-not $b7) {
+        Write-Host '      B7 diag: helper log ->' -ForegroundColor Yellow
+        ($r.log -split "`r?`n") | Where-Object { $_ -match 'continuation|send-keys|typed' } | ForEach-Object { Write-Host "        $_" }
+        Write-Host ('      B7 diag: pane tail -> ' + ((Tail $p2) -replace "`r?`n", ' | ')) -ForegroundColor Yellow
+    }
+    Assert $b7 'B7 continuation still sent despite the failure'
 
     # --- C. cleared, then the prompt was eaten ----------------------------
     $p3 = New-ProxyWindow 'rc3' 'proxy-amnesia.sh'
     $r = Run-Helper $helper $p3 'continue-marker-C'
     Assert ($r.log -match 'verified: /clear landed') 'C1 the clear itself verified'
-    Assert ($r.log -match 'continuation text never appeared') 'C2 the missing continuation is caught'
+    # A silent, unchanging pane is the ONLY thing that still fails: no echo of
+    # the prompt and no repaint. The wording moved with T261, so match the
+    # thing the verdict is about, not the sentence it used to be phrased in.
+    Assert ($r.log -match 'never echoed the continuation and did not repaint') 'C2 the missing continuation is caught'
     Assert ($r.log -match 'RESET-CONTEXT FAILED') 'C3 and shouted'
     $b3 = Banner-Of $p3
     Assert ($b3 -and $b3 -match 'reset-context FAILED') "C4 banner tells the user (got '$b3')"
+
+    # --- E. the prompt was ACCEPTED and the session is working (T182) ------
+    # The case that used to false-FAIL on every good reset: submitting empties
+    # the composer, so the text the check searched for is gone within a second
+    # and the pane shows a working session instead. Nothing is broken here, so
+    # nothing may be shouted.
+    $recvE = Join-Path $work 'received-E.txt'
+    $p4 = New-ProxyWindow 'rc4' 'proxy-working.sh' (To-Unix $recvE) 'rc-ready'
+    $r = Run-Helper $helper $p4 'continue-marker-E'
+    Assert ($r.log -match 'verified: /clear landed') 'E1 the clear verified against a non-echoing pane'
+    Assert (Wait-Tail $p4 'Working...' 10) 'E2 the pane is visibly working on the continuation'
+    # The out-of-band oracle: the continuation really did arrive, so a success
+    # verdict here is CORRECT rather than lucky.
+    # [string] because the receipt file does not exist until the pane writes it,
+    # and a $null from Get-Content would make the NEXT .Contains() throw.
+    $gotE = ''
+    for ($t = 0; $t -lt 25 -and -not $gotE.Contains('continue-marker-E'); $t++) {
+        $gotE = [string](Get-Content $recvE -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
+    }
+    Assert ($gotE -and $gotE.Contains('continue-marker-E')) 'E3 the pane really received the continuation'
+    Assert ($r.log -match 'verified: pane is repainting') 'E4 delivery verified by the repaint, not by the vanished echo'
+    Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'E5 no failure shouted over a session that is answering'
+    $b4 = Banner-Of $p4
+    Assert ([string]::IsNullOrEmpty($b4)) "E6 no recover-by-hand banner painted over it (got '$b4')"
+
+    # --- F. negative control: the same pane, minus the T261 repaint branch --
+    # Proves E is load-bearing: cut the branch out and this exact success is
+    # reported as a failure again, which is the bug T182 was filed for.
+    $recvF = Join-Path $work 'received-F.txt'
+    $p5 = New-ProxyWindow 'rc5' 'proxy-working.sh' (To-Unix $recvF) 'rc-ready'
+    $r = Run-Helper $norepaintWin $p5 'continue-marker-F'
+    $gotF = ''
+    for ($t = 0; $t -lt 25 -and -not $gotF.Contains('continue-marker-F'); $t++) {
+        $gotF = [string](Get-Content $recvF -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
+    }
+    Assert ($gotF -and $gotF.Contains('continue-marker-F')) 'F1 pre-T261: the continuation arrived just the same'
+    Assert ($r.log -match 'RESET-CONTEXT FAILED') 'F2 pre-T261: a delivered continuation is called a failure (the filed bug)'
+    $b5 = Banner-Of $p5
+    Assert ($b5 -and $b5 -match 'reset-context FAILED') "F3 pre-T261: and banners it at the user (got '$b5')"
 
     # --- D. durability of the fix (T130's lesson) -------------------------
     $cached = Get-Content $cacheHelper -Raw
     Assert ($cached -match '--when-idle C-u') 'D1 the ACTIVE plugin cache carries the composer wipe'
     Assert ($cached -match 'RESET-CONTEXT FAILED') 'D2 the ACTIVE plugin cache carries the loud verification'
+    Assert ($cached -match 'verdict="pane is repainting') 'D5 the ACTIVE plugin cache accepts a repainting pane as delivery (T182)'
+    Assert ($cached -notmatch 'continuation text never appeared') 'D6 and no longer carries the one-shot check that cried wolf'
     $srcRepo = 'D:\git\dzearing-claude-marketplace'
     $srcHelper = Join-Path $srcRepo 'skills\reset-context\scripts\reset-context.sh'
     if (Test-Path $srcHelper) {
@@ -270,7 +384,7 @@ try {
         Write-Host 'SKIP  D3/D4: dzearing-claude-marketplace not cloned on this box' -ForegroundColor Yellow
     }
 } finally {
-    foreach ($w in @('rc1', 'rc2', 'rc3')) { & $exe +close --target=$w 2>$null | Out-Null }
+    foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5')) { & $exe +close --target=$w 2>$null | Out-Null }
     Start-Sleep -Milliseconds 500
     Kill-RepoInstances
 }

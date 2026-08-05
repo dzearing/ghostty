@@ -8846,3 +8846,43 @@ places rule; that commit also carries the previously-unstaged `cygpath -w` fix
 for `--keys-file`. Filed T482: all of the above was verified by hand, and the
 one step that keeps the loop alive deserves an acceptance script that can be
 re-run.
+
+## 2026-08-05 — T182 (+T482): the false alarm now has a test that would catch it
+
+T182 filed the same defect T261 later fixed, so the fix half was already in the
+box: the deployed helper polls for either proof of delivery, and the cache copy
+carries it (now asserted, D5/D6). What was missing is the half T182 actually
+specified — a positive control for the ACCEPTED-prompt case, which is the one
+that used to false-FAIL on every good reset.
+
+`test/win32/reset-context.ps1` gains `proxy-working`: a pane that models what an
+accepted prompt really looks like — echo off, then a spinner repainting for 15s
+— so the text a naive verifier searches for is destroyed by the very success it
+is confirming, deterministically rather than as a race. It appends every line it
+receives to a file **outside** the pane, which is what lets the run distinguish
+"the verifier was right" from "the verifier got lucky". Section **E** asserts the
+happy path: the receipt proves the continuation arrived, the helper logs
+`verified: pane is repainting`, and nothing is shouted and no banner painted.
+Section **F** is why E means anything — the same pane driven by a helper copy
+with the T261 `elif` cut out (built with sed, as section B's copy is) calls that
+same delivery a failure and banners it.
+
+Two findings on the way. **C2 had been failing since T261 landed**: it asserted
+on the pre-fix sentence `continuation text never appeared`, so the script was
+red (`1 FAILURE(S) (23 passed)`) for a reason that had nothing to do with the
+product — an oracle pinned to wording rather than to the verdict. And the guard
+for the sed-built copy matched the helper's own *comments* about the repaint
+branch, which is why the first attempt reported the branch still present; both
+now match the `verdict=` assignment.
+
+Evidence: `ALL PASS (35)`, sections E/F stable across three runs. **B7** — a
+pre-existing assertion, untouched here — failed 1 run in 3, with the helper's own
+read-back agreeing the continuation never arrived; filed as **T483**, and B7 now
+prints the helper log lines and pane tail at the failure, because the shared
+`/tmp/reset-context-last.log` is overwritten by the sections after it. Floor:
+`floor-lane.ps1 -Lane all` ALL LANES PASS, P1–P3 ALL PASS.
+
+T482 is closed by these sections rather than by the separate
+`reset-context-verify.ps1` it proposed — the existing script already boots the
+isolated instance and drives the deployed cache copy, and two files would have to
+agree about the helper's log format forever. Receipt: **D14**.
