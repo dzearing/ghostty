@@ -35,6 +35,14 @@
 # Both asserts THROW. A script whose isolation has silently stopped working
 # must die where it stands, not degrade back into driving a live terminal.
 
+# T350: the suffix isolates the APP endpoint and nothing else - the local
+# agent's pipe is build-mode derived with no env override - so a release build
+# under a private suffix still dials the agent that owns the user's live
+# sessions. `Assert-GhozttyPrivateEndpoint` therefore checks the build mode
+# first, which also covers the ~half of the suite that sets a suffix by hand and
+# never loads CleanSlate.ps1.
+. (Join-Path $PSScriptRoot 'BuildMode.ps1')
+
 Set-Variable -Name GhozttyIsolationTag -Scope Script -Value $null -ErrorAction SilentlyContinue
 
 <#
@@ -81,11 +89,14 @@ app - the user's, most likely - so it throws before the script types anything.
 function Assert-GhozttyPrivateEndpoint {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
-        [string]$Label = 'endpoint is private (nothing answers before launch)'
+        [string]$Label = 'endpoint is private (nothing answers before launch)',
+        [switch]$AllowReleaseBuild
     )
     if (-not $env:GHOZTTY_PIPE_SUFFIX) {
         throw "isolation: GHOZTTY_PIPE_SUFFIX is not set - call Set-GhozttyTestIsolation first"
     }
+    # T350: a private suffix is not enough on its own - see the header.
+    Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$AllowReleaseBuild | Out-Null
     $raw = Get-GhozttyListRaw -Exe $Exe
     # A live instance answers with a JSON array of windows; a private endpoint
     # answers "No running Ghoztty instance found."

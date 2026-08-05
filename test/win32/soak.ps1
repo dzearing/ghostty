@@ -95,7 +95,12 @@ while ($true) {
 # "fresh" — a soak that inherits the previous run's persisted pane is soaking
 # a pane nobody just created, with hours of its own scrollback already in it.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
-Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
+# T350: -AllowReleaseBuild, said out loud. This harness's SUBJECT is the release
+# build (its whole point is grading what ships), so it is the one caller that
+# legitimately runs an exe whose endpoints are not the -debug ones. The '-soak'
+# suffix above keeps its app endpoint off the user's; its kills are path-exact
+# to zig-out-release either way.
+Reset-GhozttyTestState -Exe $exe -SettleMs 500 -AllowReleaseBuild | Out-Null
 
 # Auto-launch flow: +new-window spawns the GUI (detached) when no -soak
 # instance answers, and names the window.

@@ -356,6 +356,20 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 # is build-mode-derived and NOT overridable by GHOZTTY_PIPE_SUFFIX, so there is
 # no env that makes a release run safe -- refuse instead of maiming.
 #
+# T350: ask the exe FIRST, because the check below only fires when something is
+# already listening. On a cold box nothing answers, the harness proceeds, and it
+# is the release build's own auto-launch that lands on the user's endpoints -
+# the same incident, arriving through the gap in the guard written for it.
+. (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+if (-not (Test-GhozttyIsolatedBuildMode -Mode (Get-GhozttyBuildMode -Exe $Exe))) {
+    Write-Host ""
+    Write-Host "ABORT: '$Exe' is not a Debug/ReleaseSafe build, so it speaks the" -ForegroundColor Red
+    Write-Host "  user's endpoints (app pipe, agent pipe and state files alike)." -ForegroundColor Red
+    Write-Host "  Use zig-out\bin\ghoztty.exe; a release exe cannot be isolated here." -ForegroundColor Red
+    $env:LOCALAPPDATA = $savedLocalAppData
+    exit 2
+}
+
 # The check is mechanism-free: if anything already answers on the endpoint this
 # exe will use, we are not hermetic, full stop.
 & $Exe +list 2>&1 | Out-Null

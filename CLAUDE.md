@@ -995,6 +995,19 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   runner panics in `convertPathArg` (`assert(!isAbsolute(child_cwd_rel))` in std
   `Run.zig`) — it aborts the run before any test executes, which reads like a
   test failure and is not one.
+- **`-Doptimize=Debug` is not optional**, and the reason is not speed — it is
+  **endpoint isolation** (T350). The IPC pipe, the local agent's pipe and the
+  state directory are all derived from the build mode: `is_debug` (Debug or
+  ReleaseSafe) gets the `-debug` names, anything else gets *the same names the
+  user's installed Ghoztty is already using*. So a `zig build
+  -Dapp-runtime=win32` without the flag leaves a release build in `zig-out`, and
+  from that moment `+new-window` opens windows in the user's terminal, the
+  path-filtered kills match nothing, and the acceptance suite reports passes
+  about a binary nobody here built. A private `GHOZTTY_PIPE_SUFFIX` does not fix
+  it: the agent pipe has no env override. `test\win32\lib\BuildMode.ps1` now
+  refuses such a run before anything is launched (acceptance:
+  `test\win32\build-mode-guard.ps1`); `GHOZTTY_TEST_ALLOW_RELEASE=1` is the
+  opt-in for a script whose subject really is the release build.
 - **Never run or overwrite an installed Ghoztty** — not the installed release
   under `%LOCALAPPDATA%\Programs\Ghoztty`, not an extracted portable copy. This
   is the on-box analog of the `/Applications/Ghoztty.app` rule. Always run the

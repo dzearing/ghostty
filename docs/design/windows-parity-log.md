@@ -9076,3 +9076,49 @@ Filed: **T489** — a mistyped CLI flag is either silently ignored (`+list
 --bogus-flag=1` exits 0 and lists anyway) or rejected with an empty stderr
 (`+show-config --session-persistence=false` exits 1 having printed nothing),
 found while hunting for a headless oracle. **T414** closed as a duplicate.
+
+## 2026-08-05 — T350: a test run that would drive the user's terminal now stops instead
+
+An acceptance script picks its subject with `-Exe zig-out\bin\ghoztty.exe`, but
+that only chooses which CLI *binary* runs. Which app it reaches, which agent it
+reaches, and which state files it clears are all named endpoints derived from
+the BUILD MODE — and every mode that is not `is_debug` derives exactly the names
+the user's installed Ghoztty already owns. A `zig build -Dapp-runtime=win32`
+without `-Doptimize=Debug` was therefore enough to point the whole suite at the
+terminal the user is sitting in: windows opened in it, the path-filtered kills
+matched nothing, and the run reported a pass about a binary nobody here built.
+Observed for real on 2026-08-02, with `ipc-p1.ps1` fixture windows found live in
+the user's terminal.
+
+The finding that shaped the fix is that a private `GHOZTTY_PIPE_SUFFIX` cannot
+close this: it moves the app endpoint only. `LocalAgent.pipeName` derives the
+agent's pipe from `build_config.is_debug` with no env override, and the agent's
+state directory follows suit — so a suffixed release run still dials the agent
+that owns the user's live sessions. Build mode is the single thing that moves
+all three together, so it is what the new guard reads, and why a suffix is not
+accepted as the opt-in. (`is_debug` is `Debug` *or* `ReleaseSafe`, so the
+predicate is isolated-vs-shared rather than Debug-vs-not.)
+
+`test\win32\lib\BuildMode.ps1` reads the `build mode` line `+version` already
+prints from `builtin.mode` — local and offline, so it answers on a COLD box,
+which is the half T248's warm-only check could never reach. It is wired into
+both pre-flight paths, ahead of every other check: `Reset-GhozttyTestState`
+(CleanSlate, 24 scripts) and `Assert-GhozttyPrivateEndpoint` (Isolation, which
+covers the scripts that set a suffix by hand). The refusal names the mode it
+found, the exe, the rebuild command, why a suffix does not help, and the opt-in;
+an exe whose mode cannot be read at all is refused the same way, because a run
+we cannot vouch for is the run that leaks. `soak.ps1` says `-AllowReleaseBuild`
+out loud — its subject really is the release build. `session-persistence.ps1`
+got the cold-box complement of the guard its own incident note describes.
+
+Evidence: `test\win32\build-mode-guard.ps1` (new, 39 assertions) ALL PASS;
+`ipc-p1.ps1` pointed at a ReleaseFast stub aborts with `REFUSING TO RUN` and
+exit 1 before opening a window; P1–P3 unchanged ALL PASS; `floor-lane.ps1 -Lane
+all` ALL LANES PASS. The trap is now stated next to the build incantation in
+both `CLAUDE.md` and `go.md` — the reason `-Doptimize=Debug` is not optional is
+not speed, it is endpoint isolation.
+
+Filed: **T490** — the agent's pipe and state dir have no isolation hook at all,
+so `soak.ps1` and the `agent-*` scripts share the user's agent regardless of
+suffix. **T491** (`seat: mac`) — macOS has the identical trap
+(`ghostty[-debug]-<uid>.sock`, `local-agent[-debug]/agent.sock`) and no guard.

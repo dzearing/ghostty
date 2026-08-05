@@ -285,6 +285,17 @@ line did not fail — re-run it unfiltered before believing it.
    Ghoztty.app" rule has an on-box analog: never touch an installed
    Ghoztty under Program Files or the user's extracted portable dir —
    always run the freshly built `zig-out\bin\ghoztty.exe`.
+
+   **Build it with `-Doptimize=Debug`, and not for speed** (T350): the app's
+   IPC pipe, the local agent's pipe and the state directory are all derived
+   from the build mode, and a non-debug `zig-out` derives *the user's* — so the
+   whole acceptance suite silently drives the terminal they are sitting in and
+   passes. That is **endpoint isolation**, it is what the flag buys, and a
+   private `GHOZTTY_PIPE_SUFFIX` does not substitute for it (the agent pipe has
+   no env override). Acceptance scripts now refuse such a build before they
+   launch anything (`test\win32\lib\BuildMode.ps1`); if you hit that refusal,
+   rebuild rather than reach for the `GHOZTTY_TEST_ALLOW_RELEASE=1` opt-in,
+   which exists for the handful of scripts whose subject IS the release build.
 4. Sync discipline: `git pull` before starting, push at the task boundary —
    the Mac seat works Mac-side tasks on the same branch.
 

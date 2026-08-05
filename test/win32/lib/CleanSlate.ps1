@@ -56,6 +56,12 @@ Set-StrictMode -Off
 # it at the source: a test never wants to inherit an endpoint.
 Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
 
+# T350: the build-mode gate. `Assert-GhozttyUnderTest` below only catches a
+# FOREIGN app that is already answering; on a cold box nothing answers and the
+# script goes on to auto-launch a release build onto the user's own endpoints.
+# `Assert-GhozttyIsolatedBuild` reads the exe itself, so it speaks first.
+. (Join-Path $PSScriptRoot 'BuildMode.ps1')
+
 # Repo root, derived from this file's location (test\win32\lib -> repo).
 $script:CleanSlateRepo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 
@@ -233,8 +239,16 @@ function Reset-GhozttyTestState {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
         [switch]$AppOnly,
-        [int]$SettleMs = 800
+        [int]$SettleMs = 800,
+        [switch]$AllowReleaseBuild
     )
+    # Pre-flight ZERO (T350): is this exe even ours to drive? A non-debug build
+    # derives the user's app pipe, the user's agent pipe and the user's state
+    # files, and every check below is powerless against that - the kills match
+    # nothing (different ExecutablePath) and the manifest we clear is not the one
+    # in play. Refuse before a single window is opened.
+    Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$AllowReleaseBuild | Out-Null
+
     # Pre-flight: if an app is already answering the endpoint this $Exe dials
     # and it is a DIFFERENT install, the script is pointed at the user's
     # Ghoztty and every kill below will match nothing while every +new-window
