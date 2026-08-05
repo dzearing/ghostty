@@ -1216,6 +1216,9 @@ command: ?Command = null,
 /// dialed, new windows/tabs/splits fall back to running their shell directly
 /// under the app (a plain, non-persistent local surface) so terminal creation
 /// never hangs or fails on an unavailable agent.
+///
+/// Like every boolean setting, this accepts `on`/`off` and `yes`/`no` as well
+/// as `true`/`false`.
 @"session-persistence": bool = true,
 
 /// Session relaunch policy (macOS and Windows, requires `session-persistence`):

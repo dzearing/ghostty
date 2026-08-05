@@ -13,6 +13,10 @@
 #        second reload shows nothing. Positive control: ctrl+shift+r must
 #        open (and Escape close) the rename dialog first, proving chord
 #        injection works before any negative is trusted.
+#   4. T137: the documented switch spellings (off/on, no/yes) parse with no
+#        diagnostic, and a value that is not a boolean at all is REPORTED -
+#        headless via +validate-config, then through the startup path where
+#        the swallowed value used to cost the user their setting.
 #
 # Config isolation: XDG_CONFIG_HOME points at a temp dir for every launch
 # (xdg.zig prefers it over LOCALAPPDATA), so the box's real config never
@@ -112,13 +116,15 @@ $cfgFile = Join-Path $cfgDir 'config'
 $BAD_CONFIG = "not-a-real-key = 1`nbackground = notacolor`n"
 $GOOD_CONFIG = "# valid on purpose`nwindow-height = 30`n"
 
-function Launch-Gui {
+function Launch-Gui([string[]]$ExtraArgs = @()) {
     $env:XDG_CONFIG_HOME = $cfgHome
     try {
         # --session-persistence=false: a restored layout manifest would hand a
         # later case the previous case's panes (the T131/T155 trap), and the
-        # manifest write races the kill between cases.
-        $app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
+        # manifest write races the kill between cases. Case 4 overrides the
+        # spelling on purpose; every spelling it passes is still false.
+        $argv = @('--session-persistence=false') + $ExtraArgs
+        $app = Start-OnTestDesktop -Exe $exe -Arguments $argv
     } finally { Remove-Item Env:XDG_CONFIG_HOME -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
@@ -210,6 +216,62 @@ try {
     $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 2000
     Assert ($dlg -eq [IntPtr]::Zero) 'reload_config on a fixed file shows no dialog'
     Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app alive at the end'
+    Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # ------------------------------------------------------------- case 4:
+    # T137 - the documented switch spellings are ACCEPTED, and a value that is
+    # genuinely not a boolean is REPORTED rather than swallowed.
+    #
+    # `session-persistence = off` is what CLAUDE.md and the tracker tell a user
+    # to write. It used to be error.InvalidValue, and because a bad value for a
+    # known key is a diagnostic rather than a fatal error, the setting silently
+    # stayed at its default `true` - the exact opposite of the request. Two
+    # sessions were burned on that (T131, T234) and it was filed twice (T414).
+    #
+    # Oracle is the DIAGNOSTIC TEXT, never the exit code: `+validate-config`
+    # exits 1 on this box even for a clean file (filed separately), so scoring
+    # the code would pass on any outcome.
+    $probeDir = Join-Path $env:TEMP 'ghoztty-t137-probe'
+    New-Item -ItemType Directory -Force $probeDir | Out-Null
+    function Get-ConfigDiagnostics([string]$body) {
+        $p = Join-Path $probeDir 'probe.conf'
+        Set-Content -Path $p -Value $body -Encoding ascii
+        $out = & $exe +validate-config --config-file="$p" 2>&1 | Out-String
+        return $out.Trim()
+    }
+
+    foreach ($spelling in 'off', 'on', 'no', 'yes', 'false', 'true') {
+        $diag = Get-ConfigDiagnostics "session-persistence = $spelling"
+        Assert ($diag -eq '') "session-persistence = $spelling parses with no diagnostic (got: '$diag')"
+    }
+    # Negative control for the loop above: the assertion has to be able to fail,
+    # or six silent passes prove nothing.
+    $diag = Get-ConfigDiagnostics 'session-persistence = nope'
+    Assert ($diag -match 'session-persistence' -and $diag -match 'invalid value') `
+        "a non-boolean value is reported as a diagnostic (got: '$diag')"
+    Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
+
+    # And the same two states through the STARTUP path, which is where the
+    # value actually reached the user: the documented spelling must be silent,
+    # a bad one must raise the dialog.
+    Set-Content -Path $cfgFile -Value $GOOD_CONFIG -Encoding ascii
+    $g = Launch-Gui @('--session-persistence=off')
+    $gpid = $g.Pid
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 2500
+    Assert ($dlg -eq [IntPtr]::Zero) '--session-persistence=off starts with no config-errors dialog'
+    Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    $g = Launch-Gui @('--session-persistence=nope')
+    $gpid = $g.Pid
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 8000
+    Assert ($dlg -ne [IntPtr]::Zero) '--session-persistence=nope raises the config-errors dialog'
+    if ($dlg -ne [IntPtr]::Zero) {
+        Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+        Wait-Class $gpid 'GhozttyConfirmDialog' $false | Out-Null
+    }
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app alive after case 4'
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

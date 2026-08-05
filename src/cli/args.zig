@@ -651,9 +651,18 @@ pub fn parsePackedStruct(comptime T: type, v: []const u8) !T {
     return result;
 }
 
+/// Parse a boolean config/CLI value.
+///
+/// `on`/`off` and `yes`/`no` are accepted alongside `true`/`false` because
+/// that is the vocabulary the docs use for switch-shaped settings (T137:
+/// `session-persistence = off` was documented, rejected, and — since a bad
+/// value for a known key is recorded as a diagnostic rather than being fatal —
+/// silently left the setting at its default, which is the opposite of what the
+/// user asked for). Accepting them is purely additive: no spelling that parsed
+/// before changes meaning.
 pub fn parseBool(v: []const u8) !bool {
-    const t = &[_][]const u8{ "1", "t", "T", "true" };
-    const f = &[_][]const u8{ "0", "f", "F", "false" };
+    const t = &[_][]const u8{ "1", "t", "T", "true", "on", "yes" };
+    const f = &[_][]const u8{ "0", "f", "F", "false", "off", "no" };
 
     inline for (t) |str| {
         if (mem.eql(u8, v, str)) return true;
@@ -993,6 +1002,53 @@ test "parseIntoField: bool" {
     try testing.expectEqual(false, data.a);
     try parseIntoField(@TypeOf(data), alloc, &data, "a", "false");
     try testing.expectEqual(false, data.a);
+
+    // T137: the switch spellings the docs use.
+    try parseIntoField(@TypeOf(data), alloc, &data, "a", "on");
+    try testing.expectEqual(true, data.a);
+    try parseIntoField(@TypeOf(data), alloc, &data, "a", "off");
+    try testing.expectEqual(false, data.a);
+    try parseIntoField(@TypeOf(data), alloc, &data, "a", "yes");
+    try testing.expectEqual(true, data.a);
+    try parseIntoField(@TypeOf(data), alloc, &data, "a", "no");
+    try testing.expectEqual(false, data.a);
+}
+
+test "parseBool: the exact accepted set" {
+    const testing = std.testing;
+
+    // T137. This test is the contract: `off`/`on` and `no`/`yes` are accepted
+    // because the docs spell switch-shaped settings that way, and a value
+    // outside this set must stay an error so it can be reported rather than
+    // silently leaving the setting at its default.
+    for ([_][]const u8{ "1", "t", "T", "true", "on", "yes" }) |v| {
+        try testing.expectEqual(true, try parseBool(v));
+    }
+    for ([_][]const u8{ "0", "f", "F", "false", "off", "no" }) |v| {
+        try testing.expectEqual(false, try parseBool(v));
+    }
+
+    // Not accepted. Notably the capitalized long forms: the parser is
+    // case-sensitive apart from the single-letter `T`/`F`, and widening that
+    // is a separate decision from adding these spellings.
+    for ([_][]const u8{
+        "",
+        "On",
+        "OFF",
+        "True",
+        "FALSE",
+        "Yes",
+        "NO",
+        "y",
+        "n",
+        "enable",
+        "disable",
+        "off ",
+        " on",
+        "2",
+    }) |v| {
+        try testing.expectError(error.InvalidValue, parseBool(v));
+    }
 }
 
 test "parseIntoField: unsigned numbers" {
@@ -1095,6 +1151,17 @@ test "parseIntoField: packed struct true/false" {
     try testing.expect(data.v.b);
 
     try parseIntoField(@TypeOf(data), alloc, &data, "v", "false");
+    try testing.expect(!data.v.a);
+    try testing.expect(!data.v.b);
+
+    // T137: `on`/`off` set the whole set, same as `true`/`false`. No packed
+    // struct here has a field named `on`/`off`/`yes`/`no`, so nothing that
+    // parsed before changes meaning.
+    try parseIntoField(@TypeOf(data), alloc, &data, "v", "on");
+    try testing.expect(data.v.a);
+    try testing.expect(data.v.b);
+
+    try parseIntoField(@TypeOf(data), alloc, &data, "v", "off");
     try testing.expect(!data.v.a);
     try testing.expect(!data.v.b);
 

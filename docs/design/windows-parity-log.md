@@ -9038,3 +9038,41 @@ pre-fix build fails exactly the first two and passes the third.
 Filed: **T487** — the sibling silent drop, a launch against an already-running
 instance forwards a bare `new-window` with a `null` payload and discards `-e`
 (read from the code, not yet reproduced). **T488** (seat: mac) — the Mac half.
+
+## 2026-08-05 — T137 (+T414): `off` means off
+
+`session-persistence = off` is the spelling CLAUDE.md, the tracker and the user
+all use, and it was `error.InvalidValue`. A bad value for a known key is a
+diagnostic rather than a fatal error, so the setting silently kept its default
+`true` — the opposite of the request, with nothing to read. It cost two
+sessions in the product (T131, T234) and was filed twice (T137, T414); the
+second sighting did not even look like this bug, it looked like a window that
+would not take focus.
+
+Fixed in the shared parser: `cli/args.zig` `parseBool` accepts `on`/`off` and
+`yes`/`no` alongside `true`/`false`, so it lands on both seats at once. Purely
+additive — no spelling that parsed before changes meaning. Checked first that
+no config `packed struct` and neither `parseBool`-then-enum fallback
+(`BackgroundBlur`, `WindowDecoration`) has a field or tag named `on`/`off`/
+`yes`/`no`. Case sensitivity is untouched: `On`, `OFF`, `True` are still
+errors, and the new test pins that as a deliberate limit rather than an
+oversight.
+
+The docs-fixing alternative was rejected. `off`/`on` is what a person writes
+for a switch; a parser that rejects it will be tripped over again.
+
+The other half of the task — is an invalid value for a *known* key loud? — was
+already true on Windows and simply never tested on the CLI path, which is where
+it bit. `args.parse` records it in `_diagnostics` whether it came from a file
+or argv, and T69's Configuration Errors dialog raises it at startup. `case 4`
+of `test/win32/config-errors.ps1` now covers both directions: the six accepted
+spellings produce no diagnostic, `nope` produces one, `--session-persistence=off`
+starts silent and `--session-persistence=nope` raises the dialog. ALL PASS (27
+assertions, up from 19). Its oracle is the diagnostic TEXT, never the exit
+code — `$LASTEXITCODE` after a native command in a PS 5.1 pipeline reported 1
+for a clean `+validate-config` that exits 0 through `cmd.exe`.
+
+Filed: **T489** — a mistyped CLI flag is either silently ignored (`+list
+--bogus-flag=1` exits 0 and lists anyway) or rejected with an empty stderr
+(`+show-config --session-persistence=false` exits 1 having printed nothing),
+found while hunting for a headless oracle. **T414** closed as a duplicate.
