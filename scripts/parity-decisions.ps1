@@ -14,6 +14,15 @@
   So a decision is never a stop-and-wait. It is a receipt for an assumption,
   reviewable later, and reversible while it is still cheap.
 
+  Option format (user directive, 2026-08-05): every option's detail carries
+  "Pros: ... Cons: ..." and, where a con can be reduced, "Mitigation: ..."
+  naming the extra work that reduces it (file that work as a parity task if
+  the option is chosen). Exactly one option's label ends in "(Recommended)":
+  the best balance of robustness, performance, user experience, scale over
+  time, and stability with the fewest sacrifices. Implementation effort and
+  time are never part of that balance - "cheapest" and "fastest" are not
+  pros.
+
   One file per decision, same reasoning as the task files: two agents can file
   concurrently without touching each other's writes, and ids are allocated by
   creating the file atomically.
@@ -23,7 +32,7 @@
 .EXAMPLE
   scripts\parity-decisions.ps1 new -Title "Take main's send-keys fix by merge or cherry-pick?" `
       -Task T428 -Assumed "cherry-pick" `
-      -Options "Merge origin/main::Branch stays current; 42 commits of blast radius;;Cherry-pick 9bac0250f::Minimal diff; branch stays behind" `
+      -Options "Merge origin/main (Recommended)::Pros: branch stays current. Cons: 42 commits of blast radius. Mitigation: full floor lanes plus P1-P3 after the merge;;Cherry-pick 9bac0250f::Pros: minimal diff. Cons: branch keeps drifting from main, and the next conflict is bigger" `
       -Why "The fix is on main only and this branch is 42 behind."
 
 .EXAMPLE
@@ -45,9 +54,13 @@ param(
     [ValidateSet('assumption', 'question', 'blocker')]
     [string]$Kind = 'assumption',
     [string]$Assumed,
-    # "Label A::detail A;;Label B::detail B" - `;;` splits options, `::` splits
-    # a label from its detail. NOT commas: under -File, PowerShell hands an
-    # array parameter over as one string, and option labels contain commas.
+    # ";;" splits options, "::" splits the segments of one option. The first
+    # segment is the label; each later segment is either "Pros: a | b",
+    # "Cons: c | d", "Mitigation: e" (items split on "|"), or - with no such
+    # prefix - legacy free-text detail. NOT commas: under -File, PowerShell
+    # hands an array parameter over as one string, and labels contain commas.
+    #   "Do X (Recommended)::Pros: fast | safe::Cons: complex::Mitigation: design pass first;;Do Y::Pros: simple::Cons: does not scale"
+    # Exactly one label should end in "(Recommended)" - see the DESCRIPTION.
     [string]$Options,
     [string]$Why,
     [string]$Status,
@@ -90,7 +103,7 @@ function ConvertFrom-DecisionFile {
         Options = @(); Path = $Path
     }
     $lines = $text -split "`r?`n"
-    $inFm = $false; $inOpts = $false
+    $inFm = $false; $inOpts = $false; $curList = $null
     foreach ($line in $lines) {
         if ($line -eq '---') {
             if (-not $inFm) { $inFm = $true; continue }
@@ -98,16 +111,24 @@ function ConvertFrom-DecisionFile {
         }
         if (-not $inFm) { continue }
         if ($line -match '^\s*-\s+key:\s*(.+)$' -and $inOpts) {
-            $obj.Options += [ordered]@{ key = $Matches[1].Trim(); label = ''; detail = '' }
+            $obj.Options += [ordered]@{ key = $Matches[1].Trim(); label = ''; detail = ''; pros = @(); cons = @(); mitigation = @() }
+            $curList = $null
             continue
         }
         if ($inOpts -and $line -match '^\s+label:\s*(.+)$' -and $obj.Options.Count -gt 0) {
-            $obj.Options[-1].label = ($Matches[1].Trim() | ConvertFrom-Json); continue
+            $obj.Options[-1].label = ($Matches[1].Trim() | ConvertFrom-Json); $curList = $null; continue
         }
         if ($inOpts -and $line -match '^\s+detail:\s*(.+)$' -and $obj.Options.Count -gt 0) {
-            $obj.Options[-1].detail = ($Matches[1].Trim() | ConvertFrom-Json); continue
+            $obj.Options[-1].detail = ($Matches[1].Trim() | ConvertFrom-Json); $curList = $null; continue
         }
-        if ($line -match '^options:') { $inOpts = $true; continue }
+        if ($inOpts -and $line -match '^\s+(pros|cons|mitigation):\s*$' -and $obj.Options.Count -gt 0) {
+            $curList = $Matches[1]; continue
+        }
+        if ($inOpts -and $curList -and $line -match '^\s+-\s+(".*")\s*$' -and $obj.Options.Count -gt 0) {
+            $obj.Options[-1][$curList] = @($obj.Options[-1][$curList]) + @(($Matches[1] | ConvertFrom-Json))
+            continue
+        }
+        if ($line -match '^options:') { $inOpts = $true; $curList = $null; continue }
         if ($line -match '^([A-Za-z]+):\s*(.*)$') {
             $inOpts = $false
             $k = $Matches[1]; $v = $Matches[2].Trim()
@@ -172,17 +193,37 @@ switch ($Command) {
 
         $optList = @()
         if ($Options) {
-            $i = 0
             foreach ($chunk in ($Options -split ';;')) {
                 $chunk = $chunk.Trim()
                 if (-not $chunk) { continue }
-                $i++
-                $parts = $chunk -split '::', 2
-                $optList += [pscustomobject]@{
-                    key = "o$i"
-                    label = $parts[0].Trim()
-                    detail = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+                $parts = $chunk -split '::'
+                $o = [pscustomobject]@{
+                    key = ''; label = $parts[0].Trim(); detail = ''
+                    pros = @(); cons = @(); mitigation = @()
                 }
+                foreach ($seg in ($parts | Select-Object -Skip 1)) {
+                    $seg = $seg.Trim()
+                    if (-not $seg) { continue }
+                    if ($seg -match '^(?i)(pros|cons|mitigation)\s*:\s*(.*)$') {
+                        $name = $Matches[1].ToLower()
+                        $items = @($Matches[2] -split '\|' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                        $o.$name = @($o.$name) + $items
+                    } elseif (-not $o.detail) {
+                        $o.detail = $seg
+                    } else {
+                        $o.detail = $o.detail + ' ' + $seg
+                    }
+                }
+                $optList += $o
+            }
+            # The recommended option is listed FIRST (user directive,
+            # 2026-08-05), wherever it appeared in the argument, and keys are
+            # assigned after the sort so o1 is always the recommendation.
+            $optList = @($optList | Sort-Object { if ($_.label -match '(?i)\(recommended\)\s*$') { 0 } else { 1 } })
+            for ($i = 0; $i -lt $optList.Count; $i++) { $optList[$i].key = "o$($i + 1)" }
+            $recCount = @($optList | Where-Object { $_.label -match '(?i)\(recommended\)\s*$' }).Count
+            if ($optList.Count -gt 1 -and $recCount -ne 1) {
+                Write-Host "warning: $recCount options are flagged (Recommended) - exactly one should be (see go.md step 5b)"
             }
         }
 
@@ -217,7 +258,13 @@ switch ($Command) {
                     foreach ($o in $optList) {
                         $lines += "  - key: $($o.key)"
                         $lines += ("    label: " + (ConvertTo-JsonScalar $o.label))
-                        $lines += ("    detail: " + (ConvertTo-JsonScalar $o.detail))
+                        if ($o.detail) { $lines += ("    detail: " + (ConvertTo-JsonScalar $o.detail)) }
+                        foreach ($name in 'pros', 'cons', 'mitigation') {
+                            if (@($o.$name).Count -gt 0) {
+                                $lines += "    ${name}:"
+                                foreach ($it in $o.$name) { $lines += ("      - " + (ConvertTo-JsonScalar $it)) }
+                            }
+                        }
                     }
                 } else {
                     $lines += 'options: []'
