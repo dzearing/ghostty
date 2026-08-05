@@ -8731,3 +8731,36 @@ command line, so goal 2 is measured rather than assumed. Floor:
 `floor-lane.ps1 -Lane all` PASS, P1–P3 ALL PASS. Filed T479 (the watchdog counts
 remaining work from the FROZEN tracker table — fiction today, an off-switch the
 day someone tidies it) and decision D11.
+
+## 2026-08-04 — T443: the crash cannot be reproduced, and the code is not the variable
+
+Three experiments, all negative, and between them they close the two directions
+T443 was queued for. D10's question first: the `ptrInPage` diagnostic was
+reverted out of `page.zig`, the win32 lane rebuilt, the symbol's absence
+confirmed in the binary, and it soaked **10/10 clean** — so `210c763f4` did not
+perturb the crash away, and with T473's 26 runs that is 37 runs straddling the
+commit.
+
+Then the better control: `.zig-cache` still holds every test binary back to
+7/28, and the dump `ghostty-test-20260804-071353-2.dmp` *contains* the cache
+hash `9c7aca2ab62e268d2d17bd7f555aba3b`, so the bytes that crashed at 07:13 are
+identified rather than guessed at. Those exact bytes now run **10/10 clean**
+bare and **32/32 clean at 32-way concurrency**. A byte-identical binary cannot
+be fixed by a commit, so no source change explains this and a bisect of ghoztty
+cannot find it; CPU contention and a machine reboot (uptime since 7/29) are out
+too. 82 runs, 0 crashes, including the `floor-lane` build-runner condition that
+every observed crash came from.
+
+`test-binary-soak.ps1` gained `-Concurrency N` to run that experiment, and two
+latent defects went with it: `-TimeoutSeconds` was declared and never used, and
+the new `Start-Process` path caches `.Handle` before the child can exit —
+without which PS 5.1 returns an empty `ExitCode` and every crash classifies as
+PASS. Both paths smoke-tested, not assumed.
+
+T443 → `blocked(no reproducible crash in 82 runs - armed watch)`: the harness
+already captures the next occurrence with a full all-thread stack, so it needs
+an occurrence, not another context. All three crash-day binaries were copied
+out of the GC-able cache with their PDBs to `.dumps\crash-binaries-20260804\`.
+Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, P1–P3 ALL PASS. Filed T480
+(the `ProcSampler` cpu_pct test fails on a busy box — 4 in 32 under load, so a
+red lane can mean nothing but a busy machine) and decision D12.
