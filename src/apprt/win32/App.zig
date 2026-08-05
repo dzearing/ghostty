@@ -1158,9 +1158,29 @@ pub fn wakeup(self: *App) void {
     }
 }
 
-/// Register `target` under `name`. See IpcRegistry.register.
+/// Register `target` under `name`, without caring whether an incumbent kept
+/// it. See IpcRegistry.register.
 pub fn ipcRegister(self: *App, name: []const u8, target: IpcTarget) Allocator.Error!void {
+    _ = try self.ipcRegisterChecked(name, target);
+}
+
+/// Register `target` under `name` and report whether `target` actually holds
+/// it afterwards (T121). Callers that RECORD the name — a window's
+/// `ipc_name`, which `+list` reports as its `target` — must use this: a name
+/// an incumbent kept would otherwise be advertised by a window it does not
+/// route to.
+pub fn ipcRegisterChecked(
+    self: *App,
+    name: []const u8,
+    target: IpcTarget,
+) Allocator.Error!IpcRegistry.RegisterResult {
     return self.ipc_registry.register(self.core_app.alloc, self.windows.items, name, target);
+}
+
+/// Reserve an ADOPTED window name so the auto allocator can never re-mint it.
+/// See IpcRegistry.reserveWindowName (T121).
+pub fn ipcReserveWindowName(self: *App, name: []const u8) void {
+    self.ipc_registry.reserveWindowName(name);
 }
 
 /// Look up a live target by name. See IpcRegistry.lookup.

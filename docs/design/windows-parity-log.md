@@ -9122,3 +9122,35 @@ Filed: **T490** — the agent's pipe and state dir have no isolation hook at all
 so `soak.ps1` and the `agent-*` scripts share the user's agent regardless of
 suffix. **T491** (`seat: mac`) — macOS has the identical trap
 (`ghostty[-debug]-<uid>.sock`, `local-agent[-debug]/agent.sock`) and no guard.
+
+## 2026-08-05 — T121: two windows can no longer answer to the same auto name
+
+`+close --target=window-3` could close a window you did not mean. Windows
+opened without `--target=` are named from a counter that restarts at zero every
+app launch, while session restore re-adopts the names the PREVIOUS run minted.
+Restore `window-1..3`, open three more, and the new ones mint `window-1..3`
+again — six windows, three names shared between two holders each, with
+`+close`/`+split`/`+rename` routed to whichever registered first. Reproduced on
+the box: `+list` reporting `window-1, window-2, window-3, window-1, window-2,
+window-3`.
+
+Both halves of the Mac fix (`565b77a58`), translated. **Reservation**:
+`IpcRegistry.reserveWindowName` advances the counter past any adopted
+`window-N` — a restore name or an explicit `--target=` — called from
+`Window.init` before anything is minted; the parse is strict, so
+`--target=window-pane` reserves nothing, and it never rewinds. **Hold what you
+record**: `register` now answers `registered` / `already_held`, and a window
+stores `ipc_name` only for a name it actually holds, minting a fresh one
+otherwise. That is the win32 shape of Mac's "check live windows, not just the
+registry" — here registration is eager, so the gap was not a lazily-registered
+window but a window recording a name the incumbent kept, which `+list` then
+advertised as its `target`. Also fixed in passing: `register` left the map
+keyed on the caller's borrowed slice if the key dupe OOM'd.
+
+Evidence: five new unit tests in `IpcRegistry.zig` (the module is now named in
+the win32 lane's test block) covering monotonic minting, reservation, no
+rewind, eleven non-auto spellings, and conflicting vs idempotent registration;
+`test\win32\window-name-restore.ps1` (new, 22 assertions) ALL PASS; the same
+script against a build with `Window.init` reverted fails exactly on the
+duplicate-name and `+close`-routing assertions, so it catches the defect rather
+than describing it. `floor-lane.ps1 -Lane all` ALL LANES PASS; P1–P3 ALL PASS.

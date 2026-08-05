@@ -40,4 +40,8 @@ test {
     // waits on the wrong pid, so the lane compiles and checks it in its own
     // right.
     _ = @import("win32/relaunch_guard.zig");
+    // The named-target registry (T121). Its auto `window-N` allocator is the
+    // thing that must never re-mint a name a restored window already adopted,
+    // and that is pure logic worth checking in its own right.
+    _ = @import("win32/IpcRegistry.zig");
 }

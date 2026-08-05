@@ -41,6 +41,17 @@ pub const Target = union(enum) {
     }
 };
 
+/// What `register` did with the name — the caller's answer to "do I hold
+/// this?". A window that records a name it does NOT hold reports a `target`
+/// in `+list` that routes somewhere else (T121), so this is not advisory.
+pub const RegisterResult = enum {
+    /// `name` now resolves to `target` (it already did, or it does now).
+    registered,
+    /// `name` was already held by a DIFFERENT live target; the incumbent
+    /// won and `target` is not reachable under it.
+    already_held,
+};
+
 /// Register `target` under `name` (key is duped). If the name is already
 /// registered to a live target, the existing registration wins — consistent
 /// with the CLI's idempotent named-target semantics; callers that need
@@ -51,12 +62,20 @@ pub fn register(
     live_windows: []const *Window,
     name: []const u8,
     target: Target,
-) Allocator.Error!void {
+) Allocator.Error!RegisterResult {
     self.prune(alloc, live_windows);
     const gop = try self.targets.getOrPut(alloc, name);
-    if (gop.found_existing) return;
-    gop.key_ptr.* = try alloc.dupe(u8, name);
+    if (gop.found_existing) {
+        return if (gop.value_ptr.eql(target)) .registered else .already_held;
+    }
+    gop.key_ptr.* = alloc.dupe(u8, name) catch |err| {
+        // The slot holds the BORROWED key until the dupe lands; drop it
+        // rather than leave the map pointing at a caller's buffer.
+        self.targets.removeByPtr(gop.key_ptr);
+        return err;
+    };
     gop.value_ptr.* = target;
+    return .registered;
 }
 
 /// Look up a live target by name (stale entries are pruned first).
@@ -162,10 +181,44 @@ fn prune(self: *IpcRegistry, alloc: Allocator, live_windows: []const *Window) vo
     }
 }
 
+/// The prefix every auto-generated window name carries.
+const auto_prefix = "window-";
+
+/// The N of an auto-generated `window-N` name, or null if `name` is not one.
+/// Strict on purpose: only `window-` followed by ASCII digits naming a
+/// non-zero number counts, so a user's `+new-window --target=window-pane` or
+/// `--target=window-1a` is a plain name that reserves nothing.
+fn autoWindowNumber(name: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, auto_prefix)) return null;
+    const digits = name[auto_prefix.len..];
+    if (digits.len == 0) return null;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+    const n = std.fmt.parseUnsigned(u64, digits, 10) catch return null;
+    return if (n == 0) null else n;
+}
+
+/// Reserve a window name that was ADOPTED rather than minted — a persisted
+/// session-restore name, or an explicit `+new-window --target=`. If it names
+/// an auto `window-N`, advance the allocator past N so a later mint can never
+/// repeat it (T121).
+///
+/// Why this is load-bearing: `window_counter` restarts at zero every app
+/// launch, while session restore re-adopts names minted by a PREVIOUS run.
+/// Restore a `window-3`, open three fresh windows, and the third mints
+/// `window-3` again — two live windows holding one target name, with
+/// `+close`/`+split`/`+rename` routed to whichever registered first. Mac
+/// fixed the same defect the same way (`565b77a58`).
+///
+/// Never rewinds: the counter only ever moves forward.
+pub fn reserveWindowName(self: *IpcRegistry, name: []const u8) void {
+    const n = autoWindowNumber(name) orelse return;
+    self.window_counter = @max(self.window_counter, n);
+}
+
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
 pub fn nextWindowName(self: *IpcRegistry, alloc: Allocator) Allocator.Error![]u8 {
     self.window_counter += 1;
-    return std.fmt.allocPrint(alloc, "window-{d}", .{self.window_counter});
+    return std.fmt.allocPrint(alloc, auto_prefix ++ "{d}", .{self.window_counter});
 }
 
 /// Free all owned keys and the map itself.
@@ -173,4 +226,104 @@ pub fn deinit(self: *IpcRegistry, alloc: Allocator) void {
     var it = self.targets.keyIterator();
     while (it.next()) |key| alloc.free(key.*);
     self.targets.deinit(alloc);
+}
+
+const testing = std.testing;
+
+test "auto window names mint monotonically" {
+    const alloc = testing.allocator;
+    var reg: IpcRegistry = .{};
+    defer reg.deinit(alloc);
+
+    for ([_][]const u8{ "window-1", "window-2", "window-3" }) |want| {
+        const got = try reg.nextWindowName(alloc);
+        defer alloc.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+}
+
+test "an adopted window-N name reserves its number" {
+    const alloc = testing.allocator;
+    var reg: IpcRegistry = .{};
+    defer reg.deinit(alloc);
+
+    // A session restore re-adopts names minted by a previous run.
+    reg.reserveWindowName("window-1");
+    reg.reserveWindowName("window-3");
+
+    // The next mint must clear BOTH, not repeat window-3.
+    const got = try reg.nextWindowName(alloc);
+    defer alloc.free(got);
+    try testing.expectEqualStrings("window-4", got);
+}
+
+test "reserving never rewinds the allocator" {
+    const alloc = testing.allocator;
+    var reg: IpcRegistry = .{};
+    defer reg.deinit(alloc);
+
+    const first = try reg.nextWindowName(alloc);
+    defer alloc.free(first);
+    const second = try reg.nextWindowName(alloc);
+    defer alloc.free(second);
+    try testing.expectEqualStrings("window-2", second);
+
+    // A restored window-1 is behind the allocator; it must not pull it back.
+    reg.reserveWindowName("window-1");
+    const third = try reg.nextWindowName(alloc);
+    defer alloc.free(third);
+    try testing.expectEqualStrings("window-3", third);
+}
+
+test "non-auto names reserve nothing" {
+    const alloc = testing.allocator;
+    var reg: IpcRegistry = .{};
+    defer reg.deinit(alloc);
+
+    for ([_][]const u8{
+        "dev",
+        "window-",
+        "window-0",
+        "window-1a",
+        "window-a1",
+        "window--1",
+        "window-+1",
+        "window- 1",
+        "window-1_0",
+        "Window-9",
+        "window-99999999999999999999999", // overflows u64
+    }) |name| {
+        reg.reserveWindowName(name);
+    }
+
+    const got = try reg.nextWindowName(alloc);
+    defer alloc.free(got);
+    try testing.expectEqualStrings("window-1", got);
+}
+
+test "registering a name a different target holds reports already_held" {
+    const alloc = testing.allocator;
+    var reg: IpcRegistry = .{};
+    defer reg.deinit(alloc);
+
+    // Two distinct (never dereferenced) window identities.
+    const a: *Window = @ptrFromInt(0x1000);
+    const b: *Window = @ptrFromInt(0x2000);
+    const live = [_]*Window{ a, b };
+
+    try testing.expectEqual(
+        IpcRegistry.RegisterResult.registered,
+        try reg.register(alloc, &live, "window-3", .{ .window = a }),
+    );
+    // Re-registering the SAME target under the same name is idempotent, not
+    // a conflict — the caller still holds the name.
+    try testing.expectEqual(
+        IpcRegistry.RegisterResult.registered,
+        try reg.register(alloc, &live, "window-3", .{ .window = a }),
+    );
+    try testing.expectEqual(
+        IpcRegistry.RegisterResult.already_held,
+        try reg.register(alloc, &live, "window-3", .{ .window = b }),
+    );
+    try testing.expect(reg.lookup(alloc, &live, "window-3").?.eql(.{ .window = a }));
 }

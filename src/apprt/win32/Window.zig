@@ -885,16 +885,46 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // (Mac windowName semantics). Quick terminals are not listable targets.
     if (!options.is_quick_terminal) register: {
         const gpa = app.core_app.alloc;
-        const name: []u8 = if (options.ipc_name) |n|
-            gpa.dupe(u8, n) catch break :register
-        else
-            app.ipcNextWindowName() catch break :register;
-        app.ipcRegister(name, .{ .window = self }) catch |err| {
-            log.warn("IPC window registration failed err={}", .{err});
-            gpa.free(name);
-            break :register;
-        };
-        self.ipc_name = name;
+
+        // T121: an ADOPTED name — a persisted session-restore name, or an
+        // explicit `+new-window --target=` — RESERVES its number before
+        // anything is minted. The auto allocator restarts at zero every app
+        // launch while restore re-adopts names minted by a PREVIOUS run, so
+        // without this a run that restored `window-3` mints `window-3` again
+        // on its third fresh window: two live windows holding one target
+        // name, with `+close`/`+rename` routed to whichever registered first.
+        if (options.ipc_name) |n| app.ipcReserveWindowName(n);
+
+        // Claim a name this window actually HOLDS. `register` keeps the
+        // incumbent when a name is already taken, so recording the string
+        // regardless would leave `+list` reporting a `target` that routes to
+        // a different window — the same duplicate, one step further along.
+        // An adopted name that is already held falls back to a minted one
+        // (the Mac's restored window likewise keeps its own name rather than
+        // becoming a second holder). Bounded, because a PANE can be named
+        // `window-N` too and the allocator does not know about pane names.
+        const claimed: []u8 = claim: for (0..8) |attempt| {
+            const name: []u8 = if (attempt == 0 and options.ipc_name != null)
+                gpa.dupe(u8, options.ipc_name.?) catch break :register
+            else
+                app.ipcNextWindowName() catch break :register;
+            const result = app.ipcRegisterChecked(name, .{ .window = self }) catch |err| {
+                log.warn("IPC window registration failed err={}", .{err});
+                gpa.free(name);
+                break :register;
+            };
+            switch (result) {
+                .registered => break :claim name,
+                .already_held => {
+                    log.warn(
+                        "IPC window name '{s}' is already held by another target; minting a fresh one",
+                        .{name},
+                    );
+                    gpa.free(name);
+                },
+            }
+        } else break :register;
+        self.ipc_name = claimed;
     }
 }
 
