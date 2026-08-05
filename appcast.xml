@@ -298,5 +298,25 @@
 </description>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.29.0/Ghoztty-1.29.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="8U2poivehpxxnMjhTYVLjxDGWd2ATzqQRu24CRYT3Rwl8ngydn5a5Aced6rgZEKzl1eeEbY1+vDyrQdiOrEPBw==" length="25627839" />
         </item>
+        <item>
+            <title>Version 1.30.0</title>
+            <sparkle:version>1.30.0</sparkle:version>
+            <sparkle:shortVersionString>1.30.0</sparkle:shortVersionString>
+            <pubDate>Wed, 05 Aug 2026 00:26:49 +0000</pubDate>
+            <description>{
+  "version": "1.30.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "HTML files open as real pages", "text": "`ghoztty +split --view=mock/index.html` now renders the page instead of showing you its source. Its own CSS, JavaScript, images, and fonts run, links follow in the pane, and Back/Forward work across it — so a scaffolded mock or prototype is viewable straight from disk, with no `python3 -m http.server` standing in front of it. Saving the file re-renders it in place and keeps your scroll position, so you're not thrown back to the top of a long page. Assets are read from the page's own directory, so keep shared files under it; an edited sibling stylesheet needs `+reload`/Cmd+R to get past WebKit's cache." },
+        { "title": "The fork runs CI again", "text": "Pull requests build and test for real, with the Zig and Swift halves reported as separate steps so a failure points at the right half. Its first real run caught a remote-handshake bug plus two flaky viewer tests, all fixed in this release." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.30.0/Ghoztty-1.30.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="SNijHCYGaACETAG4F6J41adqpWjwj8UGLnwtVlYSh+fVaFEmSCOoCOEx1Q9j+Hp7C1jz3lPqAT314EemvcO7CQ==" length="25633021" />
+        </item>
     </channel>
 </rss>
