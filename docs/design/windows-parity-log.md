@@ -8805,3 +8805,44 @@ with the fix, ALL PASS. Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS (288s /
 own copy of the `isEmpty` branch, and deleting it blind would swallow a real
 `guard let surface` failure into a silent empty success) and decision D13 (empty
 succeeds, rather than getting a distinct nonzero error of its own).
+
+## 2026-08-04 — T261: a session that is already answering is a reset that worked
+
+`/reset-context` has been calling its own successes failures. After submitting
+the continuation it looked for the prompt's first 24 characters in the last 25
+lines of the pane, two seconds later — and that window only exists between the
+echo and the model's first output. The spinner, the two rules and the status bar
+then push the echo out of the tail, and a 400-character continuation wraps to
+several lines so it goes sooner. The probe was racing the model and losing
+whenever the model was quick, which is the normal case. It then shouted
+`RESET-CONTEXT FAILED: the continuation text never appeared in the pane` and
+painted a recover-by-hand banner across a session that was visibly mid-response.
+That matters more than the noise: a failed reset is the one case go.md allows a
+turn to stop and ask a human, so a false FAILED can stall the loop in exactly the
+way step 7 exists to prevent.
+
+The read-back now polls for **either** proof of delivery — the prompt is on
+screen, or the pane is repainting — because a pane that is painting is a session
+working on what it was just handed. The first sample is immediate (the old fixed
+`sleep 2` made losing *more* likely) and reads 60 lines rather than 25, which is
+what catches a wrapped 400-character prompt; ten one-second samples follow. Only
+a pane that never echoed the prompt and never repainted is a failure, and the
+message says that instead of asserting a mechanical cause nobody watched.
+`fail_loud`'s dump widened 15 → 40 lines — 15 was too narrow to show the `ctx:`
+line and spinner that settle it — and its banner now says to read the log first.
+
+Validation used ordinary processes for the branches that do not need a model: a
+live `claude` session took a 502-byte continuation three times and logged
+`verified: continuation is on screen (after 0s)` each run, answering `ACK` with
+`ctx:` moving 0k → 84k; `ping -t 127.0.0.1` (repaints, swallows input, never
+echoes) exercised the motion branch; `ping -t 127.0.0.1 > NUL` (silent, same
+otherwise) still failed loudly — the negative control. Reading that same live
+pane back afterwards at `--lines=40` showed nothing but chrome, which is the
+original defect reproduced exactly.
+
+The fix is in `dzearing-claude-marketplace` (`9ef25ec`) and copied into the
+active plugin cache (`dzearing-skills/0.11.0`), per the standing patch-both-
+places rule; that commit also carries the previously-unstaged `cygpath -w` fix
+for `--keys-file`. Filed T482: all of the above was verified by hand, and the
+one step that keeps the loop alive deserves an acceptance script that can be
+re-run.
