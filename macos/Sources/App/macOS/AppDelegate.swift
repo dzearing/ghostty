@@ -450,6 +450,10 @@ class AppDelegate: NSObject,
         // most once ever.
         checkCommandLineToolOnLaunch()
 
+        // Hand Claude's integration over from the standalone plugin, which the
+        // app now supersedes. Asks at most once, ever, either way.
+        checkClaudePluginMigrationOnLaunch()
+
         switch Ghostty.launchSource {
         case .app:
             // Don't have to do anything.

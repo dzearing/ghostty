@@ -131,10 +131,10 @@
                                     <action selector="installCommandLineTool:" target="bbz-4X-AYv" id="gz1-CL-ac1"/>
                                 </connections>
                             </menuItem>
-                            <menuItem title="Set Up Claude Code Integration" id="gz2-CC-mn2">
+                            <menuItem title="Set Up Agent Integrations…" id="gz2-CC-mn2">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>
-                                    <action selector="setupClaudeCodeIntegration:" target="bbz-4X-AYv" id="gz2-CC-ac2"/>
+                                    <action selector="setupAgentIntegrations:" target="bbz-4X-AYv" id="gz2-CC-ac2"/>
                                 </connections>
                             </menuItem>
                             <menuItem isSeparatorItem="YES" id="4je-JR-u6R"/>
