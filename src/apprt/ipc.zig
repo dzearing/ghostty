@@ -141,9 +141,14 @@ pub const List = @import("ipc/list.zig").List;
 /// the format cannot drift apart.
 pub const segments = @import("ipc/segments.zig");
 
+/// The `+read` "last N lines" rule, and the contract that an empty screen is
+/// an ANSWER rather than a failure (T181).
+pub const read_tail = @import("ipc/read_tail.zig");
+
 test {
     _ = args;
     _ = segments;
+    _ = read_tail;
     _ = @import("ipc/list.zig");
 }
 

@@ -8764,3 +8764,44 @@ out of the GC-able cache with their PDBs to `.dumps\crash-binaries-20260804\`.
 Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, P1–P3 ALL PASS. Filed T480
 (the `ProcSampler` cpu_pct test fails on a busy box — 4 in 32 under load, so a
 red lane can mean nothing but a busy machine) and decision D12.
+
+## 2026-08-04 — T181: a terminal that has said nothing is not a broken terminal
+
+`+read` answered a pane whose screen was empty with `failed to read terminal
+content from '<pane-id>'` — the same sentence it uses for a pane that does not
+exist. Every pane looks like that for the first fraction of a second of its life
+(the window is registered, and `+list --json` already reports its pane id and
+its child's pid, before the shell paints a prompt), and a pane running something
+quiet looks like that forever. So a script or an agent that read once could
+record "the pane produced no output" as a verdict.
+
+It was never the registration race the task was filed as. The pane is fully
+readable the whole time; `handleRead` ended with `if (result.len == 0) return
+errorResponse(...)`, and `Screen.selectionString` emits nothing at all for a
+screen with no content. The transience was coincidence: a CLI process launch is
+normally long enough for `cmd.exe` to paint its prompt, which is why the
+create→`+list`→`+read`-with-no-sleep loop the task asked for passes 6/6 pre-fix
+while `-e cmd /c "timeout /t 20 /nobreak > nul"` reproduces it on demand — pid
+4604, three reads 400 ms apart, exit 1 every time.
+
+Empty now returns success with empty text, the way `tail` of an empty file exits
+0, and each remaining failure names a different state: `not found in registry`,
+`is no longer alive`, `is a viewer pane, not a terminal`, `is not readable: its
+terminal never finished starting up` (init never completed, as opposed to having
+died — `core_surface_ready` covered both), and `failed to read terminal content`
+for a genuine serialization failure. `+send-keys` got the same liveness split,
+because `/reset-context` aims it at a freshly created pane. The "last N lines"
+rule moved to `src/apprt/ipc/read_tail.zig` — pure, tested in the `none` lane,
+and the one written description both platforms follow.
+
+The other candidate fix (have `+read` wait for the surface) would have been wrong
+twice: there is nothing to wait for, and IPC handlers run ON the GUI thread, so a
+handler waiting for GUI-thread progress cannot get it.
+
+`test/win32/ipc-read-race.ps1` is new and its oracle was checked both ways: with
+the one branch put back and rebuilt, arm A fails and every control still passes;
+with the fix, ALL PASS. Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS (288s /
+298s / 293s), P1–P3 ALL PASS. Filed T481 (`seat: mac` — the Swift handler has its
+own copy of the `isEmpty` branch, and deleting it blind would swallow a real
+`guard let surface` failure into a silent empty success) and decision D13 (empty
+succeeds, rather than getting a distinct nonzero error of its own).

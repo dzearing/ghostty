@@ -105,6 +105,22 @@ ghoztty +read --name=<pane> --lines=<N>
 - `--name`: Named pane to read from (required).
 - `--lines`: Number of lines from the end of scrollback (default: 50).
 
+**An empty pane is an answer, not an error** (T181, win32; the Mac half is
+T481). A terminal pane that has printed nothing yet exits 0 with empty output,
+the way `tail` of an empty file does — that is the state of *every* pane for
+the first fraction of a second of its life (the window is registered, and
+`+list --json` already reports its pane id and its child's pid, before the
+shell has painted a prompt) and the permanent state of a pane running something
+silent. It used to answer `failed to read terminal content from '<pane>'`,
+which a caller could not tell apart from a missing or wedged pane — so a caller
+that read once recorded "the pane produced no output" as a verdict. Every
+remaining failure names a distinct state: `not found in registry`, `is no
+longer alive`, `is a viewer pane, not a terminal`, `is not readable: its
+terminal never finished starting up`, and `failed to read terminal content`
+(now only a genuine internal failure). `+send-keys` splits the same two
+liveness states apart. The "last N lines" rule itself lives in
+`src/apprt/ipc/read_tail.zig` so both platforms describe it identically.
+
 ### `ghoztty +list`
 
 List open windows, tabs, and panes (human-readable tree, or `--json`). Listing auto-registers every pane it discovers, so returned names are immediately usable as targets.

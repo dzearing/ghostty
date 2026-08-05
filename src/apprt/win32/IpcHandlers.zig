@@ -765,8 +765,22 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name});
     const surface = pane.surface() orelse
         return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{name});
-    if (!surface.core_surface_ready)
-        return try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name});
+    // T181: each remaining failure names a DIFFERENT state, because a caller
+    // that cannot tell them apart cannot react to any of them. `core_surface_
+    // ready` covers two: a surface that once worked and is being torn down,
+    // and one whose terminal never came up at all (`core_surface_initialized`
+    // is set together with `ready` at the end of init, so it stays false when
+    // init failed). "It died" and "it never started" are different bugs.
+    if (!surface.core_surface_ready) {
+        return if (surface.core_surface_initialized)
+            try errorResponse(ctx.alloc, "pane '{s}' is no longer alive", .{name})
+        else
+            try errorResponse(
+                ctx.alloc,
+                "pane '{s}' is not readable: its terminal never finished starting up",
+                .{name},
+            );
+    }
 
     // Dump the whole screen (scrollback + active) as plain text, matching
     // the Mac's full-SCREEN ghostty_surface_read_text selection.
@@ -803,28 +817,20 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         });
     }
 
-    var full = dump orelse
+    // A null dump is a genuine internal failure — the screen could not be
+    // serialized at all (OOM, or no pages, which should not happen). An EMPTY
+    // dump is not: see below.
+    const full = dump orelse
         return try errorResponse(ctx.alloc, "failed to read terminal content from '{s}'", .{name});
 
-    // Last N lines: strip one trailing newline (the Mac drops the trailing
-    // empty split element), then walk back N newlines.
-    if (full.len > 0 and full[full.len - 1] == '\n') full = full[0 .. full.len - 1];
-    var start: usize = 0;
-    var newlines: usize = 0;
-    var i: usize = full.len;
-    while (i > 0) {
-        i -= 1;
-        if (full[i] == '\n') {
-            newlines += 1;
-            if (newlines == line_count) {
-                start = i + 1;
-                break;
-            }
-        }
-    }
-    const result = full[start..];
-    if (result.len == 0)
-        return try errorResponse(ctx.alloc, "failed to read terminal content from '{s}'", .{name});
+    // Last N lines, by the shared rule (T181). An empty result is returned as
+    // success with empty text: a pane that has printed nothing yet — the
+    // normal state of every pane for the first fraction of a second of its
+    // life, and the permanent state of a pane running something silent — is
+    // readable, and "" is the truthful answer. Reporting it as a failure made
+    // a lost race indistinguishable from a missing or wedged pane, which is
+    // how an agent ends up recording "no output" as a verdict.
+    const result = apprt.ipc.read_tail.tail(full, line_count);
 
     // {"success":true,"data":{"text":<result>}}
     var out: std.Io.Writer.Allocating = .init(ctx.alloc);
@@ -1186,8 +1192,19 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
     const surface = pane.surface() orelse
         return try errorResponse(ctx.alloc, "{s} is a viewer pane, not a terminal", .{target_name});
-    if (!surface.core_surface_ready)
-        return try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name});
+    // T181: same split as `+read` — a pane that died and a pane whose terminal
+    // never came up are different bugs, and the `/reset-context` helper aims
+    // `+send-keys` at a freshly created pane, so it is a caller that cares.
+    if (!surface.core_surface_ready) {
+        return if (surface.core_surface_initialized)
+            try errorResponse(ctx.alloc, "target '{s}' is no longer alive", .{target_name})
+        else
+            try errorResponse(
+                ctx.alloc,
+                "target '{s}' is not writable: its terminal never finished starting up",
+                .{target_name},
+            );
+    }
 
     // Segmented send: one write per run, framed by kind. A `--segments=` we
     // cannot parse is not a reason to fail the request — the same bytes are
