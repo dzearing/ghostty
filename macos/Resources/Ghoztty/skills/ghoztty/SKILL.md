@@ -1,6 +1,6 @@
 ---
 name: ghoztty
-description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a code file, or a website in a viewer ("side") pane, listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, syntax-highlighted code, or a webpage), query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", or "preview this markdown", use `+split --view=<path-or-url>`.
+description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a live HTML page, a code file, or a website in a viewer ("side") pane, showing a git diff in a pane (current branch vs main, `git status`, a single commit, or an arbitrary range), listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, listing persistent terminal sessions, opening a shell on a remote machine, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, a live HTML page, syntax-highlighted code, or a webpage), show changes for a branch, commit, or range, query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", or "preview this markdown", use `+split --view=<path-or-url>`; when they say "show me changes in this branch", "what's on my branch vs main", "show me my git status", or "what changed in <sha>", use `+split --view=git-diff:<revspec>` or `--view=git-status:`.
 ---
 
 # Ghoztty CLI Reference
@@ -70,7 +70,7 @@ ghoztty +new-window [flags]
 | `--target=<name>` | Register window with a name. If it already exists, focuses it instead. |
 | `--working-directory=<path>` | Working directory for the terminal. Relative paths are resolved from CWD. `~` is expanded. If omitted, uses the CWD where `ghoztty` is invoked. |
 | `--command=<cmd>` | Command to run in the terminal. Auto-wrapped in the user's login shell with profile loaded. |
-| `--view=<path-or-url>` | Open a **viewer** pane instead of a terminal: a rendered markdown file, a syntax-highlighted text/code file, or a website (http/https URL). Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. |
+| `--view=<path-or-url>` | Open a **viewer** pane instead of a terminal: a rendered markdown file, an `.html`/`.htm` file rendered as a **live page**, a syntax-highlighted text/code file, or a website (http/https URL). Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. |
 | `--shell=<path>` | Shell to use for `--command`/`--split-command`, invoked with `-lic`. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`. |
 | `--env=KEY=VALUE` | Environment variable for the spawned process. Repeatable. |
 | `--no-activate` | Create the window without stealing focus from the current workspace. Useful for automation and background agent windows. |
@@ -97,7 +97,7 @@ ghoztty +split [flags]
 | `--pane=<name-or-id>` | Split adjacent to this specific pane instead of the focused one. Use `--pane="$GHOZTTY_PANE_ID"` to split off your own pane regardless of what the user has focused. |
 | `--name=<name>` | Register the new pane with a name. If it already exists, focuses it instead. |
 | `--command=<cmd>` | Command to run in the new pane. Auto-wrapped in the user's login shell with profile loaded. |
-| `--view=<path-or-url>` | Open the new pane as a **viewer** (rendered markdown / highlighted code / website) instead of a terminal. Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. This is the way to "open a file/README/doc in a side pane". |
+| `--view=<path-or-url>` | Open the new pane as a **viewer** (rendered markdown / live HTML page / highlighted code / website) instead of a terminal. Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. This is the way to "open a file/README/doc in a side pane". |
 | `--shell=<path>` | Shell to use for `--command`, invoked with `-lic`. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`. |
 | `--env=KEY=VALUE` | Environment variable for the spawned process. Repeatable. |
 | `--color=<#hex\|random>` | Background color for the new pane. |
@@ -113,6 +113,12 @@ of a terminal. This is the built-in way to honor "open the README in a side pane
 
 - **Markdown** files — fully rendered (GitHub styling, code highlighting, task
   lists), with **live reload** on save (scroll position preserved).
+- **HTML** files (`.html`, `.htm`) — rendered as a **live page**, not as
+  source: the file's own CSS, JS, images, and fonts load from its directory,
+  and it **live-reloads on save** (scroll preserved). A static mock or
+  prototype needs no server. Two limits: assets must live under the page's own
+  directory (no `../shared/app.css`), and only the HTML file itself is
+  watched — `+reload` picks up a changed sibling stylesheet or script.
 - **Text / code** files — syntax-highlighted, read-only.
 - **Websites** — any `http(s)://` URL (this is the only mode that uses the
   network; file rendering is fully offline via bundled assets).
@@ -141,6 +147,68 @@ ghoztty +new-window --target=notes --command="nvim NOTES.md"
 ghoztty +split --target=notes --direction=right --name=preview --view=NOTES.md
 ```
 
+### Git diff panes (`--view=git-diff:…` / `--view=git-status:`)
+
+A viewer can also render a **git diff**: a changed-files tree with a filter on
+the left, red/green syntax-highlighted hunks on the right, and
+next/previous-change + unified ⇄ side-by-side controls in the nav bar. This is
+how to answer "show me what's changed on this branch" or "show me my git
+status" — **do not** dump `git diff` into the terminal for that.
+
+It is the same `--view=` flag, so `--name`, `--pane`, `--split-percent`,
+`+reload`, `+close`, and `+list` all work exactly as above.
+
+| `--view=` | Shows | The user says |
+|---|---|---|
+| `git-status:` | Working tree: staged, unstaged, untracked, in three sections | "my git status", "what have I changed", "uncommitted changes" |
+| `git-diff:main...HEAD` | `HEAD` against the **merge base** with `main` | "changes on this branch", "what's on my branch vs main" |
+| `git-diff:` | This branch against the repo's mainline, auto-detected | "changes in this branch", no base named |
+| `git-diff:<sha>` | That ONE commit's own changes | "what changed in `<sha>`", "show me commit `<sha>`" |
+| `git-diff:<a>..<b>` | The literal comparison of two revisions | "diff `<a>` against `<b>`", "what's changed since `<tag>`" (`<tag>..HEAD`) |
+
+Two things to get right:
+
+- **Three dots for "this branch", two for "between these two."** `main...HEAD`
+  goes against the merge base, which is what a person means by "what's on my
+  branch" — it excludes whatever landed on `main` since they branched.
+- **A bare revision means THAT COMMIT**, not "diff against it".
+  `git-diff:abc123` answers "what changed in abc123"; a comparison is
+  `git-diff:abc123..HEAD`.
+
+**`--working-directory` is the exception to the rule above.** For a plain split
+you skip it, but a `git-*:` spec is not a path — it is never path-resolved, and
+`--working-directory` is what picks the **repository** the diff is taken in. A
+split inherits your cwd, so you can omit it when you are already in the repo;
+pass it whenever the diff is about a repo you are not sitting in. A directory in
+no git working tree renders an explanatory card rather than an empty pane.
+
+```bash
+# "show me changes in the current branch against main" — beside your pane
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=60 \
+  --name=diff --view=git-diff:main...HEAD
+
+# "show me files in my git status", for a repo you are NOT cd'd into
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --name=status \
+  --working-directory=/path/to/project --view=git-status:
+
+# one commit, and an arbitrary range
+ghoztty +split --name=commit  --view=git-diff:a1b2c3d
+ghoztty +split --name=release --view=git-diff:v1.2.0..v1.3.0
+
+ghoztty +reload --target=diff        # re-run after new commits land
+```
+
+**The pane's location IS the spec.** `+list --json` reports it as the pane's
+`url`, so you can tell whether a diff pane is already open on the right revspec
+before opening another; `+reload`/Cmd+R re-runs it; the address bar shows and
+accepts it. Since `--name` is idempotent, re-splitting with the same name just
+focuses the existing pane — to retarget it at a different revspec, `+close` it
+and re-split.
+
+A `git-status:` pane **re-checks the working tree every 2s**, so it needs no
+`+reload` after an edit or a `git add`. A commit or range pane is a fixed pair
+of trees and is not polled.
+
 ### Auto-preview conventions (build → show it beside the work)
 
 When you produce something previewable, **show it in a viewer pane automatically**
@@ -159,21 +227,43 @@ ghoztty +split --direction=right --split-percent=66 --name=preview --view=docs/d
 # ...keep editing docs/design/spec.md — the preview re-renders on each save.
 ```
 
-**Trigger 2 — you scaffold or edit a mock HTML app / prototype.**
-An HTML *file* opened with `--view` renders as syntax-highlighted **source**, not
-a live page — so **host it** and view the URL. Run a static server (or the app's
-own dev server) in a work pane in the left third, then point the preview at its
-URL. URL viewers do **not** auto-reload, so `+reload` the preview after edits.
+**Trigger 2 — you scaffold or edit a static mock HTML app / prototype.**
+Point the preview straight at the **file**. An `.html`/`.htm` file opened with
+`--view` renders as a **live page** — its own CSS, JS, and images load from the
+file's directory — and it **live-reloads on save**, exactly like markdown. No
+server, no `+reload`.
 
 ```bash
-# 1. Serve the app from a work pane stacked below your session (left third)
+# Preview the mock in the right 2/3 — that's the whole setup
+ghoztty +split --direction=right --split-percent=66 --name=preview \
+  --view=/path/to/app/index.html
+# ...keep editing index.html — the page re-renders on each save.
+```
+
+Two things to know:
+
+- Only the **viewed file** is watched. Editing a sibling `style.css` or
+  `app.js` does not trigger a reload on its own — `ghoztty +reload
+  --target=preview` picks those up (it bypasses the cache).
+- The page may read assets **inside its own directory** only. A prototype that
+  reaches up out of its folder (`../shared/app.css`) won't resolve — either
+  keep assets under the page, or serve the project (Trigger 3).
+
+**Trigger 3 — the app needs a dev server** (a framework app: Vite, Next,
+webpack, `npm run dev`). A build step or a router means there is no static file
+to point at, so **host it** and view the URL. Run the dev server in a work pane
+in the left third, then point the preview at its URL. URL viewers do **not**
+auto-reload unless the dev server itself pushes HMR, so `+reload` the preview
+after edits.
+
+```bash
+# 1. Run the dev server from a work pane stacked below your session (left third)
 ghoztty +split --direction=down --name=server \
-  --working-directory=/path/to/app --command="python3 -m http.server 8000"
-#    (framework app? use its dev server instead, e.g. --command="npm run dev")
+  --working-directory=/path/to/app --command="npm run dev"
 
 # 2. Preview the running app in the right 2/3
 ghoztty +split --direction=right --split-percent=66 --name=preview \
-  --view=http://localhost:8000
+  --view=http://localhost:3000
 
 # 3. After each edit, refresh the preview (URL viewers don't live-reload)
 ghoztty +reload --target=preview
@@ -199,7 +289,7 @@ ghoztty +rearrange --target=<window> --layout='{
 
 ### `ghoztty +reload`
 
-Reload a named **viewer pane** in place — no close/reopen. Website viewers re-fetch the page from origin (bypassing caches); file viewers re-render the file preserving scroll position. Local file viewers already live-reload on save, so this mainly matters for `--view=<url>` panes (e.g. refresh a dev-server preview after a rebuild).
+Reload a named **viewer pane** in place — no close/reopen. Website viewers re-fetch the page from origin (bypassing caches); file viewers re-render the file preserving scroll position. Local file viewers already live-reload on save, so this mainly matters for `--view=<url>` panes (e.g. refresh a dev-server preview after a rebuild) — and for an `.html` pane whose sibling CSS/JS changed, which the save-watcher does not see.
 
 ```
 ghoztty +reload --target=<name>
@@ -397,6 +487,8 @@ Close a named pane or window. **Closing a nonexistent target succeeds silently**
 ghoztty +close --target=<name>
 ```
 
+**This ends the pane's session — it does not hide it.** Session persistence is on by default, so a terminal pane's shell runs under the `ghoztty-agent` and normally survives an app quit, crash, or upgrade. `+close` is not that: it kills the process once the close's undo window expires, exactly like closing the pane in the GUI. Only an app quit preserves a session for re-attach. Viewer panes have no session, and `+close` never prompts for them.
+
 ### `ghoztty +read`
 
 Read the last N lines of terminal output from a named pane and print to stdout. Useful for inspecting command output, logs, or checking if a process has finished.
@@ -415,13 +507,15 @@ ghoztty +read --name=<pane> [--lines=<N>]
 Send text and key sequences to a named pane's terminal PTY. Enables scripted interaction with running processes.
 
 ```
-ghoztty +send-keys --target=<name> <text|key>...
+ghoztty +send-keys --target=<name> [flags] <text|key>...
 ```
 
 | Flag / Arg | Description |
 |------------|-------------|
 | `--target=<name>` | Named pane or window to send input to. Required. |
-| Positional args | Text strings and key names, concatenated and written to the PTY. |
+| `--when-idle` | Poll the target's recent output every 500ms until it no longer shows `esc to interrupt` (Claude Code's busy marker) before sending. Sends anyway once the timeout elapses, or if the pane can't be read. |
+| `--idle-timeout=<seconds>` | How long `--when-idle` waits before sending regardless. Default 30. |
+| Positional args | Text strings and key names, written to the PTY in order. |
 
 **Key notation:**
 - Control keys: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
@@ -431,8 +525,19 @@ ghoztty +send-keys --target=<name> <text|key>...
 ```bash
 ghoztty +send-keys --target=term "ls -la" Enter
 ghoztty +send-keys --target=term C-c
-ghoztty +send-keys --target=term "hello\tworld\n"
+ghoztty +send-keys --target=agent --when-idle "next task" Enter
 ```
+
+**Pass text and keys as separate arguments** — `"ls -la" Enter`, never
+`"ls -la\r"`. Argument boundaries survive to the write: adjacent args of the
+same kind merge into a run, each **text** run is sent as a bracketed paste, and
+each **key** run is sent bare outside the frame. That is what makes a message
+actually submit. Flattened into one burst ending in `\r`, a TUI reads that `\r`
+as a newline *inside* pasted text — correctly, since that is what a real
+multi-line paste looks like — and the message sits unsent in the composer.
+Framing only applies when the program has enabled bracketed paste (every modern
+TUI and interactive shell does), so a plain `cat` or a script's `read` still
+gets the bytes verbatim.
 
 ### `ghoztty +set-state`
 
@@ -497,6 +602,48 @@ ghoztty +set-banner --target=dev --clear
 Multi-line banners are **collapsible** in the UI: a chevron button (top-right) or a click anywhere on the banner background toggles between the full banner (default) and a collapsed single-line preview with a bottom fade. This is a display-only, per-pane UI state — it doesn't change the stored banner text, and there's no CLI flag for it.
 
 Processes inside the pane can also set the banner without IPC via OSC escape sequence: `\033]7778;<text>\007` (empty text clears; note the OSC parser drops raw newlines, so OSC banners are single-line — use the CLI for tables/multi-line). Interactive users can press Cmd+R ("Set Pane Banner…", also in the command palette) for a multi-line editor (Return = newline, Cmd+Return = save).
+
+### `ghoztty +sessions`
+
+List the persistent terminal sessions owned by the local `ghoztty-agent` — the daemon that keeps PTYs alive across app restarts.
+
+```
+ghoztty +sessions [--json]
+```
+
+Unlike every other IPC command, this dials the **agent directly** rather than the app's socket, so it works even when the Ghoztty app is not running (as long as the agent is). Requires `session-persistence = on`, which is the default.
+
+Each row reports the session id, liveness (`alive`, or `dead(<code>)` for a tombstoned session), whether a viewer is `attached`, the activity state, the child pid, whether it is `pinned` against the agent's idle reaper, the working directory, and the command.
+
+`--json` emits a **bare array** of rows — not the `{"success":…,"data":…}` envelope the window commands use — with every field present including nulls: `id`, `alive`, `exit_code`, `attached`, `activity`, `pid`, `cwd`, `argv`, `title`, `created_at`, `last_activity`, `pinned`.
+
+```bash
+ghoztty +sessions
+ghoztty +sessions --json | jq -r '.[] | select(.alive) | "\(.id)\t\(.activity)\t\(.argv)"'
+```
+
+### `ghoztty +new-remote-window`
+
+Open a terminal window whose shell runs on a **remote machine**, via a `ghoztty-agent` reached over TCP. Same flow as the Cmd-Shift-N "New Remote Window" menu action.
+
+```
+ghoztty +new-remote-window --host=<host> --port=<port> [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--host=<host>` | Agent host, DNS name or literal IP. Required. |
+| `--port=<port>` | Agent TCP port. Required. |
+| `--working-directory=<path>` | Working directory **on the remote machine**. Overrides that machine's per-host default. |
+| `--shell=<path>` | Shell **on the remote machine** (e.g. `wsl.exe`, `powershell.exe`, `/bin/zsh`). Overrides the per-host default. |
+| `--command=<cmd>` | Command to run instead of an interactive shell, through the resolved shell's native convention (POSIX `-lic`, cmd `/c`, powershell `-Command`, wsl `--`). |
+
+```bash
+ghoztty +new-remote-window --host=127.0.0.1 --port=7777
+ghoztty +new-remote-window --host=winbox --port=7777 --shell=wsl.exe --working-directory='C:\dev'
+```
+
+Your local shell and cwd are **not** forwarded — they wouldn't exist on a different OS such as a Windows ConPTY agent. The remote machine's own defaults apply unless a per-host default (machine chooser → row `⋯` → "Host Settings…") or an explicit flag says otherwise. A remote pane's IPC still belongs to the **local** app, so `+split`, `+close`, and `+set-banner` target it like any other pane.
 
 ## Naming System
 
@@ -647,6 +794,23 @@ ghoztty +set-banner --target=dev "**PR #123** — CI **green** — ready for rev
 ghoztty +set-banner --target=dev --clear
 ```
 
+### Review your own changes beside the work
+
+Open the branch diff next to the pane you're working in, then re-run it as commits land. A `git-status:` pane is the better choice while you're still editing — it re-checks the working tree every 2s on its own.
+
+```bash
+# What's on this branch, against main
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=60 \
+  --name=diff --view=git-diff:main...HEAD
+
+# ... commit some work ...
+ghoztty +reload --target=diff
+
+# Or watch the working tree live instead — no reload needed
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --name=status \
+  --view=git-status:
+```
+
 ### Pass environment variables
 
 ```bash
@@ -674,4 +838,9 @@ Closing a nonexistent target is a no-op, so teardown scripts are safe even if so
 - **Don't use sequential `+new-window` then `+split`** for the initial layout — use `--split` and `--split-command` on `+new-window` for atomicity.
 - **Don't assume `--working-directory` propagates to `--split-command`** — the split pane must `cd` explicitly if it needs the same directory.
 - **Don't `less`/`cat`/`open` a file to show it in a pane** — that dumps raw text (unrendered markdown) or opens an external app. Use `+split --view=<path>` for a rendered, live-reloading viewer pane.
-- **Don't leave a design doc or mock HTML app preview-less** — when you author Markdown or scaffold an HTML prototype, auto-open it in a right-hand 2/3 viewer (see *Auto-preview conventions*). Markdown live-reloads; for an HTML app, serve it and `--view` the URL, then `+reload` the preview after edits (`--view` of an `.html` file shows source, not a live page).
+- **Don't leave a design doc or mock HTML app preview-less** — when you author Markdown or scaffold an HTML prototype, auto-open it in a right-hand 2/3 viewer (see *Auto-preview conventions*). Markdown and static `.html` files both render live and live-reload on save, so `--view` the file directly. Only a framework app that needs a dev server gets the serve-then-`--view`-the-URL treatment (and a `+reload` after edits).
+- **Don't dump `git diff` into the terminal to show changes** — use `+split --view=git-diff:…` for a navigable diff with a file tree. Reach for the raw command only when you need the text yourself.
+- **Don't read `git-diff:<sha>` as "compare against `<sha>`"** — a bare revision shows that commit's own changes. A comparison is `git-diff:<sha>..HEAD`.
+- **Don't `+read`, `+send-keys`, `+set-state`, or `+set-banner` a viewer pane** — all four exit 1. The pane is for the user to look at; if you need a diff as text, run `git diff` yourself.
+- **Don't `+close` a pane you only meant to hide** — it ends that pane's persistent session and the process does not come back.
+- **Don't flatten text and keys into one `+send-keys` argument** — `"message\r"` leaves the message unsent in a TUI composer. Pass `"message" Enter`.
