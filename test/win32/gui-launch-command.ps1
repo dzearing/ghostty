@@ -62,6 +62,15 @@ function Count-TestProcs($name) {
     return @(Get-CimInstance Win32_Process -Filter "Name='$name'" |
         Where-Object { $_.CommandLine -like '*zig-out*' }).Count
 }
+# Kill the APP but leave the agent running - the "quit/crash, then relaunch"
+# shape section D needs, since the agent is what keeps the sessions alive for
+# the next launch to re-attach to.
+function Stop-TestApp {
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
+        Where-Object { $_.CommandLine -like '*zig-out*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 900
+}
 
 function Run-Cli($argsLine, $out, $timeoutSec = 20) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
@@ -90,6 +99,32 @@ function Windows-Of($tree) {
     if ($null -ne $tree.data) { return @($tree.data.windows) }
     return @($tree.windows)
 }
+# Every terminal leaf in one `+list --json` snapshot, flattened across windows
+# and tabs. Section D needs the whole tree, not just the head of it: after a
+# restoring launch the requested pane and the rebuilt ones are siblings and
+# nothing promises which comes first.
+function Leaves-Of-Node($node) {
+    if ($null -eq $node) { return @() }
+    if ($node.type -eq 'leaf') { return @($node.terminal) }
+    if ($node.type -eq 'split') {
+        return @(Leaves-Of-Node $node.left) + @(Leaves-Of-Node $node.right)
+    }
+    return @()
+}
+function Snapshot-Windows($tmp, $tag) {
+    Run-Cli '+list --json' "$tmp\list-$tag.json" 20 | Out-Null
+    $tree = $null
+    try { $tree = (Out-Text "$tmp\list-$tag.json" | ConvertFrom-Json) } catch {}
+    return @(Windows-Of $tree)
+}
+function Leaves-Of-Windows($windows) {
+    $out = @()
+    foreach ($w in @($windows)) {
+        foreach ($t in @($w.tabs)) { $out += @(Leaves-Of-Node $t.splits) }
+    }
+    return $out
+}
+
 # The name of the first pane of the first window, or '' if there is none yet.
 function First-Pane($tmp, $tag, $timeoutSec = 45) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -124,6 +159,23 @@ function Wait-PaneText($tmp, $tag, $pane, $needle, $timeoutSec = 40) {
         Start-Sleep -Milliseconds 800
     }
     return $last
+}
+# Same idea across EVERY pane in the tree: returns the name of the first pane
+# whose scrollback contains $needle, or '' if none does before the deadline.
+function Wait-AnyPaneText($tmp, $tag, $needle, $timeoutSec = 60) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $i = 0
+    while ((Get-Date) -lt $deadline) {
+        foreach ($leaf in (Leaves-Of-Windows (Snapshot-Windows $tmp "$tag-$i"))) {
+            if ([string]$leaf.name -eq '') { continue }
+            Run-Cli "+read --name=$($leaf.name) --lines=60" "$tmp\read-$tag-$i.txt" 15 | Out-Null
+            $t = [string](Out-Text "$tmp\read-$tag-$i.txt")
+            if ($t -ne '' -and $t.Contains($needle)) { return $leaf.name }
+        }
+        $i++
+        Start-Sleep -Milliseconds 900
+    }
+    return ''
 }
 
 # One hermetic GUI launch. $launchArgs is passed to Start-Process VERBATIM:
@@ -230,6 +282,55 @@ $rows = @()
 try { $rows = @((Out-Text "$tmpC\sessions.json") | ConvertFrom-Json) } catch {}
 $withCmd = @($rows | Where-Object { $null -ne $_.argv -and $_.argv -ne '' })
 Assert "C4 the agent recorded NO command for the plain launch" ($withCmd.Count -eq 0)
+
+Stop-TestProcs
+
+# ============================================================================
+"== D: a launch command survives session restore (T406)"
+# ============================================================================
+# The defect: session persistence is ON by default, so the SECOND launch of the
+# day has a layout to rebuild - and launch-time restore rebuilt it and dropped
+# the command entirely. Nothing was logged and the exit code was 0, so it read
+# as "the T104 fix does not work" (it was reproduced twice that way before it
+# was understood). Core `Surface.init` hands `initial-command` to whichever
+# surface is `app.first`, and on a restoring launch that is a RESTORED pane -
+# which ATTACHes to a session that already exists and has nowhere to run it.
+#
+# The rule: do BOTH. Restore what the user left behind AND open the window they
+# just asked for. The requested window is created before restore so it is the
+# one `app.first` names.
+$tmpD = Join-Path $root 'd'
+
+# --- launch 1: seed a session to come back to -------------------------------
+Launch $tmpD @()
+$paneD0 = First-Pane $tmpD 'd0' 60
+Assert "D1 the seeding launch opened a window with a pane" ($paneD0 -ne '')
+$leavesD0 = @(Leaves-Of-Windows (Snapshot-Windows $tmpD 'd0-ids'))
+$seedId = if ($leavesD0.Count -ge 1) { [string]$leavesD0[0].id } else { '' }
+Assert "D2 the seed pane reports a stable pane id" ($seedId -ne '')
+
+# Kill the APP only. The agent keeps the PTY alive, which is exactly the state a
+# quit (or a crash) leaves behind and what the next launch re-attaches to. The
+# sleep is for the 250ms debounced layout capture to reach disk.
+Start-Sleep -Seconds 3
+Stop-TestApp
+Assert "D3 the agent outlived the app" ((Count-TestProcs 'ghoztty-agent.exe') -ge 1)
+AssertEq "D4 the app is gone" 0 (Count-TestProcs 'ghoztty.exe')
+
+# --- launch 2: same state dir (so there IS a restore) AND a command ---------
+Launch $tmpD @('-e', $script, 'omega', 'psi')
+$cmdPane = Wait-AnyPaneText $tmpD 'd1' 'T104ARGS=[omega][psi][]' 90
+Assert "D5 the -e command RAN despite the restore (pre-fix: silently dropped)" `
+    ($cmdPane -ne '')
+
+# The negative control: without this, D5 could pass simply because restore did
+# nothing at all, which is not the case under test.
+$winsD = @(Snapshot-Windows $tmpD 'd2')
+Assert "D6 restore also rebuilt the previous window (>= 2 windows)" ($winsD.Count -ge 2)
+$idsD = @(Leaves-Of-Windows $winsD | ForEach-Object { [string]$_.id })
+Assert "D7 the seed pane came back with its own pane id" ($idsD -contains $seedId)
+
+Stop-TestProcs
 
 # ---- teardown --------------------------------------------------------------
 Stop-TestProcs

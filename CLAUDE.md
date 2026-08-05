@@ -832,6 +832,18 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
 
   E2E: `test/win32/session-relaunch-notify.ps1`.
 
+**A launch command and a restore both happen.** `ghoztty -e <cmd…>` (or a
+`command`/`initial-command` in the config) asked for something on THIS launch;
+the windows restore rebuilds are what the user left behind. Neither silently
+swallows the other: the requested window is opened **first**, then restore
+rebuilds the rest, and the requested window is raised back to the foreground
+afterwards. Opening it first is not cosmetic — core `Surface.init` hands
+`initial-command` to whichever surface is `app.first`, and a restored pane would
+otherwise consume it and have nowhere to run it (it ATTACHes to a session that
+already exists), which is how the command used to vanish with no window, no
+error and no log line (T406). Acceptance: section D of
+`test/win32/gui-launch-command.ps1`.
+
 Session lifecycle: a process DIES when the user closes its pane/tab/window (or
 `+close`s it — the CLOSE lands when the close's undo window expires), when the
 shell itself exits, or when the agent dies (children then relaunch as

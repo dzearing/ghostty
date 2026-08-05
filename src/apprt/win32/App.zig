@@ -786,6 +786,23 @@ fn showConfigErrorsIfAny(
 }
 
 pub fn run(self: *App) !void {
+    // T406: a launch command (`ghoztty -e cmd…`, or `initial-command` in the
+    // config) is something the user asked for on THIS launch; the windows a
+    // restore rebuilds are what they left behind last time. Neither may
+    // silently swallow the other, so when both are present we do BOTH — and
+    // the requested window is created FIRST, before restore, for a mechanical
+    // reason: core `Surface.init` hands `initial-command` to whichever surface
+    // is `app.first`, and a restored pane would otherwise eat it and have
+    // nowhere to run it (it ATTACHes to a session that already exists, so the
+    // command would vanish with no window, no error and no log line — the
+    // whole defect).
+    const launch_command = self.config.@"initial-command" != null;
+    var startup_window: ?*Window = null;
+    if (launch_command) {
+        startup_window = try self.createWindow(.{});
+        log.info("launch command: opened its window before session restore", .{});
+    }
+
     // Session re-attach (T89f2): if a layout manifest survives and its agent
     // sessions are still alive, rebuild those windows and SUPPRESS the default
     // blank window. Any failure (no manifest, persistence off, agent gone,
@@ -795,8 +812,20 @@ pub fn run(self: *App) !void {
     // Create the initial Window container with one tab. Route through
     // createWindow so the session-persistence injection (T89d) applies to the
     // startup window exactly as it does to every later `new_window`. Skipped
-    // when restore already opened at least one window.
-    const startup_window: ?*Window = if (restored) null else try self.createWindow(.{});
+    // when restore already opened at least one window, and when the launch
+    // command above already opened one.
+    if (startup_window == null and !restored) {
+        startup_window = try self.createWindow(.{});
+    }
+
+    // Restore's windows were created after the launch-command window and are
+    // sitting on top of it. The command is what the user just typed, so give it
+    // the foreground back.
+    if (launch_command and restored) {
+        if (startup_window) |w| {
+            if (w.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+        }
+    }
 
     // Surface config load diagnostics once at startup (T69). After the
     // first window exists so the dialog has an owner to center on; the

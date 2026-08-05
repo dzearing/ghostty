@@ -8996,3 +8996,45 @@ that script aborts from inside a Ghoztty pane because it never drops the
 inherited `$GHOZTTY_IPC_SOCKET`, which is how a red section stayed unseen.
 **T486** — the LOCAL Restore All button now has no on-box rebuild oracle, since
 the launch recovers before it can; decide whether it needs one.
+
+## 2026-08-05 — T406: a launch command is no longer eaten by the windows coming back
+
+`ghoztty -e npm test` ran the command only on a truly clean start. With windows
+to restore — which, since session persistence is on by default, is nearly every
+launch — the old windows came back and the command simply did not happen: no
+window, no error, exit code 0, nothing in the log. It had already been
+reproduced twice as "the T104 fix does not work" before anyone understood it,
+which is what earned it a task rather than a footnote.
+
+The mechanism is one line of core, three files away. `Surface.init` hands
+`initial-command` to whichever surface is `app.first`, and every surface clears
+that flag on the way out. Restore ran first, so `app.first` was a RESTORED pane
+— which ATTACHes to a session that already exists and therefore has nowhere to
+put a command. It was not dropped by a check that could have logged something;
+it was consumed by a pane that could not use it.
+
+So the fix is an ordering, not a new mechanism: when a launch command is present
+its window is created BEFORE restore, which makes it the surface `app.first`
+names, and it is raised back to the front afterwards because restore's windows
+land on top of it. Restore then rebuilds everything else exactly as before.
+Nothing in the non-restoring path moves, and no second command-injection seam
+was added beside the one the core already has.
+
+What it SHOULD do was the real question, and the T240 rule (answer from the Mac
+side, with a cite) could not be followed: the Mac has the same defect —
+`applicationDidBecomeActive` opens the initial window only when no restore is
+pending, and `sessionLayoutRestoreFinished` only when the restore ended with
+zero windows. With no precedent to cite the call was made here and filed as
+**D15**: do both. It is the only option that drops nothing the user asked for —
+the command was typed a second ago, and the restored windows are real work.
+
+Section D of `test/win32/gui-launch-command.ps1` seeds a session, kills the APP
+only (the agent keeps the PTY alive — a quit or crash), then relaunches the same
+state dir with `-e`. Its three assertions are deliberately braided: the command
+ran, there are two windows, and the seed pane came back under its own pane id —
+so it cannot go green because restore quietly did nothing. Negative control: the
+pre-fix build fails exactly the first two and passes the third.
+
+Filed: **T487** — the sibling silent drop, a launch against an already-running
+instance forwards a bare `new-window` with a `null` payload and discards `-e`
+(read from the code, not yet reproduced). **T488** (seat: mac) — the Mac half.
