@@ -220,8 +220,6 @@ git commit -m "$(cat <<'EOF'
 fix(<area>): <what changed, from the user's report>
 
 Feedback report <stem>: <one-line paraphrase of the ask>
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
 )"
 mv "$q/in-progress/$stem" "$q/complete/$stem"
