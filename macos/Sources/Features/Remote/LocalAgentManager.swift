@@ -327,6 +327,28 @@ final class LocalAgentManager {
     /// only (never spawns) and frees that probe connection after reading. The
     /// `LIST_SESSIONS` RPC runs on a background queue; `completion` is delivered
     /// on the main actor — nil ⇒ no local agent reachable or the RPC failed.
+    ///
+    /// (See `warmSharedHandle` below for the long-lived-subscription variant.)
+
+    /// The warm shared local-agent connection, when one is healthy and its agent
+    /// is still alive. **Borrowed, never owned**: `LocalAgentManager` holds this
+    /// for the app's lifetime, so a caller must not free it — only use it for the
+    /// duration of a subscription and unsubscribe when done.
+    ///
+    /// Exposed for long-lived subscriptions (the chooser's per-session CPU
+    /// stream), which — unlike `listLocalSessions`' one-shot RPC — need the SAME
+    /// connection to stay open across pushes. Returns nil when there is no warm
+    /// connection; callers then simply do without rather than spawning an agent.
+    var warmSharedHandle: ghostty_remote_connection_t? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let existing = sharedOwner,
+              existing.linkState != .dead,
+              sharedAgentPid > 0,
+              kill(sharedAgentPid, 0) == 0 || errno == EPERM
+        else { return nil }
+        return existing.handle
+    }
+
     func listLocalSessions(_ completion: @escaping @MainActor ([BrowsedSession]?) -> Void) {
         dispatchPrecondition(condition: .onQueue(.main))
 
@@ -340,7 +362,7 @@ final class LocalAgentManager {
             let handle = existing.handle
             DispatchQueue.global(qos: .userInitiated).async {
                 let sessions = RemoteSessionRoster.list(handle: handle)
-                DispatchQueue.main.async { completion(sessions) }
+                onMainEvenWhenModal { completion(sessions) }
             }
             return
         }
@@ -349,12 +371,12 @@ final class LocalAgentManager {
         // browsing never starts an agent. Free the probe connection afterward.
         DispatchQueue.global(qos: .userInitiated).async {
             guard let conn = Self.dialExisting(paths: .current) else {
-                DispatchQueue.main.async { completion(nil) }
+                onMainEvenWhenModal { completion(nil) }
                 return
             }
             let sessions = RemoteSessionRoster.list(handle: conn.handle)
             ghostty_remote_connection_free(conn.handle)
-            DispatchQueue.main.async { completion(sessions) }
+            onMainEvenWhenModal { completion(sessions) }
         }
     }
 
@@ -375,19 +397,19 @@ final class LocalAgentManager {
             let handle = existing.handle
             DispatchQueue.global(qos: .userInitiated).async {
                 let ok = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
-                DispatchQueue.main.async { completion(ok) }
+                onMainEvenWhenModal { completion(ok) }
             }
             return
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
             guard let conn = Self.dialExisting(paths: .current) else {
-                DispatchQueue.main.async { completion(false) }
+                onMainEvenWhenModal { completion(false) }
                 return
             }
             let ok = RemoteSessionKiller.close(handle: conn.handle, sessionID: sessionID)
             ghostty_remote_connection_free(conn.handle)
-            DispatchQueue.main.async { completion(ok) }
+            onMainEvenWhenModal { completion(ok) }
         }
     }
 

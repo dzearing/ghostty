@@ -173,6 +173,21 @@ extension Ghostty {
         case busy
         case needsInput = "needs_input"
 
+        /// The human-facing name for this state, used wherever the state is
+        /// rendered for a person to read (today: the window title suffix).
+        ///
+        /// Deliberately distinct from `rawValue`, which is the machine token
+        /// accepted by `+set-state --state=`, carried in the OSC 7777 payload,
+        /// and published as `AXWindowActivityState`. Those are a public API —
+        /// user hooks invoke the CLI and external tools read the attribute — so
+        /// they must not follow changes made here for readability.
+        var displayLabel: String {
+            switch self {
+            case .idle, .busy: rawValue
+            case .needsInput: "question"
+            }
+        }
+
         init(c: ghostty_activity_state_e) {
             switch c {
             case GHOSTTY_ACTIVITY_STATE_BUSY:

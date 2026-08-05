@@ -27,6 +27,40 @@
 //! (whether an inbound `channel` belongs to a session this client opened — that is
 //! connection state, §15 M3) and it does not interpret terminal escapes (that is
 //! the VT parser, §9.8). It only frames bytes and bounds them structurally.
+//!
+//! ## Compatibility history (the agent contract's version log)
+//!
+//! The `ghoztty-agent` outlives the app, so a running agent is frequently a
+//! DIFFERENT build than the app talking to it (see CLAUDE.md, "Agent contract &
+//! upgrade compatibility"). Every wire evolution is therefore recorded here, so
+//! the compatibility matrix is checkable in review rather than inferred from
+//! `git log`. `proto_version` is bumped only for a BREAKING change; everything
+//! below rides version 1 and is negotiated additively as a `capability` string
+//! (see `capability` and `negotiate`).
+//!
+//! | Since | Capability | What it added | Absent ⇒ |
+//! | --- | --- | --- | --- |
+//! | v1 | `resync` | sequence-anchored resync + grid snapshot (§7.3) | no resync |
+//! | v1 | `flow` | per-channel flow control (§4.3) | unbounded writes |
+//! | v1 | `rpc` | JSON-RPC control plane (§9.5) | no in-pane RPC |
+//! | v1 | `tunnel` | port-forward tunneling (§8) | no tunnels |
+//! | v1 | `close_session` | `CLOSE_SESSION` 0x2c (kill by session id) | channel-scoped `close` only |
+//! | v1 | `grid_snapshot` | visible-screen repaint appended on ATTACH | ring-only replay |
+//! | v1 | `session_cpu` | pushed per-session CPU 0x79-0x7b | chooser shows no meter |
+//! | v1 | `sessions_push` | pushed session roster 0x7c-0x7d | client polls `LIST_SESSIONS` |
+//! | v1 | `cpu_units` | `cpu_pct` carries CORRECTED units everywhere | `% CPU` marked unverifiable |
+//!
+//! Two rules make that table load-bearing rather than decorative:
+//!
+//!   1. **New capabilities only ever describe ADDITIVE behavior**, so an older
+//!      peer that never advertises one degrades to the "Absent ⇒" column — never
+//!      to garbled output, a wedged socket, or a crash.
+//!   2. **A capability may also pin the MEANING of an existing field**, not just
+//!      the existence of an opcode. `cpu_units` is the first of that kind: the
+//!      field `Proc.cpu_pct` predates it, but its VALUE changed (macOS mach ticks
+//!      were being read as nanoseconds, ~24× low on Apple Silicon), and a value
+//!      that silently changes meaning is exactly what the contract forbids
+//!      shipping ungated.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -122,6 +156,25 @@ pub const FrameType = enum(u8) {
     proc_kill_result = 0x76, // A→C  {pid, ok, error?}
     proc_spawn = 0x77, // C→A  {cmd, cwd?, detached?}
     proc_spawn_result = 0x78, // A→C  {ok, pid?, error?}
+
+    // Per-session CPU roll-up. A server→client stream gated by a sub/unsub, like
+    // `metrics` — and, like it, only sent when the `session_cpu` capability was
+    // negotiated by BOTH peers (a new opcode is a fatal framing error to a peer
+    // that does not know it).
+    session_cpu_sub = 0x79, // C→A  {interval_ms}     — a HINT; the agent decides
+    session_cpu = 0x7a, // A→C  {interval_ms, sessions[]}
+    session_cpu_unsub = 0x7b, // C→A  {}
+
+    // Pushed session roster. The client subscribes once and the agent sends a
+    // `sessions` frame (the SAME payload `list_sessions` replies with) whenever
+    // the roster actually changes — created, exited, closed, attached, detached.
+    // Event-driven, not polled: the chooser previously re-ran `list_sessions`
+    // every 2s and still showed stale rows, because a poll can only ever be as
+    // fresh as its last tick and its completion can be lost. Gated on the
+    // `sessions_push` capability (new opcodes are a fatal framing error to a
+    // peer that does not know them).
+    sessions_sub = 0x7c, // C→A  {}
+    sessions_unsub = 0x7d, // C→A  {}
 };
 
 // -----------------------------------------------------------------------------
@@ -366,6 +419,27 @@ pub const capability = struct {
     /// that omits it keeps working over the channel-scoped `close` alone.
     pub const close_session = "close_session";
 
+    /// Pushed per-session CPU roll-up (`session_cpu_sub`/`session_cpu`/
+    /// `session_cpu_unsub`, 0x79–0x7b): the agent reports each session's CPU%
+    /// summed over its WHOLE process tree, so the chooser can show a runaway
+    /// agent at a glance without pulling the entire process table.
+    ///
+    /// Gated because these are NEW OPCODES, not new fields — an older peer treats
+    /// an unknown opcode as a fatal framing error, so the client must not send
+    /// `session_cpu_sub` unless the agent advertised this string. When it is
+    /// absent the chooser simply shows no meter (reduced function, never a wrong
+    /// number and never a fallback poll the agent did not consent to).
+    pub const session_cpu = "session_cpu";
+
+    /// Pushed session roster (`sessions_sub`/`sessions_unsub`, 0x7c-0x7d; the
+    /// agent replies on the existing `sessions` frame). The agent pushes the
+    /// roster whenever it CHANGES, so a viewer never has to poll and can never
+    /// show a session that has already exited.
+    ///
+    /// Gated because these are new opcodes. Without it the client falls back to
+    /// its `list_sessions` poll, which still works — just less promptly.
+    pub const sessions_push = "sessions_push";
+
     /// Re-attach **grid snapshot**: on ATTACH the agent, having tracked each
     /// session's visible screen in a headless emulator, replays a self-contained
     /// VT repaint of the current on-screen grid so the pane repaints EXACTLY and
@@ -384,6 +458,39 @@ pub const capability = struct {
     /// Gated on the INTERSECTION (`Negotiated.grid_snapshot`), so every skew
     /// combination degrades gracefully to today's behavior — no garble, no wedge.
     pub const grid_snapshot = "grid_snapshot";
+
+    /// Every `cpu_pct` this peer reports is in CORRECTED units.
+    ///
+    /// Unlike every capability above, this one gates no opcode and no field. It
+    /// pins the MEANING of a field that already existed: `Proc.cpu_pct` in
+    /// `PROC_SNAPSHOT`, and the same quantity in the `session_cpu` stream.
+    ///
+    /// The macOS sampler used to hand `pti_total_user`/`pti_total_system` to
+    /// `cpuForPid` as if they were nanoseconds. They are mach absolute time
+    /// units, so on an Apple Silicon box (timebase 125/3 ⇒ 41.67 ns/tick) every
+    /// per-process percentage came out ~24× low; on Intel the timebase is 1:1,
+    /// which is why it went unnoticed. `src/remote/agent/proc.zig` now converts
+    /// through `mach_timebase_info`, matching what Linux (jiffies → ns) and
+    /// Windows (100 ns FILETIME → ns) always did.
+    ///
+    /// That fix is AGENT-side, and an agent outlives the app that talks to it —
+    /// so a new app can find itself reading a pre-fix agent's `cpu_pct` and has
+    /// no way to tell from the number alone. This string is how it tells: an
+    /// agent that advertises it guarantees corrected units; one that does not
+    /// might be reporting ~24× low, and the app marks the column unverifiable
+    /// rather than rendering a possibly-wrong number as fact.
+    ///
+    /// It deliberately does NOT let the app rescale: the app cannot know the
+    /// remote machine's mach timebase, and assuming 125/3 would be wrong on an
+    /// Intel remote (and on a Linux/Windows agent, whose numbers were always
+    /// right). Reduced function, never invented data.
+    ///
+    /// Note that `session_cpu` implies this: the pushed CPU stream was added
+    /// AFTER the units fix in the same change set, so no agent can advertise
+    /// `session_cpu` without also having corrected units. The chooser's session
+    /// meter therefore needs no separate gate; the Activity Monitor's process
+    /// table, whose `cpu_pct` predates both, is what this exists for.
+    pub const cpu_units = "cpu_units";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -406,9 +513,14 @@ pub const Hello = struct {
     /// ignore it when absent. Never load-bearing for the protocol itself.
     build_version: ?[]const u8 = null,
 
-    /// Serialize to a JSON byte slice owned by `alloc`.
+    /// Serialize to a JSON byte slice owned by `alloc`. Null optionals are
+    /// elided rather than emitted as `"field":null`, matching every other
+    /// encoder here, so a HELLO that sets none of them is byte-identical to
+    /// one from a peer built before the field existed.
     pub fn encode(self: Hello, alloc: Allocator) Allocator.Error![]u8 {
-        return std.json.Stringify.valueAlloc(alloc, self, .{});
+        return std.json.Stringify.valueAlloc(alloc, self, .{
+            .emit_null_optional_fields = false,
+        });
     }
 
     /// Parse a `HELLO` payload. The returned `Parsed` owns its backing memory;
@@ -436,6 +548,29 @@ pub const Negotiated = struct {
     /// Additive: false against any older peer, so the agent falls back to today's
     /// ring-only replay and the client just renders whatever DATA arrives.
     grid_snapshot: bool = false,
+
+    /// True iff BOTH peers advertised `capability.session_cpu` — i.e. the pushed
+    /// per-session CPU stream (0x79-0x7b) is safe to use. False against any older
+    /// peer, in which case the client never sends `session_cpu_sub` (an unknown
+    /// opcode would be a fatal framing error) and the chooser shows no meter.
+    session_cpu: bool = false,
+
+    /// True iff BOTH peers advertised `capability.sessions_push` — the agent
+    /// will push the roster on every change instead of the client polling.
+    /// False against an older peer, which keeps the poll.
+    sessions_push: bool = false,
+
+    /// True iff BOTH peers advertised `capability.cpu_units` — i.e. the peer's
+    /// `cpu_pct` values are in corrected units and may be rendered as fact.
+    ///
+    /// The load-bearing half is the AGENT's advertisement (the app consumes
+    /// `cpu_pct`, it does not produce it), but this stays an intersection like
+    /// every other flag so `negotiate`'s contract has no exception: the app also
+    /// advertises the string, which costs nothing and means a future agent could
+    /// learn that the client understands corrected units. False against a pre-fix
+    /// agent, in which case the Activity Monitor marks its `% CPU` column
+    /// unverifiable instead of printing a possibly-24×-low number.
+    cpu_units: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -464,6 +599,12 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.close_session),
         .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
             hasCapability(remote.capabilities, capability.grid_snapshot),
+        .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
+            hasCapability(remote.capabilities, capability.session_cpu),
+        .sessions_push = hasCapability(local.capabilities, capability.sessions_push) and
+            hasCapability(remote.capabilities, capability.sessions_push),
+        .cpu_units = hasCapability(local.capabilities, capability.cpu_units) and
+            hasCapability(remote.capabilities, capability.cpu_units),
     };
 }
 
@@ -877,6 +1018,22 @@ pub const Proc = struct {
     mem_bytes: u64 = 0,
     user: ?[]const u8 = null,
     cmd: ?[]const u8 = null,
+    /// Controlling terminal name WITHOUT the `/dev/` prefix (macOS `ttys004`,
+    /// Linux `pts/4`), or null when the process has no controlling terminal
+    /// (a daemon, or a child that called `setsid`). Windows always reports null.
+    ///
+    /// The client uses this to attribute a process to the pane it is running in:
+    /// every process in a pane inherits the pane's tty, so a tty match seeds
+    /// attribution and the ppid chain propagates it to setsid'd descendants.
+    ///
+    /// A NAME rather than the raw `dev_t` deliberately: device numbers are only
+    /// meaningful on the machine that minted them, so a raw dev could never be
+    /// matched against a remote pane's tty. Names compare across the wire.
+    ///
+    /// Additive and back-compatible: an older agent omits the field and it
+    /// decodes as null (attribution simply reports nothing), and an older client
+    /// ignores it (`ignore_unknown_fields`). No capability gate needed.
+    tty: ?[]const u8 = null,
 };
 
 /// `PROC_LIST` (0x70). Request the process table; `sort`/`limit` shape the reply.
@@ -910,6 +1067,44 @@ pub const Metrics = struct {
 
 /// `METRICS_UNSUB` (0x74). Stop the pushed metrics stream. No fields.
 pub const MetricsUnsub = struct {};
+
+// --- Per-session CPU roll-up (pushed stream, gated on `capability.session_cpu`) --
+//
+// The chooser wants one number per session: is this agent session busy? That is a
+// property of the session's WHOLE process tree — a session is busy because the
+// agent running in it is busy, not because its zsh is — so the roll-up happens
+// AGENT-SIDE, where the session→child-pid table lives. The client would otherwise
+// have to pull the entire process table on a timer just to sum a few subtrees.
+
+/// One session's CPU roll-up.
+pub const SessionCpuRow = struct {
+    /// The session id, matching `SESSIONS`/`LIST_SESSIONS`.
+    id: []const u8,
+    /// Per-core CPU% summed over the session's shell and every descendant, in the
+    /// same units as `Proc.cpu_pct`: ~100 per fully-busy core, so a session running
+    /// four busy threads reads ~400. NOT clamped.
+    cpu_pct: f32 = 0,
+};
+
+/// `SESSION_CPU_SUB` (0x79). Subscribe to the pushed per-session CPU stream.
+pub const SessionCpuSub = struct {
+    /// The cadence the client would LIKE, as a hint. The agent treats it as a
+    /// floor and may push less often when the machine is loaded — see
+    /// `SessionCpu.interval_ms` for what it actually chose.
+    interval_ms: u32 = 2000,
+};
+
+/// `SESSION_CPU` (0x7a). One pushed per-session CPU sample (control channel).
+pub const SessionCpu = struct {
+    /// The cadence the agent ACTUALLY used for this sample, which may be longer
+    /// than the client asked for (it throttles itself under load). Reported so the
+    /// client can tell "idle" from "stale" instead of assuming its hint was honored.
+    interval_ms: u32 = 0,
+    sessions: []const SessionCpuRow = &.{},
+};
+
+/// `SESSION_CPU_UNSUB` (0x7b). Stop the pushed per-session CPU stream. No fields.
+pub const SessionCpuUnsub = struct {};
 
 /// `PROC_KILL` (0x75). Signal/kill a process by pid. `signal` defaults (agent-side)
 /// to a terminate when null.
@@ -1625,6 +1820,58 @@ test "negotiate: close_session capability is the intersection of both HELLOs" {
             .{ .transfer_encoding = .raw },
         );
         try testing.expect(!n.close_session);
+    }
+}
+
+test "negotiate: cpu_units gates the MEANING of an existing field" {
+    // The skew this exists for: a pre-fix agent advertises everything it knows
+    // about — including capabilities NEWER than the units fix would suggest — but
+    // never `cpu_units`, because its `cpu_pct` is ~24x low on Apple Silicon.
+    const modern = [_][]const u8{
+        capability.close_session,
+        capability.session_cpu,
+        capability.cpu_units,
+    };
+    const pre_fix = [_][]const u8{
+        capability.close_session,
+        capability.session_cpu,
+    };
+
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+        );
+        try testing.expect(n.cpu_units);
+    }
+    // New app + pre-fix agent: the app must NOT trust the numbers.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+            .{ .transfer_encoding = .raw, .capabilities = &pre_fix },
+        );
+        try testing.expect(!n.cpu_units);
+        // ...and everything else the pre-fix agent DOES support keeps working:
+        // a units skew degrades one column, it does not disable the connection.
+        try testing.expect(n.close_session);
+        try testing.expect(n.session_cpu);
+    }
+    // New agent + old app (an app that never learned the string): still false,
+    // and harmless — an app that doesn't ask cannot be misled.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &pre_fix },
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+        );
+        try testing.expect(!n.cpu_units);
+    }
+    // The oldest peers advertise nothing at all.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.cpu_units);
     }
 }
 

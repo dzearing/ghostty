@@ -1,0 +1,14 @@
+{
+  "version": "1.29.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        { "title": "Correct CPU numbers for your sessions", "text": "Per-process CPU was reported roughly 24× low on Apple Silicon. Until the agent restarts, Ghoztty marks that column \"% CPU (?)\" rather than showing you a number it can't vouch for — restarting clears the warning and the figures become trustworthy." },
+        { "title": "Live session activity, pushed not polled", "text": "The agent now streams session CPU and the session roster to Ghoztty as they change, instead of being asked every couple of seconds. Session lists update the moment something happens — window renames included — and machines reached over the relay get a CPU meter for the first time." },
+        { "title": "Fixes a crash under fast session switching", "text": "Stopping a CPU stream while it was also being shut down could panic the agent, taking your sessions with it. Sharing one connection per machine made that overlap happen on every selection change in the picker; it is now correctly serialized." },
+        { "title": "Session bookkeeping stops growing forever", "text": "`sessions.json` accumulated dead \"Resume\" rows indefinitely, so the agent's on-disk state grew without bound over weeks of use. Dead rows are now reaped." }
+      ]
+    }
+  ]
+}

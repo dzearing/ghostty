@@ -11,11 +11,11 @@ IPC commands communicate with a running Ghoztty instance over a Unix domain sock
 Create or focus a terminal window. Auto-launches Ghoztty if no instance is running.
 
 ```
-ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --view=<path-or-url> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> --no-activate -e <args...>
+ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --view=<path-or-url-or-diff> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> --no-activate -e <args...>
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
-- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal. Mutually exclusive with `--command`/`-e`.
+- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
 - `--title`: Set the **window title**. A window title pins the titlebar — it wins over any tab or pane title and survives pane focus changes and shell OSC title updates — until cleared. The titlebar falls back to window title → active tab's title → active pane's title. Interactive equivalents: Cmd+Shift+R ("Change Window Title", also sets/clears it), plus separate "Change Tab Title" and "Change Pane Title" commands in the menu and command palette. `ghoztty +rename --target=<name> --title=<title>` changes it later (`--title=""` clears the pin).
 
 ### `ghoztty +split`
@@ -23,13 +23,13 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
 Create a split pane in a running window.
 
 ```
-ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --command=<cmd> --view=<path-or-url> --shell=<path> --working-directory=<path> -e <args...>
+ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --command=<cmd> --view=<path-or-url-or-diff> --shell=<path> --working-directory=<path> -e <args...>
 ```
 
 - `--direction`: Split direction. Default: `right`.
 - `--target`: Named window to split in (default: most recently focused).
 - `--name`: Register the new pane with a name for later targeting.
-- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal. Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
+- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
 ### `ghoztty +close`
 
@@ -114,6 +114,8 @@ Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own 
 
 Set the activity state of a named window or pane. The state is aggregated across all panes in a window (priority: `needs_input` > `busy` > `idle`) and shown as a title suffix and custom `AXWindowActivityState` accessibility attribute.
 
+`idle`/`busy`/`needs_input` are the **machine tokens** — the vocabulary of this flag, of the OSC 7777 payload, and of `AXWindowActivityState`. They are a public API (hooks call the CLI, external tools like ztabby read the attribute) and do not change for readability. The **title suffix** shows a human label instead, and the two differ for one state: `needs_input` renders as `(question)`. Consumers must read the accessibility attribute rather than parsing the title.
+
 ```
 ghoztty +set-state --target=<name> --state=<idle|busy|needs_input>
 ```
@@ -145,7 +147,14 @@ Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic
 
 **Autolinking.** Bare URLs and bare file paths become clickable without `[text](url)` syntax. A URL must carry a scheme — only `http://` and `https://` linkify, never a bare `www.example.com` or `config.io`, so prose is never falsely linked. A file path must start with `/`, `~/`, `./`, or `../`; the sigil is the whole signal (there is no filesystem check), which is why a bare relative `macos/Sources/Foo.swift` stays plain text. `~/` expands to the home directory and `./`/`../` resolve against **the pane's current working directory** at render time — a dot-relative path in a pane with no known cwd stays plain text rather than resolving against a guess. Trailing sentence punctuation stays outside the link (`See https://x.com.` links `https://x.com`), while brackets balanced *inside* the link are kept (`…/Foo_(bar)`). Autolinking never fires inside a `` `code` `` span, after a `\` escape, or inside an explicit `[label](url)` — the explicit link always owns its whole label.
 
-Clicking a **file** link **reveals it in Finder** rather than opening it; Cmd-click opens a viewer window and Cmd-Shift-click hands it to the file's default app, and the right-click menu adds Open in Side Pane (the viewer renders local files) and Copy Path. URL links are unchanged: plain click → side pane, Cmd → new window, Cmd-Shift → default browser.
+**Link clicks.** A plain click hands the link *out* of Ghoztty; the modifiers bring it back in. Cmd opens a **viewer side pane** for either kind of link, and Cmd-Shift gives the link a surface of its own.
+
+| | plain click | Cmd | Cmd-Shift |
+|---|---|---|---|
+| **URL** | default browser | side pane | new Ghoztty window |
+| **file path** | reveal in Finder | side pane | open with default app |
+
+A URL goes to the real browser by default because Ghoztty's `WKWebView` keeps its own cookie store with no relationship to Safari/Chrome — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
 
 **Lists.** Consecutive lines that begin with a list marker render as a list block with table-like row spacing and a **shared marker gutter**, so every item's content left-aligns regardless of marker kind (bullets, numbers, and checkboxes in one run all line up). Supported markers:
 
@@ -175,7 +184,11 @@ Banners are persisted per pane in the session-layout manifest (keyed to the stab
 Reload a named **viewer pane** (see Viewer Panes below) in place — no
 close/reopen. Website viewers re-fetch the page from origin (bypassing
 caches); file viewers re-render the file preserving scroll position (they
-already live-reload on their own, so this mainly matters for URL viewers).
+already live-reload on their own, so this mainly matters for URL viewers —
+and for an **HTML** pane, whose save-watcher covers the HTML file but not the
+sibling CSS/JS it pulls in, which this bypasses the cache for);
+**diff viewers re-run their git command**, picking up commits, staging, and
+edits, and keeping the open file and its scroll position.
 
 ```
 ghoztty +reload --target=<name>
@@ -235,6 +248,15 @@ default shell too (their cwd inherits from the parent pane).
 - `+split --name=<name>` registers a **pane**
 - `+split --target`, `+close --target`, and `+send-keys --target` reference either kind
 
+A window opened without an explicit `--target=` (Cmd-N, or a bare
+`+new-window`) still gets an **auto name** — `window-1`, `window-2`, … — which
+is exported to its panes as `$GHOZTTY_WINDOW_NAME` and shown as `target` in
+`+list`. That name is targetable immediately: `resolveTarget` falls back to
+scanning live windows by name, so no `+list` is needed first. (It used to be
+registry-only, so every `--target=window-N` failed with `not found in
+registry` until something walked the tree — invisibly, for the many callers
+that discard stderr.)
+
 ### Pane identity
 
 Every pane has a **stable, ghoztty-owned pane id** (a UUID):
@@ -291,14 +313,16 @@ ghoztty +close --target=ide
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a
-markdown file, a plain text/code file, or a website. Viewers live in the
-normal split tree — they resize, focus, zoom, close, and persist like any
-pane. View-only, no editing.
+markdown file, an HTML file (as a live page), a plain text/code file, a
+website, or a **git diff**. Viewers live in the normal split tree — they
+resize, focus, zoom, close, and persist like any pane. View-only, no editing.
 
 ```bash
 ghoztty +new-window --view=README.md                 # viewer window
 ghoztty +split --target=dev --name=doc --view=docs/design.md
+ghoztty +split --target=dev --name=mock --view=mock/index.html   # a live page
 ghoztty +split --pane=doc --direction=down --view=https://example.com
+ghoztty +split --target=dev --name=diff --view=git-status:   # a git diff
 ghoztty +close --target=doc
 ```
 
@@ -309,8 +333,11 @@ ghoztty +close --target=doc
   file's directory), links. Light/dark follows the window appearance. Body
   text is set in the **system font** (SF Pro via `-apple-system`) and code in
   SF Mono, so a viewer reads as macOS content rather than a web page.
-- **Table of contents** (markdown only, and only with two or more headings):
-  a native card listing the document's headings, nested by level, with the
+- **Table of contents** (markdown only, and only with two or more headings) —
+  one of the two contents of the pane's shared **side panel** (the other is a
+  diff's file tree; see Git diff panes). Everything in this bullet is the
+  *panel*, and therefore true of both: only the rows differ.
+  A native card listing the document's headings, nested by level, with the
   section you are reading highlighted as you scroll. The card reads as a
   macOS sidebar: the selected row is a rounded pill in the system's own
   selection colors — accent-filled with white text while the window is key,
@@ -340,13 +367,44 @@ ghoztty +close --target=doc
   pane next door line up at their corners, and the text starts exactly one
   margin right of the card. Per-component fudges are what break that; there
   are none. Enforced by `documentAlignsToTheCard` in `ViewerTOCTests`.
+- **HTML files** (`.html`, `.htm`): loaded into the web view as a **live
+  page**, never as highlighted source. Its own CSS, JS, images, and fonts run,
+  so a scaffolded mock or prototype is viewable straight from disk —
+  `--view=mock/index.html` instead of standing up a `python3 -m http.server`
+  first. The web view is granted read access to the file's **own directory**
+  (recursively), which is what makes relative assets resolve; a page reaching
+  UP out of its folder (`../shared/app.css`) is the deliberate cost of keeping
+  that grant narrow — put shared assets under the page's directory, or serve
+  the project over http. Rendering is unconditional: there is no source-view
+  toggle. Because the page is the document, an HTML pane is navigable like a
+  website — its links follow **in the pane**, exactly as they would if the
+  folder were hosted — and Back/Forward cross into and out of it. A file
+  that cannot be opened shows the usual in-page error card.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
-- **Links** in file viewers: http(s) opens the default browser; a relative
-  `.md` link opens another viewer split; other local files open in their
-  default app.
+- **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
+- **Links** in markdown/code viewers: http(s) opens the default browser; a
+  relative `.md` or `.html` link opens another viewer split (both are things a
+  viewer renders); other local files open in their default app. An HTML pane
+  is the exception — being a page, it follows every link in place.
+- **Links that open a new surface** in a website viewer — `target="_blank"` or
+  `window.open()` — go to the **system default browser**, not a new Ghoztty
+  window, for the same cookie-store reason banner URLs do. Same-pane
+  navigation is untouched: a website viewer follows ordinary links in place.
+  **Cmd-click** keeps the popup in Ghoztty as its own viewer window (honoring
+  the size the opener asked for), and so does a popup the browser can't be
+  handed — a bare `window.open()` with no URL, or a non-web scheme. The
+  tradeoff: a popup that lands in the browser can't `window.close()` itself
+  back to the Ghoztty page that opened it, so an OAuth flow finishes in the
+  browser. That flow wasn't authenticating in Ghoztty anyway.
 - **Live reload**: file viewers watch the file (including atomic saves) and
-  re-render preserving scroll position.
+  re-render preserving scroll position — an HTML pane re-fetches the page from
+  disk, and WebKit restores the scroll offset across it, so a save does not
+  throw you back to the top. Only the viewed file is watched: editing a
+  sibling `style.css` does not trigger a reload, and a saved HTML file may
+  still serve that stylesheet from WebKit's memory cache. `+reload`/Cmd+R
+  bypasses the cache (`reloadFromOrigin`) and is the way to pick up a changed
+  subresource.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a
   bar with back / forward / reload / **home** and an **editable address
   field** — in every mode, files included. Typing an `http(s)` address (or a
@@ -366,6 +424,9 @@ ghoztty +close --target=doc
   - **Cmd+D** slides the nav bar in if hidden and puts the caret in the
     address field with the whole address selected — the keyboard version of
     clicking into it.
+  - The standard editing chords (Cmd+C/V/X/A) reach whichever field inside the
+    pane holds focus — the address bar, or a diff panel's filter — which they
+    otherwise would not, because Cmd+C/V are terminal keybindings.
   - Both **override their global binding only while the viewer holds focus**
     (Cmd+R = "Set Pane Banner…", Cmd+D = split right). Focus a terminal pane
     and they do their global thing again; Cmd+Shift+R ("Change Window Title")
@@ -377,17 +438,114 @@ ghoztty +close --target=doc
 - Because any viewer can browse, `+list --json`'s `"url"` (and the session
   manifest) report where a pane currently IS, not where it was opened.
 - Relative `--view` paths resolve against `--working-directory` if given,
-  else the caller's cwd.
+  else the caller's cwd. A `git-*:` spec is NOT a path — its text is a revspec,
+  so it is never path-resolved; the same `--working-directory` decides which
+  *repository* it applies to.
 - `+list` marks viewer panes with a `view:` prefix (JSON: `"type": "viewer"`
   plus `"url"`); they auto-register names like terminal panes.
 - `+read`/`+send-keys`/`+set-state`/`+set-banner` against a viewer fail with
   `... is a viewer pane, not a terminal` (exit 1). `+close` works normally
   and never prompts for viewers.
-- Session persistence: viewer panes restore by re-opening their file/URL
-  (terminals in the same window re-attach as usual); a missing file restores
-  as an in-page error card.
+- Session persistence: viewer panes restore by re-opening their file/URL, and
+  a diff pane by RE-RUNNING its spec against the origin directory the manifest
+  persisted — so a restored `git-status:` pane shows today's working tree, not
+  a snapshot of the one it was closed on. (Terminals in the same window
+  re-attach as usual.) A missing file restores as an in-page error card.
 - File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
   opens `.md`-family files as a viewer window.
+
+### Git diff panes
+
+`--view=git-status:` / `--view=git-diff:<revspec>` opens a pane that renders a
+git diff: a native file tree on the left, traditional red/green
+syntax-highlighted hunks on the right, and next/previous-change +
+unified⇄side-by-side controls in the nav bar.
+
+```bash
+# changes in this branch against main (three-dot: the merge base, which is
+# what "changes in this branch" means to a person)
+ghoztty +split --target=dev --name=diff --view=git-diff:main...HEAD
+
+# the working tree — staged, unstaged, and untracked, kept apart
+ghoztty +new-window --target=review --working-directory=~/git/repo --view=git-status:
+
+# one commit's own changes, and an arbitrary range
+ghoztty +split --view=git-diff:a1b2c3d
+ghoztty +split --view=git-diff:v1.2.0..v1.3.0
+
+# this branch against main/master/origin HEAD, whichever the repo has
+ghoztty +split --view=git-diff:
+
+ghoztty +reload --target=diff        # re-run the diff
+```
+
+**The location IS the diff spec**, which is what buys every existing viewer
+affordance for free — the address bar shows and accepts it, `+list --json`
+reports it as the pane's `url`, `+reload`/Cmd+R re-runs it, back/forward cross
+into and out of it, and the session manifest restores the pane by re-running
+it. Four forms:
+
+| `--view=` | Means |
+|---|---|
+| `git-status:` | Working tree: staged, unstaged, and untracked |
+| `git-diff:<a>...<b>` | Three-dot range — `<b>` against the merge base |
+| `git-diff:<a>..<b>` | Two-dot range, handed to git verbatim |
+| `git-diff:<sha>` | That ONE commit's changes (`git show`, first-parent for merges) |
+| `git-diff:` | This branch against `origin/HEAD`, else `main`/`master` |
+
+A bare revision means *that commit*, not "diff against it" — `git-diff:abc123`
+answers "what changed in abc123". Use `a..b` when you mean a comparison.
+
+- **Which repository**: the one containing `--working-directory` (else the
+  caller's cwd, which `+split`/`+new-window` insert for you), resolved with
+  `git rev-parse --show-toplevel`. A directory in no repo renders an
+  explanatory card, not a blank pane.
+- **The file tree is the table-of-contents card**, not a lookalike: same glass
+  card, same pinned header, same row metrics and macOS selection pill, same
+  gutter⇄overlay switch at 720pt, same drag-to-resize handle and shared width
+  preference (`ViewerSidePanel` owns all of it). What it adds is a **filter
+  field pinned under the header** — terms are ANDed against the whole path, a
+  non-empty filter flattens the tree to a hit list, Return opens the top hit,
+  Escape clears it — plus folder/file hierarchy with git's own status letter
+  (A/M/D/R…) and each file's `+N −M`. Chains of single-child directories
+  collapse into one row (`macos/Sources/Features/Viewer`), and clicking a
+  folder folds it.
+- **Working-tree sections**: staged, unstaged, and untracked are three lists,
+  in that order, because which changes are staged is the thing `git status`
+  exists to tell you. A file modified both staged and unstaged appears in both
+  (they are different diffs), and clicking each shows that side.
+- **Scale**: the file list is eager (one `--numstat`/`--name-status` pass —
+  cheap for thousands of files) and each file's PATCH is fetched only when its
+  row is clicked. Rows are appended to the page in chunks across frames, with
+  a 20 000-row cap and a "Show the rest" button past it. Binary files and
+  unreadable ones render a stub, never a hang. All git work runs off the main
+  thread.
+- **Rendering** is hand-rolled over parsed unified hunks (no new vendored
+  dependency, zero added bundle weight) on the already-bundled highlight.js.
+  Each hunk is highlighted as two contiguous texts — the old side and the new
+  side — rather than line by line, so a block comment or template literal is
+  not restarted on every row, and the result is split back into lines with the
+  open tags carried across the break. Paired removed/added lines get an
+  **intra-line word highlight** so a one-character change reads as one
+  character. Deliberately NOT Monaco: this pane is read-only, and a
+  multi-megabyte editor would blow up an offline bundle to lose on scroll
+  performance.
+- **Unified vs side-by-side**: unified is one column with sticky line-number
+  gutters and horizontal scroll (code keeps its shape); side-by-side is a
+  four-column CSS grid, so a pair stays aligned even when a long line wraps.
+  The choice is a preference in defaults, shared by every diff pane.
+- **Next/previous change** steps *change blocks* (a `@@` hunk can hold
+  several), and rolls over into the adjacent FILE when the open one runs out —
+  entering it at its first or last change so walking a diff reads continuously.
+  It steps from a remembered index, not from the scroll position, so a fast
+  double-press advances twice instead of re-picking the change the smooth
+  scroll has not reached yet; your own next scroll hands it back.
+- **Live**: a `git-status:` pane re-checks the working tree every 2s and
+  updates only when the file list actually moved, so an edit or a `git add` in
+  another pane shows up without a reload and without a flicker. A commit or a
+  range is a fixed pair of trees and is not polled.
+- The nav bar **stays pinned open** in a diff pane (it carries the change and
+  layout controls, and shows the revspec).
 
 ### Worktree feedback capture
 

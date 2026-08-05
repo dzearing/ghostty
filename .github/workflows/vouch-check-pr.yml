@@ -6,6 +6,13 @@ name: "Vouch - Check PR"
 
 jobs:
   check:
+    # Upstream-only, like every job in test.yml/nix.yml/flatpak.yml. Without
+    # this guard the job is dispatched on the fork, finds no
+    # namespace-profile-* runner, and sits queued until GitHub cancels it at
+    # 24h — surfacing as a permanently pending check on every PR. Note this one
+    # also carries `auto-close: true`, so an unguarded run that DID find a
+    # runner could close fork PRs outright.
+    if: github.repository == 'ghostty-org/ghostty'
     runs-on: namespace-profile-ghostty-xsm
     steps:
       - uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1

@@ -130,6 +130,22 @@ pub const ControlHandler = *const fn (ctx: *anyopaque, conn: *Connection, frame:
 /// by-value snapshot (no borrowed storage), so it is safe to copy out.
 pub const MetricsHandler = *const fn (ctx: *anyopaque, host: protocol.HostMetrics) void;
 
+/// Callback for one pushed per-session CPU sample. `rows` BORROWS the decoded
+/// arena and is valid only for the duration of the call — copy anything you keep.
+/// `interval_ms` is the cadence the AGENT chose (it throttles itself under load),
+/// not the one the client asked for. Fires on the control-reader thread.
+pub const SessionCpuHandler = *const fn (
+    ctx: *anyopaque,
+    rows: []const protocol.SessionCpuRow,
+    interval_ms: u32,
+) void;
+
+/// Callback for a pushed session roster. `json` is the raw `SESSIONS` payload,
+/// borrowed for the duration of the call — the client decodes it with the same
+/// path it uses for a `LIST_SESSIONS` reply, so pushed and polled rosters can
+/// never diverge. Fires on the control-reader thread.
+pub const SessionsHandler = *const fn (ctx: *anyopaque, json: []const u8) void;
+
 /// One queued outbound frame, owned by the writer queue until the writer emits it.
 /// `payload` is a private heap copy the queue owns and frees; the caller's slice is
 /// not retained past `enqueue`.
@@ -635,6 +651,7 @@ pub const OwnedProcSnapshot = struct {
             self.alloc.free(@constCast(p.name));
             if (p.user) |u| self.alloc.free(@constCast(u));
             if (p.cmd) |c| self.alloc.free(@constCast(c));
+            if (p.tty) |t| self.alloc.free(@constCast(t));
         }
         self.alloc.free(self.procs);
         self.* = undefined;
@@ -820,6 +837,10 @@ pub const Connection = struct {
     /// like `ctrl_handler` (publish discipline; see `setControlHandler`).
     metrics_handler: ?MetricsHandler = null,
     metrics_handler_ctx: *anyopaque = undefined,
+    session_cpu_handler: ?SessionCpuHandler = null,
+    session_cpu_handler_ctx: *anyopaque = undefined,
+    sessions_handler: ?SessionsHandler = null,
+    sessions_handler_ctx: *anyopaque = undefined,
 
     // --- Health & link state (increment 2) ------------------------------------
     /// Injected millisecond clock (real by default, fake in tests).
@@ -912,9 +933,20 @@ pub const Connection = struct {
     /// `grid_snapshot` asks a modern agent to append a visible-screen repaint on
     /// re-attach (FIX 2); an older agent that never advertises it just replays its
     /// ring as before.
+    /// `session_cpu` asks a modern agent for the pushed per-session CPU roll-up
+    /// the chooser's meters render; an older agent never advertises it, the
+    /// negotiated flag stays false, and we never send the opcode (which that agent
+    /// would treat as a fatal framing error) — the meters just don't appear.
+    /// `cpu_units` says this client understands (and itself produces) corrected
+    /// `cpu_pct` units; the half that matters is the AGENT's matching string,
+    /// whose absence tells the Activity Monitor that a remote `% CPU` may be
+    /// ~24× low and must not be rendered as fact.
     pub const client_capabilities = [_][]const u8{
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
+        protocol.capability.session_cpu,
+        protocol.capability.sessions_push,
+        protocol.capability.cpu_units,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1140,6 +1172,99 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         self.metrics_handler = null;
+    }
+
+    /// Subscribe to the pushed session ROSTER. The agent sends a `sessions`
+    /// frame immediately and then on every change (create, exit, close, attach,
+    /// detach) — so the client never polls and can never render a session that
+    /// has already exited.
+    ///
+    /// `error.Unsupported` when the peer did not advertise `sessions_push`; the
+    /// caller then keeps its `LIST_SESSIONS` poll. Never sends the opcode to
+    /// such a peer (an unknown opcode is a fatal framing error).
+    pub fn subscribeSessions(
+        self: *Connection,
+        ctx: *anyopaque,
+        handler: SessionsHandler,
+    ) !void {
+        if (self.negotiated) |n| {
+            if (!n.sessions_push) return error.Unsupported;
+        } else |_| return error.Unsupported;
+
+        {
+            self.sessions_handler_ctx = ctx;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            self.sessions_handler = handler;
+        }
+        try self.writeControl(.sessions_sub, protocol.control_channel, "{}");
+    }
+
+    /// Stop the pushed roster and clear the handler; no callback fires after
+    /// this returns. Safe when not subscribed and against an older agent.
+    pub fn unsubscribeSessions(self: *Connection) void {
+        const supported = if (self.negotiated) |n| n.sessions_push else |_| false;
+        if (supported) {
+            self.writeControl(.sessions_unsub, protocol.control_channel, "{}") catch {};
+        }
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        self.sessions_handler = null;
+    }
+
+    /// Subscribe to the pushed per-session CPU stream. `interval_ms` is a HINT —
+    /// the agent floors it and stretches it under its own load, reporting what it
+    /// actually used in each callback.
+    ///
+    /// Returns `error.Unsupported` when the peer did not advertise
+    /// `capability.session_cpu`. That check is NOT optional politeness: an
+    /// unknown opcode is a fatal framing error to an older agent, so sending
+    /// `session_cpu_sub` blind would kill a working connection. Callers treat
+    /// `Unsupported` as "show no meter".
+    ///
+    /// The handler fires on the control-reader thread. The caller MUST call
+    /// `unsubscribeSessionCpu` before freeing `ctx`.
+    pub fn subscribeSessionCpu(
+        self: *Connection,
+        interval_ms: u32,
+        ctx: *anyopaque,
+        handler: SessionCpuHandler,
+    ) !void {
+        if (self.negotiated) |n| {
+            if (!n.session_cpu) return error.Unsupported;
+        } else |_| return error.Unsupported;
+
+        // Publish the handler slot BEFORE subscribing so the first pushed frame
+        // is never dropped for lack of a handler.
+        {
+            self.session_cpu_handler_ctx = ctx;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            self.session_cpu_handler = handler;
+        }
+
+        const sub: protocol.SessionCpuSub = .{ .interval_ms = interval_ms };
+        const json = try protocol.encodeJson(self.alloc, sub);
+        defer self.alloc.free(json);
+        try self.writeControl(.session_cpu_sub, protocol.control_channel, json);
+    }
+
+    /// Stop the pushed per-session CPU stream and clear the handler slot, so no
+    /// further callback fires after this returns. Safe when not subscribed, and
+    /// safe against an older agent (we simply never send the gated opcode).
+    pub fn unsubscribeSessionCpu(self: *Connection) void {
+        const supported = if (self.negotiated) |n| n.session_cpu else |_| false;
+        if (supported) {
+            const json = protocol.encodeJson(self.alloc, protocol.SessionCpuUnsub{}) catch null;
+            if (json) |j| {
+                defer self.alloc.free(j);
+                self.writeControl(.session_cpu_unsub, protocol.control_channel, j) catch {};
+            }
+        }
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        self.session_cpu_handler = null;
     }
 
     // --- Observability (increment 2, §6.4) -----------------------------------
@@ -1536,6 +1661,7 @@ pub const Connection = struct {
                 self.alloc.free(@constCast(p.name));
                 if (p.user) |u| self.alloc.free(@constCast(u));
                 if (p.cmd) |c| self.alloc.free(@constCast(c));
+                if (p.tty) |t| self.alloc.free(@constCast(t));
             }
             self.alloc.free(procs);
         }
@@ -1545,6 +1671,8 @@ pub const Connection = struct {
             const user: ?[]const u8 = if (p.user) |u| try self.alloc.dupe(u8, u) else null;
             errdefer if (user) |u| self.alloc.free(u);
             const cmd: ?[]const u8 = if (p.cmd) |c| try self.alloc.dupe(u8, c) else null;
+            errdefer if (cmd) |c| self.alloc.free(c);
+            const tty: ?[]const u8 = if (p.tty) |t| try self.alloc.dupe(u8, t) else null;
             procs[i] = .{
                 .pid = p.pid,
                 .ppid = p.ppid,
@@ -1553,6 +1681,7 @@ pub const Connection = struct {
                 .mem_bytes = p.mem_bytes,
                 .user = user,
                 .cmd = cmd,
+                .tty = tty,
             };
             filled = i + 1;
         }
@@ -2077,6 +2206,18 @@ pub const Connection = struct {
         if (self.negotiated) |n| return n.close_session else |_| return false;
     }
 
+    /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`
+    /// it reports is in CORRECTED units and may be shown as fact.
+    ///
+    /// False for a pre-fix agent (whose macOS per-process percentages are ~24×
+    /// low on Apple Silicon) AND for a handshake that hasn't completed or failed,
+    /// which is the safe direction: the caller marks the number unverifiable
+    /// rather than printing it. Never rescale on a false — the app cannot know
+    /// the remote machine's mach timebase.
+    pub fn cpuUnitsCorrected(self: *Connection) bool {
+        if (self.negotiated) |n| return n.cpu_units else |_| return false;
+    }
+
     /// End a session on the agent BY SESSION ID (the session-scoped equivalent of
     /// the channel-scoped pane `CLOSE`): terminate + free the remote session even
     /// when no local pane is attached to it (the chooser's "Kill" of a browsed
@@ -2570,9 +2711,25 @@ pub const Connection = struct {
                 _ = self.deliverRpcReply(frame);
             },
             .sessions => {
-                // Reply to a LIST_SESSIONS RPC (T10). Same-channel correlation, like
-                // CWD/PROC_SNAPSHOT: the agent echoes SESSIONS on the request channel.
-                // Dropped if no caller is parked (a late reply after a timeout).
+                // Two sources share this frame type, distinguished by channel:
+                //
+                //  * a REPLY to a LIST_SESSIONS RPC, echoed on the REQUEST channel
+                //    (same-channel correlation, like CWD/PROC_SNAPSHOT). Dropped
+                //    if no caller is parked (a late reply after a timeout).
+                //  * a PUSH from `sessions_sub`, sent on the CONTROL channel
+                //    whenever the roster changes.
+                //
+                // Reusing one frame type is deliberate: pushed and polled rosters
+                // are byte-identical, so the client has a single decode path and
+                // the two can never drift apart.
+                if (frame.channel == protocol.control_channel) {
+                    self.write_mutex.lock();
+                    const handler = self.sessions_handler;
+                    const ctx = self.sessions_handler_ctx;
+                    self.write_mutex.unlock();
+                    if (handler) |h| h(ctx, frame.payload);
+                    return;
+                }
                 _ = self.deliverRpcReply(frame);
             },
             .proc_kill_result, .proc_spawn_result => {
@@ -2681,6 +2838,20 @@ pub const Connection = struct {
                 const ctx = self.metrics_handler_ctx;
                 self.write_mutex.unlock();
                 if (handler) |h| h(ctx, parsed.value.host);
+            },
+            .session_cpu => {
+                // Pushed per-session CPU roll-up. Same discipline as `.metrics`:
+                // decode failures are dropped silently, and the slot is read under
+                // the lock its publish is ordered by. `rows` borrows the parsed
+                // arena, so the handler must copy anything it keeps — the arena
+                // dies when this scope exits.
+                var parsed = protocol.parseJson(protocol.SessionCpu, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                self.write_mutex.lock();
+                const handler = self.session_cpu_handler;
+                const ctx = self.session_cpu_handler_ctx;
+                self.write_mutex.unlock();
+                if (handler) |h| h(ctx, parsed.value.sessions, parsed.value.interval_ms);
             },
             else => {},
         }

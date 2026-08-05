@@ -104,6 +104,9 @@ MSI_VERSION="$(printf '%d.%d.%d' "$SV_MAJOR" "$SV_MINOR" $((SV_PATCH * 100 + BUI
 MSI_BASENAME="Ghoztty-Agent-$SEMVER-x64.msi"
 [[ "$BUILD_NUM" -gt 1 ]] && MSI_BASENAME="Ghoztty-Agent-$SEMVER.$BUILD_NUM-x64.msi"
 [[ -z "$OUT" ]] && OUT="$REPO_ROOT/zig-out/bin/$MSI_BASENAME"
+# Validation runs msiinfo from a scratch cwd (see `table`), so the path handed
+# to it has to survive the cd.
+[[ "$OUT" = /* ]] || OUT="$PWD/$OUT"
 
 echo "== build-msi =="
 echo "   exe          : $EXE ($(du -h "$EXE" | awk '{print $1}'))"
@@ -124,8 +127,15 @@ wixl -a x64 \
 [[ -s "$OUT" ]] || { echo "error: wixl produced no output" >&2; exit 1; }
 
 # --- Validation: prove the MSI actually says what we intended. -------------
+XT="$(mktemp -d "${TMPDIR:-/tmp}/ghoztty-msi-xt.XXXXXX")"
+trap 'rm -rf "$XT"' EXIT
+
 fail() { echo "VALIDATION FAILED: $*" >&2; exit 1; }
-table() { msiinfo export "$OUT" "$1" | tr -d '\r'; }  # msiinfo emits CRLF
+# `msiinfo export` writes every binary-stream column out as a side file at
+# ./<Table>/<Table>.<Key>, relative to the CWD — so exporting the Binary table
+# from the repo root drops a copy of the CA DLL into the tree on every publish
+# (which is how one got committed by accident). Export from the scratch dir.
+table() { (cd "$XT" && msiinfo export "$OUT" "$1") | tr -d '\r'; }  # msiinfo emits CRLF
 
 # Per-user: ALLUSERS must be absent, MSIINSTALLPERUSER=1 present, and the
 # summary-info word count must carry bit 8 ("elevated privileges not required").
@@ -189,8 +199,6 @@ FINALIZE_SEQ="$(awk -F'\t' '$1=="InstallFinalize"{print $3}' <<<"$SEQ")"
 [[ "$LAUNCH_COND" == "NOT Installed" ]] || fail "LaunchAgent condition != 'NOT Installed' (got: '$LAUNCH_COND')"
 
 # Payload: the exe must extract to Programs/Ghoztty Agent/ghoztty-agent.exe.
-XT="$(mktemp -d "${TMPDIR:-/tmp}/ghoztty-msi-xt.XXXXXX")"
-trap 'rm -rf "$XT"' EXIT
 msiextract -C "$XT" "$OUT" >/dev/null
 EXPECT="$XT/Programs/Ghoztty Agent/ghoztty-agent.exe"
 [[ -f "$EXPECT" ]] || fail "extracted exe not at Programs/Ghoztty Agent/ghoztty-agent.exe"

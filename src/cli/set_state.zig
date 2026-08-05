@@ -46,6 +46,12 @@ pub const Options = struct {
 /// Sets the activity state via IPC, which updates the window title
 /// suffix and the AXWindowActivityState accessibility attribute.
 ///
+/// The state names below are the machine tokens: they are what this
+/// flag and AXWindowActivityState use. The title suffix shows the
+/// human label instead, so `needs_input` renders as `(question)`.
+/// Read the accessibility attribute, never the title, to determine
+/// a window's state.
+///
 /// Flags:
 ///
 ///   * `--target=<name>`: The named window or pane. Required.

@@ -999,6 +999,21 @@ extension TerminalWindow {
 // MARK: Accessibility
 
 extension TerminalWindow {
+    /// Cross-tool accessibility contract (consumed by ztabby and other external
+    /// tools to badge a terminal window by what it is doing):
+    ///
+    ///   Attribute: `AXWindowActivityState`
+    ///   Value:     the window's aggregated activity state as its MACHINE
+    ///              token — "idle", "busy", or "needs_input" — matching the
+    ///              `+set-state --state=` and OSC 7777 vocabulary exactly.
+    ///              Always a non-nil String; "idle" is published rather than
+    ///              omitted. A state change posts an AX value-changed
+    ///              notification on the window (see `activityState.didSet`), so
+    ///              observers see updates live.
+    ///
+    /// The token is NOT the string shown in the title: `needs_input` renders
+    /// there as "(question)" (see `Ghostty.ActivityState.displayLabel`).
+    /// Consumers must read this attribute rather than parsing the title.
     static let axActivityState = NSAccessibility.Attribute(rawValue: "AXWindowActivityState")
 
     /// Cross-tool accessibility contract (consumed by ztabby and other external

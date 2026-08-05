@@ -144,9 +144,16 @@ enum RemoteLayoutRoster {
 /// through the handshake), exactly like `MachineMetricsProbe`. A failed or slow
 /// dial resolves to `.failed` on that row — it NEVER pops a modal alert and
 /// never blocks the main thread or the chooser (cf. the remote-dial-modal-wedge
-/// rule). Per-machine probe connections are short-lived: dialed, read, freed.
-/// The local agent's warm shared connection is reused (and NOT freed here — it
-/// is owned by `LocalAgentManager`).
+/// rule).
+///
+/// ## Where the connections come from
+/// Nothing here owns a connection for longer than one call. The local agent's
+/// warm shared connection is borrowed from `LocalAgentManager`; a remote
+/// machine's is borrowed from `MachineConnectionPool` under a lease held only
+/// while that machine is the selected row. A machine with no warm connection
+/// (the pool is still dialing, or the dial failed) falls back to the original
+/// dial-read-free probe, so the roster always has a path — it is just less
+/// prompt.
 @MainActor
 final class SessionBrowserProbe: ObservableObject {
     enum State: Equatable {
@@ -170,6 +177,142 @@ final class SessionBrowserProbe: ObservableObject {
     private var inflight: Set<String> = []
     private var stopped = false
 
+    /// One live pushed-roster subscription, keyed like `states`.
+    ///
+    /// A push is strictly better than the 2s poll it replaces: the roster
+    /// changes at the instant a session is created, exits, is closed, attaches
+    /// or detaches, and the agent tells us then. A poll can only ever be as
+    /// fresh as its last tick, and — as this feature learned the hard way — a
+    /// poll whose completion cannot be delivered silently freezes with no
+    /// symptom other than stale rows.
+    private struct Push {
+        let handle: ghostty_remote_connection_t
+        let box: Unmanaged<PushBox>
+    }
+
+    /// Live subscriptions. A key is present iff its roster is currently served
+    /// by pushes — which is exactly when the poll must stand down for it.
+    private var pushes: [String: Push] = [:]
+
+    /// Pool leases for REMOTE machines we are serving (or trying to serve) by
+    /// push. Held only while that machine is the selected row: the chooser is
+    /// transient, and one connection per machine the user happened to click
+    /// through is not warm, it is a leak with good manners.
+    ///
+    /// The local agent has no lease — `LocalAgentManager` owns its warm
+    /// connection for the app's lifetime and we merely borrow the handle.
+    private var leases: [String: MachineConnectionPool.Lease] = [:]
+
+    /// Bridges the C roster callback back to the probe. `probe` is weak so the
+    /// box never keeps it alive.
+    fileprivate final class PushBox {
+        weak var probe: SessionBrowserProbe?
+        let key: String
+        init(probe: SessionBrowserProbe, key: String) {
+            self.probe = probe
+            self.key = key
+        }
+    }
+
+    /// True when `key`'s roster is served by pushes. Callers do NOT branch on
+    /// this to decide how to read the roster — pushed and polled rosters are
+    /// indistinguishable downstream. It exists only so the poll can stand down.
+    private func isPushed(_ key: String) -> Bool { pushes[key] != nil }
+
+    /// Subscribe to the local agent's pushed roster. No-op if already
+    /// subscribed. Falls back silently to polling when the agent is older or
+    /// there is no warm shared connection — the caller does not branch.
+    func subscribeLocalPush() {
+        guard !stopped, !isPushed(Self.localKey) else { return }
+        guard let handle = LocalAgentManager.shared.warmSharedHandle else { return }
+        guard attachPush(key: Self.localKey, handle: handle) else { return }
+        expanded.insert(Self.localKey)
+    }
+
+    /// Subscribe to a REMOTE machine's pushed roster, over the pool's warm
+    /// connection for that machine.
+    ///
+    /// Identical in contract to `subscribeLocalPush`: it either upgrades the row
+    /// to pushes or leaves it polling, and the caller cannot tell which. The
+    /// three ways it lands on polling are an agent too old to advertise
+    /// `sessions_push`, a machine that cannot be dialed at all, and a dial still
+    /// in flight — the last of which resolves itself when the pool reports the
+    /// connection.
+    ///
+    /// At most ONE remote machine is subscribed at a time, matching what the
+    /// chooser already polled (only the selected remote) and keeping the
+    /// connection count at one per selection rather than one per row visited.
+    func subscribePush(machine: Machine) {
+        guard !stopped else { return }
+        let key = machine.id.uuidString
+        releaseRemoteLeases(except: key)
+        guard leases[key] == nil else { return }
+
+        leases[key] = MachineConnectionPool.shared.acquire(machine: machine) { [weak self] handle in
+            guard let self, !self.stopped else { return }
+            if let handle {
+                _ = self.attachPush(key: key, handle: handle)
+            } else {
+                // The connection died or never came up: drop the subscription
+                // and let the poll take over again. This is the transition that
+                // MUST NOT be missed — a stale `isPushed` would keep the poll
+                // standing down against a socket that will never speak again.
+                self.detachPush(key: key)
+            }
+        }
+    }
+
+    /// Try to subscribe `key`'s roster on `handle`. Returns false when the agent
+    /// is older than `sessions_push` (or the connection isn't established), in
+    /// which case the row simply keeps polling.
+    @discardableResult
+    private func attachPush(key: String, handle: ghostty_remote_connection_t) -> Bool {
+        guard pushes[key] == nil else { return true }
+        let box = PushBox(probe: self, key: key)
+        let unmanaged = Unmanaged.passRetained(box)
+        let ok = ghostty_remote_connection_sessions_subscribe(
+            handle, sessionsRosterTrampoline, unmanaged.toOpaque())
+        guard ok else {
+            unmanaged.release()
+            return false
+        }
+        pushes[key] = Push(handle: handle, box: unmanaged)
+        return true
+    }
+
+    /// Tear one subscription down. Idempotent. Unsubscribes BEFORE releasing the
+    /// box, so no callback can fire against freed userdata.
+    private func detachPush(key: String) {
+        guard let push = pushes.removeValue(forKey: key) else { return }
+        ghostty_remote_connection_sessions_unsubscribe(push.handle)
+        push.box.release()
+    }
+
+    /// Give every remote machine's warm connection back — the selection moved to
+    /// something with no roster of its own. Without this a machine the user has
+    /// navigated away from keeps a connection open for the rest of the chooser's
+    /// life, which is precisely the leak the lease refcount exists to prevent.
+    func standDownRemote() {
+        releaseRemoteLeases(except: nil)
+    }
+
+    /// Release every remote lease except `key`'s, unsubscribing first so the
+    /// pool never frees a connection we are still subscribed on.
+    private func releaseRemoteLeases(except key: String?) {
+        for k in Array(leases.keys) where k != key {
+            detachPush(key: k)
+            leases.removeValue(forKey: k)?.release()
+        }
+    }
+
+    /// Apply a pushed roster. Main-actor; same decode + bookkeeping as a polled
+    /// reply, so pushed and polled rosters are indistinguishable downstream.
+    fileprivate func ingestPushedRoster(key: String, json: Data) {
+        guard !stopped else { return }
+        guard let sessions = try? JSONDecoder().decode([BrowsedSession].self, from: json) else { return }
+        finish(key, sessions, keepOnFailure: true)
+    }
+
     /// Sessions the user just KILLED, per roster key, hidden optimistically so
     /// the row vanishes immediately instead of lingering (and degrading to a
     /// "pid" label) during the close's undo window while the agent still lists
@@ -191,6 +334,14 @@ final class SessionBrowserProbe: ObservableObject {
     /// loading, failed, or never fetched). Drives the collapsed-row count badge.
     func count(for key: String) -> Int? {
         if case .loaded(let sessions) = states[key] { return sessions.count }
+        return nil
+    }
+
+    /// The loaded roster for `key`, or nil if it hasn't loaded. Lets the view
+    /// apply its own visibility filter and derive a count from the SAME list it
+    /// renders, instead of a raw total that disagrees with the rows.
+    func loadedSessions(for key: String) -> [BrowsedSession]? {
+        if case .loaded(let sessions) = states[key] { return sessions }
         return nil
     }
 
@@ -232,8 +383,11 @@ final class SessionBrowserProbe: ObservableObject {
         let key = machine.id.uuidString
         if expanded.contains(key) {
             expanded.remove(key)
+            detachPush(key: key)
+            leases.removeValue(forKey: key)?.release()
         } else {
             expanded.insert(key)
+            subscribePush(machine: machine)
             if states[key] == nil { fetch(machine: machine) }
         }
     }
@@ -243,6 +397,17 @@ final class SessionBrowserProbe: ObservableObject {
         guard !inflight.contains(key) else { return }
         inflight.insert(key)
         if states[key] == nil { states[key] = .loading }
+
+        // Warm connection? Ride it. This is the whole saving for a relay
+        // machine, whose every old poll tick paid a `RelayAccount.resolveToken()`
+        // round-trip (possibly into the Keychain) plus a fresh dial, just to read
+        // a roster. `borrow` keeps the connection alive across the blocking RPC
+        // even if the last lease drops mid-call.
+        let borrowed = MachineConnectionPool.shared.borrow(machine: machine) { [weak self] handle in
+            let sessions = RemoteSessionRoster.list(handle: handle)
+            onMainEvenWhenModal { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
+        }
+        if borrowed { return }
 
         if machine.isRelay {
             guard let base = machine.relayBase, let device = machine.deviceID else {
@@ -273,6 +438,9 @@ final class SessionBrowserProbe: ObservableObject {
 
     /// Dial (via `dial`) on a background queue, run `LIST_SESSIONS`, free the
     /// probe connection, and publish the result on the main actor.
+    ///
+    /// The fallback path, used only when the machine has no warm pooled
+    /// connection yet (still dialing, or undialable).
     private func dialAndList(
         key: String,
         keepOnFailure: Bool = false,
@@ -282,9 +450,13 @@ final class SessionBrowserProbe: ObservableObject {
             let handle = dial()
             let sessions: [BrowsedSession]? = handle.flatMap { RemoteSessionRoster.list(handle: $0) }
             if let handle { ghostty_remote_connection_free(handle) }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
-            }
+            // Must land even while an AppKit modal is up -- see
+            // `onMainEvenWhenModal`. The chooser panel itself is modeless now,
+            // but it still runs alerts of its own (Kill's confirmation, Rename,
+            // Remove), and with a plain main-queue hop this would not run until
+            // one of those closed, leaving `inflight` set forever and freezing
+            // the roster.
+            onMainEvenWhenModal { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
         }
     }
 
@@ -295,14 +467,20 @@ final class SessionBrowserProbe: ObservableObject {
     /// if not already loaded (the local roster is primed on open).
     func fetchIfNeededLocal() {
         expanded.insert(Self.localKey)
+        // Selection moved off every remote row: give their warm connections back
+        // so none outlives the row the user is actually looking at.
+        releaseRemoteLeases(except: nil)
         if states[Self.localKey] == nil { fetchLocal() }
     }
 
     /// Ensure a machine's roster is loaded and marked expanded, so selecting it
-    /// in the master list drives the detail pane. Fetches lazily on first select.
+    /// in the master list drives the detail pane. Fetches lazily on first select,
+    /// and asks for the pushed roster (silently staying on the poll if the
+    /// machine's agent can't serve one).
     func fetchIfNeeded(machine: Machine) {
         let key = machine.id.uuidString
         expanded.insert(key)
+        subscribePush(machine: machine)
         if states[key] == nil { fetch(machine: machine) }
     }
 
@@ -314,6 +492,9 @@ final class SessionBrowserProbe: ObservableObject {
     /// the last good roster rather than flipping the list to an error.
     func refreshLocalInPlace() {
         let key = Self.localKey
+        // Pushed rosters are authoritative and arrive the moment anything
+        // changes; polling on top of them would only add redundant RPCs.
+        guard !isPushed(key) else { return }
         guard expanded.contains(key), !inflight.contains(key) else { return }
         inflight.insert(key)
         LocalAgentManager.shared.listLocalSessions { [weak self] sessions in
@@ -323,10 +504,20 @@ final class SessionBrowserProbe: ObservableObject {
 
     /// Re-fetch a machine's roster IN PLACE (same no-flicker / keep-last-good
     /// contract as `refreshLocalInPlace`). Only the currently-selected remote is
-    /// polled by the chooser, so this dials at most one machine per tick.
+    /// polled by the chooser, so this touches at most one machine per tick.
     func refreshInPlace(machine: Machine) {
         let key = machine.id.uuidString
+        // Stand down for a pushed machine, exactly as the local row does: the
+        // agent tells us the instant anything changes, so a poll on top could
+        // only ever be redundant or stale.
+        guard !isPushed(key) else { return }
         guard expanded.contains(key), !inflight.contains(key) else { return }
+        // This tick doubles as the pool's recovery clock: a machine whose warm
+        // connection died gets re-dialed here (after the pool's own cooldown),
+        // and its push comes back with it. No extra timer.
+        if leases[key] != nil {
+            MachineConnectionPool.shared.ensureConnected(machine: machine)
+        }
         fetch(machine: machine, keepOnFailure: true)
     }
 
@@ -355,6 +546,20 @@ final class SessionBrowserProbe: ObservableObject {
 
     private func killRemote(sessionID: String, machine: Machine) {
         let key = machine.id.uuidString
+
+        // Warm connection? Kill over it — no second dial, no second token
+        // round-trip. A pushed machine needs no refetch afterwards either: ending
+        // a session IS a roster change, so the agent tells us.
+        let borrowed = MachineConnectionPool.shared.borrow(machine: machine) { [weak self] handle in
+            _ = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
+            onMainEvenWhenModal {
+                guard let self, !self.stopped, !self.isPushed(key) else { return }
+                self.states[key] = nil
+                self.fetch(machine: machine)
+            }
+        }
+        if borrowed { return }
+
         if machine.isRelay {
             guard let base = machine.relayBase, let device = machine.deviceID else { return }
             Task { @MainActor [weak self] in
@@ -387,12 +592,10 @@ final class SessionBrowserProbe: ObservableObject {
                 _ = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
                 ghostty_remote_connection_free(handle)
             }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let self, !self.stopped else { return }
-                    self.states[key] = nil
-                    self.fetch(machine: machine)
-                }
+            onMainEvenWhenModal {
+                guard let self, !self.stopped else { return }
+                self.states[key] = nil
+                self.fetch(machine: machine)
             }
         }
     }
@@ -408,23 +611,52 @@ final class SessionBrowserProbe: ObservableObject {
         guard let sessions else { states[key] = .failed; return }
         // Keep just-killed sessions hidden while the agent still lists them
         // (undo window); once one is truly gone from the roster, stop hiding it.
+        // Drop rows for panes the user just closed. Their sessions are still
+        // alive for the undo window, so the agent legitimately reports them --
+        // but the user closed those windows and must not be offered a Resume.
+        // Reconcile first so the hidden set can't grow: anything the agent no
+        // longer reports has finished closing and needs no hiding.
+        ClosingSessions.shared.reconcile(against: Set(sessions.map { $0.id }))
+        let visible = ClosingSessions.shared.visible(sessions)
+
         if var kills = killedByKey[key], !kills.isEmpty {
-            kills = kills.intersection(Set(sessions.map(\.id)))
+            kills = kills.intersection(Set(visible.map { $0.id }))
             killedByKey[key] = kills.isEmpty ? nil : kills
-            states[key] = .loaded(kills.isEmpty ? sessions : sessions.filter { !kills.contains($0.id) })
+            states[key] = .loaded(kills.isEmpty ? visible : visible.filter { !kills.contains($0.id) })
         } else {
-            states[key] = .loaded(sessions)
+            states[key] = .loaded(visible)
         }
     }
 
     /// Tear down: drop all state. Called from the chooser's `finish` closure so
-    /// no fetch outlives the picker. In-flight background reads land in `finish`
-    /// which no-ops once `stopped` is set.
+    /// no fetch — and no warm connection — outlives the picker. In-flight
+    /// background reads land in `finish` which no-ops once `stopped` is set.
     func stop() {
+        // Unsubscribe every push before giving the leases back, so the pool
+        // never frees a connection we still have a callback registered on.
+        for key in Array(pushes.keys) { detachPush(key: key) }
+        releaseRemoteLeases(except: nil)
         stopped = true
         states.removeAll()
         expanded.removeAll()
         inflight.removeAll()
         killedByKey.removeAll()
+    }
+}
+
+
+/// Global, capture-free C callback for the pushed session roster. Fires on the
+/// connection's control-reader thread against a borrowed buffer, so it copies
+/// the JSON out BEFORE hopping to main.
+private func sessionsRosterTrampoline(
+    _ json: UnsafePointer<CChar>?,
+    _ ud: UnsafeMutableRawPointer?
+) {
+    guard let json, let ud else { return }
+    let data = Data(String(cString: json).utf8)
+    let box = Unmanaged<SessionBrowserProbe.PushBox>.fromOpaque(ud).takeUnretainedValue()
+    let key = box.key
+    onMainEvenWhenModal {
+        box.probe?.ingestPushedRoster(key: key, json: data)
     }
 }

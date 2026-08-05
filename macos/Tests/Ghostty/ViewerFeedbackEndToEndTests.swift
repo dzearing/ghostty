@@ -47,9 +47,19 @@ struct ViewerFeedbackEndToEndTests {
     /// Await `condition`, yielding to the MainActor executor so the resolver's
     /// main-thread completion can run. A synchronous `RunLoop.main.run` spin
     /// does NOT service it under Swift Testing's @MainActor executor.
-    private func wait(upTo seconds: TimeInterval, for condition: () -> Bool) async {
+    ///
+    /// The default is a failure deadline, not a delay: it returns as soon as
+    /// the condition holds, so a generous ceiling costs nothing on an idle
+    /// machine and is what keeps a `git` shell-out or a page round trip from
+    /// reading as a behavior failure on a loaded CI runner.
+    private func wait(upTo seconds: TimeInterval = 60, for condition: () -> Bool) async {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition() && Date() < deadline {
+            // The sleep is what services the resolver's main-thread completion
+            // (see above); the run-loop turn is what lets WebKit progress, and
+            // `sendFeedback` round-trips through the page for title/selection.
+            // Both are needed, for different halves of what is being waited on.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
     }
@@ -60,7 +70,7 @@ struct ViewerFeedbackEndToEndTests {
         let (repo, file) = try makeRepo()
         ViewerWorktreeCache.shared.invalidateAll()
         let viewer = ViewerView(location: file.path)
-        await wait(upTo: 5) { viewer.worktree != nil }
+        await wait { viewer.worktree != nil }
         #expect(viewer.worktree?.path == repo.path)
         #expect(viewer.worktree?.name == repo.lastPathComponent)
     }
@@ -72,7 +82,7 @@ struct ViewerFeedbackEndToEndTests {
         let (repo, file) = try makeRepo()
         ViewerWorktreeCache.shared.invalidateAll()
         let viewer = ViewerView(location: file.path)
-        await wait(upTo: 5) { viewer.worktree != nil }
+        await wait { viewer.worktree != nil }
         let worktree = try #require(viewer.worktree)
 
         // Compose: prose + one pasted image chip.
@@ -91,7 +101,7 @@ struct ViewerFeedbackEndToEndTests {
         viewer.sendFeedback()
         // The send now round-trips through the page for title/selection and
         // writes off-main, so wait for it to land.
-        await wait(upTo: 10) {
+        await wait {
             if case .some = viewer.feedbackModel.status { return true }
             return false
         }
@@ -139,7 +149,7 @@ struct ViewerFeedbackEndToEndTests {
         viewer.feedbackModel.textStorage.append(NSAttributedString(string: "hi"))
         viewer.feedbackModel.syncAttachments()
         viewer.sendFeedback()
-        await wait(upTo: 5) {
+        await wait {
             if case .some = viewer.feedbackModel.status { return true }
             return false
         }

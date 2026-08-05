@@ -482,6 +482,11 @@ pub const Session = struct {
     /// false by a successful RELAUNCH (the session is then a normal alive one).
     relaunchable: bool = false,
 
+    /// How many agent restarts this tombstone has been materialized across
+    /// WITHOUT anyone resuming it (see `session_meta.Record.unclaimed_restarts`).
+    /// Only meaningful while `relaunchable`; reset to 0 on a real resume.
+    unclaimed_restarts: u32 = 0,
+
     /// The currently-bound connection's outbound bridge: where live child→client
     /// DATA frames are enqueued. Null while orphaned (no live connection) — output
     /// still flows into `ring` but is not framed onto any wire. (Re)pointed under
@@ -777,6 +782,12 @@ pub const SessionTable = struct {
 
         s.alive = false;
         s.relaunchable = true;
+        // This load is one more restart the record has survived unclaimed. The
+        // count rides through to `persistMeta`, which drops the record once it
+        // exceeds `max_unclaimed_restarts` -- without that bound a materialized
+        // record is immortal (materialize marks it relaunchable, persistMeta
+        // keeps everything relaunchable) and piles up as a permanent chooser row.
+        s.unclaimed_restarts = rec.unclaimed_restarts +| 1;
         s.pinned = rec.pinned;
         s.created_ms = rec.created_ms; // preserve the original creation time
         if (rec.argv) |a| s.setArgv(a); // relaunch command + LIST_SESSIONS label
@@ -1362,6 +1373,16 @@ pub const SessionStore = struct {
             // EXITED child (`!alive and !relaunchable`) has nothing to relaunch and
             // is excluded; the file self-heals on the next open/close.
             if (!s.alive and !s.relaunchable) continue;
+            // A relaunchable tombstone is kept so the reboot floor survives a
+            // restart -- but only for a BOUNDED number of them. Materialize marks
+            // every loaded record relaunchable and this loop keeps every
+            // relaunchable record, so without this check a record can never leave
+            // the file: it is re-loaded and re-written forever, showing in the
+            // chooser as a permanent "Resume" row for a process that exited long
+            // ago, and the list grows with each restart. Past the allowance
+            // nothing has re-attached across two full agent lifetimes, so it is
+            // stale and the file finally self-heals.
+            if (!s.alive and s.unclaimed_restarts > session_meta.max_unclaimed_restarts) continue;
             const rec = dupMetaRecord(alloc, s) catch continue; // best-effort per session
             recs.append(alloc, rec) catch {
                 freeMetaRecord(alloc, rec); // not in the list → free here
@@ -1613,6 +1634,7 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
         .title = title,
         .pinned = s.pinned,
         .created_ms = s.created_ms,
+        .unclaimed_restarts = s.unclaimed_restarts,
     };
 }
 
@@ -1937,6 +1959,35 @@ test "SessionStore.reapIdle: pinned+ALIVE survives fast-forward, unpinned reaped
     try testing.expect(fakes[2].terminated); // pinned-but-dead tombstone reaped too
     try testing.expect(!fakes[0].terminated); // pinned+alive child untouched
     _ = plain;
+}
+
+test "persistMeta: an unclaimed reboot-floor tombstone ages out instead of living forever" {
+    // The ratchet this guards against: `materialize` marks EVERY record loaded
+    // from disk `relaunchable = true`, and `persistMeta` keeps every relaunchable
+    // record -- so without a bound a record can never leave sessions.json. It is
+    // re-loaded and re-written on every agent start, shows in the chooser as a
+    // permanent "Resume" row for a process that exited long ago, and the set only
+    // grows. Observed in the field as 8 -> 9 -> 11 -> 13 -> 14 sessions.
+    const R = session_meta.Record;
+    const cap = session_meta.max_unclaimed_restarts;
+
+    // A record that has just been written by a live session starts at 0 and is
+    // kept across the next few restarts (the reboot floor still works).
+    var rec: R = .{ .id = "a", .pinned = true, .unclaimed_restarts = 0 };
+    var survived: u32 = 0;
+    while (survived <= cap) : (survived += 1) {
+        // Each agent start materializes it and bumps the count.
+        rec.unclaimed_restarts += 1;
+        const kept = !(rec.unclaimed_restarts > cap);
+        if (survived < cap) try testing.expect(kept);
+    }
+    // Past the allowance it is dropped, so the file self-heals.
+    try testing.expect(rec.unclaimed_restarts > cap);
+
+    // A session someone actually resumes has its allowance reset, so ordinary
+    // daily use can never age a session out.
+    rec.unclaimed_restarts = 0;
+    try testing.expect(!(rec.unclaimed_restarts > cap));
 }
 
 test "SessionStore.reapUnboundTombstone: dead+unbound+non-relaunchable is reaped; live/bound/relaunchable survive" {
