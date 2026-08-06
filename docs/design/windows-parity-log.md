@@ -9756,3 +9756,18 @@ Floor lanes none/win32/agent PASS, P1-P3 ALL PASS, run sequentially. Filed
 T523 (seat: mac - emit the same outcome/note from the Swift server; the
 shared CLI half is already live there) and decision D19 (why report-the-drop
 won over apply-the-flags and --recreate).
+
+## 2026-08-06 - T378 closed: duplicate of T456 (banner repaint during divider drag)
+
+T378 (filed 2026-08-02) described the pane banner painting stale content while
+a split divider is dragged, root-caused to the overlay class lacking
+CS_HREDRAW/CS_VREDRAW and updatePosition never invalidating. T456 (P0, done
+2026-08-04, commit 113af0a28) independently root-caused and fixed exactly this:
+CS_HREDRAW|CS_VREDRAW on the banner class, SWP_NOCOPYBITS + same-pass
+UpdateWindow on a genuine resize in updatePosition, and width-change
+invalidation in insetHeight - with unit tests (negative-controlled) and
+test/win32/banner-resize-repaint.ps1. Closed as skipped(duplicate) after
+re-proving the fix on the current tree: win32 lane banner-filtered PASS and
+banner-resize-repaint.ps1 ALL PASS (10 assertions), both on-box today. No new
+tasks; T456's validation notes already explain why the mid-drag pixel capture
+T378 sketched was replaced by non-timing-dependent assertions.
