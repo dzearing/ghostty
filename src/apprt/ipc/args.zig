@@ -214,6 +214,54 @@ pub fn autoLaunchDirectory(arguments: ?[]const []const u8) ?[]const u8 {
     return found;
 }
 
+/// The `--working-directory=<dir>` argument an auto-launch appends to the
+/// spawned GUI's command line, quoted for CreateProcessW command-line rules
+/// (T236). Returns the full token, or null when it cannot be represented —
+/// an embedded `"` (illegal in a Windows path anyway) or a buffer too small.
+///
+/// Why an argv argument at all, when the spawn already sets the new process's
+/// working directory: the STARTUP window does not read the process cwd. Its
+/// working directory comes from the resolved `working-directory` config, whose
+/// default on Windows is `home` (`Config.probableCliEnvironment` is hardcoded
+/// false there), and since T144 that resolved value is forwarded to the local
+/// agent on OPEN — so it always outranks whatever directory the process
+/// happens to sit in. Saying it on the command line makes the request explicit
+/// where inheriting was accidental.
+///
+/// Quoting: the whole token is wrapped in `"` only when the path contains
+/// whitespace. Inside a quoted region a run of trailing backslashes would
+/// escape the closing quote, so it is doubled (CommandLineToArgvW rules);
+/// backslashes elsewhere are literal.
+pub fn autoLaunchCwdArg(buf: []u8, cwd: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, cwd, '"') != null) return null;
+    const prefix = "--working-directory=";
+
+    if (std.mem.indexOfAny(u8, cwd, " \t") == null) {
+        const needed = prefix.len + cwd.len;
+        if (needed > buf.len) return null;
+        @memcpy(buf[0..prefix.len], prefix);
+        @memcpy(buf[prefix.len..needed], cwd);
+        return buf[0..needed];
+    }
+
+    var trailing: usize = 0;
+    while (trailing < cwd.len and cwd[cwd.len - 1 - trailing] == '\\')
+        trailing += 1;
+
+    const needed = 1 + prefix.len + cwd.len + trailing + 1;
+    if (needed > buf.len) return null;
+    buf[0] = '"';
+    @memcpy(buf[1..][0..prefix.len], prefix);
+    @memcpy(buf[1 + prefix.len ..][0..cwd.len], cwd);
+    var i = 1 + prefix.len + cwd.len;
+    for (0..trailing) |_| {
+        buf[i] = '\\';
+        i += 1;
+    }
+    buf[i] = '"';
+    return buf[0..needed];
+}
+
 /// `+set-banner` arguments (T35), Mac handleSetBanner parity: `--target=`
 /// and `--clear` are flags; every other argument is banner text, joined
 /// with spaces. A literal `\n` becomes a line break so multi-line banners
@@ -420,6 +468,61 @@ test "autoLaunchDirectory: returns a real path, ignores inherit/home/empty" {
     try testing.expectEqualStrings("/second", autoLaunchDirectory(&[_][]const u8{
         "--working-directory=/first", "--working-directory=/second",
     }).?);
+}
+
+test "autoLaunchCwdArg: plain path is passed unquoted" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "--working-directory=D:\\git\\ghoztty",
+        autoLaunchCwdArg(&buf, "D:\\git\\ghoztty").?,
+    );
+    // A trailing backslash outside quotes is literal — no doubling.
+    try testing.expectEqualStrings(
+        "--working-directory=C:\\x\\",
+        autoLaunchCwdArg(&buf, "C:\\x\\").?,
+    );
+}
+
+test "autoLaunchCwdArg: whitespace quotes the whole token" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "\"--working-directory=C:\\my dir\"",
+        autoLaunchCwdArg(&buf, "C:\\my dir").?,
+    );
+    try testing.expectEqualStrings(
+        "\"--working-directory=C:\\a\tb\"",
+        autoLaunchCwdArg(&buf, "C:\\a\tb").?,
+    );
+}
+
+test "autoLaunchCwdArg: trailing backslashes are doubled inside quotes" {
+    var buf: [256]u8 = undefined;
+    // One trailing backslash would escape the closing quote; it is doubled.
+    try testing.expectEqualStrings(
+        "\"--working-directory=C:\\my dir\\\\\"",
+        autoLaunchCwdArg(&buf, "C:\\my dir\\").?,
+    );
+    // A whole run doubles, not just the last one.
+    try testing.expectEqualStrings(
+        "\"--working-directory=C:\\my dir\\\\\\\\\"",
+        autoLaunchCwdArg(&buf, "C:\\my dir\\\\").?,
+    );
+    // Interior backslashes are untouched.
+    try testing.expectEqualStrings(
+        "\"--working-directory=C:\\a b\\c\"",
+        autoLaunchCwdArg(&buf, "C:\\a b\\c").?,
+    );
+}
+
+test "autoLaunchCwdArg: unrepresentable paths return null" {
+    var buf: [256]u8 = undefined;
+    // An embedded quote cannot appear in a Windows path and cannot be
+    // round-tripped through the command line — refuse rather than mangle.
+    try testing.expect(autoLaunchCwdArg(&buf, "C:\\evil\"dir") == null);
+
+    // A buffer too small refuses rather than truncating to a wrong path.
+    var tiny: [8]u8 = undefined;
+    try testing.expect(autoLaunchCwdArg(&tiny, "D:\\git\\ghoztty") == null);
 }
 
 test "parseSetBannerArgs: text joined, \\n unescaped, trimmed" {

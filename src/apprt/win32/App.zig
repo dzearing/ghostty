@@ -3577,18 +3577,43 @@ pub fn performIpc(
 /// `--working-directory` when it named a real path. Null, or a path we cannot
 /// encode, falls back to inheriting our own cwd (the pre-T132 behavior); the
 /// re-sent IPC request still carries the flag, so the worst case is the old one.
+///
+/// The directory travels on TWO channels, and both are load-bearing (T236):
+///
+/// - `lpCurrentDirectory` sets the new PROCESS's cwd, which is what the
+///   session-persistence agent it spawns inherits — a RELAUNCH of a session
+///   that recorded no cwd lands in the agent's directory.
+/// - `--working-directory=` on the command line is what the STARTUP window
+///   actually honors. Its working directory comes from the resolved config,
+///   whose Windows default is `home` (`probableCliEnvironment` is hardcoded
+///   false here), and since T144 that resolved value is forwarded to the
+///   local agent on OPEN — so the process cwd alone never reaches the startup
+///   pane. T132 shipped with only the first channel and B3 held because the
+///   OPEN then carried no cwd at all; T144 closed that hole and exposed this.
 fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void {
     const windows = std.os.windows;
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = std.fs.selfExePath(&exe_buf) catch return error.IPCFailed;
 
+    // The explicit config argument for the startup window (see above). Best-
+    // effort like the wide-encode below: an unrepresentable path just drops
+    // the argument, never fails the launch.
+    var cwd_arg_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const cwd_arg: ?[]const u8 = if (cwd) |c|
+        apprt.ipc.args.autoLaunchCwdArg(&cwd_arg_buf, c)
+    else
+        null;
+
     // Quoted, mutable (CreateProcessW may rewrite lpCommandLine), NUL-
     // terminated wide command line.
-    var cmd_utf8_buf: [std.fs.max_path_bytes + 2]u8 = undefined;
-    const cmd_utf8 = std.fmt.bufPrint(&cmd_utf8_buf, "\"{s}\"", .{exe}) catch
+    var cmd_utf8_buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
+    const cmd_utf8 = (if (cwd_arg) |a|
+        std.fmt.bufPrint(&cmd_utf8_buf, "\"{s}\" {s}", .{ exe, a })
+    else
+        std.fmt.bufPrint(&cmd_utf8_buf, "\"{s}\"", .{exe})) catch
         return error.IPCFailed;
-    var cmd_w: [std.fs.max_path_bytes + 3]u16 = undefined;
+    var cmd_w: [2 * std.fs.max_path_bytes + 129]u16 = undefined;
     const cmd_len = std.unicode.utf8ToUtf16Le(cmd_w[0 .. cmd_w.len - 1], cmd_utf8) catch
         return error.IPCFailed;
     cmd_w[cmd_len] = 0;

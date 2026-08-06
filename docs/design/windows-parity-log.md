@@ -9361,3 +9361,22 @@ ActivityMonitor): all describe stock-framed windows they own, so none share
 the bug. Validation: reset-window-size.ps1 ALL PASS (14, was 1 FAILED),
 window-size-memory.ps1 ALL PASS (30, was 1 FAILED), floor-lane all three
 lanes PASS, P1-P3 ALL PASS sequentially.
+
+## 2026-08-05 - T236 done: the auto-launched startup window opens in the requested --working-directory again
+
+B3 of auto-launch-cwd.ps1 was red at HEAD: the startup window landed in home
+instead of the requested directory. Root cause is an interaction, not a
+regression in either part alone: T144 made the local-agent OPEN carry the
+resolved working-directory config, and on Windows probableCliEnvironment() is
+hardcoded false, so that config default resolves to home on every launch - and
+an explicit home in the OPEN outranks the process-cwd inheritance T132's
+lpCurrentDirectory relied on. autoLaunchInstance now says what it means: the
+requested directory rides the spawned GUI's own command line as
+--working-directory=<dir> (new pure args.autoLaunchCwdArg with CreateProcessW
+quoting rules + none-lane tests), while lpCurrentDirectory stays for the
+agent-inheritance/RELAUNCH floor. Filed T506: the hardcoded-false CLI
+detection also sends every terminal-launched ghoztty to home, a Mac/Linux
+parity gap in its own right. Validation: auto-launch-cwd.ps1 ALL PASS (21,
+was 20/21; red reproduced first), new-window-cwd.ps1 ALL PASS, floor-lane all
+three lanes PASS (none 159s / win32 179s / agent 190s), P1-P3 ALL PASS
+sequentially.
