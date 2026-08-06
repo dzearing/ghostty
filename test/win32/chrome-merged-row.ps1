@@ -36,7 +36,14 @@
 #      HTMAXBUTTON (the code the Snap Layouts flyout watches - a merged row is
 #      exactly where that gets silently deleted), close -> HTCLOSE, and the
 #      window's top edge still answers HTTOP* so it can still be resized.
-#   7. MAXIMIZED, THE ROW IS STILL THERE AND STILL WHOLE. The classic custom
+#   7. A PINNED WINDOW TITLE PAINTS IN THE DRAG BAND (T265). Merged, the
+#      layout has no title on purpose - but a title the user explicitly
+#      pinned (`+rename --title=`) is a documented feature that would
+#      otherwise have no on-screen affordance at 2+ tabs. Ink appears in the
+#      empty band between the "+" and the seam ONLY while the pin exists:
+#      bare before, inked after `+rename`, bare again after the clear. The
+#      before/after-clear halves are this section's built-in negative control.
+#   8. MAXIMIZED, THE ROW IS STILL THERE AND STILL WHOLE. The classic custom
 #      frame bug is a band clipped off the top of the screen when maximized;
 #      the pane offset and the close button's hit test are both re-checked in
 #      that state.
@@ -104,7 +111,7 @@ try {
     # previous run's window over the one under test (T131/T248).
     Remove-Item "$env:LOCALAPPDATA\ghoztty\session-layout-debug.json" -Force -ErrorAction SilentlyContinue
     # ...and the WINDOW PLACEMENT memory (T85), which is a separate file and a
-    # separate trap. Section 7 maximizes the window, `savePlacement` records
+    # separate trap. Section 8 maximizes the window, `savePlacement` records
     # "maximized" on the way out, and the NEXT debug window - this script's or
     # any sibling's - opens maximized. That is not hypothetical: it happened on
     # this script's second run and turned the "top edge still resizes"
@@ -293,7 +300,98 @@ try {
     Check (($hitTop -eq $HTTOP) -or ($hitTop -eq $HTTOPLEFT) -or ($hitTop -eq $HTTOPRIGHT)) `
         "the window's top edge still resizes even with tabs in that row (probed the empty band, got $hitTop)"
 
-    # --- 7. maximized: the row is not clipped off the screen ------------------
+    # --- 7. T265: a PINNED window title paints in the drag band ---------------
+    # Merged, `caption_layout` lays out no title on purpose - tabs are the
+    # title, matching the reference chrome - and sections 1-7 already hold
+    # that line. But ghoztty documents the window title as a first-class,
+    # pinnable thing (`+rename --title=`, Ctrl+Shift+R), and before T265 a
+    # pin was invisible the moment a second tab came up. It paints in the
+    # empty band between the "+" and the seam, ONLY while pinned - the
+    # fallback chain (tab/pane titles) never paints there.
+    #
+    # Wider first: two measured-title tabs can eat most of a 1200px run, and
+    # a gap narrower than MinTabW deliberately DROPS the title (unit-tested
+    # in caption_layout.zig) - this section is about the paint, not the drop.
+    Set-TestWindowSize -Window $h -Width 1600 -Height 700 | Out-Null
+    Start-Sleep -Milliseconds 900
+    $m7 = Get-TestChromeMetrics -Window $h -StripVisible $true
+    $tabs7 = @(Get-TestTabExtents -Window $h -Metrics $m7)
+    Check ($tabs7.Count -ge 1) `
+        "setup: tabs measured for the pinned-title probe ($($tabs7.Count) found)"
+    if ($tabs7.Count -ge 1) {
+        $plus7 = [Math]::Min($tabs7[$tabs7.Count - 1].Right + $m7.Gap, $m7.PlusLimit)
+        # The title band, client x: one group gap off the "+"'s painted right
+        # edge, to the seam - exactly `caption_layout.mergedTitleRect`.
+        $tL = $plus7 + $m7.BtnPaint + $m7.PadMd
+        $tR = $m7.BandLeft
+        # The text DT_VCENTERs in the tab band (TabTopPad..BarH): probe rows
+        # around that centerline, in window-bitmap y.
+        $midY7 = $m7.StripTop + [int](($m7.TabTopPad + $m7.BarH) / 2)
+
+        # Ink = pixels in the band that differ from the strip background,
+        # sampled inside the group gap the title deliberately leaves after
+        # the "+" - never painted, pinned or not. -1 = the window never
+        # produced a real capture (PrintWindow returns a flat fill for a few
+        # frames on a fresh paint).
+        function Get-BandInk {
+            for ($t = 0; $t -lt 20; $t++) {
+                $shot = Get-TestWindowPixels -Window $h
+                $real = ((Get-TestDistinctColors -Shot $shot) -ge 8)
+                if ($real) {
+                    $bg = $shot.Bitmap.GetPixel($m7.OffX + $tL - [int]($m7.PadMd / 2), $midY7)
+                    $n = 0
+                    for ($y = $midY7 - 3; $y -le $midY7 + 3; $y++) {
+                        for ($x = $tL; $x -lt $tR; $x++) {
+                            $p = $shot.Bitmap.GetPixel($m7.OffX + $x, $y)
+                            if ([Math]::Abs($p.R - $bg.R) -gt 24 -or
+                                [Math]::Abs($p.G - $bg.G) -gt 24 -or
+                                [Math]::Abs($p.B - $bg.B) -gt 24) { $n++ }
+                        }
+                    }
+                    Close-TestWindowPixels $shot
+                    return $n
+                }
+                Close-TestWindowPixels $shot
+                Start-Sleep -Milliseconds 150
+            }
+            return -1
+        }
+
+        # The launched window's auto name, from the instance itself - never
+        # assumed. GHOZTTY_PIPE_SUFFIX (set at the top) aims the CLI at this
+        # test instance and no other.
+        $win7 = (& $exe +list --json | ConvertFrom-Json).data.windows[0].target
+        Check ([bool]$win7) "setup: the window has a targetable name ('$win7')"
+
+        $inkBefore = Get-BandInk
+        Check ($inkBefore -ge 0 -and $inkBefore -le 2) `
+            "unpinned, the drag band is bare - the fallback chain never paints here (ink=$inkBefore)"
+
+        & $exe +rename --target=$win7 --title=T265-PINNED-WINDOW-TITLE 2>&1 | Out-Null
+        $inkPinned = -1
+        for ($t = 0; $t -lt 25; $t++) {
+            Start-Sleep -Milliseconds 200
+            $inkPinned = Get-BandInk
+            if ($inkPinned -ge 10) { break }
+        }
+        Check ($inkPinned -ge 10) `
+            "pinned, the title paints between the '+' and the seam (ink=$inkPinned in [$tL,$tR))"
+
+        # Clear the pin - and ALWAYS clear it, pass or fail above: a painted
+        # title left behind would sit inside section 8's tab-scan background
+        # sample and corrupt an unrelated assertion.
+        & $exe +rename --target=$win7 --title= 2>&1 | Out-Null
+        $inkCleared = -1
+        for ($t = 0; $t -lt 25; $t++) {
+            Start-Sleep -Milliseconds 200
+            $inkCleared = Get-BandInk
+            if ($inkCleared -ge 0 -and $inkCleared -le 2) { break }
+        }
+        Check ($inkCleared -ge 0 -and $inkCleared -le 2) `
+            "cleared, the band is bare again - the pin's paint left with the pin (ink=$inkCleared)"
+    }
+
+    # --- 8. maximized: the row is not clipped off the screen ------------------
     # The classic custom-frame bug. A maximized window's frame hangs off every
     # edge of the monitor, so a band drawn at client y = 0 without the extra
     # top padding is simply unreachable - and with the tabs in it now, that

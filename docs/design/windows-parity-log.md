@@ -9853,3 +9853,28 @@ Also this turn: committed the user's dashboard answers to D17/D19
 (recommended options confirmed) and D18, whose answer - never age out
 silently, notify the user instead - superseded T521 with T534. Validation:
 floor-lane all lanes PASS, chrome-merged-row ALL PASS, P1-P3 ALL PASS.
+
+## 2026-08-06 - T265: a pinned window title is visible again in the merged chrome row (sessions 05013f7d + 07e48330)
+
+Since T205 merged the tab strip into the caption band, a window showing 2+
+tabs painted no window title at all - correct against the reference (Windows
+Terminal shows none), but ghoztty documents the window title as a pinnable,
+first-class thing (`+rename --title=`, Ctrl+Shift+R), and a pin the titlebar
+cannot show is a shipped feature with no on-screen affordance. Option 3 from
+the task file landed: the pinned title - and ONLY the pinned title, never the
+tab/pane fallback chain - now paints in the empty drag band between the
+strip's "+" and the caption seam, one group gap off the "+"'s painted edge,
+vertically centered on the tab labels' own band. Below `min_tab_w` of gap the
+title drops instead of ellipsizing into jitter, and it drops entirely at
+standalone (the band's own title already answers there). Geometry lives in
+`caption_layout.mergedTitleRect` with unit tests at all four scales plus a
+sweep pinning it inside the strip's half of the row; `paintTabBar` draws the
+composed window text there, and `updateWindowTitle`/`setTitleOverride`
+invalidate on pin, clear, and pinned-text changes. The work spanned a stale
+claim: session 05013f7d built the code and was reset mid-validation; this
+turn's RESUME path picked it up from the progress log and finished the
+validation half. Validation: `chrome-merged-row.ps1` gained a §7 ink probe
+(band bare unpinned, ink=1152 px pinned, bare again after clear - the
+before/after halves are the built-in negative control) - ALL PASS 28;
+`-NegativeControl` still fails as designed; `caption-bar.ps1` ALL PASS 24
+(standalone unchanged); floor-lane all lanes PASS; P1-P3 ALL PASS.

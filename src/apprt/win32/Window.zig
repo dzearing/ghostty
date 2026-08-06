@@ -3331,6 +3331,13 @@ pub fn updateWindowTitle(self: *Window) void {
 
     buf[len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
+
+    // T265: merged, a PINNED title is painted in the row's drag band by
+    // `paintTabBar`, from this window text — so any change to it (the pin
+    // itself, an activity suffix) has to dirty the strip's half of the band.
+    // Unpinned nothing is painted there, and the transitions are
+    // `setTitleOverride`'s to invalidate.
+    if (self.mergedChrome() and self.title_override != null) self.invalidateTabBar();
 }
 
 /// Set (or clear, with null) the window title pin. Owned copy; wins over
@@ -3345,6 +3352,12 @@ pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
     if (self.title_override) |old| alloc.free(old);
     self.title_override = copy;
     self.updateWindowTitle();
+    // T265: the pin appearing or clearing changes what the band shows — the
+    // standalone caption's title text, or the merged row's drag-band title.
+    // `updateWindowTitle` only dirties the band WHILE pinned, so the clear
+    // transition (painted title → bare band) is erased here. The whole band:
+    // merged, the painted title lives in the STRIP's half.
+    self.invalidateCaption();
     self.app.markLayoutDirty(); // T89f: window title pin changed → re-persist
 }
 
@@ -4338,6 +4351,42 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         bar_b,
         inactive_text_color,
     );
+
+    // --- The PINNED window title, in the drag band (T265) ---
+    // Merged, `caption_layout` lays out no title on purpose — tabs are the
+    // title, matching Windows Terminal — but a title the user explicitly
+    // pinned (`--title`, `+rename`, Ctrl+Shift+R) is a documented feature
+    // that would otherwise have NO on-screen affordance at 2+ tabs. It paints
+    // in the empty band between the "+" and the seam, which is the STRIP's
+    // half of the row (the caption's blit starts at the seam and could never
+    // show it), and only while the pin exists: the fallback chain never
+    // paints here, so an unpinned window still reads like the reference.
+    // The text is the full composed window text (suffixes and all) — what
+    // the titlebar would show if the strip went away.
+    if (self.mergedChrome() and self.title_override != null) blk: {
+        const cl = self.captionLayout() orelse break :blk;
+        const plus_paint = icon_button.targetBox(ib, strip.new_tab);
+        const trect = caption_layout.mergedTitleRect(
+            self.captionMetrics(),
+            cl,
+            plus_paint.right,
+        );
+        if (trect.isEmpty()) break :blk;
+        var title_buf: [300]u16 = undefined;
+        const n = w32.GetWindowTextW(hwnd, &title_buf, title_buf.len);
+        if (n <= 0) break :blk;
+        // The standalone caption title's color (`pal.text`), not a tab
+        // label's: this is the WINDOW's title, and one chrome surface keeps
+        // one title color.
+        _ = w32.SetTextColor(mem_dc, active_text_color);
+        drawTitleText(
+            mem_dc,
+            title_buf[0..@intCast(n)],
+            stripRect(trect),
+            em,
+            w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+        );
+    }
 
     // --- BitBlt to screen ---
     // The strip's whole coordinate space still has its own top at 0; this is

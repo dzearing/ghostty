@@ -126,6 +126,16 @@ pub const Metrics = struct {
     /// caption that drew from a second `icon_button.Metrics.init(scale)`
     /// could disagree with the square this module laid out.
     ib: icon_button.Metrics,
+    /// Top of a PINNED window title's text band in the merged row (T265):
+    /// the strip's `tab_top_pad`, so the title `DT_VCENTER`s in the same
+    /// vertical band a tab's label does and the two read as one row of text.
+    /// 0 standalone, where the title centers in the whole band.
+    merged_title_top: i32,
+    /// Narrowest gap a pinned title may paint into (T265): the strip's own
+    /// `min_tab_w`. Below the width of the narrowest legible tab, an
+    /// ellipsized title is noise that jitters as tabs resize — the title
+    /// drops instead, exactly as a too-narrow standalone band drops its.
+    merged_title_min_w: i32,
 
     pub fn init(scale: f32, mode: Mode) Metrics {
         // Not re-derived: the "…" is the shared chrome square, so it has to
@@ -157,6 +167,11 @@ pub const Metrics = struct {
             .btn_pad = ib.hit_pad,
             .cap_btn_w = px(46.0, scale),
             .ib = ib,
+            .merged_title_top = switch (mode) {
+                .standalone => 0,
+                .with_tabs => ts.tab_top_pad,
+            },
+            .merged_title_min_w = ts.min_tab_w,
         };
     }
 
@@ -275,6 +290,50 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
             .with_tabs => @max(over.left - m.pad_md, 0),
         },
         .client_w = client_w,
+    };
+}
+
+/// Where a PINNED window title may draw in the merged row (T265).
+///
+/// The merged band deliberately lays out no `title` — tabs are the title, the
+/// reference chrome (Windows Terminal, Edge, Explorer) shows none, and that
+/// stays true for everyone who never pins one. But ghoztty documents the
+/// window title as a first-class, pinnable thing (`+new-window --title`,
+/// `+rename --title=`, Ctrl+Shift+R), and a pin the titlebar cannot show is a
+/// shipped feature with no on-screen affordance. So the one band with room —
+/// the empty drag gap between the strip's "+" and the caption's "…" — carries
+/// the pinned title, and ONLY the pinned title: the fallback chain (tab/pane
+/// titles) never paints here, so the common case still reads like the
+/// reference.
+///
+/// `plus_paint_right` is the painted right edge of the strip's "+" — the
+/// rightmost thing the strip laid out, which this module cannot derive itself
+/// because the "+" travels with tab titles it never measures (the same reason
+/// `ncHitTest` takes `client_right`). The title starts one GROUP gap
+/// (`pad_md`) right of it and stops at the seam, whose own `pad_md` to the
+/// "…" then keeps the title a group gap clear of the caption cluster — the
+/// exact separation the standalone title keeps.
+///
+/// The gap is variable — it shrinks as tabs are added and can reach zero — so
+/// below `merged_title_min_w` the title DROPS rather than ellipsizing into
+/// jittering noise. Returns the empty rect then, and always in `.standalone`
+/// (the band's own `title` already answers there).
+///
+/// The rect stays inside `[0, band_left)`: the STRIP's half of the row, which
+/// is why the strip's painter draws it (the caption's blit starts at the seam
+/// and could never show it). Vertically it is the tab band
+/// (`merged_title_top`..`caption_h`), so a `DT_VCENTER` title shares the tab
+/// labels' centerline.
+pub fn mergedTitleRect(m: Metrics, l: Layout, plus_paint_right: i32) Rect {
+    const empty: Rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    if (m.mode != .with_tabs) return empty;
+    const left = plus_paint_right + m.pad_md;
+    if (l.band_left - left < m.merged_title_min_w) return empty;
+    return .{
+        .left = left,
+        .top = m.merged_title_top,
+        .right = l.band_left,
+        .bottom = m.caption_h,
     };
 }
 
@@ -884,6 +943,80 @@ test "a stale client_right can never swallow a caption button" {
         const y = m.caption_h - 1;
         try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, 8, false, 100_000));
         try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, 8, false, 100_000));
+    }
+}
+
+// -- T265: the pinned title in the merged row --------------------------------
+
+test "mergedTitleRect: one group gap off the '+', ending at the seam, in the tab band" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const ts = tab_strip.Metrics.init(s);
+        const l = layout(m, 1200);
+        // A "+" well left of the seam: a short run, lots of drag band.
+        const plus_right: i32 = dipPx(200.0, s);
+        const r = mergedTitleRect(m, l, plus_right);
+        try testing.expect(!r.isEmpty());
+        // One GROUP gap off the "+"'s painted edge...
+        try testing.expectEqual(plus_right + m.pad_md, r.left);
+        // ...to the seam, whose own pad_md to the "…" keeps the title a group
+        // gap clear of the caption cluster — the standalone separation.
+        try testing.expectEqual(l.band_left, r.right);
+        try testing.expectEqual(m.pad_md, l.overflow.left - r.right);
+        // Vertically the TAB band, so DT_VCENTER shares the tab labels'
+        // centerline rather than the full bar's.
+        try testing.expectEqual(ts.tab_top_pad, r.top);
+        try testing.expectEqual(m.caption_h, r.bottom);
+    }
+}
+
+test "mergedTitleRect: drops below the minimum width instead of ellipsizing to noise" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const ts = tab_strip.Metrics.init(s);
+        const l = layout(m, 1200);
+        try testing.expectEqual(ts.min_tab_w, m.merged_title_min_w);
+        // Exactly the minimum gap: paints.
+        const at_min = l.band_left - m.pad_md - m.merged_title_min_w;
+        try testing.expect(!mergedTitleRect(m, l, at_min).isEmpty());
+        try testing.expectEqual(
+            m.merged_title_min_w,
+            mergedTitleRect(m, l, at_min).width(),
+        );
+        // One pixel narrower: drops.
+        try testing.expect(mergedTitleRect(m, l, at_min + 1).isEmpty());
+        // A "+" at (or absurdly past) the seam: drops, never a negative rect.
+        try testing.expect(mergedTitleRect(m, l, l.band_left).isEmpty());
+        try testing.expect(mergedTitleRect(m, l, l.band_left + 500).isEmpty());
+    }
+}
+
+test "mergedTitleRect: standalone answers empty - the band's own title already exists" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        const l = layout(m, 1200);
+        try testing.expect(mergedTitleRect(m, l, dipPx(200.0, s)).isEmpty());
+        // ...and the standalone title rect is still there, so nothing painted
+        // twice and nothing painted nowhere.
+        try testing.expect(!l.title.isEmpty());
+    }
+}
+
+test "mergedTitleRect: stays inside the strip's half of the row" {
+    // The strip blits [0, band_left); a title past the seam would be cut off
+    // (or repainted over) by the caption's own blit. Swept, not spot-checked.
+    var s: f32 = 1.0;
+    while (s <= 3.0) : (s += 0.05) {
+        const m = Metrics.init(s, .with_tabs);
+        const l = layout(m, 1200);
+        var plus: i32 = 0;
+        while (plus < 1200) : (plus += 37) {
+            const r = mergedTitleRect(m, l, plus);
+            if (r.isEmpty()) continue;
+            try testing.expect(r.left >= 0);
+            try testing.expect(r.right <= l.band_left);
+            try testing.expect(r.width() >= m.merged_title_min_w);
+        }
     }
 }
 
