@@ -385,13 +385,14 @@ fn worker(req: *Request) void {
             break :r null;
         };
     }
-    // NOTE (T328): a Kill on a REMOTE row loses its connection between the dial
-    // and the reply — `CLOSE_SESSION` and the refetch behind it both come back
-    // `error.ConnectionClosed` — so the roster keeps the rows it already had.
-    // The user still sees the killed row vanish (the optimistic hide), but the
-    // refetch that would confirm it does not happen. A retry on a fresh dial
-    // was tried here and WEDGED the worker, which is worse than the stale
-    // count, so it is not shipped: the cause is settled in T328 first.
+    // T328 (resolved): a Kill on a REMOTE row used to lose its connection here
+    // — both RPCs came back `error.ConnectionClosed`/`error.Timeout` — but the
+    // defect was never in this worker: the agent's per-connection push pumps
+    // could outlive their connection and write freed memory (fixed alongside
+    // T420), and each roster dial/deinit cycle armed exactly that window. Do
+    // NOT add a retry-on-fresh-dial here: one was tried and WEDGED the worker
+    // (`relay_dial.dial`'s upgrade read has no deadline), which is worse than
+    // a stale count. `chooser-sessions-remote.ps1` asserts the refetch lands.
 
     const res = alloc.create(Result) catch {
         if (roster) |*r| r.deinit();

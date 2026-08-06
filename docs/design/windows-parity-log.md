@@ -9511,3 +9511,24 @@ Cumulative crash-free count on the class is now 170+ runs. Data point
 appended to T443's ARMED-WATCH LOG. Filed T509: test-binary-soak.ps1
 overwrites the first binary's per-run logs when a lane soaks two binaries,
 which cost an extra 20-run soak here to re-identify a lost FAIL.
+
+## 2026-08-06 - T328 done: the remote roster Kill's refetch lands, and the test asserts it
+
+The connection killer was never in the roster worker or the relay: the
+agent's per-connection push pumps (metrics, session-cpu, roster) could
+outlive their connection and write freed memory - fixed 2026-08-04 by
+449a112b4 during the T420/T442 hunt - and every chooser roster dial/deinit
+cycle armed that window, corrupting the agent so LATER connections died
+unpredictably (the ConnectionClosed/Timeout mix T328 was filed with). T183's
+0b295032c removed a second concurrent-persist corruption on the same close
+path. At HEAD the failure is gone: 5/5 chooser-sessions-remote.ps1 runs land
+the post-Kill refetch (loaded 1 + confirmed=true). Shipped on top: the
+script's deliberate NOTE is a real assertion again (baseline-counted - a
+fixed ordinal matched a pre-Kill load and produced one false red), the
+remote agent's stderr is captured with liveness diagnostics on failure, and
+the stale NOTE comment in SessionRoster.zig now records the cause and keeps
+the do-not-retry warning. -NegativeControl PASS, local chooser-sessions.ps1
+PASS, floor all lanes PASS, P1-P3 ALL PASS. T326 (close reply sent only
+after terminate+persist) stays open - latency, not this killer. Filed T510:
+relay_dial.dial's upgrade read has no deadline, the wedge that killed the
+reverted retry and would freeze the roster worker against a silent endpoint.

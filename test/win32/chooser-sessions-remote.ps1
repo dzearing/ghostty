@@ -135,6 +135,7 @@ $devicesJson = '{"devices":[' +
 
 $errlog = Join-Path $env:TEMP "ghoztty-t319-stderr-$PID.log"
 $relaylog = Join-Path $env:TEMP "ghoztty-t319-relay-$PID.log"
+$agentlog = Join-Path $env:TEMP "ghoztty-t319-agent-$PID.log"
 $tmp = Join-Path $env:TEMP "ghoztty-t319-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 Remove-Item $errlog -ErrorAction SilentlyContinue
@@ -150,8 +151,11 @@ try {
     # --- The "other machine": a real agent on a TCP port -------------------
     if (-not (Test-Path $agentExe)) { Write-Host "SETUP FAIL: no agent at $agentExe"; exit 1 }
     $env:GHOSTTY_AGENT_LOCK = Join-Path $tmp 'agent.lock'
+    # The agent's own stderr is the first witness when an RPC dies mid-flight
+    # (T328): capture it rather than discarding it with the hidden window.
     $script:agent = Start-Process -FilePath $agentExe `
-        -ArgumentList '--listen', "127.0.0.1:$AgentPort", '--headless' -PassThru -WindowStyle Hidden
+        -ArgumentList '--listen', "127.0.0.1:$AgentPort", '--headless' -PassThru -WindowStyle Hidden `
+        -RedirectStandardError $agentlog
     Start-Sleep -Seconds 2
     if ($script:agent.HasExited) { Write-Host 'SETUP FAIL: remote agent died at launch'; exit 1 }
     Write-Host "  OK   remote agent pid=$($script:agent.Id) on 127.0.0.1:$AgentPort"
@@ -322,19 +326,33 @@ try {
             Assert ($confirm -ne [IntPtr]::Zero) 'E the Kill button opens a confirmation for a remote session'
             if ($confirm -ne [IntPtr]::Zero) {
                 # Tab then Enter: the dialog is destructive, so its default is
-                # Cancel and a bare Enter must not approve it.
+                # Cancel and a bare Enter must not approve it. Take the load
+                # baseline BEFORE approving: earlier steps log the SAME
+                # `loaded N` line, so a fixed ordinal would match a pre-Kill
+                # load, and counting after approval races the refetch itself.
+                $loadsBefore = Count-LogLines $errlog "chooser roster: loaded (\d+) session.*device=$DEV_OK"
                 Send-TestControlKey -Control $confirm -Key Tab | Out-Null
                 Start-Sleep -Milliseconds 250
                 Send-TestControlKey -Control $confirm -Key Enter | Out-Null
                 $ended = Wait-LogLine $errlog 'chooser roster: ending session id=' 6000
                 Assert ($null -ne $ended) 'E approving it issues CLOSE_SESSION over the relay'
-                # NOT ASSERTED, deliberately: that the roster then REFETCHES to
-                # 1. It does not - both the close and the refetch behind it come
-                # back `error.ConnectionClosed` on this path, every run. That is
-                # a real finding, not a flake, and it is T328's; asserting it
-                # green here would mean asserting the bug.
-                $rpc = Wait-LogLine $errlog 'chooser roster: (close session|LIST_SESSIONS) failed' 6000
-                Write-Host "  NOTE T328: the post-Kill refetch does not land - $rpc"
+                # T328: the Kill's refetch must land - the roster the user is
+                # reading has to agree with the machine after a Kill.
+                $refetch = Wait-LogCount $errlog "chooser roster: loaded (\d+) session.*device=$DEV_OK" ($loadsBefore + 1) 15000
+                Assert ($refetch -match 'loaded 1 session') `
+                    "E the post-Kill refetch lands and is down to 1 ($refetch)"
+                # Diagnostics if it did not: is the agent even alive, and what
+                # did each side log around the RPCs?
+                if (-not ($refetch -match 'loaded 1 session')) {
+                    $agentAlive = -not (Get-Process -Id $script:agent.Id -ErrorAction SilentlyContinue).HasExited
+                    Write-Host "  DIAG agent alive after Kill: $agentAlive"
+                    if (Test-Path $agentlog) {
+                        Write-Host '  DIAG agent stderr tail:'
+                        Get-Content $agentlog -Tail 25 | ForEach-Object { Write-Host "    | $_" }
+                    }
+                    $rpc = Wait-LogLine $errlog 'chooser roster: (close session|LIST_SESSIONS) failed' 1000
+                    Write-Host "  DIAG app rpc failure line: $rpc"
+                }
             }
             Send-TestControlKey -Control $chooser2 -Key Escape | Out-Null
         }
