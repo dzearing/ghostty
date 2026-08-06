@@ -743,6 +743,7 @@ if ($listBefore -match '"target"\s*:\s*"main"') {
 # verify the OUTCOME: a resume that ran opened a window. If none appeared, the
 # request was swallowed by an existing target and the loop would stall - retry
 # under a name nothing can already own.
+$relaunchTarget = 'main'
 & $oldExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
     ForEach-Object { Log "relaunch: $_" }
 for ($i = 0; $i -lt 14; $i++) {
@@ -753,6 +754,7 @@ if ($relaunched) {
     Log "RELAUNCH-WINDOW OK: a new window is running the resume command (windows $before -> $($before + 1))"
 } else {
     $alt = 'main-' + (Get-Date -Format 'HHmmss')
+    $relaunchTarget = $alt
     Log "relaunch: no new window appeared - an existing 'main' was focused instead of created; retrying as $alt"
     & $oldExe +new-window "--target=$alt" "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
         ForEach-Object { Log "relaunch: $_" }
@@ -768,27 +770,33 @@ if (-not $relaunched) { Log 'RELAUNCH FAIL: no window is running the resume comm
 # looks identical to a healthy one from here, and that invisibility is what
 # made the stall above cost hours rather than seconds.
 #
-# T138: `+list --json` reports an EMPTY working_directory for agent-backed
-# panes (T98), so on a session-persistence box this check could only ever log
-# UNKNOWN. Fall back to the agent's own view - `+sessions --json` carries the
-# real cwd - restricted to sessions created in the last two minutes so an old
-# session in the same repo cannot vouch for a pane that landed elsewhere.
+# T166: `+list --json` now reports the real working_directory for agent-backed
+# panes (the app threads the agent-recorded cwd through OPEN and ATTACHED), so
+# read the RELAUNCHED window's own pane, by name. The old shape - first
+# non-empty wd anywhere in the list, then the T138 `+sessions --json` fallback
+# - predates that: it could only vouch for "some pane somewhere", which once
+# most panes report a cwd could be a DIFFERENT window's and mis-grade the
+# guard in either direction.
+function Get-PaneWd($json, $target) {
+    if (-not $json) { return $null }
+    try { $tree = $json | ConvertFrom-Json } catch { return $null }
+    $windows = if ($null -ne $tree.data) { @($tree.data.windows) } else { @($tree.windows) }
+    foreach ($w in $windows) {
+        if ($w.target -ne $target) { continue }
+        foreach ($t in @($w.tabs)) {
+            $node = $t.splits
+            while ($null -ne $node -and $node.type -eq 'split') { $node = $node.left }
+            if ($null -ne $node -and $node.type -eq 'leaf' -and $node.terminal.working_directory) {
+                return [string]$node.terminal.working_directory
+            }
+        }
+    }
+    return $null
+}
 $landed = $null
 for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 750
-    try {
-        $raw = & $oldExe +list --json 2>$null | Out-String
-        if ($raw -match '"working_directory"\s*:\s*"([^"]+)"') { $landed = $Matches[1] -replace '\\\\', '\' }
-    } catch {}
-    if (-not $landed) {
-        try {
-            $sraw = (& $oldExe +sessions --json 2>$null) | Out-String
-            $cutoff = [DateTimeOffset]::UtcNow.AddMinutes(-2).ToUnixTimeMilliseconds()
-            $fresh = @(ConvertFrom-GhozttySessionsJson $sraw |
-                Where-Object { $_.cwd -and $_.created_at -and [int64]$_.created_at -ge $cutoff })
-            if ($fresh.Count -gt 0) { $landed = [string]$fresh[-1].cwd }
-        } catch {}
-    }
+    $landed = Get-PaneWd (Get-ListJson).Json $relaunchTarget
     if ($landed) { break }
 }
 if (-not $landed) {

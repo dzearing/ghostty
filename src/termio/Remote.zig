@@ -479,8 +479,6 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
-    _ = alloc;
-
     // Set true when the pane below came back via RELAUNCH (a dead-but-relaunchable
     // session respawned across an agent restart) rather than a live attach/open —
     // used after bring-up to print a "session restarted" divider (T12c).
@@ -509,6 +507,15 @@ pub fn threadEnter(
     var attach_replay_rows: u16 = 0;
     var attach_replay_cols: u16 = 0;
     var attach_snapshot_at: u64 = 0;
+    // The session's REAL working directory as the AGENT reports it (T166).
+    // `initTerminal` could only seed the pwd from what the app already knew —
+    // on a restore that is the config-resolved default (e.g. $HOME), not where
+    // the re-attached session actually lives — so `+list --json` answered the
+    // default for every restored pane while `+sessions --json` had the truth.
+    // Every attach-family reply carries the recorded cwd (ATTACHED alive,
+    // ATTACHED dead → notify/auto/prompt); null means an older agent, and the
+    // seeded value stands (degrade, don't fail). Arena-owned.
+    var attach_cwd: ?[]const u8 = null;
 
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
@@ -560,6 +567,9 @@ pub fn threadEnter(
             attach_replay_rows = outcome.replay_rows;
             attach_replay_cols = outcome.replay_cols;
             attach_snapshot_at = outcome.snapshot_at_offset;
+            // Copy out of `outcome` before its `defer deinit()` frees it.
+            if (outcome.cwd) |c|
+                attach_cwd = self.arena.allocator().dupe(u8, c) catch null;
             break :pane p;
         }
 
@@ -589,6 +599,9 @@ pub fn threadEnter(
                 (aa.dupe(u8, c) catch self.working_directory)
             else
                 self.working_directory;
+            // The fresh shell opens THERE, so that is also the pwd to report
+            // (T166) — the initTerminal seed was the restore-path default.
+            attach_cwd = cwd;
 
             // Retire the tombstone. It is pinned against the idle reaper (every
             // persistent local pane is), the manifest is about to point at the
@@ -636,6 +649,10 @@ pub fn threadEnter(
         if (outcome.status == .dead and outcome.relaunchable and
             self.relaunch_policy == .auto)
         {
+            // The respawn runs in the RECORDED cwd (the agent's on-disk floor),
+            // so report that rather than the restore-path seed (T166).
+            if (outcome.cwd) |c|
+                attach_cwd = self.arena.allocator().dupe(u8, c) catch null;
             const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
             const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
             const r = self.conn.relaunchChannelCancellable(
@@ -681,6 +698,9 @@ pub fn threadEnter(
         if (outcome.status == .dead and outcome.relaunchable and
             self.relaunch_policy == .prompt)
         {
+            // The eventual keystroke-relaunch runs in the recorded cwd (T166).
+            if (outcome.cwd) |c|
+                attach_cwd = self.arena.allocator().dupe(u8, c) catch null;
             const p = self.conn.prepareRelaunchPane(sid, outcome.channel) catch |err| {
                 log.warn("prepare relaunch pane failed err={}", .{err});
                 return error.RemoteAttachFailed;
@@ -749,6 +769,43 @@ pub fn threadEnter(
     // bring-up paths land here: OPEN-new (OPENED), re-attach (ATTACHED), and
     // auto-relaunch (RELAUNCHED) — each filled `pane.pid`/`pane.tty`.
     self.publishProcessInfo(pane);
+
+    // Apply the agent-reported working directory (T166): set the terminal's
+    // pwd (what `core_surface.pwd()` answers) and tell the surface (what keeps
+    // the apprt's cached copy — the one `+list --json` actually reports —
+    // from staying frozen on the initTerminal seed). Same two-step shape as
+    // the OSC 7 path in `stream_handler.zig`.
+    if (attach_cwd) |cwd| {
+        log.info("attach: applying agent-reported cwd={s}", .{cwd});
+        {
+            io.renderer_state.mutex.lock();
+            defer io.renderer_state.mutex.unlock();
+            io.terminal.setPwd(cwd) catch |err| {
+                log.warn("attach: error setting terminal pwd err={}", .{err});
+            };
+        }
+        if (apprt.surface.Message.WriteReq.init(alloc, cwd)) |req| {
+            const msg: apprt.surface.Message = .{ .pwd_change = req };
+            if (io.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+                // The surface mailbox is the SHARED app mailbox, drained only
+                // by the GUI thread — which during a restore rebuild is busy
+                // building the other windows, so at bring-up it is routinely
+                // full (measured: 2 of 3 restored panes dropped here). Timed
+                // retries until it lands — unless this surface is being torn
+                // down (`shutdown` cancels before deinit joins this thread),
+                // in which case nobody cares, drop it. Mirrors
+                // `stream_handler.surfaceMessageWriter`.
+                while (io.surface_mailbox.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) == 0) {
+                    if (self.canceller.isCancelled()) {
+                        req.deinit();
+                        break;
+                    }
+                }
+            }
+        } else |err| {
+            log.warn("attach: error creating pwd_change req err={}", .{err});
+        }
+    }
 
     // The async handle the demux thread notifies to wake THIS pane's IO thread.
     // It is registered on this thread's xev loop; its callback drains the ring.

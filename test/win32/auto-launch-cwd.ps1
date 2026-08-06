@@ -146,6 +146,21 @@ function Wait-WindowCount($tmp, $tag, $target, $timeoutSec = 40) {
     }
     return $tree
 }
+# Poll +list until the named pane REPORTS the expected working directory
+# (T166): the attach RPC and the pwd_change it queues land moments after the
+# window itself appears, so a single snapshot can catch the pre-attach seed.
+function Wait-PaneWd($tmp, $tag, $target, $expected, $timeoutSec = 30) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $pane = $null
+    $n = 0
+    while ((Get-Date) -lt $deadline) {
+        $pane = Pane-In (Get-Tree $tmp "$tag$n") $target
+        if ($null -ne $pane -and (Norm $pane.working_directory) -eq (Norm $expected)) { return $pane }
+        $n++
+        Start-Sleep -Milliseconds 800
+    }
+    return $pane
+}
 
 # ---- "where is this pane REALLY?" ------------------------------------------
 # +list reports the cwd the app THINKS a pane has. That is the number the bug
@@ -283,6 +298,42 @@ if (Test-Path $sessionsJson) {
     } catch {}
 }
 Assert "C6 sessions.json records the working directory for the reboot floor" ($recorded.Count -ge 1)
+
+# T166: what the shell proved in C4, `+list --json` must also REPORT — the
+# relaunch notice pane runs a fresh shell in the recorded directory, and the
+# app now threads that recorded cwd into the pane it reports.
+$paneC7 = Wait-PaneWd $tmp 'c7-' 'alc' $workDir 30
+AssertEq "C7 +list reports the recorded directory (relaunch path)" `
+    (Norm $workDir) (Norm $paneC7.working_directory)
+
+# ============================================================================
+"== D: +list reports the recorded cwd across an APP-only restart (T166)"
+# ============================================================================
+# Kill the app but LEAVE the agent: the sessions stay alive and the relaunch
+# re-ATTACHes to them. Before T166 every re-attached pane reported the
+# config-resolved default (the user profile dir) - the initTerminal seed -
+# while `+sessions --json` knew the real answer; now the ATTACHED reply's cwd
+# is threaded into the pane. The pid must survive too: same process, new app.
+$paneD0 = Wait-PaneWd $tmp 'd0-' 'alc' $workDir 10
+Assert "D0 pane reports a live pid before the app restart" `
+    ($null -ne $paneD0 -and [int]$paneD0.pid -gt 0)
+
+Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
+    Where-Object { $_.CommandLine -like '*zig-out*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 1500
+Assert "D1 the agent survived the app kill" ((Count-TestProcs 'ghoztty-agent.exe') -ge 1)
+
+Launch-From $tmp $launcherDir
+$treeD = Wait-WindowCount $tmp 'd' 2 60
+Assert "D2 restore rebuilt the windows after the app restart" ((Windows-Of $treeD).Count -ge 2)
+
+$paneD = Wait-PaneWd $tmp 'd3-' 'alc' $workDir 30
+Assert "D3 the named window came back" ($null -ne $paneD)
+AssertEq "D4 +list reports the recorded directory after re-ATTACH" `
+    (Norm $workDir) (Norm $paneD.working_directory)
+Assert "D5 the shell pid survived the re-attach (same process)" `
+    ($null -ne $paneD -and [int]$paneD.pid -eq [int]$paneD0.pid -and [int]$paneD.pid -gt 0)
 
 # ---- teardown --------------------------------------------------------------
 Stop-TestProcs

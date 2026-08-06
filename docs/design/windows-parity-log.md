@@ -9380,3 +9380,24 @@ parity gap in its own right. Validation: auto-launch-cwd.ps1 ALL PASS (21,
 was 20/21; red reproduced first), new-window-cwd.ps1 ALL PASS, floor-lane all
 three lanes PASS (none 159s / win32 179s / agent 190s), P1-P3 ALL PASS
 sequentially.
+
+## 2026-08-05 - T166 done: +list --json reports the real working directory for re-attached agent panes
+
+The task's 2026-07-29 evidence (empty working_directory everywhere) was
+already half-history: T144/T236 fixed the OPEN paths, measured 30/30 before
+touching anything. The live defect was the re-attach family - after an app
+restart every restored pane reported the config default (home) because the
+restore path's initTerminal seed was never corrected, even though the agent's
+ATTACHED reply carries the session's real cwd. threadEnter (shared core,
+src/termio/Remote.zig) now captures that cwd on all four attach-family
+branches, sets the terminal pwd, and pushes a pwd_change surface message with
+timed retries - the shared app mailbox is routinely full during a restore
+rebuild (instant push measured dropping 2 of 3 panes' updates), and the RPC
+canceller is the teardown escape. Older agents that omit cwd leave the seed
+standing. Retired the T138 +sessions fallback in upgrade-ghoztty-windows.ps1:
+the RELAUNCH-CWD guard now reads the relaunched window's own pane by name
+instead of the first non-empty wd anywhere in the list. Filed T507 (seat:
+mac) to validate the shared-core change on macOS. Validation:
+auto-launch-cwd.ps1 ALL PASS (30, new C7 + section D re-attach asserts),
+upgrade-no-fork.ps1 ALL PASS, floor-lane all three lanes PASS (none 164s /
+win32 180s / agent 195s), P1-P3 ALL PASS sequentially.
