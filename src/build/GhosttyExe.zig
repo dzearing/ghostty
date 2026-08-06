@@ -11,6 +11,18 @@ exe: *std.Build.Step.Compile,
 /// The install step for the executable.
 install_step: *std.Build.Step.InstallArtifact,
 
+/// Windows targets only (null otherwise): ghoztty.com, the console-subsystem
+/// TWIN of ghoztty.exe (T245). PowerShell keys its wait-and-redirect decision
+/// on the PE subsystem field, so `ghoztty +verb > file` against the
+/// GUI-subsystem exe writes 0 bytes silently; PATHEXT resolves `.COM` before
+/// `.EXE`, so a bare `ghoztty` from PowerShell or cmd finds the twin, which
+/// PowerShell waits for like any console program (the devenv.com pattern).
+/// It is the SAME binary with one WORD flipped (optional header Subsystem,
+/// GUI→console) — a tiny relay shim was Defender-quarantined on sight, see
+/// src/cli/com_shim.zig for the whole story. Ships as a required sibling of
+/// ghoztty.exe, like ghoztty-agent.exe.
+com_install_step: ?*std.Build.Step.InstallFile,
+
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
         .name = "ghoztty",
@@ -48,6 +60,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     }
 
     // OS-specific
+    var com_install_step: ?*std.Build.Step.InstallFile = null;
     switch (cfg.target.result.os.tag) {
         .windows => {
             // Subsystem selection:
@@ -75,6 +88,23 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                     }),
                 },
             });
+
+            // ghoztty.com (see the field doc above): the exe with its
+            // Subsystem WORD flipped to console, produced by a tiny host
+            // tool rather than a second multi-minute link of the app.
+            const patch_tool = b.addExecutable(.{
+                .name = "patch-subsystem",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/build/patch_subsystem_main.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }),
+            });
+            const patch_run = b.addRunArtifact(patch_tool);
+            patch_run.addArtifactArg(exe);
+            patch_run.addArg("console");
+            const com_file = patch_run.addOutputFileArg("ghoztty.com");
+            com_install_step = b.addInstallBinFile(com_file, "ghoztty.com");
         },
 
         else => {},
@@ -83,6 +113,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     return .{
         .exe = exe,
         .install_step = install_step,
+        .com_install_step = com_install_step,
     };
 }
 
@@ -90,6 +121,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
 pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
+    if (self.com_install_step) |com| b.getInstallStep().dependOn(&com.step);
 }
 
 /// If we're in NixOS but not in the shell environment then we issue

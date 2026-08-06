@@ -3646,6 +3646,87 @@ fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void 
     windows.CloseHandle(pi.hThread);
 }
 
+// Not in zig std's kernel32 as of 0.15.2.
+extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]u16;
+
+/// T245: this process may be `ghoztty.com`, the console-subsystem twin of
+/// ghoztty.exe (see src/cli/com_shim.zig). A GUI launch through the twin —
+/// no `+action` on the command line — must NOT run the GUI in-process: the
+/// caller's shell is WAITING on a console-subsystem child, and a shell must
+/// never block on the terminal it just launched. Respawn the sibling
+/// ghoztty.exe detached with our command-line tail passed through verbatim,
+/// and return true so main exits 0 immediately.
+///
+/// Called from main_ghostty before the App exists (alongside the relaunch
+/// guard). Returns false — run the GUI here after all, a degraded but
+/// functional fallback — when this process is not the twin or the respawn
+/// cannot be arranged.
+pub fn runComShimGuiRespawn(alloc: Allocator) bool {
+    const windows = std.os.windows;
+    const com_shim = @import("../../cli/com_shim.zig");
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_path = std.fs.selfExePath(&exe_buf) catch return false;
+    if (!com_shim.isComShim(self_path)) return false;
+
+    const dir = std.fs.path.dirname(self_path) orelse return false;
+    const sibling = std.fs.path.join(alloc, &.{ dir, "ghoztty.exe" }) catch
+        return false;
+    defer alloc.free(sibling);
+    const sibling_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, sibling) catch
+        return false;
+    defer alloc.free(sibling_w);
+
+    // `"<sibling>" <tail>` — our raw command line minus argv[0], spliced
+    // verbatim so `-e`/`--config` arguments survive byte-exact. Mutable:
+    // CreateProcessW may rewrite lpCommandLine.
+    const raw_cmd = GetCommandLineW();
+    const raw_len = std.mem.len(raw_cmd);
+    const tail = raw_cmd[com_shim.commandLineTailIndex(raw_cmd[0..raw_len])..raw_len];
+    var cmd: std.ArrayList(u16) = .empty;
+    defer cmd.deinit(alloc);
+    build: {
+        cmd.append(alloc, '"') catch break :build;
+        cmd.appendSlice(alloc, sibling_w) catch break :build;
+        cmd.append(alloc, '"') catch break :build;
+        if (tail.len > 0) {
+            cmd.append(alloc, ' ') catch break :build;
+            cmd.appendSlice(alloc, tail) catch break :build;
+        }
+        cmd.append(alloc, 0) catch break :build;
+
+        // Same detached spawn as autoLaunchInstance above, and safe for the
+        // same reasons: no handle inheritance (a GUI child holding the
+        // caller's pipes would keep them open for its whole life), and
+        // App.init clears the inherited ignore-^C flag the process-group
+        // flag sets (T84).
+        var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+        si.cb = @sizeOf(windows.STARTUPINFOW);
+        var pi: windows.PROCESS_INFORMATION = undefined;
+        if (windows.kernel32.CreateProcessW(
+            null,
+            @ptrCast(cmd.items.ptr),
+            null,
+            null,
+            windows.FALSE,
+            .{ .detached_process = true, .create_new_process_group = true },
+            null,
+            null,
+            &si,
+            &pi,
+        ) == 0) break :build;
+        windows.CloseHandle(pi.hProcess);
+        windows.CloseHandle(pi.hThread);
+        return true;
+    }
+
+    log.warn(
+        "ghoztty.com could not respawn the GUI sibling; running the GUI in-process",
+        .{},
+    );
+    return false;
+}
+
 /// Open a URL in the user's default browser — the native Windows way.
 /// `internal_os.open()` uses `std.process.Child`, which can hit unreachable
 /// on Windows, so this goes straight to `ShellExecuteW`.

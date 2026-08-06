@@ -284,6 +284,25 @@ if (Test-Path $newPdb) {
     Log 'WARNING: no ghoztty.pdb in staging (built with strip?); dumps from this build will be unsymbolized'
 }
 
+# T245: ghoztty.com, the console-subsystem twin of ghoztty.exe (what makes
+# PowerShell '>' redirection of CLI verbs work), ships as a required sibling.
+# It is never a long-lived process (CLI verbs exit; a GUI launch through it
+# respawns ghoztty.exe and exits), so the plain copy that just worked for the
+# exe works here too. Missing from staging = an old staging build; log and
+# keep going rather than failing a delivery that predates the twin.
+$newCom = Join-Path $Staging 'bin\ghoztty.com'
+$oldCom = Join-Path $InstallDir 'ghoztty.com'
+if (Test-Path $newCom) {
+    try {
+        Copy-Item $newCom $oldCom -Force -ErrorAction Stop
+        Log 'ghoztty.com swapped'
+    } catch {
+        Log "WARNING: ghoztty.com swap failed: $($_.Exception.Message)"
+    }
+} else {
+    Log 'no ghoztty.com in staging; kept existing (pre-T245 staging build?)'
+}
+
 # T89h: swap ghoztty-agent.exe too, WITHOUT killing the running agent. A
 # running exe's file can be RENAMED (the image stays mapped), just not
 # overwritten — so move the old one aside and copy the new one in. The old
@@ -387,7 +406,7 @@ if ($script:deliveryFailure) {
             # Same set the primary swap maintains, plus ghostty-vt.dll only where
             # the target already has one (the portable ships it; the installed
             # release does not - this is not the place to invent new layout).
-            $names = @('ghoztty.exe', 'ghoztty.pdb', 'ghoztty-agent.exe', 'ghoztty-agent.pdb')
+            $names = @('ghoztty.exe', 'ghoztty.com', 'ghoztty.pdb', 'ghoztty-agent.exe', 'ghoztty-agent.pdb')
             if (Test-Path -LiteralPath (Join-Path $dir 'ghostty-vt.dll')) { $names += 'ghostty-vt.dll' }
             $copied = @()
             foreach ($n in $names) {

@@ -1053,6 +1053,20 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   The installed release runs its own agent from `%LOCALAPPDATA%\Programs\
   Ghoztty` and owns the user's live sessions — killing it by name would take
   the user's terminal sessions with it.
+- **`ghoztty.com` is the CLI entry point from PowerShell/cmd** (T245).
+  PowerShell keys its wait-and-redirect decision on the PE subsystem field, so
+  `ghoztty +verb > file` against the GUI-subsystem `ghoztty.exe` writes 0 bytes
+  silently (`$LASTEXITCODE` stays empty). The build therefore installs
+  `ghoztty.com` — the SAME binary with the optional-header Subsystem WORD
+  flipped to console (`src/build/patch_subsystem_main.zig`) — as a required
+  sibling; PATHEXT resolves `.COM` before `.EXE`, so bare `ghoztty` from
+  PowerShell or cmd gets working redirection, pipes, and exit codes (the
+  devenv.com pattern). A GUI launch through the twin respawns `ghoztty.exe`
+  detached (`runComShimGuiRespawn`), so a shell never blocks on the terminal it
+  launched. Do NOT reintroduce a small relay shim: Defender's ML quarantined
+  that shape on sight (`src/cli/com_shim.zig` has the story). Scripts calling
+  `ghoztty.exe` by explicit path still need pipe capture, or should call the
+  `.com`. Acceptance: `test/win32/cli-shim-redirect.ps1`.
 - The session-persistence agent builds alongside the app as
   `zig-out\bin\ghoztty-agent.exe` (a required sibling of `ghoztty.exe`); its
   state lives under `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\` and it is

@@ -74,6 +74,20 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T245: this process may be `ghoztty.com`, the console-subsystem twin of
+    // ghoztty.exe that exists so PowerShell waits for (and wires redirection
+    // to) CLI verbs. A GUI launch through the twin respawns the sibling
+    // ghoztty.exe detached and exits — the caller's shell is waiting on a
+    // console-subsystem child, and it must never block on the terminal it
+    // just launched. CLI actions fall through: they run right here, in the
+    // console process, which is the whole point of the twin.
+    if (@hasDecl(apprt.App, "runComShimGuiRespawn") and state.action == null) {
+        if (apprt.App.runComShimGuiRespawn(alloc)) {
+            posix.exit(0);
+            return;
+        }
+    }
+
     if (comptime builtin.mode == .Debug) {
         std.log.warn("This is a debug build. Performance will be very poor.", .{});
         std.log.warn("You should only use a debug build for developing Ghostty.", .{});

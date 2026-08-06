@@ -9,6 +9,25 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T245 done - `ghoztty +verb > file` from PowerShell now
+  captures the output instead of silently writing 0 bytes**: PowerShell keys
+  its wait-and-redirect decision on the PE subsystem field, so no child-side
+  handle fix could work (a parent that never waits tears the pipeline down
+  before the child writes). The fix ships `ghoztty.com`, a console-subsystem
+  TWIN of ghoztty.exe - the same binary with the optional-header Subsystem
+  WORD flipped by a build-time tool (src/build/patch_subsystem_main.zig) -
+  installed as a required sibling; PATHEXT resolves .COM before .EXE, so bare
+  `ghoztty` from PowerShell/cmd gets real redirection, pipes, and exit codes
+  (the devenv.com pattern). A GUI launch through the twin respawns
+  ghoztty.exe detached (runComShimGuiRespawn + main_ghostty hook) so a shell
+  never blocks on the terminal it launched. SURPRISE that reshaped the
+  design: the first cut (a ~1MB relay shim) was built, green, and then
+  quarantined by Defender ML as Trojan:Win32/Bearfoos.A!ml within a minute -
+  the twin is byte-identical to a binary Defender already trusts, and it
+  deletes the relay layer besides. Release shape proven pre-delivery (patched
+  installed-release twin captured 735 bytes under PS `>`); acceptance
+  test/win32/cli-shim-redirect.ps1 ALL PASS (17 asserts); D17 filed for the
+  twin-vs-shim call; upgrade script ships the twin to all install locations.
 - 2026-08-06 - **T193 done - +read on an alternate-screen pane already returns
   the visible screen at HEAD (the filed failure was T181's empty-dump-as-error
   path: a bare ESC[?1049h alt screen dumps empty), so the turn locked the
