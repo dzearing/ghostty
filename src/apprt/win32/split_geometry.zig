@@ -125,6 +125,24 @@ pub fn inGrabBand(a: Axis, coord: i32, scale: f32) bool {
     return coord >= a.split_pos - half and coord <= a.split_pos + half;
 }
 
+/// Map a dragged pointer position to a split's new ratio (T495).
+///
+/// `region_start`/`region_end` are the DRAGGED NODE's own layout rect on the
+/// drag axis — NEVER the whole surface. A split's ratio is relative to its own
+/// sub-rectangle, and only the ROOT split's sub-rectangle is the surface. For
+/// three equal columns the second divider rests at 2/3·W; mapping the pointer
+/// against the full width hands the nested split 0.667 as its ratio, which
+/// re-lays the divider out at 1/3·W + 0.667·(2/3·W) = 0.778·W — a rightward
+/// leap of 0.111·W (~200px on the user's window) on the first motion tick,
+/// after which the divider tracks OFFSET from the pointer instead of under it.
+/// Mapping against the node's own region makes a grabbed-but-unmoved divider
+/// reproduce its current ratio, and makes the [0.1, 0.9] clamp per-node.
+pub fn dragRatio(region_start: i32, region_end: i32, pos: i32) f32 {
+    const total: f32 = @floatFromInt(@max(region_end - region_start, 1));
+    const p: f32 = @floatFromInt(pos - region_start);
+    return std.math.clamp(p / total, 0.1, 0.9);
+}
+
 test "bandPx: 2 DIP, and never a single physical pixel at any scale" {
     try testing.expectEqual(@as(i32, 2), bandPx(1.0));
     try testing.expectEqual(@as(i32, 3), bandPx(1.25));
@@ -258,6 +276,60 @@ test "axis: a small ratio change moves the band by more than its width" {
     // The old band's pixels now belong to the LOW child of the new layout.
     try testing.expect(before.band_lo >= after.lo_start);
     try testing.expect(before.band_hi <= after.band_lo);
+}
+
+test "dragRatio: root divider keeps the old math" {
+    // For the root split the node's region IS the surface, so nothing moves.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), dragRatio(0, 1000, 500), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), dragRatio(0, 1000, 250), 0.001);
+    // Clamp, both ends, including positions outside the region entirely.
+    try testing.expectApproxEqAbs(@as(f32, 0.1), dragRatio(0, 1000, 0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), dragRatio(0, 1000, -400), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.9), dragRatio(0, 1000, 1000), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.9), dragRatio(0, 1000, 5000), 0.001);
+}
+
+test "dragRatio: a grabbed nested divider that has not moved stays put (T495)" {
+    // The user's geometry: three side-by-side columns on a ~3110px surface,
+    // tree = split(1/3) -> [pane, split(1/2) -> [pane, pane]]. The second
+    // divider's region is the right split's own rect, NOT the surface.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const w: i32 = 3110;
+        const root = axis(0, w, 1.0 / 3.0, scale);
+        // The nested split subdivides the right child's rect.
+        const nested = axis(root.band_hi, w, 0.5, scale);
+
+        // Grabbing the divider at its RESTING position and computing against
+        // the node's own region reproduces the current ratio — the divider
+        // does not move until the pointer does.
+        const kept = dragRatio(root.band_hi, w, nested.split_pos);
+        const region_w: f32 = @floatFromInt(w - root.band_hi);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), kept, 1.5 / region_w);
+
+        // THE BUG, pinned so it cannot come back unnamed: the same pointer
+        // mapped against the WHOLE surface reads ~0.667 — which re-lays the
+        // divider out at ~0.778·W, a leap of ~0.111·W (~345px here).
+        const wrong = dragRatio(0, w, nested.split_pos);
+        try testing.expect(wrong > 0.66 and wrong < 0.68);
+        const relaid = axis(root.band_hi, w, wrong, scale);
+        const jump = relaid.split_pos - nested.split_pos;
+        try testing.expect(jump > @divTrunc(w, 10)); // > ~311px of teleport
+
+        // Pointer at the region's midpoint means HALF, exactly.
+        const mid = root.band_hi + @divTrunc(w - root.band_hi, 2);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), dragRatio(root.band_hi, w, mid), 1.5 / region_w);
+    }
+}
+
+test "dragRatio: vertical analog (same function, rows for columns)" {
+    // The axis is abstract: a 3-row layout maps y against the node's own
+    // vertical region the same way.
+    const h: i32 = 1200;
+    const root = axis(0, h, 1.0 / 3.0, 1.0);
+    const nested = axis(root.band_hi, h, 0.5, 1.0);
+    const kept = dragRatio(root.band_hi, h, nested.split_pos);
+    const region_h: f32 = @floatFromInt(h - root.band_hi);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), kept, 1.5 / region_h);
 }
 
 test "grab band is wider than the visible band on both sides" {

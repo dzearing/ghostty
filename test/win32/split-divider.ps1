@@ -652,6 +652,92 @@ foreach ($axis in @('down', 'right')) {
     Stop-Process -Id $g.App.Pid -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# T495: in a 3-COLUMN layout the SECOND divider tracks the pointer 1:1.
+#
+# The bug: startDividerDrag captured surfaceRect() as the drag's reference
+# frame, which is correct only for the ROOT split. The second divider's ratio
+# belongs to the nested right-hand split, so the first motion tick mapped the
+# pointer against the full width (~0.667 as the nested ratio), teleporting the
+# divider from 2/3*W to ~0.778*W (~200px on the user's window), and every
+# later move kept that offset - the divider sat well right of the pointer for
+# the whole drag. Fixed by capturing the dragged NODE's own region
+# (Window.splitRegionRect) and mapping via split_geometry.dragRatio.
+#
+# Oracle: pane rects, not pixels - the divider position IS the boundary
+# between the panes on either side of it, and a teleport moves that boundary
+# ~10% of the window width instead of the distance the pointer traveled.
+# ---------------------------------------------------------------------------
+Kill-RepoInstances
+$a495 = Start-OnTestDesktop -Exe $exe -Arguments $common
+Start-Sleep -Seconds 3
+if ($a495.Process -and $a495.Process.HasExited) {
+    Write-Host 'SKIP T495: GUI did not come up'
+} else {
+    $launched += $script:GhozttyTestDesktopPids
+    $t495 = Wait-TestWindow -ProcessId $a495.Pid -Class 'GhozttyWindow'
+    if ($t495 -eq [IntPtr]::Zero) {
+        Write-Host 'SKIP T495: top window not found'
+        Stop-Process -Id $a495.Pid -Force -ErrorAction SilentlyContinue
+    } else {
+        # Two right-splits: +split splits the FOCUSED pane, and each split
+        # focuses its new (right) pane, so this builds exactly the T495 tree:
+        # split[p1, split[p2, p3]] - three side-by-side columns.
+        & $exe +split --direction=right | Out-Null
+        Start-Sleep -Milliseconds 800
+        & $exe +split --direction=right | Out-Null
+        Start-Sleep -Milliseconds 800
+        $panes495 = Get-Panes $t495
+        Assert ($panes495.Count -eq 3) "T495 setup: 3 visible panes (got $($panes495.Count))"
+        if ($panes495.Count -eq 3) {
+            function Get-SecondDividerX([IntPtr]$top) {
+                $p = @(Get-Panes $top | Sort-Object Left)
+                if ($p.Count -ne 3) { return $null }
+                [pscustomobject]@{
+                    X = [int](($p[1].Right + $p[2].Left) / 2)
+                    Y = [int](($p[1].Top + $p[1].Bottom) / 2)
+                    FirstX = [int](($p[0].Right + $p[1].Left) / 2)
+                }
+            }
+
+            $d0 = Get-SecondDividerX $t495
+            # A grabbed divider that has NOT moved must stay exactly where it
+            # was: pre-fix, the very first motion tick teleported it ~10% of
+            # the window width rightward even with the pointer motionless.
+            Invoke-DividerDrag -Top $t495 -X0 $d0.X -Y0 $d0.Y -X1 $d0.X -Y1 $d0.Y -Steps 3
+            $d1 = Get-SecondDividerX $t495
+            Assert ($null -ne $d1 -and [math]::Abs($d1.X - $d0.X) -le 6) `
+                "T495: a grabbed-but-unmoved second divider stays put ($($d0.X) -> $($d1.X))"
+
+            # Drag +100px right: the divider must land where the pointer was
+            # released, not 100px right of a teleported position.
+            $target = $d1.X + 100
+            Invoke-DividerDrag -Top $t495 -X0 $d1.X -Y0 $d1.Y -X1 $target -Y1 $d1.Y
+            $d2 = Get-SecondDividerX $t495
+            Assert ($null -ne $d2 -and [math]::Abs($d2.X - $target) -le 20) `
+                "T495: second divider tracks a +100px drag (wanted ~$target, got $($d2.X))"
+
+            # And back left, so the tracking is not a one-direction fluke.
+            $target2 = $d2.X - 80
+            Invoke-DividerDrag -Top $t495 -X0 $d2.X -Y0 $d2.Y -X1 $target2 -Y1 $d2.Y
+            $d3 = Get-SecondDividerX $t495
+            Assert ($null -ne $d3 -and [math]::Abs($d3.X - $target2) -le 20) `
+                "T495: second divider tracks a -80px drag (wanted ~$target2, got $($d3.X))"
+
+            # Root-divider regression: the FIRST divider still tracks too.
+            $f0 = (Get-SecondDividerX $t495).FirstX
+            $ftarget = $f0 + 60
+            Invoke-DividerDrag -Top $t495 -X0 $f0 -Y0 $d0.Y -X1 $ftarget -Y1 $d0.Y
+            $f1 = (Get-SecondDividerX $t495).FirstX
+            Assert ([math]::Abs($f1 - $ftarget) -le 20) `
+                "T495: first (root) divider still tracks (+60px: wanted ~$ftarget, got $f1)"
+
+            Assert (-not ($a495.Process -and $a495.Process.HasExited)) 'T495: no crash'
+        }
+        Stop-Process -Id $a495.Pid -Force -ErrorAction SilentlyContinue
+    }
+}
+
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

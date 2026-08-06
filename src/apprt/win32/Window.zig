@@ -2641,6 +2641,53 @@ fn dividerBandRectNode(
     }
 }
 
+/// The client-coordinate rect a split NODE subdivides — its own layout
+/// region, not the whole surface (T495). Same walk as `dividerBandRectNode`,
+/// returning the region instead of the band. Null when the handle is not a
+/// visible split in the active tab.
+fn splitRegionRect(self: *Window, target: SplitTree(PaneView).Node.Handle) ?w32.RECT {
+    if (self.tab_count == 0) return null;
+    if (self.tab_hero_active[self.active_tab]) return null;
+    const tree = self.tab_trees[self.active_tab];
+    if (!tree.isSplit()) return null;
+    if (tree.zoomed != null) return null;
+    return self.splitRegionRectNode(tree, .root, self.surfaceRect(), target);
+}
+
+fn splitRegionRectNode(
+    self: *Window,
+    tree: SplitTree(PaneView),
+    handle: SplitTree(PaneView).Node.Handle,
+    rect: w32.RECT,
+    target: SplitTree(PaneView).Node.Handle,
+) ?w32.RECT {
+    if (handle.idx() >= tree.nodes.len) return null;
+    if (handle == target) {
+        return switch (tree.nodes[handle.idx()]) {
+            .leaf => null,
+            .split => rect,
+        };
+    }
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => return null,
+        .split => |s| {
+            if (s.layout == .horizontal) {
+                const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
+                const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
+                return self.splitRegionRectNode(tree, s.left, left_rect, target) orelse
+                    self.splitRegionRectNode(tree, s.right, right_rect, target);
+            } else {
+                const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
+                const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
+                return self.splitRegionRectNode(tree, s.left, top_rect, target) orelse
+                    self.splitRegionRectNode(tree, s.right, bottom_rect, target);
+            }
+        },
+    }
+}
+
 /// Repaint ONE divider band through the normal paint cycle (T233).
 ///
 /// InvalidateRect + UpdateWindow, deliberately NOT the `GetDC` + `paintDividers`
@@ -2709,7 +2756,11 @@ fn startDividerDrag(self: *Window, handle: SplitTree(PaneView).Node.Handle, layo
     self.dragging_split = true;
     self.drag_split_handle = handle;
     self.drag_split_layout = layout;
-    self.drag_start_rect = self.surfaceRect();
+    // The dragged NODE's own region, not the surface (T495): a nested
+    // split's ratio is relative to its sub-rectangle, and mapping the
+    // pointer against the whole surface teleported the second divider of a
+    // 3-column layout ~200px right on the first motion tick.
+    self.drag_start_rect = self.splitRegionRect(handle) orelse self.surfaceRect();
     // Held hover: the band must not drop back to rest the instant it is
     // grabbed, and mid-drag the pointer routinely leaves the band.
     self.hover_split = handle;
@@ -2723,16 +2774,8 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
     const handle = self.drag_split_handle;
 
     const new_ratio: f16 = switch (self.drag_split_layout) {
-        .horizontal => ratio: {
-            const total: f32 = @floatFromInt(@max(rect.right - rect.left, 1));
-            const pos: f32 = @floatFromInt(x - rect.left);
-            break :ratio @floatCast(std.math.clamp(pos / total, 0.1, 0.9));
-        },
-        .vertical => ratio: {
-            const total: f32 = @floatFromInt(@max(rect.bottom - rect.top, 1));
-            const pos: f32 = @floatFromInt(y - rect.top);
-            break :ratio @floatCast(std.math.clamp(pos / total, 0.1, 0.9));
-        },
+        .horizontal => @floatCast(split_geometry.dragRatio(rect.left, rect.right, x)),
+        .vertical => @floatCast(split_geometry.dragRatio(rect.top, rect.bottom, y)),
     };
 
     self.tab_trees[self.active_tab].resizeInPlace(handle, new_ratio);
