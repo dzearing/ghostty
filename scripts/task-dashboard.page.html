@@ -182,7 +182,16 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .digest-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; }
 .digest-head select { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; }
 /* The day header: the first thing the eye lands on over coffee. */
-.digest-date { font-size: 22px; font-weight: 700; letter-spacing: -0.2px; margin: 2px 0 10px; }
+.digest-date { font-size: 24px; font-weight: 700; letter-spacing: -0.2px; margin: 2px 0 10px; }
+/* Digest prose (Commentary AND Task triage) reads at article size — it is a
+   morning read, not a data panel. The 13px .md base stays for task dialogs,
+   where density wins. */
+.digest-body .md { font-size: 15px; line-height: 1.65; }
+.digest-body .md h2 { font-size: 18px; }
+.digest-body .md h3 { font-size: 16px; }
+.digest-body .md h4 { font-size: 13px; }
+.digest-body .md code { font-size: 13px; }
+.digest-body .md pre.code code { font-size: 13px; }
 /* Category tabs (Commentary / Task triage). */
 .digest-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--hairline); margin-bottom: 12px; }
 .digest-tab { font: inherit; font-size: 13px; color: var(--ink-2, var(--ink)); background: none; border: none; border-bottom: 2px solid transparent; padding: 6px 10px; cursor: pointer; opacity: .75; }
@@ -1242,7 +1251,7 @@ function digestView(d) {
   }
   var cur = state.digestDate && dates.indexOf(state.digestDate) >= 0 ? state.digestDate : dates[0];
   if (d.digest && d.digest.body != null) state.digestCache[d.digest.date] = d.digest.body;
-  var body = h('div');
+  var body = h('div', { class: 'digest-body' });
   var cached = state.digestCache[cur];
   var tabsRow = null;
   if (cached != null) {
