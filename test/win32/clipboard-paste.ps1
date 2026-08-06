@@ -1,6 +1,12 @@
 # T154 acceptance: ctrl+v must PASTE when the clipboard holds text, and must
 # FALL THROUGH to the pane (as a raw ^V) when it does not.
 #
+# T156 extends it to shift+insert (sections E/F): the generic non-darwin
+# default bound shift+insert to paste_from_selection, which the win32 apprt
+# can never satisfy (no selection clipboard), so the chord was swallowed
+# outright - no paste, and the pane never saw the key. The Windows mirror
+# block now re-binds it to paste_from_clipboard, performable.
+#
 # Why this matters: Claude Code (and other TUIs) read images off the system
 # clipboard themselves when they receive ^V. Before T154 the Windows
 # ctrl-mirror block bound ctrl+v with a plain put() and no `performable`
@@ -277,6 +283,39 @@ $tail = Wait-Text 'ZQ_FULL_PASTE_TOKEN' 10
 Assert ($null -ne $tail) 'D: ctrl+v pastes the full clipboard text onto the input line'
 & $Exe +send-keys --target=$script:pane C-c | Out-Null
 Start-Sleep -Milliseconds 500
+
+# --- E: text clipboard + shift+insert -> pastes (T156) ------------------------
+# Windows Terminal / conhost parity chord. Pre-fix this fails with code=-1:
+# the paste_from_selection binding can never perform on win32 and the chord
+# was swallowed whole.
+Set-TextClipboard 'ZQTOKEN' | Out-Null
+if (-not (Start-Probe 'E')) {
+    Assert $false 'E: probe became ready'
+} else {
+    $sent = Send-TestKeys -Window $top -Target $surface -Modifiers shift -Key insert
+    Assert $sent 'E: shift+insert injected'
+    $tail = Wait-Text 'PROBE_E_CHAR=(\d+)' 10
+    $code = if ($tail -match 'PROBE_E_CHAR=(\d+)') { [int]$Matches[1] } else { -1 }
+    Assert ($code -eq 90) "E: shift+insert with text on the clipboard pastes (probe char=$code, want 90 'Z')"
+    Stop-Probe
+}
+
+# --- F: image-only clipboard + shift+insert -> reaches the pane (T156) --------
+# With nothing to paste the performable binding must decline, letting the
+# chord fall through to the pane as a keystroke (however ConPTY renders it -
+# what matters is that the probe's ReadKey RETURNS, which a swallowed chord
+# never causes).
+Set-ImageOnlyClipboard | Out-Null
+if (-not (Start-Probe 'F')) {
+    Assert $false 'F: probe became ready'
+} else {
+    $sent = Send-TestKeys -Window $top -Target $surface -Modifiers shift -Key insert
+    Assert $sent 'F: shift+insert injected'
+    $tail = Wait-Text 'PROBE_F_CHAR=(\d+)' 10
+    $code = if ($tail -match 'PROBE_F_CHAR=(\d+)') { [int]$Matches[1] } else { -1 }
+    Assert ($code -ne -1) "F: shift+insert with an image-only clipboard reaches the pane instead of being swallowed (probe char=$code)"
+    Stop-Probe
+}
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash at end of run'
 

@@ -7008,6 +7008,22 @@ pub const Keybinds = struct {
                 .{ .performable = true },
             );
 
+            // shift+insert pastes from the standard clipboard (Windows
+            // Terminal / conhost parity). The generic non-darwin block above
+            // rebinds it to paste_from_selection for Linux's selection
+            // clipboard, but Windows has no selection clipboard — the apprt
+            // reports false for any non-standard clipboard — so that binding
+            // could never perform and the chord was swallowed outright: no
+            // paste, and the pane never saw the key either. Performable for
+            // the same reason as ctrl+v: with no text on the clipboard the
+            // chord must fall through to the pane.
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
+                .paste_from_clipboard,
+                .{ .performable = true },
+            );
+
             // Clear screen + scrollback (mac: cmd+k). Performable: on the
             // alternate screen the action reports unconsumed, so ctrl+k
             // falls through to full-screen TUIs; a primary-screen shell
@@ -10848,6 +10864,30 @@ test "default keybinds: windows ctrl clipboard mirrors are performable" {
         try testing.expectEqual(case[1], leaf.action);
         try testing.expect(leaf.flags.performable);
     }
+}
+
+// T156: shift+insert must paste from the STANDARD clipboard on Windows and
+// be performable. The generic non-darwin default binds it to
+// paste_from_selection, which the win32 apprt can never satisfy (no
+// selection clipboard), so without the Windows re-bind the chord was
+// swallowed: no paste, and the key never reached the pane either.
+test "default keybinds: windows shift+insert pastes from the standard clipboard" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    const entry = cfg.keybind.set.get(.{
+        .key = .{ .physical = .insert },
+        .mods = .{ .shift = true },
+    }) orelse return error.TestExpectedBinding;
+
+    const leaf = entry.value_ptr.leaf;
+    try testing.expectEqual(inputpkg.Binding.Action.paste_from_clipboard, leaf.action);
+    try testing.expect(leaf.flags.performable);
 }
 
 test "clone default" {

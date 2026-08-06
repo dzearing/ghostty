@@ -9716,3 +9716,22 @@ relaunch's stderr names 1 unattached session while all 4 sessions stay alive
 P1-P3 ALL PASS. Filed T519 (mac sibling of the log line), T520 (chooser
 marks "not in any window"), T521 + decision D18 (opt-in orphan aging, user's
 call on whether pinned sessions may ever expire).
+
+## 2026-08-06 - T156 done: shift+insert now pastes on Windows
+
+Same defect class as T154, one block over: the generic non-darwin defaults
+rebind shift+insert to paste_from_selection (for Linux's selection
+clipboard) after the earlier paste_from_clipboard put, and the win32 apprt
+answers false for any non-standard clipboard - so the binding could never
+perform, and with no performable flag the chord was swallowed whole: no
+paste, and the pane never saw the key. Fix per the task's recommended
+option 2: the Windows ctrl-mirror block re-binds shift+insert to
+paste_from_clipboard with performable=true, next to ctrl+v, which restores
+Windows Terminal/conhost paste parity while leaving the Linux binding
+untouched. Unit test asserts the binding + flag; clipboard-paste.ps1 grew
+sections E (text clipboard: shift+insert pastes, probe char=90) and F
+(image-only clipboard: the chord reaches the pane - probe ReadKey returns
+VK_INSERT with KeyChar 0 instead of never returning) - ALL PASS (26).
+Floor lanes none/win32/agent PASS, P1-P3 ALL PASS, run sequentially.
+Filed T522: ctrl+insert copy has the same missing-performable swallow when
+nothing is selected (P2 - only dead in the no-selection case).
