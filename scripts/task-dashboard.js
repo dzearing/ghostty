@@ -172,6 +172,12 @@ function loadTasks() {
       // nobody ranked should not outrank one somebody deliberately called P2.
       priority: /^P[012]$/.test(String(F.priority || '')) ? String(F.priority) : null,
       triageReason: F['triage-reason'] == null ? null : String(F['triage-reason']),
+      // Milestone membership (the convergence cutline, 2026-08-06): the
+      // completion number the user watches is measured against a milestone's
+      // deliberate membership, never the ever-growing all-time backlog — a
+      // percentage whose denominator grows with every report cannot converge.
+      // Absent = outside every milestone; the daily triage promotes tasks in.
+      milestone: F.milestone == null ? null : String(F.milestone),
       summary: extractSummary(text.slice(fm.bodyStart)),
       // Written by the loop when it claims a task (go.md step 1). Task titles
       // are defect sentences aimed at whoever will fix them — "the notice
@@ -1005,6 +1011,12 @@ function buildPayload() {
     counts,
     ready: tasks.filter((t) => t.ready).length,
     doneLast7: Object.values(completedAt).filter((ts) => ts >= week).length,
+    // The convergence number: closed-vs-total of the M1 milestone's members.
+    milestone: (() => {
+      const m1 = tasks.filter((t) => t.milestone === 'M1');
+      const closed = m1.filter((t) => t.bucket === 'done' || t.bucket === 'skipped').length;
+      return { name: 'M1', total: m1.length, closed, open: m1.length - closed };
+    })(),
     historyStart: series.length ? series[0].ts : now,
     series,
     daily,
