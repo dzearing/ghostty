@@ -9213,3 +9213,21 @@ worktree at HEAD + this diff (the main tree still carries another session's
 in-flight chrome edits). P1–P3 not run: test-only diff, `ghoztty.exe`
 unaffected. T498 extended to hunt the same untimed-fifo pattern in the
 non-agent test harnesses.
+
+## 2026-08-05 — T437 done: the agent lane is proven reliably green, 10 consecutive passes
+
+T437 filed the lane's flakiness as its own P0 (a gate that fails ~1 run in 3
+is not a gate); the fixes themselves landed under T346 (all 11 spin-count
+waits in server.zig's tests plus the keepalive test's fixed sleep and 25ms
+staleness window replaced with deadline-bounded `waitUntil` conditions) and
+T258 (the loopback's untimed read wedge bounded at 30s, failing red with the
+test's name). What this task added was the proof the goal asked for:
+`floor-lane.ps1 -Lane agent -Repeat 10` in an isolated worktree at HEAD
+(`892c3ab44`) — 10/10 PASS, run 1 at 331s (cold build), runs 2–10 steady at
+149–155s, zero leaked webview hosts. Both flake sites verified in source as
+condition-waits, not spin counts. Side finds: T346's rewrite incidentally
+fixed 3 of T436's 11 lock-held-assert sites (T436 updated with the 8
+surviving sites at fresh line numbers), and every build on this box logs a
+poisoned zig-global-cache timestamp warning — filed as T499 (P3). The main
+tree still carries another session's in-flight chrome edits; only tracker
+files are committed here.
