@@ -30,6 +30,14 @@
 #   E  an unknown name still FAILS, and says "not found in registry" - the
 #      error the empty-screen case used to be indistinguishable from
 #   F  a viewer pane still FAILS with its own message
+#   G  (T193) a pane showing the ALTERNATE screen reads back the VISIBLE
+#      screen with exit 0 - not scrollback (the alt screen has none by
+#      design), and not the old blanket failure - and recovers the primary
+#      screen's scrollback when the program leaves the alt screen. This is
+#      what an agent watching a pane that happens to run htop, a pager, or a
+#      full-screen installer needs. The child prints markers around the
+#      switch because a +read failure is NOT a usable oracle for "on the alt
+#      screen" (it fires for other reasons too - the T190 lesson).
 #
 # Runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1) so it
 # never takes the user's foreground.
@@ -195,6 +203,55 @@ try {
         AssertAlways "F viewer pane exits nonzero" ($viewRead.Code -ne 0)
         AssertAlways "F viewer pane says it is a viewer, not a terminal" ($viewRead.Text -match 'viewer pane, not a terminal')
     }
+
+    # ------------------------------------------------------------------
+    "== G: a pane on the ALTERNATE screen reads back the visible screen (T193)"
+    # ------------------------------------------------------------------
+    # The child prints a primary-screen marker, enters the alt screen
+    # (ESC[?1049h), paints alt content, holds it for 10 s, then leaves
+    # (ESC[?1049l) and prints a return marker. Every phase is detected by its
+    # marker, never by a failing read.
+    $altScript = 'Write-Host T193PRIMARY; [Console]::Write([char]27+''[?1049h''); ' +
+        '[Console]::Write(''T193ALTCONTENT''); Start-Sleep 10; ' +
+        '[Console]::Write([char]27+''[?1049l''); Write-Host T193BACK; Start-Sleep 120'
+    Invoke-Ghoztty "+new-window --target=altscr -e powershell -NoProfile -Command `"$altScript`"" "$tmp\new-alt.txt" | Out-Null
+    $alt = $null
+    for ($t = 0; $t -lt 40 -and -not $alt; $t++) { Start-Sleep -Milliseconds 250; $alt = Get-Leaf 'altscr' }
+    AssertAlways "G +list reports the alt-screen pane" ($null -ne $alt)
+    if ($alt) {
+        # Phase 1: poll until a read shows the alt-screen content. Any read
+        # that FAILS while the pane is coming up or on the alt screen is the
+        # T193 defect shape.
+        $altRead = $null
+        $altReadFails = 0
+        for ($t = 0; $t -lt 60; $t++) {
+            Start-Sleep -Milliseconds 250
+            $r = Invoke-Ghoztty "+read --name=$($alt.id) --lines=50" "$tmp\read-altscr.txt"
+            if ($r.Code -ne 0) { $altReadFails++; continue }
+            if ($r.Text -match 'T193ALTCONTENT') { $altRead = $r; break }
+        }
+        Assert "G +read on the alt screen exits 0 and returns the visible screen" ($null -ne $altRead)
+        Assert "G no read failed on the way there (failed=$altReadFails)" ($altReadFails -eq 0)
+        if ($altRead) {
+            Assert "G the alt-screen read is the VISIBLE screen, not scrollback (no primary marker)" (
+                $altRead.Text -notmatch 'T193PRIMARY')
+        }
+
+        # Phase 2: after the child leaves the alt screen, the primary screen's
+        # scrollback is readable again - both markers visible.
+        $backRead = $null
+        for ($t = 0; $t -lt 80; $t++) {
+            Start-Sleep -Milliseconds 250
+            $r = Invoke-Ghoztty "+read --name=$($alt.id) --lines=50" "$tmp\read-altback.txt"
+            if ($r.Code -eq 0 -and $r.Text -match 'T193BACK') { $backRead = $r; break }
+        }
+        Assert "G +read recovers the primary screen after ESC[?1049l" ($null -ne $backRead)
+        if ($backRead) {
+            Assert "G the recovered read has the primary scrollback (both markers)" (
+                $backRead.Text -match 'T193PRIMARY' -and $backRead.Text -match 'T193BACK')
+        }
+    }
+    Invoke-Ghoztty "+close --target=altscr" "$tmp\close-altscr.txt" | Out-Null
 
     "== foreground"
     $fgSeen = @(Stop-TestForegroundWatch)

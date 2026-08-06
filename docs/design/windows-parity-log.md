@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T193 done - +read on an alternate-screen pane already returns
+  the visible screen at HEAD (the filed failure was T181's empty-dump-as-error
+  path: a bare ESC[?1049h alt screen dumps empty), so the turn locked the
+  behavior in rather than re-fixing it**: arm G added to
+  test/win32/ipc-read-race.ps1 (alt-screen read exits 0 with the VISIBLE
+  screen and no primary marker, zero failed reads across the transition,
+  primary scrollback recovers after ESC[?1049l), CLAUDE.md now documents the
+  alt-screen contract, and T481 - the Mac seat's isEmpty fix, which is where
+  the Mac's copy of this defect still lives - now instructs its taker to
+  include an alt-screen arm in the macOS validation. Script ALL PASS on this
+  box; no product code changed (test + docs only, so the zig lanes are the
+  morning's green run). Also this turn: Aug 6 digest written; T516
+  (upstream-divergence inventory) and T517 (D11 Claude-ism sweep) filed from
+  its reflection.
 - 2026-08-06 - **T244 done - the pid-0 defect it described was already fixed
   (T41 gave the agent real child pids, T153 verified + locked it in with
   pane-id.ps1 A7-A9, both landed before this claim), so the turn re-confirmed

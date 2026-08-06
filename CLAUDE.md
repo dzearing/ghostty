@@ -121,6 +121,15 @@ terminal never finished starting up`, and `failed to read terminal content`
 liveness states apart. The "last N lines" rule itself lives in
 `src/apprt/ipc/read_tail.zig` so both platforms describe it identically.
 
+**A pane on the alternate screen reads back the visible screen** (T193,
+win32; the Mac half rides with T481). A TUI pane — htop, a pager, a
+full-screen installer — answers `+read` with what a user looking at the pane
+sees, because the dump reads the *active* screen; the alternate screen has no
+scrollback by design, so the visible frame is the whole truthful answer. When
+the program leaves the alt screen (`ESC[?1049l`), the primary screen's
+scrollback is readable again. Regression arm: G in
+`test/win32/ipc-read-race.ps1`.
+
 ### `ghoztty +list`
 
 List open windows, tabs, and panes (human-readable tree, or `--json`). Listing auto-registers every pane it discovers, so returned names are immediately usable as targets.
