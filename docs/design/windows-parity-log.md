@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-05 - **T136 done - the original agent-lane RESIZE/SIGNAL flake is
+  the same crash T183 fixed, and it no longer reproduces.** T136 was the
+  first sighting (2026-07-28, `zig build test-agent`, exit 3 during T131's
+  floor run) of the panic T183 later root-caused: the fixed-name `.tmp`
+  staging race plus a discarded `waitUntil` timeout landing on `.?` with
+  unsynchronized FakeChild fields. The task summary's own suspects (PtyChild
+  teardown, use-after-free of the child handle) are disproven - the harness's
+  fake child never spawns a process. Verified per the task's criteria on top
+  of 0b295032c: the `-Dtest-filter="RESIZE and SIGNAL"` agent test binary
+  looped x100 with 0 failures (execution of the target test proven in the
+  captured output), and `floor-lane -Lane agent -Repeat 3` PASS x3. Docs-only
+  close-out; no new tasks - the follow-up already on file is T500 (migrate
+  the remaining fixed-name atomic-write copies).
 - 2026-08-05 - **T183 done - the floor-lane flake was two real bugs, and one
   of them could corrupt the session roster in production.** The task's
   temp-dir-sweep theory was disproven (no sweeper exists; the panicking test
