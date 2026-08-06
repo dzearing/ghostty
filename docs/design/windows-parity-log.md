@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T317 closed as a duplicate of T443 - the win32-lane PageList
+  segfault is the same half-clobbered-pointer corruption, and its failing seed
+  is proven not to be the trigger.** T317's stack (`verifyIntegrity ->
+  lookupHyperlink -> hash_map.get`) is exactly the chain T443's dumps decode,
+  and the user's D10/D12 calls (2026-08-05) park that hunt as an armed watch.
+  The one measurement T317 uniquely owned is now made: 10 runs of the win32
+  test binary at HEAD with `--seed=0xefa4b814`, 5 concurrent, **0 crashes**
+  (`test-binary-soak.ps1` label `t317-seed-0xefa4b814`), matching T443's
+  earlier same-seed result on the agent binary - the seed orders tests but
+  does not carry the trigger. Cumulative crash-free count since the last
+  occurrence: 90+ runs (logged in T443's new ARMED-WATCH LOG section).
+  Surprise: one soak run went red on a failed TEST, not a crash -
+  `atomic_write` "concurrent writers never error or tear (T183)" broke its
+  own guarantee under 5-way load; filed as **T508** (likely a transient
+  Windows rename collision; the error value is currently swallowed, so step 1
+  is capturing it). Floor: none/win32/agent lanes PASS via floor-lane, P1-P3
+  ALL PASS. No code change - docs only.
+
 - 2026-08-06 - **T178 done - the remote `--command` output loss does not
   exist; the 4 reds were the old harness, not the product.** HEAD:
   `remote-inherit.ps1` ALL PASS ×3. Decisive A/B: built the proven-red commit
