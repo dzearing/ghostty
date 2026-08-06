@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T178 done - the remote `--command` output loss does not
+  exist; the 4 reds were the old harness, not the product.** HEAD:
+  `remote-inherit.ps1` ALL PASS ×3. Decisive A/B: built the proven-red commit
+  `f1f973b88` in a worktree and drove it with TODAY'S script - the marker
+  assertions (sections 3 and 5, the T178 failure itself) PASS on that old
+  binary too, so the output was never lost by the product; the old red came
+  from harness contamination since fixed by T248 (previous-run bleed), T267
+  (wrong window), and the script's `GHOZTTY_PIPE_SUFFIX` endpoint isolation.
+  The suspected OPENED→register drop window is guarded by design: the
+  `ChannelTable` prebuffer (T06c, `inbound_ring.zig`) stashes early DATA and
+  flushes it on register, and it predates the red. The old build's remaining
+  section-4 fails are a focus-forwarding defect of that build, fixed on HEAD -
+  different signature, not this task. Also: T330 re-seated to `seat: mac`
+  (its work items are Swift/Mac repro + fix; the Windows half already ships).
+  Floor: none/win32/agent lanes PASS via floor-lane, P1-P3 ALL PASS,
+  host-settings ALL PASS (65). No code change - docs only.
+
 - 2026-08-05 - **T401 done - the lane/script collision wedge no longer
   reproduces, and its real cause was the untimed loopback wait T258 bounded,
   not a namespace collision.** Resumed from a stale claim (the 08-05
