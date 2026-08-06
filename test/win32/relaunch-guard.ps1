@@ -22,6 +22,9 @@
 #      A guard that misreads its orders would wait on some unrelated pid.
 #   E: the guard process is not a terminal: it opens no window and binds no IPC
 #      endpoint, so it can never be mistaken for a second instance.
+#   F: T524 - a guard jailed in a kill-on-close job relaunches an app that
+#      lands OUTSIDE the job and survives the job's teardown (the production
+#      failure was the guard/app dying together in a job teardown).
 #
 # Arm A/B/D drive the WATCHING half directly (the env var IS the interface).
 # The ARMING half is covered end to end by test\win32\agent-upgrade.ps1 arm H
@@ -48,14 +51,28 @@ function Say($m) { Write-Host $m }
 # Only processes started from the exe under test. The user's installed release
 # runs from %LOCALAPPDATA%\Programs\Ghoztty and must never be matched.
 #
+# And only THIS RUN's processes. Another session's harness may drive the same
+# zig-out exe concurrently (observed live 2026-08-06: a parallel loop session's
+# script spawning `+verb` one-shots and `--session-persistence=false` apps
+# mid-run), and this suite's own `+list` probes are ghoztty.exe processes for a
+# moment too. Neither may count as a stray or a relaunch. Ours are exactly two
+# shapes: the BARE exe (a guard, or a guard's relaunch - the guard passes no
+# arguments) and apps started with `--title=t421*`/`--title=t524*`.
+#
 # `, @(...)` so a single match survives the pipeline as an ARRAY - but that only
 # holds through an ASSIGNMENT. Piping the call directly (`Get-TestApps | Where`)
 # unrolls the wrapper and hands Where-Object the inner array as ONE object,
 # whose `.ProcessId` is empty; that read as "a stray process exists" and failed
 # a negative control that was in fact passing. Always assign first.
+function Test-OursCmdline($cmd) {
+    if (-not $cmd) { return $true }  # no cmdline visible: assume ours (bare spawn)
+    $t = $cmd.TrimEnd()
+    if ($t.EndsWith('ghoztty.exe') -or $t.EndsWith('ghoztty.exe"')) { return $true }
+    return ($t -match '--title=t(421|524)')
+}
 function Get-TestApps {
     return , @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -eq $Exe })
+        Where-Object { $_.ExecutablePath -eq $Exe -and (Test-OursCmdline $_.CommandLine) })
 }
 function Stop-TestApps {
     $apps = Get-TestApps
@@ -94,11 +111,15 @@ function Start-Guard($appPid, $marker) {
     }
 }
 
-function Wait-NewApp($excludePid, $timeoutSec = 30) {
+# $excludePids: every pid that is NOT the relaunch - the dead app AND the
+# guard, which is the same bare exe and used to be returned as the "new app"
+# in the instant before it exited (a probe against it then read a dead handle).
+function Wait-NewApp($excludePids, $timeoutSec = 30) {
+    $excludePids = @($excludePids | ForEach-Object { [int]$_ })
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
         $all = Get-TestApps
-        $fresh = @($all | Where-Object { $_.ProcessId -ne $excludePid })
+        $fresh = @($all | Where-Object { $excludePids -notcontains [int]$_.ProcessId })
         if ($fresh.Count -gt 0) { return [int]$fresh[0].ProcessId }
         Start-Sleep -Milliseconds 500
     }
@@ -148,7 +169,7 @@ try {
 
     # THE event: the app ends while the marker says the refresh never finished.
     Stop-Process -Id $appA -Force -ErrorAction SilentlyContinue
-    $appA2 = Wait-NewApp $appA 40
+    $appA2 = Wait-NewApp @($appA, $guardA.Id) 40
     Assert "A3 a NEW app was started after the death" ($appA2 -ne 0 -and $appA2 -ne $appA)
     # Started, not merely spawned: the whole complaint is that the user had no
     # terminal, so the replacement has to actually be one.
@@ -240,6 +261,91 @@ try {
         ($null -ne (Get-Process -Id $guardE.Id -ErrorAction SilentlyContinue))
     Remove-Item -LiteralPath $markerE -Force
     Assert "E3 ... and stops when disarmed" (Wait-Exit $guardE.Id 25)
+    Stop-TestApps
+
+    # ========================================================================
+    Say "== F: T524 - the relaunch ESCAPES a kill-on-close job object"
+    # ========================================================================
+    # Production shape: this box wraps process trees in kill-on-close job
+    # objects (LimitFlags 0x3C00 measured live on 2026-08-06), and a job
+    # teardown kills every member at once - which is how four production
+    # guards died WITH the app they were watching, before their first
+    # instruction. The fix spawns across the job boundary with
+    # CREATE_BREAKAWAY_FROM_JOB. Here the GUARD is jailed in such a job and
+    # relaunches the dead app from inside it: the replacement must land
+    # OUTSIDE the job (F4, the direct membership probe) and survive the job
+    # being torn down (F5). Under pre-T524 code the replacement inherits the
+    # job and dies with it.
+    $jobSig = @'
+using System;
+using System.Runtime.InteropServices;
+public static class T524Job {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit;
+    public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize;
+    public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IO_COUNTERS { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr job, int cls, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int len);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+}
+'@
+    Add-Type -TypeDefinition $jobSig -ErrorAction SilentlyContinue
+
+    $job = [T524Job]::CreateJobObject([IntPtr]::Zero, $null)
+    $jobInfo = New-Object T524Job+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    # KILL_ON_JOB_CLOSE (0x2000) + BREAKAWAY_OK (0x800): the measured
+    # production shape - members die on teardown, but breakaway is permitted.
+    $jobInfo.BasicLimitInformation.LimitFlags = 0x2800
+    $jobLen = [System.Runtime.InteropServices.Marshal]::SizeOf($jobInfo)
+    $jobSet = [T524Job]::SetInformationJobObject($job, 9, [ref]$jobInfo, $jobLen)
+    Assert "F0 premise: a kill-on-close job exists" ($job -ne [IntPtr]::Zero -and $jobSet)
+
+    $markerF = Join-Path $root 'guard-f.marker'
+    Set-Content -LiteralPath $markerF -Value 'armed' -Encoding utf8
+    $appF = Start-TestApp 't524f'
+    Assert "F1 premise: the app under test is up" ($appF -ne 0)
+    $guardF = Start-Guard $appF $markerF
+    $guardProc = Get-Process -Id $guardF.Id -ErrorAction SilentlyContinue
+    $jailed = $false
+    if ($guardProc) {
+        [T524Job]::AssignProcessToJobObject($job, $guardProc.Handle) | Out-Null
+        [T524Job]::IsProcessInJob($guardProc.Handle, $job, [ref]$jailed) | Out-Null
+    }
+    Assert "F2 premise: the guard is jailed in the kill-on-close job" $jailed
+    Start-Sleep -Milliseconds 1500
+
+    Stop-Process -Id $appF -Force -ErrorAction SilentlyContinue
+    $appF2 = Wait-NewApp @($appF, $guardF.Id) 40
+    Assert "F3 the jailed guard still relaunched the app" ($appF2 -ne 0)
+    $escaped = $false
+    if ($appF2 -ne 0) {
+        try {
+            $newProc = Get-Process -Id $appF2 -ErrorAction Stop
+            $inJob = $true
+            [void][T524Job]::IsProcessInJob($newProc.Handle, $job, [ref]$inJob)
+            $escaped = -not $inJob
+        } catch {}
+    }
+    Assert "F4 the relaunched app landed OUTSIDE the job (breakaway)" $escaped
+
+    # Tear the job down the way production does: close its last handle.
+    [T524Job]::CloseHandle($job) | Out-Null
+    Start-Sleep -Seconds 3
+    $survived = ($appF2 -ne 0) -and ($null -ne (Get-Process -Id $appF2 -ErrorAction SilentlyContinue))
+    Assert "F5 the relaunched app SURVIVED the job teardown" $survived
+    $listF = (& $Exe +list 2>$null) | Out-String
+    Assert "F6 ... and still answers +list" ($listF -match '\S')
 } finally {
     Stop-TestApps
     $env:LOCALAPPDATA = $savedLocalAppData

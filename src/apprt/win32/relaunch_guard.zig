@@ -37,6 +37,14 @@
 //! - **No `CREATE_NEW_PROCESS_GROUP`.** That flag is inherited by every
 //!   descendant and disables Ctrl-C for all of them (T84) — a relaunched app
 //!   whose panes ignore ^C would be a worse bug than the one being fixed.
+//! - **It breaks out of the app's job object** (T524). A child joins its
+//!   parent's job by default, and a job teardown kills every member at once —
+//!   which is how four production guards died WITH the app they were
+//!   watching, before executing one instruction. A supervisor that shares its
+//!   subject's fate supervises nothing. `spawnEscapingJob` escapes in tiers:
+//!   `CREATE_BREAKAWAY_FROM_JOB`, then a shell-parent hop for the job chains
+//!   that refuse breakaway (this box's do), then in-job as a loud last
+//!   resort.
 //! - **No new CLI surface.** It is an environment variable, not a `+verb`:
 //!   `ghoztty`'s command set stays identical on both platforms (CLAUDE.md's
 //!   standing rule), and the same variable is available to the Mac seat when it
@@ -47,6 +55,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const build_config = @import("../../build_config.zig");
+const oswin = @import("../../os/windows.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_relaunch_guard);
@@ -192,27 +201,10 @@ fn armImpl(alloc: Allocator) !Armed {
     const cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{exe});
     const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd);
 
-    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
-    si.cb = @sizeOf(windows.STARTUPINFOW);
-    var pi: windows.PROCESS_INFORMATION = undefined;
-    if (windows.kernel32.CreateProcessW(
-        null,
-        cmd_w.ptr,
-        null,
-        null,
-        windows.FALSE,
-        // Detached and windowless, but NOT a new process group: that flag is
-        // inherited all the way down and would kill Ctrl-C in every pane of the
-        // relaunched app (T84).
-        .{ .detached_process = true, .create_no_window = true },
-        null,
-        null,
-        &si,
-        &pi,
-    ) == 0) {
-        log.warn("relaunch guard: CreateProcessW failed err={}", .{windows.kernel32.GetLastError()});
-        return error.SpawnFailed;
-    }
+    // Detached and windowless, but NOT a new process group: that flag is
+    // inherited all the way down and would kill Ctrl-C in every pane of the
+    // relaunched app (T84).
+    const pi = try spawnEscapingJob(arena, cmd_w.ptr, DETACHED_PROCESS | CREATE_NO_WINDOW);
     const guard_pid = w32.GetProcessId(pi.hProcess);
     windows.CloseHandle(pi.hProcess);
     windows.CloseHandle(pi.hThread);
@@ -293,6 +285,161 @@ fn run(alloc: Allocator, spec: Spec) u8 {
     return if (ok) 0 else 1;
 }
 
+const DETACHED_PROCESS: std.os.windows.DWORD = 0x00000008;
+const CREATE_NO_WINDOW: std.os.windows.DWORD = 0x08000000;
+const CREATE_BREAKAWAY_FROM_JOB: std.os.windows.DWORD = 0x01000000;
+const PROCESS_CREATE_PROCESS: std.os.windows.DWORD = 0x0080;
+/// ProcThreadAttributeValue(ProcThreadAttributeParentProcess=0, false, true, false)
+const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: std.os.windows.DWORD = 0x00020000;
+
+/// Spawn `cmd_w` detached, ESCAPING the caller's job object.
+///
+/// T524: a child joins its parent's job by default, and this box's jobs are
+/// kill-on-close — in all four production incidents the guard died WITH the
+/// app, before executing one instruction, which is why the T421 guard never
+/// fired outside its harness. `DETACHED_PROCESS` does not leave a job. Three
+/// tiers, each logged so the next incident says which guard it had:
+///
+///  1. `CREATE_BREAKAWAY_FROM_JOB` — the clean escape, a no-op for a jobless
+///     caller. Refused with ACCESS_DENIED when ANY job in the caller's chain
+///     forbids breakaway — which is the MEASURED reality on this box (the
+///     pane-shell job chain refuses it; verified live 2026-08-06), so this
+///     tier alone would have fixed nothing.
+///  2. Parent-process hop: spawn with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`
+///     pointing at the shell (explorer). Job membership follows the ACTUAL
+///     parent used for inheritance, so the child lands in the shell's (safe)
+///     job context instead of ours — no breakaway permission involved. The
+///     environment is passed EXPLICITLY, because with a spoofed parent the
+///     spec-carrying variable would otherwise be read from the wrong process.
+///  3. Inside the job, loudly: a jailed guard is degraded (a job teardown
+///     still takes it down with the app), never absent — it still covers
+///     every death that is not a job teardown.
+fn spawnEscapingJob(
+    arena: Allocator,
+    cmd_w: [*:0]u16,
+    base: std.os.windows.DWORD,
+) !std.os.windows.PROCESS_INFORMATION {
+    const windows = std.os.windows;
+
+    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+    si.cb = @sizeOf(windows.STARTUPINFOW);
+    var pi: windows.PROCESS_INFORMATION = undefined;
+
+    if (oswin.exp.kernel32.CreateProcessW(
+        null,
+        cmd_w,
+        null,
+        null,
+        windows.FALSE,
+        base | CREATE_BREAKAWAY_FROM_JOB,
+        null,
+        null,
+        &si,
+        &pi,
+    ) != 0) return pi;
+
+    const breakaway_err = windows.kernel32.GetLastError();
+    log.warn(
+        "relaunch guard: breakaway spawn refused err={}; trying the shell-parent hop",
+        .{breakaway_err},
+    );
+
+    if (spawnViaShellParent(arena, cmd_w, base)) |shell_pi| {
+        return shell_pi;
+    } else |err| {
+        log.warn(
+            "relaunch guard: shell-parent spawn unavailable err={}; spawning INSIDE the job (a job teardown that kills the app kills this child too)",
+            .{err},
+        );
+    }
+
+    if (oswin.exp.kernel32.CreateProcessW(
+        null,
+        cmd_w,
+        null,
+        null,
+        windows.FALSE,
+        base,
+        null,
+        null,
+        &si,
+        &pi,
+    ) != 0) return pi;
+
+    log.warn("relaunch guard: CreateProcessW failed err={}", .{windows.kernel32.GetLastError()});
+    return error.SpawnFailed;
+}
+
+/// Tier 2: create the child with the SHELL (explorer) as its inheritance
+/// parent, which places it in the shell's job context rather than ours. Every
+/// failure here is an error return, never fatal — the caller falls back.
+fn spawnViaShellParent(
+    arena: Allocator,
+    cmd_w: [*:0]u16,
+    base: std.os.windows.DWORD,
+) !std.os.windows.PROCESS_INFORMATION {
+    const windows = std.os.windows;
+
+    const shell_hwnd = GetShellWindow() orelse return error.NoShellWindow;
+    var shell_pid: windows.DWORD = 0;
+    _ = w32.GetWindowThreadProcessId(shell_hwnd, &shell_pid);
+    if (shell_pid == 0) return error.NoShellWindow;
+
+    const parent = OpenProcess(PROCESS_CREATE_PROCESS, windows.FALSE, shell_pid) orelse
+        return error.OpenShellDenied;
+    defer windows.CloseHandle(parent);
+
+    var attr_size: windows.SIZE_T = 0;
+    _ = oswin.exp.kernel32.InitializeProcThreadAttributeList(null, 1, 0, &attr_size);
+    const attr_buf = try arena.alloc(u8, attr_size);
+    if (oswin.exp.kernel32.InitializeProcThreadAttributeList(attr_buf.ptr, 1, 0, &attr_size) == 0)
+        return error.AttrListFailed;
+    var parent_handle: windows.HANDLE = parent;
+    if (oswin.exp.kernel32.UpdateProcThreadAttribute(
+        attr_buf.ptr,
+        0,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        @ptrCast(&parent_handle),
+        @sizeOf(windows.HANDLE),
+        null,
+        null,
+    ) == 0) return error.AttrListFailed;
+
+    // The spec travels in OUR environment; a spoofed parent would hand the
+    // child the SHELL's environment instead, so pass ours explicitly.
+    const env = GetEnvironmentStringsW() orelse return error.NoEnvironment;
+    defer _ = FreeEnvironmentStringsW(env);
+
+    var siex: oswin.exp.STARTUPINFOEX = .{
+        .StartupInfo = std.mem.zeroes(windows.STARTUPINFOW),
+        .lpAttributeList = attr_buf.ptr,
+    };
+    siex.StartupInfo.cb = @sizeOf(oswin.exp.STARTUPINFOEX);
+
+    var pi: windows.PROCESS_INFORMATION = undefined;
+    if (oswin.exp.kernel32.CreateProcessW(
+        null,
+        cmd_w,
+        null,
+        null,
+        windows.FALSE,
+        base | oswin.exp.EXTENDED_STARTUPINFO_PRESENT | oswin.exp.CREATE_UNICODE_ENVIRONMENT,
+        env,
+        null,
+        &siex.StartupInfo,
+        &pi,
+    ) == 0) {
+        log.warn("relaunch guard: shell-parent CreateProcessW failed err={}", .{windows.kernel32.GetLastError()});
+        return error.ShellSpawnFailed;
+    }
+    log.info("relaunch guard: escaped the job via shell-parent spawn (parent pid {d})", .{shell_pid});
+    return pi;
+}
+
+extern "user32" fn GetShellWindow() callconv(.winapi) ?std.os.windows.HWND;
+extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*]u16;
+extern "kernel32" fn FreeEnvironmentStringsW(penv: [*]u16) callconv(.winapi) std.os.windows.BOOL;
+
 fn markerPresent(path: []const u8) bool {
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
@@ -312,24 +459,10 @@ fn relaunch(alloc: Allocator, exe: []const u8) bool {
     const cmd = std.fmt.allocPrint(arena, "\"{s}\"", .{exe}) catch return false;
     const cmd_w = std.unicode.utf8ToUtf16LeAllocZ(arena, cmd) catch return false;
 
-    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
-    si.cb = @sizeOf(windows.STARTUPINFOW);
-    var pi: windows.PROCESS_INFORMATION = undefined;
-    if (windows.kernel32.CreateProcessW(
-        null,
-        cmd_w.ptr,
-        null,
-        null,
-        windows.FALSE,
-        .{ .detached_process = true },
-        null,
-        null,
-        &si,
-        &pi,
-    ) == 0) {
-        log.err("relaunch guard: relaunch of {s} FAILED err={}", .{ exe, windows.kernel32.GetLastError() });
+    const pi = spawnEscapingJob(arena, cmd_w.ptr, DETACHED_PROCESS) catch {
+        log.err("relaunch guard: relaunch of {s} FAILED", .{exe});
         return false;
-    }
+    };
     const pid = w32.GetProcessId(pi.hProcess);
     windows.CloseHandle(pi.hProcess);
     windows.CloseHandle(pi.hThread);
