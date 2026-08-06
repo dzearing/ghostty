@@ -9,6 +9,25 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-05 - **T401 done - the lane/script collision wedge no longer
+  reproduces, and its real cause was the untimed loopback wait T258 bounded,
+  not a namespace collision.** Resumed from a stale claim (the 08-05
+  bluescreen turn); its baseline showed test-agent alone green in 114s. The
+  original evidence rereads as *blocked, not spinning*: 108s CPU over 11 min
+  is ~16% of a core, and ~108s IS each binary's normal full-run CPU. The
+  exact collision (test-agent lane + agent-pipe.ps1 + chooser-sessions.ps1
+  concurrently) was run twice: lane exit 0 in 110s/105s, scripts ALL PASS
+  both times, per-30s CPU sampling showing steady progress. Root cause chain
+  confirmed against 23d13c7f8 (T258): pre-T346 spin waits starved by box
+  load raced into the loopback's untimed cond.wait - now a 30s
+  `error.LoopbackReadTimeout` naming the test. go.md step 3 now says run
+  lanes and acceptance scripts sequentially, never overlapped; suite-runner
+  mutual exclusion stays with T361. Surprise: the first none-lane floor run
+  crashed intermittently in `terminal.Screen 'scrolling when viewport is
+  pruned'` (STATUS_BREAKPOINT, clean on re-run, docs-only diff) - filed
+  **T504** (shared-core, may affect Mac too). Floor: none PASS, win32 PASS,
+  agent covered by the two collision runs, P1-P3 ALL PASS.
+
 - 2026-08-05 - **T136 done - the original agent-lane RESIZE/SIGNAL flake is
   the same crash T183 fixed, and it no longer reproduces.** T136 was the
   first sighting (2026-07-28, `zig build test-agent`, exit 3 during T131's

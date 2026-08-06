@@ -165,7 +165,13 @@ Concretely, in order, with no stops in between:
    bare lane can wedge with no output and no timeout, and a wedge you cannot
    tell from a slow run is worse than a red test. The wrapper watches CPU as
    well as the clock, so it always ends with `PASS`, `FAIL` or `STALL` plus a
-   diagnostic.
+   diagnostic. **Run the lanes and the acceptance scripts sequentially, never
+   overlapped** (T401): an acceptance script deliberately kills agents and
+   takes the per-user pipe, and box load from a concurrent lane starved test
+   waits badly enough to wedge the lane for 11+ minutes before T346/T258
+   bounded them — today the same overlap costs a red flake that reads as
+   "test-agent is flaky again". A background lane plus a foreground script is
+   the exact shape that burned the T96 turn.
 4. **Make sure it's right** — validation must actually pass, on the box. A
    clean build is not evidence, and neither is a passing script you did not
    read the last line of.
