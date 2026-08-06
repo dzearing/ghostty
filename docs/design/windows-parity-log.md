@@ -9771,3 +9771,17 @@ re-proving the fix on the current tree: win32 lane banner-filtered PASS and
 banner-resize-repaint.ps1 ALL PASS (10 assertions), both on-box today. No new
 tasks; T456's validation notes already explain why the mid-drag pixel capture
 T378 sketched was replaced by non-timing-dependent assertions.
+
+## 2026-08-06 - T405 closed: duplicate of T137 (session-persistence = off silently rejected)
+
+T405 (filed 2026-08-03 from T104 evidence) reported that the documented
+`session-persistence = off|on` spelling was rejected by `parseBool`, silently
+leaving persistence on. T137 (P0, done 2026-08-04, commit 8f7af4466) fixed
+exactly this the day after T405 was filed: `parseBool` now accepts
+`on`/`off`/`yes`/`no` alongside `true`/`false` (shared Zig core, both seats),
+the `parseBool: the exact accepted set` unit test pins the contract, and the
+silent-rejection half was verified loud (win32 Configuration Errors dialog;
+`config-errors.ps1` case 4, 27 assertions). Closed as skipped(duplicate) after
+re-proving on the current tree: none-lane parseBool-filtered tests 75/75 PASS
+on-box today. No new tasks - T137 already filed T489 for the adjacent
+CLI-flag-silently-ignored gap.
