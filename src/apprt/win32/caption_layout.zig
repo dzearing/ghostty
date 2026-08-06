@@ -1,9 +1,9 @@
-//! Pure geometry for the win32 caption bar (T254). No OS imports, so these
-//! unit tests run in every app-runtime lane (the `split_geometry.zig` /
-//! `tab_strip_layout.zig` pattern). The painting half is `paintCaption` in
-//! Window.zig and the hit tests are `WM_NCHITTEST` + `handleCaptionClick`,
-//! which consume the same rects — the one rule that keeps what you see and
-//! what you can click from drifting apart.
+//! Pure geometry for the win32 caption bar (T254, restyled native by T496).
+//! No OS imports, so these unit tests run in every app-runtime lane (the
+//! `split_geometry.zig` / `tab_strip_layout.zig` pattern). The painting half
+//! is `paintCaption` in Window.zig and the hit tests are `WM_NCHITTEST` +
+//! `handleCaptionClick`, which consume the same rects — the one rule that
+//! keeps what you see and what you can click from drifting apart.
 //!
 //! ## Why this module exists at all
 //!
@@ -18,52 +18,50 @@
 //! So `WM_NCCALCSIZE` gives the caption band back to the client area, and
 //! everything in it becomes ours to lay out, paint and hit-test. That is the
 //! prerequisite T234 (a "…" button left of minimize) assumed it already had,
-//! and the one T205 (tabs inside the titlebar) needs next.
+//! and the one T205 (tabs inside the titlebar) needed next.
 //!
-//! ## The rules it is built to (docs/design/win32-design-system.md)
+//! ## The system trio is NATIVE Windows 11, not app chrome (T496)
 //!
-//!   * **One icon-button size.** The caption buttons paint the SAME 28 DIP
-//!     square as the strip's "+", "≡" and "×", from the same
-//!     `icon_button.Metrics` — not a second constant that happens to agree
-//!     today. Windows' own caption buttons are 46x32 px slabs; matching that
-//!     would put two button vocabularies one row apart in the same window.
-//!   * **Nothing touches anything.** 4 DIP between adjacent painted squares
-//!     and between the group and the window edge; the title keeps `md` (8)
-//!     from the button group because they are different GROUPS of controls.
-//!   * **Size the container to the control.** `caption_h` is 4 + 28 + 4 = 36
-//!     DIP because that is what the square plus its clearance needs. It is
-//!     not a number copied off `SM_CYCAPTION`.
-//!   * **Gaps between PAINTED edges, never hit boxes.** Every rect this module
-//!     returns is the PAINTED square; `hitBox` grows it afterwards, and the
-//!     grown boxes are allowed to eat the gaps between squares (they must not
-//!     overlap each other, which `captionButtonHitBoxesNeverOverlap` asserts).
+//! T254 originally painted minimize/maximize/close as the same 28 DIP rounded
+//! square as the strip's "+" and "≡", reasoning that Windows' 46x32 slabs
+//! would "put two button vocabularies one row apart in the same window." The
+//! user saw both and overrode it (2026-08-05): *"the minimize/restore/close
+//! buttons at the top right do not match the windows 11 look and feel. This
+//! makes the app seem off. They should match the windows design language."*
+//!
+//! So the trio now speaks Windows' own vocabulary, the same split Edge and
+//! Explorer ship — THEIR controls get small rounded hovers, the system trio
+//! is native slabs:
+//!
+//!   * **46 DIP wide, full band height, flush to the window's top and right
+//!     edges, zero gaps between them.** The Fitts-law corner is now painted
+//!     close, not merely hit-tested close.
+//!   * **Rectangular hover/pressed fills covering the whole slab** — square
+//!     corners, no inset. Close hovers Windows' red (#C42B1C, from the
+//!     palette's `danger`), minimize/maximize shade the bar color.
+//!   * **The standalone band is 32 DIP** — the native Win11 caption height —
+//!     not a number derived from the app's own button square.
+//!
+//! This is a NAMED exception to the design system's 28-square / 4-DIP-gap
+//! rules (docs/design/win32-design-system.md records it): the trio belongs to
+//! the OS, so it is drawn to the OS's ruler. The app's own "…" button stays
+//! the shared 28 DIP rounded square — it is ours, and that split is itself
+//! the native pattern.
 //!
 //! ## The tab run shares the band (T205)
 //!
 //! `Mode.with_tabs` is the merged row: tabs, "+", then the drag gap, then the
 //! "…" and the system trio, all on ONE row — what Windows Terminal, Edge and
-//! Explorer do, and what the user asked for ("this is normal terminal and it
-//! looks more polished than what you've built … the hamburger icon doesn't
-//! horizontally align under the X above it"). Two rows of controls owned by
-//! two different layouts can only ever *approximately* line up; one row makes
-//! the alignment structural.
-//!
-//! Two things change in that mode and nothing else does:
-//!
-//!   * **The band is the STRIP's height, and the buttons sit on the strip's
-//!     button baseline** — `btn_top` comes from `tab_strip_layout`'s own
-//!     `buttonHit`/`targetBox` derivation, not from centering in the band. The
-//!     "+" and the close "×" are already on that frame (T204); a caption
-//!     button centered in the 40 DIP band instead would land 2 px higher and
-//!     miss all three by exactly the amount the eye catches.
-//!   * **The title is dropped.** The tabs are the title now, and painting a
-//!     window title behind them is the two-rows problem in one row.
+//! Explorer do. The band is the STRIP's height (`tab_strip_layout.bar_h`) and
+//! the system slabs span all of it, exactly as Windows Terminal's do. The "…"
+//! keeps sitting on the strip's own button baseline so it lines up with the
+//! "+" and the tab close "×" (T204's one-frame rule); the slabs need no
+//! baseline — they ARE the band.
 //!
 //! `band_left` is the seam: the strip paints `[0, band_left)`, the caption
 //! paints `[band_left, client_w)`, and the "+"'s painted right edge lands
 //! exactly on it. The caption's own arrangement — right-anchored, close
-//! outermost, "…" one group-gap inboard — is IDENTICAL in both modes, which
-//! is why merging changed no horizontal number.
+//! outermost, "…" one group-gap inboard — is IDENTICAL in both modes.
 
 const std = @import("std");
 const testing = std.testing;
@@ -85,7 +83,7 @@ pub const Button = enum { overflow, minimize, maximize, close };
 /// Does the band hold the tab run as well (T205)?
 ///
 /// `standalone` is a window showing one tab (or none): no strip exists, so the
-/// band is its own 36 DIP row with the window title in it. `with_tabs` is the
+/// band is its own 32 DIP row with the window title in it. `with_tabs` is the
 /// merged row.
 pub const Mode = enum { standalone, with_tabs };
 
@@ -96,54 +94,57 @@ pub const Metrics = struct {
     /// caller having to remember to, and so a `Metrics` and the `Layout` built
     /// from it can never describe two different rows.
     mode: Mode,
-    /// Caption band height: `sm` + the shared 28 DIP square + `sm` = 36 DIP
-    /// standalone; the tab strip's own `bar_h` (40 DIP) when the run shares it.
-    ///
-    /// Derived from the control, never the reverse (design system §0
-    /// corollary). Centering a 28 DIP square inside a band sized from
-    /// `SM_CYCAPTION` is exactly the mistake that produced the strip's 1 px
-    /// bottom gap, and it would recur here at a different set of scales.
+    /// Caption band height: the native Windows 11 caption height (32 DIP)
+    /// standalone; the tab strip's own `bar_h` (40 DIP) when the run shares
+    /// it. The system slabs span the full height either way (T496) — the
+    /// band is not sized from the app's button square anymore, because the
+    /// controls that own it are the OS's, drawn to the OS's ruler.
     caption_h: i32,
-    /// Top of every caption button's PAINTED square, band-local.
+    /// Top of the app's own "…" button's PAINTED square, band-local. The
+    /// system trio ignores it — the slabs run the band's full height.
     ///
-    /// Standalone that is `pad_sm`. Merged it is whatever y the strip's own
-    /// "+" paints at — asked of `tab_strip_layout` rather than restated, since
-    /// the strip's buttons sit in the TABS' band (`tab_top_pad`..`bar_h`) and
-    /// not in the full bar, a deliberate asymmetry that a local `(h - 28)/2`
-    /// would quietly undo.
+    /// Standalone it centers the shared square in the native band. Merged it
+    /// is whatever y the strip's own "+" paints at — asked of
+    /// `tab_strip_layout` rather than restated, since the strip's buttons sit
+    /// in the TABS' band (`tab_top_pad`..`bar_h`) and not in the full bar, a
+    /// deliberate asymmetry that a local `(h - 28)/2` would quietly undo.
     btn_top: i32,
-    /// The 4 DIP step. Button-to-button, and group-to-window-edge.
+    /// The 4 DIP step, kept for callers that space AGAINST the caption.
     pad_sm: i32,
     /// The 8 DIP step, for separating GROUPS: the title text from the button
-    /// cluster.
+    /// cluster, and the app's "…" from the system trio.
     pad_md: i32,
-    /// The PAINTED square of every caption button — `icon_button.Metrics.target`.
+    /// The PAINTED square of the app's own "…" — `icon_button.Metrics.target`.
     btn_paint: i32,
-    /// How far a button's HIT box grows past its painted square per side.
+    /// How far the "…"'s HIT box grows past its painted square per side.
     btn_pad: i32,
+    /// Width of one native system slab: 46 DIP, Windows' own caption button
+    /// width (T496). The slab's height is `caption_h`.
+    cap_btn_w: i32,
     /// The shared chrome button metrics themselves, carried rather than
-    /// copied: the painter needs them for glyphs and fills, and a caption
-    /// button that drew from a second `icon_button.Metrics.init(scale)` could
-    /// disagree with the square this module laid out.
+    /// copied: the painter needs them for the "…"'s glyph and fill, and a
+    /// caption that drew from a second `icon_button.Metrics.init(scale)`
+    /// could disagree with the square this module laid out.
     ib: icon_button.Metrics,
 
     pub fn init(scale: f32, mode: Mode) Metrics {
-        // Not re-derived: the caption's gaps are measured against the shared
-        // chrome square, so it has to BE the shared square.
+        // Not re-derived: the "…" is the shared chrome square, so it has to
+        // BE the shared square.
         const ib = icon_button.Metrics.init(scale);
         const sm = px(4.0, scale);
         // The strip's band and its button baseline, asked for rather than
         // restated. In `standalone` nothing here is used — but computing it
         // unconditionally keeps the two branches to one expression each.
         const ts = tab_strip.Metrics.init(scale);
+        const cap_h = switch (mode) {
+            .standalone => px(32.0, scale),
+            .with_tabs => ts.bar_h,
+        };
         return .{
             .mode = mode,
-            .caption_h = switch (mode) {
-                .standalone => sm + ib.target + sm,
-                .with_tabs => ts.bar_h,
-            },
+            .caption_h = cap_h,
             .btn_top = switch (mode) {
-                .standalone => sm,
+                .standalone => @divTrunc(cap_h - ib.target, 2),
                 // `buttonHit(0)` is the strip's own hit box for a button whose
                 // painted square starts at x = 0; `targetBox` recovers that
                 // square. Its `top` is the baseline the "+", the "≡" and the
@@ -154,6 +155,7 @@ pub const Metrics = struct {
             .pad_md = px(8.0, scale),
             .btn_paint = ib.target,
             .btn_pad = ib.hit_pad,
+            .cap_btn_w = px(46.0, scale),
             .ib = ib,
         };
     }
@@ -168,14 +170,17 @@ pub const Metrics = struct {
 /// at y = 0.
 pub const Layout = struct {
     /// The "…" window-menu button (T234). Left of `minimize`, separated from
-    /// the system trio by `pad_md` rather than `pad_sm`: it is a different
-    /// GROUP of controls (ours vs the OS's), and the design system's answer to
-    /// "these are different groups" is one step up the spacing scale. The
-    /// alternative — an evenly-spaced run of four — is exactly the
-    /// undifferentiated cluster the "+"/"≡" pair was reported as.
+    /// the system trio by `pad_md`: it is a different GROUP of controls (ours
+    /// vs the OS's), and since T496 the two groups even speak different
+    /// visual languages — the "…" is the app's rounded square, the trio is
+    /// native slabs — so the separation is what keeps the seam readable.
     overflow: Rect,
+    /// Native slab: full band height, flush against `maximize`.
     minimize: Rect,
+    /// Native slab: full band height, between `minimize` and `close`.
     maximize: Rect,
+    /// Native slab: full band height, flush to the window's right edge — the
+    /// top-right corner is painted close, not just hit-tested close.
     close: Rect,
     /// Where the window title may draw. Empty when the band is too narrow to
     /// hold both the buttons and a title, in which case the title is dropped
@@ -197,9 +202,9 @@ pub const Layout = struct {
     /// move, double-click to maximize. The button hit boxes own the rest.
     drag_right: i32,
     /// The client width this layout was computed for. Carried so the hit
-    /// tests can reason about the window's right edge (the close button's hit
-    /// box runs to it) without every caller having to pass it in again and
-    /// risk passing a different one than the layout used.
+    /// tests can reason about the window's right edge without every caller
+    /// having to pass it in again and risk passing a different one than the
+    /// layout used.
     client_w: i32,
 };
 
@@ -208,21 +213,36 @@ pub const Layout = struct {
 /// Right-anchored, in Windows' order, close outermost: a user who throws the
 /// pointer at the top-right corner must land on close, which is the whole
 /// reason that corner is where it is (Fitts' law, and Windows has trained it
-/// for thirty years).
+/// for thirty years). Since T496 the corner even PAINTS close — the slabs are
+/// flush to the edges, the way every native Win11 titlebar draws them.
 pub fn layout(m: Metrics, client_w: i32) Layout {
+    // The system trio: three native slabs, full band height, zero gaps,
+    // flush right. Built by stepping one slab width at a time from the
+    // window's edge, so the three widths are the same integer by
+    // construction and cannot round apart.
+    const close: Rect = .{
+        .left = client_w - m.cap_btn_w,
+        .top = 0,
+        .right = client_w,
+        .bottom = m.caption_h,
+    };
+    const max: Rect = .{
+        .left = close.left - m.cap_btn_w,
+        .top = 0,
+        .right = close.left,
+        .bottom = m.caption_h,
+    };
+    const min: Rect = .{
+        .left = max.left - m.cap_btn_w,
+        .top = 0,
+        .right = max.left,
+        .bottom = m.caption_h,
+    };
+
+    // The app's own button: the shared 28 DIP square, one GROUP separation
+    // left of the system trio, on the app's own button baseline.
     const top = m.btn_top;
     const bot = top + m.btn_paint;
-
-    // Right to left: close, maximize, minimize. Built by stepping one
-    // (square + gap) at a time from the right edge inset, so the three gaps
-    // are the same integer by construction and cannot round apart.
-    const step = m.btn_paint + m.pad_sm;
-    const close_r = client_w - m.pad_sm;
-    const close: Rect = .{ .left = close_r - m.btn_paint, .top = top, .right = close_r, .bottom = bot };
-    const max: Rect = .{ .left = close.left - step, .top = top, .right = close.right - step, .bottom = bot };
-    const min: Rect = .{ .left = max.left - step, .top = top, .right = max.right - step, .bottom = bot };
-
-    // The app's own button, one GROUP separation left of the system trio.
     const over_r = min.left - m.pad_md;
     const over: Rect = .{ .left = over_r - m.btn_paint, .top = top, .right = over_r, .bottom = bot };
 
@@ -230,7 +250,7 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
     // where its paint begins. A hit box must never contribute to a visible
     // gap (design system §0 rule 2), but it is exactly what decides where a
     // click stops being a drag.
-    const drag_right = over.left - innerPad(m);
+    const drag_right = over.left - m.btn_pad;
 
     // The title stops `md` short of the button group, because they are
     // different groups of controls. A band with no room for both drops the
@@ -258,50 +278,32 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
     };
 }
 
-/// How far a caption button's hit box may grow toward its NEIGHBOUR.
+/// The HIT box for a caption button.
 ///
-/// `icon_button.hit_pad` is 2 DIP and the gap between two painted squares is
-/// 4 DIP, so in DIP terms the two boxes meet exactly. At fractional scales
-/// they do not: at 1.25 the pad rounds to 3 and the gap to 5, and the boxes
-/// overlap by a pixel — which means one button silently eats a strip of its
-/// neighbour's clicks, and by right-to-left order that button is always
-/// `close`. Half the gap, rounded DOWN, can never overlap at any scale.
-///
-/// This is the interior sides only. Outward, the boxes run to the band's
-/// edges (see `hitBox`), because there is nothing out there to collide with.
-fn innerPad(m: Metrics) i32 {
-    return @min(m.btn_pad, @divTrunc(m.pad_sm, 2));
-}
-
-/// The HIT box for a caption button: the painted square, grown to the band's
-/// full height, grown `innerPad` toward its neighbours, and — for the
-/// outermost button — grown all the way to the window edge.
-///
-/// That last part is deliberate and is why this does not simply call
-/// `icon_button.hitBox`. Windows has trained thirty years of users that
-/// slamming the pointer into the top-right corner closes the window (Fitts'
-/// law: an edge is infinitely tall, a 4 DIP inset from it is not). The design
-/// system's answer is already written down — rule 2, a hit box may be bigger
-/// than its paint because it is invisible — so the close button PAINTS with
-/// its 4 DIP inset and HITS to the corner.
+/// The three system slabs ARE their hit boxes: they already run the band's
+/// full height, touch each other, and reach the window's right edge, exactly
+/// as native Win11 caption buttons do — the paint and the click are one rect
+/// by construction, and `close` owns the top-right corner because it is
+/// painted there. The "…" keeps the app-button rule: its painted square grown
+/// `btn_pad` per side horizontally and to the band's full height vertically
+/// (a hit box may be bigger than its paint because it is invisible — design
+/// system §0 rule 2).
 ///
 /// On a restored window the top rows are the resize edge and `ncHitTest`
 /// gives them to `HTTOP` before it ever asks about a button, exactly as a
 /// stock frame does; maximized, there is no resize edge and the corner really
 /// is close's.
 pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
-    const inner = innerPad(m);
-    const painted = switch (b) {
-        .overflow => l.overflow,
+    return switch (b) {
         .minimize => l.minimize,
         .maximize => l.maximize,
         .close => l.close,
-    };
-    return .{
-        .left = painted.left - inner,
-        .top = 0,
-        .right = if (b == .close) l.client_w else painted.right + inner,
-        .bottom = m.caption_h,
+        .overflow => .{
+            .left = l.overflow.left - m.btn_pad,
+            .top = 0,
+            .right = l.overflow.right + m.btn_pad,
+            .bottom = m.caption_h,
+        },
     };
 }
 
@@ -328,10 +330,10 @@ pub fn command(b: Button, maximized: bool) Command {
 
 /// Which caption button, if any, is under a point in band-local coordinates.
 ///
-/// Tested right-to-left so that even if a future layout let two boxes touch,
-/// the outer (destructive) button never silently swallows its neighbour's
-/// clicks — `captionButtonHitBoxesNeverOverlap` is what keeps that from being
-/// load-bearing.
+/// Tested right-to-left so that even if a future layout let two boxes
+/// overlap, the outer (destructive) button never silently swallows its
+/// neighbour's clicks — `captionButtonHitBoxesNeverOverlap` is what keeps
+/// that from being load-bearing.
 pub fn hitTest(m: Metrics, l: Layout, x: i32, y: i32) ?Button {
     if (y < 0 or y >= m.caption_h) return null;
     if (hitBox(m, l, .close).containsPoint(x, y)) return .close;
@@ -354,7 +356,8 @@ pub fn isDragRegion(m: Metrics, l: Layout, x: i32, y: i32) bool {
 /// Resize edges come first — a caption button that answered before the top
 /// border would make a restored window's top edge un-grabbable in three
 /// places, and the user would just find that the window "sometimes" cannot be
-/// resized from the top.
+/// resized from the top. (Native Win11 titlebars make the same trade: the
+/// top few rows of the caption buttons are the resize edge when restored.)
 pub const NcHit = enum {
     top,
     top_left,
@@ -419,10 +422,10 @@ pub fn ncHitTest(
     };
 
     if (isDragRegion(m, l, x, y)) return .caption;
-    // The slivers between two buttons' hit boxes. Dragging from them is the
-    // only sane answer: they are inside the caption band, they paint the
-    // caption background, and treating them as client would put a terminal
-    // hit test in the titlebar.
+    // The slivers around the "…"'s hit box. Dragging from them is the only
+    // sane answer: they are inside the caption band, they paint the caption
+    // background, and treating them as client would put a terminal hit test
+    // in the titlebar.
     return .caption;
 }
 
@@ -456,46 +459,59 @@ pub fn resizeCorner(m: Metrics, sys_frame: i32) i32 {
 
 const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
 
-test "caption_h is the shared square plus one spacing step above and below" {
+fn dipPx(dip: f32, scale: f32) i32 {
+    return @intFromFloat(@round(dip * scale));
+}
+
+test "the standalone band is the native 32 DIP caption height" {
+    // Sized by the platform, not by the app's button square (T496). 36 DIP
+    // (4 + 28 + 4) is what "the header doesn't feel native" measured as.
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const ib = icon_button.Metrics.init(s);
-        // Size the container to the control, never the reverse.
-        try testing.expectEqual(ib.target + 2 * m.pad_sm, m.caption_h);
-        try testing.expectEqual(ib.target, m.btn_paint);
-        try testing.expectEqual(ib.hit_pad, m.btn_pad);
+        try testing.expectEqual(dipPx(32.0, s), m.caption_h);
+        try testing.expectEqual(dipPx(46.0, s), m.cap_btn_w);
     }
 }
 
-test "every caption button paints the same square on one vertical frame" {
+test "the system trio is three native slabs: 46 DIP, full height, flush, no gaps" {
+    // The native contract, as arithmetic. Every clause is something the user's
+    // screenshot comparison showed us NOT doing: inset squares with gaps and
+    // a corner that painted empty band.
     for (scales) |s| {
-        const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
-        const all = [_]Rect{ l.overflow, l.minimize, l.maximize, l.close };
-        for (all) |r| {
-            try testing.expectEqual(m.btn_paint, r.width());
-            try testing.expectEqual(m.btn_paint, r.height());
-            try testing.expectEqual(l.close.top, r.top);
-            try testing.expectEqual(l.close.bottom, r.bottom);
+        for ([_]Mode{ .standalone, .with_tabs }) |mode| {
+            const m = Metrics.init(s, mode);
+            const l = layout(m, 1200);
+            for ([_]Rect{ l.minimize, l.maximize, l.close }) |r| {
+                try testing.expectEqual(m.cap_btn_w, r.width());
+                try testing.expectEqual(@as(i32, 0), r.top);
+                try testing.expectEqual(m.caption_h, r.bottom);
+            }
+            // Flush right: the corner is PAINTED close.
+            try testing.expectEqual(@as(i32, 1200), l.close.right);
+            // Zero gaps: the slabs touch, by construction.
+            try testing.expectEqual(l.close.left, l.maximize.right);
+            try testing.expectEqual(l.maximize.left, l.minimize.right);
         }
     }
 }
 
-test "nothing touches: painted gaps are exactly one spacing step" {
+test "the app's own button keeps the shared square and a GROUP gap to the trio" {
+    // The Edge/Explorer split: our control speaks the app's design system,
+    // the OS's controls speak Windows'. The "…" is still the one 28 DIP
+    // square, still `pad_md` clear of the trio, and never touches it.
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
+        const ib = icon_button.Metrics.init(s);
         const l = layout(m, 1200);
-        // Button to button WITHIN the system trio, between PAINTED edges.
-        try testing.expectEqual(m.pad_sm, l.maximize.left - l.minimize.right);
-        try testing.expectEqual(m.pad_sm, l.close.left - l.maximize.right);
-        // Our "…" to the system trio: a GROUP separation, so `md`. This is
-        // the one gap in the band that is deliberately NOT `sm`, and it is
-        // what keeps four squares from reading as one undifferentiated run.
+        try testing.expectEqual(ib.target, l.overflow.width());
+        try testing.expectEqual(ib.target, l.overflow.height());
         try testing.expectEqual(m.pad_md, l.minimize.left - l.overflow.right);
-        // Group to the window's right edge, and to the band's top/bottom.
-        try testing.expectEqual(m.pad_sm, 1200 - l.close.right);
-        try testing.expectEqual(m.pad_sm, l.close.top);
-        try testing.expectEqual(m.pad_sm, m.caption_h - l.close.bottom);
+        // Centered in the native band (the band is the OS's number now, so
+        // the square centers in it rather than dictating it).
+        try testing.expectEqual(
+            @divTrunc(m.caption_h - m.btn_paint, 2),
+            l.overflow.top,
+        );
         // Title to the button group: a GROUP separation, so `md`.
         try testing.expectEqual(m.pad_md, l.overflow.left - l.title.right);
         try testing.expectEqual(m.pad_md, l.title.left);
@@ -503,11 +519,9 @@ test "nothing touches: painted gaps are exactly one spacing step" {
 }
 
 test "caption button hit boxes never overlap each other" {
-    // A hit box may eat the gap between two painted squares — that is what it
-    // is for — but two of them overlapping means one button steals the
-    // other's clicks, and by right-to-left order the one that wins is always
-    // `close`. Swept finely, not at four hand-picked scales: the naive
-    // `hit_pad` on both sides overlaps at 1.25 and nowhere else.
+    // The slabs are their own hit boxes and touch exactly; the "…"'s grown
+    // box must stop short of the minimize slab. Swept finely, not at four
+    // hand-picked scales.
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s, .standalone);
@@ -519,7 +533,7 @@ test "caption button hit boxes never overlap each other" {
         try testing.expect(hover.right <= hmin.left);
         try testing.expect(hmin.right <= hmax.left);
         try testing.expect(hmax.right <= hclose.left);
-        // Each box still contains the whole square it stands for, or the
+        // Each box still contains the whole rect it stands for, or the
         // "forgiving target" has been forgiving in the wrong direction.
         try testing.expect(hover.left <= l.overflow.left and hover.right >= l.overflow.right);
         try testing.expect(hmin.left <= l.minimize.left and hmin.right >= l.minimize.right);
@@ -528,7 +542,7 @@ test "caption button hit boxes never overlap each other" {
     }
 }
 
-test "hitTest finds each button and nothing between or outside them" {
+test "hitTest finds each button and nothing outside them" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
@@ -537,8 +551,7 @@ test "hitTest finds each button and nothing between or outside them" {
         try testing.expectEqual(Button.minimize, hitTest(m, l, l.minimize.left + 1, cy).?);
         try testing.expectEqual(Button.maximize, hitTest(m, l, l.maximize.left + 1, cy).?);
         try testing.expectEqual(Button.close, hitTest(m, l, l.close.left + 1, cy).?);
-        // The title area is not a button. (The far right edge IS close — see
-        // "the top-right corner lands on close".)
+        // The title area is not a button.
         try testing.expect(hitTest(m, l, l.title.left + 1, cy) == null);
         try testing.expect(hitTest(m, l, 0, cy) == null);
         // Below the band is not the caption's business at all.
@@ -547,16 +560,17 @@ test "hitTest finds each button and nothing between or outside them" {
     }
 }
 
-test "the top-right corner lands on close, not on empty band" {
+test "the top-right corner lands on close, and is painted close" {
     // Fitts' law, and thirty years of Windows muscle memory: throwing the
-    // pointer into the corner must close the window. The 4 DIP inset means
-    // the painted square does not reach the corner, so the HIT box has to.
+    // pointer into the corner must close the window. Since T496 the slab is
+    // flush to the edges, so the corner pixel is both CLICKABLE close and
+    // PAINTED close — no hit-box-vs-paint gap left to reason about.
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
-        // Every pixel of the last column inside the band, top row included.
         try testing.expectEqual(Button.close, hitTest(m, l, 1199, 0).?);
         try testing.expectEqual(Button.close, hitTest(m, l, 1199, m.caption_h - 1).?);
+        try testing.expect(l.close.containsPoint(1199, 0));
         // And the band's full height belongs to the buttons vertically, so a
         // click just under a glyph is not a lost click either.
         try testing.expectEqual(Button.minimize, hitTest(m, l, l.minimize.left + 1, 0).?);
@@ -620,11 +634,11 @@ test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" 
     }
 }
 
-test "ncHitTest: the gap between two buttons drags, it never falls to client" {
-    // The slivers between hit boxes are inside the caption and paint the
-    // caption background. Answering `client` there would put a terminal hit
-    // test in the titlebar — invisible until a user drags from a one-pixel
-    // seam and the window does not move.
+test "ncHitTest: the band right of the drag region never falls to client" {
+    // The slivers around the "…"'s hit box are inside the caption and paint
+    // the caption background. Answering `client` there would put a terminal
+    // hit test in the titlebar — invisible until a user drags from a
+    // one-pixel seam and the window does not move.
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s, .standalone);
@@ -641,16 +655,16 @@ test "ncHitTest: the gap between two buttons drags, it never falls to client" {
 test "a narrow window drops the title instead of painting it under the buttons" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        // Just wide enough for the four buttons and their insets, and no
-        // more: there is nowhere for a title to go.
-        const narrow = 4 * m.btn_paint + 4 * m.pad_sm + m.pad_md;
+        // Just wide enough for the three slabs, the "…" and its insets, and
+        // no more: there is nowhere for a title to go.
+        const narrow = 3 * m.cap_btn_w + m.btn_paint + 3 * m.pad_md;
         const l = layout(m, narrow);
         try testing.expect(l.title.isEmpty());
         // The buttons themselves are still laid out correctly — a cramped
         // window loses its title, never its close button, and never the only
         // route to the menu.
-        try testing.expectEqual(m.pad_sm, narrow - l.close.right);
-        try testing.expectEqual(m.pad_sm, l.maximize.left - l.minimize.right);
+        try testing.expectEqual(narrow, l.close.right);
+        try testing.expectEqual(l.maximize.left, l.minimize.right);
         try testing.expectEqual(m.pad_md, l.minimize.left - l.overflow.right);
         try testing.expect(l.overflow.left >= 0);
     }
@@ -706,35 +720,34 @@ test "layout is stable under width changes: only the anchor moves" {
 
 // -- T205: the merged row ----------------------------------------------------
 
-test "with_tabs: the band IS the strip's band and the buttons sit on its baseline" {
+test "with_tabs: the band IS the strip's band, slabs span it, '…' sits on its baseline" {
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
         const ts = tab_strip.Metrics.init(s);
         // Not "about the same height" — the same number, from the same module.
-        // Two heights that agree at 1.0 and drift at 1.25 is exactly the class
-        // of defect the design system's §7 sweep exists to catch.
         try testing.expectEqual(ts.bar_h, m.caption_h);
 
-        // The whole point of the merge: the caption buttons and the strip's
-        // "+" paint on ONE horizontal frame. The user's report was two rows
-        // that could not line up; a merged row that still missed by 2 px
-        // would be the same complaint with less excuse.
         const l = layout(m, 1200);
-        const plus = icon_button.targetBox(m.ib, ts.buttonHit(0));
-        for ([_]Rect{ l.overflow, l.minimize, l.maximize, l.close }) |r| {
-            try testing.expectEqual(plus.top, r.top);
-            try testing.expectEqual(plus.bottom, r.bottom);
-            try testing.expectEqual(m.btn_paint, r.height());
+        // The system slabs span the merged band's full height, exactly what
+        // Windows Terminal's caption buttons do in ITS tab row.
+        for ([_]Rect{ l.minimize, l.maximize, l.close }) |r| {
+            try testing.expectEqual(@as(i32, 0), r.top);
+            try testing.expectEqual(ts.bar_h, r.bottom);
         }
-        // And the band still clears the buttons below, on the spacing scale.
-        try testing.expectEqual(ts.pad_sm, m.caption_h - l.close.bottom);
+        // The "…" is app chrome, so it stays on the strip's own button
+        // baseline — the frame the "+" and the tab close "×" already share
+        // (T204). That is what keeps the app's buttons aligned across the
+        // seam while the OS's slabs ignore the baseline entirely.
+        const plus = icon_button.targetBox(m.ib, ts.buttonHit(0));
+        try testing.expectEqual(plus.top, l.overflow.top);
+        try testing.expectEqual(plus.bottom, l.overflow.bottom);
     }
 }
 
 test "with_tabs: standalone's horizontal arrangement is untouched" {
-    // Merging is a VERTICAL change. Every x in the band — the right inset, the
-    // trio's internal gaps, the group separation to the "…" — must be the same
-    // number it was before, or the merge quietly became a redesign.
+    // Merging is a VERTICAL change. Every x in the band — the right edge, the
+    // trio's widths, the group separation to the "…" — must be the same
+    // number it was standalone, or the merge quietly became a redesign.
     for (scales) |s| {
         const a = layout(Metrics.init(s, .standalone), 1200);
         const b = layout(Metrics.init(s, .with_tabs), 1200);

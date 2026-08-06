@@ -16,13 +16,15 @@
 #
 #   1. The band is OURS. The client area's top edge is the window's top edge
 #      (NCCALCSIZE consumed the frame's caption), and a column down the middle
-#      of the window is chrome-colored for exactly `4 + 28 + 4 = 36 DIP`
-#      before it turns into terminal background. Scanned, not assumed - the
-#      first non-chrome row IS the measured band height.
-#   2. The three buttons PAINT where caption_layout.zig says they do: a bright
-#      glyph pixel at each square's center, and plain chrome in the gaps
-#      between them (which is what catches a button drawn at the wrong scale -
-#      it would smear across its neighbour's gap).
+#      of the window is chrome-colored for exactly the native 32 DIP caption
+#      height (T496) before it turns into terminal background. Scanned, not
+#      assumed - the first non-chrome row IS the measured band height.
+#   2. The buttons PAINT where caption_layout.zig says they do: a bright
+#      glyph pixel at the center of each native 46 DIP slab and of the "..."'s
+#      square, bare chrome at rest on the slabs (native buttons light only on
+#      hover/press), and the GROUP gap between the "..." and the minimize slab
+#      is plain chrome (which is what catches a cluster laid out at the wrong
+#      scale - a button would smear across it).
 #   3. WM_NCHITTEST answers correctly, INCLUDING HTMAXBUTTON. That code is not
 #      decoration: the Snap Layouts flyout is triggered by the OS watching for
 #      it, so a maximize button that answers HTCLIENT silently deletes a
@@ -122,8 +124,8 @@ try {
     # is MEASURED off the pixels, and this script asserts they agree. That is
     # the one place the derivation is checked against reality.
     # -StripVisible $false: this window launches with `--window-show-tab-bar=
-    # never`, so the band is STANDALONE - its own 36 DIP row with the title in
-    # it, which is what every assertion below measures (T205).
+    # never`, so the band is STANDALONE - the native 32 DIP caption row with
+    # the title in it, which is what every assertion below measures (T205/T496).
     $m = Get-TestChromeMetrics -Window $h -StripVisible $false
     $dpi = $m.Dpi
     $scale = $m.Scale
@@ -141,7 +143,7 @@ try {
     $distinct = Get-TestDistinctColors $shot
     if ($distinct -lt 3) { throw "SETUP FAIL: captured a mid-paint frame (distinct=$distinct)" }
 
-    # --- 1. the band is ours, and it is exactly 36 DIP -----------------------
+    # --- 1. the band is ours, and it is exactly the native 32 DIP ------------
     # Scan a column well left of the buttons and right of the title text.
     $probeClientX = [int]($cli.Width / 2)
     $probeX = $win.Left + $borderX + $probeClientX
@@ -162,60 +164,65 @@ try {
     if ($NegativeControl) {
         Check ($firstBlack -eq 0) "NEGATIVE CONTROL: no caption band (first terminal row at y=0, got $firstBlack)"
     } else {
-        Check ($firstBlack -eq $expectCapH) "caption band is $expectCapH px tall (4+28+4 DIP); measured $firstBlack"
+        Check ($firstBlack -eq $expectCapH) "caption band is $expectCapH px tall (native 32 DIP, T496); measured $firstBlack"
     }
     $capTop = Get-TestPixel -Shot $shot -X $probeX -Y ($win.Top + 2)
     Check ($null -ne $capTop -and $capTop.R -gt 8 -and $capTop.R -lt 60) `
         "the window's TOP row is client chrome, not a DWM caption (rgb $($capTop.R),$($capTop.G),$($capTop.B))"
 
-    # --- 2. the three buttons paint where the layout module says -------------
-    # Right-anchored: close, then maximize, then minimize, one (square + gap)
-    # apart. Same arithmetic as caption_layout.layout, deliberately restated
-    # here from the DIP constants rather than read out of the binary.
-    $step = $btn + $padSm
+    # --- 2. the buttons paint where the layout module says -------------------
+    # The system trio is three NATIVE 46 DIP slabs flush to the window's right
+    # edge with zero gaps (T496); T234's "..." is the app's 28 DIP square one
+    # GROUP step (pad_md) left of the minimize slab. Same arithmetic as
+    # caption_layout.layout, deliberately restated here from the DIP constants
+    # rather than read out of the binary.
+    $capW = $m.CapBtnW
     $padMd = $m.PadMd
-    $closeL = $cli.Width - $padSm - $btn
-    $maxL = $closeL - $step
-    $minL = $maxL - $step
-    # T234's "..." sits one GROUP step (pad_md, not pad_sm) left of minimize:
-    # it is the app's button, not the OS's, and an evenly spaced run of four
-    # would read as one undifferentiated cluster.
+    $closeL = $cli.Width - $capW
+    $maxL = $closeL - $capW
+    $minL = $maxL - $capW
     $overL = $minL - $padMd - $btn
     $cy = $win.Top + [int]($expectCapH / 2)
     $names = @('overflow', 'minimize', 'maximize', 'close')
     $lefts = @($overL, $minL, $maxL, $closeL)
+    $widths = @($btn, $capW, $capW, $capW)
     for ($i = 0; $i -lt 4; $i++) {
-        $cx = $win.Left + $borderX + $lefts[$i] + [int]($btn / 2)
-        # A glyph pixel: bright against the ~20-level chrome. Sampled over the
-        # square's middle row, because a 1 DIP outline stroke does not
-        # necessarily cross the exact center pixel.
+        $cx = $win.Left + $borderX + $lefts[$i] + [int]($widths[$i] / 2)
+        # A glyph pixel: brighter than the ~20-level chrome. Scanned over a
+        # small window around the button's center, not one row: the icon-font
+        # glyphs (T497) are antialiased, and a 1 px mark like ChromeMinimize's
+        # bar can straddle two rows at partial alpha - sampling exactly one
+        # row reads ~110 on both and misses a glyph that is plainly there.
         $lit = 0
-        for ($dx = -8; $dx -le 8; $dx++) {
-            $c = Get-TestPixel -Shot $shot -X ($cx + $dx) -Y $cy
-            if ($null -ne $c -and $c.R -gt 120) { $lit++ }
+        for ($dy = -4; $dy -le 4; $dy++) {
+            for ($dx = -8; $dx -le 8; $dx++) {
+                $c = Get-TestPixel -Shot $shot -X ($cx + $dx) -Y ($cy + $dy)
+                if ($null -ne $c -and $c.R -gt 100) { $lit++ }
+            }
         }
-        Check ($lit -gt 0) "$($names[$i]) button paints a glyph in its square"
+        Check ($lit -gt 0) "$($names[$i]) button paints a glyph in its center"
     }
-    # The gaps between the squares are plain chrome - a button painted at the
-    # wrong size would bleed into them.
-    $gapX = $win.Left + $borderX + $maxL - [int]($padSm / 2) - 1
+    # At REST a native slab is bare band background - no permanent fill. The
+    # seam between the minimize and maximize slabs is glyph-free chrome, so a
+    # slab painted with a resting fill (or at the wrong size) shows up here.
+    $gapX = $win.Left + $borderX + $maxL - 1
     $gapC = Get-TestPixel -Shot $shot -X $gapX -Y $cy
-    Check ($null -ne $gapC -and $gapC.R -lt 60) "the gap between minimize and maximize is plain chrome"
-    # ...and the WIDER gap that separates our button from the system trio. If
-    # "..." were laid out with pad_sm like a fourth system button, its square
-    # would reach into this column.
+    Check ($null -ne $gapC -and $gapC.R -lt 60) "the resting slabs are bare chrome at the min/max seam"
+    # ...and the GROUP gap that separates our button from the system trio. If
+    # "..." were laid out like a fourth slab, its paint would reach into this
+    # column.
     $groupX = $win.Left + $borderX + $minL - [int]($padMd / 2)
     $groupC = Get-TestPixel -Shot $shot -X $groupX -Y $cy
     Check ($null -ne $groupC -and $groupC.R -lt 60) `
-        "the '...' is one GROUP step clear of minimize, not jammed against it"
+        "the '...' is one GROUP step clear of the minimize slab, not jammed against it"
     Close-TestWindowPixels $shot
 
     # --- 3. WM_NCHITTEST, including the Snap Layouts code --------------------
     $bandY = $win.Top + $expectCapH - 2
     $hitOver = HitAt $h ($win.Left + $borderX + $overL + [int]($btn / 2)) $bandY
-    $hitMin = HitAt $h ($win.Left + $borderX + $minL + [int]($btn / 2)) $bandY
-    $hitMax = HitAt $h ($win.Left + $borderX + $maxL + [int]($btn / 2)) $bandY
-    $hitClose = HitAt $h ($win.Left + $borderX + $closeL + [int]($btn / 2)) $bandY
+    $hitMin = HitAt $h ($win.Left + $borderX + $minL + [int]($capW / 2)) $bandY
+    $hitMax = HitAt $h ($win.Left + $borderX + $maxL + [int]($capW / 2)) $bandY
+    $hitClose = HitAt $h ($win.Left + $borderX + $closeL + [int]($capW / 2)) $bandY
     $hitDrag = HitAt $h ($win.Left + $borderX + 40) $bandY
     $hitTop = HitAt $h ($win.Left + [int]($win.Width / 2)) ($win.Top + 1)
     # The CLIENT area's top-right corner. Past it is the window's right sizing
@@ -237,22 +244,23 @@ try {
     # the gap beside it. Nothing else in the window paints that value there,
     # and it cannot appear unless WM_NCLBUTTONDOWN was routed to
     # `handleNcLButtonDown` and matched a button rect.
-    # Sampled inside the painted square but OFF the glyph: the fill's own top
-    # rows. `padSm + 4` is inside the square (whose top IS `padSm`) and well
-    # above the centered mark. Probing the band's own top row instead reads
-    # plain chrome and fails against a build that is behaving correctly.
-    function FillShade($h, $win, $borderX, $left, $btn, $padSm) {
+    # Sampled inside the slab but OFF the glyph: the slab's fill covers the
+    # band's full height (T496), so its top rows light with the press while
+    # the centered 10 DIP mark stays well below them. Probing the glyph row
+    # instead would read the mark and fail against a build that is behaving
+    # correctly.
+    function FillShade($h, $win, $borderX, $left, $w, $padSm) {
         $shot2 = Get-TestWindowPixels -Window $h
-        $x = $win.Left + $borderX + $left + [int]($btn / 2)
+        $x = $win.Left + $borderX + $left + [int]($w / 2)
         $y = $win.Top + $padSm + 4
         $c = Get-TestPixel -Shot $shot2 -X $x -Y $y
         Close-TestWindowPixels $shot2
         return $c
     }
-    $restC = FillShade $h $win $borderX $minL $btn $padSm
+    $restC = FillShade $h $win $borderX $minL $capW $padSm
     Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONDOWN -WParam ([IntPtr]$HTMINBUTTON) -LParam (PackPoint 0 0) | Out-Null
     Start-Sleep -Milliseconds 400
-    $pressC = FillShade $h $win $borderX $minL $btn $padSm
+    $pressC = FillShade $h $win $borderX $minL $capW $padSm
     Check ($null -ne $pressC -and $pressC.R -ge ($restC.R + 15)) `
         "a press on minimize lights its fill (rest $($restC.R) -> pressed $($pressC.R))"
     # Released over the DRAG region, not over minimize: that is the cancel
@@ -262,7 +270,7 @@ try {
     # stub, i.e. no pixels at all.)
     Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONUP -WParam ([IntPtr]$HTCAPTION) -LParam (PackPoint 0 0) | Out-Null
     Start-Sleep -Milliseconds 500
-    $afterC = FillShade $h $win $borderX $minL $btn $padSm
+    $afterC = FillShade $h $win $borderX $minL $capW $padSm
     Check ($null -ne $afterC -and $afterC.R -le ($restC.R + 6)) `
         "a release off the button un-lights it and cancels (back to $($afterC.R), rest $($restC.R))"
 
@@ -283,6 +291,15 @@ try {
     Start-Sleep -Milliseconds 1800
     $canAdjudicate = -not (Test-TestWindowExists -Window $h)
     if ($canAdjudicate) {
+        # The first INSTANCE outlives its last window on purpose
+        # (`quit-after-last-window-closed` defaults to false off Linux, the
+        # Mac idiom), and it still owns the debug IPC pipe - so a relaunch
+        # would single-instance-forward its new-window to the dying process
+        # and exit, and Wait-TestWindow (which filters by the NEW pid) would
+        # report no window. Stop the windowless first instance before
+        # relaunching; it is the exact pid this script started.
+        Stop-Process -Id $proc.Pid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 600
         $proc2 = Start-OnTestDesktop -Exe $exe -Arguments @(
             '--config-default-files=false', '--session-persistence=false',
             '--background=#000000', '--window-show-tab-bar=never'
@@ -299,9 +316,12 @@ try {
         Write-Host "        adjudicated here. The press/release half IS asserted above. T255."
     } else {
         ClickCaption $h $HTMINBUTTON $HTMINBUTTON
-        $minRect = Get-TestWindowRect -Window $h
-        # An iconic window's GetWindowRect is the -32000,-32000 caption stub.
-        Check ($minRect.Left -lt -10000) "minimize click iconified the window (rect left $($minRect.Left))"
+        # WS_MINIMIZE, not the rect: the -32000,-32000 caption stub is
+        # Explorer's arrangement, and this desktop has no Explorer - an iconic
+        # window here parks at a real on-screen rect (measured: 0,2066 199x34),
+        # so a rect oracle calls a working minimize broken.
+        $minStyle = Get-TestWindowStyle -Window $h
+        Check (($minStyle -band 0x20000000) -ne 0) "minimize click iconified the window (WS_MINIMIZE set)"
         Send-TestSysCommand -Window $h -Command 'restore' | Out-Null
         Start-Sleep -Milliseconds 700
 
@@ -311,16 +331,25 @@ try {
 
         # --- 6. maximized, the caption is still on screen --------------------
         if ($zoomed) {
+            # A maximized window's FRAME legitimately hangs off every monitor
+            # edge (rect top is -sysFrameY); what must be on screen is the
+            # CLIENT area, whose top row is the caption band's first row -
+            # that is exactly what the WM_NCCALCSIZE maximized inset exists
+            # to guarantee, and what these two assert.
             $mw = Get-TestWindowRect -Window $h
+            $mcli = Get-TestWindowRect -Window $h -Client
             $work = Get-TestWorkArea
-            Check ($mw.Top -ge ($work.Top - 1)) `
-                "maximized: the caption row is on screen (window top $($mw.Top) vs work top $($work.Top))"
+            Check ($mcli.Top -ge $work.Top) `
+                "maximized: the caption row is on screen (client top $($mcli.Top) vs work top $($work.Top))"
+            # Scan from the CLIENT top, not the window top: the rows above it
+            # are the off-screen frame, which PrintWindow renders black, and
+            # counting them measured the frame instead of the band.
             $mshot = Get-TestWindowPixels -Window $h
             $mProbe = $mw.Left + [int]($mw.Width / 2)
-            $mChrome = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mw.Top + 2)
+            $mChrome = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + 2)
             $mEdge = -1
             for ($y = 0; $y -lt 200; $y++) {
-                $c = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mw.Top + $y)
+                $c = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + $y)
                 if ($null -eq $c) { break }
                 $d = [math]::Abs($c.R - $mChrome.R) + [math]::Abs($c.G - $mChrome.G) + [math]::Abs($c.B - $mChrome.B)
                 if ($d -gt 24) { $mEdge = $y; break }

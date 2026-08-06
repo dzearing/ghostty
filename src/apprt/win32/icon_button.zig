@@ -182,6 +182,10 @@ pub const Metrics = struct {
     /// Vertical pitch between the hamburger's three rules. Applied
     /// symmetrically about the middle rule, so it needs no parity match.
     menu_pitch: i32,
+    /// The DPI scale these metrics were resolved for, carried so the paint
+    /// side can resolve DIP-specified sizes of its own — the icon-FONT glyph
+    /// sizes (T497) — without a second `init` that could disagree.
+    scale: f32,
 
     pub fn init(scale: f32) Metrics {
         const side = px(28.0, scale);
@@ -201,6 +205,7 @@ pub const Metrics = struct {
             .menu_pitch = px(4.0, scale),
             .mark_caption = markPx(10.0, scale, side),
             .restore_off = @max(px(3.0, scale), stroke + 1),
+            .scale = scale,
         };
     }
 
@@ -409,20 +414,22 @@ fn mirrorY(q: Quad, m: i32) Quad {
 
 /// The filled quads for `glyph`, centered in `target`.
 ///
-/// DRAWN, not a font character. Two reasons, and they are the same two T172
-/// had for drawing the machine-chooser icons by hand:
+/// Since T497 this is the FALLBACK: `icon_button_paint.glyph` renders the
+/// system icon font (Segoe Fluent Icons, else Segoe MDL2 Assets) first, so a
+/// normal Windows 10/11 machine draws Microsoft's own 1 px glyphs — the
+/// user's "should feel native like it was built by microsoft" — and only a
+/// machine actually missing both faces lands here. The two original reasons
+/// for drawing by hand still govern the fallback's design (the same two T172
+/// had for the machine-chooser icons):
 ///
-///   1. A symbol font that is missing renders as tofu. Segoe Fluent Icons
-///      ships with Windows 11 and MDL2 with Windows 10, but "ships with" is
-///      not "is present", and a chrome button that renders as a box is worse
-///      than one that is a pixel off.
-///   2. Text characters carry a font's metrics, not ours. The old "×" was
-///      U+00D7 and the old "+" an ASCII plus, both from the user's TAB TITLE
-///      font — so their size tracked a setting that has nothing to do with
-///      chrome, which is the "icons still feel too small" half of the report.
-///
-/// Drawing them means the size is a number in this module and the glyphs are
-/// optically consistent by construction.
+///   1. A symbol font that is missing renders as tofu. "Ships with" is not
+///      "is present", and a chrome button that renders as a box is worse
+///      than one that is a little heavier — so presence is PROVEN
+///      (create/select/GetTextFace) before the font path is trusted, and
+///      these quads stay behind it.
+///   2. Text characters carry a font's metrics, not ours — which is why the
+///      font path uses the fixed DIP sizes in `icon_button_paint`, never the
+///      user's tab-title font ("icons still feel too small", the old report).
 ///
 /// Returns the used prefix of `out`, which must hold `max_quads` entries.
 pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Quad {

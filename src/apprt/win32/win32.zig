@@ -1236,6 +1236,21 @@ pub extern "gdi32" fn CreateFontW(
     pszFaceName: ?[*:0]const u16,
 ) callconv(.winapi) ?*anyopaque;
 
+/// Grayscale antialiasing (`LOGFONT.lfQuality`). Chrome glyphs from the
+/// system icon font are drawn with this rather than ClearType: subpixel
+/// fringing on a colored fill (the close button's red) reads as a dirty
+/// glyph, and Windows' own caption glyphs are grayscale too.
+pub const ANTIALIASED_QUALITY: u32 = 4;
+
+/// `LOGFONT.lfFaceName` capacity, including the terminator.
+pub const LF_FACESIZE: usize = 32;
+
+pub extern "gdi32" fn GetTextFaceW(
+    hdc: HDC,
+    c: i32,
+    lpName: ?[*]u16,
+) callconv(.winapi) i32;
+
 pub const WM_SETFONT: u32 = 0x0030;
 
 pub extern "user32" fn SendMessageW(

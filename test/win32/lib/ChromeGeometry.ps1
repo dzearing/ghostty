@@ -28,8 +28,9 @@
 #     the STRIP's height (40 DIP), the strip starts at client y = 0, there is
 #     no window title, and the tab run stops at a seam one `pad_md` left of the
 #     caption's "...". Total chrome above the terminal: 40 DIP.
-#   * STANDALONE (one tab, the T234 default): no strip at all. The band is its
-#     own 36 DIP with the window title in it. Total chrome: 36 DIP.
+#   * STANDALONE (one tab, the T234 default): no strip at all. The band is the
+#     native 32 DIP Win11 caption height (T496) with the window title in it.
+#     Total chrome: 32 DIP.
 #
 # Those two disagree about the y of EVERY strip pixel and about where the "+"
 # may sit, so the helper cannot pick one. It also cannot detect which it is
@@ -75,7 +76,8 @@
 # Source of truth for every constant below, verified against the Zig:
 #
 #   icon_button.Metrics.init      target   = px(28)   hit_pad = px(2)
-#   caption_layout.Metrics.init   caption_h = px(4) + target + px(4)
+#   caption_layout.Metrics.init   caption_h = px(32) standalone (native, T496)
+#                                 cap_btn_w = px(46) - one native system slab
 #   tab_strip_layout.Metrics.init bar_h     = px(4) + px(4) + target + px(4)
 #                                 strip_pad_l = strip_pad_r = tab_gap = px(4)
 #                                 group_gap = px(8)   min_tab_w = px(60)
@@ -138,6 +140,7 @@ function Get-TestChromeMetrics {
     $gap = & $px 8.0              # tab_strip_layout group_gap
     $btnPaint = & $px 28.0        # icon_button.Metrics.target - the PAINTED square
     $btnPad = & $px 2.0           # icon_button.Metrics.hit_pad
+    $capBtnW = & $px 46.0         # caption_layout.Metrics.cap_btn_w - one native slab (T496)
 
     # Does this window draw its own caption band (T254)? `Window.customCaption`
     # is `!quick_terminal && decoration != none && (style & WS_CAPTION)`, and
@@ -159,7 +162,7 @@ function Get-TestChromeMetrics {
                "caption. Since T205 the tab run shares the caption ROW, so the strip's origin " +
                "AND the '+'s right limit both depend on whether there is a run: with a strip " +
                "the band is 40 DIP and the strip starts at client y=0; without one there is no " +
-               "strip and the band is its own 36 DIP with the window title in it. Pass " +
+               "strip and the band is the native 32 DIP caption with the window title in it. Pass " +
                "-StripVisible `$true for a window showing 2+ tabs (or --window-show-tab-bar=" +
                "always), `$false otherwise. It is not inferred because the deciding input is " +
                "the tab COUNT, which lives in the app and is not on the HWND.")
@@ -169,13 +172,13 @@ function Get-TestChromeMetrics {
     $stripShown = if ($hasCaption) { [bool]$StripVisible } else { $true }
     $merged = $hasCaption -and $stripShown
 
-    # caption_h and bar_h are built from the same two parts the modules build
-    # them from, not from a literal 36/40, so `window-decoration = none` (no
-    # caption) and any future change show up as a disagreement rather than a
-    # coincidence. Merged, the band IS the strip's height - one row, one
-    # number, exactly as `caption_layout.Metrics.init(.with_tabs)` does it.
+    # bar_h is built from the same parts the modules build it from. The
+    # standalone caption is the native 32 DIP Win11 caption height (T496) -
+    # sized by the platform, not by the app's button square. Merged, the band
+    # IS the strip's height - one row, one number, exactly as
+    # `caption_layout.Metrics.init(.with_tabs)` does it.
     $barH = 3 * $padSm + $btnPaint
-    $captionH = if (-not $hasCaption) { 0 } elseif ($merged) { $barH } else { 2 * $padSm + $btnPaint }
+    $captionH = if (-not $hasCaption) { 0 } elseif ($merged) { $barH } else { & $px 32.0 }
     $stripTopClient = if ($merged) { 0 } else { $captionH }
     # Everything above the terminal. NOT `CaptionH + BarH` at any call site:
     # that stopped being the answer the moment the two became one row.
@@ -187,11 +190,12 @@ function Get-TestChromeMetrics {
     # the "+", the "=" and a tab's close "x" all land on this row, which is
     # what T204 means by "one frame".
     $stripBtnTop = [int][Math]::Truncate(($padSm + $barH) / 2) - [int][Math]::Truncate($btnPaint / 2)
-    # Top of a caption button's PAINTED square, band-local. Merged it is the
-    # strip's own button baseline - the whole point of the merge is that the
-    # caption's buttons and the strip's "+" sit on ONE frame, so a local
-    # `(band - square) / 2` here would assert the bug rather than the fix.
-    $capBtnTop = if ($merged) { $stripBtnTop } else { $padSm }
+    # Top of the caption's "..." PAINTED square, band-local. Since T496 this
+    # is the APP's button only - the system trio is full-height native slabs
+    # with no baseline of their own. Merged, the "..." sits on the strip's own
+    # button baseline (one frame with the "+"); standalone it centers in the
+    # native band, exactly as `caption_layout.Metrics.init` derives it.
+    $capBtnTop = if ($merged) { $stripBtnTop } else { [int][Math]::Truncate(($captionH - $btnPaint) / 2) }
 
     $cr = Get-TestWindowRect -Window $Window -Client
     $wr = Get-TestWindowRect -Window $Window
@@ -206,12 +210,13 @@ function Get-TestChromeMetrics {
     # clicks one on this window is aiming at nothing (better a $null-arithmetic
     # blow-up than a click that silently lands on empty strip).
     # The caption's own "..." menu button (T234), in client x - the menu host
-    # on a caption window, and what `menu-bar.ps1` clicks there. Right-anchored
-    # like the system trio, one GROUP step (pad_md) clear of minimize, exactly
-    # as `caption_layout.layout` places it. T205 changed no x in this cluster:
-    # merging was a VERTICAL change.
-    $capCloseL = $clientW - $padSm - $btnPaint
-    $capMinL = $capCloseL - 2 * ($btnPaint + $padSm)
+    # on a caption window, and what `menu-bar.ps1` clicks there. The system
+    # trio is three native 46 DIP slabs flush to the window's right edge with
+    # zero gaps (T496); the "..." sits one GROUP step (pad_md) left of the
+    # minimize slab, exactly as `caption_layout.layout` places it. T205
+    # changed no x in this cluster: merging was a VERTICAL change.
+    $capCloseL = $clientW - $capBtnW
+    $capMinL = $capCloseL - 2 * $capBtnW
     $capOverL = if ($hasCaption) { $capMinL - $padMd - $btnPaint } else { $null }
     # The seam (`caption_layout.Layout.band_left`): the strip paints left of
     # it, the caption right of it, and the "+"'s painted limit lands ON it.
@@ -244,6 +249,9 @@ function Get-TestChromeMetrics {
         # never be used to measure a gap (design system: gaps are measured
         # between PAINTED edges).
         BtnW = $btnPaint + 2 * $btnPad
+        # One native caption slab's width (T496). The slab's height is the
+        # whole band; its hit box IS its painted rect.
+        CapBtnW = $capBtnW
 
         # --- band heights ----------------------------------------------------
         # 0 when the OS still owns the caption, so a strip-relative y offset by
@@ -302,6 +310,11 @@ function Get-TestChromeMetrics {
         # The caption's "..." (T234): the menu host on a caption window.
         CaptionOverflowLeft = $capOverL
         CaptionOverflowX = if ($null -ne $capOverL) { $capOverL + [int]($btnPaint / 2) } else { $null }
+        # The system trio's slab left edges, client x (T496). $null without a
+        # caption, like CaptionOverflowLeft.
+        CaptionMinLeft = if ($hasCaption) { $capMinL } else { $null }
+        CaptionMaxLeft = if ($hasCaption) { $capMinL + $capBtnW } else { $null }
+        CaptionCloseLeft = if ($hasCaption) { $capCloseL } else { $null }
         # T205's seam; $null on a window whose chrome is two rows.
         BandLeft = $bandLeft
         # tab_strip_layout.runWidth: what the 50% proportional cap is half OF,

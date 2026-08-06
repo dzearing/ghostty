@@ -9273,3 +9273,24 @@ dashboard selftest ALL PASS, real tracker validate ALL PASS (533), headless
 Edge screenshots of both views inspected. Filed T503 (tag backfill, P2).
 Only tracker/dashboard/protocol files committed; the chrome edits from the
 crashed T496/T497 turn stay uncommitted for their resuming turn to assess.
+
+## 2026-08-05 - T496+T497 done: the caption trio is native Win11 slabs and chrome glyphs are Segoe Fluent Icons
+
+Crash recovery: the 08:23 bluescreen killed the turn that built both, leaving
+a complete uncommitted rework in the tree. This turn reassessed it per the
+RESUME protocol (keep-and-finish: coherent, matched both task contracts, and
+the two share files), validated it, and landed it. T496: minimize/maximize/
+close now paint as native 46 DIP full-height slabs flush to the top-right
+corner with zero gaps, rectangular hover/pressed fills (close hovers the
+palette's danger red with an on_danger glyph), the standalone band at the
+native 32 DIP caption height; the app's own "..." keeps the 28 DIP rounded
+square - the same ours-vs-OS split Edge and Explorer ship, recorded as a
+NAMED exception in the design system. T497: icon_button_paint.glyph now
+renders the system icon font first (Segoe Fluent Icons, then MDL2, presence
+proven via GetTextFace before trust; grayscale AA), with the drawn quads kept
+as the fallback and negative-control world; caption cluster at 10 DIP,
+strip/banner marks at their optical extents. Validation: floor-lane all three
+lanes PASS (none 313s / win32 324s / agent 298s), caption-bar.ps1 ALL PASS
+(24 assertions, re-pinned to the 32 DIP band + slab geometry + WS_MINIMIZE
+oracle), P1-P3 ALL PASS. Also committed: the resolved D14/D15/D16 decision
+folding and the start-tracker project skill.

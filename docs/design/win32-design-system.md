@@ -255,10 +255,24 @@ window that DWM will shadow for it.
 
 ## 4. Glyphs
 
-Chrome glyphs are **drawn, not typeset** — the reasoning is in
-`icon_button.zig` (a missing symbol font renders as tofu; a text glyph carries
-the user's font metrics, not ours). That freedom comes with the obligation to
-get the geometry exactly right, because there is no font designer catching it.
+Chrome glyphs render **the system icon font first** — Segoe Fluent Icons on
+Windows 11, Segoe MDL2 Assets on Windows 10 — and fall back to the hand-drawn
+quads only when neither face is actually present (T497). The user's verdict on
+the drawn marks was direct: *"our icons look chunky and don't really feel
+native to the platform ... We should absolutely feel native like it was built
+by microsoft using their design language."* A 2 DIP filled mark with square-cut
+ends cannot read like a 1 px Fluent stroke, so on any normal machine the
+chrome now draws Microsoft's own glyphs at fixed DIP sizes (`icon_button_paint`:
+the caption cluster and tab close at 10, the strip/banner marks at 12), in
+grayscale AA, colored by the same state machine as before. Presence is
+**proven** (create/select/`GetTextFace`), never assumed — "ships with" is not
+"is present", and tofu in a chrome button is worse than a heavier chevron.
+
+The rules below govern the DRAWN FALLBACK (and any future glyph the icon font
+lacks). They still matter: the fallback is what a stripped-down VM shows, and
+its geometry discipline is why nobody notices the swap. The freedom of drawing
+by hand comes with the obligation to get the geometry exactly right, because
+there is no font designer catching it.
 
 ### 4.1 Symmetry is by construction, not by intent
 
@@ -376,9 +390,10 @@ present must justify its height every time:
   bar is already there and is mostly empty. Controls that must always be
   reachable (the window menu) belong there, left of the system minimize button.
   Since **T254** that is actually possible: `WM_NCCALCSIZE` hands the caption
-  band to the client area and `caption_layout.zig` lays it out to the rules
-  above (36 DIP = 4 + 28 + 4, the shared 28 DIP square, 4 DIP between painted
-  edges). Before T254 the caption was stock DWM and there was no DC to draw
+  band to the client area and `caption_layout.zig` lays it out. (Since T496
+  the standalone band is the native 32 DIP caption height, not a number
+  derived from the app's button square — see the trio exception below.)
+  Before T254 the caption was stock DWM and there was no DC to draw
   into — a fact two task files disagreed about for a day.
 - When a surface appears and disappears with content (the tab strip), its
   appearance must not shift the content underneath it jarringly; size the
@@ -390,21 +405,33 @@ the strip only at 2+ tabs, and the window menu moved into the caption as a
 go away while it was the app's only menu host, which is precisely what pinned
 `auto => true` on Windows from T190 until T234.
 
-Two rules the caption button had to obey, and one it had to break:
+### The system trio is native, the "…" is ours (T496)
 
-- **Different GROUPS get the next step up the scale.** The "…" is ours; the
-  minimize/maximize/close trio is the OS's. Within the trio the gap is `sm` (4);
-  between "…" and minimize it is `md` (8). Four evenly-spaced squares would read
-  as one undifferentiated run — the same defect the "+"/"≡" pair was reported
-  as. (`caption_layout.zig`, asserted in "nothing touches".)
+The minimize/maximize/close trio is a **NAMED platform exception** to the
+28-square / 4-DIP-gap rules: it paints as **native Windows 11 caption
+buttons** — 46 DIP wide, full band height, flush to the window's top and right
+edges, ZERO gaps between them, rectangular hover/pressed fills (square
+corners, no inset), close hovering the palette's `danger` red with an
+`on_danger` glyph. T254 originally drew the trio as the app's own rounded
+squares; the user saw it against a real Win11 titlebar and overrode it
+(2026-08-05): *"the minimize/restore/close buttons at the top right do not
+match the windows 11 look and feel. This makes the app seem off."* The trio
+belongs to the OS, so it is drawn to the OS's ruler — which is exactly the
+split Edge and Explorer ship (their own controls get small rounded hovers; the
+system trio is slabs).
+
+The app's own "…" stays inside the design system:
+
 - **It is the same 28 DIP square as everything else**, through the same
-  `paintIconButton`, with the same rest/hover/pressed/active states. `active` is
-  not decoration here: a menu button stays lit while its popup is up.
-- **The one break: it does not get the corner.** Fitts' law says the top-right
-  corner belongs to close, so the "…" sits to the LEFT of the whole system trio
-  rather than nearest the edge, and its hit box does not run to any window edge.
-  A destructive button and a menu button must not be reachable by the same
-  careless throw of the pointer.
+  `paintIconButton`, with the same rest/hover/pressed/active states. `active`
+  is not decoration here: a menu button stays lit while its popup is up.
+- **Different GROUPS get the next step up the scale**: `md` (8) between the
+  "…" and the minimize slab. Since the two groups now speak different visual
+  languages, the separation is what keeps the seam readable.
+- **It does not get the corner.** Fitts' law says the top-right corner belongs
+  to close — and since T496 the corner is *painted* close, not merely
+  hit-tested close. A destructive button and a menu button must not be
+  reachable by the same careless throw of the pointer.
 
 The visibility rule has an exception worth stating: a window with **no custom
 caption** (`window-decoration = none`, and the quick terminal) has nowhere to
@@ -422,13 +449,15 @@ Explorer and VS Code all do.
 
 Two rules fall out of it, and both are asserted:
 
-- **Chrome that shares a row shares a baseline.** The caption buttons take
-  their `btn_top` from the *strip's* own button derivation
-  (`icon_button.targetBox` of `tab_strip_layout`'s `buttonHit`), not from
-  centering a 28 DIP square in the 40 DIP band — the "+" and the tab close "×"
-  are already on that frame (T204), and centering would land 2 px off it. The
-  band's height likewise IS `tab_strip_layout.bar_h`, one number from one
-  module.
+- **Chrome that shares a row shares a baseline.** The APP's buttons in the
+  band — the "…" — take their `btn_top` from the *strip's* own button
+  derivation (`icon_button.targetBox` of `tab_strip_layout`'s `buttonHit`),
+  not from centering a 28 DIP square in the 40 DIP band — the "+" and the tab
+  close "×" are already on that frame (T204), and centering would land 2 px
+  off it. The band's height likewise IS `tab_strip_layout.bar_h`, one number
+  from one module. (The system trio ignores the baseline on purpose: native
+  slabs span the band's full height, T496 — exactly what Windows Terminal's
+  caption buttons do in its tab row.)
 - **Two painters, one row, disjoint blits.** `Layout.band_left` is the seam:
   the strip paints `[0, band_left)`, the caption paints `[band_left,
   client_w)`, and the "+"'s painted limit lands exactly on it. They fill the

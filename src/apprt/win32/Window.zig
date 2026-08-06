@@ -3799,38 +3799,25 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         else
             .normal;
 
-        // Close keeps Windows' red hover. A NAMED platform divergence from
-        // the design system's "hover is base ±15": every Windows user reads
-        // the red as "this one is destructive", and dropping it to be
-        // internally consistent would make our close button the only one on
-        // the desktop that does not warn. The glyph flips to white on it,
-        // which clears 4.5:1 against #C42B1C.
-        const red_hover = btn.b == .close and state != .normal;
-        const base_r: u8 = if (red_hover) pal.danger.r else cap_r;
-        const base_g: u8 = if (red_hover) pal.danger.g else cap_g;
-        const base_b: u8 = if (red_hover) pal.danger.b else cap_b;
-        const glyph_color = if (red_hover)
-            w32.RGB(pal.on_danger.r, pal.on_danger.g, pal.on_danger.b)
-        else
-            w32.RGB(pal.text.r, pal.text.g, pal.text.b);
-
-        // The red fill has to land BEFORE the glyph, and it is not a shade of
-        // the caption background, so it cannot come out of `fillDelta`. The
-        // glyph pass is still the shared one — the fill is the only thing
-        // that differs, which is the smallest divergence that expresses the
-        // rule.
-        if (red_hover) paintCaptionRedFill(mem_dc, m, btn.rect, state == .pressed, pal.danger);
-        paintIconButton(
-            mem_dc,
-            m.ib,
-            btn.rect,
-            btn.glyph,
-            if (red_hover) .normal else state,
-            base_r,
-            base_g,
-            base_b,
-            glyph_color,
-        );
+        // The split T496 draws the line on: the "…" is OURS, so it paints
+        // the app's rounded-square icon button; the system trio is the OS's,
+        // so it paints native Win11 slabs. Edge and Explorer make the same
+        // split between their own controls and the caption trio.
+        if (btn.b == .overflow) {
+            paintIconButton(
+                mem_dc,
+                m.ib,
+                btn.rect,
+                btn.glyph,
+                state,
+                cap_r,
+                cap_g,
+                cap_b,
+                w32.RGB(pal.text.r, pal.text.g, pal.text.b),
+            );
+        } else {
+            paintCaptionSlab(mem_dc, m.ib, btn.rect, btn.glyph, state, pal);
+        }
     }
 
     // Merged (T205), the caption owns only `[band_left, client_w)` of the row —
@@ -3845,33 +3832,64 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
     _ = w32.BitBlt(hdc_screen, blit_x, 0, blit_w, cap_h, mem_dc, blit_x, 0, w32.SRCCOPY);
 }
 
-/// The close button's red hover/pressed fill: the same rounded rect
-/// `paintIconButton` draws, in Windows' close red (#C42B1C, darkened for
-/// pressed the way every other button firms up).
+/// Paint one NATIVE caption slab — minimize, maximize/restore or close — the
+/// way Windows 11 draws its own (T496): a rectangular hover/pressed fill
+/// covering the whole slab (square corners, no inset), the glyph centered in
+/// it. At rest the slab is bare band background, exactly like the OS's.
 ///
-/// `danger` comes from the palette rather than the literal that used to be
-/// spelled here, so this fill and the tab strip's close-hover glyph are the
-/// same red — they were `#C42B1C` and `RGB(232,65,65)` — and so the one
-/// destructive color in the chrome still clears 3:1 against a light bar.
-fn paintCaptionRedFill(
+/// Close keeps Windows' red hover: every Windows user reads the red as "this
+/// one is destructive", and the glyph flips to `on_danger` on it, which
+/// clears 4.5:1 against #C42B1C. `danger` comes from the palette rather than
+/// a literal spelled here, so this fill and the tab strip's close-hover glyph
+/// are the same red. Minimize/maximize shade the bar color through the shared
+/// `fillDelta`, so their hover strength matches every other chrome button.
+fn paintCaptionSlab(
     mem_dc: w32.HDC,
-    m: caption_layout.Metrics,
-    box: caption_layout.Rect,
-    pressed: bool,
-    danger: chrome_theme.Rgb,
+    ib: icon_button.Metrics,
+    slab: caption_layout.Rect,
+    glyph: icon_button.Glyph,
+    state: icon_button.State,
+    pal: chrome_theme.Palette,
 ) void {
-    const d: i32 = if (pressed) -25 else 0;
-    const color = w32.RGB(
-        icon_button.shadeChannel(danger.r, d),
-        icon_button.shadeChannel(danger.g, d),
-        icon_button.shadeChannel(danger.b, d),
-    );
-    const rr = icon_button.fillRegion(m.ib, box);
-    const rgn = w32.CreateRoundRectRgn(rr.left, rr.top, rr.right, rr.bottom, rr.ellipse, rr.ellipse) orelse return;
-    defer _ = w32.DeleteObject(rgn);
-    const brush = w32.CreateSolidBrush(color) orelse return;
-    defer _ = w32.DeleteObject(brush);
-    _ = w32.FillRgn(mem_dc, rgn, brush);
+    const red = glyph == .close;
+    if (icon_button.paintsFill(state)) {
+        const color = if (red) blk: {
+            // Pressed firms up the way every other button does, just from
+            // the danger base instead of the bar.
+            const d: i32 = if (state == .pressed) -25 else 0;
+            break :blk w32.RGB(
+                icon_button.shadeChannel(pal.danger.r, d),
+                icon_button.shadeChannel(pal.danger.g, d),
+                icon_button.shadeChannel(pal.danger.b, d),
+            );
+        } else blk: {
+            const d = icon_button.fillDelta(state, true);
+            break :blk w32.RGB(
+                icon_button.shadeChannel(pal.bar.r, d),
+                icon_button.shadeChannel(pal.bar.g, d),
+                icon_button.shadeChannel(pal.bar.b, d),
+            );
+        };
+        var rect = w32.RECT{
+            .left = slab.left,
+            .top = slab.top,
+            .right = slab.right,
+            .bottom = slab.bottom,
+        };
+        if (w32.CreateSolidBrush(color)) |brush| {
+            defer _ = w32.DeleteObject(@ptrCast(brush));
+            _ = w32.FillRect(mem_dc, &rect, @ptrCast(brush));
+        }
+    }
+
+    const lit = red and icon_button.paintsFill(state);
+    const glyph_color = if (lit)
+        w32.RGB(pal.on_danger.r, pal.on_danger.g, pal.on_danger.b)
+    else
+        w32.RGB(pal.text.r, pal.text.g, pal.text.b);
+    // The whole slab is the glyph's target: the mark centers in it on both
+    // axes, which is all "centered in a 46-wide slab" means.
+    icon_paint.glyph(mem_dc, ib, slab, glyph, glyph_color);
 }
 
 /// WM_PAINT: one BeginPaint/EndPaint cycle covering both the tab bar and
