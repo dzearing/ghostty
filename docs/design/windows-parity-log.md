@@ -9344,3 +9344,20 @@ PASS on the first run; a timed probe put launch-to-registration at 0.9s cold /
 overlap (T401). Validation: deliberate-failure self-test shows the trailer +
 transcript path; 6/6 cold runs green; floor-lane all three lanes PASS (none
 159s / win32 180s / agent 185s); P1-P3 ALL PASS sequentially.
+
+## 2026-08-05 - T360 done: reset_window_size (and initial_size) now land the client at exactly the asked-for size
+
+`Window.setClientSize` predicted the outer size with
+`AdjustWindowRectEx(WS_OVERLAPPEDWINDOW)` - the stock frame - but since T254
+the window answers `WM_NCCALCSIZE` itself and keeps the caption band inside
+the client area, so every reset landed 38 px too tall (800x638 for the
+800x600 fallback). It now measures this hwnd's own GetWindowRect-GetClientRect
+delta and adds it to the wanted client size, which is exact for a
+caption-owning window, a stock one and `window-decoration = none` alike; the
+stock prediction survives only as the minimized/measure-failed fallback. The
+pure arithmetic lives in `src/apprt/win32/frame_size.zig` with tests at
+1.0/1.25/1.5/2.0. Audited the other `AdjustWindowRectEx` callers (dialogs,
+ActivityMonitor): all describe stock-framed windows they own, so none share
+the bug. Validation: reset-window-size.ps1 ALL PASS (14, was 1 FAILED),
+window-size-memory.ps1 ALL PASS (30, was 1 FAILED), floor-lane all three
+lanes PASS, P1-P3 ALL PASS sequentially.

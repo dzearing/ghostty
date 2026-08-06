@@ -88,6 +88,7 @@ const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
 const tab_strip = @import("tab_strip_layout.zig");
 const caption_layout = @import("caption_layout.zig");
+const frame_size = @import("frame_size.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const tab_shape = @import("tab_shape.zig");
@@ -4329,20 +4330,42 @@ pub fn toggleFullscreen(self: *Window) void {
 /// `reset_window_size` (T66).
 pub fn setClientSize(self: *Window, size: ClientSize) void {
     const hwnd = self.hwnd orelse return;
-    var rect = w32.RECT{
-        .left = 0,
-        .top = 0,
-        .right = @intCast(size.width),
-        .bottom = @intCast(size.height),
+    const wanted = frame_size.Size{
+        .w = @intCast(size.width),
+        .h = @intCast(size.height),
     };
-    _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+
+    // Derive the outer size from THIS window's own measured frame, not from
+    // AdjustWindowRectEx: T254 took over WM_NCCALCSIZE and keeps the caption
+    // band inside the client area, so the stock WS_OVERLAPPEDWINDOW
+    // prediction lands the client a caption band too tall (T360). The
+    // measured outer−client delta is exact for whatever frame this window
+    // actually has. Minimized, the rects describe the minimized shell rather
+    // than the frame, so fall back to the stock prediction there.
+    var outer: ?frame_size.Size = null;
+    if (w32.IsIconic(hwnd) == 0) {
+        var wr: w32.RECT = undefined;
+        var cr: w32.RECT = undefined;
+        if (w32.GetWindowRect(hwnd, &wr) != 0 and w32.GetClientRect(hwnd, &cr) != 0) {
+            outer = frame_size.outerForClient(
+                wanted,
+                .{ .w = wr.right - wr.left, .h = wr.bottom - wr.top },
+                .{ .w = cr.right - cr.left, .h = cr.bottom - cr.top },
+            );
+        }
+    }
+    if (outer == null) {
+        var rect = w32.RECT{ .left = 0, .top = 0, .right = wanted.w, .bottom = wanted.h };
+        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+        outer = .{ .w = rect.right - rect.left, .h = rect.bottom - rect.top };
+    }
     _ = w32.SetWindowPos(
         hwnd,
         null,
         0,
         0,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
+        outer.?.w,
+        outer.?.h,
         w32.SWP_NOZORDER | w32.SWP_NOMOVE,
     );
 }
