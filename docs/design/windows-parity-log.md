@@ -9544,3 +9544,19 @@ banner_layout.contentWidth reserves the chevron strip with tests at
 the filtered lanes (win32+none "wrap", win32 "contentWidth" - all PASS);
 acceptance was already recorded in T377 (pane-banner.ps1 ALL PASS x77,
 P1-P3 ALL PASS). No code change, so no new floor run. Nothing new filed.
+
+## 2026-08-06 - T184 skipped(duplicate -> T377): third filing of the banner-wrap defect closed
+
+T184 (banner text lines and list items clip instead of wrapping, filed
+before T377 landed) is the same defect T377 fixed on 2026-08-04 in
+cd509de1b - the third filing of the family after T418 and T455. Verified at
+HEAD: .text/.heading/list rows all render via layoutInline+drawWrapped,
+list continuation lines start at the shared marker gutter, breakWideTokens
+splits unbroken tokens mid-string, and the 3-line cap tail-truncates with
+an ellipsis. One wording nuance recorded in the task file: the 10-line
+display budget counts a wrapped block ONCE (the Mac rule), enforced at
+parse time (banner_markdown.max_lines=10). Filtered tests re-run at HEAD:
+win32 "wrap", win32 "contentWidth", none "max_lines" - all exit 0;
+acceptance was recorded in T377 (pane-banner.ps1 ALL PASS x77, P1-P3 ALL
+PASS). No code change, so no new floor run. Nothing new filed - T455 and
+T418 were already closed as duplicates, so the family is fully resolved.
