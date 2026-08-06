@@ -184,6 +184,7 @@ pub const Keepalive = struct {
 // =============================================================================
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 test "evaluate: fresh traffic pings, old traffic is stale" {
     const cfg: Config = .{ .ping_interval_ms = 20_000, .stale_after_ms = 50_000 };
@@ -263,11 +264,26 @@ test "keepalive: live link keeps getting pinged and is never closed" {
     var fake = FakeLink.init();
     fake.refresh_on_ping = true; // every probe is answered
     var ka = Keepalive{
-        .cfg = .{ .ping_interval_ms = 5, .stale_after_ms = 25 },
+        // stale_after is deliberately far beyond any scheduling stall: this
+        // test proves the tick/ping/stop mechanics, while "fresh traffic is
+        // never stale" is `evaluate`'s own unit test above. It used to be a
+        // tight 25ms window, which false-positived whenever the keepalive
+        // thread itself was starved past it on a loaded box (T346) — the
+        // refresh only happens when THIS thread runs, so the window measured
+        // scheduler latency, not link health.
+        .cfg = .{ .ping_interval_ms = 5, .stale_after_ms = 60_000 },
         .link = fake.link(),
     };
     const t = try std.Thread.spawn(.{}, Keepalive.run, .{&ka});
-    std.Thread.sleep(120 * std.time.ns_per_ms); // ~24 intervals ≈ many windows
+    // Wait for the pings to accumulate rather than sleeping a fixed spell —
+    // a fixed sleep undercounts exactly when the tick thread is the starved
+    // one (T346).
+    const P = struct {
+        fn pinged(f: *FakeLink) bool {
+            return f.pings.load(.monotonic) >= 3;
+        }
+    };
+    try testing.expect(test_util.waitUntil(P.pinged, .{&fake}));
     ka.requestStop();
     t.join();
 

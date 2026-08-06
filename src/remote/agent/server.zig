@@ -2108,6 +2108,9 @@ pub const Server = struct {
 const testing = std.testing;
 const all_encodings = [_]protocol.TransferEncoding{ .raw, .cobs, .base64 };
 
+/// Wall-clock waiter for cross-thread effects (T346) — see test_util.zig.
+const waitUntil = @import("test_util.zig").waitUntil;
+
 // --- ByteFifo: thread-safe blocking byte pipe (mirrors connection.zig) --------
 
 const ByteFifo = struct {
@@ -2314,7 +2317,7 @@ const FakeChild = struct {
         return self.terminated;
     }
 
-    /// Spin (bounded) until the child has been terminated.
+    /// Wait (wall-clock bounded) until the child has been terminated.
     ///
     /// The reason this exists rather than tests asserting straight after the
     /// session disappears from the store: `handleClose` is deliberately
@@ -2325,12 +2328,7 @@ const FakeChild = struct {
     /// asserts the second fails whenever it wins that gap (~1 run in 8 here).
     /// The product ordering is correct; the tests were watching the wrong edge.
     fn waitTerminated(self: *FakeChild) bool {
-        var spins: usize = 0;
-        while (spins < 10_000) : (spins += 1) {
-            if (self.wasTerminated()) return true;
-            std.Thread.yield() catch {};
-        }
-        return self.wasTerminated();
+        return waitUntil(wasTerminated, .{self});
     }
     fn inputCopy(self: *FakeChild, alloc: Allocator) ![]u8 {
         self.mutex.lock();
@@ -2916,14 +2914,14 @@ test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
     // Unsubscribe: the pump stops + joins. The harness deinit (shutdown) must then
     // tear down with no hang/leak (testing.allocator catches leaks).
     try h.client.sendControlJson(.metrics_unsub, protocol.control_channel, protocol.MetricsUnsub{});
-    // Give the unsub a moment to be processed (control reader is async); spin until
-    // the pump thread is torn down.
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        if (h.server.metrics_thread == null) break;
-        std.Thread.yield() catch {};
-    }
-    try testing.expect(h.server.metrics_thread == null);
+    // Give the unsub a moment to be processed (control reader is async); wait
+    // until the pump thread is torn down.
+    const P = struct {
+        fn pumpGone(s: *Server) bool {
+            return s.metrics_thread == null;
+        }
+    };
+    try testing.expect(waitUntil(P.pumpGone, .{h.server}));
 }
 
 test "concurrent METRICS_UNSUB and shutdown: exactly one of them joins the pump (T420)" {
@@ -3035,12 +3033,12 @@ test "SESSION_CPU_SUB pushes per-session CPU; SESSION_CPU_UNSUB stops the pump c
     // Unsubscribe: the pump stops and joins (testing.allocator catches any leak,
     // and a pump outliving the Server would be a UAF).
     try h.client.sendControlJson(.session_cpu_unsub, protocol.control_channel, protocol.SessionCpuUnsub{});
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        if (h.server.session_cpu_thread == null) break;
-        std.Thread.yield() catch {};
-    }
-    try testing.expect(h.server.session_cpu_thread == null);
+    const P = struct {
+        fn pumpGone(s: *Server) bool {
+            return s.session_cpu_thread == null;
+        }
+    };
+    try testing.expect(waitUntil(P.pumpGone, .{h.server}));
 }
 
 test "SESSIONS_SUB pushes the roster immediately and again when it changes" {
@@ -3071,12 +3069,12 @@ test "SESSIONS_SUB pushes the roster immediately and again when it changes" {
     // Unsubscribe stops it. No pump to join -- the roster pump idles on its
     // condition variable until something marks it dirty.
     try h.client.sendControlJson(.sessions_unsub, protocol.control_channel, struct {}{});
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        if (!h.server.sessions_push) break;
-        std.Thread.yield() catch {};
-    }
-    try testing.expect(!h.server.sessions_push);
+    const P = struct {
+        fn unsubscribed(s: *Server) bool {
+            return !s.sessions_push;
+        }
+    };
+    try testing.expect(waitUntil(P.unsubscribed, .{h.server}));
 }
 
 test "sessions_push: an OLDER client that never advertises it leaves the stream off" {
@@ -3331,14 +3329,15 @@ test "client DATA reaches the child (input round-trip)" {
     const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
     try h.client.sendDataInput(o.channel, 0, "ls -la\n");
 
-    // Spin until the child observes the input (the data reader thread is async).
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        const got = try fc.inputCopy(alloc);
-        defer alloc.free(got);
-        if (std.mem.eql(u8, got, "ls -la\n")) break;
-        std.Thread.yield() catch {};
-    }
+    // Wait until the child observes the input (the data reader thread is async).
+    const P = struct {
+        fn sawInput(c: *FakeChild, a: Allocator) !bool {
+            const got = try c.inputCopy(a);
+            defer a.free(got);
+            return std.mem.eql(u8, got, "ls -la\n");
+        }
+    };
+    _ = waitUntil(P.sawInput, .{ &fc, alloc });
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "ls -la\n", got);
@@ -4130,12 +4129,13 @@ test "RESIZE and SIGNAL are recorded on the child" {
     try h.client.sendControlJson(.resize, o.channel, protocol.Resize{ .rows = 50, .cols = 120, .px_w = 1, .px_h = 2 });
     try h.client.sendControlJson(.signal, o.channel, protocol.Signal{ .name = "INT" });
 
-    // Spin until both are observed (control reader is async).
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        if (fc.last_resize != null and fc.last_signal != null) break;
-        std.Thread.yield() catch {};
-    }
+    // Wait until both are observed (control reader is async).
+    const P = struct {
+        fn both(c: *FakeChild) bool {
+            return c.last_resize != null and c.last_signal != null;
+        }
+    };
+    _ = waitUntil(P.both, .{&fc});
     try testing.expectEqual([4]u16{ 50, 120, 1, 2 }, fc.last_resize.?);
     try testing.expectEqualSlices(u8, "INT", fc.last_signal.?);
     // Session dims updated.
@@ -4169,15 +4169,18 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
         _ = fl.encodeInto(&buf);
         break :blk &buf;
     });
-    // Spin until the pause is applied.
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        h.server.store.mutex.lock();
-        const paused = !h.server.store.table.getByChannel(o.channel).?.streaming;
-        h.server.store.mutex.unlock();
-        if (paused) break;
-        std.Thread.yield() catch {};
-    }
+    // Wait until the pause is applied.
+    const P = struct {
+        fn streaming(s: *Server, ch: u128) bool {
+            s.store.mutex.lock();
+            defer s.store.mutex.unlock();
+            return s.store.table.getByChannel(ch).?.streaming;
+        }
+        fn paused(s: *Server, ch: u128) bool {
+            return !streaming(s, ch);
+        }
+    };
+    try testing.expect(waitUntil(P.paused, .{ h.server, o.channel }));
     h.server.onChildOutput(o.channel, "PAUSED"); // ringed at offset 0, not sent
 
     // Resume → subsequent output streams live (the buffered bytes recover via
@@ -4188,14 +4191,7 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
         _ = fl.encodeInto(&buf);
         break :blk &buf;
     });
-    spins = 0;
-    while (spins < 10_000) : (spins += 1) {
-        h.server.store.mutex.lock();
-        const live = h.server.store.table.getByChannel(o.channel).?.streaming;
-        h.server.store.mutex.unlock();
-        if (live) break;
-        std.Thread.yield() catch {};
-    }
+    try testing.expect(waitUntil(P.streaming, .{ h.server, o.channel }));
     h.server.onChildOutput(o.channel, "LIVE"); // streams at offset 6
 
     const d = try h.client.nextData();
@@ -4239,15 +4235,15 @@ test "DETACH stops streaming but keeps the session alive" {
 
     const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
     try h.client.sendControlRaw(.detach, o.channel, "");
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        h.server.store.mutex.lock();
-        const s = h.server.store.table.getByChannel(o.channel).?;
-        const detached = !s.streaming and s.alive;
-        h.server.store.mutex.unlock();
-        if (detached) break;
-        std.Thread.yield() catch {};
-    }
+    const P = struct {
+        fn detached(s: *Server, ch: u128) bool {
+            s.store.mutex.lock();
+            defer s.store.mutex.unlock();
+            const sess = s.store.table.getByChannel(ch).?;
+            return !sess.streaming and sess.alive;
+        }
+    };
+    _ = waitUntil(P.detached, .{ h.server, o.channel });
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(o.channel).?;
     try testing.expect(!s.streaming);
@@ -4275,13 +4271,14 @@ test "unknown channel DATA is ignored (no crash, no child write)" {
     // one should reach the child.
     try h.client.sendDataInput(0xDEAD_BEEF, 0, "ghost");
     try h.client.sendDataInput(o.channel, 0, "real");
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        const got = try fc.inputCopy(alloc);
-        defer alloc.free(got);
-        if (std.mem.eql(u8, got, "real")) break;
-        std.Thread.yield() catch {};
-    }
+    const P = struct {
+        fn sawInput(c: *FakeChild, a: Allocator) !bool {
+            const got = try c.inputCopy(a);
+            defer a.free(got);
+            return std.mem.eql(u8, got, "real");
+        }
+    };
+    _ = waitUntil(P.sawInput, .{ &fc, alloc });
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "real", got); // "ghost" never landed
@@ -4432,15 +4429,15 @@ test "P1: explicit DETACH orphans the session (kept alive, unbound, not streamin
 
     const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
     try h.client.sendControlRaw(.detach, o.channel, "");
-    var spins: usize = 0;
-    while (spins < 10_000) : (spins += 1) {
-        h.store.mutex.lock();
-        const s = h.store.table.getByChannel(o.channel).?;
-        const orphaned = !s.streaming and !s.bound and s.alive;
-        h.store.mutex.unlock();
-        if (orphaned) break;
-        std.Thread.yield() catch {};
-    }
+    const P = struct {
+        fn orphaned(st: *session.SessionStore, ch: u128) bool {
+            st.mutex.lock();
+            defer st.mutex.unlock();
+            const s = st.table.getByChannel(ch).?;
+            return !s.streaming and !s.bound and s.alive;
+        }
+    };
+    _ = waitUntil(P.orphaned, .{ h.store, o.channel });
     h.store.mutex.lock();
     const s = h.store.table.getByChannel(o.channel).?;
     try testing.expect(s.alive and !s.streaming and !s.bound);

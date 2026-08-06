@@ -9172,3 +9172,22 @@ rewind, eleven non-auto spellings, and conflicting vs idempotent registration;
 script against a build with `Window.init` reverted fails exactly on the
 duplicate-name and `+close`-routing assertions, so it catches the defect rather
 than describing it. `floor-lane.ps1 -Lane all` ALL LANES PASS; P1–P3 ALL PASS.
+
+## 2026-08-05 — T346 done: the agent floor no longer fails because the box was busy
+
+The agent lane's cross-thread test waits were iteration counts, not deadlines:
+10k `Thread.yield()`s burn through in microseconds on a loaded box, before the
+watched thread runs once. All 11 spin waiters in `server.zig` now go through a
+shared `waitUntil` (wall-clock 10s bound, `src/remote/agent/test_util.zig`).
+Validating under a real 100% all-core load surfaced two more load-sensitive
+shapes in the same lane, fixed in the same spirit: keepalive's live-link test
+(its 25ms stale window measured the keepalive thread's own scheduling latency)
+and ProcSampler's busy test (an absolute >= 50% CPU assert now proportional to
+independently measured burned CPU / wall — still ~12x above what the guarded
+mach-units bug would read, at any load). Negative proof: a broken code path
+reports `slices differ` after the bound instead of hanging. Final state green:
+agent x3 (one under 100% load), none, win32 — all in an isolated worktree,
+because a concurrent session's in-flight chrome edit (duplicate `px` in
+`caption_layout.zig`) kept the main tree from compiling; that is their WIP,
+not a defect to file. Follow-up T498 files the same audit for the non-agent
+lanes.

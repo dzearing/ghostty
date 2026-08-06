@@ -704,6 +704,7 @@ const windows = struct {
     extern "kernel32" fn Process32FirstW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
     extern "kernel32" fn Process32NextW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
     extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
     extern "kernel32" fn GetProcessTimes(
         hProcess: HANDLE,
         lpCreationTime: *FILETIME,
@@ -898,16 +899,44 @@ test "machTicksToNs: converts mach absolute time units to nanoseconds" {
     try testing.expect(machTicksToNs(huge, 125, 3) > huge);
 }
 
+/// Process CPU time (user+kernel) in ns, via an API independent of the
+/// sampler's own reading on the platform where the unit bug lives (macOS:
+/// `clock_gettime` in real ns vs `proc_pidinfo`'s mach absolute time units).
+/// Test-only.
+fn selfCpuNs() u64 {
+    switch (builtin.os.tag) {
+        .windows => {
+            const W = std.os.windows;
+            var creation: W.FILETIME = undefined;
+            var exit_ft: W.FILETIME = undefined;
+            var kernel: W.FILETIME = undefined;
+            var user_ft: W.FILETIME = undefined;
+            if (windows.GetProcessTimes(windows.GetCurrentProcess(), &creation, &exit_ft, &kernel, &user_ft) == 0) return 0;
+            return (filetimeToU64(kernel) +% filetimeToU64(user_ft)) *% 100;
+        },
+        .macos, .linux => {
+            const ts = std.posix.clock_gettime(.PROCESS_CPUTIME_ID) catch return 0;
+            return @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s +% @as(u64, @intCast(ts.nsec));
+        },
+        else => return 0,
+    }
+}
+
 test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct" {
     // Guards the UNIT of the macOS busy reading, which is what made every row
     // read ~0. `pti_total_user`/`pti_total_system` are mach absolute time units,
     // not nanoseconds; reading them as ns undercounts by the timebase ratio
     // (~24x on Apple Silicon), so a fully-pinned core reports ~4 instead of ~100.
     //
-    // We spin ONE thread (this one) for the whole sample window, so our own pid
-    // must read near 100% of one core. The 50 floor is far below the correct
-    // ~100 and far above the ~4 a unit bug produces, so the test is decisive
-    // without being timing-flaky.
+    // The assertion is PROPORTIONAL, not absolute (T346): burn a measured
+    // amount of actual CPU time — via `selfCpuNs`, independent of the
+    // sampler's reading where the unit bug lives — and require the sampler to
+    // report at least half of what that burn works out to over the sample
+    // window. The old shape (wall-clock spin, assert >= 50) assumed this
+    // thread would actually GET a full core, which is false exactly when the
+    // box is loaded — the floor lane's own trigger condition. The 2x slack
+    // covers measurement skew; the unit bug undercounts by ~24x, so the test
+    // stays decisive at any load level.
     if (builtin.os.tag != .macos and builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
@@ -919,6 +948,9 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
         else => std.c.getpid(),
     });
 
+    const t0 = std.time.nanoTimestamp();
+    const cpu0 = selfCpuNs();
+
     // Baseline sample (every pid reads 0 — no prior baseline).
     var out1: std.ArrayListUnmanaged(protocol.Proc) = .empty;
     defer {
@@ -927,13 +959,18 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
     }
     _ = try s.sample(alloc, &out1, 0);
 
-    // Burn one core for the sample window. `volatile` so the spin can't be
-    // optimized away into a no-op (which would make the test vacuously pass a
-    // buggy build by reporting ~0 for a genuinely idle process).
+    // Burn ~300ms of CPU time — CPU time, not wall time: on a loaded box a
+    // wall-bounded spin is descheduled for most of its window and burns almost
+    // nothing. `volatile` so the spin can't be optimized away into a no-op
+    // (which would make the test vacuously pass a buggy build by reporting ~0
+    // for a genuinely idle process). The wall-clock bail means extreme
+    // starvation degrades the assert (proportionally) rather than hanging.
     var sink: u64 = 0;
-    const spin_ns = 400 * std.time.ns_per_ms;
-    const start = std.time.nanoTimestamp();
-    while (std.time.nanoTimestamp() - start < spin_ns) {
+    const target_cpu_ns: u64 = 300 * std.time.ns_per_ms;
+    const bail_wall_ns: i128 = 10 * std.time.ns_per_s;
+    while (selfCpuNs() -% cpu0 < target_cpu_ns and
+        std.time.nanoTimestamp() - t0 < bail_wall_ns)
+    {
         var i: u32 = 0;
         while (i < 20_000) : (i += 1) {
             const p: *volatile u64 = &sink;
@@ -947,13 +984,27 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
         out2.deinit(alloc);
     }
     _ = try s.sample(alloc, &out2, 0);
+    const wall_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
+    const burned_ns: u64 = selfCpuNs() -% cpu0;
 
     var mine: ?f32 = null;
     for (out2.items) |p| {
         if (p.pid == my_pid) mine = p.cpu_pct;
     }
     try testing.expect(mine != null);
-    try testing.expect(mine.? >= 50.0);
+
+    // The burn must have registered at all — guards a selfCpuNs failure
+    // returning 0s, which would make the proportional assert vacuous.
+    try testing.expect(burned_ns > 0);
+
+    // What a correct sampler must at least report: our own measured burn
+    // spread over the outer (so upper-bound) window, halved for skew. The
+    // sampler's window sits inside ours and its busy delta is our burn minus
+    // at most the first sample() call's own cost, so a correct reading can't
+    // fall below this while the unit bug can't reach it.
+    const expected: f32 = @as(f32, @floatFromInt(burned_ns)) /
+        @as(f32, @floatFromInt(wall_ns)) * 100.0;
+    try testing.expect(mine.? >= expected / 2.0);
 }
 
 test "parseLinuxStat: extracts ppid/comm/utime/stime/tty_nr, comm with spaces+parens" {
