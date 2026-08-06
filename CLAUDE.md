@@ -47,7 +47,14 @@ Windows session protocol lives in `go.md`.
 IPC commands communicate with a running Ghoztty instance over a local IPC
 endpoint (a Unix domain socket on macOS, a named pipe on Windows — see
 Architecture). All commands are idempotent — named targets that already exist
-are focused instead of recreated. The verbs, flags, and semantics below are the
+are focused instead of recreated. Since T135, that focus is no longer silent
+about what it dropped: `+new-window` against an existing target replies
+`outcome: "focused"` (vs `"created"`) and, when create-only flags
+(`--command`, an explicit `--working-directory`, `--view`, …) were passed, a
+`note` naming them — which the CLI prints to stderr while keeping exit 0. The
+CLI's auto-inserted cwd is marked `--cwd-implicit` on the wire so a bare
+re-focus stays quiet. (win32 server done; Mac server half is T523 — the
+shared CLI already prints any note it receives.) The verbs, flags, and semantics below are the
 same on both platforms.
 
 ### `ghoztty +new-window`

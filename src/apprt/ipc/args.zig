@@ -48,6 +48,12 @@ pub const VerbArgs = struct {
     color: ?[]const u8 = null,
     split_color: ?[]const u8 = null,
     no_activate: bool = false,
+    /// `--cwd-implicit` (T135): the CLI auto-inserts `--working-directory=<its
+    /// cwd>` when the caller gave none, and marks that insertion with this flag
+    /// so the server can tell an explicit request apart from the default. Only
+    /// consulted by the dropped-flag note on the idempotent focus path; both
+    /// servers ignore it as an unknown flag when older.
+    cwd_implicit: bool = false,
     /// `+new-window --from-focused` / `+split --from-focused`: mirror the
     /// keyboard "New Window"/split action on the focused window so the new
     /// frame inherits its remote host (T68, Mac §WP4 parity).
@@ -79,6 +85,8 @@ pub fn parseVerbArgs(
             result.no_activate = true;
         } else if (std.mem.eql(u8, arg, "--from-focused")) {
             result.from_focused = true;
+        } else if (std.mem.eql(u8, arg, "--cwd-implicit")) {
+            result.cwd_implicit = true;
         } else if (dropPrefix(arg, "--working-directory=")) |v| {
             result.working_directory = v;
         } else if (dropPrefix(arg, "--command=")) |v| {
@@ -183,6 +191,32 @@ fn hasSchemePrefix(value: []const u8, comptime prefix: []const u8) bool {
 pub fn viewConflictsWithCommand(args: VerbArgs) bool {
     if (args.view == null) return false;
     return args.command != null or args.e_args.len > 0;
+}
+
+/// T135: the flags `+new-window` silently ignores when `--target` names a
+/// window that already exists (the idempotent rule focuses it instead of
+/// recreating). Returns a comma-joined list of the flag names the caller
+/// actually passed and lost ("--command, --working-directory"), or null when
+/// nothing meaningful was dropped — a bare re-focus stays silent. The CLI's
+/// auto-inserted cwd (marked `--cwd-implicit`) is the default, not a request,
+/// so it never counts.
+pub fn droppedOnExistingTarget(arena: Allocator, args: VerbArgs) Allocator.Error!?[]const u8 {
+    var dropped: std.ArrayList([]const u8) = .empty;
+    if (args.command != null) try dropped.append(arena, "--command");
+    if (args.e_args.len > 0) try dropped.append(arena, "-e");
+    if (args.working_directory != null and !args.cwd_implicit)
+        try dropped.append(arena, "--working-directory");
+    if (args.view != null) try dropped.append(arena, "--view");
+    if (args.title != null) try dropped.append(arena, "--title");
+    if (args.split_direction != null) try dropped.append(arena, "--split");
+    if (args.split_command != null) try dropped.append(arena, "--split-command");
+    if (args.split_color != null) try dropped.append(arena, "--split-color");
+    if (args.name != null) try dropped.append(arena, "--name");
+    if (args.color != null) try dropped.append(arena, "--color");
+    if (args.shell != null) try dropped.append(arena, "--shell");
+    if (args.env.len > 0) try dropped.append(arena, "--env");
+    if (dropped.items.len == 0) return null;
+    return try std.mem.join(arena, ", ", dropped.items);
 }
 
 /// The directory a `+new-window` auto-launch should start the GUI in (T132),
@@ -593,6 +627,66 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqualStrings("x=y", parsed.env[1].value);
     try testing.expectEqualStrings("{\"pane\":\"a\"}", parsed.layout.?);
     try testing.expectEqual(@as(?u32, 4242), parsed.pid);
+}
+
+test "droppedOnExistingTarget: names exactly the flags the caller passed" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parseVerbArgs(alloc, &[_][]const u8{
+        "--target=main", "--working-directory=C:\\src", "--command=claude",
+    });
+    const dropped = (try droppedOnExistingTarget(alloc, parsed)).?;
+    try testing.expectEqualStrings("--command, --working-directory", dropped);
+}
+
+test "droppedOnExistingTarget: the CLI's implicit cwd never counts" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A bare `+new-window --target=x` always arrives with the CLI's own cwd
+    // inserted and marked; that is the default, not a request.
+    const bare = try parseVerbArgs(alloc, &[_][]const u8{
+        "--target=main", "--working-directory=C:\\wherever", "--cwd-implicit",
+    });
+    try testing.expect(bare.cwd_implicit);
+    try testing.expect(try droppedOnExistingTarget(alloc, bare) == null);
+
+    // ...but an explicit --working-directory alongside the marker still counts
+    // for OTHER flags: only the cwd mention is suppressed.
+    const with_cmd = try parseVerbArgs(alloc, &[_][]const u8{
+        "--target=main", "--working-directory=C:\\wherever", "--cwd-implicit",
+        "--command=claude",
+    });
+    try testing.expectEqualStrings(
+        "--command",
+        (try droppedOnExistingTarget(alloc, with_cmd)).?,
+    );
+}
+
+test "droppedOnExistingTarget: -e, --view, split flags and --env all count" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parseVerbArgs(alloc, &[_][]const u8{
+        "--target=main", "--view=README.md",   "--title=T",
+        "--split=down",  "--split-command=ls", "--name=p",
+        "--color=#123",  "--env=A=1",          "-e",
+        "cmd",           "/c",                 "dir",
+    });
+    try testing.expectEqualStrings(
+        "-e, --view, --title, --split, --split-command, --name, --color, --env",
+        (try droppedOnExistingTarget(alloc, parsed)).?,
+    );
+
+    // Target + --no-activate alone: nothing meaningful was dropped.
+    const quiet = try parseVerbArgs(alloc, &[_][]const u8{
+        "--target=main", "--no-activate",
+    });
+    try testing.expect(try droppedOnExistingTarget(alloc, quiet) == null);
 }
 
 test "parseVerbArgs: --view is captured, not dropped as an unknown flag" {

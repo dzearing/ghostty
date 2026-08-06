@@ -196,7 +196,7 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                     ),
                     error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
                 };
-                return try ctx.alloc.dupe(u8, "{\"success\":true}");
+                return try successResponse(ctx.alloc, "created", null);
             }
         }
         // Local (or no) parent: a normal local window; drop the flags the
@@ -207,11 +207,23 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         args.title = null;
     }
 
-    // Idempotent: an existing live target is focused, not recreated.
+    // Idempotent: an existing live target is focused, not recreated. T135:
+    // the reply says so (`outcome: focused` vs `created`), and when the
+    // caller passed flags that only a create would honor, a `note` names
+    // them — the CLI prints it to stderr so the drop is loud. Exit stays 0:
+    // idempotency is the contract, silence was the defect.
     if (args.target) |target| {
         if (app.ipcLookup(target)) |entry| {
             if (!args.no_activate) focusTarget(entry);
-            return try ctx.alloc.dupe(u8, "{\"success\":true}");
+            if (try verb_args.droppedOnExistingTarget(arena, args)) |dropped| {
+                const note = try std.fmt.allocPrint(
+                    arena,
+                    "target '{s}' already exists; focused it. Ignored: {s}. +close it first to recreate.",
+                    .{ target, dropped },
+                );
+                return try successResponse(ctx.alloc, "focused", note);
+            }
+            return try successResponse(ctx.alloc, "focused", null);
         }
     }
 
@@ -371,7 +383,7 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         }
     }
 
-    return try ctx.alloc.dupe(u8, "{\"success\":true}");
+    return try successResponse(ctx.alloc, "created", null);
 }
 
 /// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`
@@ -1633,6 +1645,34 @@ fn utf16ToUtf8Arena(arena: Allocator, utf16: []const u16) Allocator.Error![]cons
         error.OutOfMemory => error.OutOfMemory,
         else => "",
     };
+}
+
+/// T135: `+new-window`'s success reply carries an `outcome` ("created" or
+/// "focused") and, when the idempotent focus dropped caller flags, a `note`
+/// the CLI prints to stderr. Both fields are additive: an older CLI parses
+/// with ignore_unknown_fields and sees the same `success` it always did.
+fn successResponse(
+    alloc: Allocator,
+    outcome: []const u8,
+    note: ?[]const u8,
+) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer };
+    write: {
+        jws.beginObject() catch break :write;
+        jws.objectField("success") catch break :write;
+        jws.write(true) catch break :write;
+        jws.objectField("outcome") catch break :write;
+        jws.write(outcome) catch break :write;
+        if (note) |n| {
+            jws.objectField("note") catch break :write;
+            jws.write(n) catch break :write;
+        }
+        jws.endObject() catch break :write;
+        return try out.toOwnedSlice();
+    }
+    return error.OutOfMemory;
 }
 
 fn errorResponse(

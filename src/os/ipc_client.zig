@@ -413,7 +413,14 @@ pub fn sendAction(
     defer alloc.free(resp_buf);
 
     const parsed = std.json.parseFromSlice(
-        struct { success: bool = false, @"error": ?[]const u8 = null },
+        struct {
+            success: bool = false,
+            @"error": ?[]const u8 = null,
+            // T135: a non-fatal caveat about a successful action (e.g.
+            // `+new-window --target=` focusing an existing window and
+            // dropping the create-only flags). Absent from older servers.
+            note: ?[]const u8 = null,
+        },
         alloc,
         resp_buf,
         .{ .ignore_unknown_fields = true },
@@ -430,6 +437,12 @@ pub fn sendAction(
             stderr.flush() catch {};
         }
         return false;
+    }
+
+    // A note is success with a caveat: surface it, keep exit code 0.
+    if (parsed.value.note) |msg| {
+        stderr.print("{s}\n", .{msg}) catch {};
+        stderr.flush() catch {};
     }
 
     return true;

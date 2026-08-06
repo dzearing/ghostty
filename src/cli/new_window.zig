@@ -193,6 +193,10 @@ pub const Options = struct {
 ///   * `--target=<name>`: Register this window with a name. If a window
 ///     with this name already exists, it is focused instead of creating
 ///     a new one. Named windows can be targeted by `+split` and `+close`.
+///     When an existing window is focused, flags that only apply to window
+///     creation (`--command`, `--working-directory`, `--view`, ...) are
+///     ignored; a note naming the ignored flags is printed to stderr and
+///     the exit code stays 0. Close the target first to recreate it.
 ///
 ///   * `--split=right|down|left|up`: After creating the new window, create a
 ///     split in the given direction.
@@ -280,6 +284,10 @@ fn runArgs(
         const wd = try cwd.realpath(".", &buf);
         // This should be inserted at the beginning of the list, just in case `-e` was used.
         try opts._arguments.insert(alloc, 0, try std.fmt.allocPrintSentinel(alloc, "--working-directory={s}", .{wd}, 0));
+        // T135: mark the insertion as the default, not a request, so the
+        // server's existing-target note never blames a cwd the caller didn't
+        // pass. Older servers ignore unknown flags, so this is additive.
+        try opts._arguments.insert(alloc, 1, try alloc.dupeZ(u8, "--cwd-implicit"));
     }
 
     var arena = ArenaAllocator.init(alloc_gpa);

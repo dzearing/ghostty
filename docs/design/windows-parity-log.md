@@ -9735,3 +9735,24 @@ VK_INSERT with KeyChar 0 instead of never returning) - ALL PASS (26).
 Floor lanes none/win32/agent PASS, P1-P3 ALL PASS, run sequentially.
 Filed T522: ctrl+insert copy has the same missing-performable swallow when
 nothing is selected (P2 - only dead in the no-selection case).
+
+## 2026-08-06 - T135 done: +new-window no longer silently drops flags on an existing target
+
++new-window --target=<name> against an already-existing window is idempotent
+by contract (focus, do not recreate) on both platforms, but the success reply
+hid that --command/--working-directory/--view and friends were thrown away -
+the exact silent drop that made the upgrade script's relaunch a no-op back in
+T132. The Mac server (IPCServer.swift:390) has the identical silent behavior,
+so the fix is contract-shaped, not a divergence: the win32 server now replies
+outcome=focused (vs created) plus a note naming exactly the flags the caller
+passed and lost, and the shared CLI prints any note to stderr while keeping
+exit 0. A new --cwd-implicit marker distinguishes the CLI's auto-inserted cwd
+from an explicit --working-directory, so a bare re-focus stays silent (both
+servers ignore unknown flags, so every old/new pairing degrades to today's
+behavior). Pure dropped-flag logic lives in apprt/ipc/args.zig with unit
+tests; new acceptance script test/win32/ipc-target-exists-note.ps1 asserts
+note-on-flags, silence-on-bare-refocus, and silence-on-create - ALL PASS.
+Floor lanes none/win32/agent PASS, P1-P3 ALL PASS, run sequentially. Filed
+T523 (seat: mac - emit the same outcome/note from the Swift server; the
+shared CLI half is already live there) and decision D19 (why report-the-drop
+won over apply-the-flags and --recreate).
