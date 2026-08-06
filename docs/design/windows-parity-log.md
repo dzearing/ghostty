@@ -9473,3 +9473,23 @@ now 110+ runs. The task's eaten-diagnostic concern needs no new work: T444
 (exit-code decode) and T450 (cdb crash-catch) are verified wired into
 floor-lane.ps1, so the next natural occurrence captures itself. Data point
 appended to T443's ARMED-WATCH LOG; no new tasks needed.
+
+
+## 2026-08-06 - T238 closed as a T443 duplicate: the agent-lane PageList exit-3 flake is the armed-watch ghost, 0 repro in 260 runs
+
+The 2026-07-31 test-agent-lane sighting - terminal.PageList 'resize (no
+reflow) less rows trims blank lines erases pages' dying with exit code 3 -
+is the T443 crash class, not its own defect: exit 3 is the T444 truncation
+of 0x80000003 (Zig's segfault handler aborting in its recursive panic,
+T450), the neighbourhood is the same page-integrity code the T317/T369
+sightings crashed in, and PageList.zig has no local change since April so
+there is no source regression to bisect. Measurement at HEAD: the named
+test soaked 200/200 PASS on a -Dtest-filter build (both agent binaries x
+100); the full agent binaries soaked 60 runs at 5-way concurrency - the
+loaded condition every real occurrence came from - with 0 crashes; the only
+reds in those soaks were the already-filed load-sensitive atomic_write T183
+test (T508). floor-lane all three lanes PASS + P1-P3 ALL PASS the same day.
+Cumulative crash-free count on the class is now 170+ runs. Data point
+appended to T443's ARMED-WATCH LOG. Filed T509: test-binary-soak.ps1
+overwrites the first binary's per-run logs when a lane soaks two binaries,
+which cost an extra 20-run soak here to re-identify a lost FAIL.
