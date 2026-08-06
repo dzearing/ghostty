@@ -243,6 +243,29 @@ try {
     Assert ($hosts.Count -ge 1) "a GhozttyViewer host window exists (got $($hosts.Count))"
     Assert (@($hosts | Where-Object { $_.Width -gt 0 -and $_.Height -gt 0 }).Count -ge 1) 'the host window has a non-empty rect'
 
+    # --- 3b. the nav chrome exists (T159) ------------------------------------
+    # Every viewer host carries a `GhozttyViewerNav` child window with a real
+    # EDIT inside it -- the back/forward/reload/home bar and the address
+    # field. Both are BORN HIDDEN: the bar is hover-revealed, and hover cannot
+    # be proven from the background test desktop (SendInput and the real
+    # cursor are dead there), so the reveal DECISION is unit-tested in
+    # `viewer_nav_layout.hoverTick` and what is asserted here is the native
+    # window structure the reveal shows. The about:blank pane's address field
+    # is EMPTY by design (Mac parity: the blank page shows the placeholder).
+    $navBars = @()
+    foreach ($h in $hosts) {
+        $navBars += @(Get-TestChildWindows -Window ([IntPtr]$h.Hwnd) -Class 'GhozttyViewerNav')
+    }
+    Assert ($navBars.Count -ge 1) "a GhozttyViewerNav bar exists under the viewer host (got $($navBars.Count))"
+    $navEdits = @()
+    foreach ($nb in $navBars) {
+        $navEdits += @(Get-TestChildWindows -Window ([IntPtr]$nb.Hwnd) -Class 'Edit')
+    }
+    Assert ($navEdits.Count -ge 1) "the nav bar carries an EDIT address field (got $($navEdits.Count))"
+    $blankAddr = @($navEdits | ForEach-Object { Get-TestControlText ([IntPtr]$_.Hwnd) })
+    Assert (@($blankAddr | Where-Object { $_ -eq '' }).Count -ge 1) `
+        "the about:blank pane's address field is empty (got '$($blankAddr -join "','")')"
+
     # --- 4. the human renderer switches to its view: row ---------------------
     $human = (& $exe +list 2>&1 | Out-String)
     Assert ($human -match '(?m)^\s*view:') '+list (human) prints a view: row for the viewer pane'
@@ -320,6 +343,26 @@ try {
         Assert ($fileLeaves[0].type -eq 'viewer') "its leaf reports type=viewer (got '$($fileLeaves[0].type)')"
         Assert ($fileLeaves[0].url -eq $viewFile) "its leaf reports url=<the file> (got '$($fileLeaves[0].url)')"
     }
+
+    # --- 8b0. the address field shows the file's path (T159) -----------------
+    # The Mac display rule: a file pane's address is the path the user can
+    # retype, pushed into the native EDIT the moment the pane navigates. Read
+    # with WM_GETTEXT (Get-TestControlText) -- the T175 lesson, since a
+    # cross-process GetWindowTextW on another process's control reads a cache
+    # the app never sets. Scanned across every viewer host because the file
+    # window is not distinguishable by class alone.
+    $fileAddrs = @()
+    foreach ($top in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+        foreach ($h in @(Get-TestChildWindows -Window ([IntPtr]$top.Hwnd) -Class 'GhozttyViewer')) {
+            foreach ($nb in @(Get-TestChildWindows -Window ([IntPtr]$h.Hwnd) -Class 'GhozttyViewerNav')) {
+                foreach ($ed in @(Get-TestChildWindows -Window ([IntPtr]$nb.Hwnd) -Class 'Edit')) {
+                    $fileAddrs += (Get-TestControlText ([IntPtr]$ed.Hwnd))
+                }
+            }
+        }
+    }
+    Assert (@($fileAddrs | Where-Object { $_ -eq $viewFile }).Count -ge 1) `
+        "a nav address field shows the viewed file's path (got '$($fileAddrs -join "','")')"
 
     # --- 8a. titles (T383) ---------------------------------------------------
     # A file viewer is named by its FILE, and that name walks the whole T92

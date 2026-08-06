@@ -47,6 +47,10 @@ fn codepoint(which: icon_button.Glyph) u16 {
         .maximize => 0xE922, // ChromeMaximize
         .restore => 0xE923, // ChromeRestore
         .overflow => 0xE712, // More
+        .back => 0xE72B, // Back
+        .forward => 0xE72A, // Forward
+        .refresh => 0xE72C, // Refresh
+        .home => 0xE80F, // Home
     };
 }
 
@@ -59,6 +63,10 @@ fn fontDip(which: icon_button.Glyph) f32 {
     return switch (which) {
         .minimize, .maximize, .restore, .close, .overflow => 10.0,
         .add, .menu, .chevron_up, .chevron_down => 12.0,
+        // The nav cluster renders at the strip size: back/forward/refresh/home
+        // sit beside an address field the way the strip glyphs sit beside
+        // tabs, and 10 is the caption's size, not a toolbar's.
+        .back, .forward, .refresh, .home => 12.0,
     };
 }
 

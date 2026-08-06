@@ -9878,3 +9878,39 @@ validation half. Validation: `chrome-merged-row.ps1` gained a §7 ink probe
 before/after halves are the built-in negative control) - ALL PASS 28;
 `-NegativeControl` still fails as designed; `caption-bar.ps1` ALL PASS 24
 (standalone unchanged); floor-lane all lanes PASS; P1-P3 ALL PASS.
+
+## 2026-08-06 - T159: viewer panes get their nav chrome - hover strip, back/forward/reload/home, editable address bar (session c1e16a66)
+
+The user asked for this one twice by name ("it has no address bar"), and it
+is the largest single viewer-parity piece since the host floor: a Windows
+viewer pane now carries the same navigation chrome as the Mac. Hover the
+pane's top 20 DIP and a native bar slides in (2s auto-hide, held open while
+the address field has focus - the reveal DECISION is a pure `hoverTick`
+table, the timer only feeds it, and the poll is `GetCursorPos` because
+Chromium's child windows eat the mouse the same way WKWebView does on Mac).
+The bar is an owner-painted `GhozttyViewerNav` child window per design P3 -
+four icon buttons on the shared 28 DIP metrics with new
+back/forward/refresh/home glyphs (Fluent codepoints + quad fallbacks passing
+the symmetry sweep) and a real `EDIT` whose Enter/Escape route through the
+main loop like every popup edit, with click-selects-all posted from the
+`WM_LBUTTONUP` intercept so the EDIT's own click tracking cannot wipe the
+selection (Mac's `selectAddressWhenClickCompletes`, translated). Typing is
+classified by a pure module: Windows-shaped `isFilePath` (design P4 -
+`C:\`, `C:/`, UNC, `~\`), Mac's omnibox completion ported case for case, diff
+specs and `about:` passed through, `~` expanded against home. History is
+real: `webview2_iface` names SourceChanged/HistoryChanged/CanGoBack/
+CanGoForward/GoBack/GoForward, and the pane reconciles its MODE with every
+committed source (Mac's `didCommit` sync) - so Back from a website lands on
+the bundled template and re-renders the file it was showing, which the live
+test proves end to end (the handler IIDs' only possible proof, since no
+WebView2.h exists on the box: the events firing IS the verification). En
+route: leaving a file for the web now clears the stale TOC headings, and
+navigation-failure logs carry the `WebErrorStatus` ordinal that separated a
+routine superseded-load abort from a real failure during debugging.
+Validation: unit tests both lanes (completion, classification, display text,
+geometry at 4 scales, hover policy); the live host-floor test grew the whole
+history/boundary/chrome section; `viewer-panes.ps1` grew sections 3b + 8b0
+(nav bar + EDIT exist, blank address empty, file pane shows its path via
+WM_GETTEXT) - 119 passed with the 2 pre-existing reds proven at clean HEAD
+(T526 known; the second newly filed as T535); floor-lane none/win32/agent all
+PASS; P1-P3 ALL PASS.

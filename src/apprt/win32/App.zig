@@ -29,6 +29,7 @@ const QuickTerminal = @import("QuickTerminal.zig");
 const PaneView = @import("PaneView.zig");
 const Surface = @import("Surface.zig");
 const ViewerPane = @import("ViewerPane.zig");
+const ViewerNavBar = @import("ViewerNavBar.zig");
 const webview2 = @import("webview2.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
@@ -926,6 +927,15 @@ pub fn run(self: *App) !void {
                 // Surface-cast intercepts (their parent is a *MachineChooser).
                 if (chooser.handleKey(vk)) continue :loop;
             } else {
+                // A viewer pane's address field (T159): Enter navigates,
+                // Escape reverts — the same main-loop routing every popup
+                // edit uses, because an EDIT control never sees these keys
+                // itself. Everything else falls through so typing works.
+                if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
+                    if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
+                        if (nav.handleEditKey(vk)) continue :loop;
+                    }
+                }
                 // Check if this edit is a tab rename edit
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
                     for (self.windows.items) |win| {
@@ -988,6 +998,22 @@ pub fn run(self: *App) !void {
                         continue :loop;
                     }
                 }
+            }
+        }
+
+        // A click landing on a viewer address field (T159): the browser
+        // omnibox rule. A focus-GAINING click selects the whole address, and
+        // the selection has to land AFTER the EDIT's own click tracking —
+        // which runs through mouse-up and ends by placing a caret, wiping any
+        // selection applied earlier (the exact ordering Mac's
+        // `selectAddressWhenClickCompletes` exists for). Noting the DOWN and
+        // posting from the UP is what gets the order right; the messages
+        // still dispatch to the EDIT normally.
+        if ((msg.message == w32.WM_LBUTTONDOWN or msg.message == w32.WM_LBUTTONUP) and
+            msg.hwnd != null)
+        {
+            if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
+                if (msg.message == w32.WM_LBUTTONDOWN) nav.noteClickDown() else nav.noteClickUp();
             }
         }
 

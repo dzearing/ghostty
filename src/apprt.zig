@@ -148,6 +148,15 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_content.zig");
 
+    // Pure win32 viewer address-bar logic — Windows-shaped file-path
+    // classification, omnibox completion, display text (T159), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_nav.zig");
+
+    // Pure win32 viewer nav-bar geometry + reveal policy (T159), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_nav_layout.zig");
+
     // Pure win32 machine-chooser row model + geometry (T172), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");

@@ -274,6 +274,7 @@ pub const CFS_POINT: u32 = 0x0002;
 pub const VK_PROCESSKEY: u16 = 0xE5;
 pub const VK_PACKET: u16 = 0xE7;
 pub const VK_BACK: u16 = 0x08;
+pub const VK_LBUTTON: u16 = 0x01;
 pub const VK_TAB: u16 = 0x09;
 pub const VK_RETURN: u16 = 0x0D;
 pub const VK_SHIFT: u16 = 0x10;
@@ -364,6 +365,9 @@ pub const WHEEL_DELTA: i16 = 120;
 // Show window commands
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOW: i32 = 5;
+/// Show without activating — a chrome bar revealing itself must never steal
+/// keyboard focus from the content it sits above.
+pub const SW_SHOWNA: i32 = 8;
 pub const SW_MAXIMIZE: i32 = 3;
 pub const SW_RESTORE: i32 = 9;
 
@@ -681,6 +685,10 @@ pub extern "kernel32" fn GetProcessId(
 
 /// Our own pid. Cannot fail.
 pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+/// Monotonic milliseconds since boot; never wraps, never rewinds with the
+/// wall clock. What the viewer nav bar's hide deadline is measured in.
+pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 pub extern "user32" fn ToUnicode(
     wVirtKey: u32,
@@ -1105,6 +1113,7 @@ pub const DRAWITEMSTRUCT = extern struct {
 pub const EM_SETCUEBANNER: u32 = 0x1501;
 /// Select a range of an EDIT's text; `(0, -1)` selects all, so typing replaces
 /// a seeded value.
+pub const EM_GETSEL: u32 = 0x00B0;
 pub const EM_SETSEL: u32 = 0x00B1;
 
 // COMBOBOX control styles and messages (T174's Host Settings shell field —
@@ -1148,6 +1157,7 @@ pub const SS_PATHELLIPSIS: u32 = 0x00008000;
 
 // Edit control notification codes (high word of wParam in WM_COMMAND)
 pub const EN_CHANGE: u16 = 0x0300;
+pub const EN_SETFOCUS: u16 = 0x0100;
 pub const EN_KILLFOCUS: u16 = 0x0200;
 
 // Edit control styles

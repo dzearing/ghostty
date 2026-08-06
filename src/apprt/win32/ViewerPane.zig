@@ -58,6 +58,10 @@ const error_card = @import("viewer_error_card.zig");
 const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
 const viewer_watcher = @import("viewer_watcher.zig");
+const viewer_nav = @import("viewer_nav.zig");
+const nav_layout = @import("viewer_nav_layout.zig");
+const view_arg = @import("../../cli/view_arg.zig");
+const ViewerNavBar = @import("ViewerNavBar.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const PaneView = @import("PaneView.zig");
@@ -81,6 +85,13 @@ pub const WM_APP_VIEWER_RELOAD: u32 = w32.WM_APP + 20;
 
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
+
+/// The nav chrome's cursor-sampling timer (T159). Polling, not
+/// `TrackMouseEvent`: the cursor spends its life over WebView2's own Chromium
+/// child windows, so this host window never sees the WM_MOUSEMOVEs a tracking
+/// rectangle needs — the same reason Mac watches with an app-local event
+/// monitor rather than a tracking area.
+const nav_timer_id: usize = 2;
 
 /// How long the pane waits for the writes to stop before re-reading, matching
 /// Mac's 0.1s (`ViewerView.scheduleReload`). An editor's save is several
@@ -254,6 +265,38 @@ color_scheme: iface.PreferredColorScheme = .auto,
 /// — which is the whole of the unit-test population that never opens one.
 watcher: viewer_watcher.Watcher = .{},
 
+/// The navigation chrome (T159). Null when its window could not be created —
+/// the pane then has no bar, which is a degradation, not a broken pane.
+nav: ?*ViewerNavBar = null,
+
+/// Whether the bar is currently revealed. The content inset follows this bit
+/// and nothing else, so the bar RESERVES its space (Mac parity: top-of-page
+/// content is never covered).
+nav_visible: bool = false,
+
+/// When the revealed bar hides, in `GetTickCount64` ms; 0 = nothing armed.
+nav_deadline: u64 = 0,
+
+/// The last FILE location this pane rendered, kept across web navigations —
+/// it is what Back re-renders when the browser walks history onto the
+/// bundled template again (Mac's `fileLocation`, which its `syncMode` reads
+/// for exactly this). Owned. Distinct from `file_path`: that one is nulled
+/// the moment the pane goes web so the watcher disarms.
+file_location: ?[:0]u8 = null,
+
+/// History availability as of the last `HistoryChanged`. Mirrored onto the
+/// bar; read directly by the live test.
+can_go_back: bool = false,
+can_go_forward: bool = false,
+
+/// Our references on the T159 event handlers, same rule as the others.
+source_handler: ?*SourceChangedHandler = null,
+history_handler: ?*HistoryChangedHandler = null,
+
+/// The module instance the host window was created with, kept so the nav bar
+/// can be created from whichever of the two setup calls runs second.
+hinstance: ?w32.HINSTANCE = null,
+
 // -------------------------------------------------------------------------
 // Construction
 // -------------------------------------------------------------------------
@@ -320,11 +363,26 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         h.release();
         self.title_handler = null;
     }
+    if (self.source_handler) |h| {
+        h.release();
+        self.source_handler = null;
+    }
+    if (self.history_handler) |h| {
+        h.release();
+        self.history_handler = null;
+    }
     if (self.env) |e| {
         e.release();
         self.env = null;
     }
     self.clearHeadings(alloc);
+    // The bar before the host window: it is the host's child, and destroying
+    // it while its back-pointers are intact is the ordered half of the pair
+    // (DestroyWindow(host) would take it down as an anonymous child).
+    if (self.nav) |nav| {
+        nav.destroy();
+        self.nav = null;
+    }
     if (self.hwnd) |h| {
         _ = w32.SetWindowLongPtrW(h, w32.GWLP_USERDATA, 0);
         _ = w32.DestroyWindow(h);
@@ -335,12 +393,14 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.home_location) |l| alloc.free(l);
     if (self.origin_directory) |d| alloc.free(d);
     if (self.file_path) |p| alloc.free(p);
+    if (self.file_location) |l| alloc.free(l);
     if (self.resources_dir) |d| alloc.free(d);
     self.title = null;
     self.location = null;
     self.home_location = null;
     self.origin_directory = null;
     self.file_path = null;
+    self.file_location = null;
     self.resources_dir = null;
     self.state = .idle;
 }
@@ -439,8 +499,27 @@ pub fn createHostWindow(
         null,
     ) orelse return error.Win32Error;
     self.hwnd = hwnd;
+    self.hinstance = hinstance;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.readScale();
+
+    // The nav chrome's hover poll (T159): samples the cursor for the reveal
+    // strip. Runs for the pane's whole life — 150ms of GetCursorPos is noise,
+    // and a timer that starts and stops with visibility is two more states
+    // that can disagree.
+    if (self.pending) |p| self.ensureNav(p.alloc, hinstance, hwnd);
+    _ = w32.SetTimer(hwnd, nav_timer_id, nav_layout.poll_ms, null);
+}
+
+/// Create the nav bar once both halves exist: the host window to parent it
+/// and an allocator to own it. Called from whichever of `createHostWindow` /
+/// `start` runs second — the two orders are both live (PaneView starts the
+/// async chain after the window; the unit tests too, but nothing enforces it).
+fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwnd: w32.HWND) void {
+    if (self.nav != null) return;
+    self.nav = ViewerNavBar.create(alloc, self, hinstance, hwnd);
+    if (self.nav == null) log.warn("viewer nav bar could not be created; pane has no chrome", .{});
+    self.pushAddress();
 }
 
 /// Mirror of `Surface.setVisible`. A viewer has no renderer thread to park, so
@@ -502,7 +581,15 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     // same pane moves between a file and the web over its life (the address
     // bar, an in-page link), and a stale mode would render a website through
     // the markdown template.
+    const was_file = self.mode.isFile();
     self.mode = content.modeFor(url);
+    // Leaving file mode for the web: whatever headings the template last
+    // reported are gone with it, and nothing will arrive to clear them — the
+    // bridge only exists in our template. (`syncCommitted` applies the same
+    // rule to BROWSER-initiated moves, where the pane's mode has not flipped
+    // yet by the time the commit event lands; this is the pane-initiated
+    // half, which flips the mode right here.)
+    if (was_file and !self.mode.isFile()) self.clearHeadings(alloc);
     if (self.file_path) |p| alloc.free(p);
     self.file_path = null;
     if (self.mode.isFile()) {
@@ -512,6 +599,13 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
         } else {
             log.warn("viewer location is not a usable file path", .{});
         }
+        // Remember the file separately from `file_path`: this copy SURVIVES
+        // the pane going web, because it is what Back re-renders when the
+        // browser walks history onto the template again (T159).
+        if (alloc.dupeZ(u8, url)) |copy| {
+            if (self.file_location) |l| alloc.free(l);
+            self.file_location = copy;
+        } else |_| {}
     }
 
     // Name the pane NOW, from the location alone. A website's real title
@@ -529,6 +623,7 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     // insert marks the layout dirty itself) and every unit test.
     if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
 
+    self.pushAddress();
     self.applyNavigation();
     self.syncWatcher(alloc);
 }
@@ -955,7 +1050,10 @@ fn onNavigationCompleted(
     // also not a page `+reload` may re-render into, which is why the flag is
     // set AFTER this check and for both modes (T390).
     if (args) |a| if (!a.isSuccess()) {
-        log.warn("viewer template failed to load; no content injected", .{});
+        log.warn(
+            "viewer navigation did not complete (status={?d}); no content injected",
+            .{a.webErrorStatus()},
+        );
         return com.S_OK;
     };
     self.page_loaded = true;
@@ -1204,6 +1302,10 @@ fn respond(
 pub fn setColorScheme(self: *ViewerPane, dark: bool) void {
     self.color_scheme = if (dark) .dark else .light;
     self.applyColorScheme();
+    // The bar's palette derives from the pane background, which does not
+    // move with the OS scheme — but re-deriving here is cheap and keeps the
+    // chrome honest if a config reload ever changes the background underneath.
+    if (self.nav) |nav| nav.applyTheme();
 }
 
 fn applyColorScheme(self: *ViewerPane) void {
@@ -1249,14 +1351,27 @@ fn pushRasterizationScale(self: *ViewerPane) void {
 pub fn syncBounds(self: *ViewerPane) void {
     const h = self.hwnd orelse return;
     self.readScale();
-    const c = self.controller orelse return;
     var r: w32.RECT = undefined;
     if (w32.GetClientRect(h, &r) == 0) return;
+    const width = @max(r.right - r.left, 0);
+    const height = @max(r.bottom - r.top, 0);
+
+    // The bar reserves its band while visible (Mac parity: the content is
+    // inset, never covered), and follows the pane's width live.
+    var top: i32 = 0;
+    if (self.nav_visible) {
+        if (self.nav) |nav| {
+            nav.place(width, self.scale);
+            top = @min(nav_layout.Layout.init(self.scale, width).bar_h, height);
+        }
+    }
+
+    const c = self.controller orelse return;
     _ = c.setBounds(.{
         .left = 0,
-        .top = 0,
-        .right = @max(r.right - r.left, 0),
-        .bottom = @max(r.bottom - r.top, 0),
+        .top = top,
+        .right = width,
+        .bottom = height,
     });
 }
 
@@ -1307,6 +1422,10 @@ pub fn start(self: *ViewerPane, alloc: Allocator, host: *webview2.Host) void {
     p.* = .{ .pane = self, .refs = 2, .alloc = alloc };
     self.pending = p;
     self.state = .waiting_env;
+
+    // The other half of `createHostWindow`'s ensureNav — whichever call runs
+    // second creates the bar (T159).
+    if (self.hwnd) |h| self.ensureNav(alloc, self.hinstance, h);
 
     // Resolved once, here, rather than per request: it is a directory walk
     // from the exe outward and the resource handler runs dozens of times for
@@ -1444,6 +1563,9 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     // very first request IS the template's document, so an interception
     // registered after `Navigate` would miss the page it exists to serve.
     self.subscribeFileMode();
+    // Before the navigation too, so the FIRST commit already updates the
+    // address bar and the history buttons (T159).
+    self.subscribeHistory();
     if (self.focused) _ = c.moveFocus(.programmatic);
 
     // Last, so the page starts loading into a view that is already the right
@@ -1534,6 +1656,314 @@ fn onDocumentTitleChanged(
     defer p.alloc.free(utf8);
     self.setTitle(p.alloc, utf8) catch {};
     return com.S_OK;
+}
+
+// -------------------------------------------------------------------------
+// Navigation chrome (T159)
+// -------------------------------------------------------------------------
+
+/// One cursor sample against the reveal strip. The DECISION is
+/// `nav_layout.hoverTick`, pure and unit-tested; this is only the plumbing
+/// that feeds it and obeys it.
+fn navHoverTick(self: *ViewerPane) void {
+    const h = self.hwnd orelse return;
+    const nav = self.nav orelse return;
+    if (!self.visible) return;
+
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return;
+    if (w32.ScreenToClient(h, &pt) == 0) return;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return;
+
+    // Only a FOREGROUND window's cursor reveals chrome: hovering across a
+    // background app should not animate it (and the cursor's absolute screen
+    // position is meaningless to a window the user is not in — the live test
+    // depends on that, since a test window never owns the real cursor).
+    const foreground = w32.GetForegroundWindow() == w32.GetAncestor(h, w32.GA_ROOT);
+    const in_pane = foreground and
+        pt.x >= 0 and pt.y >= 0 and pt.x < r.right and pt.y < r.bottom;
+    const l = nav_layout.Layout.init(self.scale, r.right - r.left);
+    // "Held" = the address field owns the keyboard, or the cursor is on the
+    // revealed bar itself (its band is the top `bar_h` of the pane).
+    const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit);
+    const on_bar = self.nav_visible and in_pane and pt.y < l.bar_h;
+
+    const action = nav_layout.hoverTick(.{
+        .in_pane = in_pane,
+        .y = pt.y,
+        .visible = self.nav_visible,
+        .held = edit_focused or on_bar,
+        .now_ms = w32.GetTickCount64(),
+        .deadline_ms = self.nav_deadline,
+        .reveal_h = l.reveal_h,
+    });
+    self.nav_deadline = action.deadline_ms;
+    if (action.show) self.setNavVisible(true);
+    if (action.hide) self.setNavVisible(false);
+}
+
+/// Reveal or retract the bar, moving the content edge with it.
+fn setNavVisible(self: *ViewerPane, visible: bool) void {
+    if (self.nav_visible == visible) return;
+    const nav = self.nav orelse return;
+    self.nav_visible = visible;
+    if (visible) self.pushAddress();
+    self.syncBounds(); // places the bar and insets the content
+    nav.setVisible(visible);
+}
+
+/// Reveal the bar and put the caret in the address field with the whole
+/// address selected — the keyboard entry point (Mac's `focusAddressBar`).
+/// Returns false when this pane has no bar to focus.
+pub fn focusAddressBar(self: *ViewerPane) bool {
+    const nav = self.nav orelse return false;
+    self.setNavVisible(true);
+    self.nav_deadline = w32.GetTickCount64() + nav_layout.hide_delay_ms;
+    nav.focusAddress();
+    return true;
+}
+
+/// What the address field should read for where the pane is now, pushed to
+/// the bar (which ignores it while the user is typing).
+fn pushAddress(self: *ViewerPane) void {
+    const nav = self.nav orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    nav.setAddress(viewer_nav.addressText(&buf, self.location));
+}
+
+/// History state from `HistoryChanged`, mirrored to the bar's buttons.
+fn pushHistory(self: *ViewerPane) void {
+    const nav = self.nav orelse return;
+    nav.setHistory(self.can_go_back, self.can_go_forward);
+}
+
+/// The bar's back button: one entry back in the view's own history. The
+/// runtime treats a back with nowhere to go as a no-op, same as Mac's
+/// `webView.goBack()`.
+pub fn goBack(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    if (!web.goBack()) log.warn("GoBack failed for this pane", .{});
+}
+
+pub fn goForward(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    if (!web.goForward()) log.warn("GoForward failed for this pane", .{});
+}
+
+/// The bar's reload button: a NORMAL browser reload (Mac's `reloadPage` is
+/// `webView.reload()`), deliberately not `+reload`'s cache-bypassing refetch
+/// — the button is the browser convention, the verb is the agent's tool. A
+/// file pane reloads the template, whose NavigationCompleted re-renders the
+/// file. A pane with no completed load falls back to a full load.
+pub fn reloadFromChrome(self: *ViewerPane) void {
+    if (!self.page_loaded) {
+        self.reloadContent();
+        return;
+    }
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    if (!web.reload()) log.warn("Reload failed for this pane", .{});
+}
+
+/// The bar's home button: return to the location this pane was opened with.
+pub fn goHome(self: *ViewerPane) void {
+    const p = self.pending orelse return;
+    const home = self.home_location orelse return;
+    // `navigate` frees and replaces `location`/`home_location` strings; the
+    // home it is being handed must not alias the field it frees.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (home.len > buf.len) return;
+    @memcpy(buf[0..home.len], home);
+    self.navigate(p.alloc, buf[0..home.len]) catch {};
+}
+
+/// Submit from the address field (the main loop routes Enter here via the
+/// bar). Mac's `navigate(to:)`: trim, classify, complete — plus the tilde
+/// expansion the pure module cannot do, since `~` needs a home directory.
+pub fn navigateFromAddress(self: *ViewerPane, input: []const u8) void {
+    const p = self.pending orelse return;
+    var resolve_buf: [viewer_nav.max_address]u8 = undefined;
+    const resolved = viewer_nav.resolveInput(&resolve_buf, input) orelse return;
+
+    var tilde_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target: []const u8 = expand: {
+        if (view_arg.tildeRemainder(resolved)) |rem| {
+            var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home: ?[]const u8 = internal_os.home(&home_buf) catch null;
+            if (home) |hm| {
+                const rel = std.mem.trimLeft(u8, rem, "/\\");
+                const joined = std.fmt.bufPrint(&tilde_buf, "{s}{s}{s}", .{
+                    hm,
+                    if (rel.len > 0) "\\" else "",
+                    rel,
+                }) catch break :expand resolved;
+                break :expand joined;
+            }
+        }
+        break :expand resolved;
+    };
+
+    self.navigate(p.alloc, target) catch return;
+    // Submitting hands keyboard focus to the page, the way a browser omnibox
+    // does — and it genuinely moves focus off the EDIT, so a later click back
+    // into the field is a focus change that re-selects the address.
+    if (self.controller) |c| _ = c.moveFocus(.programmatic);
+}
+
+/// Escape while editing the address: throw the edit away, put the pane's
+/// real location back in the field, and hand focus to the page (Mac's
+/// `cancelAddressEditing`).
+pub fn cancelAddressEdit(self: *ViewerPane) void {
+    if (self.nav) |nav| {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        nav.forceAddress(viewer_nav.addressText(&buf, self.location));
+    }
+    if (self.controller) |c| _ = c.moveFocus(.programmatic);
+}
+
+/// `ICoreWebView2SourceChangedEventHandler`: the view's Source moved — a
+/// typed address, an in-page link, or a history walk.
+const SourceChangedHandler = com.CallbackOwning(
+    iface.IID_SourceChangedHandler,
+    onSourceChanged,
+    releasePendingToken,
+);
+
+/// `ICoreWebView2HistoryChangedEventHandler`: the back/forward list changed.
+const HistoryChangedHandler = com.CallbackOwning(
+    iface.IID_HistoryChangedHandler,
+    onHistoryChanged,
+    releasePendingToken,
+);
+
+fn onSourceChanged(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*anyopaque,
+) com.HRESULT {
+    _ = args; // only carries IsNewDocument; the source is read off the sender
+    const self = p.pane orelse return com.S_OK;
+    const web = sender orelse return com.S_OK;
+    const raw = web.sourceRaw() orelse return com.S_OK;
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(raw)) catch return com.S_OK;
+    defer p.alloc.free(utf8);
+    log.debug("source changed: {s}", .{utf8});
+    self.syncCommitted(p.alloc, utf8);
+    return com.S_OK;
+}
+
+fn onHistoryChanged(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*anyopaque,
+) com.HRESULT {
+    _ = args; // no payload; CanGoBack/CanGoForward are read off the sender
+    const self = p.pane orelse return com.S_OK;
+    const web = sender orelse return com.S_OK;
+    self.can_go_back = web.canGoBack() orelse false;
+    self.can_go_forward = web.canGoForward() orelse false;
+    self.pushHistory();
+    return com.S_OK;
+}
+
+/// Reconcile the pane's mode with whatever the web view actually committed —
+/// Mac's `syncMode(toCommitted:)`, and the thing that makes Back work across
+/// a mode switch: a user who types a URL into a file viewer and presses Back
+/// lands on the TEMPLATE page again, and the pane must go back to rendering
+/// the file rather than sitting in web mode over a blank template.
+fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
+    if (std.mem.eql(u8, src, content.page_url)) {
+        // The template is back on screen. If the pane already knows it is a
+        // file pane, this is the initial load (or a same-file reload) and
+        // `navigate` said everything already.
+        if (self.mode.isFile()) return;
+        const floc = self.file_location orelse return;
+        self.mode = content.modeFor(floc);
+        self.page_loaded = false;
+        if (alloc.dupeZ(u8, floc)) |dup| {
+            if (self.location) |l| alloc.free(l);
+            self.location = dup;
+        } else |_| {}
+        if (self.file_path) |old| alloc.free(old);
+        self.file_path = null;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (content.filePath(&pbuf, floc)) |path| {
+            self.file_path = alloc.dupe(u8, path) catch null;
+        }
+        self.setTitle(alloc, content.initialTitle(self.mode, floc, self.file_path)) catch {};
+        self.syncWatcher(alloc);
+        // The NavigationCompleted that follows this commit re-renders the
+        // file into the fresh template — nothing to do here but wait for it.
+    } else if (viewMode(src) == .web) {
+        const was_file = self.mode.isFile();
+        self.mode = .web;
+        if (alloc.dupeZ(u8, src)) |dup| {
+            if (self.location) |l| alloc.free(l);
+            self.location = dup;
+        } else |_| {}
+        if (was_file) {
+            // A website is not a rendered document: whatever headings the
+            // template last reported are gone with it (nothing will arrive
+            // to clear them — the bridge only exists in our template), and
+            // there is no file under this pane to watch anymore.
+            self.clearHeadings(alloc);
+            if (self.file_path) |old| alloc.free(old);
+            self.file_path = null;
+            self.watcher.stop();
+        }
+    } else return;
+
+    if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
+    self.pushAddress();
+}
+
+fn viewMode(src: []const u8) enum { web, other } {
+    for ([_][]const u8{ "http://", "https://", "about:" }) |prefix| {
+        if (src.len >= prefix.len and std.ascii.eqlIgnoreCase(src[0..prefix.len], prefix)) {
+            return .web;
+        }
+    }
+    return .other;
+}
+
+/// Register the T159 pair on a freshly adopted controller. Non-fatal, like
+/// every other subscription: a pane that fails here has dead back/forward
+/// buttons and a stale address on in-page navigation — degraded chrome, not
+/// a broken pane.
+fn subscribeHistory(self: *ViewerPane) void {
+    std.debug.assert(self.source_handler == null);
+    std.debug.assert(self.history_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    source: {
+        const handler = SourceChangedHandler.create(p.alloc, p) catch break :source;
+        p.refs += 1;
+        if (!web.addSourceChanged(@ptrCast(handler))) {
+            log.warn("add_SourceChanged failed; the address bar will go stale", .{});
+            handler.release();
+            break :source;
+        }
+        self.source_handler = handler;
+    }
+
+    const handler = HistoryChangedHandler.create(p.alloc, p) catch return;
+    p.refs += 1;
+    if (!web.addHistoryChanged(@ptrCast(handler))) {
+        log.warn("add_HistoryChanged failed; back/forward stay disabled", .{});
+        handler.release();
+        return;
+    }
+    self.history_handler = handler;
 }
 
 fn fail(self: *ViewerPane, reason: webview2.Failure) void {
@@ -1756,6 +2186,10 @@ pub fn wndProc(
         },
 
         w32.WM_TIMER => {
+            if (wparam == nav_timer_id) {
+                self.navHoverTick();
+                return 0;
+            }
             if (wparam != reload_timer_id) {
                 return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
             }
@@ -2437,6 +2871,141 @@ test "host floor: a real controller on a real window, on this box" {
     // needs.
     try pane.navigate(alloc, md_path);
     try testing.expect(pane.watcher.isRunning());
+
+    // ------------------------------------------------------------------
+    // T159: history — the slots, the handler IIDs, and the file<->web
+    // boundary
+    // ------------------------------------------------------------------
+    //
+    // Recorded handlers are the runtime accepting subscriptions at slots 11
+    // (`add_SourceChanged`) and 13 (`add_HistoryChanged`) — and the events
+    // FIRING below is the proof of the two handler IIDs, which no header on
+    // this box can vouch for: the runtime QIs our callback for exactly that
+    // GUID before ever invoking it, so a wrong one is an event that never
+    // arrives, and every wait below times out.
+    try testing.expect(pane.source_handler != null);
+    try testing.expect(pane.history_handler != null);
+
+    // Let the file FINISH rendering so the boundary test below has a real
+    // "before". `page_loaded` is the load-completed bit, and it is the guard
+    // that matters: the stale headings from the watch section would satisfy
+    // a headings-only wait instantly, and the next navigation would then
+    // abort this one mid-load — a race, not a test.
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.page_loaded and p.headings.len == 2 and
+                std.mem.eql(u8, p.headings[0].text, "Iota");
+        }
+    }.ready, &pane);
+
+    // Onto the web. `get_CanGoBack` (38) must flip true — the template entry
+    // is behind us — and `HistoryChanged` firing at all is what delivers it.
+    try pane.navigate(alloc, reload_url);
+    // `page_loaded` too: issuing GoBack while the forward load is still in
+    // flight cancels that load instead of testing the boundary.
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode == .web and p.can_go_back and p.page_loaded;
+        }
+    }.ready, &pane);
+    log.warn("history: web, can_back={} can_fwd={}", .{ pane.can_go_back, pane.can_go_forward });
+    try testing.expect(pane.can_go_back);
+
+    // `GoBack` (40): the browser walks onto the template again, and the pane
+    // must go back to RENDERING THE FILE — CLAUDE.md's "going Back from a
+    // website re-renders the file". SourceChanged flips the mode, the
+    // NavigationCompleted that follows re-injects the content, and the
+    // headings coming back is the whole chain having run.
+    pane.goBack();
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode == .markdown and p.headings.len == 2 and
+                std.mem.eql(u8, p.headings[0].text, "Iota");
+        }
+    }.ready, &pane);
+    log.warn("history: back -> mode={s} headings={d}", .{ @tagName(pane.mode), pane.headings.len });
+    try testing.expectEqual(content.Mode.markdown, pane.mode);
+    try testing.expectEqualStrings(md_path, pane.location.?);
+    try testing.expect(pane.watcher.isRunning());
+
+    // `GoForward` (41): the web page is ahead of us again.
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.can_go_forward;
+        }
+    }.ready, &pane);
+    pane.goForward();
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode == .web;
+        }
+    }.ready, &pane);
+    try testing.expect(std.mem.startsWith(u8, pane.location.?, "http://127.0.0.1"));
+    // Leaving the file cleared its TOC and its watch (the web page will
+    // never post headings to clear them itself).
+    try testing.expect(!pane.watcher.isRunning());
+
+    // Home: back to the location the pane was OPENED with (the markdown
+    // file, from the very first navigate in this test).
+    try testing.expectEqualStrings(md_path, pane.home_location.?);
+    pane.goHome();
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.page_loaded and p.mode == .markdown and p.headings.len == 2;
+        }
+    }.ready, &pane);
+    try testing.expectEqualStrings(md_path, pane.location.?);
+
+    // ------------------------------------------------------------------
+    // T159: the chrome itself — the bar exists, reveals, reserves its band,
+    // and the address field holds the retypable location selected
+    // ------------------------------------------------------------------
+    try testing.expect(pane.nav != null);
+    const nav = pane.nav.?;
+
+    try testing.expect(pane.focusAddressBar());
+    try testing.expectEqual(@as(?w32.HWND, nav.edit), w32.GetFocus());
+
+    // The content edge moved down by exactly the bar's height — the bar
+    // reserves space, never covers the page.
+    {
+        var cr: w32.RECT = undefined;
+        try testing.expect(w32.GetClientRect(pane.hwnd.?, &cr) != 0);
+        const nl = nav_layout.Layout.init(pane.scale, cr.right - cr.left);
+        const nb = c.bounds().?;
+        try testing.expectEqual(nl.bar_h, nb.top);
+    }
+
+    // The field shows the file's own path (the Mac-style display text) with
+    // the whole address selected, ready to replace.
+    {
+        var abuf: [4096]u8 = undefined;
+        try testing.expectEqualStrings(md_path, nav.addressText(&abuf));
+        const sel = w32.SendMessageW(nav.edit, w32.EM_GETSEL, 0, 0);
+        const sel_start: u16 = @intCast(@as(usize, @bitCast(sel)) & 0xFFFF);
+        const sel_end: u16 = @intCast((@as(usize, @bitCast(sel)) >> 16) & 0xFFFF);
+        try testing.expectEqual(@as(u16, 0), sel_start);
+        try testing.expect(sel_end > 0); // whole address, not a bare caret
+    }
+
+    // Submitting an address navigates through the SAME omnibox completion
+    // the unit tests pin: a bare host:port completes to http:// and the pane
+    // goes web. This is the Enter path minus the keystroke (the main loop's
+    // routing is one line; the behavior is here).
+    {
+        var url_buf: [64]u8 = undefined;
+        const bare = try std.fmt.bufPrint(&url_buf, "127.0.0.1:{d}{s}", .{
+            reload_page.port,
+            ReloadPage.path,
+        });
+        pane.navigateFromAddress(bare);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.mode == .web;
+            }
+        }.ready, &pane);
+        try testing.expect(std.mem.startsWith(u8, pane.location.?, "http://127.0.0.1"));
+    }
 }
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.

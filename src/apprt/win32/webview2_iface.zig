@@ -215,6 +215,29 @@ pub const IID_DocumentTitleChangedHandler: GUID = .{
     .Data4 = .{ 0x9F, 0x95, 0xF3, 0xA1, 0x18, 0xE1, 0xAF, 0xD4 },
 };
 
+// {3C067F9F-5388-4772-8B48-79F7EF1AB37C}
+// `ICoreWebView2SourceChangedEventHandler`. Its `Invoke` args carry only
+// `IsNewDocument`, which we never read — the source itself is read back off
+// the sender. Like every handler IID here, its correctness is PROVEN by the
+// live test (the runtime QIs the handler for exactly this IID before ever
+// invoking it, so a wrong GUID is an event that never fires).
+pub const IID_SourceChangedHandler: GUID = .{
+    .Data1 = 0x3C067F9F,
+    .Data2 = 0x5388,
+    .Data3 = 0x4772,
+    .Data4 = .{ 0x8B, 0x48, 0x79, 0xF7, 0xEF, 0x1A, 0xB3, 0x7C },
+};
+
+// {C79A420C-EFD9-4058-9295-3E8B4BCAB645}
+// `ICoreWebView2HistoryChangedEventHandler`. Args are a bare `IUnknown` — the
+// event carries no payload; CanGoBack/CanGoForward are read off the sender.
+pub const IID_HistoryChangedHandler: GUID = .{
+    .Data1 = 0xC79A420C,
+    .Data2 = 0xEFD9,
+    .Data3 = 0x4058,
+    .Data4 = .{ 0x92, 0x95, 0x3E, 0x8B, 0x4B, 0xCA, 0xB6, 0x45 },
+};
+
 // {49511172-CC67-4BCA-9923-137112F4C4CC}
 // `ICoreWebView2ExecuteScriptCompletedHandler`.
 pub const IID_ExecuteScriptCompletedHandler: GUID = .{
@@ -471,7 +494,7 @@ pub const ICoreWebView2NavigationCompletedEventArgs = extern struct {
         AddRef: *const fn (*ICoreWebView2NavigationCompletedEventArgs) callconv(.winapi) u32,
         Release: *const fn (*ICoreWebView2NavigationCompletedEventArgs) callconv(.winapi) u32,
         get_IsSuccess: *const fn (*ICoreWebView2NavigationCompletedEventArgs, *BOOL) callconv(.winapi) HRESULT,
-        get_WebErrorStatus: *const anyopaque,
+        get_WebErrorStatus: *const fn (*ICoreWebView2NavigationCompletedEventArgs, *u32) callconv(.winapi) HRESULT,
         get_NavigationId: *const anyopaque,
     };
 
@@ -479,6 +502,17 @@ pub const ICoreWebView2NavigationCompletedEventArgs = extern struct {
         var out: BOOL = 0;
         if (com.failed(self.vtable.get_IsSuccess(self, &out))) return false;
         return out != 0;
+    }
+
+    /// WHY a failed navigation failed (`COREWEBVIEW2_WEB_ERROR_STATUS`, as
+    /// its raw ordinal). Read for the log line alone: a navigation aborted
+    /// by a newer one is routine, a genuine load failure is a defect, and a
+    /// warn that cannot tell them apart sent T159's first live run chasing
+    /// the wrong one.
+    pub fn webErrorStatus(self: *ICoreWebView2NavigationCompletedEventArgs) ?u32 {
+        var out: u32 = 0;
+        if (com.failed(self.vtable.get_WebErrorStatus(self, &out))) return null;
+        return out;
     }
 };
 
@@ -547,8 +581,12 @@ pub const ICoreWebView2Profile = extern struct {
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
-    /// Slots 6..14: `NavigateToString` through `remove_HistoryChanged`.
-    pub const pre_nav_slots = 9;
+    /// Slots 6..10: `NavigateToString` through `remove_ContentLoading`.
+    pub const pre_source_slots = 5;
+    /// Slot 12: `remove_SourceChanged`.
+    pub const remove_source_slots = 1;
+    /// Slot 14: `remove_HistoryChanged`.
+    pub const remove_history_slots = 1;
     /// Slots 16..26: `remove_NavigationCompleted` through
     /// `remove_ProcessFailed`.
     pub const post_nav_slots = 11;
@@ -560,8 +598,10 @@ pub const ICoreWebView2 = extern struct {
     pub const post_reload_slots = 2;
     /// Slot 35: `remove_WebMessageReceived`.
     pub const remove_message_slots = 1;
-    /// Slots 37..43: `get_BrowserProcessId` through `Stop`.
-    pub const post_devtools_slots = 7;
+    /// Slot 37: `get_BrowserProcessId`.
+    pub const browser_pid_slots = 1;
+    /// Slots 42..43: `GetDevToolsProtocolEventReceiver`, `Stop`.
+    pub const post_forward_slots = 2;
     /// Slot 45: `remove_NewWindowRequested`.
     pub const remove_new_window_slots = 1;
     /// Slot 47: `remove_DocumentTitleChanged`.
@@ -579,7 +619,11 @@ pub const ICoreWebView2 = extern struct {
         get_Settings: *const anyopaque,
         get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
         Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
-        pre_nav: [pre_nav_slots]*const anyopaque,
+        pre_source: [pre_source_slots]*const anyopaque,
+        add_SourceChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        remove_source: [remove_source_slots]*const anyopaque,
+        add_HistoryChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        remove_history: [remove_history_slots]*const anyopaque,
         add_NavigationCompleted: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         post_nav: [post_nav_slots]*const anyopaque,
         AddScriptToExecuteOnDocumentCreated: *const fn (*ICoreWebView2, [*:0]const u16, *anyopaque) callconv(.winapi) HRESULT,
@@ -596,7 +640,12 @@ pub const ICoreWebView2 = extern struct {
             [*:0]const u16,
             ?*anyopaque,
         ) callconv(.winapi) HRESULT,
-        post_devtools: [post_devtools_slots]*const anyopaque,
+        browser_pid: [browser_pid_slots]*const anyopaque,
+        get_CanGoBack: *const fn (*ICoreWebView2, *BOOL) callconv(.winapi) HRESULT,
+        get_CanGoForward: *const fn (*ICoreWebView2, *BOOL) callconv(.winapi) HRESULT,
+        GoBack: *const fn (*ICoreWebView2) callconv(.winapi) HRESULT,
+        GoForward: *const fn (*ICoreWebView2) callconv(.winapi) HRESULT,
+        post_forward: [post_forward_slots]*const anyopaque,
         add_NewWindowRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         remove_new_window: [remove_new_window_slots]*const anyopaque,
         add_DocumentTitleChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
@@ -626,6 +675,46 @@ pub const ICoreWebView2 = extern struct {
         var raw: ?[*:0]u16 = null;
         if (com.failed(self.vtable.get_Source(self, &raw))) return null;
         return raw;
+    }
+
+    /// Subscribe to the Source property changing — every top-level document
+    /// change, including back/forward and same-document moves. The win32
+    /// analog of Mac's KVO on `webView.url`: what keeps the address field and
+    /// the pane's mode honest about where the view actually IS (T159).
+    pub fn addSourceChanged(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_SourceChanged(self, handler, &token));
+    }
+
+    /// Subscribe to the joint back/forward list changing — the runtime's own
+    /// "re-read CanGoBack/CanGoForward now" signal (T159).
+    pub fn addHistoryChanged(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_HistoryChanged(self, handler, &token));
+    }
+
+    /// Whether there is a page to go Back to. Null on failure — which the
+    /// caller treats as false, a disabled button being the honest degrade.
+    pub fn canGoBack(self: *ICoreWebView2) ?bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_CanGoBack(self, &out))) return null;
+        return out != 0;
+    }
+
+    pub fn canGoForward(self: *ICoreWebView2) ?bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_CanGoForward(self, &out))) return null;
+        return out != 0;
+    }
+
+    /// Navigate one entry back in this view's own history. A no-op (S_OK)
+    /// when there is nowhere to go, per the API contract.
+    pub fn goBack(self: *ICoreWebView2) bool {
+        return !com.failed(self.vtable.GoBack(self));
+    }
+
+    pub fn goForward(self: *ICoreWebView2) bool {
+        return !com.failed(self.vtable.GoForward(self));
     }
 
     /// Subscribe to `window.open()` / target=_blank. `handler` is one of OUR
@@ -1075,6 +1164,12 @@ test "the slots we actually call sit where the header puts them" {
     // check that says the split did not move anything.
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_Source"));
     try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Navigate"));
+    // T159's events, carved out of what used to be the one 9-slot `pre_nav`
+    // run. `add_HistoryChanged` at 13 has `remove_SourceChanged` (a
+    // token-taking remove) one slot before it — subscribing there would hand
+    // the runtime a handler pointer as if it were an i64 token.
+    try testing.expectEqual(11 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_SourceChanged"));
+    try testing.expectEqual(13 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_HistoryChanged"));
     try testing.expectEqual(15 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationCompleted"));
     try testing.expectEqual(27 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddScriptToExecuteOnDocumentCreated"));
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2.Vtbl, "ExecuteScript"));
@@ -1087,6 +1182,13 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Reload"));
     try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
     try testing.expectEqual(36 * ptr, @offsetOf(ICoreWebView2.Vtbl, "CallDevToolsProtocolMethod"));
+    // T159's history quartet, out of the old 7-slot `post_devtools` run. The
+    // getters take a BOOL out-param and the Go pair take nothing, so a
+    // one-off here reads as a navigation that silently does not happen.
+    try testing.expectEqual(38 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_CanGoBack"));
+    try testing.expectEqual(39 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_CanGoForward"));
+    try testing.expectEqual(40 * ptr, @offsetOf(ICoreWebView2.Vtbl, "GoBack"));
+    try testing.expectEqual(41 * ptr, @offsetOf(ICoreWebView2.Vtbl, "GoForward"));
     try testing.expectEqual(44 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NewWindowRequested"));
     // T383's pair, carved out of what used to be one 10-slot `window` run.
     // `get_DocumentTitle` (48) is a getter with an out-parameter, so calling it

@@ -353,6 +353,19 @@ pub const Glyph = enum {
     /// the two hosts would make the caption look like a duplicate of the
     /// strip rather than its overflow.
     overflow,
+    /// "←" — navigate back (T159, Fluent Back). The FALLBACK draws a left
+    /// chevron rather than a shafted arrow: it is the up-chevron transposed,
+    /// so its symmetry is inherited rather than re-derived, and a chevron
+    /// already reads as back/forward in every minimal browser chrome.
+    back,
+    /// "→" — navigate forward (Fluent Forward). The back glyph, mirrored.
+    forward,
+    /// "⟳" — reload the pane (Fluent Refresh). The fallback is an open
+    /// square with a gap and a head — crude next to the font's arc, but a
+    /// fallback's bar is "readable", not "identical" (see T497's header).
+    refresh,
+    /// "⌂" — return to the pane's opened location (Fluent Home).
+    home,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -409,6 +422,19 @@ fn mirrorX(q: Quad, m: i32) Quad {
 fn mirrorY(q: Quad, m: i32) Quad {
     var r: Quad = undefined;
     for (q.pts, 0..) |p, i| r.pts[i] = .{ .x = p.x, .y = m - p.y };
+    return r;
+}
+
+/// `q` reflected through the main diagonal of the square `sq` (x and y
+/// swapped). How a horizontal glyph becomes its vertical twin without a
+/// second set of coordinates that could disagree with the first — the same
+/// rule the mirrors follow.
+fn transposeIn(q: Quad, sq: Rect) Quad {
+    var r: Quad = undefined;
+    for (q.pts, 0..) |p, i| r.pts[i] = .{
+        .x = sq.left + (p.y - sq.top),
+        .y = sq.top + (p.x - sq.left),
+    };
     return r;
 }
 
@@ -559,6 +585,73 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
                 .bottom = b.bottom - off,
             });
             return out[0 .. used.len + 2];
+        },
+        .back, .forward => {
+            // The up-chevron's own quads, computed in a centered SQUARE and
+            // transposed through its diagonal to point left — then mirrored
+            // for forward. Building from the chevron means the arm geometry,
+            // its parity handling and its apex overlap are inherited, not
+            // re-derived (the mirrored-halves rule, one level up).
+            const side = @min(target.width(), target.height());
+            const sq = centered(target, side, side);
+            var tmp: [max_quads]Quad = undefined;
+            const arms = glyphQuads(m, sq, .chevron_up, &tmp);
+            for (arms, 0..) |q, i| out[i] = transposeIn(q, sq);
+            if (glyph == .forward) {
+                for (out[0..arms.len]) |*q| q.* = mirrorX(q.*, sq.left + sq.right);
+            }
+            return out[0..arms.len];
+        },
+        .refresh => {
+            // An open square with a gap in its top edge and a head hanging
+            // into the gap — the crude reading of a circular arrow. Bounds
+            // are the full mark box: the right bar still owns the top-right
+            // corner, so the glyph stays centered by construction.
+            const b = centered(target, m.mark_close, m.mark_close);
+            const so = m.stroke_w;
+            const gap = @max(@divTrunc(b.width(), 3), so + 1);
+            out[0] = bar(.{
+                .left = b.left,
+                .top = b.top,
+                .right = b.right - gap,
+                .bottom = b.top + so,
+            });
+            out[1] = bar(.{ .left = b.right - so, .top = b.top, .right = b.right, .bottom = b.bottom });
+            out[2] = bar(.{ .left = b.left, .top = b.bottom - so, .right = b.right - so, .bottom = b.bottom });
+            out[3] = bar(.{ .left = b.left, .top = b.top + so, .right = b.left + so, .bottom = b.bottom - so });
+            // The head: a small filled drop under the gap's left end, so the
+            // gap reads as an arrow entering the loop rather than as damage.
+            const head = @max(so + 1, 2);
+            out[4] = bar(.{
+                .left = b.right - gap,
+                .top = b.top,
+                .right = b.right - gap + head,
+                .bottom = b.top + head,
+            });
+            return out[0..5];
+        },
+        .home => {
+            // A house: a chevron roof over an open-topped body. The roof owns
+            // the full mark width and the top edge, the floor owns the
+            // bottom, so the union is exactly the centered mark box.
+            const b = centered(target, m.mark_menu, m.mark_menu);
+            const roof_h = @max(@divTrunc(b.height(), 3), t);
+            const apex_x = b.left + @divTrunc(b.width() + 1, 2);
+            out[0] = .{ .pts = .{
+                .{ .x = b.left, .y = b.top + roof_h },
+                .{ .x = apex_x, .y = b.top },
+                .{ .x = apex_x, .y = b.top + t },
+                .{ .x = b.left, .y = b.top + roof_h + t },
+            } };
+            out[1] = mirrorX(out[0], b.left + b.right);
+            // Body: two walls and a floor, inset under the eaves. The walls
+            // hang from the roof line so the silhouette closes.
+            const wi = @max(@divTrunc(b.width(), 5), t);
+            const body_top = b.top + roof_h;
+            out[2] = bar(.{ .left = b.left + wi, .top = body_top, .right = b.left + wi + t, .bottom = b.bottom - t });
+            out[3] = mirrorX(out[2], b.left + b.right);
+            out[4] = bar(.{ .left = b.left + wi, .top = b.bottom - t, .right = b.right - wi, .bottom = b.bottom });
+            return out[0..5];
         },
         .overflow => {
             // Three square dots on the mark box's center line, spanning the
@@ -850,6 +943,10 @@ const all_glyphs = [_]Glyph{
     .maximize,
     .restore,
     .overflow,
+    .back,
+    .forward,
+    .refresh,
+    .home,
 };
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph
