@@ -9326,3 +9326,21 @@ lanes PASS (none 313s / win32 324s / agent 298s), caption-bar.ps1 ALL PASS
 (24 assertions, re-pinned to the 32 DIP band + slab geometry + WS_MINIMIZE
 oracle), P1-P3 ALL PASS. Also committed: the resolved D14/D15/D16 decision
 folding and the start-tracker project skill.
+
+## 2026-08-05 - T379 done: a red P1-P3 run now keeps its evidence, and the cold-launch sleeps became polls
+
+The standing floor's P1-P3 scripts each tee their whole assertion body to
+`%TEMP%\ghoztty-ipc-p{1,2,3}-last.log` and a failing trailer names the file, so
+the `| Select-Object -Last 1` summary can no longer discard what failed (the
+original T379 observation - "2 FAILURE(S)", details lost forever - cannot
+recur). The cold-launch-critical fixed sleeps are now `Wait-ListMatch` polls
+(500ms cadence, 20s budget): P1 sections 1/3/4 wait on the registration row
+itself, P2/P3 gained the same guard before their setup sleeps. Warm runs got
+faster (P1 ~11s); a cold first launch gets 20s instead of 2s before it can
+fail. The original failure did not reproduce in six deliberate first-run
+attempts (full rebuild, fresh-file copies, delete+reinstall cycles - all ALL
+PASS on the first run; a timed probe put launch-to-registration at 0.9s cold /
+0.7s warm), so the likeliest confound was the since-outlawed lane/script
+overlap (T401). Validation: deliberate-failure self-test shows the trailer +
+transcript path; 6/6 cold runs green; floor-lane all three lanes PASS (none
+159s / win32 180s / agent 185s); P1-P3 ALL PASS sequentially.

@@ -43,11 +43,34 @@ function Get-P3Json {
     $j.data.windows | Where-Object { $_.target -eq 'p3' }
 }
 
+# T379: poll +list until a pattern shows, so the FIRST launch of a
+# just-replaced exe (cold: Defender scan, no cache) cannot outrun a fixed
+# sleep. Warm runs resolve on the first poll.
+function Wait-ListMatch([string]$Pattern, [int]$TimeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        cmd /c "`"$Exe`" +list > `"$tmp\list.txt`" 2>&1" | Out-Null
+        $l = Get-Content "$tmp\list.txt" -Raw
+        if ($l -match $Pattern) { return $l }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $l
+}
+
+# T379: tee every PASS/FAIL line to a transcript so a red run keeps its
+# evidence past a `| Select-Object -Last 1` summary; the trailer names it.
+$transcript = Join-Path $env:TEMP 'ghoztty-ipc-p3-last.log'
+
+& {
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: window + named panes"
 & $Exe +new-window --target=p3 2>&1 | Out-Null
+# Cold-launch guard first (T379); the settle sleep after it stays, because the
+# +send-keys sections need the pane's shell up, not just the window row.
+[void](Wait-ListMatch '\[target: p3\]')
 Start-Sleep -Seconds 3
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
@@ -120,11 +143,15 @@ Assert "unknown pane errors" ($LASTEXITCODE -ne 0)
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
+} 2>&1 | Tee-Object -FilePath $transcript
+
 ""
 if ($script:failures -eq 0) {
     "P3 ACCEPTANCE: ALL PASS"
     exit 0
 } else {
-    "P3 ACCEPTANCE: $script:failures FAILURE(S)"
+    $trailer = "P3 ACCEPTANCE: $script:failures FAILURE(S) - details: $transcript"
+    Add-Content $transcript $trailer
+    $trailer
     exit 1
 }

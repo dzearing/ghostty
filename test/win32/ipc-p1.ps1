@@ -46,15 +46,38 @@ function Get-List {
     Get-Content "$tmp\list.txt" -Raw
 }
 
+# T379: wait for a +list pattern instead of sleeping a fixed interval. The
+# FIRST launch of a just-replaced exe is cold (Defender scans the new file,
+# nothing is cached) and can exceed any fixed sleep that warm runs meet -- the
+# original 2s sleep is exactly how this floor failed once per rebuild and then
+# passed forever. Polls resolve as soon as the pattern shows, so warm runs get
+# FASTER, and the timeout only spends itself on a run that would have failed.
+function Wait-ListMatch([string]$Pattern, [int]$TimeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        $l = Get-List
+        if ($l -match $Pattern) { return $l }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $l
+}
+
+# T379: every PASS/FAIL line is teed to a transcript file so a red run keeps
+# its evidence. Callers summarise with `| Select-Object -Last 1` by design,
+# which used to discard exactly the lines that said WHAT failed; the trailer
+# now names this file, so the summary still points at the details.
+$transcript = Join-Path $env:TEMP 'ghoztty-ipc-p1-last.log'
+
+& {
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: +new-window auto-launch from cold, all basic flags"
 & $Exe +new-window --target=p1win --title=P1Title "--command=echo p1-marker" 2>&1 | Out-Null
 Assert "exit 0" ($LASTEXITCODE -eq 0)
-Start-Sleep -Seconds 2
+$list = Wait-ListMatch '\[target: p1win\]'
 Assert-GhozttyIsolated -Exe $Exe
-$list = Get-List
 Assert "window registered under target" ($list -match '\[target: p1win\]')
 Assert "title override shows" ($list -match 'P1Title')
 
@@ -68,8 +91,9 @@ Assert "still exactly one p1win" (([regex]::Matches($list, '\[target: p1win\]'))
 "== 3: inline split + named pane + explicit cwd"
 & $Exe +new-window --target=p1ide --split=down "--split-command=echo split-pane" --name=p1term --working-directory=C:\Windows 2>&1 | Out-Null
 Assert "exit 0" ($LASTEXITCODE -eq 0)
-Start-Sleep -Seconds 2
-$list = Get-List
+# Wait on the cwd (the last field to settle: it is served from the pane's
+# cached pwd, T111b); when it shows, the window and pane rows are there too.
+$list = Wait-ListMatch ([regex]::Escape('C:\Windows'))
 Assert "second window registered" ($list -match '\[target: p1ide\]')
 Assert "named pane registered" ($list -match '\[name: p1term\]')
 Assert "cwd honored" ($list -match [regex]::Escape('C:\Windows'))
@@ -77,8 +101,7 @@ Assert "cwd honored" ($list -match [regex]::Escape('C:\Windows'))
 "== 4: -e direct exec"
 & $Exe +new-window --target=p1exec -e cmd /K echo p1-direct 2>&1 | Out-Null
 Assert "exit 0" ($LASTEXITCODE -eq 0)
-Start-Sleep -Seconds 2
-$list = Get-List
+$list = Wait-ListMatch '\[target: p1exec\]'
 Assert "exec window registered" ($list -match '\[target: p1exec\]')
 
 "== 5: json shape"
@@ -134,11 +157,15 @@ Assert "window count grew" ($after -eq ($before + 1))
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
+} 2>&1 | Tee-Object -FilePath $transcript
+
 ""
 if ($script:failures -eq 0) {
     "P1 ACCEPTANCE: ALL PASS"
     exit 0
 } else {
-    "P1 ACCEPTANCE: $script:failures FAILURE(S)"
+    $trailer = "P1 ACCEPTANCE: $script:failures FAILURE(S) - details: $transcript"
+    Add-Content $transcript $trailer
+    $trailer
     exit 1
 }
