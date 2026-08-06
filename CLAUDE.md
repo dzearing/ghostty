@@ -83,10 +83,15 @@ ghoztty +sessions --json
 Send text input to a named pane's terminal PTY.
 
 ```
-ghoztty +send-keys --target=<name> <text|key>...
+ghoztty +send-keys --target=<name> [flags] <text|key>...
 ```
 
+> **To submit, end the text with `\n`** — `ghoztty +send-keys --target=t "prompt\n"`.
+> (`--enter`, or a separate `Enter` argument, do the same thing. Use one, not
+> two — they stack, and two of them submit twice.)
+
 - `--target`: Named pane or window to send input to. Required.
+- `--enter`: Press Enter after the text. Same as a trailing `\n` or a trailing `Enter` argument. On its own, with no text, it just presses Enter.
 - `--when-idle`: Poll the target pane's recent output every 500ms until it no longer contains `esc to interrupt` (Claude Code's busy marker) before sending; sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
 - Positional arguments are text or key names, written to the PTY in order.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
@@ -94,9 +99,18 @@ ghoztty +send-keys --target=<name> <text|key>...
 - Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
 
 ```bash
+ghoztty +send-keys --target=term "hello\tworld\n"   # types, then submits
 ghoztty +send-keys --target=term "ls -la" Enter
+ghoztty +send-keys --target=term --enter "ls -la"
 ghoztty +send-keys --target=term C-c
-ghoztty +send-keys --target=term "hello\tworld\n"
+```
+
+**A trailing newline is a keypress; an interior one is content.** The trailing run of `\n`/`\r` is peeled off the text and delivered as that many Enter presses, so `"a\nb\n"` pastes two lines and then submits. This runs after escape processing, so `\n` written as the two-character escape and a real newline byte behave identically. The accepted cost: there is no way to paste text ending in a literal newline without submitting — a trailing newline in a paste means "commit" essentially always, and a program that has not enabled bracketed paste sees `\r` mapped back to `\n` by the tty's `ICRNL` anyway.
+
+**Any unknown `--flag` is a hard error** (exit 1), naming the three submit spellings. `--press-enter` used to become a text positional and get typed into the pane at exit 0, which is how agents got this wrong without noticing. Single-dash arguments (`-la`, `-p`) are ordinary text. To send literal text starting with `--`, put it after a bare `--`, which stops flag parsing but not key notation:
+
+```bash
+ghoztty +send-keys --target=term -- "--not-a-flag" Enter
 ```
 
 **Text and keys stay distinguishable.** Argument boundaries survive all the way to the write. When a call mixes text with keys, adjacent arguments of the same kind merge into a run, and each **text** run is written to the pane as a **bracketed paste** (`ESC[200~` … `ESC[201~`) while each **key** run is written bare, outside the frame.
@@ -130,6 +144,21 @@ ghoztty +set-state --target=dev --state=idle
 ```
 
 Processes can also set state via OSC escape sequence: `\033]7777;<state>\007`
+
+**An agent should not set the state of its own pane.** The installed hooks own
+it (`macos/Resources/Ghoztty/hooks/ghoztty-activity-state.sh`, the single owner
+of the `needs_input` > `busy` > `idle` ordering), including holding the pane
+`busy` while background subagents outlive the main loop — `Stop` fires when the
+main loop goes quiet, not when the work ends. Live subagents are tracked as one
+marker file each under `/tmp/ghoztty-<runtime>-agents-<session_id>/`, recovered
+either by the owner pid baked into the filename or by a missed heartbeat past
+`GHOZTTY_AGENT_STALE_MIN` minutes (default 30, which must exceed the longest
+single *tool call*). `+set-state` is for *other* panes. Tests:
+`scripts/test-activity-state.sh`.
+
+Wired for Claude Code; Copilot CLI gets only the session-start sweep and the
+settle, because its event vocabulary for tool/subagent/permission hooks is not
+documented (see `CopilotHookSpec`).
 
 ### `ghoztty +set-banner`
 
