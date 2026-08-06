@@ -9191,3 +9191,25 @@ because a concurrent session's in-flight chrome edit (duplicate `px` in
 `caption_layout.zig`) kept the main tree from compiling; that is their WIP,
 not a defect to file. Follow-up T498 files the same audit for the non-agent
 lanes.
+
+## 2026-08-05 — T258 done: a test waiting for bytes that never come now fails red instead of freezing the lane
+
+The flake's two faces were one defect: the pre-T346 spin waits could expire
+before the server thread ran, and depending on which wait lost the race the
+test either asserted against bytes that had not arrived (the `expected 6,
+found 0` failures) or — when the resume gate stayed shut — waited for a DATA
+frame that would never be framed, wedging forever in the test loopback
+`ByteFifo.read`'s untimed `cond.wait`. That second face is the ~11-minute
+flat-CPU hang T205/T311 hit in the win32 lane (same tests run there). T346
+fixed the arrival waits; this task removed the wedge machinery: the loopback's
+client-read direction now carries a 30s liveness deadline
+(`error.LoopbackReadTimeout` names the waiting test), the WEDGE test's
+`gate_entered.wait()` is bounded the same way, and a unit test covers
+timeout/data/EOF. Negative proof: recreating the exact hang shape (resume
+never sent) failed red in ~30s naming FLOW pause, where pre-fix it wedged
+until killed. Validation: agent lane 10/10 consecutive PASS
+(`floor-lane.ps1 -Lane agent -Repeat 10`); none + win32 PASS in an isolated
+worktree at HEAD + this diff (the main tree still carries another session's
+in-flight chrome edits). P1–P3 not run: test-only diff, `ghoztty.exe`
+unaffected. T498 extended to hunt the same untimed-fifo pattern in the
+non-agent test harnesses.

@@ -2119,6 +2119,14 @@ const ByteFifo = struct {
     buf: std.ArrayList(u8) = .empty,
     head: usize = 0,
     closed: bool = false,
+    /// When set, `read` on an empty fifo gives up after this long with
+    /// `error.LoopbackReadTimeout` instead of blocking forever. A liveness
+    /// bound like `waitUntil`'s (T346), not a performance assertion: generous
+    /// enough that a loaded box cannot spend it, so it only fires when the
+    /// awaited bytes NEVER come — the T258 hang, where a test wedged ~11 min
+    /// in this wait with no failure text. Left null on the agent-side
+    /// direction, where idling between frames is the normal state.
+    read_deadline_ns: ?u64 = null,
     alloc: Allocator,
 
     fn init(alloc: Allocator) ByteFifo {
@@ -2139,8 +2147,17 @@ const ByteFifo = struct {
     fn read(self: *ByteFifo, dst: []u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.head == self.buf.items.len and !self.closed) {
-            self.cond.wait(&self.mutex);
+        if (self.read_deadline_ns) |deadline_ns| {
+            var timer = std.time.Timer.start() catch unreachable;
+            while (self.head == self.buf.items.len and !self.closed) {
+                const elapsed = timer.read();
+                if (elapsed >= deadline_ns) return error.LoopbackReadTimeout;
+                self.cond.timedWait(&self.mutex, deadline_ns - elapsed) catch {};
+            }
+        } else {
+            while (self.head == self.buf.items.len and !self.closed) {
+                self.cond.wait(&self.mutex);
+            }
         }
         const avail = self.buf.items[self.head..];
         if (avail.len == 0) return 0;
@@ -2167,11 +2184,22 @@ const Loopback = struct {
     client_to_agent: ByteFifo,
     agent_to_client: ByteFifo,
 
+    /// Liveness bound for the CLIENT-read direction (agent → client). Every
+    /// test wait for a frame — handshake reply, `waitControl`, `nextData` —
+    /// funnels through this one read, so bounding it means a frame that never
+    /// arrives fails the waiting test red instead of wedging the whole lane
+    /// (T258: ~11 minutes of flat CPU, killed by hand, no failure text). The
+    /// agent-side direction stays unbounded: a server idling between client
+    /// frames is the normal state, and close() wakes it at teardown.
+    const client_read_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
     fn init(alloc: Allocator) Loopback {
-        return .{
+        var lb: Loopback = .{
             .client_to_agent = ByteFifo.init(alloc),
             .agent_to_client = ByteFifo.init(alloc),
         };
+        lb.agent_to_client.read_deadline_ns = client_read_deadline_ns;
+        return lb;
     }
     fn deinit(self: *Loopback) void {
         self.client_to_agent.deinit();
@@ -2209,6 +2237,24 @@ const Loopback = struct {
         self.agent_to_client.close();
     }
 };
+
+test "ByteFifo: a deadlined read fails cleanly instead of wedging" {
+    // The T258 hang: a test whose expected frame never arrives used to block
+    // forever in ByteFifo.read's untimed cond.wait — 11 minutes of flat CPU
+    // with no failure text until something killed the lane. A bounded read
+    // turns that wedge into a red assert that names the waiting test.
+    var fifo = ByteFifo.init(testing.allocator);
+    defer fifo.deinit();
+    fifo.read_deadline_ns = 50 * std.time.ns_per_ms;
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.LoopbackReadTimeout, fifo.read(&buf));
+    // Data present → returned normally; the deadline is a liveness bound only.
+    _ = try fifo.write("ok");
+    try testing.expectEqual(@as(usize, 2), try fifo.read(&buf));
+    // Closed → EOF (0), never a timeout error.
+    fifo.close();
+    try testing.expectEqual(@as(usize, 0), try fifo.read(&buf));
+}
 
 // --- A fixed test clock -------------------------------------------------------
 
@@ -2697,7 +2743,9 @@ test "WEDGE: a session's blocking child write must NOT hold the global store loc
     // Send keystrokes: the agent's data thread enters child.writeAll and BLOCKS
     // there (gate held), modeling a stalled input pipe.
     try h.client.sendDataInput(opened.channel, 0, "exit\r");
-    gate_entered.wait(); // the data thread is now inside the blocking write
+    // Bounded for the same reason as Loopback's client reads (T258): if the
+    // DATA never reaches the gated write, fail here red rather than wedge.
+    try gate_entered.timedWait(Loopback.client_read_deadline_ns); // the data thread is now inside the blocking write
 
     // THE ASSERTION: with that write in flight, the global store lock must be FREE.
     // Pre-fix the data thread holds store.mutex for the whole blocked write, so a
