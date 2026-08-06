@@ -9457,3 +9457,19 @@ no-match message). T98's fix is the same plumbing, confirmed done.
 Validation: pane-id.ps1 ALL PASS (incl. new A7-A9), floor-lane all three
 lanes PASS (none 164s / win32 190s / agent 185s), P1-P3 ALL PASS
 sequentially, re-run on the final binary after the --tty hint edit.
+
+## 2026-08-06 - T369 closed as a T443 duplicate: the terminal.search recursive panic is the armed-watch ghost, 0 repro in 20+3 runs
+
+The 2026-08-02 win32-lane abort in terminal.search.screen 'simple search
+with history' is the T443 crash class, not a separate defect: exit code 5
+is the T444 truncation of 0xC0000005, the recursive panic is Zig's panic
+handler dying while reporting that AV (which is what ate the diagnostic),
+and the shape - intermittent AV in core terminal/PageList memory during a
+floor-lane run, gone on re-run - matches T317 exactly. Measurement at HEAD:
+floor-lane all three lanes PASS (none 159s / win32 190s / agent 185s),
+P1-P3 ALL PASS sequentially, then a 20-run soak of the win32 test binary at
+concurrency 5 with 0 crashes. Cumulative crash-free count on the class is
+now 110+ runs. The task's eaten-diagnostic concern needs no new work: T444
+(exit-code decode) and T450 (cdb crash-catch) are verified wired into
+floor-lane.ps1, so the next natural occurrence captures itself. Data point
+appended to T443's ARMED-WATCH LOG; no new tasks needed.
