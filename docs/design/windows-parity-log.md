@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T185 done - a cmd pane's cwd now tracks the user live: +list
+  and ctrl+n/tab/split follow every `cd` instead of reporting the starting
+  directory forever.** Root cause: the pane pwd is OSC-7-fed, and cmd.exe has
+  no prompt hook, so the value stayed at the termio seed for the pane's whole
+  life (pwsh was already live via the T27 integration). Fix: a `pwd_reported`
+  flag on the win32 Surface, set only by the `.pwd` action (i.e. a real OSC 7
+  arrived); when it is false, `+list` and the `newConfig` inherit seam read
+  the shell PROCESS's real cwd via a new shared PEB-read module
+  (`src/os/process_cwd.zig`, factored out of the agent's `queryCwdWindows` —
+  pty_child now delegates). cmd/bash chdir on every `cd` so the PEB value is
+  live; the fallback stands down the moment OSC 7 shows up, so integrated
+  shells are untouched, and it is two bounded syscalls with no ghoztty lock
+  (T111b-safe). The config `working-directory` override also feeds the local
+  agent's OPEN (the T144 seam), so exec and agent panes behave identically.
+  Validation: unit tests (own-process round-trip + bogus-pid), and
+  `new-window-cwd.ps1` section F — seed a cmd pane in dir A, `cd /d` to dir B,
+  assert +list follows (F4) and a REAL ctrl+n lands in B, shell-verified
+  (F11/F12) — ALL PASS with A–E unregressed; floor lanes + P1–P3 green.
+  Filed: T511 (Mac half — same fallback for non-integrated shells, seat mac),
+  T512 (cmd PROMPT `$E` integration for title/prompt marks; composes with
+  this fix — its OSC 7 would flip `pwd_reported` and retire the fallback).
+
 - 2026-08-06 - **T362 closed as a duplicate of T443 - the font.Collection
   'add full' exit-5 flake is the fourth victim-test sighting of the armed-watch
   ghost, and the font code is clean.** The 2026-08-02 win32-lane crash (exit 5

@@ -4210,7 +4210,15 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     const surface = core_surface.rt_surface;
-                    if (surface.core_surface_ready) surface.setPwd(value.pwd);
+                    if (surface.core_surface_ready) {
+                        surface.setPwd(value.pwd);
+                        // T185: this action only ever fires on a REAL OSC 7
+                        // report (the initial termio seed pushes no action),
+                        // so its arrival is the signal that this shell
+                        // tracks its cwd live and the OS-level fallback
+                        // (`livePwd`) must stand down.
+                        surface.pwd_reported = true;
+                    }
                 },
             }
             return true;

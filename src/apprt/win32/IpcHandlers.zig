@@ -1538,6 +1538,14 @@ fn buildNode(
             // startup with no action: the first `+list` to see a pane seeds
             // that, and no `+list` after it takes a terminal lock at all.
             const pwd: []const u8 = pwd: {
+                // T185: a shell that never reports OSC 7 (cmd.exe) leaves
+                // the cache frozen at its STARTING directory — ask the OS
+                // for the shell process's real cwd instead, which tracks
+                // the user's `cd`s. Null (shell reports OSC 7, no pid, or
+                // read failure) falls through to the cached path. This is
+                // two bounded syscall reads with no ghoztty lock, so the
+                // T111b "no terminal mutex in +list" rule holds.
+                if (surface.livePwd(arena)) |live| break :pwd live;
                 if (surface.pwd) |cached| break :pwd cached;
                 // Cache miss: this is the ONLY path in `+list` that can touch
                 // a terminal lock, so GHOZTTY_PERF names the leaf and times

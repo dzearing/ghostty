@@ -27,6 +27,7 @@ pub const ipc_client = @import("ipc_client.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
 pub const path_env = @import("path_env.zig");
+pub const process_cwd = @import("process_cwd.zig");
 pub const passwd = @import("passwd.zig");
 pub const user_env = @import("user_env.zig");
 pub const xdg = @import("xdg.zig");
@@ -76,6 +77,7 @@ test {
     _ = ipc_client;
     _ = path;
     _ = path_env;
+    _ = process_cwd;
     _ = uri;
     _ = shell;
     _ = user_env;

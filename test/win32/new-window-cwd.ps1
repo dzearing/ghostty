@@ -254,6 +254,25 @@ function Pane-ById($tree, $id) {
     }
     return $null
 }
+# Poll +list until the named window's first pane reports the wanted
+# working_directory (T185: the live value can lag a `cd` by one poll).
+# Returns the last value seen either way, so the assertion message names it.
+function Wait-PaneCwd($tmp, $tag, $target, $want, $timeoutSec = 30) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $last = ''
+    $i = 0
+    while ((Get-Date) -lt $deadline) {
+        $tree = Get-Tree $tmp "$tag-$i"
+        $i++
+        $pane = Pane-In $tree $target
+        if ($null -ne $pane) {
+            $last = $pane.working_directory
+            if ((Norm $last) -eq (Norm $want)) { return $last }
+        }
+        Start-Sleep -Milliseconds 700
+    }
+    return $last
+}
 function Wait-WindowCount($tmp, $tag, $want, $timeoutSec = 60) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $tree = $null
@@ -479,6 +498,66 @@ Wait-WindowCount $tmpE 'e' 1 60 | Out-Null
 Assert "E2 the zero-byte config was replaced by the template" ((Get-Item $cfgE).Length -gt 0)
 Assert "E3 the template content is the documented one" `
     ((Out-Text $cfgE) -match 'ghostty.org/docs/config')
+Stop-TestProcs
+
+# ============================================================================
+"== F: +list and ctrl+n track a cmd pane's LIVE directory (T185)"
+# ============================================================================
+# cmd.exe never reports OSC 7 (it has no prompt hook), so the app's cached pwd
+# used to stay frozen at the pane's STARTING directory forever - `+list`
+# answered with where the pane began, and ctrl+n reopened there, no matter
+# where the user had `cd`ed. The fix reads the shell PROCESS's real cwd (PEB)
+# whenever no OSC 7 was ever seen. cd somewhere else; both consumers follow.
+$workDir2 = Join-Path $root 'workdir2'
+New-Item -ItemType Directory -Force $workDir2 | Out-Null
+Assert "F0 the second directory differs from the first (non-vacuous)" `
+    ((Norm $workDir2) -ne (Norm $workDir))
+$tmpF = New-State 'f' $null
+$appF = Launch $tmpF $true
+$treeF0 = Wait-WindowCount $tmpF 'f0' 1 60
+Assert "F1 the app opened its startup window" ((Windows-Of $treeF0).Count -ge 1)
+
+Run-Cli "+new-window --target=livewin --title=LIVEWIN --working-directory=$workDir" "$tmpF\livewin.txt" 40 | Out-Null
+$treeF1 = Wait-WindowCount $tmpF 'f1' 2 40
+Assert "F2 the seeded window opened" ($null -ne (Pane-In $treeF1 'livewin'))
+$cwdF1 = Wait-PaneCwd $tmpF 'f1b' 'livewin' $workDir 30
+AssertEq "F3 +list reports the starting directory before any cd" (Norm $workDir) (Norm $cwdF1)
+
+# The user moves. No OSC 7 will ever announce this - only the process knows.
+Run-Cli "+send-keys --target=livewin `"cd /d $workDir2`" Enter" "$tmpF\cd-f.txt" 15 | Out-Null
+$cwdF2 = Wait-PaneCwd $tmpF 'f2' 'livewin' $workDir2 30
+AssertEq "F4 +list follows the cd (live process cwd, not the frozen seed)" `
+    (Norm $workDir2) (Norm $cwdF2)
+
+# And ctrl+n from that pane lands where the user IS, not where the pane began.
+$treeF2 = Get-Tree $tmpF 'f3'
+$beforeF = Window-Ids $treeF2
+$idLive = Window-IdOf $treeF2 'livewin'
+Assert "F5 the live window is addressable by name in +list" ($null -ne $idLive)
+$hwndLive = if ($null -ne $idLive) { [IntPtr][int64]$idLive } else { [IntPtr]::Zero }
+Focus-TestWindow -Window $hwndLive | Out-Null
+Start-Sleep -Milliseconds 300
+$surfF = [IntPtr](Get-TestFocusedWindow -Window $hwndLive)
+Assert "F6 the window forwarded focus to a terminal surface" `
+    (($surfF -ne [IntPtr]::Zero) -and ((Get-TestWindowClass -Window $surfF) -eq 'GhozttyTerminal'))
+$sentF = Send-TestKeys -Window $hwndLive -Target $surfF -Modifiers ctrl -Key N
+Assert "F7 ctrl+n was injected (harness positive control)" $sentF
+
+$treeF4 = Wait-WindowCount $tmpF 'f4' 3 40
+Assert "F8 ctrl+n created a window" ((Windows-Of $treeF4).Count -ge 3)
+$newIdF = $null
+foreach ($id in (Window-Ids $treeF4)) { if ($beforeF -notcontains $id) { $newIdF = $id } }
+Assert "F9 the new window is identifiable" ($null -ne $newIdF)
+$paneF = Pane-ById $treeF4 $newIdF
+Assert "F10 the new window has a pane" ($null -ne $paneF)
+$cwdF3 = if ($null -ne $paneF) { $paneF.working_directory } else { '' }
+AssertEq "F11 ctrl+n inherited the LIVE directory, not the starting one" `
+    (Norm $workDir2) (Norm $cwdF3)
+if ($null -ne $paneF) {
+    $shellF = Shell-Cwd $tmpF 'f5' $paneF.name 45
+    AssertEq "F12 the new pane's SHELL agrees with what +list reported" `
+        (Norm $workDir2) (Norm $shellF)
+}
 Stop-TestProcs
 
 # ---- teardown --------------------------------------------------------------

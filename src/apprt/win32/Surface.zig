@@ -180,6 +180,15 @@ title: ?[:0]u8 = null,
 /// "not cached yet" put `+list` back on the pane's mutex on every call.
 pwd: ?[:0]u8 = null,
 
+/// True once this pane's shell has ACTUALLY reported its working directory
+/// via OSC 7 (the `.pwd` action) — i.e. the shell tracks the user's `cd`s
+/// live (pwsh via the T27 integration, bash/zsh, any OSC-7-emitting
+/// program). False means `pwd` above is frozen at the starting directory
+/// termio seeded (cmd.exe has no prompt hook and can never report), so
+/// consumers that want the CURRENT directory must ask the OS for the shell
+/// process's real cwd instead (`livePwd`, T185).
+pwd_reported: bool = false,
+
 /// Non-null while the user has manually set this pane's title ("Change
 /// Pane Title…" prompt, T92). Holds the last terminal-reported title so
 /// clearing the manual title restores it; while set, setTitle updates
@@ -555,6 +564,22 @@ pub fn init(
     // Create a config copy for this surface.
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
+
+    // T185: `newConfig` inherited the focused pane's OSC-7 pwd, which for a
+    // shell that never reports (cmd.exe has no prompt hook) is frozen at
+    // that pane's STARTING directory. When the focused pane's shell tracks
+    // its cwd only in the OS (`pwd_reported` false), override with the
+    // shell process's real cwd so ctrl+n / new tab / split land where the
+    // user actually is. This runs BEFORE the IPC overrides below, so an
+    // explicit `--working-directory` still wins. The same config value is
+    // what T144 forwards to the local agent's OPEN, so the override covers
+    // exec and agent panes alike.
+    if (apprt.surface.shouldInheritWorkingDirectory(context, &app.config)) live: {
+        const prev = app.core_app.focusedSurface() orelse break :live;
+        const carena = config._arena.?.allocator();
+        const live = prev.rt_surface.livePwd(carena) orelse break :live;
+        config.@"working-directory" = .{ .path = live };
+    }
 
     // Capture the focused surface's live (possibly ctrl+scroll-zoomed)
     // font size for `window-inherit-font-size` (Mac parity: embedded.zig
@@ -1266,6 +1291,23 @@ pub fn shellPid(self: *Surface) u32 {
             return std.math.cast(u32, pid) orelse 0;
         },
     }
+}
+
+/// The pane's shell process's REAL current working directory, read from the
+/// OS (T185) — the live answer for shells that never report OSC 7. cmd.exe
+/// (and bash, nu, …) call SetCurrentDirectory/chdir on every `cd`, so the
+/// PEB value tracks the user where the OSC-7 seed stays frozen at the
+/// starting directory forever. Returns null when the shell HAS reported
+/// OSC 7 (the cached `pwd` is already live and, for pwsh, the process cwd
+/// would be the stale one), when there is no shell pid, or when the read
+/// fails — callers then fall back to the cached value. Takes no ghoztty
+/// locks (two syscall reads on the shell pid), so it is safe in the
+/// `+list` hot path (T111b).
+pub fn livePwd(self: *Surface, alloc: Allocator) ?[]u8 {
+    if (self.pwd_reported) return null;
+    const pid = self.shellPid();
+    if (pid == 0) return null;
+    return internal_os.process_cwd.fromPid(pid, alloc);
 }
 
 /// True when this pane's shell is sitting idle — nothing is running under it,

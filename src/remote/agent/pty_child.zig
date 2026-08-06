@@ -682,66 +682,11 @@ fn queryCwdLinux(pid: posix.pid_t, alloc: Allocator) ?[]u8 {
 
 /// Windows: read the child's `PEB->ProcessParameters->CurrentDirectory.DosPath`.
 /// `handle` here is the child's process HANDLE (POSIX `pid_t == windows.HANDLE`).
-///
-///   1. `NtQueryInformationProcess(ProcessBasicInformation)` → `PebBaseAddress`.
-///   2. `ReadProcessMemory` the child's PEB → `ProcessParameters` pointer.
-///   3. `ReadProcessMemory` the `RTL_USER_PROCESS_PARAMETERS` →
-///      `CurrentDirectory.DosPath` (a `UNICODE_STRING`).
-///   4. `ReadProcessMemory` its UTF-16 buffer and convert to UTF-8.
-///
-/// We use the std `PEB` / `RTL_USER_PROCESS_PARAMETERS` / `UNICODE_STRING` ABI
-/// types (no hand-rolled offsets) and the std `ReadProcessMemory` wrapper. This
-/// is the standard cross-process cwd read; every read is bounds-checked against
-/// the untrusted child and any failure returns null (never crashes).
+/// The PEB walk itself lives in `os/process_cwd.zig` (shared with the app's
+/// T185 live-cwd fallback for `+list`/window-inherit).
 fn queryCwdWindows(handle: posix.pid_t, alloc: Allocator) ?[]u8 {
     if (builtin.os.tag != .windows) return null;
-
-    // 1. PEB base address via NtQueryInformationProcess.
-    var pbi: windows.PROCESS_BASIC_INFORMATION = undefined;
-    var ret_len: windows.ULONG = 0;
-    const st = windows.ntdll.NtQueryInformationProcess(
-        handle,
-        .ProcessBasicInformation,
-        &pbi,
-        @sizeOf(windows.PROCESS_BASIC_INFORMATION),
-        &ret_len,
-    );
-    if (st != .SUCCESS) return null;
-
-    // 2. Read the child's PEB, then take ProcessParameters (a remote pointer).
-    var peb: windows.PEB = undefined;
-    _ = windows.ReadProcessMemory(
-        handle,
-        @ptrCast(pbi.PebBaseAddress),
-        std.mem.asBytes(&peb),
-    ) catch return null;
-    const pp_addr = @intFromPtr(peb.ProcessParameters);
-    if (pp_addr == 0) return null;
-
-    // 3. Read the RTL_USER_PROCESS_PARAMETERS; take CurrentDirectory.DosPath.
-    var params: windows.RTL_USER_PROCESS_PARAMETERS = undefined;
-    _ = windows.ReadProcessMemory(
-        handle,
-        @ptrFromInt(pp_addr),
-        std.mem.asBytes(&params),
-    ) catch return null;
-
-    const us = params.CurrentDirectory.DosPath; // UNICODE_STRING
-    const buf_ptr = us.Buffer orelse return null;
-    const wlen: usize = us.Length / 2; // Length is in BYTES
-    // A path far over MAX_PATH*2 is bogus; reject it (untrusted child).
-    if (wlen == 0 or wlen > 32768) return null;
-
-    // 4. Read the UTF-16 path buffer out of the child and convert to UTF-8.
-    const wbuf = alloc.alloc(u16, wlen) catch return null;
-    defer alloc.free(wbuf);
-    _ = windows.ReadProcessMemory(
-        handle,
-        @ptrCast(buf_ptr),
-        std.mem.sliceAsBytes(wbuf),
-    ) catch return null;
-
-    return std.unicode.utf16LeToUtf8Alloc(alloc, wbuf) catch null;
+    return internal_os.process_cwd.fromHandle(handle, alloc);
 }
 
 // -----------------------------------------------------------------------------
