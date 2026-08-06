@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T382 done - the task picker now resolves dependencies
+  THROUGH `skipped(split -> ...)` parents, so it can no longer hand out a task
+  whose real prerequisites are still todo**: `Get-SplitChildren` extracts
+  child ids from every split spelling the tracker actually holds (plain and
+  JSON-escaped arrows, "split into A + B", slashes, prose after ids, and the
+  T89b-T89i letter-range shorthand - expanded, so the never-written middle
+  child still counts) and `Get-OpenDeps` recurses through splits-of-splits
+  with a cycle guard; `next`'s blocked report names the open CHILDREN
+  (`T3(needs T1[open: T5])`), and `validate` prints informational SPLIT DEP
+  lines without failing (a task waiting on a split is a legitimate state).
+  Non-split skips (duplicate/obsolete) satisfy exactly as before. On the live
+  tracker validate immediately surfaced 4 real misroutes the old code hid:
+  T164 (via T90g) and T394/T396/T397 (via T90f) all resolve through splits
+  waiting on open children. New acceptance
+  test/win32/parity-tasks-split-deps.ps1 ALL PASS (20 asserts);
+  parity-tasks-seat.ps1 still ALL PASS. Filed T518: should
+  skipped(duplicate/obsolete -> X) redirect through X the same way?
 - 2026-08-06 - **T245 done - `ghoztty +verb > file` from PowerShell now
   captures the output instead of silently writing 0 bytes**: PowerShell keys
   its wait-and-redirect decision on the PE subsystem field, so no child-side

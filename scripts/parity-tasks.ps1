@@ -285,6 +285,58 @@ function Test-Done {
     return ($StatusValue -match '^(done|skipped)')
 }
 
+# A dependency on a `skipped(split -> Ta, Tb)` parent is really a dependency on
+# ALL of its children: the parent's work moved into them, it did not end (T382).
+# Splitting happens BEFORE the work, so the children always have higher ids than
+# the tasks that depended on the parent - resolving the parent as "done" offered
+# the dependent first, every time. A non-split skip (duplicate, obsolete,
+# no-op) still satisfies as before: that work genuinely ended.
+#
+# The status string is the only place a split is recorded, and its formats vary
+# in the wild ("split -> T372, T373", "split into T189 + T190",
+# "split T111a/T111b", the T89b-T89i letter-range shorthand), so children are
+# extracted as id tokens rather than by parsing one arrow style.
+function Get-SplitChildren {
+    param([string]$StatusValue)
+    if ($StatusValue -notmatch '^skipped\(\s*split\b') { return @() }
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]'
+    # Letter ranges expand first: "T89b-T89i" (hyphen, en or em dash - built
+    # from [char] codes to keep this file ASCII-only) names every child from
+    # b to i, not just its two endpoints.
+    $dashClass = '[' + [char]0x2013 + [char]0x2014 + '-]'
+    foreach ($m in [regex]::Matches($StatusValue, ('\b[Tt](\d+)([a-z])\s*' + $dashClass + '\s*[Tt]\1([a-z])\b'))) {
+        $num = $m.Groups[1].Value
+        $from = [int][char]$m.Groups[2].Value[0]
+        $to = [int][char]$m.Groups[3].Value[0]
+        for ($i = $from; $i -le $to; $i++) { [void]$ids.Add("T$num" + [char]$i) }
+    }
+    # Then every plain id token, whatever the separators and prose around it.
+    foreach ($m in [regex]::Matches($StatusValue, '\b[Tt]\d+[a-z]?\d*\b')) {
+        [void]$ids.Add('T' + $m.Value.Substring(1))
+    }
+    return @($ids)
+}
+
+# The still-open leaves a dependency resolves to; empty means satisfied. A
+# todo/in-progress/blocked dep is its own open leaf; done is satisfied; skipped
+# resolves through its split children, recursively (a split of a split is
+# normal: T89f -> T89f1/T89f2). Unknown ids are ignored - same rule as `next`
+# has always applied to a dep with no file - and the visited set makes a
+# malformed cycle terminate instead of recursing forever.
+function Get-OpenDeps {
+    param([string]$DepId, [hashtable]$ById, [hashtable]$Visited)
+    if ($Visited.ContainsKey($DepId)) { return @() }
+    $Visited[$DepId] = $true
+    if (-not $ById.ContainsKey($DepId)) { return @() }
+    $status = $ById[$DepId].Status
+    if (-not (Test-Done $status)) { return @($DepId) }
+    $open = @()
+    foreach ($c in (Get-SplitChildren $status)) {
+        $open += @(Get-OpenDeps -DepId $c -ById $ById -Visited $Visited)
+    }
+    return $open
+}
+
 # --------------------------------------------------------------- commands ---
 
 switch ($Command) {
@@ -401,8 +453,15 @@ switch ($Command) {
             if (-not (Test-SeatMatch $t.Seat $wantSeat)) { continue }
             $unmet = @()
             foreach ($d in $t.Deps) {
-                if (-not $byId.ContainsKey($d)) { continue }   # unknown dep: ignore, don't block
-                if (-not (Test-Done $byId[$d].Status)) { $unmet += $d }
+                # Resolves through skipped(split ...) parents (T382): a dep is
+                # met only when its transitive leaves are done. Unknown deps
+                # are still ignored, not blocking - Get-OpenDeps owns that rule.
+                $open = @(Get-OpenDeps -DepId $d -ById $byId -Visited @{})
+                if ($open.Count -eq 0) { continue }
+                # Name the real blockers: "T90d[open: T374+T375]" says the
+                # split parent is waiting on those children, not on itself.
+                if ($open.Count -eq 1 -and $open[0] -eq $d) { $unmet += $d }
+                else { $unmet += ("{0}[open: {1}]" -f $d, ($open -join '+')) }
             }
             if ($unmet.Count -eq 0) {
                 Write-Host ("NEXT: {0} - {1}" -f $t.Id, $t.Title)
@@ -632,6 +691,19 @@ switch ($Command) {
             foreach ($d in $t.Deps) {
                 if (-not $byId.ContainsKey($d)) {
                     Write-Host ("DANGLING DEP: {0} -> {1}" -f $t.Id, $d); $problems++
+                }
+                elseif ($t.Status -match '^(todo|in-progress)') {
+                    # A dep satisfied only on paper - a skipped(split) parent
+                    # whose children are still open - is the misroute T382
+                    # exists to end. Said out loud, but informational: a task
+                    # waiting on a split is a legitimate queue state, not a
+                    # broken file, so it must not fail the tracker.
+                    if ((Test-Done $byId[$d].Status)) {
+                        $open = @(Get-OpenDeps -DepId $d -ById $byId -Visited @{})
+                        if ($open.Count -gt 0) {
+                            Write-Host ("SPLIT DEP: {0} -> {1} resolves through a split with open children: {2} (next will not offer {0} until they are done)" -f $t.Id, $d, ($open -join ', '))
+                        }
+                    }
                 }
             }
             if ($t.Status -notmatch '^(todo|in-progress|done|blocked|skipped)') {
