@@ -35,6 +35,33 @@ Concretely, in order, with no stops in between:
      never wedges the loop.
    - `scripts\go-loop-exec.ps1 list` shows every window and which are marked.
 
+0.5. **Daily digest** (user, 2026-08-05) — before picking a task, check
+   `docs/design/windows-parity-digests/<today>.md` (local date). If it is
+   **5am or later** and today's file does not exist, write it now; then carry
+   on with the turn. Rules:
+
+   - **One file per day, today only — never backfill.** If the loop was down
+     for three days, the next turn writes today's digest and nobody writes the
+     missing two: a digest is a morning read, not a ledger, and a backfilled
+     reflection is fiction.
+   - It renders in the dashboard's **Daily digest** view (markdown: headings,
+     lists, bold, links). Frontmatter: just `date: "YYYY-MM-DD"`.
+   - **Audience: the user, over coffee.** Plain language, no task-id soup —
+     name a task id only when they might click it. What it covers:
+     - **Yesterday** — what actually landed (from the log and the tracker's
+       activity), and what it means for the end goal, not a commit list.
+     - **Today's focus** — what the queue says comes next and why that is the
+       right next thing.
+     - **Reflection** — a genuine step back: how the work has been going,
+       common themes across recent tasks and decisions, what keeps recurring.
+       Are tools missing? Skills missing? Is the UX clean? Which gaps still
+       stand between here and **merging back into main**? Think out of the
+       box; propose process changes, not just code changes.
+     - **Decisions** — anything filed for the user's call, and any directives
+       from recently resolved ones that should steer the day.
+   - Write it from evidence (the log, `git log` since yesterday 5am, the
+     dashboard payload, resolved decisions), not from memory of the session.
+
 1. **Pick up a task — ONE command, which also claims it:**
 
    ```
@@ -50,6 +77,40 @@ Concretely, in order, with no stops in between:
    could not name what it was doing (user, 2026-08-04: *"why is the loop status
    not getting updated"*). Picking and claiming are one act; they are now one
    command, which is the only version that cannot be half-done.
+
+   **If it answers `RESUME:` instead of `NEXT:`, that IS your task** (user,
+   2026-08-05). One agent runs this queue at a time, so a task still
+   in-progress when a turn starts is a stale claim — the turn that made it
+   died (crash, reboot, reset) or forgot to close out. Two bluescreens on
+   2026-08-05 left T496/T497 exactly there: in-progress with no agent, half
+   the fix uncommitted in the tree, and nothing telling the next turn. On a
+   RESUME, **reassess before you build**: read the task's `## Progress log`,
+   run `git status`/`git diff` on the files its Where section names, and
+   decide from evidence whether to keep-and-finish the uncommitted work or
+   reset it and restart clean. If the task should NOT be resumed (superseded,
+   wrong approach), record why with `note` and set it back to `todo` — never
+   just take fresh work over the top of a stale claim.
+
+   **Journal as you work.** `next -Claim` writes the first `## Progress log`
+   entry for you; add one at each meaningful step:
+
+   ```
+   powershell -NoProfile -File scripts\parity-tasks.ps1 note T144 -Text "root cause: X; fix going into Y" -Session <your-session-id>
+   ```
+
+   At minimum: after the root cause / design is settled, after the build,
+   after validation, and whenever something surprising changes the plan
+   (include ids of any tasks you filed). This is not ceremony — the progress
+   log is what the RESUME path reads when a turn dies mid-task, and
+   `validate` fails an in-progress task that has none. Pass `-Session` with
+   your session id when you know it, so a stale task names the conversation
+   that was working it.
+
+   **Tag it when you file it.** `new -Tags fix,polish` (closed set: `feature`
+   / `fix` / `polish` / `perf` / `test` / `infra` / `docs` / `security`) —
+   tags are how the dashboard tells user-facing work from internal work at a
+   glance. When you claim an untagged task, add tags to its frontmatter as
+   part of making it readable.
 
    `next` picks by **`order:`** (the queue, lowest first), then `priority:`,
    then id — so the head of the queue is one task, not a band of forty.
@@ -90,6 +151,13 @@ Concretely, in order, with no stops in between:
    they can read: no ConPTY, no repaint, no task ids. Write it for someone
    who has never opened this repo. Tick the goals as you go, so the card
    shows progress rather than a frozen list.
+
+   **And give it validation criteria.** Every task carries a `## Validation
+   criteria` checklist (`new` scaffolds it; add one to older files when you
+   claim them): the observable checks that prove the task is done. Step 4
+   ticks them — each tick names HOW it was verified (which script, which
+   lane, which manual check). The dashboard's task detail view renders this
+   checklist, so "what was validated" is answerable without the diff.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
    `zig build test` lanes, `zig build test-agent`, P1–P3). Run the three zig
@@ -114,7 +182,7 @@ Concretely, in order, with no stops in between:
    powershell -NoProfile -File scripts\parity-decisions.ps1 new ^
        -Title "<the question, phrased as a question>" -Task T123 ^
        -Assumed "<what you did meanwhile, so work continued>" ^
-       -Options "Do X (Recommended)::Pros: ... Cons: ... Mitigation: ...;;Do Y::Pros: ... Cons: ... Mitigation: ..." ^
+       -Options "Do X (Recommended)::Pros: a | b::Cons: c::Mitigation: d;;Do Y::Pros: e::Cons: f | g" ^
        -Why "<what forced the choice, in two or three sentences>"
    ```
 
@@ -131,22 +199,26 @@ Concretely, in order, with no stops in between:
    one and then wait: keep going, exactly as before.
 
    Write it for someone who has not seen the code. `-Why` states what forced
-   the choice. Each option carries **Pros:** and **Cons:** — a list without
-   both is not a choice, it is a quiz — and where a con can be reduced, a
-   **Mitigation:** naming the extra work that reduces it ("adds complexity"
-   → a thorough design pass to make sure the shape is the one that scales;
-   "touches shared core" → cross-platform tests on both lanes first). If the
-   mitigation is real work, file it with `parity-tasks.ps1 new` so picking
-   that option does not silently drop its safety net.
+   the choice. Each option carries **Pros:** and **Cons:** lists (`|` between
+   items) — a list without both is not a choice, it is a quiz — and where a
+   con can be reduced, a **Mitigation:** naming the extra work that reduces
+   it ("adds complexity" → a thorough design pass to make sure the shape is
+   the one that scales; "touches shared core" → cross-platform tests on both
+   lanes first). If the mitigation is real work, file it with
+   `parity-tasks.ps1 new` so picking that option does not silently drop its
+   safety net. The dashboard renders these as bulleted Pros/Cons columns, so
+   keep each item one crisp clause, not a paragraph.
 
-   Exactly ONE option's label ends in **"(Recommended)"**: the pick that best
-   balances robustness, performance, user experience, scale over time, and
-   stability, with the fewest sacrifices. **Implementation effort and time
-   are NEVER part of that balance** (user directive, 2026-08-05): we have
-   time to get things right, and what a choice costs in engineering hours is
-   not what it costs the customer. "Cheapest" and "fastest" are not pros;
-   "no named experiment left that could produce information" is a valid con,
-   because that is about evidence, not effort.
+   Exactly ONE option's label ends in **"(Recommended)"**, and that option is
+   **listed first**: the pick that best balances robustness, performance,
+   user experience, scale over time, and stability, with the fewest
+   sacrifices. **Implementation effort and time are NEVER part of that
+   balance** (user directive, 2026-08-05): we have time to get things right,
+   and what a choice costs in engineering hours is not what it costs the
+   customer. "Cheapest" and "fastest" are not pros; "no named experiment left
+   that could produce information" is a valid con, because that is about
+   evidence, not effort. (`parity-decisions.ps1` sorts the recommended option
+   to the front and warns if the flag count is not exactly one.)
 6. **Update the tracker** — `scripts\parity-tasks.ps1 set-status <id> -Status
    done -Commit <sha>`, evidence into that task's own file, ONE log entry in
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1

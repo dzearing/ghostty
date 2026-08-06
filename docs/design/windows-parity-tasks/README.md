@@ -36,6 +36,7 @@ deps: ["T89h"]
 status: "todo"
 commits: []
 seat: "win"
+tags: ["fix"]
 ---
 
 # T144 — New windows (ctrl+n) open in C:\Windows\System32
@@ -47,6 +48,17 @@ What is wrong, the evidence, the fix, and how it will be validated.
 ## Details
 
 Spec, design notes, on-box evidence. Grows as the task is worked.
+
+## Validation criteria
+
+- [ ] The observable checks that prove this is done. Tick each as it is
+      verified, and say HOW it was verified (which script, which lane,
+      which manual check) next to the tick.
+
+## Progress log
+
+- 2026-08-05 09:12: claimed; work starting.
+- 2026-08-05 09:40: root cause found in X; writing the fix in Y. Filed T201.
 ```
 
 | Field | Meaning |
@@ -58,6 +70,35 @@ Spec, design notes, on-box evidence. Grows as the task is worked.
 | `status` | `todo` / `in-progress` / `done` / `blocked(<what>)` / `skipped(<why>)` |
 | `commits` | Commit hashes that delivered it. |
 | `seat` | Which box can do the work: `win` (default when absent) / `mac` / `any`. |
+| `tags` | Categories, from a closed set: `feature` / `fix` / `polish` / `perf` / `test` / `infra` / `docs` / `security`. Optional (pre-tag files have none); an unknown tag fails `validate`. The dashboard shows them on activity cards and in the task detail view, so a reader can tell user-facing work (`feature`/`fix`/`polish`) from internal work at a glance. |
+
+## Progress log + stale in-progress resume (2026-08-05)
+
+Two bluescreens killed loop turns mid-task and left tasks marked
+`in-progress` with no agent on them, half-done work uncommitted, and no
+record of where the turn had got to. Two rules close that hole:
+
+- **Journal as you work.** `parity-tasks.ps1 note T144 -Text "..."` appends a
+  timestamped line to the task's `## Progress log` (creating the section if
+  needed; `-Session <id>` stamps which conversation wrote it). `next -Claim`
+  writes the first entry automatically. Add one at each meaningful step —
+  root cause found, fix built, validation run, surprise hit — so a dead turn
+  leaves a trail, not a bare status.
+- **A stale claim is resumed, never orphaned.** This queue runs ONE agent at
+  a time, so any task still `in-progress` when `next -Claim` runs is a stale
+  claim by definition. `next -Claim` hands that task back (output `RESUME:`
+  instead of `NEXT:`) with instructions to reassess from its progress log and
+  `git status` before either finishing it or noting why and resetting it to
+  `todo`. Plain `next` stays read-only and just prints an `IN FLIGHT:` line.
+  `validate` fails an in-progress task with no `## Progress log`.
+
+## Validation criteria (2026-08-05)
+
+Every task carries a `## Validation criteria` checklist — the observable
+checks that prove it is done (`new` scaffolds it). The turn that lands the
+task ticks each criterion **with how it was verified**. The dashboard's task
+detail view shows the checklist, so "what validation was done" is answerable
+without reading the diff.
 
 ## Seats (T344, 2026-08-02)
 

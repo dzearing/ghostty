@@ -9231,3 +9231,24 @@ surviving sites at fresh line numbers), and every build on this box logs a
 poisoned zig-global-cache timestamp warning — filed as T499 (P3). The main
 tree still carries another session's in-flight chrome edits; only tracker
 files are committed here.
+
+
+## 2026-08-05 - T501+T502 done: the tracker survives a crashed turn, and the dashboard grew tags + a task detail view
+
+Interactive session (not the loop; the loop was mid-T183 in its own pane).
+Trigger: two bluescreens today killed loop turns mid-task and left T496/T497
+in-progress with no agent and ~600 uncommitted lines nobody was told about.
+T501: one agent runs the queue, so `next -Claim` now detects any in-progress
+task as a stale claim and hands it back (`RESUME:`) with reassessment
+instructions; `note` journals timestamped progress-log entries (claim seeds
+the first); `validate` fails a log-less in-progress task. T183/T496/T497
+seeded with evidence-based assessments. T502: `tags:` frontmatter (closed
+vocabulary), tag chips across the dashboard, and the task dialog became a
+real L2 view - rendered markdown, goals/validation/progress sections,
+Related row, inline task-id links; activity cards click through. Dirty-file
+mtimes now count toward staleness so the task being worked right now no
+longer reads "stale". Validation: parity-tasks-seat.ps1 A-M ALL PASS,
+dashboard selftest ALL PASS, real tracker validate ALL PASS (533), headless
+Edge screenshots of both views inspected. Filed T503 (tag backfill, P2).
+Only tracker/dashboard/protocol files committed; the chrome edits from the
+crashed T496/T497 turn stay uncommitted for their resuming turn to assess.

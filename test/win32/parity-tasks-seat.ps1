@@ -26,6 +26,12 @@
 #      rather than as 0 (which would silently seize the head).
 #   L. `next -Claim` marks the picked task in-progress in the same breath;
 #      plain `next` stays a read-only question.
+#   M. Stale in-progress resume (2026-08-05): one agent runs the queue, so a
+#      task still in-progress when `next -Claim` runs is a stale claim and is
+#      handed BACK (RESUME:) instead of new work; plain `next` only reports it
+#      (IN FLIGHT:). `note` appends timestamped progress-log entries; a claim
+#      seeds the log; `new -Tags` writes tags and validate rejects a bogus one;
+#      an in-progress task with no progress log fails validate.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -329,6 +335,60 @@ Assert 'the file is now in-progress' (
     [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md')) -match '(?m)^status: "in-progress"$')
 $r = Task-Run @('next')
 Assert 'a claimed task is no longer offered' ($r.Out -notmatch 'NEXT: T3\b')
+
+# --- M. stale in-progress resume + progress log + tags ------------------------
+""
+"M. stale resume, note, tags"
+# From section L, T3 is in-progress (claimed) and T4/T2/T1/T5 are todo. A new
+# turn's `next -Claim` must hand T3 BACK rather than claim fresh work.
+$r = Task-Run @('next', '-Claim')
+Assert 'next -Claim resumes the stale in-progress task' ($r.Code -eq 0 -and $r.Out -match 'RESUME: T3\b')
+Assert 'resume does not claim new work' ($r.Out -notmatch 'CLAIMED:')
+Assert 'resume says how to reassess' ($r.Out -match 'Progress log' -and $r.Out -match 'git status')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md'))
+Assert 'the claim seeded a progress log' ($txt -match '(?m)^## Progress log\s*$')
+Assert 'the resume appended its own entry' ($txt -match 'stale in-progress claim picked up')
+
+# Plain `next` stays read-only: it reports the in-flight task and still
+# answers with the queue head.
+$r = Task-Run @('next')
+Assert 'plain next reports IN FLIGHT' ($r.Out -match 'IN FLIGHT: T3\b')
+Assert 'plain next still answers with a todo' ($r.Out -match 'NEXT: T\d')
+
+# `note` appends a timestamped entry, with an optional session stamp.
+$r = Task-Run @('note', 'T3', '-Text', 'built the thing; validating next', '-Session', 'sess-42')
+Assert 'note exits 0' ($r.Code -eq 0)
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md'))
+Assert 'note appended the text' ($txt -match 'built the thing; validating next')
+Assert 'note stamped the session' ($txt -match '\[session sess-42\]')
+Assert 'entries are timestamped' ($txt -match '(?m)^- \d{4}-\d{2}-\d{2} \d{2}:\d{2}')
+# Entries land inside the section, in chronological order.
+Assert 'the new entry follows the claim entry' (
+    $txt.IndexOf('built the thing') -gt $txt.IndexOf('claimed; work starting'))
+
+# An in-progress task with no progress log fails validate.
+New-FixtureTask -Id 'T90' -Status 'in-progress'
+$r = Task-Run @('validate')
+Assert 'in-progress without a progress log fails validate' ($r.Code -eq 1 -and $r.Out -match 'NO PROGRESS LOG: T90')
+Remove-Item (Join-Path $fixture 'T90.md') -Force
+
+# Tags: `new -Tags` writes the field, an unknown tag is refused at mint time,
+# and a bogus tag in a file fails validate.
+$n = New-AndRead @('-Tags', 'fix,polish')
+Assert 'new -Tags exits 0' ($n.Code -eq 0)
+Assert 'new -Tags writes the list' ($n.Text -match '(?m)^tags: \["fix", "polish"\]$')
+Assert 'new scaffolds validation criteria' ($n.Text -match '(?m)^## Validation criteria$')
+$r = Task-Run @('new', '-Title', 'bogus tag', '-Tags', 'testing')
+Assert 'an unknown tag is refused at mint time' ($r.Code -ne 0 -or $r.Out -match 'Unknown tag')
+New-FixtureTask -Id 'T91'
+$p91 = Join-Path $fixture 'T91.md'
+$t91 = [System.IO.File]::ReadAllText($p91) -replace '(?m)^commits: \[\]$', ("commits: []`ntags: [""banana""]")
+[System.IO.File]::WriteAllText($p91, $t91, (New-Object System.Text.UTF8Encoding $false))
+$r = Task-Run @('validate')
+Assert 'a bogus tag in a file fails validate' ($r.Code -eq 1 -and $r.Out -match "ODD TAG: T91 = 'banana'")
+Remove-Item $p91 -Force
+$r = Task-Run @('validate')
+Assert 'the fixture is clean again' ($r.Code -eq 0)
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }

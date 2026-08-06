@@ -35,12 +35,14 @@ const { execFileSync } = require('child_process');
 const REPO = path.resolve(__dirname, '..');
 const REL_TASK_DIR = 'docs/design/windows-parity-tasks';
 const REL_DECISION_DIR = 'docs/design/windows-parity-decisions';
+const REL_DIGEST_DIR = 'docs/design/windows-parity-digests';
 const REL_INDEX = 'docs/design/windows-parity-tasks.md';
 // Same escape hatch the PowerShell scripts carry (-TaskDir / -DecisionDir, and
 // GHOSTTY_HOST_DEFAULTS before them): point a run at fixtures so the write
 // paths can be exercised without filing junk into the real tracker.
 const TASK_DIR = process.env.GHOZTTY_TASK_DIR || path.join(REPO, ...REL_TASK_DIR.split('/'));
 const DECISION_DIR = process.env.GHOZTTY_DECISION_DIR || path.join(REPO, ...REL_DECISION_DIR.split('/'));
+const DIGEST_DIR = process.env.GHOZTTY_DIGEST_DIR || path.join(REPO, ...REL_DIGEST_DIR.split('/'));
 const PAGE = path.join(__dirname, 'task-dashboard.page.html');
 const CACHE = path.join(REPO, 'temp', 'task-dashboard-history.json');
 
@@ -177,6 +179,16 @@ function loadTasks() {
       // These two sections are the readable version.
       plain: extractSection(text.slice(fm.bodyStart), 'In plain terms'),
       goals: parseGoals(extractSection(text.slice(fm.bodyStart), 'Goals')),
+      // Category tags from the closed vocabulary (parity-tasks.ps1 $ValidTags).
+      // Optional — the pre-tag tracker has none — and shown on activity cards
+      // and the detail view so user-facing work reads apart from internal.
+      tags: Array.isArray(F.tags) ? F.tags.map(String) : [],
+      // The task's `## Progress log`: timestamped journal lines the loop
+      // appends as it works (go.md step 1), which is what makes a task whose
+      // turn died resumable. Last few only — the full log is in /api/task.
+      progress: parseProgress(extractSection(text.slice(fm.bodyStart), 'Progress log')),
+      // Validation criteria checklist — same shape as goals.
+      validation: parseGoals(extractSection(text.slice(fm.bodyStart), 'Validation criteria')),
       file: REL_TASK_DIR + '/' + f,
     });
   }
@@ -232,19 +244,69 @@ function loadDecisions() {
 function parseOptions(fmText) {
   const out = [];
   let inOpts = false;
+  let list = null; // which of pros/cons/mitigation the current "- item" lines belong to
   for (const line of fmText.split(/\r?\n/)) {
     if (/^options:\s*\[\s*\]\s*$/.test(line)) return [];
     if (/^options:\s*$/.test(line)) { inOpts = true; continue; }
     if (!inOpts) continue;
     if (/^[A-Za-z]/.test(line)) break; // next top-level key
     let m = /^\s*-\s*key:\s*(.+)$/.exec(line);
-    if (m) { out.push({ key: m[1].trim(), label: '', detail: '' }); continue; }
+    if (m) { out.push({ key: m[1].trim(), label: '', detail: '', pros: [], cons: [], mitigation: [] }); list = null; continue; }
     m = /^\s+label:\s*(.+)$/.exec(line);
-    if (m && out.length) { out[out.length - 1].label = parseValue(m[1]) || ''; continue; }
+    if (m && out.length) { out[out.length - 1].label = parseValue(m[1]) || ''; list = null; continue; }
     m = /^\s+detail:\s*(.+)$/.exec(line);
-    if (m && out.length) { out[out.length - 1].detail = parseValue(m[1]) || ''; }
+    if (m && out.length) { out[out.length - 1].detail = parseValue(m[1]) || ''; list = null; continue; }
+    m = /^\s+(pros|cons|mitigation):\s*$/.exec(line);
+    if (m && out.length) { list = m[1]; continue; }
+    m = /^\s+-\s+(.+)$/.exec(line);
+    if (m && out.length && list) { out[out.length - 1][list].push(String(parseValue(m[1]) || '')); }
   }
   return out;
+}
+
+/**
+ * Daily digests: one markdown file per day (YYYY-MM-DD.md), written by the
+ * loop's 5am step (go.md, "Daily digest") or the tracker-startup catch-up.
+ * The list is every date newest-first; only the NEWEST body ships in the poll
+ * payload — older ones are a /api/digest fetch away, because the page shows
+ * one at a time and yesterday's prose in every poll would be dead weight.
+ */
+function digestDates() {
+  let files = [];
+  try {
+    files = fs.readdirSync(DIGEST_DIR).filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f));
+  } catch {
+    return [];
+  }
+  return files.map((f) => f.slice(0, -3)).sort().reverse();
+}
+
+function readDigest(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  let text;
+  try {
+    text = fs.readFileSync(path.join(DIGEST_DIR, date + '.md'), 'utf8');
+  } catch {
+    return null;
+  }
+  const fm = parseFrontmatter(text);
+  return { date, body: (fm ? text.slice(fm.bodyStart) : text).trim() };
+}
+
+/**
+ * `## Progress log` entries -> [{ts, text}], newest LAST (file order is
+ * chronological). Lines look like `- 2026-08-05 09:12 [session abc]: text`;
+ * the timestamp and session stamp are both optional so a hand-written line
+ * still shows up rather than vanishing. Only the last few ship in the poll
+ * payload — the cards show recent steps, the dialog fetches the whole file.
+ */
+function parseProgress(section) {
+  const out = [];
+  for (const line of String(section || '').split(/\r?\n/)) {
+    const m = /^\s*-\s*(?:(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s*)?(?:\[session ([^\]]+)\]\s*)?:?\s*(.+?)\s*$/.exec(line);
+    if (m && m[3]) out.push({ ts: m[1] ? Date.parse(m[1]) || null : null, session: m[2] || null, text: stripMarkdown(m[3]) });
+  }
+  return out.slice(-6);
 }
 
 /** A markdown checklist -> [{done, text}]. Anything else in the section is ignored. */
@@ -521,6 +583,13 @@ function buildActivity(points, taskById, decisions) {
     const filed = (p.filed || []).filter((id) => taskById.has(id));
     if (!done.length && !filed.length) continue;
     const gap = i > 0 ? p.ts - points[i - 1].ts : null;
+    // The card's tags are the union of its completed tasks' tags (falling
+    // back to filed-task tags for a filing-only commit) — so a reader can
+    // tell a user-facing landing from a test-only one without opening it.
+    const tagSet = new Set();
+    for (const id of done.length ? done : filed) {
+      for (const tg of (taskById.get(id) || {}).tags || []) tagSet.add(tg);
+    }
     items.push({
       kind: 'work',
       ts: p.ts,
@@ -532,6 +601,7 @@ function buildActivity(points, taskById, decisions) {
       summary: (p.body || '').split(/\n\s*\n/)[0].replace(/\s+/g, ' ').trim(),
       completed: done.map((id) => ({ id, title: name(id) })),
       filed: filed.map((id) => ({ id, title: name(id) })),
+      tags: [...tagSet],
       durationMs: gap != null && gap > 0 && gap <= MAX_PLAUSIBLE_TURN_MS ? gap : null,
     });
   }
@@ -884,20 +954,25 @@ function buildPayload() {
   const loop = loopState();
   const watchdog = watchdogState();
 
-  // Date the file was last touched, for in-progress and blocked tasks only —
-  // that is what tells a 20-minute-old "in progress" apart from a five-day-old
-  // one nobody ever reset.
-  const STALE_MS = 24 * 3600 * 1000;
-  for (const t of tasks) {
-    if (t.bucket !== 'in_progress' && t.bucket !== 'blocked') continue;
-    t.touchedAt = lastTouched(t.file);
-    t.staleMs = t.touchedAt ? now - t.touchedAt : null;
-    t.stale = t.bucket === 'in_progress' && t.staleMs != null && t.staleMs > STALE_MS;
-  }
-
   // Created / modified for every task, so the table can sort on them.
   const dates = fileDates();
   const dirty = dirtyTasks();
+
+  // Date the file was last touched, for in-progress and blocked tasks only —
+  // that is what tells a 20-minute-old "in progress" apart from a five-day-old
+  // one nobody ever reset. A DIRTY file's git date is stale by definition (the
+  // active turn edits the file long before it commits), so the filesystem
+  // mtime wins there — without this the task being worked right now reads as
+  // "stale, untouched for days" the moment a turn runs long.
+  const STALE_MS = 24 * 3600 * 1000;
+  for (const t of tasks) {
+    if (t.bucket !== 'in_progress' && t.bucket !== 'blocked') continue;
+    const gitTs = lastTouched(t.file);
+    const fsTs = dirty.has(t.id) ? statDates(t.file).modified : null;
+    t.touchedAt = Math.max(gitTs || 0, fsTs || 0) || null;
+    t.staleMs = t.touchedAt ? now - t.touchedAt : null;
+    t.stale = t.bucket === 'in_progress' && t.staleMs != null && t.staleMs > STALE_MS;
+  }
   for (const t of tasks) {
     const g = dates.get(t.id);
     const fsd = g && !dirty.has(t.id) ? null : statDates(t.file);
@@ -912,8 +987,11 @@ function buildPayload() {
     priorities.set(key, (priorities.get(key) || 0) + 1);
   }
 
+  const digests = digestDates();
   const week = now - 7 * 864e5;
   return {
+    digests,
+    digest: digests.length ? readDigest(digests[0]) : null,
     priorities: ['P0', 'P1', 'P2', 'untriaged'].map((p) => ({ priority: p, open: priorities.get(p) || 0 })),
     generatedAt: now,
     pageVersion: pageVersion(),
@@ -1036,6 +1114,9 @@ function handlePost(url, body) {
     const args = ['new', '-Title', title.slice(0, 300)];
     if (body.summary) args.push('-Summary', String(body.summary).slice(0, 4000));
     if (body.seat) args.push('-Seat', must(body.seat, /^(win|mac|any)$/, 'seat'));
+    if (Array.isArray(body.tags) && body.tags.length) {
+      args.push('-Tags', body.tags.map((t) => must(t, /^[a-z]+$/, 'tag')).join(','));
+    }
     return { ok: true, message: ps('parity-tasks.ps1', args) };
   }
   throw new Error('unknown endpoint');
@@ -1081,6 +1162,14 @@ function serve(port) {
           file: REL_TASK_DIR + '/' + id + '.md',
           body: fm ? text.slice(fm.bodyStart) : text,
         }));
+      }
+      if (url === '/api/digest') {
+        const date = new URL(req.url, 'http://x').searchParams.get('date') || '';
+        const d = readDigest(date); // readDigest validates the shape, so no traversal
+        if (!d) {
+          return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'no digest for ' + date }));
+        }
+        return send(res, 200, 'application/json; charset=utf-8', JSON.stringify(d));
       }
       if (url === '/' || url === '/index.html') {
         return send(res, 200, 'text/html; charset=utf-8', fs.readFileSync(PAGE, 'utf8'));
@@ -1161,6 +1250,18 @@ function selfTest() {
 
     w = watchdogState(write({ watchdog_pid: process.pid, tick_at: iso(30e3), poll_seconds: 300, last_tick: 'nudge' }));
     check('W7 the last tick action is reported', w.lastTick === 'nudge');
+
+    // Progress-log parsing (go.md journaling): the resume path and the
+    // in-flight card both read these, so the shapes the tooling writes —
+    // and the hand-written degradations — must all parse.
+    let pr = parseProgress('- 2026-08-05 09:12: claimed; work starting.\n- 2026-08-05 09:40 [session abc-123]: root cause found.\n- a hand-written line with no stamp\nnot a list line, ignored');
+    check('P1 a stamped entry parses ts + text', pr[0].ts != null && pr[0].text === 'claimed; work starting.');
+    check('P2 a session stamp is captured', pr[1].session === 'abc-123' && pr[1].text === 'root cause found.');
+    check('P3 an unstamped line still shows up', pr[2].ts == null && /hand-written/.test(pr[2].text));
+    check('P4 non-list lines are ignored', pr.length === 3);
+    pr = parseProgress(Array.from({ length: 10 }, (_, i) => '- 2026-08-05 09:0' + (i % 10) + ': step ' + i).join('\n'));
+    check('P5 only the newest few ship in the payload', pr.length === 6 && /step 9/.test(pr[5].text));
+    check('P6 an absent section is an empty log', parseProgress('').length === 0);
   } finally {
     fs.rmSync(tmp, { force: true });
   }

@@ -22,20 +22,39 @@
   scripts\parity-tasks.ps1 next
   scripts\parity-tasks.ps1 next -Seat mac
   scripts\parity-tasks.ps1 show T144
-  scripts\parity-tasks.ps1 new -Title "Fix the thing" -Deps T73,T94
+  scripts\parity-tasks.ps1 new -Title "Fix the thing" -Deps T73,T94 -Tags fix,polish
+  scripts\parity-tasks.ps1 note T144 -Text "caption_layout re-pinned; next: slab fills"
   scripts\parity-tasks.ps1 set-order T377 -Order 2
   scripts\parity-tasks.ps1 set-order T500 -Order 2.5   # inject without renumbering
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
     [string]$Id,
 
     [string]$Status,
+
+    # Category tags, for reading the tracker at a glance: which tasks are
+    # user-facing vs perf vs test-only. `new -Tags fix,polish` writes them;
+    # the dashboard shows them on activity cards and in the task detail view.
+    # Vocabulary is closed (see $ValidTags) so the same idea cannot be spelled
+    # three ways.
+    [string[]]$Tags,
+
+    # `note` appends one timestamped line to the task's `## Progress log`.
+    # The loop journals meaningful steps there (claimed, built, validated,
+    # surprises) so a turn that dies mid-task leaves a trail the next turn can
+    # resume from instead of a bare "in-progress" and a pile of uncommitted
+    # files.
+    [string]$Text,
+
+    # Optional session/conversation id stamped into progress notes, so a stale
+    # task can be traced back to the conversation that was working it.
+    [string]$Session,
 
     # P0 severe (crash, hang, data loss, a broken feature) | P1 feature work and
     # UX polish | P2 infra and nice-to-have. `next` picks P0 before P1 before
@@ -94,6 +113,12 @@ $ValidSeats = @('win', 'mac', 'any')
 $DefaultPriority = 'P1'
 $ValidPriorities = @('P0', 'P1', 'P2')
 
+# The closed tag vocabulary. feature/fix/polish are the user-facing bands;
+# perf/test/infra/docs/security are the internal ones. Closed on purpose:
+# an open vocabulary grows "tests", "testing" and "test-quality" for one idea,
+# and then no filter matches all three.
+$ValidTags = @('feature', 'fix', 'polish', 'perf', 'test', 'infra', 'docs', 'security')
+
 # ---------------------------------------------------------------- parsing ---
 
 function ConvertFrom-Frontmatter {
@@ -151,8 +176,53 @@ function ConvertFrom-Frontmatter {
         Seat         = $seat
         Priority     = $priority
         TriageReason = & $unquote (& $get 'triage-reason')
+        Tags         = & $parseList (& $get 'tags')
         Path         = $Path
     }
+}
+
+# Append one timestamped entry to the task's `## Progress log`, creating the
+# section (at the end of the file) if it does not exist yet. Entries go at the
+# END of the section so the log reads top-down chronologically.
+function Add-ProgressNote {
+    param([string]$Path, [string]$NoteText, [string]$SessionId)
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    $who = if ($SessionId) { " [session $SessionId]" } else { '' }
+    $entry = "- ${stamp}${who}: $NoteText"
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    $m = [regex]::Match($text, '(?m)^## Progress log\s*$')
+    if ($m.Success) {
+        # Insert before the next section heading, or at EOF.
+        $after = $text.Substring($m.Index)
+        $next = [regex]::Match($after.Substring($m.Length), '(?m)^#{1,3} ')
+        $insertAt = if ($next.Success) { $m.Index + $m.Length + $next.Index } else { $text.Length }
+        $head = $text.Substring(0, $insertAt).TrimEnd() + "`n"
+        $tail = $text.Substring($insertAt)
+        if ($next.Success) { $new = $head + $entry + "`n`n" + $tail.TrimStart("`r", "`n") }
+        else { $new = $head + $entry + "`n" }
+    }
+    else {
+        $new = $text.TrimEnd() + "`n`n## Progress log`n`n$entry`n"
+    }
+    [System.IO.File]::WriteAllText($Path, $new, (New-Object System.Text.UTF8Encoding $false))
+}
+
+# Split, trim and validate a -Tags argument (which `-File` invocation hands
+# over as one comma-joined string, same as -Deps).
+function Get-TagList {
+    param([string[]]$Raw)
+    $out = @()
+    foreach ($t in $Raw) {
+        foreach ($piece in ($t -split ',')) {
+            $piece = $piece.Trim().ToLowerInvariant()
+            if (-not $piece) { continue }
+            if ($ValidTags -notcontains $piece) {
+                throw "Unknown tag '$piece' (want one of: $($ValidTags -join ', '))"
+            }
+            $out += $piece
+        }
+    }
+    return $out
 }
 
 # Sort key for `order:`. Unordered tasks sort after every ordered one, so
@@ -295,6 +365,36 @@ switch ($Command) {
         @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
         @{ Expression = { $_.Id } }
 
+        # ONE agent works this queue at a time, so any task already marked
+        # in-progress when a turn starts is a STALE claim: the turn that made
+        # it either died mid-task (crash, reboot, reset) or forgot to close it
+        # out. Handing out fresh work while that hangs would strand the
+        # half-done work in the tree - two bluescreens on 2026-08-05 left
+        # T496/T497 exactly there, in-progress with no agent and a pile of
+        # uncommitted changes nobody was told about (user, 2026-08-05).
+        # `next -Claim` therefore RESUMES the stale task instead of picking a
+        # new one; plain `next` stays a read-only question and only reports.
+        $inflight = @($ordered | Where-Object { $_.Status -match '^in-progress' -and (Test-SeatMatch $_.Seat $wantSeat) })
+        if ($inflight.Count -gt 0) {
+            if ($Claim) {
+                $t = $inflight[0]
+                Write-Host ("RESUME: {0} - {1}" -f $t.Id, $t.Title)
+                $pri = if ($t.Priority) { $t.Priority } else { 'untriaged' }
+                $ord = if ($null -ne $t.Order) { $t.Order } else { 'unordered' }
+                Write-Host ("      order={0} priority={1} seat={2} (stale in-progress; one agent runs at a time, so nobody is on it)" -f $ord, $pri, $t.Seat)
+                Write-Host  "      Reassess before working: read its '## Progress log' and check git status/diff"
+                Write-Host  "      for its files. Then either resume it as this turn's task, or record why not"
+                Write-Host ("      (note {0} -Text ...) and set it back: set-status {0} -Status todo" -f $t.Id)
+                if ($inflight.Count -gt 1) {
+                    Write-Host ("      also in flight: " + (($inflight | Select-Object -Skip 1 | ForEach-Object { $_.Id }) -join ', ') + " (next turns get these)")
+                }
+                Write-Host ("      file: docs/design/windows-parity-tasks/{0}.md" -f $t.Id)
+                Add-ProgressNote -Path $t.Path -SessionId $Session -NoteText 'stale in-progress claim picked up by a new turn; reassessing from this log and git status before resuming.'
+                exit 0
+            }
+            Write-Host ("IN FLIGHT: " + (($inflight | ForEach-Object { $_.Id }) -join ', ') + " - in-progress with no agent on it; 'next -Claim' will resume it before offering new work.")
+        }
+
         $blocked = @()
         foreach ($t in $ordered) {
             if ($t.Status -notmatch '^todo') { continue }
@@ -316,6 +416,9 @@ switch ($Command) {
                     $claimed = [regex]::Replace($claimText, '(?m)^status:\s*.*$', 'status: "in-progress"', 1)
                     [System.IO.File]::WriteAllText($t.Path, $claimed, (New-Object System.Text.UTF8Encoding $false))
                     Write-Host ("      CLAIMED: {0} is now in-progress" -f $t.Id)
+                    # The first progress-log entry. If this turn dies, the next
+                    # one finds at least when the work started and by whom.
+                    Add-ProgressNote -Path $t.Path -SessionId $Session -NoteText 'claimed; work starting.'
                 }
                 if ($blocked.Count -gt 0) {
                     Write-Host ""
@@ -430,6 +533,12 @@ switch ($Command) {
         $seatValue = if ($Seat -and $Seat -ne 'all') { $Seat } else { $DefaultSeat }
         $priorityValue = if ($Priority) { $Priority } else { $DefaultPriority }
 
+        $tagList = Get-TagList $Tags
+        $tagsJson = '[]'
+        if ($tagList.Count -gt 0) {
+            $tagsJson = '[' + (($tagList | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ', ') + ']'
+        }
+
         # Allocate the next free id by CREATING the file atomically. A racing
         # agent that picked the same number loses the CreateNew and we retry,
         # so two sessions can never mint the same id.
@@ -461,6 +570,7 @@ switch ($Command) {
                     'commits: []'
                     ("seat: " + (ConvertTo-Json $seatValue -Compress))
                     ("priority: " + (ConvertTo-Json $priorityValue -Compress))
+                    "tags: $tagsJson"
                     '---'
                     ''
                     "# $tid - $Title"
@@ -468,6 +578,13 @@ switch ($Command) {
                     '## Summary'
                     ''
                     $body
+                    ''
+                    # Every task carries validation criteria from birth: the
+                    # observable checks that prove it is done. The turn that
+                    # lands it ticks them and records HOW each was verified.
+                    '## Validation criteria'
+                    ''
+                    '- [ ] TODO: the observable checks that prove this is done, ticked with evidence of how each was validated.'
                     ''
                 )
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
@@ -482,6 +599,14 @@ switch ($Command) {
 
         if (-not $created) { throw 'Could not allocate a task id.' }
         Write-Host ("created {0}: docs/design/windows-parity-tasks/{0}.md" -f $created)
+    }
+
+    'note' {
+        $tid = Get-TaskId $Id
+        if (-not $Text) { throw 'note requires -Text.' }
+        $path = Get-TaskPath $tid
+        Add-ProgressNote -Path $path -SessionId $Session -NoteText $Text
+        Write-Host ("{0}: progress note added" -f $tid)
     }
 
     'validate' {
@@ -516,6 +641,21 @@ switch ($Command) {
             # is exactly the silent stall this field exists to end.
             if ($ValidSeats -notcontains $t.Seat) {
                 Write-Host ("ODD SEAT: {0} = '{1}' (want one of: {2})" -f $t.Id, $t.Seat, ($ValidSeats -join ', ')); $problems++
+            }
+            # Tags are optional (the pre-tag tracker has none), but a tag
+            # outside the vocabulary is a typo that no filter will ever match.
+            foreach ($tag in $t.Tags) {
+                if ($ValidTags -notcontains $tag) {
+                    Write-Host ("ODD TAG: {0} = '{1}' (want one of: {2})" -f $t.Id, $tag, ($ValidTags -join ', ')); $problems++
+                }
+            }
+            # An in-progress task with no progress log is unresumable if its
+            # turn dies - which is the whole reason the log exists.
+            if ($t.Status -match '^in-progress') {
+                $bodyText = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
+                if ($bodyText -notmatch '(?m)^## Progress log\s*$') {
+                    Write-Host ("NO PROGRESS LOG: {0} is in-progress with no '## Progress log' section (add one: parity-tasks.ps1 note {0} -Text ...)" -f $t.Id); $problems++
+                }
             }
         }
 

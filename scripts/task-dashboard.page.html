@@ -164,6 +164,32 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .opt:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
 .opt b { font-weight: 600; font-size: 13px; display: block; }
 .opt span { color: var(--muted); font-size: 12px; }
+.opt .chip.rec { background: rgba(12, 163, 12, .14); color: var(--done); font-weight: 600; margin-left: 8px; vertical-align: 1px; }
+.opt.recommended { border-color: color-mix(in srgb, var(--done) 45%, transparent); }
+.pc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin-top: 8px; }
+@media (max-width: 700px) { .pc-grid { grid-template-columns: 1fr; } }
+.pc-head { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+.pc.pros .pc-head { color: var(--done); }
+.pc.cons .pc-head { color: var(--critical); }
+.pc.mit { margin-top: 8px; }
+.pc.mit .pc-head { color: var(--warning); }
+.pc-list { margin: 0; padding-left: 16px; color: var(--ink-2); font-size: 12px; }
+.pc-list li { margin: 2px 0; }
+
+/* Daily digest ------------------------------------------------------------ */
+.digest-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; }
+.digest-head select { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; }
+.md { font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+.md h1, .md h2, .md h3, .md h4 { color: var(--ink); line-height: 1.3; margin: 18px 0 6px; }
+.md h1 { font-size: 17px; } .md h2 { font-size: 15px; } .md h3 { font-size: 13px; } .md h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-2); }
+.md h1:first-child, .md h2:first-child { margin-top: 0; }
+.md p { margin: 8px 0; }
+.md ul, .md ol { margin: 8px 0; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md code { background: var(--surface-2); border-radius: 4px; padding: 1px 5px; font: 12px ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.md hr { border: 0; border-top: 1px solid var(--hairline); margin: 16px 0; }
+.md a { color: var(--open); }
+.md blockquote { margin: 8px 0; padding: 6px 12px; border-left: 3px solid var(--axis); background: var(--surface-2); border-radius: 0 6px 6px 0; }
 .dec-note { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .dec-note textarea { flex: 1 1 220px; min-height: 34px; font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 7px 9px; resize: vertical; }
 .dec-note textarea:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
@@ -222,6 +248,37 @@ td.fin, td.when { white-space: nowrap; color: var(--muted); font-variant-numeric
 .pri.P1 { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
   background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .pri.P2 { color: var(--ink-2); }
+
+/* Category tag chip: a dot plus the word. The color is never the only
+   signal — the label is always written — so tags survive greyscale. */
+.tag { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-2);
+  background: var(--surface-2); border-radius: 4px; padding: 1px 7px; white-space: nowrap; }
+.tag i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.tag.feature i { background: var(--open); }
+.tag.fix i { background: var(--critical); }
+.tag.polish i { background: #9a6fd0; }
+.tag.perf i { background: var(--warning); }
+.tag.test i { background: var(--done); }
+
+/* Progress-log lines on the in-flight card */
+.prog-line { font-size: 12px; color: var(--ink-2); padding: 2px 0; display: flex; gap: 8px; align-items: baseline; }
+.prog-ts { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 11px; }
+
+/* Clickable activity titles + task-id links inside rendered markdown */
+.ev-link { cursor: pointer; }
+.ev-link:hover { text-decoration: underline; }
+.tid-link { color: var(--open); text-decoration: none; }
+.tid-link:hover { text-decoration: underline; }
+.td-rel { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; font-size: 12px; margin: 0 0 10px; }
+.td-rel b { color: var(--muted); font-weight: 500; margin-right: 3px; }
+
+/* Fenced code + task-list checkboxes in rendered markdown */
+.md pre.code { background: var(--surface-2); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+.md pre.code code { background: none; padding: 0; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre; }
+.md li.task { list-style: none; display: flex; gap: 8px; align-items: flex-start; margin-left: -18px; }
+.md .cbox { width: 13px; height: 13px; flex: none; margin-top: 3px; border: 1px solid var(--axis); border-radius: 3px; font-size: 10px; line-height: 12px; text-align: center; color: transparent; }
+.md li.task.done .cbox { background: rgba(12, 163, 12, .16); border-color: var(--done); color: var(--done); }
+.md li.task.done { color: var(--muted); }
 
 /* Task detail dialog */
 dialog.taskdlg { width: min(820px, 92vw); max-height: 86vh; padding: 0; border: 1px solid var(--hairline);
@@ -325,7 +382,7 @@ var $ = function (s, r) { return (r || document).querySelector(s); };
 var themeParam = /[?&]theme=(light|dark)/.exec(location.search);
 if (themeParam) document.documentElement.setAttribute('data-theme', themeParam[1]);
 
-var VIEWS = ['activity', 'data', 'tasks'];
+var VIEWS = ['activity', 'digest', 'data', 'tasks'];
 var state = {
   data: null, sig: '', busy: false, pageVersion: null,
   sort: { key: 'order', dir: 1 }, // the work queue, head first
@@ -333,6 +390,8 @@ var state = {
   filters: { q: '', status: '', priority: '', seat: '' },
   open: {},        // expanded task rows
   notes: {},       // in-progress decision notes, kept across re-renders
+  digestDate: null,  // which digest is being read; null = newest
+  digestCache: {},   // date -> body, so flipping between days does not refetch
   shown: PAGE_SIZE // timeline paging
 };
 
@@ -388,6 +447,23 @@ function dayLabel(ts) {
   return fDate(ts);
 }
 var STATUS_LABEL = { done: 'Done', todo: 'To do', in_progress: 'In progress', blocked: 'Blocked', skipped: 'Skipped' };
+
+/* --- tags ---------------------------------------------------------------- */
+var TAG_TITLE = {
+  feature: 'user-facing: new capability', fix: 'user-facing: defect fix',
+  polish: 'user-facing: look and feel', perf: 'performance',
+  test: 'test quality', infra: 'infra / tooling', docs: 'documentation', security: 'security'
+};
+function tagChips(tags) {
+  return (tags || []).map(function (tg) {
+    return h('span', { class: 'tag ' + tg, title: TAG_TITLE[tg] || tg }, [h('i'), tg]);
+  });
+}
+function taskById(id) {
+  if (!state.data) return null;
+  var want = String(id || '').toUpperCase();
+  return state.data.tasks.filter(function (t) { return t.id.toUpperCase() === want; })[0] || null;
+}
 
 /* --- toast --------------------------------------------------------------- */
 var toastT;
@@ -653,15 +729,48 @@ function resolveDecision(d, answerKey) {
     .finally(function () { state.busy = false; });
 }
 
+/** "Label (Recommended)" -> { text, recommended } — the flag renders as a chip, not prose. */
+function splitRecommended(label) {
+  var m = /^(.*?)\s*\((recommended)\)\s*$/i.exec(label || '');
+  return m ? { text: m[1], recommended: true } : { text: label || '', recommended: false };
+}
+
+function pcList(title, items, cls) {
+  return h('div', { class: 'pc ' + cls }, [
+    h('div', { class: 'pc-head', text: title }),
+    h('ul', { class: 'pc-list' }, items.map(function (x) { return h('li', { text: x }); }))
+  ]);
+}
+
+/** An option's body: structured pros/cons/mitigation lists, or legacy detail prose. */
+function optionBody(o) {
+  var out = [];
+  if (o.detail) out.push(h('span', { text: o.detail }));
+  var cols = [];
+  if (o.pros && o.pros.length) cols.push(pcList('Pros', o.pros, 'pros'));
+  if (o.cons && o.cons.length) cols.push(pcList('Cons', o.cons, 'cons'));
+  if (cols.length) out.push(h('div', { class: 'pc-grid' }, cols));
+  if (o.mitigation && o.mitigation.length) out.push(pcList('To reduce the cons', o.mitigation, 'mit'));
+  return out;
+}
+
 function decisionCard(d) {
-  var opts = h('div', { class: 'opts' }, d.options.map(function (o, i) {
+  // Recommended first, whatever order the file has (user directive, 2026-08-05).
+  var ordered = d.options.slice().sort(function (a, b) {
+    return (splitRecommended(a.label).recommended ? 0 : 1) - (splitRecommended(b.label).recommended ? 0 : 1);
+  });
+  var opts = h('div', { class: 'opts' }, ordered.map(function (o, i) {
+    var lab = splitRecommended(o.label);
     return h('button', {
-      class: 'opt', type: 'button',
+      class: 'opt' + (lab.recommended ? ' recommended' : ''), type: 'button',
+      'data-anim-key': 'opt:' + d.id + ':' + o.key,
       onclick: function () { resolveDecision(d, o.key); }
     }, [
-      h('b', { text: (i + 1) + '. ' + o.label }),
-      o.detail ? h('span', { text: o.detail }) : null
-    ]);
+      h('b', null, [
+        (i + 1) + '. ' + lab.text,
+        lab.recommended ? h('span', { class: 'chip rec', text: 'Recommended' }) : null
+      ])
+    ].concat(optionBody(o)));
   }));
   var ta = h('textarea', {
     placeholder: 'Or say what to do instead…', rows: 1,
@@ -669,7 +778,7 @@ function decisionCard(d) {
     oninput: function (e) { state.notes[d.id] = e.target.value; }
   });
   ta.value = state.notes[d.id] || '';
-  return h('div', { class: 'dec' }, [
+  return h('div', { class: 'dec', 'data-anim-key': 'dec:' + d.id }, [
     h('div', { class: 'dec-top' }, [
       h('span', { class: 'dec-id', text: d.id }),
       h('span', { class: 'dec-title', text: d.title }),
@@ -803,8 +912,12 @@ function inflightRow(t) {
       h('span', { class: 'dec-id', text: t.id }),
       h('span', { class: 'pill in_progress' }, [h('i'), 'In progress']),
       t.stale ? h('span', { class: 'chip warn', text: 'stale — untouched ' + fDur(t.staleMs) } ) : null
-    ]),
-    h('div', { class: 'if-title', text: t.title })
+    ].concat(tagChips(t.tags))),
+    h('div', {
+      class: 'if-title ev-link', text: t.title, role: 'button', tabindex: '0',
+      onclick: function () { openTask(t); },
+      onkeydown: function (e) { if (e.key === 'Enter') openTask(t); }
+    })
   ];
   if (t.plain) {
     kids.push(h('div', { class: 'if-plain', text: t.plain }));
@@ -817,6 +930,17 @@ function inflightRow(t) {
       text: 'No plain-language summary yet. go.md step 1 asks the loop to write an “In plain terms” section when it claims a task.' }));
   }
   if (t.goals && t.goals.length) kids.push(goalList(t));
+  // The run so far, from the task's progress log — what a watcher (or the
+  // next turn, after a crash) reads to know where the work actually is.
+  if (t.progress && t.progress.length) {
+    kids.push(h('div', { class: 'goals' }, [h('div', { class: 'goals-head', text: 'Run log' })]
+      .concat(t.progress.slice(-3).map(function (p) {
+        return h('div', { class: 'prog-line' }, [
+          p.ts ? h('span', { class: 'prog-ts', text: fDay(p.ts) + ' ' + fTime(p.ts) }) : null,
+          h('span', { text: p.text })
+        ]);
+      }))));
+  }
   if (t.stale) {
     kids.push(h('div', { class: 'att-why',
       text: 'Marked in progress but its file has not changed in ' + fDur(t.staleMs) +
@@ -826,7 +950,7 @@ function inflightRow(t) {
         onclick: function () { setStatus(t, 'todo', 'reset to to-do'); } })
     ]));
   }
-  return h('div', { class: 'att-row in_progress' }, [h('i', { class: 'bar' }), h('div', null, kids)]);
+  return h('div', { class: 'att-row in_progress', 'data-anim-key': 'inf:' + t.id }, [h('i', { class: 'bar' }), h('div', null, kids)]);
 }
 
 /** A blocked task with the step that unblocks it — never a dead end. */
@@ -851,7 +975,7 @@ function blockedCard(t) {
   actions.push(h('button', { class: 'btn primary', type: 'button', text: 'Mark unblocked',
     onclick: function () { setStatus(t, 'todo', 'is unblocked and back in the queue'); } }));
   kids.push(h('div', { class: 'dec-note' }, actions));
-  return h('div', { class: 'dec blocked-dec' }, kids);
+  return h('div', { class: 'dec blocked-dec', 'data-anim-key': 'blk:' + t.id }, kids);
 }
 
 function activityView(d) {
@@ -865,20 +989,26 @@ function activityView(d) {
       : 'The loop files a decision here whenever it makes a judgement call you might want to overturn.' })
   ];
   var decBody = open.length ? open.map(decisionCard) : [h('div', { class: 'empty', text: 'No open decisions.' })];
-  out.push(h('section', { class: 'card' }, decHead.concat(decBody)));
+  out.push(h('section', { class: 'card', 'data-anim-key': 'card:decisions' }, decHead.concat(decBody)));
 
-  out.push(loopCard(d));
+  var lc = loopCard(d);
+  lc.setAttribute('data-anim-key', 'card:loop');
+  out.push(lc);
 
   var inflight = d.tasks.filter(function (t) { return t.bucket === 'in_progress'; });
   if (inflight.length) {
-    out.push(card('In flight', 'Tasks marked in progress. The loop marks one when it picks it up and clears it when it lands.',
-      [h('div', { class: 'att' }, inflight.map(inflightRow))]));
+    var ic = card('In flight', 'Tasks marked in progress. The loop marks one when it picks it up and clears it when it lands.',
+      [h('div', { class: 'att' }, inflight.map(inflightRow))]);
+    ic.setAttribute('data-anim-key', 'card:inflight');
+    out.push(ic);
   }
 
   var blocked = d.tasks.filter(function (t) { return t.bucket === 'blocked'; });
   if (blocked.length) {
-    out.push(card('Blocked — needs you', 'Each one says what unblocks it. Do the step, then mark it to-do so the loop can pick it up.',
-      blocked.map(blockedCard)));
+    var bc = card('Blocked — needs you', 'Each one says what unblocks it. Do the step, then mark it to-do so the loop can pick it up.',
+      blocked.map(blockedCard));
+    bc.setAttribute('data-anim-key', 'card:blocked');
+    out.push(bc);
   }
 
   // Timeline
@@ -893,19 +1023,37 @@ function activityView(d) {
     if (a.durationMs != null) meta.push(h('span', { text: 'took ' + fDur(a.durationMs) }));
     if (a.sha) meta.push(h('span', { text: a.sha }));
 
+    // A task chip opens the L2 task view — the card is the headline, the
+    // dialog is the full story (goals, run log, validation, related work).
+    var taskChip = function (c) {
+      var t = taskById(c.id);
+      return h('span', {
+        class: 'chip' + (t ? ' link' : ''), title: c.title,
+        text: c.id,
+        onclick: t ? function (e) { e.stopPropagation(); openTask(t); } : null
+      });
+    };
     var chips = [];
     if (a.completed.length) {
       chips.push(h('span', { class: 'lab', text: 'completed' }));
-      a.completed.forEach(function (c) { chips.push(h('span', { class: 'chip', title: c.title, text: c.id })); });
+      a.completed.forEach(function (c) { chips.push(taskChip(c)); });
     }
     if (a.filed.length) {
       chips.push(h('span', { class: 'lab', text: 'follow-ups filed' }));
-      a.filed.forEach(function (c) { chips.push(h('span', { class: 'chip', title: c.title, text: c.id })); });
+      a.filed.forEach(function (c) { chips.push(taskChip(c)); });
     }
-    body.push(h('div', { class: cls }, [
+    tagChips(a.tags).forEach(function (c) { chips.push(c); });
+    // Clicking the headline opens the first finished task (or first filed).
+    var first = (a.completed[0] || a.filed[0]) ? taskById((a.completed[0] || a.filed[0]).id) : null;
+    body.push(h('div', { class: cls, 'data-anim-key': 'ev:' + (a.sha || (a.kind + ':' + (a.decision || '') + ':' + a.ts)) }, [
       h('div', { class: 'ev-rail' }, [h('div', { class: 'ev-dot' })]),
       h('div', { class: 'ev-body' }, [
-        h('div', { class: 'ev-title', text: a.title }),
+        h('div', {
+          class: 'ev-title' + (first ? ' ev-link' : ''), text: a.title,
+          role: first ? 'button' : null, tabindex: first ? '0' : null,
+          onclick: first ? function () { openTask(first); } : null,
+          onkeydown: first ? function (e) { if (e.key === 'Enter') openTask(first); } : null
+        }),
         h('div', { class: 'ev-meta' }, meta),
         a.summary ? h('div', { class: 'ev-sum', text: a.summary }) : null,
         chips.length ? h('div', { class: 'ev-chips' }, chips) : null
@@ -921,6 +1069,133 @@ function activityView(d) {
   out.push(card('Timeline', d.activity.length + ' events since ' + fDate(d.historyStart) +
     ' — each one is a commit that finished or filed work.', body.length ? body : [h('div', { class: 'empty', text: 'No activity yet.' })]));
   return out;
+}
+
+/* ===========================================================================
+   DAILY DIGEST view — one reflective write-up per day, from the loop's 5am
+   step. Markdown is rendered by the tiny renderer below (textContent-based,
+   never innerHTML) because the digest is prose meant to be READ, and the
+   preformatted-monospace treatment the task dialog uses reads as a log.
+   =========================================================================== */
+function mdInline(sText) {
+  var out = [];
+  var re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\s][^*]*\*)|(\[([^\]]+)\]\((https?:\/\/[^)\s]+)\))/g;
+  var last = 0, m;
+  var str = String(sText || '');
+  while ((m = re.exec(str))) {
+    if (m.index > last) out.push(document.createTextNode(str.slice(last, m.index)));
+    if (m[1]) out.push(h('code', { text: m[1].slice(1, -1) }));
+    else if (m[2]) out.push(h('b', { text: m[2].slice(2, -2) }));
+    else if (m[3]) out.push(h('i', { text: m[3].slice(1, -1) }));
+    else if (m[4]) out.push(h('a', { href: m[6], target: '_blank', rel: 'noopener', text: m[5] }));
+    last = re.lastIndex;
+  }
+  if (last < str.length) out.push(document.createTextNode(str.slice(last)));
+  return out;
+}
+
+function mdRender(text) {
+  var root = h('div', { class: 'md' });
+  var lines = String(text || '').split(/\r?\n/);
+  var i = 0;
+  var isList = function (l) { return /^\s*([-*]|\d+\.)\s+/.test(l); };
+  var isHead = function (l) { return /^#{1,4}\s+/.test(l); };
+  var isRule = function (l) { return /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(l); };
+  while (i < lines.length) {
+    var line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    // Fenced code: verbatim until the closing fence, never re-parsed. Task
+    // bodies are full of command blocks and log excerpts; feeding those to
+    // the list/paragraph rules turns a PowerShell one-liner into soup.
+    if (/^\s*```/.test(line)) {
+      var code = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { code.push(lines[i]); i++; }
+      i++; // the closing fence (or EOF)
+      root.appendChild(h('pre', { class: 'code' }, [h('code', { text: code.join('\n') })]));
+      continue;
+    }
+    var m = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (m) { root.appendChild(h('h' + m[1].length, null, mdInline(m[2]))); i++; continue; }
+    if (isRule(line)) { root.appendChild(h('hr')); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      var q = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      var inner = mdRender(q.join('\n'));
+      var bq = h('blockquote');
+      while (inner.firstChild) bq.appendChild(inner.firstChild);
+      root.appendChild(bq);
+      continue;
+    }
+    if (isList(line)) {
+      var list = h(/^\s*\d+\./.test(line) ? 'ol' : 'ul');
+      while (i < lines.length && isList(lines[i])) {
+        // A hard-wrapped item continues on the following lines until a blank
+        // line or a new block — fold them in (lazy continuation), or every
+        // wrapped bullet sheds its tail into a stray paragraph.
+        var item = [lines[i].replace(/^\s*([-*]|\d+\.)\s+/, '')];
+        i++;
+        while (i < lines.length && lines[i].trim() && !isList(lines[i]) &&
+               !isHead(lines[i]) && !isRule(lines[i]) && !/^\s*>/.test(lines[i])) {
+          item.push(lines[i].trim());
+          i++;
+        }
+        var joined = item.join(' ');
+        // A task-list item renders its checkbox as a real box, not "[x]"
+        // prose — this is what makes goals and validation criteria readable.
+        var cb = /^\[([ xX])\]\s+(.*)$/.exec(joined);
+        if (cb) {
+          list.appendChild(h('li', { class: 'task' + (cb[1] !== ' ' ? ' done' : '') }, [
+            h('span', { class: 'cbox', 'aria-hidden': 'true', text: cb[1] !== ' ' ? '✓' : '' }),
+            h('span', null, mdInline(cb[2]))
+          ]));
+        } else {
+          list.appendChild(h('li', null, mdInline(joined)));
+        }
+      }
+      root.appendChild(list);
+      continue;
+    }
+    var p = [];
+    while (i < lines.length && lines[i].trim() && !isHead(lines[i]) && !isList(lines[i]) &&
+           !/^\s*>/.test(lines[i]) && !isRule(lines[i])) { p.push(lines[i]); i++; }
+    root.appendChild(h('p', null, mdInline(p.join(' '))));
+  }
+  return root;
+}
+
+function digestView(d) {
+  var dates = d.digests || [];
+  if (!dates.length) {
+    return [card('Daily digest', null, [h('div', { class: 'empty',
+      text: 'No digest yet. Each morning at 5am the loop writes one — what happened yesterday, the focus for today, and a step-back reflection on how the work is going. The first one appears here once written.' })])];
+  }
+  var cur = state.digestDate && dates.indexOf(state.digestDate) >= 0 ? state.digestDate : dates[0];
+  if (d.digest && d.digest.body != null) state.digestCache[d.digest.date] = d.digest.body;
+  var body = h('div');
+  var cached = state.digestCache[cur];
+  if (cached != null) {
+    body.appendChild(mdRender(cached));
+  } else {
+    body.appendChild(h('div', { class: 'loading', text: 'Loading…' }));
+    fetch('api/digest?date=' + encodeURIComponent(cur))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.body != null) { state.digestCache[cur] = j.body; if (state.view === 'digest') renderView(); }
+      })
+      .catch(function () {});
+  }
+  var head = h('div', { class: 'digest-head' }, [
+    h('h2', { text: 'Daily digest' }),
+    dates.length > 1
+      ? h('select', { 'aria-label': 'Digest date',
+          onchange: function (e) { state.digestDate = e.target.value; renderView(); } },
+          dates.map(function (dt) {
+            return h('option', { value: dt, text: dt + (dt === dates[0] ? ' — latest' : ''), selected: dt === cur || null });
+          }))
+      : h('span', { class: 'chip', text: cur })
+  ]);
+  return [h('section', { class: 'card', 'data-anim-key': 'card:digest' }, [head, body])];
 }
 
 /* ===========================================================================
@@ -1095,7 +1370,9 @@ function openTask(t) {
       metaBit('Modified', t.modifiedAt ? fDate(t.modifiedAt) : 'unknown'),
       t.completedAt ? metaBit('Finished', fDate(t.completedAt)) : null,
       metaBit('Seat', t.seat),
-      t.deps && t.deps.length ? metaBit('Deps', t.deps.join(', ')) : null
+      t.deps && t.deps.length ? metaBit('Deps', t.deps.join(', ')) : null,
+      t.commits && t.commits.length ? metaBit('Commits', t.commits.join(', ')) : null,
+      t.tags && t.tags.length ? h('span', { class: 'td-bit' }, [h('b', { text: 'Tags' })].concat(tagChips(t.tags))) : null
     ]),
     t.triageReason ? h('div', { class: 'td-why', text: 'Triage: ' + t.triageReason }) : null,
     body,
@@ -1112,11 +1389,66 @@ function openTask(t) {
     .then(function (r) { return r.json(); })
     .then(function (j) {
       body.textContent = '';
-      // textContent, not innerHTML: the task body is markdown authored by a
-      // loop, and it is rendered as preformatted text rather than parsed.
-      body.appendChild(h('pre', { class: 'td-md', text: (j.body || '').trim() }));
+      var text = (j.body || '').trim();
+      // Related work: every real task id the body or deps mention. The body
+      // names what a task split from, superseded, or discovered — those are
+      // the edges a reader follows, so they get chips up top and links inline.
+      var seen = {};
+      (t.deps || []).forEach(function (d) { seen[String(d).toUpperCase()] = true; });
+      (text.match(/\bT\d+[a-z]?\d*\b/g) || []).forEach(function (d) { seen[d.toUpperCase()] = true; });
+      delete seen[t.id.toUpperCase()];
+      var jump = function (id) {
+        var tt = taskById(id);
+        if (tt) { dlg.close(); openTask(tt); }
+      };
+      var rel = Object.keys(seen).filter(function (d) { return taskById(d); });
+      if (rel.length) {
+        body.appendChild(h('div', { class: 'td-rel' }, [h('b', { text: 'Related:' })].concat(rel.map(function (d) {
+          return h('span', { class: 'chip link', title: taskById(d).title, text: taskById(d).id,
+            onclick: function () { jump(d); } });
+        }))));
+      }
+      // Rendered markdown (headings, checklists, fenced code), not a raw
+      // monospace dump — this dialog is the L2 view of the task: the goal,
+      // the run's progress log, and the validation criteria all read as
+      // sections. mdRender is textContent-based throughout, so the loop's
+      // markdown can never inject markup.
+      var md = mdRender(text);
+      linkifyTaskIds(md, jump);
+      body.appendChild(md);
     })
     .catch(function (e) { body.textContent = 'Could not load: ' + e.message; });
+}
+
+/**
+ * Wrap task-id mentions in rendered markdown with links that jump to that
+ * task's dialog. Only ids that actually exist link — "T30" in a sentence
+ * about a task that was never filed stays plain text.
+ */
+function linkifyTaskIds(root, jump) {
+  var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  var nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(function (n) {
+    if (n.parentNode && (n.parentNode.tagName === 'A' || n.parentNode.tagName === 'CODE')) return;
+    var re = /\bT\d+[a-z]?\d*\b/g;
+    var str = n.nodeValue, m, last = 0, frag = null;
+    while ((m = re.exec(str))) {
+      var t = taskById(m[0]);
+      if (!t) continue;
+      if (!frag) frag = document.createDocumentFragment();
+      frag.appendChild(document.createTextNode(str.slice(last, m.index)));
+      frag.appendChild(h('a', {
+        href: '#', class: 'tid-link', text: m[0],
+        onclick: (function (id) { return function (e) { e.preventDefault(); jump(id); }; })(m[0])
+      }));
+      last = m.index + m[0].length;
+    }
+    if (frag) {
+      frag.appendChild(document.createTextNode(str.slice(last)));
+      n.parentNode.replaceChild(frag, n);
+    }
+  });
 }
 function metaBit(label, value) {
   return h('span', { class: 'td-bit' }, [h('b', { text: label }), h('span', { text: String(value) })]);
@@ -1183,7 +1515,7 @@ function renderTasks() {
       h('td', null, [h('span', { class: 'pri ' + (t.priority || 'none'), text: pri })]),
       h('td', null, [h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]])]),
       h('td', null, [
-        h('div', { class: 't-title', text: t.title }),
+        h('div', { class: 't-title' }, [document.createTextNode(t.title + ' ')].concat(tagChips(t.tags))),
         t.summary ? h('div', { class: 't-sum', text: t.summary }) : null,
         t.deps.length ? h('div', { class: 't-deps', text: 'deps: ' + t.deps.join(', ') }) : null
       ]),
@@ -1218,7 +1550,7 @@ function renderNav() {
   var d = state.data;
   var nav = $('#nav');
   nav.innerHTML = '';
-  [['activity', 'Activity'], ['data', 'Data'], ['tasks', 'Tasks']].forEach(function (v) {
+  [['activity', 'Activity'], ['digest', 'Daily digest'], ['data', 'Data'], ['tasks', 'Tasks']].forEach(function (v) {
     var badge = null;
     if (v[0] === 'activity' && d && d.openDecisions) badge = h('span', { class: 'badge', text: String(d.openDecisions) });
     nav.appendChild(h('button', {
@@ -1228,15 +1560,93 @@ function renderNav() {
   });
 }
 
+var lastRenderedView = null;
+
 function renderView() {
   var d = state.data;
   if (!d) return;
   var host = $('#view');
+  // FLIP snapshot: capture where every keyed element WAS (and a clone of it,
+  // for exit ghosts) before the re-render wipes the DOM. Only within the same
+  // view — a nav switch replacing everything is not "items came and went".
+  var prev = null;
+  if (lastRenderedView === state.view && host.children.length &&
+      !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    prev = {};
+    host.querySelectorAll('[data-anim-key]').forEach(function (el) {
+      prev[el.getAttribute('data-anim-key')] = { rect: el.getBoundingClientRect(), clone: el.cloneNode(true) };
+    });
+  }
   host.innerHTML = '';
-  var nodes = state.view === 'data' ? dataView(d) : state.view === 'tasks' ? tasksView(d) : activityView(d);
+  var nodes = state.view === 'data' ? dataView(d) : state.view === 'tasks' ? tasksView(d)
+    : state.view === 'digest' ? digestView(d) : activityView(d);
   nodes.forEach(function (n) { host.appendChild(n); });
   if (state.view === 'tasks') renderTasks();
   if (state.view === 'data') drawAll();
+  if (prev) playFlip(host, prev);
+  lastRenderedView = state.view;
+}
+
+/**
+ * FLIP the keyed elements between renders: entered items fade+slide in, moved
+ * items glide from where they were, removed items fade out as fixed-position
+ * ghosts of their old selves. Nested keys move RELATIVE to their nearest keyed
+ * ancestor (standard nested-FLIP correction), or a card and its children would
+ * each play the same journey and the children would visually travel twice.
+ */
+function playFlip(host, prev) {
+  var EASE = 'cubic-bezier(.2, .7, .3, 1)';
+  var seen = {};
+  var moves = {};
+  var els = host.querySelectorAll('[data-anim-key]');
+  els.forEach(function (el) {
+    var k = el.getAttribute('data-anim-key');
+    seen[k] = true;
+    if (!prev[k]) return;
+    var now = el.getBoundingClientRect();
+    moves[k] = { dx: prev[k].rect.left - now.left, dy: prev[k].rect.top - now.top };
+  });
+  els.forEach(function (el) {
+    var k = el.getAttribute('data-anim-key');
+    var anc = el.parentElement && el.parentElement.closest('[data-anim-key]');
+    var ancKey = anc ? anc.getAttribute('data-anim-key') : null;
+    if (!prev[k]) {
+      // Entered. If its whole card is also new, the card's entrance covers it.
+      if (ancKey && !prev[ancKey]) return;
+      el.animate([{ opacity: 0, transform: 'translateY(-10px)' }, { opacity: 1, transform: 'none' }],
+        { duration: 300, easing: EASE });
+      return;
+    }
+    var pd = ancKey ? moves[ancKey] : null;
+    var dx = moves[k].dx - (pd ? pd.dx : 0), dy = moves[k].dy - (pd ? pd.dy : 0);
+    if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+      el.animate([{ transform: 'translate(' + dx + 'px,' + dy + 'px)' }, { transform: 'none' }],
+        { duration: 300, easing: EASE });
+    }
+  });
+  // Exits: ghost only the OUTERMOST removed element — an option inside a
+  // resolved decision leaves with its card, not as its own flying scrap.
+  Object.keys(prev).forEach(function (k) {
+    if (seen[k]) return;
+    var r = prev[k].rect;
+    var contained = Object.keys(prev).some(function (pk) {
+      if (pk === k || seen[pk]) return false;
+      var pr = prev[pk].rect;
+      return pr.left <= r.left && pr.top <= r.top && pr.right >= r.right && pr.bottom >= r.bottom &&
+        (pr.width > r.width || pr.height > r.height);
+    });
+    if (contained) return;
+    var g = prev[k].clone;
+    g.style.position = 'fixed';
+    g.style.left = r.left + 'px'; g.style.top = r.top + 'px';
+    g.style.width = r.width + 'px'; g.style.height = r.height + 'px';
+    g.style.margin = '0'; g.style.zIndex = '30'; g.style.pointerEvents = 'none';
+    document.body.appendChild(g);
+    var a = g.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(-10px) scale(.98)' }],
+      { duration: 240, easing: 'ease-out' });
+    a.onfinish = function () { g.remove(); };
+    setTimeout(function () { if (g.parentNode) g.remove(); }, 500);
+  });
 }
 
 function drawAll() { charts.forEach(function (fn) { fn(); }); }
@@ -1258,8 +1668,14 @@ function setMeta(d, stale) {
 function signature(d) {
   return JSON.stringify([
     d.counts,
-    d.tasks.map(function (t) { return t.id + t.status + t.title; }),
+    d.tasks.map(function (t) {
+      // Tags and the newest progress note are rendered on cards, so a change
+      // to either must re-render — status+title alone would sit stale.
+      var lastProg = t.progress && t.progress.length ? t.progress[t.progress.length - 1].text : '';
+      return t.id + t.status + t.title + (t.tags || []).join(',') + lastProg;
+    }),
     d.decisions.map(function (x) { return x.id + x.status + x.answer; }),
+    d.digests, d.digest && d.digest.body,
     d.activity.length, d.series.length, d.daily.map(function (x) { return x.count; })
   ]);
 }
