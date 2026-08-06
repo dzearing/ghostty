@@ -9914,3 +9914,21 @@ history/boundary/chrome section; `viewer-panes.ps1` grew sections 3b + 8b0
 WM_GETTEXT) - 119 passed with the 2 pre-existing reds proven at clean HEAD
 (T526 known; the second newly filed as T535); floor-lane none/win32/agent all
 PASS; P1-P3 ALL PASS.
+
+## 2026-08-06 - T443/T474: the armed-watch park is mechanical now - blocked status, not a note the queue cannot read
+
+D10 and D12 (resolved 2026-08-05) parked the T443 memory-corruption hunt until
+the crash recurs - but both T443 (order 9, P0) and T474 stayed `todo`, so
+`next -Claim` kept handing the parked hunt to every fresh turn; today alone
+four turns claimed T443 (the T317/T369/T238/T362 fold-ins), and this turn was
+the fifth. Both tasks are now `blocked(armed watch ...)` - out of `next`'s
+reach (it only offers `^todo`), green in `validate` (blocked is a first-class
+status), and rendered by the dashboard with new `unblock:`/`unblock-command:`
+frontmatter naming the reopen condition (a fresh dump in `.dumps\` or a red
+lane with a CrashDiag block naming one of our test binaries) and the one
+command that reopens them. `order: 9` is kept so a reopened T443 goes straight
+back to the head of the queue. State at parking: no occurrence since the three
+2026-08-04 dumps; today's floor-lane ALL LANES PASS + P1-P3 ALL PASS; 190+
+crash-free full-binary runs. The watch itself (floor-lane crash-catch T450 +
+exit-code decode T444) stays armed. No code changed; the queue now surfaces
+real work (T392 viewer link routing is the new head).
