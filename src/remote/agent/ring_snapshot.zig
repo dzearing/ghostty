@@ -37,13 +37,15 @@
 //!
 //! ## Layering / crash safety
 //!
-//! Depends only on `std` (like `session_meta`), so it unit-tests standalone and
-//! `session.zig` imports it without a cycle. `writeAtomic` uses the same
-//! tmp-in-the-same-dir + fsync + rename pattern as `session_meta.writeAtomic`:
-//! a future agent start never observes a torn snapshot.
+//! Depends only on `std` + `atomic_write` (like `session_meta`), so it
+//! unit-tests standalone and `session.zig` imports it without a cycle.
+//! `writeAtomic` delegates to `atomic_write.writeChunks` — safe under
+//! concurrent writers to the same path (T183): a future agent start never
+//! observes a torn snapshot.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const atomic_write = @import("atomic_write.zig");
 
 /// Current magic (written by `writeAtomic`). GRS2 adds cols/rows after
 /// base_offset. `load` also accepts the legacy `magic_v1` ("GRS1", no width);
@@ -80,11 +82,11 @@ pub fn pathFor(alloc: Allocator, dir: []const u8, id_str: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}/{s}.ring", .{ dir, id_str });
 }
 
-/// Atomically write a ring snapshot (header + `bytes`) to `path` via a
-/// same-directory tmp + fsync + rename (creating parent dirs as needed). A
-/// concurrent/subsequent reader sees only a complete file. Mirrors
-/// `session_meta.writeAtomic` but streams the header and the (potentially large)
-/// ring bytes in two writes rather than concatenating them into one buffer.
+/// Atomically write a ring snapshot (header + `bytes`) to `path`, creating
+/// parent dirs as needed. A concurrent/subsequent reader sees only a complete
+/// file, and concurrent writers to the same path are safe — see `atomic_write`
+/// (T183). The header and the (potentially large) ring bytes go down as two
+/// chunks rather than being concatenated into one buffer.
 pub fn writeAtomic(
     alloc: Allocator,
     path: []const u8,
@@ -93,30 +95,13 @@ pub fn writeAtomic(
     rows: u16,
     bytes: []const u8,
 ) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
-
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    {
-        // Declared before the create/close pair so on error (LIFO) the file
-        // closes BEFORE the delete — Windows can't delete an open file.
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-        defer file.close();
-
-        var header: [header_len]u8 = undefined;
-        @memcpy(header[0..magic.len], magic);
-        std.mem.writeInt(u64, header[magic.len..][0..8], base_offset, .little);
-        std.mem.writeInt(u16, header[magic.len + 8 ..][0..2], cols, .little);
-        std.mem.writeInt(u16, header[magic.len + 10 ..][0..2], rows, .little);
-        std.mem.writeInt(u64, header[magic.len + 12 ..][0..8], @intCast(bytes.len), .little);
-        try file.writeAll(&header);
-        try file.writeAll(bytes);
-        // Durable before the rename publishes it.
-        try file.sync();
-    }
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    var header: [header_len]u8 = undefined;
+    @memcpy(header[0..magic.len], magic);
+    std.mem.writeInt(u64, header[magic.len..][0..8], base_offset, .little);
+    std.mem.writeInt(u16, header[magic.len + 8 ..][0..2], cols, .little);
+    std.mem.writeInt(u16, header[magic.len + 10 ..][0..2], rows, .little);
+    std.mem.writeInt(u64, header[magic.len + 12 ..][0..8], @intCast(bytes.len), .little);
+    try atomic_write.writeChunks(alloc, path, &.{ &header, bytes });
 }
 
 /// Load + parse the snapshot at `path`. Returns null when the file is ABSENT (a
@@ -192,10 +177,18 @@ test "writeAtomic + load round-trip; no .tmp leftover; missing loads null" {
     const payload = "PANE=3 PID=42\r\ntick-3-0\r\ntick-3-1\r\n";
     try writeAtomic(alloc, path, 1000, 120, 40, payload);
 
-    // No staging file left behind.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
+    // No staging file of any name left behind — the dir holds exactly the ring.
+    {
+        var dir = try std.fs.cwd().openDir(rings_dir, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        var count: usize = 0;
+        while (try it.next()) |entry| {
+            count += 1;
+            try testing.expect(std.mem.endsWith(u8, entry.name, ".ring"));
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
 
     var loaded = (try load(alloc, path)).?;
     defer loaded.free(alloc);

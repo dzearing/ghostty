@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-05 - **T183 done - the floor-lane flake was two real bugs, and one
+  of them could corrupt the session roster in production.** The task's
+  temp-dir-sweep theory was disproven (no sweeper exists; the panicking test
+  never touches a temp dir). Actual mechanisms: (1) every persistence module
+  staged atomic writes at the FIXED name `<path>.tmp`, so concurrent persists
+  (control thread + exit watcher + shutdown - normal, not test-only) truncated
+  and renamed each other's staging file: one writer can publish a torn/empty
+  sessions.json, the other fails with the observed `FileNotFound` warn. Fixed
+  by a shared `src/remote/agent/atomic_write.zig` staging at a unique
+  `<path>.<hex64>.tmp` per call; session_meta, layout_meta, ring_snapshot and
+  win32 session_layout all delegate; regression test proves red with the old
+  name, green with the new. (2) five test sites discarded `waitUntil`'s bool,
+  so a timed-out wait (10s, spendable under concurrent acceptance scripts)
+  panicked later on a `.?` - now `try testing.expect(...)` at the wait, 60s
+  liveness bounds (waitUntil + loopback read), and the FakeChild's
+  cross-thread fields are mutex-guarded with the signal stored as an owned
+  copy (it was a borrowed slice into the control frame). Validation: floor
+  ALL LANES PASS, P1-P3 ALL PASS, plus the task's stress - none lane
+  concurrent with ipc-p1..p3, three rounds, green both sides every round.
+  Filed T500 (consolidate the three remaining single-writer fixed-name
+  atomic-write copies).
 - 2026-08-05 - **T253 done - the loop's liveness is now automatic, and a
   watchdog nudge can no longer queue a second task into a working session.**
   The 45-min staleness window was measured against a heartbeat only a

@@ -24,14 +24,17 @@
 //!
 //! ## Crash safety
 //!
-//! `writeAtomic` uses the same tmp-in-the-same-dir + fsync + rename pattern as
-//! the agent's info-file writer (`main.zig writeInfoFile`, itself modeled on
-//! `enroll.saveRelayEnv`): a reader (a future agent start) never observes a
-//! torn or partially-flushed file — it sees either the previous complete file
-//! or the new complete file, never a mix.
+//! `writeAtomic` delegates to `atomic_write.writeChunks` — staging file in the
+//! same dir + fsync + rename, with a staging name UNIQUE PER CALL so writers
+//! that overlap (persistMeta runs on the control thread, the exit watcher, and
+//! shutdown) can never truncate or rename away each other's staging file
+//! (T183). A reader (a future agent start) never observes a torn or
+//! partially-flushed file — it sees either the previous complete file or one
+//! writer's new complete file, never a mix.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const atomic_write = @import("atomic_write.zig");
 
 /// On-disk schema version. Bumped only on an incompatible layout change; the
 /// loader tolerates unknown fields (`ignore_unknown_fields`) so additive fields
@@ -114,26 +117,11 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Parsed {
     });
 }
 
-/// Atomically write `bytes` to `path` via a same-directory tmp + fsync + rename
-/// (creating parent directories as needed). A concurrent/subsequent reader sees
-/// only a complete file. Mirrors `main.zig writeInfoFile`.
+/// Atomically write `bytes` to `path` (creating parent directories as needed).
+/// A concurrent/subsequent reader sees only a complete file, and concurrent
+/// WRITERS to the same path are safe — see `atomic_write` (T183).
 pub fn writeAtomic(alloc: Allocator, path: []const u8, bytes: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
-
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    {
-        // Declared before the create/close pair so on error (LIFO) the file
-        // closes BEFORE the delete — Windows can't delete an open file.
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(bytes);
-        // Durable before the rename publishes it.
-        try file.sync();
-    }
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    try atomic_write.writeChunks(alloc, path, &.{bytes});
 }
 
 /// Load + parse the file at `path`. Returns null when the file is ABSENT (a
@@ -240,10 +228,19 @@ test "writeAtomic + load round-trip; no .tmp leftover; missing file loads null" 
     defer alloc.free(body);
     try writeAtomic(alloc, path, body);
 
-    // The staging file is consumed by the rename, never left behind.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
+    // The staging file is consumed by the rename, never left behind — the
+    // parent dir holds exactly the published file.
+    {
+        var dir = try std.fs.cwd().openDir(std.fs.path.dirname(path).?, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        var count: usize = 0;
+        while (try it.next()) |entry| {
+            count += 1;
+            try testing.expectEqualStrings("sessions.json", entry.name);
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
 
     var loaded = (try load(alloc, path)).?;
     defer loaded.deinit();

@@ -13,11 +13,15 @@ const std = @import("std");
 ///
 /// The deadline is deliberately generous: it is a liveness bound, not a
 /// performance assertion, so it only fires when the awaited effect NEVER
-/// happens — and a busy box must not be able to spend it. A predicate that
-/// errors counts as "not yet": every caller re-asserts after the wait, so a
-/// real error surfaces there with a proper report.
+/// happens — and a busy box must not be able to spend it. 10s proved
+/// spendable: with acceptance scripts saturating the box, a lane timed this
+/// wait out and (the bool being discarded) panicked on a null instead of
+/// failing red (T183) — hence 60s. A predicate that errors counts as "not
+/// yet", and callers must `try testing.expect(waitUntil(...))` rather than
+/// discard the bool, so a timeout fails AT the wait, named, instead of
+/// falling through to a later `.?` panic.
 pub fn waitUntil(comptime pred: anytype, args: anytype) bool {
-    const deadline_ns: u64 = 10 * std.time.ns_per_s;
+    const deadline_ns: u64 = 60 * std.time.ns_per_s;
     var timer = std.time.Timer.start() catch unreachable;
     while (true) {
         const r = @call(.auto, pred, args);

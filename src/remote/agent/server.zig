@@ -2191,7 +2191,9 @@ const Loopback = struct {
     /// (T258: ~11 minutes of flat CPU, killed by hand, no failure text). The
     /// agent-side direction stays unbounded: a server idling between client
     /// frames is the normal state, and close() wakes it at teardown.
-    const client_read_deadline_ns: u64 = 30 * std.time.ns_per_s;
+    /// 60s to match `waitUntil`'s bound: a box loaded enough to spend 10s of
+    /// one liveness bound (T183) gets the same margin on this one.
+    const client_read_deadline_ns: u64 = 60 * std.time.ns_per_s;
 
     fn init(alloc: Allocator) Loopback {
         var lb: Loopback = .{
@@ -2277,8 +2279,12 @@ const TestClock = struct {
 /// the test to simulate the process exiting; `tryWait` then returns it.
 const FakeChild = struct {
     input: std.ArrayList(u8) = .empty,
+    /// Written by the server's control thread (`rz`/`sg`), read by the test
+    /// thread — both only under `mutex` (the accessors below). `last_signal`
+    /// is an OWNED copy: the vtable hands `sg` a slice into the control frame
+    /// being parsed, whose lifetime ends with the handler.
     last_resize: ?[4]u16 = null,
-    last_signal: ?[]const u8 = null,
+    last_signal: ?[]u8 = null,
     exit_code: ?i64 = null,
     terminated: bool = false,
     /// When set, `queryCwd` returns a copy of this (models the OS cwd read). When
@@ -2334,11 +2340,17 @@ const FakeChild = struct {
     }
     fn rz(ctx: *anyopaque, rows: u16, cols: u16, px_w: u16, px_h: u16) anyerror!void {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.last_resize = .{ rows, cols, px_w, px_h };
     }
     fn sg(ctx: *anyopaque, name: []const u8) anyerror!void {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
-        self.last_signal = name;
+        const copy = try self.alloc.dupe(u8, name);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.last_signal) |s| self.alloc.free(s);
+        self.last_signal = copy;
     }
     fn tw(ctx: *anyopaque) ?i64 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
@@ -2381,12 +2393,26 @@ const FakeChild = struct {
         defer self.mutex.unlock();
         return alloc.dupe(u8, self.input.items);
     }
+    /// Read `last_resize` under the mutex (the writer is the control thread).
+    fn lastResize(self: *FakeChild) ?[4]u16 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.last_resize;
+    }
+    /// Whether the recorded signal equals `want`, under the mutex.
+    fn lastSignalIs(self: *FakeChild, want: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.last_signal orelse return false;
+        return std.mem.eql(u8, s, want);
+    }
     fn setExit(self: *FakeChild, code: i64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.exit_code = code;
     }
     fn deinit(self: *FakeChild) void {
+        if (self.last_signal) |s| self.alloc.free(s);
         self.input.deinit(self.alloc);
     }
 };
@@ -3385,7 +3411,7 @@ test "client DATA reaches the child (input round-trip)" {
             return std.mem.eql(u8, got, "ls -la\n");
         }
     };
-    _ = waitUntil(P.sawInput, .{ &fc, alloc });
+    try testing.expect(waitUntil(P.sawInput, .{ &fc, alloc }));
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "ls -la\n", got);
@@ -4177,15 +4203,18 @@ test "RESIZE and SIGNAL are recorded on the child" {
     try h.client.sendControlJson(.resize, o.channel, protocol.Resize{ .rows = 50, .cols = 120, .px_w = 1, .px_h = 2 });
     try h.client.sendControlJson(.signal, o.channel, protocol.Signal{ .name = "INT" });
 
-    // Wait until both are observed (control reader is async).
+    // Wait until both are observed (control reader is async) — and fail HERE,
+    // at the wait, if they never are. This bool used to be discarded, so a
+    // timed-out wait fell through to a `.?` and the lane's headline was
+    // `attempt to use null value` with no hint of what had been awaited (T183).
     const P = struct {
         fn both(c: *FakeChild) bool {
-            return c.last_resize != null and c.last_signal != null;
+            return c.lastResize() != null and c.lastSignalIs("INT");
         }
     };
-    _ = waitUntil(P.both, .{&fc});
-    try testing.expectEqual([4]u16{ 50, 120, 1, 2 }, fc.last_resize.?);
-    try testing.expectEqualSlices(u8, "INT", fc.last_signal.?);
+    try testing.expect(waitUntil(P.both, .{&fc}));
+    try testing.expectEqual([4]u16{ 50, 120, 1, 2 }, fc.lastResize().?);
+    try testing.expect(fc.lastSignalIs("INT"));
     // Session dims updated.
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(o.channel).?;
@@ -4291,7 +4320,7 @@ test "DETACH stops streaming but keeps the session alive" {
             return !sess.streaming and sess.alive;
         }
     };
-    _ = waitUntil(P.detached, .{ h.server, o.channel });
+    try testing.expect(waitUntil(P.detached, .{ h.server, o.channel }));
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(o.channel).?;
     try testing.expect(!s.streaming);
@@ -4326,7 +4355,7 @@ test "unknown channel DATA is ignored (no crash, no child write)" {
             return std.mem.eql(u8, got, "real");
         }
     };
-    _ = waitUntil(P.sawInput, .{ &fc, alloc });
+    try testing.expect(waitUntil(P.sawInput, .{ &fc, alloc }));
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "real", got); // "ghost" never landed
@@ -4485,7 +4514,7 @@ test "P1: explicit DETACH orphans the session (kept alive, unbound, not streamin
             return !s.streaming and !s.bound and s.alive;
         }
     };
-    _ = waitUntil(P.orphaned, .{ h.store, o.channel });
+    try testing.expect(waitUntil(P.orphaned, .{ h.store, o.channel }));
     h.store.mutex.lock();
     const s = h.store.table.getByChannel(o.channel).?;
     try testing.expect(s.alive and !s.streaming and !s.bound);
