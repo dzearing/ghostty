@@ -9532,3 +9532,15 @@ PASS, floor all lanes PASS, P1-P3 ALL PASS. T326 (close reply sent only
 after terminate+persist) stays open - latency, not this killer. Filed T510:
 relay_dial.dial's upgrade read has no deadline, the wedge that killed the
 reverted retry and would freeze the roster worker against a silent endpoint.
+
+## 2026-08-06 - T418 skipped(duplicate -> T377): the banner-wrap report was already fixed
+
+T418 (banner plain-text never wraps; first line runs under the chevron,
+filed from a live pane 2026-08-03) is the same defect T377 fixed the next
+day in cd509de1b: .text and .heading blocks now render through
+layoutInline+drawWrapped with the chevron-aware wrapWidth, and
+banner_layout.contentWidth reserves the chevron strip with tests at
+1.0/1.25/1.5/2.0. Verified at HEAD by reading the paint path and re-running
+the filtered lanes (win32+none "wrap", win32 "contentWidth" - all PASS);
+acceptance was already recorded in T377 (pane-banner.ps1 ALL PASS x77,
+P1-P3 ALL PASS). No code change, so no new floor run. Nothing new filed.
