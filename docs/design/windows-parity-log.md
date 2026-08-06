@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T362 closed as a duplicate of T443 - the font.Collection
+  'add full' exit-5 flake is the fourth victim-test sighting of the armed-watch
+  ghost, and the font code is clean.** The 2026-08-02 win32-lane crash (exit 5
+  = 0xC0000005 per the T444 decode, no assertion, green on re-run) matches the
+  T443 signature; the `add full` test is the lane's largest heap workload
+  (~16k FreeType Face.inits), the profile of a corruption victim. Review of
+  `Collection.add`'s full path found no local defect, and src/font has no
+  local change since 2026-07-05. Measurement at HEAD: full win32 binary with
+  the red run's seed `0x6e8a8aaf`, 10 runs at concurrency 5, 0 crashes
+  (add-full OK 10/10); filtered add-full binary 200/200 PASS at concurrency
+  10; `floor-lane -Lane all` ALL LANES PASS and P1-P3 ALL PASS. The 3 soak
+  reds were all the known load-sensitive `atomic_write` T183 test (= T508),
+  reproducing T317's surprise - that flake is now seen in every heavy soak,
+  which strengthens T508's priority. Data point appended to T443's
+  ARMED-WATCH LOG (cumulative 190+ crash-free full-binary runs); T472 and
+  T504 deliberately NOT folded - each needs its own triage. No code change -
+  docs only.
+
 - 2026-08-06 - **T317 closed as a duplicate of T443 - the win32-lane PageList
   segfault is the same half-clobbered-pointer corruption, and its failing seed
   is proven not to be the trigger.** T317's stack (`verifyIntegrity ->
