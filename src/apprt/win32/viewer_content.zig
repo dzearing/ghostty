@@ -376,15 +376,15 @@ pub fn percentDecode(buf: []u8, s: []const u8) ?[]const u8 {
 /// `ViewerSchemeHandler.mimeType`, byte-identical table). `ext` carries no dot.
 pub fn mimeType(ext: []const u8) []const u8 {
     const table = .{
-        .{ "html", "text/html" },       .{ "htm", "text/html" },
-        .{ "css", "text/css" },         .{ "js", "text/javascript" },
-        .{ "mjs", "text/javascript" },  .{ "json", "application/json" },
-        .{ "png", "image/png" },        .{ "jpg", "image/jpeg" },
-        .{ "jpeg", "image/jpeg" },      .{ "gif", "image/gif" },
-        .{ "svg", "image/svg+xml" },    .{ "webp", "image/webp" },
-        .{ "ico", "image/x-icon" },     .{ "txt", "text/plain" },
-        .{ "md", "text/plain" },        .{ "markdown", "text/plain" },
-        .{ "woff", "font/woff" },       .{ "woff2", "font/woff2" },
+        .{ "html", "text/html" },      .{ "htm", "text/html" },
+        .{ "css", "text/css" },        .{ "js", "text/javascript" },
+        .{ "mjs", "text/javascript" }, .{ "json", "application/json" },
+        .{ "png", "image/png" },       .{ "jpg", "image/jpeg" },
+        .{ "jpeg", "image/jpeg" },     .{ "gif", "image/gif" },
+        .{ "svg", "image/svg+xml" },   .{ "webp", "image/webp" },
+        .{ "ico", "image/x-icon" },    .{ "txt", "text/plain" },
+        .{ "md", "text/plain" },       .{ "markdown", "text/plain" },
+        .{ "woff", "font/woff" },      .{ "woff2", "font/woff2" },
     };
     inline for (table) |row| {
         if (std.ascii.eqlIgnoreCase(ext, row[0])) return row[1];
@@ -398,25 +398,25 @@ pub fn mimeType(ext: []const u8) []const u8 {
 /// dot.
 pub fn highlightLanguage(ext: []const u8) ?[]const u8 {
     const table = .{
-        .{ "js", "javascript" },   .{ "mjs", "javascript" },  .{ "cjs", "javascript" },
-        .{ "jsx", "javascript" },  .{ "ts", "typescript" },   .{ "tsx", "typescript" },
-        .{ "mts", "typescript" },  .{ "py", "python" },       .{ "rb", "ruby" },
-        .{ "rs", "rust" },         .{ "go", "go" },           .{ "c", "c" },
-        .{ "h", "c" },             .{ "cpp", "cpp" },         .{ "cc", "cpp" },
-        .{ "cxx", "cpp" },         .{ "hpp", "cpp" },         .{ "hh", "cpp" },
-        .{ "cs", "csharp" },       .{ "m", "objectivec" },    .{ "mm", "objectivec" },
-        .{ "java", "java" },       .{ "kt", "kotlin" },       .{ "kts", "kotlin" },
-        .{ "swift", "swift" },     .{ "php", "php" },         .{ "pl", "perl" },
-        .{ "pm", "perl" },         .{ "lua", "lua" },         .{ "r", "r" },
-        .{ "sql", "sql" },         .{ "sh", "bash" },         .{ "bash", "bash" },
-        .{ "zsh", "bash" },        .{ "fish", "bash" },       .{ "json", "json" },
-        .{ "yaml", "yaml" },       .{ "yml", "yaml" },        .{ "toml", "ini" },
-        .{ "ini", "ini" },         .{ "conf", "ini" },        .{ "xml", "xml" },
-        .{ "html", "xml" },        .{ "htm", "xml" },         .{ "svg", "xml" },
-        .{ "plist", "xml" },       .{ "css", "css" },         .{ "scss", "scss" },
-        .{ "less", "less" },       .{ "diff", "diff" },       .{ "patch", "diff" },
-        .{ "makefile", "makefile" }, .{ "mk", "makefile" },   .{ "graphql", "graphql" },
-        .{ "gql", "graphql" },     .{ "vb", "vbnet" },        .{ "wat", "wasm" },
+        .{ "js", "javascript" },     .{ "mjs", "javascript" }, .{ "cjs", "javascript" },
+        .{ "jsx", "javascript" },    .{ "ts", "typescript" },  .{ "tsx", "typescript" },
+        .{ "mts", "typescript" },    .{ "py", "python" },      .{ "rb", "ruby" },
+        .{ "rs", "rust" },           .{ "go", "go" },          .{ "c", "c" },
+        .{ "h", "c" },               .{ "cpp", "cpp" },        .{ "cc", "cpp" },
+        .{ "cxx", "cpp" },           .{ "hpp", "cpp" },        .{ "hh", "cpp" },
+        .{ "cs", "csharp" },         .{ "m", "objectivec" },   .{ "mm", "objectivec" },
+        .{ "java", "java" },         .{ "kt", "kotlin" },      .{ "kts", "kotlin" },
+        .{ "swift", "swift" },       .{ "php", "php" },        .{ "pl", "perl" },
+        .{ "pm", "perl" },           .{ "lua", "lua" },        .{ "r", "r" },
+        .{ "sql", "sql" },           .{ "sh", "bash" },        .{ "bash", "bash" },
+        .{ "zsh", "bash" },          .{ "fish", "bash" },      .{ "json", "json" },
+        .{ "yaml", "yaml" },         .{ "yml", "yaml" },       .{ "toml", "ini" },
+        .{ "ini", "ini" },           .{ "conf", "ini" },       .{ "xml", "xml" },
+        .{ "html", "xml" },          .{ "htm", "xml" },        .{ "svg", "xml" },
+        .{ "plist", "xml" },         .{ "css", "css" },        .{ "scss", "scss" },
+        .{ "less", "less" },         .{ "diff", "diff" },      .{ "patch", "diff" },
+        .{ "makefile", "makefile" }, .{ "mk", "makefile" },    .{ "graphql", "graphql" },
+        .{ "gql", "graphql" },       .{ "vb", "vbnet" },       .{ "wat", "wasm" },
         .{ "wasm", "wasm" },
     };
     inline for (table) |row| {
@@ -572,6 +572,106 @@ pub fn reloadPlan(mode: Mode, page_loaded: bool) ReloadPlan {
 /// answer renders the bytes the user is trying to get rid of.
 pub const devtools_reload_method = "Page.reload";
 pub const devtools_reload_params = "{\"ignoreCache\":true}";
+
+// -------------------------------------------------------------------------
+// Link routing (T392, design row 5)
+// -------------------------------------------------------------------------
+
+/// What a top-level navigation in a viewer pane should do — Mac's
+/// `decidePolicyFor` + `handleFileModeLink`, folded into one classification so
+/// the whole policy is checkable without a browser. The COM handler's only
+/// jobs are to gate on the navigation KIND (`routesAsLink`), cancel, and
+/// dispatch.
+pub const LinkClass = enum {
+    /// Let the navigation proceed in the pane. Every web-mode navigation
+    /// (websites navigate freely), and the bundled template itself.
+    allow,
+    /// Cancel it and hand the URL to the default browser (Mac:
+    /// `NSWorkspace.shared.open`).
+    browser,
+    /// Cancel it: the target is a path under the virtual host — a RELATIVE
+    /// link in the rendered document, resolved against the viewed file
+    /// (`requestPath` extracts it, `navCandidate`/`rootedCandidate` place it).
+    relative,
+    /// Cancel it: the target is an explicit `file://` URL, used as written.
+    file_url,
+    /// Cancel it and do nothing. Mac maps everything else (`mailto:`,
+    /// `about:`, unknown schemes) to a nil file URL and returns.
+    drop,
+};
+
+/// Classify a navigation target for `mode`. The virtual-host check runs
+/// BEFORE the generic http(s) one — unlike Mac, whose relative links arrive
+/// on a custom scheme, ours live under an `https://` origin, so the generic
+/// test would ship every relative link to the default browser as a URL that
+/// resolves nowhere.
+pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
+    if (!mode.isFile()) return .allow;
+    // The template itself (with or without a query/fragment): the pane's own
+    // document, never a link target to route.
+    if (std.ascii.eqlIgnoreCase(stripQuery(uri), page_url)) return .allow;
+    if (uri.len >= origin_prefix.len and
+        std.ascii.eqlIgnoreCase(uri[0..origin_prefix.len], origin_prefix) and
+        (uri.len == origin_prefix.len or uri[origin_prefix.len] == '/'))
+    {
+        return .relative;
+    }
+    for ([_][]const u8{ "http://", "https://" }) |p| {
+        if (uri.len >= p.len and std.ascii.eqlIgnoreCase(uri[0..p.len], p)) return .browser;
+    }
+    if (uri.len >= 7 and std.ascii.eqlIgnoreCase(uri[0..7], "file://")) return .file_url;
+    return .drop;
+}
+
+/// The navigation kinds WebView2 distinguishes
+/// (`COREWEBVIEW2_NAVIGATION_KIND`), as this module's own enum so the policy
+/// stays free of COM.
+pub const NavKind = enum { reload, back_or_forward, new_document };
+
+/// Whether a navigation is the kind link routing applies to. Null means the
+/// runtime is too old to say (`ICoreWebView2NavigationStartingEventArgs3` is
+/// where the kind lives), and is treated as routable — the two excluded kinds
+/// are exactly the ones a file-mode pane issues about itself.
+///
+/// This is Mac's `navigationType == .linkActivated` guard, translated by
+/// EFFECT rather than by field: WebKit reports a synthesized `a.click()` as
+/// `.linkActivated`, so WebView2's `IsUserInitiated` (which reports it false)
+/// is not the equivalent — and in file mode the only NEW_DOCUMENT navigations
+/// the pane does not issue itself ARE link activations, because the bundled
+/// template runs no navigating script of its own. Reloads and history walks —
+/// the navigations the Mac guard exists to let through — are precisely the
+/// two kinds excluded here.
+pub fn routesAsLink(kind: ?NavKind) bool {
+    const k = kind orelse return true;
+    return k == .new_document;
+}
+
+/// Mac `resolveForNavigation`'s first try: the clicked link resolved against
+/// the viewed file's own directory. The second try is `rootedCandidate`
+/// (shared with the resource resolver); existence is the caller's check, as
+/// everywhere in this module.
+///
+/// Deliberately UNGUARDED, unlike `candidateUnder`: nothing here is served to
+/// the page — the result opens in a viewer split or the default app on the
+/// user's behalf, exactly like a path they typed — and Mac's navigation
+/// resolver has no escape guard for the same reason. Caller owns the result.
+pub fn navCandidate(
+    alloc: Allocator,
+    base_dir: []const u8,
+    rel: []const u8,
+) Allocator.Error!?[]u8 {
+    if (base_dir.len == 0 or rel.len == 0) return null;
+    return try std.fs.path.resolve(alloc, &.{ base_dir, rel });
+}
+
+/// What a routed FILE target opens in (Mac `handleFileModeLink`'s final
+/// switch): markdown gets a viewer split next to this pane; everything else —
+/// code, images, archives — goes to its default app.
+pub const FileLinkAction = enum { viewer_split, default_app };
+
+pub fn fileLinkAction(path: []const u8) FileLinkAction {
+    return if (modeFor(path) == .markdown) .viewer_split else .default_app;
+}
 
 // -------------------------------------------------------------------------
 // Error-card text
@@ -918,6 +1018,98 @@ test "appendJsString escapes the JS line terminators JSON does not" {
     out.clearRetainingCapacity();
     try appendJsString(alloc, &out, "\u{2014}");
     try testing.expectEqualStrings("\"\u{2014}\"", out.items);
+}
+
+test "classifyLink: the Mac policy, with the virtual host carved out first" {
+    // Websites navigate freely within the pane — every target, even ones the
+    // file policy would route.
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "file:///C:/a.md"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "mailto:a@b.c"));
+
+    // The template is the pane's own document, fragment or query included —
+    // without the stripQuery, `viewer.html#x` would read as a relative link
+    // to `viewer.html` and open the TEMPLATE next to the file.
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url ++ "#frag"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url ++ "?v=1"));
+
+    // A relative link in the document arrives under our origin. This must win
+    // over the generic https test or it ships to the browser as a dead URL.
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer/other.md"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.code, "https://ghoztty-viewer/a/b.png"));
+    // The bare origin is ours too (no resource named — the dispatch drops it),
+    // NOT a website to open.
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer/"));
+    // A look-alike host is NOT ours — it is a real website.
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "https://ghoztty-viewer.example.com/x"));
+
+    // External links go to the default browser, whatever the case of the
+    // scheme.
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "HTTP://example.com"));
+
+    // Explicit file URLs come through as written (markdown-it linkify or the
+    // author's own `file://`).
+    try testing.expectEqual(LinkClass.file_url, classifyLink(.markdown, "file:///C:/docs/a.md"));
+    try testing.expectEqual(LinkClass.file_url, classifyLink(.code, "FILE:///C:/x.txt"));
+
+    // Everything else is dropped, exactly as Mac's nil-fileURL return.
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "mailto:a@b.c"));
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "about:blank"));
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "vscode://open"));
+}
+
+test "routesAsLink: new documents route, the pane's own kinds do not" {
+    // A reload re-runs the pane's own document; a history walk is
+    // `syncCommitted`'s job (Back from a website re-renders the file). Routing
+    // either would cancel it.
+    try testing.expect(!routesAsLink(.reload));
+    try testing.expect(!routesAsLink(.back_or_forward));
+    // A new document in file mode is a link activation (the template runs no
+    // navigating script of its own) — and a runtime too old to report a kind
+    // is read the same way, because degrading to "never route" would be the
+    // whole feature silently off.
+    try testing.expect(routesAsLink(.new_document));
+    try testing.expect(routesAsLink(null));
+}
+
+test "navCandidate: next to the viewed file, unguarded on purpose" {
+    const alloc = testing.allocator;
+    const base = if (builtin.os.tag == .windows) "D:\\docs\\project" else "/docs/project";
+
+    {
+        const got = (try navCandidate(alloc, base, "other.md")).?;
+        defer alloc.free(got);
+        const want = try std.fs.path.resolve(alloc, &.{ base, "other.md" });
+        defer alloc.free(want);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // `..` may leave the base: a link one directory up is a link the AUTHOR
+    // wrote and the USER clicked, opening on their behalf — not a resource
+    // served to the page. (`candidateUnder` refuses this; the difference is
+    // the point.)
+    {
+        const got = (try navCandidate(alloc, base, "../sibling/a.md")).?;
+        defer alloc.free(got);
+        const want = try std.fs.path.resolve(alloc, &.{ base, "..", "sibling", "a.md" });
+        defer alloc.free(want);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    try testing.expect((try navCandidate(alloc, base, "")) == null);
+    try testing.expect((try navCandidate(alloc, "", "a.md")) == null);
+}
+
+test "fileLinkAction: markdown splits, everything else opens in its app" {
+    for ([_][]const u8{ "a.md", "a.markdown", "a.MD", "docs/b.mdown" }) |p| {
+        try testing.expectEqual(FileLinkAction.viewer_split, fileLinkAction(p));
+    }
+    for ([_][]const u8{ "a.zig", "a.png", "a.pdf", "Makefile", "a.txt" }) |p| {
+        try testing.expectEqual(FileLinkAction.default_app, fileLinkAction(p));
+    }
 }
 
 test "baseDirectory is the viewed file's own" {

@@ -9932,3 +9932,33 @@ back to the head of the queue. State at parking: no occurrence since the three
 crash-free full-binary runs. The watch itself (floor-lane crash-catch T450 +
 exit-code decode T444) stays armed. No code changed; the queue now surfaces
 real work (T392 viewer link routing is the new head).
+
+## 2026-08-06 - T392: links in file viewers route the Mac way - browser, viewer split, or default app (session 170f2a16)
+
+Clicking a link in a rendered markdown/code viewer now does what the Mac
+build does instead of navigating the pane: http(s) goes to the default
+browser, a relative link to an EXISTING markdown file opens a viewer split on
+the pane's right (inheriting the origin directory, so doc-link chains keep
+their provenance), any other local file opens in its default app, and
+everything else (mailto:, about:) is dropped. Website viewers still navigate
+freely in-pane, and file-mode reloads and history walks are untouched - the
+gate keys on WebView2's NavigationKind (NEW_DOCUMENT routes; RELOAD and
+BACK_OR_FORWARD pass), deliberately NOT IsUserInitiated, because WebKit's
+.linkActivated covers synthesized clicks and the win32 live test drives the
+policy with exactly those. The policy itself is pure
+(viewer_content.classifyLink/routesAsLink/navCandidate/fileLinkAction); the
+COM half is add_NavigationStarting (vtable slot 7) + the NavigationStarting
+args/Args3 interfaces, GUIDs verified against the WebView2 SDK header. Two
+translations worth remembering: relative links arrive under the https://
+virtual host (Mac's are a custom scheme), so the ours-check must precede the
+generic http(s) test; and the pane reaches the split machinery through a
+trampoline Window.createViewerPane installs (open_link_split), because a
+direct newViewerSplitAt reference drags the surface/renderer world - and the
+GTK apprt branch - into the win32 test binary's comptime analysis. The live
+test routes through a sink instead of ShellExecute, so a green lane never
+opens a real browser. Validation: floor-lane all lanes PASS; P1-P3 ALL PASS;
+viewer-panes.ps1 119/121 with both failures proven pre-existing by a
+reverted-sources control build - filed T537 (+reload window-target string
+fails only in the harness) and T538 (split off a web viewer loses cwd
+inheritance), plus T536 (flaky undefined-memory crash in inbound_ring seen
+once at HEAD during validation).

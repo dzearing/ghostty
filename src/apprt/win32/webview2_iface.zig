@@ -195,6 +195,29 @@ pub const IID_WebResourceRequestedHandler: GUID = .{
     .Data4 = .{ 0x80, 0xE8, 0xE7, 0x63, 0x41, 0xD2, 0x5D, 0x71 },
 };
 
+// {9ADBE429-F36D-432B-9DDC-F8881FBD76E3}
+// `ICoreWebView2NavigationStartingEventHandler` (T392). Like every handler IID
+// here, proven by the live test: the runtime QIs the handler for exactly this
+// GUID before invoking it, so a wrong one is an event that never fires.
+pub const IID_NavigationStartingHandler: GUID = .{
+    .Data1 = 0x9ADBE429,
+    .Data2 = 0xF36D,
+    .Data3 = 0x432B,
+    .Data4 = .{ 0x9D, 0xDC, 0xF8, 0x88, 0x1F, 0xBD, 0x76, 0xE3 },
+};
+
+// {DDFFE494-4942-4BD2-AB73-35B8FF40E19F}
+// `ICoreWebView2NavigationStartingEventArgs3` — the revision that carries
+// `NavigationKind`, QI'd for from the base args (T392). A runtime that
+// predates it answers E_NOINTERFACE and the caller degrades to "kind
+// unknown".
+pub const IID_ICoreWebView2NavigationStartingEventArgs3: GUID = .{
+    .Data1 = 0xDDFFE494,
+    .Data2 = 0x4942,
+    .Data3 = 0x4BD2,
+    .Data4 = .{ 0xAB, 0x73, 0x35, 0xB8, 0xFF, 0x40, 0xE1, 0x9F },
+};
+
 // {D33A35BF-1C49-4F98-93AB-006E0533FE1C}
 // `ICoreWebView2NavigationCompletedEventHandler`.
 pub const IID_NavigationCompletedHandler: GUID = .{
@@ -481,6 +504,109 @@ pub const ICoreWebView2WebResourceRequestedEventArgs = extern struct {
     }
 };
 
+// --------------------------------- ICoreWebView2NavigationStartingEventArgs
+
+/// `COREWEBVIEW2_NAVIGATION_KIND` (T392): what KIND of navigation is starting.
+/// Lives on the Args3 revision; `viewer_content.NavKind` is its COM-free twin.
+pub const NavigationKind = enum(i32) {
+    reload = 0,
+    back_or_forward = 1,
+    new_document = 2,
+    _,
+};
+
+/// A top-level navigation about to happen — the interception point link
+/// routing lives on (T392). Ten slots; four are read/written: the URI, the
+/// two provenance bits, and `put_Cancel`, which is what makes this event a
+/// POLICY rather than a notification.
+pub const ICoreWebView2NavigationStartingEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2NavigationStartingEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2NavigationStartingEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2NavigationStartingEventArgs) callconv(.winapi) u32,
+        get_Uri: *const fn (*ICoreWebView2NavigationStartingEventArgs, *?[*:0]u16) callconv(.winapi) HRESULT,
+        get_IsUserInitiated: *const fn (*ICoreWebView2NavigationStartingEventArgs, *BOOL) callconv(.winapi) HRESULT,
+        get_IsRedirected: *const fn (*ICoreWebView2NavigationStartingEventArgs, *BOOL) callconv(.winapi) HRESULT,
+        get_RequestHeaders: *const anyopaque,
+        get_Cancel: *const anyopaque,
+        put_Cancel: *const fn (*ICoreWebView2NavigationStartingEventArgs, BOOL) callconv(.winapi) HRESULT,
+        get_NavigationId: *const anyopaque,
+    };
+
+    /// Where the navigation is going. Caller frees it with `CoTaskMemFree`.
+    pub fn uriRaw(self: *ICoreWebView2NavigationStartingEventArgs) ?[*:0]u16 {
+        var raw: ?[*:0]u16 = null;
+        if (com.failed(self.vtable.get_Uri(self, &raw))) return null;
+        return raw;
+    }
+
+    pub fn isUserInitiated(self: *ICoreWebView2NavigationStartingEventArgs) bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_IsUserInitiated(self, &out))) return false;
+        return out != 0;
+    }
+
+    pub fn isRedirected(self: *ICoreWebView2NavigationStartingEventArgs) bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_IsRedirected(self, &out))) return false;
+        return out != 0;
+    }
+
+    /// "Do not perform this navigation." The routed replacement (a browser, a
+    /// split, a default app) is the handler's business, not the runtime's.
+    pub fn setCancel(self: *ICoreWebView2NavigationStartingEventArgs, cancel: bool) bool {
+        return !com.failed(self.vtable.put_Cancel(self, if (cancel) 1 else 0));
+    }
+
+    /// The Args3 view of this object, or null on a runtime that predates it.
+    /// Caller owns the reference.
+    pub fn queryArgs3(
+        self: *ICoreWebView2NavigationStartingEventArgs,
+    ) ?*ICoreWebView2NavigationStartingEventArgs3 {
+        var out: ?*anyopaque = null;
+        if (com.failed(self.vtable.QueryInterface(
+            self,
+            &IID_ICoreWebView2NavigationStartingEventArgs3,
+            &out,
+        ))) return null;
+        return @ptrCast(@alignCast(out orelse return null));
+    }
+};
+
+/// The Args3 revision: the base ten slots, Args2's ancestor pair, then
+/// `get_NavigationKind` — the one slot this exists for, because the KIND is
+/// what separates a link activation from the pane's own reloads and history
+/// walks (`viewer_content.routesAsLink`).
+pub const ICoreWebView2NavigationStartingEventArgs3 = extern struct {
+    vtable: *const Vtbl,
+
+    /// Slots 3..9: the base interface's members past `IUnknown`.
+    pub const base_slots = 7;
+    /// Slots 10..11: Args2's `get_`/`put_AdditionalAllowedFrameAncestors`.
+    pub const args2_slots = 2;
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2NavigationStartingEventArgs3, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2NavigationStartingEventArgs3) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2NavigationStartingEventArgs3) callconv(.winapi) u32,
+        base: [base_slots]*const anyopaque,
+        args2: [args2_slots]*const anyopaque,
+        get_NavigationKind: *const fn (*ICoreWebView2NavigationStartingEventArgs3, *NavigationKind) callconv(.winapi) HRESULT,
+    };
+
+    pub fn release(self: *ICoreWebView2NavigationStartingEventArgs3) void {
+        _ = self.vtable.Release(self);
+    }
+
+    pub fn navigationKind(self: *ICoreWebView2NavigationStartingEventArgs3) ?NavigationKind {
+        var out: NavigationKind = .new_document;
+        if (com.failed(self.vtable.get_NavigationKind(self, &out))) return null;
+        return out;
+    }
+};
+
 // -------------------------------- ICoreWebView2NavigationCompletedEventArgs
 
 /// Whether the navigation that just finished actually loaded. Three slots
@@ -574,15 +700,19 @@ pub const ICoreWebView2Profile = extern struct {
 /// `ExecuteScript` (29), `add_WebResourceRequested` (55) and
 /// `AddWebResourceRequestedFilter` (57) — which is why the opaque runs are
 /// shorter again. T390 added `+reload`'s two: `Reload` (31) and
-/// `CallDevToolsProtocolMethod` (36), and T383 the title pair
-/// `add_DocumentTitleChanged` (46) and `get_DocumentTitle` (48). Every block's
+/// `CallDevToolsProtocolMethod` (36), T383 the title pair
+/// `add_DocumentTitleChanged` (46) and `get_DocumentTitle` (48), and T392 the
+/// link-routing interception `add_NavigationStarting` (7). Every block's
 /// LENGTH is what holds the named slots in place, and `@offsetOf` asserts all
 /// of them at the bottom of this file.
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
-    /// Slots 6..10: `NavigateToString` through `remove_ContentLoading`.
-    pub const pre_source_slots = 5;
+    /// Slot 6: `NavigateToString`.
+    pub const pre_nav_starting_slots = 1;
+    /// Slots 8..10: `remove_NavigationStarting` through
+    /// `remove_ContentLoading`.
+    pub const post_nav_starting_slots = 3;
     /// Slot 12: `remove_SourceChanged`.
     pub const remove_source_slots = 1;
     /// Slot 14: `remove_HistoryChanged`.
@@ -619,7 +749,9 @@ pub const ICoreWebView2 = extern struct {
         get_Settings: *const anyopaque,
         get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
         Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
-        pre_source: [pre_source_slots]*const anyopaque,
+        pre_nav_starting: [pre_nav_starting_slots]*const anyopaque,
+        add_NavigationStarting: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        post_nav_starting: [post_nav_starting_slots]*const anyopaque,
         add_SourceChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         remove_source: [remove_source_slots]*const anyopaque,
         add_HistoryChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
@@ -763,6 +895,14 @@ pub const ICoreWebView2 = extern struct {
     pub fn addWebMessageReceived(self: *ICoreWebView2, handler: *anyopaque) bool {
         var token: EventRegistrationToken = .{};
         return !com.failed(self.vtable.add_WebMessageReceived(self, handler, &token));
+    }
+
+    /// Subscribe to "a top-level navigation is about to start" — the policy
+    /// point where file-mode link routing cancels and redirects (T392, Mac's
+    /// `decidePolicyFor`).
+    pub fn addNavigationStarting(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_NavigationStarting(self, handler, &token));
     }
 
     /// Subscribe to "a navigation finished". File mode injects the viewed
@@ -1164,6 +1304,10 @@ test "the slots we actually call sit where the header puts them" {
     // check that says the split did not move anything.
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_Source"));
     try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Navigate"));
+    // T392's interception point, one slot past `NavigateToString`. The slot
+    // after it is `remove_NavigationStarting`, a token-taking remove —
+    // subscribing there would hand the runtime a handler pointer as an i64.
+    try testing.expectEqual(7 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationStarting"));
     // T159's events, carved out of what used to be the one 9-slot `pre_nav`
     // run. `add_HistoryChanged` at 13 has `remove_SourceChanged` (a
     // token-taking remove) one slot before it — subscribing there would hand
@@ -1211,6 +1355,25 @@ test "the slots we actually call sit where the header puts them" {
     // Navigation-completed: only "did it load" is read, and it is slot 3.
     try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NavigationCompletedEventArgs.Vtbl, "get_IsSuccess"));
 
+    // Navigation-starting (T392): the URI, the two provenance bits, and the
+    // cancel that makes the event a policy. `put_Cancel` at 8 has `get_Cancel`
+    // one slot before it — writing through the getter's slot would pass a BOOL
+    // where the runtime expects a pointer to write through.
+    try testing.expectEqual(
+        10 * ptr,
+        @sizeOf(ICoreWebView2NavigationStartingEventArgs.Vtbl),
+    );
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NavigationStartingEventArgs.Vtbl, "get_Uri"));
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2NavigationStartingEventArgs.Vtbl, "get_IsUserInitiated"));
+    try testing.expectEqual(5 * ptr, @offsetOf(ICoreWebView2NavigationStartingEventArgs.Vtbl, "get_IsRedirected"));
+    try testing.expectEqual(8 * ptr, @offsetOf(ICoreWebView2NavigationStartingEventArgs.Vtbl, "put_Cancel"));
+    // Args3: the kind getter is the last slot — base ten, Args2's two, then it.
+    try testing.expectEqual(
+        13 * ptr,
+        @sizeOf(ICoreWebView2NavigationStartingEventArgs3.Vtbl),
+    );
+    try testing.expectEqual(12 * ptr, @offsetOf(ICoreWebView2NavigationStartingEventArgs3.Vtbl, "get_NavigationKind"));
+
     // IStream: `Write` is ISequentialStream's second method, `Seek` is
     // IStream's first. Getting these two the wrong way round would call Read
     // with write arguments.
@@ -1249,6 +1412,8 @@ test "every interface puts its vtable pointer first" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceRequest, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceResponse, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NavigationCompletedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NavigationStartingEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NavigationStartingEventArgs3, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(IStream, "vtable"));
 }
 
@@ -1278,4 +1443,10 @@ test "the enums carry the values the runtime expects" {
     // value here would filter the document out of its own interception.
     try testing.expectEqual(@as(i32, 0), @intFromEnum(WebResourceContext.all));
     try testing.expectEqual(@as(i32, 1), @intFromEnum(WebResourceContext.document));
+    // `COREWEBVIEW2_NAVIGATION_KIND` (T392): routing keys on `new_document`,
+    // so these three numbers are the difference between routing a link and
+    // cancelling every reload.
+    try testing.expectEqual(@as(i32, 0), @intFromEnum(NavigationKind.reload));
+    try testing.expectEqual(@as(i32, 1), @intFromEnum(NavigationKind.back_or_forward));
+    try testing.expectEqual(@as(i32, 2), @intFromEnum(NavigationKind.new_document));
 }

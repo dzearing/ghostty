@@ -320,6 +320,23 @@ Unchanged in intent; stated here so the boundaries are explicit.
   -- a rename over the target arrives as an ordinary notification for the same
   basename. Debounce is a `WM_TIMER` on the pane's host window, since `SetTimer`
   on an existing id resets it, which is Mac's cancel-and-reschedule exactly.
+  **T392 is done as of 2026-08-06**: `add_NavigationStarting` (slot 7) cancels
+  and routes file-mode links -- http(s) to the default browser, an existing
+  relative `.md` to a viewer split on the pane's right, any other file to its
+  default app -- with the whole policy pure in `viewer_content.zig`
+  (`classifyLink`/`routesAsLink`/`navCandidate`/`fileLinkAction`). Three
+  translations worth knowing: (1) relative links arrive under the `https://`
+  virtual host rather than Mac's custom scheme, so the ours-check must run
+  before the generic http(s) one or every relative link ships to the browser
+  as a dead URL; (2) the link gate keys on `NavigationKind == NEW_DOCUMENT`
+  (Args3, QI'd with a graceful null on old runtimes), NOT `IsUserInitiated` --
+  WebKit's `.linkActivated` covers synthesized clicks and WebView2's
+  user-initiated bit does not, while reloads and history walks are exactly the
+  two kinds excluded; (3) the pane reaches the split machinery through a
+  trampoline `Window.createViewerPane` installs (`open_link_split`), because a
+  direct `newViewerSplitAt` reference pulls the surface/renderer world -- and
+  with it the GTK apprt branch -- into the win32 test binary's comptime
+  analysis.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add

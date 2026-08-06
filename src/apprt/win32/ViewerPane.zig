@@ -222,6 +222,9 @@ resource_handler: ?*WebResourceRequestedHandler = null,
 /// Our reference on the `NavigationCompleted` handler (T90e), same rule.
 navigation_handler: ?*NavigationCompletedHandler = null,
 
+/// Our reference on the `NavigationStarting` handler (T392), same rule.
+navigation_starting_handler: ?*NavigationStartingHandler = null,
+
 /// Our reference on the `DocumentTitleChanged` handler (T383), same rule.
 title_handler: ?*DocumentTitleChangedHandler = null,
 
@@ -232,6 +235,15 @@ title_handler: ?*DocumentTitleChangedHandler = null,
 /// is every pane in a unit test, and the reason `notifyTitle` is a no-op rather
 /// than a dereference there.
 pane_view: ?*PaneView = null,
+
+/// How a linked markdown file becomes a viewer split (T392). INSTALLED by
+/// `Window.createViewerPane` rather than called into `Window` directly, and
+/// the indirection is load-bearing: `newViewerSplitAt` pulls the whole
+/// surface/renderer world into comptime analysis, and this file has unit
+/// tests — the win32 test binary would then need the OTHER apprt's renderer
+/// branch (GTK modules it is never given) just to compile. Null for a bare
+/// test pane, which has no tree to split anyway.
+open_link_split: ?*const fn (pv: *PaneView, location: []const u8, origin: ?[]const u8) void = null,
 
 /// The app's shared environment, kept for the life of the pane because
 /// `CreateWebResourceResponse` lives on it and the resource handler needs one
@@ -358,6 +370,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.navigation_handler) |h| {
         h.release();
         self.navigation_handler = null;
+    }
+    if (self.navigation_starting_handler) |h| {
+        h.release();
+        self.navigation_starting_handler = null;
     }
     if (self.title_handler) |h| {
         h.release();
@@ -1063,6 +1079,194 @@ fn onNavigationCompleted(
     return com.S_OK;
 }
 
+// -------------------------------------------------------------------------
+// Link routing (T392, design row 5; Mac `decidePolicyFor` + `handleFileModeLink`)
+// -------------------------------------------------------------------------
+
+/// `ICoreWebView2NavigationStartingEventHandler`: a top-level navigation is
+/// about to happen, and file mode gets to say no.
+const NavigationStartingHandler = com.CallbackOwning(
+    iface.IID_NavigationStartingHandler,
+    onNavigationStarting,
+    releasePendingToken,
+);
+
+/// Test seam (the live host-floor test only): when set, every routed link is
+/// RECORDED here as `<kind>:<target>` instead of reaching `ShellExecuteW` or
+/// the split tree. The test must observe routing without opening the user's
+/// real browser over a green lane — and a bare test pane has no split tree to
+/// open a viewer into anyway.
+const LinkSink = struct {
+    alloc: Allocator,
+    entries: std.ArrayList([]u8) = .empty,
+
+    fn append(self: *LinkSink, kind: []const u8, target: []const u8) void {
+        const s = std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ kind, target }) catch return;
+        self.entries.append(self.alloc, s) catch self.alloc.free(s);
+    }
+
+    fn deinit(self: *LinkSink) void {
+        for (self.entries.items) |e| self.alloc.free(e);
+        self.entries.deinit(self.alloc);
+    }
+};
+var link_sink: ?*LinkSink = null;
+
+fn onNavigationStarting(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*iface.ICoreWebView2NavigationStartingEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const a = args orelse return com.S_OK;
+    const self = p.pane orelse return com.S_OK;
+
+    // Websites navigate freely within the pane, and so do the pane's own
+    // reloads and history walks (`syncCommitted` reconciles those after the
+    // fact). Both checks are cheap and neither reads the URI.
+    if (!self.mode.isFile()) return com.S_OK;
+    if (!content.routesAsLink(navKind(a))) return com.S_OK;
+
+    const raw = a.uriRaw() orelse return com.S_OK;
+    // The runtime allocated it on the COM heap; we free it on ours.
+    defer w32.CoTaskMemFree(@ptrCast(raw));
+    const uri = std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(raw)) catch return com.S_OK;
+    defer p.alloc.free(uri);
+
+    switch (content.classifyLink(self.mode, uri)) {
+        .allow => {},
+        .browser => {
+            _ = a.setCancel(true);
+            self.openExternal(p.alloc, uri);
+        },
+        .relative => {
+            _ = a.setCancel(true);
+            self.openRelativeLink(p.alloc, uri);
+        },
+        .file_url => {
+            _ = a.setCancel(true);
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (content.filePath(&buf, uri)) |path| {
+                self.dispatchFileLink(p.alloc, path);
+            }
+        },
+        // Mac's nil-fileURL return: cancelled, and nothing else happens.
+        .drop => _ = a.setCancel(true),
+    }
+    return com.S_OK;
+}
+
+/// The navigation kind, or null on a runtime whose args predate
+/// `ICoreWebView2NavigationStartingEventArgs3`.
+fn navKind(a: *iface.ICoreWebView2NavigationStartingEventArgs) ?content.NavKind {
+    const a3 = a.queryArgs3() orelse return null;
+    defer a3.release();
+    return switch (a3.navigationKind() orelse return null) {
+        .reload => .reload,
+        .back_or_forward => .back_or_forward,
+        .new_document => .new_document,
+        // A kind this build does not know is a kind the policy has no claim
+        // about — but it is also not one of the two the pane issues about
+        // itself, so it routes the way an unknown runtime does.
+        _ => null,
+    };
+}
+
+/// A clicked RELATIVE link (`https://ghoztty-viewer/<rel>`): resolve it next
+/// to the viewed file, and only an existing file opens — Mac's
+/// `resolveForNavigation`, existence checks included.
+fn openRelativeLink(self: *ViewerPane, alloc: Allocator, uri: []const u8) void {
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = content.requestPath(&rel_buf, uri) orelse return;
+    const fp = self.file_path orelse return;
+    const base = content.baseDirectory(fp) orelse return;
+
+    const first = self.takeIfFile(alloc, content.navCandidate(alloc, base, rel) catch null);
+    const path = first orelse
+        self.takeIfFile(alloc, content.rootedCandidate(alloc, base, rel) catch null) orelse {
+        // Mac returns silently here; the log line is our one addition,
+        // because "I clicked and nothing happened" should leave a trace.
+        log.info("viewer link names no existing file: {s}", .{rel});
+        return;
+    };
+    defer alloc.free(path);
+    self.dispatchFileLink(alloc, path);
+}
+
+/// Open a routed FILE target: markdown as a viewer split next to this pane,
+/// anything else with its default app (Mac `handleFileModeLink`'s switch).
+fn dispatchFileLink(self: *ViewerPane, alloc: Allocator, path: []const u8) void {
+    switch (content.fileLinkAction(path)) {
+        .viewer_split => {
+            if (link_sink) |s| return s.append("split", path);
+            self.openLinkedViewerSplit(path);
+        },
+        .default_app => {
+            if (link_sink) |s| return s.append("app", path);
+            self.shellOpen(alloc, path);
+        },
+    }
+}
+
+/// Open another viewer as a split to the RIGHT of this pane (Mac
+/// `openViewerSplit`), through the trampoline `Window.createViewerPane`
+/// installed. A pane that is not in a tree — a bare unit-test pane — has
+/// neither a leaf nor a trampoline, and does nothing.
+///
+/// The origin travels with the link: a pane opened from a link in this one
+/// inherits this one's origin, so a chain of doc links keeps the same
+/// provenance (Mac passes `originDirectory` for the same reason).
+fn openLinkedViewerSplit(self: *ViewerPane, location: []const u8) void {
+    const pv = self.pane_view orelse return;
+    const open = self.open_link_split orelse return;
+    open(pv, location, self.origin_directory);
+}
+
+/// Hand `target` (a URL or a file path) to the shell — the default browser
+/// for the one, the default app for the other. The same call answers both
+/// because that is what `ShellExecuteW(open)` is.
+fn openExternal(self: *ViewerPane, alloc: Allocator, url: []const u8) void {
+    if (link_sink) |s| return s.append("browser", url);
+    self.shellOpen(alloc, url);
+}
+
+fn shellOpen(self: *ViewerPane, alloc: Allocator, target: []const u8) void {
+    _ = self;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, target) catch return;
+    defer alloc.free(wide);
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        wide,
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
+/// Register the routing handler on a freshly adopted controller. Registered
+/// for EVERY pane, web mode included, for the reason the title handler is: a
+/// web pane becomes a file pane the moment the user types a path, and a
+/// subscription installed only for the starting mode would be dead by then.
+/// Non-fatal like every subscription — a pane without it follows file-mode
+/// links in place, which is degraded, not broken.
+fn subscribeNavigationStarting(self: *ViewerPane) void {
+    std.debug.assert(self.navigation_starting_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const handler = NavigationStartingHandler.create(p.alloc, p) catch return;
+    p.refs += 1;
+    if (!web.addNavigationStarting(@ptrCast(handler))) {
+        log.warn("add_NavigationStarting failed; file-mode links navigate in place", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.navigation_starting_handler = handler;
+}
+
 /// Reload this pane's content in place: the `+reload` verb, and (T391) the
 /// file watcher's re-render. Mac's `ViewerView.reloadContent`, whose three-way
 /// branch lives in `viewer_content.reloadPlan` so it is checkable without a
@@ -1566,6 +1770,9 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     // Before the navigation too, so the FIRST commit already updates the
     // address bar and the history buttons (T159).
     self.subscribeHistory();
+    // And the link policy (T392) — before the navigation like everything
+    // else, though its first decision is the template load it allows.
+    self.subscribeNavigationStarting();
     if (self.focused) _ = c.moveFocus(.programmatic);
 
     // Last, so the page starts loading into a view that is already the right
@@ -2428,7 +2635,7 @@ test "host floor: a real controller on a real window, on this box" {
     var msg: w32.MSG = undefined;
     const settled = webview2.pumpUntil(&pane, struct {
         fn f(ctx: *const anyopaque) bool {
-            const p: *const ViewerPane = @alignCast(@ptrCast(ctx));
+            const p: *const ViewerPane = @ptrCast(@alignCast(ctx));
             return p.state != .waiting_env and p.state != .creating;
         }
     }.f);
@@ -3006,6 +3213,107 @@ test "host floor: a real controller on a real window, on this box" {
         }.ready, &pane);
         try testing.expect(std.mem.startsWith(u8, pane.location.?, "http://127.0.0.1"));
     }
+
+    // ------------------------------------------------------------------
+    // T392: link routing — NavigationStarting cancels and routes
+    // ------------------------------------------------------------------
+    //
+    // The recorded handler is the runtime accepting a subscription at slot 7
+    // (`add_NavigationStarting`; one slot off is `NavigateToString` or a
+    // token-taking remove). The routing below FIRING is the proof of the
+    // handler's IID and of the args layout — the URI read and the cancel
+    // written are both args slots, and a wrong one is silence or a corrupt
+    // call. Note every section above already ran with this handler live, so
+    // the history walks and reloads that passed are the allow half of the
+    // policy: a gate that routed too much would have broken them.
+    try testing.expect(pane.navigation_starting_handler != null);
+
+    // Routed links land in the sink instead of the OS — a green lane must
+    // not open the user's real browser — and a bare test pane has no split
+    // tree to open a viewer into anyway.
+    var sink: LinkSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    link_sink = &sink;
+    defer link_sink = null;
+
+    // One document, one link per routed class. The linked markdown file
+    // EXISTS (relative links are existence-checked); nope-linked.md does not.
+    try tmp.dir.writeFile(.{ .sub_path = "linked.md", .data = "# Linked\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "links.md",
+        .data = "[missing](nope-linked.md)\n\n[doc](linked.md)\n\n" ++
+            "[code](t90e.zig)\n\n[ext](https://example.com/x)\n",
+    });
+    const links_path = try std.fs.path.join(alloc, &.{ dir_path, "links.md" });
+    defer alloc.free(links_path);
+    try pane.navigate(alloc, links_path);
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.page_loaded and p.mode == .markdown;
+        }
+    }.ready, &pane);
+
+    // Synthesized clicks, which is why the gate keys on the navigation KIND
+    // rather than `IsUserInitiated` (a script click reports false there; a
+    // real one reports true; both are NEW_DOCUMENT). Each click is issued
+    // after the previous one's entry arrived, and the ExecuteScript queue
+    // orders the first against the `setMarkdown` that renders the links.
+    //
+    // The MISSING link goes first and must produce nothing — proven by
+    // position: if it opened anything, ITS entry would sit where the split's
+    // is asserted below.
+    pane.executeScript(alloc, "document.querySelector('a[href=\"nope-linked.md\"]').click()");
+    pane.executeScript(alloc, "document.querySelector('a[href=\"linked.md\"]').click()");
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            _ = p;
+            return link_sink.?.entries.items.len >= 1;
+        }
+    }.ready, &pane);
+    pane.executeScript(alloc, "document.querySelector('a[href=\"t90e.zig\"]').click()");
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            _ = p;
+            return link_sink.?.entries.items.len >= 2;
+        }
+    }.ready, &pane);
+    pane.executeScript(alloc, "document.querySelector('a[href=\"https://example.com/x\"]').click()");
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            _ = p;
+            return link_sink.?.entries.items.len >= 3;
+        }
+    }.ready, &pane);
+
+    log.warn("link routing: {d} routed", .{sink.entries.items.len});
+    try testing.expectEqual(@as(usize, 3), sink.entries.items.len);
+    {
+        const linked_path = try std.fs.path.join(alloc, &.{ dir_path, "linked.md" });
+        defer alloc.free(linked_path);
+        // A markdown link opens a viewer split at the RESOLVED path, next to
+        // the viewed file.
+        const want_split = try std.fmt.allocPrint(alloc, "split:{s}", .{linked_path});
+        defer alloc.free(want_split);
+        try testing.expectEqualStrings(want_split, sink.entries.items[0]);
+        // A code file goes to its default app.
+        const want_app = try std.fmt.allocPrint(alloc, "app:{s}", .{code_path});
+        defer alloc.free(want_app);
+        try testing.expectEqualStrings(want_app, sink.entries.items[1]);
+        // An external URL goes to the default browser, byte-for-byte.
+        try testing.expectEqualStrings("browser:https://example.com/x", sink.entries.items[2]);
+    }
+
+    // Every routed click was CANCELLED: the pane never left the template, and
+    // it still believes — correctly — that it is showing the links file.
+    {
+        const raw = web.sourceRaw().?;
+        defer w32.CoTaskMemFree(@ptrCast(raw));
+        const src = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw));
+        defer alloc.free(src);
+        try testing.expectEqualStrings(content.page_url, src);
+    }
+    try testing.expectEqual(content.Mode.markdown, pane.mode);
+    try testing.expectEqualStrings(links_path, pane.location.?);
 }
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.
@@ -3151,7 +3459,8 @@ const TestPage = struct {
             if (total == 0) continue;
 
             var head_buf: [160]u8 = undefined;
-            const head = std.fmt.bufPrint(&head_buf,
+            const head = std.fmt.bufPrint(
+                &head_buf,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
                     "Content-Length: {d}\r\nConnection: close\r\n\r\n",
                 .{html.len},
@@ -3283,7 +3592,8 @@ const ReloadPage = struct {
             , .{ n, n }) catch continue;
 
             var head_buf: [220]u8 = undefined;
-            const head = std.fmt.bufPrint(&head_buf,
+            const head = std.fmt.bufPrint(
+                &head_buf,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
                     "Cache-Control: max-age=600\r\n" ++
                     "Content-Length: {d}\r\nConnection: close\r\n\r\n",
@@ -3336,8 +3646,7 @@ test "page messages land on the pane, in the pane's own memory" {
     // A second document replaces the first outright rather than appending, and
     // the testing allocator is the oracle for the old list being freed.
     {
-        const parsed = bridge.parse(alloc,
-            "{\"type\":\"headings\",\"items\":[{\"id\":\"x\",\"text\":\"X\",\"level\":1}]}").?;
+        const parsed = bridge.parse(alloc, "{\"type\":\"headings\",\"items\":[{\"id\":\"x\",\"text\":\"X\",\"level\":1}]}").?;
         pane.applyMessage(alloc, parsed.message);
         parsed.deinit();
     }

@@ -1403,6 +1403,11 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
         viewer.deinit(alloc);
         alloc.destroy(viewer);
     }
+    // The pane's clicked-markdown-link trampoline (T392). Installed here
+    // rather than called by the pane, so ViewerPane never references the
+    // split machinery at comptime — see the field's own doc for why that
+    // matters.
+    viewer.open_link_split = &openViewerSplitFromLink;
     try viewer.createHostWindow(self.app.hinstance, hwnd, self.surfaceRect());
     // Before `start`, so the location is already recorded when the controller
     // arrives and `adoptController` replays it. A viewer that is told where to
@@ -1413,6 +1418,22 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
     viewer.applyOpenMetadata(alloc, open);
     viewer.start(alloc, &self.app.webview2_host);
     return viewer;
+}
+
+/// A viewer pane's clicked markdown link opens as a split to its RIGHT
+/// (T392, Mac `openViewerSplit`). This is the target of
+/// `ViewerPane.open_link_split`; the signature carries the pane's leaf and
+/// its origin directory because those are the two things the pane knows that
+/// the split needs.
+fn openViewerSplitFromLink(pv: *PaneView, location: []const u8, origin: ?[]const u8) void {
+    const window = pv.parentWindow();
+    _ = window.newViewerSplitAt(pv, .right, 0.5, .{
+        .location = location,
+        .origin_directory = origin,
+    }) catch |err| {
+        log.warn("viewer split from link failed err={}", .{err});
+        return;
+    };
 }
 
 /// Shared tail of `addTab`/`addViewerTab`: place a ready single-leaf tree at
