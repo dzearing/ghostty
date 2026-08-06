@@ -47,11 +47,13 @@
 # the one URL that reaches `Navigate` without a network, so a box with no route
 # out still exercises the whole path (P11 makes it a product feature too).
 #
-# Relative/absolute `--view=` path resolution is NOT asserted here: it happens
-# entirely CLI-side before the request is sent, is invisible from the outside
-# (the error text does not echo the path), and is unit tested in the
-# none-runtime lane -- `src/cli/view_args.zig`, including the `C:\...` and UNC
-# cases that the retired `rest[0] == '/'` test called relative.
+# Relative/absolute `--view=` path resolution is mostly NOT asserted here: it
+# happens entirely CLI-side before the request is sent, is invisible from the
+# outside (the error text does not echo the path), and is unit tested in the
+# none-runtime lane -- `src/cli/view_arg.zig`, including the `C:\...` and UNC
+# cases that the retired `rest[0] == '/'` test called relative. The one leg
+# asserted here is `~` expansion (T388, section 8a2), because the resolved
+# path IS visible from outside: it comes back as the pane's `url`.
 #
 # Runs on the BACKGROUND test desktop (lib\TestDesktop.ps1), so it never
 # steals the user's foreground. Only touches ghoztty processes running from
@@ -412,6 +414,35 @@ try {
     Assert ($applog -notmatch 'viewer resource not found: (viewer\.|vendor/)') 'every template asset the page asked for was served'
     Assert ($applog -notmatch 'ExecuteScript failed') 'the content injection was accepted'
 
+    # --- 8a2. a ~ --view path resolves against the home directory (T388) -----
+    # `--view=~/x.md` used to reach the server as `<cwd>\~\x.md`: the tilde was
+    # never expanded (the one leg of Mac's `expandingTildeInPath` that T90e's
+    # port could not carry, because resolution happens CLI-side before the
+    # server sees the path). The pane's `url` is the externally visible product
+    # of that resolution, so it is the oracle: a real file under %USERPROFILE%
+    # opened through `~` must list back as the absolute path. Both separators,
+    # because a Windows user types a backslash.
+    # The fixture is deleted in the OUTER finally, after the app is stopped:
+    # the two panes below WATCH this file (live reload), and deleting it while
+    # they are open re-renders them into error cards mid-run -- WebView2
+    # activity that blurred the focused terminal and broke the T395 fallback
+    # case two hundred lines later.
+    $tildeName = "t388-tilde-$PID.md"
+    $tildeAbs = Join-Path $env:USERPROFILE $tildeName
+    Set-Content -Path $tildeAbs -Value '# t388 fixture' -Encoding utf8
+    foreach ($case in @(
+            @{ View = "~/$tildeName"; Pane = 'vptildef' },
+            @{ View = "~\$tildeName"; Pane = 'vptildeb' }
+        )) {
+        $r = Invoke-Verb @('+split', '--target=vp', "--name=$($case.Pane)", "--view=$($case.View)")
+        Assert ($r.Code -eq 0) "+split --view=$($case.View) exits 0 (got $($r.Code))"
+        $leaf = Wait-Leaf 'vp' $case.Pane
+        Assert ($null -ne $leaf) "+split --view=$($case.View) registers the pane"
+        if ($leaf) {
+            Assert ($leaf.url -eq $tildeAbs) "the $($case.View) leaf reports the absolute home path (got '$($leaf.url)')"
+        }
+    }
+
     # --- 8b. +reload (T390) --------------------------------------------------
     # The verb's contract is entirely about WHICH pane it accepts and what it
     # says about the ones it does not, so every rejection is asserted on its
@@ -589,6 +620,10 @@ try {
 } finally {
     Remove-TestDesktop
     Stop-RepoInstances
+    # The T388 home-dir fixture, deletable only now: while the app was alive
+    # two viewer panes watched it, and a mid-run delete re-rendered them into
+    # error cards (see section 8a2).
+    if ($tildeAbs) { Remove-Item -Path $tildeAbs -Force -ErrorAction SilentlyContinue }
 }
 
 # Runs AFTER the cleanup, so it reads the surviving all-pids list -- the live

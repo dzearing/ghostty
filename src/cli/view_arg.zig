@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lib = @import("../lib/main.zig");
+const internal_os = @import("../os/main.zig");
 
 /// The schemes that name a git diff rather than a file.
 ///
@@ -61,22 +62,60 @@ pub fn needsResolution(value: []const u8) bool {
     return true;
 }
 
-/// Rewrite the first relative `--view=` argument in place, resolved against
-/// `--working-directory=` when present (else the caller's cwd). `arguments`
-/// entries are replaced with arena-allocated copies, so `alloc` must outlive
-/// the request.
+/// The part after the tilde when a value's leading `~` names the caller's own
+/// home directory — a bare `~`, `~/…`, or (on Windows, where `\` is also a
+/// separator) `~\…`. Returns null for everything else, including `~foo/x`:
+/// that is POSIX's "another user's home", which Windows has no answer for, so
+/// it stays an ordinary relative path rather than being half-expanded. A `~`
+/// anywhere but the first byte never matches.
+///
+/// Pure classification on purpose — the address bar needs the same rule, and
+/// this is the function its tests should share.
+pub fn tildeRemainder(value: []const u8) ?[]const u8 {
+    if (value.len == 0 or value[0] != '~') return null;
+    if (value.len == 1) return value[1..];
+    if (std.fs.path.isSep(value[1])) return value[1..];
+    return null;
+}
+
+/// Rewrite the first relative `--view=` argument in place: a `~`-prefixed path
+/// resolves against the caller's home directory (the leg of Mac's
+/// `expandingTildeInPath` that T90e's port could not carry, because the CLI
+/// resolves paths before the server ever sees them), and everything else
+/// resolves against `--working-directory=` when present (else the caller's
+/// cwd). `arguments` entries are replaced with arena-allocated copies, so
+/// `alloc` must outlive the request.
 pub fn resolve(alloc: Allocator, arguments: [][:0]const u8) !void {
     for (arguments, 0..) |arg, i| {
         const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
         if (!needsResolution(rest)) return;
 
-        var base: ?[]const u8 = null;
-        for (arguments) |a| {
-            if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
-        }
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
-        const resolved = try std.fs.path.resolve(alloc, &.{ cwd, rest });
+        const resolved = resolved: {
+            if (tildeRemainder(rest)) |rem| {
+                // Home is where `~` points, never the working directory. If
+                // home cannot be detected at all we fall through and the path
+                // resolves like any other relative one — same outcome as
+                // before this branch existed.
+                const home: ?[]const u8 = internal_os.home(&buf) catch null;
+                if (home) |h| {
+                    // The remainder keeps its leading separator, which
+                    // `resolve` would read as absolute (POSIX) or rooted
+                    // (Windows) and throw the home directory away — so strip
+                    // it. Platform separators only: on POSIX a backslash is a
+                    // legal filename byte, not a separator.
+                    const seps = if (builtin.os.tag == .windows) "/\\" else "/";
+                    const rel = std.mem.trimLeft(u8, rem, seps);
+                    break :resolved try std.fs.path.resolve(alloc, &.{ h, rel });
+                }
+            }
+            var base: ?[]const u8 = null;
+            for (arguments) |a| {
+                if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
+            }
+            const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
+            break :resolved try std.fs.path.resolve(alloc, &.{ cwd, rest });
+        };
         arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
         return;
     }
@@ -141,6 +180,85 @@ test "needsResolution: absolute is the platform's own rule" {
         // drive's own cwd, which we cannot resolve here either way; treating
         // it as needing resolution matches the pre-existing behavior.
         try testing.expect(needsResolution("C:README.md"));
+    }
+}
+
+test "tildeRemainder: only a leading ~ that means home matches" {
+    // The three shapes that mean "my home".
+    try testing.expectEqualStrings("", tildeRemainder("~").?);
+    try testing.expectEqualStrings("/x.md", tildeRemainder("~/x.md").?);
+    try testing.expectEqualStrings("/", tildeRemainder("~/").?);
+    if (builtin.os.tag == .windows) {
+        // A Windows user types a backslash.
+        try testing.expectEqualStrings("\\x.md", tildeRemainder("~\\x.md").?);
+    } else {
+        // On POSIX a backslash is a filename byte, so this is a relative
+        // path whose first component is literally `~\x.md`.
+        try testing.expect(tildeRemainder("~\\x.md") == null);
+    }
+
+    // POSIX "another user's home" — no Windows answer; leave it whole.
+    try testing.expect(tildeRemainder("~foo/x") == null);
+    // A tilde anywhere but the first byte is just a filename character.
+    try testing.expect(tildeRemainder("docs/~/x.md") == null);
+    try testing.expect(tildeRemainder("x~y.md") == null);
+    try testing.expect(tildeRemainder("") == null);
+}
+
+test "resolve: a ~ view resolves against home, not the working directory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = ((internal_os.home(&home_buf) catch null) orelse
+        return error.SkipZigTest);
+
+    const base = if (builtin.os.tag == .windows) "C:\\src\\repo" else "/src/repo";
+    const tilde_views: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "~/x.md", "~\\x.md" }
+    else
+        &.{"~/x.md"};
+    for (tilde_views) |view| {
+        var arguments = [_][:0]const u8{
+            try std.fmt.allocPrintSentinel(alloc, "--working-directory={s}", .{base}, 0),
+            try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{view}, 0),
+        };
+        try resolve(alloc, &arguments);
+
+        const want = try std.fs.path.resolve(alloc, &.{ home, "x.md" });
+        const got = lib.cutPrefix(u8, arguments[1], "--view=").?;
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // A bare `~` is the home directory itself.
+    var arguments = [_][:0]const u8{
+        try alloc.dupeZ(u8, "--view=~"),
+    };
+    try resolve(alloc, &arguments);
+    const want_home = try std.fs.path.resolve(alloc, &.{home});
+    try testing.expectEqualStrings(
+        want_home,
+        lib.cutPrefix(u8, arguments[0], "--view=").?,
+    );
+}
+
+test "resolve: ~foo and a mid-path ~ stay ordinary relative paths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const base = if (builtin.os.tag == .windows) "C:\\src\\repo" else "/src/repo";
+    for ([_][]const u8{ "~foo/x.md", "docs/~/x.md" }) |view| {
+        var arguments = [_][:0]const u8{
+            try std.fmt.allocPrintSentinel(alloc, "--working-directory={s}", .{base}, 0),
+            try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{view}, 0),
+        };
+        try resolve(alloc, &arguments);
+
+        const want = try std.fs.path.resolve(alloc, &.{ base, view });
+        const got = lib.cutPrefix(u8, arguments[1], "--view=").?;
+        try testing.expectEqualStrings(want, got);
     }
 }
 

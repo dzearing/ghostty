@@ -9785,3 +9785,23 @@ silent-rejection half was verified loud (win32 Configuration Errors dialog;
 re-proving on the current tree: none-lane parseBool-filtered tests 75/75 PASS
 on-box today. No new tasks - T137 already filed T489 for the adjacent
 CLI-flag-silently-ignored gap.
+
+## 2026-08-06 - T388: ~ in --view paths expands to the home directory (win seat)
+
+`+split`/`+new-window --view=~/x.md` used to glue the caller's cwd onto the
+literal `~` (an error page for the most common way to name a home file; the
+one leg of Mac's `expandingTildeInPath` that T90e's port could not carry,
+since the CLI resolves paths before the server sees them). `view_arg.zig` now
+classifies a leading `~` with a pure `tildeRemainder()` (`~`, `~/…`, and on
+Windows `~\…`; `~foo/x` and a mid-path `~` stay ordinary relative paths) and
+`resolve()` expands it against `internal_os.home` - never the working
+directory. Unit tests cover all five shapes in both lanes;
+`viewer-panes.ps1` gains section 8a2 (a real file under `%USERPROFILE%`
+opened through both separators, the pane's `url` asserted absolute - all 6
+asserts PASS). Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, P1-P3 ALL
+PASS. The investigation also proved the script's one red assert (`a web
+viewer contributes no cwd, so the fallback stands`) is red at git HEAD with
+no local changes - filed as T526 with the root cause (the T105/T211
+deferred-focus guard drops `+split` focus into a non-active window, so the
+split off a web viewer inherits another window's cwd), plus T527 for a
+silent GUI death intermittent seen twice during validation.
