@@ -186,11 +186,13 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 /* Digest prose (Commentary AND Task triage) reads at article size — it is a
    morning read, not a data panel. The 13px .md base stays for task dialogs,
    where density wins. */
-.digest-body { max-width: 700px; }
-.digest-body .md { font-size: 15px; line-height: 1.65; }
-.digest-body .md p { margin: 10px 0; }
-.digest-body .md ul, .digest-body .md ol { margin: 10px 0; }
-.digest-body .md li { margin: 5px 0; }
+.digest-body { max-width: 860px; margin: 0 auto; }
+/* The header and tabs center with the prose so the page reads as one column. */
+.digest-date, .digest-tabs { max-width: 860px; margin-left: auto; margin-right: auto; }
+.digest-body .md { font-size: 16px; line-height: 1.7; color: var(--ink); }
+.digest-body .md p { margin: 14px 0; }
+.digest-body .md ul, .digest-body .md ol { margin: 14px 0; }
+.digest-body .md li { margin: 9px 0; }
 /* Headings breathe: generous space ABOVE (section separation) and clear
    space below before the prose starts. */
 .digest-body .md h2 { font-size: 18px; margin: 30px 0 12px; }

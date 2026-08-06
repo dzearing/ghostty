@@ -93,10 +93,13 @@ Concretely, in order, with no stops in between:
      not vetoed by the NEXT day's triage is closed as `skipped(stale: …)`.
      Never close a P0/P1 by staleness alone.
    - **Write `## Task triage`** into today's digest: counts (filed
-     yesterday, closed yesterday, net flow, M1 closed/total and the
-     percentage), what was promoted into M1 and why, dep repairs made,
-     proposed closes awaiting veto, and yesterday's proposals now enacted.
-     Same audience as Commentary: prose, not a table dump.
+     yesterday, closed yesterday, net flow, M1 closed/total), what was
+     promoted into M1 and why, dep repairs made, proposed closes awaiting
+     veto, and yesterday's proposals now enacted. **Scannable, never dense**
+     (user, 2026-08-06): lead with an H3 stat line (`### M1: X of Y
+     closed`), then short bold-labeled bullets — one idea each, two
+     sentences max. No wall-of-prose paragraphs; this is read on a
+     dashboard at a glance.
    - Commit triage-only frontmatter churn as `chore(triage): …` — the
      modified-date column must not read a bulk re-triage as work on 200
      tasks.
