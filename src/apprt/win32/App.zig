@@ -1637,6 +1637,145 @@ const AttachProbe = struct {
     }
 };
 
+/// The session id one restored leaf will ATTACH to: its recorded id iff the
+/// roster says attachable (alive or a relaunchable tombstone), or the roster is
+/// UNKNOWN (probe failed, so attempt). Null for a viewer leaf (owns no
+/// session), an id-less leaf (re-opens fresh), or a positively-gone session.
+/// This is THE attach rule — `restoreAttachOverride` applies it and the T411
+/// gap counter mirrors it, so the two cannot drift.
+fn leafAttachSessionId(
+    leaf: session_layout.Leaf,
+    attach: ?*const std.StringHashMap(void),
+) ?[]const u8 {
+    if (leaf.isViewer()) return null;
+    const sid = leaf.session_id orelse return null;
+    if (attach) |a| {
+        if (!a.contains(sid)) return null;
+    }
+    return sid;
+}
+
+/// Record every session id a restored window's leaves ATTACH to (T411): keys go
+/// into `attached` (borrowed from the manifest arena, which outlives the
+/// caller's use) and `panes` counts the attaching leaves. Fresh re-opens and
+/// viewers are not counted — they hold no agent session, so they cannot
+/// account for one.
+fn collectAttachedLeaves(
+    win: session_layout.Window,
+    attach: ?*const std.StringHashMap(void),
+    attached: *std.StringHashMap(void),
+    panes: *usize,
+) void {
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            const sid = leafAttachSessionId(leaf, attach) orelse continue;
+            attached.put(sid, {}) catch {};
+            panes.* += 1;
+        }
+    }
+}
+
+/// How many of the agent's LIVE sessions no restored pane attached to (T411).
+/// A live pinned session outside the layout is invisible otherwise — the reaper
+/// is (correctly) not allowed to touch it, so it holds a slot and a real shell
+/// forever unless someone notices. Tombstones and exited sessions are not
+/// counted: they are T278's problem, not a running process.
+fn countUnattachedLive(
+    sessions: []const remote_connection.OwnedSession,
+    attached: *const std.StringHashMap(void),
+) usize {
+    var n: usize = 0;
+    for (sessions) |s| {
+        if (s.alive and !attached.contains(s.id)) n += 1;
+    }
+    return n;
+}
+
+test "leafAttachSessionId applies the one attach rule (T411 counts what restore attaches)" {
+    var set = std.StringHashMap(void).init(std.testing.allocator);
+    defer set.deinit();
+    try set.put("alive-1", {});
+
+    // In the roster: attach.
+    try std.testing.expectEqualStrings(
+        "alive-1",
+        leafAttachSessionId(.{ .session_id = "alive-1" }, &set).?,
+    );
+    // Positively gone: fresh re-open, no session accounted for.
+    try std.testing.expect(leafAttachSessionId(.{ .session_id = "gone-1" }, &set) == null);
+    // Roster UNKNOWN (probe failed): attempt the recorded id.
+    try std.testing.expectEqualStrings(
+        "gone-1",
+        leafAttachSessionId(.{ .session_id = "gone-1" }, null).?,
+    );
+    // Viewer and id-less leaves own no session either way.
+    try std.testing.expect(
+        leafAttachSessionId(.{ .kind = "viewer", .session_id = "alive-1" }, &set) == null,
+    );
+    try std.testing.expect(leafAttachSessionId(.{}, &set) == null);
+}
+
+test "collectAttachedLeaves counts only leaves that attach a session" {
+    const nodes = [_]session_layout.Node{
+        .{ .leaf = .{ .session_id = "alive-1" } },
+        .{ .split = .{ .layout = "horizontal", .ratio = 0.5, .left = 0, .right = 2 } },
+        .{ .leaf = .{ .session_id = "gone-1" } }, // positively gone: fresh re-open
+        .{ .leaf = .{ .kind = "viewer", .viewer_location = "https://example.com/" } },
+        .{ .leaf = .{} }, // id-less: fresh re-open
+    };
+    const tabs = [_]session_layout.Tab{.{ .nodes = &nodes, .active = true }};
+    const win: session_layout.Window = .{ .id = "w1", .tabs = &tabs };
+
+    var set = std.StringHashMap(void).init(std.testing.allocator);
+    defer set.deinit();
+    try set.put("alive-1", {});
+
+    var attached = std.StringHashMap(void).init(std.testing.allocator);
+    defer attached.deinit();
+    var panes: usize = 0;
+    collectAttachedLeaves(win, &set, &attached, &panes);
+    try std.testing.expectEqual(@as(usize, 1), panes);
+    try std.testing.expect(attached.contains("alive-1"));
+    try std.testing.expectEqual(@as(u32, 1), attached.count());
+}
+
+test "countUnattachedLive counts live sessions outside the attached set only" {
+    const mk = struct {
+        fn s(id: []const u8, alive: bool) remote_connection.OwnedSession {
+            return .{
+                .id = id,
+                .alive = alive,
+                .exit_code = null,
+                .attached = false,
+                .activity = "idle",
+                .pid = 42,
+                .title = null,
+                .cwd = null,
+                .argv = null,
+                .created_at = 0,
+                .last_activity = 0,
+                .pinned = true,
+            };
+        }
+    };
+
+    var attached = std.StringHashMap(void).init(std.testing.allocator);
+    defer attached.deinit();
+    try attached.put("alive-attached", {});
+
+    const sessions = [_]remote_connection.OwnedSession{
+        mk.s("alive-attached", true), // a restored pane holds it
+        mk.s("alive-orphan", true), // the T411 orphan: live, held by nothing
+        mk.s("dead-tombstone", false), // T278's problem, never this counter's
+    };
+    try std.testing.expectEqual(@as(usize, 1), countUnattachedLive(&sessions, &attached));
+
+    // The zero case is a real answer, not a missing line.
+    const all_attached = [_]remote_connection.OwnedSession{mk.s("alive-attached", true)};
+    try std.testing.expectEqual(@as(usize, 0), countUnattachedLive(&all_attached, &attached));
+}
+
 /// Which transport a rebuild's panes ride, and what the rebuilt window owns of
 /// it. Threaded through the restore helpers as ONE value so a caller cannot set
 /// the connection and forget the ownership that goes with it — the two are the
@@ -1769,6 +1908,14 @@ pub fn restoreSessionLayout(self: *App) bool {
     defer probe.deinit();
     const attach_ptr = probe.attachSet();
 
+    // T411: track which agent sessions the restored panes actually attach to,
+    // so the launch can say — in the same breath as "restored N window(s)" —
+    // whether the agent is holding LIVE sessions nothing re-attached. Keys
+    // borrow from the manifest/blob arenas freed at function exit.
+    var attached_ids = std.StringHashMap(void).init(gpa);
+    defer attached_ids.deinit();
+    var attached_panes: usize = 0;
+
     var restored: usize = 0;
     for (union_set.windows) |win| {
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
@@ -1777,9 +1924,35 @@ pub fn restoreSessionLayout(self: *App) bool {
             continue;
         };
         restored += 1;
+        collectAttachedLeaves(win, attach_ptr, &attached_ids, &attached_panes);
     }
     if (restored == 0) return false;
     log.info("session-restore: restored {d} window(s)", .{restored});
+
+    // T411: the gap report. An unattached LIVE session is a real shell holding
+    // a session slot that no window shows; `pinned` (correctly) exempts it from
+    // the idle-TTL reaper, so without this line it is invisible unless the user
+    // opens the chooser roster and counts. The zero case logs too — a counter
+    // that only appears when nonzero cannot be told from one that never ran.
+    if (probe.roster) |roster| {
+        const unattached = countUnattachedLive(roster.sessions, &attached_ids);
+        if (unattached > 0) {
+            log.warn(
+                "session-restore: attached {d} pane(s); {d} live agent session(s) unattached",
+                .{ attached_panes, unattached },
+            );
+        } else {
+            log.info(
+                "session-restore: attached {d} pane(s); 0 live agent session(s) unattached",
+                .{attached_panes},
+            );
+        }
+    } else {
+        log.info(
+            "session-restore: attached {d} pane(s); unattached live session count unknown (probe failed)",
+            .{attached_panes},
+        );
+    }
 
     // ADOPT (Mac's `SessionLayoutManifest.adopt(_:)`): the agent-recovered
     // windows are this box's again, so write them into the local manifest —
@@ -1871,10 +2044,7 @@ fn restoreAttachOverride(
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
 ) Surface.Overrides {
-    const sid: ?[]const u8 = if (leaf.session_id) |s| blk: {
-        const ok = if (attach) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
-        break :blk if (ok) s else null;
-    } else null;
+    const sid: ?[]const u8 = leafAttachSessionId(leaf, attach);
     // T109: the recorded screen goes with the SESSION we are re-attaching to.
     // A leaf whose session is gone OPENs a fresh shell, and painting the dead
     // session's last screen over it would be a lie about what the pane is —

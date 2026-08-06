@@ -9693,3 +9693,26 @@ split both re-ran the marker), ALL PASS post-fix; `remote-inherit.ps1` ALL
 PASS (genuine-remote command inheritance preserved); floor-lane all three
 lanes PASS; P1-P3 ALL PASS. Filed T515: an explicit local `+split --command`
 opens in the agent default cwd rather than the parent pane's.
+
+## 2026-08-06 - T411 done: launch restore now reports live agent sessions nothing attached to
+
+The live sibling of T278: a pinned session no restored pane re-attaches holds
+a real shell and one of 256 slots forever, and the app used to have both
+numbers in hand at launch and say nothing (T108 evidence: 4 live sessions,
+layout held 3). restoreSessionLayout now logs, right after "restored N
+window(s)": "session-restore: attached N pane(s); M live agent session(s)
+unattached" - warn when M > 0, info at zero (the zero case logs on purpose:
+a counter that only appears when nonzero cannot be told from one that never
+ran), and a failed roster probe says "unknown (probe failed)" instead of
+omitting the line. The counter shares the attach rule with
+restoreAttachOverride via the new leafAttachSessionId, so the two cannot
+drift; only ALIVE sessions count (tombstones are T278's). Unit tests for the
+three pure helpers (proven to run by a deliberate red mutation), and
+session-reattach.ps1 grew F9c-F10c: zero case asserted on the first relaunch,
+then an orphan opened directly against the harness agent (remote-test-client
+--pipe --hold, which detaches leaving the session alive), and the second
+relaunch's stderr names 1 unattached session while all 4 sessions stay alive
+(report, never reap) - ALL PASS (43). Floor lanes none/win32/agent PASS,
+P1-P3 ALL PASS. Filed T519 (mac sibling of the log line), T520 (chooser
+marks "not in any window"), T521 + decision D18 (opt-in orphan aging, user's
+call on whether pinned sessions may ever expire).

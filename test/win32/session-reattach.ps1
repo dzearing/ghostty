@@ -60,6 +60,9 @@
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    # T411 (F9c-F10b): opens the orphan session directly against the harness
+    # agent's pipe. Built on demand: `zig build remote-test-client`.
+    [string]$ClientExe = 'D:\git\ghoztty\zig-out\bin\remote-test-client.exe',
     [switch]$NegativeControl,
     [switch]$Interactive
 )
@@ -70,6 +73,7 @@ $script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-session-reattach-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')  # Get-LocalAgentPipeName (T411)
 
 # Write-Host, not the pipeline: a helper that both asserts and returns a value
 # would otherwise hand its caller @('  PASS ...', $realValue).
@@ -81,7 +85,7 @@ function Say($m) { Write-Host $m }
 
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
+    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe', 'remote-test-client.exe')) {
         Get-CimInstance Win32_Process -Filter "Name='$n'" |
             Where-Object { $_.CommandLine -like '*zig-out*' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -109,6 +113,17 @@ function Run-Cli($argsLine, $out, $timeoutSec = 15) {
     return $p.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
+
+# Poll a captured stderr log until $pattern shows (the restore log lines land a
+# beat after the windows do). Returns $true/$false, never throws.
+function Wait-LogLine($path, $pattern, $timeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-Path $path) -and (Select-String -Path $path -Pattern $pattern -Quiet)) { return $true }
+        Start-Sleep -Milliseconds 400
+    }
+    return $false
+}
 
 # Walk +list --json for the first terminal leaf id.
 function Find-Pane($tree) {
@@ -497,7 +512,7 @@ Assert "F4 the agent kept all 3 sessions alive after the app died" (
 # a normal visible one, so this is the shape that runs.
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$relaunched = Start-OnTestDesktop -Exe $Exe
+$relaunched = Start-OnTestDesktop -Exe $Exe -StdErr "$tmp\restore1-err.txt"
 
 $winCount = Wait-Windows $tmp 'f-post' 2 30
 Assert "F5 relaunch restored exactly two windows (no extra blank)" ($winCount -eq 2)
@@ -567,6 +582,30 @@ while ((Get-Date) -lt $deadline) {
 Assert "F9b the restored pane's sticky banner came back" $f9b
 
 # ============================================================================
+Say "== F9c-F9e: T411 - the restore log counts live sessions nothing attached"
+# ============================================================================
+# The FIRST relaunch had no orphan, so its restore log must say `0` explicitly:
+# a counter that only appears when nonzero cannot be told from a counter that
+# never runs. (The line is warn-level when nonzero, info at zero; both hit the
+# debug build's stderr.)
+Assert "F9c restore log reports the zero case (0 live sessions unattached)" `
+    (Wait-LogLine "$tmp\restore1-err.txt" 'session-restore: attached 3 pane\(s\); 0 live agent session\(s\) unattached')
+
+# Now manufacture the T411 orphan: OPEN a fourth session directly against the
+# harness agent (the same pipe the app dials), then DETACH so it stays alive
+# with no pane holding it - the exact shape T108 found on the release install
+# (4 live sessions, the layout references 3). `--hold` opens a session, holds
+# it briefly, then DETACHes; a detached session SURVIVES (only CLOSE ends one).
+Assert "F9d remote-test-client exists in zig-out (zig build remote-test-client)" (Test-Path $ClientExe)
+$pipe = "\\.\pipe\$(Get-LocalAgentPipeName)"
+$pc = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
+    -ArgumentList "/c `"`"$ClientExe`" --pipe=$pipe --hold=1 > `"$tmp\orphan-client.txt`" 2>&1`""
+if (-not $pc.WaitForExit(25000)) { Stop-Process -Id $pc.Id -Force -ErrorAction SilentlyContinue }
+$rowsOrphan = Wait-AliveCount $tmp 'orphan' 4 15
+Assert "F9e the orphan session is alive on the agent (4 alive, layout holds 3)" `
+    ((Count-Alive $rowsOrphan) -eq 4)
+
+# ============================================================================
 Say "== F10: restore-time focus settling across a second relaunch (T105/T223)"
 # Do a SECOND app-only kill + relaunch and watch the GUI thread's focus window
 # while restore builds both windows back-to-back. Pre-T105 this live-locked
@@ -577,7 +616,7 @@ Say "== F10: restore-time focus settling across a second relaunch (T105/T223)"
 Stop-AppOnly
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$relaunch2 = Start-OnTestDesktop -Exe $Exe
+$relaunch2 = Start-OnTestDesktop -Exe $Exe -StdErr "$tmp\restore2-err.txt"
 $wins = @()
 $deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline) {
@@ -589,6 +628,23 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 100
 }
 Assert "F10a both restored top-level windows enumerated on the test desktop" ($wins.Count -eq 2)
+
+# T411, the nonzero case: this relaunch restored the same 3 panes while the
+# agent holds 4 live sessions, and the restore log must name the gap - one
+# line that turns a future recurrence into a grep instead of a forensic
+# exercise. F7 already proved the 3 restored panes still ATTACH (the orphan
+# must not perturb the restore itself).
+Assert "F10b restore log names the orphan (1 live agent session unattached)" `
+    (Wait-LogLine "$tmp\restore2-err.txt" 'session-restore: attached 3 pane\(s\); 1 live agent session\(s\) unattached')
+
+# And the orphan must not perturb the restore itself: the same 3 layout
+# sessions re-ATTACHed (no re-OPEN spawning a 5th) and the orphan is still
+# alive - reporting it is the whole fix; touching it is exactly what the
+# reaper is not allowed to do.
+$after2 = @(Alive-Ids (Wait-AliveCount $tmp 'f10-after' 4 20))
+Assert "F10c the 3 layout sessions and the orphan are all still alive after restore" `
+    ($after2.Count -eq 4 -and ($beforeIds | Where-Object { $after2 -contains $_ }).Count -eq 3)
+
 if ($wins.Count -eq 2) {
     $storm = Measure-FocusFlips $wins 3000 40
     Say "  (restore-time focusFlips=$storm)"
