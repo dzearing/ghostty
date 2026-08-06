@@ -439,6 +439,39 @@ function Get-TestTabRunRight {
     return $tabs[$tabs.Count - 1].Right
 }
 
+<#
+Thickness of the top resize band in physical px, exactly as
+`caption_layout.resizeBorder` derives it: the window-DPI
+`SM_CYSIZEFRAME + SM_CXPADDEDBORDER`, clamped to half the band, floor 1.
+`-PadSm` is the 4 DIP step (the module's fallback for a 0/negative metric).
+
+T266 measured the reference (live WindowsTerminal.exe 1.24, 2026-08-06, 125%):
+over a TAB, WT's island child answers HTCLIENT from the very top row — a tab
+is never a resize target — while WT's drag-bar child gives the EMPTY band an
+HTTOP edge. `chrome-merged-row` §4 therefore asserts HTCLIENT at a tab's top
+and uses this count for the boundary probes over the empty band, where we keep
+the full stock-frame metric.
+#>
+function Get-TestResizeBorder {
+    param(
+        [Parameter(Mandatory = $true)][int]$Dpi,
+        [Parameter(Mandatory = $true)][int]$BarH,
+        [Parameter(Mandatory = $true)][int]$PadSm
+    )
+    if (-not ('GhozttyTestSysMetrics' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class GhozttyTestSysMetrics {
+    [DllImport("user32.dll")] public static extern int GetSystemMetricsForDpi(int index, uint dpi);
+}
+'@
+    }
+    $frame = [GhozttyTestSysMetrics]::GetSystemMetricsForDpi(33, $Dpi) +
+             [GhozttyTestSysMetrics]::GetSystemMetricsForDpi(92, $Dpi)
+    if ($frame -le 0) { $frame = [Math]::Max($PadSm, 1) }
+    return [Math]::Max(1, [Math]::Min($frame, [int][Math]::Truncate($BarH / 2)))
+}
+
 # ---------------------------------------------------------------------------
 # The machine chooser's session roster (T318, hoisted here in T319)
 # ---------------------------------------------------------------------------

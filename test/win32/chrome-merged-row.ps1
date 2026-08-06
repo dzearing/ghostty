@@ -201,6 +201,32 @@ try {
         $hitTab = HitAt $h (ClientX $tabs[0].Center) $tabY
         Check ($hitTab -eq $HTCLIENT) `
             "a point over tab 1 answers HTCLIENT, so it selects instead of dragging the window (got $hitTab)"
+
+        # ...and the tab owns its rows all the way to the TOP (T266). Measured
+        # 2026-08-06 against a live WindowsTerminal.exe 1.24: WT's tab island
+        # answers HTCLIENT from the window's very top row at a tab's x, so a
+        # tab is never a resize target — the top edge lives in the empty drag
+        # band (full sys-frame thickness for us, both sides probed here) and
+        # the corners. Note WT's own top-level window DOES answer HTTOP over
+        # its tab run; that answer is unreachable under the island child, which
+        # is exactly the mismeasurement an earlier cut of this section shipped.
+        $border = Get-TestResizeBorder -Dpi $m.Dpi -BarH $m.BarH -PadSm $m.PadSm
+        $tabX = ClientX $tabs[0].Center
+        $hitTabTop = HitAt $h $tabX (ClientY 0)
+        $hitTabEdge = HitAt $h $tabX (ClientY ($border - 1))
+        Check ($hitTabTop -eq $HTCLIENT) `
+            "the window's very top row over tab 1 belongs to the tab, not the frame (got $hitTabTop)"
+        Check ($hitTabEdge -eq $HTCLIENT) `
+            "...and so does the row where the frame used to end (y=$($border - 1), got $hitTabEdge)"
+        # The empty band right of the strip keeps the full frame: last frame
+        # row resizes, first row past it drags the window.
+        $emptyX = ClientX ($m.BandLeft - 2)
+        $hitEmptyEdge = HitAt $h $emptyX (ClientY ($border - 1))
+        $hitEmptyBelow = HitAt $h $emptyX (ClientY $border)
+        Check ($hitEmptyEdge -eq $HTTOP) `
+            "the system frame's LAST row over the empty band still resizes (y=$($border - 1), border=$border, got $hitEmptyEdge)"
+        Check ($hitEmptyBelow -eq $HTCAPTION) `
+            "one row below the frame the empty band drags the window (y=$border, got $hitEmptyBelow)"
     }
     # ...and the functional half: a second tab, then a posted click on tab 1
     # brings its pane back. A hit test alone would pass against a band that
@@ -256,12 +282,16 @@ try {
     $hitOver = HitAt $h (ClientX $m.CaptionOverflowX) $btnY
     $maxL = $m.ClientW - $m.PadSm - $m.BtnPaint - ($m.BtnPaint + $m.PadSm)
     $hitMax = HitAt $h (ClientX ($maxL + [int]($m.BtnPaint / 2))) $btnY
-    $hitTop = HitAt $h ($win.Left + [int]($win.Width / 2)) ($win.Top + 1)
+    # The top-edge probe aims at the EMPTY band ($dragX), not the window's
+    # midpoint: since T266 the tabs own their full height (measured WT
+    # parity), so a midpoint that lands on the tab run answers HTCLIENT by
+    # design and the resize edge lives beside the tabs and in the corners.
+    $hitTop = HitAt $h $dragX ($win.Top + 1)
     Check ($hitOver -eq $HTSYSMENU) "the '...' still answers HTSYSMENU (got $hitOver)"
     Check ($hitMax -eq $HTMAXBUTTON) `
         "maximize still answers HTMAXBUTTON, so Snap Layouts survives the merge (got $hitMax)"
     Check (($hitTop -eq $HTTOP) -or ($hitTop -eq $HTTOPLEFT) -or ($hitTop -eq $HTTOPRIGHT)) `
-        "the window's top edge still resizes even with tabs in that row (got $hitTop)"
+        "the window's top edge still resizes even with tabs in that row (probed the empty band, got $hitTop)"
 
     # --- 7. maximized: the row is not clipped off the screen ------------------
     # The classic custom-frame bug. A maximized window's frame hangs off every

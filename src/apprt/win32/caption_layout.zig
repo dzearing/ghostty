@@ -358,6 +358,9 @@ pub fn isDragRegion(m: Metrics, l: Layout, x: i32, y: i32) bool {
 /// places, and the user would just find that the window "sometimes" cannot be
 /// resized from the top. (Native Win11 titlebars make the same trade: the
 /// top few rows of the caption buttons are the resize edge when restored.)
+/// The one exception is the TAB RUN (T266): between the corners, a tab owns
+/// its full height and the top edge over it selects rather than resizes —
+/// measured WT parity, see `ncHitTest`.
 pub const NcHit = enum {
     top,
     top_left,
@@ -404,14 +407,23 @@ pub fn ncHitTest(
         const corner = resizeCorner(m, sys_frame);
         if (x < corner) return .top_left;
         if (x >= l.client_w - corner) return .top_right;
-        return .top;
+        // T266: between the corners, the frame stops where the strip's own
+        // chrome begins. Measured against a live WindowsTerminal.exe 1.24
+        // (2026-08-06, 120 dpi): WT's tab island answers HTCLIENT from the
+        // window's very TOP row at a tab's x, so a WT tab owns every one of
+        // its rows and the top resize edge lives only in the empty drag band
+        // and the corners. Falling through here (instead of returning .top)
+        // hands these rows to the strip check below, which is what makes a
+        // click near a tab's top select the tab instead of resizing.
+        if (x >= @min(client_right, l.band_left)) return .top;
     }
 
-    // The strip's own controls, AFTER the resize edge (a tab must not make the
-    // window's top border un-grabbable — that is the same ordering rule the
-    // caption buttons already obey) and BEFORE the caption's, since the two
-    // regions are disjoint by construction and asking in this order means a
-    // stale `client_right` can never swallow the close button.
+    // The strip's own controls, AFTER the corners (a tab at the window's edge
+    // must not make the diagonal grab unreachable) and BEFORE the caption's,
+    // since the two regions are disjoint by construction and asking in this
+    // order means a stale `client_right` can never swallow the close button.
+    // The top rows over the strip land here too (T266, above): the tab owns
+    // its full height, the way WT's tabs do.
     if (x < @min(client_right, l.band_left)) return .client;
 
     if (hitTest(m, l, x, y)) |b| return switch (b) {
@@ -634,6 +646,46 @@ test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" 
     }
 }
 
+test "ncHitTest: over a TAB there is NO top resize edge - the tab owns its full height (T266)" {
+    // Measured against a live WindowsTerminal.exe 1.24 (2026-08-06, 120 dpi):
+    // WT's tab ISLAND answers HTCLIENT from the window's very top row at a
+    // tab's x — a WT tab owns every one of its rows, and the top resize edge
+    // lives only in the empty drag band (where WT's drag-bar child answers
+    // HTTOP) and the corners. An earlier cut of this test pinned the opposite
+    // ("the frame is never thinned over a tab") from a parent-window-only
+    // probe: WM_NCHITTEST sent to the top-level answers HTTOP there, but a
+    // user's mouse never reaches the top-level over a tab — the island child
+    // covers it from row 0 and answers for itself. Probe the window the mouse
+    // actually lands on, not the parent's model of it.
+    const frames = [_]i32{ 8, 9, 11, 13 }; // GetSystemMetricsForDpi sums measured at 96/120/144/192 dpi
+    for (scales, frames) |s, frame| {
+        const m = Metrics.init(s, .with_tabs);
+        const l = layout(m, 1200);
+        const border = resizeBorder(m, frame);
+        // A real system frame never hits the half-band clamp.
+        try testing.expectEqual(frame, border);
+        // A mid-tab x: right of the corner grab, inside the tab run.
+        const tab_x: i32 = @intFromFloat(@round(200.0 * s));
+        const client_right: i32 = @intFromFloat(@round(400.0 * s));
+        try testing.expect(tab_x > resizeCorner(m, frame));
+        try testing.expect(tab_x < client_right);
+        // Over the tab, every row from the very top belongs to the tab.
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, tab_x, 0, frame, false, client_right));
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, tab_x, border - 1, frame, false, client_right));
+        // The corners keep the full diagonal grab even over the strip.
+        try testing.expectEqual(NcHit.top_left, ncHitTest(m, l, 0, border - 1, frame, false, client_right));
+        // The empty band right of the strip keeps the full frame...
+        const empty_x = l.band_left - 1;
+        try testing.expect(empty_x >= client_right);
+        try testing.expectEqual(NcHit.top, ncHitTest(m, l, empty_x, border - 1, frame, false, client_right));
+        // ...and one row below it the caption drags: the boundary sits
+        // exactly on the metric there.
+        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, empty_x, border, frame, false, client_right));
+        // Maximized there is no edge anywhere - the top row over a tab selects.
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, tab_x, 0, frame, true, client_right));
+    }
+}
+
 test "ncHitTest: the band right of the drag region never falls to client" {
     // The slivers around the "…"'s hit box are inside the caption and paint
     // the caption background. Answering `client` there would put a terminal
@@ -835,16 +887,23 @@ test "a stale client_right can never swallow a caption button" {
     }
 }
 
-test "the resize edge still wins over a tab" {
-    // A tab reaching the window's top row must not make the top border
-    // un-grabbable — the same ordering rule the caption buttons obey, and the
-    // one a merged row is most likely to break.
+test "over the strip the TAB wins the top rows; the corners and caption keep the edge" {
+    // Until T266 this test pinned the opposite: .top at a strip x, on the
+    // theory that a tab must never make the top border un-grabbable. The
+    // measured reference (WT 1.24, see the T266 test above) says tabs own
+    // their full height; the resize edge survives in the corners, the empty
+    // band, and over the caption's own controls.
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
         const l = layout(m, 1200);
         const frame: i32 = 8;
-        try testing.expectEqual(NcHit.top, ncHitTest(m, l, 600, 0, frame, false, l.band_left));
+        // A strip x with the strip full to the seam: the tab's row, not the frame's.
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, 0, frame, false, l.band_left));
+        // The corner grab still outranks the strip.
         try testing.expectEqual(NcHit.top_left, ncHitTest(m, l, 0, 0, frame, false, l.band_left));
+        // Over the caption's own controls the top rows still resize, exactly
+        // as a stock Win11 frame treats its caption buttons when restored.
+        try testing.expectEqual(NcHit.top, ncHitTest(m, l, l.close.left + 1, 0, frame, false, l.band_left));
         // Maximized there is no resize edge, so the same point is the strip's.
         try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, 0, frame, true, l.band_left));
     }

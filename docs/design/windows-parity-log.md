@@ -9825,3 +9825,31 @@ no local changes - filed as T526 with the root cause (the T105/T211
 deferred-focus guard drops `+split` focus into a non-active window, so the
 split off a web viewer inherits another window's cwd), plus T527 for a
 silent GUI death intermittent seen twice during validation.
+
+## 2026-08-06 - T266: a tab now owns its full height - the resize edge stops at the strip, like WT's really does (sessions 61eaf089 → ccaa381f)
+
+Two measurements of the same reference disagreed today, and the second
+overturned the first. Session 61eaf089 probed `WM_NCHITTEST` against WT's
+top-level window, got `HTTOP` for the full system frame at a tab's x, and
+concluded our 9 px band over the tabs was row-for-row parity - no code
+change, tests pinning the status quo. Session ccaa381f re-verified before
+committing and found the probe was asking a window the user's mouse never
+reaches: WT 1.24's tab island child covers the tab run from the window's
+very top row and answers `HTCLIENT` itself at every row, so a real WT tab
+owns its ENTIRE height and the top resize edge only exists over the empty
+drag band (WT's drag-bar child, 7 rows at 120 dpi) and the corners. Ours
+really was materially thicker over the tabs - 9 rows vs zero - which is
+exactly the defect the task filed. What landed: `caption_layout.ncHitTest`
+now answers the corners first and hands every row of `x <
+min(client_right, band_left)` to the strip, so clicking anywhere on a tab
+selects it; the empty band, the caption controls, and both corners keep the
+full stock `SM_CYSIZEFRAME + SM_CXPADDEDBORDER` frame. The mismeasurement
+and its lesson (probe the child the mouse lands on, not the parent's model)
+are recorded in `win32-design-system.md`; the reversal got a decision
+receipt (D20). Unit tests pin the new boundary at all four scales (two
+inverted, one rewritten); `chrome-merged-row.ps1` §4 probes the live window
+on both sides of the boundary over the empty band and at a tab's top row.
+Also this turn: committed the user's dashboard answers to D17/D19
+(recommended options confirmed) and D18, whose answer - never age out
+silently, notify the user instead - superseded T521 with T534. Validation:
+floor-lane all lanes PASS, chrome-merged-row ALL PASS, P1-P3 ALL PASS.

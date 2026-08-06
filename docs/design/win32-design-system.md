@@ -472,6 +472,26 @@ other, and the approximation drifts with DPI and with the caption button width.
 One row makes the alignment structural. **Two rows of controls is the defect;
 the misalignment is only how you notice.**
 
+**Over a tab there is NO top resize edge — the tab owns its full height, and
+that is measured parity (T266).** A merged row puts the window's top resize
+band ON the tabs, and the question of how much of a tab the frame may claim
+was settled empirically, 2026-08-06, against a live `WindowsTerminal.exe`
+1.24 at 125%: WT's tab **island child** answers `HTCLIENT` from the window's
+very top row at a tab's x — the user's mouse never reaches the top-level
+window over a tab, so a WT tab owns every one of its rows. The top resize
+edge lives only in the **empty drag band** (WT's drag-bar child, which starts
+right of the tab run, answers `HTTOP` there — 7 rows at 120 dpi, slightly
+under the 9-row `SM_CYSIZEFRAME + SM_CXPADDEDBORDER` metric) and in the
+**corners**. `caption_layout.ncHitTest` mirrors that: between the corners the
+frame stops at `min(client_right, band_left)`; over the empty band and the
+caption's own controls it keeps the full system metric (the stock-frame
+convention — WT's private 7 is not a metric anything else uses). Measurement
+method matters: `WM_NCHITTEST` sent to WT's *top-level* window answers
+`HTTOP` over the tab run too, but that region is covered by the island child,
+so the parent's answer is unreachable — probe the child the mouse actually
+lands on. Pinned from both sides in `caption_layout` (T266 tests, all four
+scales) and probed live in `chrome-merged-row.ps1` §4.
+
 ---
 
 ## 6b. Horizontal space: size to content, cap by proportion
