@@ -19,13 +19,18 @@
 # the lock yet, so the lock points at a corpse while the pane is very much
 # occupied. So this probe reads the pane instead.
 #
-# Why not `+list --pid=<pid>` (ancestry, the obvious answer)? Because on a
-# session-persistence box the agent owns the PTY and `+list --json` reports
-# `"pid": 0` for every pane - `+list --pid` matches nothing at all (verified on
-# the box 2026-07-31, IpcHandlers.zig:1185 skips shell_pid == 0). Filed as its
-# own gap; the watchdog cannot wait for it.
+# The probe leads with an EXACT check (T244): since T41/T153 the pane's shell
+# pid in `+list --json` is real on a session-persistence box (the agent reports
+# each session's child pid; the app publishes it), so "is a claude alive in
+# THIS pane" is answerable from the process table - shell pid -> descendants ->
+# a live claude.exe. A hit is definitive whatever the screen shows (the busy
+# claude whose chrome scrolled off, measured 2026-08-04, classified 'unknown'
+# by the tail heuristic alone). A miss is NOT proof of absence - the pid read
+# or the table walk can fail, and an app without the fix still reports 0 - so
+# a miss falls through to the tail heuristic below, which also remains the
+# only way to tell 'shell' from 'unknown'.
 #
-# Classification rule, in order:
+# Tail-classification rule, in order:
 #   1. The last non-empty line looks like a shell prompt  -> shell.
 #      A live full-screen TUI always owns the bottom of the screen, so a shell
 #      prompt down there beats any amount of Claude output in the scrollback
@@ -131,13 +136,106 @@ function ConvertTo-SendKeysLiteral {
     return $Text.Replace('\', '\\')
 }
 
-# Read the pane and classify it. Any IPC failure is 'unknown', never a guess:
-# a caller that cannot see the pane must not be told it is safe to type a
+# The pane's shell pid, from `+list --json` (0 when the pane is not found, has
+# no terminal, or the app cannot say). $PaneId matches the leaf's stable id
+# (the $GHOZTTY_PANE_ID uuid) or its registered name, case-insensitively -
+# the same values `+read --name=` accepts.
+function Get-PaneShellPid {
+    param([string]$PaneId, [string]$GhozttyExe)
+
+    if (-not $PaneId) { return 0 }
+    $json = ''
+    try { $json = (& $GhozttyExe +list --json 2>$null | Out-String) } catch { return 0 }
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) { return 0 }
+    $tree = $null
+    try { $tree = $json | ConvertFrom-Json } catch { return 0 }
+    $root = if ($tree.PSObject.Properties.Name -contains 'data') { $tree.data } else { $tree }
+    foreach ($w in @($root.windows)) {
+        foreach ($t in @($w.tabs)) {
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($t.splits)
+            while ($stack.Count -gt 0) {
+                $n = $stack.Pop()
+                if ($null -eq $n) { continue }
+                if ($n.type -eq 'leaf') {
+                    if (-not $n.terminal) { continue }
+                    $hit = ($n.terminal.id -and ($n.terminal.id -ieq $PaneId)) -or
+                           ($n.terminal.name -and ($n.terminal.name -ieq $PaneId))
+                    if ($hit) { return [int]$n.terminal.pid }
+                } else {
+                    if ($n.right) { $stack.Push($n.right) }
+                    if ($n.left) { $stack.Push($n.left) }
+                }
+            }
+        }
+    }
+    return 0
+}
+
+# Pure: the pid of the first live Claude Code process among $ShellPid's
+# descendants in $Procs (objects with ProcessId/ParentProcessId/Name/
+# CommandLine, i.e. a Win32_Process snapshot), or 0. Chrome's native-messaging
+# host is also claude.exe but is not a TUI in any pane, so it never counts -
+# a browser launched from the pane would otherwise make every probe say
+# 'claude'. Separated from the CIM read so the walk is unit-testable
+# (go-loop-guard.ps1 section M).
+function Find-ClaudeDescendant {
+    param([int]$ShellPid, [object[]]$Procs)
+
+    if ($ShellPid -le 0 -or -not $Procs) { return 0 }
+    $kids = @{}
+    foreach ($p in $Procs) {
+        $parent = [int]$p.ParentProcessId
+        if (-not $kids.ContainsKey($parent)) { $kids[$parent] = New-Object System.Collections.ArrayList }
+        [void]$kids[$parent].Add($p)
+    }
+    # BFS with a seen-set: Windows reuses pids, so a stale snapshot can contain
+    # a parent "cycle"; without the guard that is an infinite loop.
+    $seen = @{ $ShellPid = $true }
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($ShellPid)
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        if (-not $kids.ContainsKey($cur)) { continue }
+        foreach ($p in $kids[$cur]) {
+            $cpid = [int]$p.ProcessId
+            if ($seen.ContainsKey($cpid)) { continue }
+            $seen[$cpid] = $true
+            if (($p.Name -ieq 'claude.exe') -or ($p.Name -ieq 'claude')) {
+                if (([string]$p.CommandLine) -notmatch 'chrome-native-host') { return $cpid }
+            }
+            $queue.Enqueue($cpid)
+        }
+    }
+    return 0
+}
+
+# The exact claude-in-this-pane check (T244). $true means a Claude Code
+# process is ALIVE under this pane's shell right now - definitive, whatever
+# the screen shows. $false only means "could not prove it": fall back to the
+# tail heuristic, never conclude the pane is free.
+function Test-ClaudeInPane {
+    param([string]$PaneId, [string]$GhozttyExe)
+
+    $shell = Get-PaneShellPid -PaneId $PaneId -GhozttyExe $GhozttyExe
+    if ($shell -le 0) { return $false }
+    $procs = $null
+    try {
+        $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine)
+    } catch { return $false }
+    return ((Find-ClaudeDescendant -ShellPid $shell -Procs $procs) -gt 0)
+}
+
+# Read the pane and classify it. The exact process-table check leads; the tail
+# heuristic is the fallback. Any IPC failure is 'unknown', never a guess: a
+# caller that cannot see the pane must not be told it is safe to type a
 # shell command into it.
 function Read-PaneOccupant {
     param([string]$PaneId, [string]$GhozttyExe, [int]$Lines = 15)
 
     if (-not $PaneId) { return 'unknown' }
+    if (Test-ClaudeInPane -PaneId $PaneId -GhozttyExe $GhozttyExe) { return 'claude' }
     $out = ''
     try { $out = (& $GhozttyExe +read "--name=$PaneId" "--lines=$Lines" 2>&1 | Out-String) } catch { return 'unknown' }
     if ($LASTEXITCODE -ne 0) { return 'unknown' }

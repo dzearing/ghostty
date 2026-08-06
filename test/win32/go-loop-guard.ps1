@@ -683,6 +683,42 @@ Assert 'M14 a tool-result connector is claude' `
 Assert 'M15 glyphs above a shell prompt are still a shell' `
     ((Get-PaneOccupant -Tail "$bullet Reading go.md`r`n  $connector  Read 373 lines`r`nD:\git\ghoztty>") -eq 'shell')
 
+# T244: the exact claude-in-this-pane walk. Pure - a fake Win32_Process
+# snapshot drives Find-ClaudeDescendant directly.
+function New-FakeProc([int]$ProcessId, [int]$ParentProcessId, [string]$Name, [string]$CommandLine) {
+    [pscustomobject]@{
+        ProcessId = $ProcessId; ParentProcessId = $ParentProcessId
+        Name = $Name; CommandLine = $CommandLine
+    }
+}
+$fakeTable = @(
+    (New-FakeProc 100 1   'pwsh.exe'   'pwsh')                                          # the pane's shell
+    (New-FakeProc 200 100 'claude.exe' 'claude --dangerously-skip-permissions')         # claude under it
+    (New-FakeProc 300 200 'pwsh.exe'   'pwsh -NoProfile')                               # claude's tool shell
+    (New-FakeProc 400 2   'claude.exe' 'claude')                                        # claude in ANOTHER pane
+)
+Assert 'M16 a live claude under the shell is found' `
+    ((Find-ClaudeDescendant -ShellPid 100 -Procs $fakeTable) -eq 200)
+Assert 'M17 a claude in another pane does not count' `
+    ((Find-ClaudeDescendant -ShellPid 2 -Procs @((New-FakeProc 100 1 'pwsh.exe' 'pwsh'))) -eq 0)
+# Chrome's native-messaging host is claude.exe too, but it is not a TUI in any
+# pane - a browser launched FROM the pane must not classify the pane as claude.
+$chromeTable = @(
+    (New-FakeProc 100 1   'pwsh.exe'   'pwsh')
+    (New-FakeProc 500 100 'chrome.exe' 'chrome')
+    (New-FakeProc 501 500 'claude.exe' '"C:\Users\u\.local\bin\claude.exe" --chrome-native-host')
+)
+Assert 'M18 the chrome native host is not a pane claude' `
+    ((Find-ClaudeDescendant -ShellPid 100 -Procs $chromeTable) -eq 0)
+# Windows reuses pids, so a torn snapshot can hold a parent loop; the walk
+# must terminate, not hang the watchdog.
+$loopTable = @(
+    (New-FakeProc 100 300 'pwsh.exe' 'pwsh')
+    (New-FakeProc 300 100 'cmd.exe'  'cmd')
+)
+Assert 'M19 a pid loop in the snapshot terminates with no match' `
+    ((Find-ClaudeDescendant -ShellPid 100 -Procs $loopTable) -eq 0)
+
 # --- P. the supervisor's own liveness is observable (T440) ----------------
 # The watchdog died at 09:14 on 2026-08-03 and nothing noticed for thirteen
 # hours, because the only evidence it was gone was a log that stopped. It now

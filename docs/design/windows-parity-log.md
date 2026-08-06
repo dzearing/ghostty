@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T244 done - the pid-0 defect it described was already fixed
+  (T41 gave the agent real child pids, T153 verified + locked it in with
+  pane-id.ps1 A7-A9, both landed before this claim), so the turn re-confirmed
+  that at HEAD (fresh debug build, pane-id.ps1 ALL PASS) and built the task's
+  own follow-up: the go-loop pane probe now leads with an EXACT
+  claude-in-this-pane check** - pane id -> shell pid (`+list --json`, real
+  since T41) -> BFS over a Win32_Process snapshot for a live claude.exe under
+  that shell (chrome's native-messaging claude.exe excluded; pid-reuse loops
+  terminate). A hit is definitive whatever the screen shows - the measured
+  2026-08-04 failure was a busy claude whose chrome scrolled off, classified
+  'unknown', which is the answer that makes the watchdog type a shell command
+  into a chat. A miss still falls back to the tail heuristic (the only way to
+  tell 'shell' from 'unknown', and the safety net for an app without the pid
+  fix). Stale probe header (citing the pre-T41 pid-0 world) rewritten.
+  Validation: live against this session's own pane (exact check True,
+  occupant claude; bogus/empty ids False), go-loop-guard.ps1 grew M16-M19,
+  ALL PASS; floor lanes none/win32/agent PASS; P1-P3 ALL PASS. No product
+  code changed - scripts + test only.
 - 2026-08-06 - **T151 done - agent-backed panes now get shell integration on
   Windows: a `--shell=powershell` pane starts with ghostty.ps1 dot-sourced
   (OSC 133 prompt marks + OSC 7 cwd), instead of a bare shell.** With session
