@@ -148,7 +148,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .pill.skipped i { background: var(--muted); }
 
 /* Decisions --------------------------------------------------------------- */
-.dec { border: 1px solid var(--hairline); border-left: 3px solid var(--warning); border-radius: 8px; background: var(--surface-1); padding: 14px 16px; margin-bottom: 10px; box-shadow: var(--shadow); }
+.dec { position: relative; border: 1px solid var(--hairline); border-radius: 8px; background: var(--surface-1); padding: 14px 16px 14px 25px; margin-bottom: 10px; box-shadow: var(--shadow); }
+/* Left accent drawn like .att-row .bar (inset, rounded), not a flush border-left */
+.dec::before { content: ''; position: absolute; left: 12px; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--warning); }
 .dec-top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
 .dec-id { font-size: 11px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 .dec-title { font-size: 14px; font-weight: 600; flex: 1 1 240px; }
@@ -326,7 +328,7 @@ dialog.taskdlg footer { padding: 10px 14px; border-top: 1px solid var(--hairline
 .loop-task { font-size: 13px; margin-top: 8px; }
 .loop-task.muted, .dec-why.muted { color: var(--muted); font-size: 12px; }
 .chip.warn { background: rgba(250, 178, 25, .18); color: var(--ink); }
-.dec.blocked-dec { border-left-color: var(--critical); }
+.dec.blocked-dec::before { background: var(--critical); }
 pre.cmd { margin: 10px 0 0; padding: 9px 11px; background: var(--surface-2); border-radius: 6px; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
 
 #tip { position: fixed; z-index: 40; pointer-events: none; opacity: 0; transition: opacity .08s linear; background: var(--surface-1); color: var(--ink); border: 1px solid var(--hairline); border-radius: 6px; padding: 7px 9px; font-size: 12px; line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,.16); max-width: 260px; }
