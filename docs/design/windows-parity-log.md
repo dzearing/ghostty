@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T524 fixed + T495 fixed - the user's two morning P0s** (user
+  report: upgrade confirm STILL never brings the app back; second divider in a
+  3-pane layout STILL jumps). T524: the T421 relaunch guard armed 4/4 times in
+  production and never executed one instruction - the app dies inside a
+  kill-on-close Job object and the guard, a child in the same job, dies with
+  it. Measured: `CREATE_BREAKAWAY_FROM_JOB` is ACCESS_DENIED from this box's
+  pane-shell job chain, so the fix is tiered (`spawnEscapingJob`): breakaway
+  -> shell-parent hop (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS on explorer,
+  explicit env block) -> in-job loudly. relaunch-guard.ps1 arm F jails the
+  guard in a kill-on-close job and asserts the relaunched app lands OUTSIDE it
+  and survives TerminateJobObject; suite also hardened to count only its own
+  processes (a parallel session's harness was driving the same zig-out exe).
+  The job discovery is also T426's strongest lead yet (noted there). T495: the
+  drag mapped the pointer against surfaceRect() - correct only for the root
+  split; now startDividerDrag captures the dragged NODE's own region
+  (splitRegionRect) and split_geometry.dragRatio does the clamped mapping,
+  with unit tests pinning the 3-column no-jump case at 1.0/1.25/1.5/2.0 and a
+  new split-divider.ps1 section dragging the second divider by pane-rect
+  oracle. Filed T525 (every-morning client refresh + verified reboot, the
+  user's standing ask; deps T524).
 - 2026-08-06 - **T382 done - the task picker now resolves dependencies
   THROUGH `skipped(split -> ...)` parents, so it can no longer hand out a task
   whose real prerequisites are still todo**: `Get-SplitChildren` extracts
