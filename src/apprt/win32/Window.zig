@@ -1263,7 +1263,17 @@ fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
     var command: ?[]const u8 = null;
     var cwd: ?[]u8 = null;
     if (parent) |p| {
-        command = p.core_surface.remoteCommand();
+        // Command inheritance is for GENUINE remote machines ONLY (T148, the
+        // Mac's cdb689025). There, re-running the parent's command on a new
+        // tab/split is the intended §WP4 behavior. It must NOT apply to the
+        // LOCAL session-persistence agent: every local window/tab/split rides
+        // it (default-on), so inheriting the parent's explicit `--command`
+        // would make a split of a `--command=…` window RE-RUN that command
+        // instead of opening a plain shell — `-e`/`--command` is one-shot for
+        // the surface it was given (upstream semantics). The cwd inheritance
+        // below stays for both flavors: a local split still opens where its
+        // parent is.
+        if (!is_local_agent) command = p.core_surface.remoteCommand();
         if (p.core_surface.remoteSessionId()) |sid| {
             cwd = conn.queryCwdTimeout(sid, RemoteInherit.cwd_timeout_ns) catch |err| cwd: {
                 log.debug("remote inherit: cwd query failed err={}", .{err});

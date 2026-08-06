@@ -9605,3 +9605,23 @@ win32 "wrap", win32 "contentWidth", none "max_lines" - all exit 0;
 acceptance was recorded in T377 (pane-banner.ps1 ALL PASS x77, P1-P3 ALL
 PASS). No code change, so no new floor run. Nothing new filed - T455 and
 T418 were already closed as duplicates, so the family is fully resolved.
+
+## 2026-08-06 - T148 done: local tabs/splits no longer re-run the parent's --command
+
+Reproduced on the box, then ported the Mac's cdb689025 gate.
+`Window.buildRemoteInherit` inherited the parent pane's `remoteCommand()` for
+BOTH inheritance flavors, but only gated the per-host default SHELL on
+`!is_local_agent` - so with session persistence on (the default), a ctrl+t
+tab or a no-command `+split` of a local `--command=...` window re-ran that
+command through the agent OPEN instead of opening a plain shell. One-line
+fix: gate the command inheritance on `!is_local_agent` too (cwd inheritance
+stays for both flavors, so a local split still opens where its parent is -
+and post-fix it actually does: the buggy command-carrying OPEN had been
+losing the parent's cwd as well). New window path verified clean by
+inspection (`openRemoteWindowFrom` requires `remote_machine`, null for local
+windows; a new window's initial surface passes parent=null). New acceptance
+`test\win32\local-split-no-command-rerun.ps1`: 4 FAILURES pre-fix (tab +
+split both re-ran the marker), ALL PASS post-fix; `remote-inherit.ps1` ALL
+PASS (genuine-remote command inheritance preserved); floor-lane all three
+lanes PASS; P1-P3 ALL PASS. Filed T515: an explicit local `+split --command`
+opens in the agent default cwd rather than the parent pane's.
