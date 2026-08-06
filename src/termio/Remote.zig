@@ -86,8 +86,8 @@ env: []const protocol.Open.EnvPair,
 
 /// Explicit shell argv to exec verbatim (§ local shell integration, T04c), or
 /// null to let the agent synthesize `<shell> -lic/-li`. Carries the
-/// `shell_integration.setup()` argv-rewrite for bash/nushell so those shells
-/// activate ghostty integration on the LOCAL agent. Null for cross-machine
+/// `shell_integration.setup()` argv-rewrite for bash/nushell/powershell so
+/// those shells activate ghostty integration on the LOCAL agent. Null for cross-machine
 /// windows and for env-only shells. Each element is duped into `arena`.
 argv: ?[]const []const u8,
 
@@ -245,8 +245,8 @@ pub const Config = struct {
 
     /// Explicit shell argv to exec verbatim instead of the agent's synthesized
     /// `<shell> -lic/-li` (§ local shell integration, T04c). Set ONLY by the
-    /// LOCAL-agent client for a plain interactive bash/nushell pane (the
-    /// argv-rewrite `shell_integration.setup()` returns); null everywhere else
+    /// LOCAL-agent client for a plain interactive bash/nushell/powershell pane
+    /// (the argv-rewrite `shell_integration.setup()` returns); null everywhere else
     /// (env-only shells, user-command panes, cross-machine windows). Borrowed
     /// from the caller; `init` dupes each element into the backend arena.
     argv: ?[]const []const u8 = null,

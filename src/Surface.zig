@@ -649,7 +649,15 @@ fn appendLocalShellIntegrationEnv(
 
         // `config.Command.shell` is a sentinel-terminated string; dupe into a
         // `[:0]u8` (works for both `shell_path` and the literal default).
-        const shell_z = try sa.dupeZ(u8, shell_path orelse "/bin/zsh");
+        // The default mirrors what the agent will actually spawn with no
+        // OPEN.shell (T151): %COMSPEC%/cmd.exe on Windows — which detection
+        // correctly answers "no integration" for — and the zsh default on
+        // POSIX. A /bin/zsh fallback on Windows fake-detected zsh and
+        // injected ZDOTDIR into a cmd.exe pane.
+        const shell_z = try sa.dupeZ(u8, shell_path orelse switch (builtin.target.os.tag) {
+            .windows => "cmd.exe",
+            else => "/bin/zsh",
+        });
         const integration = (shell_integration.setup(
             sa,
             resources_dir,
@@ -947,8 +955,16 @@ pub fn init(
                 // we free the env: the local agent resolves the SAME $SHELL (same
                 // user/host), so we integrate shell-integration for it (T04b).
                 // Duped because `env` is freed on the next line.
+                //
+                // POSIX only (T151): the Windows agent never consults $SHELL
+                // (its resolution is OPEN.shell → %COMSPEC% → cmd.exe), so
+                // detecting from an inherited $SHELL there — e.g. an app
+                // launched from git-bash inherits SHELL=…\bash — would inject
+                // integration for a shell the agent will not spawn, and the
+                // forwarded argv rewrite would then SWAP the pane's shell.
                 const inherited_shell: ?[]const u8 =
-                    if (rb.local_shell_integration)
+                    if (rb.local_shell_integration and
+                        comptime builtin.os.tag != .windows)
                         (if (env.get("SHELL")) |s| try alloc.dupe(u8, s) else null)
                     else
                         null;

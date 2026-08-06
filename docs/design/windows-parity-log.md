@@ -9,6 +9,29 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T151 done - agent-backed panes now get shell integration on
+  Windows: a `--shell=powershell` pane starts with ghostty.ps1 dot-sourced
+  (OSC 133 prompt marks + OSC 7 cwd), instead of a bare shell.** With session
+  persistence default-on this was every normal pane. Two root causes: the
+  Windows agent DROPPED `OPEN.argv` (pty_child.zig gated it to POSIX, on a
+  comment claiming the client never sends it on Windows - the client is
+  platform-independent and always did), and core Surface.zig detected the
+  shell from `rb.shell orelse $SHELL orelse /bin/zsh`, which mismatches the
+  agent's real Windows resolution (OPEN.shell -> COMSPEC -> cmd.exe): default
+  panes fake-detected zsh (bogus ZDOTDIR + lying log), and an inherited
+  $SHELL from a git-bash-launched app would have forwarded a rewrite that
+  swaps the pane's shell. Fix: honor OPEN.argv on Windows (ConPTY command
+  line built from it verbatim), gate $SHELL inheritance to POSIX, per-OS
+  detection fallback (cmd.exe). Protocol untouched - a pre-fix agent just
+  keeps ignoring the field. Validation: rewrote the PtyChild OPEN.argv
+  real-pty unit test to run on Windows too (cmd `/d /k echo` marker); new
+  `test\win32\agent-shell-integration.ps1` ALL PASS (rewrite on the child's
+  command line, GHOSTTY_POWERSHELL in-pane, +list follows an in-pane `cd` via
+  OSC 7, default pane stays clean cmd.exe); floor lanes + P1-P3 green.
+  Filed: T513 (detection never strips `.exe` for bash/nu/zsh/fish, so
+  `--shell=bash.exe`/full git-bash paths still get nothing), T514 (a config
+  `command = <shell>` nests under cmd.exe on agent panes and loses
+  integration).
 - 2026-08-06 - **T185 done - a cmd pane's cwd now tracks the user live: +list
   and ctrl+n/tab/split follow every `cd` instead of reporting the starting
   directory forever.** Root cause: the pane pwd is OSC-7-fed, and cmd.exe has

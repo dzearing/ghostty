@@ -959,17 +959,21 @@ pub const PtySpawner = struct {
             for (args_list.items) |a| self.alloc.free(a);
             args_list.deinit(self.alloc);
         }
-        // POSIX only: an explicit `OPEN.argv` (the local-agent shell-integration
-        // argv-rewrite for bash/nushell, T04c) is exec'd VERBATIM in place of the
-        // synthesized `-lic`/`-li` convention. The binary is still our resolved
-        // `shell_path` (always absolute); `open.argv` supplies argv (argv[0] is
-        // conventionally the shell, the rest are the integration flags, e.g.
-        // `--posix`). Set only by the local-agent client for a plain interactive
-        // shell, so it never coexists with a user `open.command`. A Windows agent
-        // never receives it (the client leaves it null cross-platform), but gate
-        // to POSIX defensively so a stray value can't bypass the ConPTY path.
-        const explicit_argv: ?[]const []const u8 =
-            if (!is_windows) open.argv else null;
+        // An explicit `OPEN.argv` (the local-agent shell-integration
+        // argv-rewrite for bash/nushell/powershell, T04c/T151) is exec'd
+        // VERBATIM in place of the synthesized `-lic`/`-li` (POSIX) or
+        // `<shell> [/c|-Command|-- <cmd>]` (Windows) convention. On POSIX the
+        // binary is our resolved `shell_path` and `open.argv` supplies argv;
+        // on Windows the command line is built from these args with
+        // lpApplicationName null (see `CommandCore.startWindows`), so argv[0]
+        // — conventionally the shell as the client wrote it, e.g. `pwsh` —
+        // resolves through the standard program search. Set only by the
+        // local-agent client for a plain interactive shell, so it never
+        // coexists with a user `open.command`. This used to be gated to POSIX
+        // on a claim the client never sends it on Windows — false: the client
+        // is platform-independent, and the gate silently dropped PowerShell
+        // integration from every agent-backed `--shell=pwsh` pane (T151).
+        const explicit_argv: ?[]const []const u8 = open.argv;
 
         if (explicit_argv) |argv| if (argv.len > 0) {
             for (argv) |a| try args_list.append(self.alloc, try self.alloc.dupeZ(u8, a));
@@ -1318,25 +1322,28 @@ test "resolveSpawnCwd: null and empty stay null (spawn in the agent's own dir)" 
     try testing.expect(sp.resolveSpawnCwd("") == null);
 }
 
-test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
-    // The explicit-argv path is POSIX-only BY DESIGN (spawnChild gates
-    // `open.argv` behind `!is_windows` — a Windows agent never receives it),
-    // so there is nothing to exercise here on Windows (T89b).
-    if (is_windows) return error.SkipZigTest;
-
+test "PtyChild: OPEN.argv is exec'd verbatim instead of the default synthesis" {
     const alloc = testing.allocator;
 
     var spawner = try PtySpawner.init(alloc);
     defer spawner.deinit();
 
-    // No `command` → the default synthesis would spawn a SILENT interactive shell
-    // (`<shell> -li`) that prints nothing. Supplying an explicit `argv` (the shell
-    // integration rewrite path, T04c) must instead exec exactly this argv, which
-    // prints a marker. Observing the marker proves argv-verbatim, not `-li`. We
-    // route through `/bin/sh -c` (universally present) as a stand-in for the
-    // bash `<shell> --posix` rewrite the client actually forwards.
+    // No `command` → the default synthesis would spawn a plain interactive
+    // shell that never prints our marker. Supplying an explicit `argv` (the
+    // shell-integration rewrite path, T04c; honored on Windows since T151)
+    // must instead exec exactly this argv, which prints a marker. Observing
+    // the marker proves argv-verbatim, not the synthesis. POSIX routes
+    // through `/bin/sh -c` as a stand-in for the bash `<shell> --posix`
+    // rewrite; Windows through `cmd.exe /d /k echo …` as a stand-in for the
+    // powershell `-NoExit -Command . '…ghostty.ps1'` rewrite (both print,
+    // then stay alive like the real interactive rewrites do).
     const marker = "ARGV_VERBATIM_OK_5b8c";
-    const argv = [_][]const u8{
+    const argv: []const []const u8 = if (is_windows) &.{
+        "cmd.exe",
+        "/d",
+        "/k",
+        "echo " ++ marker,
+    } else &.{
         "/bin/sh",
         "-c",
         "printf '" ++ marker ++ "\\n'; sleep 30",
@@ -1348,8 +1355,8 @@ test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
     const pc = try spawner.spawnChild(.{
         .rows = 24,
         .cols = 80,
-        .shell = "/bin/sh",
-        .argv = &argv,
+        .shell = if (is_windows) "cmd.exe" else "/bin/sh",
+        .argv = argv,
     });
     var terminated = false;
     defer if (!terminated) pc.child().terminate();

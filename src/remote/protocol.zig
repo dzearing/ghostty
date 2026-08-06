@@ -639,16 +639,21 @@ pub const Open = struct {
     /// `<shell> -lic/-li <command>` convention (§ local shell integration, T04c).
     /// Carries the argv-rewrite that `shell_integration.setup()` produces for
     /// shells that need one (bash → `<shell> --posix`, nushell → `<shell>
-    /// --execute 'use ghostty *'`) so an agent-backed local pane running those
+    /// --execute 'use ghostty *'`, powershell → `<shell> -NoExit -Command
+    /// . '…ghostty.ps1'`, T27/T151) so an agent-backed local pane running those
     /// shells activates ghostty integration (prompt marks / OSC 7 / title) —
     /// env-only shells (zsh/fish/elvish) never set this (their integration rides
     /// `OPEN.env` alone). Set ONLY by the LOCAL-agent client for a plain
     /// interactive shell (no user `command`); a cross-machine window leaves it
-    /// null. When present and non-empty the agent (POSIX) execs it as-is, using
-    /// its own resolved shell path as the binary and this array as argv; when
-    /// null the agent keeps the `-lic/-li` synthesis. Additive/optional: older
-    /// agents ignore the field (unknown-field-tolerant parser) and fall back to
-    /// the default invocation. `argv[0]` is conventionally the shell path.
+    /// null. When present and non-empty the agent execs it as-is — POSIX uses
+    /// its own resolved shell path as the binary with this array as argv;
+    /// Windows builds the ConPTY command line from this array (argv[0] resolves
+    /// through the standard program search) — when null the agent keeps its
+    /// per-OS default synthesis. Additive/optional: older agents ignore the
+    /// field (unknown-field-tolerant parser) and fall back to the default
+    /// invocation (a pre-T151 Windows agent additionally ignored a present
+    /// argv, degrading to no shell integration). `argv[0]` is conventionally
+    /// the shell path.
     argv: ?[]const []const u8 = null,
 
     /// Pin this session so the agent's idle-TTL reaper NEVER evicts it while
