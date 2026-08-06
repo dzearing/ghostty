@@ -145,6 +145,21 @@ ghoztty +set-state --target=dev --state=idle
 
 Processes can also set state via OSC escape sequence: `\033]7777;<state>\007`
 
+**An agent should not set the state of its own pane.** The installed hooks own
+it (`macos/Resources/Ghoztty/hooks/ghoztty-activity-state.sh`, the single owner
+of the `needs_input` > `busy` > `idle` ordering), including holding the pane
+`busy` while background subagents outlive the main loop — `Stop` fires when the
+main loop goes quiet, not when the work ends. Live subagents are tracked as one
+marker file each under `/tmp/ghoztty-<runtime>-agents-<session_id>/`, recovered
+either by the owner pid baked into the filename or by a missed heartbeat past
+`GHOZTTY_AGENT_STALE_MIN` minutes (default 30, which must exceed the longest
+single *tool call*). `+set-state` is for *other* panes. Tests:
+`scripts/test-activity-state.sh`.
+
+Wired for Claude Code; Copilot CLI gets only the session-start sweep and the
+settle, because its event vocabulary for tool/subagent/permission hooks is not
+documented (see `CopilotHookSpec`).
+
 ### `ghoztty +set-banner`
 
 Set or clear the sticky banner of a named pane or window. The banner is a native overlay rendered above the terminal content of a pane — it persists (survives scrolling, screen clears, and content updates) until changed or cleared. Setting a banner on a window target applies it to that window's focused pane (banners are per-pane).

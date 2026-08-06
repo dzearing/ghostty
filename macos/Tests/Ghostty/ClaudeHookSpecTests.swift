@@ -19,6 +19,60 @@ struct ClaudeHookSpecTests {
         }
     }
 
+    // The activity-state machine needs six events beyond the banner's three.
+    // Miss one and the failure is silent: the pane just reports the wrong state.
+    @Test func mergedFragmentRegistersEveryActivityStateEvent() {
+        let merged = ClaudeHookSpec.merge(into: [:], bannerScriptPath: scriptPath)
+        let hooks = hooksDict(merged)
+        let activityPath = HookScripts.activityState(bannerScriptPath: scriptPath)
+
+        for (event, verb) in [("SessionStart", "session-start"),
+                              ("PreToolUse", "pause"),
+                              ("Notification", "pause"),
+                              ("PermissionRequest", "pause"),
+                              ("PostToolUse", "tool-tick"),
+                              ("SubagentStart", "agent-start"),
+                              ("SubagentStop", "agent-stop"),
+                              ("Stop", "settle")] {
+            let text = serialize(hooks[event])
+            #expect(text.contains(activityPath), "\(event) must invoke the activity script")
+            #expect(text.contains("\(verb) --runtime=claude"), "\(event) must pass the \(verb) verb")
+        }
+    }
+
+    // A pane blocked on a question must not be downgraded by a background agent,
+    // so the pause events are the ones that cannot silently go missing.
+    @Test func preToolUsePausesOnlyForUserBlockingTools() {
+        let merged = ClaudeHookSpec.merge(into: [:], bannerScriptPath: scriptPath)
+        let elements = hooksDict(merged)["PreToolUse"] as? [[String: Any]] ?? []
+        #expect(elements.count == 1)
+        #expect(elements.first?["matcher"] as? String == "AskUserQuestion|ExitPlanMode")
+    }
+
+    // Ownership is keyed on the hooks DIRECTORY, not the banner path, so the
+    // activity-state elements are recognized as ours. With a banner-path
+    // signature these would survive uninstall and never report `.installed`.
+    @Test func activityStateElementsAreOwnedAndFullyRemoved() {
+        let merged = ClaudeHookSpec.merge(into: [:], bannerScriptPath: scriptPath)
+        #expect(ClaudeHookSpec.fragmentState(in: merged, bannerScriptPath: scriptPath) == .installed)
+
+        let removed = ClaudeHookSpec.removeFragment(from: merged, bannerScriptPath: scriptPath)
+        #expect(!serialize(removed).contains("ghoztty-activity-state.sh"))
+        #expect(removed["hooks"] == nil)
+    }
+
+    // An install predating the activity script has only banner commands. It must
+    // read as `.outdated` — actionable — rather than `.installed` (which would
+    // never offer the upgrade) or `.notInstalled` (which loses ownership).
+    @Test func aBannerOnlyInstallIsOutdatedNotInstalled() {
+        let bannerOnly: [String: Any] = [
+            "hooks": ["Stop": [["hooks": [["type": "command",
+                                           "command": "bash '\(scriptPath)' stop-hook --runtime=claude",
+                                           "timeout": 10]]]]],
+        ]
+        #expect(ClaudeHookSpec.fragmentState(in: bannerOnly, bannerScriptPath: scriptPath) == .outdated)
+    }
+
     @Test func mergePreservesUnrelatedKeysAndIsDetectable() {
         let existing: [String: Any] = ["theme": "dark", "model": "opus"]
         let merged = ClaudeHookSpec.merge(into: existing, bannerScriptPath: scriptPath)
@@ -75,7 +129,9 @@ struct ClaudeHookSpecTests {
         ]
         let merged = ClaudeHookSpec.merge(into: existing, bannerScriptPath: scriptPath)
         let mergedSS = hooksDict(merged)["SessionStart"] as? [[String: Any]] ?? []
-        #expect(mergedSS.count == 2)
+        // The user's one element, plus Ghoztty's two: the banner (matched to
+        // `startup|clear`) and the activity-state sweep (every session start).
+        #expect(mergedSS.count == 3)
         #expect(serialize(mergedSS).contains("echo user-start"))
         #expect(serialize(mergedSS).contains(scriptPath))
         #expect(ClaudeHookSpec.fragmentState(in: merged, bannerScriptPath: scriptPath) == .installed)

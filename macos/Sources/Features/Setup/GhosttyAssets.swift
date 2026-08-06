@@ -32,9 +32,17 @@ enum GhosttyAssets {
     }
 
     static func bannerScript() throws -> String {
-        let url = try rootURL.appendingPathComponent("hooks/ghoztty-banner.sh")
+        try hookScript(HookScripts.bannerName, describedAs: "banner script")
+    }
+
+    static func activityStateScript() throws -> String {
+        try hookScript(HookScripts.activityStateName, describedAs: "activity-state script")
+    }
+
+    private static func hookScript(_ name: String, describedAs what: String) throws -> String {
+        let url = try rootURL.appendingPathComponent("hooks/\(name)")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            throw GhosttyAssetsError.missing("banner script")
+            throw GhosttyAssetsError.missing(what)
         }
         return text
     }

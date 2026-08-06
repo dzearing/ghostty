@@ -20,8 +20,17 @@ struct ClaudeHookSpec: HookSpec {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    /// Ownership signature: any hook command that invokes our banner script.
-    static func signature(_ bannerScriptPath: String) -> String { bannerScriptPath }
+    /// Ownership signature: any hook command that invokes a script out of our
+    /// owned hooks DIRECTORY. Deliberately the directory rather than the banner
+    /// script path — Ghoztty installs a second script there
+    /// (`ghoztty-activity-state.sh`), and a banner-path signature would leave
+    /// every activity-state element unrecognized, so uninstall would strand them
+    /// and `fragmentState` would never report `.installed`. An older
+    /// banner-only install still matches, since its path is inside this
+    /// directory.
+    static func signature(_ bannerScriptPath: String) -> String {
+        HookScripts.directory(bannerScriptPath: bannerScriptPath)
+    }
 
     /// Ghoztty's contribution to the shared `hooks` map: one element per event.
     /// The map is keyed by event name; each value is the array of hook elements
@@ -38,9 +47,31 @@ struct ClaudeHookSpec: HookSpec {
             [["hooks": [command(purpose)]]]
         }
         return [
-            "SessionStart": [["matcher": "startup|clear", "hooks": [command(.sessionStart)]]],
+            // Banner: the sticky per-pane overlay.
+            // Activity: the idle/busy/needs_input state machine. Both run on
+            // SessionStart and Stop, in that order, as separate elements — the
+            // banner's own matcher is `startup|clear` (a resume keeps its
+            // banner), while the activity sweep must run on EVERY session start
+            // so a killed session's leaked agent markers are always reaped.
+            "SessionStart": [
+                ["matcher": "startup|clear", "hooks": [command(.sessionStart)]],
+                ["hooks": [command(.activitySessionStart)]],
+            ],
             "UserPromptSubmit": entry(.promptSubmit),
-            "Stop": entry(.stop),
+            // Anything that blocks on the user outranks everything else.
+            "PreToolUse": [["matcher": "AskUserQuestion|ExitPlanMode",
+                            "hooks": [command(.activityPause)]]],
+            "Notification": entry(.activityPause),
+            "PermissionRequest": entry(.activityPause),
+            // Catch-all: on the main thread this undoes a pause; inside a
+            // subagent it only beats that agent's liveness marker.
+            "PostToolUse": entry(.activityToolTick),
+            "SubagentStart": entry(.activityAgentStart),
+            "SubagentStop": entry(.activityAgentStop),
+            "Stop": [
+                ["hooks": [command(.stop)]],
+                ["hooks": [command(.activitySettle)]],
+            ],
         ]
     }
 

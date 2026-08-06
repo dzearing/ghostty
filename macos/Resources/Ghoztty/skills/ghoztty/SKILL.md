@@ -578,6 +578,26 @@ ghoztty +set-state --target=dev --state=needs_input
 ghoztty +set-state --target=dev --state=idle
 ```
 
+**Don't set the state of your own pane.** Ghoztty's installed hooks already own
+it, under the same `needs_input` > `busy` > `idle` ordering — including keeping
+the pane `busy` while background subagents outlive the main loop. A manual call
+either duplicates what the hooks just did or fights them. Use `+set-state` for
+*other* panes: a build, a dev server, a long-running job you launched.
+
+The hooks track each live subagent with a marker file under
+`/tmp/ghoztty-<runtime>-agents-<session_id>/`, so the pane stays `busy` until
+the last one finishes rather than going `idle` the moment the main loop goes
+quiet. Markers are recovered two ways when a kill skips `SubagentStop`: the
+owning agent's pid is baked into each filename (so a dead session's markers are
+dropped exactly and instantly), and an agent that emits no tool call for longer
+than `GHOZTTY_AGENT_STALE_MIN` minutes (default `30`) is presumed dead. That
+window must exceed the longest single *tool call*, not the longest agent — a
+40-minute build emits nothing between its start and its end.
+
+This is wired for **Claude Code**. Copilot CLI gets the banner hooks but not yet
+the full state machine (see the note in `CopilotHookSpec`), so a Copilot pane
+still reports `idle` at the end of a turn even with background work in flight.
+
 ### `ghoztty +set-banner`
 
 Set or clear a **sticky banner** rendered above a pane's terminal content. The banner is a native overlay — it persists across scrolling, screen clears, and content updates until you change or clear it. Ideal for pinning status, progress, or links (e.g. a PR link) above the pane you're working in.
