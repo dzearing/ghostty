@@ -224,6 +224,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .filters input, .filters select { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; min-height: 30px; }
 .filters input { flex: 1 1 180px; min-width: 130px; }
 .filters input:focus-visible, .filters select:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
+/* Multiselect dropdown (status filter): a <details> styled like the selects. */
+.filters details.ms { position: relative; }
+.filters details.ms > summary { list-style: none; cursor: pointer; font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; min-height: 30px; display: flex; align-items: center; gap: 6px; user-select: none; box-sizing: border-box; }
+.filters details.ms > summary::-webkit-details-marker { display: none; }
+.filters details.ms > summary::after { content: '▾'; opacity: .6; font-size: 10px; }
+.filters details.ms > summary:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
+.ms-menu { position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; min-width: 170px; background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 8px; padding: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); display: flex; flex-direction: column; gap: 2px; }
+.ms-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink); padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+.ms-item:hover { background: rgba(128, 128, 128, .14); }
+.ms-item input { accent-color: var(--open); margin: 0; }
+.ms-sep { border-top: 1px solid var(--hairline); margin: 4px 0; }
 .count { color: var(--muted); font-size: 12px; align-self: center; }
 .tasks td:nth-child(2) { font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
 td.ord, .tasks th:first-child { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
@@ -389,7 +400,10 @@ var state = {
   data: null, sig: '', busy: false, pageVersion: null,
   sort: { key: 'order', dir: 1 }, // the work queue, head first
   view: VIEWS.indexOf((location.hash || '').slice(1)) >= 0 ? location.hash.slice(1) : 'activity',
-  filters: { q: '', status: '', priority: '', seat: '' },
+  /* statuses: null = every status shown; else a {bucket: bool} map (the
+     status filter is a MULTISELECT — the user unchecks e.g. Done to hide it,
+     or any subset; a single-value select could not express "all but done"). */
+  filters: { q: '', statuses: null, priority: '', seat: '' },
   open: {},        // expanded task rows
   notes: {},       // in-progress decision notes, kept across re-renders
   digestDate: null,  // which digest is being read; null = newest
@@ -785,7 +799,7 @@ function decisionCard(d) {
       h('span', { class: 'dec-id', text: d.id }),
       h('span', { class: 'dec-title', text: d.title }),
       d.task ? h('span', { class: 'chip link', title: 'Show this task', text: d.task,
-        onclick: function () { state.filters = { q: d.task, status: '', priority: '', seat: '' }; go('tasks'); } }) : null,
+        onclick: function () { state.filters = { q: d.task, statuses: null, priority: '', seat: '' }; go('tasks'); } }) : null,
       h('span', { class: 'chip', text: d.kind })
     ]),
     d.why ? h('div', { class: 'dec-why', text: d.why }) : null,
@@ -1281,9 +1295,68 @@ function tasksView(d) {
     oninput: function (e) { f.q = e.target.value; renderTasks(); }
   });
   input.value = f.q;
+  /* Status is a MULTISELECT: a checkbox per status plus an "All statuses"
+     master, so "everything except Done" is one uncheck. Updates are surgical
+     (summary text + sibling checkboxes), never a rebuild — a rebuild would
+     snap the popup shut after every toggle. */
+  var STATUS_KEYS = Object.keys(STATUS_LABEL);
+  var statusSummaryText = function () {
+    var s = f.statuses;
+    if (!s) return 'Any status';
+    var on = STATUS_KEYS.filter(function (k) { return s[k]; });
+    if (on.length === STATUS_KEYS.length) return 'Any status';
+    if (!on.length) return 'No statuses';
+    var off = STATUS_KEYS.filter(function (k) { return !s[k]; });
+    if (off.length < on.length) return 'Not: ' + off.map(function (k) { return STATUS_LABEL[k]; }).join(', ');
+    return on.map(function (k) { return STATUS_LABEL[k]; }).join(', ');
+  };
+  var statusMulti = (function () {
+    var summaryLabel = h('span', { text: statusSummaryText() });
+    var itemBoxes = {};
+    var allBox = h('input', { type: 'checkbox', 'aria-label': 'All statuses' });
+    var sync = function () {
+      var s = f.statuses;
+      allBox.checked = !s || STATUS_KEYS.every(function (k) { return s[k]; });
+      STATUS_KEYS.forEach(function (k) { itemBoxes[k].checked = !s || !!s[k]; });
+      summaryLabel.textContent = statusSummaryText();
+      renderTasks();
+    };
+    allBox.onchange = function () {
+      if (allBox.checked) { f.statuses = null; }
+      else {
+        f.statuses = {};
+        STATUS_KEYS.forEach(function (k) { f.statuses[k] = false; });
+      }
+      sync();
+    };
+    var items = STATUS_KEYS.map(function (k) {
+      var cb = h('input', { type: 'checkbox', 'aria-label': STATUS_LABEL[k] });
+      itemBoxes[k] = cb;
+      cb.onchange = function () {
+        if (!f.statuses) {
+          f.statuses = {};
+          STATUS_KEYS.forEach(function (x) { f.statuses[x] = true; });
+        }
+        f.statuses[k] = cb.checked;
+        if (STATUS_KEYS.every(function (x) { return f.statuses[x]; })) f.statuses = null;
+        sync();
+      };
+      return h('label', { class: 'ms-item' }, [cb, h('span', { text: STATUS_LABEL[k] })]);
+    });
+    var s0 = f.statuses;
+    allBox.checked = !s0 || STATUS_KEYS.every(function (k) { return s0[k]; });
+    STATUS_KEYS.forEach(function (k) { itemBoxes[k].checked = !s0 || !!s0[k]; });
+    return h('details', { class: 'ms' }, [
+      h('summary', { 'aria-label': 'Filter by status (multiselect)' }, [summaryLabel]),
+      h('div', { class: 'ms-menu' }, [
+        h('label', { class: 'ms-item' }, [allBox, h('span', { text: 'All statuses' })]),
+        h('div', { class: 'ms-sep' })
+      ].concat(items))
+    ]);
+  })();
   var controls = h('div', { class: 'filters' }, [
     input,
-    sel('status', 'Any status', Object.keys(STATUS_LABEL).map(function (k) { return [k, STATUS_LABEL[k]]; })),
+    statusMulti,
     sel('priority', 'Any priority', [
       ['P0', 'P0 - severe'], ['P1', 'P1 - feature + polish'],
       ['P2', 'P2 - infra'], ['untriaged', 'Untriaged']
@@ -1461,7 +1534,7 @@ function renderTasks() {
   if (!d) return;
   var f = state.filters, q = f.q.trim().toLowerCase();
   var rows = d.tasks.filter(function (t) {
-    if (f.status && t.bucket !== f.status) return false;
+    if (f.statuses && !f.statuses[t.bucket]) return false;
     if (f.priority && (t.priority || 'untriaged') !== f.priority) return false;
     if (f.seat && t.seat !== f.seat) return false;
     if (q && (t.id + ' ' + t.title + ' ' + t.summary).toLowerCase().indexOf(q) < 0) return false;
@@ -1722,6 +1795,15 @@ if (deepLink) {
     if (t) openTask(t);
   }, 120);
 }
+
+/* A click outside an open multiselect closes it — <details> only toggles on
+   its own summary, so without this the popup lingers over the table. */
+document.addEventListener('click', function (e) {
+  var open = document.querySelectorAll('details.ms[open]');
+  for (var i = 0; i < open.length; i++) {
+    if (!open[i].contains(e.target)) open[i].removeAttribute('open');
+  }
+});
 
 renderNav();
 poll();
