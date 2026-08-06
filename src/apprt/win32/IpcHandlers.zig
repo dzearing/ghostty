@@ -1394,7 +1394,18 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 }
             }
         }
-        return try errorResponse(ctx.alloc, "no pane found for pid {d}", .{query_pid});
+        // T153: name the better route in the failure. A pane whose shell pid
+        // is unknown (a cross-machine pane, a surface still starting up) can
+        // never match, so a process inside one gets this error through no
+        // fault of its own — and $GHOZTTY_PANE_ID is baked into every pane's
+        // env precisely so it never needs pid ancestry to name itself.
+        return try errorResponse(
+            ctx.alloc,
+            "no pane found for pid {d}: no pane's shell is an ancestor of that " ++
+                "process (panes with no known shell pid cannot match). From inside " ++
+                "a pane, $GHOZTTY_PANE_ID names the pane directly.",
+            .{query_pid},
+        );
     }
 
     const foreground = w32.GetForegroundWindow();

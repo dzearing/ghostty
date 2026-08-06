@@ -288,6 +288,32 @@ Assert "A5 --target=<pane id> resolves for +send-keys/+read" (
 Assert "A6 the lowercased id resolves too (case-insensitive)" (
     $envId -ne '' -and (Marker-LandsIn $tmpA $envId.ToLower() $envId.ToUpper() 'a6' 25))
 
+# ---- T153: `+list --pid` works on a persistence-on box ---------------------
+# This launch IS persistence-on (agent-backed panes), which is the default
+# config and was the broken case: the shell is a child of ghoztty-agent, not of
+# the app, so the app used to report pid 0 for every pane and the documented
+# `--pid` self-identification route always failed. The agent reports each
+# session's child pid in its OPENED/ATTACHED replies; +list must carry it and
+# --pid must walk ancestry against it.
+$leafPid = 0
+$deadlinePid = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadlinePid) {
+    $lp = Leaf-ByName (Get-List $tmpA 'a7') $paneName
+    if ($null -ne $lp -and [int]$lp.pid -gt 0) { $leafPid = [int]$lp.pid; break }
+    Start-Sleep -Milliseconds 500
+}
+Assert "A7 +list --json reports a non-zero pid for an agent-backed pane (T153)" (
+    $leafPid -gt 0)
+$codeA8 = Run-Cli "+list --pid=$leafPid" "$tmpA\pid-a8.txt" 12
+Assert "A8 +list --pid=<pid inside the pane> answers this pane's name" (
+    $codeA8 -eq 0 -and $paneName -ne '' -and
+    (Stripped "$tmpA\pid-a8.txt") -match [regex]::Escape(($paneName -replace '\s', '')))
+# The no-match error must exit 1 AND name the route that always works. Pid 4
+# is the System process: alive, and never inside any pane.
+$codeA9 = Run-Cli '+list --pid=4' "$tmpA\pid-a9.txt" 12
+Assert "A9 --pid no-match exits 1 and names GHOZTTY_PANE_ID as the route" (
+    $codeA9 -eq 1 -and (Out-Text "$tmpA\pid-a9.txt") -match 'GHOZTTY_PANE_ID')
+
 Stop-TestProcs
 
 # ============================================================================

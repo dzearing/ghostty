@@ -9401,3 +9401,24 @@ mac) to validate the shared-core change on macOS. Validation:
 auto-launch-cwd.ps1 ALL PASS (30, new C7 + section D re-attach asserts),
 upgrade-no-fork.ps1 ALL PASS, floor-lane all three lanes PASS (none 164s /
 win32 180s / agent 195s), P1-P3 ALL PASS sequentially.
+
+## 2026-08-06 - T153 done: +list --pid resolves agent-backed panes, and a no-match names the better route
+
+The task's 2026-07-29 evidence (every leaf pid 0, --pid always IPC-failing)
+was already stale: the agent reports each session's child pid in its
+OPENED/ATTACHED/RELAUNCHED replies, Remote.publishProcessInfo caches it, and
+T41 (2026-08-02) gave Surface.shellPid a .remote branch that returns it for
+local agent panes - verified live on a persistence-on debug build (leaf pid
+non-zero; --pid with the shell pid and with a ping child of the shell both
+print the pane UUID, rc=0). What remained: the no-match path answered a bare
+"IPC request failed" because cli/list.zig discarded the server's error field,
+and the server's message itself said nothing useful. The win32 handler's
+no-match error now explains why (no pane's shell is an ancestor; panes with
+no known shell pid cannot match) and names $GHOZTTY_PANE_ID as the route
+that always works; the CLI prints the server's message; the shared --tty
+no-match got the same hint (Mac-shape symmetry, client-side). pane-id.ps1
+grew A7-A9 (non-zero pid for an agent-backed pane, --pid resolution, the
+no-match message). T98's fix is the same plumbing, confirmed done.
+Validation: pane-id.ps1 ALL PASS (incl. new A7-A9), floor-lane all three
+lanes PASS (none 164s / win32 190s / agent 185s), P1-P3 ALL PASS
+sequentially, re-run on the final binary after the --tty hint edit.

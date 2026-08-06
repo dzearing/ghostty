@@ -123,7 +123,13 @@ fn runArgs(
             try stderr.print("Failed to parse list response\n", .{});
             return 1;
         } orelse {
-            try stderr.print("No pane found for tty {s}\n", .{tty});
+            // Same shape as the --pid no-match (T153): name the route that
+            // works even when tty matching cannot (remote panes, no tty).
+            try stderr.print(
+                "No pane found for tty {s}. From inside a pane, " ++
+                    "$GHOZTTY_PANE_ID names the pane directly.\n",
+                .{tty},
+            );
             return 1;
         };
         stdout.writeAll(name) catch return 1;
@@ -175,7 +181,7 @@ fn sendListQuery(
 
     // Verify the response has success:true
     const parsed = std.json.parseFromSlice(
-        struct { success: bool = false },
+        struct { success: bool = false, @"error": ?[]const u8 = null },
         alloc,
         resp_buf,
         .{ .ignore_unknown_fields = true },
@@ -187,7 +193,15 @@ fn sendListQuery(
     defer parsed.deinit();
 
     if (!parsed.value.success) {
-        stderr.print("IPC request failed\n", .{}) catch {};
+        // Surface the server's own message when it sent one — a `--pid`
+        // no-match answers with WHY and the route to use instead
+        // ($GHOZTTY_PANE_ID), and a bare "IPC request failed" was throwing
+        // that away (T153).
+        if (parsed.value.@"error") |msg| {
+            stderr.print("{s}\n", .{msg}) catch {};
+        } else {
+            stderr.print("IPC request failed\n", .{}) catch {};
+        }
         stderr.flush() catch {};
         return error.IPCFailed;
     }
