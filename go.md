@@ -45,9 +45,13 @@ Concretely, in order, with no stops in between:
      missing two: a digest is a morning read, not a ledger, and a backfilled
      reflection is fiction.
    - It renders in the dashboard's **Daily digest** view (markdown: headings,
-     lists, bold, links). Frontmatter: just `date: "YYYY-MM-DD"`.
+     lists, bold, links). Frontmatter: just `date: "YYYY-MM-DD"`. The view
+     renders its own day/date header, so the body starts at the categories.
+   - **The body has two CATEGORIES, each an H2, rendered as tabs** (user,
+     2026-08-06): `## Commentary` (this step writes it) and `## Task triage`
+     (step 0.6 writes it). Subsections inside a category are H3s.
    - **Audience: the user, over coffee.** Plain language, no task-id soup —
-     name a task id only when they might click it. What it covers:
+     name a task id only when they might click it. `## Commentary` covers:
      - **Yesterday** — what actually landed (from the log and the tracker's
        activity), and what it means for the end goal, not a commit list.
      - **Today's focus** — what the queue says comes next and why that is the
@@ -61,6 +65,41 @@ Concretely, in order, with no stops in between:
        from recently resolved ones that should steer the day.
    - Write it from evidence (the log, `git log` since yesterday 5am, the
      dashboard payload, resolved decisions), not from memory of the session.
+
+0.6. **Daily triage** (user, 2026-08-06; option A of the convergence
+   decision) — runs whenever step 0.5 wrote a new digest, immediately after
+   it. Purpose: the backlog CONVERGES only if intake is controlled and the
+   completion number has a fixed denominator. Mechanics:
+
+   - **Milestone cutline.** `milestone: "M1"` in a task's frontmatter marks
+     it part of the current convergence target; the dashboard's number is
+     M1-closed / M1-total, never done/all-time. **New tasks default OUT of
+     M1** — promotion is a deliberate triage act, with the same bar as a P0/
+     P1 call: user-facing, or blocking a user-facing task, or blocking the
+     merge-back goal. Never remove a task from M1 to make the number move —
+     scope-cuts are `skipped(reason)`, visible as closures, not silent
+     demotions.
+   - **Sweep new-since-yesterday tasks** (git: task files added since the
+     last triage): confirm each has a sane `priority:` + `triage-reason:`,
+     wire `deps:` both ways (a follow-up depends on its parent; a split's
+     children carry the parent's deps), and make the M1 in/out call.
+   - **Dependency hygiene, whole backlog**: deps naming a missing id, deps
+     already satisfied (parent done/skipped), and cycles. `order:` is
+     re-derived where it contradicts deps — a dependent never sorts before
+     what it waits on. (Do not hand-renumber the world; fix contradictions.)
+   - **Staleness sweep**: open todos untouched for 30+ days, or whose
+     subject a later task/fix superseded, become PROPOSED closes — listed in
+     the triage summary with a one-line reason each. A proposal the user has
+     not vetoed by the NEXT day's triage is closed as `skipped(stale: …)`.
+     Never close a P0/P1 by staleness alone.
+   - **Write `## Task triage`** into today's digest: counts (filed
+     yesterday, closed yesterday, net flow, M1 closed/total and the
+     percentage), what was promoted into M1 and why, dep repairs made,
+     proposed closes awaiting veto, and yesterday's proposals now enacted.
+     Same audience as Commentary: prose, not a table dump.
+   - Commit triage-only frontmatter churn as `chore(triage): …` — the
+     modified-date column must not read a bulk re-triage as work on 200
+     tasks.
 
 1. **Pick up a task — ONE command, which also claims it:**
 
