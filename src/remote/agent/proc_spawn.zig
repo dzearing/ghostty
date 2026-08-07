@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const CommandCore = @import("../../CommandCore.zig");
+const internal_os = @import("../../os/main.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -131,6 +132,23 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
     var si: W.STARTUPINFOW = std.mem.zeroes(W.STARTUPINFOW);
     si.cb = @sizeOf(W.STARTUPINFOW);
 
+    // T358: the detached child resolves its command against PATH, so it needs
+    // the USER's environment, not the agent's lean snapshot — the same defect
+    // T42 fixed for PTY sessions (`pty_child.zig` applies the same overlay).
+    // On an agent started by the HKCU Run entry / a scheduled task, `python`,
+    // `node` and `ghoztty` itself are otherwise not found, with no shell to
+    // show the error in. Best-effort: a spawn with the lean env beats a spawn
+    // that failed, so any failure here degrades to lpEnvironment=null (inherit
+    // the agent's own environment, the pre-T358 behavior).
+    const env_block: ?[]u16 = blk: {
+        var env = std.process.getEnvMap(alloc) catch break :blk null;
+        defer env.deinit();
+        internal_os.user_env.overlay(alloc, &env);
+        break :blk internal_os.user_env.createEnvBlockW(alloc, &env) catch null;
+    };
+    defer if (env_block) |b| alloc.free(b);
+    const env_ptr: ?w.LPVOID = if (env_block) |b| @ptrCast(b.ptr) else null;
+
     // Attempt 1: WITH breakaway. Attempt 2 (on access-denied): without.
     var used_breakaway = true;
     var breakaway_gle: w.DWORD = 0;
@@ -142,7 +160,7 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
         null,
         W.FALSE, // do NOT inherit handles (fully detached)
         base_flags | w.CREATE_BREAKAWAY_FROM_JOB,
-        null,
+        env_ptr,
         if (cwd_w) |p| p.ptr else null,
         &si,
         &pi,
@@ -157,7 +175,7 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
             null,
             W.FALSE,
             base_flags,
-            null,
+            env_ptr,
             if (cwd_w) |p| p.ptr else null,
             &si,
             &pi,
@@ -196,8 +214,9 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
         "exit=STILL_ACTIVE"
     else
         "exit=EXITED";
-    const note = std.fmt.allocPrint(alloc, "diag: flags=0x{x:0>8} {s}({d}) breakaway-gle={d}", .{
+    const note = std.fmt.allocPrint(alloc, "diag: flags=0x{x:0>8} {s}({d}) breakaway-gle={d} env={s}", .{
         flags_used, alive_desc, exit_code, breakaway_gle,
+        if (env_ptr != null) @as([]const u8, "user-overlay") else "inherited",
     }) catch null;
 
     return .{ .ok = true, .pid = real_pid, .@"error" = note, .free_error = note != null };

@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T358 done - detached spawns (Activity Monitor New Process)
+  get the user's environment**. `proc_spawn.spawnWindows` now builds the
+  child's environment from the agent's env + the T42 registry overlay and
+  passes it as a real lpEnvironment block (CREATE_UNICODE_ENVIRONMENT was
+  already set but the block was null, so the child inherited the agent's lean
+  snapshot - python/node/gh not found on an agent started by the Run entry).
+  The block builder is `user_env.createEnvBlockW`: pure, sorted
+  case-insensitively by name (a documented CreateProcessW requirement std's
+  createWindowsEnvBlock skips), unit-tested in both lanes. Best-effort - any
+  failure degrades to null/inherit. Diag note now carries
+  `env=user-overlay|inherited`. agent-user-env.ps1 gained 1b/2b PROC_SPAWN
+  arms (marker present with overlay on, absent with GHOZTTY_USER_ENV=off);
+  surprise: remote-test-client's `--spawn` only accepts the `=` form, unlike
+  `--exec`. Floor: three zig lanes + agent-user-env + activity-monitor (85)
+  + P1-P3 ALL PASS.
 - 2026-08-06 - **T291 done - New Process no longer flashes a console window**.
   `proc_spawn.spawnWindows` now passes CREATE_NO_WINDOW instead of
   CREATE_NEW_CONSOLE: the child keeps a console (so cmd.exe/console apps

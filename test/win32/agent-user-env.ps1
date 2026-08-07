@@ -23,6 +23,12 @@
 # a green run proves nothing - the stripped PATH could simply not have been
 # stripped.
 #
+# T358 extends the same harness to the agent's OTHER spawn path: PROC_SPAWN
+# (Activity Monitor "New Process"), which launches a DETACHED process via a
+# direct CreateProcessW instead of a PTY. Each scenario also drives
+# `remote-test-client --spawn "set > file"` and asserts the detached child's
+# PATH the same way - marker present with the overlay on, absent with it off.
+#
 # Hermetic: LOCALAPPDATA, the port/sessions files and the heartbeat are all
 # redirected into a per-PID temp dir, and only agents launched from this
 # script's own pipe are ever stopped.
@@ -130,12 +136,39 @@ function Invoke-Scenario($tag, $overlay) {
         }
     }
 
+    # T358: the DETACHED spawn path (PROC_SPAWN). The spawned cmd.exe dumps its
+    # own environment; the child is detached, so poll for the file to fill in.
+    $spawnEnvFile = Join-Path $dir 'spawn-env.txt'
+    if ($started) {
+        $spawnClient = Start-Process -FilePath $ClientExe -PassThru -WindowStyle Hidden `
+            -ArgumentList "--pipe=$pipe --spawn=`"set > $spawnEnvFile`" --timeout 4" `
+            -RedirectStandardOutput (Join-Path $dir 'spawn-client.out') `
+            -RedirectStandardError (Join-Path $dir 'spawn-client.err')
+        if (-not $spawnClient.WaitForExit(30000)) {
+            Stop-Process -Id $spawnClient.Id -Force -ErrorAction SilentlyContinue
+        }
+        $deadline = (Get-Date).AddSeconds(6)
+        while ((Get-Date) -lt $deadline) {
+            if ((Test-Path $spawnEnvFile) -and ((Get-Item $spawnEnvFile).Length -gt 0)) { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    $spawnPathLine = ''
+    if (Test-Path $spawnEnvFile) {
+        foreach ($line in (Get-Content $spawnEnvFile)) {
+            if ($line -match '^(?i)path=(.*)$') { $spawnPathLine = $Matches[1]; break }
+        }
+    }
+
     if ($null -ne $agent -and -not $agent.HasExited) {
         Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Milliseconds 400
 
-    return @{ started = $started; path = $pathLine; dump = (Test-Path $envFile) }
+    return @{
+        started = $started; path = $pathLine; dump = (Test-Path $envFile)
+        spawnPath = $spawnPathLine; spawnDump = (Test-Path $spawnEnvFile)
+    }
 }
 
 function Test-HasEntry($pathValue, $entry) {
@@ -157,6 +190,13 @@ Assert "dumped PATH still has the system entries (positive control)" (
     Test-HasEntry $on.path "$winRoot\system32")
 Assert "dumped PATH contains the user entry '$marker'" (Test-HasEntry $on.path $marker)
 
+"== 1b: T358 - a DETACHED spawn (PROC_SPAWN) gets the user's PATH too"
+Assert "the spawned process dumped its environment" ($on.spawnDump)
+Assert "spawned PATH is non-empty" ($on.spawnPath.Length -gt 0)
+Assert "spawned PATH still has the system entries (positive control)" (
+    Test-HasEntry $on.spawnPath "$winRoot\system32")
+Assert "spawned PATH contains the user entry '$marker'" (Test-HasEntry $on.spawnPath $marker)
+
 # ---------------------------------------------------------------------------
 "== 2: negative control - GHOZTTY_USER_ENV=off leaves the stripped PATH stripped"
 $off = Invoke-Scenario 'off' 'off'
@@ -166,6 +206,13 @@ Assert "dumped PATH still has the system entries (control)" (
     Test-HasEntry $off.path "$winRoot\system32")
 Assert "dumped PATH does NOT contain '$marker' with the overlay off" (
     -not (Test-HasEntry $off.path $marker))
+
+"== 2b: T358 negative control - the detached spawn stays stripped with the overlay off"
+Assert "the spawned process dumped its environment (control)" ($off.spawnDump)
+Assert "spawned PATH still has the system entries (control)" (
+    Test-HasEntry $off.spawnPath "$winRoot\system32")
+Assert "spawned PATH does NOT contain '$marker' with the overlay off" (
+    -not (Test-HasEntry $off.spawnPath $marker))
 
 # ---------------------------------------------------------------------------
 "== 3: the overlay never weakens what the agent already had"

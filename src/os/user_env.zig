@@ -171,6 +171,56 @@ pub fn disabledBy(value: ?[]const u8) bool {
     return std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off");
 }
 
+/// Build the `lpEnvironment` block `CreateProcessW` wants when
+/// `CREATE_UNICODE_ENVIRONMENT` is set: `name=value` pairs in UTF-16, each
+/// NUL-terminated, the whole block terminated by an extra NUL — and, a
+/// documented CreateProcessW requirement std's `createWindowsEnvBlock` skips,
+/// **sorted case-insensitively by name**. Pure (no OS calls), so the shape is
+/// unit-tested in every lane. Caller owns the result.
+pub fn createEnvBlockW(alloc: Allocator, env: *const std.process.EnvMap) ![]u16 {
+    const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+
+        fn lessThan(_: void, a: @This(), b: @This()) bool {
+            const n = @min(a.key.len, b.key.len);
+            for (a.key[0..n], b.key[0..n]) |ac, bc| {
+                const au = std.ascii.toUpper(ac);
+                const bu = std.ascii.toUpper(bc);
+                if (au != bu) return au < bu;
+            }
+            return a.key.len < b.key.len;
+        }
+    };
+
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(alloc);
+    var it = env.iterator();
+    while (it.next()) |kv| {
+        if (kv.key_ptr.len == 0) continue;
+        try entries.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
+    }
+    std.mem.sort(Entry, entries.items, {}, Entry.lessThan);
+
+    var out: std.ArrayList(u16) = .empty;
+    errdefer out.deinit(alloc);
+    for (entries.items) |e| {
+        const key_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, e.key);
+        defer alloc.free(key_w);
+        try out.appendSlice(alloc, key_w);
+        try out.append(alloc, '=');
+        const value_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, e.value);
+        defer alloc.free(value_w);
+        try out.appendSlice(alloc, value_w);
+        try out.append(alloc, 0);
+    }
+    try out.append(alloc, 0);
+    // An empty environment still needs TWO NULs: CreateProcess reads the
+    // second code unit even though the first should suffice.
+    if (entries.items.len == 0) try out.append(alloc, 0);
+    return out.toOwnedSlice(alloc);
+}
+
 // -------------------------------------------------------------------------
 // Windows registry plumbing
 // -------------------------------------------------------------------------
@@ -467,6 +517,52 @@ test "applyAdditive: an empty key never creates a bare =value entry" {
     const user = [_]Var{.{ .key = "", .value = "junk" }};
     try applyAdditive(alloc, &env, &.{}, &user);
     try testing.expectEqual(@as(usize, 0), env.count());
+}
+
+test "createEnvBlockW: names are sorted case-insensitively, pairs NUL-joined, block double-NUL-terminated" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    // Deliberately inserted out of order; `b` vs `PATH` also checks the sort
+    // is case-INSENSITIVE (case-sensitive ordinal would put `PATH` before `b`).
+    try env.put("b", "2");
+    try env.put("PATH", "C:\\Windows");
+    try env.put("A", "1");
+
+    const block = try createEnvBlockW(alloc, &env);
+    defer alloc.free(block);
+
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("A=1\x00b=2\x00PATH=C:\\Windows\x00\x00");
+    try testing.expectEqualSlices(u16, expected, block);
+}
+
+test "createEnvBlockW: a value containing = survives verbatim" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("X", "a=b;c=d");
+
+    const block = try createEnvBlockW(alloc, &env);
+    defer alloc.free(block);
+
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("X=a=b;c=d\x00\x00");
+    try testing.expectEqualSlices(u16, expected, block);
+}
+
+test "createEnvBlockW: the empty map is exactly two NULs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+
+    const block = try createEnvBlockW(alloc, &env);
+    defer alloc.free(block);
+    try testing.expectEqualSlices(u16, &[_]u16{ 0, 0 }, block);
 }
 
 test "disabledBy: only 0 and off (any case) turn the overlay off" {
