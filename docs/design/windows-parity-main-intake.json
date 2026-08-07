@@ -1,0 +1,5 @@
+{
+  "lastEvaluated": "cda6e5191a6ddd751311b5f2e4f1c1434e09376b",
+  "date": "2026-08-07",
+  "note": "Seeded at the current merge-base with origin/main; the first intake evaluates everything main has gained since the branch diverged (~70 commits as of seeding)."
+}

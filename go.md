@@ -92,10 +92,26 @@ Concretely, in order, with no stops in between:
      the triage summary with a one-line reason each. A proposal the user has
      not vetoed by the NEXT day's triage is closed as `skipped(stale: …)`.
      Never close a P0/P1 by staleness alone.
+   - **Main intake** (user, 2026-08-07: "reduce the lag of the windows
+     client to virtually hours rather than days"; daily for now): `git fetch
+     origin main`, then evaluate every commit new since the last intake and
+     BREAK THE INCOMING CHANGES INTO TASKS for the windows seat — one task
+     per coherent change (feature, fix, behavior change), priority by user
+     impact, `milestone: "M1"` when it is user-facing parity, dep-linked to
+     each other where the upstream commits build on each other. Watermark:
+     `docs/design/windows-parity-main-intake.json` holds the last evaluated
+     main sha (`{ "lastEvaluated": "<sha>", "date": "YYYY-MM-DD" }`) —
+     update it in the same commit as the filed tasks, so intake never
+     double-files and never skips. Pure refactors with no windows-visible
+     behavior can be batched into one task; note what was batched. The goal
+     is that main's changes are IN THE QUEUE within a day of landing, and
+     the lag is worked off task by task instead of accumulating into a
+     merge cliff.
    - **Write `## Task triage`** into today's digest: counts (filed
-     yesterday, closed yesterday, net flow, M1 closed/total), what was
-     promoted into M1 and why, dep repairs made, proposed closes awaiting
-     veto, and yesterday's proposals now enacted. **Scannable, never dense**
+     yesterday, closed yesterday, net flow, M1 closed/total), **main intake
+     (N commits evaluated, M tasks filed, current lag in commits)**, what
+     was promoted into M1 and why, dep repairs made, proposed closes
+     awaiting veto, and yesterday's proposals now enacted. **Scannable, never dense**
      (user, 2026-08-06): lead with an H3 stat line (`### M1: X of Y
      closed`), then short bold-labeled bullets — one idea each, two
      sentences max. No wall-of-prose paragraphs; this is read on a
