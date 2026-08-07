@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const input = @import("../../input.zig");
 
 const App = @import("App.zig");
 const MachineChooser = @import("MachineChooser.zig");
@@ -18,6 +19,7 @@ const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
+const viewer_accel = @import("viewer_accel.zig");
 const viewer_content = @import("viewer_content.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
@@ -1408,6 +1410,7 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
     // split machinery at comptime — see the field's own doc for why that
     // matters.
     viewer.open_link_split = &openViewerSplitFromLink;
+    viewer.perform_accel_action = &performAccelActionFromViewer;
     try viewer.createHostWindow(self.app.hinstance, hwnd, self.surfaceRect());
     // Before `start`, so the location is already recorded when the controller
     // arrives and `adoptController` replays it. A viewer that is told where to
@@ -1425,6 +1428,15 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
 /// `ViewerPane.open_link_split`; the signature carries the pane's leaf and
 /// its origin directory because those are the two things the pane knows that
 /// the split needs.
+/// A viewer pane's forwarded accelerator chord performs its action (T394).
+/// This is the target of `ViewerPane.perform_accel_action`; the indirection
+/// keeps the renderer world out of ViewerPane's unit-test binary, same as
+/// `openViewerSplitFromLink` above.
+fn performAccelActionFromViewer(pv: *PaneView, action: input.Binding.Action) void {
+    const window = pv.parentWindow();
+    _ = window.performViewerBindingAction(pv, action);
+}
+
 fn openViewerSplitFromLink(pv: *PaneView, location: []const u8, origin: ?[]const u8) void {
     const window = pv.parentWindow();
     _ = window.newViewerSplitAt(pv, .right, 0.5, .{
@@ -3214,6 +3226,178 @@ pub fn toggleSplitZoom(self: *Window) void {
         tree.zoom(handle);
     }
     self.layoutSplits();
+}
+
+/// Perform a bound action ON BEHALF OF a viewer pane (T394). This is the
+/// dispatch half of viewer accelerator forwarding: a viewer has no core
+/// surface, so a matched chord cannot ride `performBindingAction` — instead
+/// the actions land here, on the SAME Window/App machinery the core path
+/// reaches, addressed at the viewer's own pane (`close_surface` closes the
+/// viewer, `new_split` splits off it).
+///
+/// The action vocabulary is `viewer_accel.forwards` — the window/app-scoped
+/// subset with a meaning when no terminal underlies the focused pane — and
+/// this switch must handle everything that list admits. Returns false for an
+/// action outside it.
+///
+/// Callers beware: the closing arms (`close_surface`, `close_tab`,
+/// `close_window`, …) free the pane — and with it the ViewerPane and its
+/// HWND — before returning. Nothing pane-owned may be touched afterwards.
+pub fn performViewerBindingAction(
+    self: *Window,
+    pane: *PaneView,
+    action: input.Binding.Action,
+) bool {
+    if (!viewer_accel.forwards(action)) return false;
+    switch (action) {
+        .quit => _ = self.app.performAction(.app, .quit, {}) catch |err| {
+            log.err("viewer chord quit failed err={}", .{err});
+        },
+
+        // Mirrors the App arm: New Window on a remote window opens on the
+        // SAME machine, and a failed re-dial says so rather than silently
+        // opening a local window (T68).
+        .new_window => {
+            if (self.remote_machine != null) {
+                _ = self.app.openRemoteWindowFrom(self, .{}) catch |err| {
+                    log.warn("viewer chord: new window on remote parent failed err={}", .{err});
+                    self.app.showRemoteOpenFailed(self);
+                };
+            } else _ = self.app.createWindow(.{}) catch |err| {
+                log.err("viewer chord: new window failed err={}", .{err});
+            };
+        },
+
+        .new_tab => _ = self.addTab() catch |err| {
+            log.err("viewer chord: new tab failed err={}", .{err});
+        },
+
+        .close_surface => self.closeSplitPane(pane),
+        .close_tab => |mode| self.closeTabMode(switch (mode) {
+            .this => .this,
+            .other => .other,
+            .right => .right,
+        }, pane),
+        .close_window => {
+            if (self.confirmCloseIfNeeded()) self.close();
+        },
+        .close_all_windows => _ = self.app.performAction(.app, .close_all_windows, {}) catch |err| {
+            log.err("viewer chord close_all_windows failed err={}", .{err});
+        },
+
+        .previous_tab => _ = self.selectTab(.previous),
+        .next_tab => _ = self.selectTab(.next),
+        .last_tab => _ = self.selectTab(.last),
+        .goto_tab => |n| _ = self.selectTab(@enumFromInt(n)),
+        .move_tab => |amount| self.moveTab(amount),
+
+        .new_split => |direction| {
+            // `.auto` splits along the pane's larger axis, the same rule the
+            // core applies from its screen size — read here off the host
+            // window, falling back to `right` when there is nothing to
+            // measure yet.
+            const dir: SplitTree(PaneView).Split.Direction = switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+                .auto => auto: {
+                    const hwnd = pane.hwnd() orelse break :auto .right;
+                    var r: w32.RECT = undefined;
+                    if (w32.GetClientRect(hwnd, &r) == 0) break :auto .right;
+                    break :auto if (r.bottom - r.top > r.right - r.left) .down else .right;
+                },
+            };
+            _ = self.newSplitAt(pane, dir, 0.5) catch |err| {
+                log.err("viewer chord: split failed err={}", .{err});
+            };
+        },
+        .goto_split => |direction| self.gotoSplit(switch (direction) {
+            .previous => .previous,
+            .next => .next,
+            .up => .up,
+            .left => .left,
+            .down => .down,
+            .right => .right,
+        }),
+        .swap_split => |direction| self.swapSplit(switch (direction) {
+            .previous => .previous,
+            .next => .next,
+            .up => .up,
+            .left => .left,
+            .down => .down,
+            .right => .right,
+        }),
+        .resize_split => |param| self.resizeSplit(.{
+            .amount = param[1],
+            .direction = switch (param[0]) {
+                .up => .up,
+                .down => .down,
+                .left => .left,
+                .right => .right,
+            },
+        }),
+        .equalize_splits => self.equalizeSplits(),
+        .toggle_split_zoom => self.toggleSplitZoom(),
+
+        .toggle_fullscreen => self.toggleFullscreen(),
+        .toggle_maximize => {
+            if (self.hwnd) |hwnd| {
+                _ = w32.ShowWindow(hwnd, if (w32.IsZoomed(hwnd) != 0)
+                    w32.SW_RESTORE
+                else
+                    w32.SW_MAXIMIZE);
+            }
+        },
+        .toggle_window_decorations => self.toggleWindowDecorations(),
+
+        // The palette UI is owned by a terminal Surface, so it opens on one
+        // of this window's terminals (the active tab's first, by preference).
+        // A window with no terminal pane at all has nowhere to draw it —
+        // logged, not fatal, and the chord stays claimed either way.
+        .toggle_command_palette => {
+            if (self.anyTerminalSurface()) |s| {
+                s.setCommandPaletteActive(!s.palette_active);
+            } else log.info("viewer chord: no terminal pane to host the palette", .{});
+        },
+
+        .open_config => _ = self.app.performAction(.app, .open_config, {}) catch |err| {
+            log.err("viewer chord open_config failed err={}", .{err});
+        },
+        .reload_config => _ = self.app.performAction(.app, .reload_config, .{ .soft = false }) catch |err| {
+            log.err("viewer chord reload_config failed err={}", .{err});
+        },
+
+        .prompt_window_title => self.promptRenameWindow(),
+
+        // `forwards` admitted it, so this arm being reached is a drift
+        // between that list and this switch — visible in the log rather
+        // than a silently swallowed chord.
+        else => {
+            log.warn("viewer chord: unhandled forwarded action {s}", .{@tagName(action)});
+            return false;
+        },
+    }
+    return true;
+}
+
+/// The first terminal surface in this window, preferring the active tab —
+/// the palette host for a focused viewer (T394). Null in a viewer-only
+/// window.
+fn anyTerminalSurface(self: *Window) ?*Surface {
+    if (self.tab_count == 0) return null;
+    var it = self.tab_trees[self.active_tab].iterator();
+    while (it.next()) |entry| {
+        if (entry.view.surface()) |s| return s;
+    }
+    for (0..self.tab_count) |tab| {
+        if (tab == self.active_tab) continue;
+        var it2 = self.tab_trees[tab].iterator();
+        while (it2.next()) |entry| {
+            if (entry.view.surface()) |s| return s;
+        }
+    }
+    return null;
 }
 
 /// Navigate to a tab by GotoTab target (previous, next, last, or index).

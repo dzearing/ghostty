@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T394 done - app keybinds now work inside viewer panes** (the
+  user's 2026-08-05 P0: ctrl+w/ctrl+f4 dead in a focused viewer, no keyboard
+  way out). WebView2's AcceleratorKeyPressed is wired on every viewer
+  controller: chords resolve against the app keybind table (pure
+  `viewer_accel.zig`, none-lane tested; `Surface.zig` holds an exhaustive
+  drift guard vs `mapVirtualKey`), matched window/app-scoped actions claim
+  the key and dispatch via WM_APP_VIEWER_ACCEL to
+  `Window.performViewerBindingAction` addressed at the viewer's own pane;
+  content keys stay with the page. Two structural lessons: (1) the dispatch
+  MUST ride an installed fn pointer (`perform_accel_action`) - a direct
+  ViewerPane->Window call pulled the GTK/renderer world into the win32+agent
+  test binaries; (2) of WebView2's child HWNDs only Chrome_WidgetWin_1 turns
+  a posted WM_KEYDOWN into the accelerator event, and the new
+  `Send-TestViewerChord` (TestDesktop.ps1) must share modifier state with
+  BOTH the Chromium and app threads. viewer-panes.ps1 grew section 11b
+  (control chord from a terminal, then palette/new-tab/close from inside the
+  viewer - all pass). Surfaced two PRE-EXISTING failures (reproduced on an
+  unmodified-HEAD baseline build): the +reload string assert broke on PS 5.1
+  stderr line-wrapping (fixed inline - all stderr matches now
+  whitespace-normalized) and the section-11 split-cwd fallback drift (filed
+  T540). Floor: three zig lanes PASS, P1-P3 ALL PASS. Pane-scoped viewer
+  chords (ctrl+r reload, address bar, zoom) remain T161 on this spine.
 - 2026-08-06 - **T524 fixed + T495 fixed - the user's two morning P0s** (user
   report: upgrade confirm STILL never brings the app back; second divider in a
   3-pane layout STILL jumps). T524: the T421 relaunch guard armed 4/4 times in

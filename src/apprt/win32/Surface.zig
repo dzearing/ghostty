@@ -2957,6 +2957,19 @@ pub fn cursorFromLparam(lparam: isize) w32.POINT {
     };
 }
 
+test "viewer_accel.keyFromVk never drifts from mapVirtualKey" {
+    // `viewer_accel.zig` cannot import an OS surface, so its VK table is
+    // literals. This lane CAN name the `w32.VK_*` constants through
+    // `mapVirtualKey`, so the whole 8-bit VK space is the drift guard: a
+    // transcription error over there fails here, on the box, every run.
+    const viewer_accel = @import("viewer_accel.zig");
+    for (0..256) |vk_usize| {
+        const vk: u16 = @intCast(vk_usize);
+        try std.testing.expectEqual(mapVirtualKey(vk, false), viewer_accel.keyFromVk(vk, false));
+        try std.testing.expectEqual(mapVirtualKey(vk, true), viewer_accel.keyFromVk(vk, true));
+    }
+}
+
 test "cursorFromLparam decodes signed 16-bit halves" {
     const testing = std.testing;
     // Ordinary in-window point.

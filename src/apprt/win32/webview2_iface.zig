@@ -68,6 +68,30 @@ pub const MoveFocusReason = enum(i32) {
     previous = 2,
 };
 
+/// `COREWEBVIEW2_KEY_EVENT_KIND`: which window message an
+/// `AcceleratorKeyPressed` event stands for (T394). `system_key_down` is
+/// WM_SYSKEYDOWN — an Alt chord — and counts as a press for forwarding.
+pub const KeyEventKind = enum(i32) {
+    key_down = 0,
+    key_up = 1,
+    system_key_down = 2,
+    system_key_up = 3,
+    /// The SDK enum is open-ended across runtime versions; an unknown kind
+    /// must decode rather than trap, and is simply not a press.
+    _,
+};
+
+/// `COREWEBVIEW2_PHYSICAL_KEY_STATUS`: the key-message LPARAM, unpacked by
+/// the runtime so nobody re-derives bit 24 by hand.
+pub const PhysicalKeyStatus = extern struct {
+    RepeatCount: u32,
+    ScanCode: u32,
+    IsExtendedKey: BOOL,
+    IsMenuKeyDown: BOOL,
+    WasKeyDown: BOOL,
+    IsKeyReleased: BOOL,
+};
+
 /// `COREWEBVIEW2_PREFERRED_COLOR_SCHEME`. `auto` follows the OS and is what an
 /// older runtime without `ICoreWebView2_13` degrades to (T90a design §14).
 pub const PreferredColorScheme = enum(i32) {
@@ -268,6 +292,24 @@ pub const IID_ExecuteScriptCompletedHandler: GUID = .{
     .Data2 = 0xCC67,
     .Data3 = 0x4BCA,
     .Data4 = .{ 0x99, 0x23, 0x13, 0x71, 0x12, 0xF4, 0xC4, 0xCC },
+};
+
+// {B29C7E28-FA79-41A8-8E44-65811C76DCB2}
+// `ICoreWebView2AcceleratorKeyPressedEventHandler` (T394). Registered on the
+// CONTROLLER, not the web view — its `Invoke` sender is the controller.
+pub const IID_AcceleratorKeyPressedHandler: GUID = .{
+    .Data1 = 0xB29C7E28,
+    .Data2 = 0xFA79,
+    .Data3 = 0x41A8,
+    .Data4 = .{ 0x8E, 0x44, 0x65, 0x81, 0x1C, 0x76, 0xDC, 0xB2 },
+};
+
+// {9F760F8A-FB79-42BE-9990-7B56900FA9C7}
+pub const IID_ICoreWebView2AcceleratorKeyPressedEventArgs: GUID = .{
+    .Data1 = 0x9F760F8A,
+    .Data2 = 0xFB79,
+    .Data3 = 0x42BE,
+    .Data4 = .{ 0x99, 0x90, 0x7B, 0x56, 0x90, 0x0F, 0xA9, 0xC7 },
 };
 
 /// `EventRegistrationToken` (winrt's `eventtoken.h`), the out-parameter every
@@ -1009,6 +1051,50 @@ pub const ICoreWebView2_13 = extern struct {
     }
 };
 
+// ------------------------ ICoreWebView2AcceleratorKeyPressedEventArgs
+
+/// One accelerator chord the browser saw before the page did (T394). The
+/// slots are the IDL's, in order; `put_Handled(TRUE)` is what keeps the
+/// browser from also acting on the key, and it must be decided inside the
+/// `Invoke` — the browser process is blocked waiting on it.
+pub const ICoreWebView2AcceleratorKeyPressedEventArgs = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs) callconv(.winapi) u32,
+        get_KeyEventKind: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *KeyEventKind) callconv(.winapi) HRESULT,
+        get_VirtualKey: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *u32) callconv(.winapi) HRESULT,
+        get_KeyEventLParam: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *i32) callconv(.winapi) HRESULT,
+        get_PhysicalKeyStatus: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *PhysicalKeyStatus) callconv(.winapi) HRESULT,
+        get_Handled: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, *BOOL) callconv(.winapi) HRESULT,
+        put_Handled: *const fn (*ICoreWebView2AcceleratorKeyPressedEventArgs, BOOL) callconv(.winapi) HRESULT,
+    };
+
+    pub fn keyEventKind(self: *ICoreWebView2AcceleratorKeyPressedEventArgs) ?KeyEventKind {
+        var out: KeyEventKind = .key_down;
+        if (com.failed(self.vtable.get_KeyEventKind(self, &out))) return null;
+        return out;
+    }
+
+    pub fn virtualKey(self: *ICoreWebView2AcceleratorKeyPressedEventArgs) ?u32 {
+        var out: u32 = 0;
+        if (com.failed(self.vtable.get_VirtualKey(self, &out))) return null;
+        return out;
+    }
+
+    pub fn physicalKeyStatus(self: *ICoreWebView2AcceleratorKeyPressedEventArgs) ?PhysicalKeyStatus {
+        var out: PhysicalKeyStatus = std.mem.zeroes(PhysicalKeyStatus);
+        if (com.failed(self.vtable.get_PhysicalKeyStatus(self, &out))) return null;
+        return out;
+    }
+
+    pub fn setHandled(self: *ICoreWebView2AcceleratorKeyPressedEventArgs, handled: bool) bool {
+        return !com.failed(self.vtable.put_Handled(self, if (handled) 1 else 0));
+    }
+};
+
 // -------------------------------------------------- ICoreWebView2Controller
 
 /// The host-side handle on a web view: where it sits, whether it is visible,
@@ -1041,10 +1127,10 @@ pub const ICoreWebView2Controller = extern struct {
         remove_GotFocus: *const anyopaque,
         add_LostFocus: *const anyopaque,
         remove_LostFocus: *const anyopaque,
-        /// T90a design §11 wires this in T375 (a bound chord must keep working
-        /// while Chromium holds focus); declared opaque until it has a handler.
-        add_AcceleratorKeyPressed: *const anyopaque,
-        remove_AcceleratorKeyPressed: *const anyopaque,
+        /// T90a design §11's "bound chords keep working while Chromium holds
+        /// focus" seam, wired by T394 (viewer app-keybind forwarding).
+        add_AcceleratorKeyPressed: *const fn (*ICoreWebView2Controller, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
+        remove_AcceleratorKeyPressed: *const fn (*ICoreWebView2Controller, EventRegistrationToken) callconv(.winapi) HRESULT,
         get_ParentWindow: *const anyopaque,
         put_ParentWindow: *const anyopaque,
         NotifyParentWindowPositionChanged: *const fn (*ICoreWebView2Controller) callconv(.winapi) HRESULT,
@@ -1082,6 +1168,15 @@ pub const ICoreWebView2Controller = extern struct {
 
     pub fn moveFocus(self: *ICoreWebView2Controller, reason: MoveFocusReason) bool {
         return !com.failed(self.vtable.MoveFocus(self, reason));
+    }
+
+    /// Register an `AcceleratorKeyPressed` handler (T394). The token is
+    /// discarded for the same reason every other `add_*` here discards it:
+    /// the handler lives exactly as long as the controller, and `Close`
+    /// tears both down.
+    pub fn addAcceleratorKeyPressed(self: *ICoreWebView2Controller, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_AcceleratorKeyPressed(self, handler, &token));
     }
 
     pub fn notifyParentWindowPositionChanged(self: *ICoreWebView2Controller) void {
@@ -1288,6 +1383,8 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "put_IsVisible"));
     try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "put_Bounds"));
     try testing.expectEqual(12 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "MoveFocus"));
+    try testing.expectEqual(19 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "add_AcceleratorKeyPressed"));
+    try testing.expectEqual(20 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "remove_AcceleratorKeyPressed"));
     try testing.expectEqual(23 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "NotifyParentWindowPositionChanged"));
     try testing.expectEqual(24 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "Close"));
     try testing.expectEqual(25 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "get_CoreWebView2"));
@@ -1295,6 +1392,14 @@ test "the slots we actually call sit where the header puts them" {
     // Controller3's DPI pair sits AFTER Controller's 26 and Controller2's 2.
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_RasterizationScale"));
     try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2Controller3.Vtbl, "put_ShouldDetectMonitorScaleChanges"));
+
+    // T394: the accelerator args' slots in IDL order, and the unpacked
+    // LPARAM struct's exact size (2×UINT32 + 4×BOOL) — a padding surprise
+    // here would misread every field after the scan code.
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2AcceleratorKeyPressedEventArgs.Vtbl, "get_KeyEventKind"));
+    try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2AcceleratorKeyPressedEventArgs.Vtbl, "get_PhysicalKeyStatus"));
+    try testing.expectEqual(8 * ptr, @offsetOf(ICoreWebView2AcceleratorKeyPressedEventArgs.Vtbl, "put_Handled"));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(PhysicalKeyStatus));
 
     // ICoreWebView2: the four slots we call. `Navigate` sits third among the
     // interface's own methods (after get_Settings/get_Source); the other three

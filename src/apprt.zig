@@ -242,4 +242,9 @@ test {
     // poisoned-session breaker. Same `remote/connection.zig`-only import as
     // `agent_recovery.zig`, so it builds and tests in every lane.
     _ = @import("apprt/win32/remote_reconnect.zig");
+
+    // Pure win32 viewer accelerator forwarding: vkey+modifiers → the KeyEvent
+    // the app keybind set is consulted with, plus which bound actions a
+    // viewer pane forwards at all (T394). Same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_accel.zig");
 }

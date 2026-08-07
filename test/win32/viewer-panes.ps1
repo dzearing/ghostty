@@ -295,7 +295,7 @@ try {
         )) {
         $r = Invoke-Verb $case.Args
         Assert ($r.Code -ne 0) "$($case.Label) against a viewer exits nonzero (got $($r.Code))"
-        Assert ($r.Out -match [regex]::Escape($notTerminal)) "$($case.Label) reports '$notTerminal'"
+        Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape($notTerminal)) "$($case.Label) reports '$notTerminal'"
     }
     # POSITIVE CONTROL: the same verbs against the TERMINAL pane in the same
     # window succeed, so the rejections above are about the pane kind and not
@@ -423,7 +423,7 @@ try {
     # refuse it with the same string a web one gets.
     $r = Invoke-Verb @('+read', '--name=vpcode', '--lines=1')
     Assert ($r.Code -ne 0) "+read against a file viewer exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape($notTerminal)) "+read against a file viewer reports '$notTerminal'"
+    Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape($notTerminal)) "+read against a file viewer reports '$notTerminal'"
 
     # A MISSING file still opens a pane. The error belongs IN the page, where
     # the user can read the path that failed, not in a refusal that leaves
@@ -502,7 +502,12 @@ try {
 
     $r = Invoke-Verb @('+reload', '--target=vpterm')
     Assert ($r.Code -ne 0) "+reload on a terminal pane exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape("target 'vpterm' is a terminal pane, nothing to reload")) `
+    # `-replace '\s+', ' '` before every string match on stderr: PS 5.1 wraps
+    # a native command's error records at the CONSOLE width, so on a narrow
+    # runner the asserted sentence arrives with a newline in the middle of a
+    # word and the raw match fails width-dependently (seen 2026-08-06: the
+    # wrap fell inside "reload" and only on this runner's width).
+    Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape("target 'vpterm' is a terminal pane, nothing to reload")) `
         '+reload on a terminal pane reports the Mac string'
 
     # A window target resolves to its FOCUSED pane, so this case needs a window
@@ -514,16 +519,16 @@ try {
     Assert ($null -ne (Wait-Win 'vpterms')) 'a terminal-only window exists to aim at'
     $r = Invoke-Verb @('+reload', '--target=vpterms')
     Assert ($r.Code -ne 0) "+reload on a terminal-focused WINDOW exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape("focused pane of 'vpterms' is a terminal pane, nothing to reload")) `
+    Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape("focused pane of 'vpterms' is a terminal pane, nothing to reload")) `
         '+reload on a terminal-focused window reports the OTHER Mac string'
 
     $r = Invoke-Verb @('+reload', '--target=no-such-pane')
     Assert ($r.Code -ne 0) "+reload on an unknown target exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match 'not found in registry') '+reload on an unknown target says so'
+    Assert (($r.Out -replace '\s+', ' ') -match 'not found in registry') '+reload on an unknown target says so'
 
     $r = Invoke-Verb @('+reload')
     Assert ($r.Code -ne 0) "+reload with no --target exits nonzero (got $($r.Code))"
-    Assert ($r.Out -match [regex]::Escape('--target is required for +reload')) `
+    Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape('--target is required for +reload')) `
         '+reload with no --target says which flag is missing'
 
     # And it RELOADED, rather than returning success from a handler that found
@@ -555,7 +560,7 @@ try {
         )) {
         $r = Invoke-Verb $case.Args
         Assert ($r.Code -ne 0) "--view with $($case.Label) exits nonzero (got $($r.Code))"
-        Assert ($r.Out -match [regex]::Escape($conflict)) "--view with $($case.Label) reports the Mac conflict string"
+        Assert (($r.Out -replace '\s+', ' ') -match [regex]::Escape($conflict)) "--view with $($case.Label) reports the Mac conflict string"
     }
     Assert ($null -eq (Get-Win 'vpx')) 'no window was created by any conflicting command line'
 
@@ -656,6 +661,153 @@ try {
     # The fixture dirs are left in %TEMP% on purpose: a terminal pane's cwd IS
     # one of them, so Windows would refuse to remove it anyway, and the next
     # run recreates them idempotently.
+
+    # --- 11b. T394: app keybind chords forward OUT of a focused viewer -------
+    # The user's 2026-08-05 report: with a viewer focused, ctrl+w and ctrl+f4
+    # did nothing and there was no keyboard way out of the pane. The chords
+    # here go to the WebView2 (Chromium) child HWND via Send-TestViewerChord,
+    # which shares the modifier state with BOTH the Chromium thread (it
+    # classifies the accelerator) and the app's UI thread (its
+    # AcceleratorKeyPressed callback reads GetKeyState).
+    #
+    # T157's lesson drives the shape: the terminal-side chord comes FIRST as
+    # the positive control, so a dead viewer chord below cannot be blamed on
+    # keybinds being broken in general.
+
+    function Get-TabCount($target) {
+        $w = Get-Win $target
+        if (-not $w) { return 0 }
+        return @($w.tabs).Count
+    }
+    # Get-Leaf/Wait-Leaf above only read tabs[0]; the T394 fixture puts its
+    # viewer in tab 2, so this pair searches every tab.
+    function Get-LeafAnyTab($target, $name) {
+        $w = Get-Win $target
+        if (-not $w) { return $null }
+        foreach ($tab in @($w.tabs)) {
+            foreach ($leaf in @(Get-Leaves $tab.splits)) {
+                if ($leaf.name -eq $name) { return $leaf }
+            }
+        }
+        return $null
+    }
+    function Wait-LeafAnyTab($target, $name) {
+        for ($t = 0; $t -lt 25; $t++) {
+            $leaf = Get-LeafAnyTab $target $name
+            if ($leaf) { return $leaf }
+            Start-Sleep -Milliseconds 200
+        }
+        return $null
+    }
+    function Wait-TabCount($target, [int]$want) {
+        for ($t = 0; $t -lt 25; $t++) {
+            if ((Get-TabCount $target) -eq $want) { return $true }
+            Start-Sleep -Milliseconds 200
+        }
+        return $false
+    }
+    # The command palette is a WS_POPUP of the terminal class with an EDIT
+    # child (Surface.ensureCommandPalette); "open" = such a window is visible.
+    function Test-PaletteOpen {
+        foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyTerminal')) {
+            if (-not $w.Visible) { continue }
+            if (@(Get-TestChildWindows -Window ([IntPtr]$w.Hwnd) -Class 'Edit').Count -ge 1) { return $true }
+        }
+        return $false
+    }
+
+    # A fresh window, so tab/pane counts start from a known shape.
+    $topsBefore = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' | ForEach-Object { $_.Hwnd })
+    Invoke-Verb @('+new-window', '--target=t394') | Out-Null
+    Assert ($null -ne (Wait-Win 't394')) 'T394 window created'
+    $t394top = [IntPtr]::Zero
+    for ($t = 0; $t -lt 25 -and $t394top -eq [IntPtr]::Zero; $t++) {
+        foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            if ($topsBefore -notcontains $w.Hwnd) { $t394top = [IntPtr][int64]$w.Hwnd }
+        }
+        if ($t394top -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert ($t394top -ne [IntPtr]::Zero) 'T394 found the new top-level window'
+
+    if ($t394top -ne [IntPtr]::Zero) {
+        # POSITIVE CONTROL: the same chord from the TERMINAL pane must work,
+        # or nothing below means anything.
+        Focus-TestWindow -Window $t394top | Out-Null
+        Start-Sleep -Milliseconds 400
+        $t394surface = [IntPtr](Get-TestFocusedWindow -Window $t394top)
+        Assert ((Get-TestWindowClass -Window $t394surface) -eq 'GhozttyTerminal') 'T394 CONTROL: focus starts on a terminal surface'
+        Assert (Send-TestKeys -Window $t394top -Target $t394surface -Modifiers ctrl -Key T) 'T394 CONTROL: ctrl+t injected at the terminal'
+        Assert (Wait-TabCount 't394' 2) 'T394 CONTROL: ctrl+t from a terminal added a tab'
+
+        # Split a viewer into the now-active tab. The new pane takes focus.
+        Invoke-Verb @('+split', '--target=t394', '--name=t394view', "--view=$blank") | Out-Null
+        $t394viewLeaf = Wait-LeafAnyTab 't394' 't394view'
+        Assert ($null -ne $t394viewLeaf) 'T394 viewer pane created'
+
+        # The Chromium input HWND arrives with the async controller; wait for
+        # it. The visible GhozttyViewer host belongs to the ACTIVE tab.
+        # Chrome_WidgetWin_1, specifically: WebView2's hwnd chain under our
+        # host is Chrome_WidgetWin_0 -> Chrome_WidgetWin_1 ->
+        # Chrome_RenderWidgetHostHWND, and _1 is the only one whose message
+        # loop turns a posted WM_KEYDOWN into an AcceleratorKeyPressed event
+        # (probed on-box, 2026-08-06: _0 and RenderWidgetHost both ignore it).
+        $chrome = [IntPtr]::Zero
+        for ($t = 0; $t -lt 50 -and $chrome -eq [IntPtr]::Zero; $t++) {
+            foreach ($h in @(Get-TestChildWindows -Window $t394top -Class 'GhozttyViewer')) {
+                if (-not $h.Visible) { continue }
+                $kids = @(Get-TestChildWindows -Window ([IntPtr][int64]$h.Hwnd) -Class '*')
+                $widget = @($kids | Where-Object { $_.Class -eq 'Chrome_WidgetWin_1' })
+                if ($widget.Count -ge 1) { $chrome = [IntPtr][int64]$widget[0].Hwnd; $t394host = [IntPtr][int64]$h.Hwnd }
+            }
+            if ($chrome -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+        }
+        Assert ($chrome -ne [IntPtr]::Zero) 'T394 found the Chromium input child under the viewer host'
+
+        if ($chrome -ne [IntPtr]::Zero) {
+            # ctrl+shift+p from INSIDE the viewer opens the command palette.
+            Assert (Send-TestViewerChord -Window $t394top -Target $chrome -Modifiers ctrl,shift -Key P) 'T394 ctrl+shift+p injected at the viewer'
+            $palette = $false
+            for ($t = 0; $t -lt 25 -and -not $palette; $t++) { $palette = Test-PaletteOpen; if (-not $palette) { Start-Sleep -Milliseconds 200 } }
+            Assert $palette 'T394 ctrl+shift+p from a viewer opened the command palette'
+            if ($palette) {
+                # Escape closes it again (palette keys are app-side).
+                foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyTerminal')) {
+                    if ($w.Visible) {
+                        foreach ($e in @(Get-TestChildWindows -Window ([IntPtr][int64]$w.Hwnd) -Class 'Edit')) {
+                            Send-TestControlKey -Control ([IntPtr][int64]$e.Hwnd) -Key Escape | Out-Null
+                        }
+                    }
+                }
+                Start-Sleep -Milliseconds 500
+            }
+
+            # ctrl+t from INSIDE the viewer adds a tab.
+            Focus-TestWindow -Window $t394top -Child $t394host | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChord -Window $t394top -Target $chrome -Modifiers ctrl -Key T) 'T394 ctrl+t injected at the viewer'
+            Assert (Wait-TabCount 't394' 3) 'T394 ctrl+t from a viewer added a tab'
+
+            # Walk back to the viewer's tab (ctrl+shift+[ = previous_tab,
+            # from the fresh tab's terminal), re-focus the viewer, and close
+            # it with ctrl+w -- the exact chord the user pressed into a dead
+            # pane on 2026-08-05.
+            Focus-TestWindow -Window $t394top | Out-Null
+            Start-Sleep -Milliseconds 400
+            $tabSurface = [IntPtr](Get-TestFocusedWindow -Window $t394top)
+            Send-TestKeys -Window $t394top -Target $tabSurface -Modifiers ctrl,shift -Key 0xDB | Out-Null
+            Start-Sleep -Milliseconds 600
+            Focus-TestWindow -Window $t394top -Child $t394host | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChord -Window $t394top -Target $chrome -Modifiers ctrl -Key W) 'T394 ctrl+w injected at the viewer'
+            $gone = $false
+            for ($t = 0; $t -lt 25 -and -not $gone; $t++) {
+                $gone = ($null -eq (Get-LeafAnyTab 't394' 't394view'))
+                if (-not $gone) { Start-Sleep -Milliseconds 200 }
+            }
+            Assert $gone 'T394 ctrl+w from a viewer closed the viewer pane'
+            Assert (-not ($app.Process -and $app.Process.HasExited)) 'T394 no crash closing a viewer from its own accelerator'
+        }
+    }
 
     # --- 12. app survived all of it ------------------------------------------
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'

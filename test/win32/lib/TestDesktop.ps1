@@ -979,6 +979,55 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // T394: a chord for a VIEWER pane. The keystrokes are posted to the
+    // WebView2 (Chromium) child hwnd, which lives in ANOTHER PROCESS — but
+    // the app's own UI thread is who answers the AcceleratorKeyPressed
+    // callback and reads the modifiers back with GetKeyState. Attaching to
+    // BOTH threads merges the input queues, so one SetKeyboardState is
+    // visible to Chromium (which classifies the key as an accelerator) and
+    // to the app (which resolves the binding). The modifier state is held
+    // through a longer settle than SendChord's: the chord crosses two
+    // process boundaries before anyone reads it.
+    public bool SendChordCross(IntPtr appTop, IntPtr target, ushort[] mods, ushort vk, int holdMs) {
+        return (bool)Run(delegate() {
+            uint apid; uint appTid = GetWindowThreadProcessId(appTop, out apid);
+            uint tpid; uint targetTid = GetWindowThreadProcessId(target, out tpid);
+            uint cur = GetCurrentThreadId();
+            if (!AttachThreadInput(cur, appTid, true)) { LastError = "AttachThreadInput(app) failed"; return false; }
+            bool crossAttached = (targetTid != appTid) && AttachThreadInput(cur, targetTid, true);
+            try {
+                SetActiveWindow(appTop);
+                SetFocus(target);
+                Thread.Sleep(60);
+
+                var ks = new byte[256];
+                GetKeyboardState(ks);
+                ApplyMods(ks, mods, true);
+                SetKeyboardState(ks);
+
+                bool sys = HasMod(mods, 0x12) && !HasMod(mods, 0x11);
+                uint msgDown = sys ? WM_SYSKEYDOWN : WM_KEYDOWN;
+                uint msgUp = sys ? WM_SYSKEYUP : WM_KEYUP;
+
+                foreach (ushort m in mods) PostMessageW(target, WM_KEYDOWN, (IntPtr)m, KeyLParam(m, false));
+                PostMessageW(target, msgDown, (IntPtr)vk, KeyLParam(vk, false));
+                Thread.Sleep(holdMs);
+                PostMessageW(target, msgUp, (IntPtr)vk, KeyLParam(vk, true));
+                for (int j = mods.Length - 1; j >= 0; j--)
+                    PostMessageW(target, WM_KEYUP, (IntPtr)mods[j], KeyLParam(mods[j], true));
+
+                Thread.Sleep(400);
+                ApplyMods(ks, mods, false);
+                SetKeyboardState(ks);
+                Thread.Sleep(80);
+                return true;
+            } finally {
+                if (crossAttached) AttachThreadInput(cur, targetTid, false);
+                AttachThreadInput(cur, appTid, false);
+            }
+        });
+    }
+
     static bool SendChordInteractive(IntPtr top, IntPtr target, ushort[] mods, ushort vk, int holdMs) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
@@ -1988,6 +2037,29 @@ function Send-TestKeys {
     $td = Resolve-TestDesktop $Desktop
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
     return $td.SendChord($Window, $Target, [uint16[]]$mods, (ConvertTo-TestVk $Key), $HoldMs)
+}
+
+<#
+Send a chord to a VIEWER pane's WebView2 (Chromium) child window (T394).
+
+    Send-TestViewerChord -Window $top -Target $chromiumChild -Modifiers ctrl -Key W
+
+The target hwnd lives in the msedgewebview2 process; the app's UI thread is
+who resolves the chord in its AcceleratorKeyPressed callback, so the helper
+attaches to BOTH threads and holds the modifier state across the round trip.
+#>
+function Send-TestViewerChord {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][IntPtr]$Target,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [string[]]$Modifiers = @(),
+        [int]$HoldMs = 40,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
+    return $td.SendChordCross($Window, $Target, [uint16[]]$mods, (ConvertTo-TestVk $Key), $HoldMs)
 }
 
 # Type literal text into a terminal surface (WM_KEYDOWN only - the terminal

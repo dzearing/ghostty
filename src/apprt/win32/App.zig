@@ -3664,7 +3664,7 @@ pub fn openRemoteWindowFrom(
 
 /// Show the T68 "couldn't reach the machine" dialog (T80 dark ConfirmDialog,
 /// OK-only) over `owner` after a failed inheriting re-dial.
-fn showRemoteOpenFailed(self: *App, owner: *Window) void {
+pub fn showRemoteOpenFailed(self: *App, owner: *Window) void {
     const label: [:0]const u16 = switch (owner.remote_machine orelse return) {
         .tcp => std.unicode.utf8ToUtf16LeStringLiteral(
             "Couldn't open a new window on the remote machine.\nIs its agent still running?",

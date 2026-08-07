@@ -58,6 +58,10 @@ const error_card = @import("viewer_error_card.zig");
 const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
 const viewer_watcher = @import("viewer_watcher.zig");
+const viewer_accel = @import("viewer_accel.zig");
+// `inputpkg`, not `input`: `navigateFromAddress` has a parameter named
+// `input` and zig refuses the shadow.
+const inputpkg = @import("../../input.zig");
 const viewer_nav = @import("viewer_nav.zig");
 const nav_layout = @import("viewer_nav_layout.zig");
 const view_arg = @import("../../cli/view_arg.zig");
@@ -82,6 +86,15 @@ pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewer");
 /// of that list so a post that lands on the wrong window is obviously wrong
 /// rather than plausibly right.
 pub const WM_APP_VIEWER_RELOAD: u32 = w32.WM_APP + 20;
+
+/// An app keybind chord the accelerator handler matched (T394), re-posted so
+/// the ACTION runs from the message loop rather than from inside the
+/// controller's own event callback — `close_surface` tears the controller
+/// down, and WebView2 must never be closed from within its own handler. The
+/// browser process is synchronously blocked during the `Invoke`, so the
+/// handler only decides `Handled` and posts; wparam carries the vkey (low
+/// word) and the extended bit (bit 16), lparam the `input.Mods` bits.
+pub const WM_APP_VIEWER_ACCEL: u32 = w32.WM_APP + 21;
 
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
@@ -228,6 +241,9 @@ navigation_starting_handler: ?*NavigationStartingHandler = null,
 /// Our reference on the `DocumentTitleChanged` handler (T383), same rule.
 title_handler: ?*DocumentTitleChangedHandler = null,
 
+/// Our reference on the `AcceleratorKeyPressed` handler (T394), same rule.
+accel_handler: ?*AcceleratorKeyPressedHandler = null,
+
 /// Back-pointer to the split-tree leaf that owns this pane, set by
 /// `PaneView.createViewer`. It is `Surface.pane_view`'s twin and exists for the
 /// same reason: a title change has to name a LEAF to the window, and the pane
@@ -244,6 +260,13 @@ pane_view: ?*PaneView = null,
 /// branch (GTK modules it is never given) just to compile. Null for a bare
 /// test pane, which has no tree to split anyway.
 open_link_split: ?*const fn (pv: *PaneView, location: []const u8, origin: ?[]const u8) void = null,
+
+/// How a forwarded accelerator chord's ACTION reaches the window (T394).
+/// The same load-bearing indirection as `open_link_split`, for the same
+/// reason: `performViewerBindingAction` reaches `addTab`/`newSplitAt`/
+/// `App.createWindow`, which pull the renderer world into comptime analysis.
+/// Null for a bare test pane — a chord then resolves but performs nothing.
+perform_accel_action: ?*const fn (pv: *PaneView, action: inputpkg.Binding.Action) void = null,
 
 /// The app's shared environment, kept for the life of the pane because
 /// `CreateWebResourceResponse` lives on it and the resource handler needs one
@@ -378,6 +401,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.title_handler) |h| {
         h.release();
         self.title_handler = null;
+    }
+    if (self.accel_handler) |h| {
+        h.release();
+        self.accel_handler = null;
     }
     if (self.source_handler) |h| {
         h.release();
@@ -1758,6 +1785,7 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     _ = c.setVisible(self.visible);
     self.applyColorScheme();
     self.subscribeNewWindowRequested();
+    self.subscribeAcceleratorKey();
     self.subscribeDocumentTitle();
     // Before the navigation below, and that ordering is the contract: a script
     // registered after a page has started loading does not reach that page, so
@@ -1807,6 +1835,105 @@ fn subscribeNewWindowRequested(self: *ViewerPane) void {
         return;
     }
     self.new_window_handler = handler;
+}
+
+/// `ICoreWebView2AcceleratorKeyPressedEventHandler` (T394): the browser saw
+/// a chord before the page did, and asks whether the host wants it.
+const AcceleratorKeyPressedHandler = com.CallbackOwning(
+    iface.IID_AcceleratorKeyPressedHandler,
+    onAcceleratorKeyPressed,
+    releasePendingToken,
+);
+
+/// Register the accelerator handler on a freshly adopted controller (T394).
+/// Non-fatal like every other subscription: a pane that fails here still
+/// shows its page, the app keybinds just stay dead inside it — the pre-T394
+/// state, as a degradation instead of the default.
+fn subscribeAcceleratorKey(self: *ViewerPane) void {
+    std.debug.assert(self.accel_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+
+    const handler = AcceleratorKeyPressedHandler.create(p.alloc, p) catch return;
+    p.refs += 1;
+    if (!c.addAcceleratorKeyPressed(@ptrCast(handler))) {
+        log.warn("add_AcceleratorKeyPressed failed; app keybinds stay dead in this pane", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.accel_handler = handler;
+    log.debug("accelerator handler registered", .{});
+}
+
+/// The modifier state at Invoke time. The event args carry no modifiers by
+/// design — the IDL says to ask `GetKeyState` — and the browser process is
+/// blocked on this callback, so the state cannot go stale under us.
+fn accelMods() inputpkg.Mods {
+    return .{
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
+    };
+}
+
+/// The app keybind action a chord resolves to for THIS pane, or null when the
+/// page keeps the key. Consulted twice on purpose: once in the Invoke (to
+/// decide `Handled` while the browser waits) and again when the posted
+/// message lands (the config may have been reloaded in between; the current
+/// table wins). Sequences (`leader`) and chained bindings stay with the page
+/// — a viewer has no UI for a pending sequence prefix.
+fn chordAction(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) ?inputpkg.Binding.Action {
+    const event = viewer_accel.keyEventFor(vk, extended, mods) orelse return null;
+    const set = &self.parent_window.app.config.keybind.set;
+    const entry = set.getEvent(event) orelse return null;
+    const leaf = switch (entry.value_ptr.*) {
+        .leaf => |l| l,
+        .leader, .leaf_chained => return null,
+    };
+    if (!viewer_accel.forwards(leaf.action)) return null;
+    return leaf.action;
+}
+
+fn onAcceleratorKeyPressed(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2Controller,
+    args_opt: ?*iface.ICoreWebView2AcceleratorKeyPressedEventArgs,
+) com.HRESULT {
+    _ = sender;
+    const self = p.pane orelse return com.S_OK;
+    const args = args_opt orelse return com.S_OK;
+
+    // Key-up halves of a chord are events too; only presses forward.
+    const kind = args.keyEventKind() orelse return com.S_OK;
+    switch (kind) {
+        .key_down, .system_key_down => {},
+        else => return com.S_OK,
+    }
+
+    const vk_u32 = args.virtualKey() orelse return com.S_OK;
+    if (vk_u32 > 0xFFFF) return com.S_OK;
+    const vk: u16 = @intCast(vk_u32);
+    const status = args.physicalKeyStatus() orelse return com.S_OK;
+    const extended = status.IsExtendedKey != 0;
+    const mods = accelMods();
+
+    log.debug("accel key vk=0x{x} ctrl={} shift={} alt={}", .{
+        vk, mods.ctrl, mods.shift, mods.alt,
+    });
+    if (self.chordAction(vk, extended, mods) == null) return com.S_OK;
+
+    // Ours. Claim it BEFORE returning (the browser is blocked on this very
+    // decision), then run the action from the message loop — not from inside
+    // the controller's own callback, where `close_surface` would tear the
+    // controller down under its own Invoke frame.
+    _ = args.setHandled(true);
+    const hwnd = self.hwnd orelse return com.S_OK;
+    const wparam: usize = @as(usize, vk) | (@as(usize, @intFromBool(extended)) << 16);
+    const lparam: isize = @as(u16, @bitCast(mods));
+    _ = w32.PostMessageW(hwnd, WM_APP_VIEWER_ACCEL, wparam, lparam);
+    return com.S_OK;
 }
 
 /// `ICoreWebView2DocumentTitleChangedEventHandler`: a website naming itself.
@@ -2379,6 +2506,24 @@ pub fn wndProc(
 
         w32.WM_KILLFOCUS => {
             self.focused = false;
+            return 0;
+        },
+
+        // A forwarded app keybind chord (T394), posted by the accelerator
+        // handler after it claimed the key. Resolve the chord AGAIN against
+        // the current keybind table (a config reload may have landed in
+        // between; one message-loop hop is exactly the window where that can
+        // happen), then dispatch. NOTHING may touch `self` after the
+        // dispatch: `close_surface` frees this very pane (and this HWND)
+        // before `performViewerBindingAction` returns.
+        WM_APP_VIEWER_ACCEL => {
+            const vk: u16 = @intCast(wparam & 0xFFFF);
+            const extended = (wparam & (1 << 16)) != 0;
+            const mods: inputpkg.Mods = @bitCast(@as(u16, @intCast(lparam & 0xFFFF)));
+            const action = self.chordAction(vk, extended, mods) orelse return 0;
+            const pv = self.pane_view orelse return 0;
+            const perform = self.perform_accel_action orelse return 0;
+            perform(pv, action);
             return 0;
         },
 
