@@ -10083,3 +10083,21 @@ session-relaunch-notify.ps1 grew arm F (typed ping sampled into sessions.json,
 named by the restored notice in both carriers, not re-executed) - ALL PASS 91,
 after one environmental first-run failure from leftover zig-out agents holding
 the shared agent-debug pipe (rerun after a path-filtered kill was fully green).
+
+## 2026-08-06 (T417: one-installer plan - design note + split tasks)
+
+T417 (investigate/plan/split, no code). Key finding that shaped the design:
+the relay agent's SessionStore is in-memory and separate from the local
+agent's persisted store (runRelay wires no meta_path/layouts_path), so a
+machine's local GUI sessions are invisible over the relay regardless of how
+the agent is installed - the standalone MSI was never the real gap. Decision:
+one process serves the local transport AND an optional relay uplink over the
+one persisted store; enrollment/serving becomes a "Share this machine"
+toggle in the machine chooser account row (no CLI verb, per T141); serving
+is opt-in (filed as D22 for override); migration adopts an existing
+standalone install at zero live sessions, preserves relay.env, and ends the
+GhozttyAgent Run-key collision (app + MSI both write the same value name
+today). Note: docs/design/one-installer-agent-consolidation.md. Split:
+T546 (agent core), T547 (win UI), T548 (mac UI+serving, seat mac), T549
+(adopt/retire standalone), T550 (retire publishing, keep /dl/install.ps1
+answering). Validation: doc-only change, tracker validate clean.
