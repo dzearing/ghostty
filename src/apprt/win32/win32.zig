@@ -130,6 +130,9 @@ pub const MONITORINFO = extern struct {
 pub const WM_USER: u32 = 0x0400;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
+/// A message with no effect. Posted purely to make a thread's queue tick —
+/// the second half of the MSDN "menu does not dismiss" workaround.
+pub const WM_NULL: u32 = 0x0000;
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_QUERYENDSESSION: u32 = 0x0011;
 pub const WM_ENDSESSION: u32 = 0x0016;

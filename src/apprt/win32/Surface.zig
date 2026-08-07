@@ -1101,6 +1101,7 @@ pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
     if (self.banner_overlay == null) {
         self.banner_overlay = BannerOverlay.create(
             alloc,
+            self,
             hwnd,
             self.app.hinstance,
         ) catch |err| {

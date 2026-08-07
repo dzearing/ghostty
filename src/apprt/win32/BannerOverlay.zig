@@ -30,6 +30,8 @@ const App = @import("App.zig");
 const markdown = @import("banner_markdown.zig");
 const card = @import("banner_card.zig");
 const banner_layout = @import("banner_layout.zig");
+const banner_link = @import("banner_link.zig");
+const Surface = @import("Surface.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
@@ -107,6 +109,18 @@ const GREEN = color_math.Rgb{ .r = 52, .g = 199, .b = 89 };
 
 pub const BannerOverlay = struct {
     alloc: std.mem.Allocator,
+    /// The pane this banner belongs to. Supplies the viewer-split target and
+    /// the origin directory for the link action menu (T165) — the win32
+    /// analog of Mac's weak `BannerLinkOpener.surface`. The Surface owns the
+    /// overlay and destroys it in its own deinit, so the pointer cannot
+    /// outlive the pane.
+    ///
+    /// Optional because the class-behavior tests below drive a bare overlay
+    /// against a plain owner window, with no pane behind it. Everything a
+    /// link action needs from a pane degrades to "hand it to the shell"
+    /// rather than to a null deref — the same fallback Mac takes when its
+    /// weak surface or controller is gone.
+    surface: ?*Surface,
     /// The surface HWND this banner sits on top of (popup owner).
     owner: w32.HWND,
     hwnd: w32.HWND,
@@ -178,6 +192,22 @@ pub const BannerOverlay = struct {
     /// Link hit rects, rebuilt on every paint (client coordinates).
     links: std.ArrayList(LinkRect) = .empty,
 
+    /// Which link the pointer is over, identified by its URL slice's POINTER
+    /// (T165). Not an index into `links`: one `[text](url)` occurrence can
+    /// produce several hit rects — nested styling splits it, and so does a
+    /// wrap — and the whole link must go solid together, the way Mac keys its
+    /// hover on the link's character range. The parser `arena.dupe`s the URL
+    /// once per occurrence, so the slice's `.ptr` IS that occurrence's
+    /// identity, and two `[a](x)`/`[b](x)` links with the same text are still
+    /// two different pointers. Cleared on `setText` — the arena reset that
+    /// frees the URLs is what makes the pointer meaningless.
+    hover_link: ?[*]const u8 = null,
+
+    /// Scratch for the decoded path a file link hands to a viewer pane
+    /// (T165). The viewer dupes what it keeps, so the buffer only has to
+    /// outlive the call.
+    viewer_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+
     const LinkRect = struct {
         rect: w32.RECT,
         /// Arena-owned (lives until the next setText).
@@ -186,6 +216,7 @@ pub const BannerOverlay = struct {
 
     pub fn create(
         alloc: std.mem.Allocator,
+        surface: ?*Surface,
         owner: w32.HWND,
         hinstance: w32.HINSTANCE,
     ) !*BannerOverlay {
@@ -196,6 +227,7 @@ pub const BannerOverlay = struct {
 
         self.* = .{
             .alloc = alloc,
+            .surface = surface,
             .owner = owner,
             .hwnd = undefined,
             .arena = std.heap.ArenaAllocator.init(alloc),
@@ -245,6 +277,9 @@ pub const BannerOverlay = struct {
     pub fn setText(self: *BannerOverlay, text: []const u8) void {
         _ = self.arena.reset(.retain_capacity);
         self.links.clearRetainingCapacity();
+        // The reset above freed every URL, so the hover's identity pointer
+        // now names nothing (T165).
+        self.hover_link = null;
         self.blocks = markdown.parseBlocks(self.arena.allocator(), text) catch &.{};
         self.collapsible = std.mem.indexOfScalar(u8, text, '\n') != null;
         if (!self.collapsible) self.collapsed = false;
@@ -504,9 +539,30 @@ pub const BannerOverlay = struct {
     // drift apart.
     // -----------------------------------------------------------------
 
-    fn measureSeg(self: *BannerOverlay, hdc: w32.HDC, text: []const u8, style: markdown.Style, size_class: usize, force_bold: bool) w32.SIZE {
+    /// The style a run is actually rendered with. A LINK drops the parser's
+    /// `underline` flag (T165): its rule is drawn by hand below, dotted at
+    /// rest and solid on hover, and GDI's own `lfUnderline` is only ever
+    /// solid — leaving it on would make every link look permanently hovered.
+    /// A non-link `__underline__` keeps its solid font underline, exactly as
+    /// Mac does. Applied in the MEASURE path too so the two passes select the
+    /// identical font and can never disagree about a width.
+    fn renderStyle(style: markdown.Style, link: ?[]const u8, force_bold: bool) markdown.Style {
         var s = style;
         if (force_bold) s.bold = true;
+        if (link != null) s.underline = false;
+        return s;
+    }
+
+    fn measureSeg(
+        self: *BannerOverlay,
+        hdc: w32.HDC,
+        text: []const u8,
+        style: markdown.Style,
+        link: ?[]const u8,
+        size_class: usize,
+        force_bold: bool,
+    ) w32.SIZE {
+        const s = renderStyle(style, link, force_bold);
         var wbuf: [1024]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return .{ .cx = 0, .cy = 0 };
         if (wlen == 0) return .{ .cx = 0, .cy = 0 };
@@ -531,8 +587,7 @@ pub const BannerOverlay = struct {
         force_bold: bool,
         draw: bool,
     ) i32 {
-        var s = style;
-        if (force_bold) s.bold = true;
+        const s = renderStyle(style, link, force_bold);
         var wbuf: [1024]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
         if (wlen == 0) return 0;
@@ -550,9 +605,66 @@ pub const BannerOverlay = struct {
                     .rect = .{ .left = x, .top = y, .right = x + size.cx, .bottom = y + line_h },
                     .url = url,
                 }) catch {};
+                self.drawLinkUnderline(
+                    hdc,
+                    x,
+                    ty,
+                    size.cx,
+                    size.cy,
+                    self.hover_link == url.ptr,
+                );
             }
         }
         return size.cx;
+    }
+
+    /// The link hover affordance (T165): a dotted rule under the run at rest,
+    /// a solid one while the pointer is over this link. Filled rects, not a
+    /// `LineTo` pen — the design system's rule, and here it also buys exact
+    /// dot boundaries, which a styled pen's phase does not guarantee.
+    fn drawLinkUnderline(
+        self: *BannerOverlay,
+        hdc: w32.HDC,
+        x: i32,
+        text_y: i32,
+        w: i32,
+        text_h: i32,
+        solid: bool,
+    ) void {
+        if (w <= 0) return;
+        const u = banner_layout.linkUnderline(text_y, text_h, self.scale);
+        const brush = w32.CreateSolidBrush(self.link_fg) orelse return;
+        defer _ = w32.DeleteObject(@ptrCast(brush));
+        if (solid) {
+            var r: w32.RECT = .{
+                .left = x,
+                .top = u.y,
+                .right = x + w,
+                .bottom = u.y + u.thickness,
+            };
+            _ = w32.FillRect(hdc, &r, brush);
+            return;
+        }
+        // Dot phase is keyed to the CLIENT x, not to this run's left edge.
+        // One link is drawn as many runs — the wrap tokenizer splits it per
+        // word, and nested styling splits it again — so a per-run phase would
+        // put two dots hard against each other at every word boundary and
+        // read as a dirty line. An absolute phase makes every fragment part
+        // of one continuous rule.
+        const end = x + w;
+        var dx: i32 = x - @mod(x, u.period);
+        while (dx < end) : (dx += u.period) {
+            const left = @max(x, dx);
+            const right = @min(end, dx + u.dot);
+            if (right <= left) continue;
+            var r: w32.RECT = .{
+                .left = left,
+                .top = u.y,
+                .right = right,
+                .bottom = u.y + u.thickness,
+            };
+            _ = w32.FillRect(hdc, &r, brush);
+        }
     }
 
     /// Draw a native task-list checkbox centered on the line; returns its
@@ -659,7 +771,7 @@ pub const BannerOverlay = struct {
                     var j = i;
                     while (j < s.text.len and (s.text[j] == ' ') == is_space) j += 1;
                     const word = s.text[i..j];
-                    const size = self.measureSeg(hdc, word, s.style, size_class, force_bold);
+                    const size = self.measureSeg(hdc, word, s.style, s.link, size_class, force_bold);
                     try out.append(arena, .{
                         .text = word,
                         .style = s.style,
@@ -684,7 +796,7 @@ pub const BannerOverlay = struct {
     ) i32 {
         var total: i32 = 0;
         for (segs) |inl| switch (inl) {
-            .seg => |s| total += self.measureSeg(hdc, s.text, s.style, size_class, force_bold).cx,
+            .seg => |s| total += self.measureSeg(hdc, s.text, s.style, s.link, size_class, force_bold).cx,
             .checkbox => total += self.px(CHECK_SIDE),
         };
         return total;
@@ -728,7 +840,13 @@ pub const BannerOverlay = struct {
             }
             var rest = t.text;
             while (rest.len > 0) {
-                const fit = self.prefixFitting(hdc, rest, t.style, max_w, size_class);
+                const fit = self.prefixFitting(
+                    hdc,
+                    rest,
+                    renderStyle(t.style, t.link, false),
+                    max_w,
+                    size_class,
+                );
                 // Always consume at least one codepoint: a column too
                 // narrow for even a single glyph must still terminate.
                 const take = if (fit > 0)
@@ -740,7 +858,7 @@ pub const BannerOverlay = struct {
                     .text = chunk,
                     .style = t.style,
                     .link = t.link,
-                    .width = @floatFromInt(self.measureSeg(hdc, chunk, t.style, size_class, false).cx),
+                    .width = @floatFromInt(self.measureSeg(hdc, chunk, t.style, t.link, size_class, false).cx),
                 });
                 rest = rest[chunk.len..];
             }
@@ -879,7 +997,7 @@ pub const BannerOverlay = struct {
             const ellipsis = lay.truncated and li + 1 == lay.lines.len;
             var ell_w: i32 = 0;
             if (ellipsis) {
-                ell_w = self.measureSeg(hdc, ELLIPSIS, .{}, size_class, force_bold).cx;
+                ell_w = self.measureSeg(hdc, ELLIPSIS, .{}, null, size_class, force_bold).cx;
                 if (arena.alloc(f32, run.len)) |tw2| {
                     for (run, 0..) |t, ti| tw2[ti] = t.width;
                     const keep = banner_layout.fitWithEllipsis(
@@ -1074,7 +1192,7 @@ pub const BannerOverlay = struct {
                 .ordered => |n| blk: {
                     var buf: [12]u8 = undefined;
                     const s = std.fmt.bufPrint(&buf, "{d}.", .{n}) catch break :blk 0;
-                    break :blk self.measureSeg(hdc, s, .{}, 0, false).cx;
+                    break :blk self.measureSeg(hdc, s, .{}, null, 0, false).cx;
                 },
             };
             gutter = @max(gutter, wd);
@@ -1113,7 +1231,7 @@ pub const BannerOverlay = struct {
                     .ordered => |n| {
                         var buf: [12]u8 = undefined;
                         if (std.fmt.bufPrint(&buf, "{d}.", .{n})) |s| {
-                            const mw = self.measureSeg(hdc, s, .{}, 0, false).cx;
+                            const mw = self.measureSeg(hdc, s, .{}, null, 0, false).cx;
                             const mx = x0 + @divTrunc(gutter - mw, 2);
                             const prev_color = w32.SetTextColor(hdc, self.secondary());
                             var wbuf: [24]u16 = undefined;
@@ -1472,6 +1590,191 @@ pub const BannerOverlay = struct {
         }
         return null;
     }
+
+    /// Hot-track the links (T165). Returns true when the hover CHANGED, so
+    /// the caller repaints only then — the same contract `updateChevronHover`
+    /// keeps, and for the same reason: a card that invalidates on every
+    /// WM_MOUSEMOVE repaints its whole composite continuously.
+    fn updateLinkHover(self: *BannerOverlay, x: i32, y: i32) bool {
+        const hot: ?[*]const u8 = if (self.linkAt(x, y)) |url| url.ptr else null;
+        if (hot == self.hover_link) return false;
+        self.hover_link = hot;
+        // Debug-build oracle for pane-banner.ps1's T165 section, the same
+        // deal as `banner chevron hover=`: the affordance cannot survive to a
+        // capture on the background test desktop, so the TRIGGER is read from
+        // the log and the RULE is probed separately.
+        log.debug("banner link hover={}", .{hot != null});
+        return true;
+    }
+
+    /// Right-click on a link: the action menu (T165). Every verb the modifier
+    /// scheme can reach, plus Copy, which has no chord — the discoverable
+    /// form of `banner_link.clickAction`, with the left-click default first
+    /// by contract.
+    fn openLinkMenu(self: *BannerOverlay, url: []const u8, x: i32, y: i32) void {
+        const menu = w32.CreatePopupMenu() orelse return;
+        defer _ = w32.DestroyMenu(menu);
+
+        const kind = banner_link.kindOf(url);
+        var buf: [banner_link.MAX_ITEMS]banner_link.Item = undefined;
+        for (banner_link.build(kind, &buf)) |item| switch (item) {
+            .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+            .cmd => |c| _ = w32.AppendMenuW(
+                menu,
+                w32.MF_STRING,
+                @intFromEnum(c.id),
+                c.title.ptr,
+            ),
+        };
+
+        var pt = w32.POINT{ .x = x, .y = y };
+        _ = w32.ClientToScreen(self.hwnd, &pt);
+
+        // The overlay is WS_EX_NOACTIVATE and answers WM_MOUSEACTIVATE with
+        // MA_NOACTIVATE, so the right-click that got us here did NOT bring
+        // its window forward. A tracked menu whose owner is not the
+        // foreground window is the documented case where an outside click
+        // fails to dismiss it — hence the two halves of the MSDN workaround:
+        // foreground the top-level window before, post it a message after.
+        // This is `SetForegroundWindow`, not `SetFocus`: the T48 deadlock was
+        // re-entrant IME/CTF focus routing, which this does not enter.
+        const top: ?w32.HWND = if (self.surface) |s| s.parent_window.hwnd else null;
+        if (top) |t| _ = w32.SetForegroundWindow(t);
+        const cmd = w32.TrackPopupMenuEx(
+            menu,
+            w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+            pt.x,
+            pt.y,
+            // Owned by the SURFACE window, not by this popup: a menu owned by
+            // a never-active window gets no keyboard.
+            self.owner,
+            null,
+        );
+        if (top) |t| _ = w32.PostMessageW(t, w32.WM_NULL, 0, 0);
+
+        const id = std.meta.intToEnum(
+            banner_link.Id,
+            @as(usize, @intCast(cmd)),
+        ) catch return; // 0 = dismissed without choosing
+        self.performLinkAction(banner_link.action(id), url);
+    }
+
+    /// Run one link action. The single dispatch point for both the click
+    /// scheme and the menu, so a row can never do something its chord does
+    /// not (`banner_link` maps both onto this enum for exactly that reason).
+    fn performLinkAction(self: *BannerOverlay, act: banner_link.Action, url: []const u8) void {
+        switch (act) {
+            .open_with_system => self.shellExecute(null, url),
+            .reveal_in_explorer => {
+                // `explorer /select,<path>` opens the containing folder with
+                // the file SELECTED — the Windows analog of Mac's
+                // `activateFileViewerSelecting`. A click reveals, never
+                // opens, so it can't launch whatever app claims the
+                // extension.
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = banner_link.filePath(url, &path_buf) orelse return;
+                var arg_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+                const args = std.fmt.bufPrint(&arg_buf, "/select,\"{s}\"", .{path}) catch return;
+                self.shellExecuteArgs("explorer.exe", args);
+            },
+            .open_in_side_pane => {
+                // No pane to split off ⇒ hand it to the shell rather than
+                // dropping the click on the floor (Mac's `guard … else
+                // { openWithSystem(url); return }`).
+                const surface = self.surface orelse return self.shellExecute(null, url);
+                surface.openViewerSplitBeside(self.viewerLocation(url) orelse return, false);
+            },
+            .open_in_new_window => self.openViewerWindow(url),
+            .copy => self.copyLink(url),
+        }
+    }
+
+    /// What a viewer pane is pointed at. `ViewerPane` reads any
+    /// non-`http`/`about` location as a literal filesystem path (Mac's
+    /// `viewerLocation` makes the same call), so a file link hands over its
+    /// decoded path — `file:///C:/a.md` would send it looking for a file by
+    /// that name. Returns a slice into `self.viewer_path_buf`, valid until
+    /// the next call.
+    fn viewerLocation(self: *BannerOverlay, url: []const u8) ?[]const u8 {
+        if (banner_link.kindOf(url) != .file) return url;
+        return banner_link.filePath(url, &self.viewer_path_buf);
+    }
+
+    /// A new one-pane Ghoztty viewer window — the same tree `+new-window
+    /// --view=<location>` builds.
+    fn openViewerWindow(self: *BannerOverlay, url: []const u8) void {
+        const surface = self.surface orelse return self.shellExecute(null, url);
+        const location = self.viewerLocation(url) orelse return;
+        _ = surface.app.createWindow(.{ .viewer_open = .{
+            .location = location,
+            .origin_directory = surface.pwd,
+        } }) catch |err| {
+            log.warn("banner link: viewer window failed err={}", .{err});
+        };
+    }
+
+    /// Copy the link: a plain path for a file (a `file://` string is useless
+    /// in a shell or another editor), the full URL for anything web — Mac's
+    /// `pasteboardString(for:)` rule.
+    fn copyLink(self: *BannerOverlay, url: []const u8) void {
+        const surface = self.surface orelse return;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const text = if (banner_link.kindOf(url) == .file)
+            (banner_link.filePath(url, &path_buf) orelse return)
+        else
+            url;
+        // `ClipboardContent.data` is sentinel-terminated, so the slice is
+        // copied into a terminated buffer rather than passed through.
+        var z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (text.len >= z_buf.len) return;
+        @memcpy(z_buf[0..text.len], text);
+        z_buf[text.len] = 0;
+        const z: [:0]const u8 = z_buf[0..text.len :0];
+        // `confirm = false`: this is the user's own menu choice, not a
+        // program writing the clipboard behind their back — the case
+        // `clipboard-write = ask` exists to gate.
+        surface.setClipboard(
+            .standard,
+            &.{.{ .mime = "text/plain", .data = z }},
+            false,
+        ) catch |err| log.warn("banner link: copy failed err={}", .{err});
+    }
+
+    fn shellExecute(self: *BannerOverlay, verb: ?[*:0]const u16, target: []const u8) void {
+        _ = self;
+        var wtarget: [2048:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wtarget, target) catch return;
+        if (wlen >= wtarget.len) return;
+        wtarget[wlen] = 0;
+        _ = w32.ShellExecuteW(
+            null,
+            verb orelse std.unicode.utf8ToUtf16LeStringLiteral("open"),
+            @ptrCast(&wtarget),
+            null,
+            null,
+            w32.SW_SHOW,
+        );
+    }
+
+    fn shellExecuteArgs(self: *BannerOverlay, exe: []const u8, args: []const u8) void {
+        _ = self;
+        var wexe: [260:0]u16 = undefined;
+        const elen = std.unicode.utf8ToUtf16Le(&wexe, exe) catch return;
+        if (elen >= wexe.len) return;
+        wexe[elen] = 0;
+        var wargs: [2048:0]u16 = undefined;
+        const alen = std.unicode.utf8ToUtf16Le(&wargs, args) catch return;
+        if (alen >= wargs.len) return;
+        wargs[alen] = 0;
+        _ = w32.ShellExecuteW(
+            null,
+            std.unicode.utf8ToUtf16LeStringLiteral("open"),
+            @ptrCast(&wexe),
+            @ptrCast(&wargs),
+            null,
+            w32.SW_SHOW,
+        );
+    }
 };
 
 var class_registered: bool = false;
@@ -1547,12 +1850,22 @@ fn bannerWndProc(
                 };
                 if (w32.TrackMouseEvent(&tme) != 0) self.mouse_tracked = true;
             }
-            if (self.updateChevronHover(x, y)) _ = w32.InvalidateRect(hwnd, null, 0);
+            var dirty = self.updateChevronHover(x, y);
+            // Not short-circuited: BOTH hovers must be updated on every move,
+            // or moving straight from the chevron onto a link leaves the
+            // first one latched lit.
+            if (self.updateLinkHover(x, y)) dirty = true;
+            if (dirty) _ = w32.InvalidateRect(hwnd, null, 0);
             return 0;
         },
 
         w32.WM_MOUSELEAVE => {
             self.mouse_tracked = false;
+            if (self.hover_link != null) {
+                self.hover_link = null;
+                log.debug("banner link hover={}", .{false});
+                _ = w32.InvalidateRect(hwnd, null, 0);
+            }
             if (self.hover_chevron) {
                 self.hover_chevron = false;
                 // Logged here as well as in `updateChevronHover` (T209): the
@@ -1580,23 +1893,33 @@ fn bannerWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        // Right-click a link → the action menu (T165). Anywhere else on the
+        // card is left to DefWindowProc: the banner has no menu of its own,
+        // and swallowing the click would only make the card feel dead.
+        w32.WM_RBUTTONUP => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam))))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16))));
+            if (self.linkAt(x, y)) |url| {
+                self.openLinkMenu(url, x, y);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_LBUTTONUP => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam))))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16))));
             if (self.linkAt(x, y)) |url| {
-                var wurl: [2048:0]u16 = undefined;
-                const wlen = std.unicode.utf8ToUtf16Le(&wurl, url) catch return 0;
-                if (wlen < wurl.len) {
-                    wurl[wlen] = 0;
-                    _ = w32.ShellExecuteW(
-                        null,
-                        std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                        @ptrCast(&wurl),
-                        null,
-                        null,
-                        w32.SW_SHOW,
-                    );
-                }
+                // MK_CONTROL / MK_SHIFT ride in wparam, which is the state at
+                // the time of the click — GetKeyState would answer for now
+                // instead, and a modifier released between the button-up and
+                // this handler would silently downgrade the action.
+                const ctrl = (wparam & w32.MK_CONTROL) != 0;
+                const shift = (wparam & w32.MK_SHIFT) != 0;
+                self.performLinkAction(
+                    banner_link.clickAction(banner_link.kindOf(url), ctrl, shift),
+                    url,
+                );
             } else if (self.collapsible) {
                 // Mac parity: a tap anywhere on a multi-line banner
                 // toggles collapse.
@@ -1711,7 +2034,7 @@ test "banner overlay: a size-changing updatePosition repaints in the same pass" 
     _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
     _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
 
-    const overlay = BannerOverlay.create(std.testing.allocator, owner, hinst) catch
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
         return error.SkipZigTest;
     defer overlay.destroy();
     // Claim the alpha slot before updatePosition can set STRIP_ALPHA, so the
@@ -1735,5 +2058,136 @@ test "banner overlay: a size-changing updatePosition repaints in the same pass" 
         overlay.updatePosition(scale);
 
         try std.testing.expectEqual(@as(i32, 0), w32.GetUpdateRect(overlay.hwnd, null, 0));
+    }
+}
+
+// T165: the link hover affordance, in PIXELS.
+//
+// The acceptance script can prove the hover STATE (from the debug log) and
+// that the resting rule is dotted (from a capture), but not the transition:
+// on the background test desktop there is no real pointer, so Windows
+// delivers WM_MOUSELEAVE a frame after every posted WM_MOUSEMOVE and the
+// hovered frame is gone before PrintWindow can read it — the same harness
+// limit that makes the chevron's hovered FILL a SKIP. So the transition is
+// asserted here instead, by painting the same banner twice into a DIB with
+// only `hover_link` different. No pointer, no desktop, no timing.
+test "banner overlay: a link's underline is dotted at rest and solid on hover" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        120,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    // ALL CAPS label: no descender can drop glyph ink onto the underline row
+    // and make a dotted rule score as a solid one.
+    overlay.setText("[LINKLINKLINK](https://example.com/pr/1)");
+
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        overlay.inset = @intFromFloat(80.0 * scale);
+        overlay.updatePosition(scale);
+
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(overlay.hwnd, &client) == 0) return error.SkipZigTest;
+        const w = @max(client.right - client.left, 1);
+        const h = @max(client.bottom - client.top, 1);
+
+        // A top-down 32bpp DIB to paint into, so the pixels can be counted
+        // directly (the same shape `buildCardSurface` uses).
+        var bmi = std.mem.zeroes(w32.BITMAPINFO);
+        bmi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -@as(i32, h);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+
+        const wnd_dc = w32.GetDC(overlay.hwnd) orelse return error.SkipZigTest;
+        defer _ = w32.ReleaseDC(overlay.hwnd, wnd_dc);
+        const mem_dc = w32.CreateCompatibleDC(wnd_dc) orelse return error.SkipZigTest;
+        defer _ = w32.DeleteDC(mem_dc);
+        var bits: ?*anyopaque = null;
+        const bmp = w32.CreateDIBSection(mem_dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse
+            return error.SkipZigTest;
+        defer _ = w32.DeleteObject(bmp);
+        _ = w32.SelectObject(mem_dc, bmp);
+        const pixels = @as([*]u32, @ptrCast(@alignCast(bits orelse return error.SkipZigTest)));
+        const count: usize = @intCast(w * h);
+
+        // Ink on the underline row, plus that row's span. The underline is
+        // the BOTTOM-most row carrying link-colored pixels: it sits at the
+        // foot of the text box, under every capital glyph.
+        const Rule = struct { ink: i32, span: i32 };
+        const measure = struct {
+            fn run(px: []const u32, width: i32, height: i32) ?Rule {
+                var y: i32 = height - 1;
+                while (y >= 0) : (y -= 1) {
+                    var ink: i32 = 0;
+                    var lo: i32 = -1;
+                    var hi: i32 = -1;
+                    var x: i32 = 0;
+                    while (x < width) : (x += 1) {
+                        const p = px[@intCast(y * width + x)];
+                        const r: i32 = @intCast((p >> 16) & 0xFF);
+                        const b: i32 = @intCast(p & 0xFF);
+                        // link_fg is a blue; the card wash is near-neutral.
+                        if (b - r > 40) {
+                            ink += 1;
+                            if (lo < 0) lo = x;
+                            hi = x;
+                        }
+                    }
+                    if (ink > 0) return .{ .ink = ink, .span = hi - lo + 1 };
+                }
+                return null;
+            }
+        }.run;
+
+        overlay.hover_link = null;
+        overlay.paint(mem_dc);
+        const rest = measure(pixels[0..count], w, h) orelse return error.SkipZigTest;
+
+        // The paint above rebuilt the hit rects, so the link's identity
+        // pointer is available now — the same value `updateLinkHover` stores.
+        try std.testing.expect(overlay.links.items.len > 0);
+        overlay.hover_link = overlay.links.items[0].url.ptr;
+        overlay.paint(mem_dc);
+        const hot = measure(pixels[0..count], w, h) orelse return error.SkipZigTest;
+        overlay.hover_link = null;
+
+        // Hovered: SOLID — every pixel from the run's first to its last.
+        try std.testing.expect(hot.span > @as(i32, @intFromFloat(20.0 * scale)));
+        try std.testing.expectEqual(hot.span, hot.ink);
+
+        // At rest: the SAME rule in the same place — but dots are phased on
+        // the client x (so the fragments of one link line up), which means
+        // the first and last dot need not fall exactly on the run's ends. It
+        // is short by less than one period, never more.
+        const period = banner_layout.linkUnderline(0, 20, scale).period;
+        try std.testing.expect(rest.span <= hot.span);
+        try std.testing.expect(rest.span >= hot.span - period);
+        // ...and it is DOTTED: 1 on, 2 off, so roughly a third of the span.
+        try std.testing.expect(rest.ink > 0);
+        try std.testing.expect(rest.ink <= @divTrunc(hot.span * 3, 5));
+        try std.testing.expect(hot.ink > rest.ink);
     }
 }

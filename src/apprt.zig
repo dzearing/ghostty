@@ -103,6 +103,10 @@ test {
     // deal.
     _ = @import("apprt/win32/banner_card.zig");
 
+    // Pure win32 banner-link click scheme + action menu model (T165), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/banner_link.zig");
+
     // Pure win32 split-divider geometry (T155), same no-OS-imports deal.
     _ = @import("apprt/win32/split_geometry.zig");
 

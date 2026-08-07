@@ -90,6 +90,53 @@ pub fn contentWidth(
     return @max(right - inner, 1);
 }
 
+/// The hover affordance for a banner link (T165, Mac `BannerText`'s
+/// `drawLinkUnderline`): a **dotted** rule at rest that becomes a **solid**
+/// one while the pointer is over that link. Drawn by hand rather than left to
+/// the font's own `lfUnderline`, because GDI has exactly one underline and it
+/// is solid — so a link would either always look hovered or never look like a
+/// link at all.
+///
+/// Geometry, all derived so it scales with the DPI instead of being tuned at
+/// 1.0 and left wrong at 1.25:
+///
+/// - `y` is the rule's top, `thickness` px below the text box. Sitting the
+///   rule INSIDE the line box (rather than under it) is what keeps a wrapped
+///   link's rules evenly spaced and stops the last line's rule from painting
+///   into the block gap.
+/// - `dot`/`period` are the dotted pattern: a `dot`-wide mark every `period`
+///   px. Round numbers of pixels on purpose — a fractional period beats
+///   against the pixel grid and reads as an uneven, dirty line.
+pub const LinkUnderline = struct {
+    y: i32,
+    thickness: i32,
+    dot: i32,
+    period: i32,
+};
+
+/// Underline metrics for text drawn at `text_y` with box height `text_h`.
+pub fn linkUnderline(text_y: i32, text_h: i32, scale: f32) LinkUnderline {
+    const thickness = @max(1, scaled(1.0, scale));
+    const dot = thickness;
+    // The rule hugs the bottom of the text box, one thickness of clear space
+    // under the descenders.
+    const y = text_y + @max(1, text_h - thickness);
+    return .{
+        .y = y,
+        .thickness = thickness,
+        .dot = dot,
+        // 1 on, 2 off. Wider than a 1-on-1-off pattern, which at 1.0 renders
+        // as a 50% grey line rather than as dots.
+        .period = dot * 3,
+    };
+}
+
+/// The overlay's own px rounding (`BannerOverlay.px`), repeated here so the
+/// underline lands on the same pixel grid as everything else on the card.
+fn scaled(v: f32, scale: f32) i32 {
+    return @intFromFloat(@round(v * scale));
+}
+
 /// Size table columns to the width the pane can actually give them (T123,
 /// the port of Mac's `columnWidths(natural:available:)`). `natural[i]` is
 /// column i's single-line content width; results land in `out` (same
@@ -269,6 +316,47 @@ test "contentWidth: a negative gap is treated as none, not as slack" {
         contentWidth(800, 24, 12, 28, 0),
         contentWidth(800, 24, 12, 28, -10),
     );
+}
+
+test "linkUnderline: the rule stays inside the text box at every scale" {
+    for (TEST_SCALES) |s| {
+        // A 20px base line at 1.0, scaled the way the overlay scales it.
+        const h: i32 = @intFromFloat(@round(20.0 * s));
+        const u = linkUnderline(100, h, s);
+        // Below the text's top and not past its bottom: a rule that spilled
+        // out of the box would paint into the block gap on the last wrapped
+        // line and crowd the next line on every other one.
+        try std.testing.expect(u.y > 100);
+        try std.testing.expect(u.y + u.thickness <= 100 + h);
+        try std.testing.expect(u.thickness >= 1);
+    }
+}
+
+test "linkUnderline: the dotted pattern is whole pixels, and really dotted" {
+    for (TEST_SCALES) |s| {
+        const u = linkUnderline(0, 20, s);
+        try std.testing.expect(u.dot >= 1);
+        // Strictly more gap than mark, or it reads as a grey solid line.
+        try std.testing.expect(u.period > u.dot * 2);
+        // Exact at the scales the design system pins.
+        try std.testing.expectEqual(u.dot * 3, u.period);
+    }
+    // 1.0 → 1px dots on a 3px period; 2.0 → 2px dots on a 6px period.
+    try std.testing.expectEqual(@as(i32, 1), linkUnderline(0, 20, 1.0).dot);
+    try std.testing.expectEqual(@as(i32, 3), linkUnderline(0, 20, 1.0).period);
+    try std.testing.expectEqual(@as(i32, 2), linkUnderline(0, 40, 2.0).dot);
+    try std.testing.expectEqual(@as(i32, 6), linkUnderline(0, 40, 2.0).period);
+    // 1.25 and 1.5 round to a whole pixel rather than beating against the grid.
+    try std.testing.expectEqual(@as(i32, 1), linkUnderline(0, 25, 1.25).dot);
+    try std.testing.expectEqual(@as(i32, 2), linkUnderline(0, 30, 1.5).dot);
+}
+
+test "linkUnderline: a degenerate line height still yields a drawable rule" {
+    for ([_]i32{ 0, 1, 2 }) |h| {
+        const u = linkUnderline(7, h, 1.0);
+        try std.testing.expect(u.thickness >= 1);
+        try std.testing.expect(u.y >= 7);
+    }
 }
 
 test "columnWidths: everything fits — exact natural widths, no cap" {

@@ -10631,3 +10631,71 @@ this repo has already recorded as unreliable for `GetKeyState`, so today no
 evidence says whether the backwards walk works) and **T570** (the remote script
 has no spawn-a-victim fixture, which is what D29's second option would need).
 Recorded **D29**.
+
+## 2026-08-07 — T165: a banner link now looks like one, and says what a click will do
+
+Windows banner links were clickable and nothing else: the same flat colored
+text whether you were pointing at one or not, no menu, and one hard-wired
+action. Mac has had the other half since July (`BannerLinkOpener` +
+`BannerText`, merged as `7cd580963`) and it never crossed over — this is that
+crossing, translated rather than copied.
+
+**The affordance.** A link's underline is DOTTED at rest and SOLID while the
+pointer is over it. It is hand-drawn, not the font's `lfUnderline`, because GDI
+has exactly one underline and it is solid: leave it on and every link looks
+permanently hovered, turn it off and a link stops reading as a link. The
+geometry is `banner_layout.linkUnderline` — 1px dots on a 3px period at 1.0,
+scaling to whole pixels at 1.25/1.5/2.0, asserted at all four. Hover is keyed
+on the URL slice's POINTER, not on an index into the hit-rect list: one
+`[text](url)` is drawn as many runs (the wrap tokenizer splits it per word,
+nested styling splits it again), the parser `arena.dupe`s the URL once per
+occurrence, so the pointer is the occurrence's identity and every fragment
+lights together. Dot phase is keyed to the client x for the same reason — a
+per-run phase puts two dots hard against each other at every word boundary.
+
+**The menu and the modifiers.** `banner_link.zig` is the pure model: which
+family a target belongs to, what a click with Ctrl/Ctrl-Shift does, and the
+menu rows. Plain click hands the link out of Ghoztty (browser for a URL,
+`explorer /select,` for a file); Ctrl opens a viewer side pane; Ctrl-Shift
+gives it a surface of its own — a new Ghoztty viewer window for a URL, the
+file's own app for a path. That is Mac's scheme with Cmd→Ctrl. The right-click
+menu is the discoverable form of the same set plus Copy, and a unit test pins
+the contract that its FIRST row is whatever a plain click would have done.
+Windows verbs, not Mac's: Reveal in File Explorer, Copy Path.
+
+One thing worth knowing: `kindOf` treats `D:\…` as a file, not as a one-letter
+scheme. The banner parser's `hasScheme` already accepts a drive path as a link
+target, so that shape is live TODAY — which means this also fixed the
+click-action half of **T539**. What is still missing there, and is now its whole
+remaining scope, is that win32 banner markdown does not AUTOLINK anything: only
+`[label](target)` becomes a link, so a pasted bare path (or a bare URL) still
+renders as plain text.
+
+**A build tripwire, fixed on the way past.** `src/apprt/gtk.zig`'s test block
+called `refAllDecls` unconditionally and got away with it only because nothing
+test-reachable named `apprt.gtk`. `renderer/OpenGL.zig`'s `switch
+(apprt.runtime)` mentions it as a comptime value, so the moment this change let
+a win32 test's reference chain reach a surface teardown, the whole win32 lane
+failed with eight `no module named 'adw'` errors in files the change never
+touched. It is gated on `app_runtime == .gtk` now — on any other lane those
+decls cannot compile at all, so that block was never a test, it was a mine.
+
+Tests: `banner_link.zig` carries 13 unit tests (click scheme, both menu shapes,
+kind classification incl. drive/UNC/relative paths, `file:` URL decoding, buffer
+overrun). `pane-banner.ps1` gains section **6i**: the resting rule is dotted
+(measured 39 ink px over a 115 px span at 1.25), the hover state goes true then
+false, the menu carries exactly the Mac-parity rows and dismisses, and
+Ctrl+click really adds a VIEWER pane (`+list --json`, 1 → 2). The dotted→SOLID
+transition is the one thing the background test desktop cannot show — there is
+no real pointer, so WM_MOUSELEAVE lands a frame after every posted move and the
+hovered frame is gone before PrintWindow reads it, the same wall the chevron's
+hovered fill has been SKIPping on since T209. So it is asserted in the zig lane
+instead: paint the same overlay twice into a DIB with only `hover_link`
+different and count pixels, with a negative control (forcing `solid = true`
+fails it).
+
+Floor: `floor-lane.ps1` none PASS, win32 PASS, agent PASS (322s); P1–P3 ALL
+PASS; `pane-banner.ps1` ALL PASS (88).
+
+Filed: **T571** (give the banner chevron's hovered FILL the same DIB-paint
+oracle, so its permanent SKIP stops being a hole).

@@ -254,14 +254,16 @@ Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic
 
 **Autolinking.** Bare URLs and bare file paths become clickable without `[text](url)` syntax. A URL must carry a scheme — only `http://` and `https://` linkify, never a bare `www.example.com` or `config.io`, so prose is never falsely linked. A file path must start with `/`, `~/`, `./`, or `../`; the sigil is the whole signal (there is no filesystem check), which is why a bare relative `macos/Sources/Foo.swift` stays plain text. `~/` expands to the home directory and `./`/`../` resolve against **the pane's current working directory** at render time — a dot-relative path in a pane with no known cwd stays plain text rather than resolving against a guess. Trailing sentence punctuation stays outside the link (`See https://x.com.` links `https://x.com`), while brackets balanced *inside* the link are kept (`…/Foo_(bar)`). Autolinking never fires inside a `` `code` `` span, after a `\` escape, or inside an explicit `[label](url)` — the explicit link always owns its whole label.
 
-**Link clicks.** A plain click hands the link *out* of Ghoztty; the modifiers bring it back in. Cmd opens a **viewer side pane** for either kind of link, and Cmd-Shift gives the link a surface of its own.
+**Link clicks.** A plain click hands the link *out* of Ghoztty; the modifiers bring it back in. Cmd (**Ctrl on Windows**) opens a **viewer side pane** for either kind of link, and Cmd-Shift (**Ctrl-Shift**) gives the link a surface of its own.
 
-| | plain click | Cmd | Cmd-Shift |
+| | plain click | Cmd / Ctrl | Cmd-Shift / Ctrl-Shift |
 |---|---|---|---|
 | **URL** | default browser | side pane | new Ghoztty window |
-| **file path** | reveal in Finder | side pane | open with default app |
+| **file path** | reveal in Finder / File Explorer | side pane | open with default app |
 
-A URL goes to the real browser by default because Ghoztty's `WKWebView` keeps its own cookie store with no relationship to Safari/Chrome — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
+A URL goes to the real browser by default because Ghoztty's `WKWebView` (WebView2 on Windows) keeps its own cookie store with no relationship to Safari/Chrome/Edge — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
+
+**Link hover affordance.** A banner link's underline is **dotted at rest and solid while the pointer is over it** (plus the pointing-hand cursor), so a link reads as a link before you click and tells you which one a click would take. Hovering lights the WHOLE link, not the fragment under the pointer — a link split by wrapping or by nested styling goes solid together. The underline is drawn by hand rather than by the font's own underline attribute, because there is exactly one of those and it is solid: a link would otherwise either always look hovered or never look like a link. Shared with the same click/menu model on both platforms (win32: `banner_link.zig` + `banner_layout.linkUnderline`, T165).
 
 **Lists.** Consecutive lines that begin with a list marker render as a list block with table-like row spacing and a **shared marker gutter**, so every item's content left-aligns regardless of marker kind (bullets, numbers, and checkboxes in one run all line up). Supported markers:
 

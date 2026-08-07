@@ -32,6 +32,12 @@
 #     a plaintext glyph.
 #   - A multi-line banner collapses to a first-line sliver on click and
 #     expands back on a second click.
+#   - T165 (link affordance): a link's underline is DOTTED at rest and goes
+#     SOLID under the pointer (measured as ink-over-span on the rule's own
+#     row, so it needs no pixel constant); a right-click on a link opens the
+#     Mac-parity action menu with the left-click default as its first row;
+#     and Ctrl+click really opens a viewer side pane, read back from
+#     `+list --json` rather than from a pixel.
 #   - OSC 7778 emitted from inside the pane round-trips into +list.
 #   - The editor dialog (GhozttyBannerDialog) opens on ctrl+shift+b, is modal
 #     over its window, arrives prefilled and selected, commits on ctrl+enter,
@@ -167,6 +173,36 @@ function Get-ShotPx($shot, [int]$x, [int]$y) {
     $c = $shot.Bitmap.GetPixel($x, $y)
     return "$($c.R),$($c.G),$($c.B)"
 }
+
+# Item strings of a LIVE popup menu, by position; separators come back as
+# "---". Takes a menu HANDLE, so it is not desktop-bound and runs from this
+# process — window enumeration is the desktop-bound half, and that already goes
+# through the harness (the context-menu.ps1 pattern, T165).
+Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Runtime.InteropServices;
+public class BannerMenuRead {
+    [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr menu, uint idItem, StringBuilder sb, int max, uint flags);
+    [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr menu, uint id, uint flags);
+
+    public static string[] Items(IntPtr menu) {
+        if (menu == IntPtr.Zero) return new string[0];
+        int n = GetMenuItemCount(menu);
+        var items = new List<string>();
+        for (uint i = 0; i < (uint)n; i++) {
+            uint state = GetMenuState(menu, i, 0x400); // MF_BYPOSITION
+            if ((state & 0x800) != 0) { items.Add("---"); continue; } // MF_SEPARATOR
+            var sb = new StringBuilder(128);
+            GetMenuStringW(menu, i, sb, 128, 0x400);
+            items.Add(sb.ToString());
+        }
+        return items.ToArray();
+    }
+}
+'@
 
 # Clearly-green pixels (the native checked-box stroke) in a window-coordinate
 # rect of the capture.
@@ -756,6 +792,215 @@ try {
     Set-TestWindowPos -Window $top -X 100 -Y 100 -Width 1100 -Height 700 | Out-Null
     Start-Sleep -Milliseconds 900
 
+    # --- 6i. T165: banner links have a hover affordance and an action menu ----
+    # Mac parity (BannerText + BannerLinkOpener): a link's underline is DOTTED
+    # at rest and SOLID while the pointer is over it, and a right-click opens
+    # the action menu whose FIRST row is by contract the left-click default.
+    #
+    # Oracles, in order of how much they can be trusted on this desktop:
+    #   * the rule itself, from the overlay's own capture. The link label is
+    #     ALL CAPS on purpose - no descender can put glyph ink on the
+    #     underline row and turn a dotted rule into a "solid" one.
+    #   * the hover STATE, from the `banner link hover=` debug line, the same
+    #     deal as 6f's chevron: hover cannot survive to a capture here, so the
+    #     trigger is read from the log and the pixels are probed separately.
+    #   * the MENU, read live out of the tracking popup with MN_GETHMENU.
+    #   * Ctrl+click, end to end: the pane count in `+list --json` goes up and
+    #     the new pane is a VIEWER. That is the whole modifier scheme's payoff
+    #     and it needs no pixels at all.
+    $linkLabel = 'LINKLINKLINK'
+    & $exe +set-banner --target=bw "[$linkLabel](about:blank)" | Out-Null
+    $null = Wait-Banner 'bw' 0 "[$linkLabel](about:blank)"
+    Start-Sleep -Milliseconds 700
+    $ovL = Get-Overlay $appPid $top
+    if (-not $ovL) {
+        $script:fail += 1
+        Write-Host 'FAIL  T165: no banner overlay for the link banner' -ForegroundColor Red
+    } else {
+        $lHwnd = [IntPtr]$ovL.Hwnd
+        $lScale = (Get-TestWindowDpi -Window $lHwnd) / 96.0
+        $lMargin = Get-TestChromeDip -Dip 12.0 -Scale $lScale
+        $lPad = Get-TestChromeDip -Dip 12.0 -Scale $lScale
+        $lLine = Get-TestChromeDip -Dip 20.0 -Scale $lScale
+        # A single-line banner is NOT collapsible, so there is no chevron and
+        # content starts at one margin + one padding, on the first text row.
+        $lx = $lMargin + $lPad
+        $ly = $lMargin + $lPad + [int][Math]::Truncate($lLine / 2)
+        Write-Host "INFO  T165 link box: x=$lx rowCy=$ly (overlay $($ovL.Width)x$($ovL.Height) scale=$lScale)"
+
+        # Link-colored ink: link_fg is a blue (RGB 90,160,255 on dark), the
+        # card wash is a near-neutral grey, so B-R separates them with room to
+        # spare and needs no absolute constant.
+        function Measure-LinkRows($shot) {
+            $rows = @{}
+            for ($py = 0; $py -lt $shot.Height; $py++) {
+                $n = 0; $lo = -1; $hi = -1
+                for ($px = 0; $px -lt $shot.Width; $px++) {
+                    $c = $shot.Bitmap.GetPixel($px, $py)
+                    if (([int]$c.B - [int]$c.R) -gt 40) {
+                        $n++
+                        if ($lo -lt 0) { $lo = $px }
+                        $hi = $px
+                    }
+                }
+                if ($n -gt 0) { $rows[$py] = [pscustomobject]@{ N = $n; Lo = $lo; Hi = $hi } }
+            }
+            return $rows
+        }
+        # The underline is the BOTTOM-most link-colored row: it sits at the
+        # foot of the text box, under every (capital) glyph.
+        function Get-RuleRow {
+            $s = Get-TestWindowPixels -Window $lHwnd
+            try {
+                if ((Get-TestDistinctColors -Shot $s) -lt 8) { return $null }
+                $rows = Measure-LinkRows $s
+                if ($rows.Count -eq 0) { return $null }
+                $last = ($rows.Keys | Sort-Object)[-1]
+                return $rows[$last]
+            } finally { Close-TestWindowPixels -Shot $s }
+        }
+
+        # Park the pointer away from the link first, so "at rest" really is.
+        Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $ovL.Width - $lMargin - 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
+        Start-Sleep -Milliseconds 250
+        $rest = Get-RuleRow
+        if ($null -eq $rest) {
+            $script:fail += 2
+            Write-Host 'FAIL  T165: no link-colored ink in the overlay capture at all' -ForegroundColor Red
+        } else {
+            $span = $rest.Hi - $rest.Lo + 1
+            Write-Host "INFO  T165 rest rule: ink=$($rest.N) span=$span ($($rest.Lo)..$($rest.Hi))"
+            Assert ($span -gt 4 * $lScale) `
+                "T165: a link carries an underline rule at rest (span $span px)"
+            # DOTTED, not solid: the rule's own ink covers well under its span.
+            # The pattern is 1 on / 2 off, so a solid rule would score ~1.0 and
+            # this discriminates at any DPI.
+            Assert ($rest.N -le [int]($span * 0.6)) `
+                "T165: that rule is DOTTED at rest, not solid ($($rest.N) ink px over a $span px span)"
+            # (No second -NegativeControl inversion here: the pair of
+            # assertions above and the solid-on-hover one below already
+            # discriminate in BOTH directions, which is what a negative
+            # control buys. The script's one inverted assertion stays the band
+            # oracle in section 3.)
+
+            # Hover: the state machine, from the debug log.
+            $linkLogged = $false
+            if (Test-Path $errlog) {
+                Clear-Content $errlog -ErrorAction SilentlyContinue
+                Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
+                Start-Sleep -Milliseconds 300
+                Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $ovL.Width - $lMargin - 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
+                Start-Sleep -Milliseconds 300
+                $lLines = @(Select-String -Path $errlog -Pattern 'banner link hover=(true|false)' -ErrorAction SilentlyContinue |
+                            ForEach-Object { $_.Matches[0].Groups[1].Value })
+                $linkLogged = ($lLines -contains 'true')
+                if ($linkLogged) {
+                    Write-Host "INFO  T165 link hover log: $($lLines -join ',')"
+                    Assert ($lLines[0] -eq 'true') 'T165: moving onto a link sets the hover'
+                    Assert ($lLines -contains 'false') 'T165: ...and moving off clears it rather than latching'
+                }
+            }
+            if (-not $linkLogged) {
+                Write-Host 'SKIP T165 hover trigger: no debug oracle in the log (release build?)'
+            }
+
+            # ...and the RULE going solid, best effort - the same harness limit
+            # 6f documents for the chevron fill: the hovered frame has to be
+            # captured before the un-hover lands.
+            $hot = $null
+            for ($i = 0; $i -lt 12; $i++) {
+                for ($b = 0; $b -lt 25; $b++) {
+                    Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
+                }
+                $p = Get-RuleRow
+                if ($null -ne $p -and $p.N -gt [int]($span * 0.8)) { $hot = $p; break }
+                Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $ovL.Width - $lMargin - 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
+            }
+            if ($null -eq $hot) {
+                # Not a hole: the dotted->solid transition is asserted in
+                # PIXELS by the zig test "banner overlay: a link's underline
+                # is dotted at rest and solid on hover", which paints the same
+                # banner twice into a DIB with only `hover_link` different and
+                # so needs no pointer at all.
+                Write-Host 'SKIP T165 solid rule: the hovered frame was never captured (harness limit, see 6f; covered by the zig pixel test)'
+            } else {
+                Write-Host "INFO  T165 hot rule: ink=$($hot.N) span=$($hot.Hi - $hot.Lo + 1)"
+                Assert ($hot.N -gt $rest.N) `
+                    "T165: hovering fills the rule in ($($rest.N) -> $($hot.N) ink px)"
+            }
+        }
+
+        # The action menu. Right-click ON the link opens it; right-click on
+        # empty card does NOT (the banner has no menu of its own).
+        Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly) `
+            -Button right -Action up | Out-Null
+        $menu = Wait-TestPopupMenu -ProcessId $appPid -TimeoutMs 4000
+        Assert ($menu -ne [IntPtr]::Zero) 'T165: right-clicking a banner link opens a menu'
+        if ($menu -ne [IntPtr]::Zero) {
+            $r = Invoke-TestMessage -Window $menu -Message 0x01E1  # MN_GETHMENU
+            $items = if ($r -eq [long]::MinValue -or $r -eq 0) { @() } else { [BannerMenuRead]::Items([IntPtr]$r) }
+            Write-Host "      link menu items: $($items -join ' | ')"
+            $expected = @(
+                'Open in Default Browser', '---',
+                'Open in Side Pane', 'Open in New Window', '---',
+                'Copy Link'
+            )
+            Assert (($items -join '|') -eq ($expected -join '|')) `
+                'T165: the web-link menu carries exactly the Mac-parity rows, in order'
+            Assert ($items[0] -eq 'Open in Default Browser') `
+                'T165: the first row IS the left-click default (menu contract)'
+            # Dismiss without choosing: nothing here should actually launch a
+            # browser on the user's box. WM_CANCELMODE goes to the window that
+            # OWNS the menu — the SURFACE, since a WS_EX_NOACTIVATE overlay
+            # cannot own a menu that takes the keyboard. Sent to the overlay
+            # instead it is a no-op, the GUI thread stays parked inside
+            # TrackPopupMenuEx, and every input-driven section after this one
+            # fails for reasons that have nothing to do with what it tests —
+            # which is why the dismissal is ASSERTED and not assumed.
+            $paneForCancel = Get-Pane $top 0
+            if ($paneForCancel) {
+                [void](Invoke-TestMessage -Window ([IntPtr]$paneForCancel.Hwnd) -Message 0x001F)  # WM_CANCELMODE
+            }
+            $gone = $false
+            for ($t = 0; $t -lt 40; $t++) {
+                if ((Get-TestWindow -ProcessId $appPid -Class '#32768') -eq [IntPtr]::Zero) { $gone = $true; break }
+                Start-Sleep -Milliseconds 50
+            }
+            Assert $gone 'T165: the link menu dismisses without choosing a row'
+        }
+
+        # Ctrl+click opens a VIEWER side pane - the modifier scheme, end to
+        # end, with `+list --json` as the oracle rather than a pixel.
+        $before = @(Get-Leaves (Get-Win 'bw').tabs[0].splits).Count
+        Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly) `
+            -Action up -Modifiers ctrl | Out-Null
+        $after = $before
+        $viewers = 0
+        for ($t = 0; $t -lt 25; $t++) {
+            Start-Sleep -Milliseconds 200
+            $w = Get-Win 'bw'
+            if (-not $w) { continue }
+            $leaves = @(Get-Leaves $w.tabs[0].splits)
+            $after = $leaves.Count
+            $viewers = @($leaves | Where-Object { $_.type -eq 'viewer' }).Count
+            if ($viewers -ge 1) { break }
+        }
+        Write-Host "INFO  T165 ctrl+click: panes $before -> $after, viewers=$viewers"
+        Assert ($after -eq $before + 1) "T165: Ctrl+click on a link splits a new pane ($before -> $after)"
+        Assert ($viewers -ge 1) 'T165: ...and that pane is a VIEWER, pointed at the link'
+        # Put the window back to one pane for the sections that follow.
+        $w = Get-Win 'bw'
+        if ($w) {
+            foreach ($leaf in @(Get-Leaves $w.tabs[0].splits)) {
+                if ($leaf.type -eq 'viewer') { & $exe +close --target=$($leaf.id) | Out-Null }
+            }
+        }
+        Start-Sleep -Milliseconds 800
+    }
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T165 section: GUI alive'
+    & $exe +set-banner --target=bw --clear | Out-Null
+    $null = Wait-Banner 'bw' 0 'NONE'
+
     # --- 7. per-pane: named split pane gets its own banner ---------------------
     & $exe +split --target=bw --name=bp1 --direction=down | Out-Null
     Start-Sleep -Seconds 1
@@ -783,6 +1028,7 @@ try {
     Start-Sleep -Milliseconds 800
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'styled banner: GUI alive after paint'
     & $exe +set-banner --target=bw --clear | Out-Null
+
 
     # --- 9. OSC 7778 round-trip from inside the pane ---------------------------
     # Spaces in the payload are built with [char]32: PS 5.1 mangles embedded
