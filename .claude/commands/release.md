@@ -39,17 +39,25 @@ From the categorized commits, write user-facing release notes. Rules:
 - Write in a friendly tone focused on what the user can now do or how their experience improved
 - Do NOT use raw commit messages — rewrite them as benefits
 - Group related commits into single bullet points
-- Separate fork-specific changes from upstream syncs
+- **Name sections after the part of the product that changed** — "Agent
+  integrations", "Viewer panes", "Session persistence", "Command line". NEVER
+  use "Fork Changes" (or any other inward-facing framing like "Misc" or
+  "Other"): a
+  reader wants to know which feature moved, and does not care that this is a
+  fork. Keep upstream syncs in their own "Upstream sync" section.
 - Format:
   ```
   ## What's new in Ghoztty vX.Y.Z
 
-  ### Fork Changes
+  ### <Feature area>
   - **Feature name** — What the user can now do, in plain language.
   - **Improvement** — How the experience got better.
   - **Fix** — What no longer happens / what works correctly now.
 
-  ### Upstream Sync
+  ### <Another feature area>
+  - ...
+
+  ### Upstream sync
   - Synced with Ghostty vX.Y.Z (if applicable)
   ```
 
