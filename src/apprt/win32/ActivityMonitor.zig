@@ -111,6 +111,7 @@ const rows_mod = @import("activity_rows.zig");
 const cards_mod = @import("activity_cards.zig");
 const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
+const sample_gate = @import("sample_gate.zig");
 const icon_button = @import("icon_button.zig");
 const icon_button_paint = @import("icon_button_paint.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -597,6 +598,14 @@ err_len: usize = 0,
 cpu_ring: [gauge.ring_capacity]f32 = @splat(0),
 mem_ring: [gauge.ring_capacity]f32 = @splat(0),
 ring_len: usize = 0,
+
+/// Whether a poll tick should enumerate at all (T290). A full process
+/// enumeration every 1.5 s is the right cost for a panel someone is looking at
+/// and pure waste for one that is minimized, hidden or on another virtual
+/// desktop — which is where a panel left open for hours actually spends most of
+/// its life. The two-state machine is in `sample_gate.zig`; this side supplies
+/// the OS answers and carries out the action.
+gate: sample_gate.Gate = .{},
 
 /// Current view state.
 sort: rows_mod.Sort = rows_mod.default_sort,
@@ -1650,6 +1659,77 @@ fn registerClass(app: *App) ?void {
 // ---------------------------------------------------------------------
 // Sampling
 // ---------------------------------------------------------------------
+
+/// What the OS says about this panel's window right now. Three cheap queries;
+/// none of them enumerate anything, so asking on every tick costs nothing next
+/// to the enumeration it can save.
+fn visibility(self: *ActivityMonitor) sample_gate.Visibility {
+    var cloaked: u32 = 0;
+    // A pre-Windows-10 DWM (or a failure of any kind) answers non-zero and
+    // leaves the out-param alone; `cloaked` stays 0, which is the safe default
+    // — an unknown cloak state must read as "visible" so the gate can only ever
+    // fail towards sampling a panel nobody is watching, never towards freezing
+    // one somebody is.
+    _ = w32.DwmGetWindowAttribute(self.hwnd, w32.DWMWA_CLOAKED, &cloaked, @sizeOf(u32));
+    return .{
+        .visible = w32.IsWindowVisible(self.hwnd) != 0,
+        .minimized = w32.IsIconic(self.hwnd) != 0,
+        .cloaked = cloaked != 0,
+    };
+}
+
+/// Run one gate action. `.skip` is the whole point of the gate: no enumeration,
+/// no repaint, no ring write.
+///
+/// `was_suspended` is the gate's state BEFORE the call that produced `action`,
+/// so the only thing logged is a transition — a `skip` logged every 1.5 s for
+/// the hours a panel sits minimized would be its own kind of waste.
+fn applyGate(self: *ActivityMonitor, was_suspended: bool, action: sample_gate.Action) void {
+    if (!was_suspended and self.gate.suspended) {
+        log.info(
+            "activity monitor: sampling suspended source={s}",
+            .{self.source.label()},
+        );
+    }
+    switch (action) {
+        .skip => {},
+        .sample => self.kickSample(),
+        .resume_fresh => {
+            // The rings are indexed by sample, not by time, so carrying them
+            // across a suspension would draw however long the panel was away as
+            // a single pixel — a chart lying about its own X axis. Clearing is
+            // what a source switch already does (`switchSource`), and it is the
+            // honest answer to "we have no data for that stretch".
+            self.ring_len = 0;
+            log.info(
+                "activity monitor: sampling resumed source={s} trend=cleared",
+                .{self.source.label()},
+            );
+            self.kickSample();
+        },
+    }
+}
+
+/// A poll tick: the gate decides whether it enumerates.
+fn gateTick(self: *ActivityMonitor) void {
+    const was = self.gate.suspended;
+    self.applyGate(was, self.gate.onTick(self.visibility()));
+}
+
+/// The window says it is back in view. A no-op unless the gate is suspended,
+/// which is what makes it safe from `WM_PAINT`.
+fn gateShown(self: *ActivityMonitor) void {
+    const was = self.gate.suspended;
+    self.applyGate(was, self.gate.onShown(self.visibility()));
+}
+
+/// The window says it went away — suspend now rather than waiting up to a full
+/// interval for the next tick to notice.
+fn gateHidden(self: *ActivityMonitor) void {
+    const was = self.gate.suspended;
+    self.gate.onHidden();
+    self.applyGate(was, .skip);
+}
 
 /// Start a background sample unless one is already running. Dropping a tick
 /// rather than queueing one is deliberate: a machine slow enough to miss a tick
@@ -3267,11 +3347,23 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             self.paint(hdc);
             _ = w32.EndPaint(hwnd, &ps);
+            // Coming back from another virtual desktop produces no message of
+            // its own — but it does produce a paint. `gateShown` is a no-op
+            // unless the gate is suspended, so this costs a branch per paint
+            // and buys a fresh table on the frame the panel reappears.
+            self.gateShown();
             return 0;
         },
         w32.WM_SIZE => {
             self.applyLayout();
+            if (wparam == w32.SIZE_MINIMIZED) self.gateHidden() else self.gateShown();
             return 0;
+        },
+        w32.WM_SHOWWINDOW => {
+            if (wparam == 0) self.gateHidden() else self.gateShown();
+            // Observed, not consumed: DefWindowProc owns what this message
+            // means for the window itself.
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_GETMINMAXINFO => {
             const mmi: *w32.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -3302,7 +3394,10 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
         },
         w32.WM_TIMER => {
             if (wparam == SAMPLE_TIMER_ID) {
-                self.kickSample();
+                // The gate — not `kickSample` — decides whether this tick
+                // enumerates. A tick is also the ONLY thing that can notice a
+                // virtual-desktop switch, which has no message.
+                self.gateTick();
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);

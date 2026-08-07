@@ -10360,3 +10360,55 @@ strip's leaf order is the split tree's node-ARRAY order while `+list --json`
 walks it structurally, so a `--direction=down` split's preview lands on the
 wrong side of the selection; the new script is written selection-relative so
 it does not depend on which order wins.
+
+## 2026-08-07 — T290: an Activity Monitor nobody can see stops enumerating
+
+The panel took a full inventory of every process on the box every 1.5s for as
+long as it existed — a `CreateToolhelp32Snapshot` plus an `OpenProcess` and two
+queries per pid, ~300 of them — including while it was minimized, hidden, or
+parked on another virtual desktop, where not one of those readings could be
+seen. On a panel a user leaves open for an afternoon that is an afternoon of
+CPU spent on nothing, straight against this fork's "no slowdowns over
+hours-long sessions" bar.
+
+The decision is a two-state gate, and it lives in a pure module
+(`src/apprt/win32/sample_gate.zig`, 11 unit tests in the `none` lane) rather
+than in `ActivityMonitor.zig`, which is already 135 KB. It answers one question
+per tick: `.sample`, `.skip`, or `.resume_fresh`.
+
+**Both a message path and a polled path, and the reason is virtual desktops.**
+`WM_SIZE`/`SIZE_MINIMIZED` and `WM_SHOWWINDOW` suspend on the message, so a
+minimize does not spend up to a full interval still sweeping. But a
+virtual-desktop switch produces **no window message at all**, so the tick
+re-asks the OS — `IsWindowVisible`, `IsIconic`, `DWMWA_CLOAKED` — three cheap
+calls against the enumeration they save. `WM_PAINT` calls the same resume path,
+which is what refreshes the table on the frame the panel reappears; it is a
+no-op unless the gate is suspended, so it costs one branch per paint. Failure
+direction is deliberate: an unknown cloak state reads as visible, so the gate
+can only ever sample a panel nobody is watching, never freeze one somebody is.
+
+**Occlusion was measured rather than guessed**, which the task asked for
+explicitly. `DWMWA_CLOAKED` does not false-positive on the background test
+desktop — the whole acceptance script samples normally there, which is the
+measurement. A window merely buried behind another is deliberately left
+sampling: Windows has no cheap reliable answer, and a wrong guess freezes a
+panel someone is looking at.
+
+Resuming clears the trend rings rather than stitching across the gap. They are
+indexed by sample, not by time, so carrying them would draw a ten-minute
+suspension as one pixel — a chart lying about its own X axis. Same thing a
+source switch already does. D26 carries the alternative (a gap marker, which
+needs a duration in the ring and a null-sample concept through the painter) to
+the user.
+
+On-box proof: `test/win32/activity-monitor.ps1` grows section K — ALL PASS (92
+assertions). The negative control runs first and is load-bearing (`an open
+panel really is sampling (57 -> 60)`), then `a minimized panel enumerates
+NOTHING across 3+ intervals (60 -> 60)`, `restoring resumes within 900ms` (under
+one interval, so a resume that waited for the timer could only pass by
+coincidence), `the resume CLEARED the trend history`, and `a restored panel
+samples again`. Iconification is asserted on `WS_MINIMIZE`, not a rect: this
+desktop has no Explorer, so an iconic window parks at a real on-screen rect.
+Floor lanes all PASS, P1–P3 ALL PASS. Filed T561 — section J's banner
+dismiss-glyph click failed once and passed on an immediate re-run of the same
+binary, so its pixel oracle is a flake, not the feature.

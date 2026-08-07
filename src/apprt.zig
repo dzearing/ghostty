@@ -190,6 +190,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/trend_gauge.zig");
 
+    // Pure win32 Activity Monitor sampling gate — whether a poll tick should
+    // enumerate at all given what the OS says about the panel's visibility
+    // (T290), same no-OS-imports deal.
+    _ = @import("apprt/win32/sample_gate.zig");
+
     // Pure win32 Activity Monitor process-row model — filter, sort and cell
     // text (T285), same no-OS-imports deal.
     _ = @import("apprt/win32/activity_rows.zig");

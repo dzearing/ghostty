@@ -24,7 +24,10 @@
 #      process and its pid, CANCELLING LEAVES THE PROCESS ALIVE (the negative
 #      control for "the confirmation is mandatory") and confirming terminates it;
 #   J. (T286) a failed action raises the dismissable error banner, and clicking
-#      its glyph removes it.
+#      its glyph removes it;
+#   K. (T290) a panel nobody can see does not enumerate: minimizing STOPS the
+#      1.5s process sweep, restoring resumes it within one interval, and the
+#      resume clears the trend history rather than stitching a gap across it.
 #
 # NOTHING THE BOX NEEDS IS EVER A TARGET. H spawns `cmd.exe /C pause` - a
 # throwaway that blocks forever with no child process - and I only ever kills
@@ -699,6 +702,61 @@ try {
             Close-TestWindowPixels -Shot $shotC
         }
     }
+
+    # --- K. A panel nobody can see does not enumerate (T290) -----------------
+    # Every poll is a FULL process enumeration - a snapshot plus an OpenProcess
+    # and two queries per pid, ~300 of them - and it used to run every 1.5s for
+    # as long as the panel existed, minimized or not. The oracle is the same
+    # state line the rest of this script reads: one per adopted sample, so "the
+    # count stopped growing" IS "the enumeration stopped".
+    #
+    # The negative control runs FIRST and is load-bearing: asserting a counter
+    # stopped is trivially true of a counter that never moved.
+    $k0 = Count-PanelLines
+    Start-Sleep -Seconds 5
+    $k1 = Count-PanelLines
+    Assert ($k1 -gt $k0) "K (control) an open panel really is sampling ($k0 -> $k1)"
+
+    Send-TestSysCommand -Window $panel -Command minimize | Out-Null
+    Start-Sleep -Milliseconds 1200
+    # WS_MINIMIZE, not the rect: this desktop has no Explorer, so an iconic
+    # window parks at a real on-screen rect and a rect oracle would call a
+    # working minimize broken (the caption-bar.ps1 lesson).
+    $minStyle = Get-TestWindowStyle -Window $panel
+    Assert (($minStyle -band 0x20000000) -ne 0) 'K the panel really iconified (WS_MINIMIZE set)'
+    Assert ($null -ne (Wait-LogMatch 'activity monitor: sampling suspended' 4000)) 'K minimizing suspended sampling'
+
+    $k2 = Count-PanelLines
+    Start-Sleep -Seconds 5
+    $k3 = Count-PanelLines
+    Assert ($k3 -eq $k2) "K a minimized panel enumerates NOTHING across 3+ intervals ($k2 -> $k3)"
+
+    Send-TestSysCommand -Window $panel -Command restore | Out-Null
+    # Promptly, not on the next tick. 900ms is under one 1500ms interval, so a
+    # resume that waited for the timer could only pass this by coincidence -
+    # and the pair of assertions below closes that gap: the message-driven path
+    # logs BEFORE it kicks the sample, so the line lands in tens of
+    # milliseconds while a real sample follows a moment later.
+    $promptMs = 900
+    $resumeLine = $null
+    $deadline = (Get-Date).AddMilliseconds($promptMs)
+    while ((Get-Date) -lt $deadline) {
+        $resumeLine = Get-LogMatch 'activity monitor: sampling resumed'
+        if ($resumeLine) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert ($null -ne $resumeLine) "K restoring resumes within ${promptMs}ms, not on the next tick"
+    Assert ($null -ne (Wait-LogMatch 'activity monitor: sampling resumed .*trend=cleared' 4000)) 'K the resume CLEARED the trend history rather than stitching a gap across it'
+
+    $k4 = $k3
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        $k4 = Count-PanelLines
+        if ($k4 -gt $k3) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Assert ($k4 -gt $k3) "K a restored panel samples again ($k3 -> $k4)"
+    Start-Sleep -Milliseconds 500
 
     # --- F. Escape closes the panel ------------------------------------------
     Send-TestControlKey -Control $filterEdit -Key Escape | Out-Null

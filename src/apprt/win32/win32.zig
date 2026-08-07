@@ -1474,6 +1474,19 @@ pub extern "dwmapi" fn DwmSetWindowAttribute(
     cbAttribute: u32,
 ) callconv(.winapi) i32;
 
+pub extern "dwmapi" fn DwmGetWindowAttribute(
+    hwnd: HWND,
+    dwAttribute: u32,
+    pvAttribute: *anyopaque,
+    cbAttribute: u32,
+) callconv(.winapi) i32;
+
+/// `DWMWA_CLOAKED` — the window is composed but not drawn. Non-zero for a
+/// window on another virtual desktop, or one the shell has cloaked. There is no
+/// window message for entering or leaving this state, so it can only be polled
+/// (T290).
+pub const DWMWA_CLOAKED: u32 = 14;
+
 // -----------------------------------------------------------------------
 // GDI double-buffered painting API
 // -----------------------------------------------------------------------
