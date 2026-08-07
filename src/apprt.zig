@@ -132,6 +132,11 @@ test {
     // (T310), same no-OS-imports deal.
     _ = @import("apprt/win32/type_ramp.zig");
 
+    // Pure win32 PANEL color resolution — the Activity Monitor / chooser /
+    // carousel surfaces, wells, marks and their floors (T308), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/panel_theme.zig");
+
     // Pure win32 viewer JS bridge — the injected shim/selection blob and the
     // messages that come back up it (T375), same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_bridge.zig");

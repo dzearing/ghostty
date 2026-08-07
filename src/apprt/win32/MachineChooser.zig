@@ -51,6 +51,8 @@ const HostSettingsDialog = @import("HostSettingsDialog.zig");
 const host_defaults = @import("host_defaults.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const panel_theme = @import("panel_theme.zig");
+const brush_cache = @import("brush_cache.zig");
 const color_math = @import("color_math.zig");
 const type_ramp = @import("type_ramp.zig");
 const system_colors = @import("system_colors.zig");
@@ -99,23 +101,37 @@ pub const Row = union(enum) {
     device: usize,
 };
 
-/// Dialog colors — the RenameDialog dark palette (matches the command palette
-/// and tab bar chrome).
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-const COLOR_LABEL = w32.RGB(200, 200, 200);
+/// The dialog's palette, derived from the surface `window-theme` puts the app
+/// on and the accent the user picked (T308).
+///
+/// This used to be four `w32.RGB(...)` literals plus a `DIALOG_BG` of
+/// `RGB(32,32,32)` — "the RenameDialog dark palette", which is a fine
+/// description of a dialog that can only ever be dark. On a light system theme
+/// the chooser opened dark with light text on it while the window behind it was
+/// light: the panel-scale version of the defect T203 was filed against.
+///
+/// A function rather than a `const` because the value is a live theme read, and
+/// container-level consts are comptime. `system_colors.panelPalette` memoizes
+/// it on its inputs, so calling this per painted row is a struct copy.
+fn pal(self: *const MachineChooser) panel_theme.Panel {
+    return palFor(self.window.app);
+}
 
-/// The dialog background as the pure color model sees it, and the master
-/// column's wash derived from it. The listbox is painted with the wash (not the
-/// field color) so the filter, the rows and the status strip read as one
-/// column — the way Mac's `machineListColumn` does.
-const DIALOG_BG: chooser_rows.Rgb = .{ .r = 32, .g = 32, .b = 32 };
-const WASH: chooser_rows.Rgb = chooser_rows.columnWash(DIALOG_BG);
+fn palFor(app: *App) panel_theme.Panel {
+    const bg = app.config.background;
+    return system_colors.panelPalette(
+        app.config.@"window-theme",
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+    );
+}
 
-/// The row background the owner-drawn selection/hover fills composite against:
-/// the column wash the rows actually sit on.
-const ROW_BG: chooser_rows.Rgb = WASH;
+/// The master column's wash: the listbox is painted with it (not the field
+/// color) so the filter, the rows and the status strip read as one column — the
+/// way Mac's `machineListColumn` does. It is also the row background the
+/// owner-drawn selection/hover fills composite against.
+fn columnWash(p: panel_theme.Panel) chooser_rows.Rgb {
+    return chooser_rows.columnWash(p.bg);
+}
 
 fn rgb(c: chooser_rows.Rgb) u32 {
     return w32.RGB(c.r, c.g, c.b);
@@ -128,12 +144,14 @@ fn rgb(c: chooser_rows.Rgb) u32 {
 var next_chooser_id: u64 = 1;
 
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
-var field_brush: ?w32.HBRUSH = null;
-/// The master column's wash and the hairline rules (T175). Process-lifetime,
-/// like the other two — created once with the window class.
-var wash_brush: ?w32.HBRUSH = null;
-var divider_brush: ?w32.HBRUSH = null;
+/// The dialog surface, the filter field, the master column's wash and the
+/// hairline rules (T175). Process-lifetime, and since T308 keyed on the color
+/// they were made for: a GDI brush is immutable, so a theme flip has to mean a
+/// new object rather than a stale handle painting the old palette forever.
+var bg_brush: brush_cache.CachedBrush = .{};
+var field_brush: brush_cache.CachedBrush = .{};
+var wash_brush: brush_cache.CachedBrush = .{};
+var divider_brush: brush_cache.CachedBrush = .{};
 
 window: *Window,
 hwnd: w32.HWND,
@@ -1192,12 +1210,13 @@ fn measureWith(self: *const MachineChooser, font: ?*anyopaque, text: []const u8)
 /// GDI glyph routine the list rows use — one silhouette, two sizes.
 fn paintChrome(self: *MachineChooser, hdc: w32.HDC) void {
     const l = layout(self.window.scale, self.hint_lines);
+    const p = self.pal();
 
-    if (wash_brush) |b| {
+    if (wash_brush.get(rgb(columnWash(p)))) |b| {
         var r = rect(l.master);
         _ = w32.FillRect(hdc, &r, b);
     }
-    if (divider_brush) |b| {
+    if (divider_brush.get(rgb(chooser_rows.dividerColor(p.bg)))) |b| {
         var rules = [_]w32.RECT{
             .{ .left = 0, .top = l.header_divider_y, .right = l.client_w, .bottom = l.header_divider_y + 1 },
             .{ .left = l.master_divider_x, .top = l.master.top, .right = l.master_divider_x + 1, .bottom = l.master.bottom },
@@ -1227,7 +1246,7 @@ fn paintAccount(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     const row = chooser_layout.accountRow(l, .signed_in, self.measureAccount(.signed_in));
     const box = row.avatar orelse return;
 
-    const fill = chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached());
+    const fill = self.pal().accent;
     const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(fill)) orelse return;
     defer _ = w32.DeleteObject(pen);
     const brush = w32.CreateSolidBrush(rgb(fill)) orelse return;
@@ -1266,17 +1285,15 @@ fn paintAccount(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
 fn drawAccountLink(self: *const MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     const hdc = dis.hDC;
     var r = dis.rcItem;
-    if (bg_brush) |b| _ = w32.FillRect(hdc, &r, b);
+    const p = self.pal();
+    if (bg_brush.get(rgb(p.bg))) |b| _ = w32.FillRect(hdc, &r, b);
 
     const disabled = (dis.itemState & w32.ODS_DISABLED) != 0;
     const pressed = (dis.itemState & w32.ODS_SELECTED) != 0;
     const focused = (dis.itemState & w32.ODS_FOCUS) != 0;
     const marked = self.link_hot or pressed or focused;
 
-    const color = if (disabled)
-        chooser_rows.secondaryOn(DIALOG_BG)
-    else
-        chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached());
+    const color = if (disabled) p.secondary else p.accent;
 
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
     _ = w32.SetTextColor(hdc, rgb(color));
@@ -1298,9 +1315,10 @@ fn drawAccountLink(self: *const MachineChooser, dis: *const w32.DRAWITEMSTRUCT) 
 /// or Mac's centered "No machines" when the filter matched nothing.
 fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    const p = self.pal();
 
     const row = self.selectedRow() orelse {
-        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(DIALOG_BG)));
+        _ = w32.SetTextColor(hdc, rgb(p.secondary));
         var r = rect(l.detail);
         var wbuf: [32]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&wbuf, "No machines") catch return;
@@ -1335,12 +1353,12 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
         box.width(),
         box.height(),
         detail.glyph,
-        chooser_rows.secondaryOn(DIALOG_BG),
+        p.secondary,
     );
 
     var title_rect = rect(l.detail_title);
     const old_font = if (self.title_font) |f| w32.SelectObject(hdc, f) else null;
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, rgb(p.text));
     drawTextUtf8(hdc, detail.title, &title_rect);
     if (old_font) |o| _ = w32.SelectObject(hdc, o);
 
@@ -1354,7 +1372,7 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     const subtitle = self.detailSubtitle(&sub_buf2, row, detail.subtitle);
     var sub_rect = rect(l.detail_subtitle);
     const old_sub = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
-    _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(DIALOG_BG)));
+    _ = w32.SetTextColor(hdc, rgb(p.secondary));
     drawTextUtf8(hdc, subtitle, &sub_rect);
     if (old_sub) |o| _ = w32.SelectObject(hdc, o);
 
@@ -1388,17 +1406,18 @@ fn detailSubtitle(
 /// the roster paints nothing at all when it is pointed at no machine.
 fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void {
     _ = row;
+    const p = self.pal();
     var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const visible = self.roster.visible(self.window.app, &rows);
     self.roster.paint(.{
         .hdc = hdc,
         .region = l.sessions,
         .scale = self.window.scale,
-        .bg = DIALOG_BG,
+        .bg = p.bg,
         // The user's accent floored against the surface the cards composite on
         // — the same resolution `drawRow` does for the list's selected pill, so
         // one selection language covers both halves of the dialog (T320).
-        .accent = chrome_theme.accentOn(DIALOG_BG, system_colors.accentCached()),
+        .accent = p.accent,
         .label_font = self.strong_font,
         .caption_font = self.subtitle_font,
     }, visible);
@@ -1783,8 +1802,9 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     const r = dis.rcItem;
     const idx: i32 = @bitCast(dis.itemID);
     // A listbox with no items still asks for one empty row (itemID == -1).
+    const row_bg = columnWash(self.pal());
     if (idx < 0 or @as(usize, @intCast(idx)) >= self.row_count) {
-        if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
+        if (wash_brush.get(rgb(row_bg))) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
         return;
     }
 
@@ -1801,15 +1821,21 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
 
     // Background first: the column wash the row sits on, so the pill
     // composites against what is actually behind it.
-    if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
+    if (wash_brush.get(rgb(row_bg))) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
 
     // The user's accent, floored to 3:1 against the row it composites over
     // (T305). It used to be `chooser_rows.accent`, the literal `#3D8EF8`.
     const paint = chooser_rows.rowPaint(
-        ROW_BG,
-        chrome_theme.accentOn(ROW_BG, system_colors.accentCached()),
+        row_bg,
+        chrome_theme.accentOn(row_bg, system_colors.accentCached()),
         state,
     );
+
+    // Everything drawn INSIDE the row is floored against what the row actually
+    // paints - the pill when there is one, the column wash otherwise. A
+    // selected row is a different surface from an unselected one, and a color
+    // measured against the wash was never measured against the pill.
+    const surface = paint.fill orelse row_bg;
 
     const pill: w32.RECT = .{
         .left = r.left + m.fill_inset_x,
@@ -1863,8 +1889,8 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     }
 
     const text = self.rowText(self.rows[@intCast(idx)]);
-    drawStatusDot(hdc, r, m, text.status);
-    drawGlyph(hdc, r, m, text.glyph);
+    drawStatusDot(hdc, r, m, text.status, surface);
+    drawGlyph(hdc, r, m, text.glyph, surface);
 
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
     const text_right = r.right - m.text_pad_right;
@@ -1875,7 +1901,7 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
         .right = text_right,
         .bottom = r.top + m.title_y + m.title_h,
     };
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, rgb(chrome_theme.textOn(surface)));
     drawTextUtf8(hdc, text.title, &title_rect);
 
     if (text.subtitle.len > 0) {
@@ -1886,7 +1912,7 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
             .bottom = r.top + m.subtitle_y + m.subtitle_h,
         };
         const old = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
-        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(ROW_BG)));
+        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(surface)));
         drawTextUtf8(hdc, text.subtitle, &sub_rect);
         if (old) |o| _ = w32.SelectObject(hdc, o);
     }
@@ -1913,7 +1939,13 @@ fn drawTextUtf8Aligned(hdc: w32.HDC, text: []const u8, r: *w32.RECT, flags: u32)
 /// The leading status column: a filled green dot when online, a hollow gray
 /// ring when offline, nothing for the Local row (which keeps the column so all
 /// rows share one grid). Shape-coded, not just color-coded, like Mac's.
-fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: chooser_rows.Status) void {
+fn drawStatusDot(
+    hdc: w32.HDC,
+    r: w32.RECT,
+    m: chooser_rows.RowMetrics,
+    status: chooser_rows.Status,
+    surface: chooser_rows.Rgb,
+) void {
     if (status == .none) return;
     const half = @divTrunc(m.dot_d, 2);
     const cx = r.left + m.status_cx;
@@ -1924,9 +1956,9 @@ fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: 
     // chrome floor so it keeps its green, the ring to the de-emphasized text
     // ramp so it matches the subline beside it.
     const color = if (online)
-        chooser_rows.onlineOn(ROW_BG)
+        chooser_rows.onlineOn(surface)
     else
-        chooser_rows.secondaryOn(ROW_BG);
+        chooser_rows.secondaryOn(surface);
     const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(color)) orelse return;
     defer _ = w32.DeleteObject(pen);
     const brush: ?*anyopaque = if (online)
@@ -1947,7 +1979,13 @@ fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: 
 /// The machine glyph, drawn with GDI primitives rather than an icon font (no
 /// tofu risk if Segoe's symbol font is missing): a laptop silhouette for the
 /// local machine, a two-unit rack for a relay device.
-fn drawGlyph(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, glyph: chooser_rows.Glyph) void {
+fn drawGlyph(
+    hdc: w32.HDC,
+    r: w32.RECT,
+    m: chooser_rows.RowMetrics,
+    glyph: chooser_rows.Glyph,
+    surface: chooser_rows.Rgb,
+) void {
     drawGlyphBox(
         hdc,
         r.left + m.glyph_x,
@@ -1955,7 +1993,7 @@ fn drawGlyph(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, glyph: choos
         m.glyph_w,
         m.glyph_h,
         glyph,
-        chooser_rows.secondaryOn(ROW_BG),
+        chooser_rows.secondaryOn(surface),
     );
 }
 
@@ -2120,10 +2158,10 @@ fn setHover(self: *MachineChooser, row: i32) void {
 
 fn registerClass(app: *App) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
-    field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
-    wash_brush = w32.CreateSolidBrush(rgb(WASH));
-    divider_brush = w32.CreateSolidBrush(rgb(chooser_rows.dividerColor(DIALOG_BG)));
+    // Warm the palette memo so the first paint does not resolve on the
+    // critical path; the brushes themselves are created on demand, keyed on
+    // the color they are made for.
+    _ = palFor(app);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         // The roster's cards are painted on the dialog, so the dialog is what
@@ -2137,7 +2175,10 @@ fn registerClass(app: *App) ?void {
         .hInstance = app.hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null, and erased in `WM_ERASEBKGND` from the live palette instead
+        // (T308): a class background brush is captured at registration, which
+        // happens once per process, so it cannot follow a theme flip.
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,
@@ -2275,6 +2316,16 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return 0;
         },
+        // The class carries no background brush (it would be frozen at
+        // registration time), so the dialog surface is erased here from the
+        // live palette; `paintChrome` draws the column and rules over it.
+        w32.WM_ERASEBKGND => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            var er: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &er) == 0) return 0;
+            if (bg_brush.get(rgb(self.pal().bg))) |b| _ = w32.FillRect(hdc, &er, b);
+            return 1;
+        },
         w32.WM_PAINT => {
             var ps: w32.PAINTSTRUCT = undefined;
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
@@ -2282,31 +2333,44 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             _ = w32.EndPaint(hwnd, &ps);
             return 0;
         },
+        // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
+        // a panel is one (T308). Drop the cached accent and repaint: the
+        // palette is derived per paint, so the repaint IS the re-theme.
+        w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            system_colors.invalidate();
+            _ = w32.InvalidateRect(hwnd, null, 1);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
-            if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, rgb(p.text));
+            _ = w32.SetBkColor(hdc, rgb(p.field));
+            if (field_brush.get(rgb(p.field))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         // The list sits ON the column wash, not on a field — its unfilled tail
         // below the last row has to be the same color as the rows themselves.
         w32.WM_CTLCOLORLISTBOX => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, rgb(WASH));
-            if (wash_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            const w = rgb(columnWash(p));
+            _ = w32.SetTextColor(hdc, rgb(p.text));
+            _ = w32.SetBkColor(hdc, w);
+            if (wash_brush.get(w)) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_LABEL);
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, rgb(p.label));
             // The status strip lives inside the master column, so it takes the
             // wash; everything else sits on the dialog surface.
             const on_wash = @as(?w32.HWND, self.hint) == @as(?w32.HWND, @ptrFromInt(@as(usize, @bitCast(lparam))));
-            _ = w32.SetBkColor(hdc, if (on_wash) rgb(WASH) else COLOR_BG);
-            const brush = if (on_wash) wash_brush else bg_brush;
-            if (brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const back = rgb(if (on_wash) columnWash(p) else p.bg);
+            _ = w32.SetBkColor(hdc, back);
+            const brush = if (on_wash) &wash_brush else &bg_brush;
+            if (brush.get(back)) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

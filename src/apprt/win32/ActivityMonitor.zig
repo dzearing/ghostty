@@ -115,6 +115,8 @@ const sample_gate = @import("sample_gate.zig");
 const icon_button = @import("icon_button.zig");
 const icon_button_paint = @import("icon_button_paint.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const panel_theme = @import("panel_theme.zig");
+const brush_cache = @import("brush_cache.zig");
 const system_colors = @import("system_colors.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const NewProcessDialog = @import("NewProcessDialog.zig");
@@ -165,89 +167,46 @@ const rpc_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const max_rows: usize = remote_proc.default_limit;
 
 // ---------------------------------------------------------------------
-// Palette — the RenameDialog / MachineChooser dark palette, so every dialog
-// in the app reads as one family.
+// Palette (T308)
+//
+// Every color below used to be a `w32.RGB(...)` constant here - about thirty of
+// them, each hand-picked against the one surface anybody ever checked, the
+// `RGB(32,32,32)` "RenameDialog dark palette". On a light system theme the
+// panel opened dark with light text on it while the window behind it was light.
+//
+// They are derived now, from the same two inputs `Window.chromePalette`
+// resolves the chrome from: the surface `window-theme` puts the app on, and the
+// accent the user picked. `panel_theme` owns the derivation and its floors;
+// this file only converts to COLORREF.
 // ---------------------------------------------------------------------
 
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-const COLOR_LABEL = w32.RGB(200, 200, 200);
-/// Secondary text: Mac's `.secondary` foreground. 200 -> 150 keeps it above the
-/// 4.5:1 floor on the 32,32,32 surface (design system §2.3).
-const COLOR_SECONDARY = w32.RGB(150, 150, 150);
-const COLOR_DIVIDER = w32.RGB(60, 60, 60);
-/// The table header band and the selection fill. Selection uses the system
-/// accent-ish blue the chooser rows already use.
-const COLOR_HEADER_BG = w32.RGB(40, 40, 40);
-const COLOR_SELECT = w32.RGB(38, 79, 120);
-const COLOR_HOVER = w32.RGB(45, 45, 45);
-/// The chart plot area, one notch below the panel so the gauge reads as a well.
-const COLOR_CHART_BG = w32.RGB(26, 26, 26);
-const COLOR_GRID = w32.RGB(52, 52, 52);
-/// Mac's gauge tints (`tint: .blue` / `.green`, RemoteActivityMonitorView.swift:868, :878).
-const COLOR_CPU = w32.RGB(80, 160, 235);
-const COLOR_CPU_FILL = w32.RGB(38, 66, 94);
-const COLOR_MEM = w32.RGB(90, 190, 120);
-const COLOR_MEM_FILL = w32.RGB(40, 78, 52);
-/// The "List truncated" badge — Mac's `.secondary` label with a warning glyph.
-const COLOR_WARN = w32.RGB(220, 165, 90);
-/// The action-error banner's fill: Mac's `.orange.opacity(0.12)`
-/// (RemoteActivityMonitorView.swift:1077) composited onto `COLOR_BG` — GDI has
-/// no alpha here, so the blend is precomputed. Warning text on it reads 6.1:1
-/// and the message text 10.6:1, both past design system §2.3's floors.
-const COLOR_BANNER_BG = w32.RGB(56, 47, 35);
-/// The overlay scroll thumb, at rest and while grabbed.
-const COLOR_THUMB = w32.RGB(90, 90, 90);
-const COLOR_THUMB_ACTIVE = w32.RGB(130, 130, 130);
-
-// --- Machine cards (T296) --------------------------------------------
-// Every number here is checked against design system §2.3's non-text floor
-// (3:1 for a boundary that carries meaning, 4.5:1 for text), on BOTH the rest
-// fill and the selected fill — a card is a control, and its border is what
-// tells the user where the click target is.
-/// Card fill at rest / under the pointer.
-const COLOR_CARD_BG = w32.RGB(44, 44, 44);
-const COLOR_CARD_HOVER = w32.RGB(56, 56, 56);
-/// The resting border: 3.6:1 on the card fill and 4.2:1 on the panel.
-const COLOR_CARD_BORDER = w32.RGB(130, 130, 130);
-/// The active card: Mac's accent fill + accent border. The border reads 3.1:1
-/// against its own fill and 5.9:1 against the panel.
-const COLOR_CARD_SELECT_BG = COLOR_SELECT;
-
-/// The user's accent, read once per painted card (T305). This was
-/// `w32.RGB(80, 160, 235)` — the SECOND invented blue in the tree, differing
-/// from `chooser_rows.accent`'s `#3D8EF8` by enough to see when the chooser
-/// and this panel were open together, and neither of them the color the user
-/// picked in Settings.
-///
-/// A function rather than a `const` because the value is a registry read and
-/// container-level consts are comptime; `system_colors` caches it and drops
-/// the cache on `WM_DWMCOLORIZATIONCOLORCHANGED`. Floored to 3:1 against the
-/// card it outlines, so a dark accent on this panel's dark card still reads as
-/// a border.
-fn accentColor() u32 {
-    const a = chrome_theme.accentOn(
-        .{ .r = 44, .g = 44, .b = 44 }, // COLOR_CARD_BG, as an Rgb
-        system_colors.accentCached(),
-    );
-    return w32.RGB(a.r, a.g, a.b);
+/// The panel palette, as COLORREFs are needed. A method rather than a `const`
+/// because the value is a live theme read and container-level consts are
+/// comptime; `system_colors.panelPalette` memoizes it on its inputs, so the
+/// per-painted-row calls below are a struct copy.
+fn pal(self: *const ActivityMonitor) panel_theme.Panel {
+    return palFor(self.app);
 }
-/// Secondary text has to brighten on the accent fill: `COLOR_SECONDARY` is
-/// 4.7:1 on the resting card but only 2.9:1 on the selected one, which is under
-/// the 4.5:1 floor. Same role, two surfaces, two values.
-const COLOR_CARD_SECONDARY = COLOR_SECONDARY;
-const COLOR_CARD_SECONDARY_SEL = w32.RGB(190, 205, 225);
-/// Status dots. Green/amber/red are the same three states Mac paints, plus a
-/// neutral for "the directory says offline and we have not dialed it".
-const COLOR_DOT_GOOD = w32.RGB(90, 200, 120);
-const COLOR_DOT_PENDING = w32.RGB(225, 180, 80);
-const COLOR_DOT_BAD = w32.RGB(230, 100, 100);
-const COLOR_DOT_UNKNOWN = COLOR_SECONDARY;
+
+fn palFor(app: *App) panel_theme.Panel {
+    const bg = app.config.background;
+    return system_colors.panelPalette(
+        app.config.@"window-theme",
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+    );
+}
+
+/// A `panel_theme` color as the COLORREF every GDI call here wants.
+fn cr(c: panel_theme.Rgb) u32 {
+    return w32.RGB(c.r, c.g, c.b);
+}
 
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
-var field_brush: ?w32.HBRUSH = null;
+/// The panel surface and the filter field. Keyed on the color they were made
+/// for (T308): a GDI brush is immutable, so a theme flip has to mean a new
+/// object rather than a stale handle painting the old palette forever.
+var bg_brush: brush_cache.CachedBrush = .{};
+var field_brush: brush_cache.CachedBrush = .{};
 
 // ---------------------------------------------------------------------
 // Source + registry
@@ -1633,8 +1592,9 @@ fn makeFont(height: i32, weight: i32, comptime face: []const u8) ?*anyopaque {
 
 fn registerClass(app: *App) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
-    field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
+    // Warm the palette memo so the first paint does not resolve on the critical
+    // path; the brushes are created on demand, keyed on their color.
+    _ = palFor(app);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -1644,7 +1604,11 @@ fn registerClass(app: *App) ?void {
         .hInstance = app.hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null: a class background brush is captured at registration, which
+        // happens once per process, so it cannot follow a theme flip. Nothing
+        // is lost - `WM_ERASEBKGND` already returns 1 here because the paint
+        // covers the whole client.
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,
@@ -2165,6 +2129,7 @@ fn drawText(hdc: w32.HDC, text: []const u8, r: layout_mod.Rect, flags: u32) void
 const text_flags: u32 = w32.DT_SINGLELINE | w32.DT_VCENTER;
 
 fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
+    const p = self.pal();
     const l = self.layout();
 
     // Double-buffered: the table repaints on every 1.5 s poll, and a direct
@@ -2176,7 +2141,7 @@ fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
     const old_bmp = w32.SelectObject(mem_dc, bmp);
     defer _ = w32.SelectObject(mem_dc, old_bmp);
 
-    fill(mem_dc, .{ .left = 0, .top = 0, .right = l.client_w, .bottom = l.client_h }, COLOR_BG);
+    fill(mem_dc, .{ .left = 0, .top = 0, .right = l.client_w, .bottom = l.client_h }, cr(p.bg));
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
 
     self.paintCarousel(mem_dc, l);
@@ -2189,7 +2154,7 @@ fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
     // at -1 and must not paint a line across the top of the window.
     for ([_]i32{ l.carousel_divider_y, l.header_divider_y, l.control_divider_y }) |y| {
         if (y < 0) continue;
-        fill(mem_dc, .{ .left = 0, .top = y, .right = l.client_w, .bottom = y + 1 }, COLOR_DIVIDER);
+        fill(mem_dc, .{ .left = 0, .top = y, .right = l.client_w, .bottom = y + 1 }, cr(p.divider));
     }
 
     _ = w32.BitBlt(hdc, 0, 0, l.client_w, l.client_h, mem_dc, 0, 0, w32.SRCCOPY);
@@ -2233,14 +2198,15 @@ fn paintCard(
     is_focused: bool,
     is_hover: bool,
 ) void {
+    const p = self.pal();
     const radius = px(8, self.scale);
     const fill_color: u32 = if (is_active)
-        COLOR_CARD_SELECT_BG
+        cr(p.select)
     else if (is_hover)
-        COLOR_CARD_HOVER
+        cr(p.card_hover)
     else
-        COLOR_CARD_BG;
-    const border_color: u32 = if (is_active) accentColor() else COLOR_CARD_BORDER;
+        cr(p.card);
+    const border_color: u32 = if (is_active) cr(p.accent) else cr(p.card_border);
     const border_w: i32 = if (is_active) @max(2, px(2, self.scale)) else @max(1, px(1, self.scale));
 
     roundRect(hdc, r, radius, fill_color, border_color, border_w);
@@ -2257,7 +2223,7 @@ fn paintCard(
             .right = r.right + pad,
             .bottom = r.bottom + pad,
         };
-        strokeRoundRect(hdc, ring, radius + pad, accentColor(), @max(2, px(2, self.scale)));
+        strokeRoundRect(hdc, ring, radius + pad, cr(p.accent), @max(2, px(2, self.scale)));
     }
 
     const c = layout_mod.cardContent(r, self.scale);
@@ -2265,18 +2231,18 @@ fn paintCard(
 
     // Status dot.
     const dot_color: u32 = switch (cards_mod.dot(card.summary, switching)) {
-        .good => COLOR_DOT_GOOD,
-        .pending => COLOR_DOT_PENDING,
-        .bad => COLOR_DOT_BAD,
-        .unknown => COLOR_DOT_UNKNOWN,
+        .good => cr(p.good),
+        .pending => cr(p.pending),
+        .bad => cr(p.bad),
+        .unknown => cr(p.neutral),
     };
     ellipse(hdc, c.dot, dot_color);
 
-    const secondary: u32 = if (is_active) COLOR_CARD_SECONDARY_SEL else COLOR_CARD_SECONDARY;
+    const secondary: u32 = if (is_active) cr(p.secondary_on_select) else cr(p.secondary);
     const flags: u32 = text_flags | w32.DT_END_ELLIPSIS;
 
     const old_font = if (self.font) |f| w32.SelectObject(hdc, f) else null;
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, cr(p.text));
     drawText(hdc, card.label, c.label, flags);
 
     if (self.caption_font) |f| _ = w32.SelectObject(hdc, f);
@@ -2345,6 +2311,7 @@ fn ellipse(hdc: w32.HDC, r: layout_mod.Rect, color: u32) void {
 }
 
 fn paintGauges(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const p = self.pal();
     const host: remote_protocol.HostMetrics = if (self.snap) |s| s.host else .{};
 
     var vbuf: [48]u8 = undefined;
@@ -2353,13 +2320,13 @@ fn paintGauges(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
 
     const cpu_value = rows_mod.formatHostCpu(&vbuf, host.cpu_pct);
     const cpu_detail = std.fmt.bufPrint(&dbuf, "{d} cores", .{host.ncpu}) catch "";
-    self.paintGauge(hdc, l, l.gauge_cpu, "CPU", cpu_value, cpu_detail, COLOR_CPU, COLOR_CPU_FILL, self.cpu_ring[0..self.ring_len]);
+    self.paintGauge(hdc, l, l.gauge_cpu, "CPU", cpu_value, cpu_detail, cr(p.cpu), cr(p.cpu_fill), self.cpu_ring[0..self.ring_len]);
 
     var vbuf2: [48]u8 = undefined;
     var dbuf2: [64]u8 = undefined;
     const mem_value = rows_mod.formatMemory(&vbuf2, host.mem_used);
     const mem_detail = std.fmt.bufPrint(&dbuf2, "of {s}", .{rows_mod.formatMemory(&mbuf, host.mem_total)}) catch "";
-    self.paintGauge(hdc, l, l.gauge_mem, "Memory", mem_value, mem_detail, COLOR_MEM, COLOR_MEM_FILL, self.mem_ring[0..self.ring_len]);
+    self.paintGauge(hdc, l, l.gauge_mem, "Memory", mem_value, mem_detail, cr(p.mem), cr(p.mem_fill), self.mem_ring[0..self.ring_len]);
 }
 
 fn paintGauge(
@@ -2374,6 +2341,7 @@ fn paintGauge(
     fill_tint: u32,
     samples: []const f32,
 ) void {
+    const p = self.pal();
     const title_band: layout_mod.Rect = .{
         .left = box.left,
         .top = box.top,
@@ -2382,13 +2350,13 @@ fn paintGauge(
     };
 
     _ = w32.SelectObject(hdc, self.caption_font);
-    _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
+    _ = w32.SetTextColor(hdc, cr(p.secondary));
     drawText(hdc, title, title_band, text_flags | w32.DT_LEFT);
     drawText(hdc, detail, title_band, text_flags | w32.DT_RIGHT);
 
     // The headline number sits between them, so the eye lands on it first.
     _ = w32.SelectObject(hdc, self.title_font);
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, cr(p.text));
     drawText(hdc, value, title_band, text_flags | w32.DT_CENTER);
 
     const chart: layout_mod.Rect = .{
@@ -2397,12 +2365,12 @@ fn paintGauge(
         .right = box.right,
         .bottom = box.bottom,
     };
-    fill(hdc, rect(chart), COLOR_CHART_BG);
+    fill(hdc, rect(chart), cr(p.well));
 
     var grid: [gauge.gridline_values.len]i32 = undefined;
     gauge.gridlines(chart, &grid);
     for (grid) |y| {
-        fill(hdc, .{ .left = chart.left, .top = y, .right = chart.right, .bottom = y + 1 }, COLOR_GRID);
+        fill(hdc, .{ .left = chart.left, .top = y, .right = chart.right, .bottom = y + 1 }, cr(p.grid));
     }
 
     if (samples.len == 0) return;
@@ -2414,7 +2382,7 @@ fn paintGauge(
     // The filled area under the curve, then the curve itself on top of it.
     if (gauge.fillClose(chart, line)) |closers| {
         var poly: [gauge.ring_capacity + 2]w32.POINT = undefined;
-        for (line, 0..) |p, i| poly[i] = .{ .x = p.x, .y = p.y };
+        for (line, 0..) |pt, i| poly[i] = .{ .x = pt.x, .y = pt.y };
         poly[line.len] = .{ .x = closers[0].x, .y = closers[0].y };
         poly[line.len + 1] = .{ .x = closers[1].x, .y = closers[1].y };
 
@@ -2428,11 +2396,11 @@ fn paintGauge(
             _ = w32.SelectObject(hdc, op);
         }
         if (brush) |b| _ = w32.DeleteObject(b);
-        if (pen) |p| _ = w32.DeleteObject(p);
+        if (pen) |pn| _ = w32.DeleteObject(pn);
     }
 
     var wide: [gauge.ring_capacity]w32.POINT = undefined;
-    for (line, 0..) |p, i| wide[i] = .{ .x = p.x, .y = p.y };
+    for (line, 0..) |pt, i| wide[i] = .{ .x = pt.x, .y = pt.y };
     const pen = w32.CreatePen(w32.PS_SOLID, @max(1, @as(i32, @intFromFloat(@round(self.scale)))), tint) orelse return;
     defer _ = w32.DeleteObject(pen);
     const old = w32.SelectObject(hdc, pen);
@@ -2441,30 +2409,32 @@ fn paintGauge(
 }
 
 fn paintControlBar(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const p = self.pal();
     _ = w32.SelectObject(hdc, self.caption_font);
 
     const total = if (self.snap) |s| s.rows.len else 0;
     const truncated = if (self.snap) |s| s.truncated else false;
     if (l.badge.width() > 0) {
         if (actions.badgeText(self.refresh_failed, truncated, total)) |badge| {
-            _ = w32.SetTextColor(hdc, COLOR_WARN);
+            _ = w32.SetTextColor(hdc, cr(p.warn));
             drawText(hdc, badge, l.badge, text_flags | w32.DT_LEFT | w32.DT_END_ELLIPSIS);
         }
     }
 
     var buf: [64]u8 = undefined;
     const count = rows_mod.formatCount(&buf, self.filterSpec(), self.order_len, total);
-    _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
+    _ = w32.SetTextColor(hdc, cr(p.secondary));
     drawText(hdc, count, l.count, text_flags | w32.DT_RIGHT);
 }
 
 fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const p = self.pal();
     const widths = layout_mod.columnWidths(self.scale, l.table.width());
 
     // Header band.
-    fill(hdc, rect(l.table_header), COLOR_HEADER_BG);
+    fill(hdc, rect(l.table_header), cr(p.header));
     _ = w32.SelectObject(hdc, self.font);
-    _ = w32.SetTextColor(hdc, COLOR_LABEL);
+    _ = w32.SetTextColor(hdc, cr(p.label));
     for (layout_mod.column_specs, 0..) |spec, i| {
         const col: layout_mod.Column = @enumFromInt(i);
         const cell = layout_mod.cellRect(l.table_header, widths, col, self.scale);
@@ -2488,13 +2458,13 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
                 .top = cell.top,
                 .right = cell.right,
                 .bottom = cell.bottom,
-            }, self.sort.ascending, self.scale);
+            }, self.sort.ascending, self.scale, cr(p.label));
         }
     }
     fill(
         hdc,
         .{ .left = l.table.left, .top = l.table_header.bottom - 1, .right = l.table.right, .bottom = l.table_header.bottom },
-        COLOR_DIVIDER,
+        cr(p.divider),
     );
 
     const snap = self.snap orelse {
@@ -2521,9 +2491,9 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
 
         const selected = self.isSelected(row.pid);
         if (selected) {
-            fill(hdc, rect(row_rect), COLOR_SELECT);
+            fill(hdc, rect(row_rect), cr(p.select));
         } else if (self.hover_row == idx) {
-            fill(hdc, rect(row_rect), COLOR_HOVER);
+            fill(hdc, rect(row_rect), cr(p.card));
         }
 
         self.paintRow(hdc, row_rect, widths, row, snap.host.ncpu, selected);
@@ -2542,7 +2512,7 @@ fn sortArrowWidth(scale: f32) i32 {
 /// The sort indicator: a FILLED triangle, not a text glyph (§4 — glyphs are
 /// filled shapes). Points down for descending, up for ascending, centered in
 /// its slot.
-fn paintSortArrow(hdc: w32.HDC, box: layout_mod.Rect, ascending: bool, scale: f32) void {
+fn paintSortArrow(hdc: w32.HDC, box: layout_mod.Rect, ascending: bool, scale: f32, color: u32) void {
     const half_w = @max(3, @as(i32, @intFromFloat(@round(3.5 * scale))));
     const half_h = @max(2, @as(i32, @intFromFloat(@round(2.0 * scale))));
     const cx = @divTrunc(box.left + box.right, 2);
@@ -2555,9 +2525,9 @@ fn paintSortArrow(hdc: w32.HDC, box: layout_mod.Rect, ascending: bool, scale: f3
         .{ .x = cx, .y = tip_y },
     };
 
-    const brush = w32.CreateSolidBrush(COLOR_LABEL) orelse return;
+    const brush = w32.CreateSolidBrush(color) orelse return;
     defer _ = w32.DeleteObject(brush);
-    const pen = w32.CreatePen(w32.PS_SOLID, 1, COLOR_LABEL) orelse return;
+    const pen = w32.CreatePen(w32.PS_SOLID, 1, color) orelse return;
     defer _ = w32.DeleteObject(pen);
     const ob = w32.SelectObject(hdc, brush);
     const op = w32.SelectObject(hdc, pen);
@@ -2575,10 +2545,11 @@ fn paintRow(
     ncpu: u32,
     selected: bool,
 ) void {
+    const p = self.pal();
     var buf: [32]u8 = undefined;
 
     _ = w32.SelectObject(hdc, self.num_font);
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, cr(p.text));
     const pid_text = std.fmt.bufPrint(&buf, "{d}", .{row.pid}) catch "";
     drawText(hdc, pid_text, layout_mod.cellRect(row_rect, widths, .pid, self.scale), text_flags | w32.DT_LEFT);
 
@@ -2612,7 +2583,9 @@ fn paintRow(
     // the selection fill is 2.8:1, below §2.3's 4.5:1 text floor. The floor has
     // to be re-checked against the fill a row actually sits on, not against the
     // panel background.
-    _ = w32.SetTextColor(hdc, if (selected) COLOR_TEXT else COLOR_SECONDARY);
+    // A selected row is filled with `p.select`, so its text is floored
+    // against THAT surface and not against the panel behind it (T308).
+    _ = w32.SetTextColor(hdc, if (selected) cr(p.text_on_select) else cr(p.secondary));
     drawText(
         hdc,
         if (row.cmd.len == 0) rows_mod.empty_cell else row.cmd,
@@ -2622,11 +2595,12 @@ fn paintRow(
 }
 
 fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const p = self.pal();
     const total = if (self.snap) |s| s.rows.len else 0;
     const state = actions.emptyState(self.dialing, self.loading, self.refresh_failed, total);
     if (state != .unreachable_source) {
         _ = w32.SelectObject(hdc, self.font);
-        _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
+        _ = w32.SetTextColor(hdc, cr(p.secondary));
         const text = switch (state) {
             .connecting => "Connecting\u{2026}",
             .loading => "Loading\u{2026}",
@@ -2641,7 +2615,7 @@ fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) v
     const mid = @divTrunc(l.table_rows.top + l.table_rows.bottom, 2);
     const line_h = l.row_h;
     _ = w32.SelectObject(hdc, self.font);
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, cr(p.text));
     drawText(hdc, "Couldn't connect", .{
         .left = l.table_rows.left,
         .top = mid - line_h,
@@ -2656,7 +2630,7 @@ fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) v
         .{self.source.label()},
     ) catch "The source is unreachable.";
     _ = w32.SelectObject(hdc, self.caption_font);
-    _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
+    _ = w32.SetTextColor(hdc, cr(p.secondary));
     drawText(hdc, sub, .{
         .left = l.table_rows.left,
         .top = mid,
@@ -2672,9 +2646,10 @@ fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) v
 /// with `Options.has_banner`, and a child window would have to be moved and
 /// shown/hidden in lockstep with a rect the layout module already computes.
 fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const p = self.pal();
     if (self.err_len == 0) return;
 
-    fill(hdc, rect(l.banner), COLOR_BANNER_BG);
+    fill(hdc, rect(l.banner), cr(p.banner));
     // A rule along its top edge, so the banner reads as a band and not as the
     // table's last row painted a different color.
     fill(hdc, .{
@@ -2682,7 +2657,7 @@ fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
         .top = l.banner.top,
         .right = l.banner.right,
         .bottom = l.banner.top + 1,
-    }, COLOR_DIVIDER);
+    }, cr(p.divider));
 
     const m = icon_button.Metrics.init(self.scale);
     const glyph_box = icon_button.targetBox(m, .{
@@ -2691,7 +2666,7 @@ fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
         .right = l.banner_close.right,
         .bottom = l.banner_close.bottom,
     });
-    icon_button_paint.glyph(hdc, m, glyph_box, .close, COLOR_SECONDARY);
+    icon_button_paint.glyph(hdc, m, glyph_box, .close, cr(p.secondary));
 
     // The band's own margin, TAKEN from the layout module rather than
     // re-derived from `pad_x` here: the ✕ sits one margin in from the trailing
@@ -2701,8 +2676,12 @@ fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
     const icon_w = margin;
     const gap = @divTrunc(margin, 2);
 
+    // Both floored against the BANNER, which is a tinted surface of its own -
+    // `p.warn` and `p.text` are measured against the panel (T308).
+    const warn_on_banner = panel_theme.textSemanticOn(panel_theme.warn_base, p.banner);
+    const text_on_banner = chrome_theme.textOn(p.banner);
     _ = w32.SelectObject(hdc, self.caption_font);
-    _ = w32.SetTextColor(hdc, COLOR_WARN);
+    _ = w32.SetTextColor(hdc, cr(warn_on_banner));
     drawText(hdc, "\u{26A0}", .{
         .left = l.banner.left + margin,
         .top = l.banner.top,
@@ -2711,7 +2690,7 @@ fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
     }, text_flags | w32.DT_CENTER);
 
     const text_left = l.banner.left + margin + icon_w + gap;
-    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    _ = w32.SetTextColor(hdc, cr(text_on_banner));
     drawText(hdc, self.err_buf[0..self.err_len], .{
         .left = text_left,
         .top = l.banner.top,
@@ -2725,6 +2704,7 @@ fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void 
 /// idiom (`Scrollbar.zig`, overlay mode), reusing its pure thumb arithmetic so
 /// the panel and the terminal cannot disagree about where a thumb goes.
 fn paintScrollThumb(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout, visible: i32) void {
+    const p = self.pal();
     if (visible <= 0) return;
     if (self.order_len <= @as(usize, @intCast(visible))) return;
 
@@ -2742,7 +2722,7 @@ fn paintScrollThumb(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout, 
         .top = l.table_rows.top + t.y,
         .right = l.table_rows.right,
         .bottom = l.table_rows.top + t.y + t.h,
-    }, if (self.thumb_drag_dy >= 0) COLOR_THUMB_ACTIVE else COLOR_THUMB);
+    }, if (self.thumb_drag_dy >= 0) cr(p.boundary_active) else cr(p.boundary));
 }
 
 fn thumbWidth(scale: f32) i32 {
@@ -3463,18 +3443,28 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
             );
             return 0;
         },
+        // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
+        // a panel is one (T308). Drop the cached accent and repaint: the
+        // palette is derived per paint, so the repaint IS the re-theme.
+        w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            system_colors.invalidate();
+            _ = w32.InvalidateRect(hwnd, null, 1);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
-            if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, cr(p.text));
+            _ = w32.SetBkColor(hdc, cr(p.field));
+            if (field_brush.get(cr(p.field))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_LABEL);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, cr(p.label));
+            _ = w32.SetBkColor(hdc, cr(p.bg));
+            if (bg_brush.get(cr(p.bg))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CLOSE => {

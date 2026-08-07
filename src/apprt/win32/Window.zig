@@ -528,25 +528,15 @@ fn debugMarkerEnabled() bool {
     return v;
 }
 
-/// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
-/// system apps theme is light. A missing/erroring value is treated as light,
-/// which is how the Personalize key reads before it is ever written.
+/// True when the system apps theme is light.
+///
+/// The registry read itself moved to `system_colors.usesLightTheme` in T308,
+/// where the app's other live system-color lookups already live: the panels
+/// need the same answer, and two copies of a registry read are two chances for
+/// the chrome and a dialog on top of it to disagree about the theme. This name
+/// stays because it is what the chrome's callers already say.
 pub fn systemUsesLightTheme() bool {
-    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-    );
-    const valname = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
-    var hkey: w32.HKEY = undefined;
-    if (w32.RegOpenKeyExW(w32.HKEY_CURRENT_USER, subkey, 0, w32.KEY_READ, &hkey) !=
-        w32.ERROR_SUCCESS) return true;
-    defer _ = w32.RegCloseKey(hkey);
-    var kind: u32 = 0;
-    var val: u32 = 0;
-    var cb: u32 = @sizeOf(u32);
-    if (w32.RegQueryValueExW(hkey, valname, null, &kind, @ptrCast(&val), &cb) !=
-        w32.ERROR_SUCCESS) return true;
-    if (kind != w32.REG_DWORD) return true;
-    return val != 0; // 0 = dark, nonzero = light
+    return system_colors.usesLightTheme();
 }
 
 /// Every flat color this window's chrome paints, resolved once per paint from

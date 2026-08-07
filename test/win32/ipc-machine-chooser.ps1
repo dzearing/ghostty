@@ -278,7 +278,15 @@ function Open-Chooser($g) {
 
 # Launch a GUI on the test desktop and find its window + surface.
 function Launch-Gui($errlog) {
-    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    # `--background` is pinned because the dialog's surface is DERIVED from it
+    # since T308 (`chrome_theme.chromeBase` under the default
+    # `window-theme = auto`), and the row probes below score the accent tint as
+    # b-r. Ghostty's default background is #282c34, which carries b-r = 12 of
+    # its own - so on a correct build the "untinted" control measured a tint
+    # that came from the terminal background rather than from any pill. A
+    # neutral grey gives b-r = 0 at rest, which is what makes the tint probes
+    # mean what they say (the same reason the script pins the accent below).
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false', '--background=#1e1e1e') -StdErr $errlog
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { return $null }
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'

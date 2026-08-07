@@ -70,6 +70,18 @@ $errlog = Join-Path $env:TEMP 'ghoztty-activity-monitor-stderr.log'
 $env:GHOZTTY_PIPE_SUFFIX = '-activitytest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\ColorMath.ps1')
+
+# The panel's colors are DERIVED from the surface `window-theme` puts the app
+# on (T308), which under the default `auto` is the terminal background - so the
+# probes below need to know it. Pinned rather than assumed: every pasted
+# literal in this script (the header band, the banner fill, the dismiss glyph)
+# is now recomputed from this one value with the same rule the app uses, and a
+# change to a wash amount moves the app and this oracle together.
+$PANEL_BG = @(0x1E, 0x1E, 0x1E)
+$PANEL_BG_HEX = Format-Rgb $PANEL_BG
+$PANEL_HEADER = Get-PanelHeader $PANEL_BG
+$PANEL_DIVIDER = Get-PanelRaised $PANEL_BG
 
 $script:pass = 0
 $script:fail = 0
@@ -251,14 +263,14 @@ function Get-TestFirstRowY([IntPtr]$Panel, $Client, $Fr) {
         $headerY = -1
         for ($y = [int]$Fr.Bottom; $y -lt $Client.Bottom; $y++) {
             $c = Get-TestPixel -Shot $shot -X $x -Y $y
-            if ($null -ne $c -and $c.R -eq 40 -and $c.G -eq 40 -and $c.B -eq 40) { $headerY = $y; break }
+            if ($null -ne $c -and $c.R -eq $PANEL_HEADER[0] -and $c.G -eq $PANEL_HEADER[1] -and $c.B -eq $PANEL_HEADER[2]) { $headerY = $y; break }
         }
         if ($headerY -lt 0) { return @(-1, -1) }
         for ($y = $headerY; $y -lt $Client.Bottom; $y++) {
             $c = Get-TestPixel -Shot $shot -X $x -Y $y
             if ($null -eq $c) { continue }
-            if ($c.R -eq 40 -and $c.G -eq 40 -and $c.B -eq 40) { continue }
-            if ($c.R -eq 60 -and $c.G -eq 60 -and $c.B -eq 60) { continue }
+            if ($c.R -eq $PANEL_HEADER[0] -and $c.G -eq $PANEL_HEADER[1] -and $c.B -eq $PANEL_HEADER[2]) { continue }
+            if ($c.R -eq $PANEL_DIVIDER[0] -and $c.G -eq $PANEL_DIVIDER[1] -and $c.B -eq $PANEL_DIVIDER[2]) { continue }
             return @($headerY, $y)
         }
         return @($headerY, -1)
@@ -273,7 +285,7 @@ Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 
 try {
-    $script:app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    $script:app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false', "--background=$PANEL_BG_HEX") -StdErr $errlog
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
@@ -376,8 +388,11 @@ try {
         $gTop = $client.Top
         $gBot = $fr.Top
         $mid = [int](($client.Left + $client.Right) / 2)
-        $CPU_TINT = @(80, 160, 235)   # ActivityMonitor.zig COLOR_CPU
-        $MEM_TINT = @(90, 190, 120)   # ActivityMonitor.zig COLOR_MEM
+        # `panel_theme.cpu_base` / `mem_base`, floored to 3:1 against the
+        # panel - both already clear it on this background, so the expected
+        # pixel is the hue itself.
+        $CPU_TINT = $PANEL_CPU_BASE
+        $MEM_TINT = $PANEL_MEM_BASE
         Assert (Test-ExactPixel $shot $client.Left $gTop $mid $gBot $CPU_TINT) 'B2 the CPU trend chart painted in its blue tint'
         Assert (Test-ExactPixel $shot $mid $gTop $client.Right $gBot $MEM_TINT) 'B2 the Memory trend chart painted in its green tint'
         # Control probes for the two above: each tint belongs to ONE gauge, so
@@ -445,14 +460,14 @@ try {
 
     # --- G. Clicking a column header re-sorts --------------------------------
     # The header band is FOUND, not derived: scan down the panel's right edge
-    # for the first row painted in COLOR_HEADER_BG (40,40,40). Re-deriving the
+    # for the first row painted in the derived header band. Re-deriving the
     # layout module's band offsets here is what T257 is about.
     $shot2 = Get-TestWindowPixels -Window $panel
     $headerY = -1
     try {
         for ($y = [int]$fr.Bottom; $y -lt $client.Bottom -and $headerY -lt 0; $y++) {
             $c = Get-TestPixel -Shot $shot2 -X ($client.Right - 20) -Y $y
-            if ($null -ne $c -and $c.R -eq 40 -and $c.G -eq 40 -and $c.B -eq 40) { $headerY = $y }
+            if ($null -ne $c -and $c.R -eq $PANEL_HEADER[0] -and $c.G -eq $PANEL_HEADER[1] -and $c.B -eq $PANEL_HEADER[2]) { $headerY = $y }
         }
     } finally {
         Close-TestWindowPixels -Shot $shot2
@@ -677,9 +692,9 @@ try {
     Assert ($null -ne (Wait-LogMatch "activity monitor: action error: Couldn't start" 6000)) 'J the failure became an action error'
 
     # It PAINTED. The log proves the model; this proves the band exists on
-    # screen, in ActivityMonitor.zig's COLOR_BANNER_BG.
-    $BANNER_BG = @(56, 47, 35)
-    $GLYPH = @(150, 150, 150)   # COLOR_SECONDARY - the dismiss glyph
+    # screen, in the warn hue composited over the panel at `banner_alpha`.
+    $BANNER_BG = Get-PanelBanner $PANEL_BG
+    $GLYPH = Get-PanelSecondary $PANEL_BG   # the dismiss glyph rides the secondary ramp
     $shotB = Get-TestWindowPixels -Window $panel
     $xspot = $null
     try {

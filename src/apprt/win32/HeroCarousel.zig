@@ -17,6 +17,7 @@ const PaneView = @import("PaneView.zig");
 const w32 = @import("win32.zig");
 const hero_math = @import("hero_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const panel_theme = @import("panel_theme.zig");
 const color_math = @import("color_math.zig");
 const system_colors = @import("system_colors.zig");
 
@@ -180,10 +181,15 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         .bottom = rh,
     };
     const div_accent = bandAccent(win).on;
+    // At rest the divider is a BOUNDARY on the band, derived and floored to
+    // 3:1 (T308). It used to be the literal `RGB(96,96,96)` — a mid-grey that
+    // degraded rather than vanished on a light band, which is why it survived,
+    // but it was still the one color here that came from nowhere.
+    const div_rest = panel_theme.boundaryOn(back);
     const div_color = if (win.hero_divider_hover or win.hero_divider_drag)
         w32.RGB(div_accent.r, div_accent.g, div_accent.b)
     else
-        w32.RGB(96, 96, 96);
+        w32.RGB(div_rest.r, div_rest.g, div_rest.b);
     if (w32.CreateSolidBrush(div_color)) |brush| {
         _ = w32.FillRect(mem_dc, &line, brush);
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -238,8 +244,12 @@ fn paintTile(
     const rgn = w32.CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, corner, corner);
     if (rgn) |r| _ = w32.SelectClipRgn(dc, r);
 
-    // Placeholder under (or instead of) the snapshot: near-black.
-    if (w32.CreateSolidBrush(w32.RGB(16, 16, 16))) |brush| {
+    // Placeholder under (or instead of) the snapshot: a well in the band, so a
+    // tile that has not produced a thumbnail yet reads as an empty slot on
+    // either theme rather than as the fixed near-black hole `RGB(16,16,16)`
+    // punched in a light one (T308).
+    const placeholder = panel_theme.recede(bandBackdrop(win), panel_theme.well_recede);
+    if (w32.CreateSolidBrush(w32.RGB(placeholder.r, placeholder.g, placeholder.b))) |brush| {
         var rr = rect;
         _ = w32.FillRect(dc, &rr, brush);
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -279,7 +289,9 @@ fn paintTile(
     // softer step of the same accent — Mac paints a second hue here
     // (0.416,0.416,1.0 vs 0.545,0.361,0.965), which was ported as two raw
     // literals and read as an unrelated purple once the accent stopped being
-    // blue (T305). Normal: 1px dim gray (Mac white 0.5 @ 0.3).
+    // blue (T305). Normal: 1px boundary derived from the band and floored to
+    // 3:1 (T308) — Mac's white 0.5 @ 0.3, which was ported as `RGB(110,110,110)`
+    // and so only ever answered for a dark band.
     if (rgn) |r| {
         _ = w32.SelectClipRgn(dc, null);
         _ = w32.DeleteObject(r);
@@ -289,12 +301,13 @@ fn paintTile(
     else
         @max(@as(i32, @intFromFloat(@round(1.0 * win.scale))), 1);
     const ba = bandAccent(win);
+    const rest = panel_theme.boundaryOn(bandBackdrop(win));
     const border_color = if (selected)
         w32.RGB(ba.on.r, ba.on.g, ba.on.b)
     else if (hovered)
         w32.RGB(ba.soft.r, ba.soft.g, ba.soft.b)
     else
-        w32.RGB(110, 110, 110);
+        w32.RGB(rest.r, rest.g, rest.b);
     const pen = w32.CreatePen(0, border_w, border_color) orelse return;
     defer _ = w32.DeleteObject(pen);
     const old_pen = w32.SelectObject(dc, pen);

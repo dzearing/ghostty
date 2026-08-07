@@ -5,6 +5,7 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const panel_theme = @import("panel_theme.zig");
 
 const Rgb = chrome_theme.Rgb;
 
@@ -78,6 +79,70 @@ pub fn accentCached() Rgb {
 
 pub fn invalidate() void {
     cached_accent = null;
+}
+
+/// Read `HKCU\...\Themes\Personalize\AppsUseLightTheme`. True when the system
+/// apps theme is light. A missing or erroring value is treated as light, which
+/// is how the Personalize key reads before it is ever written.
+///
+/// Lives here rather than in `Window` because it is a live system color read
+/// and this file is where those are — `Window.systemUsesLightTheme` delegates
+/// to it, so the panels and the chrome cannot end up asking the OS two
+/// different questions.
+pub fn usesLightTheme() bool {
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    const valname = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    const v = readDword(subkey, valname) orelse return true;
+    return v != 0; // 0 = dark, nonzero = light
+}
+
+/// The palette a PANEL paints from (T308): the Activity Monitor, the machine
+/// chooser, the hero carousel band.
+///
+/// The two inputs are the same ones `Window.chromePalette` resolves the chrome
+/// from — the surface `window-theme` puts the app on, and the accent the user
+/// picked — so a panel and the window behind it cannot disagree about which
+/// theme is in force. `theme` is `anytype` for the reason `chrome_theme.
+/// chromeBase`'s is: it keeps the pure module free of a config import.
+///
+/// Deliberately NOT debug-tinted. T43's marker is the chrome band, which is the
+/// surface a user looks at to tell a dev build from their own terminal; a
+/// tinted dialog would put amber on surfaces the acceptance scripts measure as
+/// the proxy for what ships.
+/// Memoized on its INPUTS rather than invalidated by a message, unlike the
+/// accent above. `resolve` runs a contrast search per derived color and the
+/// panels call this per painted row, so re-deriving an unchanged palette is
+/// pure waste — but the light/dark read stays live, because a cache with two
+/// invalidation sources is a cache that goes stale on the one nobody wired.
+var panel_key: ?struct { base: Rgb, accent: Rgb } = null;
+var panel_cache: panel_theme.Panel = undefined;
+
+pub fn panelPalette(theme: anytype, terminal_bg: Rgb) panel_theme.Panel {
+    const base = chrome_theme.chromeBase(theme, terminal_bg, usesLightTheme());
+    const acc = accentCached();
+    if (panel_key) |k| {
+        if (k.base.eql(base) and k.accent.eql(acc)) return panel_cache;
+    }
+    panel_cache = panel_theme.resolve(base, acc);
+    panel_key = .{ .base = base, .accent = acc };
+    return panel_cache;
+}
+
+test "panelPalette: memoized on its inputs, and it follows them" {
+    const testing = std.testing;
+    const Theme = enum { auto, system, light, dark, ghostty };
+    const term: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+
+    const dark = panelPalette(Theme.dark, term);
+    try testing.expectEqual(dark, panelPalette(Theme.dark, term));
+    // A different base is a different palette, not the cached one.
+    const light = panelPalette(Theme.light, term);
+    try testing.expect(!light.bg.eql(dark.bg));
+    try testing.expect(!light.text.eql(dark.text));
+    // ...and going back re-resolves rather than handing back the light one.
+    try testing.expectEqual(dark, panelPalette(Theme.dark, term));
 }
 
 test "accentCached: first read populates, invalidate forces a re-read" {

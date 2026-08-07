@@ -10412,3 +10412,70 @@ desktop has no Explorer, so an iconic window parks at a real on-screen rect.
 Floor lanes all PASS, P1–P3 ALL PASS. Filed T561 — section J's banner
 dismiss-glyph click failed once and passed on an immediate re-run of the same
 binary, so its pixel oracle is a flake, not the feature.
+
+## 2026-08-07 — T308: the dialog panels stop being dark-only
+
+The Activity Monitor and the machine chooser opened dark on a light system
+theme, with fixed pale text on them, next to a window that had already gone
+light. T305 fixed the chrome band and the tab strip; the panels were left
+behind, holding about thirty-five `RGB(...)` constants between them — "the
+RenameDialog dark palette", which is an accurate description of a surface that
+can only ever be dark.
+
+`panel_theme.zig` is the panels' answer to what `chrome_theme.zig` is for the
+chrome: pure, swept, and derived from the same two inputs the OS actually has —
+the surface `window-theme` puts the app on (`chrome_theme.chromeBase`) and the
+accent the user picked. `system_colors.panelPalette` resolves it and memoizes on
+those inputs, so a per-painted-row call is a struct copy.
+
+The one primitive `chrome_theme` did not have is `recede`: `wash` composites
+toward the surface's CONTRASTING side, which is right for a card, a header band
+or a hover, and backwards for a well. A text field and a chart plot area have to
+go the other way or they stop reading as inset. A surface at either extreme
+cannot recede at all (mixing black into black is black), and `window-theme =
+auto` hands the panel the terminal background — a pure-black terminal is a real
+configuration — so that case falls back to a wash rather than losing every field
+and every trough.
+
+The brushes were the other half. Both dialogs created theirs once, at
+window-class registration, from constants; a GDI brush is immutable, so "the
+theme flipped" has to mean a new object. `brush_cache.CachedBrush` keys the
+brush on the color it was made for — same color, same handle, no churn on the
+paint path — and the class background brush, which is captured at registration
+and can never follow a flip, is gone in favor of a `WM_ERASEBKGND` arm. Both
+panels now also repaint on `WM_SETTINGCHANGE` / `WM_DWMCOLORIZATIONCOLORCHANGED`,
+which they never did.
+
+Three surfaces got their floors measured against what is actually painted rather
+than against the panel behind it: a selected table row (its text sits on the
+selection fill), a selected chooser row (its title, subline, status dot and
+glyph sit on the pill), and the error banner (a tinted surface of its own).
+That is the class of bug the old `COLOR_CARD_SECONDARY_SEL = RGB(190,205,225)`
+was a hand-fix for.
+
+On-box proof: `chrome-theme.ps1` grows section D — both panels, on a light and a
+dark `--background`, ALL PASS (62 assertions). The oracle is exact, not
+directional: a panel paints from `chromeBase`, which under the default
+`window-theme = auto` IS `--background`, so the mode pixel must equal it. That
+one assertion carries three claims — the panel tracks the theme, it does not
+wash the way the band does, and it is not debug-tinted (this script runs with
+the T43 marker ON). Its text is scored by exact presence of the derived ramp
+color, because the first version scored the capture's luminance extreme and both
+probe backgrounds turn up a pure black or white pixel somewhere that clears any
+floor by itself — it was passing without ever looking at our text.
+
+Two acceptance scripts had PASTED the retired literals and went red on a correct
+build: `activity-monitor.ps1` hunted the table header at `RGB(40,40,40)` and the
+error banner at `RGB(56,47,35)`, and `ipc-machine-chooser.ps1` scored an
+"untinted" control as b−r ≤ 10 — which the app's own default background
+(`#282c34`, b−r = 12) now carries into the dialog. Both now pin `--background`
+and derive their expectations through the new `test/win32/lib/ColorMath.ps1`,
+which is where chrome-theme.ps1's private copy of the color math moved: three
+scripts scoring derived surfaces is exactly where a second copy of `wash` starts
+disagreeing with the app.
+
+Floor: `floor-lane.ps1 -Lane all` = ALL LANES PASS (none 312s, win32 345s, agent
+320s); P1–P3 ALL PASS; `activity-monitor` 92, `ipc-machine-chooser` 72,
+`hero-mode` 63, all ALL PASS. Filed T563 — the same defect one size down, in the
+five small dialogs and the command palette, which T308 deliberately did not
+touch.

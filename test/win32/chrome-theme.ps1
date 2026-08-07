@@ -45,6 +45,20 @@
 #      defuses T350 here: a non-Debug zig-out changes the expected pixel, and
 #      this script would notice rather than fail mysteriously.
 #
+#   D. THE PANELS FOLLOW THE SAME SURFACE (T308). A. covers the chrome band;
+#      the Activity Monitor and the machine chooser had their own ~35 hardcoded
+#      constants and opened dark on a light theme. Scored on the panel's own
+#      fill against an EXACT expectation - a panel paints from
+#      `chrome_theme.chromeBase`, which under the default `window-theme = auto`
+#      is `--background` itself, so the mode pixel must BE the background. One
+#      assertion, three claims: the panel tracks the theme, it does not wash
+#      (unlike the band, a panel abuts nothing), and it is not debug-tinted.
+#      Its text is then scored by EXACT presence of the derived ramp color,
+#      not by A's luminance-extreme oracle: a panel is full of controls, and
+#      both probe backgrounds turn up a pure black/white pixel somewhere that
+#      clears any floor by itself, so the extreme would pass without ever
+#      touching our text.
+#
 # WHAT THIS SCRIPT DOES NOT CLAIM. T305's validation text asks for the
 # ACTIVE-TAB INDICATOR to track the accent. There is no such pixel: the tab
 # strip paints no accent at all - a tab's fill comes from `tab_shape.fillColor`
@@ -117,97 +131,13 @@ function Kill-RepoInstances {
 }
 
 # ---------------------------------------------------------------------------
-# The oracle's own color math, mirroring src/apprt/win32/color_math.zig and
-# chrome_theme.zig. DERIVED, never pasted: `Wash` is the app's rule, so a
-# change to the wash direction or to `bar_wash` moves this script with it.
+# The oracle's own color math lives in lib/ColorMath.ps1 (T308) - DERIVED,
+# never pasted, so a change to a wash amount moves the app and every oracle
+# together (the T257 rule). It moved out of this file when activity-monitor.ps1
+# needed the same derivations for the panel surfaces.
 # ---------------------------------------------------------------------------
 
-$BAR_WASH = 0.08          # chrome_theme.bar_wash
-$TEXT_FLOOR = 4.5         # WCAG 1.4.3, the design system's text floor
-
-# chrome_theme.debugChromeBase (T43): a Debug/ReleaseSafe build drags the
-# chrome background toward warning amber before anything is derived from it, so
-# the window is unmistakably not the installed release. Mirrored here because
-# this script measures the band a DEBUG build paints - an oracle that expected
-# the release band would fail on every run and be "fixed" by deleting the
-# marker.
-$DEBUG_TINT = @(0xFF, 0xB0, 0x00)           # chrome_theme.debug_tint
-$DEBUG_TINT_FALLBACK = @(0x7B, 0x2F, 0xF7)  # chrome_theme.debug_tint_fallback
-$DEBUG_TINT_AMOUNT = 0.35                   # chrome_theme.debug_tint_amount
-$DEBUG_MIN_DELTA = 48                       # chrome_theme.debug_min_delta
-
-function Get-Lum601([int]$r, [int]$g, [int]$b) {
-    return (0.299 * $r + 0.587 * $g + 0.114 * $b) / 255.0
-}
-
-function Test-IsLight([int]$r, [int]$g, [int]$b) {
-    return (Get-Lum601 $r $g $b) -gt 0.5
-}
-
-# color_math.wash: composite toward the background's own contrasting side.
-function Get-Wash([int[]]$Rgb, [double]$A) {
-    $toward = if (Test-IsLight $Rgb[0] $Rgb[1] $Rgb[2]) { 0.0 } else { 255.0 }
-    $out = @()
-    foreach ($c in $Rgb) {
-        $v = [double]$c
-        $w = [Math]::Round($v + ($toward - $v) * $A, [MidpointRounding]::AwayFromZero)
-        $out += [int][Math]::Max(0, [Math]::Min(255, $w))
-    }
-    return , $out
-}
-
-# color_math.mix: composite $Fg over $Bg at $A, resolved to an opaque color.
-function Get-Mix([int[]]$Bg, [int[]]$Fg, [double]$A) {
-    $out = @()
-    for ($i = 0; $i -lt 3; $i++) {
-        $v = [double]$Bg[$i] * (1.0 - $A) + [double]$Fg[$i] * $A
-        $out += [int][Math]::Max(0, [Math]::Min(255, [Math]::Round($v, [MidpointRounding]::AwayFromZero)))
-    }
-    return , $out
-}
-
-function Get-ChannelDistance([int[]]$A, [int[]]$B) {
-    return [Math]::Abs($A[0] - $B[0]) + [Math]::Abs($A[1] - $B[1]) + [Math]::Abs($A[2] - $B[2])
-}
-
-# chrome_theme.debugChromeBase.
-function Get-DebugChromeBase([int[]]$Base) {
-    $amber = Get-Mix $Base $DEBUG_TINT $DEBUG_TINT_AMOUNT
-    if ((Get-ChannelDistance $amber $Base) -ge $DEBUG_MIN_DELTA) { return , $amber }
-    return , (Get-Mix $Base $DEBUG_TINT_FALLBACK $DEBUG_TINT_AMOUNT)
-}
-
-# Does the exe under test mark itself (T43)? Read off `+version`'s own "build
-# mode" line rather than assumed from the path: T350 is the standing hazard of
-# a non-Debug zig-out silently aiming a script at a build it was not written
-# for, and here the EXPECTED PIXEL differs between the two.
-function Test-ExeIsDebugBuild([string]$Path) {
-    $out = (& $Path +version 2>&1 | Out-String)
-    # Zig prints the enum with its leading dot (`build mode    : .Debug`).
-    if ($out -notmatch 'build mode\s*:\s*\.?(\w+)') {
-        throw "chrome-theme: could not read the build mode out of '$Path +version'"
-    }
-    return @('Debug', 'ReleaseSafe') -contains $Matches[1]
-}
-
-function Get-WcagChannel([int]$c) {
-    $s = $c / 255.0
-    if ($s -le 0.03928) { return $s / 12.92 }
-    return [Math]::Pow(($s + 0.055) / 1.055, 2.4)
-}
-
-function Get-WcagLum([int]$r, [int]$g, [int]$b) {
-    return 0.2126 * (Get-WcagChannel $r) + 0.7152 * (Get-WcagChannel $g) + 0.0722 * (Get-WcagChannel $b)
-}
-
-function Get-Contrast([int[]]$A, [int[]]$B) {
-    $la = Get-WcagLum $A[0] $A[1] $A[2]
-    $lb = Get-WcagLum $B[0] $B[1] $B[2]
-    $hi = [Math]::Max($la, $lb); $lo = [Math]::Min($la, $lb)
-    return ($hi + 0.05) / ($lo + 0.05)
-}
-
-function Format-Rgb([int[]]$Rgb) { return ('#{0:x2}{1:x2}{2:x2}' -f $Rgb[0], $Rgb[1], $Rgb[2]) }
+. (Join-Path $PSScriptRoot 'lib\ColorMath.ps1')
 
 # ---------------------------------------------------------------------------
 # Capture helpers
@@ -217,12 +147,19 @@ function Format-Rgb([int[]]$Rgb) { return ('#{0:x2}{1:x2}{2:x2}' -f $Rgb[0], $Rg
 # most pixels are, i.e. the band fill by construction - the title and the
 # button glyphs are a small minority of a caption band) and the two luminance
 # extremes with their colors.
-function Measure-Box($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
+#
+# `-Step` samples every Nth pixel in both axes. A caption band is small enough
+# to walk whole; a PANEL is ~900x700, and 630k `GetPixel` calls through
+# PowerShell is minutes per capture. Sampling cannot change which color is the
+# MODE (the fill is most of the box by construction) and still lands on plenty
+# of glyph pixels for the extremes, because text strokes are not one pixel wide
+# at these sizes.
+function Measure-Box($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$Step = 1) {
     $hist = @{}
     $minL = 2.0; $maxL = -1.0
     $minC = $null; $maxC = $null
-    for ($y = $Y0; $y -lt $Y1; $y++) {
-        for ($x = $X0; $x -lt $X1; $x++) {
+    for ($y = $Y0; $y -lt $Y1; $y += $Step) {
+        for ($x = $X0; $x -lt $X1; $x += $Step) {
             $c = Get-TestPixel -Shot $Shot -X $x -Y $y
             if ($null -eq $c) { continue }
             $key = '{0},{1},{2}' -f $c.R, $c.G, $c.B
@@ -558,6 +495,103 @@ try {
     } finally { Close-TestWindowPixels -Shot $shot }
 
     Assert (-not ($script:app.Process -and $script:app.Process.HasExited)) 'B the app survived every accent change'
+
+    # =======================================================================
+    # D. The PANELS follow the same surface (T308)
+    # =======================================================================
+    #
+    # A. proves the caption band tracks the chrome background. The panels did
+    # NOT: the Activity Monitor held ~30 `RGB(...)` constants and the chooser
+    # four more, all picked against `RGB(32,32,32)`, so on a light theme a panel
+    # opened dark with fixed light text on it. This scores the fix on the one
+    # surface that cannot lie about it - the panel's own fill.
+    #
+    # The oracle is EXACT, not directional: a panel paints from
+    # `chrome_theme.chromeBase`, and under the default `window-theme = auto`
+    # that IS `--background`. So the panel's mode pixel must equal the
+    # background exactly. That single assertion carries three claims at once -
+    # the panel follows the theme, it does not wash the way the chrome band
+    # does (a panel abuts nothing), and it is NOT debug-tinted (T43's marker is
+    # the chrome band; this script has the marker ON, so an amber panel would
+    # fail here).
+    #
+    # Then the text floor, scored like A's: the luminance extreme AWAY from the
+    # fill, which ClearType fringing can only push further from the fill and so
+    # cannot fake a pass.
+    Kill-RepoInstances
+    foreach ($case in @(
+            @{ Name = 'light'; Bg = @(0xF3, 0xF3, 0xF3) },
+            @{ Name = 'dark'; Bg = @(0x1E, 0x1E, 0x1E) })) {
+
+        $bg = $case.Bg
+        $hex = Format-Rgb $bg
+        $g = Start-Gui @("--background=$hex")
+        if (-not $g) { Write-Host "SETUP FAIL: GUI did not come up on $hex for section D"; exit 1 }
+        try {
+            foreach ($panel in @(
+                    @{ Label = 'activity'; Filter = 'ACTIVITY MONITOR'; Class = 'GhozttyActivityMonitor' },
+                    @{ Label = 'chooser'; Filter = 'NEW REMOTE WINDOW'; Class = 'GhozttyMachineChooser' })) {
+
+                if (-not (Invoke-Palette $g.Top $g.Pane $panel.Filter)) {
+                    Assert $false "D/$($case.Name)/$($panel.Label) the command palette accepted the opener"
+                    continue
+                }
+                $h = Wait-TestWindow -ProcessId $g.Pid -Class $panel.Class -TimeoutMs 8000
+                Assert ($h -ne [IntPtr]::Zero) "D/$($case.Name)/$($panel.Label) the panel opened"
+                if ($h -eq [IntPtr]::Zero) { continue }
+
+                $shot = Get-TestWindowPixels -Window $h
+                try {
+                    # The panel BODY: below the caption the frame draws (which
+                    # is DWM's, not ours) and inside the border, so neither can
+                    # contribute a pixel to the fill or to the extremes.
+                    $x0 = $shot.Left + 8
+                    $x1 = $shot.Left + $shot.Width - 8
+                    $y0 = $shot.Top + [int]($shot.Height * 0.30)
+                    $y1 = $shot.Top + $shot.Height - 8
+                    $body = Measure-Box $shot $x0 $y0 $x1 $y1 3
+                    Assert ($null -ne $body) "D/$($case.Name)/$($panel.Label) the panel body captured"
+                    if ($null -eq $body) { continue }
+
+                    Assert ($body.Distinct -ge 8) `
+                        "D/$($case.Name)/$($panel.Label) the capture holds real content ($($body.Distinct) distinct colors)"
+
+                    Assert ($body.Mode[0] -eq $bg[0] -and $body.Mode[1] -eq $bg[1] -and $body.Mode[2] -eq $bg[2]) `
+                        ("D/$($case.Name)/$($panel.Label) panel surface IS chromeBase = $hex (measured $(Format-Rgb $body.Mode))")
+
+                    # The text ramp, EXACTLY, not the capture's luminance
+                    # extreme. The extreme is useless here: a panel is full of
+                    # controls, and both probe backgrounds turn up a pure
+                    # #000000 / #ffffff pixel somewhere (a control border, a
+                    # ClearType overshoot) that clears any floor on its own -
+                    # so the assertion passed without ever looking at our text.
+                    #
+                    # `chrome_theme.textOn` is `wash(surface, text_wash)`
+                    # clamped to 4.5:1, and on both of these surfaces the wash
+                    # already clears it, so the expected pixel is the wash -
+                    # derived here, never pasted (the T257 rule). If a future
+                    # change made the clamp bite, this fails loudly rather than
+                    # silently measuring nothing.
+                    $wantText = Get-PanelText $bg
+                    Assert (Test-ShotHasColor $shot $wantText) `
+                        "D/$($case.Name)/$($panel.Label) panel paints its derived primary text $(Format-Rgb $wantText)"
+                    $ratio = Get-Contrast $wantText $body.Mode
+                    Assert ($ratio -ge $TEXT_FLOOR) `
+                        ("D/$($case.Name)/$($panel.Label) that text clears $TEXT_FLOOR" + ':1 on the measured surface (' +
+                         ('{0:n2}' -f $ratio) + ':1)')
+                } finally {
+                    Close-TestWindowPixels -Shot $shot
+                }
+
+                # Escape closes both panels (each puts focus in its own EDIT).
+                $edit = Find-TestWindowEx -Parent $h -Class 'EDIT'
+                if ($edit -ne [IntPtr]::Zero) { Send-TestControlKey -Control $edit -Key Escape | Out-Null }
+                Start-Sleep -Milliseconds 700
+            }
+        } finally {
+            Kill-RepoInstances
+        }
+    }
 } finally {
     if ($dirJob) { Stop-Job $dirJob -ErrorAction SilentlyContinue; Remove-Job $dirJob -Force -ErrorAction SilentlyContinue }
     Restore-Accent $origAccent
