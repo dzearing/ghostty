@@ -2273,10 +2273,12 @@ fn heroSnapTick(self: *Window) void {
     const geo = HeroCarousel.geometry(self) orelse return;
     var it = self.tab_trees[self.active_tab].iterator();
     while (it.next()) |entry| {
-        // Hero snapshots come from a renderer thread, so viewer panes have
-        // none (T90a S15: viewers are excluded from hero mode).
-        const surface = entry.view.surface() orelse continue;
-        surface.heroSnapRequest(
+        // Every leaf kind, terminal and viewer alike (T397). Both requests
+        // self-throttle: a terminal's is one atomic store the renderer picks
+        // up on its next frame, and a viewer's is dropped outright unless its
+        // content or tile size actually moved (a WebView2 capture is a
+        // full-size PNG round trip, not a bitmap handoff).
+        entry.view.heroSnapRequest(
             @intCast(@max(geo.layout.thumb_w, 1)),
             @intCast(@max(geo.layout.thumb_h, 1)),
         );
@@ -2294,8 +2296,7 @@ fn heroOnSnapReady(self: *Window, leaf_hwnd_int: usize) void {
     while (it.next()) |entry| : (index += 1) {
         const h = entry.view.hwnd() orelse continue;
         if (@intFromPtr(h) != leaf_hwnd_int) continue;
-        const surface = entry.view.surface() orelse continue;
-        if (surface.heroSnapPublish()) {
+        if (entry.view.heroSnapPublish()) {
             if (self.hwnd) |wh| {
                 if (HeroCarousel.tileRect(self, index)) |r| {
                     var inv: w32.RECT = .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };

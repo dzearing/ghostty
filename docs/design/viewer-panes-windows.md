@@ -51,7 +51,7 @@ wiring, not a reimplementation.
 | 12 | `+reload` verb | `reloadContent` | server verb + CDP reload | yes |
 | 13 | Blank browser pane (`about:blank`) + palette entry | `ViewerCommands.openBrowserFromPalette` | palette + address focus | yes |
 | 14 | Dark mode follows window | `underPageBackgroundColor`, profile scheme | `ICoreWebView2_13` profile | yes |
-| 15 | Titles, hero exclusion, dim walk, split-from-viewer cwd | `ViewerSplitLeaf.swift`, `title` | Zig walks | yes |
+| 15 | Titles, hero PARTICIPATION, dim walk, split-from-viewer cwd | `ViewerSplitLeaf.swift`, `title`, `HeroCarouselView.takeSnapshot` | Zig walks; `CapturePreview` → GDI+ (T397) | yes |
 | 16 | Session-persistence restore (location, home, origin) | `Codable` on `ViewerView` | manifest fields | yes |
 | 17 | Selection toolbar: Copy | `selection.js` (shared) | injection + shim (see P1/P2) | yes, Copy only |
 | 18 | Selection toolbar: Quote | `selection.js` + composer | needs the composer | no (#20) |
@@ -352,6 +352,15 @@ Unchanged in intent; stated here so the boundaries are explicit.
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add
   the blank-browser palette entry (P11).
+  **Hero "exclusion" is obsolete (T397, 2026-08-07):** Mac changed its answer
+  to "every pane participates: terminals and viewers alike", so win32 does
+  too. A viewer's tile picture comes from `ICoreWebView2::CapturePreview`
+  (an encoded PNG into an `IStream`) decoded by the GDI+ flat API in
+  `gdiplus_decode.zig`, where Mac's `WKWebView.takeSnapshot` hands back a
+  bitmap directly — which is why the viewer refresh floor is 2s and the
+  terminal's is 150ms (decision D25). The capture works on a leaf whose host
+  window is `SW_HIDE`n, because hero mode keeps the controller's `IsVisible`
+  true so every leaf keeps producing frames for its thumbnail.
 - **T90h** Session-persistence restore + E2E hardening. Unchanged, with P12's
   four fields instead of two.
 

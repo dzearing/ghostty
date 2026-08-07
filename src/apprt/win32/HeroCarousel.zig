@@ -2,15 +2,18 @@
 //! pass, T59b interactions/motion).
 //!
 //! The carousel lives in the parent Window's client area — there are NO
-//! child HWNDs per tile. Tiles show snapshot DIBs captured by each pane's
-//! renderer thread (Surface.heroSnap*). This module is geometry + GDI
-//! painting + hit-testing only; all state lives on Window (per-tab hero
-//! arrays + transient hover/drag/animation) and Surface (DIB cache).
+//! child HWNDs per tile. Tiles show snapshot DIBs, which EVERY leaf kind
+//! produces (T397): a terminal from its renderer thread's GL readback
+//! (`Surface.heroSnap*`), a viewer from `ICoreWebView2::CapturePreview`
+//! (`ViewerPane.heroSnap*`). The carousel asks `PaneView.heroSnapshot()` and
+//! never branches on kind. This module is geometry + GDI painting +
+//! hit-testing only; all state lives on Window (per-tab hero arrays +
+//! transient hover/drag/animation) and on the leaf (DIB cache).
 //! Pure math is in hero_math.zig.
 const std = @import("std");
 
 const Window = @import("Window.zig");
-const Surface = @import("Surface.zig");
+const PaneView = @import("PaneView.zig");
 const w32 = @import("win32.zig");
 const hero_math = @import("hero_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -201,10 +204,13 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         };
         const hovered = win.hero_hover_tile >= 0 and
             @as(usize, @intCast(win.hero_hover_tile)) == i;
-        // Hero tiles are renderer snapshots, so only terminal panes have
-        // one to paint (T90a S15: viewers are excluded from hero mode).
-        const surface = entry.view.surface() orelse continue;
-        paintTile(win, mem_dc, surface, local, i == geo.selected, hovered);
+        // EVERY leaf gets a tile (T397). This used to narrow through
+        // `surface()`, so a viewer leaf — still counted by `geometry()`, still
+        // selectable — painted nothing at all and left a hole in the strip.
+        // A leaf that has not produced a thumbnail yet paints its placeholder
+        // and border, which is the same state a terminal is in for the first
+        // frames of its life.
+        paintTile(win, mem_dc, entry.view.heroSnapshot(), local, i == geo.selected, hovered);
     }
 
     _ = w32.BitBlt(hdc_screen, region.left, region.top, rw, rh, mem_dc, 0, 0, w32.SRCCOPY);
@@ -217,7 +223,7 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
 fn paintTile(
     win: *Window,
     dc: w32.HDC,
-    surface: *Surface,
+    snap: ?PaneView.HeroSnapshot,
     rect: w32.RECT,
     selected: bool,
     hovered: bool,
@@ -242,10 +248,10 @@ fn paintTile(
     // Snapshot, dimmed unless selected (Mac alpha 1.0 selected / 0.6
     // hovered / 0.35 normal). AlphaBlend also stretches on transient
     // size mismatches right after a resize.
-    if (surface.snap_dib) |dib| blit: {
+    if (snap) |s| blit: {
         const src_dc = w32.CreateCompatibleDC(dc) orelse break :blit;
         defer _ = w32.DeleteDC(src_dc);
-        const old = w32.SelectObject(src_dc, dib);
+        const old = w32.SelectObject(src_dc, s.dib);
         defer _ = w32.SelectObject(src_dc, old);
         const bf: w32.BLENDFUNCTION = .{
             .SourceConstantAlpha = if (selected) 255 else if (hovered) 153 else 89,
@@ -262,8 +268,8 @@ fn paintTile(
             src_dc,
             0,
             0,
-            surface.snap_dib_w,
-            surface.snap_dib_h,
+            s.w,
+            s.h,
             bf,
         );
     }
@@ -366,12 +372,10 @@ fn paintSlideSnap(
 ) void {
     if (y >= h or y + h <= 0) return;
     const pane = win.leafAt(tab, index) orelse return;
-    const view = pane.surface() orelse return;
-    const dib = view.snap_dib orelse return;
-    if (view.snap_dib_w <= 0 or view.snap_dib_h <= 0) return;
+    const snap = pane.heroSnapshot() orelse return;
     const src_dc = w32.CreateCompatibleDC(dc) orelse return;
     defer _ = w32.DeleteDC(src_dc);
-    const old = w32.SelectObject(src_dc, dib);
+    const old = w32.SelectObject(src_dc, snap.dib);
     defer _ = w32.SelectObject(src_dc, old);
     _ = w32.StretchBlt(
         dc,
@@ -382,8 +386,8 @@ fn paintSlideSnap(
         src_dc,
         0,
         0,
-        view.snap_dib_w,
-        view.snap_dib_h,
+        snap.w,
+        snap.h,
         w32.SRCCOPY,
     );
 }

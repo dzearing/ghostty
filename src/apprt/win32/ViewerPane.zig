@@ -66,6 +66,7 @@ const viewer_nav = @import("viewer_nav.zig");
 const nav_layout = @import("viewer_nav_layout.zig");
 const toc_layout = @import("viewer_toc_layout.zig");
 const viewer_prefs = @import("viewer_prefs.zig");
+const gdiplus_decode = @import("gdiplus_decode.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
@@ -261,6 +262,40 @@ title_handler: ?*DocumentTitleChangedHandler = null,
 /// Our reference on the `AcceleratorKeyPressed` handler (T394), same rule.
 accel_handler: ?*AcceleratorKeyPressedHandler = null,
 
+// --- Hero-mode thumbnail (T397) -------------------------------------------
+// A viewer is a full citizen of the hero carousel, so it owes the carousel a
+// tile picture the same way a terminal does. The mechanism is the only part
+// that differs: a terminal's renderer thread reads its own GL back buffer
+// every 150ms, where a viewer has to ask `CapturePreview` for an encoded PNG
+// of the whole page and decode it. See `heroSnapRequest` for what that costs
+// and why the cadence is not the terminal's.
+
+/// The last decoded thumbnail, sized to the tile. Owned; `DeleteObject`ed by
+/// `deinit` and by each replacement.
+snap_dib: ?w32.HANDLE = null,
+snap_dib_w: i32 = 0,
+snap_dib_h: i32 = 0,
+
+/// A capture is outstanding: the runtime owes us exactly one completion, and
+/// starting a second would race two decodes onto the same fields. Mac's
+/// `HeroCarouselView` guards its `takeSnapshot` the same way.
+snap_in_flight: bool = false,
+
+/// The stream the in-flight capture is writing into. Owned by the pane, not
+/// by the handler, so a pane that dies mid-capture still releases it.
+snap_stream: ?*iface.IStream = null,
+
+/// Tile size the last capture was scaled for, and the moment one was last
+/// ASKED for (see `heroSnapRequest` for why the attempt, not the success, is
+/// what the refresh floor is measured from).
+snap_w: i32 = 0,
+snap_h: i32 = 0,
+snap_asked_ms: i64 = 0,
+
+/// A newly decoded thumbnail is in `snap_dib` and the tile has not repainted
+/// yet — the viewer's half of `Surface.snap_seq != snap_dib_seq`.
+snap_dirty: bool = false,
+
 /// Back-pointer to the split-tree leaf that owns this pane, set by
 /// `PaneView.createViewer`. It is `Surface.pane_view`'s twin and exists for the
 /// same reason: a title change has to name a LEAF to the window, and the pane
@@ -407,6 +442,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     // host window, and `stop` joins it. Every teardown below — the host window,
     // `file_path` — is something that thread's message would arrive at.
     self.watcher.stop();
+    // The hero thumbnail's stream and DIB, before the token below goes dead:
+    // an in-flight capture's completion handler reads them THROUGH the token,
+    // so clearing them first is what makes the null-pane check sufficient.
+    self.deinitHeroSnap();
     // Drop out of any in-flight callback FIRST: a controller that completes
     // after this point must find a dead token, not a half-freed pane. The
     // token itself outlives this call — every handler that borrowed it holds a
@@ -1838,6 +1877,155 @@ fn pushRasterizationScale(self: *ViewerPane) void {
     const c3 = c.queryV3() orelse return;
     defer c3.release();
     _ = c3.setRasterizationScale(self.scale);
+}
+
+// -------------------------------------------------------------------------
+// Hero-mode thumbnails (T397)
+// -------------------------------------------------------------------------
+
+/// `ICoreWebView2CapturePreviewCompletedHandler`. One-shot, created per
+/// capture; the `Pending` token is what makes it safe for a pane to be closed
+/// while the browser process is still encoding.
+const CapturePreviewHandler = com.CallbackOwning(
+    iface.IID_CapturePreviewCompletedHandler,
+    onCapturePreviewCompleted,
+    releasePendingToken,
+);
+
+/// How long a viewer thumbnail is allowed to be stale before the heartbeat
+/// takes another (T397).
+///
+/// The terminal cadence — every 150ms, Mac's number — is wrong here and the
+/// reason is the transport, not taste. A terminal snapshot is a GL readback
+/// into a buffer the renderer thread already owns; a viewer snapshot is a
+/// full-page PNG *encoded* by the browser process and *decoded* by GDI+ on our
+/// GUI thread, so running it at 150ms would spend a chunk of every frame on a
+/// picture of a document that has not moved. Two seconds keeps a thumbnail
+/// that visibly tracks the page for well under 1% of the GUI thread. A size
+/// change or a fresh capture request jumps the queue regardless.
+const snap_min_interval_ms: i64 = 2000;
+
+/// Ask the browser for a thumbnail at `w`x`h` device pixels, if one is due.
+///
+/// Called from the carousel's 150ms heartbeat like a terminal's, and drops
+/// most of those calls on the floor: nothing to capture into without a
+/// controller, nothing to gain while one is already in flight, and nothing to
+/// see when the last one was asked for recently AND at this same size.
+pub fn heroSnapRequest(self: *ViewerPane, w: u32, h: u32) void {
+    if (w == 0 or h == 0) return;
+    if (self.snap_in_flight) return;
+    const want_w: i32 = @intCast(@min(w, @as(u32, std.math.maxInt(i32))));
+    const want_h: i32 = @intCast(@min(h, @as(u32, std.math.maxInt(i32))));
+
+    const now = std.time.milliTimestamp();
+    const resized = want_w != self.snap_w or want_h != self.snap_h;
+    if (!resized) {
+        const age = now - self.snap_asked_ms;
+        if (age >= 0 and age < snap_min_interval_ms) return;
+    }
+    self.snap_w = want_w;
+    self.snap_h = want_h;
+    // Stamped on the ATTEMPT, not on success. A capture that keeps failing —
+    // a runtime too old for the slot, a view with no frame yet — would
+    // otherwise miss the floor entirely (there is no thumbnail, so nothing
+    // says "recent") and re-ask on all seven ticks a second, forever.
+    self.snap_asked_ms = now;
+
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    // The stream outlives this call — the runtime writes into it on its own
+    // schedule — so it hangs off the pane, which is the thing whose lifetime
+    // the completion handler already has to survive.
+    self.releaseSnapStream();
+    var stream_ptr: ?*anyopaque = null;
+    if (com.failed(w32.CreateStreamOnHGlobal(null, 1, &stream_ptr))) return;
+    const stream: *iface.IStream = @ptrCast(@alignCast(stream_ptr orelse return));
+    self.snap_stream = stream;
+
+    const handler = CapturePreviewHandler.create(p.alloc, p) catch {
+        self.releaseSnapStream();
+        return;
+    };
+    p.refs += 1;
+    // Ours; the runtime takes its own. Releasing here frees it outright when
+    // the call below fails before AddRef-ing, which is the point.
+    defer handler.release();
+
+    if (!web.capturePreview(.png, stream, @ptrCast(handler))) {
+        log.warn("CapturePreview failed to start; viewer tile keeps its placeholder", .{});
+        self.releaseSnapStream();
+        // NOT `p.release()` here: the deferred `handler.release()` above frees
+        // the handler outright (the call failed before any AddRef), and
+        // `CallbackOwning`'s zero-hook gives the token reference back as it
+        // goes. Releasing here too would decrement it twice.
+        return;
+    }
+    self.snap_in_flight = true;
+}
+
+fn onCapturePreviewCompleted(p: *Pending, result: com.HRESULT) com.HRESULT {
+    const self = p.pane orelse return com.S_OK;
+    self.snap_in_flight = false;
+    defer self.releaseSnapStream();
+
+    if (com.failed(result)) {
+        log.warn(
+            "CapturePreview hr=0x{X:0>8}; viewer tile keeps its previous picture",
+            .{@as(u32, @bitCast(result))},
+        );
+        return com.S_OK;
+    }
+    const stream = self.snap_stream orelse return com.S_OK;
+    // The runtime leaves the seek pointer at the END, exactly as `respond`
+    // documents for the resource-response stream. A decoder handed that reads
+    // zero bytes and reports a corrupt image.
+    if (!stream.rewind()) return com.S_OK;
+
+    const thumb = gdiplus_decode.decodeScaled(@ptrCast(stream), self.snap_w, self.snap_h) orelse
+        return com.S_OK;
+    if (self.snap_dib) |old| _ = w32.DeleteObject(old);
+    self.snap_dib = thumb.dib;
+    self.snap_dib_w = thumb.w;
+    self.snap_dib_h = thumb.h;
+    self.snap_dirty = true;
+    log.debug("hero snap committed hwnd={?} kind=viewer {}x{}", .{ self.hwnd, thumb.w, thumb.h });
+
+    // Same wake-up the renderer thread posts, so one path on the Window side
+    // publishes and invalidates whichever kind of leaf produced the picture.
+    if (self.hwnd) |h| _ = w32.PostMessageW(
+        self.parent_window.hwnd orelse return com.S_OK,
+        Window.WM_APP_HERO_SNAP,
+        @intFromPtr(h),
+        0,
+    );
+    return com.S_OK;
+}
+
+/// GUI thread, on `WM_APP_HERO_SNAP`: true when a newly decoded thumbnail is
+/// waiting to be painted. The decode already happened on this thread, so
+/// unlike a terminal's there is nothing left to copy — only the edge to report.
+pub fn heroSnapPublish(self: *ViewerPane) bool {
+    if (!self.snap_dirty) return false;
+    self.snap_dirty = false;
+    return true;
+}
+
+fn releaseSnapStream(self: *ViewerPane) void {
+    if (self.snap_stream) |s| s.release();
+    self.snap_stream = null;
+}
+
+/// Drop this pane's thumbnail state. Called from `deinit`, and the reason the
+/// stream is owned by the pane rather than by the in-flight handler.
+fn deinitHeroSnap(self: *ViewerPane) void {
+    self.releaseSnapStream();
+    if (self.snap_dib) |dib| _ = w32.DeleteObject(dib);
+    self.snap_dib = null;
+    self.snap_dib_w = 0;
+    self.snap_dib_h = 0;
 }
 
 /// Match the controller's bounds to the host window's client area. Bounds are

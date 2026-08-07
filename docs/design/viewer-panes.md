@@ -272,8 +272,18 @@ padding, narrow collapse + re-widen, single-heading/code cases, detach).
 Known gaps (accepted): the TOC is markdown-only (a code viewer has no heading
 structure); panel open state is deliberately ephemeral across restore.
 
+**Hero mode: every pane participates.** This once read "hero mode skips
+viewers" on both platforms. Mac changed its answer — `HeroModeView.swift`'s
+leaf list is the full one and `HeroCarouselView` snapshots a viewer with
+`WKWebView.takeSnapshot` — and win32 followed in T397, capturing through
+`ICoreWebView2::CapturePreview` and decoding the PNG with GDI+. The one
+behavioral difference is the refresh floor, and it is a property of the
+transport rather than a choice about the feature: Mac's call hands back a
+bitmap and refreshes at 0.15s, where the Windows one round-trips an encoded
+image and refreshes at most every 2s (decision D25).
+
 Known v1 gaps (accepted): goto_split keybinds don't originate FROM a
-focused viewer pane (nav INTO viewers works); hero mode skips viewers;
+focused viewer pane (nav INTO viewers works);
 activity state/banners unsupported on viewers (clean error); web page
 titles don't retitle viewer-only windows (pinned at open); backgrounded
 apps blank their WKWebViews to volatile layers until reactivated (WebKit

@@ -10315,3 +10315,48 @@ document.title -> leaf title (zoom oracle: 1.25 -> 1.375 -> 1.25 ->
 focus without splitting. Answered P7's open question: plain ctrl+l DOES
 reach add_AcceleratorKeyPressed. Floor lanes + P1-P3 green; the script's
 single FAIL is the pre-existing, already-filed T540.
+
+## 2026-08-07 - T397 done: viewer panes get a real hero-carousel tile (session 90fc0b4c)
+
+Hero mode's preview strip no longer has a hole in it. A viewer pane always
+occupied a tile slot and was always selectable, but the paint loop narrowed
+through `PaneView.surface()` and skipped anything that was not a terminal,
+so the slot drew literally nothing - neither participation nor exclusion.
+Mac had already settled that question the other way ("every pane
+participates: terminals and viewers alike"), so win32 participates too:
+`PaneView.heroSnapshot()`/`heroSnapRequest()`/`heroSnapPublish()` are
+kind-generic, and `HeroCarousel` and `Window`'s snapshot heartbeat ask the
+leaf rather than branching on what it is. A leaf with no picture yet paints
+its placeholder and border, which is the state every terminal is in for its
+first frames.
+
+The picture is real, not a placeholder. `ICoreWebView2::CapturePreview`
+(vtable slot 30, named and offset-asserted where a filler used to hold
+`Reload` in place) encodes the page into a `CreateStreamOnHGlobal` stream,
+and a new `gdiplus_decode.zig` decodes it with the GDI+ flat API and
+HALFTONE-shrinks it into a tile-sized DIB. It works on a leaf whose host
+window is `SW_HIDE`n, which was the open empirical question: hero mode keeps
+every controller's `IsVisible` true so hidden leaves keep producing frames.
+`com.Callback` grew one-parameter `Invoke` support for the completion
+handler - the arity is read off the implementation, so the two-parameter
+handlers are provably unpadded. Refresh floor is 2s, not the terminal's
+150ms, because Mac's `takeSnapshot` hands back a bitmap where this
+round-trips an encoded image through the UI thread; the floor is stamped on
+the ATTEMPT so a failing capture backs off instead of re-asking seven times
+a second (decision D25 carries the tradeoff to the user).
+
+On-box proof: `test/win32/hero-viewer-tile.ps1` (new, 18 checks, ALL PASS) -
+a terminal plus a markdown viewer in hero mode, tile rects mirrored from
+`hero_math`, asserting a border stroke on both tiles (the hole oracle: the
+band backdrop is 11,11,14 and the placeholder 16,16,16, so any ring pixel
+above 60 means `paintTile` ran), 4+ distinct colors inside the viewer tile
+(it measured 131 against the empty band's 1), a `kind=viewer` snapshot commit
+in the debug log, and arrow navigation landing the viewer on the hero rect.
+`-NegativeControl` fails exactly the inverted claim. Pure half in
+`hero_math`: every counted leaf gets a distinct, equal-sized, gap-separated,
+hit-testable slot for every count and selection, at 1.0/1.25/1.5/2.0. Floor
+lanes and P1-P3 green; `hero-mode.ps1` still ALL PASS (63). Filed T560 - the
+strip's leaf order is the split tree's node-ARRAY order while `+list --json`
+walks it structurally, so a `--direction=down` split's preview lands on the
+wrong side of the selection; the new script is written selection-relative so
+it does not depend on which order wins.

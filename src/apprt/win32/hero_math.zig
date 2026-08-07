@@ -293,6 +293,65 @@ test "easeInOutCubic endpoints, midpoint, monotonic" {
     }
 }
 
+test "every counted leaf gets a slot the strip can address (T397)" {
+    // The participation rule, in the layer that can state it purely. Hero mode
+    // counts EVERY leaf — terminals and viewers alike, which is where Mac
+    // landed and what T397 made the win32 paint loop agree with — so for any
+    // leaf count there must be `count` distinct, identically sized, ordered
+    // slots and no index the geometry declines to place. The pre-T397 bug was
+    // exactly the disagreement: `geometry()` counted a slot that `paint()`
+    // then skipped, so the strip had a hole in it.
+    //
+    // At all four scales, because that is where the win32 chrome bugs live: a
+    // gap or a size that only rounds wrong at 1.25 is invisible at 1.0.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const content: Rect = .{ .left = 0, .top = 32, .right = 1400, .bottom = 900 };
+        const split = splitRects(content, RATIO_DEFAULT, scale);
+        const hero_ar: f32 = @as(f32, @floatFromInt(split.hero.width())) /
+            @as(f32, @floatFromInt(split.hero.height()));
+        const layout = tileLayout(split.carousel, hero_ar, scale);
+
+        var count: usize = 1;
+        while (count <= 6) : (count += 1) {
+            var selected: usize = 0;
+            while (selected < count) : (selected += 1) {
+                const top0 = stripTop(split.carousel, layout, selected, 0);
+                var prev: ?Rect = null;
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    const r = tileRect(split.carousel, layout, top0, i);
+                    // A slot is real: non-empty, and the same size as its
+                    // neighbours (Mac keeps every strip slot hero-sized so a
+                    // selection swap needs no reflow).
+                    try std.testing.expectEqual(layout.thumb_w, r.width());
+                    try std.testing.expectEqual(layout.thumb_h, r.height());
+                    if (prev) |p| {
+                        // Ordered, disjoint, and separated by exactly the gap.
+                        try std.testing.expectEqual(p.bottom + layout.gap, r.top);
+                        try std.testing.expectEqual(p.left, r.left);
+                    }
+                    // And addressable: its own center hit-tests back to it,
+                    // which is what makes the slot selectable rather than
+                    // merely drawn.
+                    const cx = r.left + @divTrunc(r.width(), 2);
+                    const cy = r.top + @divTrunc(r.height(), 2);
+                    if (split.carousel.contains(cx, cy)) {
+                        try std.testing.expectEqual(
+                            @as(?usize, i),
+                            hitTest(split.carousel, layout, top0, count, cx, cy),
+                        );
+                    }
+                    prev = r;
+                }
+                // The selected slot is the centered one, whichever index it is.
+                const sel = tileRect(split.carousel, layout, top0, selected);
+                const mid = split.carousel.top + @divTrunc(split.carousel.height(), 2);
+                try std.testing.expectEqual(mid, sel.top + @divTrunc(layout.thumb_h, 2));
+            }
+        }
+    }
+}
+
 test "hitTest finds tiles and rejects gaps/outside" {
     const carousel: Rect = .{ .left = 750, .top = 0, .right = 1000, .bottom = 800 };
     const l: TileLayout = .{ .thumb_w = 220, .thumb_h = 110, .gap = 8 };

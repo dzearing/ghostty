@@ -84,11 +84,13 @@ pub fn guidEql(a: *const GUID, b: *const GUID) bool {
 /// }
 /// ```
 ///
-/// **Two `Invoke` parameters, always.** Every WebView2 handler interface has
-/// exactly two — `(HRESULT, result)` for the create-completed pair,
-/// `(sender, args)` for the events. If one ever arrives with a different
-/// arity this becomes a tuple; pinning it at two until then keeps the call
-/// site readable and the mistake loud.
+/// **One or two `Invoke` parameters.** Almost every WebView2 handler
+/// interface has two — `(HRESULT, result)` for the create-completed pair,
+/// `(sender, args)` for the events — and the arity is read off `impl`, so a
+/// handler cannot be declared with one shape and implemented with another.
+/// `ICoreWebView2CapturePreviewCompletedHandler` is the one-parameter case
+/// (`Invoke(HRESULT)`, nothing to hand back — the bytes went into the caller's
+/// stream), and T397 is why this is not pinned at two any more.
 ///
 /// Threading: the reference count is atomic. WebView2 invokes handlers on
 /// the thread that created the environment (ours), but a COM object that has
@@ -122,9 +124,9 @@ pub fn CallbackOwning(
         .@"fn" => |f| f,
         else => @compileError("com.Callback needs a function: fn (*Ctx, A0, A1) HRESULT"),
     };
-    if (fn_info.params.len != 3) @compileError(
+    if (fn_info.params.len != 2 and fn_info.params.len != 3) @compileError(
         "com.Callback's implementation takes a context pointer plus the " ++
-            "interface's TWO Invoke parameters: fn (*Ctx, A0, A1) HRESULT",
+            "interface's ONE or TWO Invoke parameters: fn (*Ctx, A0[, A1]) HRESULT",
     );
     if (fn_info.return_type != HRESULT) @compileError(
         "com.Callback's implementation must return HRESULT",
@@ -136,8 +138,10 @@ pub fn CallbackOwning(
         ),
         else => @compileError("com.Callback's first parameter must be a context pointer"),
     }
+    // How many parameters the interface's `Invoke` takes, context aside.
+    const arity = fn_info.params.len - 1;
     const A0 = fn_info.params[1].type.?;
-    const A1 = fn_info.params[2].type.?;
+    const A1 = if (arity == 2) fn_info.params[2].type.? else void;
 
     return extern struct {
         const Self = @This();
@@ -162,14 +166,17 @@ pub fn CallbackOwning(
             QueryInterface: *const fn (*Self, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
             AddRef: *const fn (*Self) callconv(.winapi) u32,
             Release: *const fn (*Self) callconv(.winapi) u32,
-            Invoke: *const fn (*Self, A0, A1) callconv(.winapi) HRESULT,
+            Invoke: if (arity == 1)
+                *const fn (*Self, A0) callconv(.winapi) HRESULT
+            else
+                *const fn (*Self, A0, A1) callconv(.winapi) HRESULT,
         };
 
         const vtable_impl: Vtbl = .{
             .QueryInterface = comQueryInterface,
             .AddRef = comAddRef,
             .Release = comRelease,
-            .Invoke = comInvoke,
+            .Invoke = if (arity == 1) comInvoke1 else comInvoke2,
         };
 
         /// Create with a reference count of 1 — the reference the caller
@@ -236,7 +243,14 @@ pub fn CallbackOwning(
             return @intCast(remaining);
         }
 
-        fn comInvoke(self: *Self, a0: A0, a1: A1) callconv(.winapi) HRESULT {
+        // Only the arity the implementation actually has is referenced by
+        // `vtable_impl`, and Zig analyzes a function only when something
+        // reaches it — so the other one never has to typecheck.
+        fn comInvoke1(self: *Self, a0: A0) callconv(.winapi) HRESULT {
+            return impl(self.ctx, a0);
+        }
+
+        fn comInvoke2(self: *Self, a0: A0, a1: A1) callconv(.winapi) HRESULT {
             return impl(self.ctx, a0, a1);
         }
     };
@@ -288,8 +302,25 @@ fn onEvent(ctx: *TestCtx, sender: ?*Sender, args: ?*Args) HRESULT {
     return ctx.answer;
 }
 
+/// The one-parameter shape: `ICoreWebView2CapturePreviewCompletedHandler`
+/// hands back only an HRESULT (T397).
+fn onOneArg(ctx: *TestCtx, hr: HRESULT) HRESULT {
+    ctx.calls += 1;
+    ctx.last_hr = hr;
+    return ctx.answer;
+}
+
+// {BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF}
+const IID_TestOneArg: GUID = .{
+    .Data1 = 0xBBBBBBBB,
+    .Data2 = 0xCCCC,
+    .Data3 = 0xDDDD,
+    .Data4 = .{ 0xEE, 0xEE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+};
+
 const TestCompleted = Callback(IID_TestCompleted, onCompleted);
 const TestEvent = Callback(IID_TestEvent, onEvent);
+const TestOneArg = Callback(IID_TestOneArg, onOneArg);
 
 test "failed() tests the sign bit, not equality with S_OK" {
     try testing.expect(!failed(S_OK));
@@ -365,6 +396,30 @@ test "Invoke forwards both arguments and returns what the implementation returns
     try testing.expectEqual(S_OK, h.vtable.Invoke(h, S_OK, null));
     try testing.expectEqual(@as(u32, 2), ctx.calls);
     try testing.expectEqual(@as(?*anyopaque, null), ctx.last_ptr);
+}
+
+test "a one-parameter Invoke is the interface's shape, not a padded two" {
+    // The arity is read off the implementation, so the vtable slot has ONE
+    // parameter — a handler declared with a spare trailing argument would
+    // read garbage off the stack for it in someone else's process.
+    const Slot = @FieldType(TestOneArg.Vtbl, "Invoke");
+    const params = @typeInfo(@typeInfo(Slot).pointer.child).@"fn".params;
+    try testing.expectEqual(@as(usize, 2), params.len); // self + HRESULT
+    try testing.expectEqual(HRESULT, params[1].type.?);
+    // The two-parameter shape is unchanged next to it.
+    const Slot2 = @FieldType(TestCompleted.Vtbl, "Invoke");
+    try testing.expectEqual(
+        @as(usize, 3),
+        @typeInfo(@typeInfo(Slot2).pointer.child).@"fn".params.len,
+    );
+
+    var ctx: TestCtx = .{ .answer = E_FAIL };
+    const h = try TestOneArg.create(testing.allocator, &ctx);
+    defer h.release();
+    try testing.expectEqual(E_FAIL, h.vtable.Invoke(h, E_NOINTERFACE));
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try testing.expectEqual(E_NOINTERFACE, ctx.last_hr);
+    try testing.expectEqual(@as(usize, 0), @offsetOf(TestOneArg, "vtable"));
 }
 
 test "each instantiation has its own IID and its own Invoke signature" {

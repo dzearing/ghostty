@@ -294,6 +294,17 @@ pub const IID_ExecuteScriptCompletedHandler: GUID = .{
     .Data4 = .{ 0x99, 0x23, 0x13, 0x71, 0x12, 0xF4, 0xC4, 0xCC },
 };
 
+// {697E05E9-3D8F-45FA-96F4-8FFE1EDEDAF5}
+// `ICoreWebView2CapturePreviewCompletedHandler` (T397). The only handler on
+// the box whose `Invoke` takes ONE parameter — the encoded image went into the
+// stream we passed in, so all that comes back is whether it worked.
+pub const IID_CapturePreviewCompletedHandler: GUID = .{
+    .Data1 = 0x697E05E9,
+    .Data2 = 0x3D8F,
+    .Data3 = 0x45FA,
+    .Data4 = .{ 0x96, 0xF4, 0x8F, 0xFE, 0x1E, 0xDE, 0xDA, 0xF5 },
+};
+
 // {B29C7E28-FA79-41A8-8E44-65811C76DCB2}
 // `ICoreWebView2AcceleratorKeyPressedEventHandler` (T394). Registered on the
 // CONTROLLER, not the web view — its `Invoke` sender is the controller.
@@ -764,8 +775,8 @@ pub const ICoreWebView2 = extern struct {
     pub const post_nav_slots = 11;
     /// Slot 28: `RemoveScriptToExecuteOnDocumentCreated`.
     pub const remove_script_slots = 1;
-    /// Slot 30: `CapturePreview`.
-    pub const capture_slots = 1;
+    /// `COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT`.
+    pub const CaptureFormat = enum(u32) { png = 0, jpeg = 1 };
     /// Slots 32..33: `PostWebMessageAsJson`, `PostWebMessageAsString`.
     pub const post_reload_slots = 2;
     /// Slot 35: `remove_WebMessageReceived`.
@@ -803,7 +814,12 @@ pub const ICoreWebView2 = extern struct {
         AddScriptToExecuteOnDocumentCreated: *const fn (*ICoreWebView2, [*:0]const u16, *anyopaque) callconv(.winapi) HRESULT,
         remove_script: [remove_script_slots]*const anyopaque,
         ExecuteScript: *const fn (*ICoreWebView2, [*:0]const u16, ?*anyopaque) callconv(.winapi) HRESULT,
-        capture: [capture_slots]*const anyopaque,
+        CapturePreview: *const fn (
+            *ICoreWebView2,
+            CaptureFormat,
+            *IStream,
+            *anyopaque,
+        ) callconv(.winapi) HRESULT,
         Reload: *const fn (*ICoreWebView2) callconv(.winapi) HRESULT,
         post_reload: [post_reload_slots]*const anyopaque,
         add_WebMessageReceived: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
@@ -839,6 +855,21 @@ pub const ICoreWebView2 = extern struct {
     /// STARTED, and the page arrives later on the message loop.
     pub fn navigate(self: *ICoreWebView2, uri: [*:0]const u16) bool {
         return !com.failed(self.vtable.Navigate(self, uri));
+    }
+
+    /// Encode the view's current visual into `stream` and call `handler` when
+    /// the bytes are all there (T397). Asynchronous, like `Navigate`: success
+    /// means the capture STARTED. The runtime writes an encoded IMAGE, not raw
+    /// pixels — there is no size parameter and no bitmap variant, which is why
+    /// the win32 hero thumbnail costs a PNG round trip where Mac's
+    /// `WKWebView.takeSnapshot` hands back a bitmap directly.
+    pub fn capturePreview(
+        self: *ICoreWebView2,
+        format: CaptureFormat,
+        stream: *IStream,
+        handler: *anyopaque,
+    ) bool {
+        return !com.failed(self.vtable.CapturePreview(self, format, stream, handler));
     }
 
     /// Where the view actually IS — the browser's answer, not ours. Caller
@@ -1439,6 +1470,10 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(15 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationCompleted"));
     try testing.expectEqual(27 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddScriptToExecuteOnDocumentCreated"));
     try testing.expectEqual(29 * ptr, @offsetOf(ICoreWebView2.Vtbl, "ExecuteScript"));
+    // T397's hero thumbnail source, between them. It used to be the one-slot
+    // `capture` filler that held `Reload` at 31; naming it does not move
+    // anything, and this assertion is what says so.
+    try testing.expectEqual(30 * ptr, @offsetOf(ICoreWebView2.Vtbl, "CapturePreview"));
     // T390's two. `Reload` (31) is one slot past `CapturePreview`, and
     // `CallDevToolsProtocolMethod` (36) one past `remove_WebMessageReceived` —
     // both were inside opaque runs until now, so these two numbers are exactly

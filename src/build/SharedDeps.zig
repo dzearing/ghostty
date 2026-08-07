@@ -618,6 +618,11 @@ pub fn add(
                     step.linkSystemLibrary2("wininet", .{});
                     // T67: ChooseColorW ("Background Color…" picker).
                     step.linkSystemLibrary2("comdlg32", .{});
+                    // T397: GDI+ flat API, the PNG decoder for a viewer
+                    // pane's hero thumbnail. `CapturePreview` is the only
+                    // way to get a WebView2's pixels and it hands back an
+                    // ENCODED image, so something has to decode it.
+                    step.linkSystemLibrary2("gdiplus", .{});
                 }
             },
         }

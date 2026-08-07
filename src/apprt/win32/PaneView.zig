@@ -209,6 +209,60 @@ pub fn healOverlayZOrders(self: *PaneView) void {
     }
 }
 
+/// A pane's most recent hero-mode thumbnail: a 32-bit DIB plus the pixel size
+/// it was captured at. Both kinds produce one — a terminal from its renderer
+/// thread's GL readback, a viewer from `ICoreWebView2::CapturePreview` — so the
+/// carousel never has to ask what kind of leaf it is painting.
+pub const HeroSnapshot = struct {
+    dib: w32.HANDLE,
+    w: i32,
+    h: i32,
+};
+
+/// The pane's current thumbnail, or null when it has not produced one yet.
+///
+/// Kind-generic ON PURPOSE (T397). Hero mode used to narrow through
+/// `surface()` here, which made a viewer leaf paint *nothing* — the tile slot
+/// was still counted, so the strip showed a hole rather than an exclusion.
+/// Mac's `HeroModeView` settled the same question the other way round ("every
+/// pane participates: terminals and viewers alike"), so the win32 answer is
+/// this accessor: every leaf has a tile, and whether it has CONTENT yet is a
+/// separate, temporary question that both kinds answer the same way.
+pub fn heroSnapshot(self: *const PaneView) ?HeroSnapshot {
+    switch (self.kind) {
+        .terminal => |s| {
+            const dib = s.snap_dib orelse return null;
+            if (s.snap_dib_w <= 0 or s.snap_dib_h <= 0) return null;
+            return .{ .dib = dib, .w = s.snap_dib_w, .h = s.snap_dib_h };
+        },
+        .viewer => |v| {
+            const dib = v.snap_dib orelse return null;
+            if (v.snap_dib_w <= 0 or v.snap_dib_h <= 0) return null;
+            return .{ .dib = dib, .w = v.snap_dib_w, .h = v.snap_dib_h };
+        },
+    }
+}
+
+/// Ask this pane for a fresh hero thumbnail sized to `w`x`h` device pixels.
+/// Both kinds are asynchronous and both self-throttle, so the carousel's
+/// heartbeat can call this unconditionally.
+pub fn heroSnapRequest(self: *PaneView, w: u32, h: u32) void {
+    switch (self.kind) {
+        .terminal => |s| s.heroSnapRequest(w, h),
+        .viewer => |v| v.heroSnapRequest(w, h),
+    }
+}
+
+/// GUI thread, on `WM_APP_HERO_SNAP`: fold whatever the pane captured into its
+/// DIB cache. True when the cache actually changed, i.e. the tile needs a
+/// repaint.
+pub fn heroSnapPublish(self: *PaneView) bool {
+    return switch (self.kind) {
+        .terminal => |s| s.heroSnapPublish(),
+        .viewer => |v| v.heroSnapPublish(),
+    };
+}
+
 /// Mark this pane to END its agent session rather than detach (T89e).
 /// Viewers never own an agent session, so this is a no-op for them.
 pub fn setSessionCloseIntent(self: *PaneView, intent: bool) void {
