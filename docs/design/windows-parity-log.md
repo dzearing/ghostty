@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-07 - **T447 done - hovering a tab shows the pane's working
+  directory**. The Windows translation of the Mac titlebar proxy icon: a
+  native comctl32 track-mode tooltip under the hovered tab names the focused
+  pane's cwd (home->~, middle-elided at 96 bytes keeping root+leaf; viewer
+  panes report their location). livePwd-first (T185) so cmd.exe without
+  OSC 7 tracks `cd`s; text derivation is pure
+  (`src/apprt/win32/tab_tooltip.zig`, 15 none-lane tests); dark mode via
+  DarkMode_Explorer when the chrome is dark. New
+  `test\win32\tab-tooltip.ps1` (ALL PASS, 15): start dir + ~ abbreviation,
+  follows a cd, right after a session-persistence restore, viewer arm -
+  hover scored via the debug oracle at hover-change since the test desktop
+  cannot hold a hover (T233). Surprise: `+send-keys` text escapes ate the
+  `\t` in `\tipB...` - paths through send-keys need doubled backslashes.
+  Filed T555 (palette Focus: jump entries w/ cwd subtitle), T556 (tooltip
+  rescues truncated titles), T557 (re-theme on mid-session flip); decision
+  D24 records the affordance choice. Floor: three zig lanes + P1-P3 ALL
+  PASS.
 - 2026-08-06 - **T332 done - +list --json reports which agent session a pane
   is bound to**. Additive `session_id` on the terminal-leaf object
   (`src/apprt/ipc/list.zig`, golden test), filled by the win32 server from

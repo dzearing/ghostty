@@ -1648,6 +1648,54 @@ pub extern "user32" fn TrackMouseEvent(
 ) callconv(.winapi) i32;
 
 // -----------------------------------------------------------------------
+// Tooltip control (comctl32) — the tab-strip cwd tooltip (T447). Track
+// mode (TTF_TRACK): the app decides when and where the tip shows, which
+// matches the strip's existing hover tracking; the control itself stays
+// native-drawn so it inherits the system's own tooltip styling.
+// -----------------------------------------------------------------------
+
+pub const TOOLTIPS_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("tooltips_class32");
+
+pub const TTS_ALWAYSTIP: u32 = 0x01;
+pub const TTS_NOPREFIX: u32 = 0x02;
+
+pub const TTF_TRACK: u32 = 0x0020;
+pub const TTF_ABSOLUTE: u32 = 0x0080;
+
+pub const TTM_TRACKACTIVATE: u32 = WM_USER + 17;
+pub const TTM_TRACKPOSITION: u32 = WM_USER + 18;
+pub const TTM_ADDTOOLW: u32 = WM_USER + 50;
+pub const TTM_UPDATETIPTEXTW: u32 = WM_USER + 57;
+
+pub const TOOLINFOW = extern struct {
+    cbSize: u32,
+    uFlags: u32,
+    hwnd: ?HWND,
+    uId: usize,
+    rect: RECT,
+    hinst: ?HINSTANCE,
+    lpszText: ?[*:0]u16,
+    lParam: isize,
+    lpReserved: ?*anyopaque,
+};
+
+pub const INITCOMMONCONTROLSEX = extern struct {
+    dwSize: u32,
+    dwICC: u32,
+};
+
+/// Tab AND tooltip control classes (they share one ICC bit).
+pub const ICC_TAB_CLASSES: u32 = 0x00000008;
+
+pub extern "comctl32" fn InitCommonControlsEx(
+    picce: *const INITCOMMONCONTROLSEX,
+) callconv(.winapi) BOOL;
+
+/// The user's double-click interval — also the system's conventional
+/// tooltip initial-show delay.
+pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
+
+// -----------------------------------------------------------------------
 // Popup menu API
 // -----------------------------------------------------------------------
 

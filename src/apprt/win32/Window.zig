@@ -107,6 +107,8 @@ const host_defaults = @import("host_defaults.zig");
 const commands = @import("commands.zig");
 const menu_bar = @import("menu_bar.zig");
 const menu_label = @import("menu_label.zig");
+const tab_tooltip = @import("tab_tooltip.zig");
+const internal_os = @import("../../os/main.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -133,6 +135,12 @@ const HERO_SNAP_TIMER_ID: usize = 0x4853; // 'HS'
 /// runs; progress comes from a real-time clock, not tick counts.
 const HERO_ANIM_TIMER_ID: usize = 0x4841; // 'HA'
 const HERO_ANIM_TICK_MS: u32 = 16;
+
+/// Delay timer for the tab cwd tooltip (T447): armed when the pointer
+/// lands on a tab, cancelled when it leaves; the tooltip shows when it
+/// fires. The delay itself is the system double-click time — the same
+/// value native tooltips use for their initial show.
+const TAB_TIP_TIMER_ID: usize = 0x5450; // 'TP'
 pub const HERO_SLIDE_MS: f32 = 350.0;
 const HERO_RECENTER_MS: f32 = 300.0;
 
@@ -194,6 +202,19 @@ hover_tab: isize = -1,
 
 /// Whether the close button on the hovered tab is being hovered.
 hover_close: bool = false,
+
+/// The tab cwd tooltip (T447): a native comctl32 track-mode tooltip that
+/// shows the hovered tab's focused pane's working directory (or a viewer
+/// pane's location), created lazily on first show. Null until then.
+tab_tip_hwnd: ?w32.HWND = null,
+
+/// Whether the tab tooltip is currently activated (visible).
+tab_tip_shown: bool = false,
+
+/// UTF-16 text handed to the tooltip control. The control keeps the
+/// POINTER it was given rather than copying, so the buffer must live as
+/// long as the tool does — it lives here, on the window.
+tab_tip_text: [tab_tooltip.max_len + 8]u16 = undefined,
 
 /// Whether the "+" (new tab) button is being hovered.
 hover_new_tab: bool = false,
@@ -2031,6 +2052,7 @@ fn heroCancelAnims(self: *Window) void {
 /// refers to.
 fn resetPointerTransients(self: *Window) void {
     self.heroCancelAnims();
+    self.tabTipHide();
     self.hero_hover_tile = -1;
     self.hero_divider_hover = false;
     self.hover_split = null;
@@ -5013,6 +5035,10 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         new_new_tab != self.hover_new_tab or
         new_menu_btn != self.hover_menu_btn)
     {
+        // Tab-to-tab (or tab-to-nothing) movement drives the cwd tooltip;
+        // movement within one tab (onto its close box) must not restart the
+        // show delay.
+        if (new_hover != self.hover_tab) self.tabTipOnHoverChange(new_hover);
         self.hover_tab = new_hover;
         self.hover_close = new_close;
         self.hover_new_tab = new_new_tab;
@@ -5385,6 +5411,7 @@ fn makeSwatchBitmap(self: *Window, c: tab_color.TabColor) ?w32.HANDLE {
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.
 fn handleTabBarMouseLeave(self: *Window) void {
     self.tracking_mouse = false;
+    self.tabTipHide();
     if (self.hover_tab != -1 or self.hover_new_tab or self.hover_menu_btn) {
         self.hover_tab = -1;
         self.hover_close = false;
@@ -5392,6 +5419,184 @@ fn handleTabBarMouseLeave(self: *Window) void {
         self.hover_menu_btn = false;
         self.invalidateTabBar();
     }
+}
+
+// --- The tab cwd tooltip (T447) --------------------------------------------
+//
+// Hovering a tab answers "which folder is this one in": a native track-mode
+// tooltip under the tab shows the focused pane's working directory (or a
+// viewer pane's current location), home-abbreviated to `~` and
+// middle-elided — the Windows-native translation of the Mac titlebar proxy
+// icon. Text derivation is pure (`tab_tooltip.zig`, none-lane tested); this
+// block is only the control plumbing: a delay timer armed by the strip's
+// existing hover tracking, and a comctl32 tooltip the system draws itself
+// (design system: a native tooltip inherits the OS styling and is left
+// alone, not owner-drawn).
+
+/// The tooltip text for tab `idx`'s focused pane, written into `out`, or
+/// null when the pane has nothing to say — a terminal whose pwd was never
+/// reported, a viewer with no location. No tooltip is the honest answer
+/// there, the way an empty pane reads as an answer, not an error (T181).
+fn tabTipTextFor(self: *Window, idx: usize, out: []u8) ?[]const u8 {
+    if (idx >= self.tab_count) return null;
+    const pane = self.tab_active_pane[idx];
+    var home_buf: [512]u8 = undefined;
+    const home: ?[]const u8 = internal_os.home(&home_buf) catch null;
+    if (pane.surface()) |s| {
+        // The OS-read live cwd first — a shell that never reports OSC 7
+        // (cmd.exe) keeps the cached seed frozen at its starting directory
+        // forever (T185) — then the OSC-7 cache. The same composition
+        // `+list` answers with, and `livePwd` is lock-free by design
+        // (T111b), so a hover can afford it.
+        const alloc = self.app.core_app.alloc;
+        const live = s.livePwd(alloc);
+        defer if (live) |p| alloc.free(p);
+        const location: []const u8 = live orelse (s.pwd orelse return null);
+        return tab_tooltip.tipText(out, location, home);
+    }
+    if (pane.viewer()) |v| {
+        const location = v.location orelse return null;
+        return tab_tooltip.tipText(out, location, home);
+    }
+    return null;
+}
+
+/// The TOOLINFOW naming this window's single tab tool. Rebuilt per call —
+/// the control identifies the tool by (hwnd, uId); everything else rides
+/// along.
+fn tabTipToolInfo(self: *Window) w32.TOOLINFOW {
+    return .{
+        .cbSize = @sizeOf(w32.TOOLINFOW),
+        .uFlags = w32.TTF_TRACK | w32.TTF_ABSOLUTE,
+        .hwnd = self.hwnd,
+        .uId = 1,
+        .rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .hinst = null,
+        .lpszText = @ptrCast(&self.tab_tip_text),
+        .lParam = 0,
+        .lpReserved = null,
+    };
+}
+
+/// Create the tooltip control on first use. The dark theme is decided the
+/// way the menus decide it (`DarkMode.modeForTheme`, `system` following the
+/// OS apps theme) and applied at creation; a theme flip mid-session catches
+/// up on the next window, which is the same latitude the dialogs take.
+fn tabTipEnsure(self: *Window) ?w32.HWND {
+    if (self.tab_tip_hwnd) |h| return h;
+    const hwnd = self.hwnd orelse return null;
+
+    var icc = w32.INITCOMMONCONTROLSEX{
+        .dwSize = @sizeOf(w32.INITCOMMONCONTROLSEX),
+        .dwICC = w32.ICC_TAB_CLASSES,
+    };
+    _ = w32.InitCommonControlsEx(&icc);
+
+    const tip = w32.CreateWindowExW(
+        w32.WS_EX_TOPMOST | w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE,
+        w32.TOOLTIPS_CLASS,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP | w32.TTS_ALWAYSTIP | w32.TTS_NOPREFIX,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        hwnd,
+        null,
+        self.app.hinstance,
+        null,
+    ) orelse return null;
+
+    const dark = switch (DarkMode.modeForTheme(
+        self.app.config.@"window-theme",
+        self.app.config.background,
+    )) {
+        .force_dark => true,
+        .allow_dark => !systemUsesLightTheme(),
+        .default, .force_light => false,
+    };
+    if (dark) {
+        _ = w32.SetWindowTheme(
+            tip,
+            std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
+            null,
+        );
+    }
+
+    self.tab_tip_text[0] = 0;
+    var ti = self.tabTipToolInfo();
+    _ = w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti)));
+    self.tab_tip_hwnd = tip;
+    return tip;
+}
+
+/// Hide the tooltip and cancel any pending show. Safe to call from any
+/// state — "no tooltip and none scheduled" is the postcondition.
+fn tabTipHide(self: *Window) void {
+    if (self.hwnd) |h| _ = w32.KillTimer(h, TAB_TIP_TIMER_ID);
+    if (!self.tab_tip_shown) return;
+    self.tab_tip_shown = false;
+    const tip = self.tab_tip_hwnd orelse return;
+    var ti = self.tabTipToolInfo();
+    _ = w32.SendMessageW(tip, w32.TTM_TRACKACTIVATE, 0, @bitCast(@intFromPtr(&ti)));
+}
+
+/// The pointer moved onto a different tab (or off the tabs): hide the tip,
+/// and arm a fresh delay when a tab is under the pointer. Also the debug
+/// oracle for `test\win32\tab-tooltip.ps1`: the derived text is logged at
+/// hover time, because the background test desktop cannot HOLD a hover
+/// across the show delay — TrackMouseEvent watches the real cursor and
+/// WM_MOUSELEAVE lands within a frame there (T233), so the TRIGGER is read
+/// from this line while the timing stays unobserved.
+fn tabTipOnHoverChange(self: *Window, new_hover: isize) void {
+    self.tabTipHide();
+    if (new_hover < 0) return;
+    const hwnd = self.hwnd orelse return;
+    _ = w32.SetTimer(hwnd, TAB_TIP_TIMER_ID, w32.GetDoubleClickTime(), null);
+    var buf: [tab_tooltip.max_len + 8]u8 = undefined;
+    if (self.tabTipTextFor(@intCast(new_hover), &buf)) |txt| {
+        log.debug("tab tooltip tab={d} text={s}", .{ new_hover, txt });
+    } else {
+        log.debug("tab tooltip tab={d} text=<none>", .{new_hover});
+    }
+}
+
+/// The show delay elapsed with the pointer still on a tab: place the tip
+/// just below the strip at the tab's left edge and activate it.
+fn tabTipTimerFire(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    _ = w32.KillTimer(hwnd, TAB_TIP_TIMER_ID);
+    if (self.hover_tab < 0) return;
+    const idx: usize = @intCast(self.hover_tab);
+    if (idx >= self.tab_count) return;
+
+    var buf: [tab_tooltip.max_len + 8]u8 = undefined;
+    const text = self.tabTipTextFor(idx, &buf) orelse return;
+    const len16 = std.unicode.utf8ToUtf16Le(
+        self.tab_tip_text[0 .. self.tab_tip_text.len - 1],
+        text,
+    ) catch return;
+    self.tab_tip_text[len16] = 0;
+
+    const tip = self.tabTipEnsure() orelse return;
+    var ti = self.tabTipToolInfo();
+    _ = w32.SendMessageW(tip, w32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&ti)));
+
+    // Just below the strip at the hovered tab's left edge — the reading
+    // position for a label about that tab — with the design system's 4 DIP
+    // clearance off the strip's painted bottom edge.
+    const gap: i32 = @intFromFloat(@round(4.0 * self.scale));
+    var pt = w32.POINT{
+        .x = self.tab_rects[idx].left,
+        .y = self.tabBarHeight() + gap,
+    };
+    _ = w32.ClientToScreen(hwnd, &pt);
+    const pos: isize = @bitCast(@as(usize, @as(u16, @bitCast(@as(i16, @truncate(pt.x))))) |
+        (@as(usize, @as(u16, @bitCast(@as(i16, @truncate(pt.y))))) << 16));
+    _ = w32.SendMessageW(tip, w32.TTM_TRACKPOSITION, 0, pos);
+    _ = w32.SendMessageW(tip, w32.TTM_TRACKACTIVATE, 1, @bitCast(@intFromPtr(&ti)));
+    self.tab_tip_shown = true;
+    log.debug("tab tooltip shown tab={d}", .{idx});
 }
 
 /// Rename edit control child ID.
@@ -5933,6 +6138,10 @@ pub fn windowWndProc(
                 window.heroAnimTick();
                 return 0;
             }
+            if (wparam == TAB_TIP_TIMER_ID) {
+                window.tabTipTimerFire();
+                return 0;
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         WM_APP_HERO_SNAP => {
@@ -6133,6 +6342,9 @@ pub fn windowWndProc(
                 return 0;
             }
             if (window.inTabBar(y)) {
+                // A click is an answer to "which tab" — the cwd tooltip
+                // (T447) has nothing left to add.
+                window.tabTipHide();
                 window.handleTabBarClick(@truncate(x), @truncate(window.toStripY(y)));
             }
             return 0;
