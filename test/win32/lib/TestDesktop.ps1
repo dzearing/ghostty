@@ -455,14 +455,17 @@ public class GhozttyTestDesktop {
     // Every top-level window of `pid` matching `cls`, in the same line format
     // as Children. FindTop answers "the window"; this answers "how many, and
     // where" - which is what a test asserting that a popup class is GONE, or
-    // that there is exactly one of them, actually needs.
+    // that there is exactly one of them, actually needs. pid <= 0 means ANY
+    // process: what a test asserting a class is absent desktop-wide needs
+    // (e.g. T291's "no console window appeared" - the console window belongs
+    // to conhost, never to the app or the child that was spawned).
     public string[] Tops(int pid, string clsArg, bool requireVisible) {
         string cls = NoFilter(clsArg);
         return (string[])Run(delegate() {
             var lines = new List<string>();
             EnumWindows(delegate(IntPtr h, IntPtr l) {
                 uint p; GetWindowThreadProcessId(h, out p);
-                if (p != (uint)pid) return true;
+                if (pid > 0 && p != (uint)pid) return true;
                 bool vis = IsWindowVisible(h);
                 if (requireVisible && !vis) return true;
                 var sb = new StringBuilder(128);
@@ -1641,6 +1644,7 @@ function ConvertTo-TestFilter($Value) {
 # unrolls a one-element array return into a scalar whose .Count is $null.
 function Get-TestWindows {
     param(
+        # 0 (or negative) enumerates EVERY process's top-levels on the desktop.
         [Parameter(Mandatory = $true)][int]$ProcessId,
         $Class = 'GhozttyWindow',
         [switch]$AllowHidden,

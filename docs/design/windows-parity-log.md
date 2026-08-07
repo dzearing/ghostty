@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T291 done - New Process no longer flashes a console window**.
+  `proc_spawn.spawnWindows` now passes CREATE_NO_WINDOW instead of
+  CREATE_NEW_CONSOLE: the child keeps a console (so cmd.exe/console apps
+  survive startup - the earlier DETACHED_PROCESS variant killed them) but the
+  console has no window. Surprise: on this box the old flash was not a
+  conhost window at all - console delegation hands it to Windows Terminal on
+  the INTERACTIVE desktop (experiment: a test-desktop spawn started
+  conhost.exe + OpenConsole.exe, zero windows on the test desktop), so the
+  planned ConsoleWindowClass assertion was a dead probe. activity-monitor.ps1
+  section H instead asserts: no new console-class window on the test desktop,
+  no new OpenConsole/WindowsTerminal process within 3s (this is what catches
+  the regression here), and the diag note's NUMERIC dwCreationFlags carry
+  0x08000000 and not 0x10 (the note used to spell a hardcoded string, i.e.
+  the assertion tested a comment). Negative-control run against the old flag
+  fails exactly the new checks. The agent's remote spawn path shares the
+  function, so T287's source is fixed too. TestDesktop.ps1 `Tops()` now
+  accepts pid<=0 = any process. Filed T551 (rare section-I row-click flake).
+  Floor: three zig lanes + P1-P3 ALL PASS.
 - 2026-08-06 - **T160 done - the markdown viewer has its table of contents**
   (user-named gap: *"the table of contents work ... missing"*). A native
   Contents card on every 2+-heading markdown document: scroll-spy highlight,

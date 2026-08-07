@@ -220,6 +220,15 @@ function Test-PidAlive([int]$ProcessId) {
     return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
 
+# T291: every VISIBLE console-hosting top-level on the test desktop, any
+# process. Both classes matter: this box delegates the default terminal to
+# Windows Terminal, so a CREATE_NEW_CONSOLE flash can surface as a CASCADIA
+# window rather than classic conhost's ConsoleWindowClass.
+function Get-ConsoleWindows {
+    return @(@(Get-TestWindows -ProcessId 0 -Class '*') |
+        Where-Object { $_.Class -in @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS') })
+}
+
 # The panel's action buttons, by caption. Hidden children are included (Kill is
 # created hidden), so a caller can assert visibility separately.
 function Get-PanelButton([IntPtr]$Panel, [string]$Like) {
@@ -470,6 +479,20 @@ try {
     # box needs is ever a target.
     $newProcBtn = Get-PanelButton $panel 'New Process*'
     Assert ($null -ne $newProcBtn) 'H the New Process button is reachable'
+    # T291 baseline: visible console windows on the test desktop BEFORE the
+    # spawn, any process (the console window belongs to conhost or the
+    # delegated terminal, never to the app or the spawned child) - plus the
+    # console-DELEGATION host processes. On a box whose default terminal is
+    # Windows Terminal (this one), a CREATE_NEW_CONSOLE spawn's window opens in
+    # WT on the INTERACTIVE desktop, which no test-desktop enumeration can see;
+    # what IS observable from here is the OpenConsole.exe/WindowsTerminal.exe
+    # process the delegation starts. CREATE_NO_WINDOW never delegates (a
+    # headless console goes to classic conhost), so a new delegation host
+    # appearing during the spawn IS the flash. Measured, not assumed: the
+    # experiment in T291's progress log showed the old flag starting
+    # conhost.exe + OpenConsole.exe from a test-desktop spawner.
+    $consolesBefore = Get-ConsoleWindows
+    $delegationBefore = @(Get-Process -Name 'OpenConsole', 'WindowsTerminal' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     Click-TestPosted $panel $newProcBtn | Out-Null
     $dlg = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyNewProcess' -TimeoutMs 8000
     Assert ($dlg -ne [IntPtr]::Zero) 'H "New Process..." opens the GhozttyNewProcess dialog'
@@ -503,6 +526,34 @@ try {
     $spawnPid = 0
     if ($m) { $spawnPid = [int]$m.Groups[1].Value; $script:spawnPid = $spawnPid }
     Assert (Test-PidAlive $spawnPid) "H the spawned process $spawnPid is really running"
+
+    # T291: the spawn must not flash a console window. CREATE_NO_WINDOW gives
+    # the child a WINDOWLESS console, so the throwaway `cmd.exe /C pause` stays
+    # alive (asserted just above - the whole risk of this change is trading the
+    # visible console for a dead child) while nothing appears on the desktop.
+    Start-Sleep -Milliseconds 300
+    $consolesAfter = Get-ConsoleWindows
+    Assert ($consolesAfter.Count -le $consolesBefore.Count) "H no console window appeared on the test desktop (before=$($consolesBefore.Count) after=$($consolesAfter.Count))"
+
+    # The delegation probe waits out a cold start: a NEGATIVE needs a bounded
+    # watch, and the experiment showed the delegation host up well inside 3s.
+    $newDelegation = @()
+    $probeDeadline = (Get-Date).AddSeconds(3)
+    while ((Get-Date) -lt $probeDeadline) {
+        $newDelegation = @(Get-Process -Name 'OpenConsole', 'WindowsTerminal' -ErrorAction SilentlyContinue |
+            Where-Object { $delegationBefore -notcontains $_.Id })
+        if ($newDelegation.Count -gt 0) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    Assert ($newDelegation.Count -eq 0) "H the spawn started no delegated-terminal host (new: $(@($newDelegation | ForEach-Object { "$($_.Name):$($_.Id)" }) -join ' '))"
+
+    # And the MECHANISM: the diag note reports the dwCreationFlags value that
+    # CreateProcessW actually received. CREATE_NO_WINDOW (0x08000000) must be
+    # set and CREATE_NEW_CONSOLE (0x10) clear.
+    $mFlags = Get-LogMatch 'activity monitor: spawn result ok=true pid=\d+ note=diag: flags=0x([0-9a-fA-F]+)'
+    $flagsVal = [int64]0
+    if ($mFlags) { $flagsVal = [Convert]::ToInt64($mFlags.Groups[1].Value, 16) }
+    Assert (($null -ne $mFlags) -and (($flagsVal -band 0x08000000) -ne 0) -and (($flagsVal -band 0x10) -eq 0)) "H the spawn passed CREATE_NO_WINDOW and not CREATE_NEW_CONSOLE (flags=0x$('{0:x8}' -f $flagsVal))"
 
     # ...and it reaches the TABLE, which is the claim a log line alone cannot make.
     $before = Count-PanelLines

@@ -97,20 +97,22 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
     const W = std.os.windows;
 
     // DIRECT CreateProcessW (not via CommandCore) so we control stdio + creation
-    // flags exactly and can instrument the result. Strategy (revised after the
-    // DETACHED_PROCESS + \Device\Null variant still vanished):
-    //   - CREATE_NEW_CONSOLE — give the child its OWN console window. cmd.exe and
-    //     console apps (ping) need a console to keep running; the prior DETACHED_
-    //     PROCESS gave them none and the \Device\Null std handles likely made
-    //     cmd.exe exit immediately. A new console keeps console apps alive and is
-    //     harmless for GUI apps (notepad).
+    // flags exactly and can instrument the result. Strategy (revised twice: the
+    // DETACHED_PROCESS + \Device\Null variant made cmd.exe exit immediately, and
+    // the CREATE_NEW_CONSOLE variant flashed a visible console on every spawn):
+    //   - CREATE_NO_WINDOW — the child gets its OWN console, but that console has
+    //     no window. Console apps (cmd.exe, ping) keep the console they need to
+    //     stay alive — the DETACHED_PROCESS failure — while nothing appears on
+    //     the desktop — the CREATE_NEW_CONSOLE failure. Harmless for GUI apps
+    //     (notepad). Note the two flags are mutually exclusive by contract:
+    //     CREATE_NO_WINDOW is IGNORED when CREATE_NEW_CONSOLE is also set.
     //   - CREATE_NEW_PROCESS_GROUP — own process group (not Ctrl-signaled with us).
     //   - CREATE_BREAKAWAY_FROM_JOB — escape a kill-on-job-close job the agent may
     //     live in. Tried first; if CreateProcessW fails with ERROR_ACCESS_DENIED
     //     (job forbids breakaway) we retry WITHOUT it.
-    // We do NOT set STARTF_USESTDHANDLES: the new console owns the child's stdio, so
-    // there are no \Device\Null handles to make cmd.exe exit on startup.
-    const base_flags: w.DWORD = w.CREATE_NEW_CONSOLE | w.CREATE_NEW_PROCESS_GROUP | w.CREATE_UNICODE_ENVIRONMENT;
+    // We do NOT set STARTF_USESTDHANDLES: the (windowless) console owns the child's
+    // stdio, so there are no \Device\Null handles to make cmd.exe exit on startup.
+    const base_flags: w.DWORD = w.CREATE_NO_WINDOW | w.CREATE_NEW_PROCESS_GROUP | w.CREATE_UNICODE_ENVIRONMENT;
 
     // Build the command line: `cmd.exe /C <cmd>`. cmd.exe's own parsing handles the
     // rest, so we don't need per-arg quoting here.
@@ -183,15 +185,19 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
     W.CloseHandle(pi.hThread);
     W.CloseHandle(pi.hProcess);
 
-    const flags_desc = if (used_breakaway) "NEW_CONSOLE|NEW_GROUP|BREAKAWAY" else "NEW_CONSOLE|NEW_GROUP(fallback,no-breakaway)";
+    // The note reports the flags NUMERICALLY, from the same value CreateProcessW
+    // got — a spelled-out name here once described flags the code no longer
+    // passed, and the T291 acceptance assertion was testing that string, i.e. a
+    // comment. Hex cannot drift from the call.
+    const flags_used: w.DWORD = if (used_breakaway) base_flags | w.CREATE_BREAKAWAY_FROM_JOB else base_flags;
     const alive_desc = if (!got_code)
         "exit=?(GetExitCodeProcess failed)"
     else if (exit_code == w.STILL_ACTIVE)
         "exit=STILL_ACTIVE"
     else
         "exit=EXITED";
-    const note = std.fmt.allocPrint(alloc, "diag: flags={s} {s}({d}) breakaway-gle={d}", .{
-        flags_desc, alive_desc, exit_code, breakaway_gle,
+    const note = std.fmt.allocPrint(alloc, "diag: flags=0x{x:0>8} {s}({d}) breakaway-gle={d}", .{
+        flags_used, alive_desc, exit_code, breakaway_gle,
     }) catch null;
 
     return .{ .ok = true, .pid = real_pid, .@"error" = note, .free_error = note != null };
@@ -219,10 +225,10 @@ const windows = struct {
     const PROCESS_INFORMATION = W.PROCESS_INFORMATION;
 
     // dwCreationFlags bits (winbase.h). Values are ABI-stable Win32 constants.
-    const CREATE_NEW_CONSOLE: DWORD = 0x00000010;
     const CREATE_NEW_PROCESS_GROUP: DWORD = 0x00000200;
     const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
     const CREATE_BREAKAWAY_FROM_JOB: DWORD = 0x01000000;
+    const CREATE_NO_WINDOW: DWORD = 0x08000000;
 
     // STILL_ACTIVE (a.k.a. STATUS_PENDING): the exit code GetExitCodeProcess reports
     // for a process that has NOT yet exited.
