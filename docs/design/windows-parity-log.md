@@ -10743,3 +10743,58 @@ P1-P3 ALL PASS; `send-keys-bracketed.ps1`, `upgrade-resume-readiness.ps1`
 (D7-D9 new), `upgrade-no-fork.ps1` and `upgrade-staleness.ps1` all ALL PASS.
 
 Filed: nothing new - the one loose thread this turned up is already T562.
+
+## 2026-08-07 - T448: clicking a notification finally does something
+
+Clicking a Ghoztty desktop notification was supposed to jump you to the pane
+that raised it. The code for that was written, read correctly, and had never
+once run - because the tray icon carrying the balloon was never registered
+with `NIM_SETVERSION`, so the shell kept it on its default pre-5.0 behavior,
+under which `NIN_BALLOONUSERCLICK` is not sent at all. Two handlers were dead
+behind that: click-to-focus, and the update balloon's open-the-release-page.
+
+T448 was filed as a VERIFICATION task and it named its own suspect: "a missing
+NIM_SETVERSION kills it". It did. Worth remembering the next time a task looks
+like it is only asking someone to go and look - the point of looking is that
+plausible-on-inspection is not evidence, and here the gap between the two was a
+user-facing feature that had never worked.
+
+Version 3 (`NOTIFYICON_VERSION`), not 4: v4 enables the same messages but
+repacks the callback - `wparam` becomes the cursor anchor, `lparam` becomes
+`(event, uID)` - and wants the Vista-sized `NOTIFYICONDATAW`, while our binding
+deliberately stops at the Windows 2000 layout and sizes `cbSize` to match. v3
+turns the notifications on and leaves the packing the handler already decoded.
+The show sequence is now `NIM_ADD` (no `NIF_INFO`) -> `NIM_SETVERSION` ->
+`NIM_MODIFY` (with `NIF_INFO`): the version has to be registered before the
+balloon exists, and as a side effect that removed a latent double balloon.
+
+The decode moved into a new `src/apprt/win32/tray_notify.zig` with unit tests,
+including the one that matters for restraint: a balloon that merely TIMED OUT
+must not present anything, because nobody chose it.
+
+Delivery vs routing, kept honest. `test/win32/notification-click-focus.ps1`
+posts the tray callback itself, so by T240's rule it proves the routing and
+nothing about delivery - and its header says so, with the manual recipe for a
+real click. What it CAN measure it does: the app now warns when the shell
+refuses the version, and the script reads its log back. On a background test
+desktop there is no notification area at all, so `NIM_ADD` and `NIM_SETVERSION`
+both fail there; the script asserts the failure has THAT shape rather than the
+"version refused while the icon was accepted" shape, which is the real-defect
+signature. Registration against the real shell was measured separately, by
+launching a debug build on the interactive desktop under a private pipe suffix:
+no warning, so this box accepts version 3.
+
+Harness: `Find-TestMessageWindow` (TestDesktop.ps1) finds a message-only window
+pid-filtered. The filter is a safety guard, not a convenience - message-only
+windows are not isolated by the test desktop the way top-level windows are, so
+an unfiltered find could return the user's own running Ghoztty and every posted
+WM_APP message would drive their terminal.
+
+Floor: `floor-lane.ps1 -Lane all` none PASS (309s), win32 PASS (347s), agent
+PASS (316s); P1-P3 ALL PASS; `notification-click-focus.ps1` ALL PASS (38
+assertions), `-NegativeControl` red as required.
+
+Filed: T572 - nobody has yet watched a REAL toast click bring the window
+forward. Both halves either side of it are measured and the middle is
+documented behavior, so it is a P2; the task carries the recipe and the reason
+the first automation attempt stalled.

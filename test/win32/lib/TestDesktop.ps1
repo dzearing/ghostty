@@ -244,6 +244,9 @@ public class GhozttyTestDesktop {
     public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     delegate bool EnumProc(IntPtr h, IntPtr l);
 
+    // The pseudo-parent that scopes FindWindowExW to message-only windows.
+    static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
+
     const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102;
     const ushort VK_PACKET = 0xE7;
     const uint WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
@@ -501,6 +504,27 @@ public class GhozttyTestDesktop {
         string cls = NoFilter(clsArg);
         string title = NoFilter(titleArg);
         return (IntPtr)Run(delegate() { return FindWindowExW(parent, IntPtr.Zero, cls, title); });
+    }
+
+    // A MESSAGE-ONLY window (an HWND_MESSAGE child) of class `cls` owned by
+    // `pid`. Message-only windows are invisible to EnumWindows, so none of the
+    // pid-filtered finders above can see them, and FindWindowEx alone would
+    // hand back the FIRST match on the box - which may well be the user's own
+    // running Ghoztty. Posting a private WM_APP message into that would drive
+    // their terminal, so the pid filter here is a safety guard, not a
+    // convenience: walk the HWND_MESSAGE list and take only our own.
+    public IntPtr FindMessageWindow(string clsArg, uint pid) {
+        string cls = NoFilter(clsArg);
+        return (IntPtr)Run(delegate() {
+            IntPtr h = IntPtr.Zero;
+            while (true) {
+                h = FindWindowExW(HWND_MESSAGE, h, cls, null);
+                if (h == IntPtr.Zero) return IntPtr.Zero;
+                uint owner;
+                GetWindowThreadProcessId(h, out owner);
+                if (owner == pid) return h;
+            }
+        });
     }
 
     public bool IsVisible(IntPtr h) { return (bool)Run(delegate() { return IsWindowVisible(h); }); }
@@ -1708,6 +1732,27 @@ function Find-TestWindowEx {
     )
     $td = Resolve-TestDesktop $Desktop
     return $td.FindWindowEx($Parent, (ConvertTo-TestFilter $Class), (ConvertTo-TestFilter $Title))
+}
+
+<#
+The app's MESSAGE-ONLY window (class 'GhozttyMsg' by default), owned by
+-ProcessId. Returns IntPtr::Zero when the process has none.
+
+A message-only window carries the app's private WM_APP protocol - the tray
+callback among them - and is invisible to every EnumWindows-based finder here,
+so this is the only way to name one. -ProcessId is MANDATORY and filtered on
+inside the search: message-only windows are not isolated by the test desktop
+the way top-level windows are, so an unfiltered find can return the user's own
+running Ghoztty and a posted WM_APP message would then drive their terminal.
+#>
+function Find-TestMessageWindow {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        $Class = 'GhozttyMsg',
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    return $td.FindMessageWindow((ConvertTo-TestFilter $Class), [uint32]$ProcessId)
 }
 
 function Get-TestWindowRect {

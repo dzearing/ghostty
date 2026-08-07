@@ -40,6 +40,7 @@ const tab_color = @import("tab_color.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
+const tray_notify = @import("tray_notify.zig");
 const session_layout = @import("session_layout.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
@@ -5234,11 +5235,39 @@ const RELEASE_TAG_URL_PREFIX = "https://github.com/dzearing/ghoztty/releases/tag
 
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
-/// removing the other's icon.
-const NOTIF_DESKTOP_UID: u32 = 1;
+/// removing the other's icon. The uIDs live in `tray_notify.zig` beside the
+/// decode that reads them back off the callback message.
+const NOTIF_DESKTOP_UID: u32 = tray_notify.desktop_uid;
 const NOTIF_DESKTOP_TIMER_ID: usize = 2;
-const NOTIF_UPDATE_UID: u32 = 2;
+const NOTIF_UPDATE_UID: u32 = tray_notify.update_uid;
 const NOTIF_UPDATE_TIMER_ID: usize = 3;
+
+/// Register a notification-area icon's behavior version, which is what turns
+/// the `NIN_*` balloon notifications on. Without it the icon keeps the
+/// shell's default pre-5.0 behavior and a balloon click is delivered to
+/// nobody — see `tray_notify.zig` for the full story. MSDN: *"NIM_SETVERSION
+/// must be called every time a notification area icon is added (NIM_ADD)"*,
+/// and the setting does not survive a logoff, so every balloon re-applies it.
+/// `added` is what NIM_ADD returned, and it is in the failure message on
+/// purpose: SETVERSION addresses an icon by (hWnd, uID), so it fails for an
+/// icon that was never created — which is the whole story on a desktop with
+/// no shell (a background test desktop, a session with explorer down), where
+/// there is no notification area to add to and nothing is wrong with us.
+fn setNotifyIconVersion(hwnd: w32.HWND, uid: u32, added: bool) void {
+    var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
+    nid.hWnd = hwnd;
+    nid.uID = uid;
+    // The union is uVersion for THIS message and uTimeout for the others,
+    // which is why this cannot ride along on the NIM_ADD struct.
+    nid.uVersion_or_uTimeout = w32.NOTIFYICON_VERSION;
+    if (w32.Shell_NotifyIconW(w32.NIM_SETVERSION, &nid) == 0) {
+        log.warn(
+            "NIM_SETVERSION failed for tray uid={d} (NIM_ADD {s}); balloon clicks will not be delivered",
+            .{ uid, if (added) "succeeded" else "failed too" },
+        );
+    }
+}
 
 /// Minimum interval between update checks, in seconds. The check
 /// timestamp is persisted in %LOCALAPPDATA%/ghostty/update_check_at.
@@ -5427,7 +5456,8 @@ fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) 
     nid.uID = NOTIF_UPDATE_UID;
     // NIF_MESSAGE registers our callback so a click on the balloon
     // is delivered as WM_APP_TRAY → opens the GitHub releases page.
-    nid.uFlags = w32.NIF_INFO | w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
+    // NIF_INFO (the balloon itself) is added only after NIM_SETVERSION below.
+    nid.uFlags = w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = w32.LoadIconW(self.hinstance, w32.IDI_GHOSTTY) orelse w32.LoadIconW(null, w32.IDI_APPLICATION);
     nid.dwInfoFlags = w32.NIIF_INFO;
@@ -5449,7 +5479,13 @@ fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) 
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
-    _ = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid);
+    // Add the icon, register the version, THEN show the balloon. The order is
+    // the point: the version must be set before the balloon exists, or the
+    // click that dismisses it is handled under the default (Windows 95)
+    // behavior and never reaches WM_APP_TRAY.
+    const added = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0;
+    setNotifyIconVersion(hwnd, NOTIF_UPDATE_UID, added);
+    nid.uFlags |= w32.NIF_INFO;
     _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
     _ = w32.SetTimer(hwnd, NOTIF_UPDATE_TIMER_ID, 10000, null);
 }
@@ -5611,7 +5647,8 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
     nid.hWnd = hwnd;
     nid.uID = NOTIF_DESKTOP_UID;
-    nid.uFlags = w32.NIF_INFO | w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
+    // NIF_INFO (the balloon itself) is added only after NIM_SETVERSION below.
+    nid.uFlags = w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = w32.LoadIconW(self.hinstance, w32.IDI_GHOSTTY) orelse w32.LoadIconW(null, w32.IDI_APPLICATION);
     nid.dwInfoFlags = w32.NIIF_INFO;
@@ -5634,8 +5671,14 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
-    // Add the icon, show notification, then remove the icon.
-    _ = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid);
+    // Add the icon, register the version, then show the balloon (the icon is
+    // removed by the timer below). The order is the point: the version must be
+    // set before the balloon exists, or the click that dismisses it is handled
+    // under the shell's default (Windows 95) behavior and never reaches
+    // WM_APP_TRAY — which is what made click-to-focus dead code until T448.
+    const added = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0;
+    setNotifyIconVersion(hwnd, NOTIF_DESKTOP_UID, added);
+    nid.uFlags |= w32.NIF_INFO;
     _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
 
     // Schedule icon removal via a timer (distinct from the update
@@ -6207,46 +6250,48 @@ fn msgWndProc(
     }
 
     if (msg == WM_APP_TRAY) {
-        // wparam = uID, lparam = NIN_* event. We only act on
-        // NIN_BALLOONUSERCLICK on the update notification, opening the
-        // GitHub releases page in the user's default browser.
-        const event: u32 = @intCast(lparam & 0xFFFF);
-        if (wparam == NOTIF_DESKTOP_UID and event == w32.NIN_BALLOONUSERCLICK) {
-            // Focus the surface that produced the notification (click-to-
-            // focus, matching macOS/GTK).
-            if (app.notif_desktop_surface_id != 0) {
-                if (app.core_app.findSurfaceByID(app.notif_desktop_surface_id)) |surface| {
-                    _ = app.performAction(
-                        .{ .surface = surface },
-                        .present_terminal,
-                        {},
-                    ) catch |err| {
-                        log.warn("present_terminal from notification failed err={}", .{err});
-                    };
+        // wparam = uID, lparam's low word = the NIN_*/WM_* event. What that
+        // pair MEANS is decided in `tray_notify.classify` (unit-tested); this
+        // is only the doing.
+        switch (tray_notify.classify(wparam, lparam) orelse return 0) {
+            .focus_notifying_surface => {
+                // Focus the surface that produced the notification (click-to-
+                // focus, matching macOS/GTK). A surface whose pane has since
+                // been closed resolves to null and is simply dropped — a
+                // notification for a pane that is gone has nowhere to go.
+                if (app.notif_desktop_surface_id != 0) {
+                    if (app.core_app.findSurfaceByID(app.notif_desktop_surface_id)) |surface| {
+                        _ = app.performAction(
+                            .{ .surface = surface },
+                            .present_terminal,
+                            {},
+                        ) catch |err| {
+                            log.warn("present_terminal from notification failed err={}", .{err});
+                        };
+                    }
                 }
-            }
-            return 0;
-        }
-        if (wparam == NOTIF_UPDATE_UID and event == w32.NIN_BALLOONUSERCLICK) {
-            // Open the specific win-v release page when a version is
-            // known (update balloon); the releases list otherwise
-            // (up-to-date / check-failed feedback balloons).
-            var url_utf8_buf: [256]u8 = undefined;
-            const url_utf8: []const u8 = if (app.update_latest_ver) |v|
-                std.fmt.bufPrint(&url_utf8_buf, RELEASE_TAG_URL_PREFIX ++ "{s}", .{v}) catch RELEASES_URL
-            else
-                RELEASES_URL;
-            var url_buf: [512]u16 = undefined;
-            const url_len = std.unicode.utf8ToUtf16Le(&url_buf, url_utf8) catch return 0;
-            url_buf[url_len] = 0;
-            _ = w32.ShellExecuteW(
-                null,
-                std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                @ptrCast(&url_buf),
-                null,
-                null,
-                w32.SW_SHOW,
-            );
+            },
+            .open_release_page => {
+                // Open the specific win-v release page when a version is
+                // known (update balloon); the releases list otherwise
+                // (up-to-date / check-failed feedback balloons).
+                var url_utf8_buf: [256]u8 = undefined;
+                const url_utf8: []const u8 = if (app.update_latest_ver) |v|
+                    std.fmt.bufPrint(&url_utf8_buf, RELEASE_TAG_URL_PREFIX ++ "{s}", .{v}) catch RELEASES_URL
+                else
+                    RELEASES_URL;
+                var url_buf: [512]u16 = undefined;
+                const url_len = std.unicode.utf8ToUtf16Le(&url_buf, url_utf8) catch return 0;
+                url_buf[url_len] = 0;
+                _ = w32.ShellExecuteW(
+                    null,
+                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
+                    @ptrCast(&url_buf),
+                    null,
+                    null,
+                    w32.SW_SHOW,
+                );
+            },
         }
         return 0;
     }

@@ -1358,6 +1358,14 @@ pub extern "user32" fn ShowScrollBar(
 pub const NIM_ADD: u32 = 0x00000000;
 pub const NIM_MODIFY: u32 = 0x00000001;
 pub const NIM_DELETE: u32 = 0x00000002;
+pub const NIM_SETVERSION: u32 = 0x00000004;
+
+/// `uVersion` values for NIM_SETVERSION. Without a NIM_SETVERSION call an
+/// icon keeps the shell's DEFAULT pre-5.0 ("Windows 95") behavior, under
+/// which the NIN_* balloon notifications below are never sent at all — see
+/// `tray_notify.zig` for why that matters and why we pick 3 over 4.
+pub const NOTIFYICON_VERSION: u32 = 3;
+pub const NOTIFYICON_VERSION_4: u32 = 4;
 
 pub const NIF_MESSAGE: u32 = 0x00000001;
 pub const NIF_ICON: u32 = 0x00000002;
