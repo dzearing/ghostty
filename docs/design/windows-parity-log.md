@@ -10699,3 +10699,47 @@ PASS; `pane-banner.ps1` ALL PASS (88).
 
 Filed: **T571** (give the banner chevron's hovered FILL the same DIB-paint
 oracle, so its permanent SKIP stops being a hole).
+
+
+## 2026-08-07 - T438: the self-upgrade's resume presses Enter in a way a TUI cannot mistake
+
+The upgrade's RESUME-REUSE path types its prompt, verifies it arrived, and only
+then submits - and that gate is why its Enter was still a bare, unframed CR.
+T428's framing works by carrying an argument boundary through to the pty, so it
+only reaches a send where ONE call holds both the text and the Enter; this path
+splits them on purpose, because a post-submit check races `/reset-context`
+clearing the pane. Every delivery went through it.
+
+Decision D4 had already ruled that a lone `--keys-file=` run stays unframed, so
+the typing call could not frame itself. The fix is on the other side: the
+SUBMITTING call now brings its own text run. `Get-LoopSubmitArgs`
+(`scripts/loop-session.ps1`) returns `' ' Enter` instead of a bare `Enter`,
+which makes that call a mixed text+key send - the one shape the CLI frames - so
+a closing fencepost lands immediately before the CR.
+
+A space is the payload that cannot cost anything. Frame honoured: a space is
+appended and the prompt submits. Pane with mode 2004 off: ` ` `\r`, today's
+bytes plus a space. Paste ignored: the verified prompt submits unchanged.
+Nothing degrades to a FRAGMENT, which is what rules out the alternatives -
+holding back the prompt's last character submits a truncated prompt if the tail
+is dropped, and backspace-then-retype eats a real character if the retype is.
+
+Measured, not reasoned. `send-keys-bracketed.ps1` gained three rounds of
+byte-exact capture from raw VT input: round 6 is the PRE-FIX ORACLE, showing the
+two-call shape arriving as flat text plus a naked `0d` with no fencepost
+anywhere even with mode 2004 ON - proof no CLI-side change could have reached
+it; round 7 captures the new submit as `1b5b3230307e 20 1b5b3230317e 0d`; round
+8 is the mode-2004-off negative control (`20 0d`, no fencepost), so the fix
+cannot inject fencepost junk into a program that never asked for it.
+
+This closes T438, not the family. T562 (P0, same morning) is the case where
+`reset-context.sh` was already sending ONE framed call and the loop was still
+found at a full composer - so framing is necessary and demonstrably not
+sufficient, and the submission gate T562 calls for is the part that matters
+most. Both task files now cross-reference the other.
+
+Floor: `floor-lane.ps1` none PASS (309s), win32 PASS (352s), agent PASS (311s);
+P1-P3 ALL PASS; `send-keys-bracketed.ps1`, `upgrade-resume-readiness.ps1`
+(D7-D9 new), `upgrade-no-fork.ps1` and `upgrade-staleness.ps1` all ALL PASS.
+
+Filed: nothing new - the one loose thread this turned up is already T562.

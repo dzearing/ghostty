@@ -229,6 +229,39 @@ function New-LoopSendKeysText {
     return @{ Args = @($Text); File = ''; Degraded = $true }
 }
 
+# The `+send-keys` arguments that SUBMIT a prompt already sitting in a pane's
+# composer (tracker T438).
+#
+# NOT `Enter` on its own, and the reason is the whole of T428: a bare CR is only
+# unambiguously a keypress when the receiving TUI can see where pasted text
+# ended. `+send-keys` states that boundary by framing a TEXT run as a bracketed
+# paste (ESC[200~ ... ESC[201~) and writing the KEY run bare after it - but it
+# can only do that when ONE call carries both runs. A boundary the CLI cannot
+# see is a boundary it cannot encode.
+#
+# The upgrade's reuse path deliberately types the prompt, VERIFIES it arrived,
+# and only then submits (T210: a half-arrived prompt becomes a chat message, and
+# a post-submit check races /reset-context clearing the pane). So the prompt
+# itself cannot ride along in the submitting call - and decision D4 ruled that a
+# lone `--keys-file=` run stays unframed, so the typing call cannot frame itself
+# either. The submitting call has to bring its own text run.
+#
+# One space is the smallest text that makes the call a mixed text+key send,
+# which is what earns the frame. Every way it can go wrong is harmless:
+#
+#   * frame honoured    -> a space is appended, the CR is a keypress, submitted.
+#   * pane has 2004 off -> ` ` `\r` unframed: exactly today's bytes plus a space.
+#   * paste ignored     -> the verified prompt is submitted unchanged.
+#
+# Trailing whitespace means nothing to the session receiving the prompt, so
+# nothing here can turn a verified prompt into a FRAGMENT. That is the property
+# the alternatives lack: holding back the prompt's last character (gate the
+# head, frame the tail) submits a truncated prompt if the tail is dropped, and
+# backspace-then-retype eats a real character if the retype is.
+function Get-LoopSubmitArgs {
+    return @(' ', 'Enter')
+}
+
 # Reduce a prompt (or a pane tail) to what the two can be compared on.
 #
 # A TUI wraps the prompt inside its input box, so the tail holds the same

@@ -217,6 +217,8 @@ Two consequences worth knowing:
 
 Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own — have no boundary to disambiguate and are sent byte-for-byte as they always were.
 
+**A boundary the CLI cannot see is a boundary it cannot encode.** Framing spans one call, so a caller that must split the text and the Enter into two calls — the self-upgrade does, because it verifies the prompt arrived before submitting it — gets a flat text run and a naked CR no matter what the CLI does. Such a caller submits with `" " Enter` rather than a bare `Enter`: the throwaway space makes the *submitting* call a mixed send, so a closing fencepost lands immediately before the CR. A trailing space means nothing to the receiver, which is what makes it safe — a submit that instead withheld the prompt's own last character would submit a truncated prompt if that character were dropped. Shared helper: `Get-LoopSubmitArgs` in `scripts/loop-session.ps1` (T438); byte-level oracle: rounds 6–8 of `test/win32/send-keys-bracketed.ps1`.
+
 ### `ghoztty +set-state`
 
 Set the activity state of a named window or pane. The state is aggregated across all panes in a window (priority: `needs_input` > `busy` > `idle`) and shown as a title suffix and custom `AXWindowActivityState` accessibility attribute.

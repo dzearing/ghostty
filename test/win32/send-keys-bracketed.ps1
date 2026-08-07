@@ -114,7 +114,13 @@ function Wait-Pane([string]$name, [string]$pat, [int]$sec = 30) {
 # byte that arrived. A pane per round, spawned with --command, so no shell ever
 # sees the payload and no round can inherit the previous one's state.
 $script:round = 0
-function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs) {
+#
+# $ThenArgs, when given, is a SECOND `+send-keys` call into the same pane a
+# beat later (T438). Two calls is the shape the upgrade's reuse path is stuck
+# with - it verifies the prompt arrived before submitting - and the point of
+# capturing it is that no CLI-side framing can span two calls, so the bytes it
+# produces are the thing the fix has to work around rather than rely on.
+function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs, [string[]]$ThenArgs) {
     $script:round++
     $tag = "R$($script:round)"
     $pane = "skb$PID-$($script:round)"
@@ -134,6 +140,14 @@ function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs) {
 
     $all = @("--target=$pane") + $SendArgs
     & $Exe +send-keys @all 2>&1 | Out-Null
+    if ($ThenArgs) {
+        # A real gap, not a race: the reuse path polls the pane for seconds
+        # between its two calls, so the capture must see them as two separate
+        # writes the way the pane does.
+        Start-Sleep -Milliseconds 1500
+        $then = @("--target=$pane") + $ThenArgs
+        & $Exe +send-keys @then 2>&1 | Out-Null
+    }
     # The capture keeps reading until $want bytes or its own timeout, so it
     # never returns early on a short send. Poll until the file stops growing
     # rather than sleeping a guessed interval: a send that lands in two chunks
@@ -209,6 +223,42 @@ $r5 = Invoke-Round 'on' 24 @($evil, 'Enter')
 "     got: $r5"
 Assert "no frame was opened" (-not $r5.StartsWith($FRAME_START))
 Assert "the bytes still arrived intact, CR last" ($r5 -eq ((To-Hex $evil) + $CR))
+
+$SPACE = '20'
+
+"== 6: PRE-FIX ORACLE (T438) - two calls can never be framed, whatever the CLI does"
+# The upgrade's reuse path types the prompt, VERIFIES it arrived, and only then
+# submits, because a post-submit check races /reset-context clearing the pane
+# (T210). That gate is not negotiable, so its Enter is a second call - and a
+# boundary the CLI never sees is a boundary it cannot encode. This round is what
+# that costs at the byte level: a flat text run and a naked CR, exactly the
+# shape T428 measured a TUI swallow.
+$r6 = Invoke-Round 'on' 12 @($msg) @('Enter')
+"     got: $r6"
+Assert "split across two calls, nothing is framed" ($r6 -eq ($msgHex + $CR))
+Assert "no fencepost anywhere, even with mode 2004 on" `
+    (-not ($r6.Contains($FRAME_START) -or $r6.Contains($FRAME_END)))
+
+"== 7: T438 FIX - the submitting call brings its own text run, so the CR is framed out"
+# Get-LoopSubmitArgs (scripts\loop-session.ps1): submit with `" " Enter`, not a
+# bare `Enter`. The space is a text run, so this call is a mixed send and the
+# CLI frames it - which puts a CLOSING fencepost immediately before the CR and
+# makes it unambiguously a keypress. The prompt itself is still delivered and
+# verified by the earlier call, unframed per decision D4.
+$r7 = Invoke-Round 'on' 25 @("--keys-file=$pf") @(' ', 'Enter')
+"     got: $r7"
+Assert "the prompt arrives unframed, as D4 decided" ($r7.StartsWith($msgHex))
+Assert "the submit is a framed space with the CR outside it" `
+    ($r7 -eq ($msgHex + $FRAME_START + $SPACE + $FRAME_END + $CR))
+
+"== 8: NEGATIVE CONTROL - the same submit against a pane with mode 2004 OFF"
+# A pane that never asked for framing gets the plain bytes: one space and a CR.
+# So the fix cannot inject fencepost junk into a program that would not
+# understand it, and the space is the only thing it adds anywhere.
+$r8 = Invoke-Round 'off' 13 @("--keys-file=$pf") @(' ', 'Enter')
+"     got: $r8"
+Assert "unframed space then CR" ($r8 -eq ($msgHex + $SPACE + $CR))
+Assert "no fencepost anywhere" (-not ($r8.Contains($FRAME_START) -or $r8.Contains($FRAME_END)))
 
 "== teardown"
 & $Exe +close "--target=$win" 2>&1 | Out-Null

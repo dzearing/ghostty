@@ -19,6 +19,9 @@
 #      between attempts, and a prompt that never arrives is never submitted.
 #   C  the watchdog handoff: -Force overrides a healthy-looking lock, and
 #      -ResumePromptFile keeps caller text off argv.
+#   D  the upgrade script is wired to all of it - including T438's framed
+#      submit, since the gate above is what forces the submit into a second
+#      call that no CLI-side framing can reach.
 #
 #   powershell -NoProfile -File test\win32\upgrade-resume-readiness.ps1
 param(
@@ -258,6 +261,18 @@ Assert 'D5 the handoff refuses to run unless the lock is held by THIS pane' `
     ($src -match "lock\.pane_id -ne \`$LoopPaneId")
 Assert 'D6 the handoff passes the prompt by file, never on the command line' `
     ($src -match "'-ResumePromptFile', \`$PromptFile")
+
+# T438: the gate forces the submit into a second call, and the CLI can only
+# frame a text run when the SAME call carries the key run after it. So the
+# submitting call has to bring a text run of its own - a bare `Enter` there is
+# the defect, not the fix.
+$submit = Get-LoopSubmitArgs
+Assert 'D7 the submit carries a text run before the key' `
+    ($submit.Count -eq 2 -and $submit[0] -eq ' ' -and $submit[1] -eq 'Enter')
+Assert 'D8 the reuse path submits through Get-LoopSubmitArgs' `
+    ($src -match 'Get-LoopSubmitArgs')
+Assert 'D9 PRE-FIX ORACLE: the bare `Enter` submit is gone' `
+    (-not ($src -match '\+send-keys "--target=\$LoopPaneId" Enter'))
 
 ""
 if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }

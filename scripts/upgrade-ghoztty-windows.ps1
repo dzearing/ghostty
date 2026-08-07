@@ -709,9 +709,17 @@ if ($action -eq 'reuse') {
     }
     Log "reuse: prompt verified in pane $LoopPaneId ($($verified.Why))"
 
-    & $oldExe +send-keys "--target=$LoopPaneId" Enter 2>&1 | ForEach-Object { Log "reuse submit: $_" }
+    # Submit it - and NOT with a bare `Enter` (T438). The gate above is why this
+    # is a second call at all, and a second call is exactly what T428's framing
+    # cannot reach: the CLI frames a text run only when the same call also
+    # carries the key run after it. So the submitting call brings its own
+    # throwaway text run. See Get-LoopSubmitArgs in loop-session.ps1 for why a
+    # single space is the payload that cannot turn a verified prompt into a
+    # fragment.
+    $submit = Get-LoopSubmitArgs
+    & $oldExe +send-keys "--target=$LoopPaneId" @($submit) 2>&1 | ForEach-Object { Log "reuse submit: $_" }
     if ($LASTEXITCODE -ne 0) {
-        Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the Enter exited $LASTEXITCODE, so it was never submitted."
+        Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the submit exited $LASTEXITCODE, so it was never submitted."
         Invoke-WatchdogNow -Why 'the prompt arrived but the Enter failed' -PromptFile $promptFile
         exit 1
     }
