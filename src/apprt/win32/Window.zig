@@ -4738,12 +4738,25 @@ fn savePlacement(self: *Window, maximized: bool) void {
     if (w < window_memory.MIN_DIM or h < window_memory.MIN_DIM) return;
     if (w > window_memory.MAX_DIM or h > window_memory.MAX_DIM) return;
 
+    // T220: two stores record window geometry — the placement memory (one
+    // global "last user-chosen size", read by NEW windows) and the
+    // session-layout manifest (a per-window frame, replayed by restore).
+    // The manifest is authoritative for a RESTORED window's frame, so it
+    // must never be staler than the placement memory: a debounced write
+    // here (the old `markLayoutDirty`) left a 250ms window in which a
+    // crash/kill stranded the manifest — and the agent's layout blobs — at
+    // the pre-resize frame, and the relaunch "forgot" the resize even
+    // though the placement file already knew it. User geometry gestures
+    // are already coalesced to their end (drag end, maximize/restore
+    // transition), so both stores are written in the same breath: manifest
+    // FIRST, placement second — a crash between the two writes then leaves
+    // only the store restore does not read stale.
+    if (self.app.config.@"session-persistence") self.app.syncSessionLayout();
     window_memory.save(self.app.core_app.alloc, .{
         .width = w,
         .height = h,
         .maximized = maximized,
     });
-    self.app.markLayoutDirty(); // T89f: window frame changed → re-persist layout
 }
 
 /// Show the transient "columns × rows" overlay during a resize, honoring

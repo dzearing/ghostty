@@ -401,6 +401,21 @@ processes after a reboot.
   A recorded working directory that no longer EXISTS falls back to the user's
   home rather than failing the spawn (`PtySpawner.resolveSpawnCwd`) — a
   deleted worktree used to leave every restored pane dead.
+- **Window geometry: two stores, one precedence rule (T220).** Two files
+  record window geometry on Windows and they answer different questions:
+  the placement memory (`window_placement[-debug]`, T85) is one global
+  "last user-chosen size" read by NEW windows, and the session-layout
+  manifest carries a per-window `frame` replayed by restore. **The manifest
+  is authoritative for a restored window's frame; the placement memory is
+  authoritative for a new window's size.** The invariant that makes that
+  safe: the manifest's frame must never be STALER than the placement
+  memory. Both are therefore written at the same user gesture — drag end
+  (`WM_EXITSIZEMOVE`) and maximize/restore transitions, in
+  `Window.savePlacement` — with the manifest sync FIRST, so a crash between
+  the two writes can only leave stale the store that restore does not read.
+  Before T220 the manifest ride was a 250ms debounce (`markLayoutDirty`),
+  and a kill inside it restored the pre-resize frame over a newer placement
+  memory. Acceptance: `test/win32/session-layout-geometry-race.ps1`.
 - **Sparkle:** no new hook strictly needed — the update path already sets
   `isQuitting` and preserves the manifest (§3.2). Add belt-and-braces: on
   `willInstallUpdateOnQuit`, flush the manifest and send explicit `DETACH`s

@@ -7,6 +7,12 @@
 //!   explicit `window-width`/`window-height` config (core sends
 //!   `initial_size`)  >  remembered placement  >  built-in default.
 //!
+//! A session-RESTORED window is different: its frame comes from the
+//! session-layout manifest (per-window, replayed by `applyRestoreFrame`),
+//! not from this memory. The two stores are kept coherent by writing both
+//! at the same user gesture, manifest first (T220, `Window.savePlacement`);
+//! see docs/design/session-persistence.md §5.3.
+//!
 //! Decisions (recorded for T85):
 //! - Only SIZE is remembered, not position — window position is governed
 //!   by `window-position-x/y` config and the cascade logic in Window.init.

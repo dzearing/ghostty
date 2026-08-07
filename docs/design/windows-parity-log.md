@@ -10187,3 +10187,30 @@ sessions remain listed. Validation: session-relaunch-notify.ps1 ALL PASS
 (92) with A14 green (live=3); diff is test-script + docs only - the zig
 lanes, P1-P3 and chooser-sessions ran green the same night on these exact
 binaries (T326's validation).
+
+
+## 2026-08-07 - T220 done: a crash right after a resize can no longer restore the old window size
+
+Two stores record window geometry and they raced: the T85 placement memory
+(one global "last user-chosen size", written synchronously at drag-end) and
+the session-layout manifest (per-window frame, replayed by restore) - but the
+manifest ride was markLayoutDirty's 250ms debounce, so a force-kill or crash
+inside that window stranded the manifest (and the agent's layout blobs) at
+the pre-resize frame, and the relaunch restored a window that had forgotten
+its size while the placement file already knew better. Found intermittently
+during T217 (6 asserts red one run, green the next three).
+
+The rule, now stated in session-persistence.md 5.3: the manifest is
+authoritative for a RESTORED window's frame, the placement memory for a NEW
+window's size - so the manifest must never be the staler of the two. The fix
+makes Window.savePlacement (drag-end + maximize/restore transitions, already
+the gesture-coalescing points) run syncSessionLayout IMMEDIATELY, manifest
+first, placement second - a crash between the two writes can only leave
+stale the store restore does not read. New acceptance
+session-layout-geometry-race.ps1 keys on that ordering to make the old
+intermittent bug deterministic: resize, wait only for the placement file,
+kill with no settle delay, assert the manifest on disk already holds the new
+frame, relaunch and assert the restored size - x3. ALL PASS (23); with the
+fix reverted it fails 6/6 on exactly the two race assertions. Filed T554
+(seat: mac) - the Mac scheduleSync debounce has the same shape - and D23 for
+the keep-geometry-in-the-manifest call. Floor lanes + P1-P3 green.
