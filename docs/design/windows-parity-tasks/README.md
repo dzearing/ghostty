@@ -143,6 +143,24 @@ scripts\parity-tasks.ps1 validate             # ids, titles, statuses, dangling 
 `ALL PASS (<n> tasks)` or the specific problems, and exits non-zero on
 failure.
 
+**A status change writes its own receipt** (T564). `set-status` appends the
+transition to the task's `## Progress log` — `status: blocked(waiting for a
+recurrence) -> todo (by dashboard: is unblocked and back in the queue)` — so a
+reader can always tell what moved a task and who moved it. Two consequences
+worth knowing:
+
+- The **old status is preserved verbatim**, reason and all. Statuses carry a
+  parenthetical (`blocked(...)`, `skipped(split -> T394)`) and the dashboard's
+  buttons write a bare `todo` over it; the log entry is the only place that text
+  survives. Before this, un-parking a task destroyed the reason it was parked.
+- `-SourceNote "<who>"` names the hand on it; `-NoNote` suppresses the entry and
+  exists **only** for a bulk normalisation pass that would otherwise stamp a note
+  into every file. A status flip with no receipt is the defect T564 fixed — do
+  not reach for it to keep a diff small.
+
+A no-op (setting the status it already has) writes nothing, so re-running a
+command is not an event.
+
 **Always mint ids with `new`.** Hand-picking a number reintroduces exactly
 the race this layout removes.
 

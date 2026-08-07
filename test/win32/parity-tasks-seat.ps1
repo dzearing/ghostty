@@ -32,6 +32,16 @@
 #      (IN FLIGHT:). `note` appends timestamped progress-log entries; a claim
 #      seeds the log; `new -Tags` writes tags and validate rejects a bogus one;
 #      an in-progress task with no progress log fails validate.
+#   N. Status journaling (T564): every `set-status` appends the transition to
+#      the task's own progress log, preserving the OLD status verbatim - which
+#      is the only place a discarded `blocked(reason)` survives. `-SourceNote`
+#      names who asked, a no-op writes nothing, and `-NoNote` is the bulk
+#      escape hatch.
+#   O. The same, end to end through the dashboard: a POST to `/api/status`
+#      carrying the button's own label lands in the file as
+#      "(by dashboard: <label>)". Runs a private node server on port 7913 with
+#      GHOZTTY_TASK_DIR pointed at the fixture, so the real tracker and the
+#      real dashboard on 7788 are never touched. Skipped if node is absent.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -389,6 +399,116 @@ Assert 'a bogus tag in a file fails validate' ($r.Code -eq 1 -and $r.Out -match 
 Remove-Item $p91 -Force
 $r = Task-Run @('validate')
 Assert 'the fixture is clean again' ($r.Code -eq 0)
+
+# --- N. every status change journals itself (T564) ---------------------------
+""
+"N. set-status journals the transition"
+Reset-Fixture
+New-FixtureTask -Id 'T1'          # todo, and deliberately with NO progress log
+
+function Get-LogLines {
+    param([string]$Id = 'T1')
+    $t = [System.IO.File]::ReadAllText((Join-Path $fixture "$Id.md"))
+    return @([regex]::Matches($t, '(?m)^- \d{4}-\d{2}-\d{2} \d{2}:\d{2}'))
+}
+
+$r = Task-Run @('set-status', 'T1', '-Status', 'blocked(waiting on a crash to recur)')
+Assert 'set-status exits 0' ($r.Code -eq 0)
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+Assert 'a file with no progress log gains one' ($txt -match '(?m)^## Progress log\s*$')
+Assert 'the entry names both ends of the transition' (
+    $txt -match 'status: todo -> blocked\(waiting on a crash to recur\)')
+Assert 'set-status says out loud that it journaled' ($r.Out -match 'journaled: status: todo ->')
+
+# The T443 case exactly: the dashboard's button writes a BARE todo, so the
+# reason only survives if the note captured the old status verbatim.
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo', '-SourceNote', 'dashboard: Mark unblocked', '-Session', 'sess-7')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+Assert 'the discarded blocked(reason) survives in the log' (
+    $txt -match 'status: blocked\(waiting on a crash to recur\) -> todo')
+Assert 'the note names who asked for it' ($txt -match '\(by dashboard: Mark unblocked\)')
+Assert 'and stamps the session' ($txt -match '\[session sess-7\]')
+Assert 'two transitions, two entries' ((Get-LogLines).Count -eq 2)
+
+# A no-op is not a transition: re-running the same status must not pad the log.
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo')
+Assert 'setting the same status again exits 0' ($r.Code -eq 0)
+Assert 'and writes no entry' ((Get-LogLines).Count -eq 2)
+
+# -NoNote is the bulk-normalisation escape hatch, and nothing else.
+$r = Task-Run @('set-status', 'T1', '-Status', 'done', '-Commit', 'abc1234', '-NoNote')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+Assert '-NoNote still applies the status' ($txt -match '(?m)^status: "done"$')
+Assert '-NoNote still records the commit' ($txt -match '(?m)^commits: \["abc1234"\]$')
+Assert '-NoNote suppresses the entry' ((Get-LogLines).Count -eq 2)
+
+# A commit-carrying transition names the commit in the log, so `done` is
+# traceable to its evidence from the task file alone.
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo')
+$r = Task-Run @('set-status', 'T1', '-Status', 'done', '-Commit', 'def5678')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+Assert 'a done transition carries its commit' ($txt -match 'status: todo -> done \[commit def5678\]')
+
+$r = Task-Run @('validate')
+Assert 'a journaled fixture still validates' ($r.Code -eq 0)
+
+# --- O. the dashboard button's label reaches the file (T564) -----------------
+""
+"O. dashboard /api/status writes the receipt end to end"
+$node = (Get-Command node -ErrorAction SilentlyContinue)
+if (-not $node) {
+    Assert 'SKIP: node is not on PATH, so the server half cannot be exercised' $true
+}
+else {
+    Reset-Fixture
+    New-FixtureTask -Id 'T1' -Status 'blocked(armed watch - needs an occurrence)'
+    # A port of its own: 7788 is very likely serving the real tracker right now,
+    # and this section must never write into it.
+    $port = 7913
+    $dash = Join-Path $Repo 'scripts\task-dashboard.js'
+    $env:GHOZTTY_TASK_DIR = $fixture
+    $srv = Start-Process -FilePath $node.Source `
+        -ArgumentList @($dash, '--port', "$port") `
+        -PassThru -WindowStyle Hidden
+    # Cache the handle before the child can exit, or PS 5.1 hands back an empty
+    # ExitCode and a dead server reads as a healthy one (the T443 soak lesson).
+    $null = $srv.Handle
+    try {
+        $up = $false
+        foreach ($i in 1..40) {
+            try {
+                $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/data" -TimeoutSec 5
+                $up = $true; break
+            }
+            catch { Start-Sleep -Milliseconds 250 }
+        }
+        Assert 'the dashboard server came up on its own port' $up
+        if ($up) {
+            $body = @{ id = 'T1'; status = 'todo'; source = 'is unblocked and back in the queue' } | ConvertTo-Json
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/status" -Method Post `
+                -ContentType 'application/json' -Body $body -TimeoutSec 30
+            Assert 'the POST is accepted' ($null -ne $resp)
+            $txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+            Assert 'the status moved' ($txt -match '(?m)^status: "todo"$')
+            Assert 'the blocked reason survives in the log' (
+                $txt -match 'status: blocked\(armed watch - needs an occurrence\) -> todo')
+            Assert 'the log names the dashboard' ($txt -match '\(by dashboard: is unblocked and back in the queue\)')
+
+            # A request with no source still leaves a receipt: "someone clicked
+            # something here" beats silence, which is the whole defect.
+            $body = @{ id = 'T1'; status = 'in-progress' } | ConvertTo-Json
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/status" -Method Post `
+                -ContentType 'application/json' -Body $body -TimeoutSec 30
+            $txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1.md'))
+            Assert 'a source-less POST still says it came from the dashboard' (
+                $txt -match '\(by dashboard: status button\)')
+        }
+    }
+    finally {
+        if ($srv -and -not $srv.HasExited) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+        Remove-Item Env:\GHOZTTY_TASK_DIR -ErrorAction SilentlyContinue
+    }
+}
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }

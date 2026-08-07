@@ -288,6 +288,14 @@ Concretely, in order, with no stops in between:
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
    validate` before committing. Commit and push.
 
+   Since T564 `set-status` **journals every transition** into the task's own
+   `## Progress log` (`status: <old> -> <new>`, plus `[commit <sha>]`), so a
+   status change is never the silent edit it used to be — and the old status is
+   preserved verbatim, which is the only place a discarded `blocked(reason)`
+   survives. Pass `-SourceNote "<who asked>"` when the reason is not obvious
+   from the turn. `-NoNote` exists for a bulk normalisation pass and nothing
+   else.
+
    **Your commit message is the activity feed.** The dashboard builds each
    feed item from the commit that finished the work: the subject becomes the
    headline, the first paragraph of the body becomes "what changed", and the

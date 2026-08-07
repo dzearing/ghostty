@@ -17,6 +17,15 @@
 
   ASCII-only by design (PS 5.1 on this box mangles non-ASCII on rewrite).
 
+  EVERY STATUS CHANGE IS JOURNALED (T564). `set-status` appends the transition
+  ("status: blocked(...) -> todo") to the task's own `## Progress log`, with
+  `-SourceNote` naming whoever asked for it. A status flip is what puts work in
+  the queue and takes it out, and it used to be the one edit that left no trace:
+  on 2026-08-07 a one-click reopen of T443's armed watch was indistinguishable
+  from an evidence-backed one, and it also discarded the `blocked(reason)` text.
+  The note preserves the old status verbatim, reason included. `-NoNote` opts a
+  bulk normalisation pass out; nothing else should.
+
 .EXAMPLE
   scripts\parity-tasks.ps1 list -Status todo
   scripts\parity-tasks.ps1 next
@@ -85,6 +94,18 @@ param(
     # the only version that cannot be half-done. Off by default so `next`
     # stays a read-only question.
     [switch]$Claim,
+
+    # Who or what asked for a `set-status`, in words a reader will understand
+    # ("dashboard: Mark unblocked", "daily triage sweep"). It is appended to the
+    # transition's progress-log entry. Optional, because the transition is
+    # journaled either way - this only says whose hand was on it.
+    [string]$SourceNote,
+
+    # Suppress the progress-log entry `set-status` writes. Exists for a bulk
+    # normalisation pass that would otherwise stamp a note into two hundred
+    # files; it is NOT for ordinary use, because a status flip with no receipt
+    # is the exact defect T564 fixed.
+    [switch]$NoNote,
 
     # Escape hatch so the acceptance script can drive a fixture directory
     # instead of the real tracker (same idea as GHOSTTY_HOST_DEFAULTS).
@@ -508,16 +529,37 @@ switch ($Command) {
         if (-not $Status) { throw 'set-status requires -Status.' }
         $path = Get-TaskPath $tid
         $text = [System.IO.File]::ReadAllText($path)
+        # Read the OLD status before overwriting it: the transition is what the
+        # progress log records, and a `blocked(reason)` head is where the reason
+        # lives. The dashboard's buttons write a bare `todo`, so without this
+        # the reason is simply gone (T564).
+        $before = ConvertFrom-Frontmatter -Path $path
+        $was = if ($before) { [string]$before.Status } else { '' }
         $json = ConvertTo-Json $Status -Compress
         $new = [regex]::Replace($text, '(?m)^status:\s*.*$', "status: $json", 1)
         if ($Commit) {
-            $existing = (ConvertFrom-Frontmatter -Path $path).Commits
+            $existing = if ($before) { $before.Commits } else { @() }
             $all = @($existing) + @($Commit)
             $listJson = '[' + (($all | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ', ') + ']'
             $new = [regex]::Replace($new, '(?m)^commits:\s*.*$', "commits: $listJson", 1)
         }
         [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
         Write-Host ("{0} -> {1}" -f $tid, $Status)
+
+        # Journal the transition. A status change is the single most consequential
+        # edit anyone makes to a task - it is what puts work into the queue and
+        # takes it out - and until T564 it was the only edit that left no trace
+        # at all. On 2026-08-07 that let a one-click reopen of T443's armed watch
+        # look exactly like an evidence-backed one, and the loop spent a turn
+        # re-deriving a park it had already recorded.
+        if (-not $NoNote -and $was -ne $Status) {
+            $from = if ($was) { $was } else { '(none)' }
+            $line = "status: {0} -> {1}" -f $from, $Status
+            if ($SourceNote) { $line += (" (by {0})" -f $SourceNote) }
+            if ($Commit) { $line += (" [commit {0}]" -f $Commit) }
+            Add-ProgressNote -Path $path -SessionId $Session -NoteText $line
+            Write-Host ("      journaled: {0}" -f $line)
+        }
     }
 
     'set-order' {

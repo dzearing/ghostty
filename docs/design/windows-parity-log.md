@@ -10479,3 +10479,50 @@ Floor: `floor-lane.ps1 -Lane all` = ALL LANES PASS (none 312s, win32 345s, agent
 `hero-mode` 63, all ALL PASS. Filed T563 — the same defect one size down, in the
 five small dialogs and the command palette, which T308 deliberately did not
 touch.
+
+## 2026-08-07 — T564: a status change now leaves a receipt (and T443 goes back on hold)
+
+`next -Claim` handed out T443, the parked crash watch, which should have been
+impossible: it was `blocked`. Commit `e0d61cc39` had carried it — and T474 with
+it — back to `todo`, in the exact shape the dashboard's **Mark unblocked** button
+writes. No occurrence was behind it. Checked before re-parking: the newest
+artifact in `.dumps\` is still the 2026-08-04 dump, and **157** `floor-lane` logs
+since 2026-08-06 00:00 scan clean for `Segmentation fault`, `recursive panic`,
+`crash diagnostics`, `crash stack`, `Access violation` and `STALL`. Both tasks
+are `blocked` again with their reasons restored, the data point is in T443's
+ARMED-WATCH LOG, and **D27** files the judgement call in case the click was
+deliberate (its other option puts T443 straight back at the head of the queue).
+
+That is the second time in two days the queue has spent a turn re-deriving this
+park, so the turn's work became the reason it keeps happening: **a status change
+was the one edit that left no trace anywhere.** It is also the edit that puts
+work into the queue and takes it out, and it silently destroyed the
+`blocked(reason)` text on the way through — the dashboard writes a bare `todo`
+over it. A stray click and an evidence-backed reopen were indistinguishable
+after the fact.
+
+`set-status` now reads the frontmatter *before* rewriting it and appends the
+transition to the task's own `## Progress log` — `status: blocked(armed watch …)
+-> todo (by dashboard: is unblocked and back in the queue) [commit abc1234]`. The
+old status is preserved verbatim, so the log is where a discarded reason
+survives. `-SourceNote` names the hand on it and `-NoNote` is the bulk-pass
+escape hatch, documented as not-for-ordinary-use. A no-op writes nothing, so
+re-running a command is not an event. The dashboard forwards each button's own
+label (`dashboard: <label>`, falling back to `dashboard: status button` rather
+than to silence — the constant prefix also keeps the value from ever binding as
+a `-parameter`), and **Mark unblocked** is now two-step: the first click re-reads
+the task's `unblock:` condition back at whoever is about to override it, in a
+warning-coloured button. Deliberately not a `confirm()` — a modal inside the
+viewer pane blocks the whole WebView.
+
+Tests: `parity-tasks-seat.ps1` gains section **N** (journaling: the transition,
+the preserved `blocked(reason)`, `-SourceNote`/`-Session`, the no-op, `-NoNote`,
+and the commit stamp) and section **O**, which drives the real path end to end —
+a private `node scripts/task-dashboard.js` on port 7913 with `GHOZTTY_TASK_DIR`
+pointed at a fixture, so the real tracker and the real dashboard on 7788 are
+never touched — asserting both the labelled and the source-less POST leave a
+receipt. Both ALL PASS; `task-dashboard.js --selftest` ALL PASS; tracker
+`validate` ALL PASS (594 tasks).
+
+Floor: `floor-lane.ps1 -Lane all` = ALL LANES PASS (none 303s, win32 356s, agent
+331s); P1–P3 ALL PASS.

@@ -227,6 +227,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .btn[disabled] { opacity: .5; cursor: default; }
 .btn.primary { background: var(--open); border-color: var(--open); color: #fff; }
 .btn.primary:hover { filter: brightness(1.08); }
+/* An armed override: the second click of a two-step action that overrules a
+   recorded condition (reopening a blocked task). Warning-coloured so the
+   button does not look like the same one that was just clicked. */
+.btn.danger { background: var(--warning); border-color: var(--warning); color: #1a1200; }
+.btn.danger:hover { filter: brightness(1.08); }
 
 /* Timeline ---------------------------------------------------------------- */
 .day { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 18px 0 8px; }
@@ -849,10 +854,12 @@ function decisionCard(d) {
   ]);
 }
 
+// `label` is both the toast text and — since T564 — the receipt written into
+// the task's own progress log, so a later reader can tell which button moved it.
 function setStatus(t, status, label) {
   if (state.busy) return;
   state.busy = true;
-  post('api/status', { id: t.id, status: status })
+  post('api/status', { id: t.id, status: status, source: label })
     .then(function () { toast(t.id + ' ' + label + '.'); return refresh(true); })
     .catch(function (e) { toast('Could not update ' + t.id + ': ' + e.message, true); })
     .finally(function () { state.busy = false; });
@@ -1021,8 +1028,26 @@ function blockedCard(t) {
   if (t.unblockCommand) kids.push(h('pre', { class: 'cmd', text: t.unblockCommand }));
   var actions = [];
   if (t.unblockCommand) actions.push(copyBtn(t.unblockCommand));
-  actions.push(h('button', { class: 'btn primary', type: 'button', text: 'Mark unblocked',
-    onclick: function () { setStatus(t, 'todo', 'is unblocked and back in the queue'); } }));
+  // Two-step, because a blocked task's `unblock:` line usually names a
+  // CONDITION rather than a chore ("a new occurrence…"), and one stray click
+  // used to put such a task back at the head of the queue with nothing
+  // recorded — which cost a turn on T443 twice (T564). Arming re-reads the
+  // condition back at whoever is about to override it. A second click still
+  // does it: this is a speed bump, not a lock. No confirm() dialog on purpose —
+  // a modal inside the viewer pane blocks the whole WebView.
+  var armed = false;
+  var unblockBtn = h('button', { class: 'btn primary', type: 'button', text: 'Mark unblocked',
+    onclick: function () {
+      if (!armed && t.unblock) {
+        armed = true;
+        unblockBtn.textContent = 'Yes - reopen it anyway';
+        unblockBtn.classList.add('danger');
+        toast(t.id + ' is blocked until: ' + t.unblock, true);
+        return;
+      }
+      setStatus(t, 'todo', 'is unblocked and back in the queue');
+    } });
+  actions.push(unblockBtn);
   kids.push(h('div', { class: 'dec-note' }, actions));
   return h('div', { class: 'dec blocked-dec', 'data-anim-key': 'blk:' + t.id }, kids);
 }

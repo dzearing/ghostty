@@ -1118,7 +1118,21 @@ function handlePost(url, body) {
     // `done` is the loop's job and needs evidence + a commit sha, so it is
     // deliberately not offered here.
     const status = must(body.status, /^(todo|in-progress|blocked)$/, 'status');
-    return { ok: true, message: ps('parity-tasks.ps1', ['set-status', id, '-Status', status]) };
+    // Say which button did it, in the task's own progress log. A status flip
+    // used to leave no trace anywhere, so a stray click on "Mark unblocked"
+    // read exactly like a deliberate, evidence-backed reopen — which is how
+    // T443's armed watch came back into the queue with no crash behind it
+    // (T564). The label comes from the page; fall back rather than omit it,
+    // because "someone clicked something here" still beats silence. The
+    // constant prefix is also what keeps the value from ever starting with a
+    // `-` and being bound as a parameter name by `powershell -File`.
+    const source = 'dashboard: ' +
+      String(body.source == null || body.source === '' ? 'status button' : body.source)
+        .replace(/[^\x20-\x7e]/g, ' ').slice(0, 120);
+    return {
+      ok: true,
+      message: ps('parity-tasks.ps1', ['set-status', id, '-Status', status, '-SourceNote', source]),
+    };
   }
   if (url === '/api/task') {
     const title = String(body.title || '').trim();
