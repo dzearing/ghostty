@@ -27,6 +27,7 @@ const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
+const ReadonlyBadge = @import("ReadonlyBadge.zig").ReadonlyBadge;
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
@@ -145,6 +146,12 @@ dim_overlay: ?*DimOverlay = null,
 /// `+list --json` can report it. Both null while no banner is set.
 banner_overlay: ?*BannerOverlay = null,
 banner_text: ?[:0]u8 = null,
+
+/// Read-only badge (T445): the corner card that marks this pane as
+/// read-only. Created lazily the first time the mode is entered — a pane
+/// that never goes read-only never pays for a popup — and kept afterwards,
+/// hidden, because the mode is a toggle people flip more than once.
+readonly_badge: ?*ReadonlyBadge = null,
 
 /// Background tint (T67): explicit `--color`/`--split-color`/picker color,
 /// or the auto-shifted split-inheritance tint. Null ⇒ config background.
@@ -863,6 +870,12 @@ pub fn deinit(self: *Surface) void {
         self.banner_text = null;
     }
 
+    // Same for the read-only badge (T445).
+    if (self.readonly_badge) |b| {
+        b.destroy();
+        self.readonly_badge = null;
+    }
+
     // Destroy popup windows and their GDI resources.
     if (self.search_hwnd) |popup| {
         _ = w32.DestroyWindow(popup);
@@ -1053,6 +1066,41 @@ pub fn hideDimOverlay(self: *Surface) void {
     if (self.dim_overlay) |d| d.hide();
 }
 
+/// Show, reposition or hide this pane's read-only badge to match
+/// `core_surface.readonly` (T445).
+///
+/// Driven from the STATE rather than from the `.readonly` action, so a tab
+/// switch, a split-divider drag, a DPI change and a session restore all keep
+/// the badge honest — an action-only path marks the pane once and then lets
+/// the badge drift away from the pane it is glued to. Idempotent and cheap:
+/// a pane that is not read-only and never has been pays one bool test.
+pub fn updateReadonlyBadge(self: *Surface) void {
+    if (!self.core_surface_ready) return;
+    if (!self.core_surface.readonly) {
+        if (self.readonly_badge) |b| b.hide();
+        return;
+    }
+    const hwnd = self.hwnd orelse return;
+    if (self.readonly_badge == null) {
+        self.readonly_badge = ReadonlyBadge.create(
+            self.app.core_app.alloc,
+            self,
+            hwnd,
+            self.app.hinstance,
+        ) catch |err| {
+            log.warn("readonly badge create failed err={}", .{err});
+            return;
+        };
+    }
+    const config = &self.app.config;
+    const pane_bg: color_math.Rgb = self.background_tint orelse .{
+        .r = config.background.r,
+        .g = config.background.g,
+        .b = config.background.b,
+    };
+    self.readonly_badge.?.update(self.scale, pane_bg);
+}
+
 /// Re-check the z-order of every layered popup this pane owns and heal any
 /// stray `WS_EX_TOPMOST` another process left behind (T142). A no-op in the
 /// normal case; see `overlay_zorder.zig`. Rides window activation as well as
@@ -1063,6 +1111,7 @@ pub fn healOverlayZOrders(self: *Surface) void {
     const owner = self.hwnd orelse return;
     if (self.banner_overlay) |b| w32.healOverlayZOrder(b.hwnd, owner);
     if (self.dim_overlay) |d| w32.healOverlayZOrder(d.hwnd, owner);
+    if (self.readonly_badge) |b| w32.healOverlayZOrder(b.hwnd, owner);
     if (self.scrollbar) |s| w32.healOverlayZOrder(s.hwnd, owner);
 }
 

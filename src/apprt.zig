@@ -107,6 +107,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/banner_link.zig");
 
+    // Pure win32 read-only pane badge geometry + contrast floors (T445),
+    // same no-OS-imports deal.
+    _ = @import("apprt/win32/readonly_badge.zig");
+
     // Pure win32 split-divider geometry (T155), same no-OS-imports deal.
     _ = @import("apprt/win32/split_geometry.zig");
 

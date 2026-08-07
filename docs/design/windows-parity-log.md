@@ -10798,3 +10798,74 @@ Filed: T572 - nobody has yet watched a REAL toast click bring the window
 forward. Both halves either side of it are measured and the middle is
 documented behavior, so it is a P2; the task carries the recipe and the reason
 the first automation attempt stalled.
+
+## 2026-08-07 - T445: a read-only pane on Windows finally says so
+
+Read-only drops every keystroke on the floor, and until now the win32 build
+said nothing about it: the `.readonly` apprt action was an acknowledged no-op,
+so a read-only pane and a wedged pane looked exactly alike. The only way to
+tell them apart was to open the context menu and look for a checkmark - a menu
+you have to already suspect the answer to open. A read-only pane now wears a
+small orange card in its top-right corner, with an eye and the word
+"Read-only", and clicking that card leaves the mode.
+
+Per-pane rather than a tab-title glyph, which is what T28's original note
+suggested and what decision **D30** was filed to record. A tab holds a whole
+split tree, so a tab glyph cannot answer "which pane" - and read-only is a
+per-pane mode, so the cheaper affordance answers a different question than the
+one the user is asking. It also could not be the way out of the mode.
+
+Shape: `readonly_badge.zig` is the pure half - metrics, the top-right anchor,
+the card's per-pixel render, and both contrast floors - with no OS imports, so
+its 18 tests run in every app-runtime lane. Every number is asserted at
+1.0/1.25/1.5/2.0, the spacing constants are asserted to be ON the 4 DIP scale,
+and the label/border colors are swept against the WHOLE 0-255 background ramp
+plus a handful of real themes rather than against the two the author looked at.
+`ReadonlyBadge.zig` is the windowing half: a `WS_EX_LAYERED` popup owned by the
+pane's surface HWND, on the DimOverlay/BannerOverlay pattern.
+
+Two things it does differently from the banner, both forced by where it sits.
+It uses the SCROLLBAR's `UpdateLayeredWindow` per-pixel-alpha path instead of
+the banner's `LWA_ALPHA` + opaque paint: the banner owns a reserved band whose
+backdrop it knows, while the badge floats over live terminal content, so its
+drop shade and antialiased edge have to be genuinely translucent rather than a
+rectangle of pane background painted over whatever was there. And it is NOT
+`WS_EX_TRANSPARENT`, because the mark is the way out.
+
+The ordering inside that paint is the whole trick and is worth remembering:
+the pure renderer writes the card in STRAIGHT color plus a separate coverage
+mask, GDI then draws the eye and the label into the same pixels, and only then
+does one pass re-apply the mask and premultiply. GDI text has no notion of
+alpha - `DrawTextW` writes zero into the byte - so any arrangement that tries
+to protect an alpha channel from it ends up punching the text back out of the
+window.
+
+Driven from the STATE, not from the action: `Window.updateReadonlyBadges` rides
+the same triggers as the dim overlays and the banners, so a tab switch, a
+divider drag, a DPI change and a zoom all keep the badge glued to its pane. An
+action-only path marks the pane once and then lets the mark drift.
+
+`icon_button_paint.fontCodepoint` was hoisted out of `fontGlyph` so the badge
+can render Fluent's `RedEye` without joining the icon-BUTTON vocabulary. Its
+answer to a machine with no icon font is to draw no glyph at all rather than
+fall back to the hand-drawn quads: a lens-and-pupil is not expressible in that
+vocabulary, the label carries the meaning, and a bad mark is worse than none.
+
+Floor: `floor-lane.ps1 -Lane all` none PASS (299s), win32 PASS (352s), agent
+PASS (322s); P1-P3 ALL PASS; `test\win32\readonly-badge.ps1` ALL PASS (28
+assertions), `-NegativeControl` red on exactly its two inverted anchor
+assertions.
+
+CAPTURE LIMIT, named in the script rather than quietly dropped: the badge
+paints through `UpdateLayeredWindow` and never services WM_PAINT, so
+PrintWindow has nothing to render and the acceptance script cannot confirm the
+card's colors or the label. Those live in the unit tests, where they are
+decidable. The rendered card was also eyeballed once, from a screenshot of a
+debug build on the interactive desktop.
+
+Filed: **T573** - the badge disables the mode with one click here and via a
+popover on the Mac, which is one affordance with two gestures; **T574** -
+`+list --json` still has no `readonly` field, so the machine-readable half of
+this signal is missing on both seats. NOT filed: read-only does not survive a
+session restore. It is a transient safety toggle and the Mac does not persist
+it either, so restoring it would be a new behavior rather than parity.

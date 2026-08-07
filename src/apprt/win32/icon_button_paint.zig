@@ -144,9 +144,30 @@ fn fontGlyph(
     which: icon_button.Glyph,
     color: u32,
 ) bool {
+    return fontCodepoint(hdc, m.scale, target, codepoint(which), fontDip(which), color);
+}
+
+/// Draw one icon-font codepoint at `dip` DIP, centered in `target`. False =
+/// this machine has neither icon face.
+///
+/// Public because not every icon in the app is an icon BUTTON. The read-only
+/// badge's eye (T445) is a decoration inside a card whose LABEL carries the
+/// meaning, so its answer to a missing face is "draw no glyph" — not the
+/// hand-drawn quad fallback, which has no vocabulary for a lens-and-pupil
+/// shape and would produce a mark worse than none. Sharing this keeps the
+/// face probe (`resolveFace`) in one place rather than growing a second copy
+/// that can disagree about what "present" means.
+pub fn fontCodepoint(
+    hdc: w32.HDC,
+    scale: f32,
+    target: icon_button.Rect,
+    cp: u16,
+    dip: f32,
+    color: u32,
+) bool {
     const face = resolveFace(hdc) orelse return false;
 
-    const em: i32 = @max(@as(i32, @intFromFloat(@round(fontDip(which) * m.scale))), 1);
+    const em: i32 = @max(@as(i32, @intFromFloat(@round(dip * scale))), 1);
     // Negative height asks the mapper for a CHARACTER height, i.e. the em
     // square — which is exactly the box these icon faces are designed to
     // fill, so `em` IS the icon size on screen.
@@ -181,7 +202,7 @@ fn fontGlyph(
         .right = target.right,
         .bottom = target.bottom,
     };
-    var ch = [1]u16{codepoint(which)};
+    var ch = [1]u16{cp};
     _ = w32.DrawTextW(
         hdc,
         &ch,

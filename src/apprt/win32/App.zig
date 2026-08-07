@@ -4524,7 +4524,6 @@ pub fn performAction(
         .key_sequence,
         .key_table,
         .cell_size,
-        .readonly,
         // Platform-specific actions that don't apply on Windows:
         .secure_input, // macOS EnableSecureEventInput
         .undo, // macOS NSUndoManager
@@ -4534,6 +4533,19 @@ pub fn performAction(
         .inspector, // Not yet implemented (debug overlay)
         .render_inspector, // Not yet implemented (debug overlay)
         => return true,
+
+        // Read-only mode changed (T445). The core has already flipped
+        // `core_surface.readonly`; all this has to do is let the pane
+        // re-derive its badge from that state. It used to be acknowledged
+        // and dropped, which is why a read-only pane on Windows was
+        // indistinguishable from a wedged one.
+        .readonly => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                core_surface.rt_surface.updateReadonlyBadge();
+                return true;
+            },
+        },
 
         // Sticky pane banner (T35): OSC 7778 / `+set-banner` / the editor
         // dialog all funnel through the core surface to here.

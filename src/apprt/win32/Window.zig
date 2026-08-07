@@ -2435,6 +2435,24 @@ pub fn updateDimOverlays(self: *Window) void {
 
     // Pane banners glue to the same layout/visibility/config events (T35).
     self.updatePaneBanners();
+    // ...and so does the read-only badge (T445).
+    self.updateReadonlyBadges();
+}
+
+/// Show/reposition/hide every pane's read-only badge (T445). Rides the same
+/// triggers as the dim overlays and the banners, which is what keeps a badge
+/// glued to its pane across a divider drag, a tab switch, a DPI change and a
+/// window move. A pane that is not read-only pays one bool test.
+pub fn updateReadonlyBadges(self: *Window) void {
+    for (0..self.tab_count) |tab| {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| {
+            // Read-only is a terminal mode; viewers have no keyboard input
+            // to drop in the first place.
+            const surface = entry.view.surface() orelse continue;
+            surface.updateReadonlyBadge();
+        }
+    }
 }
 
 /// Re-check the z-order of every layered popup this window owns — each
