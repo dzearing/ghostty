@@ -40,12 +40,17 @@ pub const Target = union(Key) {
 
     /// Convert to ghostty_target_s.
     pub fn cval(self: Target) C {
+        // Zeroed first for the same reason as Action.cval: the void `app`
+        // member must not leave the overlapping pointer bytes undefined.
+        var value: CValue = std.mem.zeroes(CValue);
+        switch (self) {
+            .app => {},
+            .surface => |v| value.surface = v.rt_surface,
+        }
+
         return .{
             .key = @as(Key, self),
-            .value = switch (self) {
-                .app => .{ .app = {} },
-                .surface => |v| .{ .surface = v.rt_surface },
-            },
+            .value = value,
         };
     }
 };
@@ -494,13 +499,16 @@ pub const Action = union(Key) {
 
     /// Convert to ghostty_action_s.
     pub fn cval(self: Action) C {
-        const value: CValue = switch (self) {
-            inline else => |v, tag| @unionInit(
-                CValue,
-                @tagName(tag),
+        // Zero the whole union first: a void (or small) payload otherwise
+        // leaves the remaining bytes undefined, and the C side reads this
+        // through overlapping members with no tag-payload binding. A reader
+        // that picks the wrong member must see a defined zero (or null,
+        // which faults deterministically) rather than garbage.
+        var value: CValue = std.mem.zeroes(CValue);
+        switch (self) {
+            inline else => |v, tag| @field(value, @tagName(tag)) =
                 if (@TypeOf(v) != void and @hasDecl(@TypeOf(v), "cval")) v.cval() else v,
-            ),
-        };
+        }
 
         return .{
             .key = @as(Key, self),
@@ -1050,4 +1058,43 @@ pub const SearchSelected = struct {
 
 test {
     _ = std.testing.refAllDeclsRecursive(@This());
+}
+
+test "Action.cval zeroes the union bytes for void-payload actions" {
+    // Read the bytes via asBytes, never through a typed member: reading an
+    // inactive member is the very hazard under test.
+    inline for (@typeInfo(Action).@"union".fields) |field| {
+        if (field.type == void) {
+            const key = @field(Action.Key, field.name);
+            const action = @unionInit(Action, field.name, {});
+            const c = action.cval();
+            try std.testing.expectEqual(key, c.key);
+            for (std.mem.asBytes(&c.value)) |b| {
+                try std.testing.expectEqual(@as(u8, 0), b);
+            }
+        }
+    }
+}
+
+test "Target.cval zeroes the union bytes for the app target" {
+    const c = Target.cval(.app);
+    try std.testing.expectEqual(Target.Key.app, c.key);
+    for (std.mem.asBytes(&c.value)) |b| {
+        try std.testing.expectEqual(@as(u8, 0), b);
+    }
+}
+
+test "Action.cval round-trips a populated payload" {
+    const action: Action = .{ .size_limit = .{
+        .min_width = 101,
+        .min_height = 102,
+        .max_width = 103,
+        .max_height = 104,
+    } };
+    const c = action.cval();
+    try std.testing.expectEqual(Action.Key.size_limit, c.key);
+    try std.testing.expectEqual(@as(u32, 101), c.value.size_limit.min_width);
+    try std.testing.expectEqual(@as(u32, 102), c.value.size_limit.min_height);
+    try std.testing.expectEqual(@as(u32, 103), c.value.size_limit.max_width);
+    try std.testing.expectEqual(@as(u32, 104), c.value.size_limit.max_height);
 }

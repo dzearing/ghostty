@@ -10231,3 +10231,22 @@ frame, relaunch and assert the restored size - x3. ALL PASS (23); with the
 fix reverted it fails 6/6 on exactly the two race assertions. Filed T554
 (seat: mac) - the Mac scheduleSync debounce has the same shape - and D23 for
 the keep-geometry-in-the-manifest call. Floor lanes + P1-P3 green.
+
+
+## 2026-08-07 - T341 done: Action.cval no longer hands apprts undefined union bytes
+
+Action.cval built the C-ABI union with @unionInit on the active member alone,
+so every void-payload action (quit, new_window, toggle_* - most of the enum)
+left the union's remaining bytes undefined; a reader that picked the wrong
+overlapping member got garbage, which is exactly what made T29's phantom
+"process exited" bar random. Both cval sites in src/apprt/action.zig
+(Action.cval and Target.cval, whose void app member overlaps a pointer) now
+start from std.mem.zeroes(CValue) and set only the active member, so the same
+class of reader mistake reads a defined zero - or faults deterministically on
+a null pointer - instead of behaving randomly. The proposal's pointer question
+is answered in the task file: null beats garbage because it fails loudly at a
+fixed address rather than silently reading plausible memory. Three none-lane
+tests pin it: an asBytes sweep over every void-payload action, a size_limit
+round-trip, and Target.cval(.app). Floor lanes (none/win32/agent) + P1-P3 all
+green on a fresh Debug build. No new tasks needed; the Mac/GTK sides inherit
+the fix through shared core.
