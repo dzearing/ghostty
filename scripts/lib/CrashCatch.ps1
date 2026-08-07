@@ -180,10 +180,15 @@ function New-CdbScript {
         Written as ONE line: cdb's -cf joins a multi-line script with spaces
         rather than newlines, which silently glues `g` onto the end of the
         previous command.
+    .PARAMETER PrologCommands
+        Extra commands to run at the loader break BEFORE the filters are
+        registered -- e.g. the databreak entry breakpoint (DataBreak.ps1).
+        Each element must be a complete, self-contained cdb command.
     #>
     param(
         [Parameter(Mandatory)][string]$DumpPath,
-        [int]$MaxFrames = 60
+        [int]$MaxFrames = 60,
+        [string[]]$PrologCommands = @()
     )
     # Forward slashes on purpose -- see the backslash note at the top.
     $dump = $DumpPath -replace '\\', '/'
@@ -202,6 +207,7 @@ function New-CdbScript {
     ) -join ';'
 
     $cmds = @()
+    foreach ($c in $PrologCommands) { $cmds += $c }
     foreach ($f in $script:FATAL_FILTERS) { $cmds += ('sxe -c "' + $onCrash + '" ' + $f) }
     $cmds += 'g'
     $cmds += 'q'

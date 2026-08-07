@@ -9937,6 +9937,31 @@ WM_GETTEXT) - 119 passed with the 2 pre-existing reds proven at clean HEAD
 (T526 known; the second newly filed as T535); floor-lane none/win32/agent all
 PASS; P1-P3 ALL PASS.
 
+## 2026-08-06 - T458: the wild-write catcher exists - hardware data breakpoints on verifyIntegrity's spill slots under cdb (session 01VFBSWtYb)
+
+The T443 armed watch gained its catch-it-in-the-act instrument.
+`scripts\crash-databreak.ps1` (mechanics in `scripts/lib/DataBreak.ps1`)
+probes the target function's Debug prologue at run time - spills, arm point,
+return slot, all as module-relative offsets - then breaks after the prologue
+on EVERY call, arms `ba w8` hardware breakpoints on the canonical spill slots,
+and disarms them via a one-shot breakpoint on the return address, so the armed
+window is exactly the live frame and stack reuse cannot false-positive. A hit
+prints the writing instruction, every thread's stack, and a full minidump.
+Proven end to end against a staged wild write (writer named with source lines)
+and rehearsed on the real agent binary (Page.verifyIntegrity resolved among
+two same-named overloads via -SignatureFilter, armed/disarmed clean). The
+practicality fear in the task ("arming on every call is far too slow") was
+measured instead of assumed: ~2.8 ms/call, 42,315 cycles in a 120s window, a
+fully-armed lane run is ~10-30 min - viable, so no canary fallback needed.
+Per D10/D12 nothing was hunted: the tool waits armed, and T443's watch log now
+carries the exact command for the next occurrence. New cdb specifics encoded
+in the lib so they are not re-derived: `$$<file` includes instead of
+(nonexistent) nested breakpoint-command quotes, pinned breakpoint IDs, and the
+frameless `push rax` prologue of tiny leaf functions being refused loudly.
+Validation: test\win32\crash-databreak.ps1 ALL PASS (38 checks);
+crash-stacks.ps1 ALL PASS (New-CdbScript's additive -PrologCommands change
+unregressed); floor-lane all lanes PASS; P1-P3 ALL PASS.
+
 ## 2026-08-06 - T443/T474: the armed-watch park is mechanical now - blocked status, not a note the queue cannot read
 
 D10 and D12 (resolved 2026-08-05) parked the T443 memory-corruption hunt until
