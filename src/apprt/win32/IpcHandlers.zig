@@ -1609,6 +1609,15 @@ fn buildNode(
                         try arena.dupe(u8, t)
                     else
                         null,
+                    // T332: the agent session this pane is bound to — the join
+                    // key against `+sessions --json`. Lock-free read (the
+                    // backend publishes the id atomically), duped because the
+                    // borrow must not outlive the call; null for a plain
+                    // local ConPTY pane, so the field is omitted there.
+                    .session_id = if (surface.core_surface.remoteSessionId()) |sid|
+                        try arena.dupe(u8, sid)
+                    else
+                        null,
                 },
             };
         },

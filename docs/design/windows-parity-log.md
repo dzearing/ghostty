@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T332 done - +list --json reports which agent session a pane
+  is bound to**. Additive `session_id` on the terminal-leaf object
+  (`src/apprt/ipc/list.zig`, golden test), filled by the win32 server from
+  `core_surface.remoteSessionId()` (lock-free, duped into the arena - the
+  T111b no-terminal-lock rule holds); omitted for plain ConPTY panes and
+  viewers, so old parsers see the old shape. This is the pane<->session join
+  key against `+sessions --json` that T320's validation had to fake with a
+  log line. New acceptance `test\win32\ipc-list-session-id.ps1` (join is
+  alive+attached; viewer omits the field) ALL PASS; three zig lanes + P1-P3
+  green. Filed T552 (+sessions-side pane_id symmetry, P2) and T553 (Mac
+  server half, seat mac). CLAUDE.md +list section documents the field.
 - 2026-08-06 - **T358 done - detached spawns (Activity Monitor New Process)
   get the user's environment**. `proc_spawn.spawnWindows` now builds the
   child's environment from the agent's env + the T42 registry overlay and

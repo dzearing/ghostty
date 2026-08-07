@@ -53,6 +53,12 @@ pub const List = struct {
         /// `background_tint`: null omits the field, keeping the golden Mac
         /// shape unchanged for bannerless panes.
         banner: ?[]const u8 = null,
+        /// The session-persistence agent session this pane is bound to
+        /// (T332): the join key against `+sessions --json`. Absent for a
+        /// plain local ConPTY pane and for viewers; present for local-agent
+        /// and cross-machine panes alike. Additive and optional like
+        /// `banner`: null omits the field.
+        session_id: ?[]const u8 = null,
     };
 
     pub const Node = union(enum) {
@@ -231,6 +237,10 @@ pub const List = struct {
             try jws.objectField("banner");
             try jws.write(banner);
         }
+        if (term.session_id) |sid| {
+            try jws.objectField("session_id");
+            try jws.write(sid);
+        }
         try jws.endObject();
     }
 };
@@ -301,6 +311,50 @@ test "List: build provenance is additive (T52)" {
             "\"mode\":\"Debug\",\"runtime\":\"win32\",\"update_check\":true," ++
             "\"exe\":\"C:\\\\g\\\\ghoztty.exe\"," ++
             "\"exe_modified\":\"2026-07-17 09:31:40 UTC\",\"pid\":42}}}",
+        json,
+    );
+}
+
+test "List: session_id is additive (T332)" {
+    const testing = std.testing;
+
+    const bound: List.Node = .{ .leaf = .{
+        .id = "3F2A", // pane id (uuid in practice)
+        .title = "pwsh",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "3F2A",
+        .focused = true,
+        .exit_code = null,
+        .session_id = "sess-0a1b2c3d",
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &bound,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+            "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
+            "{\"type\":\"leaf\",\"terminal\":{\"id\":\"3F2A\",\"title\":\"pwsh\"," ++
+            "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"3F2A\"," ++
+            "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null," ++
+            "\"session_id\":\"sess-0a1b2c3d\"}}}]}]}}",
         json,
     );
 }
