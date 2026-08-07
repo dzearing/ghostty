@@ -1,17 +1,23 @@
-//! Read another process's *current* working directory from the OS (Windows).
+//! Read another process's *current* working directory — and its command
+//! line — from the OS (Windows). Both live in the same remote structure
+//! (`PEB->ProcessParameters`), so one PEB-walking implementation serves both.
 //!
-//! This is the cwd the process itself would report: cmd.exe, bash, nu and most
-//! shells call SetCurrentDirectory/chdir on every `cd`, so the value tracks
-//! the user live — independent of any OSC 7 report. PowerShell is the notable
-//! exception (Set-Location does not move the process cwd), which is why
-//! callers treat this as a FALLBACK for shells that never report OSC 7
+//! The cwd is the one the process itself would report: cmd.exe, bash, nu and
+//! most shells call SetCurrentDirectory/chdir on every `cd`, so the value
+//! tracks the user live — independent of any OSC 7 report. PowerShell is the
+//! notable exception (Set-Location does not move the process cwd), which is
+//! why callers treat this as a FALLBACK for shells that never report OSC 7
 //! (T185); pwsh gets its live value from shell integration instead.
 //!
-//! One implementation, two entry points: the agent's pty child already holds
-//! a process HANDLE (`fromHandle`); the app side knows only a pid
-//! (`fromPid`, which opens and closes its own handle). Every read is
-//! bounds-checked against the untrusted target process and any failure
-//! returns null — never a crash.
+//! The command line (`ProcessParameters->CommandLine`) is what the process was
+//! started with — the agent's foreground-command sampling (T429) reads it so a
+//! restart notice can name what a pane was running.
+//!
+//! One implementation, two entry points each: the agent's pty child already
+//! holds a process HANDLE (`fromHandle`/`cmdlineFromHandle`); other callers
+//! know only a pid (`fromPid`/`cmdlineFromPid`, which open and close their own
+//! handle). Every read is bounds-checked against the untrusted target process
+//! and any failure returns null — never a crash.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,8 +37,38 @@ const Allocator = std.mem.Allocator;
 /// The handle needs PROCESS_QUERY_INFORMATION | PROCESS_VM_READ rights.
 pub fn fromHandle(handle: windows.HANDLE, alloc: Allocator) ?[]u8 {
     if (comptime builtin.os.tag != .windows) return null;
+    const params = readParams(handle) orelse return null;
+    return readUnicodeString(handle, params.CurrentDirectory.DosPath, alloc);
+}
 
-    // 1. PEB base address via NtQueryInformationProcess.
+/// Read the target's command line (`PEB->ProcessParameters->CommandLine`) as
+/// UTF-8 — the string the process was started with, quoting included (T429).
+/// Same trust posture as `fromHandle`: any failure returns null.
+pub fn cmdlineFromHandle(handle: windows.HANDLE, alloc: Allocator) ?[]u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    const params = readParams(handle) orelse return null;
+    return readUnicodeString(handle, params.CommandLine, alloc);
+}
+
+/// Open `pid` and read its command line. Same-user targets need no elevation.
+/// Returns a fresh `alloc`-owned UTF-8 string, or null on any failure.
+pub fn cmdlineFromPid(pid: u32, alloc: Allocator) ?[]u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    if (pid == 0) return null;
+    const handle = OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        windows.FALSE,
+        pid,
+    ) orelse return null;
+    defer windows.CloseHandle(handle);
+    return cmdlineFromHandle(handle, alloc);
+}
+
+/// Steps 1–3 of the PEB walk, shared by the cwd and command-line readers:
+/// PEB base address via `NtQueryInformationProcess`, then two bounds-checked
+/// `ReadProcessMemory` hops to the target's `RTL_USER_PROCESS_PARAMETERS`.
+/// Uses the std ABI types (no hand-rolled offsets).
+fn readParams(handle: windows.HANDLE) ?windows.RTL_USER_PROCESS_PARAMETERS {
     var pbi: windows.PROCESS_BASIC_INFORMATION = undefined;
     var ret_len: windows.ULONG = 0;
     const st = windows.ntdll.NtQueryInformationProcess(
@@ -44,7 +80,6 @@ pub fn fromHandle(handle: windows.HANDLE, alloc: Allocator) ?[]u8 {
     );
     if (st != .SUCCESS) return null;
 
-    // 2. Read the target's PEB, then take ProcessParameters (a remote pointer).
     var peb: windows.PEB = undefined;
     _ = windows.ReadProcessMemory(
         handle,
@@ -54,21 +89,27 @@ pub fn fromHandle(handle: windows.HANDLE, alloc: Allocator) ?[]u8 {
     const pp_addr = @intFromPtr(peb.ProcessParameters);
     if (pp_addr == 0) return null;
 
-    // 3. Read the RTL_USER_PROCESS_PARAMETERS; take CurrentDirectory.DosPath.
     var params: windows.RTL_USER_PROCESS_PARAMETERS = undefined;
     _ = windows.ReadProcessMemory(
         handle,
         @ptrFromInt(pp_addr),
         std.mem.asBytes(&params),
     ) catch return null;
+    return params;
+}
 
-    const us = params.CurrentDirectory.DosPath; // UNICODE_STRING
+/// Read a `UNICODE_STRING` whose buffer lives in the TARGET process, convert
+/// to UTF-8. Bounds-checked (a length far over the 32K wchar OS limit is
+/// bogus data from an untrusted target); null on any failure.
+fn readUnicodeString(
+    handle: windows.HANDLE,
+    us: windows.UNICODE_STRING,
+    alloc: Allocator,
+) ?[]u8 {
     const buf_ptr = us.Buffer orelse return null;
     const wlen: usize = us.Length / 2; // Length is in BYTES
-    // A path far over MAX_PATH*2 is bogus; reject it (untrusted target).
     if (wlen == 0 or wlen > 32768) return null;
 
-    // 4. Read the UTF-16 path buffer out of the target and convert to UTF-8.
     const wbuf = alloc.alloc(u16, wlen) catch return null;
     defer alloc.free(wbuf);
     _ = windows.ReadProcessMemory(
@@ -130,4 +171,27 @@ test "fromPid: nonexistent pid returns null" {
     // (the idle process) is rejected before OpenProcess.
     try std.testing.expect(fromPid(3, std.testing.allocator) == null);
     try std.testing.expect(fromPid(0, std.testing.allocator) == null);
+}
+
+test "cmdlineFromPid: own process names our own executable" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const got = cmdlineFromPid(windows.GetCurrentProcessId(), alloc) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(got);
+
+    // The command line's first token is the exe (possibly quoted); compare
+    // against our real image path's basename rather than pinning quoting.
+    const exe = try std.fs.selfExePathAlloc(alloc);
+    defer alloc.free(exe);
+    const base = std.fs.path.basename(exe);
+    try testing.expect(std.ascii.indexOfIgnoreCase(got, base) != null);
+}
+
+test "cmdlineFromPid: nonexistent pid returns null" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expect(cmdlineFromPid(3, std.testing.allocator) == null);
+    try std.testing.expect(cmdlineFromPid(0, std.testing.allocator) == null);
 }

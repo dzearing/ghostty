@@ -161,6 +161,18 @@ pub const Child = struct {
         /// single syscall): the store's sampling tick calls it UNDER the store
         /// mutex so the child cannot be freed mid-query (wp3).
         queryForegroundPid: ?*const fn (ctx: *anyopaque) ?i64 = null,
+        /// Optional: the command line of the FOREGROUND program running in
+        /// front of the session's shell (T429) — what a restart notice should
+        /// name for a plain shell pane, e.g. `claude --continue`. Tri-state:
+        /// `.cmd` = a program is running (a NEW `alloc`-owned string, caller
+        /// frees); `.none` = the shell itself is foreground (an idle prompt —
+        /// the caller CLEARS its record); null = the query failed or is
+        /// unsupported (the caller KEEPS its last known value, the T425
+        /// keep-on-failure rule). Like `queryCwd` — and unlike
+        /// `queryForegroundPid` — this is explicitly NOT a cheap single
+        /// syscall (a Toolhelp walk + PEB read on Windows), so it is called on
+        /// a slow periodic tick OUTSIDE the store lock.
+        queryForegroundCommand: ?*const fn (ctx: *anyopaque, alloc: Allocator) ?ForegroundCommand = null,
     };
 
     /// Hand the child its owning channel + output sink (see `VTable.attach`).
@@ -217,6 +229,24 @@ pub const Child = struct {
         const f = self.vtable.queryForegroundPid orelse return null;
         return f(self.ctx);
     }
+
+    /// The foreground program's command line (see
+    /// `VTable.queryForegroundCommand`). Null when the impl declines or the
+    /// query fails — which the caller treats as "keep the last known value".
+    pub fn queryForegroundCommand(self: Child, alloc: Allocator) ?ForegroundCommand {
+        const f = self.vtable.queryForegroundCommand orelse return null;
+        return f(self.ctx, alloc);
+    }
+};
+
+/// The tri-state answer of `Child.queryForegroundCommand` (T429): `.cmd` =
+/// record this command line, `.none` = the shell sits at an idle prompt (clear
+/// the record). The third state — "could not tell" — is the query returning
+/// null instead of a `ForegroundCommand` at all.
+pub const ForegroundCommand = union(enum) {
+    none,
+    /// Owned by the allocator the query was handed; the caller frees it.
+    cmd: []u8,
 };
 
 /// A stateless placeholder context for `deadChild` (the vtable ignores its `ctx`).
@@ -459,6 +489,16 @@ pub const Session = struct {
     /// persist the full argv to disk; this in-memory copy is the live view.
     argv: ?[]u8 = null,
 
+    /// The command line of the FOREGROUND program running inside the shell
+    /// (T429), sampled periodically by `refreshForegroundCommands` and cleared
+    /// when the shell returns to its prompt. Persisted to `sessions.json` and
+    /// sent on the dead `ATTACHED` reply so the restart notice can name what a
+    /// plain shell pane was actually running. Deliberately a SEPARATE field
+    /// from `argv`: `handleRelaunch` re-executes `argv`, and overwriting it
+    /// with a sampled foreground command would make `session-relaunch = auto`
+    /// re-run e.g. `claude` in place of the shell.
+    fg_cmd: ?[]u8 = null,
+
     /// The child's PTY slave path (e.g. `/dev/ttys014`), captured at spawn (OPEN /
     /// RELAUNCH) and surfaced via `OPENED`/`ATTACHED`/`RELAUNCHED` so a viewer pane
     /// can answer `getProcessInfo(.tty_name)` (wp3). Null on Windows (ConPTY has no
@@ -585,6 +625,7 @@ pub const Session = struct {
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
         if (self.argv) |a| self.alloc.free(a);
+        if (self.fg_cmd) |f| self.alloc.free(f);
         if (self.tty) |t| self.alloc.free(t);
         if (self.last_signal) |s| self.alloc.free(s);
         self.* = undefined;
@@ -670,6 +711,16 @@ pub const Session = struct {
         const copy = self.alloc.dupe(u8, label) catch return;
         if (self.argv) |a| self.alloc.free(a);
         self.argv = copy;
+    }
+
+    /// Record (or clear, with null) the sampled foreground command line (T429).
+    /// Owns a copy; replaces any prior value. Best-effort like `setArgv` — an
+    /// allocation failure leaves the field unchanged rather than propagating
+    /// (a stale sample beats losing the record to a transient OOM).
+    pub fn setFgCmd(self: *Session, cmd: ?[]const u8) void {
+        const copy: ?[]u8 = if (cmd) |c| (self.alloc.dupe(u8, c) catch return) else null;
+        if (self.fg_cmd) |f| self.alloc.free(f);
+        self.fg_cmd = copy;
     }
 
     /// Record the session's working directory — the cwd the child was spawned in
@@ -851,6 +902,7 @@ pub const SessionTable = struct {
         s.pinned = rec.pinned;
         s.created_ms = rec.created_ms; // preserve the original creation time
         if (rec.argv) |a| s.setArgv(a); // relaunch command + LIST_SESSIONS label
+        if (rec.fg_cmd) |f| s.setFgCmd(f); // what was running — the notice names it (T429)
         if (rec.cwd) |c| s.cwd = try self.alloc.dupe(u8, c);
         errdefer if (s.cwd) |c| self.alloc.free(c);
         if (rec.title) |t| s.title = try self.alloc.dupe(u8, t);
@@ -1096,6 +1148,11 @@ pub const SessionStore = struct {
             if (cwd_ticks >= cwd_every_ticks) {
                 cwd_ticks = 0;
                 self.refreshCwds();
+                // Same tick, same reasoning: the foreground command (T429) is
+                // only ever read when the agent restarts, so a few seconds of
+                // staleness is free while each sample costs a process-table
+                // walk per live session.
+                self.refreshForegroundCommands();
             }
             // Periodic ring disk snapshot (T13): catch dirty rings whose viewer is
             // still attached / recently detached (the connection-drop trigger only
@@ -1214,6 +1271,62 @@ pub const SessionStore = struct {
         // Only touch the disk when something actually moved. This runs on the
         // reaper's tick, and an unconditional rewrite would put a periodic write
         // on an idle box for no gain.
+        if (changed) self.persistMeta();
+    }
+
+    /// Refresh every LIVE session's recorded FOREGROUND command from its child
+    /// (T429), so the restart notice can name what a plain shell pane was
+    /// actually running. Same collect-then-act shape and locking rules as
+    /// `refreshCwds` (the query is expensive and runs OUTSIDE the store lock;
+    /// the write re-looks-up by id). The tri-state differs deliberately:
+    ///   - `.cmd`  → record it,
+    ///   - `.none` → the shell is at an idle prompt: CLEAR the record. A stale
+    ///     "previous command" for a program that already finished is exactly
+    ///     the false assertion this field exists to avoid,
+    ///   - null (query failed) → KEEP the last known value (T425's rule).
+    pub fn refreshForegroundCommands(self: *SessionStore) void {
+        const Probe = struct { id: u128, child: Child };
+        var probes: std.ArrayList(Probe) = .empty;
+        defer probes.deinit(self.table.alloc);
+
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            // Tombstones keep whatever was last sampled — that recorded value
+            // is precisely what the notify restore is about to display.
+            if (!s.alive) continue;
+            probes.append(self.table.alloc, .{
+                .id = s.id,
+                .child = s.child,
+            }) catch break; // OOM: take the rest next tick
+        }
+        self.mutex.unlock();
+
+        var changed = false;
+        for (probes.items) |p| {
+            const q = p.child.queryForegroundCommand(self.table.alloc) orelse continue;
+            const cmd: ?[]u8 = switch (q) {
+                .none => null,
+                .cmd => |c| c,
+            };
+            defer if (cmd) |c| self.table.alloc.free(c);
+
+            self.mutex.lock();
+            if (self.table.getById(p.id)) |s| {
+                const same = if (s.fg_cmd) |have|
+                    (if (cmd) |want| std.mem.eql(u8, have, want) else false)
+                else
+                    cmd == null;
+                if (!same) {
+                    s.setFgCmd(cmd);
+                    changed = true;
+                }
+            }
+            self.mutex.unlock();
+        }
+
+        // Disk only when something moved, exactly like the cwd refresh.
         if (changed) self.persistMeta();
     }
 
@@ -1799,12 +1912,15 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
     errdefer alloc.free(id);
     const argv: ?[]u8 = if (s.argv) |a| try alloc.dupe(u8, a) else null;
     errdefer if (argv) |a| alloc.free(a);
+    const fg_cmd: ?[]u8 = if (s.fg_cmd) |f| try alloc.dupe(u8, f) else null;
+    errdefer if (fg_cmd) |f| alloc.free(f);
     const cwd: ?[]u8 = if (s.cwd) |c| try alloc.dupe(u8, c) else null;
     errdefer if (cwd) |c| alloc.free(c);
     const title: ?[]u8 = if (s.title) |t| try alloc.dupe(u8, t) else null;
     return .{
         .id = id,
         .argv = argv,
+        .fg_cmd = fg_cmd,
         .cwd = cwd,
         .title = title,
         .pinned = s.pinned,
@@ -1817,6 +1933,7 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
 fn freeMetaRecord(alloc: Allocator, r: session_meta.Record) void {
     alloc.free(r.id);
     if (r.argv) |a| alloc.free(a);
+    if (r.fg_cmd) |f| alloc.free(f);
     if (r.cwd) |c| alloc.free(c);
     if (r.title) |t| alloc.free(t);
 }
@@ -1917,6 +2034,12 @@ const FakeChild = struct {
     /// How many times `queryCwd` was asked — so a test can prove the refresh
     /// skips dead sessions instead of merely finding their value unchanged.
     cwd_queries: usize = 0,
+    /// What `queryForegroundCommand` answers, modeling the tri-state (T429):
+    /// outer null = the query FAILS (keep the record), inner null = the shell
+    /// is at an idle prompt (`.none`, clear the record), a string = `.cmd`.
+    fake_fg: ??[]const u8 = null,
+    /// How many times `queryForegroundCommand` was asked (dead-session skip proof).
+    fg_queries: usize = 0,
     alloc: Allocator,
 
     fn child(self: *FakeChild) Child {
@@ -1929,12 +2052,20 @@ const FakeChild = struct {
         .tryWait = tw,
         .terminate = tm,
         .queryCwd = qcwd,
+        .queryForegroundCommand = qfg,
     };
     fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         self.cwd_queries += 1;
         const c = self.fake_cwd orelse return null;
         return alloc.dupe(u8, c) catch null;
+    }
+    fn qfg(ctx: *anyopaque, alloc: Allocator) ?ForegroundCommand {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.fg_queries += 1;
+        const answer = self.fake_fg orelse return null;
+        const c = answer orelse return .none;
+        return .{ .cmd = alloc.dupe(u8, c) catch return null };
     }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
@@ -2548,6 +2679,103 @@ test "SessionStore.refreshCwds: a failed query, an unchanged cwd, and a dead ses
     live.fake_cwd = null;
     store.refreshCwds();
     try testing.expectEqualStrings("/work/a", s_live.cwd.?);
+}
+
+test "SessionStore.refreshForegroundCommands: records what runs, clears at the prompt, lands in sessions.json (T429)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4290);
+    // A plain shell pane: no OPEN command, no OPEN shell — argv stays null.
+    var fake: FakeChild = .{ .alloc = alloc, .fake_fg = @as(?[]const u8, "claude --continue") };
+    defer fake.deinit();
+
+    var clock: MutClock = .{ .ms = 100 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(path);
+    store.meta_path = path;
+
+    const s = try store.table.create(fake.child(), 800, 24, 80, 1024, 100);
+    s.pinned = true;
+
+    // The user is running something: the sample records it, argv stays null
+    // (it is the relaunch input, and nobody asked to relaunch claude).
+    store.refreshForegroundCommands();
+    try testing.expectEqualStrings("claude --continue", s.fg_cmd.?);
+    try testing.expect(s.argv == null);
+
+    // Durable: the value is only ever read after an agent restart, so a
+    // sample that never reaches sessions.json may as well not exist.
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len);
+        try testing.expectEqualStrings("claude --continue", p.value.sessions[0].fg_cmd.?);
+        try testing.expect(p.value.sessions[0].argv == null);
+    }
+
+    // The program exits; the shell is back at its prompt. The record CLEARS —
+    // a notice naming a command that already finished would assert something
+    // false, which is the exact noise this feature exists to avoid.
+    fake.fake_fg = @as(?[]const u8, null); // .none: idle prompt
+    store.refreshForegroundCommands();
+    try testing.expect(s.fg_cmd == null);
+}
+
+test "SessionStore.refreshForegroundCommands: a failed query keeps the record; a dead session is never asked (T429)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4291);
+    var live: FakeChild = .{ .alloc = alloc, .fake_fg = @as(?[]const u8, "zig build test") };
+    var dead: FakeChild = .{ .alloc = alloc, .fake_fg = @as(?[]const u8, "never-read") };
+    defer live.deinit();
+    defer dead.deinit();
+
+    var clock: MutClock = .{ .ms = 100 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    const s_live = try store.table.create(live.child(), 801, 24, 80, 1024, 100);
+    const s_dead = try store.table.create(dead.child(), 802, 24, 80, 1024, 100);
+    s_dead.setFgCmd("ping 127.0.0.1");
+    s_dead.markExited(0, 150);
+
+    store.refreshForegroundCommands();
+    try testing.expectEqualStrings("zig build test", s_live.fg_cmd.?);
+    // The tombstone keeps its last sample unqueried — that recorded value is
+    // exactly what the notify restore is about to display.
+    try testing.expectEqual(@as(usize, 0), dead.fg_queries);
+    try testing.expectEqualStrings("ping 127.0.0.1", s_dead.fg_cmd.?);
+
+    // Transient failure (query null) keeps the last known value, T425's rule.
+    live.fake_fg = null;
+    store.refreshForegroundCommands();
+    try testing.expectEqualStrings("zig build test", s_live.fg_cmd.?);
+}
+
+test "SessionTable.materialize: fg_cmd survives the reboot floor round-trip (T429)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4292);
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    const rec: session_meta.Record = .{
+        .id = "0123456789abcdef0123456789abcdef",
+        .fg_cmd = "claude --continue",
+        .cwd = "/work",
+    };
+    const s = (try table.materialize(rec, 1024, 100)).?;
+    try testing.expectEqualStrings("claude --continue", s.fg_cmd.?);
+    try testing.expect(s.argv == null);
+
+    // And the record a persist would write carries it back out.
+    const out = try dupMetaRecord(alloc, s);
+    defer freeMetaRecord(alloc, out);
+    try testing.expectEqualStrings("claude --continue", out.fg_cmd.?);
 }
 
 test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" {

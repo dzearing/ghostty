@@ -593,8 +593,16 @@ pub fn threadEnter(
         {
             // Copy out of `outcome` before its `defer deinit()` frees it. The
             // arena lives as long as this backend, which outlives the notice.
+            //
+            // Prefer the agent's sampled FOREGROUND command (T429): for a plain
+            // shell pane `argv` is null (nobody passed --command), and what the
+            // user thinks of as "the previous command" is the program they ran
+            // INSIDE the shell — `claude`, not `cmd.exe`. `argv` remains the
+            // fallback for panes opened with an explicit command, and an older
+            // agent that reports neither keeps today's behavior (no line).
             const aa = self.arena.allocator();
-            notice_command = if (outcome.argv) |v| aa.dupe(u8, v) catch null else null;
+            const label: ?[]const u8 = outcome.fg_cmd orelse outcome.argv;
+            notice_command = if (label) |v| aa.dupe(u8, v) catch null else null;
             const cwd: ?[]const u8 = if (outcome.cwd) |c|
                 (aa.dupe(u8, c) catch self.working_directory)
             else

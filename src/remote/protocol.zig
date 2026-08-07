@@ -743,6 +743,19 @@ pub const Attached = struct {
     /// writing it to a terminal.
     argv: ?[]const u8 = null,
 
+    /// The FOREGROUND command line last sampled inside the session's shell
+    /// (T429) — e.g. `claude --continue` for a pane whose recorded `argv` is
+    /// null because the user opened a plain shell and TYPED the command. Sent
+    /// with `status == .dead` alongside `argv`; the viewer prefers this for
+    /// the restart notice (it names what the user was actually running) and
+    /// falls back to `argv`. Same trust posture as `argv`: display text only,
+    /// sanitized by the viewer, never executed.
+    ///
+    /// Additive/optional both ways, the `argv`/`tty` precedent: an older agent
+    /// omits it (the notice falls back to `argv`, today's behavior) and an
+    /// older client ignores it (`ignore_unknown_fields`). No capability gate.
+    foreground_cmd: ?[]const u8 = null,
+
     /// The geometry the session's retained ring tail was drawn at BEFORE this
     /// attach resized the pty to the client's seed (set with `status == .alive`;
     /// 0 = unknown). The raw ring replay is geometry-bound VT — conhost/pty
@@ -2056,6 +2069,24 @@ test "OPENED/ATTACHED/RELAUNCHED pid+tty round-trip and default when omitted" {
     defer ap.deinit();
     try testing.expectEqual(@as(i64, 777), ap.value.pid);
     try testing.expectEqualStrings("/dev/ttys020", ap.value.tty.?);
+
+    // ATTACHED dead carries the foreground command when a new agent sampled
+    // one (T429), and defaults to null from an older agent — the viewer then
+    // falls back to `argv` and, with neither, prints no command line at all.
+    const att_fg: Attached = .{ .status = .dead, .argv = "sleep 600", .foreground_cmd = "claude --continue" };
+    const fj = try encodeJson(alloc, att_fg);
+    defer alloc.free(fj);
+    var fp = try parseJson(Attached, alloc, fj);
+    defer fp.deinit();
+    try testing.expectEqualStrings("sleep 600", fp.value.argv.?);
+    try testing.expectEqualStrings("claude --continue", fp.value.foreground_cmd.?);
+    const att_old: Attached = .{ .status = .dead, .argv = "sleep 600" };
+    const gj = try encodeJson(alloc, att_old);
+    defer alloc.free(gj);
+    try testing.expect(std.mem.indexOf(u8, gj, "foreground_cmd") == null);
+    var gp = try parseJson(Attached, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(gp.value.foreground_cmd == null);
 
     // RELAUNCHED carries the fresh pty's tty on ok; defaults null when omitted.
     const rel: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true, .tty = "/dev/ttys021" };

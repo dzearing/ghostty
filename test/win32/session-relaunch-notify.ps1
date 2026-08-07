@@ -75,8 +75,10 @@ function Say($m) { Write-Host $m }
 # spoil - this run's oracle.
 $MARK_A = 9700 + ($PID % 89)
 $MARK_B = 8700 + ($PID % 89)
+$MARK_F = 7700 + ($PID % 89)
 $CMD_A = "ping -n $MARK_A 127.0.0.1"
 $CMD_B = "ping -n $MARK_B 127.0.0.1"
+$CMD_F = "ping -n $MARK_F 127.0.0.1"
 # T422: per-pane banners and a window title pin for arm E. Distinguishable from
 # each other so "each pane kept ITS OWN banner" is a real claim rather than "some
 # banner survived", and space-free so `Run-CliArgs` cannot re-tokenize them.
@@ -107,7 +109,7 @@ function Count-MarkerPings($mark) {
 }
 function Stop-MarkerPings {
     Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" |
-        Where-Object { $_.CommandLine -like "*-n $MARK_A *" -or $_.CommandLine -like "*-n $MARK_B *" } |
+        Where-Object { $_.CommandLine -like "*-n $MARK_A *" -or $_.CommandLine -like "*-n $MARK_B *" -or $_.CommandLine -like "*-n $MARK_F *" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 function Wait-MarkerPings($mark, $want, $timeoutSec = 25) {
@@ -605,6 +607,85 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 700
 }
 Assert "E6 the restored window's title pin came back" $titleE
+Stop-TestProcs
+
+# ============================================================================
+Say "== F: a TYPED command is named by the notice - the foreground sample (T429)"
+# ============================================================================
+# The arm A comment above says it: every arm-A pane is opened with an explicit
+# `--command=`, the one field that made the agent record a label at all. The
+# shape the user actually runs is a PLAIN shell pane where the command was
+# TYPED at the prompt - and for that pane the notice could never name anything,
+# because nothing ever recorded what was running. T429 makes the agent sample
+# the shell's live FOREGROUND command (its most recent ConPTY child, read via
+# the PEB) on the same slow tick that tracks the cwd (arm D), persist it to
+# sessions.json, and hand it to the notice on the dead attach.
+Reset-State 'f'
+$workF = Join-Path $root 'workF'
+New-Item -ItemType Directory -Force $workF | Out-Null
+
+$appPidF = Start-App 'fgsample' @("--working-directory=$workF")
+Assert "F1 the GUI came up" ($appPidF -ne 0)
+$leavesF0 = All-Leaves (Wait-Leaves 'f0' 1 45)
+Assert "F2 there is a plain shell pane (no --command)" ($leavesF0.Count -ge 1)
+$paneF = $leavesF0[0].id
+Assert "F3 the pane is interactive before typing anything" (Test-PaneResponsive $paneF 'f-pre')
+
+# TYPE the command, the way a user does. `--keys-file` sends the bytes verbatim
+# (no re-tokenizing hazards), the trailing Enter submits it.
+$kfF = Join-Path $tmp 'fgcmd.txt'
+Set-Content -NoNewline -Encoding ascii -Path $kfF -Value $CMD_F
+Run-CliArgs @('+send-keys', "--target=$paneF", "--keys-file=$kfF", 'Enter') "$tmp\keys-f.txt" 12 | Out-Null
+Assert "F4 the typed command is actually running" (Wait-MarkerPings $MARK_F 1 30)
+
+# THE oracle for the sample: the agent's OWN on-disk record gains an `fg_cmd`
+# naming the typed command. That file is all a restart has to work from, and it
+# cannot say this unless the ping is really running AND the sampler really saw
+# it. The sample rides the same 10s tick as the cwd refresh (arm D).
+$metaF = Join-Path $tmp 'ghoztty\local-agent-debug\sessions.json'
+$sawFg = $false
+$deadlineF = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadlineF) {
+    $mtext = Out-Text $metaF
+    if ($mtext -match 'fg_cmd' -and $mtext -match [regex]::Escape("-n $MARK_F")) { $sawFg = $true; break }
+    Start-Sleep -Milliseconds 700
+}
+Assert "F5 the agent sampled the TYPED foreground command into sessions.json" $sawFg
+
+# Take the app AND the agent down: the reboot / agent-upgrade shape.
+$agentF = Wait-AgentPid $tmp 25
+Assert "F6 an agent is running for this run" ($agentF -ne 0)
+Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
+Stop-AppOnly
+Stop-Process -Id $agentF -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Stop-MarkerPings
+Start-Sleep -Milliseconds 800
+Assert "F7 no marker process survived the agent kill" ((Count-MarkerPings $MARK_F) -eq 0)
+
+$appPidF2 = Start-App 'fgnotify'
+Assert "F8 the GUI came back" ($appPidF2 -ne 0)
+$leavesF1 = All-Leaves (Wait-Leaves 'f1' 1 60)
+Assert "F9 the pane restored" ($leavesF1.Count -ge 1)
+$paneF2 = $leavesF1[0].id
+
+# The notice names the TYPED command, in both carriers. The banner is the
+# strong oracle (the only way the marker reaches it is through the notice); in
+# the scrollback the typed command also appears as replayed history, so the
+# in-stream assertion keys on the notice's own "Previous command:" label.
+$sawBanF = $false
+$deadlineF2 = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadlineF2) {
+    $leavesF1 = All-Leaves (Get-List 'f2')
+    $b = @($leavesF1 | ForEach-Object { [string]$_.banner }) -join ' '
+    if ($b -match 'Session interrupted' -and $b -match [regex]::Escape("-n $MARK_F")) { $sawBanF = $true; break }
+    Start-Sleep -Milliseconds 700
+}
+Assert "F10 the banner notice names the typed command" $sawBanF
+Assert "F11 the scrollback notice names it under 'Previous command:'" `
+    (Wait-PaneTextTight $paneF2 'f-txt' "Previouscommand:ping-n$MARK_F" 1 40)
+Assert "F12 the typed command was NOT re-executed (notify policy)" ((Count-MarkerPings $MARK_F) -eq 0)
+Assert "F13 the restored pane is on a live, interactive shell" (Test-PaneResponsive $paneF2 'f-post')
 Stop-TestProcs
 
 } finally {

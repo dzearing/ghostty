@@ -600,14 +600,21 @@ pub const AttachOutcome = struct {
     /// policy (T230) can name the command it is deliberately NOT re-running.
     /// Display text: never parsed, never executed.
     argv: ?[]u8 = null,
+    /// The FOREGROUND command the agent last sampled inside the session's
+    /// shell (`protocol.Attached.foreground_cmd`, T429) — set for a plain
+    /// shell pane whose `argv` is null because the user TYPED the command.
+    /// The notice prefers this over `argv`; an older agent omits it. Display
+    /// text, same rules as `argv`.
+    fg_cmd: ?[]u8 = null,
     alloc: Allocator,
 
-    /// Free any owned strings (`cwd`/`title`/`argv`). Does NOT free `pane` — a live
-    /// pane is torn down via `closeChannel`/`detachChannel`.
+    /// Free any owned strings (`cwd`/`title`/`argv`/`fg_cmd`). Does NOT free
+    /// `pane` — a live pane is torn down via `closeChannel`/`detachChannel`.
     pub fn deinit(self: *AttachOutcome) void {
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
         if (self.argv) |a| self.alloc.free(a);
+        if (self.fg_cmd) |f| self.alloc.free(f);
         self.* = undefined;
     }
 };
@@ -2033,6 +2040,8 @@ pub const Connection = struct {
         errdefer if (title) |t| self.alloc.free(t);
         const argv = if (a.argv) |v| try self.alloc.dupe(u8, v) else null;
         errdefer if (argv) |v| self.alloc.free(v);
+        const fg_cmd = if (a.foreground_cmd) |v| try self.alloc.dupe(u8, v) else null;
+        errdefer if (fg_cmd) |v| self.alloc.free(v);
 
         var outcome: AttachOutcome = .{
             .pane = null,
@@ -2049,6 +2058,7 @@ pub const Connection = struct {
             .cwd = cwd,
             .title = title,
             .argv = argv,
+            .fg_cmd = fg_cmd,
             .alloc = self.alloc,
         };
 

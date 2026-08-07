@@ -928,6 +928,7 @@ pub const Server = struct {
                 .cols = s.cols,
                 .cwd = if (s.cwd) |c| c else null,
                 .argv = if (s.argv) |a| a else null,
+                .foreground_cmd = if (s.fg_cmd) |f| f else null,
             }) catch {};
             return;
         }
@@ -1592,6 +1593,11 @@ pub const Server = struct {
         rs.unclaimed_restarts = 0;
         rs.exit_code = null;
         rs.last_activity_ms = self.clock.now();
+        // The sampled foreground command described the OLD child's world; a
+        // respawned session starts at a fresh prompt, and the sampler will
+        // re-record whatever runs next. Keeping it would let a later restart
+        // notice name a command from two lifetimes ago (T429).
+        rs.setFgCmd(null);
         // Fresh pty ⇒ fresh tty path (wp3); stable stack copy for the
         // after-unlock reply (`Result.tty` borrows child-owned storage).
         var tty_buf: [128]u8 = undefined;
@@ -3899,6 +3905,7 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     _ = (h.server.store.table.materialize(.{
         .id = rec_id,
         .argv = "sleep 600",
+        .fg_cmd = "claude --continue",
         .pinned = true,
         .created_ms = 50,
     }, 4096, h.clock.ms) catch unreachable).?;
@@ -3916,6 +3923,10 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     try testing.expectEqual(protocol.Attached.AttachStatus.dead, ap.value.status);
     try testing.expect(ap.value.relaunchable);
     try testing.expect(ap.value.exit_code == null);
+    // The dead reply names BOTH labels (T230/T429): the recorded relaunch argv
+    // and the sampled foreground command the notice prefers.
+    try testing.expectEqualStrings("sleep 600", ap.value.argv.?);
+    try testing.expectEqualStrings("claude --continue", ap.value.foreground_cmd.?);
     const channel = af.channel; // the session's data channel
 
     // RELAUNCH → the agent spawns the child, revives the session, and replies ok.
@@ -3947,9 +3958,12 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     try testing.expectEqualStrings("xterm-256color", sp.lastTerm());
 
     // The session is now alive + not relaunchable, and streams fresh output.
+    // The sampled foreground command was CLEARED (T429): it described the old
+    // child's world, and the respawn starts at a fresh prompt.
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(channel).?;
     try testing.expect(s.alive and !s.relaunchable);
+    try testing.expect(s.fg_cmd == null);
     h.server.store.mutex.unlock();
 
     h.server.onChildOutput(channel, "back!");

@@ -10056,3 +10056,30 @@ full omnibox completion - Mac should come up to win32. Validation: floor-lane
 all lanes PASS; P1-P3 ALL PASS; viewer-panes.ps1 grew a 17-assertion T396
 section, 151 PASS with the single pre-existing T540 failure (confirmed at HEAD
 during T394, unrelated).
+
+
+## 2026-08-06 - T429: the restart notice can finally name a TYPED command - the agent samples the foreground command (session 01VFBS)
+
+A plain shell pane recorded no command label at all (handleOpen only ever read
+OPEN.command/OPEN.shell, both null for a GUI pane), so the session-interrupted
+notice after a reboot/agent restart could never say what the user was running.
+Settled the task's design fork as option 2 (decision D21): record the live
+FOREGROUND command - claude, zig build, ping - never the resolved shell path,
+which is true but useless and asserts a command where there was only a prompt.
+New agent/foreground.zig walks the ConPTY shell's direct children (Toolhelp,
+most recent wins, conhost excluded) and reads the winner's PEB CommandLine via
+the same process_cwd.zig machinery T425 uses for the cwd; POSIX rides tcgetpgrp
+(Linux procfs; macOS arm filed as T544, seat mac). Session.fg_cmd is a separate
+field from argv on purpose - handleRelaunch re-executes argv, and overwriting
+it would make session-relaunch=auto re-run claude in place of the shell. The
+sample refreshes on the same 10s tick as the cwd (record / clear-at-prompt /
+keep-on-failure tri-state), persists additively in sessions.json, rides the
+dead ATTACHED reply as the additive foreground_cmd field (argv/tty precedent,
+no capability gate, both skews degrade to today's no-line), is cleared by a
+successful RELAUNCH, and the app's notice prefers fg_cmd orelse argv.
+Follow-ups: T544 (macOS arm), T545 (+sessions roster surfacing). Validation:
+floor-lane all lanes PASS (agent lane rerun on final source); P1-P3 ALL PASS;
+session-relaunch-notify.ps1 grew arm F (typed ping sampled into sessions.json,
+named by the restored notice in both carriers, not re-executed) - ALL PASS 91,
+after one environmental first-run failure from leftover zig-out agents holding
+the shared agent-debug pipe (rerun after a path-filtered kill was fully green).

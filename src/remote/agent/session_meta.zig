@@ -3,8 +3,8 @@
 //! `sessions.json` recording just enough about every LIVE session to relaunch
 //! it after the agent (or the whole machine) restarts:
 //!
-//!   {"version":1,"sessions":[{"id":<32-hex>,"argv":?,"cwd":?,"title":?,
-//!                             "pinned":bool,"created_ms":i64}, ...]}
+//!   {"version":1,"sessions":[{"id":<32-hex>,"argv":?,"fg_cmd":?,"cwd":?,
+//!                             "title":?,"pinned":bool,"created_ms":i64}, ...]}
 //!
 //! The upgrade demo (T06–T08) keeps the agent process ALIVE across an app
 //! restart, so it never touches disk. The reboot floor is the harder case: the
@@ -53,6 +53,10 @@ pub const max_file_bytes: usize = 4 * 1024 * 1024;
 pub const Record = struct {
     id: []const u8,
     argv: ?[]const u8 = null,
+    /// The FOREGROUND command line last sampled inside the shell (T429) — what
+    /// the restart notice names. Distinct from `argv` (the relaunch input) on
+    /// purpose; see `Session.fg_cmd`. Additive: an older agent omits/ignores it.
+    fg_cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     title: ?[]const u8 = null,
     pinned: bool = false,
@@ -148,6 +152,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
         .{
             .id = "0123456789abcdef0123456789abcdef",
             .argv = "/bin/zsh -lic 'sleep 600'",
+            .fg_cmd = "claude --continue",
             .cwd = "/Users/x/work",
             .title = "work",
             .pinned = true,
@@ -178,6 +183,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
     const a = parsed.value.sessions[0];
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", a.id);
     try testing.expectEqualStrings("/bin/zsh -lic 'sleep 600'", a.argv.?);
+    try testing.expectEqualStrings("claude --continue", a.fg_cmd.?);
     try testing.expectEqualStrings("/Users/x/work", a.cwd.?);
     try testing.expectEqualStrings("work", a.title.?);
     try testing.expect(a.pinned);
@@ -186,6 +192,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
     const b = parsed.value.sessions[1];
     try testing.expectEqualStrings("ffffffffffffffffffffffffffffffff", b.id);
     try testing.expect(b.argv == null);
+    try testing.expect(b.fg_cmd == null);
     try testing.expect(b.cwd == null);
     try testing.expect(b.title == null);
     try testing.expect(!b.pinned);

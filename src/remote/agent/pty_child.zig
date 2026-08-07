@@ -51,6 +51,7 @@ const session = @import("session.zig");
 const server = @import("server.zig");
 const proc_spawn = @import("proc_spawn.zig");
 const proc = @import("proc.zig");
+const foreground = @import("foreground.zig");
 
 /// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
 /// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
@@ -259,6 +260,7 @@ pub const PtyChild = struct {
         .terminate = terminateFn,
         .queryCwd = queryCwdFn,
         .queryForegroundPid = queryForegroundPidFn,
+        .queryForegroundCommand = queryForegroundCommandFn,
     };
 
     // --- attach: publish channel + sink, start the reader ---------------------
@@ -502,6 +504,45 @@ pub const PtyChild = struct {
                 if (rc < 0) return null;
                 return @intCast(rc);
             },
+        }
+    }
+
+    /// The command line of the FOREGROUND program running in front of the
+    /// shell (T429) — see `session.Child.VTable.queryForegroundCommand` for the
+    /// tri-state contract. Called on the store's slow tick OUTSIDE the store
+    /// lock (this is a process-table walk, not a cheap syscall).
+    ///
+    ///   - Windows: ConPTY has no foreground process group, so "foreground" is
+    ///     the most recently created direct child of the shell process
+    ///     (`foreground.queryWindows`), read via its PEB.
+    ///   - POSIX: `tcgetpgrp` names the foreground group leader; the shell
+    ///     itself in front means an idle prompt (`.none`). Linux reads the
+    ///     leader's `/proc/<pid>/cmdline`; macOS has no procfs and its arm is
+    ///     deferred (seat: mac follow-up) — null keeps today's behavior.
+    fn queryForegroundCommandFn(ctx: *anyopaque, alloc: Allocator) ?session.ForegroundCommand {
+        const self: *PtyChild = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        const dead = self.reaped or self.closed;
+        self.mutex.unlock();
+        if (dead) return null;
+
+        if (is_windows) {
+            const pid = win_job.GetProcessId(self.pid);
+            if (pid == 0) return null;
+            return switch (foreground.queryWindows(alloc, pid) orelse return null) {
+                .none => .none,
+                .cmd => |c| .{ .cmd = c },
+            };
+        } else {
+            const fg = queryForegroundPidFn(ctx) orelse return null;
+            if (fg == @as(i64, @intCast(self.pid))) return .none;
+            return switch (builtin.os.tag) {
+                .linux => if (foreground.cmdlineLinux(alloc, fg)) |c|
+                    .{ .cmd = c }
+                else
+                    null,
+                else => null,
+            };
         }
     }
 
