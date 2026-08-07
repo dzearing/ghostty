@@ -1,12 +1,13 @@
-//! Modal-ish title-prompt dialog for the win32 apprt (T50, extended for
-//! the three-level title model in T92).
+//! Modal-ish one-field prompt dialog for the win32 apprt (T50, extended
+//! for the three-level title model in T92 and the viewer URL prompt in
+//! T396).
 //!
-//! One dialog serves all three PromptTitle levels ("Change Pane Title",
-//! "Change Tab Title", "Change Window Title") — a real owner-centered
-//! dialog: caption, label, prefilled edit, OK/Cancel. The owner window is
-//! disabled while it is open (modal to the window), but the app message
-//! loop keeps running, so the renderer thread and the IPC server stay
-//! live.
+//! One dialog serves the three PromptTitle levels ("Change Pane Title",
+//! "Change Tab Title", "Change Window Title") plus the palette's "Viewer:
+//! Open URL in Pane…" — a real owner-centered dialog: caption, label,
+//! prefilled edit, OK/Cancel. The owner window is disabled while it is
+//! open (modal to the window), but the app message loop keeps running, so
+//! the renderer thread and the IPC server stay live.
 //!
 //! Commit paths (empty text always clears the level's pin/override):
 //! - window: `Window.setTitleOverride`, the same path as the `+rename`
@@ -27,6 +28,7 @@ const std = @import("std");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const Surface = @import("Surface.zig");
+const viewer_nav = @import("viewer_nav.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -48,8 +50,9 @@ level: Level = .window,
 /// silent no-op instead of a use-after-free.
 target_surface: ?*Surface = null,
 
-/// The three title levels a prompt can edit (Mac PromptTitle parity).
-pub const Level = enum { pane, tab, window };
+/// What the prompt edits: the three title levels (Mac PromptTitle parity),
+/// or the viewer URL prompt (T396, Mac's "Open URL in Viewer Pane" alert).
+pub const Level = enum { pane, tab, window, viewer_url };
 
 /// Dialog caption per level, matching the Mac prompt titles.
 pub fn caption(level: Level) [:0]const u16 {
@@ -57,6 +60,7 @@ pub fn caption(level: Level) [:0]const u16 {
         .pane => std.unicode.utf8ToUtf16LeStringLiteral("Change Pane Title"),
         .tab => std.unicode.utf8ToUtf16LeStringLiteral("Change Tab Title"),
         .window => std.unicode.utf8ToUtf16LeStringLiteral("Change Window Title"),
+        .viewer_url => std.unicode.utf8ToUtf16LeStringLiteral("Open URL in Viewer Pane"),
     };
 }
 
@@ -66,6 +70,7 @@ pub fn fieldLabel(level: Level) [:0]const u16 {
         .pane => std.unicode.utf8ToUtf16LeStringLiteral("Pane title (empty restores the default):"),
         .tab => std.unicode.utf8ToUtf16LeStringLiteral("Tab title (empty restores the default):"),
         .window => std.unicode.utf8ToUtf16LeStringLiteral("Window title (empty restores the default):"),
+        .viewer_url => std.unicode.utf8ToUtf16LeStringLiteral("Web address to open beside the current pane:"),
     };
 }
 
@@ -234,6 +239,9 @@ pub fn open(window: *Window, level: Level, target: ?*Surface) void {
                 title_len = std.unicode.utf8ToUtf16Le(title_buf[0..256], t) catch 0;
             }
         },
+        // The URL prompt starts empty — there is no current value to edit
+        // (Mac's alert field shows only a placeholder).
+        .viewer_url => {},
     }
     title_buf[title_len] = 0;
 
@@ -495,6 +503,7 @@ pub fn handleKey(self: *RenameDialog, vk: u16) bool {
 /// Commit: apply the edit text at the dialog's level (T92). Empty
 /// clears the level's pin/override, reverting to the derived title.
 pub fn finish(self: *RenameDialog) void {
+    if (self.level == .viewer_url) return self.finishViewerUrl();
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
     var utf8_buf: [1024]u8 = undefined;
@@ -516,7 +525,37 @@ pub fn finish(self: *RenameDialog) void {
         .pane => if (target) |s| if (s.pane_view) |pv| {
             if (window.findTabIndex(pv) != null) s.setUserTitle(title);
         },
+        // Peeled off by the early return above — its commit is not a title.
+        .viewer_url => unreachable,
     }
+}
+
+/// Commit for the `.viewer_url` level (T396): complete the typed address
+/// the way the viewer's own omnibox would (`viewer_nav.completeAddress` —
+/// a bare host gets `https://`, a dotless word gets `.com`, localhost gets
+/// plain http) and open it as a viewer split beside the anchoring pane.
+/// Empty input just dismisses — there is nothing to open (Mac guards
+/// `!text.isEmpty` the same way). The address buffers are sized for a
+/// pasted URL, not a window title.
+fn finishViewerUrl(self: *RenameDialog) void {
+    var wbuf: [viewer_nav.max_address]u16 = undefined;
+    const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
+    var utf8_buf: [viewer_nav.max_address * 3]u8 = undefined;
+    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const typed = std.mem.trim(u8, utf8_buf[0..utf8_len], " \t\r\n");
+
+    const window = self.window;
+    const target = self.target_surface;
+    self.close();
+    if (typed.len == 0) return;
+
+    var url_buf: [viewer_nav.max_address]u8 = undefined;
+    const url = viewer_nav.completeAddress(&url_buf, typed);
+    // Address-only liveness resolve, same as the title levels: a pane
+    // closed via IPC while the dialog was open degrades to a no-op.
+    if (target) |s| if (s.pane_view) |pv| {
+        if (window.findTabIndex(pv) != null) s.openViewerSplitBeside(url, false);
+    };
 }
 
 /// Dismiss without applying.
@@ -585,16 +624,18 @@ test "layout: buttons right-aligned, OK left of Cancel, no overlap" {
     try testing.expectEqual(l.ok.top, l.cancel.top);
 }
 
-test "caption/fieldLabel: distinct non-empty strings per level (T92)" {
-    inline for ([_]Level{ .pane, .tab, .window }) |level| {
+test "caption/fieldLabel: distinct non-empty strings per level (T92, T396)" {
+    const levels = [_]Level{ .pane, .tab, .window, .viewer_url };
+    inline for (levels) |level| {
         try testing.expect(caption(level).len > 0);
         try testing.expect(fieldLabel(level).len > 0);
     }
-    try testing.expect(!std.mem.eql(u16, caption(.pane), caption(.tab)));
-    try testing.expect(!std.mem.eql(u16, caption(.tab), caption(.window)));
-    try testing.expect(!std.mem.eql(u16, caption(.pane), caption(.window)));
-    try testing.expect(!std.mem.eql(u16, fieldLabel(.pane), fieldLabel(.tab)));
-    try testing.expect(!std.mem.eql(u16, fieldLabel(.tab), fieldLabel(.window)));
+    inline for (levels, 0..) |a, i| {
+        inline for (levels[i + 1 ..]) |b| {
+            try testing.expect(!std.mem.eql(u16, caption(a), caption(b)));
+            try testing.expect(!std.mem.eql(u16, fieldLabel(a), fieldLabel(b)));
+        }
+    }
 }
 
 test "layout: scales with DPI" {

@@ -282,6 +282,21 @@ pub const omitted = [_]Omitted{
         .why = "scrolling is a keyboard/wheel gesture; no macOS menu row",
     },
     .{
+        .cmd = .viewer_open_file,
+        .why = "palette-only on macOS too: TerminalCommandPalette.swift:195-219 " ++
+            "registers the viewer entries and MainMenu.xib has no rows for them",
+    },
+    .{
+        .cmd = .viewer_open_url,
+        .why = "palette-only on macOS too: TerminalCommandPalette.swift:195-219 " ++
+            "registers the viewer entries and MainMenu.xib has no rows for them",
+    },
+    .{
+        .cmd = .viewer_open_browser,
+        .why = "palette-only on macOS too: TerminalCommandPalette.swift:195-219 " ++
+            "registers the viewer entries and MainMenu.xib has no rows for them",
+    },
+    .{
         .cmd = .clear_screen,
         .why = "pane-scoped; lives in the right-click context menu (T102)",
     },

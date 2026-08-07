@@ -20,6 +20,8 @@ const ClaudeIntegration = @import("ClaudeIntegration.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const PaneView = @import("PaneView.zig");
+const RenameDialog = @import("RenameDialog.zig");
+const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -2327,6 +2329,11 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
         // The docs, in the default browser (macOS "Ghoztty Help").
         .help => self.app.openUrl(commands.help_url),
 
+        // The three viewer palette entries (T396; Mac ViewerCommands.swift).
+        .viewer_open_file => self.viewerOpenFilePrompt(),
+        .viewer_open_url => RenameDialog.open(self.parent_window, .viewer_url, self),
+        .viewer_open_browser => self.openViewerSplitBeside("about:blank", true),
+
         .binding => _ = self.core_surface.performBindingAction(cmd.action) catch |err| {
             log.err("command action error id={s} err={}", .{ @tagName(id), err });
         },
@@ -2359,6 +2366,70 @@ fn openActivityMonitor(self: *Surface) void {
     };
 
     ActivityMonitor.openReusing(window, .{ .remote = .{ .id = id } }, dialed.conn());
+}
+
+/// "Viewer: Open File in Pane…" (T396): a standard open-file dialog, then
+/// the chosen file in a viewer split beside this pane (Mac's `NSOpenPanel`
+/// sheet, `ViewerCommands.openFileFromPalette`). `GetOpenFileNameW` is
+/// modal to the owner but runs a real message loop, so posted window
+/// messages — the IPC server's `WM_APP_IPC` among them — keep dispatching
+/// while it is up.
+fn viewerOpenFilePrompt(self: *Surface) void {
+    const owner = self.parent_window.hwnd orelse return;
+    var file_buf: [4096:0]u16 = undefined;
+    file_buf[0] = 0;
+    var ofn: w32.OPENFILENAMEW = .{
+        .hwndOwner = owner,
+        .lpstrFile = &file_buf,
+        .nMaxFile = file_buf.len,
+        .lpstrTitle = std.unicode.utf8ToUtf16LeStringLiteral(
+            "Choose a markdown or text file to view",
+        ),
+        .Flags = w32.OFN_FILEMUSTEXIST | w32.OFN_PATHMUSTEXIST |
+            w32.OFN_HIDEREADONLY | w32.OFN_NOCHANGEDIR | w32.OFN_EXPLORER,
+    };
+    // Zero is both "cancelled" and "failed"; neither opens a pane.
+    if (w32.GetOpenFileNameW(&ofn) == 0) return;
+    const wlen = std.mem.indexOfSentinel(u16, 0, &file_buf);
+    var utf8_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = std.unicode.utf16LeToUtf8(&utf8_buf, file_buf[0..wlen]) catch return;
+    if (len == 0) return;
+    self.openViewerSplitBeside(utf8_buf[0..len], false);
+}
+
+/// Open a viewer split to the RIGHT of this pane showing `location`, with
+/// this pane's working directory as the viewer's origin directory — the
+/// shared tail of the three T396 palette entries, mirroring Mac's
+/// `ViewerCommands.openViewer` (which seeds `surfaceView.pwd` the same
+/// way). `focus_address` puts the caret in the new pane's address field
+/// once the deferred pane focus has landed ("Open Browser Pane"'s caret
+/// contract).
+pub fn openViewerSplitBeside(self: *Surface, location: []const u8, focus_address: bool) void {
+    const pv = self.pane_view orelse return;
+    const alloc = self.app.core_app.alloc;
+    // `livePwd` answers null when OSC 7 has reported (the cache is live)
+    // or when the OS read fails — the cached value is the fallback either
+    // way. The `Open` strings are borrowed (the pane dupes what it keeps),
+    // so the live read is freed here.
+    const live = self.livePwd(alloc);
+    defer if (live) |p| alloc.free(p);
+    const origin: ?[]const u8 = if (live) |p| p else if (self.pwd) |p| p else null;
+    const pane = self.parent_window.newViewerSplitAt(pv, .right, 0.5, .{
+        .location = location,
+        .origin_directory = origin,
+    }) catch |err| {
+        log.warn("palette viewer split failed err={}", .{err});
+        return;
+    } orelse return;
+    // The split queued a deferred SetFocus at the new pane (T48); this
+    // post lands BEHIND it in the queue, so the caret reaches the address
+    // field after the pane focus rather than being stolen by it (Mac
+    // defers with `DispatchQueue.main.async` for the same reason).
+    if (focus_address) {
+        if (pane.viewer()) |v| {
+            if (v.hwnd) |h| _ = w32.PostMessageW(h, ViewerPane.WM_APP_VIEWER_FOCUS_ADDRESS, 0, 0);
+        }
+    }
 }
 
 /// Execute the currently selected palette entry.

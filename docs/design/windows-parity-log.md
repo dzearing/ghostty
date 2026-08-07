@@ -9984,3 +9984,27 @@ reverted-sources control build - filed T537 (+reload window-target string
 fails only in the harness) and T538 (split off a web viewer loses cwd
 inheritance), plus T536 (flaky undefined-memory crash in inbound_ring seen
 once at HEAD during validation).
+
+
+## 2026-08-06 - T396: the palette can open viewer panes - Open File / Open URL / Open Browser Pane (session 77e01331)
+
+The win32 palette gets the Mac's three viewer entries, verbatim names
+(TerminalCommandPalette.swift:195-219): "Viewer: Open File in Pane..." runs
+GetOpenFileNameW (comdlg32 was already linked for T67; OFN_NOCHANGEDIR so the
+dialog cannot silently re-aim the process cwd, and its modal loop still
+dispatches WM_APP_IPC, which the acceptance test proves by running +list while
+the dialog is up); "Viewer: Open URL in Pane..." reuses RenameDialog with a new
+.viewer_url level and commits through viewer_nav.completeAddress, so a bare
+host completes exactly like the pane's own address bar; "Viewer: Open Browser
+Pane" opens about:blank and lands the caret in the address field via a new
+WM_APP_VIEWER_FOCUS_ADDRESS posted BEHIND the split's deferred T48 focus so
+the caret is not stolen a message later. All three split .right off the
+invoking pane through newViewerSplitAt with origin_directory seeded from the
+pane's livePwd/pwd (Mac seeds surfaceView.pwd the same way). Ids were appended
+to the enum tail because menu command ids are @intFromEnum+1; the entries are
+menu_bar.omitted (palette-only on Mac too). One deliberate divergence filed as
+T541 (seat: mac): the Mac prompt only prepends https:// where win32 runs the
+full omnibox completion - Mac should come up to win32. Validation: floor-lane
+all lanes PASS; P1-P3 ALL PASS; viewer-panes.ps1 grew a 17-assertion T396
+section, 151 PASS with the single pre-existing T540 failure (confirmed at HEAD
+during T394, unrelated).

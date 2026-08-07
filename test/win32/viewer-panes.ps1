@@ -809,6 +809,130 @@ try {
         }
     }
 
+    # --- 11c. T396: the three viewer palette entries -------------------------
+    # The Mac palette carries "Viewer: Open File in Pane…", "Viewer: Open URL
+    # in Pane…" and "Viewer: Open Browser Pane"; before T396 the win32 palette
+    # had none, so there was no interactive way to open a viewer at all. Each
+    # entry is asserted by OUTCOME through the palette (the command-registry
+    # lesson: a row that is absent cannot dispatch, so an outcome proves
+    # presence AND dispatch in one move). One fresh window per case, because a
+    # created viewer split takes focus and the next case's palette chord needs
+    # a terminal surface to land on.
+
+    function Open-T396Window([string]$target, [array]$topsKnown) {
+        Invoke-Verb @('+new-window', "--target=$target") | Out-Null
+        if ($null -eq (Wait-Win $target)) { return $null }
+        $newTop = [IntPtr]::Zero
+        for ($t = 0; $t -lt 25 -and $newTop -eq [IntPtr]::Zero; $t++) {
+            foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+                if ($topsKnown -notcontains $w.Hwnd) { $newTop = [IntPtr][int64]$w.Hwnd }
+            }
+            if ($newTop -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+        }
+        return $newTop
+    }
+
+    # Open the palette on $top's focused terminal, type $filter, press Enter.
+    function Invoke-T396Palette([IntPtr]$top, [string]$filter, [string]$label) {
+        Focus-TestWindow -Window $top | Out-Null
+        Start-Sleep -Milliseconds 400
+        $pane = [IntPtr](Get-TestFocusedWindow -Window $top)
+        if ((Get-TestWindowClass -Window $pane) -ne 'GhozttyTerminal') {
+            Write-Host "  (${label}: focus is not on a terminal surface)"; return $false
+        }
+        $popup = [IntPtr]::Zero
+        foreach ($try in 1..3) {
+            if (-not (Send-TestKeys -Window $top -Target $pane -Modifiers ctrl, shift -Key P)) { continue }
+            $popup = Wait-TestWindow -ProcessId $appPid -Class 'GhozttyTerminal' -TimeoutMs 5000
+            if ($popup -ne [IntPtr]::Zero) { break }
+        }
+        if ($popup -eq [IntPtr]::Zero) { Write-Host "  (${label}: palette popup not found)"; return $false }
+        $palEdit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
+        if ($palEdit -eq [IntPtr]::Zero) { Write-Host "  (${label}: palette edit not found)"; return $false }
+        Send-TestControlText -Control $palEdit -Text $filter | Out-Null
+        return (Send-TestControlKey -Control $palEdit -Key Enter)
+    }
+
+    # A viewer leaf in $target whose url matches $urlPattern (the T396 panes
+    # are unnamed — the palette cannot name them — so they are found by kind).
+    function Wait-T396ViewerLeaf($target, [string]$urlPattern) {
+        for ($t = 0; $t -lt 25; $t++) {
+            $w = Get-Win $target
+            if ($w) {
+                foreach ($leaf in @(Get-Leaves $w.tabs[0].splits)) {
+                    if ($leaf.type -eq 'viewer' -and $leaf.url -match $urlPattern) { return $leaf }
+                }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        return $null
+    }
+
+    $topsKnown = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' | ForEach-Object { $_.Hwnd })
+
+    # --- T396 case A: "Viewer: Open Browser Pane" ----------------------------
+    $t396aTop = Open-T396Window 't396a' $topsKnown
+    Assert ($null -ne $t396aTop -and $t396aTop -ne [IntPtr]::Zero) 'T396A window created'
+    if ($t396aTop -ne [IntPtr]::Zero) {
+        Assert (Invoke-T396Palette $t396aTop 'Open Browser Pane' 'T396A') 'T396A palette filter + Enter delivered'
+        $leaf = Wait-T396ViewerLeaf 't396a' '^about:blank$'
+        Assert ($null -ne $leaf) 'T396A "Open Browser Pane" split an about:blank viewer beside the terminal'
+        Assert ((Get-PaneCount 't396a') -eq 2) "T396A the window has terminal + viewer (got $(Get-PaneCount 't396a'))"
+    }
+    $topsKnown += @($t396aTop)
+
+    # --- T396 case B: "Viewer: Open URL in Pane…" ----------------------------
+    # The typed address has no scheme, so the leaf's url proves the omnibox
+    # completion ran (localhost is completed to plain http, T159's rule —
+    # https://localhost would just fail). Port 1 so nothing answers and no
+    # real network is touched; a failed LOAD is fine, the location stands.
+    $t396bTop = Open-T396Window 't396b' $topsKnown
+    Assert ($null -ne $t396bTop -and $t396bTop -ne [IntPtr]::Zero) 'T396B window created'
+    if ($t396bTop -ne [IntPtr]::Zero) {
+        Assert (Invoke-T396Palette $t396bTop 'Open URL in Pane' 'T396B') 'T396B palette filter + Enter delivered'
+        $urlDlg = Wait-TestWindow -ProcessId $appPid -Class 'GhozttyRenameDialog' -TimeoutMs 5000
+        Assert ($urlDlg -ne [IntPtr]::Zero) 'T396B the URL prompt opened'
+        if ($urlDlg -ne [IntPtr]::Zero) {
+            Assert ((Get-TestWindowText -Window $urlDlg) -eq 'Open URL in Viewer Pane') `
+                "T396B the prompt carries the Mac caption (got '$(Get-TestWindowText -Window $urlDlg)')"
+            $urlEdit = Find-TestWindowEx -Parent $urlDlg -Class 'EDIT'
+            Assert ($urlEdit -ne [IntPtr]::Zero) 'T396B the prompt has an edit field'
+            if ($urlEdit -ne [IntPtr]::Zero) {
+                Set-TestControlText -Control $urlEdit -Text 'localhost:1' | Out-Null
+                Send-TestControlKey -Control $urlEdit -Key Enter | Out-Null
+                $leaf = Wait-T396ViewerLeaf 't396b' '^http://localhost:1/?$'
+                Assert ($null -ne $leaf) 'T396B "Open URL in Pane" completed localhost:1 to http:// and split a viewer'
+            }
+        }
+    }
+    $topsKnown += @($t396bTop)
+
+    # --- T396 case C: "Viewer: Open File in Pane…" ---------------------------
+    # The entry opens the standard open-file dialog (#32770). What is asserted:
+    # the dialog opens (dispatch reached it), the IPC pump stays LIVE while it
+    # is up (the dialog's modal loop still dispatches WM_APP_IPC — the design
+    # constraint the task named), and Escape cancels without a pane appearing.
+    $t396cTop = Open-T396Window 't396c' $topsKnown
+    Assert ($null -ne $t396cTop -and $t396cTop -ne [IntPtr]::Zero) 'T396C window created'
+    if ($t396cTop -ne [IntPtr]::Zero) {
+        Assert (Invoke-T396Palette $t396cTop 'Open File in Pane' 'T396C') 'T396C palette filter + Enter delivered'
+        $fileDlg = Wait-TestWindow -ProcessId $appPid -Class '#32770' -TimeoutMs 8000
+        Assert ($fileDlg -ne [IntPtr]::Zero) 'T396C "Open File in Pane" opened the standard file dialog'
+        if ($fileDlg -ne [IntPtr]::Zero) {
+            $data = Get-Data
+            Assert ($null -ne $data) 'T396C IPC still answers while the file dialog is up'
+            Send-TestControlKey -Control $fileDlg -Key Escape | Out-Null
+            $gone = $false
+            for ($t = 0; $t -lt 25 -and -not $gone; $t++) {
+                $gone = ((Get-TestWindow -ProcessId $appPid -Class '#32770') -eq [IntPtr]::Zero)
+                if (-not $gone) { Start-Sleep -Milliseconds 200 }
+            }
+            Assert $gone 'T396C Escape dismissed the file dialog'
+            Assert ((Get-PaneCount 't396c') -eq 1) "T396C cancel opened no pane (got $(Get-PaneCount 't396c'))"
+        }
+        Assert (-not ($app.Process -and $app.Process.HasExited)) 'T396C app alive after the file dialog'
+    }
+
     # --- 12. app survived all of it ------------------------------------------
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'

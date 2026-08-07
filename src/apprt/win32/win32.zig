@@ -2255,3 +2255,45 @@ pub const CC_FULLOPEN: u32 = 0x00000002;
 pub const CC_ANYCOLOR: u32 = 0x00000100;
 
 pub extern "comdlg32" fn ChooseColorW(lpcc: *CHOOSECOLORW) callconv(.winapi) BOOL;
+
+// --- Common open-file dialog (comdlg32) — T396 "Viewer: Open File in Pane…" ---
+
+/// OPENFILENAMEW for GetOpenFileNameW (the post-Win2000 shape, with the
+/// three reserved trailing fields — comdlg32 sizes its behavior off
+/// lStructSize, so the struct must be the full modern one).
+pub const OPENFILENAMEW = extern struct {
+    lStructSize: u32 = @sizeOf(OPENFILENAMEW),
+    hwndOwner: ?HWND = null,
+    hInstance: ?*anyopaque = null,
+    lpstrFilter: ?[*:0]const u16 = null,
+    lpstrCustomFilter: ?[*:0]u16 = null,
+    nMaxCustFilter: u32 = 0,
+    nFilterIndex: u32 = 0,
+    lpstrFile: ?[*:0]u16 = null,
+    nMaxFile: u32 = 0,
+    lpstrFileTitle: ?[*:0]u16 = null,
+    nMaxFileTitle: u32 = 0,
+    lpstrInitialDir: ?[*:0]const u16 = null,
+    lpstrTitle: ?[*:0]const u16 = null,
+    Flags: u32 = 0,
+    nFileOffset: u16 = 0,
+    nFileExtension: u16 = 0,
+    lpstrDefExt: ?[*:0]const u16 = null,
+    lCustData: usize = 0,
+    lpfnHook: ?*anyopaque = null,
+    lpTemplateName: ?[*:0]const u16 = null,
+    pvReserved: ?*anyopaque = null,
+    dwReserved: u32 = 0,
+    FlagsEx: u32 = 0,
+};
+
+pub const OFN_FILEMUSTEXIST: u32 = 0x00001000;
+pub const OFN_PATHMUSTEXIST: u32 = 0x00000800;
+pub const OFN_HIDEREADONLY: u32 = 0x00000004;
+/// Without this the dialog CHANGES THE PROCESS CWD to the browsed
+/// directory, which would silently re-aim every later relative-path
+/// resolution in the app.
+pub const OFN_NOCHANGEDIR: u32 = 0x00000008;
+pub const OFN_EXPLORER: u32 = 0x00080000;
+
+pub extern "comdlg32" fn GetOpenFileNameW(lpofn: *OPENFILENAMEW) callconv(.winapi) BOOL;

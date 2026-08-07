@@ -96,6 +96,13 @@ pub const WM_APP_VIEWER_RELOAD: u32 = w32.WM_APP + 20;
 /// word) and the extended bit (bit 16), lparam the `input.Mods` bits.
 pub const WM_APP_VIEWER_ACCEL: u32 = w32.WM_APP + 21;
 
+/// Put the caret in this pane's address field, posted rather than called
+/// (T396 "Viewer: Open Browser Pane"): the split that just created the pane
+/// queued a deferred SetFocus at it (T48), and a synchronous
+/// `focusAddressBar` would be stolen by that queued focus a moment later.
+/// Posting orders the caret behind it.
+pub const WM_APP_VIEWER_FOCUS_ADDRESS: u32 = w32.WM_APP + 22;
+
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
 
@@ -2524,6 +2531,13 @@ pub fn wndProc(
             const pv = self.pane_view orelse return 0;
             const perform = self.perform_accel_action orelse return 0;
             perform(pv, action);
+            return 0;
+        },
+
+        // The palette's "Open Browser Pane" asking for the caret, one queue
+        // hop after the pane's own deferred focus (T396).
+        WM_APP_VIEWER_FOCUS_ADDRESS => {
+            _ = self.focusAddressBar();
             return 0;
         },
 

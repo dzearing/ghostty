@@ -40,6 +40,16 @@ pub const Kind = enum {
     claude,
     /// Open the documentation in the default browser (macOS "Ghoztty Help").
     help,
+    /// Open a file-picker and show the chosen file in a viewer split (T396).
+    /// Like `remote`, apprt-local: macOS registers the three viewer entries
+    /// as palette-only openers too (TerminalCommandPalette.swift:195-219 →
+    /// ViewerCommands.swift).
+    viewer_open_file,
+    /// Prompt for a web address and open it in a viewer split (T396).
+    viewer_open_url,
+    /// Open a blank browser viewer split with the caret in its address
+    /// field (T396) — the interactive `+split --view=about:blank`.
+    viewer_open_browser,
 };
 
 /// Stable identity for a command. The name is the identity — reordering
@@ -122,6 +132,9 @@ pub const Id = enum {
     about,
     claude_integration,
     quit,
+    viewer_open_file,
+    viewer_open_url,
+    viewer_open_browser,
 };
 
 /// Where "Ghoztty Help" goes. The docs are the same for every platform, so
@@ -158,6 +171,12 @@ pub const registry = [_]Command{
     // on the LOCAL machine (T285) and grows remote sources in T287, so the name
     // does not promise a remote-only surface.
     .{ .id = .activity_monitor, .name = "Open Activity Monitor", .action = .new_window, .kind = .activity },
+    // The three viewer entries (T396), names verbatim from Mac
+    // (TerminalCommandPalette.swift:195-219): the only interactive way to
+    // open a viewer pane, mirroring the CLI `+split --view=…`.
+    .{ .id = .viewer_open_file, .name = "Viewer: Open File in Pane…", .action = .new_window, .kind = .viewer_open_file },
+    .{ .id = .viewer_open_url, .name = "Viewer: Open URL in Pane…", .action = .new_window, .kind = .viewer_open_url },
+    .{ .id = .viewer_open_browser, .name = "Viewer: Open Browser Pane", .action = .new_window, .kind = .viewer_open_browser },
     .{ .id = .new_tab, .name = "New Tab", .action = .new_tab },
     .{ .id = .close_surface, .name = "Close Surface", .action = .close_surface },
     .{ .id = .close_tab, .name = "Close Tab", .action = .{ .close_tab = .this } },
@@ -284,11 +303,27 @@ test "only the local kinds carry a placeholder action" {
     // silently run the wrong command.
     for (registry) |c| switch (c.kind) {
         .binding => {},
-        .remote, .activity, .about, .claude, .help => try std.testing.expectEqual(
+        .remote,
+        .activity,
+        .about,
+        .claude,
+        .help,
+        .viewer_open_file,
+        .viewer_open_url,
+        .viewer_open_browser,
+        => try std.testing.expectEqual(
             input.Binding.Action.new_window,
             c.action,
         ),
     };
+}
+
+test "the viewer entries carry the Mac palette names verbatim (T396)" {
+    // The names are cross-platform API surface: a user who reads the Mac
+    // docs (or muscle-memory) types the same words into the win32 palette.
+    try std.testing.expectEqualStrings("Viewer: Open File in Pane…", get(.viewer_open_file).name);
+    try std.testing.expectEqualStrings("Viewer: Open URL in Pane…", get(.viewer_open_url).name);
+    try std.testing.expectEqualStrings("Viewer: Open Browser Pane", get(.viewer_open_browser).name);
 }
 
 test "quit is the only quit_keep command" {
