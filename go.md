@@ -435,8 +435,12 @@ line did not fail — re-run it unfiltered before believing it.
    launch anything (`test\win32\lib\BuildMode.ps1`); if you hit that refusal,
    rebuild rather than reach for the `GHOZTTY_TEST_ALLOW_RELEASE=1` opt-in,
    which exists for the handful of scripts whose subject IS the release build.
-4. Sync discipline: `git pull` before starting, push at the task boundary —
-   the Mac seat works Mac-side tasks on the same branch.
+4. Sync discipline: `git pull` before starting, and **push immediately after
+   EVERY commit** — mid-task small commits included, never only at the task
+   boundary (user directive, 2026-08-07: "we should also PUSH them to
+   remote, not just horde them locally"). An unpushed commit is invisible to
+   the other seat and every parallel session, and dies with a crashed box.
+   If the push is rejected, pull/rebase and push before continuing.
 
 ## Standing quality bar (from the user, 2026-07-12; expanded 2026-07-15)
 
