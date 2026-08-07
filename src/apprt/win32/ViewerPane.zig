@@ -220,6 +220,12 @@ page_loaded: bool = false,
 /// Why there will be no content. Set with `.failed`, and the error card's text.
 failure: ?webview2.Failure = null,
 
+/// The keyboard (ctrl+plus/minus/0) page-zoom factor for this pane (T161).
+/// 1.0 is 100%. In-session only — deliberately NOT persisted, so a restored
+/// pane comes back at 100% (Mac's `zoomFactor`, same rule). Independent of
+/// pinch / ctrl+wheel, which Chromium tracks itself.
+zoom_factor: f64 = 1.0,
+
 /// The live controller, once there is one.
 controller: ?*iface.ICoreWebView2Controller = null,
 
@@ -1304,6 +1310,10 @@ fn onNavigationCompleted(
         return com.S_OK;
     };
     self.page_loaded = true;
+    // Keyboard page zoom survives navigation (T161): re-push a non-default
+    // factor so following a link or reloading keeps the chosen zoom — the
+    // same re-apply Mac does after `didFinish`.
+    if (self.zoom_factor != 1.0) self.pushZoom();
     // Web mode has nothing to inject — the page IS the content.
     if (!self.mode.isFile()) return com.S_OK;
     self.renderFileContent();
@@ -2111,6 +2121,40 @@ fn chordAction(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) 
     return leaf.action;
 }
 
+/// Push the current `zoom_factor` to the web view (T161) — Mac's
+/// `pushZoomToWebView`. Safe with no controller (a bare test pane).
+fn pushZoom(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    if (!c.setZoomFactor(self.zoom_factor)) {
+        log.warn("put_ZoomFactor failed; page zoom unchanged", .{});
+    }
+}
+
+/// Apply a ctrl+plus/minus/0 zoom chord: step the factor and push it to the
+/// page — Mac's `handleZoom`, with its exact step and clamp.
+fn handleZoom(self: *ViewerPane, action: viewer_accel.ZoomAction) void {
+    self.zoom_factor = viewer_accel.steppedZoom(self.zoom_factor, action);
+    self.pushZoom();
+}
+
+/// Perform a pane-scoped chord (T161) — Mac's `handle(_:)`.
+fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
+    switch (chord) {
+        .reload => self.reloadContent(),
+        .focus_address => _ = self.focusAddressBar(),
+    }
+}
+
+/// Whether a chord is claimed by THIS pane while its content holds focus
+/// (T161): the pane-scoped table and zoom are checked BEFORE the app keybind
+/// table (design doc P7's ordering — ctrl+d must reach the address bar, not
+/// the global split-right), and the app table before the page.
+fn claimsChord(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) bool {
+    if (viewer_accel.zoomAction(vk, mods) != null) return true;
+    if (viewer_accel.paneChord(vk, mods) != null) return true;
+    return self.chordAction(vk, extended, mods) != null;
+}
+
 fn onAcceleratorKeyPressed(
     p: *Pending,
     sender: ?*iface.ICoreWebView2Controller,
@@ -2137,7 +2181,7 @@ fn onAcceleratorKeyPressed(
     log.debug("accel key vk=0x{x} ctrl={} shift={} alt={}", .{
         vk, mods.ctrl, mods.shift, mods.alt,
     });
-    if (self.chordAction(vk, extended, mods) == null) return com.S_OK;
+    if (!self.claimsChord(vk, extended, mods)) return com.S_OK;
 
     // Ours. Claim it BEFORE returning (the browser is blocked on this very
     // decision), then run the action from the message loop — not from inside
@@ -2741,6 +2785,18 @@ pub fn wndProc(
             const vk: u16 = @intCast(wparam & 0xFFFF);
             const extended = (wparam & (1 << 16)) != 0;
             const mods: inputpkg.Mods = @bitCast(@as(u16, @intCast(lparam & 0xFFFF)));
+            // Same order as the claim (T161): zoom, then the pane-scoped
+            // chords, then the app keybind table. Both pane legs act on
+            // `self` and return — only the app-action leg below has the
+            // "nothing may touch self afterwards" hazard.
+            if (viewer_accel.zoomAction(vk, mods)) |za| {
+                self.handleZoom(za);
+                return 0;
+            }
+            if (viewer_accel.paneChord(vk, mods)) |chord| {
+                self.handlePaneChord(chord);
+                return 0;
+            }
             const action = self.chordAction(vk, extended, mods) orelse return 0;
             const pv = self.pane_view orelse return 0;
             const perform = self.perform_accel_action orelse return 0;

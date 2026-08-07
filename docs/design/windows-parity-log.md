@@ -10275,3 +10275,27 @@ name/ordering so a drift on either side fails the none lane. Floor lanes
 (none/win32/agent) + P1-P3 green; viewer-panes.ps1 152 PASS with only the
 known pre-existing T538 failure (proven unrelated 2026-08-06 by a control
 build).
+
+## 2026-08-07 - T161 done: viewer panes zoom and answer the browser chords (session fbb17647)
+
+A focused viewer pane now behaves like a browser tab: ctrl+plus/minus/0
+zoom the page with exactly the Mac client's step and clamp (x1.1,
+50%-300%, in-session only), ctrl+r reloads in place (the interactive
+`+reload`, cache-bypassing for web pages), and ctrl+d / ctrl+l / alt+d
+put the caret in the address bar with the whole address selected - while
+a focused terminal keeps every one of those keys' global meanings
+(shell ctrl+r, split-right ctrl+d, font-size ctrl+plus). The pure half
+(chord/zoom classification with exact-modifier negatives, steppedZoom)
+lives in viewer_accel.zig and unit-tests in both lanes; the accelerator
+handler checks the pane-scoped table before the app keybind table per
+the P7 ordering; the main loop routes the chords from the address field
+too (zoom stays content-only, Mac's isViewerContentFocused rule); the
+controller's get/put_ZoomFactor slots are typed with offset asserts, and
+a non-default zoom re-pushes after every completed navigation. On-box
+proof (viewer-panes.ps1 11d, 26 asserts): a raw-TCP no-store page server
+counts GETs (reload oracle), the page mirrors devicePixelRatio into
+document.title -> leaf title (zoom oracle: 1.25 -> 1.375 -> 1.25 ->
+1.1364 at 1.25 DPI), and GetGUIThreadInfo proves the address EDIT takes
+focus without splitting. Answered P7's open question: plain ctrl+l DOES
+reach add_AcceleratorKeyPressed. Floor lanes + P1-P3 green; the script's
+single FAIL is the pre-existing, already-filed T540.

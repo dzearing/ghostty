@@ -33,7 +33,9 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_nav_layout.zig");
 const viewer_nav = @import("viewer_nav.zig");
+const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
+const input = @import("../../input.zig");
 
 const log = std.log.scoped(.viewer_nav);
 
@@ -376,6 +378,29 @@ pub fn handleEditKey(self: *ViewerNavBar, vk: u16) bool {
         },
         else => return false,
     }
+}
+
+/// The pane-scoped chords while the address field holds focus (T161): the
+/// chords are live anywhere inside the viewer pane — its page OR its bar —
+/// so ctrl+r still reloads and ctrl+l/ctrl+d re-select the address from
+/// inside the field. Routed by the main message loop like `handleEditKey`
+/// (an EDIT never delivers modifier chords itself). Zoom is deliberately NOT
+/// here: Mac scopes ctrl+plus/minus/0 to focused CONTENT, and the field is
+/// chrome. Returns true when consumed.
+pub fn handleEditChord(self: *ViewerNavBar, vk: u16) bool {
+    const mods: input.Mods = .{
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
+    };
+    const chord = viewer_accel.paneChord(vk, mods) orelse return false;
+    switch (chord) {
+        .reload => self.pane.reloadContent(),
+        .focus_address => _ = self.pane.focusAddressBar(),
+    }
+    return true;
 }
 
 /// The main loop saw a `WM_LBUTTONDOWN` headed for the address field. If the

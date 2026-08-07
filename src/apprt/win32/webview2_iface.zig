@@ -1115,8 +1115,10 @@ pub const ICoreWebView2Controller = extern struct {
         /// and passing a pointer here instead would put a pointer where the
         /// callee reads a rectangle).
         put_Bounds: *const fn (*ICoreWebView2Controller, RECT) callconv(.winapi) HRESULT,
-        get_ZoomFactor: *const anyopaque,
-        put_ZoomFactor: *const anyopaque,
+        get_ZoomFactor: *const fn (*ICoreWebView2Controller, *f64) callconv(.winapi) HRESULT,
+        /// Host-driven page zoom (T161): the keyboard ctrl+plus/minus/0
+        /// chords land here. 1.0 is 100%.
+        put_ZoomFactor: *const fn (*ICoreWebView2Controller, f64) callconv(.winapi) HRESULT,
         add_ZoomFactorChanged: *const anyopaque,
         remove_ZoomFactorChanged: *const anyopaque,
         SetBoundsAndZoomFactor: *const anyopaque,
@@ -1168,6 +1170,18 @@ pub const ICoreWebView2Controller = extern struct {
 
     pub fn moveFocus(self: *ICoreWebView2Controller, reason: MoveFocusReason) bool {
         return !com.failed(self.vtable.MoveFocus(self, reason));
+    }
+
+    /// Set the page-zoom factor (T161). 1.0 is 100%.
+    pub fn setZoomFactor(self: *ICoreWebView2Controller, factor: f64) bool {
+        return !com.failed(self.vtable.put_ZoomFactor(self, factor));
+    }
+
+    /// The current page-zoom factor, or null on failure.
+    pub fn zoomFactor(self: *ICoreWebView2Controller) ?f64 {
+        var out: f64 = 0;
+        if (com.failed(self.vtable.get_ZoomFactor(self, &out))) return null;
+        return out;
     }
 
     /// Register an `AcceleratorKeyPressed` handler (T394). The token is
@@ -1382,6 +1396,9 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "get_IsVisible"));
     try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "put_IsVisible"));
     try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "put_Bounds"));
+    // T161: the zoom pair drives keyboard page zoom.
+    try testing.expectEqual(7 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "get_ZoomFactor"));
+    try testing.expectEqual(8 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "put_ZoomFactor"));
     try testing.expectEqual(12 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "MoveFocus"));
     try testing.expectEqual(19 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "add_AcceleratorKeyPressed"));
     try testing.expectEqual(20 * ptr, @offsetOf(ICoreWebView2Controller.Vtbl, "remove_AcceleratorKeyPressed"));

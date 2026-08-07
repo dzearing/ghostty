@@ -585,6 +585,13 @@ ghoztty +close --target=doc
     (Cmd+R = "Set Pane Banner…", Cmd+D = split right). Focus a terminal pane
     and they do their global thing again; Cmd+Shift+R ("Change Window Title")
     and Cmd+Shift+D (split down) are never affected.
+  - **On Windows** (T161) the pane-scoped chords are **Ctrl+R** (reload),
+    **Ctrl+D / Ctrl+L / Alt+D** (address bar — the latter two are
+    Windows-native aliases), and **Ctrl+Plus/Minus/0** (page zoom, same ×1.1
+    step and [0.5, 3.0] clamp as the Mac Cmd+/−/0), under the identical
+    override-only-while-focused rule: a focused terminal keeps ctrl+r for
+    the shell, ctrl+d for split-right, and ctrl+plus/minus/0 for font size.
+    Zoom is content-scoped (not live in the address field), matching Mac.
 - `--view=about:blank` opens a **blank browser pane**. The command palette's
   "Viewer: Open Browser Pane" does the same interactively and puts the caret
   straight in the address field — the equivalent of `+split --view=<url>` for

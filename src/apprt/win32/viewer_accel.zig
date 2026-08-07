@@ -230,6 +230,86 @@ pub fn forwards(action: input.Binding.Action) bool {
     };
 }
 
+// ------------------------------------------------------------- pane chords
+
+/// A chord that belongs to a focused viewer pane itself rather than to the
+/// app or the page (T161) — Mac's `ViewerView.PaneChord`, with the chords
+/// remapped to the Windows defaults pinned in
+/// `docs/design/viewer-panes-windows.md` P7.
+pub const PaneChord = enum {
+    /// ctrl+r — reload in place, the interactive `+reload`.
+    reload,
+    /// ctrl+d / ctrl+l / alt+d — focus and select the address field.
+    focus_address,
+};
+
+/// Classify a chord as one of the viewer's pane-scoped chords, or null if it
+/// is not one. Pure classification (no side effects) so the mapping is
+/// unit-testable without a live pane — Mac's `paneChord(for:)`.
+///
+/// Each chord requires EXACTLY its modifier: ctrl+shift+r ("reload
+/// bypassing cache" in browsers) is not claimed, ctrl+shift+d stays the
+/// global split-down, and the Win key never participates. `ctrl+l` and
+/// `alt+d` are Windows-native aliases for the address bar (every browser on
+/// Windows answers to both); `ctrl+d` mirrors Mac's Cmd+D.
+pub fn paneChord(vk: u16, mods: input.Mods) ?PaneChord {
+    if (mods.super) return null;
+    const ctrl_only = mods.ctrl and !mods.shift and !mods.alt;
+    const alt_only = mods.alt and !mods.shift and !mods.ctrl;
+    return switch (vk) {
+        0x52 => if (ctrl_only) .reload else null, // 'R'
+        0x44 => if (ctrl_only or alt_only) .focus_address else null, // 'D'
+        0x4C => if (ctrl_only) .focus_address else null, // 'L'
+        else => null,
+    };
+}
+
+// -------------------------------------------------------------------- zoom
+
+/// A ctrl+plus/minus/0 keyboard-zoom request (T161). Pinch and ctrl+wheel
+/// are Chromium's own and independent of this — Mac's `ZoomAction`, whose
+/// step and clamp are copied exactly so the two clients zoom identically.
+pub const ZoomAction = enum { zoom_in, zoom_out, reset };
+
+/// Keyboard page-zoom bounds and per-press step. 1.0 is 100%. The same
+/// values as `ViewerView.swift` (`minZoom`/`maxZoom`/`zoomStep`).
+pub const min_zoom: f64 = 0.5;
+pub const max_zoom: f64 = 3.0;
+pub const zoom_step: f64 = 1.1;
+
+/// Classify a chord as a viewer zoom action, or null if it is not one.
+///
+/// Matches the DEFAULT font-size chords (ctrl + `=`/`+`/`-`/`0`, main row
+/// and numpad) — the same keys `Config.zig` binds to
+/// increase/decrease/reset_font_size. Alt and Win are rejected so this
+/// never collides with other chords. Shift is allowed only on the main-row
+/// `=` key, because ctrl+shift+= is how a "+" is typed — the exact set Mac
+/// accepts (its `charactersIgnoringModifiers` keeps shift, so `+` reads as
+/// zoom-in while shift+`-` and shift+`0` produce other characters and fall
+/// through).
+pub fn zoomAction(vk: u16, mods: input.Mods) ?ZoomAction {
+    if (!mods.ctrl or mods.alt or mods.super) return null;
+    return switch (vk) {
+        0xBB => .zoom_in, // VK_OEM_PLUS ('=' / shift '+')
+        0x6B => if (mods.shift) null else .zoom_in, // VK_ADD (numpad +)
+        0xBD => if (mods.shift) null else .zoom_out, // VK_OEM_MINUS
+        0x6D => if (mods.shift) null else .zoom_out, // VK_SUBTRACT (numpad -)
+        0x30 => if (mods.shift) null else .reset, // '0'
+        0x60 => if (mods.shift) null else .reset, // VK_NUMPAD0
+        else => null,
+    };
+}
+
+/// The next page-zoom factor for an action, clamped to [min_zoom, max_zoom]
+/// — Mac's `steppedZoom(from:action:)`, verbatim.
+pub fn steppedZoom(current: f64, action: ZoomAction) f64 {
+    return switch (action) {
+        .zoom_in => @min(max_zoom, current * zoom_step),
+        .zoom_out => @max(min_zoom, current / zoom_step),
+        .reset => 1.0,
+    };
+}
+
 // -------------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -296,6 +376,62 @@ test "bare modifiers and unidentified keys build no event" {
 test "the extended bit distinguishes the numpad enter" {
     try testing.expectEqual(input.Key.enter, keyEventFor(0x0D, false, .{ .ctrl = true }).?.key);
     try testing.expectEqual(input.Key.numpad_enter, keyEventFor(0x0D, true, .{ .ctrl = true }).?.key);
+}
+
+test "paneChord: exact-modifier chords only" {
+    // The pinned table: ctrl+r reload; ctrl+d / ctrl+l / alt+d address bar.
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const alt: input.Mods = .{ .alt = true };
+    try testing.expectEqual(PaneChord.reload, paneChord(0x52, ctrl).?);
+    try testing.expectEqual(PaneChord.focus_address, paneChord(0x44, ctrl).?);
+    try testing.expectEqual(PaneChord.focus_address, paneChord(0x4C, ctrl).?);
+    try testing.expectEqual(PaneChord.focus_address, paneChord(0x44, alt).?);
+
+    // Exactness: the neighboring global bindings stay untouched.
+    try testing.expect(paneChord(0x52, .{ .ctrl = true, .shift = true }) == null); // ctrl+shift+r
+    try testing.expect(paneChord(0x44, .{ .ctrl = true, .shift = true }) == null); // ctrl+shift+d = split down
+    try testing.expect(paneChord(0x44, .{ .ctrl = true, .alt = true }) == null);
+    try testing.expect(paneChord(0x44, .{ .alt = true, .shift = true }) == null);
+    try testing.expect(paneChord(0x4C, alt) == null); // alt+l is nothing
+    try testing.expect(paneChord(0x52, alt) == null); // alt+r is nothing
+    try testing.expect(paneChord(0x52, .{}) == null); // bare 'r' is typing
+    try testing.expect(paneChord(0x52, .{ .ctrl = true, .super = true }) == null);
+}
+
+test "zoomAction: the default font-size chords, main row and numpad" {
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
+    try testing.expectEqual(ZoomAction.zoom_in, zoomAction(0xBB, ctrl).?); // ctrl+=
+    try testing.expectEqual(ZoomAction.zoom_in, zoomAction(0xBB, ctrl_shift).?); // ctrl+shift+= is "+"
+    try testing.expectEqual(ZoomAction.zoom_in, zoomAction(0x6B, ctrl).?); // ctrl+numpad+
+    try testing.expectEqual(ZoomAction.zoom_out, zoomAction(0xBD, ctrl).?); // ctrl+-
+    try testing.expectEqual(ZoomAction.zoom_out, zoomAction(0x6D, ctrl).?); // ctrl+numpad-
+    try testing.expectEqual(ZoomAction.reset, zoomAction(0x30, ctrl).?); // ctrl+0
+    try testing.expectEqual(ZoomAction.reset, zoomAction(0x60, ctrl).?); // ctrl+numpad0
+
+    // Shift participates only in typing "+" (Mac's exact acceptance set).
+    try testing.expect(zoomAction(0xBD, ctrl_shift) == null);
+    try testing.expect(zoomAction(0x30, ctrl_shift) == null);
+    try testing.expect(zoomAction(0x6B, ctrl_shift) == null);
+    // No ctrl, or alt/win present: not a zoom chord.
+    try testing.expect(zoomAction(0xBB, .{}) == null);
+    try testing.expect(zoomAction(0xBB, .{ .ctrl = true, .alt = true }) == null);
+    try testing.expect(zoomAction(0xBB, .{ .ctrl = true, .super = true }) == null);
+}
+
+test "steppedZoom: Mac's step and clamp, verbatim" {
+    // One press up from 100% is 110%.
+    try testing.expectApproxEqAbs(@as(f64, 1.1), steppedZoom(1.0, .zoom_in), 1e-9);
+    // One press down from 100% is 1/1.1.
+    try testing.expectApproxEqAbs(@as(f64, 1.0 / 1.1), steppedZoom(1.0, .zoom_out), 1e-9);
+    // Reset lands exactly on 1.0 from anywhere.
+    try testing.expectEqual(@as(f64, 1.0), steppedZoom(2.37, .reset));
+    // Stepping up from near the ceiling clamps at 3.0 and stays there.
+    try testing.expectEqual(max_zoom, steppedZoom(2.9, .zoom_in));
+    try testing.expectEqual(max_zoom, steppedZoom(max_zoom, .zoom_in));
+    // Stepping down from near the floor clamps at 0.5 and stays there.
+    try testing.expectEqual(min_zoom, steppedZoom(0.52, .zoom_out));
+    try testing.expectEqual(min_zoom, steppedZoom(min_zoom, .zoom_out));
 }
 
 test "forwards: window/app commands yes, terminal-content commands no" {

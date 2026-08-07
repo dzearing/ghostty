@@ -931,10 +931,17 @@ pub fn run(self: *App) !void {
                 // Escape reverts — the same main-loop routing every popup
                 // edit uses, because an EDIT control never sees these keys
                 // itself. Everything else falls through so typing works.
+                // The pane-scoped viewer chords (T161: ctrl+r reload,
+                // ctrl+d/ctrl+l re-select the address) are live in the
+                // field too — the chords belong to the PANE, and the bar is
+                // inside the pane.
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
                     if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
                         if (nav.handleEditKey(vk)) continue :loop;
                     }
+                }
+                if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
+                    if (nav.handleEditChord(vk)) continue :loop;
                 }
                 // Check if this edit is a tab rename edit
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
@@ -998,6 +1005,16 @@ pub fn run(self: *App) !void {
                         continue :loop;
                     }
                 }
+            }
+        }
+
+        // Alt chords arrive as WM_SYSKEYDOWN, which the intercept above never
+        // sees. The viewer address field's alt+d (T161, the Windows-native
+        // address-bar alias) is the one such chord we claim; everything else
+        // falls through so alt-menu access keeps working.
+        if (msg.message == w32.WM_SYSKEYDOWN and msg.hwnd != null) {
+            if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
+                if (nav.handleEditChord(@intCast(msg.wParam & 0xFFFF))) continue :loop;
             }
         }
 

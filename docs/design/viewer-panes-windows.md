@@ -359,7 +359,14 @@ New v1 tasks (filed by this refresh):
 
 - nav chrome + address bar + history/home (P3, P4)
 - markdown TOC card (P5)
-- zoom + pane-scoped chords (P6, P7)
+- zoom + pane-scoped chords (P6, P7) — **done in T161**: `viewer_accel.zig`
+  carries the pure chord/zoom tables (Mac's step ×1.1, clamp [0.5, 3.0],
+  verbatim), the accelerator handler checks pane chords before the app
+  keybind table, `put_ZoomFactor` is typed on the controller, and the
+  main loop routes the chords from the address field too (zoom stays
+  content-only, Mac's `isViewerContentFocused` rule). Open question 3 is
+  answered: plain `ctrl+l` DOES reach `add_AcceleratorKeyPressed` (asserted
+  on-box by `viewer-panes.ps1` 11d).
 - selection toolbar Copy + shim/injection verification on a real website (P1,
   P2, #17) — **done in T375**: the win32 lane's live test serves a loopback
   `http://` page whose script posts through `window.webkit.messageHandlers`

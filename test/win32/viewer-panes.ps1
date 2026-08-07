@@ -957,12 +957,215 @@ try {
         Assert (-not ($app.Process -and $app.Process.HasExited)) 'T396C app alive after the file dialog'
     }
 
+    # --- 11d. T161: pane-scoped chords + keyboard page zoom ------------------
+    # The chords that mean something different while a viewer holds focus:
+    # ctrl+r reloads the pane, ctrl+d / ctrl+l / alt+d focus the address bar,
+    # and ctrl+plus/minus/0 zoom the page. Oracles, because nothing outside a
+    # WebView2 can see its render:
+    #   - reload: a raw-TCP page server (relay-account.ps1's shape -- no
+    #     HttpListener URL-ACL) logs one line per GET and answers no-store, so
+    #     a real reload MUST produce a new hit line.
+    #   - zoom: the served page mirrors window.devicePixelRatio into
+    #     document.title, which DocumentTitleChanged carries into the leaf's
+    #     title in `+list --json`. put_ZoomFactor changes the ratio by exactly
+    #     the step, so the title is a zoom readout (ratio math, not absolute:
+    #     the test desktop's DPI scale is part of the number).
+    #   - address bar: the focused hwnd becomes the nav bar's EDIT
+    #     (Get-TestFocusedWindow), and the pane count does NOT move -- the
+    #     negative that proves ctrl+d outranked its global split-right.
+    # T157's lesson: the terminal-side ctrl+d split comes FIRST as the
+    # positive control that chords are being delivered at all.
+
+    $t161Hits = Join-Path $env:TEMP 'ghoztty-t161-hits.txt'
+    Remove-Item $t161Hits -ErrorAction SilentlyContinue
+    $t161Port = 47161
+    $t161Job = Start-Job -ScriptBlock {
+        param($port, $hitsFile)
+        $html = '<html><head><title>dpr</title></head><body>t161' +
+            '<script>function u(){document.title="dpr="+window.devicePixelRatio.toFixed(4)}' +
+            'u();setInterval(u,100);</script></body></html>'
+        $payload = [Text.Encoding]::UTF8.GetBytes($html)
+        $head = "HTTP/1.1 200 OK`r`nContent-Type: text/html`r`nCache-Control: no-store`r`nContent-Length: $($payload.Length)`r`nConnection: close`r`n`r`n"
+        $out = ([Text.Encoding]::UTF8.GetBytes($head) + $payload)
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+        $listener.Start()
+        while ($true) {
+            $client = $listener.AcceptTcpClient()
+            try {
+                $stream = $client.GetStream()
+                Start-Sleep -Milliseconds 50
+                $buf = New-Object byte[] 8192
+                $req = ''
+                while ($stream.DataAvailable) {
+                    $n = $stream.Read($buf, 0, $buf.Length)
+                    if ($n -le 0) { break }
+                    $req += [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+                }
+                $line = ($req -split "`r`n")[0]
+                if ($line -match '^GET ') { Add-Content -Path $hitsFile -Value $line }
+                $stream.Write($out, 0, $out.Length)
+                $stream.Flush()
+            } catch {}
+            $client.Close()
+        }
+    } -ArgumentList $t161Port, $t161Hits
+    function Get-T161Hits {
+        if (-not (Test-Path $t161Hits)) { return 0 }
+        return @(Get-Content $t161Hits -ErrorAction SilentlyContinue).Count
+    }
+    function Wait-T161Hits([int]$above) {
+        for ($t = 0; $t -lt 25; $t++) {
+            if ((Get-T161Hits) -gt $above) { return $true }
+            Start-Sleep -Milliseconds 200
+        }
+        return $false
+    }
+    # The leaf title as a devicePixelRatio readout; 0 while it is anything else.
+    function Get-T161Dpr {
+        $leaf = Get-LeafAnyTab 't161' 't161view'
+        if ($leaf -and $leaf.title -match '^dpr=([0-9.]+)$') { return [double]$matches[1] }
+        return 0.0
+    }
+    function Wait-T161Dpr([scriptblock]$ok) {
+        for ($t = 0; $t -lt 25; $t++) {
+            $d = Get-T161Dpr
+            if ($d -gt 0 -and (& $ok $d)) { return $d }
+            Start-Sleep -Milliseconds 200
+        }
+        return (Get-T161Dpr)
+    }
+    # The nav bar's address EDIT under a viewer host (EnumChildWindows
+    # recurses, so one call from the host finds the nested EDIT).
+    function Get-T161NavEdit($hostHwnd) {
+        foreach ($nb in @(Get-TestChildWindows -Window $hostHwnd -Class 'GhozttyViewerNav')) {
+            $edits = @(Get-TestChildWindows -Window ([IntPtr][int64]$nb.Hwnd) -Class 'Edit')
+            if ($edits.Count -ge 1) { return [IntPtr][int64]$edits[0].Hwnd }
+        }
+        return [IntPtr]::Zero
+    }
+    function Wait-T161AddressFocused($top, $hostHwnd) {
+        for ($t = 0; $t -lt 25; $t++) {
+            $edit = Get-T161NavEdit $hostHwnd
+            if ($edit -ne [IntPtr]::Zero -and
+                ([IntPtr](Get-TestFocusedWindow -Window $top)) -eq $edit) { return $true }
+            Start-Sleep -Milliseconds 200
+        }
+        return $false
+    }
+
+    $t161ok = $false
+    foreach ($i in 1..20) {
+        try {
+            $probe = [System.Net.Sockets.TcpClient]::new(); $probe.Connect('127.0.0.1', $t161Port); $probe.Close()
+            $t161ok = $true; break
+        } catch { Start-Sleep -Milliseconds 250 }
+    }
+    Assert $t161ok 'T161 page server is listening'
+
+    $topsKnown = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' | ForEach-Object { $_.Hwnd })
+    $t161top = Open-T396Window 't161' $topsKnown
+    Assert ($null -ne $t161top -and $t161top -ne [IntPtr]::Zero) 'T161 window created'
+
+    if ($t161ok -and $t161top -ne [IntPtr]::Zero) {
+        # POSITIVE CONTROL: ctrl+d on the TERMINAL is still the global
+        # split-right. Proves chord delivery works before any negative below.
+        Focus-TestWindow -Window $t161top | Out-Null
+        Start-Sleep -Milliseconds 400
+        $t161surface = [IntPtr](Get-TestFocusedWindow -Window $t161top)
+        Assert ((Get-TestWindowClass -Window $t161surface) -eq 'GhozttyTerminal') 'T161 CONTROL: focus starts on a terminal surface'
+        Assert (Send-TestKeys -Window $t161top -Target $t161surface -Modifiers ctrl -Key D) 'T161 CONTROL: ctrl+d injected at the terminal'
+        $split = $false
+        for ($t = 0; $t -lt 25 -and -not $split; $t++) {
+            $split = ((Get-PaneCount 't161') -eq 2)
+            if (-not $split) { Start-Sleep -Milliseconds 200 }
+        }
+        Assert $split 'T161 CONTROL: ctrl+d from a terminal split right (global meaning intact)'
+
+        # The viewer under test, on the page server.
+        Invoke-Verb @('+split', '--target=t161', '--name=t161view', "--view=http://127.0.0.1:$t161Port/") | Out-Null
+        Assert ($null -ne (Wait-LeafAnyTab 't161' 't161view')) 'T161 viewer pane created'
+        $dpr0 = Wait-T161Dpr { param($d) $d -gt 0 }
+        Assert ($dpr0 -gt 0) "T161 page loaded and mirrors devicePixelRatio into the title (got '$dpr0')"
+
+        # The Chromium input child, same discovery as T394.
+        $t161chrome = [IntPtr]::Zero
+        $t161host = [IntPtr]::Zero
+        for ($t = 0; $t -lt 50 -and $t161chrome -eq [IntPtr]::Zero; $t++) {
+            foreach ($h in @(Get-TestChildWindows -Window $t161top -Class 'GhozttyViewer')) {
+                if (-not $h.Visible) { continue }
+                $kids = @(Get-TestChildWindows -Window ([IntPtr][int64]$h.Hwnd) -Class '*')
+                $widget = @($kids | Where-Object { $_.Class -eq 'Chrome_WidgetWin_1' })
+                if ($widget.Count -ge 1) { $t161chrome = [IntPtr][int64]$widget[0].Hwnd; $t161host = [IntPtr][int64]$h.Hwnd }
+            }
+            if ($t161chrome -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+        }
+        Assert ($t161chrome -ne [IntPtr]::Zero) 'T161 found the Chromium input child under the viewer host'
+
+        if ($t161chrome -ne [IntPtr]::Zero) {
+            Focus-TestWindow -Window $t161top -Child $t161host | Out-Null
+            Start-Sleep -Milliseconds 400
+
+            # ctrl+r reloads: the no-store page MUST be fetched again.
+            $hits0 = Get-T161Hits
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key R) 'T161 ctrl+r injected at the viewer'
+            Assert (Wait-T161Hits $hits0) 'T161 ctrl+r from a viewer re-fetched the page from the server'
+
+            # The reload navigated; give the title mirror a beat, then zoom.
+            $dpr0 = Wait-T161Dpr { param($d) $d -gt 0 }
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key plus) 'T161 ctrl+plus injected at the viewer'
+            $dprIn = Wait-T161Dpr { param($d) [Math]::Abs($d / $dpr0 - 1.1) -lt 0.02 }
+            Assert ([Math]::Abs($dprIn / $dpr0 - 1.1) -lt 0.02) "T161 ctrl+plus zoomed the page one 1.1 step (got $dpr0 -> $dprIn)"
+
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key '0') 'T161 ctrl+0 injected at the viewer'
+            $dprReset = Wait-T161Dpr { param($d) [Math]::Abs($d / $dpr0 - 1.0) -lt 0.02 }
+            Assert ([Math]::Abs($dprReset / $dpr0 - 1.0) -lt 0.02) "T161 ctrl+0 reset the zoom (got $dprReset, want $dpr0)"
+
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key minus) 'T161 ctrl+minus injected at the viewer'
+            $dprOut = Wait-T161Dpr { param($d) [Math]::Abs($d / $dpr0 - (1.0 / 1.1)) -lt 0.02 }
+            Assert ([Math]::Abs($dprOut / $dpr0 - (1.0 / 1.1)) -lt 0.02) "T161 ctrl+minus zoomed out one step (got $dpr0 -> $dprOut)"
+            Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key '0' | Out-Null
+
+            # ctrl+d from the VIEWER focuses the address bar and does NOT
+            # split -- the pane-scoped chord outranks the global binding.
+            $panes161 = Get-PaneCount 't161'
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key D) 'T161 ctrl+d injected at the viewer'
+            Assert (Wait-T161AddressFocused $t161top $t161host) 'T161 ctrl+d from a viewer focused the address bar'
+            Assert ((Get-PaneCount 't161') -eq $panes161) 'T161 ctrl+d from a viewer did NOT split (pane chord outranks global)'
+
+            # ctrl+r AT the address field still reloads the pane: the chords
+            # are pane-scoped, not page-scoped, and the field is in the pane.
+            $hits1 = Get-T161Hits
+            $t161edit = [IntPtr](Get-TestFocusedWindow -Window $t161top)
+            Assert (Send-TestKeys -Window $t161top -Target $t161edit -Modifiers ctrl -Key R) 'T161 ctrl+r injected at the address field'
+            Assert (Wait-T161Hits $hits1) 'T161 ctrl+r from the address field re-fetched the page'
+
+            # ctrl+l and alt+d are the Windows-native address-bar aliases.
+            Focus-TestWindow -Window $t161top -Child $t161host | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers ctrl -Key L) 'T161 ctrl+l injected at the viewer'
+            Assert (Wait-T161AddressFocused $t161top $t161host) 'T161 ctrl+l from a viewer focused the address bar'
+
+            Focus-TestWindow -Window $t161top -Child $t161host | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChord -Window $t161top -Target $t161chrome -Modifiers alt -Key D) 'T161 alt+d injected at the viewer'
+            Assert (Wait-T161AddressFocused $t161top $t161host) 'T161 alt+d from a viewer focused the address bar'
+
+            Assert (-not ($app.Process -and $app.Process.HasExited)) 'T161 app alive after all viewer chords'
+        }
+    }
+
     # --- 12. app survived all of it ------------------------------------------
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
 } finally {
     Remove-TestDesktop
     Stop-RepoInstances
+    # The T161 page server: a job blocked in AcceptTcpClient, stopped by force.
+    if ($t161Job) {
+        Stop-Job $t161Job -ErrorAction SilentlyContinue
+        Remove-Job $t161Job -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item (Join-Path $env:TEMP 'ghoztty-t161-hits.txt') -ErrorAction SilentlyContinue
     # The T388 home-dir fixture, deletable only now: while the app was alive
     # two viewer panes watched it, and a mid-run delete re-rendered them into
     # error cards (see section 8a2).
