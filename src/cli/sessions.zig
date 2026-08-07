@@ -54,8 +54,9 @@ const InfoFile = struct {
 /// By default, prints a human-readable table. Use `--json` for a machine-readable
 /// array (one object per session) for scripts and AI agents.
 ///
-/// Each row reports: the session id, liveness (`alive` or `dead` with its exit
-/// code), whether a viewer is currently `attached`, the activity state
+/// Each row reports: the session id, liveness (`alive`, `dead(relaunchable)`
+/// for a tombstone RELAUNCH can revive, or `dead` with its exit code),
+/// whether a viewer is currently `attached`, the activity state
 /// (idle/busy/needs_input), the child pid, the working directory, and the command.
 ///
 /// Flags:
@@ -198,10 +199,17 @@ fn printTable(stdout: *std.Io.Writer, sessions: []const connection.OwnedSession)
         return;
     }
     for (sessions) |s| {
-        // Liveness column: "alive" or "dead(<code>)".
+        // Liveness column: "alive", "dead(relaunchable)", "dead(<code>)", or
+        // bare "dead". A relaunchable reboot-floor tombstone has
+        // `alive == false` and no exit code — exactly what a genuinely dead
+        // session without a recorded code looks like — so without the marker
+        // the one command that works with the app closed answers "dead" for a
+        // session that RELAUNCH can revive (T324).
         try stdout.print("{s}  ", .{s.id});
         if (s.alive) {
             try stdout.writeAll("alive");
+        } else if (s.relaunchable) {
+            try stdout.writeAll("dead(relaunchable)");
         } else if (s.exit_code) |code| {
             try stdout.print("dead({d})", .{code});
         } else {
@@ -264,6 +272,77 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });
     try stdout.writeAll(json);
     try stdout.writeAll("\n");
+}
+
+test "printTable distinguishes a relaunchable tombstone from a genuinely dead session" {
+    // Both rows are `alive == false` with no exit code — identical to the
+    // liveness column before T324, which printed bare "dead" for each. The
+    // relaunchable one must read as recoverable.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const sessions = [_]connection.OwnedSession{
+        .{
+            .id = "aaaa",
+            .alive = false,
+            .exit_code = null,
+            .attached = false,
+            .activity = "idle",
+            .pid = 0,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 1,
+            .last_activity = 2,
+            .pinned = false,
+            .relaunchable = true,
+        },
+        .{
+            .id = "bbbb",
+            .alive = false,
+            .exit_code = null,
+            .attached = false,
+            .activity = "idle",
+            .pid = 0,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 3,
+            .last_activity = 4,
+            .pinned = false,
+            .relaunchable = false,
+        },
+        .{
+            .id = "cccc",
+            .alive = false,
+            .exit_code = 1,
+            .attached = false,
+            .activity = "idle",
+            .pid = 0,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 5,
+            .last_activity = 6,
+            .pinned = false,
+            .relaunchable = false,
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try printTable(&out.writer, &sessions);
+
+    const text = out.written();
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const row_a = lines.next().?;
+    const row_b = lines.next().?;
+    const row_c = lines.next().?;
+
+    try testing.expect(std.mem.indexOf(u8, row_a, "dead(relaunchable)") != null);
+    try testing.expect(std.mem.indexOf(u8, row_b, "dead(relaunchable)") == null);
+    try testing.expect(std.mem.indexOf(u8, row_b, "dead") != null);
+    try testing.expect(std.mem.indexOf(u8, row_c, "dead(1)") != null);
 }
 
 test "printJson emits relaunchable for a reboot-floor tombstone" {

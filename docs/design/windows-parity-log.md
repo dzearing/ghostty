@@ -10145,3 +10145,15 @@ today). Note: docs/design/one-installer-agent-consolidation.md. Split:
 T546 (agent core), T547 (win UI), T548 (mac UI+serving, seat mac), T549
 (adopt/retire standalone), T550 (retire publishing, keep /dl/install.ps1
 answering). Validation: doc-only change, tracker validate clean.
+
+- 2026-08-07 - **T324 done - +sessions human output now says
+dead(relaunchable) for a recoverable tombstone**. `printTable` rendered a
+relaunchable reboot-floor tombstone (`alive=false`, no exit code) as bare
+`dead` - indistinguishable from a session that is gone for good, a wrong
+answer from the one command that works with the app closed. The liveness
+column now checks `relaunchable` before the exit code and prints
+`dead(relaunchable)`; JSON shape unchanged (T322 already carries the flag).
+CLAUDE.md's +sessions paragraph documents the rendering. Validation: new
+printTable unit test; all three floor lanes PASS; P1-P3 ALL PASS; on the box
+a debug agent materialized 5 real tombstones and every row printed
+dead(relaunchable).
