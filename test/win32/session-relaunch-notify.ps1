@@ -447,6 +447,30 @@ $respA = 0
 foreach ($leaf in $leavesA) { if (Test-PaneResponsive $leaf.id "a$($leaf.id.Substring(0,4))") { $respA++ } }
 Assert "A9 every restored pane is on a live, interactive shell ($respA/$($leavesA.Count))" `
     ($respA -eq $leavesA.Count)
+
+# T237: the notify policy must also RETIRE the dead tombstone it replaced -
+# the fire-and-forget CLOSE_SESSION (`closeSessionNoWait`, Remote.zig) - or
+# every agent restart leaks one dead(relaunchable) row per pane into
+# sessions.json forever. Scored on the agent's own sessions.json: the marker
+# commands must be GONE from it (the tombstones were freed), while the file
+# still lists the fresh live sessions - so an empty or missing file cannot
+# trivially satisfy the check. A5-A8 above are the positive control that the
+# tombstones existed at restore time (the notices were built from them).
+$metaA = Join-Path $tmp 'ghoztty\local-agent-debug\sessions.json'
+$tombGone = $false; $liveA14 = 0
+$deadlineA14 = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadlineA14) {
+    $rawA14 = ''
+    if (Test-Path $metaA) { $rawA14 = [string](Get-Content -Raw $metaA -ErrorAction SilentlyContinue) }
+    if ($rawA14 -ne '') {
+        $liveA14 = 0
+        try { $liveA14 = @((ConvertFrom-Json $rawA14).sessions).Count } catch {}
+        if (-not $rawA14.Contains("-n $MARK_A") -and -not $rawA14.Contains("-n $MARK_B") `
+            -and $liveA14 -ge $leavesA.Count) { $tombGone = $true; break }
+    }
+    Start-Sleep -Milliseconds 500
+}
+Assert "A14 the dead tombstones were retired from sessions.json (live=$liveA14)" $tombGone
 Stop-TestProcs
 
 # ============================================================================

@@ -10171,3 +10171,19 @@ teardown duration regardless. `handleClose` sends no reply, so nothing to
 reorder there. Validation: new agent unit test gates FakeChild.terminate
 shut and observes the reply while teardown is blocked; all three floor
 lanes PASS; chooser-sessions.ps1 ALL PASS (17); P1-P3 ALL PASS.
+
+- 2026-08-07 - **T237 closed - the CLOSE_SESSION timeout was T96's dropped
+reply; tombstone retirement is now asserted on box**. The task's four
+"what to check" questions were all answered by T96's instrumentation (frame
+arrived, reply on the request channel, ~30ms teardown, tombstone freed -
+the reply died in the client's missing `close_session_result` dispatch arm,
+fixed in 7ee3a1e16) and T326 additionally made the agent reply before the
+child teardown. What remained uncovered was the task's second validation
+bullet: nothing asserted the notify policy's fire-and-forget retirement
+(`closeSessionNoWait`) actually removes dead tombstones. Arm A of
+`session-relaunch-notify.ps1` now asserts it (A14): after the restore the
+marker tombstones must leave the agent's sessions.json while all fresh live
+sessions remain listed. Validation: session-relaunch-notify.ps1 ALL PASS
+(92) with A14 green (live=3); diff is test-script + docs only - the zig
+lanes, P1-P3 and chooser-sessions ran green the same night on these exact
+binaries (T326's validation).
