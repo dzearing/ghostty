@@ -10583,3 +10583,51 @@ no honest oracle; T289 left that one arm unasserted rather than faking it).
 
 Floor: `floor-lane.ps1` none PASS (308s), win32 PASS (345s), agent PASS (315s);
 P1–P3 ALL PASS.
+
+## 2026-08-07 — T300: the machine carousel answers to the keyboard from a cold open
+
+T289 landed first, exactly as T300's ordering note asked, and took most of this
+task with it — the `GetFocus() == self.hwnd` gate is gone, the Tab cycle is
+written (the panel is not a dialog, so nothing was inherited), and `open` ends
+with `moveFocus(.filter)`. So the reassessment came before the build, and what
+was actually left was three things.
+
+**Home/End on the carousel**, which the fix shape named and `handleKey` did not
+have. They go through a new pure `activity_cards.focusFor`, which expresses an
+edge key as a FULL-LENGTH step rather than a literal `0` / `count-1`, so
+`moveFocus`'s clamp stays the one place the range is enforced: an edge key and
+an arrow key that ran off the same end cannot disagree about where the end is.
+Asserted as that equality in the none lane, not just as two magic numbers.
+
+**An oracle**, and this is the part worth remembering. Nothing said WHICH focus
+stop held the keyboard, and the two owner-drawn stops — `carousel` and `table` —
+are both regions of the panel's own window, so `GetFocus` answers `self.hwnd`
+for either and cannot tell them apart. "Tab reached the carousel" therefore had
+no observable at all until a *second* keystroke landed, which is exactly the
+claim a test needs to make on its own before it presses anything else.
+`noteFocus` now logs `focus <old> -> <new>` and is the single write site for the
+field: `moveFocus` calls it, both mouse paths call it, and `syncFocus` calls it
+when the mouse moved Win32 focus behind our back (only on a real change — it
+runs per keystroke).
+
+Tests: `activity-monitor-remote.ps1` gains section **F**, driven entirely from a
+cold open with no click anywhere inside the panel, because the moment one lands
+the mouse has done the reaching and the claim is gone. It prints the walk it
+made — `filter -> show_all -> new_proc -> table -> carousel` — then steps the
+ring with all four keys, asserts the source and the `dialing` count never moved,
+and commits with Return. F3 is the negative control the pre-T300 gate existed
+for: with a button focused, Space presses THAT and leaves both the source and
+the ring alone. It presses "Show all", not Kill — see D29 — because the remote
+panel samples a real machine and terminating a live process to prove a
+keyboard-routing point is not a trade this suite should make.
+
+Floor: `floor-lane.ps1` none PASS (298s), win32 PASS (340s), agent PASS (315s);
+P1–P3 ALL PASS; `activity-monitor-remote.ps1` ALL PASS (56), and the sibling
+local script still ALL PASS (114) after the `syncFocus`/`moveFocus` rework.
+
+Filed: **T569** (Shift+Tab — the one-step route to the carousel — is untested on
+the box, and the harness's `SetKeyboardState` modifier faking is the mechanism
+this repo has already recorded as unreliable for `GetKeyState`, so today no
+evidence says whether the backwards walk works) and **T570** (the remote script
+has no spawn-a-victim fixture, which is what D29's second option would need).
+Recorded **D29**.

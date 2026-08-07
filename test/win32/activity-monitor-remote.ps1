@@ -21,6 +21,15 @@
 #      ARROWING dials nothing, and switching away from a BORROWED connection
 #      leaves the window's session alive exactly as closing does.
 #
+# T300 adds the other way in, for the same reason - a carousel needs a second
+# source to be reachable at all:
+#
+#   F. the carousel is reachable BY KEYBOARD from a cold open: Tab alone walks
+#      to it with no mouse click anywhere in the panel, Left/Right/Home/End
+#      then move the ring without dialing, and Return commits the switch -
+#      while a focused BUTTON still owns Space, which is why the pre-T300 gate
+#      could not simply be deleted.
+#
 # WHY B NEEDS AN ORACLE AT ALL. The loopback agent enumerates the same box, so
 # "the table populated" proves nothing: a panel that silently sampled THIS
 # process would produce an identical-looking table under another machine's
@@ -89,11 +98,23 @@ function Get-PanelState {
     if (-not $m) { return $null }
     $g = $m.Matches[0].Groups
     return [pscustomobject]@{
-        Source = $g[1].Value
-        Total  = [int]$g[2].Value
-        Shown  = [int]$g[3].Value
-        Root   = [int64]$g[6].Value
+        Source  = $g[1].Value
+        Total   = [int]$g[2].Value
+        Shown   = [int]$g[3].Value
+        ShowAll = $g[5].Value
+        Root    = [int64]$g[6].Value
     }
+}
+
+# The panel's most recent focus-stop line (T300), i.e. where the keyboard is.
+# The only oracle for it: `carousel` and `table` are owner-drawn REGIONS of the
+# panel's own window, so GetFocus answers the panel's hwnd for either and
+# cannot tell them apart.
+function Get-FocusStop {
+    if (-not (Test-Path $errlog)) { return $null }
+    $m = @(Select-String -Path $errlog -Pattern 'activity monitor: focus (\w+) -> (\w+)') | Select-Object -Last 1
+    if (-not $m) { return $null }
+    return $m.Matches[0].Groups[2].Value
 }
 
 function Wait-PanelState([string]$SourceLike, [int]$TimeoutMs = 12000) {
@@ -346,6 +367,111 @@ try {
     Send-TestWindowClose -Window $panel | Out-Null
     Start-Sleep -Seconds 2
     Assert ((@(Get-Panels)).Count -eq 0) 'E the switched panel closed cleanly'
+
+    # --- F. The carousel is KEYBOARD-reachable from a COLD OPEN (T300) --------
+    # T289 put the carousel in the panel's Tab cycle; this is the arm that
+    # proves a keyboard-only user can GET to it. Every keystroke below is posted
+    # to whichever control holds focus and NOTHING is clicked inside the panel -
+    # the moment a click lands, the mouse has done the reaching and the claim is
+    # gone. (E1 above deliberately clicks first, because its subject is the ring
+    # arithmetic rather than the reach.)
+    if (-not (Invoke-Palette $remoteTop $remotePane 'ACTIVITY MONITOR' 'F')) {
+        Write-Host 'SETUP FAIL: palette dispatch not delivered for F'; exit 1
+    }
+    $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
+    Assert ($panel -ne [IntPtr]::Zero) 'F the panel re-opened for the keyboard section'
+    if ($panel -eq [IntPtr]::Zero) { throw 'no panel to test keyboard reach on' }
+    Wait-PanelState "127.0.0.1:$Port" | Out-Null
+
+    $filterEdit = Find-TestWindowEx -Parent $panel -Class 'EDIT'
+    Assert ($filterEdit -ne [IntPtr]::Zero) 'F the filter field was found'
+
+    # F1. A cold open leaves the keyboard in the filter field, and Tab ALONE
+    # walks it round to the carousel.
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'F1 a freshly opened panel puts the keyboard in the filter field'
+    Assert ((Get-FocusStop) -eq 'filter') 'F1 ...and the panel itself says that is where the keyboard is'
+    $carF = Get-Carousel
+    Assert ($null -ne $carF -and $carF.Cards -ge 2) 'F1 the fresh panel has a carousel to reach'
+
+    $walk = @('filter')
+    $ctl = $filterEdit
+    foreach ($i in 1..6) {
+        Send-TestControlKey -Control $ctl -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 250
+        $stop = Get-FocusStop
+        $walk += $stop
+        if ($stop -eq 'carousel') { break }
+        $ctl = Get-TestFocusedWindow -Window $panel
+        if ($ctl -eq [IntPtr]::Zero) { break }
+    }
+    Assert ($walk[-1] -eq 'carousel') "F1 Tab alone reaches the carousel from a cold open, no mouse ($($walk -join ' -> '))"
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'F1 Win32 focus is on the panel window, which owns the painted cards'
+
+    # F2. The ring answers to the arrows AND to Home/End (T300) - and none of it
+    # dials, which is the rule E1 asserts for the mouse-reached carousel.
+    $dialsBefore = @(Select-String -Path $errlog -Pattern 'activity monitor: dialing ').Count
+    $srcBefore = (Get-PanelState).Source
+    $cards = $carF.Cards
+    foreach ($step in @(
+            @{ Key = 'End';   Want = $cards - 1; Label = 'End jumps the ring to the last card' },
+            @{ Key = 'Home';  Want = 0;          Label = 'Home jumps it back to the first' },
+            @{ Key = 'Right'; Want = 1;          Label = 'Right steps one card along' },
+            @{ Key = 'Left';  Want = 0;          Label = 'Left steps one card back' })) {
+        Send-TestControlKey -Control $panel -Key $step.Key | Out-Null
+        Start-Sleep -Milliseconds 400
+        $c = Get-Carousel
+        Assert ($null -ne $c -and $c.Focus -eq $step.Want) "F2 $($step.Label) (focus=$($c.Focus), want $($step.Want))"
+    }
+    Assert ((Get-PanelState).Source -eq $srcBefore) 'F2 walking the strip did NOT change the source'
+    Assert ((@(Select-String -Path $errlog -Pattern 'activity monitor: dialing ')).Count -eq $dialsBefore) 'F2 walking the strip dialed NOTHING'
+
+    # F3. NEGATIVE CONTROL, and the reason T300's gate could not simply be
+    # deleted: Space and Return belong to whichever BUTTON has focus. A carousel
+    # that took them globally would make the panel's buttons unpressable from
+    # the keyboard, so with a button focused Space must press THAT and leave
+    # both the source and the ring alone.
+    #
+    # "Show all" rather than Kill: the claim is the same one, its result is in
+    # the panel's own state line, and Kill would have to terminate a real
+    # process on the sampled machine to make it.
+    Send-TestControlKey -Control $panel -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Send-TestControlKey -Control (Get-TestFocusedWindow -Window $panel) -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-FocusStop) -eq 'show_all') "F3 two Tabs from the carousel reach the ""Show all"" button (stop=$(Get-FocusStop))"
+    $showAllBtn = Get-TestFocusedWindow -Window $panel
+    $checkBefore = (Get-PanelState).ShowAll
+    $ringBefore = (Get-Carousel).Focus
+    Send-TestControlKey -Control $showAllBtn -Key Space | Out-Null
+    Start-Sleep -Seconds 2
+    $stF = Get-PanelState
+    Assert ($stF.ShowAll -ne $checkBefore) "F3 Space pressed the focused button ($checkBefore -> $($stF.ShowAll))"
+    Assert ($stF.Source -eq $srcBefore) 'F3 ...and did NOT switch source'
+    Assert ((Get-Carousel).Focus -eq $ringBefore) 'F3 ...and did NOT move the carousel ring'
+
+    # F4. Return on the focused card commits the switch - the keyboard half of
+    # E2's click. Tab back round to the carousel first (Kill is out of the cycle
+    # with nothing selected), then Home to put the ring on Local.
+    foreach ($i in 1..3) {
+        $ctl = Get-TestFocusedWindow -Window $panel
+        if ($ctl -eq [IntPtr]::Zero) { break }
+        Send-TestControlKey -Control $ctl -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 250
+        if ((Get-FocusStop) -eq 'carousel') { break }
+    }
+    Assert ((Get-FocusStop) -eq 'carousel') 'F4 Tab walks back round to the carousel'
+    Send-TestControlKey -Control $panel -Key Home | Out-Null
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-Carousel).Focus -eq 0) 'F4 the ring is on the Local card'
+    $panelsBefore = (@(Get-Panels)).Count
+    Send-TestControlKey -Control $panel -Key Enter | Out-Null
+    $swF = Wait-PanelState 'Local' 12000
+    Assert ($null -ne $swF -and $swF.Source -eq 'Local') "F4 Return committed the switch to Local (source=$($swF.Source))"
+    Assert ((@(Get-Panels)).Count -eq $panelsBefore) 'F4 the keyboard switch did NOT open a second window'
+
+    Send-TestWindowClose -Window $panel | Out-Null
+    Start-Sleep -Seconds 2
+    Assert ((@(Get-Panels)).Count -eq 0) 'F the keyboard-driven panel closed cleanly'
 } finally {
     # cmd, not `& $exe ... 2>&1`: under $ErrorActionPreference='Stop' a native
     # command writing to stderr inside a redirected pipeline is a TERMINATING

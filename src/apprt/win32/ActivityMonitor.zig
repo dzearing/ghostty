@@ -2856,7 +2856,7 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
         // The band owns the click whether or not it landed on a card, so it
         // owns the focus too — the arrow keys must not be handed to the table
         // by a click in the carousel's padding.
-        self.focus = .carousel;
+        self.noteFocus(.carousel);
         if (layout_mod.cardIndexAt(
             l,
             @intCast(self.card_count),
@@ -3142,20 +3142,40 @@ fn focusHwnd(self: *const ActivityMonitor, f: Focusable) w32.HWND {
 /// handler already recorded which one was hit.
 fn syncFocus(self: *ActivityMonitor) void {
     const f = w32.GetFocus() orelse return;
-    if (f == @as(?w32.HWND, self.filter)) {
-        self.focus = .filter;
-    } else if (f == @as(?w32.HWND, self.show_all_btn)) {
-        self.focus = .show_all;
-    } else if (f == @as(?w32.HWND, self.kill_btn)) {
-        self.focus = .kill;
-    } else if (f == @as(?w32.HWND, self.new_proc_btn)) {
-        self.focus = .new_proc;
-    }
+    const stop: Focusable = if (f == @as(?w32.HWND, self.filter))
+        .filter
+    else if (f == @as(?w32.HWND, self.show_all_btn))
+        .show_all
+    else if (f == @as(?w32.HWND, self.kill_btn))
+        .kill
+    else if (f == @as(?w32.HWND, self.new_proc_btn))
+        .new_proc
+    else
+        return;
+    // Only when it actually moved: this runs on every keystroke, and a line
+    // per key would drown the log it exists to make readable.
+    if (stop != self.focus) self.noteFocus(stop);
+}
+
+/// Record the focus stop, and say so.
+///
+/// Logged because the stop is otherwise unobservable from outside the process
+/// (T300): `carousel` and `table` are both owner-drawn regions of the panel's
+/// own window, so `GetFocus` answers `self.hwnd` for either and cannot say
+/// which one has the keys. Without this line an acceptance script can only
+/// infer the stop from a side effect — and "Tab reached the carousel" is
+/// exactly the claim with no side effect until a second keystroke lands.
+///
+/// The mouse paths use this directly: a click has already put Win32 focus on
+/// the panel, and only the click knows which of the two regions it landed in.
+fn noteFocus(self: *ActivityMonitor, f: Focusable) void {
+    log.info("activity monitor: focus {s} -> {s}", .{ @tagName(self.focus), @tagName(f) });
+    self.focus = f;
 }
 
 /// Move keyboard focus to `f` and repaint, so the ring follows it.
 fn moveFocus(self: *ActivityMonitor, f: Focusable) void {
-    self.focus = f;
+    self.noteFocus(f);
     if (f == .table) self.ensureCaret();
     _ = w32.SetFocus(self.focusHwnd(f));
     _ = w32.InvalidateRect(self.hwnd, null, 0);
@@ -3209,16 +3229,22 @@ pub fn handleKey(self: *ActivityMonitor, vk: u16) bool {
         // Typing, and the caret keys inside a text box, belong to the EDIT.
         .filter => return false,
 
-        // The carousel's keys. Arrowing moves the ring and repaints; it never
-        // dials — committing is a separate keystroke precisely so that walking
-        // the list cannot open a connection per card (Mac makes the same
-        // split, :796-799).
+        // The carousel's keys. Arrowing — and Home/End, which jump to the ends
+        // of a strip too wide to see (T300) — moves the ring and repaints; it
+        // never dials. Committing is a separate keystroke precisely so that
+        // walking the list cannot open a connection per card (Mac makes the
+        // same split, :796-799).
         .carousel => {
             if (!cards_mod.hasCarousel(self.card_count)) return false;
             switch (vk) {
-                w32.VK_LEFT, w32.VK_RIGHT => {
-                    const delta: i32 = if (vk == w32.VK_LEFT) -1 else 1;
-                    const moved = cards_mod.moveFocus(self.card_focus, delta, self.card_count);
+                w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END => {
+                    const key: cards_mod.FocusKey = switch (vk) {
+                        w32.VK_LEFT => .left,
+                        w32.VK_RIGHT => .right,
+                        w32.VK_HOME => .home,
+                        else => .end,
+                    };
+                    const moved = cards_mod.focusFor(key, self.card_focus, self.card_count);
                     if (moved != self.card_focus) {
                         self.card_focus = moved;
                         self.scrollCardIntoView();
@@ -3639,7 +3665,7 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
             // two owner-drawn regions the user meant. The table is the default
             // because it owns everything below the carousel band; `onLeftDown`
             // overrides it for a click inside that band.
-            self.focus = .table;
+            self.noteFocus(.table);
             self.onLeftDown(loWordSigned(lparam), hiWordSigned(lparam), wparam);
             return 0;
         },

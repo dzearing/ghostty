@@ -89,6 +89,25 @@ pub fn moveFocus(focus: i32, delta: i32, count: usize) i32 {
     return std.math.clamp(focus + delta, 0, last);
 }
 
+/// The keystrokes the carousel's focus ring answers to, as a shape with no VK
+/// numbers in it — `ActivityMonitor.handleKey` maps the virtual keys onto this
+/// so the arithmetic stays runnable in the none-runtime lane.
+pub const FocusKey = enum { left, right, home, end };
+
+/// Where `key` puts the focus ring (T300). Home and End are expressed as a
+/// FULL-LENGTH step rather than a literal 0 / count-1, so `moveFocus`'s clamp
+/// stays the one place the range is enforced — an edge key and an arrow key
+/// that ran off the end must not be able to disagree about where the end is.
+pub fn focusFor(key: FocusKey, focus: i32, count: usize) i32 {
+    const span: i32 = @intCast(count);
+    return moveFocus(focus, switch (key) {
+        .left => -1,
+        .right => 1,
+        .home => -span,
+        .end => span,
+    }, count);
+}
+
 /// Whether the carousel band appears at all. One card controls nothing, and
 /// design system §6 says chrome that controls nothing does not appear.
 pub fn hasCarousel(count: usize) bool {
@@ -212,6 +231,22 @@ test "moveFocus: clamps at both ends and survives an empty list" {
     try testing.expectEqual(@as(i32, 2), moveFocus(2, 5, 3));
     try testing.expectEqual(@as(i32, 0), moveFocus(1, -9, 3));
     try testing.expectEqual(@as(i32, 0), moveFocus(4, 1, 0));
+}
+
+test "focusFor: arrows step, Home and End jump to the ends" {
+    try testing.expectEqual(@as(i32, 0), focusFor(.left, 1, 4));
+    try testing.expectEqual(@as(i32, 2), focusFor(.right, 1, 4));
+    try testing.expectEqual(@as(i32, 0), focusFor(.home, 3, 4));
+    try testing.expectEqual(@as(i32, 3), focusFor(.end, 0, 4));
+    // Already at an end: the edge key holds, it does not wrap to the other one.
+    try testing.expectEqual(@as(i32, 0), focusFor(.home, 0, 4));
+    try testing.expectEqual(@as(i32, 3), focusFor(.end, 3, 4));
+    // Home and End agree with an arrow that ran off the same end — the whole
+    // point of routing both through `moveFocus`'s clamp.
+    try testing.expectEqual(focusFor(.end, 0, 4), moveFocus(0, 99, 4));
+    try testing.expectEqual(focusFor(.home, 3, 4), moveFocus(3, -99, 4));
+    // No cards, no ring.
+    try testing.expectEqual(@as(i32, 0), focusFor(.end, 0, 0));
 }
 
 test "hasCarousel: one source paints no switcher" {
