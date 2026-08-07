@@ -1212,6 +1212,21 @@ pub const Server = struct {
         const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
         self.store.mutex.unlock();
 
+        // Reply BEFORE the teardown (T326): `found` and `ok` are both decided by
+        // the unlink and cannot change below, while phase 2 terminates a live
+        // child and rewrites two files on disk — work that has exceeded the
+        // client's 5s RPC budget on a loaded box, making a Kill that WORKED
+        // report error.Timeout. The reply's latency must not depend on the
+        // teardown's duration.
+        self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
+            .session_id = id_copy,
+            .ok = unlinked != null,
+            .found = found,
+        }) catch {};
+        // The roster changed the moment the unlink landed — subscribers that
+        // refetch will no longer see the session, terminated or not.
+        self.markRosterDirty();
+
         // Phase 2: terminate+free OUTSIDE the lock, then refresh reboot-floor
         // metadata and reap orphaned layout blobs — EXACTLY like handleClose.
         if (unlinked) |u| {
@@ -1219,14 +1234,6 @@ pub const Server = struct {
             self.store.persistMeta();
             if (self.store.reapLayouts() > 0) self.store.persistLayouts();
         }
-
-        self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
-            .session_id = id_copy,
-            .ok = unlinked != null,
-            .found = found,
-        }) catch {};
-        // A session was closed by id.
-        self.markRosterDirty();
     }
 
     /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the
@@ -2306,6 +2313,13 @@ const FakeChild = struct {
     /// child write. Null in every other test (no behavior change).
     gate_entered: ?*std.Thread.ResetEvent = null,
     gate_release: ?*std.Thread.ResetEvent = null,
+    /// Optional terminate gate (T326): when both are set, `terminate` signals
+    /// `term_gate_entered` and then BLOCKS on `term_gate_release` before marking
+    /// the child terminated — modeling a slow child teardown (a real process
+    /// kill plus persistence can take seconds). Lets a test assert that an RPC
+    /// reply is NOT gated on the teardown. Null in every other test.
+    term_gate_entered: ?*std.Thread.ResetEvent = null,
+    term_gate_release: ?*std.Thread.ResetEvent = null,
     mutex: std.Thread.Mutex = .{},
     alloc: Allocator,
 
@@ -2366,6 +2380,10 @@ const FakeChild = struct {
     }
     fn tm(ctx: *anyopaque) void {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        // Optional teardown gate: announce we're inside terminate, then block
+        // until the test releases us (models a slow child teardown).
+        if (self.term_gate_entered) |e| e.set();
+        if (self.term_gate_release) |r| r.wait();
         // Under the mutex like `tw`/`setExit`: `terminate` runs on whichever
         // thread handled CLOSE, while the test thread reads the flag.
         self.mutex.lock();
@@ -3881,6 +3899,68 @@ test "CLOSE_SESSION by id: frees the session + terminates the child; unknown id 
     defer rp2.deinit();
     try testing.expect(!rp2.value.found);
     try testing.expect(!rp2.value.ok);
+}
+
+test "CLOSE_SESSION replies BEFORE the child teardown (T326: reply is not gated on terminate)" {
+    // Regression guard for the reply-first ordering. handleCloseSession used to
+    // terminate the child + persist metadata to disk BEFORE sending
+    // CLOSE_SESSION_RESULT, so a Kill of a session with a LIVE child could
+    // exceed the client's 5s RPC budget and report error.Timeout for a close
+    // that WORKED. The outcome (found/ok) is fully decided by the unlink, so
+    // the reply must arrive even while the child's teardown is still in
+    // flight — asserted here by gating `terminate` shut and demanding the
+    // reply anyway (ordering, not a wall-clock number).
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 500 };
+    var term_entered: std.Thread.ResetEvent = .{};
+    var term_release: std.Thread.ResetEvent = .{};
+    var fc: FakeChild = .{
+        .alloc = alloc,
+        .term_gate_entered = &term_entered,
+        .term_gate_release = &term_release,
+    };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(23);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit(); // runs LAST: joins server threads (gate released below first)
+    defer term_release.set(); // runs BEFORE deinit so a blocked terminate can finish
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    const req_channel: u128 = 0x326;
+    try h.client.sendControlJson(.close_session, req_channel, protocol.CloseSession{
+        .session_id = o.id[0..],
+    });
+
+    // THE ASSERTION: the reply arrives while terminate is still blocked. The
+    // mock client's loopback reads are bounded (T258), so a pre-fix ordering
+    // fails red with a read timeout here instead of wedging the lane.
+    const rf = try h.client.waitControl(.close_session_result);
+    try testing.expectEqual(req_channel, rf.channel);
+    var rp = try protocol.parseJson(protocol.CloseSessionResult, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.found);
+    try testing.expect(rp.value.ok);
+    // The child has NOT been reaped yet: `terminated` only flips after the gate
+    // releases, so reply-before-reap is proven by ordering alone.
+    try testing.expect(!fc.wasTerminated());
+    // But the session is already gone from the table — the unlink, which is
+    // what the reply reports on, landed before the reply was sent.
+    {
+        h.server.store.mutex.lock();
+        defer h.server.store.mutex.unlock();
+        try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
+    }
+
+    // Release the teardown; it must still complete normally.
+    term_release.set();
+    try testing.expect(fc.waitTerminated());
 }
 
 test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH revives it" {

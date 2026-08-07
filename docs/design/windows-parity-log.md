@@ -10157,3 +10157,17 @@ CLAUDE.md's +sessions paragraph documents the rendering. Validation: new
 printTable unit test; all three floor lanes PASS; P1-P3 ALL PASS; on the box
 a debug agent materialized 5 real tombstones and every row printed
 dead(relaunchable).
+
+- 2026-08-07 - **T326 done - CLOSE_SESSION replies before the child
+teardown**. `handleCloseSession` sent `CLOSE_SESSION_RESULT` only after
+terminating the child and rewriting sessions.json + layouts, so the reply's
+latency included the whole teardown; it now replies (and marks the roster
+dirty) the moment the unlink decides `found`/`ok`, and tears down after.
+Premise correction recorded in the task: T96 had already root-caused the
+original on-box Timeout as a dropped reply (missing client dispatch arm,
+teardown measured ~30ms) and re-enabled chooser-sessions' `confirmed=true`
+assertion - the reordering makes the answer's timeliness independent of
+teardown duration regardless. `handleClose` sends no reply, so nothing to
+reorder there. Validation: new agent unit test gates FakeChild.terminate
+shut and observes the reply while teardown is blocked; all three floor
+lanes PASS; chooser-sessions.ps1 ALL PASS (17); P1-P3 ALL PASS.
