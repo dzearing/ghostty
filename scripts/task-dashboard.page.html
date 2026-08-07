@@ -250,6 +250,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 .filters input, .filters select { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; min-height: 30px; }
 .filters input { flex: 1 1 180px; min-width: 130px; }
 .filters input:focus-visible, .filters select:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
+/* The row count inside the card title: quiet, parenthetical. */
+.card h2 .count { font-weight: 400; font-size: 13px; color: var(--ink-2); margin-left: 6px; }
 /* Multiselect dropdown (status filter): a <details> styled like the selects. */
 .filters details.ms { position: relative; }
 .filters details.ms > summary { list-style: none; cursor: pointer; font: inherit; font-size: 12px; color: var(--ink); background: var(--surface-1); border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; min-height: 30px; display: flex; align-items: center; gap: 6px; user-select: none; box-sizing: border-box; }
@@ -433,7 +435,7 @@ var state = {
   /* statuses: null = every status shown; else a {bucket: bool} map (the
      status filter is a MULTISELECT — the user unchecks e.g. Done to hide it,
      or any subset; a single-value select could not express "all but done"). */
-  filters: { q: '', statuses: null, priority: '', seat: '' },
+  filters: { q: '', statuses: null, priority: '', seat: '', tag: '' },
   open: {},        // expanded task rows
   notes: {},       // in-progress decision notes, kept across re-renders
   digestDate: null,  // which digest is being read; null = newest
@@ -830,7 +832,7 @@ function decisionCard(d) {
       h('span', { class: 'dec-id', text: d.id }),
       h('span', { class: 'dec-title', text: d.title }),
       d.task ? h('span', { class: 'chip link', title: 'Show this task', text: d.task,
-        onclick: function () { state.filters = { q: d.task, statuses: null, priority: '', seat: '' }; go('tasks'); } }) : null,
+        onclick: function () { state.filters = { q: d.task, statuses: null, priority: '', seat: '', tag: '' }; go('tasks'); } }) : null,
       h('span', { class: 'chip', text: d.kind })
     ]),
     d.why ? h('div', { class: 'dec-why', text: d.why }) : null,
@@ -1451,7 +1453,15 @@ function tasksView(d) {
       ['P2', 'P2 - infra'], ['untriaged', 'Untriaged']
     ]),
     sel('seat', 'Any seat', d.seats.map(function (x) { return [x.seat, 'Seat: ' + x.seat]; })),
-    h('span', { class: 'count', id: 'tcount' })
+    // Tag filter: the closed vocabulary first, then anything else the files
+    // actually carry, so an off-vocabulary tag is still reachable.
+    sel('tag', 'Any tag', (function () {
+      var present = {};
+      d.tasks.forEach(function (t) { (t.tags || []).forEach(function (tg) { present[tg] = true; }); });
+      var known = Object.keys(TAG_TITLE).filter(function (k) { return present[k]; });
+      var extra = Object.keys(present).filter(function (k) { return !TAG_TITLE[k]; }).sort();
+      return known.concat(extra).map(function (k) { return [k, 'Tag: ' + k]; });
+    })())
   ]);
   // Sortable: clicking a header toggles direction, clicking another switches
   // key. Newest-first is the default because a tracker is read for what just
@@ -1480,8 +1490,12 @@ function tasksView(d) {
     ])]),
     h('tbody', { id: 'tbody' })
   ]);
-  return [card('All tasks', 'Queue order first — # is what the loop works down. Click a row for the full task, or a header to re-sort.',
-    [controls, h('div', { class: 'tv-wrap' }, [table])])];
+  var c = card('All tasks', 'Queue order first — # is what the loop works down. Click a row for the full task, or a header to re-sort.',
+    [controls, h('div', { class: 'tv-wrap' }, [table])]);
+  // The row count lives IN the title — "All tasks (129 of 592 total)" — not
+  // as a stray label dangling right of the filters (user, 2026-08-07).
+  c.querySelector('h2').appendChild(h('span', { class: 'count', id: 'tcount' }));
+  return [c];
 }
 
 /* Clicking a header toggles direction; switching keys picks the direction that
@@ -1524,7 +1538,7 @@ function openTask(t) {
         h('span', { class: 'pri ' + (t.priority || 'none'), text: t.priority || '--' }),
         h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]]),
         h('code', { class: 'td-id', text: t.id })
-      ]),
+      ].concat(tagChips(t.tags))),
       h('button', { class: 'td-x', 'aria-label': 'Close', text: '×', onclick: function () { dlg.close(); } })
     ]),
     h('h3', { class: 'td-title', text: t.title }),
@@ -1535,8 +1549,7 @@ function openTask(t) {
       t.completedAt ? metaBit('Finished', fDate(t.completedAt)) : null,
       metaBit('Seat', t.seat),
       t.deps && t.deps.length ? metaBit('Deps', t.deps.join(', ')) : null,
-      t.commits && t.commits.length ? metaBit('Commits', t.commits.join(', ')) : null,
-      t.tags && t.tags.length ? h('span', { class: 'td-bit' }, [h('b', { text: 'Tags' })].concat(tagChips(t.tags))) : null
+      t.commits && t.commits.length ? metaBit('Commits', t.commits.join(', ')) : null
     ]),
     t.triageReason ? h('div', { class: 'td-why', text: 'Triage: ' + t.triageReason }) : null,
     body,
@@ -1624,6 +1637,7 @@ function renderTasks() {
   var f = state.filters, q = f.q.trim().toLowerCase();
   var rows = d.tasks.filter(function (t) {
     if (f.statuses && !f.statuses[t.bucket]) return false;
+    if (f.tag && (t.tags || []).indexOf(f.tag) < 0) return false;
     if (f.priority && (t.priority || 'untriaged') !== f.priority) return false;
     if (f.seat && t.seat !== f.seat) return false;
     if (q && (t.id + ' ' + t.title + ' ' + t.summary).toLowerCase().indexOf(q) < 0) return false;
@@ -1692,7 +1706,9 @@ function renderTasks() {
     body.appendChild(tr);
   });
   var c = $('#tcount');
-  if (c) c.textContent = rows.length === d.tasks.length ? rows.length + ' tasks' : rows.length + ' of ' + d.tasks.length + ' tasks';
+  if (c) c.textContent = rows.length === d.tasks.length
+    ? ' (' + d.tasks.length + ' total)'
+    : ' (' + rows.length + ' of ' + d.tasks.length + ' total)';
 }
 
 /* ===========================================================================
