@@ -71,6 +71,7 @@ const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
+const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
 
@@ -371,6 +372,11 @@ history_handler: ?*HistoryChangedHandler = null,
 /// can be created from whichever of the two setup calls runs second.
 hinstance: ?w32.HINSTANCE = null,
 
+/// Unfocused-split dim overlay (T380): the same T74 layered popup a terminal
+/// pane shows, owned by the host window. Created lazily on first show, so a
+/// pane that is never part of a split never pays for one.
+dim_overlay: ?*DimOverlay = null,
+
 // -------------------------------------------------------------------------
 // Construction
 // -------------------------------------------------------------------------
@@ -470,6 +476,12 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.nav) |nav| {
         nav.destroy();
         self.nav = null;
+    }
+    // Destroy the dim overlay before the host window (its owner) is gone —
+    // the same ordering Surface.deinit keeps for its own (T380).
+    if (self.dim_overlay) |d| {
+        d.destroy();
+        self.dim_overlay = null;
     }
     if (self.hwnd) |h| {
         _ = w32.SetWindowLongPtrW(h, w32.GWLP_USERDATA, 0);
@@ -628,6 +640,43 @@ pub fn setVisible(self: *ViewerPane, visible: bool) void {
 pub fn focus(self: *ViewerPane) void {
     self.focused = true;
     if (self.controller) |c| _ = c.moveFocus(.programmatic);
+}
+
+/// Show (or reposition) this pane's unfocused-split dim overlay (T380),
+/// mirroring `Surface.showDimOverlay`. The overlay is an owned popup, so DWM
+/// composites it above WebView2's own Chromium child windows the same way it
+/// sits above a terminal's OpenGL content — a plain child window could not.
+/// Called by `Window.updateDimOverlays` through the PaneView arm; takes the
+/// allocator as a parameter (the ViewerPane convention) so the host floor
+/// stays drivable from a unit test without an `App` or a `Window`.
+pub fn showDimOverlay(self: *ViewerPane, alloc: Allocator, color: u32, alpha: u8) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.dim_overlay == null) {
+        // The host window's own module handle; createHostWindow recorded it.
+        const hinstance = self.hinstance orelse return;
+        self.dim_overlay = DimOverlay.create(
+            alloc,
+            hwnd,
+            hinstance,
+        ) catch |err| {
+            log.warn("viewer dim overlay create failed err={}", .{err});
+            return;
+        };
+    }
+    self.dim_overlay.?.show(color, alpha);
+}
+
+/// Hide this pane's dim overlay if it exists.
+pub fn hideDimOverlay(self: *ViewerPane) void {
+    if (self.dim_overlay) |d| d.hide();
+}
+
+/// Re-check the z-order of this pane's layered popups (T142). The dim overlay
+/// is the only one a viewer owns — its banner slot and scrollbar are
+/// terminal-only.
+pub fn healOverlayZOrders(self: *ViewerPane) void {
+    const owner = self.hwnd orelse return;
+    if (self.dim_overlay) |d| w32.healOverlayZOrder(d.hwnd, owner);
 }
 
 // -------------------------------------------------------------------------
@@ -2757,14 +2806,16 @@ pub fn wndProc(
             // the user just left, and a later `DocumentTitleChanged` is filtered
             // out by `onPaneTitleChanged`'s active-pane guard.
             //
-            // The other two things that path does — `heroOnPaneFocused` and
-            // `updateDimOverlays` — are deliberately NOT here: hero excludes
-            // viewers (T90g) and the viewer dim overlay is T380.
+            // `heroOnPaneFocused` is deliberately NOT here: hero excludes
+            // viewers (T90g). `updateDimOverlays` IS (T380): the active pane
+            // just changed, so the dim has to move off this pane and onto the
+            // one the user left, exactly as the terminal focus path does.
             if (self.pane_view) |pv| {
                 const win = self.parent_window;
                 const tab = win.active_tab;
                 win.tab_active_pane[tab] = pv;
                 win.refreshTabTitle(tab);
+                win.updateDimOverlays();
             }
             return 0;
         },
@@ -4490,4 +4541,93 @@ test "a restored open re-homes the pane; a fresh open homes it where it went" {
     try fresh.navigate(alloc, "https://example.org/");
     try testing.expectEqualStrings("https://example.org/", fresh.location.?);
     try testing.expectEqualStrings("about:blank", fresh.home_location.?);
+}
+
+test "T380: the dim overlay glues to the host window and follows it" {
+    // The viewer half of T74, proven on the host floor alone — no WebView2.
+    // The overlay is a property of the HOST window (T373), so a pane whose
+    // controller never arrived still dims correctly; the composited look on a
+    // real split is the acceptance script's oracle, not this one's.
+    const alloc = testing.allocator;
+    const hinstance = w32.GetModuleHandleW(null);
+    _ = registerClass(hinstance);
+    defer _ = w32.UnregisterClassW(CLASS_NAME, hinstance);
+
+    const parent_class = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyDimTestParent");
+    const pc = w32.WNDCLASSEXW{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &w32.DefWindowProcW,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = parent_class,
+        .hIconSm = null,
+    };
+    _ = w32.RegisterClassExW(&pc);
+    defer _ = w32.UnregisterClassW(parent_class, hinstance);
+
+    const parent = w32.CreateWindowExW(
+        0,
+        parent_class,
+        std.unicode.utf8ToUtf16LeStringLiteral("dim test"),
+        w32.WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        800,
+        600,
+        null,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(parent);
+
+    var pane: ViewerPane = .{};
+    defer pane.deinit(alloc);
+
+    // No host window yet: the call must be a safe no-op, the way every other
+    // pre-createHostWindow entry point is.
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    try testing.expect(pane.dim_overlay == null);
+
+    try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 300, .bottom = 200 });
+    const host = pane.hwnd.?;
+
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    const d = pane.dim_overlay orelse return error.NoOverlay;
+    try testing.expect(shownByStyle(d.hwnd));
+
+    // Click-through, non-activating, DWM-composited — the T74 contract, and
+    // the reason a dimmed viewer still takes the click that focuses it.
+    const ex: u32 = @bitCast(w32.GetWindowLongW(d.hwnd, w32.GWL_EXSTYLE));
+    try testing.expect(ex & w32.WS_EX_LAYERED != 0);
+    try testing.expect(ex & w32.WS_EX_TRANSPARENT != 0);
+    try testing.expect(ex & w32.WS_EX_NOACTIVATE != 0);
+
+    // Glued to the host: same screen rect.
+    var host_rect: w32.RECT = undefined;
+    var overlay_rect: w32.RECT = undefined;
+    try testing.expect(w32.GetWindowRect(host, &host_rect) != 0);
+    try testing.expect(w32.GetWindowRect(d.hwnd, &overlay_rect) != 0);
+    try testing.expectEqual(host_rect, overlay_rect);
+
+    // A divider drag moves the host; the next update call must re-glue.
+    _ = w32.MoveWindow(host, 40, 30, 150, 100, 0);
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    try testing.expect(w32.GetWindowRect(host, &host_rect) != 0);
+    try testing.expect(w32.GetWindowRect(d.hwnd, &overlay_rect) != 0);
+    try testing.expectEqual(host_rect, overlay_rect);
+
+    // Focus back: the overlay hides but stays allocated for the next flip.
+    pane.hideDimOverlay();
+    try testing.expect(!shownByStyle(d.hwnd));
+    try testing.expect(pane.dim_overlay != null);
+
+    // The heal pass runs against a live overlay without complaint (T142).
+    pane.healOverlayZOrders();
 }

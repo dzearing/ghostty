@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-07 - **T380 done - unfocused viewer panes now dim like terminals**.
+  The T74 dim overlay reaches viewer panes: `ViewerPane` owns the same
+  `DimOverlay` layered popup a `Surface` does (lazily created on the T373
+  host hwnd, destroyed before it in deinit), the `PaneView` viewer arms wire
+  show/hide/healOverlayZOrders, and the viewer host's WM_SETFOCUS now runs
+  `updateDimOverlays` so the dim flips in both directions. The Chromium
+  child-window worry from the task turned out benign: the overlay is an
+  owned POPUP, so DWM composites it above WebView2's children exactly as it
+  does above OpenGL. New unit test on the host floor (no WebView2 needed) +
+  new `test\win32\split-dim-viewer.ps1` (ALL PASS, 29: rect/alpha/fill/
+  ex-style oracles, goto_split + click focus flips, resize re-glue,
+  zoom/tab-switch hide-and-restore; -NegativeControl fails as designed).
+  Harness lesson recorded: Send-TestKeys focuses its target via
+  AttachThreadInput+SetFocus, so "who is focused" assertions must precede
+  any chord. Floor: three zig lanes + P1-P3 + split-dim.ps1 ALL PASS.
+  Filed T559 (Mac half: ViewerView never dims, seat mac).
 - 2026-08-07 - **T447 done - hovering a tab shows the pane's working
   directory**. The Windows translation of the Mac titlebar proxy icon: a
   native comctl32 track-mode tooltip under the hovered tab names the focused

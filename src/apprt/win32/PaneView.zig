@@ -182,21 +182,22 @@ pub fn bannerLayoutInset(self: *PaneView, slot_w: i32, slot_h: i32) i32 {
     };
 }
 
-/// Show the unfocused-split dim overlay (T74).
+/// Show the unfocused-split dim overlay (T74; viewers since T380 — the T373
+/// host window is what gives the overlay something to glue to).
 pub fn showDimOverlay(self: *PaneView, color: u32, alpha: u8) void {
     switch (self.kind) {
         .terminal => |s| s.showDimOverlay(color, alpha),
-        // T373 gave viewers a host window, so the overlay now has something to
-        // sit on; wiring it is T380 (the unfocused-split dim is a T74 layered
-        // popup, and a viewer's Chromium children change the z-order rules).
-        .viewer => {},
+        // The viewer method takes the allocator as a parameter so the host
+        // floor stays unit-testable without a Window; every PaneView is in a
+        // tree, so reaching through the parent window is safe HERE.
+        .viewer => |v| v.showDimOverlay(v.parent_window.app.core_app.alloc, color, alpha),
     }
 }
 
 pub fn hideDimOverlay(self: *PaneView) void {
     switch (self.kind) {
         .terminal => |s| s.hideDimOverlay(),
-        .viewer => {},
+        .viewer => |v| v.hideDimOverlay(),
     }
 }
 
@@ -204,7 +205,7 @@ pub fn hideDimOverlay(self: *PaneView) void {
 pub fn healOverlayZOrders(self: *PaneView) void {
     switch (self.kind) {
         .terminal => |s| s.healOverlayZOrders(),
-        .viewer => {},
+        .viewer => |v| v.healOverlayZOrders(),
     }
 }
 
