@@ -9,6 +9,29 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-06 - **T160 done - the markdown viewer has its table of contents**
+  (user-named gap: *"the table of contents work ... missing"*). A native
+  Contents card on every 2+-heading markdown document: scroll-spy highlight,
+  click-to-jump riding viewer.js's own pin, gutter layout at >= 720 DIP with
+  the page reserving `margin + cardWidth` via `setGutter`, compact overlay
+  below it behind a new leading nav-bar contents button (bar pinned open
+  there), drag-to-resize with the width persisted as a shared preference,
+  and the 12px margin tied to `banner_card.MARGIN` by identity (the
+  `documentAlignsToTheCard` analog is a unit test). New modules:
+  `viewer_toc_layout.zig` (pure, 4-scale asserts), `viewer_prefs.zig`,
+  `ViewerTOCPanel.zig` (glass card over the DOCUMENT background, macOS
+  selection pill in the system accent, wheel scroll + overflow thumb,
+  rounded window region in compact). Lessons: (1) `IsWindowVisible` is the
+  wrong oracle in the live tests - the test's top-level window is never
+  shown, so assert the child's own WS_VISIBLE bit; (2) compose DIP offsets
+  from individually-rounded parts or the 11 DIP indent step drifts a pixel
+  at 1.25x; (3) WebMessageReceived vs NavigationCompleted have no delivery
+  order - the T390 reload wait now requires BOTH page_loaded and the page's
+  report (an agent-lane failure was exactly that race). viewer-panes.ps1
+  grew the TOC structure check with a count-based negative control; its one
+  remaining failure is the pre-existing T540 cwd-fallback drift (reproduced
+  on clean HEAD). Filed T543 (compact slide animation + translucent header
+  polish). Floor: three zig lanes + P1-P3 - see T160's validation criteria.
 - 2026-08-06 - **T394 done - app keybinds now work inside viewer panes** (the
   user's 2026-08-05 P0: ctrl+w/ctrl+f4 dead in a focused viewer, no keyboard
   way out). WebView2's AcceleratorKeyPressed is wired on every viewer

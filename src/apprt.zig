@@ -157,6 +157,14 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_nav_layout.zig");
 
+    // Pure win32 viewer TOC-card geometry + policy (T160), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_toc_layout.zig");
+
+    // Pure win32 viewer chrome-preference parse/format — the persisted
+    // side-panel card width (T160), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_prefs.zig");
+
     // Pure win32 machine-chooser row model + geometry (T172), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");

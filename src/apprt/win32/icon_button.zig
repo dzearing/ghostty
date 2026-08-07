@@ -366,6 +366,12 @@ pub const Glyph = enum {
     refresh,
     /// "⌂" — return to the pane's opened location (Fluent Home).
     home,
+    /// "≡" — toggle the viewer's table-of-contents overlay (T160, Fluent
+    /// GlobalNavButton). The same mark as `menu` on purpose but a distinct
+    /// case: on Windows the hamburger IS the native nav-pane toggle (Settings,
+    /// the Store), and keeping the case separate means either host can move
+    /// off the shared mark without dragging the other with it.
+    contents,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -468,7 +474,7 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             out[1] = bar(centered(target, t, m.mark_add));
             return out[0..2];
         },
-        .menu => {
+        .menu, .contents => {
             const mid = centered(target, m.mark_menu, t);
             out[0] = bar(.{
                 .left = mid.left,
@@ -947,6 +953,7 @@ const all_glyphs = [_]Glyph{
     .forward,
     .refresh,
     .home,
+    .contents,
 };
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph

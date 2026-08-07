@@ -38,8 +38,11 @@ pub const leave_delay_ms: u32 = 500;
 /// needs (the same reason Mac uses an app-local event monitor here).
 pub const poll_ms: u32 = 150;
 
-/// The bar's four buttons, in strip order.
-pub const Button = enum { back, forward, reload, home };
+/// The bar's buttons, in strip order. `contents` leads and exists only in a
+/// narrow viewer pane whose document has a table of contents (T160): the
+/// compact card's only opener lives in the chrome bar, which is why the bar
+/// pins open there. Mac puts the same button first in its chrome bar.
+pub const Button = enum { contents, back, forward, reload, home };
 pub const button_count = std.enums.values(Button).len;
 
 /// Everything the bar paints, in physical pixels, for one scale and width.
@@ -49,12 +52,14 @@ pub const Layout = struct {
     bar_h: i32,
     /// Hover strip height, for the reveal test.
     reveal_h: i32,
-    /// Painted squares of the four buttons, indexed by `Button`.
+    /// Painted squares of the buttons, indexed by `Button`. A button the bar
+    /// is not showing (the contents toggle outside the compact TOC layout)
+    /// has an EMPTY rect: it takes no room, paints nothing, and hits nothing.
     buttons: [button_count]Rect,
     /// The address field (a real EDIT control fills this rect).
     address: Rect,
 
-    pub fn init(scale: f32, width: i32) Layout {
+    pub fn init(scale: f32, width: i32, with_contents: bool) Layout {
         const m = icon_button.Metrics.init(scale);
         const pad = px(4.0, scale); // band edge + inter-button gap
         const field_gap = px(8.0, scale); // buttons cluster <-> field
@@ -63,7 +68,11 @@ pub const Layout = struct {
 
         var buttons: [button_count]Rect = undefined;
         var x = pad;
-        for (&buttons) |*b| {
+        for (&buttons, 0..) |*b, i| {
+            if (i == @intFromEnum(Button.contents) and !with_contents) {
+                b.* = .{ .left = x, .top = top, .right = x, .bottom = top };
+                continue;
+            }
             b.* = .{
                 .left = x,
                 .top = top,
@@ -100,6 +109,9 @@ pub const Layout = struct {
     pub fn hitButton(self: *const Layout, scale: f32, x: i32, y: i32) ?Button {
         const m = icon_button.Metrics.init(scale);
         for (self.buttons, 0..) |b, i| {
+            // An absent button's empty rect must not answer hits — inflating
+            // it by the hit pad would otherwise conjure a phantom target.
+            if (b.width() <= 0) continue;
             if (icon_button.hitBox(m, b).containsPoint(x, y)) {
                 return @enumFromInt(i);
             }
@@ -183,44 +195,74 @@ const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
 
 test "bar geometry holds the design system at every scale" {
     for (scales) |scale| {
+        // Both bar variants hold the same rules: the contents toggle either
+        // leads the strip or takes no room at all.
+        for ([_]bool{ false, true }) |with_contents| {
+            const m = icon_button.Metrics.init(scale);
+            const l = Layout.init(scale, px(600.0, scale), with_contents);
+            const gap = px(4.0, scale);
+
+            // The band is the control plus 4 DIP above and below — sized to
+            // the control, and tall enough that nothing touches its edges.
+            try testing.expect(l.bar_h >= m.target + 2 * gap - 1);
+            for (l.buttons) |b| {
+                if (b.width() <= 0) continue; // absent contents toggle
+                try testing.expect(b.top >= gap - 1);
+                try testing.expect(l.bar_h - b.bottom >= gap - 1);
+                // Painted square is the shared icon-button size.
+                try testing.expectEqual(m.target, b.width());
+                try testing.expectEqual(m.target, b.height());
+            }
+
+            // >= 4 DIP between any two painted squares, and buttons stay in
+            // strip order with no overlap.
+            var prev: ?Rect = null;
+            for (l.buttons) |b| {
+                if (b.width() <= 0) continue;
+                if (prev) |p| try testing.expect(b.left - p.right >= gap);
+                prev = b;
+            }
+
+            // The field clears the last button by 8 DIP and the band edge by
+            // 8, and shares the buttons' vertical band.
+            const last = l.buttons[button_count - 1];
+            try testing.expect(l.address.left - last.right >= px(8.0, scale));
+            try testing.expectEqual(last.top, l.address.top);
+            try testing.expect(l.address.right < px(600.0, scale));
+
+            // Reveal strip is 20 DIP.
+            try testing.expectEqual(px(reveal_dip, scale), l.reveal_h);
+        }
+    }
+}
+
+test "the contents toggle leads the strip, and is absent when not asked for" {
+    for (scales) |scale| {
         const m = icon_button.Metrics.init(scale);
-        const l = Layout.init(scale, px(600.0, scale));
-        const gap = px(4.0, scale);
+        const without = Layout.init(scale, px(600.0, scale), false);
+        const with = Layout.init(scale, px(600.0, scale), true);
 
-        // The band is the control plus 4 DIP above and below — sized to the
-        // control, and tall enough that nothing touches its edges.
-        try testing.expect(l.bar_h >= m.target + 2 * gap - 1);
-        for (l.buttons) |b| {
-            try testing.expect(b.top >= gap - 1);
-            try testing.expect(l.bar_h - b.bottom >= gap - 1);
-            // Painted square is the shared icon-button size.
-            try testing.expectEqual(m.target, b.width());
-            try testing.expectEqual(m.target, b.height());
-        }
+        // Absent: an empty rect, and the back button holds the lead slot.
+        try testing.expectEqual(@as(i32, 0), without.button(.contents).width());
+        try testing.expectEqual(px(4.0, scale), without.button(.back).left);
+        // And an empty rect answers no hit, even dead on its position.
+        const c = without.button(.contents);
+        try testing.expect(without.hitButton(scale, c.left, c.top) != Button.contents);
 
-        // >= 4 DIP between any two painted squares, and buttons stay in
-        // strip order with no overlap.
-        var prev: ?Rect = null;
-        for (l.buttons) |b| {
-            if (prev) |p| try testing.expect(b.left - p.right >= gap);
-            prev = b;
-        }
-
-        // The field clears the last button by 8 DIP and the band edge by 8,
-        // and shares the buttons' vertical band.
-        const last = l.buttons[button_count - 1];
-        try testing.expect(l.address.left - last.right >= px(8.0, scale));
-        try testing.expectEqual(last.top, l.address.top);
-        try testing.expect(l.address.right < px(600.0, scale));
-
-        // Reveal strip is 20 DIP.
-        try testing.expectEqual(px(reveal_dip, scale), l.reveal_h);
+        // Present: first in the strip, standard size, and everything after it
+        // shifts right by one slot.
+        try testing.expectEqual(px(4.0, scale), with.button(.contents).left);
+        try testing.expectEqual(m.target, with.button(.contents).width());
+        try testing.expectEqual(
+            with.button(.contents).right + px(4.0, scale),
+            with.button(.back).left,
+        );
     }
 }
 
 test "a violently narrow pane never inverts the field rect" {
     for (scales) |scale| {
-        const l = Layout.init(scale, 10);
+        const l = Layout.init(scale, 10, true);
         try testing.expect(l.address.right >= l.address.left);
     }
 }
@@ -228,7 +270,7 @@ test "a violently narrow pane never inverts the field rect" {
 test "hit testing answers on the hit box, not the paint" {
     const scale: f32 = 1.25;
     const m = icon_button.Metrics.init(scale);
-    const l = Layout.init(scale, 800);
+    const l = Layout.init(scale, 800, false);
     const back = l.button(.back);
     // Dead center of the painted square.
     try testing.expectEqual(

@@ -64,8 +64,11 @@ const viewer_accel = @import("viewer_accel.zig");
 const inputpkg = @import("../../input.zig");
 const viewer_nav = @import("viewer_nav.zig");
 const nav_layout = @import("viewer_nav_layout.zig");
+const toc_layout = @import("viewer_toc_layout.zig");
+const viewer_prefs = @import("viewer_prefs.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
+const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const PaneView = @import("PaneView.zig");
@@ -311,6 +314,29 @@ watcher: viewer_watcher.Watcher = .{},
 /// the pane then has no bar, which is a degradation, not a broken pane.
 nav: ?*ViewerNavBar = null,
 
+/// The table-of-contents card (T160). Created lazily the first time a
+/// document reports 2+ headings; null before that, and null when its window
+/// could not be created (a degradation, not a broken pane).
+toc: ?*ViewerTOCPanel = null,
+
+/// Which presentation the card is in right now. `compact` pins the nav bar
+/// open (its contents button is the card's only opener).
+toc_mode: toc_layout.Mode = .hidden,
+
+/// Whether the compact overlay is toggled open. Deliberately EPHEMERAL — it
+/// must not survive a session restore, because restoring an overlay would
+/// hide the content it covers (CLAUDE.md's viewer contract).
+toc_open: bool = false,
+
+/// The shared card-width preference, DIP. 0 = not loaded yet; read from
+/// `viewer_prefs` the first time a card is needed.
+toc_width_dip: f32 = 0,
+
+/// The gutter width last pushed to the page (CSS px), so bounds syncs do not
+/// spam `setGutter`. -1 forces the next push — set whenever a render has
+/// reset the page's own padding.
+toc_gutter_css: f32 = 0,
+
 /// Whether the bar is currently revealed. The content inset follows this bit
 /// and nothing else, so the bar RESERVES its space (Mac parity: top-of-page
 /// content is never covered).
@@ -426,6 +452,12 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         self.env = null;
     }
     self.clearHeadings(alloc);
+    // The TOC panel after clearHeadings (whose hook just emptied its
+    // borrowed rows) and before the host window, for the nav bar's reason.
+    if (self.toc) |panel| {
+        panel.destroy();
+        self.toc = null;
+    }
     // The bar before the host window: it is the host's child, and destroying
     // it while its back-pointers are intact is the ordered half of the pair
     // (DestroyWindow(host) would take it down as an anonymous child).
@@ -920,6 +952,13 @@ fn setHeadings(self: *ViewerPane, alloc: Allocator, items: []const bridge.Headin
     }
     self.clearHeadings(alloc);
     self.headings = owned;
+
+    // The render that produced these headings also reset the page's own
+    // padding, so the next layout pass must re-push the gutter even when its
+    // width did not change.
+    self.toc_gutter_css = -1;
+    if (self.toc) |panel| panel.setItems();
+    self.updateTOC(alloc);
 }
 
 fn freeOwned(alloc: Allocator, owned: []Heading, filled: usize) void {
@@ -943,12 +982,170 @@ fn clearHeadings(self: *ViewerPane, alloc: Allocator) void {
     self.headings = &.{};
     if (self.active_heading) |id| alloc.free(id);
     self.active_heading = null;
+
+    // The panel's rows BORROW the ids just freed: rebuild them (to empty) in
+    // the same breath, and retract the card — a document with no headings has
+    // no contents. No script push here: the page this padding belonged to is
+    // being replaced or torn down.
+    if (self.toc) |panel| {
+        panel.setItems();
+        panel.hide();
+    }
+    self.toc_mode = .hidden;
+    self.toc_open = false;
+    self.toc_gutter_css = 0;
+    if (self.nav) |nav| nav.setContentsButton(false);
 }
 
 fn setActiveHeading(self: *ViewerPane, alloc: Allocator, id: ?[]const u8) void {
     const dup: ?[]u8 = if (id) |v| (alloc.dupe(u8, v) catch return) else null;
     if (self.active_heading) |old| alloc.free(old);
     self.active_heading = dup;
+    // The card's highlight follows the page's own reports — including the
+    // pin a row click sets, which the page holds through its smooth scroll.
+    if (self.toc) |panel| panel.syncActiveFromPane(true);
+}
+
+// -------------------------------------------------------------------------
+// The table-of-contents card (T160)
+// -------------------------------------------------------------------------
+
+/// Recompute the card's presentation for the pane's current size and heading
+/// list, place (or retract) the panel, and keep the page's gutter and the nav
+/// bar's contents button in step. The one entry point — headings arriving,
+/// bounds syncs, width drags and the overlay toggle all funnel here (Mac's
+/// `updateSidePanelLayout`).
+fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
+    const h = self.hwnd orelse return;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return;
+    const width = @max(r.right - r.left, 0);
+    const height = @max(r.bottom - r.top, 0);
+    var top: i32 = 0;
+    if (self.nav_visible) {
+        if (self.nav) |nav| {
+            top = @min(
+                nav_layout.Layout.init(self.scale, width, nav.show_contents).bar_h,
+                height,
+            );
+        }
+    }
+
+    const pane_w_dip = @as(f32, @floatFromInt(width)) / self.scale;
+    const wanted = toc_layout.mode(pane_w_dip, self.headings.len);
+
+    if (wanted == .hidden) {
+        self.toc_mode = .hidden;
+        self.toc_open = false;
+        if (self.toc) |panel| panel.hide();
+        if (self.nav) |nav| nav.setContentsButton(false);
+        self.pushGutter(alloc, 0);
+        return;
+    }
+
+    if (self.toc_width_dip == 0) self.toc_width_dip = viewer_prefs.loadWidth(alloc);
+    if (self.toc == null) {
+        self.toc = ViewerTOCPanel.create(alloc, self, self.hinstance, h);
+        const panel = self.toc orelse {
+            log.warn("viewer TOC panel could not be created; document has no contents card", .{});
+            return;
+        };
+        panel.setItems();
+    }
+    const panel = self.toc.?;
+
+    // Entering the compact layout closes the overlay (it opens only from its
+    // button) and hands the bar its contents toggle; the pinning itself rides
+    // the hover poll, which shows the bar and holds it open while compact.
+    if (wanted == .compact and self.toc_mode != .compact) self.toc_open = false;
+    self.toc_mode = wanted;
+    if (self.nav) |nav| nav.setContentsButton(wanted == .compact);
+
+    const visible = wanted == .gutter or self.toc_open;
+    const placement = panel.place(
+        self.scale,
+        top,
+        width,
+        @max(height - top, 0),
+        self.toc_width_dip,
+        visible,
+    );
+
+    // Only the gutter reserves page space; the compact overlay floats over
+    // the document the way a menu does.
+    const css: f32 = if (placement.which == .gutter)
+        toc_layout.gutterCssWidth(placement.card_w_dip)
+    else
+        0;
+    self.pushGutter(alloc, css);
+}
+
+/// Hand the page how much left padding to reserve for the card (CSS px; the
+/// page's device-pixel ratio makes CSS px == DIP). The card floats OVER the
+/// web view rather than beside it — insetting the web view natively left a
+/// seam of window background where the page's own background should be
+/// (Mac's `pushSidePanelGutter`, and viewer.js's `setGutter` comment).
+fn pushGutter(self: *ViewerPane, alloc: Allocator, css: f32) void {
+    if (css == self.toc_gutter_css) return;
+    if (!self.page_loaded) return;
+    self.toc_gutter_css = css;
+    var buf: [64]u8 = undefined;
+    const js = std.fmt.bufPrint(&buf, "window.__viewer.setGutter({d})", .{css}) catch return;
+    self.executeScript(alloc, js);
+}
+
+/// The nav bar's contents button (compact layout only): slide the card in or
+/// out. The open state is ephemeral by design.
+pub fn toggleTOCPanel(self: *ViewerPane) void {
+    const p = self.pending orelse return;
+    if (self.toc_mode != .compact) return;
+    self.toc_open = !self.toc_open;
+    self.updateTOC(p.alloc);
+}
+
+/// A card row was clicked: scroll the page to that heading. The page's
+/// `scrollToAnchor` PINS the scroll spy to the clicked heading for the length
+/// of the smooth scroll — the highlight must not walk off the row the user
+/// asked for — and posts the pinned id back as an `active` message, which is
+/// what moves this side's selection. The user's next scroll gesture hands the
+/// spy back (all of that lives in viewer.js; this side must not fight it).
+pub fn tocRowClicked(self: *ViewerPane, id: []const u8) void {
+    const p = self.pending orelse return;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(p.alloc);
+    out.appendSlice(p.alloc, "window.__viewer.scrollToAnchor(") catch return;
+    content.appendJsString(p.alloc, &out, id) catch return;
+    out.append(p.alloc, ')') catch return;
+    self.executeScript(p.alloc, out.items);
+
+    // The overlay is a menu in the narrow layout: using it dismisses it.
+    if (self.toc_mode == .compact and self.toc_open) {
+        self.toc_open = false;
+        self.updateTOC(p.alloc);
+    }
+}
+
+/// A resize drag is moving the card's right edge (called continuously with
+/// the absolute width the drag implies, so the card cannot drift from
+/// accumulated deltas). The card, the handle, and the page's gutter all
+/// derive from this — one layout pass moves all three together.
+pub fn setTOCWidthLive(self: *ViewerPane, proposed_dip: f32) void {
+    const p = self.pending orelse return;
+    const h = self.hwnd orelse return;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return;
+    const pane_w_dip = @as(f32, @floatFromInt(r.right - r.left)) / self.scale;
+    const clamped = toc_layout.clampWidth(proposed_dip, pane_w_dip);
+    if (clamped == self.toc_width_dip) return;
+    self.toc_width_dip = clamped;
+    self.updateTOC(p.alloc);
+}
+
+/// The resize drag ended: the chosen width is worth persisting. Saved once on
+/// mouse-up rather than per pixel of drag (Mac's `onDragEnded`).
+pub fn commitTOCWidth(self: *ViewerPane) void {
+    const p = self.pending orelse return;
+    if (self.toc_width_dip > 0) viewer_prefs.saveWidth(p.alloc, self.toc_width_dip);
 }
 
 /// Install the P2 blob and subscribe to what it posts back.
@@ -1544,6 +1741,9 @@ pub fn setColorScheme(self: *ViewerPane, dark: bool) void {
     // move with the OS scheme — but re-deriving here is cheap and keeps the
     // chrome honest if a config reload ever changes the background underneath.
     if (self.nav) |nav| nav.applyTheme();
+    // The TOC card's palette DOES follow the scheme: it sits on the document,
+    // whose background is the page's own light/dark.
+    if (self.toc) |panel| panel.applyTheme();
 }
 
 fn applyColorScheme(self: *ViewerPane) void {
@@ -1600,17 +1800,25 @@ pub fn syncBounds(self: *ViewerPane) void {
     if (self.nav_visible) {
         if (self.nav) |nav| {
             nav.place(width, self.scale);
-            top = @min(nav_layout.Layout.init(self.scale, width).bar_h, height);
+            top = @min(
+                nav_layout.Layout.init(self.scale, width, nav.show_contents).bar_h,
+                height,
+            );
         }
     }
 
-    const c = self.controller orelse return;
-    _ = c.setBounds(.{
-        .left = 0,
-        .top = top,
-        .right = width,
-        .bottom = height,
-    });
+    if (self.controller) |c| {
+        _ = c.setBounds(.{
+            .left = 0,
+            .top = top,
+            .right = width,
+            .bottom = height,
+        });
+    }
+
+    // The TOC card follows the pane's width LIVE — dragging a split divider
+    // across 720 DIP flips it between its gutter and overlay layouts here.
+    if (self.pending) |p| self.updateTOC(p.alloc);
 }
 
 // -------------------------------------------------------------------------
@@ -2021,10 +2229,16 @@ fn navHoverTick(self: *ViewerPane) void {
     // background app should not animate it (and the cursor's absolute screen
     // position is meaningless to a window the user is not in — the live test
     // depends on that, since a test window never owns the real cursor).
+    // The compact TOC layout pins the bar open: its contents button is the
+    // card's only opener, so a bar that auto-hides strands the card (T160,
+    // Mac's `setChromeVisible(true)` on entering compact).
+    const toc_pinned = self.toc_mode == .compact;
+    if (toc_pinned and !self.nav_visible) self.setNavVisible(true);
+
     const foreground = w32.GetForegroundWindow() == w32.GetAncestor(h, w32.GA_ROOT);
     const in_pane = foreground and
         pt.x >= 0 and pt.y >= 0 and pt.x < r.right and pt.y < r.bottom;
-    const l = nav_layout.Layout.init(self.scale, r.right - r.left);
+    const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.show_contents);
     // "Held" = the address field owns the keyboard, or the cursor is on the
     // revealed bar itself (its band is the top `bar_h` of the pane).
     const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit);
@@ -2034,7 +2248,7 @@ fn navHoverTick(self: *ViewerPane) void {
         .in_pane = in_pane,
         .y = pt.y,
         .visible = self.nav_visible,
-        .held = edit_focused or on_bar,
+        .held = edit_focused or on_bar or toc_pinned,
         .now_ms = w32.GetTickCount64(),
         .deadline_ms = self.nav_deadline,
         .reveal_h = l.reveal_h,
@@ -2980,6 +3194,88 @@ test "host floor: a real controller on a real window, on this box" {
     // whatever the bundled renderer calls itself.
     try testing.expectEqualStrings("t90e.md", pane.title.?);
 
+    // ------------------------------------------------------------------
+    // T160: the table-of-contents card rides the same chain
+    // ------------------------------------------------------------------
+    //
+    // Two headings arrived, so the pane built its native card. Which
+    // PRESENTATION it is in depends on the pane's width in DIP, which depends
+    // on this monitor's scale — so both layouts are driven explicitly by
+    // resizing the host window rather than asserting whichever one 640px
+    // happens to land on here.
+    try testing.expect(pane.toc != null);
+    const toc_panel = pane.toc.?;
+
+    // Wide: >= 720 DIP puts the card in a left gutter — visible with no
+    // toggle — and reserves the page gutter (the card's left margin plus the
+    // card, one number; the document's own padding supplies the gap).
+    {
+        const wide_px: i32 = @intFromFloat(@ceil(760.0 * pane.scale));
+        _ = w32.MoveWindow(pane.hwnd.?, 0, 0, wide_px, 480, 1);
+        pane.syncBounds();
+        try testing.expectEqual(toc_layout.Mode.gutter, pane.toc_mode);
+        try testing.expect(shownByStyle(toc_panel.hwnd));
+        // The width preference is live and inside its draggable range
+        // (whatever a previous session persisted).
+        try testing.expect(pane.toc_width_dip >= toc_layout.card_min_dip);
+        try testing.expect(pane.toc_width_dip <= toc_layout.card_max_dip);
+        var wr: w32.RECT = undefined;
+        try testing.expect(w32.GetClientRect(pane.hwnd.?, &wr) != 0);
+        const pane_w_dip = @as(f32, @floatFromInt(wr.right - wr.left)) / pane.scale;
+        try testing.expectEqual(
+            toc_layout.gutterCssWidth(toc_layout.clampWidth(pane.toc_width_dip, pane_w_dip)),
+            pane.toc_gutter_css,
+        );
+    }
+
+    // Narrow: below 720 DIP the card becomes an overlay — closed until the
+    // chrome bar's contents button opens it — and the page gutter is
+    // released. The switch followed the pane width LIVE, off one resize.
+    {
+        const narrow_px: i32 = @intFromFloat(@floor(500.0 * pane.scale));
+        _ = w32.MoveWindow(pane.hwnd.?, 0, 0, narrow_px, 480, 1);
+        pane.syncBounds();
+        try testing.expectEqual(toc_layout.Mode.compact, pane.toc_mode);
+        try testing.expect(!shownByStyle(toc_panel.hwnd));
+        try testing.expectEqual(@as(f32, 0), pane.toc_gutter_css);
+        // The bar gained its contents toggle (its band is the card's only
+        // opener in this layout)...
+        try testing.expect(pane.nav.?.show_contents);
+        // ...which slides the card in.
+        pane.toggleTOCPanel();
+        try testing.expect(pane.toc_open);
+        try testing.expect(shownByStyle(toc_panel.hwnd));
+
+        // Clicking a row scrolls the page to that heading and PINS it: the
+        // page posts the pinned id back as an `active` message, which is what
+        // moves the native selection — and using the overlay dismisses it.
+        const target_id = try alloc.dupe(u8, pane.headings[1].id);
+        defer alloc.free(target_id);
+        pane.tocRowClicked(target_id);
+        try testing.expect(!pane.toc_open);
+        try testing.expect(!shownByStyle(toc_panel.hwnd));
+        var click_timer = try std.time.Timer.start();
+        while (click_timer.read() < 30 * std.time.ns_per_s) {
+            if (pane.active_heading) |a| {
+                if (std.mem.eql(u8, a, target_id)) break;
+            }
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        log.warn("toc: click -> active={?s}", .{pane.active_heading});
+        try testing.expect(pane.active_heading != null);
+        try testing.expectEqualStrings(target_id, pane.active_heading.?);
+        // The panel's highlighted row followed the page's report.
+        try testing.expectEqual(@as(i32, 1), toc_panel.active);
+
+        // Back to the original size for everything below.
+        _ = w32.MoveWindow(pane.hwnd.?, 0, 0, 640, 480, 1);
+        pane.syncBounds();
+    }
+
     // CODE mode, on the same template: `setCode` clears the heading index, and
     // the page posts the empty list up the same bridge. Headings falling back
     // to zero is the page saying `window.__viewer.setCode` ran — a template
@@ -2998,6 +3294,11 @@ test "host floor: a real controller on a real window, on this box" {
     }
     try testing.expectEqual(@as(usize, 0), pane.headings.len);
     try testing.expectEqualStrings("t90e.zig", pane.title.?);
+    // No headings, no card: the TOC retracted with the document that fed it
+    // (T160 — a code file gets no contents card, and neither does a
+    // one-heading document, which the page reports as an empty list too).
+    try testing.expectEqual(toc_layout.Mode.hidden, pane.toc_mode);
+    try testing.expect(!shownByStyle(pane.toc.?.hwnd));
 
     // A missing file must not take the pane down: it renders the page's own
     // error card and the pane stays a live, navigable citizen.
@@ -3114,9 +3415,15 @@ test "host floor: a real controller on a real window, on this box" {
 
     try pane.navigate(alloc, reload_url);
     try testing.expect(!pane.page_loaded);
+    // Wait for BOTH the page's report and the completed-load flag: the
+    // page's postMessage and NavigationCompleted are delivered in no
+    // guaranteed order relative to each other, and under box load the
+    // message wins the race often enough to fail a bare page_loaded assert
+    // right after this wait (seen 2026-08-06 in the agent lane).
     try waitFor(&msg, 30, struct {
         fn ready(p: *ViewerPane) bool {
-            return p.active_heading != null and std.mem.eql(u8, p.active_heading.?, "req1");
+            return p.page_loaded and
+                p.active_heading != null and std.mem.eql(u8, p.active_heading.?, "req1");
         }
     }.ready, &pane);
     try testing.expectEqualStrings("req1", pane.active_heading.?);
@@ -3337,7 +3644,7 @@ test "host floor: a real controller on a real window, on this box" {
     {
         var cr: w32.RECT = undefined;
         try testing.expect(w32.GetClientRect(pane.hwnd.?, &cr) != 0);
-        const nl = nav_layout.Layout.init(pane.scale, cr.right - cr.left);
+        const nl = nav_layout.Layout.init(pane.scale, cr.right - cr.left, nav.show_contents);
         const nb = c.bounds().?;
         try testing.expectEqual(nl.bar_h, nb.top);
     }
@@ -3473,6 +3780,15 @@ test "host floor: a real controller on a real window, on this box" {
     }
     try testing.expectEqual(content.Mode.markdown, pane.mode);
     try testing.expectEqualStrings(links_path, pane.location.?);
+}
+
+/// A window's OWN visibility bit (T160's oracle). NOT `IsWindowVisible`,
+/// which also requires every ancestor to be visible — the live tests' top-
+/// level window is deliberately never shown, so that answer is always false
+/// here regardless of what `place` did.
+fn shownByStyle(hwnd: w32.HWND) bool {
+    const style: usize = @bitCast(w32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE));
+    return style & w32.WS_VISIBLE_STYLE != 0;
 }
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.

@@ -59,6 +59,10 @@ alloc: Allocator,
 can_back: bool = false,
 can_forward: bool = false,
 
+/// Whether the leading contents toggle is shown (T160): true only while the
+/// pane's TOC is in its compact overlay layout, pushed by the pane.
+show_contents: bool = false,
+
 hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
 tracking: bool = false,
@@ -256,7 +260,7 @@ pub fn applyTheme(self: *ViewerNavBar) void {
 /// Idempotent and cheap; the pane calls it from every bounds sync while the
 /// bar is visible.
 pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
-    const l = layout_mod.Layout.init(scale, width);
+    const l = layout_mod.Layout.init(scale, width, self.show_contents);
     _ = w32.MoveWindow(self.hwnd, 0, 0, width, l.bar_h, 1);
     _ = w32.MoveWindow(
         self.edit,
@@ -303,6 +307,14 @@ pub fn setHistory(self: *ViewerNavBar, back: bool, forward: bool) void {
     if (self.can_back == back and self.can_forward == forward) return;
     self.can_back = back;
     self.can_forward = forward;
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
+/// Show or drop the leading contents toggle (T160). The pane follows with a
+/// bounds sync, whose `place` re-lays the strip around the change.
+pub fn setContentsButton(self: *ViewerNavBar, show: bool) void {
+    if (self.show_contents == show) return;
+    self.show_contents = show;
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
@@ -385,6 +397,7 @@ pub fn noteClickUp(self: *ViewerNavBar) void {
 
 fn buttonEnabled(self: *const ViewerNavBar, b: layout_mod.Button) bool {
     return switch (b) {
+        .contents => true,
         .back => self.can_back,
         .forward => self.can_forward,
         .reload, .home => true,
@@ -393,6 +406,7 @@ fn buttonEnabled(self: *const ViewerNavBar, b: layout_mod.Button) bool {
 
 fn buttonGlyph(b: layout_mod.Button) icon_button.Glyph {
     return switch (b) {
+        .contents => .contents,
         .back => .back,
         .forward => .forward,
         .reload => .refresh,
@@ -408,10 +422,11 @@ fn paint(self: *ViewerNavBar, hdc: w32.HDC, width: i32, height: i32) void {
         _ = w32.FillRect(hdc, &r, brush);
     }
 
-    const l = layout_mod.Layout.init(self.scale, width);
+    const l = layout_mod.Layout.init(self.scale, width, self.show_contents);
     const m = icon_button.Metrics.init(self.scale);
     for (std.enums.values(layout_mod.Button)) |b| {
         const box = l.button(b);
+        if (box.width() <= 0) continue; // absent contents toggle
         const enabled = self.buttonEnabled(b);
 
         const state: icon_button.State = st: {
@@ -461,7 +476,7 @@ fn updateHover(self: *ViewerNavBar, x: i32, y: i32) void {
 fn currentLayout(self: *ViewerNavBar) layout_mod.Layout {
     var r: w32.RECT = undefined;
     const w = if (w32.GetClientRect(self.hwnd, &r) != 0) r.right - r.left else 0;
-    return layout_mod.Layout.init(self.scale, w);
+    return layout_mod.Layout.init(self.scale, w, self.show_contents);
 }
 
 fn wndProc(
@@ -581,6 +596,7 @@ fn wndProc(
 /// button, not what "back" means.
 fn activate(self: *ViewerNavBar, b: layout_mod.Button) void {
     switch (b) {
+        .contents => self.pane.toggleTOCPanel(),
         .back => self.pane.goBack(),
         .forward => self.pane.goForward(),
         .reload => self.pane.reloadFromChrome(),

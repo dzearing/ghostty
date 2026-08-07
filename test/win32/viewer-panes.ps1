@@ -457,6 +457,30 @@ try {
     Assert ($applog -notmatch 'viewer resource not found: (viewer\.|vendor/)') 'every template asset the page asked for was served'
     Assert ($applog -notmatch 'ExecuteScript failed') 'the content injection was accepted'
 
+    # --- 8a1. the table-of-contents card (T160) ------------------------------
+    # README.md renders with 2+ headings, so its pane must grow a native
+    # `GhozttyViewerTOC` card window -- proof the page posted its headings up
+    # the bridge and the REAL app built the card from them. Which LAYOUT the
+    # card is in (gutter vs overlay, shown vs toggled closed) depends on the
+    # pane's width in DIP on this desktop, so presentation behavior lives in
+    # the win32 lane's live host-floor test, which drives both layouts by
+    # resizing; what is asserted here is structure, with the COUNT as the
+    # negative control: the blank, code and missing-file panes opened above
+    # must not have one (code files and 0/1-heading documents get no card).
+    $tocCount = -1
+    for ($t = 0; $t -lt 50; $t++) {
+        $tocs = @()
+        foreach ($top in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            foreach ($h in @(Get-TestChildWindows -Window ([IntPtr]$top.Hwnd) -Class 'GhozttyViewer')) {
+                $tocs += @(Get-TestChildWindows -Window ([IntPtr]$h.Hwnd) -Class 'GhozttyViewerTOC')
+            }
+        }
+        $tocCount = @($tocs).Count
+        if ($tocCount -ge 1) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    Assert ($tocCount -eq 1) "exactly the README pane grew a GhozttyViewerTOC card (got $tocCount)"
+
     # --- 8a2. a ~ --view path resolves against the home directory (T388) -----
     # `--view=~/x.md` used to reach the server as `<cwd>\~\x.md`: the tilde was
     # never expanded (the one leg of Mac's `expandingTildeInPath` that T90e's

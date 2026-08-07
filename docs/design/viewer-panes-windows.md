@@ -151,6 +151,17 @@ it is testable without a window.
 
 ### P5. The TOC card is `banner_card.zig`, already ported
 
+**Done 2026-08-06 (T160).** Landed as `src/apprt/win32/viewer_toc_layout.zig`
+(pure geometry/policy, four-scale asserts incl. the `documentAlignsToTheCard`
+analog), `viewer_prefs.zig` (the persisted shared card width) and
+`ViewerTOCPanel.zig` (the native window: `banner_card` glass over the
+document background, macOS-style selection pill in the system accent, wheel
+scrolling with an overflow thumb, the drag-resize handle, and a rounded
+window region in the compact overlay). The nav bar grew its leading contents
+button (`viewer_nav_layout` `with_contents`) and pins open while compact.
+Deferred polish — the compact slide animation and the translucent pinned
+header — is T543.
+
 Mac's TOC panel and the pane banner share one `GlassCardBackground`
 (`ViewerTOC.swift`, and CLAUDE.md's "Margins are one number" rule:
 `GlassCard.outerMargin` = 12pt on all four sides, enforced by
