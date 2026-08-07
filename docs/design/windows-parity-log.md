@@ -10250,3 +10250,28 @@ tests pin it: an asBytes sweep over every void-payload action, a size_limit
 round-trip, and Target.cval(.app). Floor lanes (none/win32/agent) + P1-P3 all
 green on a fresh Debug build. No new tasks needed; the Mac/GTK sides inherit
 the fix through shared core.
+
+
+## 2026-08-07 - T162 done: the viewer selection toolbar's Copy works on every page, and Quote hides until it has somewhere to go
+
+Selecting text in a Windows viewer pane now offers a working Copy: the shared
+toolbar (selection.js, already injected into every page by T375's one-blob
+rule) had its Copy half proven end to end, and its Quote button - which has
+nowhere to send a quote until the T164 feedback composer - is hidden rather
+than shipped dead. The hide is a documented additive flag
+(window.__ghozttyHideQuote) the win32 blob sets before selection.js runs;
+the shared file stays a single copy and Mac, which never sets the flag,
+keeps both buttons (T558, seat: mac, files the cross-seat test-run check).
+The proof lives in the live win32-lane "host floor" test per the T375
+precedent (an acceptance script cannot select text or press an in-page
+button): it drives the REAL toolbar through the open shadow root on the
+bundled markdown template AND a loopback http:// page, with CDP focus
+emulation + a clipboard-write grant standing in for the focus and user
+activation a real click brings, and reads the SYSTEM clipboard back natively
+both times (copy[md] / copy[web] logged the exact passages; the :1 button
+count in both reports is the Quote-hidden assertion; the user's clipboard is
+saved and restored around the section). viewer_bridge.zig pins the flag
+name/ordering so a drift on either side fails the none lane. Floor lanes
+(none/win32/agent) + P1-P3 green; viewer-panes.ps1 152 PASS with only the
+known pre-existing T538 failure (proven unrelated 2026-08-06 by a control
+build).

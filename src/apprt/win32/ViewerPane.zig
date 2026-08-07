@@ -3780,6 +3780,132 @@ test "host floor: a real controller on a real window, on this box" {
     }
     try testing.expectEqual(content.Mode.markdown, pane.mode);
     try testing.expectEqualStrings(links_path, pane.location.?);
+
+    // ------------------------------------------------------------------
+    // T162: the selection toolbar's Copy — on the template AND a website
+    // ------------------------------------------------------------------
+    //
+    // The toolbar itself is shared JS the blob already carried in (T375); what
+    // is under test is the half a Windows user can reach in v1: select text,
+    // press Copy, and the passage lands on the SYSTEM clipboard. The oracle is
+    // the native clipboard read back through `GetClipboardData` — the page's
+    // own confirmation flash cannot vouch for bytes having left the browser.
+    //
+    // Two pages, deliberately: the bundled markdown template and the loopback
+    // `http://` page. The website case is the whole point of user-script
+    // injection — it is the exact gap Mac's fix closed — so a test that only
+    // covered the template would pass on a build where websites get no
+    // toolbar at all.
+    //
+    // Two CDP calls stand in for what a real user's click brings and a hidden
+    // test window cannot: focus emulation (the async clipboard API refuses an
+    // unfocused document outright) and a clipboard-write permission grant (a
+    // real click carries user activation; a synthetic `dispatchEvent` does
+    // not). Neither changes what the toolbar DOES — they remove the two
+    // environmental refusals that have nothing to do with the code under test.
+    {
+        // The lane runs on the real window station, so the user's clipboard is
+        // saved and put back — a test that eats what they had copied is a
+        // defect of its own.
+        const saved_clip = clipboardReadText(alloc);
+        defer {
+            if (saved_clip) |s| {
+                clipboardWriteText(alloc, s);
+                alloc.free(s);
+            }
+        }
+
+        try tmp.dir.writeFile(.{
+            .sub_path = "copy.md",
+            .data = "# Copy\n\nghoztty copied this passage\n",
+        });
+        const copy_path = try std.fs.path.join(alloc, &.{ dir_path, "copy.md" });
+        defer alloc.free(copy_path);
+
+        const cases = [_]struct {
+            location: []const u8,
+            needle: []const u8,
+            tag: []const u8,
+        }{
+            .{ .location = copy_path, .needle = "ghoztty copied this passage", .tag = "md" },
+            .{ .location = page_url, .needle = "the quick brown fox", .tag = "web" },
+        };
+        for (cases) |case| {
+            try pane.navigate(alloc, case.location);
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.page_loaded;
+                }
+            }.ready, &pane);
+
+            // Re-issued after each navigation: cheap, and it leaves no question
+            // of whether an emulation override survived the document swap.
+            _ = web.callDevToolsProtocolMethod(
+                std.unicode.utf8ToUtf16LeStringLiteral("Emulation.setFocusEmulationEnabled"),
+                std.unicode.utf8ToUtf16LeStringLiteral("{\"enabled\":true}"),
+                null,
+            );
+            _ = web.callDevToolsProtocolMethod(
+                std.unicode.utf8ToUtf16LeStringLiteral("Browser.grantPermissions"),
+                std.unicode.utf8ToUtf16LeStringLiteral(
+                    "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}",
+                ),
+                null,
+            );
+
+            clipboardWriteText(alloc, "t162-sentinel");
+
+            const driver = try copyDriverJs(alloc, case.needle, case.tag);
+            defer alloc.free(driver);
+            pane.executeScript(alloc, driver);
+
+            // The driver reports through the bridge once it has pressed Copy —
+            // and its button count is the v1 shape: ONE button. Two would mean
+            // Quote came back wired to nothing; the count rides in the id so
+            // the failure names itself.
+            const want_id = try std.fmt.allocPrint(alloc, "copybar-{s}:1", .{case.tag});
+            defer alloc.free(want_id);
+            var press_timer = try std.time.Timer.start();
+            while (press_timer.read() < 30 * std.time.ns_per_s) {
+                while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                    _ = w32.TranslateMessage(&msg);
+                    _ = w32.DispatchMessageW(&msg);
+                }
+                if (pane.active_heading) |a| {
+                    // Any report from this page's driver ends the wait; the
+                    // exact-match assert below then names a wrong button count.
+                    if (std.mem.startsWith(u8, a, want_id[0 .. want_id.len - 1])) break;
+                }
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            log.warn("copy[{s}]: toolbar report={?s}", .{ case.tag, pane.active_heading });
+            try testing.expectEqualStrings(want_id, pane.active_heading.?);
+
+            // Now the system clipboard. Asynchronous on the browser side, so
+            // poll — and keep pumping, the write completion still needs the
+            // message loop.
+            var clip_timer = try std.time.Timer.start();
+            var copied: ?[]u8 = null;
+            defer if (copied) |c_| alloc.free(c_);
+            while (clip_timer.read() < 30 * std.time.ns_per_s) {
+                while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                    _ = w32.TranslateMessage(&msg);
+                    _ = w32.DispatchMessageW(&msg);
+                }
+                if (clipboardReadText(alloc)) |text| {
+                    if (std.mem.eql(u8, text, case.needle)) {
+                        copied = text;
+                        break;
+                    }
+                    alloc.free(text);
+                }
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+            }
+            log.warn("copy[{s}]: clipboard={?s}", .{ case.tag, copied });
+            try testing.expect(copied != null);
+            try testing.expectEqualStrings(case.needle, copied.?);
+        }
+    }
 }
 
 /// A window's OWN visibility bit (T160's oracle). NOT `IsWindowVisible`,
@@ -3789,6 +3915,92 @@ test "host floor: a real controller on a real window, on this box" {
 fn shownByStyle(hwnd: w32.HWND) bool {
     const style: usize = @bitCast(w32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE));
     return style & w32.WS_VISIBLE_STYLE != 0;
+}
+
+/// Test-only: the JS that drives one Copy through the REAL toolbar (T162). It
+/// polls for the paragraph carrying `needle` (which is also how it waits out
+/// the template's async render), makes a live selection over it, raises the
+/// `mouseup` the toolbar listens for, and presses the LAST button in the bar —
+/// then reports through the bridge as `copybar-<tag>:<buttonCount>` so the
+/// native side can assert both that Copy was pressed and that Quote is hidden
+/// (v1 ships exactly one button). Reaching the buttons through
+/// `host.shadowRoot` is legitimate for a test: the root is `mode: "open"`.
+fn copyDriverJs(alloc: Allocator, needle: []const u8, tag: []const u8) ![]u8 {
+    const template =
+        \\(function () {
+        \\  var tries = 0;
+        \\  var timer = setInterval(function () {
+        \\    tries += 1;
+        \\    if (tries > 400) { clearInterval(timer); return; }
+        \\    var all = document.querySelectorAll("p");
+        \\    var target = null;
+        \\    for (var i = 0; i < all.length; i++) {
+        \\      if (all[i].textContent.indexOf("@NEEDLE@") !== -1) { target = all[i]; break; }
+        \\    }
+        \\    if (!target) return;
+        \\    var range = document.createRange();
+        \\    range.selectNodeContents(target);
+        \\    var sel = window.getSelection();
+        \\    sel.removeAllRanges();
+        \\    sel.addRange(range);
+        \\    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        \\    var host = document.querySelector("[data-ghoztty-ui]");
+        \\    var bar = host && host.shadowRoot && host.shadowRoot.querySelector(".bar.on");
+        \\    if (!bar) return;
+        \\    clearInterval(timer);
+        \\    var buttons = bar.querySelectorAll("button");
+        \\    buttons[buttons.length - 1].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        \\    window.webkit.messageHandlers.viewerTOC.postMessage(
+        \\      { type: "active", id: "copybar-@TAG@:" + buttons.length });
+        \\  }, 25);
+        \\})();
+    ;
+    const with_needle = try std.mem.replaceOwned(u8, alloc, template, "@NEEDLE@", needle);
+    defer alloc.free(with_needle);
+    return try std.mem.replaceOwned(u8, alloc, with_needle, "@TAG@", tag);
+}
+
+/// Test-only: the system clipboard's current text, owned by the caller, or
+/// null when it holds none. The live copy test's oracle — the toolbar's whole
+/// job is landing bytes HERE, outside the browser process.
+fn clipboardReadText(alloc: Allocator) ?[]u8 {
+    if (w32.OpenClipboard(null) == 0) return null;
+    defer _ = w32.CloseClipboard();
+    const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return null;
+    const ptr = w32.GlobalLock(hglobal) orelse return null;
+    defer _ = w32.GlobalUnlock(hglobal);
+    const wptr: [*]const u16 = @ptrCast(@alignCast(ptr));
+    var wlen: usize = 0;
+    while (wptr[wlen] != 0) wlen += 1;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, wptr[0..wlen]) catch null;
+}
+
+/// Test-only: put text on the system clipboard — the sentinel before each
+/// press, and the user's own contents back afterwards. Mirrors the write in
+/// `Surface.completeClipboardRequest` (SetClipboardData owns the HGLOBAL on
+/// success; on any earlier failure we free it ourselves).
+fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
+    const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch return;
+    defer alloc.free(utf16);
+    const byte_size = (utf16.len + 1) * @sizeOf(u16);
+    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, byte_size) orelse return;
+    const dst = w32.GlobalLock(hglobal) orelse {
+        _ = w32.GlobalFree(hglobal);
+        return;
+    };
+    const dst16: [*]u16 = @ptrCast(@alignCast(dst));
+    @memcpy(dst16[0..utf16.len], utf16);
+    dst16[utf16.len] = 0;
+    _ = w32.GlobalUnlock(hglobal);
+    if (w32.OpenClipboard(null) == 0) {
+        _ = w32.GlobalFree(hglobal);
+        return;
+    }
+    defer _ = w32.CloseClipboard();
+    _ = w32.EmptyClipboard();
+    if (w32.SetClipboardData(w32.CF_UNICODETEXT, hglobal) == null) {
+        _ = w32.GlobalFree(hglobal);
+    }
 }
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.

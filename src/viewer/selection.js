@@ -114,7 +114,10 @@
       copySelection();
     });
 
-    bar.appendChild(quote);
+    /* A host with nowhere to put a quote (no feedback composer yet) sets
+     * window.__ghozttyHideQuote before this script runs; the bar then ships
+     * Copy alone rather than a Quote button wired to nothing. */
+    if (!window.__ghozttyHideQuote) bar.appendChild(quote);
     bar.appendChild(copyButton);
     root.appendChild(bar);
     (document.body || document.documentElement).appendChild(host);

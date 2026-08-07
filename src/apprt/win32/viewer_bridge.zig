@@ -60,6 +60,14 @@ pub const shim_js =
     \\    window.webkit.messageHandlers.
 ++ handler_name ++ " = target;\n  }\n";
 
+/// T162: Windows v1 ships the toolbar's Copy half only — Quote has nowhere to
+/// put text until the feedback composer (T164) exists, and a Quote button
+/// wired to nothing is worse than none. `selection.js` reads this documented
+/// flag when it builds the bar and skips the Quote button; the shared file is
+/// NOT forked (Mac never sets the flag and keeps both buttons). T164 removes
+/// this line to un-hide Quote.
+pub const hide_quote_js = "  window.__ghozttyHideQuote = true;\n";
+
 /// The shared selection toolbar, verbatim. Embedded rather than read off disk
 /// so Windows has no "resource missing" degrade to reason about (Mac's own is
 /// a `logger.warning` and no quoting): the blob either compiled in, or the
@@ -77,7 +85,7 @@ const epilogue = "\n})();\n";
 ///
 /// The `"use strict"` is the wrapper's own; `selection.js` declares its own
 /// inside its IIFE, so nesting changes nothing for it.
-pub const injected_js = prologue ++ shim_js ++ selection_js ++ epilogue;
+pub const injected_js = prologue ++ hide_quote_js ++ shim_js ++ selection_js ++ epilogue;
 
 // -------------------------------------------------------------------------
 // Messages coming back up
@@ -259,7 +267,7 @@ test "selection.js is embedded VERBATIM — P1's whole point" {
     // lines.
     try testing.expect(std.mem.indexOf(u8, injected_js, selection_js) != null);
     try testing.expectEqual(
-        prologue.len + shim_js.len + selection_js.len + epilogue.len,
+        prologue.len + hide_quote_js.len + shim_js.len + selection_js.len + epilogue.len,
         injected_js.len,
     );
     // And the shared file is the one on disk, not a copy under apprt/win32 —
@@ -298,7 +306,7 @@ test "the wrapper we wrote closes every brace it opens" {
     // inside a browser. `selection.js` is deliberately outside the scan: it is
     // upstream's file, and a brace-counter that trips on a future Mac edit
     // would be a test failing for something it does not own.
-    const ours = prologue ++ shim_js ++ epilogue;
+    const ours = prologue ++ hide_quote_js ++ shim_js ++ epilogue;
     var depth: isize = 0;
     for (ours) |c| {
         switch (c) {
@@ -314,6 +322,16 @@ test "the wrapper we wrote closes every brace it opens" {
     // The wrapper is an IIFE, so the shim runs at injection time rather than
     // defining a function nobody calls.
     try testing.expect(std.mem.endsWith(u8, epilogue, "})();\n"));
+}
+
+test "T162: the hide-quote flag is set before the toolbar reads it" {
+    // The shared toolbar reads the flag by this exact name when it builds the
+    // bar; if either side drifts, Quote silently reappears wired to nothing —
+    // no error anywhere, which is why the agreement is asserted here.
+    try testing.expect(std.mem.indexOf(u8, selection_js, "window.__ghozttyHideQuote") != null);
+    const set = std.mem.indexOf(u8, injected_js, "window.__ghozttyHideQuote = true;").?;
+    const toolbar = std.mem.indexOf(u8, injected_js, "window.__ghozttySelection").?;
+    try testing.expect(set < toolbar);
 }
 
 test "the shim survives a page that already defines window.webkit" {
