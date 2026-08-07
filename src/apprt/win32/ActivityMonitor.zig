@@ -592,6 +592,26 @@ tracking_leave: bool = false,
 /// Thumb drag: the grab offset inside the thumb, or -1 when not dragging.
 thumb_drag_dy: i32 = -1,
 
+/// Which stop keyboard focus sits on (T289). The four native children carry
+/// real Win32 focus and this field only mirrors them; the carousel and the
+/// table are OWNER-DRAWN regions of the panel's own window, so for those two
+/// Win32 knows only "the panel" and this field is the only thing that says
+/// which. §2.2 requires focus to be VISIBLE, which first requires it to be
+/// KNOWN.
+focus: Focusable = .filter,
+/// Whether the panel's own window holds the keyboard focus. Maintained from
+/// WM_SETFOCUS/WM_KILLFOCUS rather than read from `GetFocus` at paint time:
+/// the ring must disappear when the panel is deactivated, and a painter that
+/// asked `GetFocus` would be asking about whichever window is active instead.
+panel_focused: bool = false,
+/// The table's CARET — the row the arrow keys move from, and the row the focus
+/// ring goes on. Distinct from the selection (T289): Windows list views draw
+/// focus on the caret row separately from the selection fill, so tabbing into
+/// an unselected table can show where the keyboard is without selecting
+/// anything. Keyed by pid for the same reason the selection is — a re-sort or
+/// a re-poll moves rows under it. 0 means "no caret".
+caret_pid: i64 = 0,
+
 /// Set while `close` is unwinding, so a WM_CLOSE arriving from DestroyWindow
 /// cannot re-enter it.
 closing: bool = false,
@@ -631,7 +651,7 @@ fn openInner(window: *Window, src: Source, borrow: ?*remote_connection.Connectio
             log.info("activity monitor: focusing existing panel source={s}", .{src.label()});
             _ = w32.ShowWindow(existing.hwnd, w32.SW_SHOW);
             _ = w32.SetForegroundWindow(existing.hwnd);
-            _ = w32.SetFocus(existing.filter);
+            existing.moveFocus(.filter);
             return;
         }
     }
@@ -835,7 +855,7 @@ fn openInner(window: *Window, src: Source, borrow: ?*remote_connection.Connectio
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.SetForegroundWindow(hwnd);
-    _ = w32.SetFocus(self.filter);
+    self.moveFocus(.filter);
 
     // Wire the source's data plane BEFORE the first poll: a remote panel that
     // samples before its connection exists just burns a tick reporting failure.
@@ -1968,6 +1988,14 @@ fn rebuild(self: *ActivityMonitor) void {
 
     self.clampScroll();
 
+    // A caret whose row was filtered out, sorted away or has exited is no
+    // caret. Re-established at the first visible row while the table holds
+    // focus, so narrowing the filter never leaves the ring nowhere.
+    if (self.caretIndex() == null) {
+        self.caret_pid = 0;
+        if (self.panel_focused and self.focus == .table) self.ensureCaret();
+    }
+
     log.info(
         // `root` is the snapshot's own root pid — this process for a local
         // sample, the AGENT's for a remote one. It is the field that tells the
@@ -2082,6 +2110,11 @@ fn refreshChrome(self: *ActivityMonitor) void {
     const n = std.unicode.utf8ToUtf16Le(&wbuf, label) catch 0;
     wbuf[n] = 0;
     _ = w32.SetWindowTextW(self.kill_btn, @ptrCast(&wbuf));
+    // Hand focus off BEFORE hiding the control that has it. Windows drops the
+    // thread's keyboard focus entirely when the focused window is hidden, and
+    // with no focus window WM_KEYDOWN arrives with a null hwnd and the panel
+    // goes deaf — the same trap `MachineChooser.refreshActions` documents.
+    if (self.sel_len == 0 and self.focus == .kill) self.moveFocus(.new_proc);
     _ = w32.ShowWindow(self.kill_btn, if (self.sel_len > 0) w32.SW_SHOW else w32.SW_HIDE);
     self.applyLayout();
 }
@@ -2148,6 +2181,9 @@ fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
     self.paintGauges(mem_dc, l);
     self.paintControlBar(mem_dc, l);
     self.paintTable(mem_dc, l);
+    // After the rows, and after the empty state: a rim the next row painted
+    // over is not a focus indicator.
+    self.paintTableFocus(mem_dc, l);
     self.paintBanner(mem_dc, l);
 
     // Dividers last so nothing paints over them. A hidden band reports its rule
@@ -2185,7 +2221,11 @@ fn paintCarousel(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) voi
         const r = layout_mod.cardRect(l, idx, self.carousel_scroll, self.scale);
         if (r.right <= l.carousel.left or r.left >= l.carousel.right) continue;
         const is_active = active != null and active.? == i;
-        self.paintCard(hdc, r, card, is_active, idx == self.card_focus, idx == self.card_hover);
+        // The ring means "the keyboard is HERE" (§2.2), so it is drawn only
+        // while the carousel really holds focus — a ring parked on a card
+        // while the caret sits in the filter box says the opposite.
+        const carousel_focused = self.panel_focused and self.focus == .carousel;
+        self.paintCard(hdc, r, card, is_active, carousel_focused and idx == self.card_focus, idx == self.card_hover);
     }
 }
 
@@ -2482,12 +2522,7 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
         const idx = self.scroll + i;
         if (idx < 0 or @as(usize, @intCast(idx)) >= self.order_len) break;
         const row = snap.rows[self.order[@intCast(idx)]];
-        const row_rect: layout_mod.Rect = .{
-            .left = l.table.left,
-            .top = l.table_rows.top + i * l.row_h,
-            .right = l.table.right,
-            .bottom = l.table_rows.top + (i + 1) * l.row_h,
-        };
+        const row_rect = layout_mod.rowRect(l, i);
 
         const selected = self.isSelected(row.pid);
         if (selected) {
@@ -2500,6 +2535,45 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
     }
 
     self.paintScrollThumb(hdc, l, visible);
+}
+
+/// §2.2's keyboard focus ring for the table (T289).
+///
+/// The table is an owner-drawn region, so nothing draws this for us the way the
+/// theme draws it for the native EDIT and BUTTONs. It goes on the CARET row —
+/// Windows' list-view convention, and the split T312 already made for the
+/// chooser's rows: a selection is a fill and stays put while focus moves away,
+/// focus is a rim and follows the keyboard. A row that is both wears both.
+///
+/// With no row to carry it — an empty table, everything filtered out, or a
+/// caret scrolled off screen by the wheel — the rim falls back to the row area
+/// itself, inset by the panel's margin. A focus stop that draws nothing is the
+/// defect this task exists to fix, and "there are no rows" is not an excuse to
+/// reproduce it.
+fn paintTableFocus(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    if (!self.panel_focused or self.focus != .table) return;
+
+    const visible = layout_mod.visibleRows(l);
+    const on_row: ?layout_mod.Rect = blk: {
+        const idx = self.caretIndex() orelse break :blk null;
+        const row = idx - self.scroll;
+        if (row < 0 or row >= visible) break :blk null;
+        break :blk layout_mod.rowRect(l, row);
+    };
+    const target = on_row orelse layout_mod.tableFocusFallback(l, self.scale);
+    const path = layout_mod.focusRingPath(target, self.scale);
+    if (path.width() <= 0 or path.height() <= 0) return;
+
+    // A row is a square band, so its rim is square; the fallback is a
+    // standalone element and takes the scale's smallest radius (§3.1).
+    const radius: i32 = if (on_row != null) 0 else px(4, self.scale);
+    strokeRoundRect(
+        hdc,
+        path,
+        radius,
+        cr(self.pal().accent),
+        layout_mod.focusRing(self.scale).width,
+    );
 }
 
 /// The slot the sort indicator reserves at a header cell's trailing edge: the
@@ -2779,6 +2853,10 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     // click (Mac's card `onSelect`, :828-831); a click in the band's padding
     // just moves nothing, and never falls through to the table below.
     if (cards_mod.hasCarousel(self.card_count) and y < l.carousel.bottom) {
+        // The band owns the click whether or not it landed on a card, so it
+        // owns the focus too — the arrow keys must not be handed to the table
+        // by a click in the carousel's padding.
+        self.focus = .carousel;
         if (layout_mod.cardIndexAt(
             l,
             @intCast(self.card_count),
@@ -2848,9 +2926,13 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     const idx = layout_mod.rowIndexAt(l, y, self.scroll) orelse return;
     const pid = self.pidAt(idx) orelse {
         self.clearSelection();
+        self.caret_pid = 0;
         self.refreshChrome();
         return;
     };
+    // A click puts the caret where it landed, whichever selection gesture it
+    // was — the ring and the next arrow key both follow the mouse.
+    self.caret_pid = pid;
     if (mods & w32.MK_CONTROL != 0) {
         self.toggleSelection(pid);
     } else if (mods & w32.MK_SHIFT != 0 and self.sel_len > 0) {
@@ -2983,87 +3065,224 @@ fn onWheel(self: *ActivityMonitor, delta: i16, screen_x: i32, screen_y: i32) voi
     _ = w32.InvalidateRect(self.hwnd, null, 0);
 }
 
+// ---------------------------------------------------------------------
+// Keyboard focus (T289)
+// ---------------------------------------------------------------------
+
+/// Keyboard focus stops, in Tab order — top to bottom down the panel, then
+/// left to right along the control bar, so Tab walks the panel the way the eye
+/// reads it. `carousel` and `table` are owner-drawn REGIONS of the panel's own
+/// window rather than child controls; everything else is a native control that
+/// draws the theme's own ring.
+pub const Focusable = enum { carousel, filter, show_all, kill, new_proc, table };
+
+const focus_count = @typeInfo(Focusable).@"enum".fields.len;
+
+/// Pure Tab-order cycle. Unit-tested.
+pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
+    return if (backwards) switch (cur) {
+        .carousel => .table,
+        .filter => .carousel,
+        .show_all => .filter,
+        .kill => .show_all,
+        .new_proc => .kill,
+        .table => .new_proc,
+    } else switch (cur) {
+        .carousel => .filter,
+        .filter => .show_all,
+        .show_all => .kill,
+        .kill => .new_proc,
+        .new_proc => .table,
+        .table => .carousel,
+    };
+}
+
+/// The Tab step that lands on a stop the user can actually see, `visible`
+/// indexed by `@intFromEnum`. The carousel is absent with a single source and
+/// Kill only exists while rows are selected, so Tab has to step OVER them
+/// rather than park focus on something that is not on screen. Bounded by the
+/// cycle length; `filter` and `table` are always visible, so the fallback of
+/// staying put is unreachable in the running panel. Pure — unit-tested.
+pub fn nextVisibleFocus(cur: Focusable, backwards: bool, visible: [focus_count]bool) Focusable {
+    var from = cur;
+    for (0..focus_count) |_| {
+        const next = nextFocus(from, backwards);
+        if (visible[@intFromEnum(next)]) return next;
+        from = next;
+    }
+    return cur;
+}
+
+/// Which stops exist right now.
+fn focusVisibility(self: *const ActivityMonitor) [focus_count]bool {
+    var v: [focus_count]bool = @splat(true);
+    v[@intFromEnum(Focusable.carousel)] = cards_mod.hasCarousel(self.card_count);
+    v[@intFromEnum(Focusable.kill)] = self.sel_len > 0;
+    return v;
+}
+
+/// The window behind a focus stop. Both owner-drawn regions live on the
+/// panel's own window, which is why `focus` and not `GetFocus` is what tells
+/// them apart.
+fn focusHwnd(self: *const ActivityMonitor, f: Focusable) w32.HWND {
+    return switch (f) {
+        .carousel, .table => self.hwnd,
+        .filter => self.filter,
+        .show_all => self.show_all_btn,
+        .kill => self.kill_btn,
+        .new_proc => self.new_proc_btn,
+    };
+}
+
+/// Adopt a focus change the mouse made behind our back. A click on a native
+/// child moves Win32 focus without routing through `moveFocus`, and a key
+/// handler that trusted a stale `focus` would send Down to the table while the
+/// caret sat in the filter. `GetFocus` naming the panel itself leaves the field
+/// alone on purpose: it cannot tell the carousel from the table, and the click
+/// handler already recorded which one was hit.
+fn syncFocus(self: *ActivityMonitor) void {
+    const f = w32.GetFocus() orelse return;
+    if (f == @as(?w32.HWND, self.filter)) {
+        self.focus = .filter;
+    } else if (f == @as(?w32.HWND, self.show_all_btn)) {
+        self.focus = .show_all;
+    } else if (f == @as(?w32.HWND, self.kill_btn)) {
+        self.focus = .kill;
+    } else if (f == @as(?w32.HWND, self.new_proc_btn)) {
+        self.focus = .new_proc;
+    }
+}
+
+/// Move keyboard focus to `f` and repaint, so the ring follows it.
+fn moveFocus(self: *ActivityMonitor, f: Focusable) void {
+    self.focus = f;
+    if (f == .table) self.ensureCaret();
+    _ = w32.SetFocus(self.focusHwnd(f));
+    _ = w32.InvalidateRect(self.hwnd, null, 0);
+}
+
+/// The caret's display index, or null when the row it named is gone (exited,
+/// filtered out) or there is no caret yet.
+fn caretIndex(self: *const ActivityMonitor) ?i32 {
+    if (self.caret_pid == 0) return null;
+    var i: usize = 0;
+    while (i < self.order_len) : (i += 1) {
+        if (self.pidAt(@intCast(i)) == self.caret_pid) return @intCast(i);
+    }
+    return null;
+}
+
+/// Give the table a caret if it has none, so focus landing on it is visible.
+/// The first VISIBLE row, not row 0 — the ring must appear where the user is
+/// looking. Selection is deliberately untouched: tabbing into a table is not a
+/// selection gesture, and making it one would pop the Kill button on a Tab.
+fn ensureCaret(self: *ActivityMonitor) void {
+    if (self.caretIndex() != null) return;
+    self.caret_pid = self.pidAt(self.scroll) orelse 0;
+}
+
 /// Keyboard, routed from the app's message loop. Returns true when consumed.
 ///
-/// Escape always closes. The table's navigation keys are consumed ONLY when the
-/// caret is not in the filter field: Home/End/arrows inside a text box belong to
-/// the text box, and eating them there would break the filter's editing for the
-/// sake of a table the user is not looking at. (T289 owns the focus RING; this
-/// is the routing half, which cannot wait for it without shipping a filter
-/// whose Home key does nothing.)
+/// Escape always closes. Everything else is routed by the focus stop (T289):
+/// the table's navigation keys reach the table only while the TABLE holds
+/// focus, the carousel's only while the CAROUSEL does, and a focused button or
+/// the filter field keeps every key it can use. Before the panel had a visible
+/// focus ring, the row keys applied unconditionally — which is what made a
+/// missing indicator confusing rather than merely plain: Down moved a
+/// selection somewhere off screen while the caret sat in the filter box.
 pub fn handleKey(self: *ActivityMonitor, vk: u16) bool {
     if (vk == w32.VK_ESCAPE) {
         self.close();
         return true;
     }
-    if (w32.GetFocus()) |focus| {
-        if (focus == @as(?w32.HWND, self.filter)) return false;
+
+    // Adopt whatever the mouse did to Win32 focus before reading it.
+    self.syncFocus();
+
+    if (vk == w32.VK_TAB) {
+        const backwards = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+        self.moveFocus(nextVisibleFocus(self.focus, backwards, self.focusVisibility()));
+        return true;
     }
 
-    // The carousel's keys, and ONLY while the panel itself holds focus: Space
-    // and Enter belong to whichever button has focus otherwise, and a switcher
-    // that stole them would make the Kill button unpressable from the keyboard.
-    //
-    // Arrowing moves the ring and repaints. It never dials — committing is a
-    // separate keystroke precisely so that walking the list cannot open a
-    // connection per card (Mac makes the same split, :796-799).
-    if (cards_mod.hasCarousel(self.card_count) and w32.GetFocus() == @as(?w32.HWND, self.hwnd)) {
-        switch (vk) {
-            w32.VK_LEFT, w32.VK_RIGHT => {
-                const delta: i32 = if (vk == w32.VK_LEFT) -1 else 1;
-                const moved = cards_mod.moveFocus(self.card_focus, delta, self.card_count);
-                if (moved != self.card_focus) {
-                    self.card_focus = moved;
-                    self.scrollCardIntoView();
-                    self.logCarousel();
+    switch (self.focus) {
+        // Typing, and the caret keys inside a text box, belong to the EDIT.
+        .filter => return false,
+
+        // The carousel's keys. Arrowing moves the ring and repaints; it never
+        // dials — committing is a separate keystroke precisely so that walking
+        // the list cannot open a connection per card (Mac makes the same
+        // split, :796-799).
+        .carousel => {
+            if (!cards_mod.hasCarousel(self.card_count)) return false;
+            switch (vk) {
+                w32.VK_LEFT, w32.VK_RIGHT => {
+                    const delta: i32 = if (vk == w32.VK_LEFT) -1 else 1;
+                    const moved = cards_mod.moveFocus(self.card_focus, delta, self.card_count);
+                    if (moved != self.card_focus) {
+                        self.card_focus = moved;
+                        self.scrollCardIntoView();
+                        self.logCarousel();
+                        _ = w32.InvalidateRect(self.hwnd, null, 0);
+                    }
+                    return true;
+                },
+                w32.VK_RETURN, w32.VK_SPACE => {
+                    self.switchToCard(self.card_focus);
                     _ = w32.InvalidateRect(self.hwnd, null, 0);
-                }
-                return true;
-            },
-            w32.VK_RETURN, w32.VK_SPACE => {
-                self.switchToCard(self.card_focus);
-                _ = w32.InvalidateRect(self.hwnd, null, 0);
-                return true;
-            },
-            else => {},
-        }
-    }
+                    return true;
+                },
+                else => return false,
+            }
+        },
 
-    const l = self.layout();
-    const page: i32 = @max(1, layout_mod.visibleRows(l) - 1);
-    switch (vk) {
-        w32.VK_UP => {
-            self.moveSelection(-1);
-            return true;
+        .table => {
+            const l = self.layout();
+            const page: i32 = @max(1, layout_mod.visibleRows(l) - 1);
+            switch (vk) {
+                w32.VK_UP => {
+                    self.moveSelection(-1);
+                    return true;
+                },
+                w32.VK_DOWN => {
+                    self.moveSelection(1);
+                    return true;
+                },
+                w32.VK_PRIOR => {
+                    self.moveSelection(-page);
+                    return true;
+                },
+                w32.VK_NEXT => {
+                    self.moveSelection(page);
+                    return true;
+                },
+                w32.VK_HOME => {
+                    self.moveSelectionTo(0);
+                    return true;
+                },
+                w32.VK_END => {
+                    self.moveSelectionTo(@as(i32, @intCast(self.order_len)) - 1);
+                    return true;
+                },
+                else => return false,
+            }
         },
-        w32.VK_DOWN => {
-            self.moveSelection(1);
-            return true;
-        },
-        w32.VK_PRIOR => {
-            self.moveSelection(-page);
-            return true;
-        },
-        w32.VK_NEXT => {
-            self.moveSelection(page);
-            return true;
-        },
-        w32.VK_HOME => {
-            self.moveSelectionTo(0);
-            return true;
-        },
-        w32.VK_END => {
-            self.moveSelectionTo(@as(i32, @intCast(self.order_len)) - 1);
-            return true;
-        },
-        else => return false,
+
+        // A focused button owns Space and Enter, and nothing else here is ours.
+        .show_all, .kill, .new_proc => return false,
     }
 }
 
 fn moveSelection(self: *ActivityMonitor, delta: i32) void {
     if (self.order_len == 0) return;
+    // From the caret when there is one — that is the row the ring is on, and
+    // moving from anywhere else would make the indicator a lie. It falls back
+    // to the anchor of a mouse-made selection, and then to "before the first
+    // row" so a first arrow key lands on row 0.
     var cur: i32 = -1;
-    if (self.sel_len > 0) {
+    if (self.caretIndex()) |idx| {
+        cur = idx;
+    } else if (self.sel_len > 0) {
         const pid = self.sel_pids[self.sel_len - 1];
         var i: usize = 0;
         while (i < self.order_len) : (i += 1) {
@@ -3080,6 +3299,10 @@ fn moveSelectionTo(self: *ActivityMonitor, index: i32) void {
     if (self.order_len == 0) return;
     const clamped = std.math.clamp(index, 0, @as(i32, @intCast(self.order_len)) - 1);
     const pid = self.pidAt(clamped) orelse return;
+    // Caret and selection move together for a plain arrow key: this panel has
+    // no gesture that decouples them (no Ctrl+Arrow), so a caret that stayed
+    // behind would signal a distinction the panel does not have.
+    self.caret_pid = pid;
     self.selectOnly(pid);
     self.scrollIntoView(clamped);
     self.refreshChrome();
@@ -3412,7 +3635,27 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
         },
         w32.WM_LBUTTONDOWN => {
             _ = w32.SetFocus(hwnd);
+            // Win32 focus is now on the panel, which cannot say WHICH of its
+            // two owner-drawn regions the user meant. The table is the default
+            // because it owns everything below the carousel band; `onLeftDown`
+            // overrides it for a click inside that band.
+            self.focus = .table;
             self.onLeftDown(loWordSigned(lparam), hiWordSigned(lparam), wparam);
+            return 0;
+        },
+        // §2.2's ring is only honest while the panel really holds the
+        // keyboard. Tracked from the messages rather than asked of `GetFocus`
+        // at paint time: `GetFocus` answers for whichever window is active,
+        // so a deactivated panel would keep painting a ring over nothing.
+        w32.WM_SETFOCUS => {
+            self.panel_focused = true;
+            if (self.focus == .table) self.ensureCaret();
+            _ = w32.InvalidateRect(hwnd, null, 0);
+            return 0;
+        },
+        w32.WM_KILLFOCUS => {
+            self.panel_focused = false;
+            _ = w32.InvalidateRect(hwnd, null, 0);
             return 0;
         },
         w32.WM_LBUTTONUP => {
@@ -3581,4 +3824,63 @@ test "columnSortKey round-trips every column" {
         };
         try testing.expectEqual(col, back);
     }
+}
+
+test "nextFocus: the cycle is a ring, and backwards undoes forwards" {
+    for (0..focus_count) |i| {
+        const f: Focusable = @enumFromInt(i);
+        try testing.expectEqual(f, nextFocus(nextFocus(f, false), true));
+        try testing.expectEqual(f, nextFocus(nextFocus(f, true), false));
+    }
+
+    // Every stop is reached exactly once before coming back — a cycle that
+    // skipped one would leave a control unreachable by keyboard, which is the
+    // whole defect (§2.2).
+    var seen: [focus_count]bool = @splat(false);
+    var cur: Focusable = .filter;
+    for (0..focus_count) |_| {
+        try testing.expect(!seen[@intFromEnum(cur)]);
+        seen[@intFromEnum(cur)] = true;
+        cur = nextFocus(cur, false);
+    }
+    try testing.expectEqual(Focusable.filter, cur);
+    for (seen) |s| try testing.expect(s);
+}
+
+test "nextFocus: Tab order reads top to bottom, then left to right" {
+    // The carousel is the top band, the control bar runs filter -> show all ->
+    // kill -> new process (`activity_layout`'s own order), and the table is
+    // everything below it.
+    const order = [_]Focusable{ .carousel, .filter, .show_all, .kill, .new_proc, .table };
+    for (order, 0..) |f, i| {
+        try testing.expectEqual(order[(i + 1) % order.len], nextFocus(f, false));
+    }
+}
+
+test "nextVisibleFocus: steps OVER a stop that is not on screen" {
+    var v: [focus_count]bool = @splat(true);
+
+    // A single-source panel has no carousel: Tab from the table wraps straight
+    // past it to the filter.
+    v[@intFromEnum(Focusable.carousel)] = false;
+    try testing.expectEqual(Focusable.filter, nextVisibleFocus(.table, false, v));
+    try testing.expectEqual(Focusable.table, nextVisibleFocus(.filter, true, v));
+
+    // Kill exists only while rows are selected.
+    v[@intFromEnum(Focusable.kill)] = false;
+    try testing.expectEqual(Focusable.new_proc, nextVisibleFocus(.show_all, false, v));
+    try testing.expectEqual(Focusable.show_all, nextVisibleFocus(.new_proc, true, v));
+
+    // With both back, neither is skipped.
+    v = @splat(true);
+    try testing.expectEqual(Focusable.carousel, nextVisibleFocus(.table, false, v));
+    try testing.expectEqual(Focusable.kill, nextVisibleFocus(.show_all, false, v));
+}
+
+test "nextVisibleFocus: nothing visible leaves focus where it is" {
+    // Unreachable in the running panel (the filter and the table are always
+    // there), but a loop that could not terminate would hang the message pump.
+    const v: [focus_count]bool = @splat(false);
+    try testing.expectEqual(Focusable.filter, nextVisibleFocus(.filter, false, v));
+    try testing.expectEqual(Focusable.table, nextVisibleFocus(.table, true, v));
 }

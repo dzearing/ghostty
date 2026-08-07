@@ -305,10 +305,16 @@ try {
     $dialsBefore = @(Select-String -Path $errlog -Pattern 'activity monitor: dialing ').Count
     $srcBefore = (Get-PanelState).Source
     $focusBefore = $car.Focus
-    # Click below the carousel to put keyboard focus on the panel without
-    # landing on a card.
+    # Put keyboard focus on the panel without landing on a card. Well below the
+    # carousel, not just past the cards: the band's own padding belongs to the
+    # carousel too, and at 125% that padding is where "card bottom + 8" lands.
+    # A click down there focuses the TABLE, so since T289 - where the arrow keys
+    # belong to the focus stop that has them - one Tab is what walks focus round
+    # to the carousel (the cycle wraps table -> carousel).
     Send-TestMouse -Window $panel -Target $panel `
-        -X ($origin.Left + 8) -Y ($origin.Top + $car.Rects[0].Bottom + 8) -Action click | Out-Null
+        -X ($origin.Left + 8) -Y ($origin.Bottom - 30) -Action click | Out-Null
+    Start-Sleep -Milliseconds 300
+    Send-TestKeys -Window $panel -Target $panel -Key Tab | Out-Null
     Start-Sleep -Milliseconds 300
     Send-TestKeys -Window $panel -Target $panel -Key Left | Out-Null
     Start-Sleep -Milliseconds 500

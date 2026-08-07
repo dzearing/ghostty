@@ -378,6 +378,69 @@ pub fn rowIndexAt(l: Layout, y: i32, scroll_rows: i32) ?i32 {
     return scroll_rows + @divTrunc(y - l.table_rows.top, l.row_h);
 }
 
+/// The painted rect of the table row at `visible_index` — 0 is the topmost row
+/// on screen, whatever the scroll offset. Rows are full-bleed by design (a
+/// process table is a Windows list view, not a card list), so the rect spans
+/// the table's whole width.
+pub fn rowRect(l: Layout, visible_index: i32) Rect {
+    return .{
+        .left = l.table.left,
+        .top = l.table_rows.top + visible_index * l.row_h,
+        .right = l.table.right,
+        .bottom = l.table_rows.top + (visible_index + 1) * l.row_h,
+    };
+}
+
+/// §2.2's keyboard focus ring: *"a 2 DIP accent ring inset 1 DIP inside the
+/// painted square"*. Both numbers are quoted from the design system rather than
+/// chosen here, and both are floored at one physical pixel — a ring that rounds
+/// away at 1.0 is a missing focus indicator, which §2.2 calls an accessibility
+/// defect rather than a polish item.
+pub const FocusRing = struct {
+    /// GDI pen width.
+    width: i32,
+    /// How far the pen's CENTRE line sits inside the surface, so the ring's
+    /// OUTER edge lands exactly 1 DIP in. GDI centres a pen on its path, so
+    /// passing the 1 DIP inset straight through hangs half the ring over the
+    /// surface's own edge (`chooser_rows.rowMetrics` makes the same
+    /// correction, one dialog over).
+    path_inset: i32,
+};
+
+pub fn focusRing(scale: f32) FocusRing {
+    const width = @max(px(2, scale), 1);
+    const inset = @max(px(1, scale), 1);
+    return .{ .width = width, .path_inset = inset + @divTrunc(width, 2) };
+}
+
+/// The rect the focus ring's pen path follows inside `r`. Empty (right <= left)
+/// when `r` is too small to carry a ring, so the caller can skip it rather than
+/// paint an inverted rectangle.
+pub fn focusRingPath(r: Rect, scale: f32) Rect {
+    const m = focusRing(scale);
+    return .{
+        .left = r.left + m.path_inset,
+        .top = r.top + m.path_inset,
+        .right = r.right - m.path_inset,
+        .bottom = r.bottom - m.path_inset,
+    };
+}
+
+/// Where the table's focus ring goes when NO row can carry it — an empty table,
+/// or one whose every row was filtered out, that still holds keyboard focus.
+/// Inset by the panel's margin because here the ring is a standalone element
+/// inside the client rather than a rim on a full-bleed row, and §0.1 does not
+/// let an element touch its container's edge.
+pub fn tableFocusFallback(l: Layout, scale: f32) Rect {
+    const margin = px(pad_x, scale);
+    return .{
+        .left = l.table_rows.left + margin,
+        .top = l.table_rows.top + margin,
+        .right = @max(l.table_rows.left + margin, l.table_rows.right - margin),
+        .bottom = @max(l.table_rows.top + margin, l.table_rows.bottom - margin),
+    };
+}
+
 /// The painted rect of the carousel card at `index`, given the carousel's
 /// horizontal scroll offset in pixels. Cards keep `md` between them.
 pub fn cardRect(l: Layout, index: i32, scroll_x: i32, scale: f32) Rect {
@@ -1039,6 +1102,70 @@ test "columns: dividers land on the accumulated column edges" {
     // The last divider is the table's own trailing edge, since the widths sum
     // to the table width.
     try testing.expectEqual(l.table.right, columnDividerX(l.table, widths, .path));
+}
+
+test "rowRect: visible rows stack from the row area's top, full bleed" {
+    for (scales) |s| {
+        const l = defaultLayout(s);
+        const first = rowRect(l, 0);
+        try testing.expectEqual(l.table_rows.top, first.top);
+        try testing.expectEqual(l.row_h, first.height());
+        // Full bleed: a row is the table's whole width, the way a Windows list
+        // view's rows are.
+        try testing.expectEqual(l.table.left, first.left);
+        try testing.expectEqual(l.table.right, first.right);
+        // And rows stack without a gap — the next one starts where this ends.
+        try testing.expectEqual(first.bottom, rowRect(l, 1).top);
+    }
+}
+
+test "focusRing: never rounds away, and its outer edge lands 1 DIP in" {
+    for (scales) |s| {
+        const m = focusRing(s);
+        // §2.2's 2 DIP ring, floored at a physical pixel.
+        try testing.expect(m.width >= 1);
+        try testing.expectEqual(@max(@as(i32, @intFromFloat(@round(2 * s))), 1), m.width);
+        // The pen is centred on its path, so the path has to sit half a width
+        // further in than the 1 DIP inset. Anything less hangs the ring over
+        // the surface's own edge.
+        try testing.expect(m.path_inset > @divTrunc(m.width, 2));
+        const outer = m.path_inset - @divTrunc(m.width, 2);
+        try testing.expectEqual(@max(@as(i32, @intFromFloat(@round(1 * s))), 1), outer);
+    }
+    try testing.expectEqual(@as(i32, 2), focusRing(1.0).width);
+}
+
+test "focusRingPath: fits inside a table row at every scale" {
+    for (scales) |s| {
+        const l = defaultLayout(s);
+        const row = rowRect(l, 0);
+        const path = focusRingPath(row, s);
+        const m = focusRing(s);
+        // Non-degenerate: a ring the row cannot carry would paint inverted.
+        try testing.expect(path.width() > 0);
+        try testing.expect(path.height() > 0);
+        // The ring's painted band, both edges, stays inside the row.
+        try testing.expect(path.top - @divTrunc(m.width, 2) >= row.top);
+        try testing.expect(path.bottom + @divTrunc(m.width, 2) <= row.bottom);
+        try testing.expect(path.left - @divTrunc(m.width, 2) >= row.left);
+        try testing.expect(path.right + @divTrunc(m.width, 2) <= row.right);
+    }
+}
+
+test "tableFocusFallback: an empty table's ring never touches the client edge" {
+    for (scales) |s| {
+        const l = defaultLayout(s);
+        const r = tableFocusFallback(l, s);
+        const margin = px(pad_x, s);
+        // §0.1: nothing touches its container's edge. The margin is the
+        // panel's own `xl`, not a number invented here.
+        try testing.expect(r.left - l.table_rows.left >= margin);
+        try testing.expect(l.table_rows.right - r.right >= margin);
+        try testing.expect(r.top - l.table_rows.top >= margin);
+        try testing.expect(l.table_rows.bottom - r.bottom >= margin);
+        try testing.expect(r.width() > 0);
+        try testing.expect(r.height() > 0);
+    }
 }
 
 test "layout: scales with DPI" {

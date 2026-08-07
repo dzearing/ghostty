@@ -10526,3 +10526,60 @@ receipt. Both ALL PASS; `task-dashboard.js --selftest` ALL PASS; tracker
 
 Floor: `floor-lane.ps1 -Lane all` = ALL LANES PASS (none 303s, win32 356s, agent
 331s); P1–P3 ALL PASS.
+
+## 2026-08-07 — T289: the Activity Monitor says where the keyboard is
+
+The panel had no visible keyboard focus anywhere, which design system §2.2 calls
+an accessibility defect rather than a polish item. Tab moved nothing, the
+process table — an owner-drawn region, so no theme rings it for us — never said
+which row the arrow keys would act from, and those arrow keys applied
+unconditionally: pressing Down while typing a filter picked a process somewhere
+off screen.
+
+Focus is now KNOWN before it is visible. `ActivityMonitor.Focusable` is
+`carousel → filter → show all → Kill → New Process → table` (top to bottom, then
+left to right along the control bar — `activity_layout`'s own order), with a
+pure `nextFocus` ring and a pure `nextVisibleFocus` that steps OVER a stop that
+is not on screen: no carousel on a single-source panel, no Kill without a
+selection. The four native children carry real Win32 focus and the field mirrors
+them, so a mouse click cannot leave it stale; the carousel and the table are
+both the panel's own HWND, so for those two the field is the only thing that
+says which, and `WM_LBUTTONDOWN` records the region the click landed in.
+`panel_focused` comes from `WM_SETFOCUS`/`WM_KILLFOCUS`, not from asking
+`GetFocus` at paint time — `GetFocus` answers for whichever window is active, so
+a deactivated panel would keep painting a ring over nothing. Every key is then
+dispatched by the focus stop: row keys only to the table, the carousel's arrows
+only to the carousel, Space and Enter left to a focused button.
+
+Row focus and row selection became two signals (decision D28). The panel now has
+a caret — keyed by pid, like the selection, because a re-sort or a re-poll moves
+rows underneath it. The ring goes on the caret row, the selection stays a fill,
+a row that is both wears both (the split T312 already made for the chooser's
+rows). Tabbing into the table establishes a caret at the first VISIBLE row and
+selects nothing, so focus becomes visible without a Tab silently arming Kill.
+Deliberately NOT built: a gesture that decouples them, because a plain arrow key
+has always moved both and a caret that lagged behind would signal a distinction
+the panel cannot express. Ring geometry is in `activity_layout.zig` and asserted
+at 1.0/1.25/1.5/2.0, including where the ring goes when no row can carry it.
+One thing fixed on the way: the carousel used to paint its focus ring
+unconditionally, so a card wore a ring while the caret sat in the filter box.
+
+Tests: `activity-monitor.ps1` gains section **L** — Tab read back with
+`Get-TestFocusedWindow` at each stop including the step over a hidden Kill (and
+back into the cycle once a row is selected), Down in the filter selecting
+nothing against Down on the table selecting exactly one row (the panel's own
+state line is the oracle), and the caret row's left rim bare → painted → bare
+again across a `Get-TestWindowPixels` capture as focus arrives and leaves, with
+the empty table area below it bare throughout. ALL PASS (114 assertions);
+`-NegativeControl` now inverts L as well as D and FAILS. `activity-monitor-
+remote.ps1` needed its E1 updated rather than merely re-run — a click below the
+carousel now focuses the table, so it Tabs once to reach the carousel before
+arrowing — and is ALL PASS (33).
+
+Filed: **T567** (the table's column headers are still mouse-only — no keyboard
+route to re-sort) and **T568** (the harness cannot deactivate a window on the
+background desktop, so "chrome that shows only while the window is active" has
+no honest oracle; T289 left that one arm unasserted rather than faking it).
+
+Floor: `floor-lane.ps1` none PASS (308s), win32 PASS (345s), agent PASS (315s);
+P1–P3 ALL PASS.

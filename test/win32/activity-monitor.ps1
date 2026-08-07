@@ -27,7 +27,13 @@
 #      its glyph removes it;
 #   K. (T290) a panel nobody can see does not enumerate: minimizing STOPS the
 #      1.5s process sweep, restoring resumes it within one interval, and the
-#      resume clears the trend history rather than stitching a gap across it.
+#      resume clears the trend history rather than stitching a gap across it;
+#   L. (T289) keyboard focus is VISIBLE and it ROUTES: Tab walks filter ->
+#      "Show all" -> [Kill] -> "New Process..." -> table and steps over a Kill
+#      that is not on screen, the row keys reach the table only while the TABLE
+#      holds focus, and the table - an owner-drawn region no theme rings for us
+#      - paints design system 2.2's ring on its caret row exactly while it has
+#      the keyboard.
 #
 # NOTHING THE BOX NEEDS IS EVER A TARGET. H spawns `cmd.exe /C pause` - a
 # throwaway that blocks forever with no child process - and I only ever kills
@@ -47,8 +53,10 @@
 #
 # CONTROLS. A positive control (ctrl+shift+p opening the palette) runs first, so
 # a broken injection aborts instead of reading as a T285 regression. The
-# `-NegativeControl` switch inverts D's load-bearing claim - a needle that
-# matches nothing is asserted to still show every row - and that run MUST fail.
+# `-NegativeControl` switch inverts two load-bearing claims - D's (a needle that
+# matches nothing is asserted to still show every row) and L's (the focus ring
+# is asserted to be painted while the FILTER holds focus) - and that run MUST
+# fail.
 #
 # T211/T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1)
 # and asserts at the end that it never took the user's foreground. The panel is
@@ -180,6 +188,20 @@ function Test-ExactPixel($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int[]]$
 
 function Get-Panels {
     return @(Get-TestWindows -ProcessId $script:app.Pid -Class 'GhozttyActivityMonitor')
+}
+
+# How many pixels in the box are NOT $Rgb. "The rim is bare background" and
+# "the rim got painted" are the same measurement, read in two directions.
+function Count-NonMatching($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int[]]$Rgb) {
+    $n = 0
+    for ($y = $Y0; $y -lt $Y1; $y += 1) {
+        for ($x = $X0; $x -lt $X1; $x += 1) {
+            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            if ($c.R -ne $Rgb[0] -or $c.G -ne $Rgb[1] -or $c.B -ne $Rgb[2]) { $n++ }
+        }
+    }
+    return $n
 }
 
 # The FIRST screen coordinate in the box whose pixel is exactly $Rgb, or $null.
@@ -772,6 +794,173 @@ try {
     }
     Assert ($k4 -gt $k3) "K a restored panel samples again ($k3 -> $k4)"
     Start-Sleep -Milliseconds 500
+
+    # --- L. Keyboard focus is VISIBLE, and it routes the keys (T289) ---------
+    # Two claims, and they are the same claim from either end: the panel knows
+    # where the keyboard is (so a key goes to the control that has it), and it
+    # SAYS where the keyboard is (design system 2.2 - "if a control can be
+    # tabbed to, it draws the ring; missing focus rings are an accessibility
+    # defect, not a polish item").
+    #
+    # The oracles are the panel's own state line for the routing half and the
+    # panel's own paint for the ring. Narrow the table to the app's own pid
+    # first: one row makes "the caret row" unambiguous and leaves the rest of
+    # the table area bare, which is what the control probe below reads.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text "$($app.Pid)" | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.Shown -ge 1) "L the table narrowed to the app's own pid (shown=$($st.Shown))"
+
+    $rowInfo = Get-TestFirstRowY $panel $client $fr
+    $rowY = $rowInfo[1]
+    Assert ($rowY -ge 0) 'L the first table row was located by its own paint'
+
+    # Clear the selection by clicking the bare area below the last row, so the
+    # ring probe measures a rim and not a selection fill, and so the Kill stop
+    # is genuinely absent from the Tab cycle below.
+    $before = Count-PanelLines
+    Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($client.Bottom - 30) -Button left -Action click | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.Selected -eq 0) "L the selection cleared for the focus probes (selected=$($st.Selected))"
+    $killVisible = $killBtn -and (Test-TestWindowVisible -Window ([IntPtr]$killBtn.Hwnd))
+    Assert (-not $killVisible) 'L Kill is out of the Tab cycle while nothing is selected'
+
+    # Put the caret in the filter field the way a user would.
+    $fr2 = Get-TestWindowRect -Window $filterEdit
+    Send-TestMouse -Window $panel -Target $filterEdit `
+        -X ([int](($fr2.Left + $fr2.Right) / 2)) -Y ([int](($fr2.Top + $fr2.Bottom) / 2)) `
+        -Button left -Action click | Out-Null
+    Start-Sleep -Milliseconds 300
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'L clicking the filter field focuses it'
+
+    # L1. The row keys do NOT reach the table while the filter holds focus.
+    # Before T289 they applied unconditionally, which is exactly what makes a
+    # missing ring confusing rather than merely plain: Down moved a selection
+    # the user could not see, from a caret that was somewhere else entirely.
+    Send-TestControlKey -Control $filterEdit -Key Down | Out-Null
+    Send-TestControlKey -Control $filterEdit -Key Down | Out-Null
+    $before = Count-PanelLines
+    $st = Wait-PanelState $before
+    Assert ($st.Selected -eq 0) "L1 Down in the filter field selects NOTHING (selected=$($st.Selected))"
+
+    # The ring's absence, measured before anything is tabbed: the caret row's
+    # left rim, 6px in from the client edge, is bare panel background. The band
+    # is clear of text (a cell is inset by 8 DIP) and clear of fills (nothing is
+    # selected, and the pointer is over the filter field, not a row).
+    $ringX1 = $client.Left + 6
+    $ringY0 = $rowY + 3
+    $ringY1 = $rowY + 10
+    $shotL = Get-TestWindowPixels -Window $panel
+    try {
+        $bare = Count-NonMatching $shotL $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        if ($NegativeControl) {
+            Write-Host 'NEGATIVE CONTROL: asserting the focus ring is painted while the FILTER holds focus - this run MUST fail'
+            Assert ($bare -gt 0) "L (inverted): the caret row's rim is painted with focus in the filter ($bare px)"
+        } else {
+            Assert ($bare -eq 0) "L the caret row's rim is bare while the filter holds focus ($bare px painted)"
+        }
+    } finally {
+        Close-TestWindowPixels -Shot $shotL
+    }
+
+    # L2. Tab walks the cycle, stepping OVER the hidden Kill stop.
+    Send-TestControlKey -Control $filterEdit -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$showAll.Hwnd)) 'L2 Tab from the filter reaches "Show all"'
+
+    Send-TestControlKey -Control ([IntPtr]$showAll.Hwnd) -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$newProc.Hwnd)) 'L2 Tab STEPS OVER the hidden Kill to "New Process..."'
+
+    Send-TestControlKey -Control ([IntPtr]$newProc.Hwnd) -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'L2 Tab reaches the TABLE (the panel window owns the owner-drawn region)'
+
+    # L3. The ring is now painted on the caret row - the same band that was bare
+    # a moment ago, with nothing else about the panel changed.
+    $shotL2 = Get-TestWindowPixels -Window $panel
+    try {
+        $ring = Count-NonMatching $shotL2 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($ring -gt 0) "L3 the table's focus ring PAINTS on the caret row once the table holds focus ($ring px)"
+        # Control: the same band further down the (single-row) table stays
+        # bare, so what was measured is a rim on the caret row and not a
+        # table-wide repaint or a panel-wide accent.
+        $belowY0 = $client.Bottom - 40
+        $below = Count-NonMatching $shotL2 $client.Left $belowY0 $ringX1 ($belowY0 + 7) $PANEL_BG
+        Assert ($below -eq 0) "L3 (control) the empty table area below the caret row is still bare ($below px)"
+    } finally {
+        Close-TestWindowPixels -Shot $shotL2
+    }
+
+    # L4. And the keys now reach the table: Down selects, from the caret the
+    # ring is drawn on.
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Down | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.Selected -eq 1) "L4 Down with the table focused selects exactly one row (selected=$($st.Selected))"
+
+    # L5. A selection puts Kill back INTO the cycle - the skip is dynamic, not
+    # a one-time reading of the layout.
+    Assert ($killBtn -and (Test-TestWindowVisible -Window ([IntPtr]$killBtn.Hwnd))) 'L5 Kill is visible again with a row selected'
+    Send-TestControlKey -Control $panel -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'L5 Tab from the table wraps to the filter (no carousel on a single-source panel)'
+    Send-TestControlKey -Control $filterEdit -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Send-TestControlKey -Control ([IntPtr]$showAll.Hwnd) -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtn.Hwnd)) 'L5 Kill is now a Tab stop'
+
+    # L6. The ring means "the keyboard is HERE", so it goes away when the
+    # keyboard goes elsewhere. Focus the terminal window - the same GUI thread,
+    # so the panel really does lose the focus rather than merely the z-order -
+    # and the caret row's rim is bare again.
+    # Clear the selection first, so the band under the probe carries a RIM and
+    # not a selection fill - the two are different signals and this is the one
+    # that has to follow the keyboard. The click focuses the table and drops the
+    # caret with it, so Tab the whole cycle round to re-establish one: table ->
+    # filter -> "Show all" -> (Kill, hidden again) -> "New Process..." -> table.
+    $before = Count-PanelLines
+    Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($client.Bottom - 30) -Button left -Action click | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.Selected -eq 0) 'L6 (setup) the selection cleared'
+    foreach ($i in 1..4) {
+        Send-TestControlKey -Control $panel -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 300
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'L6 (setup) the table holds focus again'
+
+    # Tabbing in gave the table a caret WITHOUT selecting anything - so this
+    # rim is focus and nothing else.
+    $shotL4 = Get-TestWindowPixels -Window $panel
+    try {
+        $rimOnly = Count-NonMatching $shotL4 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($rimOnly -gt 0) "L6 tabbing in rings the caret row without selecting it ($rimOnly px)"
+        Assert ($st.Selected -eq 0) 'L6 ...and the selection really is still empty'
+    } finally {
+        Close-TestWindowPixels -Shot $shotL4
+    }
+
+    # And it LEAVES when focus does. The caret has not moved - Tab does not
+    # touch it - so a rim that survived here would be painting a row's state
+    # rather than the keyboard's position, which is the difference between a
+    # focus ring and decoration.
+    #
+    # Focus moving to another STOP, not the panel being deactivated: posted
+    # input cannot activate a window off the input desktop (activation comes
+    # from WM_MOUSEACTIVATE on real input), so the deactivated case has no
+    # honest oracle here and is left unasserted rather than faked.
+    Send-TestControlKey -Control $panel -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'L6 Tab moved focus off the table'
+    $shotL5 = Get-TestWindowPixels -Window $panel
+    try {
+        $gone = Count-NonMatching $shotL5 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($gone -eq 0) "L6 the ring LEAVES with the focus ($gone px still painted)"
+    } finally {
+        Close-TestWindowPixels -Shot $shotL5
+    }
 
     # --- F. Escape closes the panel ------------------------------------------
     Send-TestControlKey -Control $filterEdit -Key Escape | Out-Null
