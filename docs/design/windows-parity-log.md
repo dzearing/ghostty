@@ -9,6 +9,43 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-08 - **T277 done - Float on Top pins the window from the keyboard,
+  because the app now checks that it did**. Root cause, measured rather than
+  guessed: `SetWindowPos(hwnd, HWND_TOPMOST, ...)` is not a report of its own
+  outcome. With NO foreground window — a background desktop, a locked session,
+  the gap between two windows taking focus — it returns TRUE with
+  `GetLastError() == 0` and leaves `WS_EX_TOPMOST` clear; the identical call on
+  the very next line lands (`ok=1 lasterr=0 after=0x100`, then `after=0x108`).
+  That is the whole explanation for the split T191 spotted and could not close:
+  the MENU path worked because it happened to run with a foreground window, and
+  the KEYBIND path — the one anybody would actually use — did nothing. Getting
+  there needed three controls, because every cheap theory was wrong: a second
+  keybind (`new_window`) proved chords reach the app; the app's own stderr
+  proved the binding resolved and `float_window` ran; and an env switch proved
+  disabling the T142 heal changed nothing. Fix: `win32.setTopmost(hwnd, want)`
+  reads the ex-style back and retries up to
+  `overlay_zorder.band_change_attempts` (3 — the second attempt is the one
+  observed to land, and a spin would wedge the UI thread), with the policy half
+  pure and unit-tested (`bandSettled`). `float_window` and
+  `QuickTerminal.animateIn` both go through it. **Second defect, found by the
+  new script rather than by reading**: `healOverlayZOrder` returned early for a
+  topmost root, so a banner re-laid-out while its window was pinned stayed
+  seated three windows BELOW its own window — a banner hidden behind the
+  terminal it describes. Only the DEMOTION half is skipped for a topmost root
+  now (demoting an owned popup drags its owner out of the band with it); the
+  re-seat still runs. New `test/win32/float-on-top.ps1`, 12 assertions ALL
+  PASS, drives the keybind path and the pinned-banner case. Floor: three zig
+  lanes via `floor-lane.ps1 -Lane all`, P1-P3, `overlay-zorder.ps1` ALL PASS
+  (24) x3. **What is NOT fixed, and was split rather than forced**: with a
+  SECOND ghoztty window on the background test desktop, the first refuses
+  topmost from ANY process — an external harness `SetWindowPos` fails too,
+  while `charmap.exe` in the same desktop takes it every time — so
+  `overlay-zorder.ps1` section E still skips. That is **T607**, with the table
+  of measurements. Filed **D35** for the question underneath it: whether
+  acceptance scripts may ever run on the user's own desktop, which is the only
+  place T277's step 1 ("reproduce interactively first") could have been
+  answered.
+
 - 2026-08-08 - **T191 done - "Float on Top" is a row in the Windows Window
   menu**. The task's premise was half wrong and reading beat grepping again:
   `App.zig` has handled `.float_window` since the FIRST win32 commit

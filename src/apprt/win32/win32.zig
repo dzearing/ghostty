@@ -1946,6 +1946,38 @@ fn seatedAboveOwner(hwnd: HWND, root: HWND) bool {
     return false;
 }
 
+/// Move `hwnd` into (or out of) the always-on-top band and CONFIRM it landed
+/// there, returning whether it did (T277).
+///
+/// `SetWindowPos` is not a reliable report of its own outcome here: with no
+/// foreground window — a background desktop, a locked session, the moment
+/// between two windows taking focus — the first `HWND_TOPMOST` returns TRUE
+/// with `GetLastError() == 0` and leaves `WS_EX_TOPMOST` clear. Measured on
+/// this box: `ok=1 lasterr=0 after=0x100`, then an identical call issued on
+/// the very next line lands (`after=0x108`). That is why
+/// `toggle_window_float_on_top` read as "a feature that does nothing" from a
+/// keybind while the same code worked from the menu — the menu happened to
+/// run with a foreground window and the keybind path did not.
+///
+/// So the ex-style is read back and the call retried, up to
+/// `overlay_zorder.band_change_attempts`. Callers that care get `false` and
+/// can say so rather than reporting a float that never happened.
+pub fn setTopmost(hwnd: HWND, want: bool) bool {
+    const insert_after = if (want) HWND_TOPMOST else HWND_NOTOPMOST;
+    const flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    var attempt: u8 = 0;
+    while (attempt < overlay_zorder.band_change_attempts) : (attempt += 1) {
+        if (overlay_zorder.bandSettled(GetWindowLongW(hwnd, GWL_EXSTYLE), want)) return true;
+        _ = SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags);
+    }
+    const settled = overlay_zorder.bandSettled(GetWindowLongW(hwnd, GWL_EXSTYLE), want);
+    if (!settled) std.log.scoped(.win32).warn(
+        "topmost band change did not take want={} attempts={d}",
+        .{ want, overlay_zorder.band_change_attempts },
+    );
+    return settled;
+}
+
 /// Re-assert the z-order of an owned overlay popup — the banner strip, dim
 /// overlay, themed scrollbar and resize overlay — so that it sits directly
 /// above the window it decorates and nowhere else (T142). Call after every
@@ -1960,18 +1992,23 @@ fn seatedAboveOwner(hwnd: HWND, root: HWND) bool {
 ///      foreground app" report, with no stray bit involved at all.
 ///
 /// A no-op once the popup is seated, so the common path is a short z-order
-/// walk and two `GetWindowLongW` reads. A window whose owner is legitimately
-/// topmost (`toggle_window_float_on_top`, the quick terminal) is left
-/// entirely alone: Windows keeps owned popups in the topmost band with their
-/// owner, and both "corrections" below would drop the overlay out of it and
-/// hide the banner behind its own window.
+/// walk and two `GetWindowLongW` reads.
+///
+/// When the owner is legitimately topmost (`toggle_window_float_on_top`, the
+/// quick terminal) the topmost bit on the popup is NOT a stray and must be
+/// left alone — demoting it would drop the banner out of the band its own
+/// window is in, and Windows drags an owner out of the topmost band along with
+/// any owned window that is demoted. The SEATING half still runs, though
+/// (T277): being in the same band as your owner does not put you above it, and
+/// a banner that was re-laid-out while its window was pinned measured three
+/// windows BELOW its own window — a banner hidden behind the terminal it
+/// describes. Only the demotion is skipped, not the re-seat.
 ///
 /// `owner` may be a child window (the pane overlays are owned by the surface
 /// HWND); the z-order — and the topmost bit — live on its top-level ancestor.
 pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
     const root = GetAncestor(owner, GA_ROOT) orelse owner;
     const root_ex = GetWindowLongW(root, GWL_EXSTYLE);
-    if (overlay_zorder.isTopmost(root_ex)) return;
 
     const flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
     if (overlay_zorder.isStray(GetWindowLongW(hwnd, GWL_EXSTYLE), root_ex)) {

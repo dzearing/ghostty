@@ -118,6 +118,11 @@ fn animateIn(self: *QuickTerminal) void {
         self.hidden_rect.bottom - self.hidden_rect.top,
         w32.SWP_NOACTIVATE,
     );
+    // The band half of that call is not self-reporting: with no foreground
+    // window `SetWindowPos` returns TRUE having left the window in the
+    // ordinary band (T277), and a quick terminal that is not topmost slides
+    // under whatever it was summoned over. Confirm it — a no-op once seated.
+    _ = w32.setTopmost(hwnd, true);
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
 
@@ -132,6 +137,7 @@ fn animateIn(self: *QuickTerminal) void {
             self.target_rect.bottom - self.target_rect.top,
             w32.SWP_NOACTIVATE,
         );
+        _ = w32.setTopmost(hwnd, true);
         self.visible = true;
         self.forceForeground();
         return;

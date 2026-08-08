@@ -5013,16 +5013,12 @@ pub fn performAction(
                         .toggle => !is_topmost,
                     };
                     if (want == is_topmost) return true;
-                    const insert_after = if (want) w32.HWND_TOPMOST else w32.HWND_NOTOPMOST;
-                    _ = w32.SetWindowPos(
-                        win_hwnd,
-                        insert_after,
-                        0,
-                        0,
-                        0,
-                        0,
-                        w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE,
-                    );
+                    // Not a bare SetWindowPos: the API reports success on a
+                    // band change it did not make when there is no foreground
+                    // window, which is what made this action look like it did
+                    // nothing from a keybind while working from the menu
+                    // (T277). `setTopmost` reads the ex-style back.
+                    _ = w32.setTopmost(win_hwnd, want);
                     // Changing bands moves every popup this window owns —
                     // the OS drags them along, but only as far as the band,
                     // not to the seat directly above their owner. Re-check

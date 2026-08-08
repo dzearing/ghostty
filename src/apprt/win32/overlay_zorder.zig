@@ -60,6 +60,46 @@ pub fn isStray(overlay_ex: u32, owner_ex: u32) bool {
     return isTopmost(overlay_ex) and !isTopmost(owner_ex);
 }
 
+/// How many times a band change is attempted before we give up and log
+/// (T277). `SetWindowPos` can report SUCCESS on a `HWND_TOPMOST` it did not
+/// make: measured on this box with no foreground window (a background
+/// desktop, a locked session, the gap between two windows taking focus), the
+/// first call returns TRUE with `GetLastError() == 0` and `WS_EX_TOPMOST`
+/// still clear, while an identical call issued immediately after takes. So
+/// the outcome is READ BACK rather than inferred from the return value.
+///
+/// Three, not one and not a spin: the second attempt is the one that has been
+/// observed to land, and a window that will not change bands at all must not
+/// wedge the UI thread.
+pub const band_change_attempts: u8 = 3;
+
+/// True once the window's ex-style agrees with the band we asked for, i.e.
+/// there is nothing left to retry. The only honest test of a band change,
+/// because the API's own success value does not imply it.
+pub fn bandSettled(ex_style: u32, want_topmost: bool) bool {
+    return isTopmost(ex_style) == want_topmost;
+}
+
+test "bandSettled: only the ex-style answers, in both directions" {
+    try testing.expect(bandSettled(ex_topmost, true));
+    try testing.expect(!bandSettled(0, true));
+    try testing.expect(bandSettled(0, false));
+    try testing.expect(!bandSettled(ex_topmost, false));
+    // Unrelated bits never decide it. 0x100 is WS_EX_WINDOWEDGE, which every
+    // ordinary top-level window carries — and is exactly what the failing
+    // T277 read back looked like.
+    try testing.expect(!bandSettled(0x100, true));
+    try testing.expect(bandSettled(0x100, false));
+    try testing.expect(bandSettled(0x100 | ex_topmost, true));
+}
+
+test "band_change_attempts leaves room for the retry that lands" {
+    // One attempt is the bug this constant exists to fix; an unbounded spin
+    // would hang the UI thread on a window that will not move.
+    try testing.expect(band_change_attempts >= 2);
+    try testing.expect(band_change_attempts <= 5);
+}
+
 /// One window seen while walking DOWN from the owner through the windows
 /// stacked directly above it, looking for the overlay.
 pub const WalkWindow = struct {
