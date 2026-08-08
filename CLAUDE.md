@@ -368,6 +368,41 @@ tabs/splits on a remote window use the per-host default shell too — but NOT it
 working directory, since their cwd inherits from the parent pane and a default
 must not yank a split away from where its parent is.
 
+### The connection status pill (GUI, both platforms)
+
+A remote window's titlebar carries a small **connection pill**, because a
+dropped link is otherwise invisible until you type into a pane and nothing
+happens. Three states, driven by the per-window reconnect ladder:
+
+| State | Shows | Clickable |
+|---|---|---|
+| connected | a **green dot**, no words | no |
+| reconnecting | an **amber dot** + `Reconnecting… n/5` | no |
+| disconnected | a **red** capsule: refresh glyph + **Reconnect** | yes — re-dials now |
+
+Connected is deliberately wordless: a chip that permanently reads "Connected"
+is chrome that says nothing, so the pill only grows words when something is
+wrong. That is also what keeps the three states apart without relying on hue
+(WCAG 1.4.1) — they differ in whether there is text and in what it says.
+Clicking **Reconnect** starts from ANY disconnected tier, terminal included,
+resets the poisoned-session breaker (a click is fresh evidence) and dials
+immediately instead of waiting out a backoff. It re-attaches when the session
+survived — **but on Windows a session that did NOT survive still ends the
+window rather than opening a fresh shell on the machine** (T611), so a click
+after the remote box rebooted currently dials, finds nothing to re-attach, and
+leaves the pill red.
+
+macOS renders this as Mac's machine pill plus a separate status capsule
+(`MachinePillView.swift`); Windows merges the two into one capsule in the
+caption band (T367) — the band already hosts the "…" button, so the affordance
+costs no terminal rows, and the pill shares that button's vertical center. A
+**quiet** win32 pill is not a button and stays part of the drag region, so it
+never leaves a dead patch in the titlebar. Windows geometry, wording and
+contrast floors: `src/apprt/win32/remote_pill.zig` (asserted at
+1.0/1.25/1.5/2.0); acceptance: `test/win32/remote-pill.ps1`. The win32 pill
+does not yet name the machine or open the Activity Monitor on click the way
+Mac's does — filed as T610.
+
 ### Relay account sign-in (GUI only — there is no CLI verb)
 
 Signing in to the Google account that authenticates relay connections is a

@@ -94,6 +94,8 @@ const caption_layout = @import("caption_layout.zig");
 const frame_size = @import("frame_size.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
+const type_ramp = @import("type_ramp.zig");
+const remote_pill = @import("remote_pill.zig");
 const tab_shape = @import("tab_shape.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -186,6 +188,17 @@ caption_hover: ?caption_layout.Button = null,
 caption_pressed: ?caption_layout.Button = null,
 /// Whether `TME_NONCLIENT` tracking is armed, so a hover can un-hover.
 tracking_nc_mouse: bool = false,
+
+/// Painted width of the remote connection pill (T367), 0 when this window has
+/// none. Cached rather than measured on demand because `captionLayout` runs on
+/// every `WM_NCHITTEST` — i.e. on every mouse move over the band — and the
+/// width follows a GDI-measured label. `refreshRemotePill` is the one writer;
+/// it runs when the ladder moves and when the DPI does.
+remote_pill_w: i32 = 0,
+/// The pill label's font: the type ramp's CAPTION role, which is the badge
+/// size, not the 16 px face the tab titles use. Owned; created and deleted
+/// alongside `tab_font`.
+pill_font: ?*anyopaque = null,
 
 /// DPI scale factor (DPI / 96.0).
 scale: f32 = 1.0,
@@ -588,7 +601,7 @@ fn chromePalette(self: *const Window) chrome_theme.Palette {
 /// `system_colors.repaintForColorChange`, which redraws the window and every
 /// child: the accent is painted well outside this rect (the hero carousel
 /// band) and inside child HWNDs that never receive the broadcast at all (T307).
-fn invalidateChrome(self: *Window) void {
+pub fn invalidateChrome(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var r: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &r) == 0) return;
@@ -720,6 +733,38 @@ fn createTabFont(self: *Window) void {
             _ = w32.SendMessageW(h, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
     }
+
+    // The pill's label rides the type ramp, not the title face: it is a badge,
+    // and §2.4 sets badges at the caption role. Recreated here so the one place
+    // that reacts to a DPI or config change carries both chrome fonts.
+    self.createPillFont();
+    self.refreshRemotePill();
+}
+
+/// (Re)create the connection pill's label font at the current DPI scale.
+fn createPillFont(self: *Window) void {
+    if (self.pill_font) |font| {
+        _ = w32.DeleteObject(font);
+        self.pill_font = null;
+    }
+    const f = type_ramp.caption(self.scale);
+    const face = std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face);
+    self.pill_font = w32.CreateFontW(
+        -f.height, // cHeight (negative = character height)
+        0, // cWidth
+        0, // cEscapement
+        0, // cOrientation
+        f.weight, // cWeight
+        0, // bItalic
+        0, // bUnderline
+        0, // bStrikeOut
+        w32.DEFAULT_CHARSET, // iCharSet
+        0, // iOutPrecision
+        0, // iClipPrecision
+        0, // iQuality
+        0, // iPitchAndFamily
+        face,
+    );
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -973,6 +1018,11 @@ pub fn layoutUuid(self: *const Window) []const u8 {
 pub fn setRemoteDialed(self: *Window, dialed: RemoteDialed) void {
     self.remote_dialed = dialed;
     RemoteReconnect.install(self);
+    // ...and the third half: this is the moment the window acquires a
+    // connection to have a status ABOUT, so it is the moment its pill appears
+    // (T367). Without this the band shows nothing until the first state change,
+    // i.e. a healthy remote window would never have a green dot at all.
+    self.refreshRemotePill();
 }
 
 pub fn deinit(self: *Window) void {
@@ -1013,10 +1063,14 @@ pub fn deinit(self: *Window) void {
         self.remote_machine = null;
     }
 
-    // Delete the tab bar font.
+    // Delete the chrome fonts.
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
         self.tab_font = null;
+    }
+    if (self.pill_font) |font| {
+        _ = w32.DeleteObject(font);
+        self.pill_font = null;
     }
 
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
@@ -1176,13 +1230,88 @@ fn sysFrameY(self: *const Window) i32 {
         w32.GetSystemMetricsForDpi(w32.SM_CXPADDEDBORDER, dpi);
 }
 
+/// Does this window show a remote connection pill (T367)?
+///
+/// Only a window with a `remote_dialed` transport does: a local window has no
+/// machine to be connected to, and a session-persistence window recovers
+/// through `agent_recovery` rather than this ladder, so a pill there would be
+/// reporting on a link it does not own.
+pub fn hasRemotePill(self: *const Window) bool {
+    return self.remote_dialed != null;
+}
+
+/// This window's connection state as the pill presents it.
+fn remotePillMode(self: *const Window) remote_pill.Mode {
+    return remote_pill.modeFor(self.reconnect.ladder);
+}
+
+/// The pill's size for the caption's layout: zero when there is no pill, or
+/// when the label has not been measured yet.
+fn captionPill(self: *const Window) caption_layout.Pill {
+    if (!self.hasRemotePill()) return .{};
+    if (self.remote_pill_w <= 0) return .{};
+    return .{
+        .w = self.remote_pill_w,
+        .h = remote_pill.Metrics.init(self.scale).h,
+        .interactive = remote_pill.isAction(self.remotePillMode()),
+    };
+}
+
+/// Re-measure the pill's label and, if its width moved, repaint the chrome.
+///
+/// The chrome and not just the caption: the pill's width decides `band_left`,
+/// which is the seam the tab strip lays out against, so a pill that grew from
+/// "Reconnect" to "Reconnecting… 3/5" moves the tab run too. One writer for
+/// `remote_pill_w`, so no other path can leave the cached width describing a
+/// label nobody is drawing.
+pub fn refreshRemotePill(self: *Window) void {
+    const want: i32 = blk: {
+        if (!self.hasRemotePill()) break :blk 0;
+        const m = remote_pill.Metrics.init(self.scale);
+        const mode = self.remotePillMode();
+
+        var buf: [remote_pill.label_cap]u8 = undefined;
+        const text = remote_pill.label(&buf, self.reconnect.ladder);
+        break :blk remote_pill.width(m, mode, self.measurePillLabel(text));
+    };
+    if (want == self.remote_pill_w) return;
+    self.remote_pill_w = want;
+    self.invalidateChrome();
+}
+
+/// GDI width of `text` in the pill's own font. 0 for an empty label, and 0
+/// when there is no window or font to measure with — which reads to `width`
+/// as "no label", i.e. the mark-only pill, rather than as a wrong number.
+fn measurePillLabel(self: *const Window, text: []const u8) i32 {
+    if (text.len == 0) return 0;
+    const hwnd = self.hwnd orelse return 0;
+    const font = self.pill_font orelse return 0;
+
+    var wide: [remote_pill.label_cap]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, text) catch return 0;
+    if (n == 0) return 0;
+
+    const hdc = w32.GetDC(hwnd) orelse return 0;
+    defer _ = w32.ReleaseDC(hwnd, hdc);
+    const old = w32.SelectObject(hdc, font);
+    defer _ = w32.SelectObject(hdc, old);
+
+    var size: w32.SIZE = undefined;
+    if (w32.GetTextExtentPoint32W(hdc, &wide, @intCast(n), &size) == 0) return 0;
+    return size.cx;
+}
+
 /// The caption band's layout for this window's current client width.
 fn captionLayout(self: *const Window) ?caption_layout.Layout {
     if (!self.customCaption()) return null;
     const hwnd = self.hwnd orelse return null;
     var rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &rect) == 0) return null;
-    return caption_layout.layout(self.captionMetrics(), rect.right - rect.left);
+    return caption_layout.layout(
+        self.captionMetrics(),
+        rect.right - rect.left,
+        self.captionPill(),
+    );
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -3926,6 +4055,14 @@ fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
         // the flyout silently stops existing.
         .maximize => w32.HTMAXBUTTON,
         .close => w32.HTCLOSE,
+        // The connection pill (T367) is the app's own control with no system
+        // counterpart to borrow, so it takes `HTOBJECT` — the code Windows
+        // reserves for exactly that, "an object in the non-client area", and
+        // the one code `DefWindowProc` attaches no behavior of its own to. It
+        // is only ever returned while the pill is a BUTTON: `caption_layout`
+        // gives a quiet pill no hit box, so a quiet one never reaches here and
+        // stays draggable titlebar.
+        .pill => w32.HTOBJECT,
     };
 }
 
@@ -3933,6 +4070,7 @@ fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
 /// code Windows already computed for us in `wparam`.
 fn captionButtonFor(code: usize) ?caption_layout.Button {
     return switch (@as(isize, @bitCast(code))) {
+        w32.HTOBJECT => .pill,
         w32.HTSYSMENU => .overflow,
         w32.HTMINBUTTON => .minimize,
         w32.HTMAXBUTTON => .maximize,
@@ -4049,6 +4187,16 @@ fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
         // stray release is a message-ordering accident, not a bug worth
         // crashing a terminal over.
         .menu => return true,
+        // The connection pill: re-dial this window's machine now. Re-checked
+        // against the LIVE state rather than trusted from the press, because
+        // the ladder runs on a timer and the link can come back between the
+        // two — and `manualReconnect` on a connected window is meaningless.
+        .reconnect => {
+            if (remote_pill.isAction(self.remotePillMode())) {
+                RemoteReconnect.manualReconnect(self.app, self);
+            }
+            return true;
+        },
     };
     _ = w32.PostMessageW(hwnd, w32.WM_SYSCOMMAND, cmd, 0);
     return true;
@@ -4148,7 +4296,7 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
     if (client_w <= 0) return;
 
     const m = self.captionMetrics();
-    const l = caption_layout.layout(m, client_w);
+    const l = caption_layout.layout(m, client_w, self.captionPill());
 
     const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
     defer _ = w32.DeleteDC(mem_dc);
@@ -4252,6 +4400,12 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         }
     }
 
+    // The connection pill, left of that cluster. After the buttons because it
+    // is the newest thing in the band and painting order here is arbitrary —
+    // the rects are disjoint by construction (`captionButtonHitBoxesNeverOverlap`
+    // and its pill sibling).
+    self.paintRemotePill(mem_dc, l);
+
     // Merged (T205), the caption owns only `[band_left, client_w)` of the row —
     // the tab strip paints the rest, and blitting the full width here would
     // erase the tabs on every caption repaint (a hover on close would blank
@@ -4262,6 +4416,107 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
     const blit_w = client_w - blit_x;
     if (blit_w <= 0) return;
     _ = w32.BitBlt(hdc_screen, blit_x, 0, blit_w, cap_h, mem_dc, blit_x, 0, w32.SRCCOPY);
+}
+
+/// Paint the remote connection pill (T367) into the caption band.
+///
+/// One capsule, three presentations, all resolved by `remote_pill`: this
+/// function only turns rects and colors into GDI calls. The capsule is filled
+/// as a region rather than a `RoundRect` for the same reason
+/// `paintIconButton` is — no pen to reconcile, and it composes with a clip the
+/// caller may already hold.
+fn paintRemotePill(self: *Window, mem_dc: w32.HDC, l: caption_layout.Layout) void {
+    if (l.pill.isEmpty()) return;
+    const pm = remote_pill.Metrics.init(self.scale);
+    const mode = self.remotePillMode();
+    const pal = self.chromePalette();
+
+    // The pill only lights up when it is a BUTTON. A hover fill on the quiet
+    // states would promise an action that clicking does not deliver.
+    const state: icon_button.State = if (!remote_pill.isAction(mode))
+        .normal
+    else if (self.caption_pressed == .pill)
+        .pressed
+    else if (self.caption_hover == .pill)
+        .hover
+    else
+        .normal;
+
+    const ink = remote_pill.ink(pal.bar, pal, mode, state);
+    const inner = remote_pill.layout(pm, l.pill, mode);
+    if (inner.mark.isEmpty()) return;
+
+    // The capsule.
+    if (w32.CreateRoundRectRgn(
+        l.pill.left,
+        l.pill.top,
+        l.pill.right + 1,
+        l.pill.bottom + 1,
+        pm.radius * 2,
+        pm.radius * 2,
+    )) |rgn| {
+        defer _ = w32.DeleteObject(rgn);
+        if (w32.CreateSolidBrush(w32.RGB(ink.fill.r, ink.fill.g, ink.fill.b))) |brush| {
+            defer _ = w32.DeleteObject(@ptrCast(brush));
+            _ = w32.FillRgn(mem_dc, rgn, @ptrCast(brush));
+        }
+    }
+
+    // The mark: a status dot, or the shared refresh glyph on the button.
+    switch (remote_pill.mark(mode)) {
+        .dot => {
+            const d = inner.mark;
+            // A round rect whose ellipse is the box IS a circle, and it is the
+            // one fill primitive the rest of the chrome already uses — an
+            // `Ellipse` here would need a pen selected and would draw a
+            // one-pixel outline nobody asked for.
+            if (w32.CreateRoundRectRgn(
+                d.left,
+                d.top,
+                d.right + 1,
+                d.bottom + 1,
+                d.width(),
+                d.height(),
+            )) |rgn| {
+                defer _ = w32.DeleteObject(rgn);
+                if (w32.CreateSolidBrush(w32.RGB(ink.mark.r, ink.mark.g, ink.mark.b))) |brush| {
+                    defer _ = w32.DeleteObject(@ptrCast(brush));
+                    _ = w32.FillRgn(mem_dc, rgn, @ptrCast(brush));
+                }
+            }
+        },
+        .refresh => icon_paint.glyph(
+            mem_dc,
+            pm.ib,
+            inner.mark,
+            .refresh,
+            w32.RGB(ink.mark.r, ink.mark.g, ink.mark.b),
+        ),
+    }
+
+    // The label.
+    if (inner.text.isEmpty()) return;
+    var buf: [remote_pill.label_cap]u8 = undefined;
+    const text = remote_pill.label(&buf, self.reconnect.ladder);
+    if (text.len == 0) return;
+    var wide: [remote_pill.label_cap]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
+    if (n == 0) return;
+
+    const old_font = if (self.pill_font) |f| w32.SelectObject(mem_dc, f) else null;
+    defer if (old_font) |f| {
+        _ = w32.SelectObject(mem_dc, f);
+    };
+    _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(mem_dc, w32.RGB(ink.text.r, ink.text.g, ink.text.b));
+    var tr = stripRect(inner.text);
+    _ = w32.DrawTextW(
+        mem_dc,
+        &wide,
+        @intCast(n),
+        &tr,
+        w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS,
+    );
 }
 
 /// Paint one NATIVE caption slab — minimize, maximize/restore or close — the
@@ -6056,6 +6311,10 @@ fn onDestroy(self: *Window) void {
             _ = w32.DeleteObject(font);
             self.tab_font = null;
         }
+        if (self.pill_font) |font| {
+            _ = w32.DeleteObject(font);
+            self.pill_font = null;
+        }
         self.hwnd = null;
         // QuickTerminal handles the rest of cleanup (freeing self, quit timer).
         if (app.quick_terminal) |qt| {
@@ -6116,6 +6375,10 @@ fn onDestroy(self: *Window) void {
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
         self.tab_font = null;
+    }
+    if (self.pill_font) |font| {
+        _ = w32.DeleteObject(font);
+        self.pill_font = null;
     }
     self.hwnd = null;
 

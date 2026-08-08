@@ -71,6 +71,42 @@ pub const ui_contrast_target: f64 = 3.0;
 /// two different reds (`#C42B1C` vs `RGB(232,65,65)`).
 pub const danger_base: Rgb = .{ .r = 0xC4, .g = 0x2B, .b = 0x1C };
 
+/// What a status mark MEANS, never what color it is. Every consumer resolves a
+/// tone against the surface it lands on (`toneInk` / `toneFill`), so the same
+/// meaning clears the same floor on light and dark alike.
+///
+/// Hoisted here in T367 because the connection pill needed the very colors the
+/// chooser's session badges had already picked, and a second private copy of
+/// "what green means" is the silent divergence this module exists to stop.
+pub const Tone = enum { neutral, good, warn, danger };
+
+/// Mac's `.green` / `.orange` / `.red` as BASES — never drawn raw. `toneInk`
+/// clamps each to the surface it is drawn on.
+pub const good_base: Rgb = .{ .r = 0x34, .g = 0xC7, .b = 0x59 };
+pub const warn_base: Rgb = .{ .r = 0xFF, .g = 0x95, .b = 0x00 };
+/// Deliberately NOT `danger_base` above: that one is Windows' close-button red,
+/// a CONTROL color, and this one is Apple's status red that the chooser badges
+/// and the connection pill both mean when they say "this is broken".
+pub const status_danger_base: Rgb = .{ .r = 0xFF, .g = 0x3B, .b = 0x30 };
+
+/// A status mark's ink on `surface`, floored to the 3:1 chrome target.
+pub fn toneInk(surface: Rgb, tone: Tone) Rgb {
+    return switch (tone) {
+        .neutral => textSecondaryOn(surface),
+        .good => accentOn(surface, good_base),
+        .warn => accentOn(surface, warn_base),
+        .danger => accentOn(surface, status_danger_base),
+    };
+}
+
+/// A status chip's fill: its own ink at a low alpha over the surface, so the
+/// chip reads as a tint of the thing it labels rather than a second color to
+/// reconcile. Mac's badge capsules are built the same way.
+pub fn toneFill(surface: Rgb, tone: Tone) Rgb {
+    const alpha: f64 = if (tone == .neutral) 0.15 else 0.18;
+    return color_math.mix(surface, toneInk(surface, tone), alpha);
+}
+
 /// The debug build's marker hue (T43): warning amber, the same signal the Mac
 /// debug banner carries as a yellow `exclamationmark.triangle.fill`.
 pub const debug_tint: Rgb = .{ .r = 0xFF, .g = 0xB0, .b = 0x00 };

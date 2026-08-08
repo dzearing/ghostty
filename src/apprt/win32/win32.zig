@@ -213,6 +213,12 @@ pub const HTTOP: isize = 12;
 pub const HTTOPLEFT: isize = 13;
 pub const HTTOPRIGHT: isize = 14;
 pub const HTCLOSE: isize = 20;
+/// "An object in the non-client area" — Windows' own code for a caption
+/// control that is not one of the system's. `DefWindowProc` attaches no
+/// behavior to it, which is exactly what an app-owned control wants: the NC
+/// mouse messages arrive and nothing else happens behind our back. The remote
+/// connection pill (T367) uses it.
+pub const HTOBJECT: isize = 19;
 
 pub const WM_NCCALCSIZE: u32 = 0x0083;
 pub const WM_NCMOUSEMOVE: u32 = 0x00A0;

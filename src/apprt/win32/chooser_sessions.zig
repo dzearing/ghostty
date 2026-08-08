@@ -142,35 +142,28 @@ pub fn countLabel(buf: []u8, n: usize) []const u8 {
 /// How a badge is colored. The tone names the MEANING, never a literal — the
 /// pixel color is resolved against the surface it lands on (the T206 rule), so
 /// every badge clears the 3:1 chrome floor on light and dark alike.
-pub const Tone = enum { neutral, warn, danger, good };
+///
+/// The tone vocabulary and its three bases moved to `chrome_theme` in T367,
+/// when the connection pill needed the same green/amber/red: this alias keeps
+/// the roster's own spelling while there is exactly one definition of what each
+/// tone means.
+pub const Tone = chrome_theme.Tone;
 
 pub const Badge = struct {
     text: []const u8,
     tone: Tone,
 };
 
-/// Mac's `.orange` / `.red` / `.green` as BASES. Never drawn raw — `badgeInk`
-/// clamps each to the surface.
-const warn_base: Rgb = .{ .r = 0xFF, .g = 0x95, .b = 0x00 };
-const danger_base: Rgb = .{ .r = 0xFF, .g = 0x3B, .b = 0x30 };
-const good_base: Rgb = .{ .r = 0x34, .g = 0xC7, .b = 0x59 };
-
 /// The badge's text color on `bg`, floored to the chrome contrast target.
 pub fn badgeInk(bg: Rgb, tone: Tone) Rgb {
-    return switch (tone) {
-        .neutral => chrome_theme.textSecondaryOn(bg),
-        .warn => chrome_theme.accentOn(bg, warn_base),
-        .danger => chrome_theme.accentOn(bg, danger_base),
-        .good => chrome_theme.accentOn(bg, good_base),
-    };
+    return chrome_theme.toneInk(bg, tone);
 }
 
 /// The badge's capsule fill: its own ink at Mac's low alpha over the row card,
 /// so the capsule reads as a tint of the thing it labels rather than a second
 /// color to reconcile.
 pub fn badgeFill(bg: Rgb, tone: Tone) Rgb {
-    const alpha: f64 = if (tone == .neutral) 0.15 else 0.18;
-    return color_math.mix(bg, badgeInk(bg, tone), alpha);
+    return chrome_theme.toneFill(bg, tone);
 }
 
 /// The badge run for a row, in Mac's order (`MachineChooserView.swift:632-646`):
@@ -671,7 +664,7 @@ pub fn cursorBorder(bg: Rgb, accent: Rgb) Rgb {
 /// live dot and strokes the dead one as a ring — so the mark is never color
 /// alone (§2.4).
 pub fn dotInk(bg: Rgb, alive: bool) Rgb {
-    return if (alive) chrome_theme.accentOn(bg, good_base) else chrome_theme.textSecondaryOn(bg);
+    return if (alive) chrome_theme.toneInk(bg, .good) else chrome_theme.toneInk(bg, .neutral);
 }
 
 // =====================================================================

@@ -246,6 +246,18 @@ one script that owns the marker.
 Nothing else. A radius is a size signal — bigger surface, bigger radius — so a
 4 DIP card or an 8 DIP button both read as mistakes.
 
+**One named exception: a STATUS CHIP is a capsule** — radius exactly half its
+own height, so its ends are semicircles at every scale rather than a rounded
+rect at some of them. It applies to the small mark-plus-label chips that report
+a state rather than offering a command: the chooser's session badges
+(`chooser_sessions`), and the remote connection pill in the caption band
+(`remote_pill`, T367). Their height is likewise derived and not picked — one
+caption line box plus the 4 DIP step — so the chip follows the type ramp
+instead of pinning a number that stops matching its text. A chip on the fixed
+scale would read as a small button, which is precisely what these are not (the
+connection pill is only a button in ONE of its three states, and that is the
+state where it changes color and grows a verb).
+
 ### 3.2 Elevation
 
 Win32 GDI has no shadow primitive, so elevation is expressed with the tools we

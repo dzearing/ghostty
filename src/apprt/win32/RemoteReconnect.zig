@@ -214,7 +214,7 @@ fn drive(app: *App, window: *Window, now: i64) void {
             _ = rc.gen.bump();
             rc.attempt = 0;
             rc.due_ms = 0;
-            rc.ladder = .connected;
+            setLadder(window, .connected);
             rc.breaker.reset();
             log.info("remote reconnect: link recovered on its own for '{s}'", .{windowName(window)});
         },
@@ -229,7 +229,7 @@ fn drive(app: *App, window: *Window, now: i64) void {
                     .{windowName(window)},
                 );
             }
-            goTerminal(rc);
+            goTerminal(window);
         },
     }
 
@@ -265,19 +265,19 @@ fn beginLadder(app: *App, window: *Window, now: i64, manual: bool) void {
                 "remote reconnect: '{s}' dropped with no session to re-attach; nothing to come back to",
                 .{windowName(window)},
             );
-            goTerminal(rc);
+            goTerminal(window);
         },
         .terminal_poisoned => {
             log.warn(
                 "remote reconnect: '{s}' condemned after {d} swaps that died inside {d}ms",
                 .{ windowName(window), policy.poison_limit, policy.poison_window_ms },
             );
-            goTerminal(rc);
+            goTerminal(window);
         },
         .start => |s| {
             _ = rc.gen.bump();
             rc.attempt = s.attempt;
-            rc.ladder = .{ .reconnecting = .{ .attempt = s.attempt } };
+            setLadder(window, .{ .reconnecting = .{ .attempt = s.attempt } });
             const delay = policy.backoffMs(s.attempt, manual);
             rc.due_ms = now + @as(i64, @intCast(delay));
             log.warn(
@@ -289,11 +289,34 @@ fn beginLadder(app: *App, window: *Window, now: i64, manual: bool) void {
     }
 }
 
-fn goTerminal(rc: *State) void {
+/// The ONE writer of `rc.ladder`. Assigning the field directly is how the
+/// status pill (T367) silently stops matching the ladder driving it: the driver
+/// mutates state from a timer nobody repaints on, so every transition has to
+/// carry its own invalidation or the window keeps showing the state it was in
+/// when something else happened to repaint.
+///
+/// A no-op transition invalidates nothing — the ladder is re-folded every 250ms
+/// while a drop is in flight, and repainting the chrome at 4 Hz for no visible
+/// change would be a battery cost with nothing on the other side of it.
+fn setLadder(window: *Window, next: policy.WindowState) void {
+    const rc = &window.reconnect;
+    if (std.meta.eql(rc.ladder, next)) return;
+    rc.ladder = next;
+    // The label's WIDTH moves with the state ("Reconnect" vs "Reconnecting…
+    // 3/5"), and the width moves the seam the tab strip lays out against, so
+    // this repaints the whole chrome row rather than just the caption.
+    window.refreshRemotePill();
+    // ...and unconditionally, because the two quiet states are the same width
+    // and would otherwise change color with nothing asking for a repaint.
+    window.invalidateChrome();
+}
+
+fn goTerminal(window: *Window) void {
+    const rc = &window.reconnect;
     _ = rc.gen.bump();
     rc.attempt = 0;
     rc.due_ms = 0;
-    rc.ladder = policy.terminal_state;
+    setLadder(window, policy.terminal_state);
 }
 
 /// The user asked for this window to reconnect NOW (T367's pill button). Starts
@@ -395,7 +418,7 @@ fn startAttempt(app: *App, window: *Window) void {
             "remote reconnect: '{s}' has no recorded machine; cannot re-dial",
             .{windowName(window)},
         );
-        goTerminal(rc);
+        goTerminal(window);
         return;
     };
 
@@ -415,7 +438,7 @@ fn startAttempt(app: *App, window: *Window) void {
                     "remote reconnect: '{s}' needs a relay credential (signed out)",
                     .{windowName(window)},
                 );
-                goTerminal(rc);
+                goTerminal(window);
                 return;
             };
             const base = alloc.dupe(u8, r.base) catch return failAttempt(app, window);
@@ -479,7 +502,7 @@ fn failAttempt(app: *App, window: *Window) void {
     switch (policy.onAttemptFailed(rc.attempt, has_session)) {
         .retry => |r| {
             rc.attempt = r.attempt;
-            rc.ladder = .{ .reconnecting = .{ .attempt = r.attempt } };
+            setLadder(window, .{ .reconnecting = .{ .attempt = r.attempt } });
             rc.due_ms = std.time.milliTimestamp() + @as(i64, @intCast(r.delay_ms));
         },
         .exhausted => |e| {
@@ -487,7 +510,7 @@ fn failAttempt(app: *App, window: *Window) void {
             // NOT terminal: the window is kept, the state is truthfully
             // self-healable, and a link that comes back later still recovers it
             // with no click (`onLinkChange`).
-            rc.ladder = policy.exhausted_state;
+            setLadder(window, policy.exhausted_state);
             rc.due_ms = if (e.arm_background_redial)
                 std.time.milliTimestamp() + @as(i64, @intCast(policy.redial_interval_ms))
             else
@@ -630,7 +653,7 @@ pub fn onDialed(app: *App, res: *Result) void {
                 "remote reconnect: '{s}' is terminal after attempt {d} ({s})",
                 .{ windowName(window), rc.attempt, @tagName(outcome) },
             );
-            goTerminal(rc);
+            goTerminal(window);
         },
     }
     arm(app);
@@ -735,7 +758,7 @@ fn applySwap(
 
     rc.attempt = 0;
     rc.due_ms = 0;
-    rc.ladder = .connected;
+    setLadder(window, .connected);
     // Not `breaker.reset()`: a swap is not yet proof of recovery. The breaker
     // judges it if and when this link dies — that is what catches a session
     // that probes alive and then kills every connection attached to it.

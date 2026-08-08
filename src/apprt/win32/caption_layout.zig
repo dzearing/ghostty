@@ -78,7 +78,31 @@ pub const Rect = icon_button.Rect;
 /// sits OUTSIDE that group, to its left, so it can never be mistaken for a
 /// fourth system button and can never be the thing under a pointer thrown at
 /// the top-right corner.
-pub const Button = enum { overflow, minimize, maximize, close };
+pub const Button = enum { pill, overflow, minimize, maximize, close };
+
+/// The remote connection pill's painted size (T367), or all-zero when this
+/// window has no pill to show — a local window has no machine to be connected
+/// to, so most windows pass `.{}` and nothing about the band changes.
+///
+/// A size rather than a rect: the caption owns WHERE its cluster sits, and the
+/// pill owns how big it needs to be (its width follows a GDI-measured label
+/// this module never sees, exactly like the tab run's "+"). Passing the two
+/// numbers in keeps `remote_pill` out of this module's imports, so neither can
+/// drag the other into a cycle.
+pub const Pill = struct {
+    w: i32 = 0,
+    h: i32 = 0,
+    /// Is the pill a BUTTON right now? It only is while the link is down (see
+    /// `remote_pill.isAction`), and the difference is not cosmetic: a quiet
+    /// status chip must stay part of the DRAG region, or a window whose
+    /// titlebar is mostly tab strip grows a dead patch you cannot pick it up
+    /// by. Carried with the size so one struct decides where a click goes.
+    interactive: bool = false,
+
+    pub fn isEmpty(self: Pill) bool {
+        return self.w <= 0 or self.h <= 0;
+    }
+};
 
 /// Does the band hold the tab run as well (T205)?
 ///
@@ -184,6 +208,13 @@ pub const Metrics = struct {
 /// extents, right/bottom exclusive, in client coordinates with the band's top
 /// at y = 0.
 pub const Layout = struct {
+    /// The remote connection pill (T367), one `pad_md` left of the "…" and
+    /// sharing its vertical center. Empty when the window has none — which is
+    /// every local window, i.e. almost all of them.
+    pill: Rect,
+    /// Whether that pill is currently a button (see `Pill.interactive`). False
+    /// whenever `pill` is empty.
+    pill_interactive: bool,
     /// The "…" window-menu button (T234). Left of `minimize`, separated from
     /// the system trio by `pad_md`: it is a different GROUP of controls (ours
     /// vs the OS's), and since T496 the two groups even speak different
@@ -230,7 +261,7 @@ pub const Layout = struct {
 /// reason that corner is where it is (Fitts' law, and Windows has trained it
 /// for thirty years). Since T496 the corner even PAINTS close — the slabs are
 /// flush to the edges, the way every native Win11 titlebar draws them.
-pub fn layout(m: Metrics, client_w: i32) Layout {
+pub fn layout(m: Metrics, client_w: i32, pill_size: Pill) Layout {
     // The system trio: three native slabs, full band height, zero gaps,
     // flush right. Built by stepping one slab width at a time from the
     // window's edge, so the three widths are the same integer by
@@ -261,24 +292,56 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
     const over_r = min.left - m.pad_md;
     const over: Rect = .{ .left = over_r - m.btn_paint, .top = top, .right = over_r, .bottom = bot };
 
-    // The drag region ends where the leftmost button's HIT box begins — not
-    // where its paint begins. A hit box must never contribute to a visible
-    // gap (design system §0 rule 2), but it is exactly what decides where a
-    // click stops being a drag.
-    const drag_right = over.left - m.btn_pad;
+    // The pill (T367), one GROUP gap left of the "…" and centered on the SAME
+    // vertical axis as the button's painted square, so the two read as one
+    // cluster rather than two things that happen to be adjacent. It is dropped
+    // rather than squeezed when the band cannot hold it and still leave the
+    // strip (or a title) somewhere to live — the same rule the title follows,
+    // for the same reason: a control clipped to a sliver is noise, not
+    // information.
+    const pill: Rect = if (pill_size.isEmpty()) .{} else blk: {
+        const right = over.left - m.pad_md;
+        const left = right - pill_size.w;
+        if (left < m.pad_md) break :blk .{};
+        const pill_top = top + @divTrunc(m.btn_paint - pill_size.h, 2);
+        break :blk .{
+            .left = left,
+            .top = pill_top,
+            .right = right,
+            .bottom = pill_top + pill_size.h,
+        };
+    };
+
+    // Everything left of the cluster is the cluster's leading edge: the pill
+    // when there is one, the "…" otherwise. Stated once, because the drag
+    // region, the title and the seam all measure from it.
+    const cluster_left = if (pill.isEmpty()) over.left else pill.left;
+    const pill_interactive = !pill.isEmpty() and pill_size.interactive;
+
+    // The drag region ends where the leftmost CLICKABLE thing's hit box begins
+    // — not where its paint begins. A hit box must never contribute to a
+    // visible gap (design system §0 rule 2), but it is exactly what decides
+    // where a click stops being a drag. The pill's hit box is its paint (it is
+    // a capsule, not a 28 DIP square with slack around it), so an interactive
+    // pill lands the two edges on the same x; a quiet one is not clickable at
+    // all and stays inside the drag band, so you can still pick the window up
+    // by it.
+    const drag_right = if (pill_interactive) pill.left else over.left - m.btn_pad;
 
     // The title stops `md` short of the button group, because they are
     // different groups of controls. A band with no room for both drops the
     // title; painting it under the buttons is worse than not painting it.
     // In `.with_tabs` there is no title at all — the tab run has the space.
     const title_l = m.pad_md;
-    const title_r = over.left - m.pad_md;
+    const title_r = cluster_left - m.pad_md;
     const title: Rect = if (m.mode == .standalone and title_r > title_l)
         .{ .left = title_l, .top = 0, .right = title_r, .bottom = m.caption_h }
     else
         .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 
     return .{
+        .pill = pill,
+        .pill_interactive = pill_interactive,
         .overflow = over,
         .minimize = min,
         .maximize = max,
@@ -287,7 +350,7 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
         .drag_right = drag_right,
         .band_left = switch (m.mode) {
             .standalone => 0,
-            .with_tabs => @max(over.left - m.pad_md, 0),
+            .with_tabs => @max(cluster_left - m.pad_md, 0),
         },
         .client_w = client_w,
     };
@@ -357,6 +420,21 @@ pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
         .minimize => l.minimize,
         .maximize => l.maximize,
         .close => l.close,
+        // The pill's hit box is its PAINT, grown only to the band's full height
+        // the way the "…"'s is. It is not grown horizontally: unlike a 28 DIP
+        // square in a wider slot, the capsule already extends to its own
+        // padding, and a hit box reaching past it would start swallowing drags
+        // from the empty band beside it.
+        //
+        // A pill that is not a button has NO hit box: there is nothing to
+        // click, and an empty box is what puts it back in the drag region
+        // instead of leaving a dead patch in the titlebar.
+        .pill => if (!l.pill_interactive) .{} else .{
+            .left = l.pill.left,
+            .top = 0,
+            .right = l.pill.right,
+            .bottom = m.caption_h,
+        },
         .overflow => .{
             .left = l.overflow.left - m.btn_pad,
             .top = 0,
@@ -373,7 +451,7 @@ pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
 /// the part most likely to be wrong in a way nothing notices — a maximize
 /// button that always sends `SC_MAXIMIZE` looks perfect until you click it on
 /// an already-maximized window and nothing happens.
-pub const Command = enum { minimize, maximize, restore, close, menu };
+pub const Command = enum { minimize, maximize, restore, close, menu, reconnect };
 
 pub fn command(b: Button, maximized: bool) Command {
     return switch (b) {
@@ -381,6 +459,10 @@ pub fn command(b: Button, maximized: bool) Command {
         // It is in this enum anyway so that "what does this button do" has
         // exactly one answer, decided in the pure module with the rest.
         .overflow => .menu,
+        // Likewise ours: the caller re-dials the window's machine. Whether the
+        // pill is clickable AT ALL is `remote_pill.isAction`, which the caller
+        // checks before it ever gets here.
+        .pill => .reconnect,
         .minimize => .minimize,
         .maximize => if (maximized) .restore else .maximize,
         .close => .close,
@@ -399,6 +481,7 @@ pub fn hitTest(m: Metrics, l: Layout, x: i32, y: i32) ?Button {
     if (hitBox(m, l, .maximize).containsPoint(x, y)) return .maximize;
     if (hitBox(m, l, .minimize).containsPoint(x, y)) return .minimize;
     if (hitBox(m, l, .overflow).containsPoint(x, y)) return .overflow;
+    if (hitBox(m, l, .pill).containsPoint(x, y)) return .pill;
     return null;
 }
 
@@ -424,6 +507,11 @@ pub const NcHit = enum {
     top,
     top_left,
     top_right,
+    /// The remote connection pill (T367). It gets its own code for the same
+    /// reason the "…" borrows `HTSYSMENU`: the band's pixels are client but its
+    /// mouse messages are non-client, so a control here only sees hover and
+    /// click at all if the hit test names it.
+    pill,
     overflow,
     minimize,
     maximize,
@@ -486,6 +574,7 @@ pub fn ncHitTest(
     if (x < @min(client_right, l.band_left)) return .client;
 
     if (hitTest(m, l, x, y)) |b| return switch (b) {
+        .pill => .pill,
         .overflow => .overflow,
         .minimize => .minimize,
         .maximize => .maximize,
@@ -551,7 +640,7 @@ test "the system trio is three native slabs: 46 DIP, full height, flush, no gaps
     for (scales) |s| {
         for ([_]Mode{ .standalone, .with_tabs }) |mode| {
             const m = Metrics.init(s, mode);
-            const l = layout(m, 1200);
+            const l = layout(m, 1200, .{});
             for ([_]Rect{ l.minimize, l.maximize, l.close }) |r| {
                 try testing.expectEqual(m.cap_btn_w, r.width());
                 try testing.expectEqual(@as(i32, 0), r.top);
@@ -573,7 +662,7 @@ test "the app's own button keeps the shared square and a GROUP gap to the trio" 
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
         const ib = icon_button.Metrics.init(s);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expectEqual(ib.target, l.overflow.width());
         try testing.expectEqual(ib.target, l.overflow.height());
         try testing.expectEqual(m.pad_md, l.minimize.left - l.overflow.right);
@@ -596,7 +685,7 @@ test "caption button hit boxes never overlap each other" {
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const hover = hitBox(m, l, .overflow);
         const hmin = hitBox(m, l, .minimize);
         const hmax = hitBox(m, l, .maximize);
@@ -616,7 +705,7 @@ test "caption button hit boxes never overlap each other" {
 test "hitTest finds each button and nothing outside them" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const cy = @divTrunc(m.caption_h, 2);
         try testing.expectEqual(Button.overflow, hitTest(m, l, l.overflow.left + 1, cy).?);
         try testing.expectEqual(Button.minimize, hitTest(m, l, l.minimize.left + 1, cy).?);
@@ -638,7 +727,7 @@ test "the top-right corner lands on close, and is painted close" {
     // PAINTED close — no hit-box-vs-paint gap left to reason about.
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expectEqual(Button.close, hitTest(m, l, 1199, 0).?);
         try testing.expectEqual(Button.close, hitTest(m, l, 1199, m.caption_h - 1).?);
         try testing.expect(l.close.containsPoint(1199, 0));
@@ -652,7 +741,7 @@ test "the top-right corner lands on close, and is painted close" {
 test "drag region ends at the leftmost button's hit box, not its paint" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expect(isDragRegion(m, l, l.title.left + 1, 1));
         try testing.expect(isDragRegion(m, l, l.drag_right - 1, 1));
         try testing.expect(!isDragRegion(m, l, l.drag_right, 1));
@@ -667,7 +756,7 @@ test "drag region ends at the leftmost button's hit box, not its paint" {
 test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const frame: i32 = @intFromFloat(@round(8.0 * s));
         const border = resizeBorder(m, frame);
         const corner = resizeCorner(m, frame);
@@ -719,7 +808,7 @@ test "ncHitTest: over a TAB there is NO top resize edge - the tab owns its full 
     const frames = [_]i32{ 8, 9, 11, 13 }; // GetSystemMetricsForDpi sums measured at 96/120/144/192 dpi
     for (scales, frames) |s, frame| {
         const m = Metrics.init(s, .with_tabs);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const border = resizeBorder(m, frame);
         // A real system frame never hits the half-band clamp.
         try testing.expectEqual(frame, border);
@@ -753,7 +842,7 @@ test "ncHitTest: the band right of the drag region never falls to client" {
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const y = m.caption_h - 1;
         var x: i32 = l.drag_right;
         while (x < 1200) : (x += 1) {
@@ -769,7 +858,7 @@ test "a narrow window drops the title instead of painting it under the buttons" 
         // Just wide enough for the three slabs, the "…" and its insets, and
         // no more: there is nowhere for a title to go.
         const narrow = 3 * m.cap_btn_w + m.btn_paint + 3 * m.pad_md;
-        const l = layout(m, narrow);
+        const l = layout(m, narrow, .{});
         try testing.expect(l.title.isEmpty());
         // The buttons themselves are still laid out correctly — a cramped
         // window loses its title, never its close button, and never the only
@@ -818,8 +907,8 @@ test "layout is stable under width changes: only the anchor moves" {
     // that recomputed gaps from the width would drift here.
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const a = layout(m, 800);
-        const b = layout(m, 1000);
+        const a = layout(m, 800, .{});
+        const b = layout(m, 1000, .{});
         try testing.expectEqual(@as(i32, 200), b.close.left - a.close.left);
         try testing.expectEqual(@as(i32, 200), b.minimize.left - a.minimize.left);
         try testing.expectEqual(@as(i32, 200), b.overflow.left - a.overflow.left);
@@ -838,7 +927,7 @@ test "with_tabs: the band IS the strip's band, slabs span it, '…' sits on its 
         // Not "about the same height" — the same number, from the same module.
         try testing.expectEqual(ts.bar_h, m.caption_h);
 
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         // The system slabs span the merged band's full height, exactly what
         // Windows Terminal's caption buttons do in ITS tab row.
         for ([_]Rect{ l.minimize, l.maximize, l.close }) |r| {
@@ -860,8 +949,8 @@ test "with_tabs: standalone's horizontal arrangement is untouched" {
     // trio's widths, the group separation to the "…" — must be the same
     // number it was standalone, or the merge quietly became a redesign.
     for (scales) |s| {
-        const a = layout(Metrics.init(s, .standalone), 1200);
-        const b = layout(Metrics.init(s, .with_tabs), 1200);
+        const a = layout(Metrics.init(s, .standalone), 1200, .{});
+        const b = layout(Metrics.init(s, .with_tabs), 1200, .{});
         try testing.expectEqual(a.close.left, b.close.left);
         try testing.expectEqual(a.maximize.left, b.maximize.left);
         try testing.expectEqual(a.minimize.left, b.minimize.left);
@@ -873,10 +962,10 @@ test "with_tabs: standalone's horizontal arrangement is untouched" {
 test "with_tabs: the tabs are the title, so no title is laid out" {
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
-        try testing.expect(layout(m, 1200).title.isEmpty());
+        try testing.expect(layout(m, 1200, .{}).title.isEmpty());
         // ...and a standalone band of the same width still has one, so the
         // emptiness is the mode and not the width.
-        try testing.expect(!layout(Metrics.init(s, .standalone), 1200).title.isEmpty());
+        try testing.expect(!layout(Metrics.init(s, .standalone), 1200, .{}).title.isEmpty());
     }
 }
 
@@ -885,7 +974,7 @@ test "band_left is the seam: one group gap left of the button cluster" {
         const m = Metrics.init(s, .with_tabs);
         const ts = tab_strip.Metrics.init(s);
         const ib = icon_button.Metrics.init(s);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expectEqual(l.overflow.left - m.pad_md, l.band_left);
 
         // The contract with the strip: handed `band_left + strip_pad_r` as its
@@ -916,7 +1005,7 @@ test "band_left is the seam: one group gap left of the button cluster" {
 test "with_tabs: the strip's own controls answer .client, the caption's do not" {
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const y = m.caption_h - 1; // below any resize edge
         const frame: i32 = 8;
         const client_right = l.band_left; // strip filled its whole half
@@ -939,7 +1028,7 @@ test "a stale client_right can never swallow a caption button" {
     // close button must still close: it is clamped to the seam.
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const y = m.caption_h - 1;
         try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, 8, false, 100_000));
         try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, 8, false, 100_000));
@@ -952,7 +1041,7 @@ test "mergedTitleRect: one group gap off the '+', ending at the seam, in the tab
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
         const ts = tab_strip.Metrics.init(s);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         // A "+" well left of the seam: a short run, lots of drag band.
         const plus_right: i32 = dipPx(200.0, s);
         const r = mergedTitleRect(m, l, plus_right);
@@ -974,7 +1063,7 @@ test "mergedTitleRect: drops below the minimum width instead of ellipsizing to n
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
         const ts = tab_strip.Metrics.init(s);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expectEqual(ts.min_tab_w, m.merged_title_min_w);
         // Exactly the minimum gap: paints.
         const at_min = l.band_left - m.pad_md - m.merged_title_min_w;
@@ -994,7 +1083,7 @@ test "mergedTitleRect: drops below the minimum width instead of ellipsizing to n
 test "mergedTitleRect: standalone answers empty - the band's own title already exists" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         try testing.expect(mergedTitleRect(m, l, dipPx(200.0, s)).isEmpty());
         // ...and the standalone title rect is still there, so nothing painted
         // twice and nothing painted nowhere.
@@ -1008,7 +1097,7 @@ test "mergedTitleRect: stays inside the strip's half of the row" {
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s, .with_tabs);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         var plus: i32 = 0;
         while (plus < 1200) : (plus += 37) {
             const r = mergedTitleRect(m, l, plus);
@@ -1028,7 +1117,7 @@ test "over the strip the TAB wins the top rows; the corners and caption keep the
     // band, and over the caption's own controls.
     for (scales) |s| {
         const m = Metrics.init(s, .with_tabs);
-        const l = layout(m, 1200);
+        const l = layout(m, 1200, .{});
         const frame: i32 = 8;
         // A strip x with the strip full to the seam: the tab's row, not the frame's.
         try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, 0, frame, false, l.band_left));
@@ -1040,4 +1129,204 @@ test "over the strip the TAB wins the top rows; the corners and caption keep the
         // Maximized there is no resize edge, so the same point is the strip's.
         try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, 0, frame, true, l.band_left));
     }
+}
+
+// ---------------------------------------------------------------------
+// The remote connection pill (T367)
+// ---------------------------------------------------------------------
+
+/// A representative pill size for a scale: the same shape `remote_pill` builds,
+/// stated here as plain numbers so this module's tests stay free of it.
+fn samplePill(s: f32) Pill {
+    return .{
+        .w = @intFromFloat(@round(120.0 * s)),
+        .h = @intFromFloat(@round(20.0 * s)),
+        .interactive = true,
+    };
+}
+
+/// The same pill in its quiet (non-button) state.
+fn sampleQuietPill(s: f32) Pill {
+    var p = samplePill(s);
+    p.interactive = false;
+    return p;
+}
+
+test "no pill is the default, and it changes nothing about the band" {
+    for (scales) |s| {
+        for ([_]Mode{ .standalone, .with_tabs }) |mode| {
+            const m = Metrics.init(s, mode);
+            const l = layout(m, 1200, .{});
+            try testing.expect(l.pill.isEmpty());
+            try testing.expect(!l.pill_interactive);
+            try testing.expect(hitBox(m, l, .pill).isEmpty());
+            // Left of the "…"'s HIT box (which reaches `btn_pad` past its
+            // paint) there is nothing to hit at all — no pill, no sliver.
+            try testing.expect(hitTest(
+                m,
+                l,
+                l.overflow.left - m.btn_pad - 1,
+                @divTrunc(m.caption_h, 2),
+            ) == null);
+            // Byte-for-byte the layout the caption had before pills existed.
+            const zero: Pill = .{ .w = 0, .h = 0 };
+            try testing.expectEqual(l, layout(m, 1200, zero));
+        }
+    }
+}
+
+test "the pill sits one GROUP gap left of the button, on the button's center" {
+    for (scales) |s| {
+        for ([_]Mode{ .standalone, .with_tabs }) |mode| {
+            const m = Metrics.init(s, mode);
+            const p = samplePill(s);
+            const l = layout(m, 1200, p);
+
+            try testing.expect(!l.pill.isEmpty());
+            try testing.expectEqual(p.w, l.pill.width());
+            try testing.expectEqual(p.h, l.pill.height());
+            // §1: a GROUP separation from the "…", never a smaller fudge.
+            try testing.expectEqual(m.pad_md, l.overflow.left - l.pill.right);
+            // Same vertical center as the button's painted square, to the pixel
+            // — which is what makes the two read as one cluster.
+            const btn_cy2 = l.overflow.top + l.overflow.bottom;
+            try testing.expectEqual(btn_cy2, l.pill.top + l.pill.bottom);
+            // §0 rule 2: clear of the band's own edges.
+            try testing.expect(l.pill.top >= m.pad_sm);
+            try testing.expect(m.caption_h - l.pill.bottom >= m.pad_sm);
+        }
+    }
+}
+
+test "the pill takes its space from the title and the seam, not from the buttons" {
+    for (scales) |s| {
+        const p = samplePill(s);
+
+        // Standalone: the title stops a group gap short of the PILL now.
+        const ms = Metrics.init(s, .standalone);
+        const without = layout(ms, 1200, .{});
+        const with = layout(ms, 1200, p);
+        try testing.expectEqual(without.overflow, with.overflow);
+        try testing.expectEqual(without.minimize, with.minimize);
+        try testing.expectEqual(without.maximize, with.maximize);
+        try testing.expectEqual(without.close, with.close);
+        try testing.expectEqual(with.pill.left - ms.pad_md, with.title.right);
+        try testing.expect(with.title.right < without.title.right);
+
+        // Merged: the seam moves left with the pill, so the strip gets a
+        // narrower run rather than the two painters overlapping.
+        const mm = Metrics.init(s, .with_tabs);
+        const mwithout = layout(mm, 1200, .{});
+        const mwith = layout(mm, 1200, p);
+        try testing.expectEqual(mwith.pill.left - mm.pad_md, mwith.band_left);
+        try testing.expect(mwith.band_left < mwithout.band_left);
+        try testing.expect(mwith.pill.left >= mwith.band_left);
+    }
+}
+
+test "the drag region stops at a CLICKABLE pill, so dragging never fires it" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        const l = layout(m, 1200, samplePill(s));
+        const cy = @divTrunc(m.caption_h, 2);
+        try testing.expectEqual(l.pill.left, l.drag_right);
+        try testing.expect(!isDragRegion(m, l, l.pill.left, cy));
+        try testing.expect(isDragRegion(m, l, l.pill.left - 1, cy));
+    }
+}
+
+test "a quiet pill is still titlebar you can pick the window up by" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        const l = layout(m, 1200, sampleQuietPill(s));
+        const cy = @divTrunc(m.caption_h, 2);
+        const frame: i32 = 8;
+
+        // Same rect — the pill is drawn either way; only its click behavior
+        // differs, which is what keeps the band from reflowing when the link
+        // drops and comes back.
+        try testing.expectEqual(layout(m, 1200, samplePill(s)).pill, l.pill);
+        try testing.expect(!l.pill_interactive);
+
+        try testing.expect(hitBox(m, l, .pill).isEmpty());
+        try testing.expect(hitTest(m, l, l.pill.left + 1, cy) == null);
+        try testing.expect(isDragRegion(m, l, l.pill.left + 1, cy));
+        try testing.expectEqual(
+            NcHit.caption,
+            ncHitTest(m, l, l.pill.left + 1, cy, frame, true, 0),
+        );
+    }
+}
+
+test "the pill is hit over its whole capsule and the band's full height" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        const l = layout(m, 1200, samplePill(s));
+        const cy = @divTrunc(m.caption_h, 2);
+
+        try testing.expectEqual(Button.pill, hitTest(m, l, l.pill.left, cy).?);
+        try testing.expectEqual(Button.pill, hitTest(m, l, l.pill.right - 1, cy).?);
+        // The band's full height: a click just above the capsule is still the
+        // pill's, the same forgiveness the "…" gets.
+        try testing.expectEqual(Button.pill, hitTest(m, l, l.pill.left, 0).?);
+        try testing.expectEqual(Button.pill, hitTest(m, l, l.pill.left, m.caption_h - 1).?);
+        // And it never reaches past its own paint into the drag band.
+        try testing.expect(hitTest(m, l, l.pill.left - 1, cy) == null);
+        // Its neighbour still wins its own box.
+        try testing.expectEqual(Button.overflow, hitTest(m, l, l.overflow.left, cy).?);
+    }
+}
+
+test "the pill's hit box never overlaps the buttons'" {
+    for (scales) |s| {
+        for ([_]Mode{ .standalone, .with_tabs }) |mode| {
+            const m = Metrics.init(s, mode);
+            const l = layout(m, 1200, samplePill(s));
+            const boxes = [_]Rect{
+                hitBox(m, l, .pill),
+                hitBox(m, l, .overflow),
+                hitBox(m, l, .minimize),
+                hitBox(m, l, .maximize),
+                hitBox(m, l, .close),
+            };
+            for (boxes, 0..) |a, i| {
+                for (boxes[i + 1 ..]) |b| {
+                    try testing.expect(a.right <= b.left or b.right <= a.left);
+                }
+            }
+        }
+    }
+}
+
+test "WM_NCHITTEST names the pill, and the resize edge still outranks it" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        const l = layout(m, 1200, samplePill(s));
+        const frame: i32 = 8;
+        const cy = @divTrunc(m.caption_h, 2);
+        try testing.expectEqual(NcHit.pill, ncHitTest(m, l, l.pill.left + 1, cy, frame, false, 0));
+        // Restored, the top rows are the frame's — the same trade the caption
+        // buttons make, so the top edge stays grabbable across the whole band.
+        try testing.expectEqual(NcHit.top, ncHitTest(m, l, l.pill.left + 1, 0, frame, false, 0));
+        // Maximized there is no frame, so the pill owns its top row.
+        try testing.expectEqual(NcHit.pill, ncHitTest(m, l, l.pill.left + 1, 0, frame, true, 0));
+    }
+}
+
+test "a band too narrow for the pill drops it rather than clipping it" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .standalone);
+        // The buttons alone nearly fill the band: whatever is left cannot hold
+        // a 120 DIP capsule.
+        const narrow = m.cap_btn_w * 3 + m.btn_paint + m.pad_md * 2 + 4;
+        const l = layout(m, narrow, samplePill(s));
+        try testing.expect(l.pill.isEmpty());
+        // ...and the band degrades exactly as it did before pills existed.
+        try testing.expectEqual(layout(m, narrow, .{}), l);
+    }
+}
+
+test "command: the pill re-dials; nothing else in the caption does" {
+    try testing.expectEqual(Command.reconnect, command(.pill, false));
+    try testing.expectEqual(Command.reconnect, command(.pill, true));
 }

@@ -11595,3 +11595,59 @@ quick-terminal slide and its tray icon is never cleaned up; found while auditing
 timer ids for a free one. **T609** — the ladder's per-window state is only
 readable by grepping the log; put it in `+list --json` so T367's pill and T368's
 acceptance script read one source instead of two.
+
+## 2026-08-08 — T367: a remote window's titlebar says whether its connection is alive
+
+T366 taught a remote window to re-dial itself, but told nobody it was doing it:
+a machine that went away looked exactly like one that hadn't, and you found out
+by typing into a pane and watching nothing happen. The titlebar now carries a
+small chip. Green dot while the link is up; amber dot and `Reconnecting… 3/5`
+while the ladder is working through its attempts; a red **Reconnect** button
+once it has given up, which dials again the moment you click it. A local window
+has none — there is no machine to be connected to — and the band lays out
+byte-for-byte as it did before.
+
+The connected state is a dot with no words, and that is the design rather than
+an omission: a chip that permanently reads "Connected" is chrome that says
+nothing, so the pill only grows words when something is wrong. It also settles
+WCAG 1.4.1 without a second signal bolted on — the three states differ in
+whether there is text and in what it says, so hue is never the only thing
+carrying the state. Mac reaches the same place from the other direction (its
+status capsule is invisible while connected). The one deliberate divergence from
+Mac is the red: Mac's Reconnect button is accent-filled because its separate red
+dot is still on screen beside it, and here the pill is one control, so the color
+that means "broken" has to be on the control itself. Filed as **D36** for the
+user to overturn if they disagree.
+
+Three things fell out of building it. The geometry is a new pure module
+(`remote_pill.zig`, asserted at 1.0/1.25/1.5/2.0 with a contrast sweep across
+eight bands and two accents), so the caption keeps its own file to itself.
+`chrome_theme` gained the status tones — green/amber/red — that
+`chooser_sessions` had privately, because the pill wanted the same three colors
+and a second definition of what green means is the divergence that module exists
+to prevent. And every `rc.ladder` write in `RemoteReconnect` now goes through one
+`setLadder` that repaints: the driver mutates state from a 250ms timer nobody
+repaints on, so a transition that did not invalidate the chrome is precisely how
+the chip would end up showing a state the window left minutes ago.
+
+A quiet pill is deliberately NOT a button — it has no hit box, so it stays part
+of the drag region. Without that, a window whose titlebar is mostly tab strip
+grows a patch you cannot pick it up by, which is the kind of defect you only
+notice when your window will not move.
+
+Floor green — none PASS (284s), win32 PASS (337s), agent PASS (312s), P1–P3 ALL
+PASS. `test\win32\remote-pill.ps1` ALL PASS (6 checks): it opens a real remote
+window against a loopback agent and reads PAINTED pixels — the green dot, then
+the red capsule and an `HTOBJECT` hit test 39s after the agent is killed, then
+the immediate manual dial after the click, and a local window with nothing there
+at all. Its `-NegativeControl` fails, as it must.
+
+Filed: **T611** — the Reconnect button reaches `manualReconnect` and dials with
+no backoff (measured: `attempt 1/5 in 0ms`), but `onDialed` calls
+`onProbeOutcome` with a hardcoded `fresh_session_on_gone = false` and asserts
+the case away, so a click after the remote box rebooted goes terminal instead of
+opening a fresh shell. The policy has modelled the right answer since T365; this
+task is the first caller to reach the gap, and section 4 of the acceptance
+script asserts the ATTEMPT rather than the recovery until it is closed.
+**T610** — the machine-name half of Mac's pill (which machine, and
+click-to-open-Activity-Monitor), split out rather than dropped.

@@ -285,4 +285,10 @@ test {
     // the app keybind set is consulted with, plus which bound actions a
     // viewer pane forwards at all (T394). Same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_accel.zig");
+
+    // Pure win32 remote connection pill — the caption-band affordance's
+    // wording, geometry and contrast floors (T367). Its only non-std imports
+    // are sibling pure modules and the reconnect policy, so it builds and tests
+    // in every lane.
+    _ = @import("apprt/win32/remote_pill.zig");
 }
