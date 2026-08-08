@@ -117,7 +117,16 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           meson --version
 
-          git clone --depth 1 --branch "$MSITOOLS_TAG" \
+          # Full clone, submodules included, and neither is incidental:
+          #   * meson.build calls find_program on subprojects/bats-core/bin/bats
+          #     unconditionally (it is a git submodule, not a meson wrap), so a
+          #     plain clone fails configure outright.
+          #   * the project version comes from `build-aux/git-version-gen`,
+          #     i.e. git describe -- and a --depth 1 clone of an ANNOTATED tag
+          #     leaves no tag object to describe against, which would make
+          #     wixl report a version the assertion below then rejects.
+          git clone --recurse-submodules --shallow-submodules \
+            --branch "$MSITOOLS_TAG" \
             https://gitlab.gnome.org/GNOME/msitools.git /tmp/msitools
           meson setup /tmp/msitools/_build /tmp/msitools --prefix=/usr/local
           ninja -C /tmp/msitools/_build
