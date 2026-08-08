@@ -9,6 +9,36 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-08 - **T191 done - "Float on Top" is a row in the Windows Window
+  menu**. The task's premise was half wrong and reading beat grepping again:
+  `App.zig` has handled `.float_window` since the FIRST win32 commit
+  (`e0118f682`) — the original evidence searched for the core binding name
+  (`toggle_window_float_on_top`) while the apprt switches on the action name
+  the core translates it into. What was actually missing was the surface:
+  `commands.zig` had no id, so the feature was in no menu and no palette and
+  could only be reached by hand-writing a keybind. Fix: registry gains
+  `toggle_float_on_top` ("Toggle Float on Top", the core's own palette title);
+  the Window menu gains `Fl&oat on Top` directly after Return To Default Size,
+  where `MainMenu.xib` puts it, CHECKED off the window's live `GWL_EXSTYLE`
+  (never a mirrored flag — the OS owns that bit and propagates it to owned
+  popups) and GRAYED on the quick terminal, mirroring Mac's
+  `validateMenuItem`; `App.zig` refuses the toggle on the quick terminal for
+  the palette/keybind paths and calls `Window.healOverlayZOrders()` after the
+  band change. New `menu-bar.ps1` section I (7 assertions) drives the row and
+  reads `WS_EX_TOPMOST` back off the live window in both directions.
+  **Bonus measurement for T277**, which claims float-on-top does nothing on
+  this box: through the product's own menu path it takes AND KEEPS the bit,
+  including across the menu traffic that follows. T277 stays open — it measured
+  the keybind path and says nothing yet about propagation to a live banner,
+  which is what `overlay-zorder.ps1` section E waits on — with the evidence in
+  its progress log. Surprise en route: `menu-bar.ps1` section G was already red
+  on a STALE ORACLE, not a defect — it polled for `+read` FAILING as proof a
+  pane had reached the alternate screen, and T193 (2026-08-06) deliberately
+  made that read succeed and return the visible screen. Re-pointed at the
+  other side of the same fact (the alt screen starts empty, so the pane reads
+  back blank). Floor: three zig lanes + P1-P3 + menu-bar.ps1 (ALL PASS, 78).
+  Filed T597: the agent lane's T400 stale-debounce arm is flaky — failed once,
+  passed on an immediate unoverlapped re-run.
 - 2026-08-07 - **T380 done - unfocused viewer panes now dim like terminals**.
   The T74 dim overlay reaches viewer panes: `ViewerPane` owns the same
   `DimOverlay` layered popup a `Surface` does (lazily created on the T373

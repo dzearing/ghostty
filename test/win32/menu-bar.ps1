@@ -24,6 +24,10 @@
 #   G: keyboard activation - F10 and a lone Alt open the menu; alt+<key> does
 #      not; and F10 is passed through to a full-screen TUI (alternate screen)
 #      instead of opening the menu, then works again on the primary screen.
+#   I: T191 - Window>Float on Top flips the window's live WS_EX_TOPMOST and the
+#      row comes back CHECKED, then both revert. The action shipped with the
+#      first win32 commit and had no surface whatsoever; this is the oracle for
+#      the surface AND for the bit actually sticking.
 #   H: T260 - a `window-decoration = none` window has no caption to host the
 #      menu, so the strip keeps its "=" button there and it opens the same
 #      menu. The positive control for A's "the strip has no button": without
@@ -553,6 +557,7 @@ $expectedTree = @(
     "&Window/&Last Tab"
     '&Window/---'
     "&Window/Return To &Default Size"
+    "&Window/Fl&oat on Top"
     '&Help >'
     "&Help/Ghoztty &Help"
     '&Help/---'
@@ -804,6 +809,58 @@ $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&View/Terminal Read-&only") -eq '') 'C: a second choice clears the check'
 Close-Menu $g
 
+# --- I: Window>Float on Top (T191) -----------------------------------------
+# The row is the whole point of T191 - the ACTION existed from the first win32
+# commit and had no surface at all. So this asserts both halves by outcome: the
+# window's live WS_EX_TOPMOST (read off the window, never a mirrored flag) and
+# the checkmark the next menu open reports.
+function Test-WindowTopmost([IntPtr]$h) {
+    return ((Get-TestWindowStyle -Window $h -ExStyle) -band 0x8) -ne 0
+}
+$tree = Open-Menu $g
+Assert ($null -ne $tree -and (Row-Flags $tree "&Window/Fl&oat on Top") -eq '') `
+    'I: Float on Top is enabled and UNCHECKED on a plain window'
+Close-Menu $g
+Assert (-not (Test-WindowTopmost $g.Top)) 'I: the window does not start out topmost'
+
+[void](Click-MenuHost $g.Top)
+[void](Wait-Menu $g.Pid 3000)
+Send-MenuKey $g.Top 'W'  # Window
+Start-Sleep -Milliseconds 300
+Send-MenuKey $g.Top 'O'  # Float on Top
+[void](Test-MenuGone $g.Pid 2500)
+$floated = $false
+for ($t = 0; $t -lt 20; $t++) {
+    Start-Sleep -Milliseconds 250
+    if (Test-WindowTopmost $g.Top) { $floated = $true; break }
+}
+Assert $floated 'I: Window>Float on Top put WS_EX_TOPMOST on the window'
+$tree = Open-Menu $g
+Assert ($null -ne $tree -and (Row-Flags $tree "&Window/Fl&oat on Top") -eq ':checked') `
+    'I: the row comes back CHECKED, from the live ex-style'
+Close-Menu $g
+# The bit must still be there after all of that menu traffic - a float that
+# only holds until the next window message is not a float (T277).
+Assert (Test-WindowTopmost $g.Top) 'I: the window is STILL topmost after reopening the menu'
+
+# ...and off again, so the rest of the run is not fighting a topmost window.
+[void](Click-MenuHost $g.Top)
+[void](Wait-Menu $g.Pid 3000)
+Send-MenuKey $g.Top 'W'
+Start-Sleep -Milliseconds 300
+Send-MenuKey $g.Top 'O'
+[void](Test-MenuGone $g.Pid 2500)
+$unfloated = $false
+for ($t = 0; $t -lt 20; $t++) {
+    Start-Sleep -Milliseconds 250
+    if (-not (Test-WindowTopmost $g.Top)) { $unfloated = $true; break }
+}
+Assert $unfloated 'I: a second choice clears WS_EX_TOPMOST again'
+$tree = Open-Menu $g
+Assert ($null -ne $tree -and (Row-Flags $tree "&Window/Fl&oat on Top") -eq '') `
+    'I: and the checkmark goes with it'
+Close-Menu $g
+
 # --- C/D: Window>Zoom Split, with a real split ----------------------------
 $paneName = Pane-Name
 & $exe +split --target=$paneName --direction=right 2>&1 | Out-Null
@@ -873,12 +930,18 @@ $inner = '[Console]::Write((-join @([char]27,"[?1049h"))); Start-Sleep 12; ' +
          '[Console]::Write((-join @([char]27,"[?1049l"))); Write-Host "' + $marker + '"'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
 & $exe +send-keys --target=$paneName "powershell -NoProfile -EncodedCommand $b64" Enter 2>&1 | Out-Null
-# On the alternate screen there is no scrollback for +read to return, which
-# is the cheapest proof the switch landed.
+# T193 (2026-08-06) changed what this measurement looks like: +read on an
+# alternate-screen pane now SUCCEEDS and returns the visible screen, so "the
+# read fails" - what this loop used to poll for - stopped being reachable and
+# section G went red on a stale oracle rather than on a defect. The switch is
+# still trivially observable, just from the other side: the alternate screen
+# starts EMPTY, so the pane that was echoing a prompt and a typed command line
+# reads back blank the moment it lands there.
 $onAlt = $false
 for ($t = 0; $t -lt 20; $t++) {
     Start-Sleep -Milliseconds 400
-    if ((Read-Exit $paneName) -ne 0) { $onAlt = $true; break }
+    if ((Read-Exit $paneName) -ne 0) { continue }
+    if ((Read-Text $paneName 40).Trim().Length -eq 0) { $onAlt = $true; break }
 }
 Assert $onAlt 'G: the pane switched to the alternate screen (setup for the F10 pass-through)'
 if ($onAlt) {

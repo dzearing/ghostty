@@ -84,6 +84,16 @@ pub const State = struct {
     /// `session-persistence` is on, so quitting DETACHES sessions for
     /// re-attach rather than ending them — and the menu must say so (T89e).
     session_persistence: bool = false,
+    /// The window currently carries `WS_EX_TOPMOST` (T191), so the Float on
+    /// Top row shows a checkmark. Read from the live ex-style at open time,
+    /// never tracked separately — the OS owns this bit and another process
+    /// can change it.
+    float_on_top: bool = false,
+    /// This is the quick terminal, which topmosts itself as part of how it
+    /// works. Float on Top would fight it, so the row is grayed — matching
+    /// Mac, where `validateMenuItem` disables it for anything that is not a
+    /// primary terminal window (`AppDelegate.swift`).
+    is_quick_terminal: bool = false,
 };
 
 pub const Flags = struct {
@@ -202,6 +212,10 @@ const window_menu = [_]Node{
     .{ .item = .{ .cmd = .last_tab, .title = u16lit("&Last Tab") } },
     .separator,
     .{ .item = .{ .cmd = .reset_window_size, .title = u16lit("Return To &Default Size") } },
+    // Mac's Window menu puts Float on Top directly after Return To Default
+    // Size (`MainMenu.xib`), and it is a checkable row there — so it is one
+    // here. `F` and `T` are already spoken for at this level, hence `o`.
+    .{ .item = .{ .cmd = .toggle_float_on_top, .title = u16lit("Fl&oat on Top") } },
 };
 
 const help_menu = [_]Node{
@@ -361,6 +375,13 @@ pub fn flags(cmd: commands.Id, state: State) Flags {
         => .{ .enabled = state.pane_count > 1 },
 
         .toggle_readonly => .{ .checked = state.readonly },
+
+        // A checkmark, and grayed on the one window that manages its own
+        // topmost state.
+        .toggle_float_on_top => .{
+            .enabled = !state.is_quick_terminal,
+            .checked = state.float_on_top,
+        },
 
         else => .{},
     };
@@ -541,6 +562,32 @@ test "state gates the rows whose target may not exist" {
     try std.testing.expect(flags(.new_window, empty).enabled);
     try std.testing.expect(flags(.quit, empty).enabled);
     try std.testing.expect(flags(.about, empty).enabled);
+}
+
+test "float on top is a checkmark, and grayed on the quick terminal (T191)" {
+    // Unchecked and reachable on a plain window...
+    try std.testing.expect(!flags(.toggle_float_on_top, .{}).checked);
+    try std.testing.expect(flags(.toggle_float_on_top, .{}).enabled);
+    // ...checked once the window carries the bit...
+    try std.testing.expect(flags(.toggle_float_on_top, .{ .float_on_top = true }).checked);
+    // ...and grayed on the quick terminal, whichever way the bit reads,
+    // because the quick terminal topmosts itself.
+    try std.testing.expect(!flags(.toggle_float_on_top, .{ .is_quick_terminal = true }).enabled);
+    try std.testing.expect(!flags(
+        .toggle_float_on_top,
+        .{ .is_quick_terminal = true, .float_on_top = true },
+    ).enabled);
+    // The gate is specific to this row: a quick terminal's other rows are
+    // untouched by it.
+    try std.testing.expect(flags(.toggle_fullscreen, .{ .is_quick_terminal = true }).enabled);
+}
+
+test "float on top sits where Mac puts it, at the foot of the Window menu (T191)" {
+    // `MainMenu.xib` has Float on Top directly after Return To Default Size.
+    const last = window_menu[window_menu.len - 1];
+    const prev = window_menu[window_menu.len - 2];
+    try std.testing.expectEqual(commands.Id.toggle_float_on_top, last.item.cmd);
+    try std.testing.expectEqual(commands.Id.reset_window_size, prev.item.cmd);
 }
 
 test "read-only is a checkmark, not a gray-out" {

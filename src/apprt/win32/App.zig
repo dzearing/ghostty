@@ -4996,7 +4996,15 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const win_hwnd = core_surface.rt_surface.parent_window.hwnd orelse return true;
+                    const window = core_surface.rt_surface.parent_window;
+                    // The quick terminal topmosts itself as part of how it
+                    // works; letting this action fight it would leave it
+                    // sliding under other windows. Mac refuses for the same
+                    // reason (`validateMenuItem` in AppDelegate.swift), and
+                    // the menu row is grayed here to match — this is the
+                    // guard for the palette and a keybind, which are not.
+                    if (window.is_quick_terminal) return true;
+                    const win_hwnd = window.hwnd orelse return true;
                     const ex = w32.GetWindowLongPtrW(win_hwnd, w32.GWL_EXSTYLE);
                     const is_topmost = (ex & @as(isize, w32.WS_EX_TOPMOST)) != 0;
                     const want: bool = switch (value) {
@@ -5015,6 +5023,13 @@ pub fn performAction(
                         0,
                         w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE,
                     );
+                    // Changing bands moves every popup this window owns —
+                    // the OS drags them along, but only as far as the band,
+                    // not to the seat directly above their owner. Re-check
+                    // them so a banner cannot end up over another app on the
+                    // way in, or under a foreign window on the way out (the
+                    // T142 invariant, from the other direction).
+                    window.healOverlayZOrders();
                 },
             }
             return true;

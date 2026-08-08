@@ -95,6 +95,7 @@ pub const Id = enum {
     toggle_maximize,
     reset_window_size,
     toggle_window_decorations,
+    toggle_float_on_top,
     toggle_background_opacity,
     toggle_quick_terminal,
     toggle_visibility,
@@ -210,6 +211,10 @@ pub const registry = [_]Command{
     .{ .id = .toggle_maximize, .name = "Toggle Maximize", .action = .toggle_maximize },
     .{ .id = .reset_window_size, .name = "Reset Window Size", .action = .reset_window_size },
     .{ .id = .toggle_window_decorations, .name = "Toggle Window Decorations", .action = .toggle_window_decorations },
+    // The name is the core's own palette title for this action
+    // (`src/input/command.zig`), so the words a user learns from the Mac or
+    // GTK palette find it here too.
+    .{ .id = .toggle_float_on_top, .name = "Toggle Float on Top", .action = .toggle_window_float_on_top },
     .{ .id = .toggle_background_opacity, .name = "Toggle Background Opacity", .action = .toggle_background_opacity },
     .{ .id = .toggle_quick_terminal, .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },
     .{ .id = .toggle_visibility, .name = "Show/Hide All Terminals", .action = .toggle_visibility },

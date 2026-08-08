@@ -107,6 +107,7 @@ const host_defaults = @import("host_defaults.zig");
 const commands = @import("commands.zig");
 const menu_bar = @import("menu_bar.zig");
 const menu_label = @import("menu_label.zig");
+const overlay_zorder = @import("overlay_zorder.zig");
 const tab_tooltip = @import("tab_tooltip.zig");
 const internal_os = @import("../../os/main.zig");
 
@@ -5300,7 +5301,14 @@ fn menuBarState(self: *Window) menu_bar.State {
         .tab_count = self.tab_count,
         .pane_count = if (self.tab_count > 0) self.leafCount(self.active_tab) else 1,
         .session_persistence = self.app.config.@"session-persistence",
+        .is_quick_terminal = self.is_quick_terminal,
     };
+    // T191: read the topmost bit off the window rather than tracking it —
+    // the OS owns it (it propagates to owned popups, and another process can
+    // set it), so a mirrored flag could only ever be a second version of the
+    // truth.
+    if (self.hwnd) |hwnd| state.float_on_top =
+        overlay_zorder.isTopmost(w32.GetWindowLongW(hwnd, w32.GWL_EXSTYLE));
     if (self.getActiveSurface()) |surface| {
         state.search_active = surface.search_active;
         if (surface.core_surface_ready) {
