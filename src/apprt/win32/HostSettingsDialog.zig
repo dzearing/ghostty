@@ -150,8 +150,9 @@ pub fn layoutFor(
 
     const field_left = margin + label_w + label_gap;
     const field_right = client_w - margin;
-    // Labels sit on the field's text baseline band, not the field's full box.
-    const label_h = px(18, scale);
+    // Labels sit on the field's text baseline band, not the field's full box —
+    // one line of the ramp's body, boxed by the ramp (T313).
+    const label_h = type_ramp.lineBox(type_ramp.body(scale), scale);
     const label_drop = @divTrunc(field_h - label_h, 2);
 
     const cancel_left = client_w - margin - btn_w;
@@ -239,21 +240,26 @@ pub fn prompt(
     var caption_buf: [256]u16 = undefined;
     const caption = captionFor(&caption_buf, machine_name);
 
+    // T310 pointed this dialog's LAYOUT at the ramp but left the GDI font it
+    // actually draws with at the retired 15, so `layoutFor` was doing its
+    // arithmetic against a 14 that no text on screen was ever set in. Both
+    // ends read the ramp now (T313) — a half-migrated dialog is worse than an
+    // unmigrated one, because its numbers look right.
     const font = w32.CreateFontW(
-        -px(15, scale),
+        -type_ramp.body(scale).height,
         0,
         0,
         0,
-        400,
-        0,
-        0,
-        0,
-        0,
+        type_ramp.weight_normal,
         0,
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     defer if (font) |f| {
         _ = w32.DeleteObject(f);
@@ -855,4 +861,18 @@ test "nextFocusIndex: wd -> shell -> Save -> Cancel -> wrap" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "layoutFor: the font comes from the ramp, and so does the drawn font (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        try testing.expectEqual(
+            type_ramp.body(scale).height,
+            layoutFor(scale, 400, 60, 120, 88).font_h,
+        );
+    }
+    // T310 migrated this dialog's arithmetic and left its `CreateFontW` at the
+    // retired 15, so the layout measured a 14 that nothing was drawn in. Both
+    // read `type_ramp.body` now; this is the number a reviewer can check the
+    // font call against.
+    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 400, 60, 120, 88).font_h);
 }

@@ -115,6 +115,7 @@ const sample_gate = @import("sample_gate.zig");
 const icon_button = @import("icon_button.zig");
 const icon_button_paint = @import("icon_button_paint.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const type_ramp = @import("type_ramp.zig");
 const panel_theme = @import("panel_theme.zig");
 const brush_cache = @import("brush_cache.zig");
 const system_colors = @import("system_colors.zig");
@@ -1580,10 +1581,15 @@ pub fn ownsHwnd(self: *const ActivityMonitor, hwnd: w32.HWND) bool {
 }
 
 fn createFonts(self: *ActivityMonitor, l: layout_mod.Layout) void {
-    self.font = makeFont(l.font_h, 400, "Segoe UI");
-    self.num_font = makeFont(l.font_h, 400, "Consolas");
-    self.title_font = makeFont(l.title_font_h, 600, "Segoe UI");
-    self.caption_font = makeFont(l.caption_font_h, 400, "Segoe UI");
+    // Sizes and weights both come from the layout, which gets them from
+    // `type_ramp` (T313) — a literal 600 here is how a weight drifts from the
+    // ramp while the size still agrees with it. `num_font` is the one
+    // deliberate exception: same ramp height, Consolas face, because the
+    // numeric columns are tabular (see the note above `drawTable`).
+    self.font = makeFont(l.font_h, type_ramp.weight_normal, type_ramp.face);
+    self.num_font = makeFont(l.font_h, type_ramp.weight_normal, "Consolas");
+    self.title_font = makeFont(l.title_font_h, l.title_font_weight, type_ramp.face);
+    self.caption_font = makeFont(l.caption_font_h, type_ramp.weight_normal, type_ramp.face);
     if (self.font) |f| {
         for ([_]w32.HWND{ self.filter, self.show_all_btn, self.new_proc_btn, self.kill_btn }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);

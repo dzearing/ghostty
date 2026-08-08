@@ -217,9 +217,9 @@ pub fn rowMetrics(scale: f32) RowMetrics {
     // matching the text the moment the ramp moved.
     const v_pad = px(4, scale);
     const title_y = v_pad;
-    const title_h = type_ramp.body(scale).height + px(4, scale);
+    const title_h = type_ramp.lineBox(type_ramp.body(scale), scale);
     const subtitle_y = title_y + title_h + px(2, scale);
-    const subtitle_h = type_ramp.caption(scale).height + px(4, scale);
+    const subtitle_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
     const height = subtitle_y + subtitle_h + v_pad;
 
     // §2.2's ring, in the pill's own coordinates. Both numbers are quoted from

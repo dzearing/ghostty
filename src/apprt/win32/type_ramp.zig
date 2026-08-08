@@ -46,6 +46,14 @@ pub const subtitle_dip: f32 = 20;
 pub const weight_normal: i32 = 400;
 pub const weight_semibold: i32 = 600;
 
+/// The leading a single line of text gets on top of its character height when
+/// a layout has to reserve a box for it — the `sm` step of the 4 DIP spacing
+/// scale. One number, because a line box written out per dialog is the same
+/// silent-divergence hazard the ramp itself removes: `BannerDialog` reserved a
+/// flat 16 px for a 15 px label, which was a fit by coincidence and would have
+/// clipped the moment either number moved.
+pub const leading_dip: f32 = 4;
+
 fn px(v: f32, scale: f32) i32 {
     return @intFromFloat(@round(v * scale));
 }
@@ -70,6 +78,14 @@ pub fn bodyStrong(scale: f32) Font {
 /// A pane's subject: the biggest text on a dialog surface.
 pub fn subtitle(scale: f32) Font {
     return .{ .height = px(subtitle_dip, scale), .weight = weight_semibold };
+}
+
+/// The height of the box a layout reserves for ONE line of `f`: the character
+/// height plus `leading_dip`. Use it wherever a rect exists to hold a line of
+/// text — a label row, a hint strip, a row title — so the box follows the ramp
+/// instead of being a constant that happens to be big enough today.
+pub fn lineBox(f: Font, scale: f32) i32 {
+    return f.height + px(leading_dip, scale);
 }
 
 /// The face every role is set in. One name, so a dialog cannot half-migrate.
@@ -101,6 +117,25 @@ test "the ramp is 12 / 14 / 20 at 1.0, and nothing else" {
         if (i == 0 or h != seen[i - 1]) distinct += 1;
     }
     try testing.expectEqual(@as(usize, 3), distinct);
+}
+
+test "a line box is the ramp height plus one leading step, at every scale" {
+    try testing.expectEqual(@as(i32, 16), lineBox(caption(1.0), 1.0));
+    try testing.expectEqual(@as(i32, 18), lineBox(body(1.0), 1.0));
+    try testing.expectEqual(@as(i32, 24), lineBox(subtitle(1.0), 1.0));
+
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        // The box always clears its text, and never by more than one step —
+        // a box that has drifted away from its font is the defect this exists
+        // to prevent.
+        inline for (.{ caption, body, subtitle }) |role| {
+            const f = role(scale);
+            try testing.expect(lineBox(f, scale) > f.height);
+            try testing.expectEqual(f.height + @as(i32, @intFromFloat(@round(leading_dip * scale))), lineBox(f, scale));
+        }
+        // Emphasis does not change the box, because it does not change the size.
+        try testing.expectEqual(lineBox(body(scale), scale), lineBox(bodyStrong(scale), scale));
+    }
 }
 
 test "caption is never smaller than the system's own body metric" {

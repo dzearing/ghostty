@@ -30,6 +30,7 @@ const Window = @import("Window.zig");
 const Surface = @import("Surface.zig");
 const viewer_nav = @import("viewer_nav.zig");
 const w32 = @import("win32.zig");
+const type_ramp = @import("type_ramp.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -100,8 +101,10 @@ pub const Layout = struct {
 };
 
 pub fn layout(scale: f32) Layout {
+    const body = type_ramp.body(scale);
     const margin = px(16, scale);
-    const label_h = px(16, scale);
+    // One line of body text, boxed by the ramp (T313).
+    const label_h = type_ramp.lineBox(body, scale);
     const label_gap = px(6, scale);
     const edit_h = px(26, scale);
     const btn_gap_v = px(18, scale);
@@ -124,7 +127,7 @@ pub fn layout(scale: f32) Layout {
         .edit = .{ .left = margin, .top = edit_top, .right = client_w - margin, .bottom = edit_top + edit_h },
         .ok = .{ .left = ok_left, .top = btn_top, .right = ok_left + btn_w, .bottom = btn_top + btn_h },
         .cancel = .{ .left = cancel_left, .top = btn_top, .right = cancel_left + btn_w, .bottom = btn_top + btn_h },
-        .font_h = px(15, scale),
+        .font_h = body.height,
     };
 }
 
@@ -324,7 +327,7 @@ pub fn open(window: *Window, level: Level, target: ?*Surface) void {
         0,
         0,
         0,
-        400,
+        type_ramp.weight_normal,
         0,
         0,
         0,
@@ -333,7 +336,7 @@ pub fn open(window: *Window, level: Level, target: ?*Surface) void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     if (self.font) |f| {
         if (label) |lbl| _ = w32.SendMessageW(lbl, w32.WM_SETFONT, @intFromPtr(f), 1);
@@ -645,4 +648,17 @@ test "layout: scales with DPI" {
     try testing.expectEqual(l1.client_h * 2, l2.client_h);
     try testing.expectEqual(l1.edit.left * 2, l2.edit.left);
     try testing.expectEqual(l1.font_h * 2, l2.font_h);
+}
+
+test "layout: the font and the label box come from the ramp (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        try testing.expectEqual(
+            type_ramp.lineBox(type_ramp.body(scale), scale),
+            l.label.bottom - l.label.top,
+        );
+        try testing.expect(l.label.bottom - l.label.top > l.font_h);
+    }
+    try testing.expectEqual(@as(i32, 14), layout(1.0).font_h);
 }

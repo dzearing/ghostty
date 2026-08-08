@@ -11109,3 +11109,42 @@ Floor green: `floor-lane -Lane all` ALL LANES PASS, `hero-mode.ps1` ALL PASS
 
 Filed: **T582** — Mac's hero divider ignores `split-divider-color` the same
 way, verified by reading the source this port was checked against.
+
+## 2026-08-07 — T313: every Windows dialog finally reads at the same size
+
+T310 built `type_ramp.zig` and pointed the Ctrl+Shift+N surface at it, which
+left the app in a state that is worse than the one it fixed: the chooser read
+at 14 while the rename box, the banner editor, confirmations, the New Process
+form and the Activity Monitor all read at 15. Opening two dialogs showed it.
+All five read the ramp now — size, weight AND face, because a dialog that takes
+its size from the ramp and hardcodes a `600` beside it has only moved where the
+divergence hides. `activity_layout` gained a `title_font_weight` for that
+reason; `ActivityMonitor` no longer spells a weight out next to a ramp height.
+
+The design system already said a line box is its role's height plus 4 DIP of
+leading, but every caller derived it by hand — five copies in the chooser
+alone. That is now `type_ramp.lineBox(font, scale)`, and the constants that
+were standing in for it are gone: `BannerDialog` reserved a flat 16 for a 15 px
+label, a fit by coincidence that would have clipped the moment either number
+moved. The rule is for boxes that HOLD TEXT and deliberately not for
+interactive rows — `HostSettingsDialog`'s combo `item_h` stays at `font_h + 6`,
+because a click target is sized to what it must hold, not to the text in it,
+and §2.4 now says so instead of leaving the difference to be guessed at.
+
+Turned up on the way: **`HostSettingsDialog` was half-migrated by T310** — its
+`layoutFor` reported the ramp's 14 while its `CreateFontW` still asked for 15,
+so the dialog measured itself against a size no text on it was ever drawn in.
+Both ends read the ramp now. A half-migrated dialog is worse than an unmigrated
+one precisely because its numbers look right.
+
+The new tests were mutation-checked rather than trusted: moving `body_dip`
+14 → 15 turns four of them red with `expected 14, found 15`. Floor green —
+`floor-lane -Lane all` ALL LANES PASS, P1–P3 ALL PASS, `pane-banner.ps1` ALL
+PASS (88), `activity-monitor.ps1` ALL PASS (114), `host-settings.ps1` ALL PASS
+(65).
+
+Filed: **T583** — the pane banner is the eighth copy of the retired 15, and its
+six-step markdown heading scale needs a stated relationship to a three-size
+ramp. **T584** — the tab strip and window title draw at 16, a size the ramp
+does not have at all; the face there is user-configurable, so whether the size
+should follow the ramp is a decision to make rather than a patch to apply.

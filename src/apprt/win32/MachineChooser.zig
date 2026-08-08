@@ -678,7 +678,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        400,
+        type_ramp.weight_normal,
         0,
         0,
         0,
@@ -687,7 +687,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     if (self.font) |f| {
         for ([_]w32.HWND{
@@ -706,7 +706,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        400,
+        type_ramp.weight_normal,
         0,
         1,
         0,
@@ -741,7 +741,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        400,
+        type_ramp.weight_normal,
         0,
         0,
         0,
@@ -750,7 +750,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     // The status strip is the same caption role (§3.2), and `hint_line_h` is
     // derived from it — so it takes the caption font rather than the body one,
@@ -774,7 +774,7 @@ pub fn open(window: *Window) void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
 
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));

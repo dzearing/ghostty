@@ -28,6 +28,7 @@ const std = @import("std");
 const App = @import("App.zig");
 const actions = @import("activity_actions.zig");
 const w32 = @import("win32.zig");
+const type_ramp = @import("type_ramp.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -152,7 +153,9 @@ pub fn layoutFor(
 
     const field_left = margin + label_w + label_gap;
     const field_right = client_w - margin;
-    const label_h = px(18, scale);
+    // The label is one line of the ramp's body, so its box is the ramp's line
+    // box (T313) — the same 18 at 1.0 it always was, now for a reason.
+    const label_h = type_ramp.lineBox(type_ramp.body(scale), scale);
     const label_drop = @divTrunc(field_h - label_h, 2);
 
     const cancel_left = client_w - margin - btn_w;
@@ -203,7 +206,7 @@ pub fn layoutFor(
             .right = cancel_left + btn_w,
             .bottom = btn_top + btn_h,
         },
-        .font_h = px(15, scale),
+        .font_h = type_ramp.body(scale).height,
     };
 }
 
@@ -235,21 +238,22 @@ pub fn prompt(
     var caption_buf: [256]u16 = undefined;
     const caption = captionFor(&caption_buf, source_label);
 
+    // Measured in and drawn in the ramp's body, from one call (T313).
     const font = w32.CreateFontW(
-        -px(15, scale),
+        -type_ramp.body(scale).height,
         0,
         0,
         0,
-        400,
-        0,
-        0,
-        0,
-        0,
+        type_ramp.weight_normal,
         0,
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     defer if (font) |f| {
         _ = w32.DeleteObject(f);
@@ -775,4 +779,14 @@ test "nextFocusIndex: forward and backward wrap around the four stops" {
     try testing.expectEqual(@as(usize, 0), nextFocusIndex(3, 4, false));
     try testing.expectEqual(@as(usize, 3), nextFocusIndex(0, 4, true));
     try testing.expectEqual(@as(usize, 0), nextFocusIndex(0, 0, false));
+}
+
+test "layoutFor: the font comes from the ramp (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layoutFor(scale, 400, 60, 120, 88);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        try testing.expect(l.font_h > type_ramp.caption(scale).height);
+        try testing.expect(l.font_h < type_ramp.subtitle(scale).height);
+    }
+    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 400, 60, 120, 88).font_h);
 }

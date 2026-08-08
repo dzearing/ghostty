@@ -169,14 +169,25 @@ Two rules go with it:
 - **Emphasis is weight, never size.** A strong run is the same height as the
   body around it, so it cannot reflow the line box it sits in.
 
-A line box is its role's height plus `sm` (4) of leading. Derive it — a
-hardcoded 17 stops matching its text the moment the ramp moves.
+A line box is its role's height plus `sm` (4) of leading, and that too is one
+call: **`type_ramp.lineBox(font, scale)`** (T313). Derive it — a hardcoded 17
+stops matching its text the moment the ramp moves, and `BannerDialog`'s flat 16
+around a 15 px label is what that looks like before it breaks: a fit by
+coincidence, one ramp change away from clipping.
+
+A line box is for a box that HOLDS TEXT. It is not the sizing rule for an
+interactive row — a combo item, a list row, a button — which is sized to what it
+must hold plus its own padding (§0's corollary). `HostSettingsDialog`'s
+`item_h = font_h + px(6)` is deliberately not a line box for that reason.
 
 The ramp exists because the number did not: `font_h = px(15, scale)` was
 written out in **seven** dialogs, a size nobody chose, and the first task to
 fix one copy would have made that dialog the odd one out. Same argument as
 T257's chrome-geometry hoist: the duplication is not the defect, the silent
-divergence it permits is.
+divergence it permits is. All seven read the ramp as of T313 (T310 did the
+chooser surface; T313 the rest) — including the SIZE, the WEIGHT and the FACE,
+because a dialog that takes its size from the ramp and hardcodes `600` beside
+it has only moved where the divergence hides.
 
 ### 2.5 Build-mode marking (T43)
 

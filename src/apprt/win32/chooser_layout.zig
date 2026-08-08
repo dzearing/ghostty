@@ -175,8 +175,8 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     // email/link stack, not the 28 control height — a band pinned to `control_h`
     // is exactly what forced the row to be one static and one button.
     const avatar_d = px(32, scale);
-    const email_h = type_ramp.caption(scale).height + px(4, scale);
-    const link_h = type_ramp.body(scale).height + px(4, scale);
+    const email_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
+    const link_h = type_ramp.lineBox(type_ramp.body(scale), scale);
     const stack_gap = px(2, scale);
     const account_h = @max(@max(avatar_d, email_h + stack_gap + link_h), control_h);
     const account_top = gap;
@@ -210,7 +210,7 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     // left between it and the filter.
     // The status strip is caption text, so its wrapped line box is the caption
     // role plus the same `sm` leading every other line box on the surface has.
-    const hint_line_h = type_ramp.caption(scale).height + px(4, scale);
+    const hint_line_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
     const hint_h = hint_line_h * lines;
     const hint: Rect = .{
         .left = filter_pad,
@@ -250,8 +250,8 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     // instead of Mac's 30 and our own 20.
     const glyph_w = px(32, scale);
     // Line boxes from the ramp plus `sm` of leading, like the row's.
-    const title_h = type_ramp.subtitle(scale).height + px(4, scale);
-    const subtitle_h = type_ramp.caption(scale).height + px(4, scale);
+    const title_h = type_ramp.lineBox(type_ramp.subtitle(scale), scale);
+    const subtitle_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
     const detail_glyph: Rect = .{
         .left = detail.left + margin,
         .top = detail.top + margin,
@@ -1059,8 +1059,8 @@ test "layout: the account band is sized to its tallest content, not to a control
         try testing.expectEqual(@max(@max(stack_h, a.avatar_d), l.control_h), a.band.height());
         // Line boxes come from the ramp: caption for the email, body for the
         // link, so the row consumes T310's ramp rather than restating sizes.
-        try testing.expectEqual(type_ramp.caption(scale).height + px(4, scale), a.email_h);
-        try testing.expectEqual(type_ramp.body(scale).height + px(4, scale), a.link_h);
+        try testing.expectEqual(type_ramp.lineBox(type_ramp.caption(scale), scale), a.email_h);
+        try testing.expectEqual(type_ramp.lineBox(type_ramp.body(scale), scale), a.link_h);
         try testing.expect(a.email_h < a.link_h);
     }
     // The band grew from the 28 control height to the stack's own height; the

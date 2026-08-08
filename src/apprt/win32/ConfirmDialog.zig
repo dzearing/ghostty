@@ -21,6 +21,7 @@ const ConfirmDialog = @This();
 const std = @import("std");
 const App = @import("App.zig");
 const w32 = @import("win32.zig");
+const type_ramp = @import("type_ramp.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -172,7 +173,7 @@ pub fn layoutFor(
             .right = right_left + btn_w,
             .bottom = btn_top + btn_h,
         } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-        .font_h = px(15, scale),
+        .font_h = type_ramp.body(scale).height,
     };
 }
 
@@ -246,22 +247,25 @@ fn run(
     const has_cancel = opts.style == .ok_cancel;
     const has_input = opts.input != null;
 
-    // DPI-scaled dialog font, needed up front to measure the text.
+    // DPI-scaled dialog font, needed up front to measure the text. It is the
+    // ramp's body — the same source `layoutFor` reports as `font_h`, so the
+    // font the message is MEASURED in cannot differ from the one it is drawn
+    // in (T313).
     const font = w32.CreateFontW(
-        -px(15, scale),
+        -type_ramp.body(scale).height,
         0,
         0,
         0,
-        400,
-        0,
-        0,
-        0,
-        0,
+        type_ramp.weight_normal,
         0,
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     defer if (font) |f| {
         _ = w32.DeleteObject(f);
@@ -883,4 +887,17 @@ test "nextFocusIndex: cycles both ways and wraps" {
     // Degenerate cases never index out of range.
     try testing.expectEqual(@as(usize, 0), nextFocusIndex(0, 1, false));
     try testing.expectEqual(@as(usize, 0), nextFocusIndex(0, 0, false));
+}
+
+test "layoutFor: the font comes from the ramp (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layoutFor(scale, 300, 40, true, false, true, 88);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        // A confirm's message is body text, never a subtitle and never a
+        // caption — one role, so it reads at the same size as the chooser it
+        // is often opened over.
+        try testing.expect(l.font_h > type_ramp.caption(scale).height);
+        try testing.expect(l.font_h < type_ramp.subtitle(scale).height);
+    }
+    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 300, 40, true, false, true, 88).font_h);
 }

@@ -30,6 +30,13 @@
 
 const std = @import("std");
 
+/// Every text size on this panel comes from the one win32 type ramp (T313), so
+/// the Activity Monitor cannot read a size apart from the chooser and the four
+/// dialogs beside it. It already had the ramp's SHAPE — three roles, with the
+/// caption and title at the ramp's own numbers — which is exactly the state
+/// that hides a divergence: agreeing by coincidence is not sharing a source.
+const type_ramp = @import("type_ramp.zig");
+
 /// A rectangle in physical pixels, left/top inclusive and right/bottom
 /// exclusive — the same convention as `RECT`, which this converts to at the
 /// call site.
@@ -151,10 +158,13 @@ pub const Layout = struct {
     /// The banner's dismiss button, at its trailing edge.
     banner_close: Rect,
 
-    /// `CreateFontW` heights (positive; the caller negates them).
+    /// `CreateFontW` heights (positive; the caller negates them), and the
+    /// title's weight — all four straight from `type_ramp`, so the panel's
+    /// type cannot drift from the chooser's.
     font_h: i32,
     title_font_h: i32,
     caption_font_h: i32,
+    title_font_weight: i32,
 };
 
 fn px(v: f32, scale: f32) i32 {
@@ -357,9 +367,10 @@ pub fn layout(scale: f32, client_w_in: i32, client_h_in: i32, opts: Options) Lay
         .row_h = px(table_row_h, scale),
         .banner = banner,
         .banner_close = banner_close,
-        .font_h = px(15, scale),
-        .title_font_h = px(20, scale),
-        .caption_font_h = px(12, scale),
+        .font_h = type_ramp.body(scale).height,
+        .title_font_h = type_ramp.subtitle(scale).height,
+        .caption_font_h = type_ramp.caption(scale).height,
+        .title_font_weight = type_ramp.subtitle(scale).weight,
     };
 }
 
@@ -468,10 +479,10 @@ pub const CardContent = struct {
 /// The dot's diameter (Mac's 7pt circle, rounded onto the 4 DIP scale's
 /// neighbour so it stays even and centers without a half pixel).
 const card_dot: f32 = 8;
-/// The three text rows. `label` carries `font_h` (15) and the two detail rows
-/// carry `caption_font_h` (12), each in a line box with room to sit in.
-const card_label_h: f32 = 18;
-const card_detail_h: f32 = 14;
+// The card's three text rows are NOT constants: `label` carries the ramp's
+// BODY and the two detail rows its CAPTION, each in a `type_ramp.lineBox`, so a
+// row follows its font instead of being a number that happened to clear it
+// (T313).
 
 /// Lay out one card's contents inside its painted rect. The text block is
 /// CENTERED vertically, so the padding above and below it is symmetric by
@@ -481,8 +492,8 @@ pub fn cardContent(card: Rect, scale: f32) CardContent {
     const pad = px(pad_md, scale);
     const gap = px(pad_sm, scale);
     const dot_d = px(card_dot, scale);
-    const label_h = px(card_label_h, scale);
-    const detail_h = px(card_detail_h, scale);
+    const label_h = type_ramp.lineBox(type_ramp.body(scale), scale);
+    const detail_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
 
     const block_h = label_h + gap + detail_h + gap + detail_h;
     const top = card.top + @divTrunc(card.height() - block_h, 2);
@@ -1179,4 +1190,46 @@ test "layout: scales with DPI" {
     try testing.expectEqual(a.title_font_h * 2, b.title_font_h);
     // The table gets what is left, so it scales with the rest of the window.
     try testing.expect(b.table.height() >= a.table.height() * 2 - 4);
+}
+
+test "layout: every font role comes from the ramp (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 700, 480, .{});
+        try testing.expectEqual(type_ramp.caption(scale).height, l.caption_font_h);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        try testing.expectEqual(type_ramp.subtitle(scale).height, l.title_font_h);
+        try testing.expectEqual(type_ramp.weight_semibold, l.title_font_weight);
+        // The ordering has to survive rounding at every scale, or the panel
+        // inverts its own hierarchy somewhere between 1.0 and 2.0.
+        try testing.expect(l.caption_font_h < l.font_h);
+        try testing.expect(l.font_h < l.title_font_h);
+    }
+    // The panel's caption and title already agreed with the ramp's numbers
+    // before T313; only the body moved. This is the one that would have
+    // caught the old 15.
+    try testing.expectEqual(@as(i32, 14), layout(1.0, 700, 480, .{}).font_h);
+}
+
+test "cardContent: the card's rows are ramp line boxes (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 700, 480, .{});
+        const card = cardRect(l, 0, 0, scale);
+        const c = cardContent(card, scale);
+        try testing.expectEqual(
+            type_ramp.lineBox(type_ramp.body(scale), scale),
+            c.label.bottom - c.label.top,
+        );
+        const detail = type_ramp.lineBox(type_ramp.caption(scale), scale);
+        try testing.expectEqual(detail, c.summary.bottom - c.summary.top);
+        try testing.expectEqual(detail, c.metric.bottom - c.metric.top);
+        // The whole text block still sits inside the card with symmetric
+        // padding — growing the detail rows must not push it out (§0.1). The
+        // block is centered by construction, so the two paddings differ by at
+        // most the odd pixel `divTrunc` cannot split.
+        try testing.expect(c.label.top > card.top);
+        try testing.expect(c.metric.bottom < card.bottom);
+        const pad_top = c.label.top - card.top;
+        const pad_bottom = card.bottom - c.metric.bottom;
+        try testing.expect(@abs(pad_top - pad_bottom) <= 1);
+    }
 }

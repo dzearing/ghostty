@@ -21,6 +21,7 @@ const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+const type_ramp = @import("type_ramp.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -64,12 +65,16 @@ pub const Layout = struct {
 };
 
 pub fn layout(scale: f32) Layout {
+    const body = type_ramp.body(scale);
     const margin = px(16, scale);
-    const label_h = px(16, scale);
+    // The label and the hint are each ONE line of body text, so their boxes
+    // come from the ramp (T313) rather than from a flat 16 that cleared the
+    // old 15 px font by coincidence.
+    const label_h = type_ramp.lineBox(body, scale);
     const label_gap = px(6, scale);
-    const edit_h = px(96, scale); // ~5 lines at 15px font + padding
+    const edit_h = px(96, scale); // ~5 lines of body text + padding
     const hint_gap = px(6, scale);
-    const hint_h = px(16, scale);
+    const hint_h = type_ramp.lineBox(body, scale);
     const btn_gap_v = px(12, scale);
     const btn_w = px(88, scale);
     const btn_h = px(28, scale);
@@ -93,7 +98,7 @@ pub fn layout(scale: f32) Layout {
         .hint = .{ .left = margin, .top = hint_top, .right = client_w - margin, .bottom = hint_top + hint_h },
         .ok = .{ .left = ok_left, .top = btn_top, .right = ok_left + btn_w, .bottom = btn_top + btn_h },
         .cancel = .{ .left = cancel_left, .top = btn_top, .right = cancel_left + btn_w, .bottom = btn_top + btn_h },
-        .font_h = px(15, scale),
+        .font_h = body.height,
     };
 }
 
@@ -311,7 +316,7 @@ pub fn open(surface: *Surface) void {
         0,
         0,
         0,
-        400,
+        type_ramp.weight_normal,
         0,
         0,
         0,
@@ -320,7 +325,7 @@ pub fn open(surface: *Surface) void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
     );
     if (self.font) |f| {
         if (label) |lbl| _ = w32.SendMessageW(lbl, w32.WM_SETFONT, @intFromPtr(f), 1);
@@ -567,4 +572,19 @@ test "normalizeText: CRLF to LF and trim" {
     try testing.expectEqualStrings("", normalizeText(&buf3));
     var buf4 = "bare\rreturn".*;
     try testing.expectEqualStrings("bare\nreturn", normalizeText(&buf4));
+}
+
+test "layout: the fonts and the line boxes come from the ramp (T313)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale);
+        try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
+        // The label and the hint each hold ONE line of that same body text, so
+        // both boxes are the ramp's line box rather than a flat constant.
+        const box = type_ramp.lineBox(type_ramp.body(scale), scale);
+        try testing.expectEqual(box, l.label.bottom - l.label.top);
+        try testing.expectEqual(box, l.hint.bottom - l.hint.top);
+        try testing.expect(l.label.bottom - l.label.top > l.font_h);
+    }
+    // The retired 15 px body is gone, at the size a user actually sees it.
+    try testing.expectEqual(@as(i32, 14), layout(1.0).font_h);
 }
