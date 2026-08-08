@@ -10869,3 +10869,60 @@ popover on the Mac, which is one affordance with two gestures; **T574** -
 this signal is missing on both seats. NOT filed: read-only does not survive a
 session restore. It is a transient safety toggle and the Mac does not persist
 it either, so restoring it would be a new behavior rather than parity.
+
+## 2026-08-07 - T446: a half-pressed chord and an active key table are visible
+
+Ghoztty lets a binding be a SEQUENCE (press one combination, then a second key
+finishes it) and lets a binding drop you into a named KEY TABLE where the
+keyboard temporarily means something else. On Windows neither state showed up
+anywhere: the `.key_sequence` and `.key_table` apprt actions were a bare
+`return true` in `App.zig`. A pane waiting for the second half of a chord
+looked exactly like a pane that had ignored the first half, and a table
+entered by accident silently reinterpreted every key after it with nothing on
+screen to say so. Mac has shown a floating pill for both since forever.
+
+Three new files, split the way the design system asks - `key_state.zig` (the
+model: a key-table STACK plus the pending-key list, fixed capacity, labels
+formatted through the same `menu_label.formatTrigger` the menus use),
+`key_state_pill.zig` (geometry, colors and card pixels, asserted at
+1.0/1.25/1.5/2.0) and `KeyStateIndicator.zig` (the layered popup, the GDI text
+and the animation timer). Wired through the two `App.zig` action arms plus
+`Surface.updateKeyStateIndicator` / `Window.updateKeyStateIndicators`, driven
+from the STATE rather than from the action - the read-only badge's triple,
+which is what keeps the pill glued to its pane across a divider drag, a tab
+switch and a DPI change.
+
+Two translations away from the Mac, both deliberate. The pill is
+`WS_EX_TRANSPARENT` where the read-only badge is not: it floats over the
+bottom-center of live terminal content, which is where a selection drag ends,
+so it must not eat mouse input. And it is FIXED at the pane's bottom rather
+than draggable to the top - the Windows shell has no vocabulary for a chrome
+control you reposition by hand, and making it draggable means making it
+clickable, which costs exactly the click-through above. Filed as **D31**
+rather than skipped silently. Everything else is at parity, including the
+animated waiting dots: a static mark cannot tell "waiting for your next key"
+apart from "wedged", which is the whole ambiguity this feature removes.
+
+The stack is a stack, and that is load-bearing: `deactivate` pops ONE, so one
+pop out of a nested table leaves the outer one still named. The model counts
+the true DEPTH past the names it can display, because a pop after an
+overflowing push has to land back where it came from.
+
+Floor: `floor-lane.ps1 -Lane all` none PASS (305s), win32 PASS (352s), agent
+PASS (322s), with none and win32 re-run to PASS on the final tree; P1-P3 ALL
+PASS; `test\win32\key-state-pill.ps1` ALL PASS (53 assertions),
+`-NegativeControl` red on exactly its one inverted anchor assertion.
+
+Two bugs the box found that no unit test could have. `for (1..table_count)`
+in the text pass UNDERFLOWED when a pending sequence had no key table - Zig
+lowers a for-range to a counted loop over `end - start`, so `for (1..0)`
+panics with "integer overflow" - and that is the single most common state
+this feature has, so it crashed the app on the first key of every chord. And
+F10 never reaches the core on Windows at all: `handleKeyEvent` claims it for
+the menu system before `keyCallback`. The first draft of the acceptance script
+used `f9>f10` for exactly the reason a user would, and the menu then swallowed
+every key after it; it now uses `f5>f6` and names the trap.
+
+Filed: **T575** - an F10 keybind silently never fires here, and the menu it
+opens eats the keyboard afterwards; **T576** - Mac's pill has a popover
+explaining what a key table is, and ours has nothing to click.

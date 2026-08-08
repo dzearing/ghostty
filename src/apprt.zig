@@ -111,6 +111,14 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/readonly_badge.zig");
 
+    // Pure win32 key-state model — the key-table stack and the pending key
+    // sequence behind the indicator pill (T446), same no-OS-imports deal.
+    _ = @import("apprt/win32/key_state.zig");
+
+    // Pure win32 key-state pill geometry, contrast floors and card pixels
+    // (T446), same no-OS-imports deal.
+    _ = @import("apprt/win32/key_state_pill.zig");
+
     // Pure win32 split-divider geometry (T155), same no-OS-imports deal.
     _ = @import("apprt/win32/split_geometry.zig");
 

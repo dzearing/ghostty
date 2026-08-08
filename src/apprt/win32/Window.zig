@@ -2437,6 +2437,24 @@ pub fn updateDimOverlays(self: *Window) void {
     self.updatePaneBanners();
     // ...and so does the read-only badge (T445).
     self.updateReadonlyBadges();
+    // ...and the key-state pill (T446).
+    self.updateKeyStateIndicators();
+}
+
+/// Show/reposition/hide every pane's key-state pill (T446). Rides the same
+/// triggers as the read-only badges, which is what keeps a pill glued to its
+/// pane across a divider drag, a tab switch, a DPI change and a window move.
+/// A pane with no pending key sequence and no active key table pays one test.
+pub fn updateKeyStateIndicators(self: *Window) void {
+    for (0..self.tab_count) |tab| {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| {
+            // Key tables and key sequences are terminal-input state; a viewer
+            // pane has no keybinding stack to be inside.
+            const surface = entry.view.surface() orelse continue;
+            surface.updateKeyStateIndicator();
+        }
+    }
 }
 
 /// Show/reposition/hide every pane's read-only badge (T445). Rides the same

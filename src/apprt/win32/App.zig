@@ -4519,10 +4519,46 @@ pub fn performAction(
             return true;
         },
 
+        // A sequenced binding started, continued or resolved (T446). Each
+        // pending key is appended to the pane's key-state model and shown as a
+        // key cap in the pill at the pane's bottom; `.end` clears it.
+        //
+        // This used to be acknowledged and dropped, which meant a pane waiting
+        // for the second half of a chord looked exactly like a pane that had
+        // ignored the first half.
+        .key_sequence => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                const surface = core_surface.rt_surface;
+                switch (value) {
+                    .trigger => |t| surface.key_state_model.pushTrigger(t),
+                    .end => surface.key_state_model.endSequence(),
+                }
+                surface.updateKeyStateIndicator();
+                return true;
+            },
+        },
+
+        // A key table was entered or left (T446). Tables NEST, so this is a
+        // stack: `.activate` pushes, `.deactivate` pops one, `.deactivate_all`
+        // clears — mirroring `Surface.keyboard.table_stack` in the core, which
+        // the apprt never sees directly.
+        .key_table => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                const surface = core_surface.rt_surface;
+                switch (value) {
+                    .activate => |name| surface.key_state_model.activate(name),
+                    .deactivate => surface.key_state_model.deactivate(),
+                    .deactivate_all => surface.key_state_model.deactivateAll(),
+                }
+                surface.updateKeyStateIndicator();
+                return true;
+            },
+        },
+
         // Acknowledge actions that don't need Win32-specific handling.
         // The core handles the logic; we just confirm receipt.
-        .key_sequence,
-        .key_table,
         .cell_size,
         // Platform-specific actions that don't apply on Windows:
         .secure_input, // macOS EnableSecureEventInput

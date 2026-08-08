@@ -28,6 +28,8 @@ const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const ReadonlyBadge = @import("ReadonlyBadge.zig").ReadonlyBadge;
+const KeyStateIndicator = @import("KeyStateIndicator.zig").KeyStateIndicator;
+const key_state = @import("key_state.zig");
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
@@ -152,6 +154,15 @@ banner_text: ?[:0]u8 = null,
 /// that never goes read-only never pays for a popup — and kept afterwards,
 /// hidden, because the mode is a toggle people flip more than once.
 readonly_badge: ?*ReadonlyBadge = null,
+
+/// Key-state pill (T446): which key tables this pane is inside, and which
+/// keys of a multi-key sequence have been pressed so far. The MODEL is always
+/// present (it is 700-odd bytes of fixed buffers and it has to be able to
+/// record a `.key_table` activation before any window exists); the popup is
+/// created lazily the first time there is something to show, so a pane that
+/// never enters a sequence or a table never pays for one.
+key_state_model: key_state.Model = .{},
+key_state_indicator: ?*KeyStateIndicator = null,
 
 /// Background tint (T67): explicit `--color`/`--split-color`/picker color,
 /// or the auto-shifted split-inheritance tint. Null ⇒ config background.
@@ -876,6 +887,13 @@ pub fn deinit(self: *Surface) void {
         self.readonly_badge = null;
     }
 
+    // ...and the key-state pill (T446), which also owns an animation timer
+    // that must be killed before its window goes away.
+    if (self.key_state_indicator) |k| {
+        k.destroy();
+        self.key_state_indicator = null;
+    }
+
     // Destroy popup windows and their GDI resources.
     if (self.search_hwnd) |popup| {
         _ = w32.DestroyWindow(popup);
@@ -1101,6 +1119,40 @@ pub fn updateReadonlyBadge(self: *Surface) void {
     self.readonly_badge.?.update(self.scale, pane_bg);
 }
 
+/// Show, reposition or hide this pane's key-state pill to match
+/// `key_state_model` (T446).
+///
+/// Driven from the STATE rather than from the `.key_sequence` / `.key_table`
+/// actions, for the reason `updateReadonlyBadge` documents: an action-only
+/// path marks the pane once and then lets the popup drift away from the pane
+/// it is glued to across a tab switch, a divider drag, a DPI change or a
+/// window move. Idempotent and cheap — a pane with no pending keys and no
+/// active table pays one `isEmpty` test.
+pub fn updateKeyStateIndicator(self: *Surface) void {
+    if (self.key_state_model.isEmpty()) {
+        if (self.key_state_indicator) |k| k.hide();
+        return;
+    }
+    const hwnd = self.hwnd orelse return;
+    if (self.key_state_indicator == null) {
+        self.key_state_indicator = KeyStateIndicator.create(
+            self.app.core_app.alloc,
+            hwnd,
+            self.app.hinstance,
+        ) catch |err| {
+            log.warn("key state indicator create failed err={}", .{err});
+            return;
+        };
+    }
+    const config = &self.app.config;
+    const pane_bg: color_math.Rgb = self.background_tint orelse .{
+        .r = config.background.r,
+        .g = config.background.g,
+        .b = config.background.b,
+    };
+    self.key_state_indicator.?.update(self.scale, pane_bg, &self.key_state_model);
+}
+
 /// Re-check the z-order of every layered popup this pane owns and heal any
 /// stray `WS_EX_TOPMOST` another process left behind (T142). A no-op in the
 /// normal case; see `overlay_zorder.zig`. Rides window activation as well as
@@ -1112,6 +1164,7 @@ pub fn healOverlayZOrders(self: *Surface) void {
     if (self.banner_overlay) |b| w32.healOverlayZOrder(b.hwnd, owner);
     if (self.dim_overlay) |d| w32.healOverlayZOrder(d.hwnd, owner);
     if (self.readonly_badge) |b| w32.healOverlayZOrder(b.hwnd, owner);
+    if (self.key_state_indicator) |k| w32.healOverlayZOrder(k.hwnd, owner);
     if (self.scrollbar) |s| w32.healOverlayZOrder(s.hwnd, owner);
 }
 
@@ -2130,7 +2183,6 @@ pub const PALETTE_EDIT_ID: u16 = 200;
 /// Layout constants for the palette list (unscaled, multiply by self.scale).
 pub const PALETTE_LIST_TOP: f32 = 40.0;
 pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
-
 
 /// Toggle the command palette visibility.
 pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
