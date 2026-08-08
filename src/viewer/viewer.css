@@ -59,9 +59,17 @@ body.viewer-has-gutter .markdown-body {
  * Native typography
  *
  * The vendored stylesheet ships GitHub's web font stack (Segoe UI / Noto Sans
- * ahead of Helvetica) and its metrics. A viewer pane is macOS content, not a
- * web page, so the body renders in the system font — SF Pro via -apple-system —
- * and code in SF Mono via ui-monospace.
+ * ahead of Helvetica) and its metrics. A viewer pane is native content, not a
+ * web page, so the body renders in the SYSTEM font — SF Pro on macOS, Segoe UI
+ * on Windows — and code in the system monospace.
+ *
+ * `system-ui` leads both stacks so ONE stack is right on both platforms: it
+ * resolves to San Francisco on macOS and to Segoe UI on Windows, the face
+ * every piece of win32 chrome is drawn in. The -apple-system/SF entries behind
+ * it are the older WebKit spelling of the same font, and the Segoe/Consolas
+ * entries are the same insurance for a Chromium that does not answer
+ * `system-ui`. Without them a Windows pane fell through to the generic
+ * families — Arial and Courier New — while its chrome stayed Segoe UI.
  *
  * The font stacks are swapped by redefining the vendor's own custom
  * properties, which every one of its font-family rules reads. The size and
@@ -72,10 +80,11 @@ body.viewer-has-gutter .markdown-body {
  * ------------------------------------------------------------------------ */
 
 .markdown-body {
-  --fontStack-sansSerif: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Helvetica Neue", Helvetica, Arial, sans-serif, "Apple Color Emoji";
+  --fontStack-sansSerif: system-ui, -apple-system, BlinkMacSystemFont,
+    "SF Pro Text", "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
   --fontStack-monospace: ui-monospace, "SF Mono", SFMono-Regular, Menlo,
-    Monaco, "Liberation Mono", monospace;
+    Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
 
   font-size: 15px;
   line-height: 1.62;
@@ -85,8 +94,9 @@ body.viewer-has-gutter .markdown-body {
   font-synthesis: none;
 }
 
-/* The vendored file hardcodes `font-family: monospace` in a few normalization
- * rules that predate its custom properties; point those at SF Mono too. */
+/* The vendored file hardcodes the generic `monospace` family in a few
+ * normalization rules that predate its custom properties; point those at the
+ * system monospace too. */
 .markdown-body code,
 .markdown-body kbd,
 .markdown-body pre,
@@ -149,7 +159,7 @@ body.viewer-has-gutter .markdown-body {
   padding: 24px 28px;
   border: 1px solid #d1d9e0;
   border-radius: 8px;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Helvetica, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 

@@ -3503,6 +3503,90 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqualStrings("t90e.md", pane.title.?);
 
     // ------------------------------------------------------------------
+    // T386: the page's fonts, measured rather than asserted from the CSS
+    // ------------------------------------------------------------------
+    //
+    // The bundled sheet and the selection toolbar both used to name macOS-only
+    // families with a GENERIC keyword behind them, so on Windows they landed on
+    // Arial while the chrome around them stayed Segoe UI. Reading the stack
+    // back out of the stylesheet only proves what we typed; what matters is
+    // which face the font matcher picks HERE, and that is measurable: two
+    // strings set in different families measure to different widths on a
+    // canvas. So the page measures the real stacks against Arial (the generic
+    // sans-serif's answer on Windows) and against the Segoe families.
+    //
+    // The assertion is deliberately "not Arial, and one of the Segoe faces"
+    // rather than "exactly Segoe UI": `system-ui` may resolve to Segoe UI
+    // Variable Text on Windows 11, which is the RIGHT answer and would fail an
+    // equality check against plain Segoe UI.
+    {
+        const Probe = struct {
+            done: bool = false,
+            ok: bool = false,
+            text: [256]u8 = undefined,
+            len: usize = 0,
+
+            fn onDone(p: *@This(), result: com.HRESULT, value: ?[*:0]const u16) com.HRESULT {
+                p.done = true;
+                p.ok = !com.failed(result);
+                if (value) |v| {
+                    const span = std.mem.span(v);
+                    const n = std.unicode.utf16LeToUtf8(&p.text, span) catch 0;
+                    p.len = @min(n, p.text.len);
+                }
+                return com.S_OK;
+            }
+        };
+        const ProbeHandler = com.Callback(iface.IID_ExecuteScriptCompletedHandler, Probe.onDone);
+
+        // One measurement helper, then: the toolbar's stack, the document
+        // body's COMPUTED stack (so the vendored sheet's variable really did
+        // get overridden), Arial, and the Segoe faces.
+        const js =
+            \\(function () {
+            \\  var c = document.createElement("canvas").getContext("2d");
+            \\  function w(f) { c.font = "16px " + f; return c.measureText("Quote Copy Segoe 12345"); }
+            \\  function width(f) { return w(f).width; }
+            \\  var toolbar = 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+            \\  var body = getComputedStyle(document.querySelector(".markdown-body")).fontFamily;
+            \\  var arial = width("Arial");
+            \\  function segoe(f) {
+            \\    return width(f) === width('"Segoe UI"') ||
+            \\      width(f) === width('"Segoe UI Variable Text"') ||
+            \\      width(f) === width('"Segoe UI Variable"');
+            \\  }
+            \\  return [
+            \\    width(toolbar) !== arial, segoe(toolbar),
+            \\    width(body) !== arial, segoe(body)
+            \\  ].join(",");
+            \\})()
+        ;
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, js);
+        defer alloc.free(wide);
+
+        var probe: Probe = .{};
+        const handler = try ProbeHandler.create(alloc, &probe);
+        defer handler.release();
+        try testing.expect(web.executeScript(wide.ptr, @ptrCast(handler)));
+
+        var probe_timer = try std.time.Timer.start();
+        while (probe_timer.read() < 15 * std.time.ns_per_s and !probe.done) {
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        try testing.expect(probe.done);
+        try testing.expect(probe.ok);
+        // ExecuteScript hands back the result as JSON, so a string comes
+        // quoted. Loud on success as well as failure: "the fonts are right" is
+        // the whole point of the test and cannot be read off a pass count.
+        log.warn("font probe: {s}", .{probe.text[0..probe.len]});
+        try testing.expectEqualStrings("\"true,true,true,true\"", probe.text[0..probe.len]);
+    }
+
+    // ------------------------------------------------------------------
     // T160: the table-of-contents card rides the same chain
     // ------------------------------------------------------------------
     //

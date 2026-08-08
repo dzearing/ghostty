@@ -11426,3 +11426,37 @@ Filed: **T593** — the in-page exit from a document (a link click reaching
 `syncCommitted`) shares the fixed function but has no test of its own; only the
 `navigate` caller is asserted, so the invariant is one refactor from a silent
 regression.
+
+## 2026-08-08 — T386: viewer text is set in the system font on Windows, not Arial
+
+The shared viewer styling named only macOS families with a GENERIC family
+behind them, so on Windows the selection popover, the rendered document body
+and its error card all fell through to Arial — and code blocks toward the
+generic monospace — next to chrome that is Segoe UI. One edit fixes both
+platforms without forking either file: `system-ui` leads every stack (San
+Francisco on macOS, Segoe UI here), with the `-apple-system`/SF spellings kept
+behind it and `"Segoe UI"` / `"Cascadia Mono"` / `Consolas` added as insurance
+for an engine that does not answer `system-ui`. `selection.js` stays the file
+T375's verbatim-embed test guards.
+
+The oracle is a MEASUREMENT, not a string compare. Reading the stack back out
+of the stylesheet only proves what we typed, so the "host floor" live-runtime
+test now runs an `ExecuteScript` round trip against the rendered page that sets
+the same strings on a canvas and compares their widths against Arial and
+against the Segoe faces. It reports `font probe: "true,true,true,true"` — not
+Arial, and a Segoe face, for both the toolbar stack and the body's computed
+stack. The assertion is deliberately "one of the Segoe faces" rather than
+"exactly Segoe UI", because `system-ui` may resolve to Segoe UI Variable Text
+on Windows 11 and that is the right answer.
+
+Floor green — none PASS (300s), win32 PASS (338s), agent PASS (180s on re-run),
+P1–P3 ALL PASS. The agent lane's first pass was red on T400's assertion, NOT on
+this work: the same test passed in the win32 lane of the same run five minutes
+earlier, because that assertion compares two WebView2-cache-dependent fetch
+counts.
+
+Filed: **T595** — `diff.css` still has the identical hole in six declarations;
+it rides T463 so the CSS edit and the probe extension land with the win32 diff
+pane rather than ahead of it. **T596** — T400's end-to-end debounce assertion
+compares two cache-dependent counts and so flakes red about half the time; the
+deterministic timer oracle above it is what actually proves that fix.

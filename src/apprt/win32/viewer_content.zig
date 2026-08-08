@@ -844,6 +844,44 @@ test "requestPath: ours, decoded, and nobody else's" {
     try testing.expect(requestPath(&buf, "https://ghoztty-viewer") == null);
 }
 
+test "the bundled stylesheet names fonts that resolve on Windows" {
+    // T386: `viewer.css` is the SHARED sheet the bundled markdown/code page
+    // renders through on both platforms, and its stacks were macOS-only —
+    // -apple-system / SF Pro Text / SF Mono, with the generic families behind
+    // them. On Windows none of those resolve, so a document body drew in Arial
+    // and its code blocks in whatever the generic monospace is, next to chrome
+    // that is Segoe UI. `system-ui` leads the sans stack (San Francisco on
+    // macOS, Segoe UI here) and the Windows monospace faces sit ahead of the
+    // generic keyword; the sheet stays one file, unforked.
+    const css = @embedFile("../../viewer/viewer.css");
+
+    // Every font-family declaration in OUR half of the sheet — the vendored
+    // GitHub stylesheet is not ours to edit — must offer a family Windows can
+    // actually resolve before it reaches a generic keyword.
+    try testing.expect(std.mem.indexOf(u8, css, "--fontStack-sansSerif: system-ui,") != null);
+    try testing.expect(std.mem.indexOf(u8, css, "\"Segoe UI\"") != null);
+    try testing.expect(std.mem.indexOf(u8, css, "Consolas") != null);
+
+    // The error card is a separate declaration and had the same hole.
+    const card = "font-family: system-ui, -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\"";
+    try testing.expect(std.mem.indexOf(u8, css, card) != null);
+
+    // Nothing in our half may lead with the macOS-only spelling again: every
+    // `font-family:`/`--fontStack-` declaration starts either with `system-ui`
+    // or with `ui-monospace` (which Chromium answers on both platforms), never
+    // with `-apple-system`.
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, css, i, "font-family: ")) |at| : (i = at + 1) {
+        const rest = css[at + "font-family: ".len ..];
+        try testing.expect(
+            std.mem.startsWith(u8, rest, "system-ui") or
+                std.mem.startsWith(u8, rest, "ui-monospace") or
+                std.mem.startsWith(u8, rest, "var(--fontStack") or
+                std.mem.startsWith(u8, rest, "inherit"),
+        );
+    }
+}
+
 test "candidateUnder: resolves inside the root and refuses every way out" {
     const alloc = testing.allocator;
     const root = if (builtin.os.tag == .windows) "C:\\app\\share\\viewer" else "/app/share/viewer";

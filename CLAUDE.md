@@ -509,8 +509,15 @@ ghoztty +close --target=doc
   headings, GFM tables, nested/task lists, fenced code with syntax
   highlighting, blockquotes, images (relative paths resolve against the
   file's directory), links. Light/dark follows the window appearance. Body
-  text is set in the **system font** (SF Pro via `-apple-system`) and code in
-  SF Mono, so a viewer reads as macOS content rather than a web page.
+  text is set in the **system font** and code in the system monospace, so a
+  viewer reads as native content rather than a web page. One stack serves both
+  platforms: `system-ui` leads it (San Francisco on macOS, Segoe UI on
+  Windows), with the `-apple-system`/SF spellings and the `"Segoe UI"` /
+  `Consolas` entries behind it as insurance for an engine that does not answer
+  `system-ui`. A stack that names only the macOS families falls through to the
+  GENERIC family on Windows — Arial, Courier New — next to chrome that is Segoe
+  UI, which is what T386 fixed in `selection.js` and `viewer.css`. The same
+  hole is still open in `diff.css` and rides the win32 diff pane (T595).
 - **Table of contents** (markdown only, and only with two or more headings) —
   one of the two contents of the pane's shared **side panel** (the other is a
   diff's file tree; see Git diff panes). Everything in this bullet is the

@@ -37,7 +37,12 @@
       background: #ffffff;
       border: 1px solid rgba(0, 0, 0, 0.12);
       box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      /* system-ui FIRST so one stack is right on both platforms: it resolves
+       * to San Francisco on macOS and to Segoe UI on Windows, which is the
+       * face every piece of win32 chrome is drawn in. Without it the popover
+       * fell through to the generic sans-serif — Arial — on Windows, because
+       * neither -apple-system nor BlinkMacSystemFont resolves there. */
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .bar.on { display: flex; }
     button {

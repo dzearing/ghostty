@@ -275,6 +275,27 @@ test "selection.js is embedded VERBATIM — P1's whole point" {
     try testing.expect(std.mem.indexOf(u8, selection_js, "window.__ghozttySelection") != null);
 }
 
+test "the selection toolbar names a font that resolves on Windows" {
+    // T386: the toolbar's stack used to be `-apple-system, BlinkMacSystemFont,
+    // sans-serif`. Neither of the first two resolves here, so the popover drew
+    // in Arial — the generic sans-serif — while every other piece of win32
+    // chrome is Segoe UI. `system-ui` LEADS the stack because it is the one
+    // keyword that is right on both platforms (San Francisco on macOS, Segoe
+    // UI here), which is what keeps this a shared file rather than a fork.
+    const decl = "font-family: system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;";
+    try testing.expect(std.mem.indexOf(u8, selection_js, decl) != null);
+
+    // Matching the whole declaration is what makes `system-ui` FIRST rather
+    // than merely present — an entry behind `-apple-system` would never be
+    // reached on macOS and would not fix Windows either, since the family that
+    // decides the render is whichever one resolves first. And the toolbar has
+    // exactly ONE font declaration, so this check covers all of it.
+    var decls: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, selection_js, i, "font-family:")) |at| : (i = at + 1) decls += 1;
+    try testing.expectEqual(@as(usize, 1), decls);
+}
+
 test "the injected blob is main-frame-only, and the guard comes first" {
     try testing.expect(std.mem.indexOf(u8, injected_js, "if (window.top !== window) return;") != null);
 
