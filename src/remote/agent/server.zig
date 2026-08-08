@@ -64,6 +64,7 @@ const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const metrics = @import("metrics.zig");
 const proc = @import("proc.zig");
+const descendants = @import("descendants.zig");
 const proc_control = @import("proc_control.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
@@ -329,6 +330,10 @@ pub const Server = struct {
             // is what lets a new app distinguish us from a pre-fix agent whose
             // numbers are ~24× low on Apple Silicon.
             protocol.capability.cpu_units,
+            // This build samples each bound session's process subtree and pushes
+            // `META{has_descendants}`, so a viewer can skip the close
+            // confirmation for an idle CROSS-MACHINE pane (T356).
+            protocol.capability.session_busy,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -479,6 +484,8 @@ pub const Server = struct {
                 s.bridge_ctx = null;
                 s.bridge_data = null;
                 s.bridge_exit = null;
+                s.bridge_busy = null;
+                s.has_descendants = null;
                 s.bound = false;
                 s.streaming = false;
                 s.last_activity_ms = self.clock.now();
@@ -595,6 +602,17 @@ pub const Server = struct {
         const self: *Server = @ptrCast(@alignCast(ctx));
         self.sendJson(.meta, channel, protocol.Meta{
             .foreground_pid = fg_pid,
+        }) catch {};
+    }
+
+    /// Push the session's changed "is anything running under this shell?" answer
+    /// as `META{has_descendants}` on its channel (T356; see
+    /// `SessionStore.sampleDescendants`). Installed only when the peer negotiated
+    /// `capability.session_busy`, which is also what gates the sampling itself.
+    fn bridgeBusy(ctx: *anyopaque, channel: u128, has_descendants: bool) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.sendJson(.meta, channel, protocol.Meta{
+            .has_descendants = has_descendants,
         }) catch {};
     }
 
@@ -879,10 +897,21 @@ pub const Server = struct {
         s.bridge_data = bridgeData;
         s.bridge_exit = bridgeExit;
         s.bridge_fgpid = bridgeFgPid;
+        // The busy bridge is the capability gate (T356): with it absent the store's
+        // `sampleDescendants` skips its process-table walk entirely, so an agent
+        // whose attached clients are all too old to understand
+        // `META{has_descendants}` does no sampling work at all.
+        s.bridge_busy = if (self.negotiated) |n|
+            (if (n.session_busy) bridgeBusy else null)
+        else |_|
+            null;
         // Reset the sampler baseline so a freshly-(re)bound viewer receives the
         // CURRENT foreground pid on the next tick even if it hasn't changed —
-        // the previous viewer's pushes died with its connection (wp3).
+        // the previous viewer's pushes died with its connection (wp3). Same
+        // reasoning for the descendants answer: null is the client's UNKNOWN, and
+        // a fresh viewer must be told rather than inherit a dead one's state.
         s.fg_pid = 0;
+        s.has_descendants = null;
         s.bound = true;
         // A client attached: the session is in use, so it is not a stale
         // reboot-floor leftover -- reset its unclaimed-restart allowance.
@@ -1121,6 +1150,8 @@ pub const Server = struct {
             s.bridge_ctx = null;
             s.bridge_data = null;
             s.bridge_exit = null;
+            s.bridge_busy = null;
+            s.has_descendants = null;
             s.bound = false;
             s.last_activity_ms = self.clock.now();
             // A dead, now-unbound, non-relaunchable session is unreconnectable
@@ -3662,6 +3693,155 @@ test "foreground-pid sampling pushes META on change only (wp3)" {
     var p2 = try protocol.parseJson(protocol.Meta, alloc, m2.payload);
     defer p2.deinit();
     try testing.expectEqual(@as(i64, 4322), p2.value.foreground_pid.?);
+}
+
+/// A synthetic parent table: `pairs` are `{pid, ppid}`. Lets the descendants
+/// push rules be asserted against a KNOWN process tree instead of whatever the
+/// test runner's own children happen to be at that instant.
+fn parentMap(alloc: Allocator, pairs: []const [2]i64) !descendants.ParentMap {
+    var map: descendants.ParentMap = .empty;
+    errdefer map.deinit(alloc);
+    for (pairs) |p| try map.put(alloc, p[0], p[1]);
+    return map;
+}
+
+test "descendants sampling pushes META{has_descendants} on change only (T356)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(356);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // Both sides advertise `session_busy`, so the bridge is installed.
+    const caps = [_][]const u8{ protocol.capability.close_session, protocol.capability.session_busy };
+    try h.client.handshakeCaps(&caps);
+    _ = try h.server.waitHandshake();
+
+    // The fake spawner's first session gets pid 1001 (`pid_base + 0`).
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // An idle prompt: the shell is in the table with nothing under it.
+    var idle = try parentMap(alloc, &.{.{ 1001, 1 }});
+    defer idle.deinit(alloc);
+    // Something starts: a child, and a grandchild that the direct child spawned.
+    var busy = try parentMap(alloc, &.{ .{ 1001, 1 }, .{ 2001, 1001 }, .{ 3001, 2001 } });
+    defer busy.deinit(alloc);
+    // The shell is not in the table at all (a failed/partial enumeration).
+    var absent = try parentMap(alloc, &.{.{ 9001, 1 }});
+    defer absent.deinit(alloc);
+
+    // First sample: idle. Pushed even though "no descendants" is the state the
+    // session was born in — the client starts at UNKNOWN and must be told.
+    h.server.store.sampleDescendantsIn(&idle);
+    // Same answer again: silence.
+    h.server.store.sampleDescendantsIn(&idle);
+    // Now busy.
+    h.server.store.sampleDescendantsIn(&busy);
+    // A table that cannot see the shell must not report anything — in
+    // particular not `false`, which would skip a close confirmation while a job
+    // is running. Runs between the two real transitions so a spurious push
+    // would land here and be read as the wrong value below.
+    h.server.store.sampleDescendantsIn(&absent);
+    // Back to idle.
+    h.server.store.sampleDescendantsIn(&idle);
+
+    const want = [_]bool{ false, true, false };
+    for (want) |w| {
+        const f = try h.client.waitControl(.meta);
+        try testing.expectEqual(o.channel, f.channel);
+        var p = try protocol.parseJson(protocol.Meta, alloc, f.payload);
+        defer p.deinit();
+        try testing.expectEqual(w, p.value.has_descendants.?);
+    }
+}
+
+test "descendants sampling is silent for a peer without session_busy (T356)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(357);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An OLDER APP: it never advertises `session_busy`.
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // No bridge was installed, so the whole sampler is a no-op — and the outer
+    // `sampleDescendants` never even takes a process snapshot.
+    var busy = try parentMap(alloc, &.{ .{ 1001, 1 }, .{ 2001, 1001 } });
+    defer busy.deinit(alloc);
+    h.server.store.sampleDescendantsIn(&busy);
+    h.server.store.sampleDescendants();
+
+    // Prove the silence is the gate, not a dead channel: a foreground-pid push
+    // on the SAME channel still arrives, and it is the FIRST meta frame — so a
+    // stray `has_descendants` push would have been read here and failed.
+    fc.mutex.lock();
+    fc.fake_fg_pid = 777;
+    fc.mutex.unlock();
+    h.server.store.sampleForegroundPids();
+
+    const f = try h.client.waitControl(.meta);
+    try testing.expectEqual(o.channel, f.channel);
+    var p = try protocol.parseJson(protocol.Meta, alloc, f.payload);
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 777), p.value.foreground_pid.?);
+    try testing.expect(p.value.has_descendants == null);
+}
+
+test "descendants sampling re-pushes to a freshly re-bound viewer (T356)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(358);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{ protocol.capability.close_session, protocol.capability.session_busy };
+    try h.client.handshakeCaps(&caps);
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    var idle = try parentMap(alloc, &.{.{ 1001, 1 }});
+    defer idle.deinit(alloc);
+    h.server.store.sampleDescendantsIn(&idle);
+    const first = try h.client.waitControl(.meta);
+    var fp = try protocol.parseJson(protocol.Meta, alloc, first.payload);
+    defer fp.deinit();
+    try testing.expect(!fp.value.has_descendants.?);
+
+    // Re-ATTACH (the app-relaunch path). The previous viewer's pushes died with
+    // its connection, so the agent's record must be cleared and the CURRENT
+    // answer re-sent even though it has not changed.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = o.id[0..],
+        .rows = 24,
+        .cols = 80,
+    });
+    _ = try h.client.waitControl(.attached);
+
+    h.server.store.sampleDescendantsIn(&idle);
+    const again = try h.client.waitControl(.meta);
+    var ap = try protocol.parseJson(protocol.Meta, alloc, again.payload);
+    defer ap.deinit();
+    try testing.expect(!ap.value.has_descendants.?);
 }
 
 test "OPEN with a tty-less spawner elides tty (Windows / older-agent shape)" {

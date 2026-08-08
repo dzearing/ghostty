@@ -973,6 +973,9 @@ pub const Connection = struct {
         protocol.capability.session_cpu,
         protocol.capability.sessions_push,
         protocol.capability.cpu_units,
+        // We consume `META{has_descendants}` for the close confirmation (T356).
+        // Advertising it is what tells the agent the sampling is worth doing.
+        protocol.capability.session_busy,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -2906,24 +2909,38 @@ pub const Connection = struct {
                 );
             },
             .meta => {
-                // Session metadata push. Today the routed payload is the live
-                // foreground pid (wp3 `tcgetpgrp` sampling): signal it on the
-                // pane's inbound ring under the channel-table lock (the same
-                // `withChannel` discipline as `.exit` — the ring can't be freed
+                // Session metadata push. Two payloads are routed onto the pane's
+                // inbound ring today — the live foreground pid (wp3 `tcgetpgrp`
+                // sampling) and whether anything is running under the shell
+                // (T356) — each signalled under the channel-table lock (the same
+                // `withChannel` discipline as `.exit`: the ring can't be freed
                 // mid-call, and an unknown/late channel is dropped silently).
-                // The pane's IO thread republishes it on the stable Remote
-                // backend for GUI reads. Additive: the user `ctrl_handler`
-                // still observes the frame afterward in `controlReaderLoop`.
+                // The pane's IO thread republishes both on the stable Remote
+                // backend for GUI reads. They arrive in SEPARATE frames in
+                // practice (different samplers, pushed on change), but each is
+                // handled independently so a frame carrying both loses neither.
+                // Additive: the user `ctrl_handler` still observes the frame
+                // afterward in `controlReaderLoop`.
                 var parsed = protocol.parseJson(protocol.Meta, self.alloc, frame.payload) catch return;
                 defer parsed.deinit();
-                const fg = parsed.value.foreground_pid orelse return;
-                const FgSig = struct {
-                    pid: i64,
-                    fn apply(self_sig: @This(), ch: *ring.Channel) void {
-                        ch.signalForegroundPid(self_sig.pid);
-                    }
-                };
-                _ = self.channels.withChannel(frame.channel, FgSig{ .pid = fg }, FgSig.apply);
+                if (parsed.value.foreground_pid) |fg| {
+                    const FgSig = struct {
+                        pid: i64,
+                        fn apply(self_sig: @This(), ch: *ring.Channel) void {
+                            ch.signalForegroundPid(self_sig.pid);
+                        }
+                    };
+                    _ = self.channels.withChannel(frame.channel, FgSig{ .pid = fg }, FgSig.apply);
+                }
+                if (parsed.value.has_descendants) |has| {
+                    const BusySig = struct {
+                        has: bool,
+                        fn apply(self_sig: @This(), ch: *ring.Channel) void {
+                            ch.signalHasDescendants(self_sig.has);
+                        }
+                    };
+                    _ = self.channels.withChannel(frame.channel, BusySig{ .has = has }, BusySig.apply);
+                }
             },
             .detached => {
                 // Server-initiated eviction / steal (§5.3): terminal DEAD.

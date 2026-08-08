@@ -17,6 +17,7 @@ test {
     _ = @import("agent/ring_snapshot.zig");
     _ = @import("agent/metrics.zig");
     _ = @import("agent/foreground.zig");
+    _ = @import("agent/descendants.zig");
     _ = @import("agent/keepalive.zig");
     _ = @import("agent/self_update.zig");
     _ = @import("socket_stream.zig");

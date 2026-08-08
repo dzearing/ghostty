@@ -491,6 +491,38 @@ pub const capability = struct {
     /// meter therefore needs no separate gate; the Activity Monitor's process
     /// table, whose `cpu_pct` predates both, is what this exists for.
     pub const cpu_units = "cpu_units";
+
+    /// Live "is anything running in this session's shell?" reporting: the agent
+    /// samples each bound session's process subtree and pushes
+    /// `META{has_descendants}` whenever the answer CHANGES (T356).
+    ///
+    /// What it is for: the close confirmation. A pane whose shell sits at an
+    /// idle prompt has nothing to lose, so closing it should not ask — which on
+    /// Windows is decided by walking the process table (`ProcessTree`,
+    /// T41), because cmd.exe and stock PowerShell emit no OSC 133 marks for the
+    /// core's `cursorIsAtPrompt` to read. A CROSS-MACHINE pane's shell is not in
+    /// this box's process table at all, so the only machine that can answer is
+    /// the one running it.
+    ///
+    /// PUSHED, not asked on demand, because `Surface.close` is a synchronous
+    /// GUI-thread path that puts up a modal: a round-trip there would block the
+    /// close behind the link, and a half-dead link would stall it (see D37).
+    /// The client reads the last pushed value instantly and treats "never
+    /// reported" and "link not connected" alike as UNKNOWN, i.e. confirm — the
+    /// pre-T356 behavior.
+    ///
+    /// Gated even though `has_descendants` is an additive optional FIELD on an
+    /// existing opcode (which would need no gate to be safe), because the gate
+    /// buys something the field alone cannot: the sampling costs a process-table
+    /// walk per tick, and the agent should only pay it when a peer that will
+    /// actually consume the answer is attached. `bindLocked` installs the
+    /// push bridge only for a negotiated connection, so an agent whose clients
+    /// are all older does no work at all.
+    ///
+    /// Skew is safe in both directions: an older agent never sends the field
+    /// (client stays at confirm-always for remote panes), and an older client
+    /// ignores an unknown JSON field.
+    pub const session_busy = "session_busy";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -579,6 +611,14 @@ pub const Negotiated = struct {
     /// agent, in which case the Activity Monitor marks its `% CPU` column
     /// unverifiable instead of printing a possibly-24×-low number.
     cpu_units: bool = false,
+
+    /// True iff BOTH peers advertised `capability.session_busy` — the agent
+    /// samples each bound session's process subtree and pushes
+    /// `META{has_descendants}` on change, and the client wants it for the close
+    /// confirmation (T356). False against any older peer, in which case the
+    /// agent installs no sampling bridge (and does no walk) and the client keeps
+    /// confirming every cross-machine close.
+    session_busy: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -613,6 +653,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.sessions_push),
         .cpu_units = hasCapability(local.capabilities, capability.cpu_units) and
             hasCapability(remote.capabilities, capability.cpu_units),
+        .session_busy = hasCapability(local.capabilities, capability.session_busy) and
+            hasCapability(remote.capabilities, capability.session_busy),
     };
 }
 
@@ -805,6 +847,22 @@ pub const Meta = struct {
     /// and from older agents; the client then falls back to the child pid.
     /// Additive/optional both ways (unknown-field-tolerant parsers).
     foreground_pid: ?i64 = null,
+
+    /// Whether the session's child process currently has at least one live
+    /// DESCENDANT process — i.e. something is running in front of the shell
+    /// (T356). Pushed by the agent whenever the answer changes, and only when
+    /// `capability.session_busy` was negotiated (the sampling costs a
+    /// process-table walk, so an agent with no interested peer does none).
+    ///
+    /// Deliberately the same question `ProcessTree.hasDescendants` answers
+    /// locally, so a cross-machine pane and a local one decide the close
+    /// confirmation by the same rule rather than by two similar-looking ones.
+    ///
+    /// Additive/optional both ways: absent means UNKNOWN, never `false` — an
+    /// older agent omits it and the client keeps confirming, and an older
+    /// client ignores it. A wrong `false` here would skip a confirmation and
+    /// kill a running job, so absence must never read as idle.
+    has_descendants: ?bool = null,
 };
 
 /// `GET_CWD` (0x22). On-demand request for a session's child working directory.
@@ -2147,6 +2205,67 @@ test "META foreground_pid and RELAUNCH env/term/argv round-trip with skew defaul
     try testing.expectEqual(@as(usize, 0), old.value.env.len);
     try testing.expect(old.value.term == null);
     try testing.expect(old.value.argv == null);
+}
+
+test "META has_descendants: tri-state round-trip, absent means UNKNOWN (T356)" {
+    const alloc = testing.allocator;
+
+    // Both concrete values survive the wire in both directions.
+    for ([_]bool{ true, false }) |want| {
+        const meta: Meta = .{ .has_descendants = want };
+        const j = try encodeJson(alloc, meta);
+        defer alloc.free(j);
+        var p = try parseJson(Meta, alloc, j);
+        defer p.deinit();
+        try testing.expectEqual(want, p.value.has_descendants.?);
+    }
+
+    // A `false` must be EMITTED, not elided: it is the value that skips the
+    // close confirmation, and an encoder that dropped it would leave the client
+    // at "unknown" forever and the feature silently dead.
+    const idle: Meta = .{ .has_descendants = false };
+    const ij = try encodeJson(alloc, idle);
+    defer alloc.free(ij);
+    try testing.expect(std.mem.indexOf(u8, ij, "has_descendants") != null);
+
+    // An OLDER AGENT's META omits it entirely — which must parse as null
+    // (unknown ⇒ the client keeps confirming), never as `false` (idle).
+    var old = try parseJson(Meta, alloc, "{\"foreground_pid\":42}");
+    defer old.deinit();
+    try testing.expect(old.value.has_descendants == null);
+
+    // And a META that carries ONLY this field must not disturb the others.
+    var solo = try parseJson(Meta, alloc, "{\"has_descendants\":true}");
+    defer solo.deinit();
+    try testing.expect(solo.value.has_descendants.?);
+    try testing.expect(solo.value.foreground_pid == null);
+    try testing.expect(solo.value.cwd == null);
+}
+
+test "negotiate: session_busy is the intersection of both HELLOs (T356)" {
+    const both = [_][]const u8{capability.session_busy};
+    const other = [_][]const u8{capability.rpc};
+
+    try testing.expect((try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+    )).session_busy);
+
+    // One side only, or neither: never enable a one-sided capability — the
+    // agent would sample for nobody, or the client would wait for a push that
+    // never comes and read staleness as fact.
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+        .{ .transfer_encoding = .raw, .capabilities = &other },
+    )).session_busy);
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &other },
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+    )).session_busy);
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw },
+        .{ .transfer_encoding = .raw },
+    )).session_busy);
 }
 
 test "METRICS/HostMetrics JSON round-trips with null optional elision" {

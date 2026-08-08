@@ -51,6 +51,11 @@ const layout_meta = @import("layout_meta.zig");
 // Imports src/terminal — the only heavyweight dependency this module pulls; kept
 // behind an optional pointer so it costs nothing until a session produces output.
 const grid_snapshot = @import("grid_snapshot.zig");
+// "Is anything running under this session's shell?" (T356). `descendants` is the
+// pure walk (no OS); `proc` owns the per-OS parent-table snapshot next to the
+// externs it needs. Neither imports this module, so there is no cycle.
+const descendants = @import("descendants.zig");
+const proc = @import("proc.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -562,11 +567,25 @@ pub const Session = struct {
     /// foreground process group changes (wp3 live-fg sampling). Same
     /// lifetime/locking rules as `bridge_data`.
     bridge_fgpid: ?*const fn (ctx: *anyopaque, channel: u128, fg_pid: i64) void = null,
+    /// Frames `META{has_descendants}` on the session's channel when the answer to
+    /// "is anything running under this shell?" changes (T356). Same
+    /// lifetime/locking rules as `bridge_data` — but installed ONLY when the
+    /// bound connection negotiated `capability.session_busy`, which is also what
+    /// makes `sampleDescendants` skip its process walk entirely when no attached
+    /// peer would consume the answer.
+    bridge_busy: ?*const fn (ctx: *anyopaque, channel: u128, has_descendants: bool) void = null,
 
     /// The last foreground pid the sampling tick observed (0 = none yet).
     /// Guarded by the store mutex; reset to 0 on (re)bind so a fresh viewer gets
     /// the current value pushed within one tick even if it hasn't changed.
     fg_pid: i64 = 0,
+
+    /// The last "has descendants" answer pushed to the bound viewer (T356), or
+    /// null for "nothing pushed yet" — which is exactly the client's UNKNOWN.
+    /// Guarded by the store mutex; reset to null on (re)bind so a fresh viewer
+    /// receives the current answer within a tick even when it has not changed
+    /// (the previous viewer's pushes died with its connection).
+    has_descendants: ?bool = null,
 
     /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`startReaper`).
     created_ms: i64,
@@ -1139,6 +1158,13 @@ pub const SessionStore = struct {
             // tracks the running program (Exec `tcgetpgrp` parity) instead of
             // reporting the shell forever.
             self.sampleForegroundPids();
+            // "Is anything running under this shell?" (T356), pushed on change
+            // so the viewer's close confirmation can decide instantly for a
+            // pane whose shell is not in ITS process table. Same one-second
+            // cadence as the foreground pid, and for the same reason: a value
+            // read at close time is only as good as its last sample, and a
+            // command started seconds ago must not read as an idle prompt.
+            self.sampleDescendants();
             // Track each live session's CURRENT working directory (T425) so the
             // value that outlives the agent is where the user actually IS, not
             // where the shell was spawned. Separate cadence from the ring
@@ -1206,6 +1232,114 @@ pub const SessionStore = struct {
         self.mutex.unlock();
 
         for (pushes.items) |p| p.f(p.ctx, p.channel, p.fg);
+    }
+
+    /// Sample whether each bound session's child has any live DESCENDANT process
+    /// and push `META{has_descendants}` (via `bridge_busy`) for the ones whose
+    /// answer changed (T356). This is what lets the viewer skip the close
+    /// confirmation for an idle CROSS-MACHINE pane: its shell is in this
+    /// machine's process table, not the viewer's, so we are the only side that
+    /// can look.
+    ///
+    /// Cost discipline, in order:
+    ///   1. If no bound session has a `bridge_busy` — i.e. no attached peer
+    ///      negotiated `capability.session_busy` — this returns having done
+    ///      NOTHING. An agent whose clients are all older pays nothing.
+    ///   2. Otherwise ONE parent-table snapshot answers every session at once,
+    ///      rather than a walk per session.
+    ///
+    /// What that costs, since "once a second" invites the question: one
+    /// `CreateToolhelp32Snapshot` / `proc_listpids` / `/proc` pass and a
+    /// pid→ppid map, and nothing else — no per-process handle, no PEB read, no
+    /// allocated name strings. `refreshForegroundCommands` already runs a
+    /// HEAVIER walk (Toolhelp + `GetProcessTimes` per candidate + a PEB read)
+    /// once per live session every ten ticks, so on any box with a handful of
+    /// panes this is the same order of work the agent has always done, and per
+    /// walk it is the cheaper of the two. The one-second cadence is not
+    /// negotiable down: the value is read at close time, and a command started
+    /// N seconds ago must not still read as an idle prompt.
+    ///
+    /// The snapshot runs OUTSIDE the store mutex: it is an OS enumeration of the
+    /// whole process table, not a cheap syscall, so holding the lock across it
+    /// would stall every OPEN/ATTACH/DATA frame behind it (the same rule
+    /// `refreshCwds` follows, and the opposite of `sampleForegroundPids`, whose
+    /// query is contractually one non-blocking syscall). Collect-then-act: the
+    /// bridge calls fire outside the lock too, since they take the connection's
+    /// writer lock.
+    ///
+    /// A failed snapshot pushes NOTHING and leaves every recorded answer alone.
+    /// The client's last value stays put and a session that never got one stays
+    /// UNKNOWN — which it reads as "confirm", the pre-T356 behavior. Reporting
+    /// "idle" because we could not look would skip a confirmation and kill a
+    /// running job.
+    pub fn sampleDescendants(self: *SessionStore) void {
+        // Phase 0: is anyone listening? Read under the lock, act on a snapshot
+        // of the answer — a connection that unbinds right after is handled by
+        // the re-lookup in phase 2.
+        self.mutex.lock();
+        var wanted = false;
+        var it0 = self.table.by_id.valueIterator();
+        while (it0.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive or !s.bound) continue;
+            if (s.bridge_busy != null) {
+                wanted = true;
+                break;
+            }
+        }
+        self.mutex.unlock();
+        if (!wanted) return;
+
+        // Phase 1: one table snapshot for every session, taken unlocked.
+        var map = proc.snapshotParents(self.table.alloc) orelse return;
+        defer map.deinit(self.table.alloc);
+
+        self.sampleDescendantsIn(&map);
+    }
+
+    /// `sampleDescendants`'s phase 2, against a caller-supplied parent table.
+    /// Split out so the push rules — busy vs idle, silence when nothing changed,
+    /// silence for a shell the table cannot see — are testable against a
+    /// synthetic process tree rather than whatever the test runner's own
+    /// descendants happen to be at that instant.
+    pub fn sampleDescendantsIn(self: *SessionStore, map: *const descendants.ParentMap) void {
+        const Push = struct {
+            f: *const fn (ctx: *anyopaque, channel: u128, has: bool) void,
+            ctx: *anyopaque,
+            channel: u128,
+            has: bool,
+        };
+        var pushes: std.ArrayList(Push) = .empty;
+        defer pushes.deinit(self.table.alloc);
+
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive or !s.bound) continue;
+            const f = s.bridge_busy orelse continue;
+            const ctx = s.bridge_ctx orelse continue;
+            if (s.pid <= 0) continue;
+            // A shell that is not in the snapshot is not something we can answer
+            // about — it exited between the walk and here, or the walk could not
+            // see it. Leave the recorded value alone rather than reporting the
+            // empty-table false.
+            if (!descendants.contains(map, s.pid)) continue;
+            const has = descendants.hasDescendants(map, s.pid);
+            if (s.has_descendants) |prev| if (prev == has) continue;
+            pushes.append(self.table.alloc, .{
+                .f = f,
+                .ctx = ctx,
+                .channel = s.channel,
+                .has = has,
+            }) catch break; // OOM: drop the rest of this tick, retry on the next
+            // Recorded only once the push is queued, so an OOM'd session is
+            // re-tried next tick instead of being remembered as already sent.
+            s.has_descendants = has;
+        }
+        self.mutex.unlock();
+
+        for (pushes.items) |p| p.f(p.ctx, p.channel, p.has);
     }
 
     /// Refresh every LIVE session's recorded working directory from its child, so

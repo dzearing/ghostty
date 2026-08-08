@@ -9,6 +9,50 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-08 - **T356 done - a cross-machine pane stops asking to confirm a
+  close it does not need to ask about**. T41 skips the confirmation for an idle
+  shell by walking THIS box's process table; a cross-machine pane's shell is not
+  in it (`Surface.shellPid` returns 0 for a non-`local` `.remote` connection on
+  purpose — that pid indexes another machine's table), so every such close
+  confirmed, forever, and a question that is always asked stops being read.
+  **The design fork, filed as D37:** `Surface.close` is a synchronous GUI-thread
+  path that puts up a modal, so the answer had to be there BEFORE the click, not
+  fetched during it — an on-demand query would block the close behind the link
+  and a half-dead link would stall it into "confirm anyway", the exact answer we
+  were trying to avoid. So the agent PUSHES it: `capability.session_busy` +
+  an additive `Meta.has_descendants`, sampled on the reaper's existing 1s tick
+  and pushed only on change, the same shape as `META{foreground_pid}`. Absence
+  is UNKNOWN, never `false` — a wrong `false` skips a confirmation and kills a
+  running job — and `Remote.shellHasDescendants` also answers null when the link
+  is not `connected`, since a value pushed before a disconnect has unbounded
+  staleness. **The capability earns its keep beyond skew safety**: the push
+  bridge is installed only for a negotiated connection, and
+  `sampleDescendants` returns having taken NO process snapshot when no bound
+  session has one, so an agent whose clients are all older does no work at all.
+  Cost, since "once a second" invites the question: one Toolhelp32/`proc_listpids`
+  //proc pass and a pid→ppid map, no per-process handle and no PEB read —
+  strictly cheaper per walk than `refreshForegroundCommands`, which has always
+  run a heavier one per live session every ten ticks. New `descendants.zig`
+  holds the walk (pure, cycle-safe, depth-capped, OS-free so it unit-tests) and
+  `proc.snapshotParents` the three OS arms next to the externs they need.
+  `Surface.shellIsIdle` consults the pushed value ONLY when there is no local
+  pid, so where we can walk exactly, we still do. **Validation:**
+  `close-confirm-idle.ps1` gained a `C/remote` section (12 checks, ALL PASS 35
+  total) dialed over TCP to a loopback `ghoztty-agent --listen`; it asserts
+  `+list --json` reports pid 0 for the pane — proof the new path is what
+  answered — and leaves the pane idle long enough to be TOLD idle before
+  starting `ping`, so the busy dialog is evidence of a transition rather than of
+  the never-told default. `-NegativeControl` → 3 FAILURE(S), one per section.
+  Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, P1-P3 + `ipc-remote.ps1` ALL
+  PASS. **One red herring worth recording**: an earlier floor run failed the
+  win32 lane on the known **T536** flake (`inbound DATA routing`, the 0xAA
+  undefined-memory index); crash-catch re-ran that lane under cdb and it
+  completed cleanly, and the next full run passed — fresh evidence appended to
+  T536, which is still open and still P1. Filed **T612** (seat: mac) for the
+  consumer half: macOS decides this from OSC 133, which a `cmd.exe`/PowerShell
+  session never emits, so the same defect is live there and the wire already
+  carries its answer.
+
 - 2026-08-08 - **T277 done - Float on Top pins the window from the keyboard,
   because the app now checks that it did**. Root cause, measured rather than
   guessed: `SetWindowPos(hwnd, HWND_TOPMOST, ...)` is not a report of its own

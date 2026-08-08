@@ -178,6 +178,16 @@ tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
 /// `child_pid`, which is also the correct answer for a fresh shell.
 fg_pid: std.atomic.Value(i64) = .init(0),
 
+/// Whether anything is running under this session's shell, as the agent last
+/// reported it (`META{has_descendants}`, T356): the agent samples its own
+/// process table once a second and pushes changes; the control reader signals
+/// the pane's ring and the IO thread copies the value here (see `drainRing`) for
+/// lock-free GUI reads. This is what lets the close confirmation be skipped for
+/// an idle CROSS-MACHINE pane, whose shell is in no process table the app can
+/// walk. `.unknown` until the agent reports (older agent, or nothing sampled
+/// yet), which callers must read as "ask the user" — never as idle.
+busy_state: std.atomic.Value(u8) = .init(@intFromEnum(inbound_ring.Channel.BusyState.unknown)),
+
 /// WP-D3 fast, visually-correct re-attach. `restore_snapshot` is the app's OWN
 /// structured VT repaint of the pane's screen (palette + modes + styles +
 /// cursor + bounded scrollback) captured when the session was last persisted,
@@ -1204,6 +1214,31 @@ pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Ty
     };
 }
 
+/// Whether anything is running under this pane's shell, as the owning agent last
+/// reported it (T356) — the cross-machine answer to the question
+/// `ProcessTree.hasDescendants` answers locally.
+///
+/// Null means UNKNOWN and callers must treat it as "cannot skip the
+/// confirmation": the agent is older than `capability.session_busy`, or has not
+/// sampled this session yet, or — the case worth naming — the LINK IS NOT UP. A
+/// value pushed before a disconnect describes a machine we have since stopped
+/// hearing from, and its staleness is unbounded; a job could have started on the
+/// far side at any point since. So a connection that is not connected reports
+/// null rather than its last-known answer.
+///
+/// Callable from any thread (the GUI reads it in the close path).
+pub fn shellHasDescendants(self: *Remote) ?bool {
+    if (self.conn.state() != .connected) return null;
+    return switch (@as(
+        inbound_ring.Channel.BusyState,
+        @enumFromInt(self.busy_state.load(.acquire)),
+    )) {
+        .unknown => null,
+        .idle => false,
+        .busy => true,
+    };
+}
+
 /// Publish the pane's agent-reported pid/tty for `getProcessInfo` (wp3). Runs on
 /// the IO thread (`threadEnter`, and again after an in-place relaunch replaces
 /// the child). The tty is duped into `arena` so previously-published pointers
@@ -1218,6 +1253,14 @@ fn publishProcessInfo(self: *Remote, pane: *const connection.Pane) void {
     // current one within a tick of the rebind — `bindLocked` resets its sampler
     // baseline). Until then the child pid above is the correct fallback.
     self.fg_pid.store(0, .release);
+    // Likewise the busy answer (T356): a fresh child or a fresh viewer binding
+    // makes the previous answer meaningless, and `bindLocked` clears the agent's
+    // own record so the current one is re-pushed within a tick. Until then the
+    // pane is UNKNOWN, i.e. its close confirms — the safe direction.
+    self.busy_state.store(
+        @intFromEnum(inbound_ring.Channel.BusyState.unknown),
+        .release,
+    );
 
     if (!self.local) return;
     const tty = pane.tty orelse return;
@@ -1438,6 +1481,15 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     // reads never touch the pane/ring (which die at threadExit).
     const fg = ch.foregroundPid();
     if (fg > 0) rd.io.backend.remote.fg_pid.store(fg, .release);
+
+    // Same republish for the agent's "is anything running under this shell?"
+    // answer (T356), signalled on the ring by the control reader. `.unknown` is
+    // never republished: it only means the agent has not told us, and stamping
+    // it would erase a real answer we already hold.
+    const busy = ch.busyState();
+    if (busy != .unknown) {
+        rd.io.backend.remote.busy_state.store(@intFromEnum(busy), .release);
+    }
 
     if (!rd.exited and ch.isExited()) {
         rd.exited = true;

@@ -226,6 +226,20 @@ pub const Channel = struct {
     /// which republishes it on the stable Remote backend for GUI reads.
     fg_pid: Atomic(i64) = .init(0),
 
+    /// Whether the session's child currently has any live DESCENDANT process —
+    /// i.e. whether something is running in front of the shell — pushed by the
+    /// agent as `META{has_descendants}` on change (T356). Tri-state, because
+    /// "we were never told" and "nothing is running" must not be the same
+    /// value: the second skips the close confirmation and the first must not.
+    /// Written by the control reader (`signalHasDescendants`), read by the
+    /// pane's IO thread during drain, which republishes it on the stable Remote
+    /// backend for GUI reads.
+    busy_state: Atomic(u8) = .init(@intFromEnum(BusyState.unknown)),
+
+    /// The tri-state carried by `busy_state`. `unknown` is the initial value and
+    /// the answer for any agent too old to advertise `capability.session_busy`.
+    pub const BusyState = enum(u8) { unknown = 0, idle = 1, busy = 2 };
+
     pub const InitOptions = struct {
         capacity: usize = default_capacity,
         /// Pause threshold; defaults to `capacity * 3/4` (== 192 KiB at the
@@ -321,6 +335,24 @@ pub const Channel = struct {
     /// reported; fall back to the child pid).
     pub fn foregroundPid(self: *const Channel) i64 {
         return self.fg_pid.load(.acquire);
+    }
+
+    /// Producer entry point (control reader, on `META{has_descendants}`): record
+    /// whether anything is running under the session's shell and wake the
+    /// consumer so its next drain republishes it for GUI reads. Mirrors
+    /// `signalForegroundPid`'s wake pattern.
+    pub fn signalHasDescendants(self: *Channel, has: bool) void {
+        self.busy_state.store(
+            @intFromEnum(if (has) BusyState.busy else BusyState.idle),
+            .release,
+        );
+        self.waker.wake();
+    }
+
+    /// Consumer entry point: the last agent-reported answer, or `.unknown` when
+    /// none has arrived (an older agent, or a session not sampled yet).
+    pub fn busyState(self: *const Channel) BusyState {
+        return @enumFromInt(self.busy_state.load(.acquire));
     }
 };
 

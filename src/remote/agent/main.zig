@@ -2309,6 +2309,8 @@ test {
     _ = @import("relay_creds.zig");
     _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
+    _ = @import("descendants.zig");
+    _ = @import("proc.zig");
 }
 
 test "decideRelayCred: env token wins over relay.env" {

@@ -26,6 +26,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const protocol = @import("../protocol.zig");
+const descendants = @import("descendants.zig");
 
 /// Default cap on the number of processes returned when the request asks for no
 /// limit (`limit == 0`). Generous enough for any real machine's foreground set,
@@ -1099,6 +1100,154 @@ test "ProcSampler: enumerates own pid with a name; second sample yields cpu_pct 
     _ = try s.sample(alloc, &out2, 0);
     try testing.expect(out2.items.len > 0);
     for (out2.items) |p| try testing.expect(p.cpu_pct >= 0);
+}
+
+// =============================================================================
+// Parent-map snapshot (T356) — pid → ppid for the WHOLE table, nothing else
+// =============================================================================
+
+/// Snapshot every process's parent pid, for `descendants.hasDescendants`.
+///
+/// Separate from `ProcSampler.sample` on purpose: this runs on the agent's
+/// once-a-second tick to answer "is anything running in this session's shell?"
+/// for every bound session at once, and it must stay as close to free as the
+/// enumeration itself. `sample` opens a handle per process for CPU, memory and
+/// the image path, and allocates a name string for each — none of which this
+/// question needs. It lives HERE rather than in `descendants.zig` because the
+/// per-OS externs it needs already exist in this file, and one copy of a
+/// `proc_bsdinfo` ABI declaration is enough.
+///
+/// Returns null when the OS enumeration fails, which the caller must NOT read
+/// as "nothing is running": an empty or missing table would answer every
+/// session "idle" and skip a confirmation that was needed. Caller deinits.
+pub fn snapshotParents(alloc: Allocator) ?descendants.ParentMap {
+    return switch (builtin.os.tag) {
+        .macos => snapshotParentsMacos(alloc),
+        .windows => snapshotParentsWindows(alloc),
+        .linux => snapshotParentsLinux(alloc),
+        else => null,
+    };
+}
+
+fn snapshotParentsWindows(alloc: Allocator) ?descendants.ParentMap {
+    if (comptime builtin.os.tag != .windows) return null;
+    const w = windows;
+    const W = std.os.windows;
+
+    const snap = w.CreateToolhelp32Snapshot(w.TH32CS_SNAPPROCESS, 0);
+    if (snap == W.INVALID_HANDLE_VALUE) return null;
+    defer W.CloseHandle(snap);
+
+    var map: descendants.ParentMap = .empty;
+
+    var entry: w.PROCESSENTRY32W = .{ .dwSize = @sizeOf(w.PROCESSENTRY32W) };
+    if (w.Process32FirstW(snap, &entry) == 0) {
+        map.deinit(alloc);
+        return null;
+    }
+    var ok = true;
+    while (ok) : (ok = w.Process32NextW(snap, &entry) != 0) {
+        map.put(alloc, @intCast(entry.th32ProcessID), @intCast(entry.th32ParentProcessID)) catch {
+            // OOM mid-walk leaves a PARTIAL table, and a partial table's
+            // "no descendants" is a guess. Fail the whole snapshot instead.
+            map.deinit(alloc);
+            return null;
+        };
+    }
+    return map;
+}
+
+fn snapshotParentsLinux(alloc: Allocator) ?descendants.ParentMap {
+    if (comptime builtin.os.tag != .linux) return null;
+
+    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var map: descendants.ParentMap = .empty;
+
+    var it = dir.iterate();
+    while (it.next() catch null) |ent| {
+        if (ent.kind != .directory) continue;
+        const pid = std.fmt.parseInt(i64, ent.name, 10) catch continue;
+
+        var path_buf: [64]u8 = undefined;
+        const stat_path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{ent.name}) catch continue;
+        var sbuf: [4096]u8 = undefined;
+        const f = std.fs.cwd().openFile(stat_path, .{}) catch continue;
+        const slen = f.readAll(&sbuf) catch {
+            f.close();
+            continue;
+        };
+        f.close();
+        // A process that exits between the readdir and the read is simply gone;
+        // skipping it is correct (it is not running under anything any more).
+        const parsed = parseLinuxStat(sbuf[0..slen]) orelse continue;
+        map.put(alloc, pid, parsed.ppid) catch {
+            map.deinit(alloc);
+            return null;
+        };
+    }
+    if (map.count() == 0) {
+        map.deinit(alloc);
+        return null;
+    }
+    return map;
+}
+
+fn snapshotParentsMacos(alloc: Allocator) ?descendants.ParentMap {
+    if (comptime builtin.os.tag != .macos) return null;
+    const c = macos;
+
+    // Two-step sizing, exactly as `sampleMacos` does: ask for the byte count,
+    // allocate with slack for procs that appear in between, fetch.
+    const needed = c.proc_listpids(c.PROC_ALL_PIDS, 0, null, 0);
+    if (needed <= 0) return null;
+    const cap_bytes: usize = @as(usize, @intCast(needed)) + @sizeOf(i32) * 32;
+    const pid_buf = alloc.alloc(u8, cap_bytes) catch return null;
+    defer alloc.free(pid_buf);
+    const wrote = c.proc_listpids(c.PROC_ALL_PIDS, 0, pid_buf.ptr, @intCast(pid_buf.len));
+    if (wrote <= 0) return null;
+    const npids: usize = @as(usize, @intCast(wrote)) / @sizeOf(i32);
+    const pids: [*]const i32 = @ptrCast(@alignCast(pid_buf.ptr));
+
+    var map: descendants.ParentMap = .empty;
+
+    var i: usize = 0;
+    while (i < npids) : (i += 1) {
+        const pid32 = pids[i];
+        if (pid32 <= 0) continue;
+        var bsd: c.proc_bsdinfo = undefined;
+        const bsd_sz: c_int = @sizeOf(c.proc_bsdinfo);
+        // A protected or vanished pid answers short — skip the row rather than
+        // failing the whole enumeration (same rule as `sampleMacos`).
+        if (c.proc_pidinfo(pid32, c.PROC_PIDTBSDINFO, 0, &bsd, bsd_sz) != bsd_sz) continue;
+        map.put(alloc, pid32, @intCast(bsd.pbi_ppid)) catch {
+            map.deinit(alloc);
+            return null;
+        };
+    }
+    if (map.count() == 0) {
+        map.deinit(alloc);
+        return null;
+    }
+    return map;
+}
+
+test "snapshotParents: this process is in the table and descends from something" {
+    const alloc = testing.allocator;
+    var map = snapshotParents(alloc) orelse return error.SkipZigTest;
+    defer map.deinit(alloc);
+
+    const me: i64 = switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        else => @intCast(std.c.getpid()),
+    };
+    try testing.expect(descendants.contains(&map, me));
+    // Our own parent (the test runner's launcher) must see us as a descendant —
+    // the round-trip that proves the map is wired the right way up rather than
+    // being an accidental identity table.
+    const parent = map.get(me).?;
+    if (parent > 0) try testing.expect(descendants.hasDescendants(&map, parent));
 }
 
 /// Free one row's caller-owned strings. Public because `sample` hands ownership

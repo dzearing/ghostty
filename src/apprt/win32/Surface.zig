@@ -1420,19 +1420,31 @@ pub fn livePwd(self: *Surface, alloc: Allocator) ?[]u8 {
 /// (`ProcessTree.snapshot`); callers closing a whole window take one for every
 /// pane rather than one each.
 ///
-/// Answers FALSE whenever it cannot know: no shell pid (a cross-machine pane,
-/// a surface that is not up yet), a shell missing from the snapshot (Toolhelp32
-/// failed, and an empty map would otherwise read as "nothing is running"), a
-/// read-only surface, or `confirm-close-surface = always` — a confirmation the
-/// user configured unconditionally is not a question about the shell.
+/// A CROSS-MACHINE pane has no local pid to walk, so it asks the machine that
+/// owns the process instead: the agent samples its own process table and pushes
+/// the answer (`META{has_descendants}`, T356), and this reads the last pushed
+/// value. That path is only reached when there is no local pid — where we have
+/// one, the snapshot taken at close time is the exact answer and wins.
+///
+/// Answers FALSE whenever it cannot know: a surface that is not up yet, a shell
+/// missing from the snapshot (Toolhelp32 failed, and an empty map would
+/// otherwise read as "nothing is running"), a remote pane whose agent never
+/// reported (too old, not sampled yet) or whose link is down, a read-only
+/// surface, or `confirm-close-surface = always` — a confirmation the user
+/// configured unconditionally is not a question about the shell.
 pub fn shellIsIdle(self: *Surface, map: *const ProcessTree.PidMap) bool {
     if (!self.core_surface_ready) return false;
     if (self.core_surface.readonly) return false;
     if (self.core_surface.config.confirm_close_surface == .always) return false;
     const pid = self.shellPid();
-    if (pid == 0) return false;
-    if (!ProcessTree.contains(map, pid)) return false;
-    return !ProcessTree.hasDescendants(map, pid);
+    if (pid != 0) {
+        if (!ProcessTree.contains(map, pid)) return false;
+        return !ProcessTree.hasDescendants(map, pid);
+    }
+    return switch (self.core_surface.io.backend) {
+        .exec => false,
+        .remote => |*r| !(r.shellHasDescendants() orelse return false),
+    };
 }
 
 /// `shellIsIdle` against a snapshot taken here. A failed snapshot answers

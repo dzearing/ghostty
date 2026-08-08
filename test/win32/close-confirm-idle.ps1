@@ -17,6 +17,14 @@
 #     ghoztty-agent.exe and the app only knows the pid the agent reports (the
 #     `remote` backend, local connection). A fix that only handles `exec`
 #     leaves every real user pane confirming.
+#   Section C - a CROSS-MACHINE pane (T356), dialed over TCP to a listening
+#     ghoztty-agent. Here the app has no pid it may walk at all: the shell's pid
+#     indexes the far machine's process table, so `Surface.shellPid` returns 0 by
+#     design and every close used to confirm. The answer now comes from the
+#     machine that owns the process - the agent samples its own table each
+#     second and pushes `META{has_descendants}` on change, which the app reads
+#     synchronously at close time. The agent here listens on loopback, so the
+#     same Win32_Process oracle still works.
 #
 # Each section runs the same two cases in ONE window, busy first:
 #
@@ -51,6 +59,8 @@
 # Only touches ghoztty processes running from this repo's zig-out.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    [string]$AgentExe = '',
+    [int]$Port = 47741,
     [switch]$NegativeControl,
     [switch]$Interactive
 )
@@ -59,6 +69,7 @@ $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 if (-not (Test-Path $Exe)) { Write-Host "SETUP FAIL: no exe at $Exe"; exit 1 }
+if (-not $AgentExe) { $AgentExe = Join-Path (Split-Path $Exe -Parent) 'ghoztty-agent.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
 # instance on the shared pipe cannot answer our +list.
@@ -174,6 +185,36 @@ function Get-PaneShellPid {
     return 0
 }
 
+# The pid `+list --json` reports for the pane of the window registered under
+# $Target, or -1 when that window/pane is not there at all. Distinct from
+# `Get-PaneShellPid` (which takes the first pane with a pid > 0) because for a
+# CROSS-MACHINE pane the interesting value IS zero: `Surface.shellPid` refuses to
+# hand back a pid that indexes another machine's process table.
+function Get-TargetPaneShellPid([string]$Target) {
+    $json = & $Exe +list --json 2>$null | Out-String
+    if (-not $json) { return -1 }
+    try { $tree = $json | ConvertFrom-Json } catch { return -1 }
+    $root = if ($tree.PSObject.Properties.Name -contains 'data') { $tree.data } else { $tree }
+    foreach ($w in @($root.windows)) {
+        if ($w.target -ne $Target) { continue }
+        foreach ($t in @($w.tabs)) {
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($t.splits)
+            while ($stack.Count -gt 0) {
+                $n = $stack.Pop()
+                if ($null -eq $n) { continue }
+                if ($n.type -eq 'leaf') {
+                    if ($n.terminal) { return [int]$n.terminal.pid }
+                } else {
+                    if ($n.right) { $stack.Push($n.right) }
+                    if ($n.left) { $stack.Push($n.left) }
+                }
+            }
+        }
+    }
+    return -1
+}
+
 function Launch-Gui([string[]]$ExtraArgs) {
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $ExtraArgs
     Start-Sleep -Seconds 3
@@ -283,6 +324,145 @@ function Invoke-Section([string]$Label, [string[]]$ExtraArgs) {
     Start-Sleep -Milliseconds 500
 }
 
+# How long to allow for the agent's pushed answer to reach the app (T356). The
+# agent samples once a second and pushes only on change, so this is that tick
+# plus slack for the frame. It is a WAIT, not a poll of anything the app says -
+# every busy/idle verdict below is still anchored on Win32_Process.
+$script:PushSettleMs = 3000
+
+# Section C: a CROSS-MACHINE pane. A loopback `ghoztty-agent --listen` stands in
+# for the other machine - the app dials it over TCP, so the connection is
+# `remote` and NOT `local`, which is exactly the case where `Surface.shellPid`
+# returns 0 and the local process walk has nothing to walk.
+function Invoke-RemoteSection([string]$Label) {
+    Write-Host ""
+    Write-Host "== $Label =="
+
+    if (-not (Test-Path $AgentExe)) {
+        Write-Host "SETUP FAIL: no agent at $AgentExe"
+        $script:fail++
+        return
+    }
+
+    # A unique lock path so this harness agent never fights a real agent's
+    # single-instance guard (the ipc-remote.ps1 precedent).
+    $env:GHOSTTY_AGENT_LOCK = Join-Path $env:TEMP 'ghoztty-t356-agent.lock'
+    $agent = Start-Process -FilePath $AgentExe `
+        -ArgumentList "--listen", "127.0.0.1:$Port", "--headless" `
+        -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    if ($agent.HasExited) {
+        Write-Host "SETUP FAIL: $Label listening agent exited immediately"
+        $script:fail++
+        return
+    }
+
+    $g = $null
+    try {
+        # Persistence OFF for the app's own first window, so the ONLY
+        # ghoztty-agent on the box is our listener and the shell-pid oracle
+        # below cannot pick up a local-agent session by mistake.
+        $g = Launch-Gui @('--session-persistence=false')
+        if (-not $g) { Write-Host "SETUP FAIL: $Label GUI did not come up"; $script:fail++; return }
+        Assert (-not (Test-TestDesktopLeak -ProcessId $g.Pid)) "$Label window is NOT on the interactive desktop"
+
+        $before = @(Get-TestWindows -ProcessId $g.Pid | ForEach-Object { $_.Hwnd })
+        & $Exe +new-remote-window --host=127.0.0.1 --port=$Port --name=t356rem 2>&1 | Out-Null
+        $top = [IntPtr]::Zero
+        for ($t = 0; $t -lt 60 -and $top -eq [IntPtr]::Zero; $t++) {
+            Start-Sleep -Milliseconds 250
+            foreach ($w in (Get-TestWindows -ProcessId $g.Pid)) {
+                if ($before -notcontains $w.Hwnd) { $top = [IntPtr]$w.Hwnd; break }
+            }
+        }
+        Assert ($top -ne [IntPtr]::Zero) "$Label +new-remote-window opened a window"
+        if ($top -eq [IntPtr]::Zero) { return }
+        Set-TestWindowSize -Window $top -Width 1100 -Height 700 | Out-Null
+        Start-Sleep -Milliseconds 400
+        $surface = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+        if ($surface -eq [IntPtr]::Zero) {
+            Write-Host "SETUP FAIL: $Label remote window has no terminal surface"
+            $script:fail++
+            return
+        }
+
+        # THIS is what makes the section a cross-machine one rather than an
+        # accidental re-run of B: the app must report NO pid for the pane. A
+        # non-zero pid here would mean the local walk could have answered, and
+        # every verdict below would be about the wrong code path.
+        $reported = Get-TargetPaneShellPid 't356rem'
+        Assert ($reported -eq 0) "$Label the app reports no local pid for the remote pane (got $reported)"
+
+        # The shell itself, from the OS: the agent's own non-console descendant.
+        $shell = 0
+        for ($t = 0; $t -lt 40 -and $shell -eq 0; $t++) {
+            foreach ($p in (Get-DescendantPids $agent.Id)) {
+                if ($p.Name -match '^(conhost|openconsole)\.exe$') { continue }
+                $shell = [int]$p.ProcessId
+                break
+            }
+            if ($shell -eq 0) { Start-Sleep -Milliseconds 250 }
+        }
+        Assert ($shell -gt 0) "$Label the agent spawned a shell for the remote session"
+        if ($shell -le 0) { return }
+
+        $idle0 = @(Get-DescendantPids $shell)
+        Assert ($idle0.Count -eq 0) "$Label a fresh remote shell has no descendants (found $($idle0.Count))"
+
+        # Let the agent push the IDLE answer BEFORE anything runs. This is what
+        # makes the busy dialog below evidence of a real transition: without it,
+        # a confirm could just as well be the app's "I was never told" default,
+        # which is also a confirm.
+        Start-Sleep -Milliseconds $script:PushSettleMs
+
+        # ---------------------------------------------------------------- busy
+        Send-TestText -Window $top -Target $surface -Text 'ping -n 100 127.0.0.1' | Out-Null
+        Send-TestKeys -Window $top -Target $surface -Key Enter | Out-Null
+        $busy = @(Wait-Descendants $shell $true)
+        Assert ($busy.Count -gt 0) "$Label ping is running under the remote shell ($($busy.Count) descendants)"
+        if ($busy.Count -eq 0) { return }
+        Start-Sleep -Milliseconds $script:PushSettleMs
+
+        Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key W | Out-Null
+        $dlg = Wait-Dialog $g.Pid $true 5000
+        Assert ($dlg -ne [IntPtr]::Zero) "$Label busy remote shell: ctrl+w opens the confirm dialog"
+        if ($dlg -ne [IntPtr]::Zero) {
+            Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+            $gone = Wait-Dialog $g.Pid $false
+            Assert ($gone -eq [IntPtr]::Zero) "$Label Escape dismisses the busy confirm"
+            Assert (Test-TestWindowVisible -Window $top) "$Label remote window survives the cancelled close"
+        }
+
+        # ---------------------------------------------------------------- idle
+        Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key C | Out-Null
+        $left = @(Wait-Descendants $shell $false)
+        Assert ($left.Count -eq 0) "$Label ctrl+c leaves the remote shell with no descendants (found $($left.Count))"
+        if ($left.Count -ne 0) { return }
+        Start-Sleep -Milliseconds $script:PushSettleMs
+
+        Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key W | Out-Null
+        $dlg = Wait-Dialog $g.Pid $true 2500
+        $closed = $false
+        for ($t = 0; $t -lt 40 -and -not $closed; $t++) {
+            Start-Sleep -Milliseconds 100
+            $closed = (-not (Test-TestWindowExists -Window $top)) -or (-not (Test-TestWindowVisible -Window $top))
+        }
+
+        if ($NegativeControl) {
+            Write-Host "NEGATIVE CONTROL: asserting the IDLE remote close still confirms - this run MUST fail"
+            Assert ($dlg -ne [IntPtr]::Zero) "$Label idle remote shell: ctrl+w opens the confirm dialog (inverted)"
+        } else {
+            Assert ($dlg -eq [IntPtr]::Zero) "$Label idle remote shell: ctrl+w opens NO confirm dialog"
+        }
+        Assert $closed "$Label idle remote shell: the pane closed without confirming"
+        if ($dlg -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlg -Key Escape | Out-Null }
+    } finally {
+        if ($g) { Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue }
+        Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
 Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
 Reset-AgentState
 Start-TestForegroundWatch
@@ -293,6 +473,9 @@ try {
     Stop-RepoProcesses @('ghoztty')
     Reset-AgentState
     Invoke-Section 'B/agent' @('--session-persistence=true')
+    Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
+    Reset-AgentState
+    Invoke-RemoteSection 'C/remote'
 } finally {
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     $fgSeen = @(Stop-TestForegroundWatch)
