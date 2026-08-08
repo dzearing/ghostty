@@ -405,6 +405,24 @@ implementable rather than aspirational:
   otherwise shade to itself. Legibility of the control outranks the
   §5 direction convention in that corner, and only there.
 
+**Every divider in the window obeys the width and the color** — including the
+hero-mode divider between the hero pane and its carousel, which is the same
+2 DIP mark, reads the same `split-divider-color` (via `Window
+.dividerConfiguredColor`, floored by `dividerPaint` against the carousel band
+rather than a pane), and is centered in hero mode's own wider 6 DIP grab band
+(T250). Until then it was 1 DIP with a color derived from the band, so one
+window showed two dividers of two widths and a themed divider was themed on one
+side of it and not the other.
+
+The ONE thing it does differently is the hot state: hover and drag paint the
+**accent**, not the ±25 shade. That is deliberate hero-mode behavior, cited
+rather than assumed — Mac fills this divider with `Color(red: 0.416, green:
+0.416, blue: 1.0)` while hovered or dragged
+(`macos/Sources/Features/HeroMode/HeroModeView.swift:117`) — and T305 replaced
+the ported copy of that literal with the user's own accent, floored to 3:1
+against the band. A carousel is a selection surface and its accent already
+means "this one"; the divider joining it reads as part of that surface.
+
 ---
 
 ## 6. Vertical space is expensive

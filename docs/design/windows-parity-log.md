@@ -11065,3 +11065,47 @@ Floor green: `floor-lane -Lane all` ALL LANES PASS, `split-divider.ps1` ALL PASS
 Filed: **T580** — Mac has the same unfloored hole, so the seats now disagree
 about the same config line; **T581** — win32's unset-divider fallback is a fixed
 `#808080` while Mac derives its default from the terminal background.
+
+## 2026-08-07 — T250: both dividers in a hero window are finally the same divider
+
+Turn hero mode on and there were two dividers on screen — the one between the
+big pane and the thumbnail strip, and the ordinary one between split panes —
+that disagreed about what a divider is. The hero one drew its own `1.0 * scale`
+mark, which is the single physical pixel at 100% and 125% that T233 retired
+everywhere else, and it took its rest color from the carousel band rather than
+from `split-divider-color`, so a user who themed their dividers got one themed
+and one not, in one window. Both now go through the same two calls the split
+divider uses: `split_geometry.bandPx` for the width and
+`split_geometry.dividerPaint` for the color, floored to 3:1 against the band it
+has to read against.
+
+The hover accent was checked before it was flattened, per the T240 lesson, and
+it survives: `HeroModeView.swift:117-121` fills this divider with
+`Color(red: 0.416, green: 0.416, blue: 1.0)` while hovered or dragged, so the
+accent is deliberate hero-mode behavior rather than a stray literal — and T305
+had already replaced the ported copy of that number with the user's own accent.
+Recorded in `win32-design-system.md` §5, which now says outright that every
+divider in the window obeys the width and the color rule and names the one
+thing hero mode does differently.
+
+The configured color is read in exactly one place now
+(`Window.dividerConfiguredColor`, over `split_geometry.FALLBACK_COLOR`) rather
+than resolved separately at each paint site — which is how the hero divider
+came to ignore the config in the first place, and which leaves T581's
+"derive the unset fallback from the background" a one-line change.
+
+`hero-mode.ps1` gained the probe: it launches with
+`--split-divider-color=c86400` and measures the painted mark off a PrintWindow
+capture — 3px at this box's 120 dpi, and that orange, so "honored the config"
+is distinguishable from "happened to paint a gray". The hot color is probed
+mid-DRAG, not mid-hover, because a posted `WM_MOUSEMOVE` cannot HOLD a hover on
+the background test desktop (TrackMouseEvent watches the real cursor and
+`WM_MOUSELEAVE` lands within a frame — T233's lesson); a posted button-down
+does hold, and a drag is a held hover by design. The hover half gets the house
+debug-log oracle instead, a new `hero divider hover=` line.
+
+Floor green: `floor-lane -Lane all` ALL LANES PASS, `hero-mode.ps1` ALL PASS
+(68 assertions), `split-divider.ps1` ALL PASS (51), P1–P3 ALL PASS.
+
+Filed: **T582** — Mac's hero divider ignores `split-divider-color` the same
+way, verified by reading the source this port was checked against.

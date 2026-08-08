@@ -33,6 +33,13 @@ pub fn bandPx(scale: f32) i32 {
     return @max(@as(i32, @intFromFloat(@round(2.0 * scale))), 2);
 }
 
+/// What a divider is painted with when the user set no `split-divider-color`
+/// (Mac's `Ghostty.Config.swift` fallback, mid-gray). Lives here rather than at
+/// a paint site because more than one divider reads it — the split dividers and
+/// the hero/carousel divider — and a fallback that differs between them is the
+/// same defect as ignoring the config outright.
+pub const FALLBACK_COLOR: color_math.Rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+
 /// Per-channel shade applied to the divider while its grab band is hovered
 /// or being dragged (design system §5).
 ///

@@ -2164,6 +2164,14 @@ fn heroMouseMove(self: *Window, x: i32, y: i32) void {
     const new_div = self.heroHitDivider(x, y);
     if (new_div != self.hero_divider_hover) {
         self.hero_divider_hover = new_div;
+        // Debug-build oracle for hero-mode.ps1, the `divider hover=` idiom
+        // (T233/T250): a POSTED WM_MOUSEMOVE cannot hold a hover on the
+        // background test desktop, because TrackMouseEvent watches the real
+        // cursor and WM_MOUSELEAVE lands within a frame. That makes the hover
+        // paint unobservable to a pixel probe and the TRIGGER unobservable
+        // without this line. (The hot COLOR is probed mid-DRAG, which a posted
+        // button-down does hold.)
+        log.debug("hero divider hover={}", .{new_div});
         self.heroInvalidateDivider();
     }
 }
@@ -2542,6 +2550,22 @@ fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneVi
     }
 }
 
+/// The user's `split-divider-color`, or the design system's fallback gray.
+///
+/// Public because EVERY divider in the window reads it (T250): the split
+/// dividers below and the hero/carousel divider in `HeroCarousel.paint`. Two
+/// call sites resolving the same config key separately is how the hero divider
+/// ended up ignoring `split-divider-color` while the divider next to it
+/// honored it. The contrast floor is NOT applied here — that is
+/// `split_geometry.dividerPaint`'s job, against whichever background the
+/// particular divider has to read against.
+pub fn dividerConfiguredColor(self: *Window) color_math.Rgb {
+    return if (self.app.config.@"split-divider-color") |c|
+        .{ .r = c.r, .g = c.g, .b = c.b }
+    else
+        split_geometry.FALLBACK_COLOR;
+}
+
 /// Paint divider lines between split panes in the active tab.
 fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (self.tab_count == 0) return;
@@ -2550,10 +2574,7 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
     const rect = self.surfaceRect();
-    const configured: color_math.Rgb = if (self.app.config.@"split-divider-color") |c|
-        .{ .r = c.r, .g = c.g, .b = c.b }
-    else
-        .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+    const configured = self.dividerConfiguredColor();
 
     // T233: the hovered/dragged divider paints shaded, and which way to shade
     // is decided by the PANE background, not the OS theme — the divider has to

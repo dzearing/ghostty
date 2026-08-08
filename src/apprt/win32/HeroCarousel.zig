@@ -19,6 +19,7 @@ const hero_math = @import("hero_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const panel_theme = @import("panel_theme.zig");
 const color_math = @import("color_math.zig");
+const split_geometry = @import("split_geometry.zig");
 const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32);
@@ -170,22 +171,34 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         _ = w32.DeleteObject(@ptrCast(brush));
     }
 
-    // Divider: thin vertical line centered in the band; gray normally,
-    // accent while hovered or dragged (Mac: blue while hovered/dragged).
-    const line_w = @max(@as(i32, @intFromFloat(@round(1.0 * win.scale))), 1);
+    // Divider: the visible mark, centered in the 6 DIP grab band.
+    //
+    // WIDTH is `split_geometry.bandPx` — the same 2 DIP every other divider in
+    // the window is (design system §5, T250). It used to compute its own
+    // `1.0 * scale`, which is the single physical pixel at 100%/125% that T233
+    // retired everywhere else, so the window showed two dividers of two widths.
     const band_w = geo.split.divider.width();
+    const line_w = @min(split_geometry.bandPx(win.scale), band_w);
     var line: w32.RECT = .{
         .left = @divTrunc(band_w - line_w, 2),
         .top = 0,
         .right = @divTrunc(band_w - line_w, 2) + line_w,
         .bottom = rh,
     };
+    // REST is the user's `split-divider-color` (same fallback as a split
+    // divider), floored to 3:1 by `dividerPaint` against the BAND — the surface
+    // this particular divider has to read against. Before T250 it derived from
+    // the band alone (T308) and from a literal `RGB(96,96,96)` before that, so
+    // a user who themed their dividers got one themed and one not, in one
+    // window.
+    const div_rest = split_geometry.dividerPaint(win.dividerConfiguredColor(), back, false);
+    // HOVER/DRAG is the ACCENT, not the split divider's shade rule — a
+    // deliberate hero-mode behavior, not a stray literal: Mac fills this
+    // divider with `Color(red: 0.416, green: 0.416, blue: 1.0)` while hovered
+    // or dragged (`macos/Sources/Features/HeroMode/HeroModeView.swift:117`).
+    // T305 replaced the ported copy of that number with the user's own accent,
+    // floored to 3:1 against the band.
     const div_accent = bandAccent(win).on;
-    // At rest the divider is a BOUNDARY on the band, derived and floored to
-    // 3:1 (T308). It used to be the literal `RGB(96,96,96)` — a mid-grey that
-    // degraded rather than vanished on a light band, which is why it survived,
-    // but it was still the one color here that came from nowhere.
-    const div_rest = panel_theme.boundaryOn(back);
     const div_color = if (win.hero_divider_hover or win.hero_divider_drag)
         w32.RGB(div_accent.r, div_accent.g, div_accent.b)
     else

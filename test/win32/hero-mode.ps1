@@ -27,7 +27,10 @@
 #      reduced-motion setting disables client-area animations.
 #   7. Hover + wheel reach the carousel (debug-log oracles); with 5 tiles
 #      the strip overflows and the wheel offset is nonzero.
-#   8. Divider drag narrows the hero (all leaves re-sized to the new hero
+#   8. The divider MARK is design-system compliant (T250): bandPx wide (the
+#      same 2 DIP as a split divider), painted with the run's
+#      `split-divider-color`, and it changes color under the pointer.
+#   9. Divider drag narrows the hero (all leaves re-sized to the new hero
 #      rect); double-clicking the divider resets the ratio to 0.25.
 #
 # T218 batch 6: migrated onto the BACKGROUND test desktop
@@ -227,6 +230,66 @@ function Get-RegionSignature([IntPtr]$top, [int]$xMin) {
     } finally { Close-TestWindowPixels $shot }
 }
 
+# split_geometry.bandPx / hero_math's grab band, mirrored in PowerShell (T250).
+# [math]::Round is BANKER'S rounding in .NET while Zig's @round is
+# half-away-from-zero, and 125% DPI lands exactly on 2 * 1.25 = 2.5 - so the
+# naive form expects 2px where the product paints 3 and fails a healthy build
+# at the scale most users run.
+function Get-ExpectedMarkPx([int]$dpi) {
+    [math]::Max([int][math]::Round(2.0 * $dpi / 96.0, [MidpointRounding]::AwayFromZero), 2)
+}
+function Get-ExpectedGrabPx([int]$dpi) {
+    [math]::Max([int][math]::Round(6.0 * $dpi / 96.0, [MidpointRounding]::AwayFromZero), 2)
+}
+
+# A horizontal line of "r,g,b" straight across the hero divider band, read off
+# a PrintWindow capture of the TOP-LEVEL window - which is exactly where
+# HeroCarousel.paint's output lands (see the header: no child HWNDs, painted
+# into the parent DC inside BeginPaint/EndPaint). $hero is a client-coordinate
+# pane rect; the strip spans a few px either side of the band so a mark that
+# drifted off the band still shows up rather than being cropped out of the
+# probe. Returns $null when the capture held no real content, so an empty
+# capture reads as "this probe is meaningless" and never as "no divider".
+function Get-HeroDividerStrip([IntPtr]$top, $hero, [int]$grab, [int]$pad = 4) {
+    $shot = Get-TestWindowPixels -Window $top
+    try {
+        if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
+        $midY = [int](($hero.Top + $hero.Bottom) / 2)
+        $s = To-Screen $top ($hero.Right - $pad) $midY
+        $x0 = [int]($s[0] - $shot.Left)
+        $y = [int]($s[1] - $shot.Top)
+        if ($y -lt 0 -or $y -ge $shot.Height) { return $null }
+        $out = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt ($grab + 2 * $pad); $i++) {
+            $x = $x0 + $i
+            if ($x -lt 0 -or $x -ge $shot.Width) { $out.Add('-1,-1,-1'); continue }
+            $c = $shot.Bitmap.GetPixel($x, $y)
+            $out.Add("$($c.R),$($c.G),$($c.B)")
+        }
+        return , $out.ToArray()
+    } finally { Close-TestWindowPixels $shot }
+}
+
+function Pixel-Matches([string]$px, [int]$tr, [int]$tg, [int]$tb, [int]$tol = 12) {
+    $c = $px -split ','
+    ([math]::Abs([int]$c[0] - $tr) -le $tol) -and
+    ([math]::Abs([int]$c[1] - $tg) -le $tol) -and
+    ([math]::Abs([int]$c[2] - $tb) -le $tol)
+}
+
+# Longest run of consecutive pixels matching the target, and where it starts.
+function Get-ColorRun([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
+    $best = 0; $bestAt = -1; $run = 0; $at = -1
+    for ($i = 0; $i -lt $strip.Count; $i++) {
+        if (Pixel-Matches $strip[$i] $tr $tg $tb) {
+            if ($run -eq 0) { $at = $i }
+            $run++
+            if ($run -gt $best) { $best = $run; $bestAt = $at }
+        } else { $run = 0 }
+    }
+    return @{ Length = $best; Start = $bestAt }
+}
+
 function Save-WindowShot([IntPtr]$top, [string]$path) {
     $shot = Get-TestWindowPixels -Window $top
     try { $shot.Bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) }
@@ -250,8 +313,14 @@ try {
 # session-persistence=false: a persisted session survives the force-kills this
 # script brackets itself with, and the panes would re-attach LAST run's shells
 # (T248).
+# split-divider-color is set here for the T250 probe in phase 3: the hero
+# divider must honor the SAME config key the split divider next to it does, and
+# a distinctive orange is the only way to tell "honored the config" apart from
+# "happened to paint a gray". It clears the 3:1 chrome floor against the
+# darkened carousel band, so `dividerPaint` paints it verbatim.
 $app = Start-OnTestDesktop -Exe $exe -StdErr $errlog -Arguments @(
-    '--config-default-files=false', '--session-persistence=false')
+    '--config-default-files=false', '--session-persistence=false',
+    '--split-divider-color=c86400')
 $gpid = [int]$app.Pid
 $launched += $gpid
 Start-Sleep -Seconds 3
@@ -567,6 +636,73 @@ if ($null -ne $big4) {
         $scrollLines = @(Select-String -Path $errlog -Pattern 'hero wheel scroll=(-?\d+)')
         $lastScroll = if ($scrollLines.Count -gt 0) { [int]$scrollLines[-1].Matches[0].Groups[1].Value } else { 0 }
         Assert ($lastScroll -ne 0) "wheel: overflowing strip scrolled (offset $lastScroll)"
+    }
+
+    # (e0) The divider MARK itself (T250), read off a PrintWindow capture:
+    #   * it is `split_geometry.bandPx` wide - the same 2 DIP the split divider
+    #     next to it is. It used to compute its own 1 DIP, which rounds to a
+    #     single physical pixel at 100% and 125%, so one window showed two
+    #     dividers of two widths.
+    #   * it is the user's `split-divider-color` (the orange this run launched
+    #     with), not a color derived from the band. A themed divider was themed
+    #     on one side of the window and not the other.
+    #   * it CHANGES under the pointer, so the grab affordance still reads.
+    # Runs before (e), which moves the divider.
+    if ($null -ne $big5) {
+        $dpi = Get-TestWindowDpi -Window $top
+        $markPx = Get-ExpectedMarkPx $dpi
+        $grabPx = Get-ExpectedGrabPx $dpi
+        $midY0 = [int](($big5.Top + $big5.Bottom) / 2)
+
+        # Pointer parked well inside the hero pane: divider at REST.
+        $sAway = To-Screen $top ([int]($big5.Left + $big5.Width / 2)) $midY0
+        [void](Send-TestMouse -Window $top -Target $top -X $sAway[0] -Y $sAway[1] -Action move)
+        Start-Sleep -Milliseconds 250
+        $rest = Get-HeroDividerStrip $top $big5 $grabPx
+        Assert ($null -ne $rest) 'divider mark: capture held real content'
+        if ($null -ne $rest) {
+            $run = Get-ColorRun $rest 200 100 0
+            Assert ($run.Length -gt 0) `
+                "divider mark: painted with split-divider-color c86400 (strip: $($rest -join ' '))"
+            Assert ($run.Length -eq $markPx) `
+                "divider mark: ${markPx}px wide at ${dpi} dpi (got $($run.Length))"
+
+            # HOT: the same strip while the band is GRABBED. Hero mode paints
+            # the accent here (Mac parity, HeroModeView.swift:117), and a drag
+            # is a held hover so the two states paint identically.
+            #
+            # Probed mid-DRAG rather than mid-hover on purpose: a POSTED
+            # WM_MOUSEMOVE cannot hold a hover on the background test desktop -
+            # TrackMouseEvent watches the real cursor, so WM_MOUSELEAVE wipes
+            # the state within a frame (T233's lesson). A posted button-down
+            # holds. The divider has not moved yet (no move event between the
+            # down and the capture), so the mark is still at $run.Start.
+            $sOn = To-Screen $top ([int]($big5.Right + $grabPx / 2)) $midY0
+            [void](Send-TestMouse -Window $top -Target $top -X $sOn[0] -Y $sOn[1] -Action move)
+            Start-Sleep -Milliseconds 150
+            if ($haveLog) {
+                $hv = @(Select-String -Path $errlog -Pattern 'hero divider hover=true')
+                Assert ($hv.Count -gt 0) 'divider hover: the pointer lit the divider (log)'
+            }
+            [void](Send-TestMouse -Window $top -Target $top -X $sOn[0] -Y $sOn[1] -Action down)
+            Start-Sleep -Milliseconds 300
+            $hot = Get-HeroDividerStrip $top $big5 $grabPx
+            [void](Send-TestMouse -Window $top -Target $top -X $sOn[0] -Y $sOn[1] -Action up)
+            Start-Sleep -Milliseconds 300
+            if ($null -eq $hot) {
+                Assert $false 'divider grabbed: capture held real content'
+            } else {
+                $stillRest = $false
+                for ($i = $run.Start; $i -lt ($run.Start + $run.Length); $i++) {
+                    if (Pixel-Matches $hot[$i] 200 100 0) { $stillRest = $true }
+                }
+                Assert (-not $stillRest) `
+                    "divider grabbed: the mark changed color (hot strip: $($hot -join ' '))"
+            }
+            # Back to rest, so (e)'s drag starts from the state it expects.
+            [void](Send-TestMouse -Window $top -Target $top -X $sAway[0] -Y $sAway[1] -Action move)
+            Start-Sleep -Milliseconds 150
+        }
     }
 
     # (e) Divider drag: press in the divider band, drag 150px left, release.

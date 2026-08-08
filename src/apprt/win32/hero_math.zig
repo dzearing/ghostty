@@ -212,6 +212,25 @@ test "splitRects clamps ratio to Mac bounds" {
     try std.testing.expectEqual(@as(i32, 600), content.right - hi.carousel.left);
 }
 
+test "the hero divider's visible mark is a split divider's, and fits its band" {
+    // T250. The mark HeroCarousel.paint centers in this band is
+    // `split_geometry.bandPx` — one number for "how wide is a divider",
+    // asserted here because the two modules are otherwise unaware of each
+    // other and the hero divider spent T233 disagreeing with the split
+    // divider next to it (1 DIP against 2, in the same window).
+    const split_geometry = @import("split_geometry.zig");
+    const content: Rect = .{ .left = 0, .top = 0, .right = 1000, .bottom = 800 };
+    for ([_]f32{ 0.1, 1.0, 1.25, 1.5, 2.0, 3.0 }) |scale| {
+        const s = splitRects(content, 0.25, scale);
+        const mark = split_geometry.bandPx(scale);
+        // Never a single physical pixel — the whole point of the 2 DIP rule.
+        try std.testing.expect(mark >= 2);
+        // And it always fits inside the grab band, so the centering arithmetic
+        // in the painter can never produce a negative inset.
+        try std.testing.expect(mark <= s.divider.width());
+    }
+}
+
 test "splitRects degenerate tiny content stays ordered" {
     const content: Rect = .{ .left = 0, .top = 0, .right = 4, .bottom = 4 };
     const s = splitRects(content, 0.6, 2.0);
