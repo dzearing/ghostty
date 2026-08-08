@@ -11695,3 +11695,64 @@ task is the first caller to reach the gap, and section 4 of the acceptance
 script asserts the ATTEMPT rather than the recovery until it is closed.
 **T610** — the machine-name half of Mac's pill (which machine, and
 click-to-open-Activity-Monitor), split out rather than dropped.
+
+## 2026-08-08 — T301: the Activity Monitor can go back to a machine a window is on
+
+The panel could always leave a machine. Coming back is what did not work, and the
+re-dial in the task title turned out to be the second of two problems, not the
+first.
+
+The first: the card disappeared. `rebuildCards` built the strip from the relay
+directory plus the ACTIVE source, so the moment the panel switched to Local the
+machine it had come from stopped being the active source and lost its card
+outright. Nothing lists a `127.0.0.1:PORT` box — the relay directory does not
+know it exists — and with no signed-in account the directory is empty anyway, so
+the trip to Local was one-way. The strip now also carries a card for every
+machine a live WINDOW is connected to (`refreshWindowMachines`, held by value in
+`win_machines`: a window can close between two rebuilds and a card slicing into
+its freed strings would outlive them).
+
+The second, now reachable: switching to such a machine BORROWS that window's
+connection instead of dialing a fresh owned one. A re-dial there is wrong twice
+over — with no account it just fails while a working link sits one window away,
+and with an account it opens a redundant second connection to a machine we are
+already talking to. The direct-TCP case cannot be papered over at all: there is
+no relay device id to dial. The decision is pure and unit-tested in
+`activity_borrow.zig` — the identity key (relay device id, else `host:port`, the
+same derivation `Surface.openActivityMonitor` uses) and the first CONNECTED
+window that matches. A window whose link is down is deliberately not borrowed:
+that would trade a dial that might work for a connection that certainly will
+not.
+
+Borrowing from a window the panel cannot see the lifetime of needs the other
+half, so `RemoteReconnect.releaseTransports` — the one place both window
+teardown paths meet — now calls `ActivityMonitor.releaseBorrowed` for the live
+transport and every retired one. It goes AFTER `clearStateHandler` and the
+teardown joins: `releaseBorrowed` shuts the connection down to cut a parked
+sample worker loose, and doing that with the state handler still installed hands
+a dying transition to a window that is already mid-destroy (found the hard way —
+that ordering was the first thing tried and it crashed).
+
+The chooser's Activity button deliberately still dials its own: that is what the
+entry means on both platforms, and it is the only one that can reach a machine
+no window is on.
+
+Floor green — none PASS (294s), agent PASS (328s), P1–P3 ALL PASS. The win32
+lane failed its first run on a live-WebView2 arm nothing here touches (T400's
+stale-debounce fetch count) and PASSED on an immediate re-run of the same build;
+that arm compares two WebView2-cache-dependent counts, so it is filed as
+**T615** rather than shrugged at. `test\win32\activity-monitor-remote.ps1` ALL
+PASS (70 assertions) with a new
+section G: a panel opened from a remote window goes to Local, still sees the
+machine's card there (the arm that failed before this), goes back, samples it
+again with the AGENT's root pid — and dialed nothing on the way.
+
+Filed: **T613** — closing a remote window while an Activity Monitor panel is
+open crashes the app. Section G4 hit it, and it is NOT this task's dangler: it
+reproduces with `releaseBorrowed` neutered to a no-op and does not reproduce
+with no panel open. The fault lands after `Window.onDestroy` has fully run, back
+inside `DestroyWindow`'s child-window destruction, with an `OPENGL32` frame on
+the stack — the hazard `Surface.deinit` already names in a comment. G4 asserts
+only the release notice until it is closed. **T614** — a panel keeps sampling a
+RETIRED transport after its window reconnects, so it reads "Couldn't connect"
+forever beside a window that recovered. **T615** — the flaky T400 arm above.

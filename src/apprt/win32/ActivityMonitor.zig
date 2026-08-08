@@ -109,6 +109,7 @@ const w32 = @import("win32.zig");
 const layout_mod = @import("activity_layout.zig");
 const rows_mod = @import("activity_rows.zig");
 const cards_mod = @import("activity_cards.zig");
+const borrow_mod = @import("activity_borrow.zig");
 const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
 const sample_gate = @import("sample_gate.zig");
@@ -511,6 +512,13 @@ last_metrics: ?remote_protocol.HostMetrics = null,
 /// `id_buf`/`name_buf` for the active source — never at a fetch's arena.
 machines: [max_machines]MachineEntry = @splat(.{}),
 machine_count: usize = 0,
+/// The machines a live WINDOW is connected to, re-derived on every
+/// `rebuildCards` (T301). Held separately from `machines` so a directory fetch
+/// landing cannot wipe them and they cannot leak into one: the directory is
+/// what the ACCOUNT can reach, this is what this app is already talking to, and
+/// the two answer different questions.
+win_machines: [max_machines]MachineEntry = @splat(.{}),
+win_machine_count: usize = 0,
 cards: [cards_mod.max_cards]cards_mod.Card = @splat(.{ .local = true, .label = "Local" }),
 card_count: usize = 0,
 /// The keyboard focus ring. Arrowing moves this and NOTHING else — a carousel
@@ -1225,6 +1233,29 @@ fn rebuildCards(self: *ActivityMonitor) void {
         n += 1;
     }
 
+    // Machines a live WINDOW is connected to (T301). Without these the panel
+    // can leave a borrowed machine and never get back: the relay directory does
+    // not list a `127.0.0.1:PORT` box at all, and lists nothing whatsoever with
+    // no signed-in account, so the machine's card vanished the moment it
+    // stopped being the ACTIVE source — a one-way trip to Local. These cards
+    // are always reachable, because `switchToCard` borrows that window's
+    // connection rather than dialing one.
+    self.refreshWindowMachines();
+    for (self.win_machines[0..self.win_machine_count]) |*m| {
+        if (n == self.cards.len) break;
+        const id = m.idSlice();
+        // A machine the directory already listed keeps the directory's card:
+        // that one carries the human NAME, and this one only has an id.
+        if (cards_mod.indexOf(self.cards[0..n], false, id) != null) continue;
+        self.cards[n] = .{
+            .local = false,
+            .id = id,
+            .label = if (m.name_len > 0) m.nameSlice() else id,
+            .summary = self.cardSummary(false, id, m.online),
+        };
+        n += 1;
+    }
+
     // The active source ALWAYS has a card. It can be missing from the directory
     // for reasons that are all normal: the panel borrowed a remote window's
     // connection, the account is signed out, the fetch failed, or the machine
@@ -1256,6 +1287,47 @@ fn rebuildCards(self: *ActivityMonitor) void {
     if (cards_mod.hasCarousel(n) != had) self.applyLayout();
     self.clampCarousel();
     self.logCarousel();
+}
+
+/// Re-derive `win_machines` from the app's live windows (T301). By VALUE, like
+/// every other entry here: a window can close between two rebuilds, and a card
+/// slicing into its freed `remote_machine` strings would outlive them.
+///
+/// The id is the same key `borrowFromWindow` matches on, and it doubles as the
+/// label — a window knows which machine it is on, not what the user named it.
+/// A directory entry for the same machine wins in `rebuildCards`, so the nicer
+/// name is preferred wherever one exists.
+fn refreshWindowMachines(self: *ActivityMonitor) void {
+    var n: usize = 0;
+    for (self.app.windows.items) |win| {
+        if (n == self.win_machines.len) break;
+        if (win.remote_dialed == null) continue;
+        const machine = win.remote_machine orelse continue;
+
+        var buf: [borrow_mod.max_id]u8 = undefined;
+        const id = borrow_mod.sourceId(&buf, switch (machine) {
+            .relay => |r| .{ .relay = r.device },
+            .tcp => |t| .{ .tcp = .{ .host = t.host, .port = t.port } },
+        }) orelse continue;
+
+        // Two windows on one machine are one card. The first wins, which is the
+        // same first-match rule the borrow itself uses.
+        var seen = false;
+        for (self.win_machines[0..n]) |*prev| {
+            if (std.mem.eql(u8, prev.idSlice(), id)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        // `online` is not the directory's guess here — it is this app's own
+        // link state for that window, which is the one thing about a machine we
+        // do not have to ask anybody about.
+        self.win_machines[n].set(id, id, win.reconnect.ladder == .connected);
+        n += 1;
+    }
+    self.win_machine_count = n;
 }
 
 /// The card index of the panel's current source, or null (which can only happen
@@ -1394,14 +1466,103 @@ fn switchToCard(self: *ActivityMonitor, index: i32) void {
     self.resetForNewSource();
 
     if (self.source == .remote) {
-        // Always a FRESH, OWNED dial. A borrowed connection belongs to a window
-        // and was dropped by `teardownSource`; re-borrowing it would tie this
-        // panel's lifetime back to a window it can no longer see.
-        self.startDial();
+        // Borrow the connection a live WINDOW is already riding to this machine
+        // (T301). A fresh owned dial was the only option here before, and it is
+        // wrong twice over when a window is already talking to the target: with
+        // no signed-in account it just fails, while a working link sits one
+        // window away, and with an account it opens a redundant second
+        // connection. A direct-TCP window is the case that cannot be papered
+        // over at all — it has no relay device id, so there is nothing correct
+        // to re-dial. Borrowing is what the palette entry already does, and the
+        // window-close release path (`releaseBorrowed`) is what makes it safe to
+        // do from here, where the panel cannot see that window's lifetime.
+        if (borrowFromWindow(self.app, self.source.remote.id)) |conn| {
+            self.remote_conn = .{ .conn = conn, .dialed = null };
+            self.beginMetrics();
+            log.info("activity monitor: borrowing a window's connection source={s}", .{self.source.label()});
+        } else {
+            self.startDial();
+        }
     }
     self.rebuildCards();
     self.kickSample();
     _ = w32.InvalidateRect(self.hwnd, null, 0);
+}
+
+/// The connection a live WINDOW is already riding to the machine `id` names, or
+/// null when no window is — in which case the caller dials its own (T301).
+///
+/// The decision itself is pure (`activity_borrow.borrowFrom`), asked one window
+/// at a time so the first-connected-match rule holds without building a list.
+/// The identity key it compares — relay device id, else `host:port` — is the
+/// same one `Surface.openActivityMonitor` builds when the palette opens a panel
+/// on its window's connection, which is what makes the two entry points agree
+/// about which machine a window IS.
+///
+/// This is deliberately NOT wired into the chooser's Activity button: dialing
+/// your own connection is what that entry means on both platforms (Mac's
+/// `presentDialing`), and it is the only entry that can reach a machine no
+/// window is on. The switch is different — it is the panel returning to a
+/// machine it was already borrowing.
+fn borrowFromWindow(app: *App, id: []const u8) ?*remote_connection.Connection {
+    for (app.windows.items) |win| {
+        const dialed = win.remote_dialed orelse continue;
+        const machine = win.remote_machine orelse continue;
+        const cand = [_]borrow_mod.Candidate{.{
+            .machine = switch (machine) {
+                .relay => |r| .{ .relay = r.device },
+                .tcp => |t| .{ .tcp = .{ .host = t.host, .port = t.port } },
+            },
+            // Only a window whose link is UP is worth borrowing: a connection
+            // that cannot answer would report the machine unreachable when a
+            // dial might still have reached it.
+            .connected = win.reconnect.ladder == .connected,
+        }};
+        if (borrow_mod.borrowFrom(&cand, id) != null) return dialed.conn();
+    }
+    return null;
+}
+
+/// A window is about to FREE `conn` (T301). Any panel BORROWING it has to let go
+/// first — the panel's sample worker holds it across an RPC, and the window's
+/// teardown does not otherwise know a panel exists.
+///
+/// Called from `RemoteReconnect.releaseTransports`, which is the one place both
+/// window-teardown paths meet and which runs for the live transport and every
+/// retired one alike. Order inside: unsubscribe (no further metrics callback can
+/// fire), shut the connection down so a worker parked on an unresponsive agent
+/// returns at once, then JOIN it — the usual borrowed-connection rule against
+/// shutdown does not apply when the owner is destroying it in the next breath.
+/// The panel stays open and reports the machine as unreachable, which is the
+/// truth: the link it was watching through has gone.
+pub fn releaseBorrowed(conn: *remote_connection.Connection) void {
+    for (open_wins) |maybe| {
+        const self = maybe orelse continue;
+        const rc = self.remote_conn orelse continue;
+        if (rc.owned() or rc.conn != conn) continue;
+
+        log.info("activity monitor: borrowed connection is going away source={s}", .{self.source.label()});
+        rc.conn.unsubscribeMetrics();
+        rc.conn.shutdown();
+        if (self.worker) |t| {
+            t.join();
+            self.worker = null;
+            self.sampling = false;
+        }
+        self.remote_conn = null;
+        self.metrics_mutex.lock();
+        self.last_metrics = null;
+        self.metrics_mutex.unlock();
+
+        // A sample already parked by that worker described a machine we can no
+        // longer reach; retiring the generation is what drops it.
+        self.source_gen +%= 1;
+        if (self.closing) continue;
+        self.refresh_failed = true;
+        self.loading = false;
+        self.rebuildCards();
+        _ = w32.InvalidateRect(self.hwnd, null, 0);
+    }
 }
 
 /// Stop everything the current source owns, leaving the panel ready to begin a

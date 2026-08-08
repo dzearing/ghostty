@@ -58,6 +58,7 @@ const Allocator = std.mem.Allocator;
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const ActivityMonitor = @import("ActivityMonitor.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const policy = @import("remote_reconnect.zig");
 const session_layout = @import("session_layout.zig");
@@ -828,6 +829,20 @@ pub fn releaseTransports(window: *Window, alloc: Allocator) void {
     for (rc.teardowns.items) |t| t.join();
     rc.teardowns.deinit(alloc);
     rc.teardowns = .empty;
+
+    // An Activity Monitor panel may be BORROWING one of these connections
+    // (T301) — the palette opens a panel on the window's live transport, and a
+    // carousel switch back to this machine borrows it again. Nothing refcounts
+    // it, so the panel has to be told before the memory goes. Both the live
+    // transport and every retired one, because a panel that borrowed before a
+    // reconnect is riding the retired one.
+    //
+    // AFTER the two steps above, not before: `releaseBorrowed` shuts the
+    // connection down to cut a parked sample worker loose, and shutting a
+    // transport down while its state handler is still installed hands a dying
+    // transition to a window that is already mid-destroy.
+    if (window.remote_dialed) |d| ActivityMonitor.releaseBorrowed(d.conn());
+    for (rc.retired.items) |d| ActivityMonitor.releaseBorrowed(d.conn());
 
     for (rc.retired.items) |d| d.deinitDestroy(alloc);
     rc.retired.deinit(alloc);

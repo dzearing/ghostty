@@ -230,6 +230,11 @@ test {
     // deal.
     _ = @import("apprt/win32/activity_cards.zig");
 
+    // Pure win32 Activity Monitor connection-borrow model — which live window's
+    // connection a panel switching machines should borrow instead of dialing a
+    // second one (T301), same no-OS-imports deal.
+    _ = @import("apprt/win32/activity_borrow.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

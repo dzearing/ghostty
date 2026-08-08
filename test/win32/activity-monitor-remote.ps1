@@ -30,6 +30,14 @@
 #      while a focused BUTTON still owns Space, which is why the pre-T300 gate
 #      could not simply be deleted.
 #
+# T301 closes the round trip E only half made:
+#
+#   G. switching BACK to a machine a live WINDOW is connected to keeps that
+#      machine's CARD reachable and BORROWS the window's connection instead of
+#      re-dialing one - and when that window closes underneath, the panel is
+#      told to let go rather than reading freed memory. (The app then crashes
+#      for an OLDER, unrelated reason - see G4's note and T613.)
+#
 # WHY B NEEDS AN ORACLE AT ALL. The loopback agent enumerates the same box, so
 # "the table populated" proves nothing: a panel that silently sampled THIS
 # process would produce an identical-looking table under another machine's
@@ -472,6 +480,98 @@ try {
     Send-TestWindowClose -Window $panel | Out-Null
     Start-Sleep -Seconds 2
     Assert ((@(Get-Panels)).Count -eq 0) 'F the keyboard-driven panel closed cleanly'
+
+    # --- G. Switching BACK to a machine a window is on borrows, never re-dials
+    # (T301) ----------------------------------------------------------------
+    # E proved the panel can leave a borrowed machine. Coming home was the half
+    # that did not work, in two compounding ways: the machine's card DISAPPEARED
+    # the moment it stopped being the active source (nothing lists a
+    # 127.0.0.1:PORT box - the relay directory does not know it, and with no
+    # signed-in account the directory is empty anyway), so the trip to Local was
+    # one-way; and had a card existed, the switch would have dialed a FRESH
+    # relay connection, which with no account simply fails while a perfectly
+    # good link sits one window away.
+    #
+    # The oracle for "it did not re-dial" is the panel's own `dialing` line,
+    # counted before and after: a borrow leaves it untouched. The oracle for "it
+    # really came back" is the same root pid B uses - the AGENT's, not this
+    # app's - so a panel that came home to a card but sampled nothing cannot
+    # pass.
+    if (-not (Invoke-Palette $remoteTop $remotePane 'ACTIVITY MONITOR' 'G')) {
+        Write-Host 'SETUP FAIL: palette dispatch not delivered for G'; exit 1
+    }
+    $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
+    Assert ($panel -ne [IntPtr]::Zero) 'G the panel re-opened on the borrowed connection'
+    if ($panel -eq [IntPtr]::Zero) { throw 'no panel to test the borrow on' }
+    Wait-PanelState "127.0.0.1:$Port" | Out-Null
+
+    # Walk the keyboard round to the carousel from wherever it is. Same Tab
+    # cycle F1 proved reachable; this is only transport for G's own claim.
+    function Reach-Carousel([IntPtr]$p) {
+        foreach ($i in 1..7) {
+            if ((Get-FocusStop) -eq 'carousel') { return $true }
+            $c = Get-TestFocusedWindow -Window $p
+            if ($c -eq [IntPtr]::Zero) { return $false }
+            Send-TestControlKey -Control $c -Key Tab | Out-Null
+            Start-Sleep -Milliseconds 250
+        }
+        return ((Get-FocusStop) -eq 'carousel')
+    }
+
+    $dialsBeforeG = @(Select-String -Path $errlog -Pattern 'activity monitor: dialing ').Count
+    Assert (Reach-Carousel $panel) 'G the keyboard reached the carousel'
+    Send-TestControlKey -Control $panel -Key Home | Out-Null
+    Start-Sleep -Milliseconds 400
+    Send-TestControlKey -Control $panel -Key Enter | Out-Null
+    $gLocal = Wait-PanelState 'Local' 12000
+    Assert ($null -ne $gLocal -and $gLocal.Source -eq 'Local') "G the panel left the machine for Local (source=$($gLocal.Source))"
+
+    # G1. THE card is still there. This is the arm that failed before T301: with
+    # the machine no longer active, nothing kept its card alive.
+    $carG = Get-Carousel
+    Assert ($null -ne $carG) 'G1 the panel logged its carousel from Local'
+    if ($null -ne $carG) {
+        Write-Host "      carousel from Local: cards=$($carG.Cards) focus=$($carG.Focus) active=$($carG.Active)"
+        Assert ($carG.Cards -ge 2) "G1 the machine a WINDOW is connected to still has a card while the panel sits on Local (cards=$($carG.Cards))"
+    }
+
+    # G2. Return to it. `End` is the machine card: Local is always first.
+    Assert (Reach-Carousel $panel) 'G2 the keyboard reached the carousel again'
+    Send-TestControlKey -Control $panel -Key End | Out-Null
+    Start-Sleep -Milliseconds 400
+    Send-TestControlKey -Control $panel -Key Enter | Out-Null
+    $gBack = Wait-PanelState "127.0.0.1:$Port" 12000
+    Assert ($null -ne $gBack -and $gBack.Source -eq "127.0.0.1:$Port") "G2 the panel switched BACK to the machine (source=$($gBack.Source))"
+    if ($null -ne $gBack) {
+        Assert ($gBack.Total -gt 0) 'G2 it is sampling the machine again'
+        Assert ($gBack.Root -eq $agentPid) "G2 the snapshot's root pid is the AGENT's ($agentPid) again, not this app's ($($app.Pid))"
+    }
+
+    # G3. And it got there by BORROWING - no second connection to a machine we
+    # were already talking to, and nothing that needs an account.
+    Assert ((@(Select-String -Path $errlog -Pattern 'activity monitor: dialing ')).Count -eq $dialsBeforeG) 'G3 switching back dialed NOTHING'
+    Assert (Select-String -Path $errlog -Pattern 'activity monitor: borrowing a window' -Quiet) 'G3 the panel logged that it borrowed the window connection'
+
+    cmd /c "`"$exe`" +send-keys --target=remact `"echo activity-after-borrow`" Enter > nul 2>&1" | Out-Null
+    Start-Sleep -Seconds 3
+    Assert ((Read-Pane 'remact') -match 'activity-after-borrow') 'G3 the remote pane still round-trips while the panel borrows its connection'
+
+    # G4. Closing the WINDOW while the panel borrows. The window frees the
+    # transport; a panel still sampling through it would be reading freed
+    # memory, and nothing refcounts it - so the window's teardown has to hand
+    # the panel its notice, which is what this asserts.
+    #
+    # WHY SURVIVAL IS NOT ASSERTED HERE. The app crashes moments later, and it
+    # is NOT this dangler: the same close crashes with T301's release neutered
+    # to a no-op (T296-era behavior) and does NOT crash with no panel open at
+    # all. The fault lands after `Window.onDestroy` has fully run, back inside
+    # DestroyWindow while Win32 destroys the child HWNDs, with an OPENGL32
+    # frame on the stack - the hazard `Surface.deinit` already names in a
+    # comment. It is filed as T613, which owns the survival assertions; adding
+    # them here would only make this script red about somebody else's bug.
+    cmd /c "`"$exe`" +close --target=remact > nul 2>&1" | Out-Null
+    Start-Sleep -Seconds 4
+    Assert (Select-String -Path $errlog -Pattern 'borrowed connection is going away' -Quiet) 'G4 the closing window told the panel to let go of its connection'
 } finally {
     # cmd, not `& $exe ... 2>&1`: under $ErrorActionPreference='Stop' a native
     # command writing to stderr inside a redirected pipeline is a TERMINATING
