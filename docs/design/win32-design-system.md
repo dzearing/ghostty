@@ -366,6 +366,30 @@ x icon on the tab??? it should be the standard X close icon, not some weird
 variant"*. So `k ≈ 3t/4 ≈ t/√2`, and a unit test asserts `|k·√2 − t| <= 1` at
 every scale.
 
+**The same rule, running the other way, on any SLOPED arm.** A mark whose band
+is offset **vertically** by `t` — the banner's collapse chevron, the back and
+forward arrows transposed from it, the roof of the home icon — paints a
+perpendicular thickness of `t · cos θ`, which is *smaller* than `t`. It is the
+identical error to the ×'s, mirrored: measuring thickness down a screen axis
+instead of across the mark. The chevron's arms run 6 across and rise 4, so they
+painted `0.83 · stroke_w` and read as a faded version of the "+" beside them
+(T239). The correction is one shared helper, `icon_button.slopedStroke(run,
+rise, t)`, which returns the vertical offset whose perpendicular band is `t`:
+
+> `tv = t · hypot(run, rise) / run`
+
+Note it is a **no-op below ~200% scaling** — the correction is a fraction of a
+pixel there and a mark cannot be painted in fractions of one. That is not a
+reason to skip it: the deficit grows with `stroke_w`, so it is exactly the
+high-DPI screens where the odd glyph out is obvious.
+
+The general rule both halves share, and the one to apply to any new mark:
+**thickness is measured perpendicular to the mark, never down a screen axis.**
+The unit test is written that way too — it measures every open glyph's quads as
+parallelograms (`area / long side`) and asserts each lands within a pixel of
+`stroke_w` at every scale from 1.0 to 3.0, so a new glyph that gets this wrong
+fails without anyone having to remember the rule.
+
 ---
 
 ## 5. Dividers and split lines

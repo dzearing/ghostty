@@ -11202,3 +11202,40 @@ Filed: **T585** — the harness cannot score any accent-painting child window, s
 T307's child half is guarded by review alone. **T586** — nothing catches an
 acceptance script that cannot even start, which is how a one-line typo hid a
 whole script for a week.
+
+## 2026-08-07 — T239: sloped icon arms now paint at the weight the eye reads
+
+The banner's collapse chevron built its arms by offsetting them **vertically**
+by `stroke_w`, which on a sloped arm paints only `stroke_w · cos θ` across the
+mark — so it read as a faded version of the "+", the "×" and the hamburger next
+to it. The correction is one shared helper, `icon_button.slopedStroke(run,
+rise, t)`, applied to `chevron_up`/`chevron_down` (and therefore to `back` and
+`forward`, which transpose the chevron) and to the `home` icon's roof, which had
+the identical defect. It is the mirror image of the bug T232 fixed in the "×",
+where the same axis-vs-perpendicular confusion made the arms too HEAVY.
+
+The task's own arithmetic was wrong in three places and the file now records
+what the numbers actually are: the arms are at 33.7°, not 45°, so the shortfall
+was `0.83t` and not `0.71t`; `stroke_w` at 150% scaling is 2 px, not 4; and the
+arms were already "shallower than a caret", so the fix the task preferred would
+not have closed the gap on its own. Scope, likewise stated rather than implied:
+`glyphQuads` has been the FALLBACK since T497 — a stock Windows 10/11 box draws
+these from Segoe Fluent Icons — so this fixes the fallback and, more usefully,
+the rule.
+
+The test is the part worth keeping. T232's assertion covered the "×" alone;
+this generalises it to the whole open set, measuring each glyph's quads as
+parallelograms (`area / long side`) and requiring every one to land within a
+pixel of `stroke_w` at every scale from 1.0 to 3.0. It was proven to be a real
+test by reverting the fix, which fails it with `scale 2.999998: chevron_up
+paints a 4.99px mark, want 6.00`. Design system §4.3 now states the general
+rule — thickness is measured perpendicular to the mark, never down a screen
+axis — with both directions of the mistake under it.
+
+Floor green — `floor-lane -Lane all` ALL LANES PASS (none 314s, win32 362s,
+agent 321s), `pane-banner.ps1` ALL PASS (88), P1–P3 ALL PASS.
+
+Filed: **T587** — `stroke_w` is non-monotonic in DPI. `markPx`'s parity fit is
+an argument about mark EXTENTS but is also applied to stroke weight, so the
+chrome paints a 3 px stroke at 125% and a 2 px one at 150%: turning scaling up
+makes every icon in the set lighter.

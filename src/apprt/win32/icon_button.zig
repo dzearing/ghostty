@@ -523,13 +523,22 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             // Where the arm meets the apex. `+1` so an odd-width chevron's
             // two arms overlap by a pixel at the apex rather than leaving a
             // hole there.
-            const apex_x = b.left + @divTrunc(b.width() + 1, 2);
-            // Arm as it runs down-left for `chevron_up`: thick vertically by
-            // `t`, low at the left edge and high at the apex.
+            const run = @divTrunc(b.width() + 1, 2);
+            const apex_x = b.left + run;
+            // Thickness measured VERTICALLY, and therefore slope-corrected so
+            // the thickness the eye reads is `stroke_w` like every other mark
+            // in the set (T239). The arm's rise is whatever the box has left
+            // after the arm's own thickness, which the correction depends on —
+            // so the rise is estimated from the nominal `t`. One step, not a
+            // fixed point: the correction is a slope factor whose sensitivity
+            // to the rise is well under half a pixel per pixel at every scale.
+            const tv = slopedStroke(run, b.height() - t, t);
+            // Arm as it runs down-left for `chevron_up`: low at the left edge
+            // and high at the apex.
             const left_arm: Quad = .{ .pts = .{
-                .{ .x = b.left, .y = b.bottom - t },
+                .{ .x = b.left, .y = b.bottom - tv },
                 .{ .x = apex_x, .y = b.top },
-                .{ .x = apex_x, .y = b.top + t },
+                .{ .x = apex_x, .y = b.top + tv },
                 .{ .x = b.left, .y = b.bottom },
             } };
             out[0] = left_arm;
@@ -643,11 +652,15 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             const b = centered(target, m.mark_menu, m.mark_menu);
             const roof_h = @max(@divTrunc(b.height(), 3), t);
             const apex_x = b.left + @divTrunc(b.width() + 1, 2);
+            // Slope-corrected like the chevron's arms, and for the same
+            // reason: the roof is sloped, so a thickness measured vertically
+            // paints a lighter mark than the walls under it (T239).
+            const rt = slopedStroke(apex_x - b.left, roof_h, t);
             out[0] = .{ .pts = .{
                 .{ .x = b.left, .y = b.top + roof_h },
                 .{ .x = apex_x, .y = b.top },
-                .{ .x = apex_x, .y = b.top + t },
-                .{ .x = b.left, .y = b.top + roof_h + t },
+                .{ .x = apex_x, .y = b.top + rt },
+                .{ .x = b.left, .y = b.top + roof_h + rt },
             } };
             out[1] = mirrorX(out[0], b.left + b.right);
             // Body: two walls and a floor, inset under the eaves. The walls
@@ -687,6 +700,33 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             return out[0..3];
         },
     }
+}
+
+/// The VERTICAL thickness a SLOPED arm needs so that the thickness the eye
+/// reads — the one measured PERPENDICULAR to the arm — is `t`.
+///
+/// An arm that travels `run` across and `rise` up is a band whose two long
+/// edges are `tv` apart measured straight down the screen, but only
+/// `tv · run / hypot(run, rise)` apart across the arm. So a glyph built by
+/// offsetting its arm vertically by `stroke_w` paints at `stroke_w · cos θ`,
+/// and the shallower the arm the less that costs: the banner chevron's arms
+/// run 6 across and rise 4, which is `0.83 · stroke_w` — a third of a pixel at
+/// 100%, a full pixel at 300%, and one glyph quietly disagreeing with the "+",
+/// the "×" and the hamburger beside it at every scale in between (T239).
+///
+/// This is the same mistake T232 fixed in the "×", where it ran the other way:
+/// there the corner offset `k` produced `k·√2` and painted an arm ~1.4x too
+/// HEAVY. Both are the design system's §4.3 rule — thickness is measured
+/// perpendicular to the mark, never down a screen axis.
+fn slopedStroke(run: i32, rise: i32, t: i32) i32 {
+    if (run <= 0 or rise <= 0) return t;
+    const a: f64 = @floatFromInt(run);
+    const r: f64 = @floatFromInt(rise);
+    const s: f64 = @floatFromInt(t);
+    const tv: i32 = @intFromFloat(@round(s * @sqrt(a * a + r * r) / a));
+    // Never thinner than the nominal stroke (the correction only ever adds),
+    // and never so thick it eats the whole rise and paints a wedge.
+    return std.math.clamp(tv, t, @max(t, rise));
 }
 
 /// Four filled bars forming the outline of `b`, `t` thick, drawn inward.
@@ -1066,6 +1106,58 @@ test "the two chevrons mirror each other" {
     }
 }
 
+/// The narrow dimension of a parallelogram quad, measured PERPENDICULAR to its
+/// long side — the thickness the eye actually reads. Every mark in the open set
+/// is built as a parallelogram (a bar is the axis-aligned case), so one formula
+/// covers the lot: `area / long side`, with the area from the cross product.
+fn quadThickness(q: Quad) f64 {
+    const ux: f64 = @floatFromInt(q.pts[1].x - q.pts[0].x);
+    const uy: f64 = @floatFromInt(q.pts[1].y - q.pts[0].y);
+    const vx: f64 = @floatFromInt(q.pts[3].x - q.pts[0].x);
+    const vy: f64 = @floatFromInt(q.pts[3].y - q.pts[0].y);
+    const area = @abs(ux * vy - uy * vx);
+    const lu = @sqrt(ux * ux + uy * uy);
+    const lv = @sqrt(vx * vx + vy * vy);
+    return area / @max(lu, lv);
+}
+
+test "every open glyph paints at the same PERPENDICULAR thickness" {
+    // T232 asserted this of the "×" alone; T239 generalised it, because the
+    // chevron was failing the same rule in the opposite direction — its arms
+    // were offset by `stroke_w` VERTICALLY, which on a sloped arm paints
+    // `stroke_w · cos θ`, so the banner's collapse control read lighter than
+    // the "+" and the "≡" it sits beside. Measured across the whole open set:
+    // whatever the arm's angle, the band the eye reads has to land within a
+    // pixel of `stroke_w`, or the controls stop reading as one set.
+    //
+    // Closed OUTLINE glyphs (maximize, restore) are deliberately absent — they
+    // are drawn at `stroke_outline` for the optical reason `Metrics` documents.
+    const open = [_]Glyph{
+        .add,        .close,   .menu,     .contents,
+        .chevron_up, .chevron_down, .back, .forward,
+        .minimize,   .home,    .overflow,
+    };
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const want: f64 = @floatFromInt(m.stroke_w);
+        for (open) |g| {
+            for (glyphQuads(m, t, g, &buf)) |q| {
+                const got = quadThickness(q);
+                if (@abs(got - want) > 1.0) {
+                    std.debug.print(
+                        "scale {d}: {s} paints a {d:.2}px mark, want {d:.2}\n",
+                        .{ scale, @tagName(g), got, want },
+                    );
+                    return error.MarkThicknessOffTheSet;
+                }
+            }
+        }
+    }
+}
+
 test "a mark is never hairline-invisible at any DPI" {
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 }) |scale| {
         try testing.expect(Metrics.init(scale).stroke_w >= 2);
@@ -1289,3 +1381,4 @@ test "the shipped build centers glyphs and lights every button" {
     try testing.expect(universalHover());
     try testing.expect(!T204_NEUTERED);
 }
+
