@@ -10968,3 +10968,58 @@ Filed: **T577** (P0, M1, order 147.5) - get the Windows release publishing;
 **D32** - whether to cherry-pick the workflow onto main, hand-publish now,
 or wait for the merge-back, since the first option ships Windows users a
 build without this branch's parity work.
+
+## 2026-08-07 (evening) - T577: Windows releases actually publish now
+
+The automated Windows release ran for the first time and published
+**win-v1.31.0** - MSI and portable ZIP, 20 MB each - and its own gh-pages
+commit moved the download page off the 2026-07-19 build it had been offering
+for three weeks. Windows and macOS are on the same version number for the
+first time since the channel was set up.
+
+The diagnosis T577 was filed with was wrong, and the way it was wrong is the
+interesting part. "The workflow is not on main" was true; "so cherry-pick it
+onto main" does not follow, because main does not merely lack the workflow -
+it lacks everything the workflow builds. No `src/apprt/win32`, no
+`dist/windows-installer`, no `dist/website`, and an apprt enum of
+gtk/none/embedded, so `-Dapp-runtime=win32` is not a valid build option there
+at all. A workflow runs from the tree of the ref that triggered it, so a
+`vX.Y.Z` tag cut from main can never build a Windows terminal no matter which
+branch the file sits on. Cherry-picking would have turned every macOS release
+red rather than shipping Windows. **D32 is resolved as superseded on that
+evidence** - it recommended exactly that option - and **D33** asks the
+question that is actually still open: whether publishing off a branch that
+has not merged back is right.
+
+So the trigger set was widened instead: `release-windows.yml` fires on
+`win-v*` as well as `v*`. A `win-vX.Y.Z` tag cut on this branch is the only
+tag shape whose tree carries both the workflow and the source it compiles.
+`v*` is untouched, so the main-side trigger takes over by itself at
+merge-back with nothing to rewire. The release runbook now pushes the second
+tag and says why, including that `gh run list --workflow release-windows.yml`
+answers 404 *while a run of that very workflow is in progress* - the lookup
+resolves against the default branch.
+
+Five runs to green, and every failure was in the packaging toolchain rather
+than in this branch: the Zig cross-compile worked on the first attempt.
+CI's msitools was 0.103, whose wixl does not know `<Environment>` and so
+aborts on the component that puts ghoztty on the user PATH (T70), while the
+Mac seat and the on-box Docker image are both on 0.106.
+`build-release-artifacts.sh` was written so those paths could not produce
+different artifacts - but that only ever covered the script; the tool
+underneath it was whatever the machine happened to have. CI builds msitools
+v0.106 from source now and asserts the version it got. Getting that to build
+took meson from pipx (apt's is 1.3.2 against a >= 1.4 requirement), a full
+clone with `--recurse-submodules` (bats-core is a submodule, and git describe
+supplies the version), and finally `apt-get build-dep msitools` instead of a
+hand-guessed `-dev` list. Nothing was published from any failed run, because
+the `Verify artifacts` gate sits ahead of the publish step.
+
+Floor green throughout: `floor-lane -Lane all` ALL LANES PASS, P1-P3 ALL
+PASS, and `website-windows-download.ps1 -RequireNetwork` ALL PASS including
+the live link checks and the mirror compare.
+
+Filed: **T578** - nothing builds the Windows target in CI until release time,
+so a broken cross-compile is only ever found while shipping; **T579** - a
+release can still ship macOS-only in silence if the second tag is forgotten,
+which is the same shape of failure as the one just fixed.
