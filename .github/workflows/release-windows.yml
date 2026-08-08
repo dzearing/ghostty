@@ -83,10 +83,47 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
 
-      - name: Install msitools (wixl)
+      # msitools is BUILT, not apt-installed, and that is load-bearing (T577).
+      # ubuntu-latest ships msitools 0.103, whose wixl does not know the
+      # <Environment> element at all -- it aborts with "unhandled child
+      # Component node Environment" (wix.vala:232) on the component that puts
+      # ghoztty on the user PATH (T70). The other two paths that build this
+      # MSI are both on 0.106: `brew install msitools` on the Mac seat and the
+      # msitools-local Debian image the on-box publish script runs. Pinning
+      # the same version here is what makes "CI and a hand publish cannot
+      # drift apart" true of the TOOL as well as the script.
+      #
+      # 0.106 is also the version build-msi.sh's post-compile patches are
+      # written against -- it parses <Environment> but ignores Permanent="no",
+      # which is why the Environment table gets patched from =PATH to =-PATH
+      # afterwards. That patch has a guard that fails loudly if the behavior
+      # changes, so a future bump announces itself rather than silently
+      # shipping an MSI that leaves a PATH entry behind on uninstall.
+      - name: Build and install msitools 0.106 (wixl, msiinfo, msibuild)
+        env:
+          MSITOOLS_TAG: v0.106
         run: |
           sudo apt-get update
-          sudo apt-get install -y msitools wixl
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build valac pkg-config gettext \
+            libglib2.0-dev libgsf-1-dev libgcab-dev
+          git clone --depth 1 --branch "$MSITOOLS_TAG" \
+            https://gitlab.gnome.org/GNOME/msitools.git /tmp/msitools
+          meson setup /tmp/msitools/_build /tmp/msitools --prefix=/usr/local
+          ninja -C /tmp/msitools/_build
+          sudo ninja -C /tmp/msitools/_build install
+          sudo ldconfig
+
+          # Assert the version we actually got. Without this a fallback to a
+          # distro wixl earlier on PATH would only show up as the same
+          # inscrutable vala abort this step exists to prevent.
+          for tool in wixl msiinfo msibuild; do
+            echo "$tool -> $(command -v "$tool")"
+          done
+          got="$( { wixl --version || true; } 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)"
+          want="${MSITOOLS_TAG#v}"
+          echo "wixl reports $got (want $want)"
+          [ "$got" = "$want" ] || { echo "::error::wixl is $got, expected $want"; exit 1; }
 
       - name: Set release variables
         run: |
