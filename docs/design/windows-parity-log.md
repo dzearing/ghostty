@@ -11948,3 +11948,44 @@ clamp against a roster that shrank.
 
 Filed: **T620** — `chooser-resume.ps1` can no longer build its orphan fixture,
 so the chooser's whole resume flow is unwatched.
+
+## 2026-08-08 — T413: a pane rebuilt from another machine proves it came back with its content
+
+T413 asked whether agent-held layout blobs should carry a per-pane screen
+snapshot, so a cross-machine Restore All would get the fast re-attach instead of
+the ring replay. Answer: no, and the reasoning is now written where the strip
+happens (`layout_blobs.serializeWindow`) and in design §5.4.1, rather than
+leaving the asymmetry looking accidental.
+
+The premise had aged. T106 reflows the client grid to the agent-reported capture
+geometry for the replay and back afterwards, and FIX 2 has the agent append its
+own repaint of the visible screen — generated at the geometry the attaching
+client just asked for. A blob-sourced pane is exact on screen; what is left is
+the replay's wire cost and imperfect scrollback for ring segments drawn at older
+sizes. A stored snapshot could not close that: it would be whatever viewer last
+pushed the blob, at that viewer's size and offset, stale by construction, and a
+stale offset makes the agent report scrollback lost that it still holds. The
+agent's own snapshot is fresh, correctly sized and free; the only thing it lacks
+is scrollback (`max_scrollback = 0`). So the gap belongs to the agent — where it
+also fixes resuming a single session from another machine, which no blob change
+could ever have reached.
+
+Pinned on both sides. A unit test round-trips a snapshot-bearing window through
+`serializeWindow` → `decodeLayouts` and asserts the leaf comes back with its
+session and no WP-D3 pair. Section J of `chooser-restore-all-remote.ps1` asserts
+all three cross-machine rebuilt panes log `offset=0 snapshot=0`, that none claims
+a delta, and — the point — that the machine's own output still reads back through
+`+read` afterwards.
+
+Two fixture bugs found building that arm, neither a product defect: a marker must
+be space-free and matched whitespace-insensitively (a third-of-a-window pane
+wraps it), and the pane id in `+list --json` hangs off the leaf's `terminal`
+object, not the leaf — reading `node.id` made every `+read` answer nothing, which
+is indistinguishable from a restore that lost its content. A section-1 positive
+control now separates those two failure modes.
+
+Floor green — `floor-lane.ps1 -Lane all` ALL LANES PASS (none 142s, win32 326s,
+agent 316s), P1–P3 ALL PASS, `chooser-restore-all-remote.ps1` ALL PASS (39).
+
+Filed: **T621** — the agent's grid snapshot carries no scrollback, so every
+snapshot-less attach still replays the whole ring. Decision receipt: **D40**.
