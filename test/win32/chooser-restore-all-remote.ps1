@@ -43,6 +43,11 @@
 #   E  the rebuild: one window, its recorded 3-pane split shape, over the relay
 #   F  per-window transport ownership: the restore spends >= 2 dials (the pull's
 #      own, plus one per window), counted in the relay's request log
+#   I  the app keeps PUMPING while those dials are outstanding (T339). The relay
+#      is told to answer every connect 1.5 s late, so the restore is in flight
+#      for seconds, and the chooser is asked for a WM_NULL every 150 ms
+#      throughout. Before T339 all N+1 upgrades ran on the GUI thread and every
+#      one of those probes would time out
 #   G  independent oracle - the agent, asked directly over its pipe, reports all
 #      three original sessions ATTACHED
 #   H  pressing it again rebuilds nothing: the machine-scoped double-attach
@@ -64,7 +69,11 @@
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [int]$BridgePort = 47951,
-    [int]$RelayPort = 47952
+    [int]$RelayPort = 47952,
+    # How late the relay answers each `/connect` while section 6's slow-connect
+    # file is armed. 1.5 s per dial x (1 pull + N windows) is several seconds of
+    # in-flight time, which is the window the responsiveness probe measures in.
+    [int]$SlowMs = 1500
 )
 
 $ErrorActionPreference = 'Continue'
@@ -172,15 +181,32 @@ function Layouts-Store {
     return @($doc.layouts)
 }
 
+# The store record for the window whose IPC name is $name, found by reading the
+# BLOB rather than the record key. T338 (landed 72 minutes after T336, and this
+# script was not re-run) re-keyed every blob on the window's stable UUID, so
+# `key -eq 't336-multi'` has matched nothing since - and PowerShell answered
+# `@($null.session_ids).Count` = 1, which is why "no record at all" read as a
+# window with one session id. The ipc_name inside the blob is what actually
+# names the window, and it survives both keying schemes.
+function Find-BlobFor($name) {
+    foreach ($rec in Layouts-Store) {
+        if ($rec.key -eq $name) { return $rec }   # pre-T338 keying
+        $blob = $null
+        try { $blob = $rec.blob | ConvertFrom-Json } catch { continue }
+        if ($null -ne $blob -and $blob.ipc_name -eq $name) { return $rec }
+    }
+    return $null
+}
+
 # Poll until the named window's blob claims $n session ids. A record can exist
 # before its panes have published their ids (the OPEN reply is async and
 # syncSessionLayout re-arms a retry), so waiting for EXISTENCE would race a
 # correct implementation (the T334 lesson).
-function Wait-BlobIds($key, $n, $timeoutSec = 30) {
+function Wait-BlobIds($name, $n, $timeoutSec = 30) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $rec = $null
     while ((Get-Date) -lt $deadline) {
-        $rec = @(Layouts-Store | Where-Object { $_.key -eq $key }) | Select-Object -First 1
+        $rec = Find-BlobFor $name
         if ($null -ne $rec -and @($rec.session_ids).Count -ge $n) { return $rec }
         Start-Sleep -Milliseconds 500
     }
@@ -311,8 +337,14 @@ try {
 
     $tripAuth = Join-Path $tmp 'trip401'
     Remove-Item $tripAuth -ErrorAction SilentlyContinue
+    # Armed only for section 6 (T339): while it exists every connect is answered
+    # $SlowMs late, which is what makes "the app is still pumping" a measurable
+    # claim rather than a race with a loopback dial that takes 3 ms.
+    $slowConnect = Join-Path $tmp 'slowconnect'
+    Remove-Item $slowConnect -ErrorAction SilentlyContinue
     $script:relay = Start-FakeRelay -Port $RelayPort -AgentPort $BridgePort `
-        -DevicesJson $devicesJson -LogPath $relaylog -TripUnauthorizedFile $tripAuth
+        -DevicesJson $devicesJson -LogPath $relaylog -TripUnauthorizedFile $tripAuth `
+        -SlowConnectFile $slowConnect -SlowConnectMs $SlowMs
     Assert ((Test-Path $relaylog) -and (Select-String -Path $relaylog -Pattern 'LISTEN' -Quiet)) `
         "the fake relay serves that machine as device $DEV"
 
@@ -384,11 +416,40 @@ try {
     Write-Host ''
     Write-Host '6. Restore All rebuilds the remote machine''s topology here'
     $connectsBefore = Count-RelayConnects $relaylog $DEV
+    # T339: make the link slow, so the N+1 dials take seconds. Before T339 they
+    # ran on the GUI thread and this is the interval in which the app answered
+    # nothing at all.
+    New-Item -ItemType File -Path $slowConnect -Force | Out-Null
+    $deferBefore = Count-LogLines $relaylog 'DEFER '
     $btn = Get-RestoreAllButton $chooser
     Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab reaches the button again (the positive control)'
     Send-TestKeys -Window $chooser -Target $btn -Key Return | Out-Null
 
-    $rebuilt = Wait-LogLine $errlogB 'restore all: rebuilt (\d+) window' 20000
+    # I: the app keeps pumping while the restore is in flight. Each probe is a
+    # WM_NULL SendMessageTimeout at the chooser - its wndproc runs on the GUI
+    # thread, so an answer IS the message loop turning over. Probing stops at
+    # the first sign the dialing phase is over (the rebuild itself legitimately
+    # occupies the GUI thread, and measuring that would be measuring the wrong
+    # thing).
+    $probes = 0
+    $blocked = 0
+    $probeDeadline = (Get-Date).AddMilliseconds([Math]::Max(2000, $SlowMs * 2))
+    while ((Get-Date) -lt $probeDeadline) {
+        if (-not (Test-TestWindowExists -Window $chooser)) { break }
+        if (Count-LogLines $errlogB 'restore all: rebuilt \d+ window') { break }
+        $probes++
+        if (-not (Test-TestWindowResponsive -Window $chooser -TimeoutMs 1000)) { $blocked++ }
+        Start-Sleep -Milliseconds 150
+    }
+    $deferAfter = Count-LogLines $relaylog 'DEFER '
+    Assert (($deferAfter - $deferBefore) -ge 1) `
+        "the link really was slow for this press ($($deferAfter - $deferBefore) deferred connect(s) at ${SlowMs}ms)"
+    Assert ($probes -ge 3) "the restore stayed in flight long enough to measure ($probes probes)"
+    Assert ($blocked -eq 0) `
+        "I the app kept pumping while the restore dialed ($blocked of $probes probes went unanswered)"
+    Remove-Item $slowConnect -ErrorAction SilentlyContinue
+
+    $rebuilt = Wait-LogLine $errlogB 'restore all: rebuilt (\d+) window' 30000
     Assert ($null -ne $rebuilt) "E Return on the button rebuilds a window ($rebuilt)"
     $rebuiltN = 0
     if ($rebuilt -match 'rebuilt (\d+) window') { $rebuiltN = [int]$Matches[1] }

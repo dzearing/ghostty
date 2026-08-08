@@ -60,6 +60,7 @@ const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const SessionRoster = @import("SessionRoster.zig");
+const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
 const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
@@ -244,6 +245,13 @@ id: u64,
 /// The selected machine's live sessions (T318). Only the Local row has one
 /// today; a remote machine's roster comes over its own transport in T319.
 roster: SessionRoster,
+
+/// A cross-machine Restore All is dialing on a worker thread (T339). It gates
+/// a second press: the first one's dials are still in flight, and pressing
+/// again would rebuild the same topology twice — the button has no other way
+/// to say "already working on it" now that the work no longer blocks the
+/// keystroke.
+restore_inflight: bool = false,
 
 /// Dialog layout in physical pixels from the owner DPI scale. Pure — the math
 /// and its tests live in `chooser_layout.zig`.
@@ -2654,33 +2662,95 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
 /// has nowhere to say them. Mac uses a modal alert
 /// (`SessionLayoutRestore.swift:755-773`); the footer hint is this dialog's
 /// equivalent and does not steal the user's next keystroke.
+///
+/// The LOCAL arm runs here and now — every RPC in it is a bounded named-pipe
+/// round trip to a daemon on this box. The REMOTE arm hands the job to a worker
+/// thread (T339) and comes back through `onRestoreAll`: its N+1 relay dials are
+/// the ones that would otherwise stop the message loop for as long as the link
+/// is slow.
 fn restoreAll(self: *MachineChooser) void {
     const row = self.selectedRow() orelse return;
     const app = self.window.app;
 
-    // Dialled synchronously while the chooser is still alive: `relay_base`, the
-    // token and the device id are all borrowed from it, exactly as
-    // `openSelection` and `resumeRow` borrow them.
     const n = switch (row) {
         .local => app.restoreAllLocalSessions(),
-        .device => |i| relay: {
+        .device => |i| {
+            // A second press while the first one's dials are still open would
+            // build the same windows twice — the snapshot guard cannot see a
+            // window that does not exist yet.
+            if (self.restore_inflight) return;
             const dev = self.devices[i];
             const tok = self.token orelse {
                 self.setHint("Not signed in - use Sign in with Google above.");
                 return;
             };
-            break :relay app.restoreAllRelaySessions(self.relay_base, dev.id, tok);
+            // `relay_base`, the token and the device id are all borrowed from
+            // this chooser, which may close while the worker is still dialing;
+            // `start` deep-copies them.
+            if (!RestoreAllRelay.start(app, self.id, .{
+                .base = self.relay_base,
+                .device = dev.id,
+                .token = tok,
+            })) {
+                self.setHint("Couldn't start the restore.");
+                return;
+            }
+            self.restore_inflight = true;
+            self.setHint("Restoring this machine's windows...");
+            return;
         },
     } catch |err| {
-        log.warn("machine chooser: restore all failed err={}", .{err});
-        self.setHint(switch (err) {
-            error.NoAgent => "The session agent isn't running - there's nothing to restore from.",
-            error.PullFailed => "Couldn't read this machine's saved layouts from the agent.",
-            error.DialFailed => "Couldn't reach that machine - is its agent running?",
-            error.Unauthorized => "Session expired - sign in again above.",
-        });
+        self.restoreAllFailed(err);
         return;
     };
+    self.restoreAllFinished(n);
+}
+
+/// GUI thread: a cross-machine Restore All came back (T339). The REBUILD happens
+/// either way — the user asked for it, and dismissing the chooser in the
+/// meantime was never a cancel — so a reply whose chooser is gone still builds
+/// its windows and only drops the sentence it had nowhere to say.
+pub fn onRestoreAll(app: *App, job: *RestoreAllRelay.Job) void {
+    defer job.destroy();
+
+    var owner: ?*MachineChooser = null;
+    for (app.windows.items) |win| {
+        const chooser = win.machine_chooser orelse continue;
+        if (chooser.id != job.chooser_id) continue;
+        owner = chooser;
+        break;
+    }
+    if (owner) |c| c.restore_inflight = false;
+
+    if (job.err) |err| {
+        if (owner) |c| c.restoreAllFailed(err) else log.warn(
+            "machine chooser: restore all failed after its chooser closed err={}",
+            .{err},
+        );
+        return;
+    }
+
+    const n = app.adoptRestoreAll(job);
+    if (owner) |c| c.restoreAllFinished(n) else log.info(
+        "machine chooser: restore all rebuilt {d} window(s) after its chooser closed",
+        .{n},
+    );
+}
+
+/// Turn a failed restore into the one sentence the user can act on.
+fn restoreAllFailed(self: *MachineChooser, err: App.RestoreAllError) void {
+    log.warn("machine chooser: restore all failed err={}", .{err});
+    self.setHint(switch (err) {
+        error.NoAgent => "The session agent isn't running - there's nothing to restore from.",
+        error.PullFailed => "Couldn't read this machine's saved layouts from the agent.",
+        error.DialFailed => "Couldn't reach that machine - is its agent running?",
+        error.Unauthorized => "Session expired - sign in again above.",
+    });
+}
+
+/// A restore that reached the end: dismiss onto the rebuilt windows, or say why
+/// there were none.
+fn restoreAllFinished(self: *MachineChooser, n: usize) void {
     if (n == 0) {
         // A successful pull that rebuilt nothing is a different fact from a
         // failed one, and the user is owed the difference: their windows are

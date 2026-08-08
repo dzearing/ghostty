@@ -21,6 +21,7 @@ const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const SessionRoster = @import("SessionRoster.zig");
+const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
@@ -1676,7 +1677,7 @@ pub fn captureOneWindow(
 /// on the local agent). A healthy agent answers in single-digit ms; a wedged one
 /// times out and restore proceeds treating liveness as UNKNOWN (attempt ATTACH,
 /// never drop) rather than hanging startup.
-const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
+pub const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 
 /// The liveness probe every rebuild takes before replaying a topology: the
 /// agent's roster, plus the set of session ids we will ATTACH (alive, or a
@@ -1693,7 +1694,7 @@ pub const AttachProbe = struct {
     roster: ?remote_connection.OwnedSessions = null,
     set: ?std.StringHashMap(void) = null,
 
-    fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
+    pub fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
         const roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
             log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
             return .{};
@@ -2195,7 +2196,7 @@ fn pullAgentLayouts(self: *App, conn: *remote_connection.Connection) ?layout_blo
 /// viewer arm below keeps a viewer-bearing window, and a terminal-only window
 /// is dropped. That equivalence is the point — "no agent" and "agent has
 /// forgotten every session" are the same fact about every terminal leaf.
-fn restoreWindowHasAttachableLeaf(
+pub fn restoreWindowHasAttachableLeaf(
     win: session_layout.Window,
     attach: ?*const std.StringHashMap(void),
 ) bool {
@@ -3615,7 +3616,8 @@ pub const RestoreAllError = error{
 /// states the same property (`SessionLayoutRestore.swift:586-588`).
 ///
 /// The cross-machine half (rebuild ANOTHER machine's topology here, over the
-/// relay) is `restoreAllRelaySessions`; this one dials nothing.
+/// relay) is `RestoreAllRelay`, which does its dialing on a worker thread and
+/// lands back in `adoptRestoreAll` (T339); this one dials nothing.
 pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
     // Non-spawning would be wrong here, unlike the push: the user asked for
     // this, so resolving (and if necessary starting) the agent is the job.
@@ -3624,7 +3626,7 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
         return error.NoAgent;
     };
 
-    const restored = try self.restoreAllFrom(conn, .local);
+    const restored = try self.restoreAllLocalFrom(conn);
     if (restored > 0) {
         // The rebuilt windows are this box's again: record them locally so the
         // NEXT launch restores them from the manifest without the round trip
@@ -3636,61 +3638,8 @@ pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
     return restored;
 }
 
-/// Restore ALL of a RELAY machine's windows here (T336, Mac's
-/// `resumeAllRemoteSessions`): dial that machine, pull ITS agent-owned layout
-/// blobs, and rebuild the whole topology locally with every pane ATTACHed to a
-/// session that keeps running over there. Returns how many windows were rebuilt.
-///
-/// **Every rebuilt window gets its own dial.** The pull runs on a dial this
-/// function owns and frees; each window then takes a fresh one it owns for life
-/// (`RestoreTransport`). Mac shares one connection across the rebuild
-/// (`SessionLayoutRestore.swift:659-675`) — win32 cannot, because `Window.deinit`
-/// tears its transport down, so the first window the user closed would take the
-/// others' agent with it. N windows is N+1 dials, and that is the deliberate
-/// answer to the ownership question rather than an accident of the loop.
-///
-/// It runs SYNCHRONOUSLY on the GUI thread, like the single-session remote
-/// resume it generalizes (T320's `resumeRelaySession`). That is fine for a
-/// loopback or LAN relay and visible on a slow one; T339 moves it off-thread.
-pub fn restoreAllRelaySessions(
-    self: *App,
-    relay_base: []const u8,
-    device: []const u8,
-    token: []const u8,
-) RestoreAllError!usize {
-    const alloc = self.core_app.alloc;
-
-    // The PULL's own connection: short-lived by design, exactly like the
-    // roster's browse dial (`SessionRoster.worker`). Freed below whatever
-    // happens — the windows never ride it.
-    var pull = self.dialRelay(relay_base, device, token) catch |err| return err;
-    defer pull.deinitDestroy(alloc);
-
-    const machine: Window.RemoteMachine = .{ .relay = .{ .base = relay_base, .device = device } };
-    return self.restoreAllFrom(pull.conn(), .{ .relay = .{
-        .base = relay_base,
-        .device = device,
-        .token = token,
-        .machine = machine,
-    } });
-}
-
-/// Where a Restore All's windows come from, and how each one is transported.
-const RestoreAllSource = union(enum) {
-    /// This box's agent: the windows ride the shared local connection and are
-    /// bound back into the local manifest by the caller.
-    local,
-    /// Another machine over the relay: each window dials its own transport.
-    relay: struct {
-        base: []const u8,
-        device: []const u8,
-        token: []const u8,
-        machine: Window.RemoteMachine,
-    },
-};
-
-/// The rebuild both Restore All paths share: pull the agent-owned layout blobs
-/// (`GET_LAYOUTS`, T334) over `pull`, probe liveness, and replay each decoded
+/// The LOCAL rebuild: pull the agent-owned layout blobs (`GET_LAYOUTS`, T334)
+/// over the shared agent connection, probe liveness, and replay each decoded
 /// window through the SAME helpers launch-time restore uses. Returns how many
 /// windows were rebuilt (0 is a valid answer — the agent may hold nothing, or
 /// everything it holds may already be open here).
@@ -3701,10 +3650,15 @@ const RestoreAllSource = union(enum) {
 /// which is exactly when a user wants their windows back and exactly when
 /// launch-time restore can do nothing. Mac states the same property
 /// (`SessionLayoutRestore.swift:586-588`).
-fn restoreAllFrom(
+///
+/// It runs synchronously on the GUI thread, and stays that way: every RPC here
+/// is a bounded named-pipe round trip to a daemon on this box. The CROSS-MACHINE
+/// rebuild is the one whose network cannot be trusted to be fast — it dials a
+/// relay N+1 times — and that half lives in `RestoreAllRelay` on a worker thread
+/// (T339), landing back through `adoptRestoreAll`.
+fn restoreAllLocalFrom(
     self: *App,
     pull: *remote_connection.Connection,
-    source: RestoreAllSource,
 ) RestoreAllError!usize {
     const gpa = self.core_app.alloc;
 
@@ -3729,15 +3683,6 @@ fn restoreAllFrom(
     defer probe.deinit();
     const attach_ptr = probe.attachSet();
 
-    // Which machine's panes count as "already here" for the guard below. A
-    // session id is only meaningful WITH the machine that owns it, so the walk
-    // is scoped: a local id and a remote id that happen to match are two
-    // different sessions on two different boxes.
-    const scope: ?Window.RemoteMachine = switch (source) {
-        .local => null,
-        .relay => |r| r.machine,
-    };
-
     var restored: usize = 0;
     for (decoded.windows) |win| {
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
@@ -3746,41 +3691,11 @@ fn restoreAllFrom(
         // attach, so rebuilding a window whose panes are already on screen would
         // quietly steal them from the window that has them — and the user would
         // watch their own terminal go blank to make a copy of itself.
-        //
-        // Mac skips the guard entirely for a cross-machine rebuild because its
-        // ids come from the LOCAL manifest and cannot match. Ours are read off
-        // the live panes, so the same check keeps working across the relay —
-        // pressing Restore All twice on a remote machine must not tear apart the
-        // windows the first press built.
-        if (self.windowIsOpenOn(win, scope)) {
+        if (self.windowIsOpenOn(win, null)) {
             log.info("restore all: '{s}' is already open here, skipping", .{win.id});
             continue;
         }
-
-        // Per-window transport. The dial happens BEFORE the rebuild so a
-        // machine that stops answering mid-restore costs a skipped window
-        // rather than a half-built one.
-        const tr: RestoreTransport = switch (source) {
-            .local => .local(pull),
-            .relay => |r| blk: {
-                const dialed = self.dialRelay(r.base, r.device, r.token) catch |err| {
-                    log.warn(
-                        "restore all: window '{s}' dial failed err={}",
-                        .{ win.id, err },
-                    );
-                    continue;
-                };
-                break :blk .{
-                    .conn = dialed.conn(),
-                    .local_agent = false,
-                    .dialed = dialed,
-                    .machine = r.machine,
-                    // The far machine's monitors are not ours (T336).
-                    .reanchor = true,
-                };
-            },
-        };
-
+        const tr: RestoreTransport = .local(pull);
         self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("restore all: window '{s}' failed err={}", .{ win.id, err });
             continue;
@@ -3796,29 +3711,92 @@ fn restoreAllFrom(
     return restored;
 }
 
-/// Dial an enrolled relay device for a restore, mapping the transport's errors
-/// onto the two the chooser can actually say something useful about. Heap-owned
-/// so the result can be handed to a window; the caller frees it if it does not.
-fn dialRelay(
-    self: *App,
-    relay_base: []const u8,
-    device: []const u8,
-    token: []const u8,
-) RestoreAllError!Window.RemoteDialed {
-    const alloc = self.core_app.alloc;
-    const dialed = alloc.create(relay_dial.Dialed) catch return error.DialFailed;
-    dialed.* = relay_dial.dial(alloc, relay_base, device, token, .raw) catch |err| {
-        log.warn(
-            "restore all: relay dial failed relay={s} device={s} err={}",
-            .{ relay_base, device, err },
-        );
-        alloc.destroy(dialed);
-        // A rejected bearer is not an unreachable machine, and telling the user
-        // to check the network when the fix is signing in wastes their time
-        // (the split T319 drew for the roster).
-        return if (err == error.WebSocketUnauthorized) error.Unauthorized else error.DialFailed;
-    };
-    return .{ .relay = dialed };
+/// GUI thread (T339): rebuild the windows a `RestoreAllRelay` worker prepared,
+/// each on the transport that worker dialed for it. Returns how many were
+/// rebuilt; the job's remaining dials are freed by `Job.destroy`, so every early
+/// return here is safe rather than a leaked connection per window.
+///
+/// The dials are already open, so nothing in this function blocks on the
+/// network. What it must still do on this thread is the DECIDING — `createWindow`
+/// and everything under it is GUI-thread-only — and re-applying the
+/// double-attach guard against the LIVE panes: the worker filtered against a
+/// snapshot taken before it dialed, and a pane can have attached to one of these
+/// sessions in between (a second chooser, an IPC resume, the reconnect ladder).
+pub fn adoptRestoreAll(self: *App, job: *RestoreAllRelay.Job) usize {
+    // The app is on its way out: building windows now would race teardown, and
+    // the user is not going to see them. Every dial the job holds is freed with
+    // it.
+    if (self.quit_requested) {
+        log.info("restore all: reply landed while quitting; dropping the rebuild", .{});
+        return 0;
+    }
+
+    const attach_ptr = job.probe.attachSet();
+    const machine = job.machine();
+    var restored: usize = 0;
+    for (job.prepared) |*p| {
+        if (self.windowIsOpenOn(p.win, machine)) {
+            log.info("restore all: '{s}' is already open here, skipping", .{p.win.id});
+            continue;
+        }
+        const dialed = p.dialed orelse continue;
+        const tr: RestoreTransport = .{
+            .conn = dialed.conn(),
+            .local_agent = false,
+            .dialed = dialed,
+            .machine = machine,
+            // The far machine's monitors are not ours (T336).
+            .reanchor = true,
+        };
+        // Ownership moves with the transport: `restoreWindow` hands it to the
+        // window it builds and frees it itself on every failure path, so the
+        // job must not free it a second time.
+        p.dialed = null;
+        self.restoreWindow(p.win, tr, attach_ptr) catch |err| {
+            log.warn("restore all: window '{s}' failed err={}", .{ p.win.id, err });
+            continue;
+        };
+        restored += 1;
+    }
+
+    if (restored > 0) {
+        log.info("restore all: rebuilt {d} window(s) from the agent's layouts", .{restored});
+    } else {
+        log.info("restore all: nothing to rebuild ({d} layout(s) held)", .{job.held});
+    }
+    return restored;
+}
+
+/// Snapshot the session ids our panes currently hold on `scope` (null ⇒ this
+/// box's agent), deep-copied so a worker thread can use them after this returns.
+/// Caller frees each id and the slice — `RestoreAllRelay.Job.destroy` does.
+///
+/// GUI thread only: it walks the live window tree, which is exactly what a
+/// worker may not do.
+pub fn openSessionIdsOn(
+    self: *const App,
+    alloc: Allocator,
+    scope: ?Window.RemoteMachine,
+) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |id| alloc.free(id);
+        out.deinit(alloc);
+    }
+    for (self.windows.items) |win| {
+        if (!windowIsOn(win, scope)) continue;
+        for (0..win.tab_count) |t| {
+            var it = win.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                const surface = entry.view.surface() orelse continue;
+                if (!surface.core_surface_ready) continue;
+                const sid = surface.core_surface.remoteSessionId() orelse continue;
+                if (sid.len == 0) continue;
+                try out.append(alloc, try alloc.dupe(u8, sid));
+            }
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// Whether any leaf of `win` names a session one of our panes already has open
@@ -6579,6 +6557,19 @@ fn msgWndProc(
         if (wparam != 0) {
             const res: *SessionRoster.Result = @ptrFromInt(wparam);
             MachineChooser.onSessions(app, res);
+        }
+        return 0;
+    }
+
+    if (msg == RestoreAllRelay.WM_APP_RESTORE_ALL) {
+        // wparam = heap *Job owned by the handler (T339: a cross-machine
+        // Restore All dialed on a worker thread). It lands here rather than on
+        // the chooser's own window for the same reason the roster does — a
+        // chooser that closed first would have the message DISCARDED with its
+        // queue, leaking one relay connection per window it carries.
+        if (wparam != 0) {
+            const job: *RestoreAllRelay.Job = @ptrFromInt(wparam);
+            MachineChooser.onRestoreAll(app, job);
         }
         return 0;
     }

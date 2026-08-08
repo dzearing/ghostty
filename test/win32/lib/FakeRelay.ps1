@@ -42,10 +42,11 @@
 # Both are the NORMAL case in a chooser listing every enrolled device, and both
 # must resolve to a state of the region rather than a modal.
 #
-# Two more are FILE-triggered, so a run can change the machine's behaviour
+# Three more are FILE-triggered, so a run can change the machine's behaviour
 # part-way through - after a fixture has been built through it, or after a
-# roster has loaded: `-TripFile` (502 from then on) and
-# `-TripUnauthorizedFile` (401 from then on).
+# roster has loaded: `-TripFile` (502 from then on), `-TripUnauthorizedFile`
+# (401 from then on) and `-SlowConnectFile` (every connect answered
+# `-SlowConnectMs` late, deferred rather than slept on).
 #
 # Everything is loopback-only and lives in a background job; `Stop-FakeRelay`
 # kills it. The request log is the independent evidence that a dial really went
@@ -72,13 +73,22 @@ function Start-FakeRelay {
         # one - the Restore All button, for instance. Expiring a credential
         # AFTER the roster loaded is both the reachable path and the honest one:
         # tokens go stale between one click and the next.
-        [string]$TripUnauthorizedFile = ''
+        [string]$TripUnauthorizedFile = '',
+        # While this file EXISTS, every `/v1/client/connect` is answered
+        # `-SlowConnectMs` LATER (T339). It is how a run makes the link slow on
+        # purpose - a restore that dials N+1 times is only visibly wrong when a
+        # dial takes long enough to notice - without the relay itself stalling:
+        # the answer is deferred to a later pass of the loop, never slept on, so
+        # every live bridge keeps pumping in the meantime.
+        [string]$SlowConnectFile = '',
+        [int]$SlowConnectMs = 1500
     )
 
     Remove-Item $LogPath -ErrorAction SilentlyContinue
 
     $job = Start-Job -ScriptBlock {
-        param($port, $agentPort, $devicesJson, $logPath, $unauthDev, $deadDev, $tripFile, $tripAuthFile)
+        param($port, $agentPort, $devicesJson, $logPath, $unauthDev, $deadDev, $tripFile, $tripAuthFile,
+            $slowFile, $slowMs)
 
         function Write-RelayLog([string]$m) {
             Add-Content -Path $logPath -Value ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $m)
@@ -130,6 +140,91 @@ function Start-FakeRelay {
             } catch { return $false }
         }
 
+        # Answer one deferred `/v1/client/connect`: reject it, or complete the
+        # WebSocket upgrade and register the bridge. Split out of the accept
+        # branch so the answer can be held back by `-SlowConnectFile` without
+        # the loop sleeping (T339); with no slow file it runs on the same pass
+        # the request arrived on, which is what it always did.
+        #
+        # The decision is made HERE, not when the request landed, so a trip file
+        # dropped mid-flight still applies to a connect already in the queue.
+        function Complete-Connect($p) {
+            $device = $p.Device
+            $key = $p.Key
+            $ns = $p.Ws
+            $client = $p.Client
+
+            $unauthList = @()
+            if ($unauthDev) { $unauthList = @($unauthDev -split ',' | ForEach-Object { $_.Trim() }) }
+            $deadList = @()
+            if ($deadDev) { $deadList = @($deadDev -split ',' | ForEach-Object { $_.Trim() }) }
+
+            $tripped = $false
+            if ($tripFile -and (Test-Path $tripFile)) { $tripped = $true }
+            $trippedAuth = $false
+            if ($tripAuthFile -and (Test-Path $tripAuthFile)) { $trippedAuth = $true }
+
+            if ($trippedAuth) {
+                Write-RelayLog "REJECT 401 (tripped) device=$device"
+                Write-Http $ns '401 Unauthorized' 'text/plain' 'expired'
+                $client.Close()
+            } elseif ($tripped) {
+                Write-RelayLog "REJECT 502 (tripped) device=$device"
+                Write-Http $ns '502 Bad Gateway' 'text/plain' 'tripped'
+                $client.Close()
+            } elseif ($unauthList -contains $device) {
+                Write-RelayLog "REJECT 401 device=$device"
+                Write-Http $ns '401 Unauthorized' 'text/plain' 'expired'
+                $client.Close()
+            } elseif ($deadList -contains $device) {
+                Write-RelayLog "REJECT 502 device=$device"
+                Write-Http $ns '502 Bad Gateway' 'text/plain' 'offline'
+                $client.Close()
+            } elseif (-not $key) {
+                Write-Http $ns '400 Bad Request' 'text/plain' 'no key'
+                $client.Close()
+            } else {
+                $sha = [System.Security.Cryptography.SHA1]::Create()
+                $accept = [Convert]::ToBase64String($sha.ComputeHash(
+                        [Text.Encoding]::ASCII.GetBytes($key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')))
+                $agentSock = $null
+                try {
+                    $agentSock = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $agentPort)
+                    $agentSock.NoDelay = $true
+                } catch {
+                    Write-RelayLog "REJECT 502 (agent dial failed) device=$device"
+                    Write-Http $ns '502 Bad Gateway' 'text/plain' 'agent unreachable'
+                    $client.Close()
+                    $agentSock = $null
+                }
+                if ($null -ne $agentSock) {
+                    # A read that can block forever stalls the WHOLE relay - it
+                    # is one loop - and a stalled relay looks to the app like a
+                    # connection that stopped answering, which its heartbeat
+                    # then shuts down as `error.ConnectionClosed`. Every socket
+                    # here gets a deadline so a bridge can only ever kill
+                    # itself.
+                    $ns.ReadTimeout = 5000
+                    $ns.WriteTimeout = 5000
+                    $agentSock.GetStream().ReadTimeout = 5000
+                    $agentSock.GetStream().WriteTimeout = 5000
+                    $resp = "HTTP/1.1 101 Switching Protocols`r`nUpgrade: websocket`r`n" +
+                    "Connection: Upgrade`r`nSec-WebSocket-Accept: $accept`r`n`r`n"
+                    $rb = [Text.Encoding]::ASCII.GetBytes($resp)
+                    $ns.Write($rb, 0, $rb.Length)
+                    $ns.Flush()
+                    [void]$bridges.Add([pscustomobject]@{
+                            Client = $client
+                            Ws     = $ns
+                            Agent  = $agentSock
+                            AgentS = $agentSock.GetStream()
+                            Device = $device
+                        })
+                    Write-RelayLog "BRIDGE up device=$device"
+                }
+            }
+        }
+
         function Write-Http($stream, [string]$status, [string]$contentType, [string]$body) {
             $payload = [Text.Encoding]::UTF8.GetBytes($body)
             $head = "HTTP/1.1 $status`r`n"
@@ -144,6 +239,8 @@ function Start-FakeRelay {
         Write-RelayLog "LISTEN 127.0.0.1:$port -> agent 127.0.0.1:$agentPort"
 
         $bridges = New-Object System.Collections.ArrayList
+        # Accepted `/connect` requests waiting for their answer's deadline.
+        $deferred = New-Object System.Collections.ArrayList
         # 32 KiB, so an agent->client frame always fits the 16-bit length form.
         # Framing is free to differ from what the client sent: the layer above
         # the WebSocket reads a STREAM, and `readMessage` reassembles.
@@ -191,79 +288,38 @@ function Start-FakeRelay {
                     }
                     Write-RelayLog "CONNECT device=$device auth=$auth"
 
-                    $unauthList = @()
-                    if ($unauthDev) { $unauthList = @($unauthDev -split ',' | ForEach-Object { $_.Trim() }) }
-                    $deadList = @()
-                    if ($deadDev) { $deadList = @($deadDev -split ',' | ForEach-Object { $_.Trim() }) }
-
-                    $tripped = $false
-                    if ($tripFile -and (Test-Path $tripFile)) { $tripped = $true }
-                    $trippedAuth = $false
-                    if ($tripAuthFile -and (Test-Path $tripAuthFile)) { $trippedAuth = $true }
-
-                    if ($trippedAuth) {
-                        Write-RelayLog "REJECT 401 (tripped) device=$device"
-                        Write-Http $ns '401 Unauthorized' 'text/plain' 'expired'
-                        $client.Close()
-                    } elseif ($tripped) {
-                        Write-RelayLog "REJECT 502 (tripped) device=$device"
-                        Write-Http $ns '502 Bad Gateway' 'text/plain' 'tripped'
-                        $client.Close()
-                    } elseif ($unauthList -contains $device) {
-                        Write-RelayLog "REJECT 401 device=$device"
-                        Write-Http $ns '401 Unauthorized' 'text/plain' 'expired'
-                        $client.Close()
-                    } elseif ($deadList -contains $device) {
-                        Write-RelayLog "REJECT 502 device=$device"
-                        Write-Http $ns '502 Bad Gateway' 'text/plain' 'offline'
-                        $client.Close()
-                    } elseif (-not $key) {
-                        Write-Http $ns '400 Bad Request' 'text/plain' 'no key'
-                        $client.Close()
-                    } else {
-                        $sha = [System.Security.Cryptography.SHA1]::Create()
-                        $accept = [Convert]::ToBase64String($sha.ComputeHash(
-                                [Text.Encoding]::ASCII.GetBytes($key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')))
-                        $agentSock = $null
-                        try {
-                            $agentSock = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $agentPort)
-                            $agentSock.NoDelay = $true
-                        } catch {
-                            Write-RelayLog "REJECT 502 (agent dial failed) device=$device"
-                            Write-Http $ns '502 Bad Gateway' 'text/plain' 'agent unreachable'
-                            $client.Close()
-                            $agentSock = $null
-                        }
-                        if ($null -ne $agentSock) {
-                            # A read that can block forever stalls the WHOLE
-                            # relay - it is one loop - and a stalled relay looks
-                            # to the app like a connection that stopped
-                            # answering, which its heartbeat then shuts down as
-                            # `error.ConnectionClosed`. Every socket here gets a
-                            # deadline so a bridge can only ever kill itself.
-                            $ns.ReadTimeout = 5000
-                            $ns.WriteTimeout = 5000
-                            $agentSock.GetStream().ReadTimeout = 5000
-                            $agentSock.GetStream().WriteTimeout = 5000
-                            $resp = "HTTP/1.1 101 Switching Protocols`r`nUpgrade: websocket`r`n" +
-                            "Connection: Upgrade`r`nSec-WebSocket-Accept: $accept`r`n`r`n"
-                            $rb = [Text.Encoding]::ASCII.GetBytes($resp)
-                            $ns.Write($rb, 0, $rb.Length)
-                            $ns.Flush()
-                            [void]$bridges.Add([pscustomobject]@{
-                                    Client = $client
-                                    Ws     = $ns
-                                    Agent  = $agentSock
-                                    AgentS = $agentSock.GetStream()
-                                    Device = $device
-                                })
-                            Write-RelayLog "BRIDGE up device=$device"
-                        }
+                    # A SLOW link, without stalling the relay (T339). The answer
+                    # is deferred, not slept on: this is one loop, so a sleep
+                    # here would freeze every live bridge too and the app would
+                    # see connections that stopped answering rather than a dial
+                    # that takes a while. With no slow file the deadline is now,
+                    # so the sweep below completes it on this same pass.
+                    $delayMs = 0
+                    if ($slowFile -and (Test-Path $slowFile)) { $delayMs = $slowMs }
+                    [void]$deferred.Add([pscustomobject]@{
+                            Client  = $client
+                            Ws      = $ns
+                            Device  = $device
+                            Key     = $key
+                            ReadyAt = (Get-Date).AddMilliseconds($delayMs)
+                        })
+                    if ($delayMs -gt 0) {
+                        Write-RelayLog "DEFER ${delayMs}ms device=$device"
                     }
                 } else {
                     Write-Http $ns '404 Not Found' 'text/plain' 'no'
                     $client.Close()
                 }
+            }
+
+            # Deferred connects whose deadline has passed. Answered from the
+            # loop rather than from a sleep, so live bridges keep pumping while
+            # a "slow" dial is outstanding.
+            foreach ($p in @($deferred)) {
+                if ((Get-Date) -lt $p.ReadyAt) { continue }
+                $idle = $false
+                $deferred.Remove($p)
+                Complete-Connect $p
             }
 
             foreach ($b in @($bridges)) {
@@ -365,7 +421,7 @@ function Start-FakeRelay {
 
             if ($idle) { Start-Sleep -Milliseconds 5 }
         }
-    } -ArgumentList $Port, $AgentPort, $DevicesJson, $LogPath, $UnauthorizedDevice, $UnreachableDevice, $TripFile, $TripUnauthorizedFile
+    } -ArgumentList $Port, $AgentPort, $DevicesJson, $LogPath, $UnauthorizedDevice, $UnreachableDevice, $TripFile, $TripUnauthorizedFile, $SlowConnectFile, $SlowConnectMs
 
     # Wait for the listener to actually bind before handing the job back: a
     # relay that is not listening yet reads exactly like a relay that is broken.

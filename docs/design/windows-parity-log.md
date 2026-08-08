@@ -9,6 +9,51 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-08 - **T339 done - Restore All stops freezing the app while it
+  reaches another machine**. Rebuilding a machine's topology costs 1 + N relay
+  dials (the pull, then one per window, because a win32 window owns its
+  transport and frees it on close - T336's rule, not the defect), and all N+1
+  full WebSocket upgrades ran on the GUI thread. On the loopback fixture that is
+  milliseconds; on a 300 ms link a six-window machine is ~2 s with no cursor, no
+  paint and no way to cancel. **The split is at the line that decides**: the new
+  `RestoreAllRelay.zig` does dial -> `GET_LAYOUTS` -> `LIST_SESSIONS` -> one dial
+  per window on a worker thread and `PostMessage`s ONE `Job` back to the app's
+  message window (not the chooser's - `DestroyWindow` discards a window's queue,
+  and a discarded reply would leak a connection per window, the T318/T295
+  lesson); `App.adoptRestoreAll` does the GUI-only half. **Ownership is the part
+  worth stating**: `Job.destroy` frees every dial the rebuild did not hand to a
+  window, so a reply landing after the chooser closed, while the app is quitting,
+  or on a window that failed to build cannot leak a transport - and the rebuild
+  happens either way, because dismissing the chooser was never offered as a
+  cancel. The double-attach guard is applied TWICE on purpose: against a
+  GUI-thread snapshot of open session ids before dialing (so an already-open
+  window costs no dial at all) and again against the LIVE panes before building,
+  since a pane can attach while the worker is out. `restoreAllFrom`'s
+  local/relay union collapsed to `restoreAllLocalFrom` - the local arm stays
+  synchronous (bounded named-pipe RPCs to a daemon on this box) and is filed as
+  **T618** for the wedged-agent tail. Serial vs concurrent per-window dials was
+  the one judgement call: kept serial, filed as **T616** with **D38** carrying
+  the reasoning. **The assertion that proves it** (validation criterion 2) needed
+  a slow link, so `FakeRelay.ps1` gained `-SlowConnectFile`/`-SlowConnectMs`,
+  which DEFERS each `/connect` answer to a later pass of its loop rather than
+  sleeping in it - the relay is one loop, and a sleep would stall every live
+  bridge and read to the app as connections that stopped answering. With 1.5 s
+  per dial armed, the chooser is asked for a `WM_NULL` every 150 ms from the
+  keypress until the rebuild starts: **19 probes, 0 unanswered**, against 2
+  deferred connects in the relay log. **The surprise**: assertions A and G of
+  `chooser-restore-all-remote.ps1` were already red, and had been since
+  2026-08-02 - T338 re-keyed layout blobs onto the window UUID 72 minutes after
+  T336's last green run, so the fixture's `key -eq 't336-multi'` lookup matched
+  nothing. It read as a product defect rather than a broken oracle because
+  `@($null.session_ids).Count` is **1** in PowerShell, so "no record at all"
+  printed as "the window's blob claims 1 session id". The store held a correct
+  3-id blob throughout; the oracle now finds the record by the `ipc_name` inside
+  the blob. Filed **T617** for the gap that let it sit: nothing re-runs a script
+  whose subject was not touched, and nothing records when a script was last
+  green. Validation: `chooser-restore-all-remote.ps1` ALL PASS (35),
+  `chooser-restore-all.ps1` ALL PASS (30), `chooser-sessions-remote.ps1` ALL PASS
+  (20), `relay-account.ps1` ALL PASS, all three zig lanes and P1-P3 green.
+
 - 2026-08-08 - **T356 done - a cross-machine pane stops asking to confirm a
   close it does not need to ask about**. T41 skips the confirmation for an idle
   shell by walking THIS box's process table; a cross-machine pane's shell is not
