@@ -7,12 +7,43 @@
 //!                            "session_ids":[<32-hex>, ...]}, ...]}
 //!
 //! The agent is DELIBERATELY topology-agnostic: `blob` is stored and returned
-//! verbatim (it is the owning viewer's `SessionLayoutManifest.Entry` JSON — the
-//! window frame, split tree with per-leaf session ids, titles, ipc names). The
-//! agent only inspects `session_ids`, and only to REAP a blob once none of its
-//! sessions exist any more. A viewer on another machine pulls these blobs with
-//! `GET_LAYOUTS` and rebuilds the full window/tab/split topology locally,
-//! attaching each leaf to its live session.
+//! verbatim. The agent only inspects `session_ids`, and only to REAP a blob once
+//! none of its sessions exist any more. A viewer on another machine pulls these
+//! blobs with `GET_LAYOUTS` and rebuilds the full window/tab/split topology
+//! locally, attaching each leaf to its live session.
+//!
+//! ## What `blob` actually contains (the contract this file does NOT enforce)
+//!
+//! "Opaque" describes the AGENT's relationship to the bytes, not the absence of
+//! a schema. The schema is a contract between two VIEWERS, and there are two of
+//! them (T337):
+//!
+//!   * **macOS** writes a `SessionLayoutManifest.Entry` — camelCase, ONE blob
+//!     per TAB (tabs of a window share a `tabGroupID` and order by `tabIndex`),
+//!     a NESTED `tree` whose Swift enum cases carry a `_0` payload.
+//!   * **win32** writes a `session_layout.Window` — snake_case, one blob per
+//!     WINDOW, a FLAT `nodes` array whose splits hold `left`/`right` indices.
+//!
+//! Both carry the window frame, the split tree with per-leaf session ids, titles
+//! and ipc names; neither is a superset of the other, and **there is no version
+//! or lineage tag** — an agent outlives the app that wrote its blobs, so the
+//! blobs already in a live store predate any tag that could be added now.
+//!
+//! The consequences are all on the READ side, where they belong:
+//!
+//!   * A reader identifies a blob by SHAPE (`tree` vs `tabs`) and translates the
+//!     other lineage's — win32 does this in `apprt/win32/mac_layout_blob.zig`;
+//!     the Mac half is T622.
+//!   * A blob it still cannot read is SKIPPED, never fatal. One unreadable blob
+//!     must not cost the user the other five windows.
+//!   * Both sides evolve their own schema additively (unknown fields ignored,
+//!     absent fields fall back), exactly as `File` below does.
+//!
+//! This file's own contract is narrower and unaffected by any of that: `blob` is
+//! a JSON *string*, and `session_ids` is the truth about what the blob
+//! references. Nothing here may start parsing a blob to answer a question —
+//! doing so would make the agent a third party to a contract it is deliberately
+//! not part of, and would break the moment either viewer evolved.
 //!
 //! ## Layering
 //!

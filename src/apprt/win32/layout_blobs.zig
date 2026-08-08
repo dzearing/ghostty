@@ -21,9 +21,16 @@
 //! `nodes` array with `left`/`right` indices — because that is the shape its
 //! restore already reads, and reusing it means "Restore All" and launch-time
 //! restore share one rebuild instead of two. macOS pushes a camelCase
-//! `SessionLayoutManifest.Entry`, so a blob does not cross lineages: a Mac
-//! viewer pointed at a Windows machine decodes nothing and shows "nothing to
-//! restore". That gap is real, deliberate for now, and tracked as **T337**.
+//! `SessionLayoutManifest.Entry` — one blob per TAB, with a nested `tree`.
+//!
+//! Two lineages, two shapes, and no tag to tell them apart: the blobs already
+//! sitting in live agents were written before any tag could exist, and an agent
+//! outlives the app that wrote them by design. So the READER decides by shape
+//! (T337) — a macOS entry has a `tree` and no `tabs` — and translates
+//! (`mac_layout_blob.zig`), which is what makes "Restore All" pointed at a Mac
+//! machine rebuild that Mac's windows here instead of reporting "nothing to
+//! restore". The mirror direction (a Mac viewer reading these blobs) is the Mac
+//! seat's half, filed as T622.
 //!
 //! ## Why a malformed blob is skipped rather than fatal
 //!
@@ -36,6 +43,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("../../remote/protocol.zig");
+const mac_layout_blob = @import("mac_layout_blob.zig");
 const session_layout = @import("session_layout.zig");
 
 /// Serialize one window into its opaque blob. Absent optionals are dropped, the
@@ -173,6 +181,11 @@ pub const Decoded = struct {
 /// is nothing to be partial about); a malformed INNER blob is skipped. A blob
 /// that parses but carries no tabs is skipped too: it would rebuild as a window
 /// with nothing in it, which is worse than not rebuilding it.
+///
+/// A **macOS-lineage** blob is neither: it is recognized by shape and translated
+/// (T337). Mac stores one blob per TAB, so its entries are collected across the
+/// whole reply and grouped into windows at the end — which is why translated
+/// windows follow the win32 ones rather than holding their reply position.
 pub fn decodeLayouts(alloc: Allocator, payload: []const u8) !Decoded {
     const arena = try alloc.create(std.heap.ArenaAllocator);
     errdefer alloc.destroy(arena);
@@ -186,9 +199,35 @@ pub fn decodeLayouts(alloc: Allocator, payload: []const u8) !Decoded {
     });
 
     var out: std.ArrayList(session_layout.Window) = .empty;
+    var mac_entries: std.ArrayList(mac_layout_blob.Entry) = .empty;
     var skipped: usize = 0;
     for (reply.layouts) |rec| {
-        const win = std.json.parseFromSliceLeaky(session_layout.Window, a, rec.blob, .{
+        // One generic parse serves both lineages: the shape test needs a tree of
+        // values anyway, and re-parsing the bytes per candidate schema would let
+        // the two readers disagree about what the blob even is.
+        const value = std.json.parseFromSliceLeaky(std.json.Value, a, rec.blob, .{
+            .allocate = .alloc_always,
+        }) catch {
+            skipped += 1;
+            continue;
+        };
+
+        if (mac_layout_blob.looksLikeEntry(value)) {
+            const entry = mac_layout_blob.parseEntry(a, value) catch {
+                skipped += 1;
+                continue;
+            };
+            // An entry whose tree held nothing is the Mac equivalent of a
+            // zero-tab window: skipped rather than rebuilt empty.
+            if (entry.nodes.len == 0) {
+                skipped += 1;
+                continue;
+            }
+            try mac_entries.append(a, entry);
+            continue;
+        }
+
+        const win = std.json.parseFromValueLeaky(session_layout.Window, a, value, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch {
@@ -200,6 +239,11 @@ pub fn decodeLayouts(alloc: Allocator, payload: []const u8) !Decoded {
             continue;
         }
         try out.append(a, win);
+    }
+
+    if (mac_entries.items.len > 0) {
+        const translated = try mac_layout_blob.groupIntoWindows(a, mac_entries.items);
+        try out.appendSlice(a, translated);
     }
 
     return .{
@@ -430,9 +474,9 @@ test "decodeLayouts: one malformed blob is skipped, the good one survives" {
     const payload = try layoutsReply(alloc, &.{
         .{ .key = "broken", .blob = "{not json" },
         .{ .key = "win-0", .blob = blob },
-        // Another lineage's shape (macOS pushes camelCase with a nested tree):
-        // it parses as JSON but has no `tabs`, so it is unusable here (T337).
-        .{ .key = "macos", .blob = "{\"windowID\":\"x\",\"tree\":{\"leaf\":{\"sessionID\":\"z\"}}}" },
+        // A shape that is neither lineage: valid JSON, no `tabs` to rebuild and
+        // no `tree` to translate.
+        .{ .key = "alien", .blob = "{\"windowID\":\"x\"}" },
     });
     defer alloc.free(payload);
 
@@ -441,6 +485,105 @@ test "decodeLayouts: one malformed blob is skipped, the good one survives" {
     try testing.expectEqual(@as(usize, 1), decoded.windows.len);
     try testing.expectEqual(@as(usize, 2), decoded.skipped);
     try testing.expectEqualStrings("win-0", decoded.windows[0].id);
+}
+
+test "T337: a macOS blob restores as a window instead of being dropped" {
+    const alloc = testing.allocator;
+    // The shape a Mac viewer actually pushes: camelCase, a nested `tree` whose
+    // enum cases carry a `_0` payload, and — because Mac stores one entry per
+    // TAB — two blobs that belong to ONE window.
+    const tab_a =
+        \\{"id":"1D0A0B0C-0000-4000-8000-000000000001",
+        \\ "tabGroupID":"GGGGGGGG-0000-4000-8000-000000000009","tabIndex":0,
+        \\ "ipcName":"dev","titleOverride":"editor",
+        \\ "frame":{"x":120,"y":300,"width":1440,"height":900},
+        \\ "tree":{"split":{"_0":{"direction":"vertical","ratio":0.25,
+        \\   "left":{"leaf":{"_0":{"sessionID":"aaaa","surfaceID":"pane-a"}}},
+        \\   "right":{"leaf":{"_0":{"sessionID":"bbbb"}}}}}}}
+    ;
+    const tab_b =
+        \\{"id":"1D0A0B0C-0000-4000-8000-000000000002",
+        \\ "tabGroupID":"GGGGGGGG-0000-4000-8000-000000000009","tabIndex":1,
+        \\ "titleOverride":"logs",
+        \\ "tree":{"leaf":{"_0":{"sessionID":"cccc"}}}}
+    ;
+
+    const payload = try layoutsReply(alloc, &.{
+        .{ .key = "mac-a", .blob = tab_a },
+        .{ .key = "mac-b", .blob = tab_b },
+    });
+    defer alloc.free(payload);
+
+    const decoded = try decodeLayouts(alloc, payload);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(usize, 0), decoded.skipped);
+    // ONE window with two tabs — not two windows, and not nothing.
+    try testing.expectEqual(@as(usize, 1), decoded.windows.len);
+    const w = decoded.windows[0];
+    try testing.expectEqualStrings("dev", w.id);
+    try testing.expectEqual(@as(usize, 2), w.tabs.len);
+    try testing.expectEqual(@as(i32, 1440), w.frame.?.w);
+    // The split tree arrived as win32's flat indexed nodes.
+    try testing.expectEqual(@as(usize, 3), w.tabs[0].nodes.len);
+    try testing.expectEqualStrings("vertical", w.tabs[0].nodes[0].split.?.layout);
+    try testing.expectEqual(@as(u16, 2), w.tabs[0].nodes[0].split.?.right);
+    try testing.expectEqualStrings("aaaa", w.tabs[0].nodes[1].leaf.?.session_id.?);
+    try testing.expectEqualStrings("pane-a", w.tabs[0].nodes[1].leaf.?.pane_id.?);
+    try testing.expectEqualStrings("cccc", w.tabs[1].nodes[0].leaf.?.session_id.?);
+
+    // ...and the sessions it references are exactly the three the Mac holds —
+    // across BOTH tabs — so the attach probe and the double-attach guard see
+    // every pane, not just the frontmost tab's.
+    const ids = try sessionIds(alloc, w);
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqualStrings("aaaa", ids[0]);
+    try testing.expectEqualStrings("bbbb", ids[1]);
+    try testing.expectEqualStrings("cccc", ids[2]);
+}
+
+test "T337: a mixed store decodes both lineages, and a broken Mac blob is skipped" {
+    const alloc = testing.allocator;
+    const win_blob = try serializeWindow(alloc, twoPaneWindow());
+    defer alloc.free(win_blob);
+
+    const payload = try layoutsReply(alloc, &.{
+        .{ .key = "mac-bad", .blob = "{\"id\":\"e\",\"tree\":{\"branch\":{\"_0\":{}}}}" },
+        .{ .key = "win-0", .blob = win_blob },
+        .{ .key = "mac-ok", .blob = "{\"id\":\"e2\",\"tree\":{\"leaf\":{\"_0\":{\"sessionID\":\"z\"}}}}" },
+    });
+    defer alloc.free(payload);
+
+    const decoded = try decodeLayouts(alloc, payload);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(usize, 1), decoded.skipped);
+    try testing.expectEqual(@as(usize, 2), decoded.windows.len);
+    // win32 windows keep their reply order; translated ones follow.
+    try testing.expectEqualStrings("win-0", decoded.windows[0].id);
+    try testing.expectEqualStrings("e2", decoded.windows[1].id);
+    try testing.expectEqualStrings("z", decoded.windows[1].tabs[0].nodes[0].leaf.?.session_id.?);
+}
+
+test "T337: a Mac blob's screen snapshot never reaches a restored leaf" {
+    // The IN-side twin of the T413 assertion above. Mac's `layoutBlob` does NOT
+    // strip snapshots the way win32's `serializeWindow` does, so the only thing
+    // standing between another viewer's stale screen and this pane is the
+    // translator.
+    const alloc = testing.allocator;
+    const payload = try layoutsReply(alloc, &.{.{
+        .key = "mac",
+        .blob = "{\"id\":\"e\",\"tree\":{\"leaf\":{\"_0\":{\"sessionID\":\"a\"," ++
+            "\"screenSnapshot\":\"SU5WSVNJQkxF\",\"screenSnapshotOffset\":9001}}}}",
+    }});
+    defer alloc.free(payload);
+
+    const decoded = try decodeLayouts(alloc, payload);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(usize, 1), decoded.windows.len);
+    const leaf = decoded.windows[0].tabs[0].nodes[0].leaf.?;
+    try testing.expectEqualStrings("a", leaf.session_id.?);
+    try testing.expect(leaf.screen_snapshot == null);
+    try testing.expect(leaf.screen_snapshot_offset == null);
 }
 
 test "decodeLayouts: an empty layouts array is a valid, empty answer" {

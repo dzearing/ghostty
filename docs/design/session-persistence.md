@@ -482,6 +482,62 @@ session, which has no local manifest entry either and which no blob change could
 ever have helped. Tracked separately; T413 is the decision not to solve it in
 the topology mirror.
 
+#### 5.4.2 The layout blob has TWO schemas, and the reader reconciles them (T337)
+
+The agent stores a layout blob verbatim and never looks inside it
+(`layout_meta.zig`). "Opaque" describes the agent's relationship to the bytes,
+not the absence of a schema — the schema is a contract between two **viewers**,
+and the two lineages never shared one:
+
+| | macOS | win32 |
+|---|---|---|
+| Type | `SessionLayoutManifest.Entry` | `session_layout.Window` |
+| Keys | camelCase (`sessionID`) | snake_case (`session_id`) |
+| One blob is | one **tab** (siblings share `tabGroupID`, order by `tabIndex`) | one **window** (a `tabs` array) |
+| Split tree | nested `tree`; Swift enum cases wrap their payload in `_0` | flat `nodes` array; splits hold `left`/`right` indices |
+
+The consequence used to be silent: Restore All pointed across lineages decoded
+nothing and reported "nothing to restore" — a feature that looked present and
+was not.
+
+**The fix is on the read side, and it has to be.** There is no version or
+lineage tag to add, because the blobs already sitting in live agents predate any
+tag we could introduce now — an agent outlives the app that wrote its blobs by
+design (see CLAUDE.md, "Agent contract & upgrade compatibility"), so an envelope
+would describe only future blobs while the old ones stayed undecodable. A reader
+that tolerates the other shape is therefore required either way, which makes it
+the whole fix rather than half of one.
+
+So a reader:
+
+1. **Identifies the blob by shape** — a Mac entry has a `tree` and no `tabs`; a
+   win32 window has `tabs` and no `tree`.
+2. **Translates** the other lineage's into its own vocabulary. win32 does this
+   in `apprt/win32/mac_layout_blob.zig`: it flattens the nested tree into
+   indexed `nodes`, maps the leaf fields, and groups Mac's per-tab entries back
+   into one window per `tabGroupID` in `tabIndex` order — the same regrouping
+   Mac's own `SessionLayoutRestore` does. The mirror (a Mac viewer reading a
+   win32 blob) is **T622**.
+3. **Skips what it still cannot read**, counting it rather than failing. One bad
+   blob must not cost the user the other five windows.
+
+Two things deliberately do NOT survive the translation:
+
+- **The WP-D3 snapshot pair.** Mac's `layoutBlob` encodes the whole entry,
+  snapshots included, where win32's `serializeWindow` strips its own. Carrying
+  one across would paint another viewer's screen into this pane and ATTACH at
+  that viewer's stale offset — exactly the failure §5.4.1 exists to prevent — so
+  the translator drops it and the pane takes the replay path like every other
+  blob-sourced pane.
+- **The window ORIGIN.** Cocoa measures y up from the bottom-left of the primary
+  screen, win32 down from the top-left, and the blob records no source-screen
+  height, so the flip cannot be undone from the data. The origin is passed
+  through (landing the window vertically mirrored but on screen) and
+  `restore_frame.reanchor` re-centers anything that lands on no monitor at all.
+  Centering every translated window instead would stack a whole restored session
+  on one spot, which is worse for the multi-window case the feature exists for.
+  Recording the source screen's geometry as an additive field is **T623**.
+
 ### 5.5 Portability / moving windows
 
 - The Mac enrolls as a relay device (already supported; this Mac has a device

@@ -975,6 +975,25 @@ roster, resume one session or rebuild the whole topology locally. Cross-machine
 Resume shipped on macOS 2026-07-16; on Windows, browse/Resume-one landed with
 T318–T320 and cross-machine Restore All with T336 (2026-08-02).
 
+**Restore All across LINEAGES** (a Mac machine restored on Windows) works as of
+T337, and it works by translation rather than by agreement. The layout blob the
+agent stores is opaque to it, so its schema is a contract between two viewers —
+and the two never shared one: macOS writes a camelCase
+`SessionLayoutManifest.Entry`, one blob per TAB, with a nested `tree`; win32
+writes a snake_case `session_layout.Window`, one blob per WINDOW, with a flat
+indexed `nodes` array. There is no lineage tag to switch on and there cannot be
+one retroactively — the blobs already in a live agent were written before any tag
+could exist. So the READER identifies a blob by shape (`tree` vs `tabs`) and
+converts the other lineage's into its own (win32:
+`src/apprt/win32/mac_layout_blob.zig`; the Mac half is T622), skipping — never
+failing on — anything it still cannot read. Two things deliberately do not
+survive the trip: the WP-D3 screen snapshot (another viewer's stale screen must
+never be painted into a restored pane) and the window ORIGIN (Cocoa measures y
+up from the bottom-left and the blob records no source-screen height, so it is
+passed through and re-anchored if it lands off-screen — T623). Full contract:
+`docs/design/session-persistence.md` §5.4.2. Acceptance:
+`test/win32/layout-blob-cross-lineage.ps1`.
+
 ### Agent contract & upgrade compatibility
 
 The `ghoztty-agent` outlives the app on purpose (per-user LaunchAgent; survives

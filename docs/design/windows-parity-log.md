@@ -9,6 +9,56 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-08 - **T337 done - a Mac's windows now rebuild on Windows.** Restore
+  All pointed across lineages used to report "nothing to restore" over a machine
+  with six windows open: the layout blob is opaque to the agent, so its schema is
+  a contract between two VIEWERS, and the two never shared one (macOS: camelCase
+  `Entry`, one blob per TAB, nested `tree`; win32: snake_case `Window`, one blob
+  per WINDOW, flat indexed `nodes`). **The task was filed as a decision and the
+  filed options all lose to the same fact**: the blobs already sitting in live
+  agents carry no tag and never can, because an agent outlives the app that wrote
+  them by design - so an envelope or a shared schema would describe only future
+  blobs while every existing one stayed undecodable. A tolerant reader is
+  required either way, which makes it the whole fix rather than half of one.
+  So `decodeLayouts` now parses each blob to a `std.json.Value` once, routes by
+  SHAPE (`tree` vs `tabs`), and hands Mac's to the new `mac_layout_blob.zig`,
+  which flattens the nested tree (`_0` payloads and all), maps the leaf fields,
+  and regroups Mac's per-TAB entries into one window per `tabGroupID` in
+  `tabIndex` order. Nothing new is written: no wire, protocol or agent change, so
+  no skew is possible against a running agent. Rationale filed as **D41**; the
+  contract is now stated in `layout_meta.zig`'s header (the file that called the
+  blob opaque) and in `session-persistence.md` §5.4.2.
+  - Two things deliberately do NOT survive the translation, both load-bearing:
+    the WP-D3 snapshot pair (Mac's writer does not strip it and win32's does, so
+    the translator must - painting another viewer's screen at that viewer's stale
+    offset is the failure T413 made unreachable), and the window ORIGIN (Cocoa
+    measures y up from the bottom-left and the blob records no source-screen
+    height, so it rides through and `restore_frame.reanchor` catches anything
+    off-screen; centering them all instead would stack a whole restored session
+    on one spot). Filed as **T623**. The Mac mirror is **T622**.
+  - Validation: 16 unit tests, plus a new on-box oracle
+    `test\win32\layout-blob-cross-lineage.ps1` that transplants MAC-shaped blobs
+    into a hermetic agent's `layouts.json` - the relaunch rebuilds 1 window / 2
+    tabs / 3 panes with the split in tab one and an ATTACH for every session id
+    the blobs named (ALL PASS, 13). **The negative control was run**:
+    `looksLikeEntry` forced to false and rebuilt reproduces the pre-fix symptom
+    exactly - a blank 1/1/1 relaunch, nothing attached - then reverted and
+    rebuilt.
+  - Three harness/behavior traps cost a cycle each and are now written into the
+    script. (1) PS 5.1 unrolls a function's array return, and the usual `, @(…)`
+    fix repairs the ONE-element case while breaking the many-element one, so a
+    correct two-window read scored as "1 window" - every call site wraps in `@()`
+    instead. (2) `Set-Content -Encoding utf8` writes a BOM and `std.json` rejects
+    it, which would have scored a working build as broken. (3)
+    `session-relaunch = notify` RETIRES the tombstone and opens a FRESH session,
+    so the post-restore roster ids are new by design - the ATTACH log is the
+    oracle, not the roster.
+  - Floor: `none` + `win32` + `test-agent` all PASS (the agent lane failed once
+    on the known T407-class WebView2 host-floor contention and passed clean on
+    re-run), P1-P3 ALL PASS, and `session-crash-recover.ps1` (17) +
+    `layout-blobs.ps1` confirm win32-shaped blobs did not regress through the
+    new `parseFromValueLeaky` path.
+
 - 2026-08-08 - **T339 done - Restore All stops freezing the app while it
   reaches another machine**. Rebuilding a machine's topology costs 1 + N relay
   dials (the pull, then one per window, because a win32 window owns its
