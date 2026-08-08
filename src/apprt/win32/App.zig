@@ -1670,6 +1670,16 @@ const AttachProbe = struct {
         return self;
     }
 
+    /// The probe for a launch with NO agent connection (T398). An EMPTY set,
+    /// deliberately not a null one: with no agent nothing CAN be attached, and
+    /// that is KNOWN rather than unknown. The difference is the whole liveness
+    /// tri-state — a null here would read as "probe failed, attempt every leaf"
+    /// and rebuild terminal-only windows as walls of fresh shells, which is
+    /// exactly what the never-all-dead rule refuses to do.
+    fn agentless(gpa: Allocator) AttachProbe {
+        return .{ .set = std.StringHashMap(void).init(gpa) };
+    }
+
     /// What the restore helpers take: null ⇒ unknown ⇒ attempt every leaf.
     fn attachSet(self: *const AttachProbe) ?*const std.StringHashMap(void) {
         return if (self.set) |*m| m else null;
@@ -1760,6 +1770,41 @@ test "leafAttachSessionId applies the one attach rule (T411 counts what restore 
     try std.testing.expect(leafAttachSessionId(.{}, &set) == null);
 }
 
+test "restoreWindowHasAttachableLeaf keeps viewer-bearing windows with no agent (T398)" {
+    // The agentless roster: nothing is attachable, and that is KNOWN.
+    var empty = std.StringHashMap(void).init(std.testing.allocator);
+    defer empty.deinit();
+
+    const viewer_only = [_]session_layout.Node{
+        .{ .leaf = .{ .kind = "viewer", .viewer_location = "https://example.com/" } },
+    };
+    const mixed = [_]session_layout.Node{
+        .{ .split = .{ .layout = "horizontal", .ratio = 0.5, .left = 1, .right = 2 } },
+        .{ .leaf = .{ .session_id = "gone-1" } },
+        .{ .leaf = .{ .kind = "viewer", .viewer_location = "https://example.com/" } },
+    };
+    const terminal_only = [_]session_layout.Node{
+        .{ .leaf = .{ .session_id = "gone-1" } },
+    };
+
+    const mk = struct {
+        fn win(nodes: []const session_layout.Node) session_layout.Window {
+            const tabs = &[_]session_layout.Tab{.{ .nodes = nodes, .active = true }};
+            return .{ .id = "w1", .tabs = tabs };
+        }
+    };
+
+    // The bug: both of these were dropped before restore ever reached them,
+    // because the connection resolve above bailed first.
+    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&viewer_only), &empty));
+    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&mixed), &empty));
+    // Still dropped, and must be: every leaf in it is a session that is gone.
+    try std.testing.expect(!restoreWindowHasAttachableLeaf(mk.win(&terminal_only), &empty));
+    // An UNKNOWN roster (probe failed) is the other tri-state arm and still
+    // attempts everything — the agentless set must not be spelled `null`.
+    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&terminal_only), null));
+}
+
 test "collectAttachedLeaves counts only leaves that attach a session" {
     const nodes = [_]session_layout.Node{
         .{ .leaf = .{ .session_id = "alive-1" } },
@@ -1833,8 +1878,13 @@ test "countUnattachedLive counts live sessions outside the attached set only" {
 /// connection there is refcounted and owned by nobody in particular; here the
 /// rule is one dial per window, stated rather than inherited.
 const RestoreTransport = struct {
-    /// The connection each restored leaf ATTACHes over.
-    conn: *remote_connection.Connection,
+    /// The connection each restored leaf ATTACHes over, or NULL when this
+    /// launch has no agent at all (T398). A viewer leaf rides no connection in
+    /// either case — re-opening its recorded location IS its restore (T90h) —
+    /// so a null here does not cancel the restore; it means every TERMINAL leaf
+    /// in the window opens as a plain local ConPTY pane, which is what a pane
+    /// opened while the agent is down would be anyway.
+    conn: ?*remote_connection.Connection,
     /// true ⇒ this box's own agent (the launch-time and local Restore All
     /// paths). false ⇒ a CROSS-MACHINE dial, which also stops `createWindow`
     /// from handing the window a local agent it must not use.
@@ -1854,6 +1904,14 @@ const RestoreTransport = struct {
     fn local(conn: *remote_connection.Connection) RestoreTransport {
         return .{ .conn = conn };
     }
+
+    /// The transport for a launch with NO local agent (T398): nothing to ATTACH
+    /// to, so terminal leaves open fresh local panes and viewer leaves restore
+    /// normally. Only the launch-time path builds one — the chooser's Restore
+    /// All starts from a connection by definition.
+    fn agentless() RestoreTransport {
+        return .{ .conn = null };
+    }
 };
 
 /// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Rebuilds
@@ -1872,9 +1930,17 @@ const RestoreTransport = struct {
 ///
 /// Returns TRUE iff at least one window was restored, in which case the caller
 /// (`run`) SUPPRESSES the default blank startup window. Any failure — persistence
-/// off, no agent, neither source holding anything, an all-dead layout — returns
-/// false so the normal single blank window opens instead. Best-effort by design;
-/// a partial failure restores the windows it can and skips the rest.
+/// off, neither source holding anything, an all-dead layout — returns false so
+/// the normal single blank window opens instead. Best-effort by design; a
+/// partial failure restores the windows it can and skips the rest.
+///
+/// NO AGENT is a degraded restore, not a failure (T398). Terminal leaves cannot
+/// ATTACH without one, so they count as gone and their windows drop out under
+/// the never-all-dead rule below — but a VIEWER leaf never needed a connection,
+/// so a window holding one comes back with its viewers at their recorded
+/// locations and any terminal beside them as a fresh local ConPTY pane. This
+/// used to bail before it reached them, dropping a whole viewer-only window for
+/// a reason that applied to none of its panes.
 ///
 /// Liveness is TRI-STATE (design pin): a window is dropped ONLY when every one
 /// of its session-backed leaves is POSITIVELY gone (the agent answered and none
@@ -1909,23 +1975,34 @@ pub fn restoreSessionLayout(self: *App) bool {
     const local_windows: []const session_layout.Window =
         if (parsed) |p| p.value.windows else &.{};
 
-    // Resolve (find-or-spawn) the local agent. Without a connection we cannot
-    // ATTACH anything, so fall back to a blank window. A cold reboot spawns the
-    // agent fresh; it re-materializes the sessions from disk as relaunchable
+    // Resolve (find-or-spawn) the local agent. A cold reboot spawns the agent
+    // fresh; it re-materializes the sessions from disk as relaunchable
     // tombstones, so the probe below finds them attachable and each leaf applies
     // `session-relaunch` (T89g/T230 — by default a fresh shell plus a notice,
     // never a re-run). Only sessions the agent truly no longer knows re-open
     // fresh.
-    const conn = self.local_agent.sharedConnection() orelse {
-        log.info("session-restore: no local agent; opening a blank window", .{});
-        return false;
-    };
+    //
+    // A MISSING agent (unspawnable binary, a dial that will not come up) is no
+    // longer the end of the restore (T398). It does end every ATTACH — those
+    // shells are genuinely gone — but a VIEWER pane rides no agent at all
+    // (T90h: re-opening its recorded location IS its restore), so a window
+    // holding one is restorable with no connection whatsoever. Everything below
+    // therefore treats the connection as optional and the roster as EMPTY: the
+    // never-all-dead rule then drops exactly the windows whose every leaf is a
+    // gone session (as it does today when the agent answers and knows none of
+    // them), and keeps the rest.
+    const conn: ?*remote_connection.Connection = self.local_agent.sharedConnection();
+    if (conn == null) log.info(
+        "session-restore: no local agent; restoring only windows that need none",
+        .{},
+    );
 
     // T194: ALWAYS ask the agent what it holds, even with a healthy manifest —
     // that is the whole point, since the case worth recovering is exactly the
     // one where the local file cannot tell us about it. A pull failure is not
-    // fatal: it degrades to the manifest-only behaviour this had before.
-    const recovered = self.pullAgentLayouts(conn);
+    // fatal: it degrades to the manifest-only behaviour this had before. With
+    // no agent there is nobody to ask, which is the same empty set.
+    const recovered = if (conn) |c| self.pullAgentLayouts(c) else null;
     defer if (recovered) |d| d.deinit();
     const agent_windows: []const session_layout.Window =
         if (recovered) |d| d.windows else &.{};
@@ -1948,7 +2025,7 @@ pub fn restoreSessionLayout(self: *App) bool {
     // leaf); a present set holds every session we can ATTACH: alive (same-PID
     // re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
     // Genuinely-exited/unknown ids are absent → their leaves re-open fresh.
-    var probe = AttachProbe.take(gpa, conn);
+    var probe = if (conn) |c| AttachProbe.take(gpa, c) else AttachProbe.agentless(gpa);
     defer probe.deinit();
     const attach_ptr = probe.attachSet();
 
@@ -1963,7 +2040,8 @@ pub fn restoreSessionLayout(self: *App) bool {
     var restored: usize = 0;
     for (union_set.windows) |win| {
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
-        self.restoreWindow(win, .local(conn), attach_ptr) catch |err| {
+        const tr: RestoreTransport = if (conn) |c| .local(c) else .agentless();
+        self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
             continue;
         };
@@ -1978,7 +2056,14 @@ pub fn restoreSessionLayout(self: *App) bool {
     // the idle-TTL reaper, so without this line it is invisible unless the user
     // opens the chooser roster and counts. The zero case logs too — a counter
     // that only appears when nonzero cannot be told from one that never ran.
-    if (probe.roster) |roster| {
+    if (conn == null) {
+        // Not "unknown": with no agent there is no roster to be behind on, and
+        // every restored terminal pane is a fresh local shell by construction.
+        log.info(
+            "session-restore: attached 0 pane(s); no local agent, so every restored terminal pane is a fresh local shell",
+            .{},
+        );
+    } else if (probe.roster) |roster| {
         const unattached = countUnattachedLive(roster.sessions, &attached_ids);
         if (unattached > 0) {
             log.warn(
@@ -2048,6 +2133,12 @@ fn pullAgentLayouts(self: *App, conn: *remote_connection.Connection) ?layout_blo
 /// leaf (all its recorded sessions are gone from the roster) is dropped rather
 /// than restored as a wall of exited panes. A relaunchable tombstone counts as
 /// attachable (it RELAUNCHes), so a window of tombstones is kept (T89g).
+///
+/// With no agent at all (T398) `attach` is the EMPTY set, so this reads exactly
+/// as it does against an agent that knows none of the recorded sessions: the
+/// viewer arm below keeps a viewer-bearing window, and a terminal-only window
+/// is dropped. That equivalence is the point — "no agent" and "agent has
+/// forgotten every session" are the same fact about every terminal leaf.
 fn restoreWindowHasAttachableLeaf(
     win: session_layout.Window,
     attach: ?*const std.StringHashMap(void),
@@ -2088,6 +2179,12 @@ fn restoreAttachOverride(
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
 ) Surface.Overrides {
+    // No connection (T398): there is nothing to ATTACH over, so this leaf opens
+    // as a plain local ConPTY pane. It still ADOPTs its recorded pane id — the
+    // id is ghoztty's own, not the agent's, and dropping it would break every
+    // `--target=$GHOZTTY_PANE_ID` the pane's own processes were baked with.
+    const conn = tr.conn orelse return .{ .pane_id = leaf.pane_id };
+
     const sid: ?[]const u8 = leafAttachSessionId(leaf, attach);
     // T109: the recorded screen goes with the SESSION we are re-attaching to.
     // A leaf whose session is gone OPENs a fresh shell, and painting the dead
@@ -2101,7 +2198,7 @@ fn restoreAttachOverride(
         // app restart — the exact class of breakage T112 hit with pids.
         .pane_id = leaf.pane_id,
         .remote = .{
-            .connection = tr.conn,
+            .connection = conn,
             .local_agent = tr.local_agent,
             .session_id = sid,
             .restore_snapshot = if (snap) |s| s.data else null,

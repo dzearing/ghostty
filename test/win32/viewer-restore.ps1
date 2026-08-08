@@ -36,6 +36,17 @@
 #        the positive control that this script did not simply rebuild everything
 #        from scratch, which would make D-G true for the wrong reason.
 #
+#   NO AGENT (J) - T398. Kill the app AND the agent, point the agent binary
+#   override at a path that does not exist, and relaunch. Restore used to
+#   resolve the connection FIRST and give up without one - correct for a
+#   terminal (there is nothing to ATTACH to) and true of no viewer pane at all,
+#   so a manifest whose windows are viewers was dropped for a reason that
+#   applied to none of its leaves. Now the viewer-only window comes back at its
+#   recorded location, the mixed window comes back with its terminal degraded to
+#   a fresh local pane in place, and a terminal-ONLY window would still be
+#   dropped (its every leaf is a gone session). J5/J6 are the controls that no
+#   agent quietly came back to make any of it true the easy way.
+#
 # Hermetic: per-run LOCALAPPDATA, per-run agent binary override, a private IPC
 # pipe suffix, and it only ever kills ghoztty processes launched from this
 # repo's zig-out. Runs on the BACKGROUND test desktop, so it never takes the
@@ -360,6 +371,48 @@ try {
         'I2 the restored file viewer still records its home'
     Assert ($doc2.Count -eq 1 -and $doc2[0].viewer_origin_directory -eq $repo) `
         'I3 the restored file viewer still records its origin directory'
+
+    # ---- J: restore with NO local agent at all (T398) ------------------------
+    # Kill the app AND the agent, then point the binary override at a path that
+    # does not exist so the relaunch cannot spawn one either. Every recorded
+    # terminal session is now genuinely gone; every recorded viewer never needed
+    # one.
+    Say '== J: restore with no local agent'
+    Stop-RepoInstances
+    $env:LOCALAPPDATA = $tmp
+    $env:GHOSTTY_LOCAL_AGENT_BIN = (Join-Path $root 'no-such-agent.exe')
+    Assert (-not (Test-Path $env:GHOSTTY_LOCAL_AGENT_BIN)) `
+        'J0 the agent binary override points at nothing (setup control)'
+
+    $agentless = Start-OnTestDesktop -Exe $exe
+    if ((Wait-TestWindow -ProcessId $agentless.Pid -Class 'GhozttyWindow') -eq [IntPtr]::Zero) {
+        Say 'SETUP FAIL: agentless app has no GhozttyWindow'
+    }
+
+    $missJ = @(Wait-Panes 'vrmiss' 1 45)
+    Assert ($missJ.Count -eq 1) `
+        "J1 the viewer-only window restored with no agent (got $($missJ.Count) panes)"
+    if ($missJ.Count -eq 1) {
+        Assert ($missJ[0].type -eq 'viewer' -and $missJ[0].url -eq $missingFile) `
+            "J2 it came back at its recorded location (got '$($missJ[0].type)' '$($missJ[0].url)')"
+    }
+
+    $vrJ = @(Wait-Panes 'vr' 3 45)
+    Assert ($vrJ.Count -eq 3) "J3 the mixed window restored all three panes (got $($vrJ.Count))"
+    if ($vrJ.Count -eq 3) {
+        $kindsJ = @($vrJ | ForEach-Object { $_.type })
+        Assert (($kindsJ -join ',') -eq 'viewer,terminal,viewer') `
+            "J4 its terminal degraded to a fresh pane in place (got $($kindsJ -join ','))"
+    }
+
+    # The controls. Without these, an agent that quietly came back would make
+    # J1-J4 pass as an ordinary re-attach and prove nothing about T398.
+    $agentProcs = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') })
+    Assert ($agentProcs.Count -eq 0) `
+        "J5 no local agent is running (control, got $($agentProcs.Count))"
+    Assert ((@(Alive-Ids)).Count -eq 0) `
+        'J6 no agent session is reachable (control: there was nothing to ATTACH to)'
 
 } finally {
     Say '== cleanup'

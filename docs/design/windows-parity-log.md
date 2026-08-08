@@ -11285,3 +11285,43 @@ with no leave tracking, so it stays lit when the pointer leaves. There the
 tracking belongs on the DIALOG, because those cards are painted on the dialog
 itself and a leave that fires when the pointer enters a child is the right
 answer.
+
+## 2026-08-08 — T398: a missing background agent no longer throws away the panes that never needed it
+
+Reopening Ghoztty when the session-persistence agent cannot be reached used to
+give you one empty window and nothing else. That is the right answer for your
+terminals — those processes really are gone — and it was applied to viewer
+panes too, which never rode the agent in the first place: re-opening a viewer's
+recorded location IS its restore (T90h). `restoreSessionLayout` resolved the
+connection first and returned false without one, so it never reached the
+never-all-dead rule that already knew to keep a viewer.
+
+`RestoreTransport.conn` is optional now, and a null one produces a plain local
+override (recorded pane id, no `.remote`) so the leaf opens as an ordinary
+ConPTY pane. The subtle half is the probe: a no-agent launch uses a new
+`AttachProbe.agentless` — an **EMPTY** attach set, deliberately not a null one.
+Null is the tri-state's "probe failed, attempt every leaf" and would have
+rebuilt terminal-only windows as walls of fresh shells; empty is "known,
+nothing is attachable", which is exactly how the rule already reads an agent
+that knows none of the recorded sessions. So: a viewer-only window comes back
+at its recorded location, a mixed window comes back with its terminal degraded
+to a fresh pane in place, a terminal-only window is still dropped. The T411 gap
+line gained a no-agent branch rather than reporting a probe that never ran.
+
+New section J in `test/win32/viewer-restore.ps1` kills the app AND the agent and
+points `GHOSTTY_LOCAL_AGENT_BIN` at a path that does not exist — ALL PASS (45),
+with J5/J6 as controls that no agent came back to make it true the easy way. It
+was proven to discriminate: a one-line `if (conn == null) return false` restoring
+the old behavior turned J1 and J3 red at `got 0 panes`, and was then reverted and
+rebuilt.
+
+Floor green — `floor-lane -Lane all` ALL LANES PASS (none 320s, win32 352s,
+agent 322s), P1–P3 ALL PASS.
+
+Filed: **T589** — the same gate exists in Swift (`SessionLayoutRestore.swift`),
+so the Mac drops viewer-only windows for the same reason; `seat: mac`.
+**T590** — a launch that restores nothing then overwrites the manifest with the
+blank window it opened, so the recorded layout is lost for good. macOS
+deliberately keeps its entries "for next launch"; win32 regenerates wholesale.
+That is total loss in precisely the no-agent case, where the agent's blobs are
+not a second copy either.
