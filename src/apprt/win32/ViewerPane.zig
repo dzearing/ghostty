@@ -817,11 +817,19 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
 /// There is no equivalent of `reloadNeedsRearm` to drive from the reload path.
 fn syncWatcher(self: *ViewerPane, alloc: Allocator) void {
     self.watcher.stop();
-    const path = self.file_path orelse return;
     // No host window means nothing to post at. That is the pre-`createHostWindow`
     // moment and every unit test that drives a bare pane, both of which want a
     // pane that simply does not watch rather than one that fails to open.
     const hwnd = self.hwnd orelse return;
+    // Stopping the watcher is not enough: a notification that arrived within
+    // the debounce window has already armed the timer, and a one-shot timer
+    // outlives the thread that armed it. Left running it fires against
+    // wherever the pane WENT — for a web destination a cache-bypassing
+    // re-fetch of a page nobody asked to reload (T400). Leaving a document
+    // cancels its pending render, the way Mac's `reloadDebounce?.cancel()`
+    // does.
+    _ = w32.KillTimer(hwnd, reload_timer_id);
+    const path = self.file_path orelse return;
     self.watcher.start(alloc, hwnd, WM_APP_VIEWER_RELOAD, path);
 }
 
@@ -2752,7 +2760,12 @@ fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
             self.clearHeadings(alloc);
             if (self.file_path) |old| alloc.free(old);
             self.file_path = null;
-            self.watcher.stop();
+            // Through `syncWatcher` rather than a bare `watcher.stop()`: with
+            // `file_path` already cleared it stops the watch AND cancels a
+            // debounce the watcher may have armed on the way out (T400), so
+            // an in-page link to a website leaves the document as completely
+            // as an address-bar navigation does.
+            self.syncWatcher(alloc);
         }
     } else return;
 
@@ -3841,6 +3854,87 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expect(pane.watcher.isRunning());
 
     // ------------------------------------------------------------------
+    // T400: leaving a document CANCELS a debounce it already armed
+    // ------------------------------------------------------------------
+    //
+    // A save landing inside the ~100ms debounce window of the user navigating
+    // away used to leave a one-shot timer running on the host window, and
+    // firing it re-rendered wherever the pane HAD GONE — for a web
+    // destination `refetchFromOrigin`, an unrequested cache-bypassing
+    // re-fetch of a page the user just opened. Modelled exactly: arm the
+    // timer with the very message the watcher thread posts, then navigate
+    // WITHOUT pumping in between, which is the whole window the bug lives in.
+    //
+    // Calibrate first. Whether a repeat navigation to the page costs a fetch
+    // at all is Chromium's cache's business (the response is `max-age=600`
+    // and still fresh), so measure that cost rather than assume it — the
+    // assertion below is "the navigation's own fetch and NOTHING else".
+    const t400_base = reload_page.requests.load(.acquire);
+    try pane.navigate(alloc, reload_url);
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode == .web and p.page_loaded;
+        }
+    }.ready, &pane);
+    const nav_cost = reload_page.requests.load(.acquire) - t400_base;
+    try pane.navigate(alloc, md_path);
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode.isFile() and p.page_loaded;
+        }
+    }.ready, &pane);
+    log.warn("t400: a repeat navigation costs {d} fetch(es)", .{nav_cost});
+
+    const t400_host = pane.hwnd.?;
+
+    // Positive control: the watcher's message really does arm a timer on this
+    // window (`KillTimer` answers nonzero only when there was one to kill), so
+    // "nothing armed" below is a cancellation and not an arming that quietly
+    // stopped working.
+    _ = w32.SendMessageW(t400_host, WM_APP_VIEWER_RELOAD, 0, 0);
+    try testing.expect(w32.KillTimer(t400_host, reload_timer_id) != 0);
+
+    // THE ORACLE, and it is the timer itself rather than the fetch it would
+    // have caused: armed, navigated away, and nothing left on the host window
+    // the instant `navigate` returns — before a single message has been
+    // pumped, which is the whole window the bug lives in. Restoring the bug
+    // (drop the `KillTimer` from `syncWatcher`) turns this line red.
+    //
+    // Counting fetches cannot do this job, and the reason is worth recording:
+    // a stale timer that fires while the destination is STILL LOADING hits
+    // `reloadPlan`'s `full_load` branch, not `refetch` — it re-navigates to a
+    // page the cache already holds, so the server sees nothing. Loading needs
+    // pumping and pumping is what fires the timer, so that is the ordering the
+    // race actually lands in (measured: the mutation is invisible at the
+    // server in both cache states). The redundant render is real either way;
+    // only the timer says so reliably.
+    const before_nav = reload_page.requests.load(.acquire);
+    _ = w32.SendMessageW(t400_host, WM_APP_VIEWER_RELOAD, 0, 0);
+    try pane.navigate(alloc, reload_url);
+    try testing.expectEqual(@as(i32, 0), w32.KillTimer(t400_host, reload_timer_id));
+
+    // The end-to-end companion: with the debounce cancelled, settling on the
+    // destination and pumping well past it costs the navigation's own fetch
+    // and nothing more. Weaker than the line above (see why, there), but it
+    // is the user-visible claim — the page they opened is loaded once.
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            return p.mode == .web and p.page_loaded;
+        }
+    }.ready, &pane);
+    pumpFor(&msg, reload_debounce_ms * 4);
+    const after_nav = reload_page.requests.load(.acquire) - before_nav;
+    log.warn("t400: stale-debounce window cost {d} fetch(es), expected {d}", .{
+        after_nav,
+        nav_cost,
+    });
+    try testing.expectEqual(nav_cost, after_nav);
+
+    // Leave the pane where the T391 section left it: on the file, watching.
+    try pane.navigate(alloc, md_path);
+    try testing.expect(pane.watcher.isRunning());
+
+    // ------------------------------------------------------------------
     // T159: history — the slots, the handler IIDs, and the file<->web
     // boundary
     // ------------------------------------------------------------------
@@ -4317,6 +4411,21 @@ fn waitFor(
         }
         if (ready(pane)) return;
         std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+/// Dispatch messages for a fixed span with nothing to wait FOR — the negative
+/// half of `waitFor`. Proving something does NOT happen needs the window in
+/// which it would have happened to actually elapse, and a `WM_TIMER` only
+/// exists while somebody is pumping (T400).
+fn pumpFor(msg: *w32.MSG, ms: u64) void {
+    var timer = std.time.Timer.start() catch return;
+    while (timer.read() < ms * std.time.ns_per_ms) {
+        while (w32.PeekMessageW(msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+            _ = w32.TranslateMessage(msg);
+            _ = w32.DispatchMessageW(msg);
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
     }
 }
 

@@ -11392,3 +11392,37 @@ instead of adopting the recorded one (`restoreViewerOpen` drops `leaf.pane_id`
 while the terminal path keeps it, T113), so a script holding a viewer's id loses
 its target across an app restart. Found because that regeneration is exactly
 what this task's oracle measures.
+
+## 2026-08-08 — T400: leaving a document cancels the re-render it had queued
+
+A viewer pane watching a file re-renders it ~100ms after a save. Saving and then
+immediately opening something else in that pane left the pending re-render armed
+and aimed at the new destination: the pane loaded the page you asked for, then
+loaded it a second time on its own. `syncWatcher` stopped the WATCHER on every
+navigation and nothing killed the debounce the watcher had already started —
+Windows had no counterpart to Mac's `reloadDebounce?.cancel()`.
+
+`syncWatcher` now kills `reload_timer_id` alongside `watcher.stop()`, and the
+second way out of a document — `syncCommitted`'s in-page file→web branch — was
+rerouted from a bare `watcher.stop()` through `syncWatcher`, so both exits
+cancel by construction rather than by remembering to.
+
+The oracle is the timer, not the fetch it would have caused, and that is the
+finding worth keeping: a fetch-counting test CANNOT see this bug. A stale timer
+firing while the destination is still loading hits `reloadPlan`'s `full_load`
+branch instead of `refetch`, and the re-navigation it does is served from cache,
+so the server sees nothing — and loading needs the same pumping that fires the
+timer, so that is the ordering the race actually lands in (measured in both
+cache states; filtering `WM_TIMER` out of the pump does not reorder it, because
+WebView2's own handlers pump unfiltered from inside `DispatchMessageW`). The
+host-floor test therefore arms the timer with the watcher's own message, proves
+the arming worked, navigates away, and asserts `KillTimer` finds nothing left
+before a single message is pumped. Mutation verified red twice.
+
+Floor green — none PASS (315s), win32 PASS (363s), agent PASS (328s), P1–P3 ALL
+PASS.
+
+Filed: **T593** — the in-page exit from a document (a link click reaching
+`syncCommitted`) shares the fixed function but has no test of its own; only the
+`navigate` caller is asserted, so the invariant is one refactor from a silent
+regression.
