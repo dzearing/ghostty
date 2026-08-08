@@ -2174,6 +2174,16 @@ pub const WM_SHOWWINDOW: u32 = 0x0018;
 pub const HWND_BROADCAST: HWND = @ptrFromInt(0xFFFF);
 pub const SMTO_ABORTIFHUNG: u32 = 0x0002;
 
+/// Case-insensitive wide-string compare. Used on the `WM_SETTINGCHANGE`
+/// `lparam`, which is a pointer supplied by whoever broadcast the message —
+/// `lstrcmpiW` is the canonical reader for it precisely because it guards the
+/// dereference with structured exception handling, so a sender that passes a
+/// bad pointer costs a mismatch rather than an access violation.
+pub extern "kernel32" fn lstrcmpiW(
+    lpString1: [*:0]const u16,
+    lpString2: [*:0]const u16,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn SendMessageTimeoutW(
     hWnd: HWND,
     Msg: u32,

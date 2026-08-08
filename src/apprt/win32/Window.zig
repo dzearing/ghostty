@@ -568,11 +568,17 @@ fn chromePalette(self: *const Window) chrome_theme.Palette {
     );
 }
 
-/// Repaint every chrome surface this window owns, after the palette's inputs
-/// moved under it. Invalidate rather than paint: the caption and the strip are
-/// two disjoint blits of one row (T205), and re-entering both painters from a
+/// Repaint the chrome ROW — the caption band plus the strip under it — after
+/// the palette's inputs moved under it. Invalidate rather than paint: the two
+/// are disjoint blits of one row (T205), and re-entering both painters from a
 /// notification handler would run them outside the WM_PAINT ordering they were
 /// written for.
+///
+/// This is the narrow path, used for a `WM_SETTINGCHANGE` that did NOT name a
+/// color change. An actual accent or light/dark move goes through
+/// `system_colors.repaintForColorChange`, which redraws the window and every
+/// child: the accent is painted well outside this rect (the hero carousel
+/// band) and inside child HWNDs that never receive the broadcast at all (T307).
 fn invalidateChrome(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var r: w32.RECT = undefined;
@@ -6152,9 +6158,18 @@ pub fn windowWndProc(
             // signal (`chrome_theme.chromeBase` under `window-theme = system`),
             // and a personalization change can carry the accent with it — so
             // drop the cached accent and repaint rather than waiting for the
-            // next thing that happens to invalidate the row (T305).
-            system_colors.invalidate();
-            window.invalidateChrome();
+            // next thing that happens to invalidate the row (T305). The whole
+            // window and its children, not just the chrome row: the accent also
+            // paints the hero carousel band and the viewer's own child HWNDs,
+            // and neither of those ever sees this message (T307).
+            if (system_colors.isColorSettingChange(lparam)) {
+                system_colors.repaintForColorChange(hwnd);
+            } else {
+                // Not a color broadcast — the work above is cheap and safe to
+                // run on any setting change, but a whole-window redraw is not.
+                system_colors.invalidate();
+                window.invalidateChrome();
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
@@ -6164,8 +6179,7 @@ pub fn windowWndProc(
             // the accent, and the reason `system_colors` reads the registry
             // instead. So this message is used only as the SIGNAL: drop the
             // cache, let the next paint read the authoritative value.
-            system_colors.invalidate();
-            window.invalidateChrome();
+            system_colors.repaintForColorChange(hwnd);
             return 0;
         },
         w32.WM_GETOBJECT => {

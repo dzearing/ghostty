@@ -81,6 +81,59 @@ pub fn invalidate() void {
     cached_accent = null;
 }
 
+/// The setting name Windows broadcasts when the apps light/dark theme or the
+/// accent moves. Every other `WM_SETTINGCHANGE` shares the same message id.
+const immersive_color_set = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
+
+/// Is this `WM_SETTINGCHANGE` the one that carries a COLOR change?
+///
+/// `WM_SETTINGCHANGE` is broadcast for everything from an environment-variable
+/// edit to a policy refresh — Ghoztty itself sends one from `PathInstaller`
+/// after it repairs the user's PATH — and `repaintForColorChange` below is a
+/// whole-window redraw. Reacting to the message id alone would put that redraw,
+/// including every terminal pane, behind unrelated events.
+///
+/// A null `lparam` is treated as a color change: the parameter is documented as
+/// optional, and a broadcast that declines to name its area is not evidence the
+/// area was something else. The cost of the false positive is one repaint; the
+/// cost of the false negative is chrome that stays stale until something else
+/// happens to invalidate it, which is the whole defect (T307).
+pub fn isColorSettingChange(lparam: isize) bool {
+    if (lparam == 0) return true;
+    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    return w32.lstrcmpiW(name, immersive_color_set) == 0;
+}
+
+/// The one reaction a TOP-LEVEL window has to a system color change: drop the
+/// process-global accent cache, then repaint the window AND EVERY CHILD.
+///
+/// `RDW_ALLCHILDREN` is the load-bearing half (T307). A child HWND never
+/// receives the broadcast itself — `WM_SETTINGCHANGE` and
+/// `WM_DWMCOLORIZATIONCOLORCHANGED` reach top-level windows only — so its owner
+/// is the only place its repaint can come from. That covers the viewer's nav
+/// bar and table-of-contents card (the selected row is drawn in the accent),
+/// and the panels' EDIT/STATIC children, whose brushes come from a
+/// `WM_CTLCOLOR*` that is only sent when the child repaints.
+///
+/// Whole-window rather than a rect, for the same reason: a window's accent is
+/// not confined to its chrome row. `Window` paints the hero carousel's
+/// selection border and hovered-tile wash from the accent well below the tab
+/// strip, and a rect-limited invalidate left exactly that band stale.
+///
+/// Invalidate rather than paint: the caption and the strip are two disjoint
+/// blits of one row (T205), and re-entering their painters from a notification
+/// handler would run them outside the `WM_PAINT` ordering they were written
+/// for.
+pub fn repaintForColorChange(hwnd: w32.HWND) void {
+    invalidate();
+    _ = w32.RedrawWindow(
+        hwnd,
+        null,
+        null,
+        w32.RDW_INVALIDATE | w32.RDW_ERASE | w32.RDW_ALLCHILDREN,
+    );
+}
+
 /// Read `HKCU\...\Themes\Personalize\AppsUseLightTheme`. True when the system
 /// apps theme is light. A missing or erroring value is treated as light, which
 /// is how the Personalize key reads before it is ever written.
@@ -157,6 +210,33 @@ test "accentCached: first read populates, invalidate forces a re-read" {
     invalidate();
     try testing.expect(cached_accent == null);
     try testing.expectEqual(first, accentCached());
+}
+
+test "isColorSettingChange: only the color broadcast, and case-insensitively" {
+    const testing = std.testing;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const p = struct {
+        fn f(s: [*:0]const u16) isize {
+            return @bitCast(@intFromPtr(s));
+        }
+    }.f;
+
+    try testing.expect(isColorSettingChange(p(L("ImmersiveColorSet"))));
+    // Windows is not consistent about the casing across versions, and neither
+    // is every third party that re-broadcasts it.
+    try testing.expect(isColorSettingChange(p(L("immersivecolorset"))));
+    // A broadcast that does not name its area could be anything, including a
+    // color change — repainting once beats painting the old accent forever.
+    try testing.expect(isColorSettingChange(0));
+
+    // The noisy ones, which must NOT cost a whole-window redraw. "Environment"
+    // is the one Ghoztty itself sends, from `PathInstaller`.
+    try testing.expect(!isColorSettingChange(p(L("Environment"))));
+    try testing.expect(!isColorSettingChange(p(L("Policy"))));
+    try testing.expect(!isColorSettingChange(p(L("intl"))));
+    // A prefix is not a match: the compare is whole-string.
+    try testing.expect(!isColorSettingChange(p(L("Immersive"))));
+    try testing.expect(!isColorSettingChange(p(L("ImmersiveColorSetExtra"))));
 }
 
 test "accentOrDefault falls back exactly when the system does not answer" {

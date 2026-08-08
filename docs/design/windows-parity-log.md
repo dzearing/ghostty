@@ -11148,3 +11148,57 @@ six-step markdown heading scale needs a stated relationship to a three-size
 ramp. **T584** — the tab strip and window title draw at 16, a size the ramp
 does not have at all; the face there is user-configurable, so whether the size
 should follow the ramp is a decision to make rather than a patch to apply.
+
+
+## 2026-08-07 — T307: an accent change now repaints everything on screen, not just the strip
+
+Pick a new accent color in Windows Settings and Ghoztty's chrome across the top
+changed with it while everything else kept the old color until you closed and
+reopened it. The handler invalidated the caption band plus the tab strip and
+stopped there, which left out everything the window paints below that rect —
+and, the part with no rect at all, every CHILD window: `WM_SETTINGCHANGE` and
+`WM_DWMCOLORIZATIONCOLORCHANGED` are broadcast to top-level windows only, so a
+child's owner is the only place its repaint can ever come from. The viewer's
+contents card, whose selected row is filled with the raw accent, was the
+clearest casualty.
+
+The three near-identical handlers became one: `system_colors.
+repaintForColorChange(hwnd)` drops the process-global accent cache and calls
+`RedrawWindow(RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN)`. Because that is
+now a whole-window redraw, `WM_SETTINGCHANGE` is filtered through a new
+`isColorSettingChange(lparam)` to the `ImmersiveColorSet` broadcast — otherwise
+an environment or policy change would repaint every terminal pane, and Ghoztty
+sends one of those itself from `PathInstaller`. A null lparam counts as a color
+change: the parameter is optional, and one extra repaint beats chrome that
+stays stale. The lparam is read with `lstrcmpiW`, which guards the dereference
+with SEH, so a sender that passes a bad pointer costs a mismatch rather than an
+access violation.
+
+The Summary the task was filed with had gone stale in six days — T308 gave both
+panels their own arms this morning, so the panels already worked and the window
+itself was what was left.
+
+**What could not be measured, and was not faked.** `chrome-theme.ps1` gains
+**B4**, which leaves the panel OPEN across the notification (B3 closes and
+reopens it, so B3 only ever scored the cache drop; the header now says which is
+which). The CHILD half has no oracle here and two were built before that was
+clear: the hero carousel's accent outline passed *with the fix reverted*,
+because its 150ms thumbnail refresh repaints the band unprompted; and the
+viewer's contents card only paints its accent pill when its window is
+foreground, which `lib/TestDesktop.ps1`'s own header records a background
+desktop never has. Both findings are now in that script's header under "WHAT
+THIS SCRIPT CANNOT CLAIM" rather than in an assertion that passes either way.
+
+Fixed in passing because it blocked validating anything: `chrome-theme.ps1`
+called `Test-ExeIsDebugBuild`, a function that exists nowhere in the repo
+(introduced by T308 this morning), so the script threw on its first line and had
+been unrunnable since. Composed from the two `lib/BuildMode.ps1` helpers that
+already existed.
+
+Floor green — `floor-lane -Lane all` ALL LANES PASS (none 319s, win32 351s,
+agent 321s), P1–P3 ALL PASS, `chrome-theme.ps1` ALL PASS (64).
+
+Filed: **T585** — the harness cannot score any accent-painting child window, so
+T307's child half is guarded by review alone. **T586** — nothing catches an
+acceptance script that cannot even start, which is how a one-line typo hid a
+whole script for a week.

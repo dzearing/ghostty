@@ -2336,9 +2336,14 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
         // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
         // a panel is one (T308). Drop the cached accent and repaint: the
         // palette is derived per paint, so the repaint IS the re-theme.
+        //
+        // Through the shared helper since T307, which redraws the CHILDREN too
+        // — this chooser's filter field and buttons colour themselves from a
+        // `WM_CTLCOLOR*` reply, which is only sent when the child repaints.
         w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
-            system_colors.invalidate();
-            _ = w32.InvalidateRect(hwnd, null, 1);
+            if (msg != w32.WM_SETTINGCHANGE or system_colors.isColorSettingChange(lparam)) {
+                system_colors.repaintForColorChange(hwnd);
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLOREDIT => {

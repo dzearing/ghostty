@@ -32,6 +32,14 @@
 #      `WM_DWMCOLORIZATIONCOLORCHANGED` is posted to the top-level window and
 #      the next panel must paint the NEW one (the invalidation is wired).
 #
+#      Two cases, and only ONE of them is the live-update claim. B3 closes and
+#      reopens the panel around the message, so it scores the CACHE DROP only -
+#      a panel that repaints because it was freshly constructed passes it, and
+#      that close/reopen was the workaround standing in for the missing
+#      repaint. **B4 is the live-update claim** (T307): the panel stays OPEN
+#      across the notification and its accent pixel must move anyway, which is
+#      the thing a user with the panel on screen actually sees.
+#
 #   C. THE DEBUG BUILD MARKS ITSELF (T43), and the release build does not.
 #      A Debug/ReleaseSafe build drags the chrome background toward warning
 #      amber before anything is derived from it, so the whole band is amber and
@@ -58,6 +66,30 @@
 #      both probe backgrounds turn up a pure black/white pixel somewhere that
 #      clears any floor by itself, so the extreme would pass without ever
 #      touching our text.
+#
+# WHAT THIS SCRIPT CANNOT CLAIM, and why - T307's CHILD-WINDOW half. T307
+# widened the reaction from "invalidate the chrome row" to "redraw this window
+# and every child", because a child HWND never receives the broadcast (it goes
+# to top-level windows only) and so its owner is the only place its repaint can
+# come from. B4 above scores the live update on a PANEL, but a panel is
+# top-level and gets the message itself, so it passes either way. Two oracles
+# for the child half were built and BOTH were measured to be undiscriminating
+# here; they are written down so the next attempt does not re-derive them:
+#
+#   - The hero carousel's accent-outlined selected tile. Measured PASS with
+#     the repaint reverted: its thumbnail refresh timer repaints the band every
+#     150ms unprompted, so it picks the new accent up from the cache drop
+#     alone. A surface that repaints on its own cannot score whether anything
+#     invalidated it.
+#   - The viewer's contents card (`GhozttyViewerTOC`), a child HWND whose
+#     ACTIVE row is filled with the raw accent. The card appears and captures
+#     fine, but the accent fill is gated on `isEmphasized()`, i.e. on
+#     `GetForegroundWindow`, and lib\TestDesktop.ps1's own header records that
+#     a background desktop HAS no foreground window - the pill is therefore
+#     always the unemphasized gray here. It would score on a real desktop.
+#
+# The child claim is left to code review and a manual check, and the gap is
+# filed rather than papered over with an assertion that passes both ways.
 #
 # WHAT THIS SCRIPT DOES NOT CLAIM. T305's validation text asks for the
 # ACTIVE-TAB INDICATOR to track the accent. There is no such pixel: the tab
@@ -107,6 +139,9 @@ Remove-Item $errlog -ErrorAction SilentlyContinue
 $env:GHOZTTY_PIPE_SUFFIX = '-chromethemetest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# `+version`'s build mode, which section A's expectation flips on. TestDesktop
+# does not pull this in, so it is sourced here explicitly.
+. (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 
 # The harness disables the T43 debug marker so every other GUI script measures
 # the chrome that SHIPS. This script is the one that owns the marker, so it
@@ -288,7 +323,12 @@ function Close-Panel([IntPtr]$panel) {
 
 # ---------------------------------------------------------------------------
 
-$isDebugBuild = Test-ExeIsDebugBuild $exe
+# Composed from the two BuildMode helpers rather than a third one of our own:
+# T43's marker gates on exactly `build_config.is_debug`, which is the predicate
+# `Test-GhozttyIsolatedBuildMode` already mirrors. (It was written here as a
+# call to a `Test-ExeIsDebugBuild` that never existed, which made this script
+# unrunnable from its first line - fixed while validating T307.)
+$isDebugBuild = Test-GhozttyIsolatedBuildMode (Get-GhozttyBuildMode -Exe $exe)
 Write-Host ("build under test: " + $(if ($isDebugBuild) { 'marks itself (Debug/ReleaseSafe)' } else { 'release, unmarked' }))
 
 Kill-RepoInstances
@@ -494,6 +534,27 @@ try {
         Assert (-not (Test-ShotHasColor $shot $ACCENT_A)) 'B3 and the old accent is gone - the pixel MOVED'
     } finally { Close-TestWindowPixels -Shot $shot }
 
+    # B4: the LIVE-UPDATE claim (T307). B3 above closes and reopens the panel
+    # around the message, so all it can prove is that the CACHE was dropped -
+    # a panel that repaints only because it was just constructed would pass it.
+    # This leaves the panel OPEN across the notification, which is what a user
+    # who picks a new accent with the panel on screen actually does.
+    #
+    # DWM broadcasts to every top-level window, so the message goes to both the
+    # main window and the panel; posting only to the main window would test a
+    # broadcast Windows does not send. The colors run backwards - B -> A - so
+    # the assertion reuses the two probes already vetted against the card.
+    Set-Accent $ACCENT_A
+    foreach ($h in @($g.Top, $panel)) {
+        Send-TestRawMessage -Window $h -Message $WM_DWMCOLORIZATIONCOLORCHANGED -WParam 0 -LParam 0 | Out-Null
+    }
+    Start-Sleep -Milliseconds 900
+    $shot = Get-TestWindowPixels -Window $panel
+    try {
+        Assert (Test-ShotHasColor $shot $ACCENT_A) "B4 the OPEN panel repaints to $(Format-Rgb $ACCENT_A) without being reopened"
+        Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) 'B4 and the accent it opened with is gone - it repainted, it did not just gain a pixel'
+    } finally { Close-TestWindowPixels -Shot $shot }
+
     Assert (-not ($script:app.Process -and $script:app.Process.HasExited)) 'B the app survived every accent change'
 
     # =======================================================================
@@ -592,6 +653,7 @@ try {
             Kill-RepoInstances
         }
     }
+
 } finally {
     if ($dirJob) { Stop-Job $dirJob -ErrorAction SilentlyContinue; Remove-Job $dirJob -Force -ErrorAction SilentlyContinue }
     Restore-Accent $origAccent
