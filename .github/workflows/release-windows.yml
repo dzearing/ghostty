@@ -105,8 +105,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            meson ninja-build valac pkg-config gettext \
+            ninja-build valac pkg-config gettext \
             libglib2.0-dev libgsf-1-dev libgcab-dev
+
+          # NOT apt's meson: noble ships 1.3.2 and msitools 0.106's
+          # meson.build requires >= 1.4, so `meson setup` refuses the project
+          # outright. pipx is preinstalled on the runner image; the pip line
+          # is the fallback if that ever stops being true.
+          pipx install 'meson>=1.4' \
+            || python3 -m pip install --user --break-system-packages 'meson>=1.4'
+          export PATH="$HOME/.local/bin:$PATH"
+          meson --version
+
           git clone --depth 1 --branch "$MSITOOLS_TAG" \
             https://gitlab.gnome.org/GNOME/msitools.git /tmp/msitools
           meson setup /tmp/msitools/_build /tmp/msitools --prefix=/usr/local
