@@ -235,6 +235,12 @@ test {
     // second one (T301), same no-OS-imports deal.
     _ = @import("apprt/win32/activity_borrow.zig");
 
+    // Pure win32 Activity Monitor metrics-probe policy — which machines get a
+    // probe connection, the refused-dial backoff and the staleness rule that
+    // stops a dead link being painted as a live reading (T298), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/activity_probe.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

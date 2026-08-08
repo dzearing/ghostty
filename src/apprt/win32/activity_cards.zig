@@ -27,11 +27,12 @@ pub const max_cards: usize = 9;
 /// What a card knows about its machine right now.
 ///
 /// Mac has three states (`CardSummary.State`: connecting / failed / live)
-/// because every card there is fed by a live probe. Windows has no such probe
-/// yet (that is a follow-up), so an INACTIVE remote card reports what the relay
-/// directory told us — hence `.idle`, which says "we are not connected to this
-/// machine" rather than inventing a reading. A state we do not have is a state
-/// we do not paint.
+/// because every card there is fed by a live probe. Windows has those too since
+/// T298 (`activity_probe.zig`), and a fourth: `.idle`, for a machine no probe
+/// has reached — signed out, past the probe cap, or inside a refused dial's
+/// backoff. Such a card reports what the relay directory told us rather than
+/// inventing a reading, which is what EVERY inactive card did before T298. A
+/// state we do not have is a state we do not paint.
 pub const State = enum {
     /// Not connected by us; `online` is the relay directory's word, not ours.
     idle,
@@ -159,8 +160,8 @@ pub fn summaryLine(buf: []u8, s: Summary, switching: bool) []const u8 {
     return switch (s.state) {
         .connecting => "connecting…",
         .failed => "unreachable",
-        // We have not dialed this machine; the directory's flag is all we know,
-        // and saying so beats a dash that could mean anything.
+        // No probe has reached this machine; the directory's flag is all we
+        // know, and saying so beats a dash that could mean anything.
         .idle => if (s.online) "online" else "offline",
         .live => blk: {
             const up = uptimeString(buf, s.uptime_s);
@@ -315,7 +316,7 @@ test "metricLine: only a live card with a memory total prints numbers" {
     }));
 }
 
-test "dot: an idle card reports the directory's flag, not a guess" {
+test "dot: a card with no probe reports the directory's flag, not a guess" {
     try testing.expectEqual(Dot.good, dot(.{ .state = .idle, .online = true }, false));
     try testing.expectEqual(Dot.unknown, dot(.{ .state = .idle, .online = false }, false));
     try testing.expectEqual(Dot.pending, dot(.{ .state = .connecting }, false));

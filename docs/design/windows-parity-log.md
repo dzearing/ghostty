@@ -11801,3 +11801,93 @@ the stack — the hazard `Surface.deinit` already names in a comment. G4 asserts
 only the release notice until it is closed. **T614** — a panel keeps sampling a
 RETIRED transport after its window reconnects, so it reads "Couldn't connect"
 forever beside a window that recovered. **T615** — the flaky T400 arm above.
+
+## 2026-08-08 — T298: every Activity Monitor card carries a live readout, not just the one you are on
+
+The carousel T296 shipped could switch machines in one click, and every card it
+was not showing said `online` or `offline` and nothing else. Mac paints uptime
+and `CPU n% · Mem n%` on all of them at once, from `MachineMetricsProbe`, which
+dials every registered machine and holds a metrics subscription for the panel's
+lifetime. Windows now does too, with its own transports.
+
+**A probe OWNS the connection it uses** — never the panel's, never a window's.
+That is the rule everything else follows from, and it is not a preference:
+`Connection` has exactly ONE `metrics_handler` slot (connection.zig:859-865), so
+a second subscriber does not multiplex with the first, it CLOBBERS it, and an
+unsubscribe on either path then silences both. Dialing our own is also what Mac
+does, and it makes teardown one uniform sequence per probe: unsubscribe (whose
+return is the guarantee no further callback can fire), then free. A relay
+machine is dialed through `relay_dial`, a `127.0.0.1:PORT` one through
+`tcp_dial`, and which of those it is travels WITH the machine entry rather than
+being guessed from a colon in the id.
+
+The policy is pure and lives in the new `activity_probe.zig`, testable in the
+`none` lane: which machines get a probe (`want` — the active source excluded,
+deduplicated across the directory and window lists, capped at eight), the
+refused-dial backoff (30 s doubling to a 5 min ceiling), the staleness rule
+(five missed pushes retire the reading), and the `host:port` parse that turns a
+card id back into a dial target. `ActivityMonitor.zig` keeps the connections.
+
+Four decisions the task asked for, answered:
+
+- **The cap is eight**, the carousel's own machine cap, so every card that can
+  be painted can be probed.
+- **A suspended panel probes nothing.** T290 stood the process enumeration down
+  when nobody can see the panel; N held-open sockets are the same waste, so they
+  go with it and are re-dialed on resume. The visible cost is a second of
+  "connecting…" on the way back, which is why it is filed as **D39** rather than
+  decided silently.
+- **The active source is excluded**, since its card is already fed by the
+  panel's own live connection.
+- **A refused dial is an answer**: the card says `unreachable` and the probe
+  backs off. A probe that goes quiet is RETIRED — its link freed, its card
+  `failed` — rather than left painting a reading nobody is refreshing.
+
+The Local card gets the same treatment while another machine is on screen, from
+a plain sampler (no connection needed — the box is right here) with its own
+baseline, kept apart from the active source's `host_sampler` so neither
+corrupts the other's CPU delta. It publishes nothing until it has two samples:
+the first has no previous tick to difference against and would paint an idle
+box no matter how busy this one is.
+
+Two of my own bugs, caught before they shipped. Probe slots were originally
+compacted when one was retired — but `&probes[i]` IS the metrics callback's
+context, so sliding a live probe down into a hole would have left a
+control-reader thread writing through a pointer into somebody else's slot;
+slots are freed in place now and never move. And the signed-out path returned
+early without scheduling anything, which would have re-read the DPAPI account
+store on every 1.5 s tick for as long as the panel was open; it takes the same
+backoff (`deferProbe`) as everything else that cannot dial.
+
+The carousel log line grew `probes=` and a `states=` field carrying each card's
+own summary, because a GDI-painted card has no text to read back and "does an
+inactive card have numbers on it" is the whole subject.
+
+Floor green — none PASS (293s), win32 PASS (341s), agent PASS (322s), P1–P3 ALL
+PASS. `activity-monitor.ps1` ALL PASS (114) and `activity-monitor-remote.ps1`
+ALL PASS (87) with a new section H: the inactive machine card goes live with the
+AGENT's uptime and memory, the Local card carries its own reading, the ACTIVE
+machine gets no probe (exactly one socket to the agent — the window's), the
+probe holds its own socket beside it, and closing the panel gives that socket
+back while the window's session keeps round-tripping. The socket counts come
+from `Get-NetTCPConnection` outside the app, not from its own log.
+
+The refused-dial half needed a **new script**,
+`test/win32/activity-monitor-probe-fail.ps1`, and the reason is worth recording:
+the remote fixture cannot produce an unreachable card. A `127.0.0.1:PORT`
+machine has a card only because a WINDOW is connected to it, so every card there
+is reachable by construction, and the obvious fix — a second loopback agent,
+killed — does not exist: `--listen` takes the single-instance guard and the
+second agent exits 183 before it binds, which showed up as
+`+new-remote-window … error.ConnectionRefused`. The new script fakes the relay
+DIRECTORY instead (the same loopback-HTTP harness `ipc-machine-chooser.ps1`
+uses), listing a device that has never existed and refusing the WebSocket
+upgrade a probe dial needs. Its card goes `failed`, is dialed exactly once, and
+is still dialed exactly once twenty seconds later — against a 1.5 s tick, which
+is what makes that a real assertion. ALL PASS (17), and its `-NegativeControl`
+run fails as required.
+
+Filed: **T619** — the machine chooser's rows still carry no metrics, which is
+what Mac's `MachineMetricsProbe` was originally written for; the mechanism now
+exists to point at it. **D39** — the suspend behavior above, for the user to
+overturn if they would rather keep the sockets and pay for instant numbers.

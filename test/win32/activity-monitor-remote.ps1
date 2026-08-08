@@ -30,6 +30,17 @@
 #      while a focused BUTTON still owns Space, which is why the pre-T300 gate
 #      could not simply be deleted.
 #
+# T298 puts a LIVE readout on the cards the panel is not showing, which is the
+# half of Mac's MachineMetricsProbe T296 deliberately deferred:
+#
+#   H. an INACTIVE card carries live numbers, not the directory's online flag -
+#      the Local card from a plain local sampler, a machine card from a PROBE
+#      that dialed its OWN connection - while the ACTIVE machine gets no probe
+#      at all, and closing the panel hands every probe connection back without
+#      touching the window's. (The refused-dial half needs a machine with a
+#      card and no listener, which this fixture cannot make; it lives in
+#      `activity-monitor-probe-fail.ps1`.)
+#
 # T301 closes the round trip E only half made:
 #
 #   G. switching BACK to a machine a live WINDOW is connected to keeps that
@@ -139,17 +150,19 @@ function Get-Panels {
     return @(Get-TestWindows -ProcessId $script:app.Pid -Class 'GhozttyActivityMonitor')
 }
 
-# The panel's most recent carousel line (T296). `rects` is the painter's own
-# card arithmetic, so a click can land on a painted card without this script
-# re-deriving a layout it would then be asserting against itself.
+# The panel's most recent carousel line (T296, extended by T298). `rects` is the
+# painter's own card arithmetic, so a click can land on a painted card without
+# this script re-deriving a layout it would then be asserting against itself;
+# `states` is each card's READOUT, which is otherwise unreadable - the cards are
+# GDI-painted strings with no control to query.
 function Get-Carousel {
     if (-not (Test-Path $errlog)) { return $null }
-    $pat = 'activity monitor: carousel cards=(\d+) focus=(-?\d+) active=(-?\d+) scroll=(-?\d+) rects=(\S*)'
+    $pat = 'activity monitor: carousel cards=(\d+) focus=(-?\d+) active=(-?\d+) scroll=(-?\d+) probes=(\d+) rects=(\S*) states=(\S*)'
     $m = @(Select-String -Path $errlog -Pattern $pat) | Select-Object -Last 1
     if (-not $m) { return $null }
     $g = $m.Matches[0].Groups
     $rects = @()
-    foreach ($part in ($g[5].Value -split ';')) {
+    foreach ($part in ($g[6].Value -split ';')) {
         if (-not $part) { continue }
         $c = $part -split ','
         if ($c.Count -ne 4) { continue }
@@ -157,14 +170,62 @@ function Get-Carousel {
             Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
         }
     }
+    $states = @()
+    foreach ($part in ($g[7].Value -split ';')) {
+        if (-not $part) { continue }
+        $c = $part -split '/'
+        if ($c.Count -ne 6) { continue }
+        $states += [pscustomobject]@{
+            Id       = $c[0]
+            State    = $c[1]
+            UptimeS  = [int64]$c[2]
+            CpuPct   = [int]$c[3]
+            MemUsed  = [int64]$c[4]
+            MemTotal = [int64]$c[5]
+        }
+    }
     return [pscustomobject]@{
         Cards  = [int]$g[1].Value
         Focus  = [int]$g[2].Value
         Active = [int]$g[3].Value
         Scroll = [int]$g[4].Value
+        Probes = [int]$g[5].Value
         Rects  = $rects
-        Raw    = $g[5].Value
+        States = $states
+        Raw    = $g[6].Value
+        RawSt  = $g[7].Value
     }
+}
+
+# One card's readout by id ("local" for the Local card), or $null.
+function Get-CardState([string]$Id) {
+    $c = Get-Carousel
+    if ($null -eq $c) { return $null }
+    foreach ($s in $c.States) { if ($s.Id -eq $Id) { return $s } }
+    return $null
+}
+
+# Poll until a card reaches one of $States, or time out. Returns the last
+# reading seen either way, so a failure can print what it actually said.
+function Wait-CardState([string]$Id, [string[]]$States, [int]$TimeoutMs = 20000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $last = $null
+    while ((Get-Date) -lt $deadline) {
+        $last = Get-CardState $Id
+        if ($null -ne $last -and $States -contains $last.State) { return $last }
+        Start-Sleep -Milliseconds 500
+    }
+    return $last
+}
+
+# How many ESTABLISHED sockets this app holds to the agent's port. The external
+# oracle for "a probe dialed its OWN connection" and for "closing the panel gave
+# it back" - counted from outside the app, not from its own log.
+function Get-AgentConnCount([int]$ToPort) {
+    try {
+        return @(Get-NetTCPConnection -State Established -RemotePort $ToPort `
+                -OwningProcess $script:app.Pid -ErrorAction SilentlyContinue).Count
+    } catch { return -1 }
 }
 
 # Open the palette on $pane, type $filter, press Enter.
@@ -480,6 +541,120 @@ try {
     Send-TestWindowClose -Window $panel | Out-Null
     Start-Sleep -Seconds 2
     Assert ((@(Get-Panels)).Count -eq 0) 'F the keyboard-driven panel closed cleanly'
+
+    # --- H. Every card carries a LIVE readout, not the directory's flag (T298)
+    # ------------------------------------------------------------------------
+    # T296 shipped the carousel with inactive cards reporting `online`/`offline`
+    # - honest, but no numbers. Mac paints uptime and CPU/Mem on every card at
+    # once (MachineMetricsProbe). This is that, and the four things that make it
+    # a connection budget rather than a leak.
+    #
+    # The oracle is the carousel line's `states=` field: the cards are
+    # GDI-painted strings with no control to query, so the panel logs each
+    # card's own summary - the same struct the painter formats, not a
+    # restatement of the assertion.
+    #
+    # THE REFUSED-DIAL HALF IS NOT HERE. It wants a machine with a card and no
+    # listener, and this fixture cannot produce one: a card for a
+    # `127.0.0.1:PORT` box exists only because a WINDOW is connected to it, and
+    # a second loopback agent cannot even start - `--listen` takes the
+    # single-instance guard (`single_instance.zig`, exit 183), so the second
+    # agent dies and the window that would carry its card is refused. That arm
+    # lives in `activity-monitor-probe-fail.ps1`, which fakes the relay
+    # DIRECTORY instead and so can list a machine that was never reachable.
+    # Counted from HERE, not from the top of the log: E and F each opened a
+    # panel and switched it to Local, and each of those panels probed this
+    # machine on the way. Their dials are correct and are not H's subject.
+    $probePat = "activity monitor: probing machine=127.0.0.1:$Port"
+    $dialsBeforeH = @(Select-String -Path $errlog -Pattern $probePat).Count
+
+    if (-not (Invoke-Palette $remoteTop $remotePane 'ACTIVITY MONITOR' 'H')) {
+        Write-Host 'SETUP FAIL: palette dispatch not delivered for H'; exit 1
+    }
+    $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
+    Assert ($panel -ne [IntPtr]::Zero) 'H the panel re-opened for the probe section'
+    if ($panel -eq [IntPtr]::Zero) { throw 'no panel to test probes on' }
+    Wait-PanelState "127.0.0.1:$Port" | Out-Null
+
+    # H1. The LOCAL card, while ANOTHER machine is the source. It needs no
+    # connection - the box is right here - but it does need two samples before
+    # it says anything, because the first has no previous tick to difference
+    # against and would report an idle box no matter how busy this one is.
+    $localCard = Wait-CardState 'local' @('live') 15000
+    Assert ($null -ne $localCard -and $localCard.State -eq 'live') `
+        "H1 the inactive Local card carries a LIVE reading (state=$($localCard.State))"
+    if ($null -ne $localCard) {
+        Write-Host "      local card: state=$($localCard.State) up=$($localCard.UptimeS) cpu=$($localCard.CpuPct)% mem=$($localCard.MemUsed)/$($localCard.MemTotal)"
+        Assert ($localCard.MemTotal -gt 0) 'H1 ...with a real memory total, which is what lets the card print Mem%'
+    }
+
+    # H1b. The ACTIVE machine is NOT probed: its card is fed by the connection
+    # the panel is already using, so a probe would be a second link to the
+    # machine you are looking at. One socket to the agent - the window's - is
+    # the whole claim, and it is the assertion that fails if the probe set ever
+    # stops excluding the active source.
+    $connsActive = Get-AgentConnCount $Port
+    Assert ($connsActive -eq 1) `
+        "H1b the machine the panel IS showing gets no probe of its own (sockets=$connsActive, want 1)"
+
+    # H2. Switch to Local so the MACHINE card becomes inactive - which is what
+    # gives it a probe. (Clicking, exactly as E2 does; the keyboard route is F's
+    # subject, not this one's.)
+    $origin = Get-TestWindowRect -Window $panel -Client
+    $carH = Get-Carousel
+    Assert ($null -ne $carH -and $carH.Rects.Count -gt 0) 'H2 the panel logged its cards'
+    $lc = $carH.Rects[0]
+    Send-TestMouse -Window $panel -Target $panel `
+        -X ($origin.Left + [int](($lc.Left + $lc.Right) / 2)) `
+        -Y ($origin.Top + [int](($lc.Top + $lc.Bottom) / 2)) -Action click | Out-Null
+    $swH = Wait-PanelState 'Local' 12000
+    Assert ($null -ne $swH -and $swH.Source -eq 'Local') "H2 the panel switched to Local (source=$($swH.Source))"
+
+    # H3. The machine the panel is NOT showing now carries live numbers, dialed
+    # by its own probe.
+    $machCard = Wait-CardState "127.0.0.1:$Port" @('live') 25000
+    Assert ($null -ne $machCard -and $machCard.State -eq 'live') `
+        "H3 the INACTIVE machine card went live (state=$($machCard.State))"
+    if ($null -ne $machCard) {
+        Write-Host "      machine card: state=$($machCard.State) up=$($machCard.UptimeS) cpu=$($machCard.CpuPct)% mem=$($machCard.MemUsed)/$($machCard.MemTotal)"
+        Assert ($machCard.MemTotal -gt 0) 'H3 ...with a memory total from the AGENT, not a zero'
+        Assert ($machCard.UptimeS -gt 0) 'H3 ...and an uptime, which is what the card prints as "up Nd Nh"'
+    }
+    Assert (Select-String -Path $errlog -Pattern "activity monitor: probing machine=127.0.0.1:$Port kind=tcp" -Quiet) `
+        'H3 the panel logged the probe dial, over the machine''s OWN transport kind'
+    Assert (Select-String -Path $errlog -Pattern "activity monitor: probe connected machine=127.0.0.1:$Port" -Quiet) `
+        'H3 ...and logged it connected'
+
+    # H4. A working probe is dialed ONCE per panel, not on every 1.5s tick. The
+    # panel has sat here for several seconds - many ticks - between the
+    # assertions above; a `sync` that re-dialed whenever it saw a slot with no
+    # link would show up here as a climbing count.
+    $dialsH = @(Select-String -Path $errlog -Pattern $probePat).Count - $dialsBeforeH
+    Assert ($dialsH -eq 1) "H4 this panel dialed the live machine once, not once per tick (dials=$dialsH)"
+
+    # H6. The probe dialed its OWN connection rather than riding the window's -
+    # counted from OUTSIDE the app, because `Connection` has exactly one metrics
+    # handler slot and a probe sharing the window's link would silently clobber
+    # whatever else subscribed to it.
+    $connsH = Get-AgentConnCount $Port
+    Write-Host "      established sockets app -> 127.0.0.1:${Port}: $connsH"
+    Assert ($connsH -ge 2) "H6 the probe holds its own socket to the machine, beside the window's (n=$connsH)"
+
+    # H7. Closing the panel gives every probe connection back - and takes
+    # nothing that was not its own with it.
+    Send-TestWindowClose -Window $panel | Out-Null
+    Start-Sleep -Seconds 3
+    Assert ((@(Get-Panels)).Count -eq 0) 'H7 the probing panel closed'
+    $connsAfter = -1
+    foreach ($i in 1..10) {
+        $connsAfter = Get-AgentConnCount $Port
+        if ($connsAfter -le 1) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    Assert ($connsAfter -le 1) "H7 closing the panel tore down the probe's connection (n=$connsAfter)"
+    cmd /c "`"$exe`" +send-keys --target=remact `"echo activity-after-probe`" Enter > nul 2>&1" | Out-Null
+    Start-Sleep -Seconds 3
+    Assert ((Read-Pane 'remact') -match 'activity-after-probe') 'H7 ...and left the WINDOW''s connection alone'
 
     # --- G. Switching BACK to a machine a window is on borrows, never re-dials
     # (T301) ----------------------------------------------------------------

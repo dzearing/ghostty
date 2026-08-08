@@ -6585,6 +6585,18 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == ActivityMonitor.WM_APP_ACTIVITY_PROBE) {
+        // wparam = heap *ProbeResult owned by the handler (T298). Landing here
+        // is what lets a probe dial that finished after its panel closed FREE
+        // the connection it just opened instead of leaking it with the
+        // window's discarded message queue.
+        if (wparam != 0) {
+            const res: *ActivityMonitor.ProbeResult = @ptrFromInt(wparam);
+            ActivityMonitor.onProbeDialed(res);
+        }
+        return 0;
+    }
+
     if (msg == WM_APP_AGENT_UPGRADE_CHECK) {
         // T147: a persistent window closed; the agent may have just gone idle,
         // which is the safe moment to adopt a newer bundled build.
