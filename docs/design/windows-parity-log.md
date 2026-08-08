@@ -11239,3 +11239,49 @@ Filed: **T587** — `stroke_w` is non-monotonic in DPI. `markPx`'s parity fit is
 an argument about mark EXTENTS but is also applied to stroke weight, so the
 chrome paints a 3 px stroke at 125% and a 2 px one at 150%: turning scaling up
 makes every icon in the set lighter.
+
+## 2026-08-08 — T315: the chooser's Sign Out link stops glowing after you walk away
+
+The machine chooser's "Sign Out" link underlines under the pointer, and used to
+keep underlining after the pointer had gone. T311 drove that hover from the
+dialog's `WM_SETCURSOR`, which names the window under the cursor — so entering
+the link and moving off it onto something else in the dialog were the same one
+test, three lines, no subclass. The case it cannot see is the pointer leaving
+the WINDOW: no further `WM_SETCURSOR` arrives at all, `link_hot` stays true, and
+the link advertises itself to an empty room. The link sits a margin in from the
+client's top-right corner, so "up or right and you are out" is the short way
+out, not a corner case.
+
+The fix is a `TrackMouseEvent(TME_LEAVE)` subclass on the LINK. Not on the
+dialog, which was the obvious shape and is the wrong one: while the pointer is
+over a child, the parent is not the window under the cursor, so a parent-armed
+leave fires the moment the pointer ENTERS the link — clearing the hover on entry
+and "fixing" the sticking by deleting the feature. `linkWndProc` reaches `self`
+through the PARENT's `GWLP_USERDATA` rather than the button's own, because a
+control class may use its own; the original proc is put back in `close` before
+that userdata is zeroed. A new `setLinkHot` is the one place the flag changes,
+so the three callers — enter, leave, and the link being hidden on sign-out —
+cannot drift apart.
+
+The task said this needed a human on the real desktop, since `TrackMouseEvent`
+watches the REAL cursor and `SetCursorPos` is refused off the input desktop. That
+rules out driving a pointer, not measuring the app's repaint. New
+`test/win32/chooser-link-hover.ps1` counts INK — pixels differing from the
+background in the link's rect, from a `PrintWindow` capture of the chooser — and
+reads rest **342**, hovered **407**, after `WM_MOUSELEAVE` **342 exactly**,
+twice over. Both shortcuts are in the input (a posted `WM_SETCURSOR` sets the
+state the real one would without arming the tracker that would instantly un-set
+it; the posted `WM_MOUSELEAVE` is byte-for-byte what Windows delivers); the
+oracle is the app's own pixels. It was proven to discriminate by building once
+with the subclass install disabled, where after-leave stayed at 407 and the
+script reported 3 FAILURES.
+
+Floor green — `floor-lane -Lane all` ALL LANES PASS (none 320s, win32 346s,
+agent 311s), P1–P3 ALL PASS, `ipc-machine-chooser.ps1` ALL PASS (72).
+
+Filed: **T588** — the same defect on a sibling control in the same dialog. The
+session roster's Kill-button hover is driven only by the dialog's `WM_MOUSEMOVE`
+with no leave tracking, so it stays lit when the pointer leaves. There the
+tracking belongs on the DIALOG, because those cards are painted on the dialog
+itself and a leave that fires when the pointer enters a child is the right
+answer.

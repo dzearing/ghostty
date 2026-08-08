@@ -180,10 +180,12 @@ account_btn: w32.HWND,
 /// The signed-in state's "Sign Out" link (T311). Only one of it and
 /// `account_btn` is ever visible — see `accountControl`.
 account_link: w32.HWND,
-/// True while the pointer is over the link, so it can underline. Tracked from
-/// `WM_SETCURSOR` (which the child forwards to us) rather than a subclass: the
-/// message already names the window under the cursor, so entering and leaving
-/// are the same one line.
+/// True while the pointer is over the link, so it can underline. Entering is
+/// seen from `WM_SETCURSOR` (which the child forwards to us, so the message
+/// already names the window under the cursor); LEAVING needs the link's own
+/// `WM_MOUSELEAVE` (T315), because a pointer that goes from the link straight
+/// out of the dialog produces no further `WM_SETCURSOR` at all and the
+/// underline would stick until it came back.
 link_hot: bool = false,
 font: ?*anyopaque = null,
 /// Smaller font for the dimmed row subline (Mac's `.caption`).
@@ -207,6 +209,12 @@ hover_row: i32 = -1,
 /// Whether the listbox currently has a `TrackMouseEvent` leave request in
 /// flight, so one is armed per entry instead of per mouse-move.
 tracking_leave: bool = false,
+
+/// The account link's original window procedure, saved when it is subclassed
+/// for leave tracking (T315). Same lifetime rule as `list_proc`.
+link_proc: ?*const anyopaque = null,
+/// Whether the link currently has a `TrackMouseEvent` leave request in flight.
+link_tracking_leave: bool = false,
 /// Wrapped line count the footer hint is currently laid out for. The dialog
 /// re-lays-out (and resizes) when a new hint needs a different number.
 hint_lines: i32 = 1,
@@ -461,6 +469,17 @@ pub fn open(window: *Window) void {
         self.destroyState();
         return;
     };
+    // Leave tracking has to sit on the LINK, not on the dialog: while the
+    // pointer is over a child, the parent is not the window under the cursor,
+    // so a `TME_LEAVE` armed on the dialog fires the moment the pointer enters
+    // the link — which would clear the hover on entry instead of on exit. The
+    // proc reaches `self` through the PARENT's userdata rather than the
+    // button's own, because a control class may use `GWLP_USERDATA` for itself.
+    self.link_proc = @ptrFromInt(@as(usize, @bitCast(w32.SetWindowLongPtrW(
+        self.account_link,
+        w32.GWLP_WNDPROC,
+        @bitCast(@intFromPtr(&linkWndProc)),
+    ))));
 
     self.filter = w32.CreateWindowExW(
         0,
@@ -889,6 +908,10 @@ fn refreshAccountRow(self: *MachineChooser) void {
 
     _ = w32.ShowWindow(self.account_btn, if (signed_in) w32.SW_HIDE else w32.SW_SHOW);
     _ = w32.ShowWindow(self.account_link, if (signed_in) w32.SW_SHOW else w32.SW_HIDE);
+    // A hidden window gets no `WM_MOUSELEAVE`, so signing out under the pointer
+    // would leave the flag set and the link would come back already underlined
+    // the next time it is shown.
+    if (!signed_in) self.setLinkHot(false);
     _ = w32.EnableWindow(self.account_btn, if (busy) 0 else 1);
 
     self.applyAccountRow(layout(self.window.scale, self.hint_lines));
@@ -2118,6 +2141,43 @@ fn listWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(
     return w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
 }
 
+/// Subclassed account-link proc (T315): the one place that can see the pointer
+/// LEAVE the link. `WM_SETCURSOR` on the dialog says when the pointer is on the
+/// link and when it has moved onto something else inside the dialog, but a
+/// pointer that goes from the link straight off the top or trailing edge of the
+/// window sends no further `WM_SETCURSOR`, and the underline used to stay lit
+/// until it came back. Everything else falls through untouched.
+fn linkWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+    const parent = w32.GetParent(hwnd) orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const userdata = w32.GetWindowLongPtrW(parent, w32.GWLP_USERDATA);
+    if (userdata == 0) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const self: *MachineChooser = @ptrFromInt(@as(usize, @bitCast(userdata)));
+    const prev = self.link_proc orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    switch (msg) {
+        w32.WM_MOUSEMOVE => {
+            if (!self.link_tracking_leave) {
+                var tme: w32.TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                    .dwFlags = w32.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                if (w32.TrackMouseEvent(&tme) != 0) self.link_tracking_leave = true;
+            }
+            // The positive control lives here too, so the hover does not depend
+            // on `WM_SETCURSOR` having been delivered first.
+            self.setLinkHot(true);
+        },
+        w32.WM_MOUSELEAVE => {
+            self.link_tracking_leave = false;
+            self.setLinkHot(false);
+        },
+        else => {},
+    }
+    return w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+}
+
 /// The row index under a listbox client point (`lparam` of a mouse message),
 /// or null when the point is past the last row.
 fn rowAtPoint(list: w32.HWND, self: *const MachineChooser, lparam: isize) ?i32 {
@@ -2154,6 +2214,15 @@ fn setHover(self: *MachineChooser, row: i32) void {
     if (self.hover_row == row) return;
     self.hover_row = row;
     _ = w32.InvalidateRect(self.list, null, 0);
+}
+
+/// One place that changes the link's hover state and repaints it, so the three
+/// callers (enter via `WM_SETCURSOR`, leave via `WM_MOUSELEAVE`, and the link
+/// being hidden on sign-out) cannot drift apart.
+fn setLinkHot(self: *MachineChooser, hot: bool) void {
+    if (self.link_hot == hot) return;
+    self.link_hot = hot;
+    _ = w32.InvalidateRect(self.account_link, null, 1);
 }
 
 fn registerClass(app: *App) ?void {
@@ -2262,10 +2331,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             const over: ?w32.HWND = @ptrFromInt(wparam);
             const hot = over == @as(?w32.HWND, self.account_link) and
                 w32.IsWindowVisible(self.account_link) != 0;
-            if (hot != self.link_hot) {
-                self.link_hot = hot;
-                _ = w32.InvalidateRect(self.account_link, null, 1);
-            }
+            self.setLinkHot(hot);
             if (hot) {
                 if (w32.LoadCursorW(null, w32.IDC_HAND)) |c| {
                     _ = w32.SetCursor(c);
@@ -3015,6 +3081,13 @@ fn close(self: *MachineChooser, refocus_owner: bool) void {
 
     if (window.hwnd) |owner| _ = w32.EnableWindow(owner, 1);
 
+    // Put the link's own proc back before the dialog's userdata goes, else the
+    // subclass loses its way to `self` and would answer the teardown's button
+    // messages with `DefWindowProcW` instead of the BUTTON class.
+    if (self.link_proc) |prev| {
+        _ = w32.SetWindowLongPtrW(self.account_link, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(prev)));
+        self.link_proc = null;
+    }
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
     _ = w32.SetWindowLongPtrW(self.list, w32.GWLP_USERDATA, 0);
     _ = w32.DestroyWindow(self.hwnd);
