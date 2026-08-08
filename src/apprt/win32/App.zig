@@ -2901,10 +2901,16 @@ fn tickAgentSettleWatch(self: *App) void {
 ///
 /// The shape is deliberately the launch-restore path, not a parallel one: we
 /// capture the live topology into the same manifest structs `syncSessionLayout`
-/// writes, re-dial, and then replay each window's tabs through `restoreTab` —
-/// so split ratios, tab colors, hero ratios, pinned titles, IPC pane names and
-/// pane ids all come back through code that is already exercised by every
-/// restore test, and a bug fixed in one place is fixed in both.
+/// writes, re-dial, and then rebuild each window's tabs from that capture using
+/// the same per-leaf ATTACH override, presentation restore and IPC re-register
+/// the restore walk uses — so split ratios, tab colors, hero ratios, pinned
+/// titles, IPC pane names and pane ids all come back through code that is
+/// already exercised by every restore test, and a bug fixed in one place is
+/// fixed in both.
+///
+/// Since T399 it rebuilds only the leaves that rode the dropped connection.
+/// Viewer panes stay exactly where they are, alive, because they never rode it
+/// (`rebuildTabInPlace`).
 ///
 /// What it does NOT do is close anything. The departing surfaces are released
 /// by `SplitTree.deinit`, which tears them down with their DEFAULT intent —
@@ -3000,7 +3006,7 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
         // re-attach and must not have its shells replaced.
         if (win.local_agent_conn == null) continue;
 
-        self.rebuildWindowInPlace(win, captured.windows[ci], conn, attach_ptr) catch |err| {
+        self.rebuildWindowInPlace(arena, win, captured.windows[ci], conn, attach_ptr) catch |err| {
             log.warn("in-place recovery: window '{s}' failed err={}", .{ captured.windows[ci].id, err });
             continue;
         };
@@ -3017,6 +3023,7 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
 /// only the surfaces inside it are rebuilt, which is what makes this "in place".
 fn rebuildWindowInPlace(
     self: *App,
+    arena: Allocator,
     window: *Window,
     captured: session_layout.Window,
     conn: *remote_connection.Connection,
@@ -3033,7 +3040,7 @@ fn rebuildWindowInPlace(
 
     const tab_count = @min(window.tab_count, captured.tabs.len);
     for (0..tab_count) |ti| {
-        self.rebuildTabInPlace(window, ti, captured.tabs[ti], conn, attach) catch |err| {
+        self.rebuildTabInPlace(arena, window, ti, captured.tabs[ti], conn, attach) catch |err| {
             log.warn("in-place recovery: tab {d} failed err={}", .{ ti, err });
             continue;
         };
@@ -3049,10 +3056,26 @@ fn rebuildWindowInPlace(
     window.layoutSplits();
 }
 
-/// Rebuild ONE tab in place: build a fresh root surface for it, swap the tree,
-/// then replay the recorded splits onto it via the shared restore walker.
+/// Rebuild ONE tab in place, re-binding only what the dropped link actually
+/// invalidated.
+///
+/// The surgical path swaps each TERMINAL leaf for a fresh surface ATTACHed on
+/// `conn`, in the slot it already occupies, and touches nothing else: the tree
+/// keeps its shape, its ratios and its zoom, and every VIEWER pane keeps its
+/// WebView2 host, its page, its scroll position and its in-page state (T399).
+/// A viewer rides no agent session, so a link that dropped cannot have
+/// invalidated it — tearing one down was churn charged to the user for an event
+/// that never touched their pane.
+///
+/// That walk is licensed by a correspondence check, not by hope:
+/// `captureSessionLayout` writes the manifest node array as a 1:1 copy of the
+/// live `SplitTree` node array, so while the two still agree node-for-node,
+/// index `i` names the same pane in both. A tab whose tree MOVED between the
+/// capture and the rebuild falls back to replacing the whole root, which is
+/// correct for any tree at the cost of the churn above.
 fn rebuildTabInPlace(
     self: *App,
+    arena: Allocator,
     window: *Window,
     tab_index: usize,
     tab: session_layout.Tab,
@@ -3060,12 +3083,90 @@ fn rebuildTabInPlace(
     attach: ?*const std.StringHashMap(void),
 ) !void {
     if (tab.nodes.len == 0) return error.CorruptLayout;
-    const first_leaf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
 
     // Always the LOCAL agent: in-place recovery re-binds panes whose local
     // agent link dropped (T145). A cross-machine window's transport belongs to
     // the window and is torn down with it, never recovered here.
     const tr: RestoreTransport = .local(conn);
+
+    const captured_shapes = try capturedNodeShapes(arena, tab.nodes);
+    const live_shapes = try liveNodeShapes(arena, &window.tab_trees[tab_index]);
+    if (agent_recovery.shapesCorrespond(captured_shapes, live_shapes)) {
+        self.rebuildTabLeavesInPlace(window, tab_index, tab, tr, attach);
+        return;
+    }
+
+    log.warn(
+        "in-place recovery: tab {d}'s tree no longer matches its capture " ++
+            "({d} live node(s) vs {d} captured); replacing the whole root",
+        .{ tab_index, live_shapes.len, captured_shapes.len },
+    );
+    try self.rebuildTabRootInPlace(window, tab_index, tab, tr, attach);
+}
+
+/// Swap ONLY this tab's terminal leaves, each in the slot it already holds.
+/// Caller has already established that `tab.nodes` and the live tree correspond
+/// index-for-index, which is what makes `nodes[i]` addressable in both.
+///
+/// Never fails as a whole: a leaf that cannot be rebuilt is logged and left
+/// frozen, because the panes that DID come back are worth more than an
+/// all-or-nothing tab.
+fn rebuildTabLeavesInPlace(
+    self: *App,
+    window: *Window,
+    tab_index: usize,
+    tab: session_layout.Tab,
+    tr: RestoreTransport,
+    attach: ?*const std.StringHashMap(void),
+) void {
+    for (tab.nodes, 0..) |node, i| {
+        const lf = node.leaf orelse continue;
+        if (!agent_recovery.rebuildsLeaf(if (lf.isViewer()) .viewer else .terminal)) continue;
+
+        // Re-read the tree every iteration: each replacement re-allocates the
+        // node array (the tree is a persistent structure), so a slice taken
+        // before the loop would be freed memory by the second pass. The HANDLES
+        // are what stay put, which is the whole reason this walk is by index.
+        const live = switch (window.tab_trees[tab_index].nodes[i]) {
+            .leaf => |pane| pane,
+            .split => continue,
+        };
+
+        var ov = self.restoreAttachOverride(lf, tr, attach);
+        const fresh = window.replaceTabLeaf(tab_index, live, .{ .terminal = &ov }) catch |err| {
+            log.warn(
+                "in-place recovery: tab {d} leaf {d} failed err={}",
+                .{ tab_index, i, err },
+            );
+            continue;
+        };
+
+        // The two things a fresh surface does NOT inherit from the one it
+        // replaced — the same pair `restoreBuildSubtree` puts back on the
+        // launch-restore path. The IPC name went with the departing surface's
+        // teardown (it forgets its own registry entry), and the title and
+        // banner live nowhere but the manifest.
+        if (lf.ipc_name) |n|
+            self.ipcRegister(n, .{ .pane = fresh }) catch |err|
+                log.warn("in-place recovery: pane IPC register '{s}' failed err={}", .{ n, err });
+        restoreLeafPresentation(fresh, lf);
+    }
+}
+
+/// The fallback: build a fresh root surface for the tab, swap the whole tree,
+/// then replay the recorded splits onto it via the shared restore walker. This
+/// is what every tab used to get; it is now reserved for a tab whose live tree
+/// no longer corresponds to the capture, where per-leaf replacement has no
+/// meaningful slot to aim at.
+fn rebuildTabRootInPlace(
+    self: *App,
+    window: *Window,
+    tab_index: usize,
+    tab: session_layout.Tab,
+    tr: RestoreTransport,
+    attach: ?*const std.StringHashMap(void),
+) !void {
+    const first_leaf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
     var ov = self.restoreAttachOverride(first_leaf, tr, attach);
     // Rebuild the root as the KIND it was. A viewer rides no agent connection,
     // so recovery has nothing to re-bind for it — but the tab still has to come
@@ -3079,6 +3180,43 @@ fn rebuildTabInPlace(
     // would re-apply color/hero/title too, but those live on the WINDOW and
     // were never lost — only the surfaces were — so we replay just the splits.
     try self.restoreBuildSubtree(window, tab.nodes, 0, root, tr, attach, 0);
+}
+
+/// Project a captured manifest tab onto the shape vocabulary the correspondence
+/// rule speaks (`agent_recovery.NodeShape`).
+fn capturedNodeShapes(
+    arena: Allocator,
+    nodes: []const session_layout.Node,
+) ![]agent_recovery.NodeShape {
+    const out = try arena.alloc(agent_recovery.NodeShape, nodes.len);
+    for (nodes, 0..) |n, i| {
+        out[i] = if (n.leaf) |lf|
+            (if (lf.isViewer())
+                agent_recovery.NodeShape.viewer
+            else
+                agent_recovery.NodeShape.terminal)
+        else
+            .split;
+    }
+    return out;
+}
+
+/// The same projection for the LIVE tree the capture was taken from.
+fn liveNodeShapes(
+    arena: Allocator,
+    tree: *const SplitTree(PaneView),
+) ![]agent_recovery.NodeShape {
+    const out = try arena.alloc(agent_recovery.NodeShape, tree.nodes.len);
+    for (tree.nodes, 0..) |n, i| {
+        out[i] = switch (n) {
+            .leaf => |pane| if (pane.isViewer())
+                agent_recovery.NodeShape.viewer
+            else
+                agent_recovery.NodeShape.terminal,
+            .split => .split,
+        };
+    }
+    return out;
 }
 
 /// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact

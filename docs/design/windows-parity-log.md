@@ -11325,3 +11325,70 @@ blank window it opened, so the recorded layout is lost for good. macOS
 deliberately keeps its entries "for next launch"; win32 regenerates wholesale.
 That is total loss in precisely the no-agent case, where the agent's blobs are
 not a second copy either.
+
+## 2026-08-08 — T399: an agent crash no longer reloads the document panes it never touched
+
+When the local session-persistence agent dies, in-place recovery (T145) rebuilds
+your panes without relaunching the app. It did that by replacing each tab's
+ENTIRE split tree — which meant every viewer pane in the tab was destroyed and
+re-opened for an event that had nothing to do with it. A viewer holds no agent
+session; its content came from a file, a URL or a git command. What the user
+paid for the churn was the WebView2 host and browser process torn down and
+rebuilt, the page re-fetched, and scroll position plus in-page state gone. For a
+markdown doc that is a visible jump; for a `localhost` dev page it can be a lost
+form or a lost log tail. T90h had already fixed the worse half (a viewer used to
+come back as a *terminal*), but it could only make the rebuild reproduce the
+recorded KIND, not stop the rebuild.
+
+Recovery is a tree EDIT now, not a wholesale swap. `SplitTree.replaceLeaf` is
+the primitive: clone-with-one-leaf-changed, same persistent-structure idiom and
+same ownership rule as `swap`, so the returned tree holds a reference on every
+view and deinit'ing the OLD tree drops exactly the departing one. `Window
+.replaceTabLeaf` is `replaceTabRoot`'s surgical sibling and keeps its invariant
+verbatim — a SWAP, never a close, so nothing on the path calls
+`setSessionCloseIntent` and the sessions being re-ATTACHed are spared
+(`agent_recovery.sessionSpared`, the `e65cfa4d5` lesson). `rebuildTabInPlace`
+walks the tab's nodes and replaces only the terminal leaves, each in the slot it
+already occupies, then puts back the two things a fresh surface does not inherit
+(its IPC name, which went with the departing surface's teardown, and its
+title/banner, which live nowhere but the manifest).
+
+The walk is by INDEX, and that is licensed rather than assumed:
+`captureSessionLayout` writes the manifest node array as a 1:1 copy of the live
+`SplitTree` node array, so while the two still agree node-for-node, index `i`
+names the same pane in both. `agent_recovery.shapesCorrespond` states that as a
+pure rule over a three-value shape vocabulary, and a tab that fails it falls back
+to the old whole-root rebuild — correct for any tree, at the cost of the churn.
+`agent_recovery.rebuildsLeaf` states the other half (terminals only) in one
+place. Both are unit-tested in the none lane, as is `replaceLeaf` (shape,
+ratios and zoom preserved; `testing.allocator` is what proves the reference
+accounting balanced).
+
+`test/win32/agent-recovery.ps1` grew a viewer pane in the tab under test and a
+section F — ALL PASS (31). The oracle is the viewer's pane id, and it is a real
+one because `ViewerPane.create` draws a fresh random id, so an unchanged id can
+only mean the pane object was never destroyed. It is not vacuous either: the
+same run proves recovery genuinely ran (C5, the terminals came back on NEW child
+processes), that their sessions were spared (D1) and that their own ids were
+kept (E6). Writing it cost one harness bug worth remembering: `All-Leaves`
+returns its list behind a unary comma, and piping that call straight into
+`Where-Object` unrolls only the wrapper — `$_` is then the whole array, `$_.type`
+member-enumerates into something always truthy, and both filters "matched" so
+four assertions passed vacuously.
+
+Floor green — none PASS, win32 PASS (353s), agent PASS (164s), P1–P3 ALL PASS.
+The agent lane went red once inside `-Lane all` and passed alone on the re-run;
+that is filed rather than shrugged off, see T592.
+
+Filed: **T592** — `-Lane all` starts each lane the instant the previous one
+exits, and both the win32 and the agent lane stand up a REAL WebView2
+environment, so the incoming one can be refused with `hr=0x80004005` while the
+outgoing one's browser tree is still tearing down. `TestProfile` (T430) already
+keeps each lane off the user's profile; what is missing is settling between two
+TEST profiles. A red floor that is really a scheduling artifact costs a turn each
+time and teaches the loop to distrust its own gate.
+**T591** — a launch-time restore regenerates every viewer pane's id
+instead of adopting the recorded one (`restoreViewerOpen` drops `leaf.pane_id`
+while the terminal path keeps it, T113), so a script holding a viewer's id loses
+its target across an app restart. Found because that regeneration is exactly
+what this task's oracle measures.

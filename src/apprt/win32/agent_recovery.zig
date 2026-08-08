@@ -26,6 +26,9 @@
 //!     the child of a session an on-screen pane is using. The invariant is
 //!     stated in terms of session ids (`sessionSpared`), not in terms of "is
 //!     this a swap?", so it holds for any future tree-replacing caller.
+//!  3. **Which LEAVES does recovery touch at all?** Only the ones that rode the
+//!     dropped connection (`rebuildsLeaf`), and only while the live tree still
+//!     matches what was captured from it (`shapesCorrespond`).
 
 const std = @import("std");
 const connection = @import("../../remote/connection.zig");
@@ -127,6 +130,44 @@ pub fn sessionSpared(session_id: ?[]const u8, surviving_ids: []const []const u8)
     return false;
 }
 
+/// One node of a tab, reduced to the only thing recovery needs to know about
+/// it. Both the live `SplitTree` and the captured manifest tab project down to
+/// this, which is what lets the correspondence rule below be pure.
+pub const NodeShape = enum { split, terminal, viewer };
+
+/// Whether in-place recovery REBUILDS a leaf of this kind.
+///
+/// Only terminals. A terminal pane's shell runs under the agent, so a dropped
+/// link genuinely invalidated it and the only cure is a fresh surface
+/// re-ATTACHed on the new connection. A VIEWER holds no agent session at all —
+/// its content came from a file, a URL or a git command — so there is nothing
+/// for recovery to re-bind, and destroying it would tear down its WebView2 host,
+/// reload the page, and lose the user's scroll position and in-page state for an
+/// event that never touched it (T399).
+pub fn rebuildsLeaf(shape: NodeShape) bool {
+    return shape == .terminal;
+}
+
+/// Whether a captured manifest tab and the live tree it was captured FROM still
+/// describe the same tab, node for node.
+///
+/// This is what licenses the surgical path: `captureSessionLayout` writes the
+/// manifest node array as a 1:1 copy of the live `SplitTree` node array, so when
+/// the two still correspond, index `i` names the same pane in both and a leaf
+/// can be replaced in the slot it already occupies. When they do NOT — the tree
+/// moved between the capture and the rebuild — no index means anything and the
+/// caller must fall back to replacing the whole root, which is correct for any
+/// tree at the cost of the churn the surgical path exists to avoid.
+///
+/// An empty pair corresponds to nothing: there is no tab there to rebuild.
+pub fn shapesCorrespond(captured: []const NodeShape, live: []const NodeShape) bool {
+    if (captured.len == 0 or captured.len != live.len) return false;
+    for (captured, live) |c, l| {
+        if (c != l) return false;
+    }
+    return true;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -220,4 +261,37 @@ test "sessionSpared: a session the new tree still uses is never close-intented" 
     try testing.expect(!sessionSpared(null, &surviving));
     // An empty surviving set cannot spare anything.
     try testing.expect(!sessionSpared("0123456789abcdef0123456789abcdef", &.{}));
+}
+
+test "rebuildsLeaf: only terminals ride the connection that dropped" {
+    try testing.expect(rebuildsLeaf(.terminal));
+    // T399, the whole point: a viewer is not the agent's, so recovery is not
+    // entitled to reload it.
+    try testing.expect(!rebuildsLeaf(.viewer));
+    try testing.expect(!rebuildsLeaf(.split));
+}
+
+test "shapesCorrespond: index i means the same pane in both, or nothing does" {
+    const tree = [_]NodeShape{ .split, .terminal, .split, .viewer, .terminal };
+    try testing.expect(shapesCorrespond(&tree, &tree));
+
+    // A leaf that changed KIND between capture and rebuild: replacing by index
+    // would put a terminal where the user has a viewer.
+    const kind_moved = [_]NodeShape{ .split, .terminal, .split, .terminal, .terminal };
+    try testing.expect(!shapesCorrespond(&tree, &kind_moved));
+
+    // A leaf that became a split (someone split a pane mid-recovery), and a
+    // tree that grew or shrank.
+    const split_moved = [_]NodeShape{ .split, .split, .split, .viewer, .terminal };
+    try testing.expect(!shapesCorrespond(&tree, &split_moved));
+    try testing.expect(!shapesCorrespond(&tree, tree[0..4]));
+
+    // Nothing corresponds to nothing.
+    try testing.expect(!shapesCorrespond(&.{}, &.{}));
+    try testing.expect(!shapesCorrespond(&tree, &.{}));
+
+    // The single-leaf tab, which is the common case.
+    const lone = [_]NodeShape{.terminal};
+    try testing.expect(shapesCorrespond(&lone, &lone));
+    try testing.expect(!shapesCorrespond(&lone, &[_]NodeShape{.viewer}));
 }

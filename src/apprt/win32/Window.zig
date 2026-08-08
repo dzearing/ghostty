@@ -1551,6 +1551,39 @@ pub const RootSpec = union(PaneView.Kind) {
     viewer: ViewerPane.Open,
 };
 
+/// Build one detached pane from a `RootSpec`: a fresh leaf that belongs to this
+/// window but is not in any tree yet, so the caller still owns it (release with
+/// `destroyUnowned` if the insert fails). Shared by the two rebuild entry points
+/// below, which differ only in WHERE the pane goes.
+fn buildPane(self: *Window, spec: RootSpec) !*PaneView {
+    const alloc = self.app.core_app.alloc;
+    return switch (spec) {
+        .terminal => |overrides| term: {
+            self.pending_surface_overrides = overrides;
+            defer self.pending_surface_overrides = null;
+
+            const surface = try alloc.create(Surface);
+            surface.init(self.app, self, .tab) catch |err| {
+                alloc.destroy(surface);
+                return err;
+            };
+            break :term PaneView.createTerminal(alloc, surface) catch |err| {
+                surface.deinit();
+                alloc.destroy(surface);
+                return err;
+            };
+        },
+        .viewer => |open| view: {
+            const viewer = try self.createViewerPane(open);
+            break :view PaneView.createViewer(alloc, viewer) catch |err| {
+                viewer.deinit(alloc);
+                alloc.destroy(viewer);
+                return err;
+            };
+        },
+    };
+}
+
 /// Replace a tab's ENTIRE split tree with a single fresh pane built from
 /// `spec`, and return it (T145, in-place local-agent crash recovery).
 ///
@@ -1576,31 +1609,7 @@ pub fn replaceTabRoot(
 
     // Build the replacement FIRST: if it fails, the tab keeps the panes it has
     // (frozen, but present) rather than being emptied.
-    const pane: *PaneView = switch (spec) {
-        .terminal => |overrides| term: {
-            self.pending_surface_overrides = overrides;
-            defer self.pending_surface_overrides = null;
-
-            const surface = try alloc.create(Surface);
-            surface.init(self.app, self, .tab) catch |err| {
-                alloc.destroy(surface);
-                return err;
-            };
-            break :term PaneView.createTerminal(alloc, surface) catch |err| {
-                surface.deinit();
-                alloc.destroy(surface);
-                return err;
-            };
-        },
-        .viewer => |open| view: {
-            const viewer = try self.createViewerPane(open);
-            break :view PaneView.createViewer(alloc, viewer) catch |err| {
-                viewer.deinit(alloc);
-                alloc.destroy(viewer);
-                return err;
-            };
-        },
-    };
+    const pane = try self.buildPane(spec);
     var tree = SplitTree(PaneView).init(alloc, pane) catch |err| {
         pane.destroyUnowned(alloc);
         return err;
@@ -1617,6 +1626,53 @@ pub fn replaceTabRoot(
     self.tab_hero_index[tab_index] = 0;
     old_tree.deinit();
 
+    return pane;
+}
+
+/// Replace ONE leaf of a tab's split tree with a fresh pane built from `spec`,
+/// leaving the tree's shape, its split ratios, its zoom and every OTHER pane
+/// exactly as they are (T399).
+///
+/// `replaceTabRoot`'s surgical sibling, and it keeps every one of that
+/// function's rules: it is a SWAP rather than a close, so the departing surface
+/// is released by the old tree's `deinit` with its default DETACH (keep-alive)
+/// teardown and nothing here ever calls `setSessionCloseIntent` — the caller is
+/// re-ATTACHing that very session (`agent_recovery.sessionSpared`).
+///
+/// What it buys over replacing the root is the panes it does NOT touch. A
+/// viewer holds no agent session, so rebuilding a tab wholesale destroyed its
+/// WebView2 host and reloaded its page for an event that had nothing to do with
+/// it. On failure the tab is left exactly as it was.
+pub fn replaceTabLeaf(
+    self: *Window,
+    tab_index: usize,
+    old: *PaneView,
+    spec: RootSpec,
+) !*PaneView {
+    if (self.closing) return error.WindowClosing;
+    if (tab_index >= self.tab_count) return error.InvalidTabIndex;
+    const alloc = self.app.core_app.alloc;
+    const handle = self.findHandle(tab_index, old) orelse return error.PaneNotInTab;
+
+    const pane = try self.buildPane(spec);
+    var tree = self.tab_trees[tab_index].replaceLeaf(alloc, handle, pane) catch |err| {
+        pane.destroyUnowned(alloc);
+        return err;
+    };
+    errdefer tree.deinit();
+
+    // Same swap-then-release order as `replaceTabRoot`, and for the same reason:
+    // the window must never be observable holding a freed tree. The survivors
+    // net out at their original counts (the clone reffed them, this deinit
+    // unrefs them); only `old` reaches zero and tears down.
+    var old_tree = self.tab_trees[tab_index];
+    self.tab_trees[tab_index] = tree;
+    if (self.tab_active_pane[tab_index] == old) self.tab_active_pane[tab_index] = pane;
+    old_tree.deinit();
+
+    // Hero state indexes LEAVES, and the leaf count and order are unchanged, so
+    // the carousel keeps pointing at the same slot — unlike a root replacement,
+    // which collapses the tab to one pane and has to reset it.
     return pane;
 }
 

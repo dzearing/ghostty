@@ -128,6 +128,23 @@ function All-Leaves($tree) {
     return , $acc
 }
 function Leaf-Count($tree) { return (All-Leaves $tree).Count }
+# Terminal-only / viewer-only views of that list. A viewer leaf reports
+# `"type": "viewer"` and none of the shell fields (no pid, no tty, no pwd).
+#
+# The `$all = ...` step is load-bearing: `All-Leaves` returns its list wrapped
+# in a unary-comma array, and piping that function call DIRECTLY into
+# Where-Object unrolls only the wrapper — so `$_` is the whole leaf array and
+# `$_.type` member-enumerates into an array that is always truthy. Both filters
+# then "matched", and every assertion below them passed vacuously. Assigning
+# first unrolls the wrapper to the real list, which is what enumerates.
+function Terminal-Leaves($tree) {
+    $all = All-Leaves $tree
+    return , @($all | Where-Object { $_.type -ne 'viewer' })
+}
+function Viewer-Leaves($tree) {
+    $all = All-Leaves $tree
+    return , @($all | Where-Object { $_.type -eq 'viewer' })
+}
 
 function Get-Sessions($tmp, $tag) {
     $code = Run-Cli '+sessions --json' "$tmp\sess-$tag.json" 12
@@ -247,7 +264,26 @@ while ((Get-Date) -lt $deadline) {
 }
 Assert "A2 the window has exactly 2 panes" ((Leaf-Count $treeA) -eq 2)
 
-$paneA = (All-Leaves $treeA)[0]
+# T399: put a VIEWER pane in the same tab. It rides no agent session, so the
+# agent going down cannot have invalidated it — section F measures that recovery
+# leaves it strictly alone.
+$viewFile = Join-Path $tmp 'view.md'
+Set-Content -Path $viewFile -Value "# t399`n`nviewer pane content." -Encoding utf8
+Run-CliArgs @('+split', "--pane=$($firstLeaf.id)", '--direction=down',
+    '--name=t399v', "--view=$viewFile") "$tmp\viewsplit.txt" 20 | Out-Null
+
+$deadline = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadline) {
+    $treeA = Get-List $tmp 'a2v' 10
+    if ((Viewer-Leaves $treeA).Count -eq 1) { break }
+    Start-Sleep -Milliseconds 500
+}
+$viewerA = @(Viewer-Leaves $treeA)[0]
+Assert "A2b a viewer pane joined the tab" ($null -ne $viewerA)
+Assert "A2c the tab now holds 2 terminals and 1 viewer" (
+    (Terminal-Leaves $treeA).Count -eq 2 -and (Viewer-Leaves $treeA).Count -eq 1)
+
+$paneA = (Terminal-Leaves $treeA)[0]
 $rowsA = Wait-AliveCount $tmp 'a' 2 25
 Assert "A3 both panes are agent-backed (2 live sessions)" ((Alive-Rows $rowsA).Count -eq 2)
 $pidsA = Alive-Pids $rowsA
@@ -319,7 +355,7 @@ Assert "D2 the pane still works after the teardown window" (
 # ============================================================================
 $treeE = Get-List $tmp 'e' 12
 Assert "E1 still exactly one window" ((Windows-Of $treeE).Count -eq 1)
-Assert "E2 still exactly 2 panes in a split" ((Leaf-Count $treeE) -eq 2)
+Assert "E2 still exactly 2 terminals in a split" ((Terminal-Leaves $treeE).Count -eq 2)
 $tabsE = @((Windows-Of $treeE)[0].tabs)
 Assert "E3 still exactly one tab" ($tabsE.Count -eq 1)
 Assert "E4 the tab's root is a split, not a lone leaf" ($tabsE[0].splits.type -eq 'split')
@@ -333,8 +369,32 @@ Assert "E5 the pane's IPC name still resolves after the rebuild" ($rcE -eq 0)
 # itself. (The first version of this script asserted the opposite — that a
 # rebuilt pane is a "new" surface — which would have passed only on a build
 # that broke the guarantee.)
-$paneE = (All-Leaves $treeE)[0]
+$paneE = (Terminal-Leaves $treeE)[0]
 Assert "E6 the rebuilt pane kept its stable pane id" ($paneE.id -eq $paneA.id)
+
+# ============================================================================
+"== F: T399 - the viewer pane was never touched by the recovery"
+# ============================================================================
+# A viewer holds no agent session, so a dropped agent link cannot have
+# invalidated it. Recovery used to replace the tab's WHOLE tree, which destroyed
+# the WebView2 host and re-opened the page — losing scroll position and in-page
+# state for an event that had nothing to do with the pane.
+#
+# The pane id is the cheap observable, and it is a real one BECAUSE a re-created
+# viewer draws a fresh random id (`ViewerPane.create`). Sections C and E already
+# established that recovery genuinely ran and rebuilt the terminals on new
+# children, so an untouched viewer here is a spared pane, not a skipped test.
+$viewerE = @(Viewer-Leaves $treeE)
+Assert "F1 the viewer pane is still in the tab" ($viewerE.Count -eq 1)
+Assert "F2 it kept its stable pane id - it was never re-created" (
+    $viewerE.Count -eq 1 -and $viewerE[0].id -eq $viewerA.id)
+Assert "F3 it still shows the file it was opened with" (
+    $viewerE.Count -eq 1 -and $viewerE[0].url -like '*view.md')
+# And it is a live viewer, not a husk: `+reload` is viewer-only (it rejects a
+# terminal pane outright), so a clean exit means the pane is still a working
+# viewer answering to the name it was registered under before the crash.
+$rcF = Run-Cli "+reload --target=t399v" "$tmp\reload-f.txt" 12
+Assert "F4 the viewer still answers +reload by its registered name" ($rcF -eq 0)
 
 # ============================================================================
 Stop-TestProcs

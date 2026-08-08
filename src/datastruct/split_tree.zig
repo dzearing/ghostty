@@ -824,6 +824,47 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// Replace the view at ONE leaf handle, returning a new tree with the
+        /// same shape, the same ratios and the same zoom. Every other leaf is
+        /// carried over untouched — the same pointer, still alive.
+        ///
+        /// Ownership follows `swap`'s rule: the returned tree holds a reference
+        /// on every view in it (the replacement included), and deinit'ing the
+        /// OLD tree is what releases the departing view. So a caller that swaps
+        /// the trees and then deinits the old one leaves the survivors at their
+        /// original counts and drops the replaced view by exactly one.
+        ///
+        /// This exists so a rebuild can be a tree EDIT rather than a wholesale
+        /// swap (win32 T399): when a dropped agent connection invalidates the
+        /// terminal panes and nothing else, replacing the root would also
+        /// destroy and re-create every viewer pane in the tab — reloading its
+        /// page and losing the user's scroll and in-page state for an event
+        /// that never touched it.
+        pub fn replaceLeaf(
+            self: *const Self,
+            gpa: Allocator,
+            handle: Node.Handle,
+            view: *View,
+        ) Allocator.Error!Self {
+            assert(handle.idx() < self.nodes.len);
+            assert(self.nodes[handle.idx()] == .leaf);
+
+            var arena = ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            const nodes = try alloc.dupe(Node, self.nodes);
+            nodes[handle.idx()] = .{ .leaf = view };
+
+            try refNodes(gpa, nodes);
+
+            return .{
+                .arena = arena,
+                .nodes = nodes,
+                .zoomed = self.zoomed,
+            };
+        }
+
         fn weight(
             self: *const Self,
             from: Node.Handle,
@@ -2394,4 +2435,60 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: replaceLeaf swaps one leaf and leaves the rest of the tree alone" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | (B | C), so the replaced leaf has a sibling on both sides of it.
+    var vA: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &vA);
+    defer t1.deinit();
+    var vB: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &vB);
+    defer t2.deinit();
+    var ab = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer ab.deinit();
+    var vC: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &vC);
+    defer t3.deinit();
+    var abc = try ab.split(alloc, handleOf(&ab, "B") orelse return error.NotFound, .down, 0.25, &t3);
+    defer abc.deinit();
+
+    // Zoom something OTHER than the replaced leaf: the zoom rides on a handle,
+    // and the whole point of an edit-in-place is that handles do not move.
+    abc.zoom(handleOf(&abc, "C") orelse return error.NotFound);
+
+    var vZ: TestTree.View = .{ .label = "Z" };
+    var replaced = try abc.replaceLeaf(
+        alloc,
+        handleOf(&abc, "B") orelse return error.NotFound,
+        &vZ,
+    );
+    defer replaced.deinit();
+
+    // Same shape, same ratios, same zoom — only B became Z. (The surviving
+    // views are still the same LEAVES; `testing.allocator` is what proves the
+    // reference accounting balanced, since a survivor freed here or a
+    // replacement never freed would both show up as a leak.)
+    try testing.expect(replaced.zoomed != null);
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(replaced, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: A
+        \\  split (layout: vertical, ratio: 0.25)
+        \\    leaf: Z
+        \\    (zoomed) leaf: C
+        \\
+    );
+}
+
+fn handleOf(tree: *const TestTree, label: []const u8) ?TestTree.Node.Handle {
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, label)) return entry.handle;
+    }
+    return null;
 }
