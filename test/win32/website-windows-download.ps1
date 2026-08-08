@@ -267,6 +267,27 @@ Assert 'D5 mac appcast push retries on rejection too' `
 Assert 'D6 both writers target the gh-pages branch' `
     (($wf -match 'clone --branch gh-pages') -and ($macWf -match 'clone --branch gh-pages'))
 
+# T577. The workflow was correct for two weeks and had still never run once,
+# because a workflow runs from the tree of the ref that triggered it and the
+# only trigger was `v*` -- a tag cut from main, which carries neither this
+# file nor the win32 apprt it builds. So the wiring check is not "does the
+# file exist", it is "is there a tag shape THIS tree can be tagged with that
+# reaches this workflow", plus "does the version parse survive that shape".
+$tagBlock = ''
+if ($wf -match '(?s)on:\s*\r?\n\s*push:\s*\r?\n(.*?)\r?\n\s*workflow_dispatch:') { $tagBlock = $Matches[1] }
+Assert 'D7 workflow triggers on a tag the windows branch can carry (win-v*)' `
+    ($tagBlock -match '(?m)^\s*-\s*"win-v\*"\s*$')
+Assert 'D8 workflow still triggers on v* for after the merge-back' `
+    ($tagBlock -match '(?m)^\s*-\s*"v\*"\s*$')
+# A win-v tag must parse to a bare X.Y.Z or the version regex rejects it and
+# the release dies on a version that was never malformed.
+Assert 'D9 the version parse strips the win- prefix before the v' `
+    ($wf -match '(?s)VERSION=\$\{TAG_NAME#win-\}.*?VERSION=\$\{VERSION#v\}')
+# What the workflow builds has to be present in the same tree as the
+# workflow, which is the whole point of D7.
+Assert 'D10 this tree carries the win32 apprt the workflow builds' `
+    (Test-Path -LiteralPath (Join-Path $Repo 'src\apprt\win32'))
+
 "=== E. the links answer (live) ==="
 
 function Test-Url($url) {

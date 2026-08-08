@@ -1,11 +1,34 @@
 on:
   push:
-    # Deliberately the SAME pattern release.yml uses, not a stricter one:
-    # "every release ships Windows too" is only true if a tag that reaches
-    # the macOS job always reaches this one. A tag that is not X.Y.Z fails
-    # loudly below rather than being silently skipped here.
+    # TWO patterns, for two different worlds (T577).
+    #
+    #   win-v*  is the one that works TODAY. A workflow runs from the tree of
+    #           the ref that triggered it, and the Windows frontend
+    #           (src/apprt/win32, dist/windows-installer, dist/website) exists
+    #           ONLY on users/dzearing/windows-amd64 -- origin/main's apprt
+    #           enum is gtk/none/embedded, so `-Dapp-runtime=win32` is not
+    #           even a valid option there. A vX.Y.Z tag is cut from main, so
+    #           it carries neither this file nor anything it builds: putting
+    #           this workflow on main would not produce a Windows release, it
+    #           would produce a red run on every macOS release. So a Windows
+    #           release is cut as its OWN tag on the Windows branch, which is
+    #           the only ref whose tree can build one.
+    #
+    #   v*      is the one that takes over at merge-back, unchanged. Once the
+    #           Windows branch is in main, a vX.Y.Z tag carries the win32
+    #           source and this workflow fires from it -- "every release ships
+    #           Windows too" without anyone rewiring anything. It is
+    #           deliberately the SAME pattern release.yml uses, not a stricter
+    #           one: a tag that reaches the macOS job must reach this one, and
+    #           a tag that is not X.Y.Z fails loudly below rather than being
+    #           silently skipped here.
+    #
+    # `v*` does not match `win-v1.31.0` (tag globs are anchored), so the two
+    # patterns never double-fire, and release.yml's own `v*` never picks up a
+    # win-v tag and tries to notarize a DMG for it.
     tags:
       - "v*"
+      - "win-v*"
 
   workflow_dispatch:
     inputs:
@@ -19,11 +42,16 @@ on:
 
 name: Release (Windows)
 
-# The Windows half of a release (T38). The same vX.Y.Z tag push that builds
-# and publishes the macOS DMG in release.yml builds the Windows terminal
-# here, so one release produces both platforms' artifacts at the same
-# version -- Ghoztty-<version>-x64.msi and Ghoztty-portable-<version>-x64.zip
-# alongside Ghoztty-<version>-arm64.dmg.
+# The Windows half of a release (T38). It builds the Windows terminal at the
+# version a release carries, so one release produces both platforms'
+# artifacts at the same version -- Ghoztty-<version>-x64.msi and
+# Ghoztty-portable-<version>-x64.zip alongside Ghoztty-<version>-arm64.dmg.
+# Until merge-back that is two tag pushes rather than one, for the reason
+# spelled out on the triggers above; the version number is what ties them.
+#
+# workflow_dispatch is listed but is INERT until merge-back: GitHub only
+# offers manual dispatch for workflows on the default branch, and this file
+# is not on main. Cutting a win-v tag is the way to run it today.
 #
 # It is a SEPARATE workflow, not a job in release.yml, for two reasons: the
 # macOS job is a signing/notarization pipeline that a Windows failure must
@@ -63,7 +91,15 @@ jobs:
       - name: Set release variables
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
+            # Both trigger shapes land here: `v1.31.0` and `win-v1.31.0` are
+            # the same version, published onto the same win-v release. Strip
+            # the optional `win-` first, then the `v` -- doing it in one
+            # substitution would leave `win-v1.31.0` untouched (the prefix
+            # `refs/tags/v` simply does not match) and fail the regex below
+            # with a message about a version that was never malformed.
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG_NAME#win-}
+            VERSION=${VERSION#v}
             PUBLISH=true
           else
             VERSION="${{ github.event.inputs.version }}"
@@ -134,8 +170,15 @@ jobs:
             echo "release $TAG exists -- replacing its assets"
             gh release upload "$TAG" "$MSI" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
           else
+            # --target names the commit a NEW tag should be created at, and is
+            # meaningless once the tag exists -- which it does whenever this
+            # run was triggered by a win-v tag push (the tag IS the trigger).
+            # Passing it anyway would ask gh to move a tag it must not move.
+            TARGET=()
+            git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+              || TARGET=(--target "$(git rev-parse HEAD)")
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "$(git rev-parse HEAD)" \
+              "${TARGET[@]}" \
               --title "Ghoztty for Windows v$VERSION" \
               --latest=false --notes-file "$NOTES" \
               "$MSI" "$ZIP"
