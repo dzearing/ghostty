@@ -8,6 +8,10 @@
 # T233 acceptance (run 2 tail): the band is 2 DIP (never one physical pixel),
 # and hover/drag is a COLOR change - asserted as a pair of probes that must
 # read differently in the two states, not as a cursor shape.
+# T251 acceptance (own run): a deliberately terrible `split-divider-color`
+# (#0a0a0a on a black terminal) still paints a band that clears the design
+# system's 3:1 chrome floor, in BOTH the rest and the hovered state - measured
+# as WCAG contrast against the pane background, not as "some other color".
 #
 # paintDividerNode previously hardcoded a 0x808080 pen; it now uses the
 # config color (COLORREF from Config.Color RGB) with the same gray as the
@@ -302,17 +306,25 @@ if (Test-Path $errlog) {
     Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
 }
 
-# Rewrite the config file, reload with ctrl+shift+, and poll for blue.
-Set-Content -Path $conf -Value 'split-divider-color = 0000ff' -Encoding Ascii
+# Rewrite the config file, reload with ctrl+shift+, and poll for cyan.
+#
+# CYAN, not the blue this used to use (T251). Pure blue is 2.44:1 against this
+# black background - under the 3:1 chrome floor the product now enforces at
+# paint time - so the painted band is a LIGHTENED blue and an exact-color probe
+# would read a floor doing its job as a broken reload. Cyan is 16.7:1 and is
+# painted verbatim, so this assertion keeps testing what it is named for: that
+# a config reload re-colors the divider live. The floor itself is asserted in
+# its own section below, against a color chosen to trip it.
+Set-Content -Path $conf -Value 'split-divider-color = 00ffff' -Encoding Ascii
 Assert (Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl, shift -Key comma) `
-    'red->blue: reload chord delivered'
-$blue = $false
+    'red->cyan: reload chord delivered'
+$cyan = $false
 for ($t = 0; $t -lt 25; $t++) {
-    if (Divider-HasColor $top $A $B 0 0 255) { $blue = $true; break }
+    if (Divider-HasColor $top $A $B 0 255 255) { $cyan = $true; break }
     Start-Sleep -Milliseconds 200
 }
-Assert $blue 'red->blue: config reload re-colored the divider live'
-if (-not $blue) { Dump-Strip $top $A $B 'red->blue' }
+Assert $cyan 'red->cyan: config reload re-colored the divider live'
+if (-not $cyan) { Dump-Strip $top $A $B 'red->cyan' }
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'red: no crash'
 Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
@@ -495,6 +507,92 @@ if ($null -eq $backIsRest -or $null -eq $backIsHot) {
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'default: no crash'
 Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# T251: a deliberately terrible `split-divider-color` still paints a band you
+# can see - and so does its hover.
+#
+# `split-divider-color` is an unconstrained user color and nothing used to
+# check it against the pane background, so `#0a0a0a` on a black terminal was an
+# invisible divider (1.10:1) whose T233 hover shade (#232323) was invisible too
+# (1.42:1). The control disappeared and its feedback went with it. The product
+# now applies the design system's 3:1 chrome floor (section 2.3/5) at PAINT
+# time - the config value itself is untouched, so it round-trips - which is a
+# deliberate divergence from Mac, where the raw value is filled as-is.
+#
+# The oracle is the measured band pixel, scored the same way the floor is
+# defined: WCAG contrast against the pane background, which here is #000000.
+# That is stronger than "is it some other color" - it is the actual rule.
+# Tolerance is not a factor: the band is a GDI solid fill of one brush color.
+# ---------------------------------------------------------------------------
+function Get-WcagLuminance([int]$r, [int]$g, [int]$b) {
+    $lin = @(0.0, 0.0, 0.0)
+    $ch = @($r, $g, $b)
+    for ($i = 0; $i -lt 3; $i++) {
+        $v = $ch[$i] / 255.0
+        $lin[$i] = if ($v -le 0.04045) { $v / 12.92 } else { [math]::Pow(($v + 0.055) / 1.055, 2.4) }
+    }
+    return 0.2126 * $lin[0] + 0.7152 * $lin[1] + 0.0722 * $lin[2]
+}
+function Get-WcagContrast([string]$px, [int]$br, [int]$bg2, [int]$bb) {
+    $c = $px -split ','
+    $l1 = Get-WcagLuminance ([int]$c[0]) ([int]$c[1]) ([int]$c[2])
+    $l2 = Get-WcagLuminance $br $bg2 $bb
+    $hi = [math]::Max($l1, $l2); $lo = [math]::Min($l1, $l2)
+    return ($hi + 0.05) / ($lo + 0.05)
+}
+# The best contrast any pixel of the divider gap reaches against black, plus
+# the pixel that reached it. $null if the capture held no content.
+function Get-BandContrast([IntPtr]$top) {
+    $gap = Get-GapStrip $top 'down'
+    if ($null -eq $gap -or $null -eq $gap.Strip) { return $null }
+    $best = 0.0; $bestPx = ''
+    foreach ($px in $gap.Strip) {
+        $r = Get-WcagContrast $px 0 0 0
+        if ($r -gt $best) { $best = $r; $bestPx = $px }
+    }
+    return [pscustomobject]@{ Ratio = $best; Pixel = $bestPx }
+}
+
+Kill-RepoInstances
+$g251 = Start-Gui 'floor' ($common + @('--split-divider-color=0a0a0a')) $false
+$launched += $script:GhozttyTestDesktopPids
+$app251 = $g251.App; $top251 = $g251.Top
+
+$rest251 = Get-BandContrast $top251
+if ($null -eq $rest251) {
+    Write-Host 'SKIP T251 (rest): empty capture - pixel probe would be meaningless'
+} else {
+    Assert ($rest251.Ratio -ge 3.0) `
+        "T251 rest: a #0a0a0a divider on a black terminal still clears 3:1 (got $([math]::Round($rest251.Ratio,2)):1 at pixel $($rest251.Pixel))"
+    # And it is not the color a floor-blind build would paint: #0a0a0a is
+    # 1.10:1, so this is the same claim stated as the defect.
+    Assert (-not (Pixel-Matches $rest251.Pixel 10 10 10 6)) `
+        "T251 rest: the band is NOT the raw unreadable #0a0a0a (pixel $($rest251.Pixel))"
+}
+
+# The hover/drag state has to clear the floor too - a rest color that is legible
+# whose hover shade is not is the same defect one frame later. Read mid-DRAG,
+# for the reason the T233 section spells out: a posted move cannot hold a hover
+# on a background desktop, while `dragging_split` does not consult the cursor.
+$d251 = Get-DividerLine $top251
+[void](Send-TestMouse -Window $top251 -Target $top251 -X $d251.X -Y $d251.Y -Action down)
+[void](Send-TestMouse -Window $top251 -Target $top251 -X $d251.X -Y ($d251.Y + 20) -Action move)
+Start-Sleep -Milliseconds 250
+$hot251 = Get-BandContrast $top251
+[void](Send-TestMouse -Window $top251 -Target $top251 -X $d251.X -Y ($d251.Y + 20) -Action up)
+Start-Sleep -Milliseconds 250
+if ($null -eq $hot251 -or $null -eq $rest251) {
+    Write-Host 'SKIP T251 (drag): empty capture'
+} else {
+    Assert ($hot251.Ratio -ge 3.0) `
+        "T251 drag: the hovered band clears 3:1 too (got $([math]::Round($hot251.Ratio,2)):1 at pixel $($hot251.Pixel))"
+    Assert ($hot251.Pixel -ne $rest251.Pixel) `
+        "T251 drag: the hover is still a visible change (rest $($rest251.Pixel) -> hot $($hot251.Pixel))"
+}
+
+Assert (-not ($app251.Process -and $app251.Process.HasExited)) 'T251: no crash'
+Stop-Process -Id $app251.Pid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # T155: the visible gap between panes is ONE solid divider band.

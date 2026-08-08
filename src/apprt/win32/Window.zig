@@ -2550,20 +2550,26 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
     const rect = self.surfaceRect();
-    const rest: color_math.Rgb = if (self.app.config.@"split-divider-color") |c|
+    const configured: color_math.Rgb = if (self.app.config.@"split-divider-color") |c|
         .{ .r = c.r, .g = c.g, .b = c.b }
     else
         .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+
+    // T233: the hovered/dragged divider paints shaded, and which way to shade
+    // is decided by the PANE background, not the OS theme — the divider has to
+    // read against the two panes it separates, and a light terminal in a dark
+    // Windows theme is an ordinary configuration.
+    //
+    // T251: the same background is what the 3:1 chrome contrast floor is
+    // measured against, for BOTH states. `dividerPaint` owns all of it; the
+    // config value is never rewritten, only the paint is floored.
+    const cfg_bg = self.app.config.background;
+    const bg: color_math.Rgb = .{ .r = cfg_bg.r, .g = cfg_bg.g, .b = cfg_bg.b };
+    const rest = split_geometry.dividerPaint(configured, bg, false);
     const brush = w32.CreateSolidBrush(w32.RGB(rest.r, rest.g, rest.b)) orelse return;
     defer _ = w32.DeleteObject(brush);
 
-    // T233: the hovered/dragged divider paints shaded. Which way to shade is
-    // decided by the PANE background, not the OS theme — the divider has to
-    // read against the two panes it separates, and a light terminal in a dark
-    // Windows theme is an ordinary configuration.
-    const bg = self.app.config.background;
-    const dark = !color_math.isLight(.{ .r = bg.r, .g = bg.g, .b = bg.b });
-    const hot_rgb = split_geometry.dividerColor(rest, dark, true);
+    const hot_rgb = split_geometry.dividerPaint(configured, bg, true);
     const hot_brush = w32.CreateSolidBrush(w32.RGB(hot_rgb.r, hot_rgb.g, hot_rgb.b));
     defer if (hot_brush) |hb| {
         _ = w32.DeleteObject(hb);

@@ -11023,3 +11023,45 @@ Filed: **T578** - nothing builds the Windows target in CI until release time,
 so a broken cross-compile is only ever found while shipping; **T579** - a
 release can still ship macOS-only in silence if the second tag is forgotten,
 which is the same shape of failure as the one just fixed.
+
+## 2026-08-07 — T251: a divider color you cannot see is now lifted until you can
+
+`split-divider-color` was an unconstrained user color that nothing checked
+against the pane background. `#0a0a0a` on a black terminal painted a 1.10:1
+divider, and T233's hover shade took it to 1.42:1 — the control you grab to
+resize a split was invisible, and so was the feedback that says the pointer is
+over it. `split_geometry.dividerPaint` now applies the design system's 3:1
+chrome floor (§2.3, WCAG 1.4.11) at PAINT time, so the config value still
+round-trips exactly as typed and a color that is already readable is painted
+verbatim. Measured on the box: that divider now lands at 3.14:1, its hover at
+4.56:1.
+
+Two things made this more than a call to `contrastAdjustedTo`. The floor has to
+hold in BOTH states, and a color can be squeezed between the floor and the end
+of the channel range — `#f0f0f0` on `#808080` sits at 3.47:1 with 15 units of
+headroom to white and only ~14 before the darker side drops through 3:1, so no
+full 25-step hover is legal there. The magnitude gives way, never the floor: a
+hover 10 short still reads as a state change, a hover under 3:1 has stopped
+reading as a divider. And the shade re-aims when its conventional direction is
+exhausted (white on a dark theme would otherwise shade to itself). Both corners
+are asserted, and `contrastAdjustedTo`'s CIELAB answer is re-measured after
+8-bit quantization rather than trusted — it can land a hair under the ratio it
+searched for, and a hair under a floor is a failed floor.
+
+Mac paints the raw value and checks nothing
+(`Ghostty.Config.swift:535`), so this is a deliberate divergence and is
+recorded in `win32-design-system.md` §5 beside the 2 DIP band. Filed as **D34**
+because silently lifting a color the user typed is a call they may want back.
+
+The acceptance script's own history is the negative control: its new T251
+section failed against the pre-fix binary at exactly 1.06:1 rest / 1.34:1 hover
+and passes against the rebuilt one. Run 1's reload color moved `0000ff` →
+`00ffff` — pure blue is 2.44:1 on black, so the floor now legitimately moves it
+and an exact-color probe would read a working floor as a broken reload.
+
+Floor green: `floor-lane -Lane all` ALL LANES PASS, `split-divider.ps1` ALL PASS
+(51 assertions), P1–P3 ALL PASS.
+
+Filed: **T580** — Mac has the same unfloored hole, so the seats now disagree
+about the same config line; **T581** — win32's unset-divider fallback is a fixed
+`#808080` while Mac derives its default from the terminal background.

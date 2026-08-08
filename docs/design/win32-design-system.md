@@ -363,7 +363,7 @@ every scale.
 |---|---|
 | Visible band | **2 DIP** (not 1 — a 1 DIP line disappears at 100% and reads as an artifact) |
 | Grab band | +-4 DIP either side of the visible band, invisible |
-| Rest color | 3:1 against both panes it separates |
+| Rest color | 3:1 against both panes it separates — **enforced**, see below |
 | **Hover** | Lighten by 25 per channel in dark themes, darken by 25 in light |
 | Drag | Same as hover, held for the duration of the drag |
 | Cursor | `SIZEWE` / `SIZENS` over the grab band |
@@ -375,6 +375,35 @@ rather than at the pointer, and none at all on a screenshot.
 This is a **deliberate divergence from Mac**, whose divider is 1 pt: at Windows'
 common fractional scales a 1 DIP band rounds to a single physical pixel that
 visually vanishes against a dark pane. Recorded here so nobody "fixes" it back.
+
+**The 3:1 row is a rule the product applies, not advice to the user** (T251).
+`split-divider-color` is an unconstrained color, so `#0a0a0a` on a black
+terminal is a divider at 1.10:1 — invisible — whose hover shade (#232323) is
+invisible too. The control and its feedback both disappear, which is exactly
+what the §2.3 floor for "chrome glyphs and meaningful boundaries" exists to
+prevent, and a divider is a meaningful boundary: it is the thing you grab to
+resize a split. `split_geometry.dividerPaint` therefore lifts the color to the
+floor **at paint time**, so the config value round-trips unchanged — the same
+shape `min-contrast` uses for terminal text, and the same call the project
+already made for under-contrast palette entries in T150/T247.
+
+A **second deliberate divergence from Mac**, where `splitDividerColor`
+(`Ghostty.Config.swift`) fills the raw value and checks nothing. Recorded here
+for the same reason as the 2 DIP band.
+
+Two consequences worth stating, because they are what makes the rule
+implementable rather than aspirational:
+
+- **The floor is absolute; the hover MAGNITUDE is what gives way.** A color can
+  be squeezed between the two — `#f0f0f0` on a `#808080` background sits at
+  3.47:1 with 15 units of headroom to white and only ~14 before the darker side
+  drops through 3:1 — and then the hover is the largest shade that is still
+  legal, not 25. A hover 10 units short still reads as a state change; a hover
+  under 3:1 has stopped reading as a divider.
+- **The hover re-aims when its conventional direction is exhausted.** A rest
+  color clamped at the end of the channel range (white on a dark theme) would
+  otherwise shade to itself. Legibility of the control outranks the
+  §5 direction convention in that corner, and only there.
 
 ---
 

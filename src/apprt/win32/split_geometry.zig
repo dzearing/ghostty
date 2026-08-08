@@ -49,6 +49,133 @@ pub fn hoverDelta(dark: bool) i32 {
     return if (dark) HOVER_DELTA else -HOVER_DELTA;
 }
 
+/// The contrast floor a divider must clear against the panes it separates:
+/// WCAG 1.4.11's 3:1 for "chrome glyphs and meaningful boundaries" (design
+/// system §2.3/§5). A divider IS a meaningful boundary — it is the control you
+/// grab to resize a split.
+pub const CONTRAST_FLOOR: f64 = 3.0;
+
+/// The smallest per-channel separation that still comfortably reads as a state
+/// change between the rest mark and the hover mark — the number the T233 test
+/// already asserted for the fallback gray. `HOVER_DELTA` is what we aim for;
+/// this is the point below which `dividerPaint` stops honoring the shade
+/// DIRECTION convention and looks the other way for a more visible mark.
+///
+/// It is a preference, not a guarantee: a color squeezed between the contrast
+/// floor and the end of the channel range can afford less, and the floor wins.
+pub const HOVER_DELTA_MIN: i32 = 20;
+
+/// The divider's PAINTED color for one state, with the chrome contrast floor
+/// applied against the pane background (T251).
+///
+/// `configured` is the user's `split-divider-color` (or the fallback gray);
+/// `bg` is the pane background the divider has to read against. The config
+/// value itself is never rewritten — the floor is applied here, at paint time,
+/// so the color round-trips through the config unchanged the way `min-contrast`
+/// treats terminal text.
+///
+/// **A deliberate divergence from Mac**, which fills the divider with the raw
+/// `split-divider-color` and checks nothing (`Ghostty.Config.swift`
+/// `splitDividerColor`). Recorded in `docs/design/win32-design-system.md` §5,
+/// the same treatment T233's 2 DIP band got. `split-divider-color = #0a0a0a`
+/// on a black terminal is otherwise an invisible control whose hover shade
+/// (#232323) is invisible too — the control and its feedback both disappear.
+///
+/// Both states are floored, and the hover mark additionally has to stay
+/// DISTINGUISHABLE from rest: a hover that satisfies the contrast floor by
+/// landing on the rest color is no feedback at all. The floor is absolute; the
+/// hover MAGNITUDE is what gives way when a color leaves no room for both (see
+/// `hoverShade`).
+pub fn dividerPaint(configured: color_math.Rgb, bg: color_math.Rgb, hot: bool) color_math.Rgb {
+    const bg_lum = color_math.wcagLuminance(bg);
+    const rest = floored(configured, bg, bg_lum);
+    if (!hot) return rest;
+
+    // Which way to shade is decided by the PANE background, not the OS theme
+    // (T233) — the divider has to read against the two panes it separates.
+    const dark = !color_math.isLight(bg);
+    const conventional = hoverShade(rest, bg_lum, hoverDelta(dark));
+    if (channelDelta(conventional, rest) >= HOVER_DELTA_MIN) return conventional;
+
+    // The conventional direction (icon_button's sign convention) has run out
+    // of room. Two ways that happens, and only two: a rest color already
+    // clamped at the end of the channel range, where the shade is a no-op, and
+    // a background the shade moves TOWARD, where the floor bites first. Re-aim
+    // rather than paint an invisible hover — legibility of the control
+    // outranks the direction convention — but keep the conventional direction
+    // when it is the more visible of the two anyway.
+    const reaimed = hoverShade(rest, bg_lum, -hoverDelta(dark));
+    return if (channelDelta(reaimed, rest) > channelDelta(conventional, rest))
+        reaimed
+    else
+        conventional;
+}
+
+/// `rest` shaded by up to `d` per channel in `d`'s direction — the LARGEST
+/// magnitude that still clears the contrast floor against `bg_lum`.
+///
+/// `HOVER_DELTA` is the design system's number and is what this returns
+/// whenever the color has room for it. It gives way rather than the floor
+/// because a hover 10 units short still reads as a state change, while a
+/// hover under 3:1 has stopped reading as a divider at all. A color can be
+/// genuinely squeezed — `split-divider-color = #f0f0f0` on a `#808080`
+/// background sits at 3.47:1 with 15 units of headroom to white and only 14
+/// before the darker side drops through the floor — and then a 15-step hover
+/// is the whole truthful answer.
+fn hoverShade(rest: color_math.Rgb, bg_lum: f64, d: i32) color_math.Rgb {
+    const step: i32 = if (d < 0) -1 else 1;
+    var m: i32 = @as(i32, @intCast(@abs(d)));
+    while (m > 0) : (m -= 1) {
+        const c = shade(rest, step * m);
+        if (channelDelta(c, rest) == 0) continue; // clamped: no change to test
+        if (contrastAgainst(c, bg_lum) >= CONTRAST_FLOOR) return c;
+    }
+    return rest;
+}
+
+/// The largest per-channel difference between two colors — "how much did the
+/// mark visibly move".
+fn channelDelta(a: color_math.Rgb, b: color_math.Rgb) i32 {
+    const dr: i32 = @intCast(@abs(@as(i32, a.r) - @as(i32, b.r)));
+    const dg: i32 = @intCast(@abs(@as(i32, a.g) - @as(i32, b.g)));
+    const db: i32 = @intCast(@abs(@as(i32, a.b) - @as(i32, b.b)));
+    return @max(dr, @max(dg, db));
+}
+
+/// Slack asked for on top of `CONTRAST_FLOOR` when searching for a legible
+/// color. `contrastAdjustedTo` searches in CIELAB and quantizes back to 8 bits
+/// only at the end, so its answer can land a hair UNDER the ratio it searched
+/// for — measured at up to ~0.04 against a black background. A hair under a
+/// floor is a failed floor, so the search is aimed slightly past it and the
+/// quantized answer is re-measured below.
+const QUANTIZE_MARGIN: f64 = 0.15;
+
+/// `base` lifted to the chrome contrast floor against `bg`, hue preserved
+/// where that is reachable. A color already clearing the floor is returned
+/// untouched — this is a floor, not a restyle.
+fn floored(base: color_math.Rgb, bg: color_math.Rgb, bg_lum: f64) color_math.Rgb {
+    if (contrastAgainst(base, bg_lum) >= CONTRAST_FLOOR) return base;
+    const adjusted = color_math.contrastAdjustedTo(base, bg, CONTRAST_FLOOR + QUANTIZE_MARGIN);
+    if (contrastAgainst(adjusted, bg_lum) >= CONTRAST_FLOOR) return adjusted;
+    // A saturated color can clamp against the sRGB gamut before its luminance
+    // gets where it needs to be, on BOTH sides of a mid-tone background. Plain
+    // black or white always clears the floor, and losing the hue beats losing
+    // the control.
+    return color_math.contrastForeground(bg);
+}
+
+fn shade(c: color_math.Rgb, d: i32) color_math.Rgb {
+    return .{
+        .r = icon_button.shadeChannel(c.r, d),
+        .g = icon_button.shadeChannel(c.g, d),
+        .b = icon_button.shadeChannel(c.b, d),
+    };
+}
+
+fn contrastAgainst(c: color_math.Rgb, bg_lum: f64) f64 {
+    return color_math.wcagContrastRatio(color_math.wcagLuminance(c), bg_lum);
+}
+
 /// The divider's painted color. `rest` is the configured (or fallback)
 /// divider color; `dark` says which way to shade — take it from the pane
 /// background the divider separates (`!color_math.isLight(bg)`), not from
@@ -56,14 +183,14 @@ pub fn hoverDelta(dark: bool) i32 {
 ///
 /// Hover and drag paint identically — a drag is a held hover, so the mark
 /// must not change under the pointer at the moment it is grabbed.
+///
+/// This is the SHADE RULE alone. Painting goes through `dividerPaint`, which
+/// wraps it in the 3:1 chrome contrast floor (T251); this stays public because
+/// the rule — direction, magnitude, and rest-is-untouched — is worth stating
+/// and asserting on its own.
 pub fn dividerColor(rest: color_math.Rgb, dark: bool, hot: bool) color_math.Rgb {
     if (!hot) return rest;
-    const d = hoverDelta(dark);
-    return .{
-        .r = icon_button.shadeChannel(rest.r, d),
-        .g = icon_button.shadeChannel(rest.g, d),
-        .b = icon_button.shadeChannel(rest.b, d),
-    };
+    return shade(rest, hoverDelta(dark));
 }
 
 /// Half-width of the invisible grab band around the divider (T94, Mac's
@@ -230,6 +357,144 @@ test "dividerColor: rest AND hover clear the 3:1 chrome floor on both themes" {
         const delta = @abs(@as(i32, hot.r) - @as(i32, rest.r));
         try testing.expect(delta >= 20);
     }
+}
+
+test "dividerPaint: an adversarial user color still clears the 3:1 floor in BOTH states" {
+    // T251. T233 could only assert the floor for the FALLBACK gray, because
+    // that was the only divider color the product controlled. `dividerPaint`
+    // makes the floor a property of the paint, so a user's
+    // `split-divider-color` cannot hide the control it names.
+    const backgrounds = [_]color_math.Rgb{
+        .{ .r = 0, .g = 0, .b = 0 }, // black terminal
+        .{ .r = 0x0a, .g = 0x0a, .b = 0x0a }, // near-black
+        .{ .r = 0x1e, .g = 0x1e, .b = 0x2e }, // a typical dark theme
+        .{ .r = 0x77, .g = 0x77, .b = 0x77 }, // isLight vs WCAG disagree here
+        .{ .r = 0x80, .g = 0x80, .b = 0x80 }, // mid gray
+        .{ .r = 0xfa, .g = 0xf8, .b = 0xf0 }, // near-white
+        .{ .r = 255, .g = 255, .b = 255 }, // white terminal
+    };
+    const dividers = [_]color_math.Rgb{
+        .{ .r = 0, .g = 0, .b = 0 }, // THE report: black on black
+        .{ .r = 0x0a, .g = 0x0a, .b = 0x0a },
+        .{ .r = 0x12, .g = 0x12, .b = 0x18 },
+        .{ .r = 0x80, .g = 0x80, .b = 0x80 }, // the fallback
+        .{ .r = 0, .g = 0, .b = 255 }, // pure blue: 2.44:1 on black
+        .{ .r = 0xf0, .g = 0xf0, .b = 0xf0 },
+        .{ .r = 255, .g = 255, .b = 255 }, // white on white
+        .{ .r = 0xfe, .g = 0xfd, .b = 0xfa },
+    };
+
+    for (backgrounds) |bg| {
+        const bg_lum = color_math.wcagLuminance(bg);
+        for (dividers) |configured| {
+            const rest = dividerPaint(configured, bg, false);
+            const hot = dividerPaint(configured, bg, true);
+
+            const rest_ratio = color_math.wcagContrastRatio(color_math.wcagLuminance(rest), bg_lum);
+            const hot_ratio = color_math.wcagContrastRatio(color_math.wcagLuminance(hot), bg_lum);
+            try testing.expect(rest_ratio >= CONTRAST_FLOOR);
+            try testing.expect(hot_ratio >= CONTRAST_FLOOR);
+
+            // And the hover has to be SEEN as a change, not merely be legible.
+            try testing.expect(!rest.eql(hot));
+            // The full HOVER_DELTA wherever the color has room for it. The one
+            // squeezed pair in this sweep (#f0f0f0 on #808080) is pinned with
+            // its numbers in its own test below.
+            const moved = channelDelta(hot, rest);
+            const squeezed = bg.eql(.{ .r = 128, .g = 128, .b = 128 }) and
+                configured.eql(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 });
+            try testing.expect(moved >= if (squeezed) 8 else HOVER_DELTA_MIN);
+        }
+    }
+}
+
+test "dividerPaint: a squeezed color spends the hover magnitude, never the floor" {
+    // `split-divider-color = #f0f0f0` on a `#808080` background: 3.47:1 at
+    // rest, 15 units of headroom to white, and only ~14 before the darker
+    // (conventional, light-theme) side drops through 3:1. There is no shade
+    // here that is both a full 25 and legal, so the magnitude gives way — the
+    // floor does not.
+    const bg: color_math.Rgb = .{ .r = 128, .g = 128, .b = 128 };
+    const cfg: color_math.Rgb = .{ .r = 0xf0, .g = 0xf0, .b = 0xf0 };
+    const bg_lum = color_math.wcagLuminance(bg);
+
+    const rest = dividerPaint(cfg, bg, false);
+    try testing.expect(cfg.eql(rest)); // legible already: untouched
+    const hot = dividerPaint(cfg, bg, true);
+    try testing.expect(contrastAgainst(hot, bg_lum) >= CONTRAST_FLOOR);
+    try testing.expect(channelDelta(hot, rest) >= 8);
+    try testing.expect(channelDelta(hot, rest) < HOVER_DELTA);
+
+    // The full conventional shade IS what a floor-blind build would paint,
+    // and it is under the floor — that is the trade being made here.
+    try testing.expect(contrastAgainst(shade(rest, -HOVER_DELTA), bg_lum) < CONTRAST_FLOOR);
+}
+
+test "dividerPaint: a color that already clears the floor is painted verbatim" {
+    // The floor is a floor, not a restyle: `split-divider-color` that is
+    // legible arrives at the brush unchanged, hue and all. This is what makes
+    // the adjustment defensible — it only fires where the alternative is a
+    // control the user cannot see.
+    const black: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    const white: color_math.Rgb = .{ .r = 255, .g = 255, .b = 255 };
+
+    const red: color_math.Rgb = .{ .r = 255, .g = 0, .b = 0 }; // 5.25:1 on black
+    try testing.expect(red.eql(dividerPaint(red, black, false)));
+    const green: color_math.Rgb = .{ .r = 0, .g = 255, .b = 0 };
+    try testing.expect(green.eql(dividerPaint(green, black, false)));
+    const gray: color_math.Rgb = .{ .r = 128, .g = 128, .b = 128 };
+    try testing.expect(gray.eql(dividerPaint(gray, black, false)));
+    try testing.expect(gray.eql(dividerPaint(gray, white, false)));
+
+    // ... and the hover shade on top of it is still the plain T233 rule, so
+    // the acceptance script's 128 -> 153 oracle keeps meaning what it says.
+    try testing.expect(dividerColor(gray, true, true).eql(dividerPaint(gray, black, true)));
+    try testing.expect(dividerColor(gray, false, true).eql(dividerPaint(gray, white, true)));
+}
+
+test "dividerPaint: THE T251 report - near-black divider on a black terminal" {
+    // `split-divider-color = #0a0a0a` on `background = #000000`: 1.10:1 at
+    // rest, and T233's hover shade takes it to #232323, which is 1.42:1. Both
+    // states invisible — the control disappears and its feedback with it.
+    const bg: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    const configured: color_math.Rgb = .{ .r = 0x0a, .g = 0x0a, .b = 0x0a };
+    const bg_lum = color_math.wcagLuminance(bg);
+
+    // Pin the defect itself, so the numbers above are not just a comment.
+    const unfloored_rest = dividerColor(configured, true, false);
+    const unfloored_hot = dividerColor(configured, true, true);
+    try testing.expect(color_math.wcagContrastRatio(color_math.wcagLuminance(unfloored_rest), bg_lum) < 1.2);
+    try testing.expect(color_math.wcagContrastRatio(color_math.wcagLuminance(unfloored_hot), bg_lum) < 1.5);
+
+    const rest = dividerPaint(configured, bg, false);
+    const hot = dividerPaint(configured, bg, true);
+    try testing.expect(rest.r > 0x0a); // lifted off the background
+    try testing.expect(color_math.wcagContrastRatio(color_math.wcagLuminance(rest), bg_lum) >= CONTRAST_FLOOR);
+    try testing.expect(color_math.wcagContrastRatio(color_math.wcagLuminance(hot), bg_lum) >= CONTRAST_FLOOR);
+    try testing.expect(!rest.eql(hot));
+}
+
+test "dividerPaint: a clamped rest color still gets a visible hover" {
+    // White divider on a black terminal: the conventional dark-theme shade
+    // (lighten) is a no-op at 255, so the hover would land ON the rest color.
+    // Re-aiming is what keeps the grab feedback; the contrast floor is not in
+    // danger on either side here.
+    const black: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    const white: color_math.Rgb = .{ .r = 255, .g = 255, .b = 255 };
+    const rest = dividerPaint(white, black, false);
+    const hot = dividerPaint(white, black, true);
+    try testing.expect(white.eql(rest));
+    try testing.expect(hot.r <= 255 - HOVER_DELTA_MIN);
+    try testing.expect(color_math.wcagContrastRatio(
+        color_math.wcagLuminance(hot),
+        color_math.wcagLuminance(black),
+    ) >= CONTRAST_FLOOR);
+
+    // The mirror case: black divider on a white terminal.
+    const rest2 = dividerPaint(black, white, false);
+    const hot2 = dividerPaint(black, white, true);
+    try testing.expect(black.eql(rest2));
+    try testing.expect(hot2.r >= HOVER_DELTA_MIN);
 }
 
 test "axis: panes and divider tile the rect with no leftover gap" {
