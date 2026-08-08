@@ -45,6 +45,7 @@ const session_layout = @import("session_layout.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
 const agent_recovery = @import("agent_recovery.zig");
+const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -1568,71 +1569,107 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
         if (win.remote_dialed != null) continue;
         if (win.tab_count == 0) continue;
 
-        const tabs = try arena.alloc(session_layout.Tab, win.tab_count);
-        for (0..win.tab_count) |ti| {
-            const tree = &win.tab_trees[ti];
-            const nodes = try arena.alloc(session_layout.Node, tree.nodes.len);
-            for (tree.nodes, 0..) |node, ni| {
-                nodes[ni] = switch (node) {
-                    .leaf => |pane| leaf: {
-                        // A viewer leaf has no agent session to capture: what
-                        // restores it is its own location, so the four additive
-                        // viewer fields ARE its restore metadata (T90h).
-                        const surface = pane.surface() orelse break :leaf .{
-                            .leaf = try captureViewerLeaf(self, arena, pane),
-                        };
-                        const leaf = try self.captureLeaf(arena, surface, &snapshot_budget);
-                        // No id yet but this leaf is EXPECTED to be agent-backed
-                        // (its window rides the local agent, or the surface's
-                        // remote backend is already wired) ⇒ the OPEN is still in
-                        // flight; ask syncSessionLayout to retry so the id gets
-                        // recorded. `local_agent_conn` is set before the first
-                        // surface/capture, so this catches the startup pane whose
-                        // remote_conn isn't attached at the very first write.
-                        if (leaf.session_id == null and
-                            (surface.remote_conn != null or win.local_agent_conn != null))
-                            pending.* = true;
-                        break :leaf .{ .leaf = leaf };
-                    },
-                    .split => |sp| .{ .split = .{
-                        .layout = @tagName(sp.layout),
-                        .ratio = @floatCast(sp.ratio),
-                        .left = @intFromEnum(sp.left),
-                        .right = @intFromEnum(sp.right),
-                    } },
-                };
-            }
-            const color = win.tab_colors[ti];
-            tabs[ti] = .{
-                .nodes = nodes,
-                .color = if (color == .none) null else @tagName(color),
-                .hero_ratio = win.tab_hero_ratio[ti],
-                .title = if (win.tab_title_pinned[ti])
-                    try captureTabTitle(arena, win, ti)
-                else
-                    null,
-                .active = ti == win.active_tab,
-            };
-        }
-
-        const frame_max = captureFrame(win.hwnd);
-        try windows.append(arena, .{
-            .id = if (win.ipc_name) |n|
-                try arena.dupe(u8, n)
-            else
-                try std.fmt.allocPrint(arena, "win-{d}", .{wi}),
-            // The identity that survives this app run (T338). `id` above does
-            // not: both spellings restart per process.
-            .uuid = try arena.dupe(u8, win.layoutUuid()),
-            .frame = frame_max.frame,
-            .maximized = frame_max.maximized,
-            .title_override = if (win.title_override) |t| try arena.dupe(u8, t) else null,
-            .ipc_name = if (win.ipc_name) |n| try arena.dupe(u8, n) else null,
-            .active_tab = @intCast(win.active_tab),
-            .tabs = tabs,
-        });
+        try windows.append(arena, try self.captureWindow(arena, win, wi, &snapshot_budget, pending));
     }
     return .{ .windows = try windows.toOwnedSlice(arena) };
+}
+
+/// Capture ONE live window as a manifest entry: its tabs, their split-tree node
+/// arrays (a 1:1 copy, so child handles carry over as indices), presentation
+/// state and outer frame.
+///
+/// Split out of `captureSessionLayout` for T366: the remote-reconnect swap
+/// rebuilds exactly one CROSS-MACHINE window, which that walk deliberately skips
+/// — but the thing it needs captured is the same thing, node for node, and a
+/// second capture written beside this one would drift the first time a field is
+/// added to a leaf.
+fn captureWindow(
+    self: *App,
+    arena: Allocator,
+    win: *Window,
+    wi: usize,
+    snapshot_budget: *session_layout.SnapshotBudget,
+    pending: *bool,
+) !session_layout.Window {
+    const tabs = try arena.alloc(session_layout.Tab, win.tab_count);
+    for (0..win.tab_count) |ti| {
+        const tree = &win.tab_trees[ti];
+        const nodes = try arena.alloc(session_layout.Node, tree.nodes.len);
+        for (tree.nodes, 0..) |node, ni| {
+            nodes[ni] = switch (node) {
+                .leaf => |pane| leaf: {
+                    // A viewer leaf has no agent session to capture: what
+                    // restores it is its own location, so the four additive
+                    // viewer fields ARE its restore metadata (T90h).
+                    const surface = pane.surface() orelse break :leaf .{
+                        .leaf = try captureViewerLeaf(self, arena, pane),
+                    };
+                    const leaf = try self.captureLeaf(arena, surface, snapshot_budget);
+                    // No id yet but this leaf is EXPECTED to be agent-backed
+                    // (its window rides the local agent, or the surface's
+                    // remote backend is already wired) ⇒ the OPEN is still in
+                    // flight; ask syncSessionLayout to retry so the id gets
+                    // recorded. `local_agent_conn` is set before the first
+                    // surface/capture, so this catches the startup pane whose
+                    // remote_conn isn't attached at the very first write.
+                    if (leaf.session_id == null and
+                        (surface.remote_conn != null or win.local_agent_conn != null))
+                        pending.* = true;
+                    break :leaf .{ .leaf = leaf };
+                },
+                .split => |sp| .{ .split = .{
+                    .layout = @tagName(sp.layout),
+                    .ratio = @floatCast(sp.ratio),
+                    .left = @intFromEnum(sp.left),
+                    .right = @intFromEnum(sp.right),
+                } },
+            };
+        }
+        const color = win.tab_colors[ti];
+        tabs[ti] = .{
+            .nodes = nodes,
+            .color = if (color == .none) null else @tagName(color),
+            .hero_ratio = win.tab_hero_ratio[ti],
+            .title = if (win.tab_title_pinned[ti])
+                try captureTabTitle(arena, win, ti)
+            else
+                null,
+            .active = ti == win.active_tab,
+        };
+    }
+
+    const frame_max = captureFrame(win.hwnd);
+    return .{
+        .id = if (win.ipc_name) |n|
+            try arena.dupe(u8, n)
+        else
+            try std.fmt.allocPrint(arena, "win-{d}", .{wi}),
+        // The identity that survives this app run (T338). `id` above does
+        // not: both spellings restart per process.
+        .uuid = try arena.dupe(u8, win.layoutUuid()),
+        .frame = frame_max.frame,
+        .maximized = frame_max.maximized,
+        .title_override = if (win.title_override) |t| try arena.dupe(u8, t) else null,
+        .ipc_name = if (win.ipc_name) |n| try arena.dupe(u8, n) else null,
+        .active_tab = @intCast(win.active_tab),
+        .tabs = tabs,
+    };
+}
+
+/// Capture ONE window on its own, with a fresh snapshot budget (T366). The
+/// remote-reconnect swap's entry into the shared capture above: it rebuilds a
+/// single window, so the whole-file budget that keeps a manifest under
+/// `max_file_bytes` has nothing to share with, and nothing here is written to
+/// disk — the capture is consumed in the same call stack.
+pub fn captureOneWindow(
+    self: *App,
+    arena: Allocator,
+    win: *Window,
+    index: usize,
+) !session_layout.Window {
+    var budget: session_layout.SnapshotBudget = .{};
+    var pending = false;
+    return self.captureWindow(arena, win, index, &budget, &pending);
 }
 
 /// Bounded wall-clock budget for the launch-time liveness probe (`LIST_SESSIONS`
@@ -1652,18 +1689,29 @@ const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 ///
 /// The set BORROWS its keys from `roster`, so the two are freed together and
 /// neither may outlive this struct.
-const AttachProbe = struct {
+pub const AttachProbe = struct {
     roster: ?remote_connection.OwnedSessions = null,
     set: ?std.StringHashMap(void) = null,
 
     fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
-        var self: AttachProbe = .{};
-        self.roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
+        const roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
             log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
-            return self;
+            return .{};
         };
+        return .fromRoster(gpa, roster);
+    }
+
+    /// Build the probe from a roster that was ALREADY fetched, taking ownership
+    /// of it. The remote-reconnect swap (T366) runs its `LIST_SESSIONS` on the
+    /// redial worker — the whole point of that thread is that the GUI never
+    /// blocks on a machine that may be gone — so by the time the decision is
+    /// made the blocking half has happened. A null roster is a FAILED probe and
+    /// keeps the tri-state's "unknown ⇒ attempt every leaf" meaning.
+    pub fn fromRoster(gpa: Allocator, roster: ?remote_connection.OwnedSessions) AttachProbe {
+        var self: AttachProbe = .{ .roster = roster };
+        const r = roster orelse return self;
         var m = std.StringHashMap(void).init(gpa);
-        for (self.roster.?.sessions) |sess| {
+        for (r.sessions) |sess| {
             if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
         }
         self.set = m;
@@ -1681,11 +1729,19 @@ const AttachProbe = struct {
     }
 
     /// What the restore helpers take: null ⇒ unknown ⇒ attempt every leaf.
-    fn attachSet(self: *const AttachProbe) ?*const std.StringHashMap(void) {
+    pub fn attachSet(self: *const AttachProbe) ?*const std.StringHashMap(void) {
         return if (self.set) |*m| m else null;
     }
 
-    fn deinit(self: *AttachProbe) void {
+    /// Whether the agent that answered still owns `id`. Tri-state, and the
+    /// caller must keep it that way: null means the probe never landed, which
+    /// is NOT "the session is gone" (T366 reads it as "attempt anyway").
+    pub fn owns(self: *const AttachProbe, id: []const u8) ?bool {
+        const m = self.set orelse return null;
+        return m.contains(id);
+    }
+
+    pub fn deinit(self: *AttachProbe) void {
         if (self.set) |*m| m.deinit();
         if (self.roster) |*s| s.deinit();
     }
@@ -2329,7 +2385,7 @@ fn restoreWindow(
     };
     // From here the WINDOW owns the transport: every later failure leaves a
     // partially built window alive, and `Window.deinit` is what frees it.
-    if (tr.dialed) |d| window.remote_dialed = d;
+    if (tr.dialed) |d| window.setRemoteDialed(d);
     if (tr.machine) |m| window.setRemoteMachine(m) catch |err| {
         // Non-fatal: only T68's "New Window inherits the remote host" degrades.
         log.warn("session-restore: recording machine identity failed err={}", .{err});
@@ -3006,7 +3062,7 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
         // re-attach and must not have its shells replaced.
         if (win.local_agent_conn == null) continue;
 
-        self.rebuildWindowInPlace(arena, win, captured.windows[ci], conn, attach_ptr) catch |err| {
+        _ = self.rebuildWindowInPlace(arena, win, captured.windows[ci], .local(conn), attach_ptr) catch |err| {
             log.warn("in-place recovery: window '{s}' failed err={}", .{ captured.windows[ci].id, err });
             continue;
         };
@@ -3018,29 +3074,38 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
     return rebuilt;
 }
 
-/// Replace one live window's tab trees with fresh surfaces ATTACHed on `conn`.
+/// Replace one live window's tab trees with fresh surfaces ATTACHed over `tr`.
 /// The window itself — its HWND, position, tab count and selection — is kept;
 /// only the surfaces inside it are rebuilt, which is what makes this "in place".
-fn rebuildWindowInPlace(
+///
+/// Two callers, one walk: the LOCAL-agent crash recovery above (`tr.local_agent`,
+/// a fresh shared connection) and the CROSS-MACHINE reconnect swap (T366,
+/// `RemoteReconnect`, a freshly dialed per-window transport the caller has
+/// already installed on the window). Returns the number of terminal leaves that
+/// came back, which is what tells the remote swap whether it attached anything
+/// at all — a swap that attached nothing must not retire the old transport.
+pub fn rebuildWindowInPlace(
     self: *App,
     arena: Allocator,
     window: *Window,
     captured: session_layout.Window,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
-) !void {
+) !usize {
     if (captured.tabs.len == 0) return error.CorruptLayout;
     const active_tab = window.active_tab;
 
     // The window's own connection pointer must move to the new connection
     // BEFORE any surface is built: later tabs/splits read it, and leaving it on
     // the retired connection would quietly make every future pane in this
-    // window unrecoverable.
-    window.local_agent_conn = conn;
+    // window unrecoverable. The cross-machine caller does the same for
+    // `remote_dialed` (its own field) before it gets here.
+    if (tr.local_agent) window.local_agent_conn = tr.conn;
 
+    var attached: usize = 0;
     const tab_count = @min(window.tab_count, captured.tabs.len);
     for (0..tab_count) |ti| {
-        self.rebuildTabInPlace(arena, window, ti, captured.tabs[ti], conn, attach) catch |err| {
+        attached += self.rebuildTabInPlace(arena, window, ti, captured.tabs[ti], tr, attach) catch |err| {
             log.warn("in-place recovery: tab {d} failed err={}", .{ ti, err });
             continue;
         };
@@ -3054,13 +3119,14 @@ fn rebuildWindowInPlace(
     }
     if (active_tab < window.tab_count) window.selectTabIndex(active_tab);
     window.layoutSplits();
+    return attached;
 }
 
 /// Rebuild ONE tab in place, re-binding only what the dropped link actually
-/// invalidated.
+/// invalidated. Returns how many terminal leaves came back on `tr`.
 ///
-/// The surgical path swaps each TERMINAL leaf for a fresh surface ATTACHed on
-/// `conn`, in the slot it already occupies, and touches nothing else: the tree
+/// The surgical path swaps each TERMINAL leaf for a fresh surface ATTACHed over
+/// `tr`, in the slot it already occupies, and touches nothing else: the tree
 /// keeps its shape, its ratios and its zoom, and every VIEWER pane keeps its
 /// WebView2 host, its page, its scroll position and its in-page state (T399).
 /// A viewer rides no agent session, so a link that dropped cannot have
@@ -3079,21 +3145,15 @@ fn rebuildTabInPlace(
     window: *Window,
     tab_index: usize,
     tab: session_layout.Tab,
-    conn: *remote_connection.Connection,
+    tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
-) !void {
+) !usize {
     if (tab.nodes.len == 0) return error.CorruptLayout;
-
-    // Always the LOCAL agent: in-place recovery re-binds panes whose local
-    // agent link dropped (T145). A cross-machine window's transport belongs to
-    // the window and is torn down with it, never recovered here.
-    const tr: RestoreTransport = .local(conn);
 
     const captured_shapes = try capturedNodeShapes(arena, tab.nodes);
     const live_shapes = try liveNodeShapes(arena, &window.tab_trees[tab_index]);
     if (agent_recovery.shapesCorrespond(captured_shapes, live_shapes)) {
-        self.rebuildTabLeavesInPlace(window, tab_index, tab, tr, attach);
-        return;
+        return self.rebuildTabLeavesInPlace(window, tab_index, tab, tr, attach);
     }
 
     log.warn(
@@ -3101,7 +3161,12 @@ fn rebuildTabInPlace(
             "({d} live node(s) vs {d} captured); replacing the whole root",
         .{ tab_index, live_shapes.len, captured_shapes.len },
     );
-    try self.rebuildTabRootInPlace(window, tab_index, tab, tr, attach);
+    // The root walk rebuilds the whole tab, so its terminal leaves are back by
+    // construction — it counts them from the capture rather than instrumenting
+    // the recursive walker, and reports them even on a partial failure (what the
+    // caller needs is "does anything now ride the new transport"). A tab whose
+    // leaves are all viewers is honestly zero.
+    return try self.rebuildTabRootInPlace(window, tab_index, tab, tr, attach);
 }
 
 /// Swap ONLY this tab's terminal leaves, each in the slot it already holds.
@@ -3110,7 +3175,7 @@ fn rebuildTabInPlace(
 ///
 /// Never fails as a whole: a leaf that cannot be rebuilt is logged and left
 /// frozen, because the panes that DID come back are worth more than an
-/// all-or-nothing tab.
+/// all-or-nothing tab. Returns how many leaves actually came back.
 fn rebuildTabLeavesInPlace(
     self: *App,
     window: *Window,
@@ -3118,7 +3183,8 @@ fn rebuildTabLeavesInPlace(
     tab: session_layout.Tab,
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
-) void {
+) usize {
+    var attached: usize = 0;
     for (tab.nodes, 0..) |node, i| {
         const lf = node.leaf orelse continue;
         if (!agent_recovery.rebuildsLeaf(if (lf.isViewer()) .viewer else .terminal)) continue;
@@ -3150,7 +3216,9 @@ fn rebuildTabLeavesInPlace(
             self.ipcRegister(n, .{ .pane = fresh }) catch |err|
                 log.warn("in-place recovery: pane IPC register '{s}' failed err={}", .{ n, err });
         restoreLeafPresentation(fresh, lf);
+        attached += 1;
     }
+    return attached;
 }
 
 /// The fallback: build a fresh root surface for the tab, swap the whole tree,
@@ -3158,6 +3226,12 @@ fn rebuildTabLeavesInPlace(
 /// is what every tab used to get; it is now reserved for a tab whose live tree
 /// no longer corresponds to the capture, where per-leaf replacement has no
 /// meaningful slot to aim at.
+///
+/// Errors ONLY before the root has been replaced. Once it has, a failure in the
+/// subtree walk is logged and the count returned anyway — because the count is
+/// what tells the remote-reconnect swap whether anything now rides the NEW
+/// transport (T366), and "the root moved but I reported nothing moved" is how
+/// that caller would free a connection a live surface is holding.
 fn rebuildTabRootInPlace(
     self: *App,
     window: *Window,
@@ -3165,7 +3239,7 @@ fn rebuildTabRootInPlace(
     tab: session_layout.Tab,
     tr: RestoreTransport,
     attach: ?*const std.StringHashMap(void),
-) !void {
+) !usize {
     const first_leaf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
     var ov = self.restoreAttachOverride(first_leaf, tr, attach);
     // Rebuild the root as the KIND it was. A viewer rides no agent connection,
@@ -3179,7 +3253,15 @@ fn rebuildTabRootInPlace(
     // Everything below the root is the ordinary restore walk. `restoreTab`
     // would re-apply color/hero/title too, but those live on the WINDOW and
     // were never lost — only the surfaces were — so we replay just the splits.
-    try self.restoreBuildSubtree(window, tab.nodes, 0, root, tr, attach, 0);
+    self.restoreBuildSubtree(window, tab.nodes, 0, root, tr, attach, 0) catch |err|
+        log.warn("in-place recovery: tab {d} subtree replay failed err={}", .{ tab_index, err });
+
+    var n: usize = 0;
+    for (tab.nodes) |node| {
+        const lf = node.leaf orelse continue;
+        if (!lf.isViewer()) n += 1;
+    }
+    return n;
 }
 
 /// Project a captured manifest tab onto the shape vocabulary the correspondence
@@ -3421,7 +3503,7 @@ pub fn openDialedWindow(
         dialed.deinitDestroy(self.core_app.alloc);
         return error.CreateFailed;
     };
-    window.remote_dialed = dialed;
+    window.setRemoteDialed(dialed);
     if (opts.machine) |machine| {
         window.setRemoteMachine(machine) catch |err| {
             // Non-fatal: the window works; only T68 "New Window inherits the
@@ -6527,6 +6609,25 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == RemoteReconnect.WM_APP_REMOTE_LINK) {
+        // T366: a cross-machine window's transport changed state. Posted from
+        // that connection's reader thread; the ladder is driven here.
+        RemoteReconnect.onLinkPost(app);
+        return 0;
+    }
+
+    if (msg == RemoteReconnect.WM_APP_REMOTE_DIALED) {
+        // wparam = heap *Result owned by the handler. It lands HERE and not on
+        // the terminal window for the same reason the chooser's replies do:
+        // DestroyWindow discards a window's queued messages, and a discarded
+        // reply would leak the connection this attempt just opened.
+        if (wparam != 0) {
+            const res: *RemoteReconnect.Result = @ptrFromInt(wparam);
+            RemoteReconnect.onDialed(app, res);
+        }
+        return 0;
+    }
+
     if (msg == WM_APP_UPDATE_AVAILABLE) {
         // wparam = heap pointer to the version string, lparam = length.
         // We own the buffer and must free it after use. wparam == 0 is
@@ -6610,6 +6711,14 @@ fn msgWndProc(
     // periodic SetTimer), killed by `endAgentSettleWatch` once a verdict lands.
     if (msg == w32.WM_TIMER and wparam == AGENT_WATCH_TIMER_ID) {
         app.tickAgentSettleWatch();
+        return 0;
+    }
+
+    // Timer ID 6: the cross-machine reconnect ladder (T366). Armed only while
+    // some remote window is mid-ladder, waiting on a background re-dial, or has
+    // a dial in flight; it disarms itself the moment none does.
+    if (msg == w32.WM_TIMER and wparam == RemoteReconnect.TIMER_ID) {
+        RemoteReconnect.tick(app);
         return 0;
     }
 

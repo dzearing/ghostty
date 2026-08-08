@@ -26,6 +26,7 @@ const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
+const RemoteReconnect = @import("RemoteReconnect.zig");
 
 /// The two remote transports a window can ride on: a direct TCP dial to the
 /// agent (T20) or a rendezvous-relay WebSocket (T21b). Both `Dialed` shapes
@@ -363,6 +364,13 @@ pending_surface_overrides: ?*const Surface.Overrides = null,
 /// the transport's `conn`; core surface deinit joins the IO thread first).
 /// Attached by the IPC handler right after createWindow succeeds.
 remote_dialed: ?RemoteDialed = null,
+
+/// The remote reconnect ladder's live state for this window (T366): what the
+/// link observer, the redial worker and the ATTACH-then-DETACH swap keep between
+/// them. Inert for a local window — nothing drives it unless `remote_dialed` is
+/// set. Its retired-transport list is emptied by `RemoteReconnect
+/// .releaseTransports` on both teardown paths, after every surface is gone.
+reconnect: RemoteReconnect.State = .{},
 
 /// The machine identity `remote_dialed` was dialed to (T68): lets New Window
 /// on this window open a fresh connection to the same agent. Owned strings
@@ -957,6 +965,16 @@ pub fn layoutUuid(self: *const Window) []const u8 {
     return &self.layout_uuid;
 }
 
+/// Hand this window the transport it rides on, and start WATCHING that
+/// transport (T366). The two belong together: a `remote_dialed` set without an
+/// observer is a window that goes dead silently, which is the whole defect the
+/// reconnect ladder exists to fix. Every site that installs a dial goes through
+/// here so none can forget the second half.
+pub fn setRemoteDialed(self: *Window, dialed: RemoteDialed) void {
+    self.remote_dialed = dialed;
+    RemoteReconnect.install(self);
+}
+
 pub fn deinit(self: *Window) void {
     // Close the rename dialog / machine chooser first (each re-enables and
     // refocuses this window's HWND, which must still be alive).
@@ -983,6 +1001,9 @@ pub fn deinit(self: *Window) void {
     // Tear down the remote-agent transport AFTER every surface is gone:
     // each remote surface's termio backend borrows the transport's `conn`,
     // and its IO thread (joined by core surface deinit above) uses it.
+    // The reconnect ladder's RETIRED transports are borrowed by exactly the
+    // same things and go at exactly the same moment (T366).
+    RemoteReconnect.releaseTransports(self, self.app.core_app.alloc);
     if (self.remote_dialed) |d| {
         d.deinitDestroy(self.app.core_app.alloc);
         self.remote_dialed = null;
@@ -6079,7 +6100,9 @@ fn onDestroy(self: *Window) void {
     // the connection, its ws socket, and all its threads outlived every
     // window close). Safe here for the same reason as in deinit(): close()
     // already ran cleanupAllSurfaces() before DestroyWindow, so no termio
-    // backend borrows the conn anymore.
+    // backend borrows the conn anymore. Same for the reconnect ladder's
+    // retired transports (T366), which are borrowed by the same surfaces.
+    RemoteReconnect.releaseTransports(self, app.core_app.alloc);
     if (self.remote_dialed) |d| {
         d.deinitDestroy(app.core_app.alloc);
         self.remote_dialed = null;

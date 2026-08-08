@@ -11527,3 +11527,71 @@ it rides T463 so the CSS edit and the probe extension land with the win32 diff
 pane rather than ahead of it. **T596** — T400's end-to-end debounce assertion
 compares two cache-dependent counts and so flakes red about half the time; the
 deterministic timer oracle above it is what actually proves that fix.
+
+## 2026-08-08 — T366: a dropped remote window re-dials itself and takes its sessions back
+
+A window whose shell runs on another machine used to go quiet when that
+machine's connection dropped, and stay quiet — the panes frozen, nothing saying
+why, and no way out but closing the window and losing whatever was running. Mac
+has reconnected since WP-D1. Windows does now: the window notices the drop,
+re-dials on its own across five attempts (1/2/4/8/15s, ~30s), and when it gets
+through it re-ATTACHes the same agent sessions, so the panes come back with
+their programs still running rather than as fresh prompts. Exhausting the fast
+ladder is not the end — the window is kept, a background re-dial runs every 45s,
+and a link that comes back an hour later recovers the window with no click.
+
+T365 shipped the DECISIONS pure and testable; this is the moving half, and it is
+a new file (`RemoteReconnect.zig`) rather than 400 more lines in `Window.zig`.
+The shape is four steps: an observer on the window's transport that does nothing
+but post to the app's message-only window (it runs on the connection's reader
+thread, under its state mutex); a 250ms GUI-thread poller — the same cadence and
+the same reason as `agent_recovery`'s settle watch — armed only while some window
+has something to wait for, so a healthy remote window costs nothing; a detached
+worker that dials, completes the bounded handshake and asks for the session
+roster; and the swap.
+
+**The worker carries a window's uuid, never its pointer.** A dial that outlives
+the window it was for cannot write through anything: the reply fails to resolve a
+live window and frees the connection it brought. That is also why the reply lands
+on the app's message window and not the terminal's — `DestroyWindow` discards a
+window's queued messages, and a discarded reply would leak a whole connection
+(the T295/T318 lesson, now paid once more).
+
+**ATTACH-then-DETACH is a guard, not a comment.** The old transport is retired
+only after the rebuild reports how many panes actually came back, and the
+ordering is enforced by `SwapGuard` — a four-stage marker the driver executes and
+the none-lane asserts, because the two steps sit forty lines apart and the wrong
+order still compiles. It has an honest `abandoned` stage: an attempt that dialed
+but attached nothing leaves the window on the transport it had, dead as that is,
+because the old connection is still the only thing that knows the session. That
+last part needed a fix one level down — the root-replacement fallback used to
+report "nothing happened" when its subtree walk failed *after* the root had
+moved, which would have had the caller free a connection a live surface was
+holding.
+
+**A replaced transport is retired, never destroyed** — `Surface.remote_conn` and
+each pane's `termio.Remote` hold it borrowed and nothing refcounts it. It is shut
+down off the GUI thread and freed at window teardown, after every surface is
+gone. Exactly `LocalAgent.retire`'s bargain, for exactly its reason.
+
+Two pieces of `App.zig` became shared rather than copied: the per-window layout
+capture came out of `captureSessionLayout` (which skips cross-machine windows —
+the very ones this needs), and the in-place rebuild now takes a
+`RestoreTransport` instead of a bare local-agent connection, so the local crash
+recovery and the cross-machine swap walk one path. `AttachProbe` gained a
+`fromRoster` constructor because the reconnect worker does its `LIST_SESSIONS`
+off the GUI thread — the whole point of that thread being that the GUI never
+blocks on a machine that may be gone.
+
+Floor green — none PASS (289s), win32 PASS (337s), agent PASS (323s), P1–P3 ALL
+PASS, and `ipc-relay.ps1` ALL PASS (the remote-window script, run because this
+change is on its path — its sections 6/7 are the dropped-agent case that used to
+end at a dead pane). A cosmetic reindent landed after the first floor run, so
+none and win32 were re-run on the committed bytes: PASS in 294s and 342s.
+
+Filed: **T608** — `QuickTerminal.ANIM_TIMER_ID` and `NOTIF_UPDATE_TIMER_ID` are
+both `3` on `App.msg_hwnd`, so an update notification stalls an in-flight
+quick-terminal slide and its tray icon is never cleaned up; found while auditing
+timer ids for a free one. **T609** — the ladder's per-window state is only
+readable by grepping the log; put it in `+list --json` so T367's pill and T368's
+acceptance script read one source instead of two.

@@ -333,6 +333,115 @@ pub const Generation = struct {
 };
 
 // =============================================================================
+// Attempt results (T366)
+// =============================================================================
+
+/// What one off-thread redial came back with, before any liveness question is
+/// asked. `unauthorized` is kept apart from `failed` because a rejected bearer
+/// is not an unreachable machine — the fix is signing in, and telling the user
+/// to check the network wastes their time (the split T319 drew for the roster).
+pub const DialResult = enum { ok, failed, unauthorized };
+
+/// Collapse one attempt's raw result onto the ladder's vocabulary.
+///
+/// `session_present` is TRI-STATE and the third state is the interesting one:
+///
+///   - `true`  — the agent answered and still owns at least one of this
+///               window's sessions. Re-ATTACH.
+///   - `false` — the agent answered and owns NONE of them. They are gone; the
+///               automatic ladder must not silently replace the user's grid
+///               with fresh shells (`onProbeOutcome`).
+///   - `null`  — the roster probe itself failed, so liveness is UNKNOWN. Treat
+///               it as alive and attempt the swap, the same tri-state rule the
+///               restore path uses (`AttachProbe`: null ⇒ attempt every leaf,
+///               never drop a window over a transport fault). The breaker is
+///               what stops an unknown that turns out to be poison from looping.
+pub fn outcomeFromAttempt(dial: DialResult, session_present: ?bool) ProbeOutcome {
+    return switch (dial) {
+        .unauthorized => .signed_out,
+        .failed => .unreachable_agent,
+        .ok => if (session_present orelse true) .session_alive else .session_gone,
+    };
+}
+
+// =============================================================================
+// Swap ordering
+// =============================================================================
+
+/// Enforces the one ordering a swap may not get wrong: the OLD transport is
+/// retired strictly AFTER every pane has been re-ATTACHed on the NEW one.
+///
+/// Backwards, this ends the session it was trying to save — the same hazard
+/// `agent_recovery.sessionSpared` states for the local in-place rebuild, and the
+/// reason Mac's WP-D1 swap is written ATTACH-then-DETACH. It is a guard rather
+/// than a comment because the two steps sit ~40 lines apart in the driver and
+/// the wrong order still compiles, still runs, and only shows up as a user's
+/// work disappearing.
+///
+/// `abandoned` is the honest fourth state: an attempt that dialed but never
+/// attached anything (nothing to capture, every leaf failed to rebuild) must
+/// free what it dialed and leave the window exactly as it found it — on the old
+/// transport, which is dead but is still the only thing that knows the session.
+pub const SwapGuard = struct {
+    pub const Stage = enum { dialed, attached, retired, abandoned };
+
+    stage: Stage = .dialed,
+
+    /// Every pane that could be rebuilt now rides the new connection.
+    pub fn onAttached(self: *SwapGuard) void {
+        std.debug.assert(self.stage == .dialed);
+        self.stage = .attached;
+    }
+
+    /// The attempt attached nothing. The new dial is the caller's to free.
+    pub fn onAbandoned(self: *SwapGuard) void {
+        std.debug.assert(self.stage == .dialed);
+        self.stage = .abandoned;
+    }
+
+    /// Whether the OLD transport may be retired at this instant.
+    pub fn mayRetireOld(self: SwapGuard) bool {
+        return self.stage == .attached;
+    }
+
+    /// The old transport has been retired; the swap is complete.
+    pub fn onRetired(self: *SwapGuard) void {
+        std.debug.assert(self.stage == .attached);
+        self.stage = .retired;
+    }
+
+    /// Whether the NEW dial is now the window's (and must NOT be freed by the
+    /// attempt). True from the moment anything attached over it.
+    pub fn newDialAdopted(self: SwapGuard) bool {
+        return switch (self.stage) {
+            .attached, .retired => true,
+            .dialed, .abandoned => false,
+        };
+    }
+};
+
+// =============================================================================
+// Driving cadence
+// =============================================================================
+
+/// Whether a window in this state still needs the reconnect poller ticking.
+///
+/// A `connected` window does not: its link-state observer is what wakes the
+/// ladder, and polling a healthy window forever is a cost charged for nothing.
+/// A `reconnecting` one is counting out a backoff. A self-healable
+/// `disconnected` one is waiting on both the slow background re-dial AND a link
+/// that may come back on its own — the observer alone cannot be trusted for the
+/// second, because the transport FSM's own retry can land on `connected` while
+/// nothing else is listening. A terminal window is waiting on the user.
+pub fn needsTick(state: WindowState) bool {
+    return switch (state) {
+        .connected => false,
+        .reconnecting => true,
+        .disconnected => |d| d.self_healable,
+    };
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -692,4 +801,75 @@ test "a full drop-to-exhaustion pass keeps the window self-healable" {
     try testing.expect(state.disconnected.self_healable);
     // The agent thaws minutes later: the window comes back with no click.
     try testing.expectEqual(LinkAction.recovered, onLinkChange(state, classify(.connected)));
+}
+
+test "outcomeFromAttempt: a failed dial is a retry, a rejected one is not" {
+    // The whole point of keeping the two apart: `failed` feeds the ladder,
+    // `unauthorized` ends it, because no amount of retrying signs anyone in.
+    try testing.expectEqual(ProbeOutcome.unreachable_agent, outcomeFromAttempt(.failed, null));
+    try testing.expectEqual(ProbeOutcome.signed_out, outcomeFromAttempt(.unauthorized, null));
+    // The liveness answer is irrelevant when the dial itself did not land.
+    try testing.expectEqual(ProbeOutcome.unreachable_agent, outcomeFromAttempt(.failed, true));
+    try testing.expectEqual(ProbeOutcome.signed_out, outcomeFromAttempt(.unauthorized, false));
+
+    try testing.expectEqual(OutcomeAction.retry, onProbeOutcome(outcomeFromAttempt(.failed, null), false));
+    try testing.expectEqual(OutcomeAction.terminal, onProbeOutcome(outcomeFromAttempt(.unauthorized, null), false));
+}
+
+test "outcomeFromAttempt: an UNKNOWN roster attempts the swap, an empty one does not" {
+    try testing.expectEqual(ProbeOutcome.session_alive, outcomeFromAttempt(.ok, true));
+    try testing.expectEqual(ProbeOutcome.session_gone, outcomeFromAttempt(.ok, false));
+    // The tri-state's third leg: the probe failed, so liveness is unknown and
+    // the swap is attempted rather than the window being condemned over a
+    // transport fault. `false` would send an automatic ladder straight to
+    // terminal on nothing more than a slow LIST_SESSIONS.
+    try testing.expectEqual(ProbeOutcome.session_alive, outcomeFromAttempt(.ok, null));
+
+    switch (onProbeOutcome(outcomeFromAttempt(.ok, null), false)) {
+        .swap => |s| try testing.expect(!s.fresh_session),
+        else => return error.TestUnexpectedResult,
+    }
+    // And a genuinely empty roster stays terminal for the AUTOMATIC ladder.
+    try testing.expectEqual(
+        OutcomeAction.terminal,
+        onProbeOutcome(outcomeFromAttempt(.ok, false), false),
+    );
+}
+
+test "SwapGuard: the old transport may only be retired after the new one attached" {
+    var g: SwapGuard = .{};
+    // Freshly dialed, nothing attached: retiring here is the bug this exists
+    // to catch — it would end the very session the swap is saving.
+    try testing.expect(!g.mayRetireOld());
+    try testing.expect(!g.newDialAdopted());
+
+    g.onAttached();
+    try testing.expect(g.mayRetireOld());
+    try testing.expect(g.newDialAdopted());
+
+    g.onRetired();
+    try testing.expectEqual(SwapGuard.Stage.retired, g.stage);
+    // Retired is a terminal stage: nothing may be retired twice.
+    try testing.expect(!g.mayRetireOld());
+    // The window owns the new dial from `onAttached` onwards, retire or not.
+    try testing.expect(g.newDialAdopted());
+}
+
+test "SwapGuard: an attempt that attached nothing keeps the old transport" {
+    var g: SwapGuard = .{};
+    g.onAbandoned();
+    // Neither half moves: the window stays on the transport it had (dead, but
+    // the only thing that knows the session), and the caller frees its dial.
+    try testing.expect(!g.mayRetireOld());
+    try testing.expect(!g.newDialAdopted());
+}
+
+test "needsTick: only a window with something to wait for keeps the poller alive" {
+    try testing.expect(!needsTick(.connected));
+    try testing.expect(needsTick(.{ .reconnecting = .{ .attempt = 1 } }));
+    // Exhausted-but-self-healable: the slow re-dial AND a link that may come
+    // back on its own are both waiting on this tick.
+    try testing.expect(needsTick(exhausted_state));
+    // Terminal is waiting on the user, not on us.
+    try testing.expect(!needsTick(terminal_state));
 }
