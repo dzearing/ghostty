@@ -92,10 +92,19 @@ git tag vX.Y.Z
 git push origin main --tags
 ```
 
-One tag push starts **both** platforms (T38):
+That starts the macOS half: `release.yml` builds, signs, notarizes, and publishes `Ghoztty-X.Y.Z-arm64.dmg` to the `vX.Y.Z` release.
 
-- `release.yml` builds, signs, notarizes, and publishes `Ghoztty-X.Y.Z-arm64.dmg` to the `vX.Y.Z` release.
-- `release-windows.yml` cross-builds the Windows terminal and publishes `Ghoztty-X.Y.Z-x64.msi` + `Ghoztty-portable-X.Y.Z-x64.zip` to a `win-vX.Y.Z` release (`--latest=false`, so the Mac latest/Sparkle flow is untouched). The separate tag is a contract with shipped binaries: installed Windows builds find updates by scanning the releases list for the newest `win-v` tag (`src/apprt/win32/update_check.zig`).
+**Until the Windows branch merges back, the Windows half needs its own tag** (T577). Push it too, at the head of the Windows branch:
+
+```bash
+git push origin users/dzearing/windows-amd64        # the tag must point at a pushed commit
+git tag -a win-vX.Y.Z -m "Ghoztty for Windows vX.Y.Z" users/dzearing/windows-amd64
+git push origin win-vX.Y.Z
+```
+
+A GitHub workflow runs from the tree of the ref that triggered it, and `main` has no Windows frontend at all — no `src/apprt/win32`, no `dist/windows-installer`, and an apprt enum of gtk/none/embedded, so `-Dapp-runtime=win32` is not a valid option there. A `vX.Y.Z` tag cut from main therefore cannot build a Windows terminal no matter which branch the workflow file sits on. `release-windows.yml` triggers on **both** `v*` and `win-v*` for exactly that reason: today the `win-v` tag is what fires it, and at merge-back the `vX.Y.Z` tag starts firing it on its own with nothing to rewire. Between now and then, **a release that skips the second tag ships macOS only**, silently — which is how Windows came to be offered a build from 2026-07-19 while macOS shipped v1.31.0.
+
+Either trigger publishes `Ghoztty-X.Y.Z-x64.msi` + `Ghoztty-portable-X.Y.Z-x64.zip` to a `win-vX.Y.Z` release (`--latest=false`, so the Mac latest/Sparkle flow is untouched). The separate release tag is a contract with shipped binaries: installed Windows builds find updates by scanning the releases list for the newest `win-v` tag (`src/apprt/win32/update_check.zig`).
 
 They are separate workflows so a Windows failure cannot interrupt the signing/notarization pipeline. Both artifacts are defined by `dist/windows-installer/build-release-artifacts.sh`, which the on-box path (`scripts/publish-windows-release.ps1`) runs too, so a hand publish and CI cannot drift.
 
@@ -131,10 +140,12 @@ Note: this step is independent of the macOS release — if the SSH upload fails,
 Watch BOTH release workflows — the release is not out until each has published its own artifacts:
 ```bash
 gh run list --repo dzearing/ghoztty --workflow release.yml --limit 1
-gh run list --repo dzearing/ghoztty --workflow release-windows.yml --limit 1
+gh run list --repo dzearing/ghoztty --branch win-vX.Y.Z --limit 5
 ```
 
-Monitor them until completion. If one fails, check logs with `gh run view <id> --repo dzearing/ghoztty --log-failed` and fix the issue. They are independent: a Windows failure leaves the DMG release valid, and re-running `release-windows.yml` (`gh workflow run release-windows.yml -f version=X.Y.Z -f publish=true`) republishes just the Windows half. The on-box fallback, from a Windows machine at the tagged commit, is `scripts\publish-windows-release.ps1` (it defaults `-Version` to the newest `vX.Y.Z` tag).
+The Windows run is listed by its **tag**, not by `--workflow release-windows.yml`: that flag resolves a workflow by filename against the **default branch**, and this one is not on main yet, so it answers `HTTP 404: workflow release-windows.yml not found on the default branch` even while a run of it is in progress. That 404 is not evidence of a missing run — check the tag.
+
+Monitor them until completion. If one fails, check logs with `gh run view <id> --repo dzearing/ghoztty --log-failed` and fix the issue. They are independent: a Windows failure leaves the DMG release valid, and re-running the Windows half means moving the tag (`git tag -f win-vX.Y.Z <fixed-sha> && git push -f origin win-vX.Y.Z`) — `gh workflow run` needs the workflow on the default branch, so it is unavailable for the same reason the `--workflow` lookup is. The on-box fallback, from a Windows machine at the tagged commit, is `scripts\publish-windows-release.ps1` (it defaults `-Version` to the newest `vX.Y.Z` tag).
 
 ### Step 6: Publish Release
 
