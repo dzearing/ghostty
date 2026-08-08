@@ -48,7 +48,7 @@ const CACHE = path.join(REPO, 'temp', 'task-dashboard-history.json');
 
 // Bump when a cached point gains or changes a field, so an old cache is
 // rebuilt instead of silently feeding half-populated activity items.
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 // A gap longer than this between tracker commits is idle time, not work. The
 // loop stalled for six days once; reporting that as a six-day "duration" would
@@ -500,9 +500,12 @@ function statusesFromIndex(sha) {
 function readCache() {
   try {
     const c = JSON.parse(fs.readFileSync(CACHE, 'utf8'));
-    if (c.version === CACHE_VERSION && Array.isArray(c.points) && c.last && typeof c.last === 'object') return c;
+    if (c.version === CACHE_VERSION && Array.isArray(c.points) && c.last && typeof c.last === 'object') {
+      if (!c.since || typeof c.since !== 'object') c.since = {};
+      return c;
+    }
   } catch {}
-  return { version: CACHE_VERSION, points: [], last: {} };
+  return { version: CACHE_VERSION, points: [], last: {}, since: {} };
 }
 
 function writeCache(cache) {
@@ -525,9 +528,12 @@ function buildHistory() {
   // A rebase makes cached points meaningless. Require them to still be a
   // prefix of the log; otherwise start over.
   const stale = cache.points.some((p, i) => !commits[i] || commits[i].sha !== p.sha);
-  if (stale) cache = { version: CACHE_VERSION, points: [], last: {} };
+  if (stale) cache = { version: CACHE_VERSION, points: [], last: {}, since: {} };
 
   let prev = new Map(Object.entries(cache.last));
+  // When each task's CURRENT bucket began (commit timestamp of the last
+  // transition) — what "blocked for 3d" / "in flight 2h" is measured from.
+  const since = { ...cache.since };
   let added = 0;
   const todo = commits.length - cache.points.length;
   if (todo > 20) warn('building history from ' + todo + ' commits (cached after this run)…');
@@ -549,6 +555,9 @@ function buildHistory() {
         if (!prev.has(id)) filed.push(id);
       }
     }
+    for (const [id, b] of cur) {
+      if (prev.get(id) !== b) since[id] = c.ts;
+    }
     cache.points.push({
       sha: c.sha, ts: c.ts, subject: c.subject, body: c.body,
       ...tally(cur.values()), newlyDone, filed,
@@ -558,8 +567,10 @@ function buildHistory() {
   }
   if (added) {
     cache.last = Object.fromEntries(prev);
+    cache.since = since;
     writeCache(cache);
   }
+  cache.since = since;
   return cache;
 }
 
@@ -1021,7 +1032,15 @@ function buildPayload() {
     series,
     daily,
     seats: [...seats.values()].sort((a, b) => b.total - a.total),
-    tasks: tasks.map((t) => ({ ...t, completedAt: completedAt[t.id] || null })),
+    tasks: tasks.map((t) => ({
+      ...t,
+      completedAt: completedAt[t.id] || null,
+      // When the task entered its current bucket. If the on-disk status has
+      // not been committed yet, history knows an older state — report "now"
+      // rather than the previous transition's stamp, which would inflate a
+      // fresh block into days.
+      statusSince: history.last[t.id] === t.bucket ? (history.since[t.id] || null) : now,
+    })),
   };
 }
 

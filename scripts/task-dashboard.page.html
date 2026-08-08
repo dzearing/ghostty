@@ -967,6 +967,8 @@ function inflightRow(t) {
     h('div', { class: 'if-head' }, [
       h('span', { class: 'dec-id', text: t.id }),
       h('span', { class: 'pill in_progress' }, [h('i'), 'In progress']),
+      t.statusSince ? h('span', { class: 'chip', title: 'Since ' + fDate(t.statusSince) + ' ' + fTime(t.statusSince),
+        text: 'in flight ' + fDur(Date.now() - t.statusSince) }) : null,
       t.stale ? h('span', { class: 'chip warn', text: 'stale — untouched ' + fDur(t.staleMs) } ) : null
     ].concat(tagChips(t.tags))),
     h('div', {
@@ -1015,7 +1017,9 @@ function blockedCard(t) {
     h('div', { class: 'dec-top' }, [
       h('span', { class: 'dec-id', text: t.id }),
       h('span', { class: 'dec-title', text: t.title }),
-      h('span', { class: 'pill blocked' }, [h('i'), 'Blocked'])
+      h('span', { class: 'pill blocked' }, [h('i'), 'Blocked']),
+      t.statusSince ? h('span', { class: 'chip warn', title: 'Since ' + fDate(t.statusSince) + ' ' + fTime(t.statusSince),
+        text: 'blocked ' + fDur(Date.now() - t.statusSince) }) : null
     ])
   ];
   if (t.reason) kids.push(h('div', { class: 'dec-assumed' }, [h('b', { text: 'Why: ' }), t.reason]));
@@ -1557,12 +1561,25 @@ function dateCell(ts, cls) {
    seconds is megabytes on the wire for content nobody is looking at. */
 function openTask(t) {
   var body = h('div', { class: 'td-body', text: 'Loading…' });
+  // How long the task has been ALIVE — created to finished for closed tasks,
+  // created to a live-ticking "now" for open ones (user, 2026-08-07).
+  var alivePill = h('span', { class: 'chip', title: t.createdAt ? 'Created ' + fDate(t.createdAt) + ' ' + fTime(t.createdAt) : '' });
+  var closedEnd = (t.bucket === 'done' || t.bucket === 'skipped') ? (t.completedAt || t.modifiedAt) : null;
+  var tickAlive = function () {
+    if (!t.createdAt) { alivePill.textContent = ''; return; }
+    alivePill.textContent = closedEnd
+      ? 'lived ' + fDur(Math.max(closedEnd - t.createdAt, 0))
+      : 'alive ' + fDur(Math.max(Date.now() - t.createdAt, 0));
+  };
+  tickAlive();
+  var aliveTimer = closedEnd ? null : setInterval(tickAlive, 30000);
   var dlg = h('dialog', { class: 'taskdlg' }, [
     h('header', null, [
       h('div', { class: 'td-head' }, [
         h('span', { class: 'pri ' + (t.priority || 'none'), text: t.priority || '--' }),
         h('span', { class: 'pill ' + t.bucket }, [h('i'), STATUS_LABEL[t.bucket]]),
-        h('code', { class: 'td-id', text: t.id })
+        h('code', { class: 'td-id', text: t.id }),
+        alivePill
       ].concat(tagChips(t.tags))),
       h('button', { class: 'td-x', 'aria-label': 'Close', text: '×', onclick: function () { dlg.close(); } })
     ]),
@@ -1584,7 +1601,7 @@ function openTask(t) {
   // Clicking the backdrop (i.e. the dialog element itself, outside its
   // content box) closes — the standard <dialog> idiom.
   dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
-  dlg.addEventListener('close', function () { dlg.remove(); });
+  dlg.addEventListener('close', function () { if (aliveTimer) clearInterval(aliveTimer); dlg.remove(); });
   dlg.showModal();
 
   fetch('/api/task?id=' + encodeURIComponent(t.id))
@@ -1632,7 +1649,12 @@ function linkifyTaskIds(root, jump) {
   var nodes = [];
   while (walker.nextNode()) nodes.push(walker.currentNode);
   nodes.forEach(function (n) {
-    if (n.parentNode && (n.parentNode.tagName === 'A' || n.parentNode.tagName === 'CODE')) return;
+    var p = n.parentNode;
+    if (!p) return;
+    // Never inside an existing link, code, a button, or a chip that already
+    // navigates — a nested link would double-fire or restyle the control.
+    if (p.tagName === 'A' || p.tagName === 'CODE' || p.tagName === 'BUTTON' ||
+        p.tagName === 'OPTION' || (p.closest && p.closest('.chip, .tid-link'))) return;
     var re = /\bT\d+[a-z]?\d*\b/g;
     var str = n.nodeValue, m, last = 0, frag = null;
     while ((m = re.exec(str))) {
@@ -1641,8 +1663,10 @@ function linkifyTaskIds(root, jump) {
       if (!frag) frag = document.createDocumentFragment();
       frag.appendChild(document.createTextNode(str.slice(last, m.index)));
       frag.appendChild(h('a', {
-        href: '#', class: 'tid-link', text: m[0],
-        onclick: (function (id) { return function (e) { e.preventDefault(); jump(id); }; })(m[0])
+        href: '#', class: 'tid-link', text: m[0], title: t.title,
+        // stopPropagation: many hosts (task-table rows, activity cards) have
+        // their OWN click handler; the id link must win, not fire both.
+        onclick: (function (id) { return function (e) { e.preventDefault(); e.stopPropagation(); jump(id); }; })(m[0])
       }));
       last = m.index + m[0].length;
     }
@@ -1650,6 +1674,16 @@ function linkifyTaskIds(root, jump) {
       frag.appendChild(document.createTextNode(str.slice(last)));
       n.parentNode.replaceChild(frag, n);
     }
+  });
+}
+
+/** Every task-id mention anywhere in a rendered view opens that task's
+    dialog (user, 2026-08-07) — the loop card, blocked lists, digest prose,
+    table titles, all of it. */
+function linkifyView(root) {
+  linkifyTaskIds(root, function (id) {
+    var t = taskById(id);
+    if (t) openTask(t);
   });
 }
 function metaBit(label, value) {
@@ -1734,6 +1768,7 @@ function renderTasks() {
   if (c) c.textContent = rows.length === d.tasks.length
     ? ' (' + d.tasks.length + ' total)'
     : ' (' + rows.length + ' of ' + d.tasks.length + ' total)';
+  linkifyView(body);
 }
 
 /* ===========================================================================
@@ -1788,6 +1823,7 @@ function renderView() {
   nodes.forEach(function (n) { host.appendChild(n); });
   if (state.view === 'tasks') renderTasks();
   if (state.view === 'data') drawAll();
+  linkifyView(host);
   if (prev) playFlip(host, prev);
   lastRenderedView = state.view;
 }
