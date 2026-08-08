@@ -442,6 +442,46 @@ processes after a reboot.
   (`snapshot_at_offset` is an acknowledged stub, `session.zig:27-31`) for
   instant attach without replay cost and eviction-invisible scrollback.
 
+#### 5.4.1 Which panes get the delta attach, and which take the replay (T413)
+
+There are two re-attach paths and it is deliberate that not every pane gets the
+faster one.
+
+| Path | When | Attach |
+|---|---|---|
+| **WP-D3 delta** (T109) | the pane is restored from the LOCAL `session-layout.json`, which carries a per-pane screen snapshot | `offset=N snapshot=M` — we paint our own repaint, the agent gap-fills `(N, S]` |
+| **Replay** | the pane is restored from an AGENT-held layout blob: "Restore All" (T335/T336), or a single session resumed from the chooser's roster | `offset=0 snapshot=0` — the agent replays its ring, then appends its own grid snapshot |
+
+The blob deliberately carries no snapshot (`layout_blobs.serializeWindow`
+strips it): a blob is a topology mirror re-pushed on every layout mutation, and
+`blobHash` skipping unchanged windows is what keeps that mirror cheap. A
+per-pane VT dump would change on every capture, so every window would re-upload
+forever, and the agent would hold two orders of magnitude more per window.
+
+**That is not the pre-T109 loss it looks like.** Two later changes cover the
+replay path: T106 reflows the client grid to the agent-reported capture geometry
+for the replay and back to the live grid once it is applied, and FIX 2 has the
+agent append a self-contained VT repaint of the visible screen **generated at
+the geometry the attaching client just asked for** (`server.zig` `want_snapshot`
+→ `session.zig gridSnapshotAlloc`). A blob-sourced pane therefore comes up with
+an exact visible screen. What remains is the replay's wire cost (up to the ring
+size per pane, over a relay for the cross-machine case) and imperfect scrollback
+for ring segments drawn at older geometries.
+
+**And a stored snapshot could not close that.** A blob's snapshot would be
+whatever viewer last pushed it, at that viewer's geometry and offset — stale by
+construction for a machine still in use, and a stale offset makes the agent emit
+its "bytes of scrollback lost" marker for bytes it still holds. The agent's own
+snapshot is fresh, correctly sized, and free. The single thing it lacks is
+scrollback, because its emulator runs `max_scrollback = 0` (`grid_snapshot.zig`).
+
+So the remaining gap belongs to the **agent**: giving that emulator bounded
+scrollback lets the raw ring replay be skipped outright and fixes every
+snapshot-less attach at once — including a cross-machine resume of a single
+session, which has no local manifest entry either and which no blob change could
+ever have helped. Tracked separately; T413 is the decision not to solve it in
+the topology mirror.
+
 ### 5.5 Portability / moving windows
 
 - The Mac enrolls as a relay device (already supported; this Mac has a device

@@ -173,6 +173,53 @@ function Get-WindowShapes {
     return @($out)
 }
 
+# Every leaf pane id under $node, in tree order (T413). `+list` auto-registers
+# what it discovers and every --target/--name accepts a pane id directly, so
+# these are usable as `+read` targets with no extra naming step.
+# The pane id hangs off the leaf's `terminal` object, NOT off the leaf itself
+# (`{type:leaf, terminal:{id,...}}`) - reading `$node.id` yields empty strings,
+# and `+read --name=` then answers nothing for every pane, which reads exactly
+# like a restore that lost the content.
+function Get-LeafIds($node) {
+    if ($null -eq $node) { return @() }
+    if ($node.type -eq 'leaf') {
+        if ($null -ne $node.terminal) { return @($node.terminal.id) }
+        if ($null -ne $node.viewer) { return @($node.viewer.id) }
+        return @()
+    }
+    if ($node.type -eq 'split') { return @(Get-LeafIds $node.left) + @(Get-LeafIds $node.right) }
+    return @()
+}
+
+# Poll $paneIds for $mark, whitespace-insensitively - the pane is a third of a
+# 100-column window, so a marker sitting near the right edge comes back wrapped
+# across two rows and a naive match misses content that is plainly there.
+function Wait-PaneText($paneIds, $mark, $timeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $needle = ($mark -replace '\s', '')
+    while ((Get-Date) -lt $deadline) {
+        foreach ($id in @($paneIds)) {
+            $text = (& $Exe +read --name=$id --lines=200 2>$null | Out-String)
+            if ((($text -replace '\s', '')) -match [regex]::Escape($needle)) { return $true }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+# The pane ids of the window whose ipc name is $name, in the app the CLI reaches.
+function Get-WindowPaneIds($name) {
+    $tree = Get-ListTree
+    if ($null -eq $tree) { return @() }
+    foreach ($w in @($tree.windows)) {
+        if ($w.target -ne $name) { continue }
+        $ids = @()
+        foreach ($t in @($w.tabs)) { $ids += @(Get-LeafIds $t.splits) }
+        return @($ids)
+    }
+    return @()
+}
+
 function Layouts-Store {
     $path = Join-Path $agentDir 'layouts.json'
     if (-not (Test-Path $path)) { return @() }
@@ -283,6 +330,11 @@ function Focus-RestoreAll($chooser, $filter, $btn) {
 
 $TOKEN = 'faketoken-t336'
 $DEV = 'dev-remote'
+# T413: echoed into a fixture pane before the machine is taken away, and looked
+# for again after the cross-machine rebuild. Space-free on purpose - send-keys
+# concatenates adjacent text, and a marker with spaces in it cannot be matched
+# back reliably once the pane has wrapped it (the T109 script's lesson).
+$T413MARK = "T413RINGREPLAY$($PID)Z"
 $devicesJson = '{"devices":[{"id":"' + $DEV + '","name":"E2E-Remote","hostname":"remote.local","online":true}]}'
 
 $errlogA = Join-Path $env:TEMP "ghoztty-t336-stderrA-$PID.log"
@@ -313,6 +365,15 @@ try {
     & $Exe +split --target=t336-multi --direction=right 2>$null | Out-Null
     Start-Sleep -Seconds 2
     & $Exe +split --target=t336-multi --direction=down 2>$null | Out-Null
+    # T413: a line of the machine's OWN output, so section 6 can ask whether the
+    # rebuilt pane came back with its content and not merely with its shape. The
+    # read-back HERE is the positive control: without it, a miss after the
+    # rebuild is equally consistent with the marker never having been typed.
+    Start-Sleep -Seconds 2
+    & $Exe +send-keys --target=t336-multi "echo $T413MARK" Enter 2>$null | Out-Null
+    $fixturePanes = @(Get-WindowPaneIds 't336-multi')
+    Assert (Wait-PaneText $fixturePanes $T413MARK) `
+        "the fixture pane really printed the marker before the machine went away ($($fixturePanes.Count) pane(s))"
     $alive = @(Wait-AliveCount 4)
     Assert ($alive.Count -ge 4) "the machine has four live sessions ($($alive.Count))"
 
@@ -486,6 +547,34 @@ try {
     $attached = @(Get-Sessions | Where-Object { $multiIds -contains $_.id -and $_.attached }).Count
     Assert ($attached -eq 3) `
         "G the agent reports all three original sessions ATTACHED ($attached of 3)"
+
+    # --- J: WHICH re-attach a blob-sourced pane takes, and what it costs ----
+    # T413 resolved this deliberately: layout blobs carry no WP-D3 snapshot, so
+    # every pane rebuilt from one attaches at offset 0 and takes the agent's ring
+    # replay. Asserting the log line pins the decision (a future change that put
+    # snapshots back into the topology mirror - and re-uploaded every window on
+    # every layout mutation - would flip these numbers and fail here), and the
+    # marker read-back is the other half: the replay path must still deliver the
+    # pane's CONTENT, which is what T106's capture-geometry reflow plus the
+    # agent's own grid snapshot are there to guarantee.
+    $deltaAttaches = 0
+    $replayAttaches = 0
+    foreach ($sid in $multiIds) {
+        $line = Wait-LogLine $errlogB "attach: session=$sid offset=(\d+) snapshot=(\d+)" 5000
+        if ($null -eq $line) { continue }
+        if ($line -match 'offset=(\d+) snapshot=(\d+)') {
+            if ([int64]$Matches[1] -gt 0 -or [int64]$Matches[2] -gt 0) { $deltaAttaches++ }
+            else { $replayAttaches++ }
+        }
+    }
+    Assert ($replayAttaches -eq 3) `
+        "J every blob-sourced pane attached at offset=0 snapshot=0, the documented replay path ($replayAttaches of 3)"
+    Assert ($deltaAttaches -eq 0) `
+        "and none claimed a WP-D3 delta the blob cannot carry ($deltaAttaches)"
+
+    $paneIds = @(Get-WindowPaneIds 't336-multi')
+    Assert (Wait-PaneText $paneIds $T413MARK) `
+        "J the replay still brought the machine's own output back ('$T413MARK' readable in $($paneIds.Count) rebuilt pane(s))"
 
     # --- 7. the double-attach guard, across the relay -----------------------
     Write-Host ''

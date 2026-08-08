@@ -48,9 +48,40 @@ const session_layout = @import("session_layout.zig");
 /// mutation, and `blobHash` skipping the unchanged ones is what keeps that
 /// mirror cheap. A per-pane VT screen dump would both multiply a blob's size by
 /// a hundred and change its bytes on every single push, so every window would
-/// re-upload forever. Restore-from-blob therefore uses the pre-WP-D3 full-ring
-/// replay; the local manifest — which is not pushed anywhere — carries the
-/// snapshots for the same-machine re-attach they were built for.
+/// re-upload forever. Restore-from-blob therefore attaches at offset 0 and takes
+/// the ring replay; the local manifest — which is not pushed anywhere — carries
+/// the snapshots for the same-machine re-attach they were built for.
+///
+/// **T413 settled this deliberately, not by omission.** The asymmetry looks like
+/// a gap ("a blob-sourced pane takes the lossy pre-T109 path"), and it is worth
+/// writing down why putting a snapshot back is the wrong shape:
+///
+///   * **The pane is not lossy on screen any more.** Two later changes already
+///     cover what WP-D3 was built to cover on this path. T106 reflows the client
+///     grid to the agent-reported CAPTURE geometry for the replay and back to the
+///     live grid when it is fully applied (`termio/Remote.zig`, `attach_offset ==
+///     0` branch), and FIX 2 has the agent append its OWN grid snapshot after the
+///     gap-fill — a self-contained VT repaint of the visible screen, generated
+///     at the geometry the attaching client just asked for (`agent/server.zig`
+///     `want_snapshot`; `agent/session.zig gridSnapshotAlloc`). What is left is
+///     the replay's wire cost and imperfect scrollback for ring segments drawn at
+///     older geometries, not a blank or smeared pane.
+///   * **A stored snapshot cannot beat the agent's.** Ours would be whatever
+///     viewer last pushed the blob, at THAT viewer's geometry, at whatever offset
+///     it last captured — stale by construction for a machine still in use, and
+///     a stale offset makes the agent emit its "bytes of scrollback lost" marker
+///     for bytes it still holds. The agent's is fresh, correctly sized and costs
+///     no storage. The only thing it lacks is scrollback, because its emulator
+///     runs `max_scrollback = 0`.
+///   * **So the remaining gap belongs in the agent**, which is filed as its own
+///     task rather than smuggled into the topology mirror. Giving that emulator
+///     bounded scrollback lets the raw ring replay be skipped outright, and fixes
+///     every snapshot-less attach — a cross-machine Resume-one of a single
+///     session has no local manifest entry either, and no blob change could ever
+///     have helped it.
+///
+/// The strip is therefore load-bearing in both directions, and
+/// `decodeLayouts` is asserted to hand back leaves with no WP-D3 pair.
 pub fn serializeWindow(alloc: Allocator, win: session_layout.Window) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -240,6 +271,37 @@ test "T109: serializeWindow strips screen snapshots but keeps everything else" {
     const blob2 = try serializeWindow(alloc, .{ .id = "win-0", .active_tab = 0, .tabs = &quiet_tabs });
     defer alloc.free(blob2);
     try testing.expectEqual(blobHash(blob), blobHash(blob2));
+}
+
+test "T413: a blob-sourced leaf carries no WP-D3 pair, so restore attaches at offset 0" {
+    // The out-side strip is asserted above on the blob's BYTES; this closes the
+    // loop on the IN side, which is what a restore actually reads. A leaf whose
+    // pair survived here would have `restoreAttachOverride` paint one viewer's
+    // screen into another's pane and attach at that viewer's stale offset — the
+    // failure mode the strip exists to make unreachable.
+    const alloc = testing.allocator;
+    const nodes = [_]session_layout.Node{.{ .leaf = .{
+        .session_id = "aaaa",
+        .pane_id = "pane-a",
+        .screen_snapshot = "SU5WSVNJQkxF",
+        .screen_snapshot_offset = 9001,
+    } }};
+    const tabs = [_]session_layout.Tab{.{ .nodes = &nodes, .active = true }};
+    const blob = try serializeWindow(alloc, .{ .id = "win-0", .tabs = &tabs });
+    defer alloc.free(blob);
+
+    const payload = try layoutsReply(alloc, &.{.{ .key = "win-0", .blob = blob }});
+    defer alloc.free(payload);
+    const decoded = try decodeLayouts(alloc, payload);
+    defer decoded.deinit();
+
+    try testing.expectEqual(@as(usize, 1), decoded.windows.len);
+    const leaf = decoded.windows[0].tabs[0].nodes[0].leaf.?;
+    // The session is still there to attach to — only the snapshot is gone.
+    try testing.expectEqualStrings("aaaa", leaf.session_id.?);
+    try testing.expectEqualStrings("pane-a", leaf.pane_id.?);
+    try testing.expect(leaf.screen_snapshot == null);
+    try testing.expect(leaf.screen_snapshot_offset == null);
 }
 
 test "serializeWindow round-trips through the manifest parser" {
