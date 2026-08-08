@@ -449,7 +449,18 @@ pub fn adopt(self: *SessionRoster, res: *Result) bool {
             @tagName(self.state),
         });
     }
-    self.scroll = 0;
+    // The scroll offset is NOT reset here (T333). An adopt is a refetch of the
+    // machine we are already looking at — `refresh_in_place` exists precisely so
+    // a re-selection does not flash the region back to Loading — and sending the
+    // region back to the top under a parked keyboard cursor (T320) leaves the
+    // highlighted row off screen until the next keystroke drags it back. A REAL
+    // machine change goes through `clear()`, which still owns the reset along
+    // with the rows, the cursor and the optimistic kill hides.
+    //
+    // The rows can SHRINK under the offset, so the caller re-clamps against the
+    // new content the moment it knows the region (`clampScrollTo`) — the same
+    // clamp-at-the-point-of-use rule `cursorIndex` follows, and for the same
+    // reason: this function has no geometry to clamp against.
     return true;
 }
 
@@ -1086,6 +1097,19 @@ pub fn scrollToCursor(
     return self.scroll != before;
 }
 
+/// Re-clamp the offset against the rows as they are NOW. Called after an adopt
+/// (T333), which keeps the offset the user scrolled to but can replace the rows
+/// with a shorter set — and an offset past the end of the new content would
+/// paint the region empty. Returns true when the offset moved.
+pub fn clampScrollTo(
+    self: *SessionRoster,
+    rows: []const VisibleRow,
+    region: chooser_layout.Rect,
+    scale: f32,
+) bool {
+    return self.scrollBy(0, rows, region, scale);
+}
+
 /// Apply a wheel notch. Returns true when the offset actually changed, so the
 /// caller only repaints when there is something new to see.
 pub fn scrollBy(
@@ -1102,4 +1126,131 @@ pub fn scrollBy(
         region.height(),
     );
     return self.scroll != before;
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// `n` alive sessions with agent-owned strings, shaped exactly like a landed
+/// `LIST_SESSIONS` so `adopt` can take them and `deinit` can free them.
+fn testSessions(alloc: Allocator, n: usize) !remote_connection.OwnedSessions {
+    const sessions = try alloc.alloc(remote_connection.OwnedSession, n);
+    for (sessions, 0..) |*s, i| {
+        s.* = .{
+            .id = try std.fmt.allocPrint(alloc, "session-{d}", .{i}),
+            .alive = true,
+            .exit_code = null,
+            .attached = false,
+            .activity = try alloc.dupe(u8, "idle"),
+            .pid = @intCast(1000 + i),
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 0,
+            .last_activity = 0,
+            .pinned = true,
+        };
+    }
+    return .{ .sessions = sessions, .alloc = alloc };
+}
+
+fn testRows(buf: []VisibleRow) []const VisibleRow {
+    for (buf) |*r| r.* = .{ .session = .{ .id = "s", .alive = true } };
+    return buf;
+}
+
+test "adopt keeps the offset a refetch was parked at (T333)" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .local;
+    roster.serial = 7;
+    roster.scroll = 140;
+    roster.cursor = 4;
+
+    var res: Result = .{
+        .alloc = alloc,
+        .chooser_id = 1,
+        .serial = 7,
+        .roster = try testSessions(alloc, 6),
+    };
+    defer if (res.roster) |*r| r.deinit();
+
+    try testing.expect(roster.adopt(&res));
+    try testing.expectEqual(@as(usize, 6), roster.owned.?.sessions.len);
+    // The whole point: the region does not jump back to the top under a parked
+    // keyboard cursor just because the same machine was refetched.
+    try testing.expectEqual(@as(i32, 140), roster.scroll);
+    try testing.expectEqual(@as(i32, 4), roster.cursor);
+}
+
+test "a stale reply changes nothing, offset included" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .local;
+    roster.serial = 7;
+    roster.scroll = 140;
+
+    var res: Result = .{
+        .alloc = alloc,
+        .chooser_id = 1,
+        .serial = 6,
+        .roster = try testSessions(alloc, 2),
+    };
+    defer if (res.roster) |*r| r.deinit();
+
+    try testing.expect(!roster.adopt(&res));
+    try testing.expectEqual(@as(i32, 140), roster.scroll);
+    try testing.expect(roster.owned == null);
+}
+
+test "a machine change still resets the offset" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.scroll = 140;
+    roster.cursor = 4;
+    roster.hover_kill = 2;
+
+    roster.clear();
+    try testing.expectEqual(@as(i32, 0), roster.scroll);
+    try testing.expectEqual(chooser_sessions.no_cursor, roster.cursor);
+    try testing.expectEqual(@as(i32, -1), roster.hover_kill);
+}
+
+test "clampScrollTo pulls a parked offset back into a roster that shrank" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+
+    var buf: [8]VisibleRow = undefined;
+    const rows = testRows(&buf);
+    const scale: f32 = 1.0;
+    const row_h = chooser_sessions.rowHeight(chooser_sessions.metrics(scale), 0);
+    const region: chooser_layout.Rect = .{
+        .left = 0,
+        .top = 0,
+        .right = 400,
+        .bottom = row_h * 2,
+    };
+
+    // Parked at the very bottom of eight rows: already legal, so nothing moves.
+    roster.scroll = contentHeight(rows, scale) - region.height();
+    const parked = roster.scroll;
+    try testing.expect(parked > 0);
+    try testing.expect(!roster.clampScrollTo(rows, region, scale));
+    try testing.expectEqual(parked, roster.scroll);
+
+    // The refetch came back with three: the same offset is now past the end,
+    // and an unclamped one would paint the region empty.
+    try testing.expect(roster.clampScrollTo(rows[0..3], region, scale));
+    try testing.expectEqual(
+        chooser_sessions.clampScroll(parked, contentHeight(rows[0..3], scale), region.height()),
+        roster.scroll,
+    );
+    try testing.expect(roster.scroll < parked);
 }

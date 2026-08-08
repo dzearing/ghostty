@@ -1462,7 +1462,13 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
     for (app.windows.items) |win| {
         const chooser = win.machine_chooser orelse continue;
         if (chooser.id != res.chooser_id) continue;
-        if (chooser.roster.adopt(res)) chooser.refreshSessions();
+        if (chooser.roster.adopt(res)) {
+            // The offset survives the refetch (T333); the ROWS may not, so it is
+            // re-clamped here, where the region is known, before anything paints
+            // against it.
+            chooser.clampRosterScroll();
+            chooser.refreshSessions();
+        }
         return;
     }
     log.debug("chooser roster: reply landed after its chooser closed", .{});
@@ -2474,6 +2480,14 @@ fn sessionView(
     if (self.roster.target == .none) return null;
     const l = layout(self.window.scale, self.hint_lines);
     return .{ .region = l.sessions, .rows = self.roster.visible(self.window.app, rows) };
+}
+
+/// Hold the roster's scroll offset inside the content it now has (T333). A
+/// no-op when the selected row has no roster, or when the offset already fits.
+fn clampRosterScroll(self: *MachineChooser) void {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return;
+    _ = self.roster.clampScrollTo(view.rows, view.region, self.window.scale);
 }
 
 fn onSessionHover(self: *MachineChooser, x: i32, y: i32) void {

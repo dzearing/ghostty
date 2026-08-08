@@ -11891,3 +11891,60 @@ Filed: **T619** — the machine chooser's rows still carry no metrics, which is
 what Mac's `MachineMetricsProbe` was originally written for; the mechanism now
 exists to point at it. **D39** — the suspend behavior above, for the user to
 overturn if they would rather keep the sockets and pay for instant numbers.
+
+## 2026-08-08 — T333: the chooser's session list stays where you scrolled it
+
+The machine chooser lists a machine's running sessions and lets you walk them
+with the arrow keys. When there are more than fit, the list scrolls to follow
+the cursor. Every time the app re-checked that list — which it does while you
+are looking at it — the region snapped back to the top and left your
+highlighted row off screen; you pressed an arrow key to go find it again. It
+now stays exactly where you left it.
+
+`SessionRoster.adopt` ended with `scroll = 0`. That was harmless while the
+roster was read-only: the only thing that refetched was a machine change, which
+resets everything anyway. T319 then added `refresh_in_place` — a refetch of the
+machine you are already on, which deliberately touches nothing else so a
+re-selection does not flash the region back to Loading — and T320 added a cursor
+that can be parked several rows down. Those three together are the defect: the
+one line that used to be redundant became the one line that undid the other two.
+
+So `adopt` no longer touches the offset, and `clear()` keeps owning the reset
+for a real machine change, where it belongs alongside the rows, the cursor and
+the optimistic kill hides. The rows CAN shrink under a kept offset, and `adopt`
+has no geometry to clamp against — it is handed a reply, not a region — so the
+clamp happens at the point of use, which is the rule `cursorIndex` already
+follows for exactly the same reason. `SessionRoster.clampScrollTo` re-clamps
+against the rows as they are now, and `MachineChooser.onSessions` calls it
+between the adopt and the repaint, where the region IS known.
+
+The regression test needed a new script,
+`test/win32/chooser-roster-refetch.ps1`, and the reason is worth recording: the
+plan said to extend `chooser-resume.ps1`, and that script has stopped running.
+Its fixture builds an ORPHANED session — panes under the agent, kill the app,
+delete the layout manifest, relaunch — and launch-time restore has since learned
+a SECOND source (T194: the agent's own layout-blob store, read live over
+`GET_LAYOUTS`), so the relaunched app rebuilds the window from the agent and
+re-attaches both sessions. It exits at `SETUP FAIL: no orphaned live session`
+before section 1 finishes, and has done since some point after 2026-08-02, when
+the log records it ALL PASS (21). Deleting `layouts.json` does not help: the
+agent is kept alive across that kill by design and answers from memory. Filed as
+**T620**; this property needs no orphan, so it did not wait on it.
+
+The new script's oracle is the accent wash on the cursored card, sampled at the
+BOTTOM of the region — where `scrollToCursor` puts the last row, and where a
+zero offset cannot leave it. The refetch is forced through the chooser's own
+path (a filter edit re-selects the same row) and proved independently by the
+app's "chooser roster: loaded" counter, so "still accented" can never pass
+because nothing happened.
+
+Floor green — none PASS (289s), win32 PASS (326s), agent PASS (327s), P1–P3 ALL
+PASS. New: `chooser-roster-refetch.ps1` ALL PASS (8) twice. Its negative control
+is real and was run twice by accident as well as on purpose: with `scroll = 0`
+put back in `adopt` and the app rebuilt, the last assertion reports `B +0` where
+the fixed build reports `B +26`. Four unit tests in `SessionRoster.zig` cover the
+kept offset, the stale reply, the machine change that still resets, and the
+clamp against a roster that shrank.
+
+Filed: **T620** — `chooser-resume.ps1` can no longer build its orphan fixture,
+so the chooser's whole resume flow is unwatched.
