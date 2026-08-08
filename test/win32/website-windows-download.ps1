@@ -13,8 +13,10 @@
 #   A  page shape: the Windows card sits beside the macOS card, its href is a
 #      real win-v<version> asset whose FILENAME carries the same version plus
 #      the arch, the portable ZIP alternative is offered, and the minimum-OS
-#      note is there. Also that the card reuses existing CSS classes rather
-#      than inventing its own (the design-system rule, applied to the site).
+#      note is there, and the unsigned/SmartScreen caveat warns the user
+#      before they download rather than after the scary dialog (T349). Also
+#      that the card and the caveat reuse existing CSS classes rather than
+#      inventing their own (the design-system rule, applied to the site).
 #   B  name agreement: the asset names in the rewrite script are the names the
 #      workflow publishes and the shared build script produces. Three writers,
 #      one convention -- the same check release-artifacts.ps1 makes.
@@ -123,6 +125,29 @@ Assert 'A8 win-version label agrees with the msi link' `
 # (src/apprt/win32 targets it; see windows-parity-details.md).
 Assert 'A9 minimum-OS note names the Windows floor' ($html -match 'Windows 10 1809\+')
 Assert 'A10 minimum-OS note names the architecture' ($html -match '64-bit')
+
+# The Windows artifacts are unsigned (no code-signing cert -- the macOS half
+# is signed and notarized, which the page says two lines up). A download that
+# trips "Windows protected your PC" with no warning on the page reads as
+# broken, and a user who backs out of that dialog never runs Ghoztty. The
+# portable ZIP's READ-ME-FIRST already says this (build-portable-zip.sh); the
+# page is where a user reads it BEFORE downloading. T349.
+$ssNote = [regex]::Match($html, '(?s)<p class="download-note" id="win-smartscreen-note">(.*?)</p>')
+Assert 'A15 the page carries the unsigned/SmartScreen caveat' $ssNote.Success
+if ($ssNote.Success) {
+    $ssText = $ssNote.Groups[1].Value
+    Assert 'A15b it names SmartScreen and the dialog wording' `
+        ($ssText -match 'SmartScreen' -and $ssText -match 'Windows protected your PC')
+    Assert 'A15c it says what to click' `
+        ($ssText -match 'More info' -and $ssText -match 'Run anyway')
+    # It must not claim the Windows build is signed -- the section header
+    # says "signed and notarized on macOS" and this line is the other half.
+    Assert 'A15d it says the build is not signed' ($ssText -match 'not code-signed|unsigned')
+}
+# Same design-system rule as A14: the caveat reuses .download-note rather
+# than introducing a class of its own.
+Assert 'A16 the caveat reuses the existing download-note class' `
+    ($html -match 'class="download-note" id="win-smartscreen-note"')
 
 # The Windows card must live in the SAME .download-cards container as the
 # macOS one -- "alongside the existing platform links", not a section of its

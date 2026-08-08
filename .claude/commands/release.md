@@ -177,12 +177,20 @@ Do NOT touch two things by hand:
 - The **Remote Agent** section — its version badge fetches the agent's `version.json` from the relay live, so it updates itself when Step 4 publishes.
 - The **Windows** download card and its `Windows vX.Y.Z` note line (`id="win-msi-link"`, `id="win-zip-link"`, `id="win-version"`) — `release-windows.yml` retargets those at the `win-vX.Y.Z` release it just published, in the same run, via `dist/website/update-windows-links.py` (T39). Editing them by hand is how they would come to advertise a Windows build that does not exist. If a release ran with `publish=false`, the site correctly still points at the previous `win-v` release.
 
-Also mirror the change into `relay/deploy/ghpages/index.html` on `main` so the in-repo copy does not drift from the live site (it has twice). `test/win32/website-windows-download.ps1` fails when it does.
-
 ```bash
 cd /tmp/ghoztty-gh-pages && git add index.html && git commit -m "Update website version to vX.Y.Z" && git push origin gh-pages
+```
+
+Then mirror the deployed page back into `relay/deploy/ghpages/index.html` so the in-repo copy does not drift from the live site. **Copy the whole file, do not re-apply the edit by hand** — `release-windows.yml` pushes its own commit to `gh-pages` in this same release (the Windows link rewrite), so the deployed page carries changes this step never made, and re-typing only the macOS edit reproduces exactly the drift this guards. Pull first for the same reason:
+
+```bash
+cd /tmp/ghoztty-gh-pages && git pull --rebase origin gh-pages
+cp /tmp/ghoztty-gh-pages/index.html <repo>/relay/deploy/ghpages/index.html
+# commit the mirror on the working branch, then:
 git worktree remove /tmp/ghoztty-gh-pages
 ```
+
+`test/win32/website-windows-download.ps1` (check F) fails when the mirror and the deployed page disagree. It has now drifted three times — 2026-08-07 was `v1.28.0` in the mirror against `v1.31.0` live — so run it before calling the release done.
 
 ### Step 8: Report
 

@@ -10926,3 +10926,45 @@ every key after it; it now uses `f5>f6` and names the trap.
 Filed: **T575** - an F10 keybind silently never fires here, and the menu it
 opens eats the keyboard afterwards; **T576** - Mac's pill has a popover
 explaining what a key table is, and ours has nothing to click.
+
+## 2026-08-07 - T349: the download page says why Windows will warn you
+
+Picked up as "the download page offers no Windows terminal build" and most
+of it was already there: T39 landed the Windows card, the portable-ZIP
+alternative, the minimum-OS note, the release-time link rewrite and an
+acceptance script. T39 also settled the fork this task left open - fetch the
+newest `win-v` release live from the GitHub API, or rewrite the links when a
+release publishes - and settled it the other way with a better reason than
+this task assumed: `win-v` releases are published `--latest=false` on
+purpose, so there is no stable "latest" URL to fetch at all. That stands.
+
+What was actually missing is the sentence a Windows visitor needs BEFORE
+they download. Neither Windows artifact is code-signed, so the first run
+raises SmartScreen's "Windows protected your PC" - and the natural response
+to that box is Cancel plus the conclusion that the download was broken. The
+portable ZIP's READ-ME-FIRST has said so since T38, but that file is only
+readable after the download. Now one more `.download-note` line sits under
+the Windows note, in the same dim centered treatment with no new CSS, naming
+the dialog verbatim and the two clicks past it. Deployed to gh-pages
+(`d7586718e`) and confirmed on the live page.
+
+The mirror had drifted a third time - `relay/deploy/ghpages/index.html` at
+macOS v1.28.0 against v1.31.0 live - so check F of
+`test/win32/website-windows-download.ps1` was already red before this task
+started. Synced, and Step 7 of the release command now spells the mirror out
+as a whole-file `cp` after a `git pull --rebase` instead of a prose aside.
+That is the actual cause of the recurrence: `release-windows.yml` pushes its
+own commit to gh-pages in the same release, so re-typing only the macOS edit
+by hand reproduces the drift by construction.
+
+The finding is bigger than the task. `release-windows.yml` exists only on
+this branch, not on `origin/main`, and tags are cut from main - so the
+automated Windows release T38 built **has never run once**. The newest
+Windows release is still the hand-published `win-v1.4.1` from 2026-07-19
+while macOS is at v1.31.0. Every link answers 200, which is exactly why it
+stayed invisible; they answer with a three-week-old build.
+
+Filed: **T577** (P0, M1, order 147.5) - get the Windows release publishing;
+**D32** - whether to cherry-pick the workflow onto main, hand-publish now,
+or wait for the merge-back, since the first option ships Windows users a
+build without this branch's parity work.
