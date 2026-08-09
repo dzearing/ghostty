@@ -12103,3 +12103,54 @@ Filed: **T624**, **T625** (the split), **T626** (the app-is-older direction stil
 tells the user nothing), **T627** (`seat: mac` — macOS has no skew path either),
 **T628** (a remote machine on an incompatible protocol still reads as merely
 unreachable).
+
+## 2026-08-08 — T188: Ghoztty answers CLI commands while it is still restoring your windows
+
+Launching Ghoztty used to open a hole in the CLI. The app is up and the pipe is
+bound, but every `ghoztty +…` issued while the session restore runs just sits
+there — a caller cannot tell that from a dead instance, which is how the upgrade
+script came to report "no running Ghoztty" about an app that was plainly on
+screen. Now the restore answers as it goes: a request lands during it and is
+served during it.
+
+The task prescribed the T48 pattern — post `restoreSessionLayout` into the
+message loop and run it from there — and reading `IpcServer` shows that cannot
+work. A listener thread accepts the connection, posts `WM_APP_IPC` to the
+message-only window and then BLOCKS on the request's `done` event; the request is
+served exactly when the GUI thread pumps, and a handler that owns the loop for
+ten seconds is the same blackout as a call that blocks before the loop starts.
+So the fix pumps instead of moving: `src/apprt/win32/gui_pump.zig` holds one
+process-wide hook the app installs beside its message-only window, and the
+blocking stretches of startup call it — `LocalAgent.findOrSpawn` around its dial
+and inside its spawn poll (where the worst case lives), and
+`restoreSessionLayout` around the connect, the layout pull, the roster probe and
+between windows. The hook drains ONLY `WM_APP_IPC`, the same targeted
+`PeekMessageW` `IpcServer.deinit` already relies on, so it never re-enters paint,
+focus or input — the restraint is the safety argument, since a nested general
+pump inside a WndProc stack is precisely the T48 deadlock. It is also a no-op off
+the installing thread, because worker-safe helpers call these paths too.
+Pumping made the agent resolve re-entrant, so `LocalAgent` gained a `resolving`
+guard: a request served from inside a find-or-spawn is answered "no connection"
+rather than being allowed to start a second agent and overwrite the shared one.
+That answer is truthful — at that instant there is no usable connection — and it
+is the same one the caller would have gotten a millisecond earlier. Decision
+**D42** records the deviation from the filed prescription.
+
+Evidence: new `test\win32\ipc-startup-latency.ps1` reads two numbers out of one
+poll loop — elapsed to the first `+list --json` that answers at all, and elapsed
+to the first that reports a pane — across a cold start, a healthy 5-pane restore,
+and an agent SUSPENDED across the relaunch (NtSuspendProcess, so it holds the
+single-instance guard and every dial burns its full handshake timeout). Before
+the fix those two numbers collapse onto each other; after it the gap between them
+is the interval that used to be a blackout. ALL PASS (17): the suspended-agent
+case answers at 1 302 ms while startup settles at 10 689 ms. The pre-fix control
+— `pump()` stubbed to return immediately, rebuilt — measures first answer
+10 658 ms == first window 10 658 ms and fails C3/C5, reproducing the 10 755 ms
+this task was filed on.
+
+Filed: **T629** (`seat: mac` — nobody has measured whether macOS has the same
+startup blackout), **T630** (one blocking agent handshake, ~1.2 s, is still
+unpumped — it is why the wedged-agent first answer is 1 331 ms and not 250 ms),
+**T631** (a `-Dtest-filter` run that matches NOTHING exits 0, so the cheap way
+to prove a new test runs reports green either way — this task had to fall back
+to the full lane).

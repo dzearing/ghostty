@@ -51,6 +51,7 @@ const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const host_defaults = @import("host_defaults.zig");
+const gui_pump = @import("gui_pump.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -492,6 +493,12 @@ pub fn init(
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+    // T188: from here on, a long blocking GUI-thread operation can keep serving
+    // IPC by calling `gui_pump.pump()` — session restore is the one that needs
+    // it. Installed as soon as the window it drains exists, and taken down in
+    // `deinit` before that window is destroyed.
+    gui_pump.install(self, pumpIpcHook);
+
     // T118: an app launched from inside ANOTHER instance's pane inherits that
     // instance's `$GHOZTTY_IPC_SOCKET` (running `zig-out\bin\ghoztty.exe` from
     // a pane of the installed release is the everyday case). That value names
@@ -790,6 +797,43 @@ fn showConfigErrorsIfAny(
     if (result == .ok) self.openConfigFile();
 }
 
+/// True while `pumpIpc` is draining, so a handler that reaches a pump point of
+/// its own (an IPC-created window that resolves the agent, say) does not recurse
+/// into the drain it is already inside.
+var ipc_pumping: bool = false;
+
+/// The `gui_pump` hook (T188). `ctx` is the `*App`.
+fn pumpIpcHook(ctx: ?*anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(ctx orelse return));
+    self.pumpIpc();
+}
+
+/// Serve every IPC request already marshalled to the GUI thread, then return.
+///
+/// Deliberately narrow: `PeekMessageW` is filtered to `WM_APP_IPC` on the
+/// message-only window, so this never dispatches paint, focus, timer or input
+/// messages and therefore cannot re-enter a WndProc the way a general nested
+/// pump would (which is the T48 deadlock's shape). `IpcServer.deinit` runs the
+/// identical drain for the same reason.
+///
+/// Called from the blocking stretches of startup — see `gui_pump` — where the
+/// alternative is a listener thread parked on `Pending.done` for the whole
+/// restore while its client waits.
+pub fn pumpIpc(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    if (ipc_pumping) return;
+    ipc_pumping = true;
+    defer ipc_pumping = false;
+
+    var msg: w32.MSG = undefined;
+    while (w32.PeekMessageW(&msg, hwnd, WM_APP_IPC, WM_APP_IPC, w32.PM_REMOVE) != 0) {
+        if (msg.wParam != 0) {
+            const pending: *IpcServer.Pending = @ptrFromInt(msg.wParam);
+            IpcServer.serveOnGuiThread(pending);
+        }
+    }
+}
+
 pub fn run(self: *App) !void {
     // T406: a launch command (`ghoztty -e cmd…`, or `initial-command` in the
     // config) is something the user asked for on THIS launch; the windows a
@@ -846,6 +890,7 @@ pub fn run(self: *App) !void {
     // agent is NOTICED and the local windows rebuild in place, instead of the
     // panes sitting frozen until the user quits and relaunches.
     self.installLocalAgentWatch();
+    gui_pump.pump();
 
     // T147: restore has settled, so this is a safe moment to adopt a newer
     // bundled agent build. Idle ⇒ silent restart; live sessions ⇒ the mandatory
@@ -853,6 +898,11 @@ pub fn run(self: *App) !void {
     // upgrades on an old binary (the upgrade script deliberately never kills
     // it), instead of waiting for a reboot.
     self.refreshLocalAgentIfStale("launch restore finished");
+
+    // T188: the last pump before the loop takes over. Everything above this
+    // line runs with the loop not yet started, so without it a request that
+    // arrived during the final startup steps would wait on them too.
+    gui_pump.pump();
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
@@ -1112,6 +1162,10 @@ pub fn terminate(self: *App) void {
         qt.deinit();
         self.quick_terminal = null;
     }
+
+    // T188: no more pumping from here. The IPC drain below owns the remaining
+    // in-flight requests, and the window it peeks is about to be destroyed.
+    gui_pump.uninstall();
 
     // Stop the IPC listener while msg_hwnd is still alive (a request could
     // be mid-marshal; deinit joins the listener thread).
@@ -2049,7 +2103,14 @@ pub fn restoreSessionLayout(self: *App) bool {
     // never-all-dead rule then drops exactly the windows whose every leaf is a
     // gone session (as it does today when the agent answers and knows none of
     // them), and keeps the rest.
+    //
+    // T188: from here to the end of the restore, every stretch that blocks the
+    // GUI thread pumps IPC around itself. The dial below is the longest one by
+    // far (measured 10.7 s against an agent suspended across the relaunch) and
+    // pumps from inside its own poll loop as well — see `LocalAgent.findOrSpawn`.
+    gui_pump.pump();
     const conn: ?*remote_connection.Connection = self.local_agent.sharedConnection();
+    gui_pump.pump();
     if (conn == null) log.info(
         "session-restore: no local agent; restoring only windows that need none",
         .{},
@@ -2062,6 +2123,7 @@ pub fn restoreSessionLayout(self: *App) bool {
     // no agent there is nobody to ask, which is the same empty set.
     const recovered = if (conn) |c| self.pullAgentLayouts(c) else null;
     defer if (recovered) |d| d.deinit();
+    gui_pump.pump();
     const agent_windows: []const session_layout.Window =
         if (recovered) |d| d.windows else &.{};
 
@@ -2085,6 +2147,7 @@ pub fn restoreSessionLayout(self: *App) bool {
     // Genuinely-exited/unknown ids are absent → their leaves re-open fresh.
     var probe = if (conn) |c| AttachProbe.take(gpa, c) else AttachProbe.agentless(gpa);
     defer probe.deinit();
+    gui_pump.pump();
     const attach_ptr = probe.attachSet();
 
     // T411: track which agent sessions the restored panes actually attach to,
@@ -2097,6 +2160,11 @@ pub fn restoreSessionLayout(self: *App) bool {
 
     var restored: usize = 0;
     for (union_set.windows) |win| {
+        // T188: a window boundary is the natural yield point — nothing of this
+        // one is half-built, and each window costs an ATTACH per pane. A caller
+        // that lands mid-restore sees the windows built so far, which is a
+        // truthful partial answer; before this it saw no answer at all.
+        gui_pump.pump();
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
         const tr: RestoreTransport = if (conn) |c| .local(c) else .agentless();
         self.restoreWindow(win, tr, attach_ptr) catch |err| {

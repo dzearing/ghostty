@@ -43,6 +43,7 @@ const connection = @import("../../remote/connection.zig");
 const build_config = @import("../../build_config.zig");
 const protocol = @import("../../remote/protocol.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
+const gui_pump = @import("gui_pump.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_local_agent);
@@ -109,6 +110,12 @@ state_handler: ?connection.StateHandler = null,
 /// Timestamp (ms) of the last find-or-spawn failure, or null. Guards the
 /// cooldown so a broken agent falls back to exec immediately.
 last_failure_ms: ?i64 = null,
+
+/// True while a find-or-spawn is in flight on the GUI thread (T188). The
+/// resolve pumps IPC while it waits, so a request served from inside it can
+/// re-enter this manager; that nested caller is answered "no connection" rather
+/// than being allowed to start a second agent and overwrite `shared`.
+resolving: bool = false,
 
 /// Whether this app run already wrote/refreshed the HKCU Run autostart entry
 /// (T89h). Once per run: the value only changes when the install moves.
@@ -309,6 +316,16 @@ const STILL_ACTIVE: std.os.windows.DWORD = 259;
 pub fn reconnectForRecovery(self: *LocalAgent) ?*connection.Connection {
     if (comptime builtin.os.tag != .windows) return null;
 
+    // Same re-entrancy rule as `sharedConnection` (T188): the find-or-spawn
+    // below pumps IPC, and a request served from inside it must not start a
+    // second agent on top of this one.
+    if (self.resolving) {
+        log.info("in-place recovery: a local-agent resolve is already in flight", .{});
+        return null;
+    }
+    self.resolving = true;
+    defer self.resolving = false;
+
     const dialed = self.findOrSpawn() orelse {
         self.last_failure_ms = std.time.milliTimestamp();
         log.warn("in-place recovery: no local agent could be reached", .{});
@@ -353,6 +370,21 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
     if (self.last_failure_ms) |last| {
         if (std.time.milliTimestamp() - last < failure_cooldown_ms) return null;
     }
+
+    // T188: `findOrSpawn` now pumps IPC while it waits, so an IPC request served
+    // from inside it can land HERE, one frame deep, asking for the very
+    // connection this call is still resolving. Re-entering would spawn a SECOND
+    // agent and overwrite `self.shared` from under the outer call. There is no
+    // usable shared connection at this instant, so the truthful answer is the
+    // same one the caller would have gotten a millisecond earlier: none. The
+    // pane opens as a plain local shell, exactly as it does whenever the agent
+    // is unreachable.
+    if (self.resolving) {
+        log.info("shared local-agent connection is still resolving; answering none", .{});
+        return null;
+    }
+    self.resolving = true;
+    defer self.resolving = false;
 
     const dialed = self.findOrSpawn() orelse {
         self.last_failure_ms = std.time.milliTimestamp();
@@ -706,8 +738,13 @@ fn writeAutostart(self: *LocalAgent, arena: Allocator) !void {
 /// Find an existing agent (dial its recorded pipe) or spawn one and poll until
 /// it dials, within `spawn_deadline_ms`. Returns the dialed connection or null.
 fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
-    // 1. Find: dial the agent recorded in port.json, if any.
+    // 1. Find: dial the agent recorded in port.json, if any. The dial itself is
+    //    bounded by `probe_handshake_ns`, and a WEDGED agent spends all of it —
+    //    so pump either side of it (T188) and keep the unserviced stretch to one
+    //    handshake timeout instead of the whole find-or-spawn budget.
+    gui_pump.pump();
     if (self.dialExisting()) |d| return d;
+    gui_pump.pump();
 
     // 1b. A skewed agent is ALIVE and holding the single-instance guard, so the
     //     spawn below cannot succeed: the new process exits immediately and we
@@ -727,6 +764,13 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     };
     while (std.time.milliTimestamp() < deadline) {
         std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        // T188: this loop is where the worst measured startup blackout lives —
+        // an agent suspended across the relaunch holds the single-instance guard,
+        // so every poll fails and we spend the whole deadline here. We are asleep
+        // most of that time anyway, so answer the IPC requests piling up behind
+        // us instead of making their callers wait for an agent they never asked
+        // about. A no-op off the GUI thread and before the app installs the hook.
+        gui_pump.pump();
         if (self.dialExisting()) |d| return d;
         // An agent that ANSWERED and disagreed is up; polling it again just
         // re-runs the same handshake to the same conclusion, and every extra
