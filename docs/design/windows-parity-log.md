@@ -9,6 +9,39 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-09 - **T532 investigated, not fixed - the freeze does not reproduce,
+  and the arms that would have caught it now exist (T652, D50 filed).** The P0
+  is the 2026-08-06 report where a hard app kill plus a manual relaunch brought
+  every pane back painted correctly and dead: no input echo, no output, and
+  `attach:` / `restored 1 window(s)` / `attached 2 pane(s)` logged at every
+  step. Two things came out of the context. First, the suspects named at filing
+  are **refuted**: both agent paths that unbind a session (`detachAll`
+  `server.zig:490`, `handleDetach` `server.zig:1155`) already refuse to clear a
+  bridge that is not their own connection, and have since June and July - so a
+  late-dying viewer cannot steal the tap from the new one. Second, the plain
+  shape does not reproduce at HEAD on either re-attach path, including the
+  `Stop-Process -Force` kill the upgrade script performs.
+  What the turn actually delivered is the missing oracle. Every restore
+  assertion in the suite reads the screen, and a **replayed** pane is
+  byte-identical to a **live** one - `session-snapshot-reattach.ps1`'s C5 even
+  proves the painted bytes match the recorded snapshot byte for byte, which a
+  frozen pane proves just as well. So both scripts now type into the pane after
+  the restore: **F8b** in `session-reattach.ps1` (full-ring) and **C6d** in
+  `session-snapshot-reattach.ps1` (the WP-D3 delta path, `offset > 0` with a
+  snapshot - the path the incident took). Teeth checked rather than assumed:
+  sending a different token than the one matched turned C6d **red with the
+  other 27 assertions still green**, which is precisely the incident's
+  signature. T652 sweeps the same gap out of the seven remaining restore
+  scripts; D50 asks whether to keep hunting or park this as an armed watch, and
+  names the four untested conditions - aged rings, an **alternate-screen** TUI
+  (the one `skip_replay` branch no test exercises), agent build skew, and the
+  17-second gap. T532 stays open at the head of the queue with all of that in
+  its progress log. Also this morning: the daily digest and a triage that found
+  **five task files describing two defects** (T615/T643/T649 one flaky test,
+  T529/T532 one incident) and that the queue was sorting every P0 last, because
+  a missing `order:` sorts after every present one - five P0s now hold
+  positions 1-5 (D49). T536 recurred during the floor run and got today's
+  crash coordinates.
 - 2026-08-08 - **T337 done - a Mac's windows now rebuild on Windows.** Restore
   All pointed across lineages used to report "nothing to restore" over a machine
   with six windows open: the layout blob is opaque to the agent, so its schema is

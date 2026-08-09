@@ -381,6 +381,26 @@ Assert "C6b the pre-quit marker is still on the restored pane" $postOk
 Assert "C6c the relaunched app has no window on the interactive desktop" `
     (-not (Test-TestDesktopLeak -ProcessId $relaunched.Pid))
 
+# C6d (T532): a REPAINTED pane and a LIVE pane look identical until you type.
+# Everything above this line is satisfied by a recording - C5 even proves the
+# painted bytes match the recorded snapshot byte for byte, which is exactly what
+# a frozen pane would also prove. On 2026-08-06 a user hit the difference: after
+# a hard kill and relaunch, panes restored on THIS path (a delta attach, offset
+# and snapshot both nonzero - `attach: offset=43394044 snapshot=14382`) painted
+# correctly and then took no input and produced no output, while the app logged
+# success at every step. So probe the live half directly: plant a marker AFTER
+# the restore and require it to come back.
+$liveMarker = "SNAPLIVE$($PID)XYZ"
+Run-Cli "+send-keys --target=$paneC $liveMarker Enter" "$tmp\mark-live.txt" 12 | Out-Null
+$liveOk = $false
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline) {
+    Run-Cli "+read --name=$paneC --lines=200" "$tmp\read-live.txt" 10 | Out-Null
+    if (((Out-Text "$tmp\read-live.txt") -replace '\s', '') -match $liveMarker) { $liveOk = $true; break }
+    Start-Sleep -Milliseconds 600
+}
+Assert "C6d the delta-restored pane is LIVE: input reaches the child, output returns" $liveOk
+
 # The restored pane keeps snapshotting: the offset only ever moves forward, so
 # the NEXT restore is a delta too rather than silently reverting to the ring.
 # (Provoke the debounced capture the same way as A.)

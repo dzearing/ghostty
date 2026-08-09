@@ -549,6 +549,28 @@ while ((Get-Date) -lt $deadline) {
 }
 Assert "F8 restored pane keeps its IPC name and its pre-quit scrollback" $postOk
 
+# F8b (T532): ATTACHED IS NOT ALIVE. F8 proves the agent REPLAYED what the pane
+# had before the kill - a recording. It says nothing about whether the live
+# stream ever wired up, and on 2026-08-06 the user hit exactly that gap: every
+# restored pane painted correctly and was then a dead picture, with the app
+# logging `attach:` + `restored N window(s)` + `attached N pane(s)` at every
+# step. A replayed snapshot is indistinguishable from a working pane until
+# something types into it, so this arm types into it: plant a NEW marker AFTER
+# the restore and require it to come back. That exercises both halves the freeze
+# takes out - input reaching the child, and the child's output reaching the pane.
+$liveMarker = "REATTACHLIVE$($PID)XYZ"
+Run-Cli "+send-keys --target=f89sib $liveMarker Enter" "$tmp\mark-live.txt" 12 | Out-Null
+$liveOk = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $code = Run-Cli '+read --name=f89sib --lines=2000' "$tmp\read-live.txt" 10
+    if ($code -eq 0 -and ((Out-Text "$tmp\read-live.txt") -replace '\s', '') -match $liveMarker) {
+        $liveOk = $true; break
+    }
+    Start-Sleep -Milliseconds 700
+}
+Assert "F8b restored pane is LIVE: input reaches the child and new output arrives" $liveOk
+
 # The window title pin survived the round-trip (rewritten manifest post-restore).
 # Direct poll (not Wait-Manifest): the manifest is rewritten atomically as the
 # restored panes publish their session ids, so a single racy read can miss it -
