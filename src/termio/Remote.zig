@@ -577,6 +577,20 @@ pub fn threadEnter(
             attach_replay_rows = outcome.replay_rows;
             attach_replay_cols = outcome.replay_cols;
             attach_snapshot_at = outcome.snapshot_at_offset;
+            // T532: the connection clamps a resume point that sits ABOVE the
+            // agent's stream head (a session id whose byte stream restarted
+            // under it — an agent restart, or a manifest written before one).
+            // Rebase our absolute base onto what was actually honored, or every
+            // later `appliedOffset()` and the manifest entry written from it
+            // stay in that phantom future and the NEXT restore freezes too.
+            if (outcome.resume_offset != self.attach_offset) {
+                log.warn(
+                    "attach: recorded offset {d} is ahead of the agent's stream head {d}; " ++
+                        "resuming from the head (the session's stream restarted under this id)",
+                    .{ self.attach_offset, outcome.resume_offset },
+                );
+                self.attach_offset = outcome.resume_offset;
+            }
             // Copy out of `outcome` before its `defer deinit()` frees it.
             if (outcome.cwd) |c|
                 attach_cwd = self.arena.allocator().dupe(u8, c) catch null;
@@ -968,6 +982,19 @@ pub fn threadEnter(
             if (snap.len > 0) @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
         }
     }
+
+    // T532, the WRITER half. A relaunch, a notify-policy fresh shell, and a
+    // prompt-deferred relaunch all begin a NEW byte stream at 0 — `Connection`
+    // arms their panes with `discard_below = 0` for exactly that reason. Our
+    // absolute base has to follow, or `appliedOffset()` keeps counting from the
+    // DEAD stream's offset and the manifest written from it records a resume
+    // point into a stream that no longer exists. That is how a 43 MB offset
+    // against a minutes-old agent came to be recorded on 2026-08-06; the clamp
+    // in `attachChannel` is the reader's defence against such a record, and
+    // this is what stops one being written. Placed after the three blocks above
+    // that read `attach_offset` (each already excludes these paths) and before
+    // the first drain, which is the first thing to advance `applied_bytes`.
+    if (did_relaunch or did_notify or self.awaiting_relaunch) self.attach_offset = 0;
 
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).

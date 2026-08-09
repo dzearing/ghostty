@@ -12627,3 +12627,65 @@ listener's answer and the origin's answer are different strings and the
 assertion has something to discriminate. All three cases run against one app in
 one run and produce three different answers, which is what makes a
 green-and-empty pass impossible.
+
+## 2026-08-09 — The restored window that was a photograph (T532)
+
+On 2026-08-06 a user relaunched Ghoztty after a hard kill and got their windows
+back exactly as they had left them — and dead. Typing did nothing. Nothing new
+ever appeared. Every line in the log said the restore had worked: sessions
+re-attached, panes attached, windows restored. Their words were precise about
+the strangest part: *"non interactive, not painting, but seemed to still be
+working."* They were right about all three.
+
+**The two suspects that were not it.** The alternate screen was the sharpest
+hypothesis going in — the incident's panes were a TUI, and an alt-screen
+session takes a branch of the agent's ATTACH (`skip_replay`) that no test had
+ever executed. So a fixture was built that genuinely lives there: a `-e` child
+that enters `?1049h` and echoes every line it reads, with the manifest snapshot
+carrying `?1049h` as proof it arrived rather than an assumption that it did.
+Hard-kill, relaunch: **live**. The build skew was next, and it died to a diff
+rather than an experiment — `git diff --name-only 8db5dc509..1cda2827c` touches
+nothing under `src/remote/`, `src/termio/`, `src/Surface.zig` or the win32
+session path. The skew was real; the code on both sides of it was identical.
+
+**What it was: a bookmark into a book that no longer exists.** On ATTACH the
+client arms its §7.3 discard watermark from the offset its own manifest
+recorded — and never compared it against the agent's stream head, which the
+`ATTACHED` reply has carried all along. A session **id** outlives its byte
+**stream**: an agent restart brings a session back under the same id with a
+fresh stream at 0. A manifest written before that restart therefore names an
+offset in a stream nobody has any more, and the incident's numbers say exactly
+that — `offset=43394044` against an agent process spawned minutes earlier.
+
+Arm that watermark and `routeInboundData` drops every chunk forever, the
+agent's own grid snapshot included, and `resync_active` never disarms. The pane
+still paints, because the viewer replays its OWN persisted snapshot locally.
+Input still reaches the child, which keeps running and keeps producing output
+that the viewer throws away. Non-interactive, not painting, still working —
+three symptoms, one cause, and no error anywhere because nothing failed.
+
+**One rule, both ends of it.** A client's resume point can never be ahead of
+the agent's stream head. `Connection.resumeOffset` clamps to the head (a head of
+0 never clamps — it is ambiguous between "produced nothing" and "peer too old
+to report one", and a wrong clamp there would trade a freeze for a
+double-paint); `termio.Remote` rebases its own base onto what was honored and
+says so in the log. Fixing the reader turned up the writer: `Remote` never
+reset `attach_offset` on the three paths that begin a NEW stream at 0 — a
+notify-policy fresh shell, an `auto` RELAUNCH, a prompt-deferred relaunch — so
+`appliedOffset()` kept counting from the dead stream and the next manifest
+write recorded the phantom. That is where a 43 MB offset against a minutes-old
+agent comes from. Now nothing writes such a record, and nothing trusts one.
+It is all shared core, so the Mac has the fix too; T654 asks for its arm.
+
+**The proof is a reproduction, not an argument.** `session-reattach-zombie.ps1`
+section D ages the on-disk manifest to the incident's own 43394044 while the app
+is dead, then relaunches. Against a build with the clamp neutered the run *is*
+the incident: `restored 1 window(s)`, `attached 1 pane(s); 0 live agent
+session(s) unattached`, the pre-kill screen painted correctly, and the typed
+token neither echoed nor answered — **D7 red with 25 assertions still green**.
+With the clamp in: **ALL PASS (27)**. Two traps the section documents because
+the first attempt hit both: PS 5.1's `Set-Content -Encoding UTF8` writes a BOM
+the app's JSON parser rejects, and a *rejected* manifest is silently routed
+around — the app recovers the window from the agent on a fresh offset-0 attach —
+so every liveness assertion passes against a pane the repro never touched. D4
+now asserts the manifest was consumed, and D5/D7 are gated on it.

@@ -567,6 +567,14 @@ pub const AttachOutcome = struct {
     /// The byte offset the agent's replay anchor was captured at (§7.3; the
     /// gap-fill replay covers `[last_byte_offset, snapshot_at_offset)`).
     snapshot_at_offset: u64,
+    /// The offset this attach actually resumed from (T532) — the caller's
+    /// `last_byte_offset`, except when that was AHEAD of the agent's stream
+    /// head, in which case it is the head (`Connection.resumeOffset`). The
+    /// caller MUST use this, not what it passed in, as the absolute base for
+    /// its own applied-byte accounting: keeping the phantom base would put
+    /// every later `appliedOffset()` — and the manifest entry written from it —
+    /// back in the future, and the next restore would freeze again.
+    resume_offset: u64 = 0,
     /// The session already had an attached bridge (§5.3). When true with
     /// `force=false`, the caller may retry `attachChannel(..., force=true)` to steal.
     attached_elsewhere: bool,
@@ -1988,6 +1996,35 @@ pub const Connection = struct {
         return self.attachChannelCancellable(session_id, rows, cols, last_byte_offset, force, null);
     }
 
+    /// The resume point an ATTACH may honor, given what the client believes it
+    /// has applied (`last_byte_offset`) and where the agent says its outbound
+    /// stream actually is (`ATTACHED.snapshot_at_offset`). T532.
+    ///
+    /// A client can never legitimately have applied MORE bytes than the agent
+    /// has ever produced, so `last_byte_offset > agent_head` is not a resume —
+    /// it is proof that the two are talking about different streams. That
+    /// happens for real: a session id survives an agent restart, and the child
+    /// relaunched under it starts a FRESH byte stream at 0, while a manifest
+    /// written before the restart still records the old stream's offset.
+    ///
+    /// Honoring such an offset arms the §7.3 discard watermark above every byte
+    /// the agent will ever send, so `routeInboundData` drops the agent's grid
+    /// snapshot and then all live output, permanently, and `resync_active`
+    /// never disarms. The pane still paints (the viewer replays its OWN
+    /// persisted snapshot) and input still reaches the child, which is why the
+    /// failure reads as "restored correctly, then non-interactive and not
+    /// painting, but seemed to still be working" rather than as a blank pane or
+    /// an error — the exact report from 2026-08-06.
+    ///
+    /// A head of 0 never clamps. It is ambiguous — a session that has produced
+    /// nothing, or a peer too old to report one — and a wrong clamp there would
+    /// re-deliver bytes the client already has. This guard exists to fix a
+    /// freeze, not to trade it for a double-paint.
+    pub fn resumeOffset(last_byte_offset: u64, agent_head: u64) u64 {
+        if (agent_head == 0) return last_byte_offset;
+        return @min(last_byte_offset, agent_head);
+    }
+
     /// `attachChannel` with an optional cancellation token (see `RpcCanceller`):
     /// `cancelRpcsFor(canceller)` from another thread aborts the parked ATTACH
     /// with `error.Cancelled`. Used by the remote termio backend so surface
@@ -2056,10 +2093,19 @@ pub const Connection = struct {
         const fg_cmd = if (a.foreground_cmd) |v| try self.alloc.dupe(u8, v) else null;
         errdefer if (fg_cmd) |v| self.alloc.free(v);
 
+        // T532: what this attach will actually resume from. Equal to
+        // `last_byte_offset` in every healthy case; clamped to the agent's head
+        // when the caller's record belongs to a stream that no longer exists.
+        // This module is the pure transport and does not log; the caller
+        // (`termio.Remote`) compares `resume_offset` against what it passed and
+        // says so out loud.
+        const resume_at = resumeOffset(last_byte_offset, a.snapshot_at_offset);
+
         var outcome: AttachOutcome = .{
             .pane = null,
             .status = a.status,
             .snapshot_at_offset = a.snapshot_at_offset,
+            .resume_offset = resume_at,
             .attached_elsewhere = a.attached_elsewhere,
             .exit_code = a.exit_code,
             .relaunchable = a.relaunchable,
@@ -2109,8 +2155,12 @@ pub const Connection = struct {
             // entire replay and every reconnect/restore attach came up BLANK
             // (the WP-D1 wedged-window bug). A fresh attach (offset 0) keeps
             // everything; a resumed surface drops only the bytes it already has.
-            .discard_below = if (last_byte_offset > 0) last_byte_offset - 1 else 0,
-            .resync_active = last_byte_offset > 0,
+            //
+            // T532: anchored at `resume_at`, not at the raw `last_byte_offset` —
+            // a resume point above the agent's own head is a different stream,
+            // and arming it discards every byte the agent will ever send.
+            .discard_below = if (resume_at > 0) resume_at - 1 else 0,
+            .resync_active = resume_at > 0,
         };
         try self.trackPane(pane);
         keep_channel = true; // the pane now owns the registered ring
@@ -5362,7 +5412,13 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     defer h.destroy();
     const a = h.configure();
     a.attach_status = .alive;
-    a.snapshot_at_offset = 10;
+    // The agent's head. It used to be 10 here, BEHIND the client's
+    // last_byte_offset of 11 — a state the protocol cannot produce (both are
+    // "next byte" indices in one space, so a client cannot have applied a byte
+    // the agent never emitted) and one the T532 clamp now treats as the
+    // stale-stream signal it is. Set it where a real resumed attach puts it:
+    // at or above what the client has applied.
+    a.snapshot_at_offset = 20;
     a.tty = "/dev/ttys020";
     try h.start();
 
@@ -5372,7 +5428,9 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 11, false);
     defer outcome.deinit();
     try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
-    try testing.expectEqual(@as(u64, 10), outcome.snapshot_at_offset);
+    try testing.expectEqual(@as(u64, 20), outcome.snapshot_at_offset);
+    // Untouched by the clamp: this resume point is behind the head.
+    try testing.expectEqual(@as(u64, 11), outcome.resume_offset);
     try testing.expect(!outcome.attached_elsewhere);
     const pane = outcome.pane orelse return error.NoPane;
     try testing.expectEqualStrings("/home/me", outcome.cwd.?);
@@ -5399,6 +5457,73 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     defer got.deinit(alloc);
     try drainChannel(pane.ring, &got, alloc, expected.len);
     try testing.expectEqualStrings(expected, got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "resumeOffset: a resume point can never be ahead of the agent's stream head (T532)" {
+    // Normal resumes are untouched: behind the head, and exactly caught up.
+    try testing.expectEqual(@as(u64, 11), Connection.resumeOffset(11, 1000));
+    try testing.expectEqual(@as(u64, 1000), Connection.resumeOffset(1000, 1000));
+    try testing.expectEqual(@as(u64, 0), Connection.resumeOffset(0, 1000));
+
+    // Ahead of the head is impossible in a healthy stream, so it is evidence
+    // that the stream restarted under this session id — clamp to the head.
+    try testing.expectEqual(@as(u64, 1000), Connection.resumeOffset(43_394_044, 1000));
+
+    // A head of 0 is ambiguous (a session that produced nothing, or a peer too
+    // old to report one), so it never triggers the clamp: a wrong clamp here
+    // would re-deliver bytes the client already has, and this guard exists to
+    // fix a freeze, not to trade it for a double-paint.
+    try testing.expectEqual(@as(u64, 11), Connection.resumeOffset(11, 0));
+}
+
+test "attachChannel: a resume point AHEAD of the agent's head is clamped, not armed (T532)" {
+    // 2026-08-06: a user hard-killed the app, relaunched, and every restored
+    // pane painted perfectly and was dead — no echo, no output — while the app
+    // logged a successful attach at every step. This is that failure in one
+    // test. The client's recorded offset (43 MB, from a manifest written before
+    // the session's byte stream restarted under the same id) is far ahead of
+    // the agent's actual head, so arming the §7.3 watermark at it discards
+    // EVERY byte the agent will ever send: the agent's own grid snapshot, and
+    // then live output, forever. The pane still paints — from the viewer's own
+    // persisted snapshot — and input still reaches the child, which is exactly
+    // why it reads as "repainted correctly, non-interactive, still working".
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .alive;
+    a.snapshot_at_offset = 1000; // the agent's stream head
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 43_394_044, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
+    const pane = outcome.pane orelse return error.NoPane;
+
+    h.agent.saw_request.wait();
+    const ch = pane.id;
+
+    // The agent's grid snapshot lands AT its head; live output follows it.
+    // Asserted BEFORE the bookkeeping below on purpose: without the clamp this
+    // drain is what fails (with `error.Timeout` — nothing ever arrives), which
+    // is the user-visible freeze rather than a mismatched number.
+    try agentSendData(&h.data_agent, ch, 1000, "SNAPSHOT");
+    try agentSendData(&h.data_agent, ch, 1008, "LIVE!");
+
+    const expected = "SNAPSHOTLIVE!";
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, expected.len);
+    try testing.expectEqualStrings(expected, got.items);
+
+    // The caller is TOLD what was honored, because its own absolute offset base
+    // has to be rebased too — otherwise every later `appliedOffset()`, and the
+    // manifest entry written from it, stays in the phantom future and the next
+    // restore freezes again.
+    try testing.expectEqual(@as(u64, 1000), outcome.resume_offset);
 
     try testing.expect(a.err == null);
     h.conn.closeChannel(pane);
