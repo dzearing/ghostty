@@ -12839,3 +12839,53 @@ argument submits twice — inherited from main verbatim on purpose), **T659**
 (`seat: mac` validation against a real composer, which this seat cannot run),
 **T660** (the bundled `SKILL.md` does not exist on this branch, so main's doc
 half of `a7f7476e1` had nowhere to land).
+
+## 2026-08-09 — T525: the client updates itself in the morning, and asks nothing
+
+The user works all day inside one Ghoztty, which keeps running whatever exe it
+was launched with — so finished work reads to them as missing features. Twice
+now they have reported something as absent that was already at HEAD and merely
+undelivered. **T525** closes that: the first task-boundary push at or after 5am
+local triggers an app-only refresh of the running client. A push rather than a
+clock, because a push is the loop saying *this commit is good*;
+`scripts\morning-refresh.ps1` is the trigger and go.md step 6.5 is where a turn
+runs it (exit 10 = the delivery will reset this pane itself, so end the turn
+without `/reset-context`).
+
+The hard part was not the delivery, which already existed — it was making a
+restart that interrupts nothing. `upgrade-ghoztty-windows.ps1 -AppOnly` does
+not touch `ghoztty-agent.exe` in ANY install location, so the panes re-attach
+to their still-running sessions and the loop survives its own refresh. That
+alone is not enough, and the reason is worth keeping: on a box that has taken
+earlier deliveries the on-disk agent is **already** newer than the running one,
+so the fresh app raises the mandatory agent-restart confirmation regardless of
+what today's run copied — a modal on an empty desk at 5am. So the delivery also
+leaves a marker holding a UTC deadline, and `agent_upgrade.applyDeferral` folds
+it into the policy: a `confirm_first` becomes a logged no-op, by both routes
+that reach that dialog (stale build and protocol skew). Deliberately a deadline
+rather than a flag — a marker nobody cleaned up would silence the confirmation
+on that machine forever — and deliberately not the same as pressing "Later": it
+does not set `agent_upgrade_declined`, so the check that runs when the last
+persistent window closes still fires, and by then there are no live sessions,
+which is the silent `refresh_now` rule 3 always promised.
+
+Two ordering rules carry the safety. The watermark is stamped **before** the
+launch, because the failure this must never have is a refresh that fails and
+re-fires on the next push, restarting the user's terminal all day; one attempt
+per day, with a rollback only for launch-upgrade's exit 3, which provably
+aborts before the kill. And the marker is armed **before** the kill, so there
+is no ordering in which a fast app reaches its agent check first.
+
+Found on the way and fixed: `launch-upgrade.ps1` defaulted `-UpgradeScript`
+from `$PSScriptRoot`, which PowerShell 5.1 leaves EMPTY while parameter
+defaults are evaluated under `powershell -File`. That throws in the binder,
+before line 1, with nothing logged and only a stderr the caller has redirected
+away — the exact evidence-free shape T200 exists to keep out of this path. All
+three delivery scripts are now guarded against it by section G.
+
+Measured: `floor-lane -Lane all` ALL LANES PASS (none 294s, win32 179s, agent
+332s); P1–P3 ALL PASS; the new `test\win32\morning-refresh.ps1` ALL PASS (A–G,
+including the positive control that an ordinary delivery still ships the agent
+and the negative control that a run with no app started reports itself
+`APP-REFRESH UNVERIFIED`); `upgrade-staleness`, `upgrade-no-fork` and
+`upgrade-resume-readiness` ALL PASS, since this changed the scripts they cover.

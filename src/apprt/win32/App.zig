@@ -2669,6 +2669,39 @@ fn liveAgentSessionCount(self: *App) ?usize {
     return n;
 }
 
+/// Is an unattended client refresh in progress (T525)?
+///
+/// The morning delivery restarts the app with nobody in front of it, and the
+/// fresh app's first act is the agent-upgrade check below — which, on a box that
+/// has taken a few deliveries, lands on `confirm_first` and puts a modal on an
+/// empty desk. The delivery leaves a marker holding a UTC unix-seconds deadline;
+/// while it is in the future, a confirmation is deferred rather than shown.
+///
+/// Every failure here answers `false`. A marker we could not read, a
+/// `%LOCALAPPDATA%` we could not resolve, a deadline we could not parse — none
+/// of those are evidence that a refresh is running, and "suppress on a guess" is
+/// the direction that fails silently and forever.
+fn unattendedRefreshActive(self: *App) bool {
+    const alloc = self.core_app.alloc;
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return false;
+    defer alloc.free(dir);
+    // Debug builds get their own marker, same coexistence rule as the IPC pipe
+    // and the agent's state dir: a dev build's unattended run must not silence
+    // the release app the user is sitting in front of.
+    const name = if (build_config.is_debug)
+        agent_upgrade.defer_marker_name ++ "-debug"
+    else
+        agent_upgrade.defer_marker_name;
+    const path = std.fs.path.join(alloc, &.{ dir, "ghoztty", name }) catch return false;
+    defer alloc.free(path);
+
+    const f = std.fs.cwd().openFile(path, .{}) catch return false;
+    defer f.close();
+    var buf: [128]u8 = undefined;
+    const n = f.readAll(&buf) catch return false;
+    return agent_upgrade.deferralActive(buf[0..n], std.time.timestamp());
+}
+
 /// Adopt a newer bundled agent build without waiting for a reboot (T147, Mac
 /// `refreshLocalAgentIfStale`).
 ///
@@ -2735,7 +2768,15 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     // `.none` reported nothing ever. That made a correctly-working mandatory
     // confirmation indistinguishable in the log from a check that decided
     // nothing, and from one that never ran.
-    const decision = agent_upgrade.evaluate(running, bundled, live);
+    // T525: fold the unattended deferral in BEFORE the log line, so the one line
+    // an operator greps reports the decision that was actually acted on. Only
+    // consulted when a confirmation is on the table — the marker read is a file
+    // open, and the common case is `.none`.
+    const raw = agent_upgrade.evaluate(running, bundled, live);
+    const decision = agent_upgrade.applyDeferral(
+        raw,
+        raw.action == .confirm_first and self.unattendedRefreshActive(),
+    );
     log.info(
         "agent upgrade check: {s} (running {s}, bundled {s}, {d} live session(s)) [{s}]",
         .{
@@ -2889,7 +2930,15 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
 /// failure notice — so there is one restart story rather than two.
 fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8) void {
     const alloc = self.core_app.alloc;
-    const decision = agent_upgrade.evaluateSkew(skew.peer_proto_version, protocol.proto_version);
+    const raw = agent_upgrade.evaluateSkew(skew.peer_proto_version, protocol.proto_version);
+    // T525: the same deferral the staleness path takes. This is the same modal
+    // with the same outcome, so an unattended refresh must not raise it here
+    // either — and a skew is if anything the worse one to leave on an empty
+    // desk, since until it is answered session persistence is off.
+    const decision = agent_upgrade.applyDeferral(
+        raw,
+        raw.action == .confirm_first and self.unattendedRefreshActive(),
+    );
 
     // Logged where it is made, before acting, for the same reason the staleness
     // check logs there (T201): a modal can sit unanswered forever, and a `.none`

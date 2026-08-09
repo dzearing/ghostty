@@ -341,6 +341,37 @@ Concretely, in order, with no stops in between:
    manual refresh still matters as the fallback for a session whose transcript
    could not be resolved (`acquire` says which: `pulse=transcript` vs
    `pulse=heartbeat-only`).
+6.5. **Morning client refresh** (T525; user, 2026-08-07) — right after the
+   push, one command:
+
+   ```
+   powershell -NoProfile -File scripts\morning-refresh.ps1
+   ```
+
+   The user works all day inside one Ghoztty, which keeps running whatever exe
+   it was launched with, so work that shipped days ago reads to them as a
+   missing feature (measured twice: 2026-08-06, and 2026-08-07's "still no
+   address bar" over a feature already at HEAD). The **first task-boundary push
+   at or after 5am local** is the signal that the day has started and there are
+   bits worth having — a push, not a clock, because a push is the loop saying
+   "this commit is good".
+
+   - **exit 0** — not due (before 5am, already refreshed today, or not in a
+     Ghoztty pane). Carry on to step 7 exactly as normal.
+   - **exit 10** — the refresh is running. **END THE TURN HERE. Do NOT run
+     `/reset-context`**: the delivery types `/reset-context read go.md and go`
+     into this very pane once the app is back, and a second reset races it.
+   - **exit 1** — it was due and the launch failed; nothing was delivered. Do
+     step 7 normally so a bad delivery cannot stall the loop.
+
+   It delivers the **app only, never the agent** — `ghoztty-agent.exe` is not
+   swapped anywhere, and the mandatory agent-restart confirmation is deferred
+   past the unattended restart — because an agent update ends the loop, which
+   is what the directive rules out ("avoid an agent update because that will
+   shut down the loop"). The staged agent keeps for the next deliberate,
+   attended delivery. Once per day: the watermark is stamped BEFORE the launch,
+   so a failed refresh cannot re-fire on the next push and restart the user's
+   terminal all day. Acceptance: `test\win32\morning-refresh.ps1`.
 7. **`/reset-context read go.md and go`, and end the turn there.**
 
 **Ending a turn any other way is a failure, not a pause.** The loop

@@ -132,6 +132,11 @@ pub const Reason = enum {
     /// destructive on a guess.
     skew_unknown,
 
+    /// A confirmation WAS required (stale build or agent-older skew), but an
+    /// unattended refresh is in progress, so nobody is here to answer it. Not
+    /// the same as a decline: the next quiet moment still asks (T525).
+    confirm_deferred,
+
     /// One clause, written to be read in a log line after "agent upgrade
     /// check:".
     pub fn description(self: Reason) []const u8 {
@@ -144,6 +149,7 @@ pub const Reason = enum {
             .skew_agent_older => "protocol skew, running agent speaks an OLDER protocol, confirmation required",
             .skew_app_older => "no action, running agent speaks a NEWER protocol — this app is the out-of-date side (never downgrade)",
             .skew_unknown => "no action, protocol skew of unknown direction (no peer version captured)",
+            .confirm_deferred => "no action, confirmation required but an unattended refresh is in progress (will ask at the next quiet moment)",
         };
     }
 };
@@ -182,6 +188,72 @@ pub fn evaluate(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize
 /// The action alone, for callers that don't log (and every existing test).
 pub fn decide(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize) Action {
     return evaluate(running, bundled, live_sessions).action;
+}
+
+// =============================================================================
+// Unattended deferral (T525)
+// =============================================================================
+
+/// The morning client refresh restarts the app with nobody sitting in front of
+/// it, and the FIRST thing the fresh app does is run the check above. On a box
+/// that has taken several deliveries the on-disk agent is already newer than the
+/// running one, so that check lands on `confirm_first` and puts a modal on an
+/// empty desk — the "interruption by another name" T525 exists to remove. The
+/// user's directive is explicit that the agent must not be touched by the
+/// morning flow at all ("avoid an agent update because that will shut down the
+/// loop"), so the honest answer is not to ask.
+///
+/// The signal is a small marker file the delivery writes just before it starts
+/// the app: one line holding a UTC unix-seconds DEADLINE. A deadline rather than
+/// a flag, because the failure mode of a flag is permanent silence — a marker
+/// nobody cleaned up would suppress the confirmation forever, on a machine whose
+/// agent then never updates again. This expires on its own.
+///
+/// Deferral is deliberately NOT the same as the user pressing "Later": it does
+/// not set `agent_upgrade_declined`, so the check that runs when the last
+/// persistent window closes still fires. By then the marker has expired and
+/// there are no live sessions anyway, which is `refresh_now` — the quiet moment
+/// rule 3 always promised.
+pub const defer_marker_name = "agent-upgrade-defer";
+
+/// Parse a marker's contents into its UTC unix-seconds deadline.
+///
+/// One decimal integer, leading/trailing whitespace ignored, everything from the
+/// first newline on ignored (so a future writer can add a human-readable comment
+/// line without breaking older apps). Anything else is null — an unreadable
+/// marker must never be read as "suppress", because that is the direction that
+/// fails silently.
+pub fn parseDeferDeadline(contents: []const u8) ?i64 {
+    const first_line = blk: {
+        const nl = std.mem.indexOfAny(u8, contents, "\r\n") orelse break :blk contents;
+        break :blk contents[0..nl];
+    };
+    const trimmed = std.mem.trim(u8, first_line, " \t");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(i64, trimmed, 10) catch null;
+}
+
+/// Is an unattended refresh in progress right now?
+///
+/// `contents == null` is "no marker file" — the overwhelmingly common case, and
+/// the one that must cost nothing. A deadline at or before `now_s` has expired.
+pub fn deferralActive(contents: ?[]const u8, now_s: i64) bool {
+    const c = contents orelse return false;
+    const deadline = parseDeferDeadline(c) orelse return false;
+    return now_s < deadline;
+}
+
+/// Fold an active deferral into a decision.
+///
+/// Only `confirm_first` is affected, and that is the whole point: `refresh_now`
+/// has no live session to lose and no dialog to show, so suppressing it would
+/// trade a free upgrade for nothing, and `none` has nothing to suppress. Both
+/// paths that reach `confirm_first` — a stale build and a protocol skew — are
+/// the same modal with the same outcome, so both defer.
+pub fn applyDeferral(d: Decision, deferred: bool) Decision {
+    if (!deferred) return d;
+    if (d.action != .confirm_first) return d;
+    return .{ .action = .none, .reason = .confirm_deferred };
 }
 
 // =============================================================================
@@ -452,8 +524,10 @@ test "evaluate and decide can never disagree" {
             .stale_idle => .refresh_now,
             .stale_live => .confirm_first,
             // `evaluate` is the STALENESS policy; a skew reason coming out of it
-            // would mean the two policies had been crossed.
-            .skew_agent_older, .skew_app_older, .skew_unknown => unreachable,
+            // would mean the two policies had been crossed. `confirm_deferred`
+            // is `applyDeferral`'s, applied on top afterwards — never produced
+            // here.
+            .skew_agent_older, .skew_app_older, .skew_unknown, .confirm_deferred => unreachable,
         };
         try testing.expectEqual(expected, d.action);
         // A `.none` must never be reported as stale, and vice versa.
@@ -467,8 +541,8 @@ test "Reason.description is a distinct non-empty clause for every reason" {
     // Logged verbatim, so an empty or duplicated clause would silently make two
     // different box states read identically — the defect T201 exists to fix.
     const all = [_]Reason{
-        .bundled_unknown, .current,        .running_newer, .stale_idle, .stale_live,
-        .skew_agent_older, .skew_app_older, .skew_unknown,
+        .bundled_unknown,  .current,        .running_newer, .stale_idle, .stale_live,
+        .skew_agent_older, .skew_app_older, .skew_unknown,  .confirm_deferred,
     };
     for (all, 0..) |a, i| {
         try testing.expect(a.description().len > 0);
@@ -564,6 +638,86 @@ test "the skew dialog shares the staleness dialog's title" {
     // One outcome (the background process restarts) reached two ways is one
     // dialog. Pinned so a later copy edit to one does not quietly fork them.
     try testing.expectEqualStrings(confirm_title, skew_confirm_title);
+}
+
+test "parseDeferDeadline reads one integer and refuses everything else" {
+    try testing.expectEqual(@as(?i64, 1786000000), parseDeferDeadline("1786000000"));
+    // The writer is PowerShell's Set-Content, which appends a newline; CRLF too.
+    try testing.expectEqual(@as(?i64, 1786000000), parseDeferDeadline("1786000000\n"));
+    try testing.expectEqual(@as(?i64, 1786000000), parseDeferDeadline("1786000000\r\n"));
+    try testing.expectEqual(@as(?i64, 1786000000), parseDeferDeadline("  1786000000  \r\n"));
+    // A trailing human-readable line is ignored, so a future writer can explain
+    // itself in the file without an older app misreading the deadline.
+    try testing.expectEqual(
+        @as(?i64, 1786000000),
+        parseDeferDeadline("1786000000\n# written by upgrade-ghoztty-windows.ps1 -AppOnly\n"),
+    );
+
+    // Everything unreadable is null, NEVER a deadline: the direction that fails
+    // silently is the one that suppresses the confirmation.
+    try testing.expectEqual(@as(?i64, null), parseDeferDeadline(""));
+    try testing.expectEqual(@as(?i64, null), parseDeferDeadline("   \r\n"));
+    try testing.expectEqual(@as(?i64, null), parseDeferDeadline("later"));
+    try testing.expectEqual(@as(?i64, null), parseDeferDeadline("17860000000000000000000"));
+    // A BOM is the classic PowerShell 5.1 write; it must not read as a number.
+    try testing.expectEqual(@as(?i64, null), parseDeferDeadline("\xEF\xBB\xBF1786000000"));
+}
+
+test "deferralActive: absent, malformed and expired markers never suppress" {
+    const now: i64 = 1_786_000_000;
+    // The steady state on every box that has never run an unattended refresh.
+    try testing.expect(!deferralActive(null, now));
+    try testing.expect(!deferralActive("", now));
+    try testing.expect(!deferralActive("garbage", now));
+
+    // Live: the delivery wrote a deadline a few minutes out.
+    try testing.expect(deferralActive("1786000900", now));
+    try testing.expect(deferralActive("1786000001", now));
+
+    // Expired, including the exact boundary — a deadline that has arrived is
+    // over, so a stopped clock cannot hold the confirmation off forever.
+    try testing.expect(!deferralActive("1786000000", now));
+    try testing.expect(!deferralActive("1785999999", now));
+    // A marker left behind by a delivery days ago.
+    try testing.expect(!deferralActive("1785000000", now));
+}
+
+test "applyDeferral suppresses only the modal, never the free upgrade" {
+    const stale_live = Decision{ .action = .confirm_first, .reason = .stale_live };
+    const skew_older = Decision{ .action = .confirm_first, .reason = .skew_agent_older };
+    const idle = Decision{ .action = .refresh_now, .reason = .stale_idle };
+    const nothing = Decision{ .action = .none, .reason = .current };
+
+    // Not deferred ⇒ the decision is returned untouched, whatever it is.
+    for ([_]Decision{ stale_live, skew_older, idle, nothing }) |d| {
+        const out = applyDeferral(d, false);
+        try testing.expectEqual(d.action, out.action);
+        try testing.expectEqual(d.reason, out.reason);
+    }
+
+    // Deferred ⇒ both routes to the SAME modal are suppressed, with a reason
+    // that says so rather than pretending nothing was wrong.
+    for ([_]Decision{ stale_live, skew_older }) |d| {
+        const out = applyDeferral(d, true);
+        try testing.expectEqual(Action.none, out.action);
+        try testing.expectEqual(Reason.confirm_deferred, out.reason);
+    }
+
+    // `refresh_now` asks nobody and loses nothing, so deferring it would trade a
+    // free upgrade for no benefit at all. `none` has nothing to suppress.
+    try testing.expectEqual(Action.refresh_now, applyDeferral(idle, true).action);
+    try testing.expectEqual(Reason.stale_idle, applyDeferral(idle, true).reason);
+    try testing.expectEqual(Action.none, applyDeferral(nothing, true).action);
+    try testing.expectEqual(Reason.current, applyDeferral(nothing, true).reason);
+}
+
+test "applyDeferral is idempotent" {
+    // The app composes it once, but a re-check on the same live marker must not
+    // walk the decision somewhere else.
+    const d = applyDeferral(.{ .action = .confirm_first, .reason = .stale_live }, true);
+    const again = applyDeferral(d, true);
+    try testing.expectEqual(d.action, again.action);
+    try testing.expectEqual(d.reason, again.reason);
 }
 
 test "baseName takes the last component with either separator" {

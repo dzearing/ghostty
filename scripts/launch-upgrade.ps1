@@ -48,7 +48,13 @@ param(
     # The same value, already on disk. Wins over -Prompt when both are given.
     [string]$PromptFile = '',
     [string]$Staging = 'D:\git\ghoztty\zig-out-release',
-    [string]$UpgradeScript = (Join-Path $PSScriptRoot 'upgrade-ghoztty-windows.ps1'),
+    # Empty = the sibling upgrade-ghoztty-windows.ps1. Deliberately NOT
+    # defaulted with $PSScriptRoot: under `powershell -File <this>` that
+    # variable is still empty while parameter defaults are evaluated, so a
+    # Join-Path against it throws before line 1 - a launch that fails with only
+    # a binder error on a redirected stderr, which is the exact evidence-free
+    # shape this whole wrapper exists to prevent. Resolved in the body.
+    [string]$UpgradeScript = '',
     # The tree the delivery is meant to ship. Its HEAD is what the staged exe
     # must carry (T208).
     [string]$Repo = 'D:\git\ghoztty',
@@ -88,6 +94,7 @@ function Fail-Launch([string]$msg, [int]$code) {
 
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
 
+if (-not $UpgradeScript) { $UpgradeScript = Join-Path $PSScriptRoot 'upgrade-ghoztty-windows.ps1' }
 if (-not (Test-Path -LiteralPath $UpgradeScript -PathType Leaf)) {
     Fail-Launch "upgrade script not found: $UpgradeScript" 2
 }

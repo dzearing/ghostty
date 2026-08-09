@@ -110,7 +110,28 @@ param(
     [switch]$AllowPlainResume,
     # Relaunch even if the launching session survived. Escape hatch for a
     # session that is wedged rather than merely idle.
-    [switch]$ForceRelaunch
+    [switch]$ForceRelaunch,
+    # T525 - the unattended morning refresh. Deliver the APP and nothing else:
+    #
+    #   * ghoztty-agent.exe is NOT swapped, in any install location. The user's
+    #     directive is that the morning flow must not update the agent at all
+    #     ("avoid an agent update because that will shut down the loop"), and
+    #     the staged binary keeps until the next deliberate full delivery.
+    #   * a deferral marker is written before the app is restarted, so the fresh
+    #     app does not raise the mandatory agent-restart confirmation at a
+    #     machine nobody is sitting at. Skipping the swap alone cannot achieve
+    #     that: on a box that has taken earlier deliveries the on-disk agent is
+    #     ALREADY newer than the running one, so the dialog fires regardless of
+    #     what this run copies.
+    [switch]$AppOnly,
+    # Where the marker goes. A parameter only so the acceptance test can watch
+    # it being written without touching the real one.
+    [string]$DeferMarkerPath = (Join-Path $env:LOCALAPPDATA 'ghoztty\agent-upgrade-defer'),
+    # How long the deferral holds. It only has to cover kill -> swap -> app start
+    # -> restore -> the app's first agent check; measured worst case to IPC-ready
+    # is ~11s (T187). Generous, and self-expiring is the point: a marker that
+    # never expired would silence the confirmation on this box forever.
+    [int]$DeferMinutes = 20
 )
 
 $ErrorActionPreference = 'Continue'
@@ -126,7 +147,23 @@ Log "=== upgrade start (staging=$Staging)"
 # after it) and reported in ONE place, so `UPGRADE OK` cannot appear over a
 # delivery that did not happen. Every exit below goes through this.
 $script:deliveryFailure = ''
+# T525: did a live app answer IPC after the restart, and what commit is on disk?
+# Goal 2 of the morning refresh is that the reboot is VERIFIED rather than
+# assumed, and the two halves of that evidence are produced far apart - the
+# commit read-back happens right after the swap, the "a window is up" proof only
+# once the resume path has waited for the app. Collected here so the verdict is
+# one greppable line instead of a correlation exercise across the log.
+$script:appAnswered = $false
+$script:installedCommit = ''
 function Complete-Upgrade([string]$note) {
+    if ($AppOnly) {
+        if ($script:appAnswered) {
+            Log ("APP-REFRESH OK: the restarted app answered +list, and $oldExe reports " +
+                "'$(if ($script:installedCommit) { $script:installedCommit } else { '<unread>' })' (agent untouched)")
+        } else {
+            Log 'APP-REFRESH UNVERIFIED: no live instance answered +list during this run, so nothing here proves a window came back on the new build'
+        }
+    }
     if ($script:deliveryFailure) {
         # Deliberately does not spell the success tag - a log grep for
         # "UPGRADE OK" must never match a failure line.
@@ -149,10 +186,10 @@ if ($ResumePromptFile) {
     $ResumePrompt = [IO.File]::ReadAllText($ResumePromptFile) -replace '\r?\n\z', ''
     Log "resume prompt read from file ($($ResumePrompt.Length) chars): $ResumePromptFile"
 }
-Log ("params: install=[{0}] wd=[{1}] pane=[{2}] loopPid={3} delay={4} noResume={5} force={6} expect=[{7}] allowStale={8} resumeCmd=[{9}] resumePrompt=[{10}]" -f `
+Log ("params: install=[{0}] wd=[{1}] pane=[{2}] loopPid={3} delay={4} noResume={5} force={6} expect=[{7}] allowStale={8} appOnly={9} resumeCmd=[{10}] resumePrompt=[{11}]" -f `
     $InstallDir, $WorkingDirectory, $LoopPaneId, $LoopClaudePid, $DelaySeconds, `
     [bool]$NoResume, [bool]$ForceRelaunch, $ExpectedCommit, [bool]$AllowStaleStaging, `
-    $ResumeCommand, $ResumePrompt)
+    [bool]$AppOnly, $ResumeCommand, $ResumePrompt)
 
 # Both of these are consumed by destructive steps (the kill is scoped to
 # $InstallDir, the swap reads $Staging). A mis-bound value must stop the run
@@ -226,6 +263,37 @@ if (-not $expected) {
 # it (T208), and an indentation-only diff over 120 lines hides the one line that
 # changed behaviour.
 if (-not $stale) {
+
+# T525: arm the deferral BEFORE the kill, not after the swap.
+#
+# The app can come back up by two different routes below (the reuse path starts
+# it, or an already-running instance answers), and on a fast box the restore's
+# agent check runs within a second of the process starting. Writing the marker
+# first means there is no ordering in which the app can reach that check before
+# the marker exists. It is not cleaned up on the way out: expiry is the release
+# mechanism, so a delivery that dies halfway cannot leave the confirmation
+# silenced.
+if ($AppOnly) {
+    try {
+        $markerDir = Split-Path -Parent $DeferMarkerPath
+        if ($markerDir -and -not (Test-Path -LiteralPath $markerDir)) {
+            New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+        }
+        $deadline = [int64]([DateTimeOffset]::UtcNow.AddMinutes($DeferMinutes).ToUnixTimeSeconds())
+        # No BOM: the app parses the first line as a decimal integer, and a
+        # U+FEFF in front of it reads as garbage (which is safe - it declines to
+        # defer - but silently defeats the whole point). Set-Content in PS 5.1
+        # would write one.
+        $body = "$deadline`n# ghoztty app-only delivery; the agent-restart confirmation is deferred until this UTC unix time`n"
+        [IO.File]::WriteAllText($DeferMarkerPath, $body, (New-Object Text.UTF8Encoding($false)))
+        Log "APP-ONLY: agent-upgrade confirmation deferred until $deadline (+$DeferMinutes min) via $DeferMarkerPath"
+    } catch {
+        # Not fatal. The cost is a dialog on an unattended box, which is the
+        # thing being fixed - but a delivery that refused to ship over it would
+        # leave the user on a stale client instead, which is worse.
+        Log "WARNING: APP-ONLY: could not write the deferral marker $DeferMarkerPath ($($_.Exception.Message)); the agent-restart confirmation may appear unattended"
+    }
+}
 
 # Let the launching Claude turn finish so the session transcript is flushed
 # before its terminal is killed.
@@ -309,9 +377,17 @@ if (Test-Path $newCom) {
 # agent keeps running with every PTY attached (lazy upgrade, as on Mac); the
 # next cold start — reboot autostart or find-or-spawn after it exits — picks
 # up the new binary.
+#
+# T525: skipped wholesale in -AppOnly mode. Swapping it here is what makes the
+# freshly restarted app find a bundled agent newer than the running one and ask
+# to restart it - an interruption on an unattended box, and one that would end
+# the very sessions the morning refresh exists to preserve. The staged binary is
+# not lost: the next deliberate (attended) delivery ships it.
 $newAgent = Join-Path $Staging 'bin\ghoztty-agent.exe'
 $oldAgent = Join-Path $InstallDir 'ghoztty-agent.exe'
-if (Test-Path $newAgent) {
+if ($AppOnly) {
+    Log 'APP-ONLY: ghoztty-agent.exe NOT swapped (staged for the next full delivery); the running agent and its sessions are untouched'
+} elseif (Test-Path $newAgent) {
     try {
         if (Test-Path $oldAgent) {
             if (Test-Path "$oldAgent.bak") {
@@ -374,6 +450,7 @@ if ($preSessions.Count -gt 0) {
 # say which one it is. This is the line a later turn greps when it wants to know
 # what the user is actually running.
 $installedInfo = Resolve-GhozttyExeCommit -Exe $oldExe
+$script:installedCommit = $installedInfo.Commit
 $want = if ($expected) { $expected } else { $stagedInfo.Commit }
 if (-not $installedInfo.Commit) {
     Log "POST-SWAP VERIFY UNKNOWN: could not read the installed exe's commit ($($installedInfo.Why)); wanted '$want'"
@@ -406,7 +483,15 @@ if ($script:deliveryFailure) {
             # Same set the primary swap maintains, plus ghostty-vt.dll only where
             # the target already has one (the portable ships it; the installed
             # release does not - this is not the place to invent new layout).
-            $names = @('ghoztty.exe', 'ghoztty.com', 'ghoztty.pdb', 'ghoztty-agent.exe', 'ghoztty-agent.pdb')
+            # T525: -AppOnly means app, everywhere. A portable copy that got a
+            # newer agent would hand the same unattended dialog to whoever
+            # launches it next, and "app-only except over there" is the kind of
+            # per-location divergence this repo does not ship.
+            $names = if ($AppOnly) {
+                @('ghoztty.exe', 'ghoztty.com', 'ghoztty.pdb')
+            } else {
+                @('ghoztty.exe', 'ghoztty.com', 'ghoztty.pdb', 'ghoztty-agent.exe', 'ghoztty-agent.pdb')
+            }
             if (Test-Path -LiteralPath (Join-Path $dir 'ghostty-vt.dll')) { $names += 'ghostty-vt.dll' }
             $copied = @()
             foreach ($n in $names) {
@@ -482,7 +567,12 @@ try { Set-Location -LiteralPath $WorkingDirectory -ErrorAction Stop } catch {
 # loop ever iterating, and the deadline then reported the app as DEAD. Running it
 # as a child with a hard wait makes the deadline mean what it says.
 function Get-ListJson([int]$callTimeoutSec = 10) {
-    return (Invoke-GhozttyListJson -Exe $oldExe -WorkingDirectory $WorkingDirectory -TimeoutSec $callTimeoutSec)
+    $r = Invoke-GhozttyListJson -Exe $oldExe -WorkingDirectory $WorkingDirectory -TimeoutSec $callTimeoutSec
+    # A single answered +list is the whole of "a live app is up on the new exe";
+    # recorded once, here, because every caller below has a different reason for
+    # asking and none of them is the reporting site (T525).
+    if ($r.Json) { $script:appAnswered = $true }
+    return $r
 }
 
 # Wait for the instance to answer IPC. `$appProc` is the process this script
