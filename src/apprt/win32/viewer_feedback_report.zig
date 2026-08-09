@@ -18,7 +18,7 @@
 //! ```
 //! <worktree>/temp/feedback/new/20260809T004912Z-a3f9c2/
 //!     report.json
-//!     images/image-1.png        (T637; the array is empty until then)
+//!     images/image-1.png
 //! ```
 //!
 //! Everything for a submission lives together, so a report can be moved,
@@ -156,10 +156,13 @@ pub fn stemIsFilenameSafe(stem: []const u8) bool {
 
 /// An image's path relative to the report folder — `/`-separated, because the
 /// consumer is shared and a `\` in a markdown link is an escape, not a
-/// separator (T637 writes the files these name).
+/// separator.
 pub fn imageRelativePath(buf: []u8, number: u32) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/image-{d}.png", .{ images_dir_name, number }) catch null;
 }
+
+/// Bytes a `images/image-N.png` needs, at the widest `N` there is.
+pub const image_path_max = images_dir_name.len + "/image-".len + 10 + ".png".len;
 
 // -----------------------------------------------------------------------------
 // Body
@@ -328,6 +331,18 @@ pub const Quote = struct {
     source_line: ?u32 = null,
 };
 
+/// One image the report carries, on its way to `images/image-N.png` inside the
+/// folder. The bytes are already PNG-encoded — this module never looks at
+/// pixels, it only files what it is handed.
+pub const Image = struct {
+    /// The chip's stable number. It names the file too, so the markdown link
+    /// in `body` and the entry in `images` cannot drift apart.
+    number: u32,
+    png: []const u8,
+    pixel_width: ?u32 = null,
+    pixel_height: ?u32 = null,
+};
+
 /// Everything known about WHAT the feedback is about. The point of a report is
 /// that a downstream agent can act on it without asking follow-up questions,
 /// so this is deliberately generous: where the user was, what they had
@@ -418,7 +433,7 @@ const Payload = struct {
     worktree: PayloadWorktree,
     app: PayloadApp,
     quotes: []const PayloadQuote,
-    /// Always present, empty until T637 pastes images into the composer. A
+    /// Always present, empty when the composer held no images. A
     /// present-but-empty array is what tells a reader "no images" apart from
     /// "written by something that did not know about images".
     images: []const PayloadImage = &.{},
@@ -436,6 +451,7 @@ pub fn serialize(
     body: []const u8,
     ctx: Context,
     quotes: []const Quote,
+    images: []const Image,
 ) ![]u8 {
     var payload_quotes = try alloc.alloc(PayloadQuote, quotes.len);
     defer alloc.free(payload_quotes);
@@ -450,6 +466,24 @@ pub fn serialize(
         .documentOffset = q.document_offset,
         .sourceLine = q.source_line,
     };
+
+    // Each path is formatted into a buffer that outlives the stringify below,
+    // which is why they are allocated together rather than on a per-image
+    // stack slot.
+    const path_buf = try alloc.alloc(u8, images.len * image_path_max);
+    defer alloc.free(path_buf);
+    var payload_images = try alloc.alloc(PayloadImage, images.len);
+    defer alloc.free(payload_images);
+    for (images, 0..) |img, i| {
+        const slot = path_buf[i * image_path_max ..][0..image_path_max];
+        payload_images[i] = .{
+            .number = img.number,
+            .path = imageRelativePath(slot, img.number) orelse unreachable,
+            .pixelWidth = img.pixel_width,
+            .pixelHeight = img.pixel_height,
+            .bytes = img.png.len,
+        };
+    }
 
     const payload: Payload = .{
         .id = stem,
@@ -473,6 +507,7 @@ pub fn serialize(
         },
         .app = .{ .version = ctx.app_version },
         .quotes = payload_quotes,
+        .images = payload_images,
     };
 
     return std.json.Stringify.valueAlloc(alloc, payload, .{
@@ -509,10 +544,15 @@ pub fn write(
     ctx: Context,
     body: []const u8,
     quotes: []const Quote,
+    images: []const Image,
     epoch_secs: u64,
     suffix: u24,
 ) !Written {
-    if (std.mem.trim(u8, body, " \t\r\n").len == 0) return WriteError.Empty;
+    // A report whose whole content is a picture is a real report, so an empty
+    // BODY is only empty when there are no images either.
+    if (images.len == 0 and std.mem.trim(u8, body, " \t\r\n").len == 0) {
+        return WriteError.Empty;
+    }
 
     var stem_buf: [stem_len]u8 = undefined;
     const stem = makeStem(&stem_buf, epoch_secs, suffix);
@@ -521,7 +561,7 @@ pub fn write(
     var created_buf: [20]u8 = undefined;
     const created = formatCreated(&created_buf, epoch_secs);
 
-    const json = try serialize(alloc, stem, created, body, ctx, quotes);
+    const json = try serialize(alloc, stem, created, body, ctx, quotes, images);
     defer alloc.free(json);
 
     const feedback_dir = try std.fs.path.join(alloc, &.{
@@ -549,6 +589,27 @@ pub fn write(
         var file = try std.fs.cwd().createFile(report_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(json);
+    }
+
+    // Inside the staging folder, so the single rename below publishes the
+    // report and every one of its images at once. A watcher can never see a
+    // report whose pictures have not arrived yet.
+    if (images.len != 0) {
+        const dir = try std.fs.path.join(alloc, &.{ staging, images_dir_name });
+        defer alloc.free(dir);
+        try std.fs.cwd().makePath(dir);
+        for (images) |img| {
+            // The bare file name, not the `/`-separated relative path: that
+            // one is for the JSON, and a path separator belongs to
+            // `path.join` on this platform.
+            var name_buf: [image_path_max]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "image-{d}.png", .{img.number}) catch continue;
+            const path = try std.fs.path.join(alloc, &.{ dir, name });
+            defer alloc.free(path);
+            var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(img.png);
+        }
     }
 
     try std.fs.cwd().rename(staging, final);
@@ -782,6 +843,7 @@ test "serialize: every context block round-trips, and absent optionals are absen
         "this is wrong\n\n> the passage",
         sampleContext("D:\\repo"),
         &quotes,
+        &.{},
     );
     defer alloc.free(json);
 
@@ -842,9 +904,51 @@ test "serialize: every context block round-trips, and absent optionals are absen
     try testing.expectEqual(@as(i64, 345), q.get("documentOffset").?.integer);
     try testing.expectEqual(@as(i64, 7), q.get("sourceLine").?.integer);
 
-    // Present but empty until T637 — which is how a reader tells "no images"
-    // apart from "written by a build that had none".
+    // Present but empty — which is how a reader tells "no images" apart from
+    // "written by a build that did not know about them".
     try testing.expectEqual(@as(usize, 0), root.get("images").?.array.items.len);
+}
+
+test "serialize: an image's entry names the file the folder will hold" {
+    const alloc = testing.allocator;
+    const images = [_]Image{
+        .{ .number = 1, .png = "0123456789", .pixel_width = 1920, .pixel_height = 1080 },
+        // A hole in the numbering: #2 was deleted from the composer, and the
+        // report says so by not mentioning it.
+        .{ .number = 3, .png = "abc" },
+    };
+    const json = try serialize(
+        alloc,
+        "stem",
+        "2026-08-09T00:49:12Z",
+        "see ![Image #1](images/image-1.png)",
+        sampleContext("D:\\repo"),
+        &.{},
+        &images,
+    );
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("images").?.array.items;
+    try testing.expectEqual(@as(usize, 2), arr.len);
+
+    const first = arr[0].object;
+    try testing.expectEqual(@as(i64, 1), first.get("number").?.integer);
+    // Folder-relative and `/`-separated, so it survives the move into
+    // `in-progress/` and works as a markdown link.
+    try testing.expectEqualStrings("images/image-1.png", first.get("path").?.string);
+    try testing.expectEqual(@as(i64, 1920), first.get("pixelWidth").?.integer);
+    try testing.expectEqual(@as(i64, 1080), first.get("pixelHeight").?.integer);
+    try testing.expectEqual(@as(i64, 10), first.get("bytes").?.integer);
+
+    const second = arr[1].object;
+    try testing.expectEqual(@as(i64, 3), second.get("number").?.integer);
+    try testing.expectEqualStrings("images/image-3.png", second.get("path").?.string);
+    // Unknown dimensions are dropped rather than written as null, like every
+    // other absent optional.
+    try testing.expect(second.get("pixelWidth") == null);
+    try testing.expectEqual(@as(i64, 3), second.get("bytes").?.integer);
 }
 
 test "serialize: an absent optional is dropped, not written as null" {
@@ -856,7 +960,7 @@ test "serialize: an absent optional is dropped, not written as null" {
         .worktree_path = "D:\\repo",
         .worktree_name = "repo",
     };
-    const json = try serialize(alloc, "stem", "2026-08-09T00:49:12Z", "b", ctx, &.{});
+    const json = try serialize(alloc, "stem", "2026-08-09T00:49:12Z", "b", ctx, &.{}, &.{});
     defer alloc.free(json);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
@@ -883,6 +987,7 @@ test "write: one complete folder appears, and nothing is left staged" {
         alloc,
         sampleContext(root),
         "the report body",
+        &.{},
         &.{},
         sample_epoch,
         0xa3f9c2,
@@ -917,9 +1022,9 @@ test "write: a second report in the same second gets its own folder" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    const a = try write(alloc, sampleContext(root), "first", &.{}, sample_epoch, 0x000001);
+    const a = try write(alloc, sampleContext(root), "first", &.{}, &.{}, sample_epoch, 0x000001);
     defer a.deinit(alloc);
-    const b = try write(alloc, sampleContext(root), "second", &.{}, sample_epoch, 0x000002);
+    const b = try write(alloc, sampleContext(root), "second", &.{}, &.{}, sample_epoch, 0x000002);
     defer b.deinit(alloc);
     try testing.expect(!std.mem.eql(u8, a.stem, b.stem));
 
@@ -940,9 +1045,72 @@ test "write: an empty composer files nothing at all" {
 
     try testing.expectError(
         WriteError.Empty,
-        write(alloc, sampleContext(root), "   \n\t ", &.{}, sample_epoch, 0x000001),
+        write(alloc, sampleContext(root), "   \n\t ", &.{}, &.{}, sample_epoch, 0x000001),
     );
     // Not even the queue directory: a refused send must leave no trace for a
     // watcher to poll.
     try testing.expectError(error.FileNotFound, tmp.dir.access("temp/feedback", .{}));
+}
+
+test "write: the images land in the folder, published by the same one rename" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const images = [_]Image{
+        .{ .number = 1, .png = "first-png-bytes", .pixel_width = 8, .pixel_height = 4 },
+        .{ .number = 3, .png = "third-png-bytes" },
+    };
+    const written = try write(
+        alloc,
+        sampleContext(root),
+        "see ![Image #1](images/image-1.png) and ![Image #3](images/image-3.png)",
+        &.{},
+        &images,
+        sample_epoch,
+        0xa3f9c2,
+    );
+    defer written.deinit(alloc);
+
+    // Both files are there under the numbers the body links to — the property
+    // that makes the report movable as one unit.
+    for ([_][]const u8{
+        "temp/feedback/new/20260809T004912Z-a3f9c2/images/image-1.png",
+        "temp/feedback/new/20260809T004912Z-a3f9c2/images/image-3.png",
+    }, [_][]const u8{ "first-png-bytes", "third-png-bytes" }) |path, want| {
+        const got = try tmp.dir.readFileAlloc(alloc, path, 4096);
+        defer alloc.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // ...and nothing survives in staging, so the publish was still one rename.
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access("temp/feedback/.staging/20260809T004912Z-a3f9c2", .{}),
+    );
+}
+
+test "write: a report that is only a picture is not an empty report" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    // Nothing typed but an image pasted: the body renders to the link alone,
+    // and "here, look at this" is a complete piece of feedback.
+    const images = [_]Image{.{ .number = 1, .png = "bytes" }};
+    const written = try write(
+        alloc,
+        sampleContext(root),
+        "",
+        &.{},
+        &images,
+        sample_epoch,
+        0x000001,
+    );
+    defer written.deinit(alloc);
+    try tmp.dir.access("temp/feedback/new/20260809T004912Z-000001/images/image-1.png", .{});
 }

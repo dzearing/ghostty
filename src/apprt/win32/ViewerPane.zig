@@ -72,6 +72,7 @@ const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
 const feedback_doc = @import("viewer_feedback_doc.zig");
 const feedback_report = @import("viewer_feedback_report.zig");
+const feedback_images_mod = @import("viewer_feedback_images.zig");
 const ViewerFeedbackSend = @import("ViewerFeedbackSend.zig");
 const viewer_worktree = @import("viewer_worktree.zig");
 const git_run = @import("git_run.zig");
@@ -421,6 +422,13 @@ feedback_text: std.ArrayListUnmanaged(u8) = .empty,
 /// notice the deletion.
 feedback_quotes: feedback_doc.Registry = .{},
 
+/// Every image pasted into the composer, PNG-encoded (T637). On the pane for
+/// the same reason the quotes are, and derived the same way: which of them are
+/// still in the report comes from the `[Image #N]` chips still in
+/// `feedback_text`, so deleting a chip drops its picture without anything
+/// having to be told.
+feedback_images: feedback_images_mod.Store = .{},
+
 /// The machinery that files a report off the UI thread (T636), created
 /// alongside the probe for the same reason it is: it needs a host window to
 /// post its completion at. Null for every pane that never opened one.
@@ -607,6 +615,7 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     }
     self.feedback_text.deinit(alloc);
     self.feedback_quotes.deinit(alloc);
+    self.feedback_images.deinit(alloc);
     self.feedback_open = false;
     if (self.feedback_status) |s| alloc.free(s);
     self.feedback_status = null;
@@ -948,12 +957,47 @@ pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
     const spans = self.feedbackQuoteSpans(alloc) orelse &.{};
     defer if (spans.len != 0) alloc.free(spans);
 
-    const body = feedback_report.renderBody(alloc, self.feedback_text.items, spans) catch {
+    // The images still chipped into the text, and the entries they name.
+    // Derived exactly like the quotes, from the same buffer.
+    const image_spans = self.feedback_images.live(alloc, self.feedback_text.items) catch &.{};
+    defer if (image_spans.len != 0) alloc.free(image_spans);
+
+    var images = alloc.alloc(feedback_report.Image, image_spans.len) catch {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer alloc.free(images);
+    var numbers = alloc.alloc(u32, image_spans.len) catch {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer alloc.free(numbers);
+    for (image_spans, 0..) |s, i| {
+        const e = self.feedback_images.entries.items[s.index];
+        images[i] = .{
+            .number = e.number,
+            .png = e.png,
+            .pixel_width = e.pixel_width,
+            .pixel_height = e.pixel_height,
+        };
+        numbers[i] = e.number;
+    }
+
+    const quoted = feedback_report.renderBody(alloc, self.feedback_text.items, spans) catch {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer alloc.free(quoted);
+    // Chips become markdown image references LAST, over the rendered body:
+    // `renderBody` has already moved every offset by adding `> ` and trimming,
+    // and the links are re-found by text rather than placed by offset.
+    const body = feedback_images_mod.renderLinks(alloc, quoted, numbers) catch {
         self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
         return;
     };
     defer alloc.free(body);
-    if (std.mem.trim(u8, body, " \t\r\n").len == 0) return;
+    // A report that is nothing but a picture is still a report.
+    if (images.len == 0 and std.mem.trim(u8, body, " \t\r\n").len == 0) return;
 
     var quotes = alloc.alloc(feedback_report.Quote, spans.len) catch {
         self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
@@ -993,6 +1037,7 @@ pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
         .app_version = build_config.version_string,
         .body = body,
         .quotes = quotes,
+        .images = images,
         .epoch_secs = @intCast(@max(std.time.timestamp(), 0)),
         // Only has to break a tie inside one second; the timestamp separates
         // everything else.
@@ -1010,8 +1055,8 @@ pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
     // two differ (trimming, `> ` on quoted lines), and the acceptance script
     // needs the first to check the control⇄pane mirror.
     log.info(
-        "viewer feedback pane={s} action=send bytes={d} buffer={d} quotes={d} worktree={s}",
-        .{ self.paneId(), body.len, self.feedback_text.items.len, quotes.len, root },
+        "viewer feedback pane={s} action=send bytes={d} buffer={d} quotes={d} images={d} worktree={s}",
+        .{ self.paneId(), body.len, self.feedback_text.items.len, quotes.len, images.len, root },
     );
 }
 
@@ -1043,6 +1088,9 @@ fn completeFeedbackSend(self: *ViewerPane) void {
         // are now in a filed report, and a quote that survived into the NEXT
         // report would attach that report's context to this one's passage.
         self.feedback_quotes.deinit(p.alloc);
+        // ...and so do the images, for the same reason plus a plainer one:
+        // they are megabytes, and the report that needed them has them now.
+        self.feedback_images.deinit(p.alloc);
         if (self.feedback) |bar| bar.seedControl();
         if (self.hwnd) |h| {
             _ = w32.SetTimer(h, feedback_close_timer_id, feedback_close_delay_ms, null);
@@ -1530,6 +1578,38 @@ pub fn feedbackQuoteSpans(self: *const ViewerPane, alloc: Allocator) ?[]feedback
 pub fn feedbackQuoteCount(self: *const ViewerPane, alloc: Allocator) usize {
     const spans = self.feedbackQuoteSpans(alloc) orelse return 0;
     defer alloc.free(spans);
+    return spans.len;
+}
+
+/// Take one PNG into the composer's store and answer with the number its chip
+/// carries, or null when it could not be taken (not a PNG, too big, or the
+/// composer already holds as much as it will).
+///
+/// The pane owns the store, so the picture survives the composer being closed
+/// and reopened exactly as its text does — and the chip's number is allocated
+/// here, before anything is inserted, so the two can never disagree about what
+/// `[Image #N]` refers to.
+pub fn feedbackAddImage(self: *ViewerPane, alloc: Allocator, png: []const u8) ?u32 {
+    const number = self.feedback_images.add(alloc, png) catch |err| {
+        log.warn("viewer feedback pane={s} image rejected: {s}", .{
+            self.paneId(),
+            @errorName(err),
+        });
+        self.setFeedbackStatus(alloc, switch (err) {
+            error.TooLarge, error.Full => "That image is too large to attach",
+            else => "That is not an image this can attach",
+        });
+        if (self.feedback) |bar| bar.repaint();
+        return null;
+    };
+    return number;
+}
+
+/// How many images the report would carry right now — the number that drops
+/// when the user deletes a chip. The acceptance script's oracle.
+pub fn feedbackImageCount(self: *const ViewerPane, alloc: Allocator) usize {
+    const spans = self.feedback_images.live(alloc, self.feedback_text.items) catch return 0;
+    defer if (spans.len != 0) alloc.free(spans);
     return spans.len;
 }
 

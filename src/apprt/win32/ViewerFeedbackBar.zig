@@ -65,6 +65,8 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_feedback_layout.zig");
 const doc = @import("viewer_feedback_doc.zig");
+const feedback_images = @import("viewer_feedback_images.zig");
+const clipboard_image = @import("clipboard_image.zig");
 const system_colors = @import("system_colors.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -77,6 +79,10 @@ pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral(class_name_utf8);
 
 /// Child id of the RichEdit, so `WM_COMMAND`'s low word names it.
 const edit_id: usize = 1;
+
+/// `'V'`. There is no `VK_V` — the letter keys ARE their ASCII codes, which is
+/// how `viewer_accel.zig` spells them too.
+const vk_v: u16 = 0x56;
 
 /// "The wrapped line count moved while I was being laid out; ask the pane to
 /// lay me out again." Posted, never sent — see `place`.
@@ -113,6 +119,10 @@ lines: u32 = 1,
 /// True while `seedControl` is writing the buffer INTO the control, so the
 /// `EN_CHANGE` that write raises does not mirror straight back out again.
 seeding: bool = false,
+
+/// Set when Ctrl+V was consumed as an IMAGE paste, so the `WM_CHAR` the
+/// keystroke also generates is dropped rather than typed after the chip.
+swallow_paste_char: bool = false,
 
 /// The RichEdit's own window procedure, kept so the subclass can hand every
 /// message it does not add to.
@@ -635,6 +645,97 @@ pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
     _ = w32.InvalidateRect(self.edit, null, 1);
 }
 
+// -------------------------------------------------------------------------
+// Images (T637)
+// -------------------------------------------------------------------------
+
+/// Take the clipboard's picture into the composer, if it has one. True when it
+/// did — in which case the caller must NOT let the control run its own paste,
+/// or the image's text fallback lands underneath the chip.
+///
+/// This is where Mac's `readablePasteboardTypes` trap has its win32 twin: a
+/// RichEdit asks the clipboard for text and nothing else, so an image-only
+/// clipboard pastes as silence. The composer asks first.
+fn tryPasteImage(self: *ViewerFeedbackBar) bool {
+    if (!clipboard_image.available()) return false;
+    const png = clipboard_image.read(self.alloc, self.hwnd) orelse return false;
+    defer self.alloc.free(png);
+    return self.attachImage(png);
+}
+
+/// Store one PNG and put its chip at the caret. False when the picture could
+/// not be taken, in which case nothing was inserted and the pane has already
+/// said why in the footer.
+pub fn attachImage(self: *ViewerFeedbackBar, png: []const u8) bool {
+    const number = self.pane.feedbackAddImage(self.alloc, png) orelse return false;
+
+    const ins = feedback_images.insertion(
+        self.alloc,
+        self.pane.feedbackText(),
+        self.caret(),
+        number,
+    ) catch return false;
+    defer ins.deinit(self.alloc);
+
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, ins.insert) catch return false;
+    defer self.alloc.free(wide);
+
+    // The chip is plain text with plain formatting: born inside a quote's wash
+    // it would read as part of the quote, and its metadata is its NUMBER, not
+    // its styling.
+    self.ensurePlainAtCaret();
+    const at: w32.CHARRANGE = .{ .cpMin = @intCast(ins.at), .cpMax = @intCast(ins.at) };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&at)));
+    // wparam TRUE, so Ctrl+Z takes the chip back out the way it takes typing
+    // out — and the picture leaves the report with it, because the report is
+    // derived from the text.
+    _ = w32.SendMessageW(self.edit, w32.EM_REPLACESEL, 1, @bitCast(@intFromPtr(wide.ptr)));
+
+    self.readBack();
+    self.applyQuoteFormatting();
+    self.setCaret(ins.caret_after);
+    self.ensurePlainAtCaret();
+
+    if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    _ = w32.InvalidateRect(self.edit, null, 1);
+
+    log.info("viewer feedback pane={s} image=#{d} bytes={d} live={d}", .{
+        self.pane.paneId(),
+        number,
+        png.len,
+        self.pane.feedbackImageCount(self.alloc),
+    });
+    return true;
+}
+
+/// Backspace and Delete against a chip take the WHOLE chip.
+///
+/// A chip is literally the characters `[Image #3]`, so an unguarded Backspace
+/// eats the `]` and leaves `[Image #3` — text that no longer parses as a chip,
+/// which silently drops the picture from the report while still looking like
+/// it is attached. Selecting the run first makes the chip behave like Mac's
+/// single attachment character. Returns true when it selected something, and
+/// the caller then lets the control delete the selection normally.
+fn selectChipForDelete(self: *ViewerFeedbackBar, vk: u16) bool {
+    var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
+    // Only a bare caret: an explicit selection is the user's own, and widening
+    // it would delete more than they asked for.
+    if (sel.cpMin != sel.cpMax or sel.cpMin < 0) return false;
+
+    const text = self.pane.feedbackText();
+    const at: usize = @intCast(sel.cpMin);
+    const chip = switch (vk) {
+        w32.VK_BACK => feedback_images.chipEndingAt(text, at),
+        w32.VK_DELETE => feedback_images.chipStartingAt(text, at),
+        else => null,
+    } orelse return false;
+
+    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(chip.start), .cpMax = @intCast(chip.end) };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+    return true;
+}
+
 /// The live quote spans, in the pane's buffer coordinates. Caller frees.
 /// Null when there is nothing to do, so callers can bail without a branch on
 /// an empty slice they would then have to free.
@@ -1024,13 +1125,14 @@ fn updateHover(self: *ViewerFeedbackBar, x: i32, y: i32) void {
 }
 
 /// A button click, delivered on mouse-up over the same button it went down on.
-/// `↑` files the report (T636); `+` is still a stub, because screenshots are
-/// T637 — and a button that logs its intent is what T633 established as the
-/// honest placeholder for a wired-but-unbuilt action.
+/// `↑` files the report (T636); `+` is still a stub, because the CAPTURE
+/// primitive is T647 — the storage and the chip it would feed are here (T637),
+/// and a button that logs its intent is what T633 established as the honest
+/// placeholder for a wired-but-unbuilt action.
 fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
     switch (b) {
         .snapshot => log.info(
-            "viewer feedback pane={s} action=snapshot (screenshots are T637)",
+            "viewer feedback pane={s} action=snapshot (screenshot capture is T647)",
             .{self.pane.paneId()},
         ),
         .send => self.pane.sendFeedback(self.alloc),
@@ -1110,13 +1212,41 @@ fn editProc(
     // afterwards would mean repainting a character the user already saw
     // tinted.
     switch (msg) {
-        w32.WM_CHAR, w32.WM_PASTE => self.ensurePlainAtCaret(),
+        // A clipboard carrying a picture is pasted as the picture, and the
+        // control never runs its own paste — see `tryPasteImage`.
+        w32.WM_PASTE => {
+            if (self.tryPasteImage()) return 0;
+            self.ensurePlainAtCaret();
+        },
+        w32.WM_CHAR => {
+            // Ctrl+V still generates its control character (TranslateMessage
+            // runs before dispatch), so a paste this handled has to swallow
+            // the SYN that follows or the chip gets a stray character after it.
+            if (self.swallow_paste_char) {
+                self.swallow_paste_char = false;
+                if (wparam & 0xFFFF == 0x16) return 0;
+            }
+            self.ensurePlainAtCaret();
+        },
         w32.WM_KEYDOWN => {
             // Enter is the one key that inserts text, and Delete/Backspace can
             // remove the character the caret was inheriting from.
             const vk: u16 = @intCast(wparam & 0xFFFF);
             if (vk == w32.VK_RETURN or vk == w32.VK_BACK or vk == w32.VK_DELETE) {
+                // A chip deletes whole (see `selectChipForDelete`), then the
+                // control removes the selection it was handed.
+                _ = self.selectChipForDelete(vk);
                 self.ensurePlainAtCaret();
+            }
+            // Ctrl+V is intercepted HERE rather than relying on the control to
+            // turn it into a WM_PASTE: whether it does is a RichEdit internal,
+            // and a paste that silently does nothing is the exact failure this
+            // whole path exists to prevent.
+            if (vk == vk_v and w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
+                if (self.tryPasteImage()) {
+                    self.swallow_paste_char = true;
+                    return 0;
+                }
             }
         },
         else => {},

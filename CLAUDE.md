@@ -851,8 +851,10 @@ the queue; consuming it is separate and not built here).
   revision is resolved on the SEND rather than cached with the worktree (D47),
   so a pane left open across a branch switch still names what the user saw.
   What Windows does not have yet: the long-lived DRAFT staging folder and its
-  footer link (**T645**) and screenshots/image chips (**T637**); the quoted
-  block landed in **T641** (below).
+  footer link (**T645**), the thumbnail carousel (**T646**) and the screenshot
+  CAPTURE behind the `+` button (**T647**, whose primitive is decision D44);
+  the quoted block landed in **T641** (below) and the image half of the
+  composer in **T637**.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
@@ -862,6 +864,34 @@ the queue; consuming it is separate and not built here).
   number always points at the same image. Composer contents survive
   toggling the toolbar closed/open and a detach/undo (they live on the pane,
   not the toolbar).
+
+  **Windows pastes pictures too** (T637), by the same two rules and with the
+  same consequences. A chip there is literally the characters `[Image #3]` —
+  RichEdit has no attachment run to hang an image off, the same hole quoting
+  works around — so the NUMBER is the identity and the report's `images` array
+  is derived by scanning the composer text for chips, exactly as `quotes` is
+  derived by scanning it for passages. Delete a chip and its picture leaves the
+  report; nothing has to be told about the deletion. Atomicity is restored by
+  hand: Backspace or Delete against a chip selects the whole run first, because
+  eating the `]` alone would leave text that still LOOKS attached and no longer
+  parses (`src/apprt/win32/viewer_feedback_images.zig`, pure and asserted in
+  the none lane).
+  The paste path has Mac's `readablePasteboardTypes` trap in win32 dress: a
+  RichEdit asks the clipboard for text and nothing else, so an image-only
+  clipboard would paste as silence. The composer therefore asks first
+  (`clipboard_image.zig`), preferring the registered **`"PNG"`** format — which
+  browsers publish and which is copied **byte for byte**, never re-encoded —
+  then `CF_DIBV5`/`CF_DIB`/`CF_BITMAP`, which are normalised through one
+  `StretchDIBits` into a 32-bit top-down DIB section (GDI already knows every
+  palette, mask and row order; `dib_packed.zig` supplies the one thing it will
+  not, where the pixels start inside the packed block) and encoded by
+  `png_encode.zig`. That encoder is **pure** — `std.compress.flate` produces
+  the zlib stream `IDAT` is defined as, so there is no new vendored dependency
+  and no COM on the paste path, and it asserts against a decoder written in its
+  own test rather than against itself. Alpha is dropped on the normalised path
+  (a clipboard DIB's fourth byte is routinely all zeroes, and honouring that
+  turns a good screenshot into a blank one). Acceptance:
+  `test/win32/viewer-feedback-images.ps1`.
 
   **⇧⌘S** adds a screenshot from the keyboard while the composer has focus
   (free: the app's shift+cmd letters are t/z/w/d/f/g/v/n/r/[/], and macOS's own

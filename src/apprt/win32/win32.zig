@@ -1026,6 +1026,21 @@ pub extern "user32" fn FillRect(
 // Clipboard format: Unicode text (UTF-16LE, null-terminated)
 pub const CF_UNICODETEXT: u32 = 13;
 
+// Clipboard image formats, in the order a reader should prefer them: V5 first
+// because it is the only one carrying an alpha channel, then the plain DIB,
+// then a bare HBITMAP (which GDI synthesises for anything else).
+pub const CF_BITMAP: u32 = 2;
+pub const CF_DIB: u32 = 8;
+pub const CF_DIBV5: u32 = 17;
+
+pub extern "user32" fn RegisterClipboardFormatW(
+    lpszFormat: [*:0]const u16,
+) callconv(.winapi) u32;
+
+pub extern "user32" fn IsClipboardFormatAvailable(
+    format: u32,
+) callconv(.winapi) i32;
+
 // GlobalAlloc flags
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 
@@ -1062,6 +1077,14 @@ pub extern "kernel32" fn GlobalUnlock(
 pub extern "kernel32" fn GlobalFree(
     hMem: *anyopaque,
 ) callconv(.winapi) ?*anyopaque;
+
+pub extern "kernel32" fn GlobalSize(
+    hMem: *anyopaque,
+) callconv(.winapi) usize;
+
+pub extern "kernel32" fn Sleep(
+    dwMilliseconds: u32,
+) callconv(.winapi) void;
 
 // -----------------------------------------------------------------------
 // Edit control / child window API
@@ -2294,6 +2317,80 @@ pub extern "gdi32" fn CreateDIBSection(
     hSection: ?HANDLE,
     offset: u32,
 ) callconv(.winapi) ?HANDLE;
+
+/// The `BITMAPV5HEADER` prefix, which is what `CF_DIBV5` on the clipboard
+/// starts with. Only the fields up to the masks are named: everything past
+/// them is colour-management metadata that GDI reads for us.
+pub const BITMAPV5HEADER = extern struct {
+    bV5Size: u32 = @sizeOf(BITMAPV5HEADER),
+    bV5Width: i32,
+    bV5Height: i32,
+    bV5Planes: u16 = 1,
+    bV5BitCount: u16 = 32,
+    bV5Compression: u32 = BI_RGB,
+    bV5SizeImage: u32 = 0,
+    bV5XPelsPerMeter: i32 = 0,
+    bV5YPelsPerMeter: i32 = 0,
+    bV5ClrUsed: u32 = 0,
+    bV5ClrImportant: u32 = 0,
+    bV5RedMask: u32 = 0,
+    bV5GreenMask: u32 = 0,
+    bV5BlueMask: u32 = 0,
+    bV5AlphaMask: u32 = 0,
+    bV5CSType: u32 = 0,
+    bV5Endpoints: [36]u8 = [_]u8{0} ** 36,
+    bV5GammaRed: u32 = 0,
+    bV5GammaGreen: u32 = 0,
+    bV5GammaBlue: u32 = 0,
+    bV5Intent: u32 = 0,
+    bV5ProfileData: u32 = 0,
+    bV5ProfileSize: u32 = 0,
+    bV5Reserved: u32 = 0,
+};
+
+pub const BI_BITFIELDS: u32 = 3;
+
+pub const BITMAP = extern struct {
+    bmType: i32 = 0,
+    bmWidth: i32 = 0,
+    bmHeight: i32 = 0,
+    bmWidthBytes: i32 = 0,
+    bmPlanes: u16 = 0,
+    bmBitsPixel: u16 = 0,
+    bmBits: ?*anyopaque = null,
+};
+
+pub extern "gdi32" fn GetObjectW(
+    h: HANDLE,
+    c: i32,
+    pv: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "gdi32" fn GetDIBits(
+    hdc: HDC,
+    hbm: HANDLE,
+    start: u32,
+    lines: u32,
+    bits: ?*anyopaque,
+    bmi: *BITMAPINFO,
+    usage: u32,
+) callconv(.winapi) i32;
+
+pub extern "gdi32" fn StretchDIBits(
+    hdc: HDC,
+    xDest: i32,
+    yDest: i32,
+    destWidth: i32,
+    destHeight: i32,
+    xSrc: i32,
+    ySrc: i32,
+    srcWidth: i32,
+    srcHeight: i32,
+    bits: ?*const anyopaque,
+    bmi: *const anyopaque,
+    usage: u32,
+    rop: u32,
+) callconv(.winapi) i32;
 
 // -----------------------------------------------------------------------
 // Mouse activate

@@ -66,6 +66,7 @@ const Job = struct {
     ctx: report.Context,
     body: []const u8,
     quotes: []report.Quote,
+    images: []report.Image,
     epoch_secs: u64,
     suffix: u24,
 
@@ -101,6 +102,9 @@ pub const Request = struct {
     /// The live quotes, WITHOUT `source_line` — the worker resolves that
     /// against the file.
     quotes: []const report.Quote,
+    /// The live images, PNG-encoded. Copied like everything else here: the
+    /// composer's store is the user's to keep editing while the write is out.
+    images: []const report.Image = &.{},
     epoch_secs: u64,
     suffix: u24,
 };
@@ -177,6 +181,7 @@ pub fn begin(self: *Sender, req: Request) bool {
         .ctx = .{ .location = "", .kind = "", .worktree_path = "", .worktree_name = "" },
         .body = "",
         .quotes = &.{},
+        .images = &.{},
         .epoch_secs = req.epoch_secs,
         .suffix = req.suffix,
     };
@@ -235,6 +240,17 @@ fn fill(job: *Job, req: Request) !void {
         };
     }
     job.quotes = quotes;
+
+    const images = try aa.alloc(report.Image, req.images.len);
+    for (req.images, 0..) |img, i| {
+        images[i] = .{
+            .number = img.number,
+            .png = try aa.dupe(u8, img.png),
+            .pixel_width = img.pixel_width,
+            .pixel_height = img.pixel_height,
+        };
+    }
+    job.images = images;
 }
 
 fn dupeOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
@@ -251,7 +267,15 @@ fn work(self: *Sender, job: *Job) void {
     job.ctx.commit = revision(aa, job.ctx.worktree_path, .commit);
     resolveSourceLines(aa, job);
 
-    if (report.write(aa, job.ctx, job.body, job.quotes, job.epoch_secs, job.suffix)) |written| {
+    if (report.write(
+        aa,
+        job.ctx,
+        job.body,
+        job.quotes,
+        job.images,
+        job.epoch_secs,
+        job.suffix,
+    )) |written| {
         job.ok = true;
         job.stem = written.stem;
     } else |err| {

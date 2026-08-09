@@ -201,6 +201,19 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_report.zig");
 
+    // Pure win32 viewer feedback IMAGES — stable chip numbering, which chips
+    // are still in the report, and the PNG header read (T637), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_feedback_images.zig");
+
+    // Pure win32 PNG encoder — what a clipboard bitmap becomes on its way into
+    // a feedback report (T637), same no-OS-imports deal.
+    _ = @import("apprt/win32/png_encode.zig");
+
+    // Pure win32 packed-DIB header reader — where a clipboard bitmap's pixels
+    // actually start (T637), same no-OS-imports deal.
+    _ = @import("apprt/win32/dib_packed.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");
