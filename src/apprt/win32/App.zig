@@ -31,6 +31,7 @@ const PaneView = @import("PaneView.zig");
 const Surface = @import("Surface.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
+const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
 const webview2 = @import("webview2.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
@@ -997,6 +998,15 @@ pub fn run(self: *App) !void {
                 if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
                     if (nav.handleEditChord(vk)) continue :loop;
                 }
+                // A viewer pane's feedback composer (T635): its RichEdit eats
+                // Escape and Ctrl+Enter itself, so the composer's own chords
+                // are routed here exactly like the address field's. Everything
+                // else — typing, arrows, Ctrl+A/C/V/X/Z — falls through to the
+                // control, which is the whole point of using a real one.
+                if (ViewerFeedbackBar.owningEdit(msg.hwnd.?)) |bar| {
+                    if (bar.handleKey(vk)) continue :loop;
+                    if (bar.handleChord(vk)) continue :loop;
+                }
                 // Check if this edit is a tab rename edit
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
                     for (self.windows.items) |win| {
@@ -1069,6 +1079,9 @@ pub fn run(self: *App) !void {
         if (msg.message == w32.WM_SYSKEYDOWN and msg.hwnd != null) {
             if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
                 if (nav.handleEditChord(@intCast(msg.wParam & 0xFFFF))) continue :loop;
+            }
+            if (ViewerFeedbackBar.owningEdit(msg.hwnd.?)) |bar| {
+                if (bar.handleChord(@intCast(msg.wParam & 0xFFFF))) continue :loop;
             }
         }
 

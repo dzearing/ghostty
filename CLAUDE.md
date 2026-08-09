@@ -821,11 +821,18 @@ the queue; consuming it is separate and not built here).
   chrome: `ViewerFeedbackBar.zig`; acceptance: `test/win32/viewer-feedback.ps1`.
   **The composer's TEXT and its open flag live on the pane, not on the toolbar
   window**, which is what makes contents survive a close/reopen on both
-  platforms. What the win32 composer is not yet is a real text control — which
-  control it becomes (RichEdit, a second WebView2, or owner-drawn) is decision
-  **D43** and lands with **T635**, so today it edits a plain buffer with no
-  caret navigation, selection or IME. Screenshots are **T636** and the report
-  writer is **T637**.
+  platforms. The win32 editing surface is a **RichEdit** (`Msftedit.dll`,
+  class `RichEdit50W`) filling the pill's text rect — D43's answer, landed in
+  **T635** — so caret, selection, word wrap, undo, clipboard and IME
+  composition come from the OS rather than from a hand-rolled model. The
+  control is the storage while the composer is open and every change mirrors
+  back into the pane from `EN_CHANGE`; the pane is still what outlives the
+  window. Two win32 details worth knowing: RichEdit sends **no** notifications
+  until `EM_SETEVENTMASK`/`ENM_CHANGE` asks for them, and it does **not**
+  answer `EM_SETCUEBANNER`, so the empty composer's placeholder is painted by
+  a subclass over the control's own `WM_PAINT`. Screenshots are **T636**, the
+  quoted block and the page's Quote button are **T641**, and the report writer
+  is **T637**.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input

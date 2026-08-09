@@ -809,6 +809,9 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
         // size, its position and its fonts, and a window shown at 0x0 with no
         // scale would take one paint pass to become itself.
         self.syncBounds();
+        // Seeded BEFORE it is shown, so a reopened composer never flashes
+        // empty on its way back to the half-written report it holds.
+        bar.seedControl();
         bar.setVisible(true);
         bar.takeFocus();
     } else {
@@ -856,28 +859,25 @@ pub fn sendFeedback(self: *ViewerPane) void {
     });
 }
 
-// The composer's text model. Deliberately minimal — see the "which text
-// control this is NOT" section of `ViewerFeedbackBar`: D43 has not been
-// answered, so T634 ships a byte buffer and T635 replaces the editing path
-// with whatever the decision picks. What outlives that swap is WHERE the text
-// lives, which is here.
+// The composer's text. The editing happens in a RichEdit (T635, D43's answer)
+// which is the storage WHILE the composer is open; this buffer is the copy
+// that outlives it, mirrored from `EN_CHANGE` and seeded back on open. That
+// split is what makes composer contents survive a close/reopen, which Mac is
+// explicit about and which a buffer kept in the child window could not do.
+//
+// Line endings here are LF. RichEdit speaks CR; `ViewerFeedbackBar` converts
+// in both directions so exactly one convention reaches the report writer.
 
 pub fn feedbackText(self: *const ViewerPane) []const u8 {
     return self.feedback_text.items;
 }
 
-pub fn feedbackInsert(self: *ViewerPane, alloc: Allocator, bytes: []const u8) void {
+/// Replace the buffer wholesale — what the composer's change mirror does.
+/// All-or-nothing: a failed allocation leaves the previous contents in place
+/// rather than a truncated report.
+pub fn feedbackSetText(self: *ViewerPane, alloc: Allocator, bytes: []const u8) void {
+    self.feedback_text.clearRetainingCapacity();
     self.feedback_text.appendSlice(alloc, bytes) catch {};
-}
-
-/// Drop the last CODEPOINT, not the last byte: a buffer left holding half a
-/// UTF-8 sequence would fail to render and could not be repaired by typing.
-pub fn feedbackBackspace(self: *ViewerPane) void {
-    var n = self.feedback_text.items.len;
-    if (n == 0) return;
-    n -= 1;
-    while (n > 0 and (self.feedback_text.items[n] & 0xC0) == 0x80) n -= 1;
-    self.feedback_text.shrinkRetainingCapacity(n);
 }
 
 /// Mirror of `Surface.setVisible`. A viewer has no renderer thread to park, so

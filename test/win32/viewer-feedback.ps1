@@ -281,11 +281,48 @@ try {
     Assert ($null -ne $contentOpen -and $contentOpen -gt $contentBefore) `
         "the page moved down for the composer ($contentBefore -> $contentOpen)"
 
+    # --- C2. the editing surface is a real text control (T635) ---------------
+    # The band paints the pill; the text lives in a RichEdit child filling the
+    # pill's text rect. Everything below types into THAT, which is also the
+    # check that it exists at all -- a missing Msftedit.dll leaves the pane
+    # with no composer, and this is where that shows up.
+    $rich = $null
+    $richClass = '<none>'
+    foreach ($c in @(Get-TestChildWindows -Window $fb -Class $null)) {
+        $rich = [IntPtr]$c.Hwnd; $richClass = [string]$c.Class; break
+    }
+    Assert ($null -ne $rich -and $richClass -eq 'RichEdit50W') `
+        "the composer hosts a RichEdit50W text control (found '$richClass')"
+    if (-not $rich) { throw 'no text control in the composer' }
+    $richRect = Get-TestWindowRect $rich
+    Assert ($richRect -and $richRect.Width -gt 0 -and $richRect.Height -gt 0) `
+        "the text control is placed inside the pill ($($richRect.Width)x$($richRect.Height))"
+
+    # The empty composer's placeholder rides on EM_SETCUEBANNER, which RichEdit
+    # only understands from Msftedit 8 onwards. The app logs whether the
+    # control accepted it, because a cue banner is the one piece of this chrome
+    # nothing else can observe from outside the process.
+    $cue = $null; $painted = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match 'composer created cue_banner=(\w+) painted_placeholder=(\w+)') {
+            $cue = $Matches[1]; $painted = $Matches[2]
+        }
+    }
+    Assert (($cue -eq 'true') -or ($painted -eq 'true')) `
+        "the empty composer has a placeholder by one path or the other (cue=$cue painted=$painted)"
+
     # --- D. the pill grows with content, and shrinks again -------------------
-    # Typed newlines are what grows it (word wrap arrives with the real text
-    # model in T635), so this drives exactly what T634 built.
+    # Enter is pressed as a KEY, not typed as a CR: RichEdit breaks a paragraph
+    # from WM_KEYDOWN(VK_RETURN) and ignores a bare WM_CHAR 0x0D, so posting
+    # the character alone silently concatenates the lines. It is also the path
+    # a person takes, and it proves the main loop does not eat a bare Enter on
+    # its way to the control (only Ctrl+Enter is the composer's).
     $h1 = (Get-TestWindowRect $fb).Height
-    [void](Send-TestControlText -Control $fb -Text "one`rtwo`rthree")
+    [void](Send-TestControlText -Control $rich -Text 'one')
+    [void](Send-TestControlKey -Control $rich -Key Enter)
+    [void](Send-TestControlText -Control $rich -Text 'two')
+    [void](Send-TestControlKey -Control $rich -Key Enter)
+    [void](Send-TestControlText -Control $rich -Text 'three')
     Start-Sleep -Milliseconds 400
     $h3 = (Get-TestWindowRect $fb).Height
     Assert ($h3 -gt $h1) "three lines make the composer taller ($h1 -> $h3)"
@@ -296,7 +333,7 @@ try {
 
     # Backspace the last line away: the band must give the space BACK, which is
     # the half a "grows with content" implementation forgets.
-    for ($i = 0; $i -lt 6; $i++) { [void](Send-TestControlKey -Control $fb -Key Backspace) }
+    for ($i = 0; $i -lt 6; $i++) { [void](Send-TestControlKey -Control $rich -Key Backspace) }
     Start-Sleep -Milliseconds 400
     $h2 = (Get-TestWindowRect $fb).Height
     Assert ($h2 -lt $h3) "deleting a line gives the space back ($h3 -> $h2)"
@@ -305,7 +342,10 @@ try {
         "...and the page came back up with it ($contentTall -> $contentTwoLine)"
 
     # --- E/F. Escape closes; the text survives the round trip ----------------
-    [void](Send-TestControlKey -Control $fb -Key Escape)
+    # Escape is posted at the TEXT CONTROL, which is where focus really is: a
+    # multi-line RichEdit swallows both Escape and Ctrl+Enter itself, so the
+    # main loop intercepts them by the control's hwnd (App.zig, T635).
+    [void](Send-TestControlKey -Control $rich -Key Escape)
     $s = Wait-FeedbackState $errlog $paneId $false
     Assert ($s -and -not $s.Open) "Escape closes the composer (state '$($s.Open)')"
     Assert (-not (Test-TestWindowVisible $fb)) 'the composer window is hidden once closed'
@@ -330,7 +370,7 @@ try {
         "the reopened composer is still the size its TEXT makes it ($hBack vs $h2) -- state lives on the pane"
 
     # --- G. Ctrl+Enter sends, and names the length the pane still holds ------
-    [void](Send-TestViewerChord -Window $view.Top -Target $fb -Key Enter -Modifiers Ctrl)
+    [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
     $len = $null
     for ($t = 0; $t -lt 20; $t++) {
         $len = Get-LastSendLen $errlog $paneId
@@ -340,6 +380,107 @@ try {
     Assert ($null -ne $len) "Ctrl+Enter reaches the pane as a send (len=$len)"
     Assert ($null -ne $len -and $len -gt 0) `
         "...and the text typed before the close/reopen is still there (len=$len)"
+
+    # --- I. it edits like a text control: caret and selection (T635) ---------
+    # The T634 surface could only append and backspace, so every check here is
+    # one it could not have passed. The oracle is the control's own text, read
+    # with WM_GETTEXT (GetWindowTextW across processes reads a cache the app
+    # never sees).
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key A -Modifiers Ctrl)
+    [void](Send-TestControlKey -Control $rich -Key Delete)
+    Start-Sleep -Milliseconds 250
+    [void](Send-TestControlText -Control $rich -Text 'bcd')
+    Start-Sleep -Milliseconds 250
+    Assert ((Get-TestControlText $rich) -eq 'bcd') `
+        "the control starts from a known state (got '$(Get-TestControlText $rich)')"
+
+    # Home, then type: an appending buffer would put the 'a' at the END.
+    [void](Send-TestControlKey -Control $rich -Key Home)
+    [void](Send-TestControlText -Control $rich -Text 'a')
+    Start-Sleep -Milliseconds 250
+    $caretText = Get-TestControlText $rich
+    Assert ($caretText -eq 'abcd') `
+        "Home moves the caret and typing inserts there (got '$caretText', want 'abcd')"
+
+    # Shift+Right twice selects 'ab'; typing replaces the SELECTION.
+    [void](Send-TestControlKey -Control $rich -Key Home)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key Right -Modifiers Shift)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key Right -Modifiers Shift)
+    [void](Send-TestControlText -Control $rich -Text 'Z')
+    Start-Sleep -Milliseconds 250
+    $selText = Get-TestControlText $rich
+    Assert ($selText -eq 'Zcd') `
+        "a keyboard selection is replaced by what is typed over it (got '$selText', want 'Zcd')"
+
+    # Word wrap: one long unbroken-by-newlines line still grows the pill,
+    # which only a control that wraps can do.
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key A -Modifiers Ctrl)
+    [void](Send-TestControlKey -Control $rich -Key Delete)
+    Start-Sleep -Milliseconds 250
+    $hEmpty = (Get-TestWindowRect $fb).Height
+    [void](Send-TestControlText -Control $rich -Text ('wrap ' * 60) -PerKeyMs 2)
+    Start-Sleep -Milliseconds 600
+    $hWrapped = (Get-TestWindowRect $fb).Height
+    Assert ($hWrapped -gt $hEmpty) `
+        "a long line with no newlines in it wraps and grows the pill ($hEmpty -> $hWrapped)"
+
+    # --- J. the standard editing chords (T635) -------------------------------
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key A -Modifiers Ctrl)
+    [void](Send-TestControlKey -Control $rich -Key Delete)
+    Start-Sleep -Milliseconds 250
+    [void](Send-TestControlText -Control $rich -Text 'copyme')
+    Start-Sleep -Milliseconds 250
+
+    # Shift+End selects the line, and Ctrl+X takes it. Deliberately NOT Ctrl+A
+    # here: a select-ALL in RichEdit runs through the end of the document and
+    # carries its final paragraph mark onto the clipboard, so pasting it back
+    # would add a newline that has nothing to do with whether the chords work.
+    # (Ctrl+A itself is covered above, where it clears the control.)
+    [void](Send-TestControlKey -Control $rich -Key Home)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key End -Modifiers Shift)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key X -Modifiers Ctrl)
+    Start-Sleep -Milliseconds 300
+    $afterCut = Get-TestControlText $rich
+    Assert ($afterCut -eq '') "Shift+End then Ctrl+X cuts the line away (got '$afterCut')"
+
+    # ...and Ctrl+V brings it back, twice, which proves the clipboard round
+    # trip rather than an undo that happens to look the same.
+    #
+    # Compared with line breaks stripped: a RichEdit selection that runs to the
+    # end of the document carries its final paragraph mark onto the clipboard,
+    # so each paste lands as "copyme" plus a break. That is the control's own
+    # documented behaviour (WordPad does it too), and this test is about
+    # whether the chords work, not about that mark.
+    function Flatten([string]$s) { return ($s -replace "`r`n", '' -replace "`r", '' -replace "`n", '') }
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key V -Modifiers Ctrl)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key V -Modifiers Ctrl)
+    Start-Sleep -Milliseconds 400
+    $afterPaste = Flatten (Get-TestControlText $rich)
+    Assert ($afterPaste -eq 'copymecopyme') `
+        "Ctrl+V pastes what Ctrl+X took (got '$afterPaste', want 'copymecopyme')"
+
+    # Ctrl+Z undoes the last paste.
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key Z -Modifiers Ctrl)
+    Start-Sleep -Milliseconds 400
+    $afterUndo = Flatten (Get-TestControlText $rich)
+    Assert ($afterUndo -eq 'copyme') `
+        "Ctrl+Z undoes the last edit (got '$afterUndo', want 'copyme')"
+
+    # The pane's own buffer tracked all of it. The oracle is the CONTROL's own
+    # text, canonicalised to LF the way the mirror does -- the invariant is
+    # "the buffer is what the control holds", not a hard-coded number, and it
+    # is what the report writer (T637) will read.
+    $ctlText = (Get-TestControlText $rich) -replace "`r`n", "`n" -replace "`r", "`n"
+    $lenBefore = Get-LastSendLen $errlog $paneId
+    [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
+    $lenAfter = $null
+    for ($t = 0; $t -lt 20; $t++) {
+        $lenAfter = Get-LastSendLen $errlog $paneId
+        if ($lenAfter -ne $lenBefore) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert ($lenAfter -eq $ctlText.Length) `
+        "the pane's buffer mirrors the control through all of it (len=$lenAfter, control holds $($ctlText.Length))"
 
     # --- H. the chords are pane-scoped ---------------------------------------
     # A terminal pane gets the same two chords. Nothing composer-shaped may

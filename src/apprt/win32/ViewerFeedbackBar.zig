@@ -19,17 +19,35 @@
 //! only renders and edits it (`pane.feedbackText`, `feedbackInsert`,
 //! `feedbackBackspace`).
 //!
-//! ## Which text control this is NOT
+//! ## Which text control this IS
 //!
-//! None yet, on purpose. What the composer is built on — RichEdit, a second
-//! WebView2, or an owner-drawn model — is an open decision (D43) that T635
-//! takes, and it decides how IME, undo, accessibility, image chips and the
-//! quote accent bar all behave. This task ships the CHROME, so the editing
-//! surface here is deliberately the smallest honest thing: a plain UTF-8
-//! buffer, appended by `WM_CHAR`, with backspace and newline. No caret
-//! navigation, no selection, no IME composition — T635 replaces this whole
-//! editing path with whatever D43 answers, and the geometry, the paint, the
-//! open/close lifecycle and the pane's reflow all survive that swap.
+//! A **RichEdit** (`Msftedit.dll`, class `RichEdit50W`) hosted as a child
+//! filling the pill's text rect — D43's recommended answer, taken in T635.
+//! T634 shipped this file's chrome over a deliberately minimal editing
+//! surface (a plain UTF-8 buffer appended by `WM_CHAR`); everything that made
+//! that surface a placeholder — no caret, no selection, no clipboard, no undo,
+//! no IME — is the control's job now, and the geometry, the paint, the
+//! open/close lifecycle and the pane's reflow all survived the swap exactly as
+//! that task promised.
+//!
+//! RichEdit rather than a plain `EDIT` because the composer's end state has
+//! image chips and quoted blocks in it (T641, T636), and an `EDIT` carries
+//! neither attachments nor per-run formatting. RichEdit rather than a hand-
+//! rolled model because caret, selection, word wrap, undo, drag-drop,
+//! clipboard and IME composition are things the OS already gets right in cases
+//! we would never think to test — and a feedback composer that eats a
+//! Japanese user's text is worse than one that looks slightly off.
+//!
+//! Two consequences worth knowing:
+//!
+//! - **The control is the storage; the PANE is still the owner.** RichEdit
+//!   holds the text while the composer is open, and every change is mirrored
+//!   straight back into `pane.feedbackText()` from `EN_CHANGE`, so the buffer
+//!   that has to outlive this window still does. Opening seeds the control
+//!   from that buffer.
+//! - **RichEdit sends no notifications by default.** Without the
+//!   `EM_SETEVENTMASK`/`ENM_CHANGE` in `create`, `EN_CHANGE` never arrives and
+//!   the mirror above silently never runs.
 //!
 //! Geometry lives in `viewer_feedback_layout.zig`, where it asserts at
 //! 1.0/1.25/1.5/2.0 without a window.
@@ -52,18 +70,26 @@ const input = @import("../../input.zig");
 
 const log = std.log.scoped(.viewer_feedback);
 
-pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewerFeedback");
+const class_name_utf8 = "GhozttyViewerFeedback";
+pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral(class_name_utf8);
+
+/// Child id of the RichEdit, so `WM_COMMAND`'s low word names it.
+const edit_id: usize = 1;
 
 /// The placeholder an empty composer shows, Mac's accessibility label turned
 /// into the cue an empty field needs (`EM_SETCUEBANNER`'s job, hand-drawn
 /// here because the pill is not an EDIT).
-const placeholder = "What's wrong with what you're looking at?";
+const placeholder_w = std.unicode.utf8ToUtf16LeStringLiteral(
+    "What's wrong with what you're looking at?",
+);
 
 /// The key hints in the footer's trailing slot. Spelled in the Windows
 /// chords, which is the whole reason it is not Mac's string.
 const hints = "Ctrl+Enter send  ·  Esc close";
 
 hwnd: w32.HWND,
+/// The RichEdit filling the pill's text rect. See "Which text control this IS".
+edit: w32.HWND,
 pane: *ViewerPane,
 alloc: Allocator,
 
@@ -71,6 +97,24 @@ hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
 tracking: bool = false,
 focused: bool = false,
+
+/// Wrapped lines the control is currently showing, clamped by the layout's own
+/// cap. Cached rather than queried per layout pass: `place` is called from
+/// every bounds sync, and asking the control there would mean sizing the
+/// control from a number the control itself produces.
+lines: u32 = 1,
+
+/// True while `seedControl` is writing the buffer INTO the control, so the
+/// `EN_CHANGE` that write raises does not mirror straight back out again.
+seeding: bool = false,
+
+/// The RichEdit's own window procedure, kept so the subclass can hand every
+/// message it does not add to.
+prev_edit_proc: ?*const anyopaque = null,
+
+/// Whether the control answered `EM_SETCUEBANNER`. False everywhere measured
+/// so far, which is why `editProc` paints the placeholder instead.
+cue_banner: bool = false,
 
 /// The scale the fonts were last built for; rebuilt when the pane's monitor
 /// changes.
@@ -88,6 +132,7 @@ secondary_ref: u32 = 0x00AAAAAA,
 dark: bool = true,
 
 var class_registered: bool = false;
+var richedit_loaded: bool = false;
 
 fn registerClass(hinstance: ?w32.HINSTANCE) void {
     if (class_registered) return;
@@ -125,6 +170,18 @@ pub fn create(
     registerClass(hinstance);
     if (!class_registered) return null;
 
+    // Msftedit registers its classes from its entry point, so this has to
+    // happen before the CreateWindowExW below — without it the control window
+    // simply fails to create and the pane loses its composer. Never freed: the
+    // classes stay registered for the process's life either way.
+    if (!richedit_loaded) {
+        richedit_loaded = w32.LoadLibraryW(w32.MSFTEDIT_DLL) != null;
+        if (!richedit_loaded) {
+            log.warn("Msftedit.dll could not be loaded; viewer has no composer", .{});
+            return null;
+        }
+    }
+
     const self = alloc.create(ViewerFeedbackBar) catch return null;
     const hwnd = w32.CreateWindowExW(
         0,
@@ -144,13 +201,93 @@ pub fn create(
         return null;
     };
 
-    self.* = .{ .hwnd = hwnd, .pane = pane, .alloc = alloc };
+    // ES_WANTRETURN so a bare Enter is a newline in the report rather than a
+    // beep (Ctrl+Enter sends, and that is routed in App.zig); ES_AUTOVSCROLL
+    // so a report past the pill's six-line cap scrolls with the caret. No
+    // WS_VSCROLL: a scrollbar inside a capsule is not a thing this design has.
+    const edit = w32.CreateWindowExW(
+        0,
+        w32.MSFTEDIT_CLASS,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.ES_MULTILINE |
+            w32.ES_AUTOVSCROLL | w32.ES_WANTRETURN,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        @ptrFromInt(edit_id),
+        hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        alloc.destroy(self);
+        return null;
+    };
+
+    // RichEdit sends NOTHING to its parent until asked. Without this the
+    // EN_CHANGE mirror never runs and the pane's buffer stays empty while the
+    // user watches their text appear on screen.
+    _ = w32.SendMessageW(edit, w32.EM_SETEVENTMASK, 0, @bitCast(w32.ENM_CHANGE));
+
+    // The placeholder an empty composer shows — Mac's accessibility label
+    // turned into a cue. wparam TRUE keeps it up while the empty field is
+    // focused, which is the state the composer opens in.
+    //
+    // `EM_SETCUEBANNER` is an EDIT message, and RichEdit does not answer it —
+    // measured, not assumed: it returns 0 on Msftedit here. So the placeholder
+    // is painted by the subclass below, and this call stays only as the
+    // preferred path if a future RichEdit grows one. The acceptance script
+    // reads the logged answer, which is how the fallback stays honest rather
+    // than becoming a fallback nobody notices is always taken.
+    const cue = w32.SendMessageW(
+        edit,
+        w32.EM_SETCUEBANNER,
+        1,
+        @bitCast(@intFromPtr(placeholder_w.ptr)),
+    );
+    const prev_proc = w32.SetWindowLongPtrW(edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
+    log.info(
+        "viewer feedback composer created cue_banner={} painted_placeholder={}",
+        .{ cue != 0, cue == 0 },
+    );
+
+    self.* = .{
+        .hwnd = hwnd,
+        .edit = edit,
+        .pane = pane,
+        .alloc = alloc,
+        .prev_edit_proc = if (prev_proc != 0) @ptrFromInt(@as(usize, @bitCast(prev_proc))) else null,
+        .cue_banner = cue != 0,
+    };
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.applyTheme();
     return self;
 }
 
+/// The bar that owns `hwnd` when `hwnd` is its RichEdit — the hook the main
+/// message loop routes composer keys through, mirroring
+/// `ViewerNavBar.owningEdit`. Identified by the PARENT's class name rather
+/// than by a pointer stashed on the control, because a control's
+/// `GWLP_USERDATA` belongs to the control.
+pub fn owningEdit(hwnd: w32.HWND) ?*ViewerFeedbackBar {
+    const parent = w32.GetParent(hwnd) orelse return null;
+    var name: [32:0]u16 = undefined;
+    const n = w32.GetClassNameW(parent, &name, name.len);
+    if (n <= 0) return null;
+    if (!std.mem.eql(u16, name[0..@intCast(n)], CLASS_NAME)) return null;
+    const self = fromHwnd(parent) orelse return null;
+    if (self.edit != hwnd) return null;
+    return self;
+}
+
 pub fn destroy(self: *ViewerFeedbackBar) void {
+    // Un-subclass the control BEFORE the back-pointer goes: `editProc` finds
+    // its bar through the parent, so a teardown message arriving in between
+    // would reach a proc that can no longer route it.
+    if (self.prev_edit_proc) |p| {
+        _ = w32.SetWindowLongPtrW(self.edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(p)));
+    }
     // Clear the back-pointer FIRST: DestroyWindow delivers messages
     // synchronously, and they must not find a half-dead object.
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
@@ -198,18 +335,48 @@ pub fn applyTheme(self: *ViewerFeedbackBar) void {
         icon_button.shadeChannel(self.pill_rgb.g, bd),
         icon_button.shadeChannel(self.pill_rgb.b, bd),
     );
+
+    // RichEdit paints its own background and its own text, so the pill's fill
+    // and the band's text colour have to be pushed INTO it — they are still
+    // derived above, in the one place, rather than picked again here.
+    _ = w32.SendMessageW(
+        self.edit,
+        w32.EM_SETBKGNDCOLOR,
+        0, // 0: use the COLORREF given, not the system window colour
+        @bitCast(@as(usize, w32.RGB(self.pill_rgb.r, self.pill_rgb.g, self.pill_rgb.b))),
+    );
+    var cf = std.mem.zeroes(w32.CHARFORMAT2W);
+    cf.cbSize = @sizeOf(w32.CHARFORMAT2W);
+    cf.dwMask = w32.CFM_COLOR;
+    cf.crTextColor = self.text_ref;
+    // DEFAULT sets what the NEXT character typed inherits; ALL recolours what
+    // is already there. An empty composer needs the first, a re-themed one
+    // mid-report needs the second, and there is no single flag that is both.
+    _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_DEFAULT, @bitCast(@intFromPtr(&cf)));
+    _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_ALL, @bitCast(@intFromPtr(&cf)));
+
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
-/// How many lines the composer currently shows — the pane's buffer counted in
-/// newlines, clamped by the layout's own cap.
+/// How many lines the composer currently shows: the control's own WRAPPED line
+/// count, clamped by the layout's cap. Cached in `self.lines` by `syncLines`,
+/// because `place` sizes the control from this and must not ask the control it
+/// is about to move.
 fn lineCount(self: *const ViewerFeedbackBar) u32 {
-    const text = self.pane.feedbackText();
-    var n: u32 = 1;
-    for (text) |c| {
-        if (c == '\n') n += 1;
+    return layout_mod.visibleLines(self.lines);
+}
+
+/// Re-read the control's wrapped line count. Returns true when it changed, i.e.
+/// when the pill has to grow or shrink and the pane has to re-inset the page.
+fn syncLines(self: *ViewerFeedbackBar) bool {
+    const n = w32.SendMessageW(self.edit, w32.EM_GETLINECOUNT, 0, 0);
+    const lines: u32 = if (n > 0) @intCast(@as(usize, @bitCast(n))) else 1;
+    if (layout_mod.visibleLines(lines) == layout_mod.visibleLines(self.lines)) {
+        self.lines = lines;
+        return false;
     }
-    return layout_mod.visibleLines(n);
+    self.lines = lines;
+    return true;
 }
 
 fn layoutInput(self: *const ViewerFeedbackBar, width: i32, scale: f32) layout_mod.Input {
@@ -242,7 +409,100 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
         if (self.caption_font) |f| _ = w32.DeleteObject(@ptrCast(f));
         self.body_font = makeFont(type_ramp.body(scale));
         self.caption_font = makeFont(type_ramp.caption(scale));
+        if (self.body_font) |f| {
+            // 0 for lparam: no redraw request needed, the MoveWindow below
+            // repaints the control anyway.
+            _ = w32.SendMessageW(self.edit, w32.WM_SETFONT, @intFromPtr(f), 0);
+        }
     }
+    // The control fills the text rect exactly, which is what makes the pill's
+    // 12 DIP lead and the gap to the buttons the control's OWN margins — no
+    // second inset to keep in step with the layout module.
+    _ = w32.MoveWindow(
+        self.edit,
+        l.text.left,
+        l.text.top,
+        @max(l.text.width(), 0),
+        @max(l.text.height(), 0),
+        1,
+    );
+}
+
+/// Push the pane's buffer into the control — what opening the composer does,
+/// so contents survive a close/reopen.
+///
+/// Line endings convert on the way in: the pane stores LF, and a RichEdit
+/// given a bare LF renders it but reports its own CR back, so normalising in
+/// both directions here keeps the buffer canonical.
+pub fn seedControl(self: *ViewerFeedbackBar) void {
+    const text = self.pane.feedbackText();
+    var buf = std.ArrayList(u16).empty;
+    defer buf.deinit(self.alloc);
+    // Worst case one UTF-16 unit per byte plus a CR per LF; a failed
+    // allocation leaves the control empty rather than showing half a report.
+    buf.ensureTotalCapacity(self.alloc, text.len * 2 + 1) catch return;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        if (!first) buf.appendSlice(self.alloc, &.{ '\r', '\n' }) catch return;
+        first = false;
+        var tmp: [512]u16 = undefined;
+        var rest = line;
+        while (rest.len > 0) {
+            const chunk = @min(rest.len, tmp.len / 2);
+            const n = std.unicode.utf8ToUtf16Le(&tmp, rest[0..chunk]) catch break;
+            buf.appendSlice(self.alloc, tmp[0..n]) catch return;
+            rest = rest[chunk..];
+        }
+    }
+    buf.append(self.alloc, 0) catch return;
+
+    self.seeding = true;
+    defer self.seeding = false;
+    _ = w32.SetWindowTextW(self.edit, @ptrCast(buf.items.ptr));
+    // Caret to the end, so reopening resumes writing rather than typing into
+    // the front of what is already there.
+    const all: w32.CHARRANGE = .{ .cpMin = -1, .cpMax = -1 };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&all)));
+    _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+    _ = self.syncLines();
+}
+
+/// Mirror the control's text back into the pane's buffer. The pane is what
+/// everything else reads (`feedbackText`, the send button's enabled state, the
+/// report writer), and it is what outlives this window.
+fn readBack(self: *ViewerFeedbackBar) void {
+    const n = w32.GetWindowTextLengthW(self.edit);
+    if (n <= 0) {
+        self.pane.feedbackSetText(self.alloc, "");
+        return;
+    }
+    const len: usize = @intCast(n);
+    const wide = self.alloc.alloc(u16, len + 1) catch return;
+    defer self.alloc.free(wide);
+    const got = w32.GetWindowTextW(self.edit, wide.ptr, @intCast(wide.len));
+    if (got <= 0) {
+        self.pane.feedbackSetText(self.alloc, "");
+        return;
+    }
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, wide[0..@intCast(got)]) catch return;
+    defer self.alloc.free(utf8);
+
+    // RichEdit reports line breaks as bare CR. Canonicalise to LF so the
+    // buffer, the report and every test speak one line ending.
+    var norm = self.alloc.alloc(u8, utf8.len) catch return;
+    defer self.alloc.free(norm);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < utf8.len) : (i += 1) {
+        const c = utf8[i];
+        if (c == '\r') {
+            if (i + 1 < utf8.len and utf8[i + 1] == '\n') continue; // CRLF -> the LF
+            norm[w] = '\n';
+        } else norm[w] = c;
+        w += 1;
+    }
+    self.pane.feedbackSetText(self.alloc, norm[0..w]);
 }
 
 fn makeFont(f: type_ramp.Font) ?*anyopaque {
@@ -274,13 +534,15 @@ pub fn setVisible(self: *ViewerFeedbackBar, visible: bool) void {
 /// Put the caret in the composer. Separate from `setVisible` on purpose — see
 /// the comment there.
 pub fn takeFocus(self: *ViewerFeedbackBar) void {
-    _ = w32.SetFocus(self.hwnd);
+    _ = w32.SetFocus(self.edit);
 }
 
 /// Whether keyboard focus is inside the composer right now. The pane's hover
-/// poll reads this to hold the nav bar open.
+/// poll reads this to hold the nav bar open — and "inside" includes the text
+/// control, which is where focus actually sits while anyone is typing.
 pub fn hasFocus(self: *const ViewerFeedbackBar) bool {
-    return w32.GetFocus() == @as(?w32.HWND, self.hwnd);
+    const f = w32.GetFocus();
+    return f == @as(?w32.HWND, self.hwnd) or f == @as(?w32.HWND, self.edit);
 }
 
 /// The text changed: the pill may have grown or shrunk, so the pane has to
@@ -328,7 +590,9 @@ fn paint(self: *ViewerFeedbackBar, hdc: w32.HDC, width: i32, height: i32) void {
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
     self.paintPill(hdc, l);
-    self.paintText(hdc, l);
+    // No text here: the RichEdit paints its own, in `l.text`. This window
+    // draws the pill AROUND it, which is why the control is created with no
+    // border and its background pushed to match `pill_rgb`.
     self.paintButtons(hdc, l);
     self.paintFooter(hdc, l);
 }
@@ -356,73 +620,6 @@ fn paintPill(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void 
     }
     if (fill) |b| _ = w32.DeleteObject(@ptrCast(b));
     if (pen) |p| _ = w32.DeleteObject(p);
-}
-
-/// The composer's text, or its placeholder, clipped to the text rect so a long
-/// line can never paint over the buttons.
-fn paintText(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
-    if (l.text.width() <= 0) return;
-    const saved = w32.SaveDC(hdc);
-    defer _ = w32.RestoreDC(hdc, saved);
-    _ = w32.IntersectClipRect(hdc, l.text.left, l.text.top, l.text.right, l.text.bottom);
-
-    const prev = if (self.body_font) |f| w32.SelectObject(hdc, f) else null;
-    defer if (prev) |p| {
-        _ = w32.SelectObject(hdc, p);
-    };
-
-    const text = self.pane.feedbackText();
-    const line_h = @divTrunc(l.text.height(), @as(i32, @intCast(l.lines)));
-
-    if (text.len == 0) {
-        _ = w32.SetTextColor(hdc, self.secondary_ref);
-        drawUtf8(hdc, l.text.left, l.text.top, placeholder);
-        if (self.focused) self.paintCaret(hdc, l, l.text.left);
-        return;
-    }
-
-    _ = w32.SetTextColor(hdc, self.text_ref);
-    // The LAST `lines` lines: a composer past its cap scrolls with the caret
-    // rather than pinning the reader to the top of a report they are still
-    // writing.
-    var total: u32 = 1;
-    for (text) |c| {
-        if (c == '\n') total += 1;
-    }
-    const skip = if (total > l.lines) total - l.lines else 0;
-
-    var it = std.mem.splitScalar(u8, text, '\n');
-    var index: u32 = 0;
-    var row: i32 = 0;
-    var caret_x = l.text.left;
-    while (it.next()) |line| : (index += 1) {
-        if (index < skip) continue;
-        const y = l.text.top + row * line_h;
-        drawUtf8(hdc, l.text.left, y, line);
-        caret_x = l.text.left + textWidth(hdc, line);
-        row += 1;
-    }
-    if (self.focused) self.paintCaret(hdc, l, caret_x);
-}
-
-/// A 1 DIP insertion bar at the end of the last visible line. Drawn, not a
-/// system caret: `CreateCaret` owns a blink timer and a focus contract that
-/// belongs to whatever real text control D43 picks, and inheriting half of it
-/// here would be a worse starting point for T635 than none.
-fn paintCaret(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout, x: i32) void {
-    const line_h = @divTrunc(l.text.height(), @as(i32, @intCast(l.lines)));
-    const bottom = l.text.bottom;
-    const w: i32 = @max(@as(i32, @intFromFloat(@round(self.scale))), 1);
-    var r = w32.RECT{
-        .left = @min(x, l.text.right - w),
-        .top = bottom - line_h,
-        .right = @min(x, l.text.right - w) + w,
-        .bottom = bottom,
-    };
-    if (w32.CreateSolidBrush(self.text_ref)) |brush| {
-        defer _ = w32.DeleteObject(@ptrCast(brush));
-        _ = w32.FillRect(hdc, &r, brush);
-    }
 }
 
 fn paintButtons(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
@@ -550,7 +747,13 @@ fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
     }
 }
 
-fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
+/// The composer's own chords: Ctrl+Enter sends, Escape closes.
+///
+/// Routed from the main message loop (`App.zig`, via `owningEdit`) rather than
+/// handled in a window proc, for the same reason the address field's
+/// Enter/Escape are: a multi-line edit control consumes both itself and its
+/// parent never sees them. Returns true when consumed.
+pub fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
     const mods: input.Mods = .{
         .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
         .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
@@ -565,12 +768,64 @@ fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
         }
         return true;
     }
-    if (vk == w32.VK_BACK) {
-        self.pane.feedbackBackspace();
-        self.textChanged();
-        return true;
-    }
     return false;
+}
+
+/// The pane-scoped chords (T161: ctrl+r reload, ctrl+d / ctrl+l / alt+d
+/// address bar) while the composer holds focus. They belong to the PANE, and
+/// the composer is inside the pane — the same rule the address field follows.
+/// Ctrl+A/C/V/X/Z are deliberately NOT here: they are the control's.
+pub fn handleChord(self: *ViewerFeedbackBar, vk: u16) bool {
+    const mods: input.Mods = .{
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
+    };
+    const chord = viewer_accel.paneChord(vk, mods) orelse return false;
+    switch (chord) {
+        .reload => self.pane.reloadContent(),
+        .focus_address => _ = self.pane.focusAddressBar(),
+    }
+    return true;
+}
+
+/// The RichEdit's subclass, whose whole job is the placeholder.
+///
+/// Painted here rather than by the band behind it because the control is
+/// opaque and on top: there is no "behind" to draw into. Drawn AFTER the
+/// control's own `WM_PAINT` has run, so it lands over a background the control
+/// has already cleared, and only while the control is empty — where "empty"
+/// means the pane's mirrored buffer, so nothing has to parse the control's
+/// text on a paint.
+fn editProc(
+    hwnd: w32.HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) callconv(.winapi) isize {
+    const self = owningEdit(hwnd) orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const prev = self.prev_edit_proc orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const res = w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+    if (msg != w32.WM_PAINT) return res;
+    if (self.cue_banner) return res; // the control drew its own
+    if (self.pane.feedbackText().len != 0) return res;
+
+    const hdc = w32.GetDC(hwnd) orelse return res;
+    defer _ = w32.ReleaseDC(hwnd, hdc);
+    // Character 0's own position, so the cue starts exactly where the first
+    // typed character will — RichEdit keeps a small inset of its own that a
+    // hand-picked origin would only approximate.
+    var origin: w32.POINTL = .{ .x = 0, .y = 0 };
+    _ = w32.SendMessageW(hwnd, w32.EM_POSFROMCHAR, @intFromPtr(&origin), 0);
+    const saved = w32.SaveDC(hdc);
+    defer _ = w32.RestoreDC(hdc, saved);
+    if (self.body_font) |f| _ = w32.SelectObject(hdc, f);
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(hdc, self.secondary_ref);
+    _ = w32.TextOutW(hdc, origin.x, origin.y, placeholder_w.ptr, placeholder_w.len);
+    return res;
 }
 
 fn wndProc(
@@ -596,9 +851,38 @@ fn wndProc(
             return 0;
         },
 
-        w32.WM_SETFOCUS, w32.WM_KILLFOCUS => {
-            self.focused = msg == w32.WM_SETFOCUS;
+        // Focus lands on the text control, not on the band; a click that
+        // reaches the band itself hands it straight on so the caret is never
+        // somewhere the user cannot type.
+        w32.WM_SETFOCUS => {
+            self.focused = true;
+            _ = w32.SetFocus(self.edit);
+            return 0;
+        },
+
+        w32.WM_KILLFOCUS => {
+            self.focused = false;
             _ = w32.InvalidateRect(hwnd, null, 1);
+            return 0;
+        },
+
+        w32.WM_COMMAND => {
+            const code: u16 = @intCast((wparam >> 16) & 0xFFFF);
+            const id: usize = wparam & 0xFFFF;
+            if (id == edit_id and code == w32.EN_CHANGE and !self.seeding) {
+                const was_empty = self.pane.feedbackText().len == 0;
+                self.readBack();
+                // The painted placeholder appears and disappears with the
+                // text, and the control only repaints what IT changed — so
+                // the crossing has to force a full repaint of the control.
+                if (was_empty != (self.pane.feedbackText().len == 0)) {
+                    _ = w32.InvalidateRect(self.edit, null, 1);
+                }
+                // Only a line-count change moves the page; anything else is a
+                // repaint. Asking the pane to re-inset on every keystroke
+                // would resize the WebView2 while someone is typing into it.
+                if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(hwnd, null, 1);
+            }
             return 0;
         },
 
@@ -663,31 +947,6 @@ fn wndProc(
         w32.WM_KEYDOWN => {
             if (self.handleKey(@intCast(wparam & 0xFFFF))) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_CHAR => {
-            const cp: u21 = @intCast(wparam & 0xFFFF);
-            switch (cp) {
-                // Handled as keys, and their control characters must not also
-                // land in the buffer.
-                0x08, 0x1B => return 0,
-                // Enter arrives as CR; the buffer is LF-terminated lines.
-                '\r' => {
-                    // Ctrl+Enter already sent from WM_KEYDOWN; its WM_CHAR is
-                    // a 0x0A line feed, which must not become a newline too.
-                    self.pane.feedbackInsert(self.alloc, "\n");
-                    self.textChanged();
-                    return 0;
-                },
-                '\n' => return 0,
-                else => {},
-            }
-            if (cp < 0x20) return 0;
-            var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(cp, &buf) catch return 0;
-            self.pane.feedbackInsert(self.alloc, buf[0..n]);
-            self.textChanged();
-            return 0;
         },
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

@@ -1164,6 +1164,92 @@ pub const SS_CENTERIMAGE: u32 = 0x0200;
 /// keeps the domain visible where `SS_ENDELLIPSIS` would eat it.
 pub const SS_PATHELLIPSIS: u32 = 0x00008000;
 
+// -------------------------------------------------------------------------
+// RichEdit (T635 — the viewer feedback composer's text control, D43's answer)
+//
+// The control lives in Msftedit.dll, which is NOT loaded by default: the DLL
+// registers its window classes from its entry point, so a `CreateWindowExW`
+// before the `LoadLibraryW` fails with "class not registered". Everything
+// below is the subset the composer uses; RichEdit's message numbers are all
+// `WM_USER (0x0400) + n`, spelled out here so a reader can check them against
+// richedit.h without arithmetic.
+// -------------------------------------------------------------------------
+
+/// Msftedit's own class, i.e. RichEdit 4.1 and later. `RICHEDIT_CLASS`
+/// ("RichEdit20W") is riched20.dll's older one and is deliberately not used.
+pub const MSFTEDIT_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("RichEdit50W");
+pub const MSFTEDIT_DLL = std.unicode.utf8ToUtf16LeStringLiteral("Msftedit.dll");
+
+/// Background colour of the whole control. wparam 0 = use the given COLORREF,
+/// 1 = fall back to the system window colour. RichEdit paints its own
+/// background, so this is the ONLY way the pill's fill reaches it.
+pub const EM_SETBKGNDCOLOR: u32 = 0x0443; // WM_USER + 67
+pub const EM_SETCHARFORMAT: u32 = 0x0444; // WM_USER + 68
+pub const EM_SETEVENTMASK: u32 = 0x0445; // WM_USER + 69
+/// Cap on the undo stack. 0 disables undo entirely; the composer leaves the
+/// default in place and only names the message so the intent is greppable.
+pub const EM_SETUNDOLIMIT: u32 = 0x0452; // WM_USER + 82
+pub const EM_EXSETSEL: u32 = 0x0437; // WM_USER + 55
+/// Where a character sits in client coordinates. RichEdit's is NOT the EDIT
+/// message of the same name: wparam is a `POINTL*` that receives the position
+/// and lparam is the index, where the EDIT version packs the point into the
+/// return value.
+pub const EM_POSFROMCHAR: u32 = 0x04D6; // WM_USER + 214
+pub const EM_GETLINECOUNT: u32 = 0x00BA;
+pub const EM_SCROLLCARET: u32 = 0x00B7;
+
+/// Which notifications the control is allowed to send its parent. RichEdit
+/// sends NONE by default — an EN_CHANGE that never arrives is the classic
+/// "my RichEdit does not notify" bug.
+pub const ENM_CHANGE: usize = 0x00000001;
+
+/// `EM_SETCHARFORMAT` targets.
+pub const SCF_DEFAULT: usize = 0x0000;
+pub const SCF_SELECTION: usize = 0x0001;
+pub const SCF_ALL: usize = 0x0004;
+
+/// `CHARFORMAT2W.dwMask` bits the composer sets.
+pub const CFM_COLOR: u32 = 0x40000000;
+
+/// The character-formatting struct, in its `CHARFORMAT2W` (v2, wide) form —
+/// which is what `EM_SETCHARFORMAT` expects from Msftedit. `cbSize` is how the
+/// control tells v1 from v2, so it must be the size of THIS struct.
+pub const CHARFORMAT2W = extern struct {
+    cbSize: u32,
+    dwMask: u32,
+    dwEffects: u32,
+    yHeight: i32,
+    yOffset: i32,
+    crTextColor: u32,
+    bCharSet: u8,
+    bPitchAndFamily: u8,
+    szFaceName: [32]u16,
+    wWeight: u16,
+    sSpacing: i16,
+    crBackColor: u32,
+    lcid: u32,
+    dwReserved: u32,
+    sStyle: i16,
+    wKerning: u16,
+    bUnderlineType: u8,
+    bAnimation: u8,
+    bRevAuthor: u8,
+    bReserved1: u8,
+};
+
+/// A character range for `EM_EXSETSEL`. `cpMax` of -1 means "to the end", so
+/// `(0, -1)` selects everything.
+pub const CHARRANGE = extern struct {
+    cpMin: i32,
+    cpMax: i32,
+};
+
+/// `EM_POSFROMCHAR`'s out-parameter.
+pub const POINTL = extern struct {
+    x: i32,
+    y: i32,
+};
+
 // Edit control notification codes (high word of wParam in WM_COMMAND)
 pub const EN_CHANGE: u16 = 0x0300;
 pub const EN_SETFOCUS: u16 = 0x0100;
