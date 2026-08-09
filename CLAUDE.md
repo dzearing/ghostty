@@ -800,9 +800,7 @@ the queue; consuming it is separate and not built here).
   terminal next door draws on. Leg 2 is **T638**: Windows has no `lsof` and its
   replacement is a real choice, so until it lands a `localhost:PORT` pane falls
   through to leg 3, which is its origin directory and usually the right answer
-  anyway. The composer the button opens is **T634**; today a win32 click logs
-  the worktree it would file into. Acceptance:
-  `test/win32/viewer-worktree.ps1`.
+  anyway. Acceptance: `test/win32/viewer-worktree.ps1`.
 
   The button is **icon-only**, in the same 24pt square as the other chrome
   controls; the destination is on its tooltip and in the composer footer.
@@ -811,6 +809,23 @@ the queue; consuming it is separate and not built here).
   interactive screen snapshot (`screencapture -i -o` to a temp file — never
   `-c`, which would clobber the user's clipboard), and `↑` sends. `Enter`
   inserts a newline, `Cmd-Enter` sends, `Escape` closes.
+  **Windows has the composer's chrome** (T634): the same pill and the same two
+  circular actions, opened and closed by the same button, with `Ctrl+Enter` for
+  Mac's `Cmd-Enter`. It is a native owner-painted child window under the nav
+  bar — the page is inset by its band and gets the space back as the pill
+  shrinks — and the nav bar stays pinned open while it is up, since the button
+  that closes it lives there. The pill is a **capsule**, a named exception to
+  the win32 radius scale (design system §3.1), with the radius pinned to the
+  collapsed height so a six-line pill does not become an oval. Geometry:
+  `src/apprt/win32/viewer_feedback_layout.zig` (asserted at 1.0/1.25/1.5/2.0);
+  chrome: `ViewerFeedbackBar.zig`; acceptance: `test/win32/viewer-feedback.ps1`.
+  **The composer's TEXT and its open flag live on the pane, not on the toolbar
+  window**, which is what makes contents survive a close/reopen on both
+  platforms. What the win32 composer is not yet is a real text control — which
+  control it becomes (RichEdit, a second WebView2, or owner-drawn) is decision
+  **D43** and lands with **T635**, so today it edits a plain buffer with no
+  caret navigation, selection or IME. Screenshots are **T636** and the report
+  writer is **T637**.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input

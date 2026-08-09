@@ -196,10 +196,12 @@ try {
         "the address field still shows the file's path beside the button (got '$($addrs -join "','")')"
 
     # --- 3. clicking is live (the action reaches the pane) -------------------
-    # The composer is T634; what T633 owes is a button that is WIRED. The pane
-    # logs the intent with the worktree it would file into, which nothing but
-    # `ViewerNavBar.activate(.feedback)` can produce -- there is no IPC verb
-    # for it.
+    # What T633 owes is a button that is WIRED, and since T634 what it is wired
+    # to is the composer: the pane reports the open transition with the worktree
+    # it files into, which nothing but `ViewerNavBar.activate(.feedback)` can
+    # produce -- there is no IPC verb for it. (The composer's own behavior is
+    # `test\win32\viewer-feedback.ps1`'s subject; all this asserts is that the
+    # button reaches it.)
     #
     # Driven through posted mouse messages rather than SendInput, which is dead
     # on the background desktop. The bar is REVEALED first by seeding
@@ -236,10 +238,10 @@ try {
     $sawClick = $false
     for ($t = 0; $t -lt 20; $t++) {
         $txt = (Get-Content $errlog -ErrorAction SilentlyContinue | Out-String)
-        if ($txt -match 'viewer feedback requested for worktree') { $sawClick = $true; break }
+        if ($txt -match "viewer feedback pane=$([regex]::Escape($filePane)) open=true") { $sawClick = $true; break }
         Start-Sleep -Milliseconds 250
     }
-    Assert $sawClick 'clicking the feedback button reaches the pane (composer is T634)'
+    Assert $sawClick 'clicking the feedback button opens the composer (T634)'
 
     # --- 4. leg 3, empty: a remote URL with no origin shows NO button --------
     # Navigating the SAME pane, so this is the "re-resolved on every

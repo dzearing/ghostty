@@ -69,6 +69,7 @@ const viewer_prefs = @import("viewer_prefs.zig");
 const gdiplus_decode = @import("gdiplus_decode.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
+const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
 const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
@@ -370,6 +371,24 @@ nav: ?*ViewerNavBar = null,
 /// test that drives a bare pane.
 worktree: ?ViewerWorktreeProbe = null,
 
+/// The feedback composer (T634). Created hidden alongside the nav bar, in
+/// `ensureNav`, because that is the one place with both halves it needs (a
+/// host window to parent it and an allocator to own it) — a WndProc has
+/// neither, and this window's own message handlers are where the composer is
+/// edited. Null when its window could not be created, which is a degradation
+/// (a feedback button that logs its intent) rather than a broken pane.
+feedback: ?*ViewerFeedbackBar = null,
+
+/// Whether the composer is open. Ephemeral, like `toc_open` and for the same
+/// reason: restoring an open composer would cover the content it is about.
+feedback_open: bool = false,
+
+/// The composer's text. On the PANE, not on the bar, because Mac is explicit
+/// that contents survive toggling the toolbar closed and open — and on win32
+/// the natural mistake is to own the buffer in the child window, where it
+/// dies with the window. Owned; freed in `deinit`.
+feedback_text: std.ArrayListUnmanaged(u8) = .empty,
+
 /// The table-of-contents card (T160). Created lazily the first time a
 /// document reports 2+ headings; null before that, and null when its window
 /// could not be created (a degradation, not a broken pane).
@@ -530,6 +549,15 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         nav.destroy();
         self.nav = null;
     }
+    // The composer is the bar's sibling, so it goes on the same terms — and
+    // its TEXT is the pane's, so it is freed here rather than with the window
+    // that renders it (T634: the buffer must outlive the chrome).
+    if (self.feedback) |bar| {
+        bar.destroy();
+        self.feedback = null;
+    }
+    self.feedback_text.deinit(alloc);
+    self.feedback_open = false;
     // After the bar (which reads the probe's answer) and before the host
     // window: `deinit` JOINS the worker, and a completion posted in the
     // meantime is dropped with the window it was addressed to.
@@ -688,6 +716,17 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
         self.worktree.?.attach(hwnd, WM_APP_VIEWER_WORKTREE);
         self.refreshWorktree();
     }
+    // The composer (T634) needs the same two halves, and it is built HERE
+    // rather than on first open for one concrete reason: it edits itself from
+    // its own WndProc, which has no allocator to reach for. Hidden until the
+    // feedback button opens it, so a pane that never files anything pays for
+    // one 0x0 child window and nothing else.
+    if (self.feedback == null) {
+        self.feedback = ViewerFeedbackBar.create(alloc, self, hinstance, hwnd);
+        if (self.feedback == null) {
+            log.warn("viewer feedback composer could not be created", .{});
+        }
+    }
 }
 
 /// Re-derive which worktree this pane's content belongs to, and move the nav
@@ -723,18 +762,122 @@ fn pushWorktree(self: *ViewerPane) void {
         if (root != null) "shown" else "hidden",
         root orelse "<none>",
     });
+    // A pane that navigated out of every working tree has nowhere left to
+    // file, so an open composer closes with the button that opened it. The
+    // TEXT survives — the user may navigate straight back — and closing is
+    // what keeps the composer from being a form with no destination.
+    if (root == null and self.feedback_open) self.setFeedbackOpen(false);
     const nav = self.nav orelse return;
     if (nav.setWorktree(root) and self.nav_visible) self.syncBounds();
 }
 
-/// The feedback button was clicked (T633). The composer itself is T634; until
-/// it lands this is deliberately a logged no-op rather than a missing button —
-/// the provenance and the affordance are what this task ships, and the log line
-/// is what the acceptance script reads to prove the button is live.
+/// The worktree the composer would file into, or null when this pane's
+/// content belongs to no working tree. The same answer the nav bar gates its
+/// button on, so the button and the composer's footer cannot disagree.
+pub fn feedbackWorktree(self: *ViewerPane) ?[]const u8 {
+    const probe = if (self.worktree) |*p| p else return null;
+    return probe.worktreePath();
+}
+
+/// The feedback button was clicked (T633's affordance, T634's composer).
 pub fn toggleFeedback(self: *ViewerPane) void {
-    const probe = if (self.worktree) |*p| p else return;
-    const root = probe.worktreePath() orelse return;
-    log.info("viewer feedback requested for worktree {s} (composer is T634)", .{root});
+    self.setFeedbackOpen(!self.feedback_open);
+}
+
+/// Open or close the composer (Mac's `setFeedbackOpen`).
+///
+/// Opening is gated on a worktree for the same reason the button is: with
+/// nowhere to file, a composer is a lie. Closing hands focus back to the page
+/// so the pane is usable again, and never touches the text — a composer
+/// closed and reopened comes back with the half-written report in it.
+pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
+    if (self.feedback_open == open) return;
+    const root = self.feedbackWorktree();
+    if (open and root == null) return;
+
+    if (open) {
+        const bar = self.feedback orelse {
+            log.warn("viewer feedback composer could not be created", .{});
+            return;
+        };
+        self.feedback_open = true;
+        // The composer's only close affordance is the button that opened it,
+        // so the nav bar has to stop auto-hiding while it is open — the same
+        // reason the compact TOC layout pins it.
+        if (!self.nav_visible) self.setNavVisible(true);
+        // Placed BEFORE it is shown: `place` is what gives the window its
+        // size, its position and its fonts, and a window shown at 0x0 with no
+        // scale would take one paint pass to become itself.
+        self.syncBounds();
+        bar.setVisible(true);
+        bar.takeFocus();
+    } else {
+        self.feedback_open = false;
+        if (self.feedback) |bar| {
+            // Hand focus back to the content before hiding: a hidden window
+            // holding focus leaves the pane with no keyboard at all.
+            if (bar.hasFocus()) self.focus();
+            bar.setVisible(false);
+        }
+        self.syncBounds();
+        // The bar was pinned open by the composer; give it back its ordinary
+        // auto-hide deadline rather than leaving it open forever.
+        self.nav_deadline = w32.GetTickCount64() + nav_layout.hide_delay_ms;
+    }
+
+    // The acceptance script's oracle, and the same shape T633's line has:
+    // native owner-painted chrome inside a background test desktop cannot be
+    // screenshotted, so the pane states what it did in its own stderr.
+    log.info("viewer feedback pane={s} open={} bar_h={d} worktree={s}", .{
+        self.paneId(),
+        self.feedback_open,
+        self.feedbackBarHeight(),
+        root orelse "<none>",
+    });
+}
+
+/// The band the composer currently reserves above the page, 0 when closed.
+fn feedbackBarHeight(self: *ViewerPane) i32 {
+    if (!self.feedback_open) return 0;
+    const bar = self.feedback orelse return 0;
+    const h = self.hwnd orelse return 0;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return 0;
+    return bar.barHeight(@max(r.right - r.left, 0), self.scale);
+}
+
+/// Sending is T637 (the report writer). Wired now so the button and
+/// Ctrl+Enter are live rather than dead pixels, and so the path they take is
+/// the one T637 fills in.
+pub fn sendFeedback(self: *ViewerPane) void {
+    log.info("viewer feedback pane={s} action=send len={d} (the report writer is T637)", .{
+        self.paneId(),
+        self.feedback_text.items.len,
+    });
+}
+
+// The composer's text model. Deliberately minimal — see the "which text
+// control this is NOT" section of `ViewerFeedbackBar`: D43 has not been
+// answered, so T634 ships a byte buffer and T635 replaces the editing path
+// with whatever the decision picks. What outlives that swap is WHERE the text
+// lives, which is here.
+
+pub fn feedbackText(self: *const ViewerPane) []const u8 {
+    return self.feedback_text.items;
+}
+
+pub fn feedbackInsert(self: *ViewerPane, alloc: Allocator, bytes: []const u8) void {
+    self.feedback_text.appendSlice(alloc, bytes) catch {};
+}
+
+/// Drop the last CODEPOINT, not the last byte: a buffer left holding half a
+/// UTF-8 sequence would fail to render and could not be repaired by typing.
+pub fn feedbackBackspace(self: *ViewerPane) void {
+    var n = self.feedback_text.items.len;
+    if (n == 0) return;
+    n -= 1;
+    while (n > 0 and (self.feedback_text.items[n] & 0xC0) == 0x80) n -= 1;
+    self.feedback_text.shrinkRetainingCapacity(n);
 }
 
 /// Mirror of `Surface.setVisible`. A viewer has no renderer thread to park, so
@@ -1207,6 +1350,15 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
                 nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
                 height,
             );
+        }
+    }
+    // The card starts BELOW the composer, not behind it. Mac solves the same
+    // problem by z-order (`composerDrawsAboveTheTOCCard`); here the two are
+    // sibling child windows, so the honest fix is that the card's band starts
+    // where the composer's ends — no overlap to resolve.
+    if (self.feedback_open) {
+        if (self.feedback) |bar| {
+            top = @min(top + bar.barHeight(width, self.scale), height);
         }
     }
 
@@ -1924,6 +2076,7 @@ pub fn setColorScheme(self: *ViewerPane, dark: bool) void {
     // move with the OS scheme — but re-deriving here is cheap and keeps the
     // chrome honest if a config reload ever changes the background underneath.
     if (self.nav) |nav| nav.applyTheme();
+    if (self.feedback) |bar| bar.applyTheme();
     // The TOC card's palette DOES follow the scheme: it sits on the document,
     // whose background is the page's own light/dark.
     if (self.toc) |panel| panel.applyTheme();
@@ -2136,6 +2289,18 @@ pub fn syncBounds(self: *ViewerPane) void {
                 nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
                 height,
             );
+        }
+    }
+
+    // The composer takes the next band down, and reserves it the same way the
+    // bar does — the page is inset by nav + composer, never covered by either.
+    // Its height tracks the text BOTH WAYS: a deleted line gives the space
+    // back, which is the half of this a "grows with content" implementation
+    // forgets (Mac pins it with `contentReflowsUpWhenComposerShrinks`).
+    if (self.feedback_open) {
+        if (self.feedback) |bar| {
+            bar.place(top, width, self.scale);
+            top = @min(top + bar.barHeight(width, self.scale), height);
         }
     }
 
@@ -2598,7 +2763,11 @@ fn navHoverTick(self: *ViewerPane) void {
     // The compact TOC layout pins the bar open: its contents button is the
     // card's only opener, so a bar that auto-hides strands the card (T160,
     // Mac's `setChromeVisible(true)` on entering compact).
-    const toc_pinned = self.toc_mode == .compact;
+    // The open composer pins it for the same reason and one more: the button
+    // that closes the composer lives in the bar, so a bar that auto-hid out
+    // from under an open composer would leave it with no close affordance at
+    // all (Mac's `setChromeVisible(true)` in `setFeedbackOpen`).
+    const toc_pinned = self.toc_mode == .compact or self.feedback_open;
     if (toc_pinned and !self.nav_visible) self.setNavVisible(true);
 
     const foreground = w32.GetForegroundWindow() == w32.GetAncestor(h, w32.GA_ROOT);
@@ -2607,7 +2776,8 @@ fn navHoverTick(self: *ViewerPane) void {
     const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.shown());
     // "Held" = the address field owns the keyboard, or the cursor is on the
     // revealed bar itself (its band is the top `bar_h` of the pane).
-    const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit);
+    const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit) or
+        (if (self.feedback) |bar| bar.hasFocus() else false);
     const on_bar = self.nav_visible and in_pane and pt.y < l.bar_h;
 
     const action = nav_layout.hoverTick(.{

@@ -258,6 +258,20 @@ scale would read as a small button, which is precisely what these are not (the
 connection pill is only a button in ONE of its three states, and that is the
 state where it changes color and grows a verb).
 
+**A second named exception: the FEEDBACK COMPOSER PILL is a capsule** — the
+viewer pane's feedback input (`viewer_feedback_layout.zig`, T634). By the table
+above an input field is 4 DIP, and this one deliberately is not, for two
+reasons. The shape is what says *chat composer* rather than *form field*, which
+is the whole affordance; and Mac's composer is a capsule, so a 4 DIP box here
+would be a viewer that reads as a different product on the two platforms — the
+divergence this project does not ship.
+
+Its radius is **half the COLLAPSED pill height**, pinned, not half the current
+height. A radius recomputed at every height stops being a pill and becomes an
+oval the moment the text grows to two lines; pinning it lets the straight sides
+lengthen while the caps stay exactly as round as they started. (Mac writes the
+same rule out in `ViewerFeedbackBar.pillCornerRadius`, and both are asserted.)
+
 ### 3.2 Elevation
 
 Win32 GDI has no shadow primitive, so elevation is expressed with the tools we

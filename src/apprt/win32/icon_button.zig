@@ -380,6 +380,11 @@ pub const Glyph = enum {
     /// a fallback's bar is "readable", not "identical" (see the header of
     /// `icon_button_paint`).
     feedback,
+    /// "↑" — send what is in the feedback composer (T634; Mac uses
+    /// `arrow.up`). An arrow, not the collapse chevron: a bare chevron in a
+    /// composer reads as "collapse this", which is the one thing the button
+    /// must not be mistaken for.
+    send,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -710,6 +715,34 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             } };
             return out[0..5];
         },
+        .send => {
+            // An up arrow: a chevron head over a shaft. The head owns the
+            // mark box's top edge and BOTH flanks, the shaft its bottom, so
+            // the union is exactly the centered mark box — the arrow cannot
+            // drift off center the way an appended shaft would.
+            const b = centered(target, m.mark_close, m.mark_close);
+            const head_h = @max(@divTrunc(b.height(), 2), t);
+            const apex_x = b.left + @divTrunc(b.width() + 1, 2);
+            // Slope-corrected like every other sloped arm in this set (§4.3):
+            // a head offset vertically by `t` paints lighter than the shaft
+            // beside it.
+            const ht = slopedStroke(apex_x - b.left, head_h, t);
+            out[0] = .{ .pts = .{
+                .{ .x = b.left, .y = b.top + head_h },
+                .{ .x = apex_x, .y = b.top },
+                .{ .x = apex_x, .y = b.top + ht },
+                .{ .x = b.left, .y = b.top + head_h + ht },
+            } };
+            out[1] = mirrorX(out[0], b.left + b.right);
+            const shaft = centered(b, t, t);
+            out[2] = bar(.{
+                .left = shaft.left,
+                .top = b.top,
+                .right = shaft.right,
+                .bottom = b.bottom,
+            });
+            return out[0..3];
+        },
         .overflow => {
             // Three square dots on the mark box's center line, spanning the
             // same `mark_caption` extent as the three system glyphs beside it
@@ -1033,6 +1066,7 @@ const all_glyphs = [_]Glyph{
     .home,
     .contents,
     .feedback,
+    .send,
 };
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph

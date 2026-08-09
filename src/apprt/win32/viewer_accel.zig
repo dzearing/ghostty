@@ -264,6 +264,39 @@ pub fn paneChord(vk: u16, mods: input.Mods) ?PaneChord {
     };
 }
 
+// ---------------------------------------------------------------- composer
+
+/// A chord that belongs to the viewer's FEEDBACK COMPOSER (T634) — live only
+/// while keyboard focus is inside the composer itself, which on win32 means
+/// the chord is classified from the composer window's own WndProc rather than
+/// from the accelerator hop above. Mac's `ViewerFeedbackTextView` keys, with
+/// Cmd-Enter respelled as the Windows Ctrl-Enter.
+pub const ComposerChord = enum {
+    /// ctrl+enter — send the report. Mac's ⌘↩.
+    send,
+    /// escape — close the composer, leaving its contents on the pane.
+    close,
+};
+
+/// Classify a chord as one of the composer's, or null if it is not one —
+/// including the case that matters most, PLAIN Enter, which inserts a newline
+/// and must never be mistaken for a send (a composer that submits on Enter
+/// cannot write a two-paragraph report).
+///
+/// Pure classification, so the table is unit-testable without a live pane.
+/// Exact modifiers, the same rule `paneChord` follows: ctrl+shift+enter and
+/// alt+escape are nobody's here.
+pub fn composerChord(vk: u16, mods: input.Mods) ?ComposerChord {
+    if (mods.super) return null;
+    const bare = !mods.ctrl and !mods.shift and !mods.alt;
+    const ctrl_only = mods.ctrl and !mods.shift and !mods.alt;
+    return switch (vk) {
+        0x0D => if (ctrl_only) .send else null, // VK_RETURN
+        0x1B => if (bare) .close else null, // VK_ESCAPE
+        else => null,
+    };
+}
+
 // -------------------------------------------------------------------- zoom
 
 /// A ctrl+plus/minus/0 keyboard-zoom request (T161). Pinch and ctrl+wheel
@@ -396,6 +429,29 @@ test "paneChord: exact-modifier chords only" {
     try testing.expect(paneChord(0x52, alt) == null); // alt+r is nothing
     try testing.expect(paneChord(0x52, .{}) == null); // bare 'r' is typing
     try testing.expect(paneChord(0x52, .{ .ctrl = true, .super = true }) == null);
+}
+
+test "composerChord: ctrl+enter sends, plain enter does not" {
+    const ctrl: input.Mods = .{ .ctrl = true };
+    try testing.expectEqual(ComposerChord.send, composerChord(0x0D, ctrl).?);
+    try testing.expectEqual(ComposerChord.close, composerChord(0x1B, .{}).?);
+
+    // The one that matters: a bare Enter is a NEWLINE, not a send. A
+    // composer that submits on Enter cannot write a two-paragraph report.
+    try testing.expect(composerChord(0x0D, .{}) == null);
+    try testing.expect(composerChord(0x0D, .{ .shift = true }) == null);
+
+    // Exactness, the same rule the pane chords follow.
+    try testing.expect(composerChord(0x0D, .{ .ctrl = true, .shift = true }) == null);
+    try testing.expect(composerChord(0x0D, .{ .ctrl = true, .alt = true }) == null);
+    try testing.expect(composerChord(0x0D, .{ .ctrl = true, .super = true }) == null);
+    try testing.expect(composerChord(0x1B, ctrl) == null);
+    try testing.expect(composerChord(0x1B, .{ .alt = true }) == null);
+
+    // And nothing else is a composer chord — typing must reach the buffer.
+    try testing.expect(composerChord(0x41, .{}) == null); // 'A'
+    try testing.expect(composerChord(0x08, .{}) == null); // backspace
+    try testing.expect(composerChord(0x52, ctrl) == null); // ctrl+r stays the pane's
 }
 
 test "zoomAction: the default font-size chords, main row and numpad" {

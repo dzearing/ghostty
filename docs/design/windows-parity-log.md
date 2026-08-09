@@ -12281,3 +12281,49 @@ one running app so the "no button" ones cannot pass while the "button" ones are
 broken, plus a click that reaches the pane. It refuses to run at all if `%TEMP%`
 is itself inside a working tree, since the negative cases would then prove
 nothing.
+
+## 2026-08-08 — T634: the Windows feedback button now opens something
+
+Clicking a viewer pane's feedback button used to record what it would have done.
+It now slides a composer open under the navigation bar: a rounded input that
+grows as you type, with a button to attach a screenshot and a button to send
+sitting inside its trailing edge. The page below moves down to make room and
+comes back up as the box shrinks, the navigation bar stays put while it is open
+(it carries the only thing that closes it), Escape closes it, and Ctrl+Enter
+sends. Close it and open it again and your half-written report is still there.
+
+The composer is a native child window beside the nav bar rather than a layer
+inside it. That answers the question the task left open, and it pays twice: it
+overlaps nothing, so the contents card simply starts where the composer ends
+instead of needing the z-order arrangement macOS has to make; and a real window
+has a class, a visibility and a rect, which is the only kind of thing an
+acceptance script can read on a desktop where nothing can be screenshotted.
+
+What it deliberately is NOT is a text control. Which one it becomes — RichEdit,
+a second WebView2, or owner-drawn — is an open decision (D43) that T635 takes,
+and it decides IME, undo, accessibility, the image chips and the quote accent
+bar all at once. Pre-empting it here to make a demo type would have been the
+expensive kind of convenient. So the editing surface is a plain byte buffer with
+`WM_CHAR`, backspace and newline, and everything around it — the geometry, the
+paint, the open/close lifecycle, the page's reflow — is built so the swap does
+not touch any of it. What does survive that swap is WHERE the text lives: on the
+pane, not on the toolbar window, which is exactly why it outlives a close.
+
+One design-system conflict had to be settled rather than papered over. The win32
+radius scale says an input field is 4 DIP and ends with "Nothing else"; Mac's
+composer is a capsule, and says in its own source why the radius is pinned to
+the collapsed height rather than recomputed (a six-line pill would otherwise
+stop being a pill and become an oval). Shipping a 4 DIP box here would make the
+same feature read as a chat composer on one platform and a form field on the
+other. It is built as a capsule, the exception is now written into
+`docs/design/win32-design-system.md` §3.1 beside the status chip so it is a
+citable rule rather than a drift, and the call is filed as D45 for the user to
+overturn if they disagree.
+
+Lanes none/win32/agent PASS and P1–P3 ALL PASS. New acceptance:
+`test\win32\viewer-feedback.ps1`, ALL PASS (37). Its content assertions read the
+`Chrome_WidgetWin_0` widget's own top edge — the window `setBounds` actually
+moves — so "the page made room" is measured rather than inferred: it walks down
+for the composer, further for a third line, back up when a line is deleted, and
+lands exactly on the nav bar's bottom when the composer closes. Also filed: T640
+(the two circular actions have no tooltips and no keyboard reach yet).

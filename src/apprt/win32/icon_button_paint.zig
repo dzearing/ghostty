@@ -53,6 +53,7 @@ fn codepoint(which: icon_button.Glyph) u16 {
         .home => 0xE80F, // Home
         .contents => 0xE700, // GlobalNavButton — Windows' own nav-pane toggle
         .feedback => 0xED15, // Feedback — Windows' own "tell us about this"
+        .send => 0xE74A, // Up — the composer's submit arrow
     };
 }
 
@@ -69,6 +70,9 @@ fn fontDip(which: icon_button.Glyph) f32 {
         // sit beside an address field the way the strip glyphs sit beside
         // tabs, and 10 is the caption's size, not a toolbar's.
         .back, .forward, .refresh, .home, .contents, .feedback => 12.0,
+        // The composer's in-pill actions render at the same 12 as the
+        // toolbar marks: they sit in the same 28 DIP square.
+        .send => 12.0,
     };
 }
 
