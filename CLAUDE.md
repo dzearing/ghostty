@@ -827,12 +827,17 @@ the queue; consuming it is separate and not built here).
   composition come from the OS rather than from a hand-rolled model. The
   control is the storage while the composer is open and every change mirrors
   back into the pane from `EN_CHANGE`; the pane is still what outlives the
-  window. Two win32 details worth knowing: RichEdit sends **no** notifications
-  until `EM_SETEVENTMASK`/`ENM_CHANGE` asks for them, and it does **not**
+  window. Three win32 details worth knowing: RichEdit sends **no** notifications
+  until `EM_SETEVENTMASK`/`ENM_CHANGE` asks for them; it does **not**
   answer `EM_SETCUEBANNER`, so the empty composer's placeholder is painted by
-  a subclass over the control's own `WM_PAINT`. Screenshots are **T636**, the
-  quoted block and the page's Quote button are **T641**, and the report writer
-  is **T637**.
+  a subclass over the control's own `WM_PAINT`; and the mirror reads the
+  control with `EM_GETTEXTEX`/`GT_DEFAULT` rather than `WM_GETTEXT`, because
+  the latter expands each paragraph mark to CR+LF and every quote offset the
+  composer computes has to index the control and the pane's buffer the same
+  way.
+  The report writer is **T636** and screenshots/image chips are **T637** (the
+  two were named the wrong way round here until T641); the quoted block landed
+  in **T641** (below).
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
@@ -871,6 +876,27 @@ the queue; consuming it is separate and not built here).
   just deleted*, so select-all + delete + type used to leave the user trapped
   writing inside the quote (and resurrected its metadata). The delegate
   refuses quote attributes at the source.
+
+  **Windows has the same two-button toolbar and the same quoted block** (T641).
+  Quote used to be hidden here (`window.__ghozttyHideQuote`, set by the
+  injected blob) because there was nowhere to put the text; T635 built the
+  composer and that flag is gone, so the shared `selection.js` now ships both
+  buttons on both platforms. What differs is only how identity survives an
+  edit: RichEdit has **no per-run user field** to hang a `feedbackQuoteID` on,
+  so a quote is recovered from the TEXT — a registry entry is live when its
+  passage still occupies a **complete run of lines** at or after the previous
+  quote's end (`src/apprt/win32/viewer_feedback_doc.zig`, pure and asserted in
+  the none lane). Same consequence as Mac's: delete the block and its metadata
+  leaves the report, quote the same passage twice and you get two quotes; plus
+  one Mac does not have — *editing* a quote's characters drops its context,
+  which is the honest answer once the text is no longer the passage the
+  context describes. The block is drawn with a wash (`CFM_BACKCOLOR`), a
+  paragraph indent (`PFM_STARTINDENT`) and a **hand-painted accent bar**,
+  because RichEdit's background colour paints tight line boxes with no bar —
+  the same limitation that makes Mac draw its own. The typing trap has a win32
+  spelling too: RichEdit carries character formatting forward from the
+  character before the caret, so the composer resets typing attributes to
+  plain **before** each `WM_CHAR`/paste/Enter that lands outside a quote.
 
   Each quote carries **referential context** so an agent can find what was
   being discussed (text alone is ambiguous — the same sentence can appear

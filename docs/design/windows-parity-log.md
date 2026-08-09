@@ -12371,3 +12371,53 @@ Lanes none/win32/agent PASS and P1–P3 ALL PASS. `test\win32\viewer-feedback.ps
 ALL PASS (50), with new sections C2 (the control's identity and which
 placeholder path is live), I (caret, selection, wrap, and the narrow/widen
 re-wrap arm) and J (Ctrl+A/C/X/V/Z and the pane-buffer mirror).
+
+## 2026-08-09 — T641: selecting text in a Windows viewer pane can quote it again
+
+The Quote button is back. Selecting text in any viewer pane — the markdown
+template or an arbitrary website — pops the same two-button toolbar macOS has,
+and pressing Quote opens the feedback composer with the passage in it as its own
+indented, tinted, accent-barred block, ready for the user to say what is wrong
+with it underneath. Windows had been shipping Copy alone since T162, because a
+Quote button with nowhere to put text is worse than none; T635 built the
+somewhere, so `viewer_bridge.hide_quote_js` is deleted and its unit test now
+asserts that nothing in the injected blob assigns that flag, in any spelling.
+
+The design call worth reading is how a quote keeps its identity. Mac hangs a
+`feedbackQuoteID` attribute on the quote's text run, so deleting the run drops
+its metadata from the report; RichEdit has no per-run user field to hang an id
+on. The task prescribed walking the control's `CHARFORMAT2` runs instead — which
+means binary-searching the control's own formatting on every serialize, and puts
+the identity rule somewhere no unit test can reach. What shipped applies the
+same matching rule to the TEXT: a registry entry is live while its passage still
+occupies a complete run of LINES, matched in document order, non-overlapping
+(`viewer_feedback_doc.zig`, 17 tests in the none lane). Formatting is then
+derived FROM those spans rather than being the source of them, so what is
+painted and what is filed cannot drift — and a paint bug stays cosmetic instead
+of becoming a wrong report. Filed as **D46**, with the two costs stated: the
+block is editable, and editing it drops its context.
+
+Two win32 traps are recorded in the code. RichEdit carries character formatting
+forward from the character before the caret, so the composer resets typing
+attributes to plain *before* each `WM_CHAR`/paste/Enter that lands outside a
+quote — the win32 spelling of the `typingAttributes` trap Mac's delegate
+refuses. And the change mirror now reads the control with
+`EM_GETTEXTEX`/`GT_DEFAULT` rather than `WM_GETTEXT`: the latter expands each
+paragraph mark to CR+LF, so a document with N line breaks reads back N
+characters longer than the control believes it is, and every quote offset the
+composer hands to `EM_EXSETSEL` would be wrong by the number of lines above it.
+
+Evidence is the live WebView2 arm rather than a PowerShell script, because
+pressing the page's own button means running script IN the page and the
+acceptance harness cannot do that from outside the process. A real page, a real
+selection, a real press: `quote: text='ghoztty quoted this passage'
+heading=Beta block=p:nth-of-type(2) offset=47` — the SECOND heading, which is
+what proves `selection.js` walked the document. The arm also pins that the
+composer opened, that the block is live, and that rewriting the buffer takes the
+count to 0 while the registry entry survives, which is the undo case.
+
+Lanes none/win32/agent PASS (win32 re-run alone after the last edit, PASS in
+341s), P1–P3 ALL PASS, `viewer-feedback.ps1` ALL PASS (50). Filed **T643**: the
+`t400` stale-debounce assertion derives its expectation from an unpinned
+baseline and failed once in three runs of the same tree — the passing runs are
+vacuous, so neither outcome is evidence.

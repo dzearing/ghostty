@@ -191,6 +191,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_layout.zig");
 
+    // Pure win32 viewer feedback-composer DOCUMENT — where a quoted passage
+    // is inserted and which quotes are still in the report (T641), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_feedback_doc.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");

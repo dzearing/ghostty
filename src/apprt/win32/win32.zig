@@ -161,6 +161,11 @@ pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
+/// Suppress a control's own repainting while a batch of changes is applied,
+/// then turn it back on. The control does NOT repaint itself on the way back,
+/// so an `InvalidateRect` has to follow.
+pub const WM_SETREDRAW: u32 = 0x000B;
+pub const WM_PASTE: u32 = 0x0302;
 pub const WM_DEADCHAR: u32 = 0x0103;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSKEYUP: u32 = 0x0105;
@@ -1190,6 +1195,20 @@ pub const EM_SETEVENTMASK: u32 = 0x0445; // WM_USER + 69
 /// default in place and only names the message so the intent is greppable.
 pub const EM_SETUNDOLIMIT: u32 = 0x0452; // WM_USER + 82
 pub const EM_EXSETSEL: u32 = 0x0437; // WM_USER + 55
+pub const EM_EXGETSEL: u32 = 0x0434; // WM_USER + 52
+/// Paragraph formatting — how the composer indents a quoted block (T641).
+/// Applies to every paragraph the selection touches, so a quote is selected
+/// and then set.
+pub const EM_SETPARAFORMAT: u32 = 0x0447; // WM_USER + 71
+/// Replace the selection with text, keeping it on the undo stack when wparam
+/// is TRUE. The insertion point ends up after what was inserted.
+pub const EM_REPLACESEL: u32 = 0x00C2;
+/// Read the control's text WITHOUT the CR->CRLF translation `WM_GETTEXT`
+/// does. That is load-bearing for T641: with bare CRs, a byte offset into the
+/// pane's LF buffer is the same number as a character index in the control,
+/// so a quote's span can be computed in pure code and handed straight to
+/// `EM_EXSETSEL`. With CRLF the two drift by one per line break.
+pub const EM_GETTEXTEX: u32 = 0x045E; // WM_USER + 94
 /// Where a character sits in client coordinates. RichEdit's is NOT the EDIT
 /// message of the same name: wparam is a `POINTL*` that receives the position
 /// and lparam is the index, where the EDIT version packs the point into the
@@ -1210,6 +1229,57 @@ pub const SCF_ALL: usize = 0x0004;
 
 /// `CHARFORMAT2W.dwMask` bits the composer sets.
 pub const CFM_COLOR: u32 = 0x40000000;
+/// The tint behind a quoted block (T641). RichEdit paints a background colour
+/// as tight line boxes, which is why the accent bar down the left is drawn by
+/// hand rather than asked for here.
+pub const CFM_BACKCOLOR: u32 = 0x04000000;
+
+/// `PARAFORMAT2.dwMask` bits the composer sets: the left indent that makes a
+/// quoted block read as a block.
+pub const PFM_STARTINDENT: u32 = 0x00000001;
+
+/// Paragraph formatting, v2 (`PARAFORMAT2`) — distinguished from v1 by
+/// `cbSize`, exactly like `CHARFORMAT2W`. Indents are in TWIPs (1/1440"), so
+/// 15 twips is one DIP and the control does the DPI conversion itself.
+pub const PARAFORMAT2 = extern struct {
+    cbSize: u32,
+    dwMask: u32,
+    wNumbering: u16,
+    wEffects: u16,
+    dxStartIndent: i32,
+    dxRightIndent: i32,
+    dxOffset: i32,
+    wAlignment: u16,
+    cTabCount: i16,
+    rgxTabs: [32]i32,
+    dySpaceBefore: i32,
+    dySpaceAfter: i32,
+    dyLineSpacing: i32,
+    sStyle: i16,
+    bLineSpacingRule: u8,
+    bOutlineLevel: u8,
+    wShadingWeight: u16,
+    wShadingStyle: u16,
+    wNumberingStart: u16,
+    wNumberingStyle: u16,
+    wNumberingTab: u16,
+    wBorderSpace: u16,
+    wBorderWidth: u16,
+    wBorders: u16,
+};
+
+/// `EM_GETTEXTEX`'s in-parameter. `cb` is a BYTE count for a wide buffer, and
+/// `flags` of 0 (`GT_DEFAULT`) is what leaves line breaks as bare CR.
+pub const GETTEXTEX = extern struct {
+    cb: u32,
+    flags: u32,
+    codepage: u32,
+    lpDefaultChar: ?*const anyopaque,
+    lpUsedDefChar: ?*anyopaque,
+};
+
+/// `GETTEXTEX.codepage` for UTF-16.
+pub const CP_UNICODE: u32 = 1200;
 
 /// The character-formatting struct, in its `CHARFORMAT2W` (v2, wide) form —
 /// which is what `EM_SETCHARFORMAT` expects from Msftedit. `cbSize` is how the

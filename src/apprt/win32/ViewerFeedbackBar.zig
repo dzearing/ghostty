@@ -64,6 +64,8 @@ const type_ramp = @import("type_ramp.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_feedback_layout.zig");
+const doc = @import("viewer_feedback_doc.zig");
+const system_colors = @import("system_colors.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const input = @import("../../input.zig");
@@ -133,6 +135,9 @@ pill_rgb: color_math.Rgb = .{ .r = 0x1A, .g = 0x1A, .b = 0x1A },
 border_ref: u32 = 0x00404040,
 text_ref: u32 = 0x00FFFFFF,
 secondary_ref: u32 = 0x00AAAAAA,
+/// The wash behind a quoted block, and the bar down its left edge (T641).
+quote_rgb: color_math.Rgb = .{ .r = 0x24, .g = 0x24, .b = 0x28 },
+accent_ref: u32 = 0x00D47800,
 dark: bool = true,
 
 var class_registered: bool = false;
@@ -347,6 +352,16 @@ pub fn applyTheme(self: *ViewerFeedbackBar) void {
         icon_button.shadeChannel(self.pill_rgb.b, bd),
     );
 
+    // A quoted block reads as a block through THREE things at once, because no
+    // one of them survives on its own: a wash behind its text, an accent bar
+    // down its left, and a paragraph indent. The wash is a faint pull of the
+    // pill toward the accent rather than a saturated panel — it sits under
+    // body text that still has to clear 4.5:1, and `text_ref` is derived from
+    // the band, not re-derived per run.
+    const accent = chrome_theme.accentOn(self.pill_rgb, system_colors.accentCached());
+    self.accent_ref = w32.RGB(accent.r, accent.g, accent.b);
+    self.quote_rgb = color_math.mix(self.pill_rgb, accent, 0.14);
+
     // RichEdit paints its own background and its own text, so the pill's fill
     // and the band's text colour have to be pushed INTO it — they are still
     // derived above, in the one place, rather than picked again here.
@@ -365,6 +380,9 @@ pub fn applyTheme(self: *ViewerFeedbackBar) void {
     // mid-report needs the second, and there is no single flag that is both.
     _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_DEFAULT, @bitCast(@intFromPtr(&cf)));
     _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_ALL, @bitCast(@intFromPtr(&cf)));
+    // ...and the quote washes on top of it, in the theme's new colours. The
+    // SCF_ALL above just flattened them.
+    self.applyQuoteFormatting();
 
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
@@ -478,31 +496,63 @@ pub fn seedControl(self: *ViewerFeedbackBar) void {
     const all: w32.CHARRANGE = .{ .cpMin = -1, .cpMax = -1 };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&all)));
     _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+    // A reopened composer comes back with its quoted blocks looking like
+    // quoted blocks: the text survived on the pane, the FORMATTING did not —
+    // it lived in a control that was emptied. Derived here, from the same
+    // registry the report is derived from, so the two cannot disagree.
+    self.applyQuoteFormatting();
+    self.ensurePlainAtCaret();
     _ = self.syncLines();
 }
 
 /// Mirror the control's text back into the pane's buffer. The pane is what
 /// everything else reads (`feedbackText`, the send button's enabled state, the
 /// report writer), and it is what outlives this window.
+///
+/// Read with `EM_GETTEXTEX`/`GT_DEFAULT` rather than `WM_GETTEXT`, and that is
+/// load-bearing rather than a style choice (T641): `WM_GETTEXT` translates each
+/// paragraph mark into CR+LF, so a document with N line breaks comes back N
+/// characters longer than the control believes it is. Every quote offset this
+/// file computes in the pane's buffer is handed straight to `EM_EXSETSEL`, so
+/// the two indexings have to be the same one. `GT_DEFAULT` leaves the bare CRs,
+/// which map to LF one-for-one.
 fn readBack(self: *ViewerFeedbackBar) void {
     const n = w32.GetWindowTextLengthW(self.edit);
     if (n <= 0) {
         self.pane.feedbackSetText(self.alloc, "");
         return;
     }
-    const len: usize = @intCast(n);
-    const wide = self.alloc.alloc(u16, len + 1) catch return;
+    // GetWindowTextLengthW can OVER-report (it answers for the CRLF form), so
+    // the buffer is generous and the copied count is what is trusted.
+    const wide = self.alloc.alloc(u16, @as(usize, @intCast(n)) + 2) catch return;
     defer self.alloc.free(wide);
-    const got = w32.GetWindowTextW(self.edit, wide.ptr, @intCast(wide.len));
+    var gt: w32.GETTEXTEX = .{
+        .cb = @intCast(wide.len * @sizeOf(u16)),
+        .flags = 0, // GT_DEFAULT: no CR -> CRLF translation
+        .codepage = w32.CP_UNICODE,
+        .lpDefaultChar = null,
+        .lpUsedDefChar = null,
+    };
+    const got = w32.SendMessageW(
+        self.edit,
+        w32.EM_GETTEXTEX,
+        @intFromPtr(&gt),
+        @bitCast(@intFromPtr(wide.ptr)),
+    );
     if (got <= 0) {
         self.pane.feedbackSetText(self.alloc, "");
         return;
     }
-    const utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, wide[0..@intCast(got)]) catch return;
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(
+        self.alloc,
+        wide[0..@intCast(@as(usize, @bitCast(got)))],
+    ) catch return;
     defer self.alloc.free(utf8);
 
     // RichEdit reports line breaks as bare CR. Canonicalise to LF so the
-    // buffer, the report and every test speak one line ending.
+    // buffer, the report and every test speak one line ending. A CRLF that
+    // slips through anyway (a paste, an older control) still collapses to one
+    // LF rather than two breaks.
     var norm = self.alloc.alloc(u8, utf8.len) catch return;
     defer self.alloc.free(norm);
     var w: usize = 0;
@@ -516,6 +566,214 @@ fn readBack(self: *ViewerFeedbackBar) void {
         w += 1;
     }
     self.pane.feedbackSetText(self.alloc, norm[0..w]);
+}
+
+// -------------------------------------------------------------------------
+// Quotes (T641)
+// -------------------------------------------------------------------------
+
+/// The left indent of a quoted block, in TWIPs (1/1440"): 15 twips is one DIP,
+/// so this is the design system's 16 DIP step. Twips rather than pixels
+/// because RichEdit does the DPI conversion itself — the same number is right
+/// at every scale.
+const quote_indent_twips: i32 = 16 * 15;
+
+/// Where the caret is, as a character index — which is also a byte offset into
+/// the pane's buffer, because the two indexings agree (see `readBack`).
+fn caret(self: *const ViewerFeedbackBar) usize {
+    var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
+    return if (sel.cpMin > 0) @intCast(sel.cpMin) else 0;
+}
+
+fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
+    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(at), .cpMax = @intCast(at) };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+    _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+}
+
+/// Drop a quoted passage into the composer at the caret (Mac's Quote button).
+///
+/// The passage has already been registered by the pane, so this is only the
+/// editing half: compute the block purely, put it in with `EM_REPLACESEL` so
+/// it lands on the undo stack, then re-derive the formatting from the text.
+pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
+    const ins = doc.insertion(
+        self.alloc,
+        self.pane.feedbackText(),
+        self.caret(),
+        passage,
+    ) catch return;
+    defer ins.deinit(self.alloc);
+
+    // LF -> CRLF on the way in, the same conversion `seedControl` does: a bare
+    // LF handed to RichEdit is not a paragraph break.
+    var crlf: std.ArrayList(u8) = .empty;
+    defer crlf.deinit(self.alloc);
+    crlf.ensureTotalCapacity(self.alloc, ins.insert.len + 8) catch return;
+    for (ins.insert) |c| {
+        if (c == '\n') crlf.append(self.alloc, '\r') catch return;
+        crlf.append(self.alloc, c) catch return;
+    }
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, crlf.items) catch return;
+    defer self.alloc.free(wide);
+
+    const at: w32.CHARRANGE = .{ .cpMin = @intCast(ins.at), .cpMax = @intCast(ins.at) };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&at)));
+    // wparam TRUE: the insertion is undoable, so Ctrl+Z takes a quote back out
+    // the way it takes typing back out.
+    _ = w32.SendMessageW(self.edit, w32.EM_REPLACESEL, 1, @bitCast(@intFromPtr(wide.ptr)));
+
+    self.readBack();
+    self.applyQuoteFormatting();
+    self.setCaret(ins.caret_after);
+    // The caret is now on the plain line under the block; without this the
+    // first character typed there would be born wearing the quote's wash.
+    self.ensurePlainAtCaret();
+
+    if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    _ = w32.InvalidateRect(self.edit, null, 1);
+}
+
+/// The live quote spans, in the pane's buffer coordinates. Caller frees.
+/// Null when there is nothing to do, so callers can bail without a branch on
+/// an empty slice they would then have to free.
+fn quoteSpans(self: *const ViewerFeedbackBar) ?[]doc.Span {
+    const spans = self.pane.feedbackQuoteSpans(self.alloc) orelse return null;
+    if (spans.len == 0) {
+        self.alloc.free(spans);
+        return null;
+    }
+    return spans;
+}
+
+/// Re-derive every run's formatting from the text: flat everywhere, washed and
+/// indented over each live quote.
+///
+/// Derived rather than maintained, for the same reason identity is (see
+/// `viewer_feedback_doc.zig`): RichEdit will not tell us how an edit moved a
+/// run, so the only formatting that cannot drift out of step with the report
+/// is formatting computed from the text the report is made of.
+fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
+    const spans = self.quoteSpans();
+    defer if (spans) |s| self.alloc.free(s);
+
+    // Selection is the caret when nothing is selected, so this is also what
+    // keeps the caret where it was through the walk below.
+    var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
+
+    _ = w32.SendMessageW(self.edit, w32.WM_SETREDRAW, 0, 0);
+    self.formatRange(0, -1, false);
+    if (spans) |list| {
+        for (list) |s| self.formatRange(@intCast(s.start), @intCast(s.end), true);
+    }
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&sel)));
+    _ = w32.SendMessageW(self.edit, w32.WM_SETREDRAW, 1, 0);
+    // WM_SETREDRAW does not repaint on the way back on; without this the
+    // control keeps showing whatever was on screen when it was switched off.
+    _ = w32.InvalidateRect(self.edit, null, 1);
+}
+
+/// Character wash + paragraph indent over one range. `to` of -1 is "to the
+/// end", which is how the flat pass covers the whole document.
+fn formatRange(self: *ViewerFeedbackBar, from: i32, to: i32, quoted: bool) void {
+    const cr: w32.CHARRANGE = .{ .cpMin = from, .cpMax = to };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+
+    const wash = if (quoted) self.quote_rgb else self.pill_rgb;
+    var cf = std.mem.zeroes(w32.CHARFORMAT2W);
+    cf.cbSize = @sizeOf(w32.CHARFORMAT2W);
+    cf.dwMask = w32.CFM_COLOR | w32.CFM_BACKCOLOR;
+    cf.crTextColor = self.text_ref;
+    // "No wash" is the PILL's own colour rather than an auto-colour effect:
+    // the control's background is the pill, so they are the same pixel, and
+    // one code path is easier to keep right than two.
+    cf.crBackColor = w32.RGB(wash.r, wash.g, wash.b);
+    _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_SELECTION, @bitCast(@intFromPtr(&cf)));
+
+    var pf = std.mem.zeroes(w32.PARAFORMAT2);
+    pf.cbSize = @sizeOf(w32.PARAFORMAT2);
+    pf.dwMask = w32.PFM_STARTINDENT;
+    pf.dxStartIndent = if (quoted) quote_indent_twips else 0;
+    _ = w32.SendMessageW(self.edit, w32.EM_SETPARAFORMAT, 0, @bitCast(@intFromPtr(&pf)));
+}
+
+/// Refuse quote styling at the source, before the character that would inherit
+/// it exists.
+///
+/// RichEdit carries character formatting forward from the character BEFORE the
+/// caret — the win32 spelling of the trap Mac hits through `typingAttributes`.
+/// So the moment before a keystroke is applied, a caret that is not inside a
+/// quote has its typing attributes reset to plain. Doing it here rather than
+/// after the fact is what keeps a select-all + delete + type from leaving the
+/// user writing inside a quote that no longer exists.
+fn ensurePlainAtCaret(self: *ViewerFeedbackBar) void {
+    var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
+    _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
+    // A non-empty selection is about to be REPLACED; the format that matters
+    // is the one at its start, which is where the new text lands.
+    const pos: usize = if (sel.cpMin > 0) @intCast(sel.cpMin) else 0;
+
+    const spans = self.quoteSpans();
+    defer if (spans) |s| self.alloc.free(s);
+    const list: []const doc.Span = if (spans) |s| s else &.{};
+    if (doc.insideQuote(list, pos)) return;
+
+    var cf = std.mem.zeroes(w32.CHARFORMAT2W);
+    cf.cbSize = @sizeOf(w32.CHARFORMAT2W);
+    cf.dwMask = w32.CFM_COLOR | w32.CFM_BACKCOLOR;
+    cf.crTextColor = self.text_ref;
+    cf.crBackColor = w32.RGB(self.pill_rgb.r, self.pill_rgb.g, self.pill_rgb.b);
+    _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_SELECTION, @bitCast(@intFromPtr(&cf)));
+
+    // The indent is per PARAGRAPH, and the caret one past a quote's last
+    // character is still in the quote's last paragraph — resetting from there
+    // would un-indent the block the user is typing at the end of.
+    if (doc.lineTouchesQuote(self.pane.feedbackText(), list, pos)) return;
+    var pf = std.mem.zeroes(w32.PARAFORMAT2);
+    pf.cbSize = @sizeOf(w32.PARAFORMAT2);
+    pf.dwMask = w32.PFM_STARTINDENT;
+    pf.dxStartIndent = 0;
+    _ = w32.SendMessageW(self.edit, w32.EM_SETPARAFORMAT, 0, @bitCast(@intFromPtr(&pf)));
+}
+
+/// The accent bar down each quoted block's left edge.
+///
+/// Hand-drawn because `CHARFORMAT2.crBackColor` paints tight line boxes and
+/// nothing else — no bar, no rounding — which is the same limitation that
+/// makes Mac draw its bar in `drawBackground(in:)` rather than asking for a
+/// background attribute. Drawn over the control's own `WM_PAINT` for the same
+/// reason the placeholder is: the control is opaque and on top, so there is no
+/// "behind" to paint into.
+fn paintQuoteBars(self: *ViewerFeedbackBar, hdc: w32.HDC) void {
+    const spans = self.quoteSpans() orelse return;
+    defer self.alloc.free(spans);
+
+    const scale = if (self.scale > 0) self.scale else 1.0;
+    const line_h = type_ramp.lineBox(type_ramp.body(scale), scale);
+    const w: i32 = @max(2, @as(i32, @intFromFloat(@round(3 * scale))));
+    const x: i32 = @max(1, @as(i32, @intFromFloat(@round(5 * scale))));
+
+    const brush = w32.CreateSolidBrush(self.accent_ref) orelse return;
+    defer _ = w32.DeleteObject(@ptrCast(brush));
+    for (spans) |s| {
+        if (s.end == 0) continue;
+        var top: w32.POINTL = .{ .x = 0, .y = 0 };
+        var bottom: w32.POINTL = .{ .x = 0, .y = 0 };
+        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&top), @intCast(s.start));
+        // The block's LAST character, not the position after it: one past the
+        // end is the next line, and the bar would run a line too far.
+        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&bottom), @intCast(s.end - 1));
+        var r: w32.RECT = .{
+            .left = x,
+            .top = top.y,
+            .right = x + w,
+            .bottom = bottom.y + line_h,
+        };
+        if (r.bottom <= r.top) continue;
+        _ = w32.FillRect(hdc, &r, brush);
+    }
 }
 
 fn makeFont(f: type_ramp.Font) ?*anyopaque {
@@ -756,7 +1014,7 @@ fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
             "viewer feedback pane={s} action=snapshot (screenshots are T636)",
             .{self.pane.paneId()},
         ),
-        .send => self.pane.sendFeedback(),
+        .send => self.pane.sendFeedback(self.alloc),
     }
 }
 
@@ -776,7 +1034,7 @@ pub fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
     };
     if (viewer_accel.composerChord(vk, mods)) |chord| {
         switch (chord) {
-            .send => self.pane.sendFeedback(),
+            .send => self.pane.sendFeedback(self.alloc),
             .close => self.pane.setFeedbackOpen(false),
         }
         return true;
@@ -820,8 +1078,38 @@ fn editProc(
 ) callconv(.winapi) isize {
     const self = owningEdit(hwnd) orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
     const prev = self.prev_edit_proc orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    // BEFORE the control acts on it: every message that is about to put new
+    // text where the caret is has its typing attributes reset first, so the
+    // character never exists wearing the quote's formatting (T641). Doing it
+    // afterwards would mean repainting a character the user already saw
+    // tinted.
+    switch (msg) {
+        w32.WM_CHAR, w32.WM_PASTE => self.ensurePlainAtCaret(),
+        w32.WM_KEYDOWN => {
+            // Enter is the one key that inserts text, and Delete/Backspace can
+            // remove the character the caret was inheriting from.
+            const vk: u16 = @intCast(wparam & 0xFFFF);
+            if (vk == w32.VK_RETURN or vk == w32.VK_BACK or vk == w32.VK_DELETE) {
+                self.ensurePlainAtCaret();
+            }
+        },
+        else => {},
+    }
+
     const res = w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
     if (msg != w32.WM_PAINT) return res;
+
+    // The quote bars come first: they are content, the placeholder is only
+    // ever shown over an EMPTY control, and the two therefore never overlap.
+    {
+        const bars = w32.GetDC(hwnd);
+        if (bars) |dc| {
+            defer _ = w32.ReleaseDC(hwnd, dc);
+            self.paintQuoteBars(dc);
+        }
+    }
+
     if (self.cue_banner) return res; // the control drew its own
     if (self.pane.feedbackText().len != 0) return res;
 

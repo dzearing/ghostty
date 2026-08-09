@@ -70,6 +70,7 @@ const gdiplus_decode = @import("gdiplus_decode.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
+const feedback_doc = @import("viewer_feedback_doc.zig");
 const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
@@ -389,6 +390,17 @@ feedback_open: bool = false,
 /// dies with the window. Owned; freed in `deinit`.
 feedback_text: std.ArrayListUnmanaged(u8) = .empty,
 
+/// Every quoted passage the page has sent up, with its referential context
+/// (T641). On the pane for the same reason the text is — a quote inserted,
+/// the composer closed and reopened, and the report sent has to still carry
+/// the quote's heading and block selector.
+///
+/// Entries are never removed here. Which of them are still IN the report is
+/// derived from `feedback_text` on demand (`feedbackQuoteSpans`), which is
+/// what makes deleting a block drop its metadata without anything having to
+/// notice the deletion.
+feedback_quotes: feedback_doc.Registry = .{},
+
 /// The table-of-contents card (T160). Created lazily the first time a
 /// document reports 2+ headings; null before that, and null when its window
 /// could not be created (a degradation, not a broken pane).
@@ -557,6 +569,7 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         self.feedback = null;
     }
     self.feedback_text.deinit(alloc);
+    self.feedback_quotes.deinit(alloc);
     self.feedback_open = false;
     // After the bar (which reads the probe's answer) and before the host
     // window: `deinit` JOINS the worker, and a completion posted in the
@@ -852,11 +865,18 @@ fn feedbackBarHeight(self: *ViewerPane) i32 {
 /// Sending is T637 (the report writer). Wired now so the button and
 /// Ctrl+Enter are live rather than dead pixels, and so the path they take is
 /// the one T637 fills in.
-pub fn sendFeedback(self: *ViewerPane) void {
-    log.info("viewer feedback pane={s} action=send len={d} (the report writer is T637)", .{
-        self.paneId(),
-        self.feedback_text.items.len,
-    });
+pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
+    log.info(
+        "viewer feedback pane={s} action=send len={d} quotes={d} (the report writer is T637)",
+        .{
+            self.paneId(),
+            self.feedback_text.items.len,
+            // Derived, not counted: this is the number that goes into the
+            // report's `quotes` array, so it has to be the same derivation the
+            // writer will use rather than a tally something has to maintain.
+            self.feedbackQuoteCount(alloc),
+        },
+    );
 }
 
 // The composer's text. The editing happens in a RichEdit (T635, D43's answer)
@@ -1245,14 +1265,63 @@ fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) vo
     switch (message) {
         .headings => |items| self.setHeadings(alloc, items),
         .active => |id| self.setActiveHeading(alloc, id),
-        // The composer that consumes a quote is not built yet (design P10); the
-        // bridge that carries it is, and dropping it silently here would make
-        // the two indistinguishable from the outside.
-        .quote => |q| log.debug(
-            "viewer quote ({d} bytes) from heading={s}; no composer yet",
-            .{ q.text.len, q.heading_id orelse "-" },
-        ),
+        .quote => |q| self.acceptQuote(alloc, q),
     }
+}
+
+/// The page's Quote button: register the passage with its referential context
+/// and put it into the composer as its own block (T641).
+///
+/// Opening the composer is part of quoting, not a separate step — the user
+/// pressed Quote to say something about the passage, and a quote filed into a
+/// composer they cannot see is a quote they do not know they made. It is the
+/// one thing here that can fail: a pane in no working tree has nowhere to
+/// file, and `setFeedbackOpen` refuses for that reason.
+fn acceptQuote(self: *ViewerPane, alloc: Allocator, q: bridge.Quote) void {
+    if (!self.feedback_open) self.setFeedbackOpen(true);
+    if (!self.feedback_open) {
+        log.info("viewer quote pane={s} dropped: no worktree to file into", .{self.paneId()});
+        return;
+    }
+
+    const id = self.feedback_quotes.add(alloc, q) catch |err| {
+        log.warn("viewer quote pane={s} not registered: {s}", .{ self.paneId(), @errorName(err) });
+        return;
+    };
+    const entry = self.feedback_quotes.entries.items[self.feedback_quotes.entries.items.len - 1];
+    if (self.feedback) |bar| bar.insertQuote(entry.text);
+
+    // The acceptance script's oracle: this chrome is owner-painted inside a
+    // background test desktop and cannot be screenshotted, so the pane states
+    // what it did — including the context it recorded, which is the half a
+    // "the text arrived" check would miss.
+    log.info(
+        "viewer quote pane={s} id={d} bytes={d} heading={s} block={s} offset={?d} live={d}",
+        .{
+            self.paneId(),
+            id,
+            entry.text.len,
+            entry.heading_id orelse "-",
+            entry.block_selector orelse "-",
+            entry.document_offset,
+            self.feedbackQuoteCount(alloc),
+        },
+    );
+}
+
+/// Where the live quotes sit in the composer's text. Caller frees. Null when
+/// the derivation could not be done at all (an allocation failure), which
+/// callers treat as "no quotes" rather than as a reason to stop.
+pub fn feedbackQuoteSpans(self: *const ViewerPane, alloc: Allocator) ?[]feedback_doc.Span {
+    return self.feedback_quotes.live(alloc, self.feedback_text.items) catch null;
+}
+
+/// How many quotes the report would carry right now — the number that drops
+/// when the user deletes a block.
+pub fn feedbackQuoteCount(self: *const ViewerPane, alloc: Allocator) usize {
+    const spans = self.feedbackQuoteSpans(alloc) orelse return 0;
+    defer alloc.free(spans);
+    return spans.len;
 }
 
 /// Replace the pane's heading list with its own copy of `items`.
@@ -4590,15 +4659,16 @@ test "host floor: a real controller on a real window, on this box" {
 
             clipboardWriteText(alloc, "t162-sentinel");
 
-            const driver = try copyDriverJs(alloc, case.needle, case.tag);
+            const driver = try selectionDriverJs(alloc, case.needle, case.tag, false);
             defer alloc.free(driver);
             pane.executeScript(alloc, driver);
 
             // The driver reports through the bridge once it has pressed Copy —
-            // and its button count is the v1 shape: ONE button. Two would mean
-            // Quote came back wired to nothing; the count rides in the id so
+            // and its button count is the shape T641 restored: TWO buttons,
+            // Quote then Copy. One would mean the hide-quote flag is back and
+            // Windows has silently lost quoting; the count rides in the id so
             // the failure names itself.
-            const want_id = try std.fmt.allocPrint(alloc, "copybar-{s}:1", .{case.tag});
+            const want_id = try std.fmt.allocPrint(alloc, "copybar-{s}:2", .{case.tag});
             defer alloc.free(want_id);
             var press_timer = try std.time.Timer.start();
             while (press_timer.read() < 30 * std.time.ns_per_s) {
@@ -4641,6 +4711,108 @@ test "host floor: a real controller on a real window, on this box" {
             try testing.expectEqualStrings(case.needle, copied.?);
         }
     }
+
+    // ------------------------------------------------------------------
+    // T641: the selection toolbar's Quote — passage into the composer
+    // ------------------------------------------------------------------
+    //
+    // The other half of the same bar, and the reason the button count above
+    // is 2. This is the whole path in one go: a REAL page, a real selection, a
+    // real press of the real Quote button, the shared `selection.js` gathering
+    // the referential context, the bridge carrying it, and the pane putting it
+    // into the composer as a block. Nothing here is a stand-in except the
+    // mouse event, which is the same synthetic press Copy is driven with.
+    //
+    // It lives in this live test rather than in `test/win32/viewer-feedback.ps1`
+    // because pressing the page's own button means running script IN the page,
+    // and the acceptance harness has no way to do that from outside the
+    // process — the app exposes no "execute JS" verb, deliberately.
+    {
+        try tmp.dir.writeFile(.{
+            .sub_path = "quote.md",
+            .data =
+            \\# Alpha
+            \\
+            \\a paragraph under the first heading
+            \\
+            \\## Beta
+            \\
+            \\ghoztty quoted this passage
+            \\
+            ,
+        });
+        const quote_path = try std.fs.path.join(alloc, &.{ dir_path, "quote.md" });
+        defer alloc.free(quote_path);
+
+        try pane.navigate(alloc, quote_path);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.page_loaded;
+            }
+        }.ready, &pane);
+
+        // The composer only opens for a pane that has somewhere to file, and
+        // that answer arrives from a worker thread (T633). The tmp dir is
+        // inside THIS repo, so the probe has a real worktree to find — waiting
+        // for it is waiting out the thread, not hoping.
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.feedbackWorktree() != null;
+            }
+        }.ready, &pane);
+        log.warn("quote: worktree={?s}", .{pane.feedbackWorktree()});
+
+        const driver = try selectionDriverJs(alloc, "ghoztty quoted this passage", "quote", true);
+        defer alloc.free(driver);
+        pane.executeScript(alloc, driver);
+
+        var quote_timer = try std.time.Timer.start();
+        while (quote_timer.read() < 30 * std.time.ns_per_s) {
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            if (pane.feedback_quotes.entries.items.len > 0) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+
+        try testing.expectEqual(@as(usize, 1), pane.feedback_quotes.entries.items.len);
+        const entry = pane.feedback_quotes.entries.items[0];
+        log.warn("quote: text='{s}' heading={?s} block={?s} offset={?d}", .{
+            entry.text,
+            entry.heading_text,
+            entry.block_selector,
+            entry.document_offset,
+        });
+
+        // The passage itself...
+        try testing.expectEqualStrings("ghoztty quoted this passage", entry.text);
+        // ...and the context that lets an agent find it again. The heading is
+        // the SECOND one, which is the assertion that `selection.js` walked
+        // the document rather than grabbing the first heading it saw.
+        try testing.expectEqualStrings("Beta", entry.heading_text.?);
+        try testing.expect(entry.block_selector != null);
+        try testing.expect(entry.block_text != null);
+
+        // Quoting opens the composer — a quote filed into a composer the user
+        // cannot see is a quote they do not know they made.
+        try testing.expect(pane.feedback_open);
+
+        // The block is in the composer's text, on lines of its own, and it is
+        // LIVE: that is the number the report's `quotes` array will have.
+        try testing.expect(std.mem.indexOf(u8, pane.feedbackText(), entry.text) != null);
+        try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
+
+        // ...and deleting it takes its metadata out of the report without
+        // anything having to notice the deletion. (Done by rewriting the
+        // buffer, which is exactly what the control's change mirror does when
+        // a user selects the block and hits Delete.)
+        pane.feedbackSetText(alloc, "just my own words\n");
+        try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
+        // The entry is still in the registry — "not in the report" is derived,
+        // not destructive, which is what makes an undo bring the quote back.
+        try testing.expectEqual(@as(usize, 1), pane.feedback_quotes.entries.items.len);
+    }
 }
 
 /// A window's OWN visibility bit (T160's oracle). NOT `IsWindowVisible`,
@@ -4657,10 +4829,19 @@ fn shownByStyle(hwnd: w32.HWND) bool {
 /// the template's async render), makes a live selection over it, raises the
 /// `mouseup` the toolbar listens for, and presses the LAST button in the bar —
 /// then reports through the bridge as `copybar-<tag>:<buttonCount>` so the
-/// native side can assert both that Copy was pressed and that Quote is hidden
-/// (v1 ships exactly one button). Reaching the buttons through
-/// `host.shadowRoot` is legitimate for a test: the root is `mode: "open"`.
-fn copyDriverJs(alloc: Allocator, needle: []const u8, tag: []const u8) ![]u8 {
+/// native side can assert both that Copy was pressed and that Quote is THERE
+/// (T641 restored it: the bar ships two buttons, Quote then Copy, so the last
+/// one is still Copy). Reaching the buttons through `host.shadowRoot` is
+/// legitimate for a test: the root is `mode: "open"`.
+///
+/// `press_first` picks Quote (the leading button) instead — same selection,
+/// same synthetic press, so the two arms differ in exactly one thing.
+fn selectionDriverJs(
+    alloc: Allocator,
+    needle: []const u8,
+    tag: []const u8,
+    press_first: bool,
+) ![]u8 {
     const template =
         \\(function () {
         \\  var tries = 0;
@@ -4684,7 +4865,7 @@ fn copyDriverJs(alloc: Allocator, needle: []const u8, tag: []const u8) ![]u8 {
         \\    if (!bar) return;
         \\    clearInterval(timer);
         \\    var buttons = bar.querySelectorAll("button");
-        \\    buttons[buttons.length - 1].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        \\    buttons[@INDEX@].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
         \\    window.webkit.messageHandlers.viewerTOC.postMessage(
         \\      { type: "active", id: "copybar-@TAG@:" + buttons.length });
         \\  }, 25);
@@ -4692,7 +4873,15 @@ fn copyDriverJs(alloc: Allocator, needle: []const u8, tag: []const u8) ![]u8 {
     ;
     const with_needle = try std.mem.replaceOwned(u8, alloc, template, "@NEEDLE@", needle);
     defer alloc.free(with_needle);
-    return try std.mem.replaceOwned(u8, alloc, with_needle, "@TAG@", tag);
+    const with_tag = try std.mem.replaceOwned(u8, alloc, with_needle, "@TAG@", tag);
+    defer alloc.free(with_tag);
+    return try std.mem.replaceOwned(
+        u8,
+        alloc,
+        with_tag,
+        "@INDEX@",
+        if (press_first) "0" else "buttons.length - 1",
+    );
 }
 
 /// Test-only: the system clipboard's current text, owned by the caller, or
@@ -5102,13 +5291,21 @@ test "page messages land on the pane, in the pane's own memory" {
     }
     try testing.expectEqual(@as(usize, 0), pane.headings.len);
 
-    // A quote has no consumer yet (design P10) and must not disturb what does.
+    // A quote arriving at a pane with nowhere to FILE (no worktree, and here
+    // no window either) is dropped rather than half-accepted: the composer
+    // never opens, the registry stays empty, and nothing else in the pane
+    // moves. That is the same refusal the feedback BUTTON makes, and it has to
+    // survive on this path too — `+split --view=https://example.com` in a
+    // directory outside any repo is exactly this pane.
     {
         const parsed = bridge.parse(alloc, "{\"type\":\"quote\",\"text\":\"hello\"}").?;
         pane.applyMessage(alloc, parsed.message);
         parsed.deinit();
     }
     try testing.expectEqual(@as(usize, 0), pane.headings.len);
+    try testing.expect(!pane.feedback_open);
+    try testing.expectEqual(@as(usize, 0), pane.feedback_quotes.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
 }
 
 test "a page message that arrives after the pane is gone is dropped" {
