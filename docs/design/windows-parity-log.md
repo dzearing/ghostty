@@ -12327,3 +12327,47 @@ moves — so "the page made room" is measured rather than inferred: it walks dow
 for the composer, further for a third line, back up when a line is deleted, and
 lands exactly on the nav bar's bottom when the composer closes. Also filed: T640
 (the two circular actions have no tooltips and no keyboard reach yet).
+
+## 2026-08-08 — T635: the Windows feedback composer is a real text box
+
+T634 shipped the composer's chrome over a placeholder editing surface: a byte
+buffer that only appended, with backspace as the sole edit. There was no caret
+to move, no selection, no clipboard, no undo, and no IME — so writing a report
+in Japanese or Chinese did not work at all. The composer now hosts a
+**RichEdit** (`Msftedit.dll`, `RichEdit50W`) filling the pill's text rect, which
+is D43's recommended option, taken while that decision is still open. Long
+lines wrap instead of running off the end, and the pill grows with the wrap.
+
+The control is the storage while the composer is open; every change mirrors
+back into the pane from `EN_CHANGE`, so the buffer that has to outlive the
+window still does and a half-written report still survives a close/reopen.
+Escape and Ctrl+Enter route through the main message loop by the control's
+hwnd, exactly as the address field's Enter/Escape do — a multi-line edit
+control swallows both itself.
+
+Two things measured rather than assumed, both of which would have been silent
+bugs: RichEdit sends **no** notifications at all until `EM_SETEVENTMASK` asks
+(without it the mirror never runs while text appears on screen), and it does
+**not** answer `EM_SETCUEBANNER` — so the empty composer's placeholder is
+painted by a subclass over the control's own `WM_PAINT`, and the app logs which
+path it took so the fallback cannot quietly become the only path. A third:
+RichEdit breaks a paragraph from `WM_KEYDOWN(VK_RETURN)` and ignores a bare
+`WM_CHAR` 0x0D, which is why the acceptance script presses Enter rather than
+typing a CR.
+
+Two defects found while building it and fixed here: converting the buffer to
+UTF-16 line by line sliced UTF-8 at byte boundaries and dropped the tail of any
+non-ASCII line, and a pane resize re-wrapped the text without the composer
+re-reading its line count, leaving the band a stale height until the next
+keystroke.
+
+T635 was filed as two halves; the second — inserting a quoted passage and
+un-hiding the page's Quote button — is now **T641**, dep-linked, because a
+Quote button needs somewhere to put text first. **T642** files the IME check
+this box cannot run (no IME installed), so the one claim without evidence is
+tracked rather than asserted.
+
+Lanes none/win32/agent PASS and P1–P3 ALL PASS. `test\win32\viewer-feedback.ps1`
+ALL PASS (50), with new sections C2 (the control's identity and which
+placeholder path is live), I (caret, selection, wrap, and the narrow/widen
+re-wrap arm) and J (Ctrl+A/C/X/V/Z and the pane-buffer mirror).

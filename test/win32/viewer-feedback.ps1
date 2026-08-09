@@ -424,6 +424,23 @@ try {
     Assert ($hWrapped -gt $hEmpty) `
         "a long line with no newlines in it wraps and grows the pill ($hEmpty -> $hWrapped)"
 
+    # ...and the wrap FOLLOWS the pane. Narrowing the window re-wraps the same
+    # text onto more lines, which the composer only notices if it re-reads the
+    # control's line count after being moved (a layout pass is driven by that
+    # count, so the naive version leaves the pill a stale height until the next
+    # keystroke).
+    $winRect = Get-TestWindowRect $view.Top
+    [void](Set-TestWindowSize -Window $view.Top -Width ([int]($winRect.Width * 0.6)) -Height $winRect.Height)
+    Start-Sleep -Milliseconds 900
+    $hNarrow = (Get-TestWindowRect $fb).Height
+    Assert ($hNarrow -gt $hWrapped) `
+        "narrowing the pane re-wraps and the pill follows without a keystroke ($hWrapped -> $hNarrow)"
+    [void](Set-TestWindowSize -Window $view.Top -Width $winRect.Width -Height $winRect.Height)
+    Start-Sleep -Milliseconds 900
+    $hWide = (Get-TestWindowRect $fb).Height
+    Assert ($hWide -eq $hWrapped) `
+        "...and widening it back gives the height back ($hNarrow -> $hWide, want $hWrapped)"
+
     # --- J. the standard editing chords (T635) -------------------------------
     [void](Send-TestKeys -Window $view.Top -Target $rich -Key A -Modifiers Ctrl)
     [void](Send-TestControlKey -Control $rich -Key Delete)

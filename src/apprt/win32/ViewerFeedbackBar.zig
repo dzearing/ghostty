@@ -76,6 +76,10 @@ pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral(class_name_utf8);
 /// Child id of the RichEdit, so `WM_COMMAND`'s low word names it.
 const edit_id: usize = 1;
 
+/// "The wrapped line count moved while I was being laid out; ask the pane to
+/// lay me out again." Posted, never sent — see `place`.
+const WM_APP_RELAYOUT: u32 = w32.WM_APP + 1;
+
 /// The placeholder an empty composer shows, Mac's accessibility label turned
 /// into the cue an empty field needs (`EM_SETCUEBANNER`'s job, hand-drawn
 /// here because the pill is not an EDIT).
@@ -246,7 +250,6 @@ pub fn create(
         1,
         @bitCast(@intFromPtr(placeholder_w.ptr)),
     );
-    const prev_proc = w32.SetWindowLongPtrW(edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
     log.info(
         "viewer feedback composer created cue_banner={} painted_placeholder={}",
         .{ cue != 0, cue == 0 },
@@ -257,10 +260,18 @@ pub fn create(
         .edit = edit,
         .pane = pane,
         .alloc = alloc,
-        .prev_edit_proc = if (prev_proc != 0) @ptrFromInt(@as(usize, @bitCast(prev_proc))) else null,
         .cue_banner = cue != 0,
     };
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    // Subclassed LAST, and only once the bar is reachable from the parent:
+    // `editProc` finds its bar through `owningEdit`, so a message arriving
+    // before that back-pointer exists would be answered by `DefWindowProcW`
+    // instead of by the control's own procedure.
+    const prev_proc = w32.SetWindowLongPtrW(edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
+    self.prev_edit_proc = if (prev_proc != 0)
+        @ptrFromInt(@as(usize, @bitCast(prev_proc)))
+    else
+        null;
     self.applyTheme();
     return self;
 }
@@ -426,6 +437,15 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
         @max(l.text.height(), 0),
         1,
     );
+
+    // A narrower pane re-wraps the text, so the line count this layout was
+    // built from can be wrong the moment the control is moved — which is how
+    // a composer ends up two lines tall around three lines of text after a
+    // split divider is dragged. Corrected on the next message rather than
+    // in-place: `place` is called FROM the pane's bounds sync, and calling
+    // back into it here would re-enter it. The correction converges after one
+    // pass, because the text rect's WIDTH does not depend on the line count.
+    if (self.syncLines()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
 }
 
 /// Push the pane's buffer into the control — what opening the composer does,
@@ -436,30 +456,23 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
 /// both directions here keeps the buffer canonical.
 pub fn seedControl(self: *ViewerFeedbackBar) void {
     const text = self.pane.feedbackText();
-    var buf = std.ArrayList(u16).empty;
-    defer buf.deinit(self.alloc);
-    // Worst case one UTF-16 unit per byte plus a CR per LF; a failed
-    // allocation leaves the control empty rather than showing half a report.
-    buf.ensureTotalCapacity(self.alloc, text.len * 2 + 1) catch return;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    var first = true;
-    while (it.next()) |line| {
-        if (!first) buf.appendSlice(self.alloc, &.{ '\r', '\n' }) catch return;
-        first = false;
-        var tmp: [512]u16 = undefined;
-        var rest = line;
-        while (rest.len > 0) {
-            const chunk = @min(rest.len, tmp.len / 2);
-            const n = std.unicode.utf8ToUtf16Le(&tmp, rest[0..chunk]) catch break;
-            buf.appendSlice(self.alloc, tmp[0..n]) catch return;
-            rest = rest[chunk..];
-        }
+
+    // Converted whole, in one pass, rather than line by line: splitting UTF-8
+    // at a byte boundary can cut a multi-byte sequence in half, and every such
+    // split is a silently dropped tail for anyone not writing in ASCII.
+    var crlf = std.ArrayList(u8).empty;
+    defer crlf.deinit(self.alloc);
+    crlf.ensureTotalCapacity(self.alloc, text.len + 16) catch return;
+    for (text) |c| {
+        if (c == '\n') crlf.append(self.alloc, '\r') catch return;
+        crlf.append(self.alloc, c) catch return;
     }
-    buf.append(self.alloc, 0) catch return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, crlf.items) catch return;
+    defer self.alloc.free(wide);
 
     self.seeding = true;
     defer self.seeding = false;
-    _ = w32.SetWindowTextW(self.edit, @ptrCast(buf.items.ptr));
+    _ = w32.SetWindowTextW(self.edit, wide.ptr);
     // Caret to the end, so reopening resumes writing rather than typing into
     // the front of what is already there.
     const all: w32.CHARRANGE = .{ .cpMin = -1, .cpMax = -1 };
@@ -941,6 +954,11 @@ fn wndProc(
                 const l = self.currentLayout();
                 if (l.hitButton(self.scale, x, y) == b) self.activate(b);
             }
+            return 0;
+        },
+
+        WM_APP_RELAYOUT => {
+            self.textChanged();
             return 0;
         },
 
