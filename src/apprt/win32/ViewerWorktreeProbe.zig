@@ -13,6 +13,12 @@
 //! (`work`), and the pane is repainted from the completion (`complete`), which
 //! is the only function here the GUI thread runs that touches the answer.
 //!
+//! Leg 2 of the strategy — a `localhost:PORT` pane's listening process and that
+//! process's working directory (T638) — rides the same worker for the same
+//! reason: it is a machine-wide TCP table fetch plus a PEB read on an untrusted
+//! process. Which is why `kick` plans rather than resolves: `viewer_worktree`'s
+//! `plan` settles legs 1 and 3 here (string work) and hands the port to `work`.
+//!
 //! One worker at a time. A request arriving while one is in flight sets
 //! `dirty` and is re-issued from the completion rather than racing a second
 //! spawn — a pane can move three times in a second (a link, a redirect, a
@@ -25,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const w32 = @import("win32.zig");
 const worktree = @import("viewer_worktree.zig");
 const git_run = @import("git_run.zig");
+const internal_os = @import("../../os/main.zig");
 
 const log = std.log.scoped(.viewer_worktree);
 
@@ -44,8 +51,14 @@ const Job = struct {
     alloc: Allocator,
     /// The cache key this answers (`location \0 origin`). Owned.
     key: []u8,
-    /// The candidate directory git was asked about. Owned.
-    dir: []u8,
+    /// The candidate directory git is to be asked about. Owned. Null only for a
+    /// `port` job with no origin behind it, where the listener is the pane's
+    /// one and only chance of being attributable to anything.
+    dir: ?[]u8,
+    /// Leg 2: the loopback port to resolve BEFORE `dir` is used, when the
+    /// location named one. The lookup is two syscalls against another process,
+    /// which is why it rides the worker rather than the message loop.
+    port: ?u16 = null,
     /// The resolved worktree root, written by the worker. Owned; null when the
     /// directory is in no repository at all.
     root: ?[]u8 = null,
@@ -53,7 +66,7 @@ const Job = struct {
     fn destroy(self: *Job) void {
         const alloc = self.alloc;
         alloc.free(self.key);
-        alloc.free(self.dir);
+        if (self.dir) |d| alloc.free(d);
         if (self.root) |r| alloc.free(r);
         alloc.destroy(self);
     }
@@ -81,12 +94,45 @@ thread: ?std.Thread = null,
 job: ?*Job = null,
 dirty: bool = false,
 
-/// How the strategy's impure edges are reached. Overridden by tests; leg 2's
-/// port lookup stays absent until T638 installs one.
+/// How the strategy's impure edges are reached. Overridden by tests; `init`
+/// installs the real ones, leg 2's port lookup included (T638).
 strategy: worktree.Strategy = .{},
 
 pub fn init(alloc: Allocator) Probe {
-    return .{ .alloc = alloc, .cache = .{ .alloc = alloc } };
+    return .{
+        .alloc = alloc,
+        .cache = .{ .alloc = alloc },
+        .strategy = .{ .port_lookup = listenerCwd },
+    };
+}
+
+/// Leg 2 for real: the working directory of whatever is listening on `port`.
+///
+/// Two OS calls, each of which is allowed to fail without consequence beyond a
+/// null. `GetExtendedTcpTable` names the owning process
+/// (`os/listening_pid.zig`), and a PEB read gets that process's cwd
+/// (`os/process_cwd.zig`) — Windows exposes no documented API for the latter,
+/// and the alternative on offer is guessing from a command line, which is the
+/// confidently-wrong answer this whole feature is built to avoid.
+///
+/// BLOCKING, and deliberately reachable only from `work`: both calls are
+/// syscalls against another process, and the viewer's message loop is the one
+/// the terminal next door draws on.
+///
+/// The trailing separator the PEB stores (`D:\git\ghoztty\`) is trimmed, so a
+/// listener's directory is spelled the same way a file viewer's is and the two
+/// cannot cache or compare as different strings. A drive root (`D:\`) keeps its
+/// separator, since `D:` alone means "whatever the current directory on D: is".
+fn listenerCwd(alloc: Allocator, port: u16, buf: []u8) ?[]const u8 {
+    const pid = internal_os.listening_pid.forPort(alloc, port) orelse return null;
+    const cwd = internal_os.process_cwd.fromPid(pid, alloc) orelse return null;
+    defer alloc.free(cwd);
+
+    var out: []const u8 = cwd;
+    if (out.len > 3) out = std.mem.trimRight(u8, out, "\\/");
+    if (out.len == 0 or out.len > buf.len) return null;
+    @memcpy(buf[0..out.len], out);
+    return buf[0..out.len];
 }
 
 /// Join any worker and drop everything. Safe from any state.
@@ -181,18 +227,24 @@ fn kick(self: *Probe) Outcome {
     const now = w32.GetTickCount64();
     if (self.cache.get(key, now)) |hit| return self.apply(hit);
 
+    // Legs 1 and 3 are decided here, on the GUI thread, because they are string
+    // work. Leg 2 is not — its port lookup goes with the job.
     var dir_buf: [path_cap]u8 = undefined;
-    const dir = worktree.candidateDirectory(
-        &dir_buf,
-        location,
-        origin,
-        self.strategy,
-    ) orelse {
-        // Nothing to attribute this pane to at all — a negative answer worth
-        // caching, since a website re-asks on every navigation.
-        self.cache.put(key, null, now);
-        return self.apply(null);
-    };
+    var dir: ?[]const u8 = null;
+    var port: ?u16 = null;
+    switch (worktree.plan(&dir_buf, location, origin, self.strategy.dir_exists)) {
+        .none => {
+            // Nothing to attribute this pane to at all — a negative answer worth
+            // caching, since a website re-asks on every navigation.
+            self.cache.put(key, null, now);
+            return self.apply(null);
+        },
+        .directory => |d| dir = d,
+        .port => |p| {
+            port = p.port;
+            dir = p.fallback;
+        },
+    }
 
     const job = self.alloc.create(Job) catch return self.apply(null);
     job.* = .{
@@ -201,11 +253,12 @@ fn kick(self: *Probe) Outcome {
             self.alloc.destroy(job);
             return self.apply(null);
         },
-        .dir = self.alloc.dupe(u8, dir) catch {
+        .dir = if (dir) |d| (self.alloc.dupe(u8, d) catch {
             self.alloc.free(job.key);
             self.alloc.destroy(job);
             return self.apply(null);
-        },
+        }) else null,
+        .port = port,
     };
 
     self.job = job;
@@ -218,13 +271,25 @@ fn kick(self: *Probe) Outcome {
     return .pending;
 }
 
-/// The worker: one `git rev-parse --show-toplevel`, then a post. Runs on its
-/// own thread and touches nothing on the probe but the two handles it was
-/// attached with (which are set before any worker can exist and never change).
+/// The worker: leg 2's port lookup when the job carries one, then one
+/// `git rev-parse --show-toplevel`, then a post. Runs on its own thread and
+/// touches nothing on the probe but the two handles it was attached with (which
+/// are set before any worker can exist and never change) and `port_lookup`,
+/// which is set at construction.
 fn work(self: *Probe, job: *Job) void {
+    var dir_buf: [path_cap]u8 = undefined;
+    const dir = if (job.port) |port| worktree.resolvePort(
+        job.alloc,
+        &dir_buf,
+        .{ .port = port, .fallback = job.dir },
+        self.strategy,
+    ) else job.dir;
+
     var buf: [path_cap]u8 = undefined;
-    if (repositoryRoot(job.alloc, job.dir, &buf)) |root| {
-        job.root = job.alloc.dupe(u8, root) catch null;
+    if (dir) |d| {
+        if (repositoryRoot(job.alloc, d, &buf)) |root| {
+            job.root = job.alloc.dupe(u8, root) catch null;
+        }
     }
     if (self.hwnd) |h| {
         if (w32.PostMessageW(h, self.message, 0, 0) == 0) {
@@ -340,6 +405,73 @@ test "a resolution completes, sticks, and answers from cache the second time" {
     try testing.expectEqual(Outcome.unchanged, p.refresh(here, null));
     try testing.expect(p.thread == null);
     try testing.expectEqualStrings(root_owned, p.worktreePath().?);
+}
+
+test "leg 2: a loopback port resolves to the LISTENER's worktree, not the origin" {
+    var p = Probe.init(testing.allocator);
+    defer p.deinit();
+
+    // This test process is the listener, so the right answer is our own
+    // working directory's worktree.
+    const cwd = std.process.getCwdAlloc(testing.allocator) catch
+        return error.SkipZigTest;
+    defer testing.allocator.free(cwd);
+    var root_buf: [path_cap]u8 = undefined;
+    const want = repositoryRoot(testing.allocator, cwd, &root_buf) orelse
+        return error.SkipZigTest;
+    const want_owned = try testing.allocator.dupe(u8, want);
+    defer testing.allocator.free(want_owned);
+
+    // The pane's ORIGIN is deliberately outside that worktree, so a pass
+    // cannot be leg 3 wearing leg 2's clothes.
+    const tmp = std.process.getEnvVarOwned(testing.allocator, "TEMP") catch
+        return error.SkipZigTest;
+    defer testing.allocator.free(tmp);
+    if (std.mem.startsWith(u8, tmp, want_owned)) return error.SkipZigTest;
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var loc_buf: [64]u8 = undefined;
+    const loc = try std.fmt.bufPrint(
+        &loc_buf,
+        "http://localhost:{d}/",
+        .{server.listen_address.getPort()},
+    );
+
+    _ = p.refresh(loc, tmp);
+    if (p.thread != null) _ = p.complete();
+    try testing.expectEqualStrings(want_owned, p.worktreePath().?);
+}
+
+test "a loopback port with nobody behind it falls through to the origin" {
+    var p = Probe.init(testing.allocator);
+    defer p.deinit();
+
+    // Bind and release: a port that was ours a moment ago is a far better
+    // "free port" than a guessed number.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    const port = server.listen_address.getPort();
+    server.deinit();
+
+    var loc_buf: [64]u8 = undefined;
+    const loc = try std.fmt.bufPrint(&loc_buf, "http://localhost:{d}/", .{port});
+
+    const cwd = std.process.getCwdAlloc(testing.allocator) catch
+        return error.SkipZigTest;
+    defer testing.allocator.free(cwd);
+    var root_buf: [path_cap]u8 = undefined;
+    const want = repositoryRoot(testing.allocator, cwd, &root_buf) orelse
+        return error.SkipZigTest;
+    const want_owned = try testing.allocator.dupe(u8, want);
+    defer testing.allocator.free(want_owned);
+
+    // Leg 3 answers, which is the whole point: an unattributable port is not a
+    // dead end, it is a pane that still belongs to where it was opened from.
+    _ = p.refresh(loc, cwd);
+    if (p.thread != null) _ = p.complete();
+    try testing.expectEqualStrings(want_owned, p.worktreePath().?);
 }
 
 test "a directory in no repository resolves to no worktree" {

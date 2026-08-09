@@ -20,6 +20,7 @@
 //! seat.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const content = @import("viewer_content.zig");
 
 /// Candidate `git` binaries, in order. The bare name first — a GUI app on
@@ -42,13 +43,25 @@ pub const DirProbe = *const fn (path: []const u8) bool;
 /// `buf`; null when nothing is listening or its cwd cannot be read.
 ///
 /// Leg 2 of the strategy, and the ONLY leg that is not portable: Windows has no
-/// `lsof`, and picking its replacement is a real choice, so it is T638's. Until
-/// that lands the hook is simply never installed and a localhost pane falls
-/// through to leg 3 — its origin directory, which is usually the right answer
-/// anyway.
-pub const PortProbe = *const fn (port: u16, buf: []u8) ?[]const u8;
+/// `lsof`, so its replacement is `GetExtendedTcpTable` for the pid and a PEB
+/// read for that pid's working directory (T638, `os/listening_pid.zig` +
+/// `os/process_cwd.zig`). Both halves are impure and both cost a syscall on an
+/// untrusted process, which is why the strategy takes them as a hook: this
+/// module still asserts without a port, a process or a repo.
+///
+/// It takes an allocator because both of its halves need scratch — a TCP table
+/// whose size is only known after asking for it, and a UTF-16 path read out of
+/// another process — and returns its answer in `buf`, so nothing it allocates
+/// outlives the call.
+pub const PortProbe = *const fn (alloc: Allocator, port: u16, buf: []u8) ?[]const u8;
 
-/// The impure edges of `candidateDirectory`, defaulted to the real ones.
+/// The impure edges of `candidateDirectory`.
+///
+/// `dir_exists` defaults to the real one because a filesystem is always there.
+/// `port_lookup` defaults to ABSENT because the real one is win32-only and
+/// lives outside this module — `ViewerWorktreeProbe.init` installs it, and a
+/// strategy built by hand (every test in this file) leaves leg 2 unresolved and
+/// falls to the origin, which is what a port with no listener does anyway.
 pub const Strategy = struct {
     dir_exists: DirProbe = realDirExists,
     port_lookup: ?PortProbe = null,
@@ -71,37 +84,91 @@ pub fn realDirExists(path: []const u8) bool {
 /// In order:
 ///   1. A file viewer contributes the viewed file's own directory.
 ///   2. An `http://localhost:PORT` viewer contributes the listening process's
-///      working directory (T638; today the hook is absent and this never fires).
+///      working directory (T638).
 ///   3. Anything else — a remote site, a blank pane, a diff spec, a port with
 ///      no listener — falls back to the directory the pane was OPENED from.
 ///
 /// The result is borrowed from `buf`, from `location`, or from
 /// `origin_directory`, so it lives exactly as long as the shortest of those.
 pub fn candidateDirectory(
+    alloc: Allocator,
     buf: []u8,
     location: []const u8,
     origin_directory: ?[]const u8,
     strategy: Strategy,
 ) ?[]const u8 {
+    return switch (plan(buf, location, origin_directory, strategy.dir_exists)) {
+        .none => null,
+        .directory => |dir| dir,
+        .port => |p| resolvePort(alloc, buf, p, strategy),
+    };
+}
+
+/// What `candidateDirectory` would do, WITHOUT doing leg 2's part of it.
+///
+/// The split exists because the three legs do not cost the same. Legs 1 and 3
+/// are string work — cheap enough to run wherever the question is asked — while
+/// leg 2 is two syscalls against another process, and the win32 viewer asks
+/// this question from the message loop the terminal next door draws on. So the
+/// caller settles a `.none`/`.directory` plan on the spot and hands a `.port`
+/// one to the worker it was going to spawn for git anyway (T638).
+pub const Plan = union(enum) {
+    /// Nothing to attribute this pane to at all.
+    none,
+    /// Ask git about this directory.
+    directory: []const u8,
+    /// Look this loopback port up first; use `fallback` if it yields nothing.
+    port: PortPlan,
+};
+
+pub const PortPlan = struct { port: u16, fallback: ?[]const u8 };
+
+pub fn plan(
+    buf: []u8,
+    location: []const u8,
+    origin_directory: ?[]const u8,
+    dir_exists: DirProbe,
+) Plan {
     // 1. A file's own directory. A file naming a directory that does not exist
     // still falls through to the origin: a viewer showing a missing file must
     // not misattribute feedback to a directory nobody has.
     if (fileDirectory(buf, location)) |dir| {
-        if (strategy.dir_exists(dir)) return dir;
-        return origin_directory;
+        if (dir_exists(dir)) return .{ .directory = dir };
+        return fallbackPlan(origin_directory);
     }
 
     // 2. Loopback dev servers: port -> pid -> cwd.
     if (loopbackPort(location)) |port| {
-        if (strategy.port_lookup) |probe| {
-            if (probe(port, buf)) |cwd| {
-                if (strategy.dir_exists(cwd)) return cwd;
-            }
-        }
+        return .{ .port = .{ .port = port, .fallback = origin_directory } };
     }
 
-    // 3. Everything else, a loopback port with no listener included.
-    return origin_directory;
+    // 3. Everything else — a remote site, a blank pane, a diff spec.
+    return fallbackPlan(origin_directory);
+}
+
+fn fallbackPlan(origin_directory: ?[]const u8) Plan {
+    return if (origin_directory) |o| .{ .directory = o } else .none;
+}
+
+/// Carry out a `.port` plan: the listener's own working directory when there is
+/// one we can read, else the origin the pane was opened from.
+///
+/// A listener whose cwd we cannot read is NOT an error — a dev server owned by
+/// another user, or a port held by a system process, both land here — so it
+/// degrades to leg 3 exactly as a port with no listener does. The one thing it
+/// never does is answer with a directory that does not exist.
+pub fn resolvePort(
+    alloc: Allocator,
+    buf: []u8,
+    p: PortPlan,
+    strategy: Strategy,
+) ?[]const u8 {
+    if (strategy.port_lookup) |probe| {
+        if (probe(alloc, p.port, buf)) |cwd| {
+            if (strategy.dir_exists(cwd)) return cwd;
+        }
+    }
+    return p.fallback;
 }
 
 /// The directory of the file a location names, or null when it names anything
@@ -390,7 +457,7 @@ fn allDirs(_: []const u8) bool {
     return true;
 }
 
-fn fakePort(port: u16, buf: []u8) ?[]const u8 {
+fn fakePort(_: Allocator, port: u16, buf: []u8) ?[]const u8 {
     if (port != 3000) return null;
     const dir = "D:\\git\\server";
     @memcpy(buf[0..dir.len], dir);
@@ -403,17 +470,17 @@ test "leg 1: a file viewer is attributed to the file's own directory" {
 
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty\\docs",
-        candidateDirectory(&buf, "D:\\git\\ghoztty\\docs\\design.md", null, s).?,
+        candidateDirectory(testing.allocator, &buf, "D:\\git\\ghoztty\\docs\\design.md", null, s).?,
     );
     // A `file://` URL is the same file said another way.
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty",
-        candidateDirectory(&buf, "file:///D:/git/ghoztty/README.md", null, s).?,
+        candidateDirectory(testing.allocator, &buf, "file:///D:/git/ghoztty/README.md", null, s).?,
     );
     // The file's directory WINS over the origin: the pane moved.
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty\\docs",
-        candidateDirectory(&buf, "D:\\git\\ghoztty\\docs\\design.md", "D:\\elsewhere", s).?,
+        candidateDirectory(testing.allocator, &buf, "D:\\git\\ghoztty\\docs\\design.md", "D:\\elsewhere", s).?,
     );
 }
 
@@ -424,9 +491,9 @@ test "leg 1 falls through when the file's directory does not exist" {
     // directory nobody has — it falls back to where the pane was opened.
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty",
-        candidateDirectory(&buf, "D:\\gone\\design.md", "D:\\git\\ghoztty", s).?,
+        candidateDirectory(testing.allocator, &buf, "D:\\gone\\design.md", "D:\\git\\ghoztty", s).?,
     );
-    try testing.expect(candidateDirectory(&buf, "D:\\gone\\design.md", null, s) == null);
+    try testing.expect(candidateDirectory(testing.allocator, &buf, "D:\\gone\\design.md", null, s) == null);
 }
 
 test "leg 3: an http location and a blank pane fall back to the origin" {
@@ -435,7 +502,7 @@ test "leg 3: an http location and a blank pane fall back to the origin" {
 
     for ([_][]const u8{
         "https://example.com/docs",
-        "http://localhost:3000/", // no port probe installed yet (T638)
+        "http://localhost:3000/", // a port with no listener behind it
         "about:blank",
         "",
         "git-status:", // a revspec is not a path
@@ -444,9 +511,9 @@ test "leg 3: an http location and a blank pane fall back to the origin" {
     }) |loc| {
         try testing.expectEqualStrings(
             "D:\\git\\ghoztty",
-            candidateDirectory(&buf, loc, "D:\\git\\ghoztty", s).?,
+            candidateDirectory(testing.allocator, &buf, loc, "D:\\git\\ghoztty", s).?,
         );
-        try testing.expect(candidateDirectory(&buf, loc, null, s) == null);
+        try testing.expect(candidateDirectory(testing.allocator, &buf, loc, null, s) == null);
     }
 }
 
@@ -456,17 +523,71 @@ test "leg 2: a loopback port resolves through the probe when one is installed" {
 
     try testing.expectEqualStrings(
         "D:\\git\\server",
-        candidateDirectory(&buf, "http://localhost:3000/app", "D:\\git\\ghoztty", s).?,
+        candidateDirectory(testing.allocator, &buf, "http://localhost:3000/app", "D:\\git\\ghoztty", s).?,
     );
     // A port with no listener is leg 3, not a dead end.
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty",
-        candidateDirectory(&buf, "http://localhost:9999/", "D:\\git\\ghoztty", s).?,
+        candidateDirectory(testing.allocator, &buf, "http://localhost:9999/", "D:\\git\\ghoztty", s).?,
     );
     // A REMOTE site never consults the probe.
     try testing.expectEqualStrings(
         "D:\\git\\ghoztty",
-        candidateDirectory(&buf, "http://example.com:3000/", "D:\\git\\ghoztty", s).?,
+        candidateDirectory(testing.allocator, &buf, "http://example.com:3000/", "D:\\git\\ghoztty", s).?,
+    );
+}
+
+test "the plan says which leg applies, so only leg 2 has to leave the UI thread" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    // Leg 1 and leg 3 are answers, not work: the caller settles them itself.
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty\\docs",
+        plan(&buf, "D:\\git\\ghoztty\\docs\\design.md", null, allDirs).directory,
+    );
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty",
+        plan(&buf, "https://example.com/", "D:\\git\\ghoztty", allDirs).directory,
+    );
+    try testing.expectEqual(Plan.none, plan(&buf, "https://example.com/", null, allDirs));
+
+    // Leg 2 is deferred, and it carries the fallback with it so whoever runs
+    // it can finish the decision without asking again.
+    const p = plan(&buf, "http://127.0.0.1:3000/app", "D:\\git\\ghoztty", allDirs).port;
+    try testing.expectEqual(@as(u16, 3000), p.port);
+    try testing.expectEqualStrings("D:\\git\\ghoztty", p.fallback.?);
+    // A loopback pane with no origin still asks: a dev server is the only
+    // thing that could attribute it, so there is nothing to settle early.
+    const p2 = plan(&buf, "http://localhost:5173/", null, allDirs).port;
+    try testing.expectEqual(@as(u16, 5173), p2.port);
+    try testing.expect(p2.fallback == null);
+
+    // A file whose directory is gone plans the ORIGIN, not the missing path.
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty",
+        plan(&buf, "D:\\gone\\x.md", "D:\\git\\ghoztty", noDirs).directory,
+    );
+}
+
+test "resolvePort prefers the listener, falls back to the origin, never to a ghost" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const s: Strategy = .{ .dir_exists = allDirs, .port_lookup = fakePort };
+
+    try testing.expectEqualStrings(
+        "D:\\git\\server",
+        resolvePort(testing.allocator, &buf, .{ .port = 3000, .fallback = "D:\\git\\ghoztty" }, s).?,
+    );
+    // No listener -> the origin.
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty",
+        resolvePort(testing.allocator, &buf, .{ .port = 9999, .fallback = "D:\\git\\ghoztty" }, s).?,
+    );
+    try testing.expect(resolvePort(testing.allocator, &buf, .{ .port = 9999, .fallback = null }, s) == null);
+    // A listener whose cwd no longer exists is not an answer either.
+    const gone: Strategy = .{ .dir_exists = noDirs, .port_lookup = fakePort };
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty",
+        resolvePort(testing.allocator, &buf, .{ .port = 3000, .fallback = "D:\\git\\ghoztty" }, gone).?,
     );
 }
 

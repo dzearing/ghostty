@@ -792,15 +792,24 @@ the queue; consuming it is separate and not built here).
   or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
   per (location, origin) for 15s so navigation never stutters and a dev server
   started later still makes the button appear.
-  **Windows has legs 1 and 3 and the button** (T633): the strategy, the
+  **Windows has all three legs and the button** (T633, T638): the strategy, the
   classification and the 15s cache are `src/apprt/win32/viewer_worktree.zig`
   (pure, asserted in the none lane), and the `git rev-parse` runs on a worker
   thread that posts `WM_APP_VIEWER_WORKTREE` back at the pane —
   `ViewerWorktreeProbe.zig` — because the viewer's message loop is the one the
-  terminal next door draws on. Leg 2 is **T638**: Windows has no `lsof` and its
-  replacement is a real choice, so until it lands a `localhost:PORT` pane falls
-  through to leg 3, which is its origin directory and usually the right answer
-  anyway. Acceptance: `test/win32/viewer-worktree.ps1`.
+  terminal next door draws on. Leg 2's translation of `lsof` is
+  `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER)` for the listening pid
+  (`src/os/listening_pid.zig`, both address families) and the PEB walk
+  `src/os/process_cwd.zig` already does for that pid's working directory —
+  Windows exposes no documented API for another process's cwd, and the
+  alternative on offer, guessing from its command line, is exactly the
+  confidently-wrong answer the report format avoids everywhere else. Both are
+  syscalls against an untrusted process, so they ride the SAME worker as git:
+  `viewer_worktree.plan` settles legs 1 and 3 on the message loop (string work)
+  and hands a `.port` plan to the worker. Every failure — no listener, another
+  user's process, a pid that exits mid-lookup — degrades to leg 3, never to a
+  wrong repo. Acceptance: `test/win32/viewer-worktree.ps1` (legs 1 and 3) and
+  `test/win32/viewer-worktree-port.ps1` (leg 2).
 
   The button is **icon-only**, in the same 24pt square as the other chrome
   controls; the destination is on its tooltip and in the composer footer.

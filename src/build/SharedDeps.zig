@@ -636,6 +636,10 @@ pub fn add(
         if (step.rootModuleTarget().os.tag == .windows) {
             step.linkSystemLibrary2("advapi32", .{});
             step.linkSystemLibrary2("crypt32", .{});
+            // T638: `GetExtendedTcpTable`, which answers "who is listening on
+            // this port" for the viewer's leg-2 worktree provenance. In
+            // `os/listening_pid.zig`, i.e. the shared graph, not the win32 one.
+            step.linkSystemLibrary2("iphlpapi", .{});
         }
     }
 

@@ -12541,3 +12541,56 @@ which lands a quote or a chip in the wrong place once the report holds
 non-ASCII text (pre-existing, from T641); and **T649**, the T400 stale-debounce
 test, which calibrates its fetch count on a cold cache and asserts it against a
 warm one — it failed once here and re-ran green with the other calibration.
+
+## 2026-08-09 — A Windows viewer pane pointed at a dev server knows whose code it is (T638)
+
+Leg 2 of the viewer's worktree provenance now works on Windows. A pane showing
+`http://localhost:3000` no longer guesses from where the pane was opened — it
+finds the process actually listening on that port and files feedback against
+**that** process's checkout. Open a pane on your dev server from anywhere on the
+box and the feedback button names the repo the server is running out of.
+
+**The half nobody had to build.** T638's design settled the pid half
+(`GetExtendedTcpTable` with `TCP_TABLE_OWNER_PID_LISTENER`) and left the cwd
+half open, calling the PEB read "the recommended shape when this is taken". It
+turned out `src/os/process_cwd.zig` has done exactly that walk since T185 — for
+a pane's own shell, using the std `PEB`/`RTL_USER_PROCESS_PARAMETERS` ABI types
+rather than hand-rolled offsets, with every read bounds-checked and every
+failure a null. So the cwd half is a call. What is new is
+`src/os/listening_pid.zig`: both address families, v4 first, the port read back
+out of network byte order (a naive read of :3000 is 47115), and a bounded retry
+around the size-then-fetch pair because the table grows while you ask about it.
+
+**The structural part is where the work runs.** Leg 2 was already a hook inside
+`candidateDirectory` — and `candidateDirectory` is called from
+`ViewerWorktreeProbe.kick`, which is the GUI thread. That was free while the
+hook was absent and would not have been once it was: a machine-wide TCP table
+fetch plus a cross-process PEB read, on every navigation, on the message loop
+the terminal next door draws on. So `viewer_worktree` gained a pure `plan()`.
+Legs 1 and 3 are string work and still settle synchronously; a `.port` plan
+rides the worker the pane was going to spawn for `git` anyway. No new thread, no
+new spawn, and the cheap answers stay cheap.
+
+**Three outcomes, one URL shape.** The same `http://localhost:PORT` produces the
+listener's checkout, the pane's origin, or nothing at all, and which one is not
+a detail — it is the difference between filing a report in the right repo, a
+plausible one, and refusing to guess. A listener in NO repository resolves to
+**no worktree**, not to the pane's origin: the task's own validation criterion
+asked for the fall-through, and Mac's `ViewerWorktree.swift` does not do that —
+it returns the listener's cwd and lets git decide. Platform symmetry decided it;
+the criterion was corrected in the task file rather than the code bent to it.
+The fall-through belongs to a port with no listener at all, which is a different
+case and asserted separately.
+
+Lanes none/win32/agent PASS, P1–P3 ALL PASS, and T633's own
+`viewer-worktree.ps1` re-run **ALL PASS (25)** since this change moves the code
+under it. The win32 lane went red once on the way — `t400: stale-debounce
+window cost 0 fetch(es), expected 1` — which is **T649**, the calibrate-cold /
+assert-warm flake filed yesterday, in its exact recorded shape; it re-ran green.
+New `test/win32/viewer-worktree-port.ps1` **ALL PASS (20)**: it creates a scratch
+`git init` tree under `%TEMP%`, starts a raw-socket HTTP responder with its cwd
+set there, and opens the pane with `--working-directory=D:\git\ghoztty` — so the
+listener's answer and the origin's answer are different strings and the
+assertion has something to discriminate. All three cases run against one app in
+one run and produce three different answers, which is what makes a
+green-and-empty pass impossible.
