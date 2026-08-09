@@ -12039,3 +12039,67 @@ agent 316s), P1–P3 ALL PASS, `chooser-restore-all-remote.ps1` ALL PASS (39).
 
 Filed: **T621** — the agent's grid snapshot carries no scrollback, so every
 snapshot-less attach still replays the whole ring. Decision receipt: **D40**.
+
+## 2026-08-08 — T125: an agent Ghoztty can't negotiate with now says so, instead of quietly giving up
+
+T147 taught the app to notice a local agent from an older BUILD and offer to
+restart it. It could only ever ask that question over a working connection. The
+case left open was the one where the HANDSHAKE is what fails: two ends that no
+longer agree on the protocol, which is reachable on Windows today because the
+agent outlives the app by design (HKCU Run entry, survives every upgrade).
+
+What happened then: `dialExisting` returned null, exactly as it does for a dead
+agent, and `findOrSpawn` tried to spawn a replacement — which the running agent's
+single-instance guard refused, so the app spent the whole spawn deadline on the
+GUI thread polling a pipe that would keep saying no, then fell back to
+non-persistent shells. No dialog, no explanation, session persistence off for the
+rest of the run. CLAUDE.md's agent contract asks for the opposite: an
+incompatible skew must take the mandatory-update path.
+
+The fix is one decision plus the plumbing to make it decidable. `negotiate`
+reports a mismatch as a bare `error.Incompatible`, which cannot say which side is
+behind — and that direction is the whole game, because the response is
+destructive. So the connection now captures the peer's `proto_version` BEFORE
+negotiating (it is the one HELLO fact that has to survive a failed handshake),
+the dialer surfaces `error.ProtocolIncompatible` and carries that version out in
+a `DialReport`, and `agent_upgrade.evaluateSkew` decides: agent older ⇒ the same
+confirmation dialog T147 built, with copy about the skew; agent NEWER ⇒ nothing
+at all, because killing it would replace a newer binary with an older one and end
+sessions a newer app could still have attached to.
+
+`error.Incompatible` could not simply be renamed: the control reader also raises
+it for EOF-before-HELLO, a malformed frame and an unparseable payload. A parsed
+peer version is what tells a genuine disagreement from a torn socket, and the
+distinction is load-bearing — mapping a dropped stream to "incompatible" would
+answer a transient problem by killing the user's sessions.
+
+The skew path has no idle arm, deliberately. Liveness lives inside the agent we
+cannot talk to; an unknown session count is not "no sessions", so there is no
+state in which a silent destructive restart is justified.
+
+A skew cannot be produced from one tree — both ends compile the same
+`proto_version` — so the agent gained `GHOZTTY_AGENT_PROTO_VERSION`, a debug-only
+seam mirroring the app's `GHOZTTY_AGENT_BUNDLED_VERSION`. Arms J and K of
+`agent-upgrade.ps1` drive a real agent through both directions: J proves the
+dialog appears where nothing appeared before, that nothing is killed before
+consent, and that accepting actually replaces the agent with the app surviving; K
+proves a newer agent is left strictly alone. Without K, an implementation that
+restarted on any skew would pass J and eat sessions on every rollback.
+
+Scope: the row carried an unrelated second half ("What's new" notes UI), split
+out as **T624** (bundled notes + store + last-seen tracking + the tabbed window)
+and **T625** (the accessory on the restart dialog), and T125 retitled to what is
+left.
+
+Floor green — none PASS (288s), win32 PASS (336s), agent PASS (180s), P1–P3 ALL
+PASS, `agent-upgrade.ps1` ALL PASS (107, up from 90). The agent lane went red
+twice first on **T596**'s known flake (`t400: stale-debounce window cost 0
+fetch(es), expected 1` in the ViewerPane host-floor test); the identical failure
+is in this box's 16:04 lane log, from before this task was claimed, so it is not
+this change's. The new unit tests were proven to actually run by breaking one and
+watching the win32 lane go red.
+
+Filed: **T624**, **T625** (the split), **T626** (the app-is-older direction still
+tells the user nothing), **T627** (`seat: mac` — macOS has no skew path either),
+**T628** (a remote machine on an incompatible protocol still reads as merely
+unreachable).

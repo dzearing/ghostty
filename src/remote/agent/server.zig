@@ -345,6 +345,12 @@ pub const Server = struct {
         /// so the app can detect it is running an older build than it bundles and
         /// lazily refresh it. Must outlive `start()` (encoded there). Optional.
         build_version: ?[]const u8 = null,
+        /// The `proto_version` to advertise, overriding this build's pinned one.
+        /// A TEST SEAM (T125) and nothing else: an incompatible protocol skew is
+        /// otherwise unreproducible from one tree, because both ends are built
+        /// from the same `protocol.proto_version` constant. Null = the pinned
+        /// version, which is what every real agent uses.
+        proto_version: ?u16 = null,
     };
 
     /// Stand up a per-connection Server over a SHARED daemon `store` (the registry
@@ -368,6 +374,7 @@ pub const Server = struct {
             .data = data,
             .encoding = opts.encoding,
             .local_hello = .{
+                .proto_version = opts.proto_version orelse protocol.proto_version,
                 .transfer_encoding = opts.encoding,
                 .capabilities = opts.capabilities,
                 .hostname = opts.hostname,

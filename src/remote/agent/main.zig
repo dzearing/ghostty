@@ -1779,6 +1779,27 @@ const ConnWorker = struct {
     }
 };
 
+/// The `proto_version` this agent should advertise, from
+/// `GHOZTTY_AGENT_PROTO_VERSION`. **DEBUG BUILDS ONLY**, like the app's
+/// `GHOZTTY_AGENT_BUNDLED_VERSION` hook, and for the same reason: an
+/// incompatible protocol skew cannot be produced from a single tree — both ends
+/// compile the same `protocol.proto_version` — so the mandatory-update path a
+/// skew is supposed to trigger (T125) would have no way to be exercised on a
+/// real agent. Never honored in a release build: a stray env var must not be
+/// able to cut a user's app off from its own sessions.
+///
+/// Null (absent, empty, or unparseable) leaves the pinned version alone.
+fn protoVersionOverride(alloc: Allocator) ?u16 {
+    // Same gate as `build_config.is_debug`, spelled out because the agent is its
+    // own module and does not link the app's build config.
+    if (comptime builtin.mode != .Debug and builtin.mode != .ReleaseSafe) return null;
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_PROTO_VERSION") catch return null;
+    defer alloc.free(v);
+    const n = std.fmt.parseInt(u16, std.mem.trim(u8, v, " \t\r\n"), 10) catch return null;
+    std.log.warn("advertising proto_version {d} instead of {d} (debug test hook)", .{ n, protocol.proto_version });
+    return n;
+}
+
 /// Stand up a `Mux` + `Server` over one transport `server.Stream`, sharing the
 /// daemon `store` + `spawner`, run until the transport EOFs, then tear the
 /// connection down. Shared by both stdio and TCP modes.
@@ -1803,7 +1824,13 @@ fn serveOne(
         mux.dataStream(),
         spawner,
         store,
-        .{ .encoding = encoding, .hostname = hostname, .ring_bytes = configured_ring_bytes, .build_version = agent_version },
+        .{
+            .encoding = encoding,
+            .hostname = hostname,
+            .ring_bytes = configured_ring_bytes,
+            .build_version = agent_version,
+            .proto_version = protoVersionOverride(alloc),
+        },
     );
     defer srv.destroy(alloc);
 

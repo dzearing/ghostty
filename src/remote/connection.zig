@@ -787,6 +787,16 @@ pub const Connection = struct {
     /// build it bundles to detect a stale local agent and lazily refresh it.
     peer_build_version: ?[:0]u8 = null,
 
+    /// The `proto_version` the peer advertised in its HELLO, or null when no
+    /// HELLO was ever parsed (dropped stream, garbage payload). Same write/read
+    /// ordering as `peer_hostname`, with one deliberate difference: this one is
+    /// captured so it survives a handshake that FAILED, because that is the only
+    /// case it exists for. `negotiate` reports an incompatible pair as a bare
+    /// `error.Incompatible`, which cannot say which side is behind — and killing
+    /// the local agent to "fix" a skew where the AGENT is the newer side would be
+    /// a silent downgrade (T125).
+    peer_proto_version: ?u16 = null,
+
     /// Per-connection frame sequence (§4.2). Assigned by the writer thread at send
     /// time so seq order matches wire order, single-writer (no atomics needed).
     frame_seq: protocol.FrameSeq = .{},
@@ -3037,7 +3047,19 @@ pub const Connection = struct {
                 self.peer_build_version = self.alloc.dupeZ(u8, v) catch null;
             }
         }
+        // And the peer's protocol version, which — unlike the two above — is
+        // captured FOR the failure case: `negotiate` below turns a mismatch into
+        // a bare `error.Incompatible`, and the only way to tell "the agent is
+        // behind us" from "we are behind the agent" afterwards is this number.
+        self.peer_proto_version = parsed.value.proto_version;
         return protocol.negotiate(self.local_hello, parsed.value);
+    }
+
+    /// The `proto_version` the peer advertised, or null when no HELLO was
+    /// parsed. Valid after the handshake resolves EITHER WAY — the incompatible
+    /// case is what it exists for (see the field).
+    pub fn peerProtoVersion(self: *const Connection) ?u16 {
+        return self.peer_proto_version;
     }
 
     /// The peer's self-reported hostname (display-only), or null. Only valid

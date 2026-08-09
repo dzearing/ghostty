@@ -26,6 +26,12 @@
 #      second dialog). "Ghoztty updates automatically the next time no sessions
 #      are open" is a promise the code has to keep.
 #   F: negative control - session-persistence=off never runs the check at all.
+#   J: T125 - a PROTOCOL SKEW (the handshake itself fails, so there is no
+#      connection to judge) takes the same mandatory-update path, and answering
+#      it actually replaces the agent.
+#   K: T125 negative control - a skew where the AGENT is the newer side is never
+#      acted on. The app is the out-of-date one; downgrading it would eat
+#      sessions a newer app could still have attached to.
 #
 # The staleness INPUT is faked with GHOZTTY_AGENT_BUNDLED_VERSION (a debug-only
 # hook): every stamp in a real build comes from the same binary the agent runs,
@@ -281,6 +287,7 @@ New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedOverride = $env:GHOZTTY_AGENT_BUNDLED_VERSION
+$savedProto = $env:GHOZTTY_AGENT_PROTO_VERSION
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
 
 $tmp = Join-Path $root 'run'
@@ -623,12 +630,91 @@ Assert "I7 the user is TOLD, in the same modal channel that asked for consent" `
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 Stop-TestProcs
 
+# ============================================================================
+Say "== J: T125 - a PROTOCOL SKEW takes the mandatory-update path"
+# ============================================================================
+# Arms B-I all measure the T147 question: "is the running agent an older
+# BUILD?", which needs a working connection to ask. This arm is the case T147
+# deliberately did not cover: the handshake itself fails, so there is NO
+# connection to judge, and until T125 the app just gave up - no dialog, no
+# explanation, session persistence quietly off for the rest of the run.
+#
+# The skew INPUT is GHOZTTY_AGENT_PROTO_VERSION, a debug-only hook on the AGENT
+# (mirroring GHOZTTY_AGENT_BUNDLED_VERSION on the app) - both ends compile the
+# same protocol.proto_version constant, so a skew cannot otherwise be produced
+# from one tree. The agent inherits this harness's environment when the app
+# spawns it, so setting it here is what makes the spawned agent disagree.
+# proto_version is 1, so 0 is an agent from the past.
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+$env:GHOZTTY_AGENT_PROTO_VERSION = '0'
+$appPidJ = Start-App $tmp 't125-skew-old'
+$logJ = $script:AppLog
+$topJ = $script:AppTop
+Assert "J1 the GUI came up" ($appPidJ -ne 0)
+$agentJ = Wait-AgentPid $tmp 30
+Assert "J2 the skewed agent is running" ($agentJ -ne 0)
+$dlgJ = Wait-Dialog $appPidJ 60
+Assert "J3 the skew raised the mandatory confirmation (it used to raise nothing)" `
+    ($dlgJ -ne [IntPtr]::Zero)
+if ($dlgJ -ne [IntPtr]::Zero) {
+    Assert "J4 it is the SAME dialog the staleness path uses" `
+        ((Get-TestWindowText -Window $dlgJ) -like '*background terminal process*')
+    Assert "J5 the owner is disabled while it is up (mandatory, not advisory)" `
+        (($topJ -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $topJ)))
+}
+# Same contract as C5: consent comes BEFORE the destruction.
+Assert "J6 nothing was killed while the dialog was up" ((Agent-Pid $tmp) -eq $agentJ)
+Assert "J7 the decision is logged with its reason, while the dialog is still up" `
+    (Wait-LogMatch $logJ 'agent upgrade check: protocol skew, running agent speaks an OLDER protocol' 25)
+Assert "J8 the pending modal announces itself before it blocks" `
+    (Wait-LogMatch $logJ 'showing mandatory protocol-skew confirmation.*waiting for the user' 25)
+# Answering it must actually cure the skew. The replacement agent inherits the
+# APP's environment, not this harness's - and the app was launched with the
+# override set - so clear it first, exactly as a real upgrade would leave a
+# binary that speaks the current protocol.
+$env:GHOZTTY_AGENT_PROTO_VERSION = $null
+if ($dlgJ -ne [IntPtr]::Zero) { Say "    Update Now => $(Confirm-Update $dlgJ)" }
+Assert "J9 the confirmation was answered with 'Update Now'" `
+    (Wait-LogMatch $logJ 'user confirmed destructive agent restart to clear a protocol skew' 25)
+$agentJ2 = Wait-AgentPid $tmp 40 $agentJ
+Assert "J10 the skewed agent was REPLACED (new pid)" ($agentJ2 -ne 0 -and $agentJ2 -ne $agentJ)
+Assert "J11 the app survived the restart it promised to survive" `
+    (@(Get-Process -Id $appPidJ -ErrorAction SilentlyContinue).Count -eq 1)
+Stop-TestProcs
+
+# ============================================================================
+Say "== K: T125 negative control - a NEWER agent is never downgraded"
+# ============================================================================
+# The other direction of the same skew, and the one that must NOT act: if the
+# agent speaks a protocol newer than this app, the APP is the out-of-date side.
+# Killing the agent there would replace a newer binary with an older one AND end
+# sessions a newer app could still have attached to. Without this arm, an
+# implementation that simply restarts on any skew would pass arm J and quietly
+# eat the user's sessions on every rollback.
+$env:GHOZTTY_AGENT_PROTO_VERSION = '9999'
+$appPidK = Start-App $tmp 't125-skew-new'
+$logK = $script:AppLog
+Assert "K1 the GUI came up" ($appPidK -ne 0)
+$agentK = Wait-AgentPid $tmp 30
+Assert "K2 the newer-protocol agent is running" ($agentK -ne 0)
+Assert "K3 the app noticed the skew and named its direction" `
+    (Wait-LogMatch $logK 'running agent speaks a NEWER protocol' 40)
+Start-Sleep -Seconds 6
+Assert "K4 NO confirmation was shown (nothing for the user to consent to)" `
+    ((Find-Dialog $appPidK) -eq [IntPtr]::Zero)
+Assert "K5 the newer agent was NOT touched (same pid)" ((Agent-Pid $tmp) -eq $agentK)
+Assert "K6 the app is still running (degraded, not broken)" `
+    (@(Get-Process -Id $appPidK -ErrorAction SilentlyContinue).Count -eq 1)
+$env:GHOZTTY_AGENT_PROTO_VERSION = $null
+Stop-TestProcs
+
 } finally {
     Remove-TestDesktop
     Stop-TestProcs
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
     $env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedOverride
+    $env:GHOZTTY_AGENT_PROTO_VERSION = $savedProto
     $env:GHOZTTY_PIPE_SUFFIX = $savedPipe
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 }

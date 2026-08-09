@@ -121,6 +121,23 @@ autostart_done: bool = false,
 bundled_version: ?[]const u8 = null,
 bundled_version_probed: bool = false,
 
+/// The last dial that failed because the agent speaks a protocol this build
+/// cannot negotiate (T125), or null when the last dial did not fail that way.
+///
+/// Recorded rather than swallowed because a skewed agent is indistinguishable
+/// from a dead one at the call site — both make `dialExisting` return null — and
+/// the two need OPPOSITE responses: a dead agent should be replaced by spawning
+/// one, while a skewed agent is alive, holding every session, and must not be
+/// touched without consent. Cleared by the next dial that succeeds and by a
+/// restart, so it always describes the agent that is out there NOW.
+protocol_skew: ?Skew = null,
+
+/// What a skewed dial learned. `peer_proto_version` is null when the peer never
+/// got as far as a parseable HELLO.
+pub const Skew = struct {
+    peer_proto_version: ?u16 = null,
+};
+
 pub fn init(alloc: Allocator) LocalAgent {
     return .{ .alloc = alloc };
 }
@@ -493,6 +510,10 @@ pub fn restartForUpgrade(self: *LocalAgent) bool {
     // A deliberate restart is not a failure, and the cooldown must not make the
     // very next resolve fall back to exec.
     self.last_failure_ms = null;
+    // Whatever skew we recorded belonged to the agent we are about to kill. Its
+    // replacement is by definition this build's protocol, and leaving the flag
+    // set would make `findOrSpawn` refuse to spawn that replacement.
+    self.protocol_skew = null;
 
     log.info("agent restart: terminating agent pid {d}", .{pid});
     const killed = if (pid > 0) self.terminateAgent(pid) else false;
@@ -688,6 +709,16 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     // 1. Find: dial the agent recorded in port.json, if any.
     if (self.dialExisting()) |d| return d;
 
+    // 1b. A skewed agent is ALIVE and holding the single-instance guard, so the
+    //     spawn below cannot succeed: the new process exits immediately and we
+    //     spend the whole spawn deadline (seconds, on the GUI thread) polling a
+    //     pipe that will keep refusing us. Fail fast instead and let the app take
+    //     the mandatory-update path, which is the only thing that can fix this.
+    if (self.protocol_skew != null) {
+        log.info("not spawning a local agent: the running one is protocol-skewed, not absent", .{});
+        return null;
+    }
+
     // 2. Spawn: launch the agent detached, then poll for it to bind + dial.
     const deadline = std.time.milliTimestamp() + spawn_deadline_ms;
     self.spawnAgent() catch |err| {
@@ -697,6 +728,11 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     while (std.time.milliTimestamp() < deadline) {
         std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
         if (self.dialExisting()) |d| return d;
+        // An agent that ANSWERED and disagreed is up; polling it again just
+        // re-runs the same handshake to the same conclusion, and every extra
+        // second of that is spent blocking the GUI thread. Stop and let the
+        // caller take the mandatory-update path.
+        if (self.protocol_skew != null) return null;
     }
     log.warn("local agent did not become dialable within {d}ms", .{spawn_deadline_ms});
     return null;
@@ -710,10 +746,38 @@ fn dialExisting(self: *LocalAgent) ?tcp_dial.Dialed {
     if (info.pipe_len == 0) return null;
     const pipe = info.pipe_buf[0..info.pipe_len];
 
-    return tcp_dial.dialPipeTimeout(self.alloc, pipe, .raw, probe_handshake_ns) catch |err| {
+    var report: tcp_dial.DialReport = .{};
+    const dialed = tcp_dial.dialPipeTimeoutReport(
+        self.alloc,
+        pipe,
+        .raw,
+        probe_handshake_ns,
+        &report,
+    ) catch |err| {
+        if (err == error.ProtocolIncompatible) {
+            // The agent ANSWERED and we could not agree with it. That is a live
+            // process holding live sessions, not a dead one — so it is recorded
+            // for `App.refreshLocalAgentIfStale` to act on, and this returns null
+            // only because there is no usable connection to hand back.
+            self.protocol_skew = .{ .peer_proto_version = report.peer_proto_version };
+            log.warn(
+                "local agent refused the handshake: protocol skew (agent offers {?d}, this app speaks {d})",
+                .{ report.peer_proto_version, protocol.proto_version },
+            );
+            return null;
+        }
         log.debug("dial existing agent failed err={}", .{err});
         return null;
     };
+    // A dial we could negotiate is proof the skew (if any) is over.
+    self.protocol_skew = null;
+    return dialed;
+}
+
+/// The protocol skew the last dial hit, or null. Read by the app to decide
+/// whether the mandatory-update path applies (T125).
+pub fn protocolSkew(self: *const LocalAgent) ?Skew {
+    return self.protocol_skew;
 }
 
 /// The agent's info file as OWNED, allocation-free data. The pipe name is

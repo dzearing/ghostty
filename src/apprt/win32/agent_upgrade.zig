@@ -104,6 +104,10 @@ pub const Action = enum {
 /// "nothing to do" cannot be audited afterwards: "current", "newer, leave it
 /// alone", and "we couldn't read the binary we ship" are very different states
 /// to find a user's box in (T201).
+///
+/// The `skew_*` variants share this enum with the staleness ones deliberately:
+/// they end in the same dialog and the same log line, and one vocabulary is what
+/// makes "why did Ghoztty restart my agent?" answerable from a single grep.
 pub const Reason = enum {
     /// Rule 1: no readable bundled stamp, so there is nothing to judge against.
     bundled_unknown,
@@ -117,6 +121,17 @@ pub const Reason = enum {
     /// Stale with live sessions: restarting would end them, so consent first.
     stale_live,
 
+    /// Protocol skew, and the AGENT is the older side: the mandatory-update path
+    /// applies, so confirm and restart it onto the bundled build.
+    skew_agent_older,
+    /// Protocol skew, and the agent is the NEWER side: the APP is what is out of
+    /// date. Rule 2 applies with more force than usual here — restarting would
+    /// replace a newer agent with an older one AND end its sessions to do it.
+    skew_app_older,
+    /// A skew we cannot orient: no HELLO version was captured. Rule 1 — nothing
+    /// destructive on a guess.
+    skew_unknown,
+
     /// One clause, written to be read in a log line after "agent upgrade
     /// check:".
     pub fn description(self: Reason) []const u8 {
@@ -126,6 +141,9 @@ pub const Reason = enum {
             .running_newer => "no action, running agent is NEWER than bundled (never downgrade)",
             .stale_idle => "stale and idle, refreshing now",
             .stale_live => "stale with live sessions, confirmation required",
+            .skew_agent_older => "protocol skew, running agent speaks an OLDER protocol, confirmation required",
+            .skew_app_older => "no action, running agent speaks a NEWER protocol — this app is the out-of-date side (never downgrade)",
+            .skew_unknown => "no action, protocol skew of unknown direction (no peer version captured)",
         };
     }
 };
@@ -165,6 +183,80 @@ pub fn evaluate(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize
 pub fn decide(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize) Action {
     return evaluate(running, bundled, live_sessions).action;
 }
+
+// =============================================================================
+// Protocol skew (T125)
+// =============================================================================
+
+/// What to do about an agent whose HELLO could not be negotiated — the second
+/// trigger for the same mandatory-update dialog `evaluate` feeds.
+///
+/// `evaluate` above answers "is the running agent an older BUILD?". This answers
+/// the question it deliberately did not: "did the handshake fail because the two
+/// ends speak DIFFERENT PROTOCOLS?" CLAUDE.md's agent contract requires that on
+/// an incompatible skew the app must not replay across it and must take the
+/// mandatory-update path instead — which, on Windows, means this decision.
+///
+/// The direction is everything, and it is why the peer's version is plumbed all
+/// the way out of a failed dial (`tcp_dial.DialReport`):
+///
+///  - **Agent older** ⇒ restart it, after the same consent the stale path asks
+///    for. Sessions it still holds WILL be lost — the app cannot reach them to
+///    save them, which is the whole problem — so this is never silent, and
+///    (unlike `stale_idle`) there is no idle arm: "no live sessions" is not
+///    knowable across a skew, and an unknown count is never grounds for a silent
+///    destructive act.
+///  - **Agent newer** ⇒ do nothing. The app is the out-of-date side; killing the
+///    agent would be a downgrade AND would end sessions a NEWER app could still
+///    have attached to. Rule 2, at its most load-bearing.
+///  - **Unknown** ⇒ do nothing. Rule 1.
+///
+/// `local` is this build's `protocol.proto_version`; `peer` is what the agent
+/// advertised, or null when no HELLO was parsed at all.
+pub fn evaluateSkew(peer: ?u16, local: u16) Decision {
+    const p = peer orelse return .{ .action = .none, .reason = .skew_unknown };
+    if (p > local) return .{ .action = .none, .reason = .skew_app_older };
+    if (p < local) return .{ .action = .confirm_first, .reason = .skew_agent_older };
+    // Same version, still incompatible: the disagreement was over the transfer
+    // encoding, which the CLIENT proposes and the agent echoes. An agent that
+    // echoes something else is one that does not understand what we asked for,
+    // i.e. the older side, and restarting it is the same cure.
+    return .{ .action = .confirm_first, .reason = .skew_agent_older };
+}
+
+/// The mandatory-confirmation body for a protocol skew. Distinct from
+/// `formatConfirmText` because the situation is: there, the agent still works
+/// and the restart is an upgrade; here the agent is already unreachable, so the
+/// honest promise is not "you keep working" but "this is how you get working
+/// again".
+///
+/// It states the cost without inventing a number — the session count lives
+/// inside the agent we cannot talk to, and a dialog that guessed at it would be
+/// making up the very fact the user is being asked to weigh.
+pub fn formatSkewConfirmText(buf: []u8, peer: ?u16, local: u16) ![]const u8 {
+    const lead =
+        "Ghoztty can no longer talk to the background process that keeps your " ++
+        "terminal sessions running: it is from a different version of Ghoztty " ++
+        "and no longer speaks the same protocol";
+    const tail =
+        ".\n\nRestarting it now updates it to the version shipped with this app. " ++
+        "Any sessions it is still holding will close, and they cannot be " ++
+        "carried across — Ghoztty cannot reach them to save them.\n\n" ++
+        "If you do nothing, new windows keep working but without session " ++
+        "persistence.";
+    // The version pair is a parenthetical, not a sentence, so an unknown peer
+    // simply drops it rather than printing a placeholder the user has to decode.
+    return if (peer) |p|
+        std.fmt.bufPrint(buf, lead ++ " (it speaks version {d}, this app speaks {d})" ++ tail, .{ p, local })
+    else
+        std.fmt.bufPrint(buf, lead ++ tail, .{});
+}
+
+/// Title for the skew confirmation. Deliberately the SAME title as the staleness
+/// one: it is one dialog with one outcome (the background process restarts),
+/// reached two ways, and giving each trigger its own title would make the app
+/// look like it has two unrelated features.
+pub const skew_confirm_title = confirm_title;
 
 /// What to print for a stamp that may be absent. `running == null` is an agent
 /// too old to advertise one; `bundled == null` is an unreadable binary.
@@ -359,6 +451,9 @@ test "evaluate and decide can never disagree" {
             .bundled_unknown, .current, .running_newer => .none,
             .stale_idle => .refresh_now,
             .stale_live => .confirm_first,
+            // `evaluate` is the STALENESS policy; a skew reason coming out of it
+            // would mean the two policies had been crossed.
+            .skew_agent_older, .skew_app_older, .skew_unknown => unreachable,
         };
         try testing.expectEqual(expected, d.action);
         // A `.none` must never be reported as stale, and vice versa.
@@ -371,7 +466,10 @@ test "evaluate and decide can never disagree" {
 test "Reason.description is a distinct non-empty clause for every reason" {
     // Logged verbatim, so an empty or duplicated clause would silently make two
     // different box states read identically — the defect T201 exists to fix.
-    const all = [_]Reason{ .bundled_unknown, .current, .running_newer, .stale_idle, .stale_live };
+    const all = [_]Reason{
+        .bundled_unknown, .current,        .running_newer, .stale_idle, .stale_live,
+        .skew_agent_older, .skew_app_older, .skew_unknown,
+    };
     for (all, 0..) |a, i| {
         try testing.expect(a.description().len > 0);
         for (all[i + 1 ..]) |b| {
@@ -402,6 +500,70 @@ test "formatConfirmText pluralizes and names the count" {
     // The "you can defer" half is what makes the dialog honest about the
     // decline path; it must never be dropped.
     try testing.expect(std.mem.indexOf(u8, many, "next time no sessions are open") != null);
+}
+
+test "evaluateSkew: the agent is only restarted when IT is the older side" {
+    const local: u16 = 3;
+
+    // The case the feature exists for: an agent left behind by an app upgrade.
+    // Never silent — an unknown session count is not "no sessions".
+    try testing.expectEqual(Action.confirm_first, evaluateSkew(2, local).action);
+    try testing.expectEqual(Reason.skew_agent_older, evaluateSkew(2, local).reason);
+    try testing.expectEqual(Action.confirm_first, evaluateSkew(0, local).action);
+
+    // Rule 2 at its strongest: a NEWER agent is never killed to install an older
+    // one, and the sessions a newer app could still attach to are never ended.
+    try testing.expectEqual(Action.none, evaluateSkew(4, local).action);
+    try testing.expectEqual(Reason.skew_app_older, evaluateSkew(4, local).reason);
+    try testing.expectEqual(Action.none, evaluateSkew(std.math.maxInt(u16), local).action);
+
+    // Rule 1: no HELLO parsed ⇒ no direction ⇒ nothing destructive.
+    try testing.expectEqual(Action.none, evaluateSkew(null, local).action);
+    try testing.expectEqual(Reason.skew_unknown, evaluateSkew(null, local).reason);
+
+    // Equal versions still reached the skew path, so the disagreement was over
+    // the transfer encoding the client proposed — the agent is the side that did
+    // not understand it, and the restart is the same cure.
+    try testing.expectEqual(Action.confirm_first, evaluateSkew(local, local).action);
+    try testing.expectEqual(Reason.skew_agent_older, evaluateSkew(local, local).reason);
+}
+
+test "evaluateSkew never returns refresh_now" {
+    // A skew has no idle arm on purpose: liveness lives inside the agent we
+    // cannot talk to, so there is no state in which a silent destructive restart
+    // is justified. Enumerated rather than argued, so a later edit that adds one
+    // has to come through this test.
+    var peer: u17 = 0;
+    while (peer <= std.math.maxInt(u16)) : (peer += 1) {
+        const d = evaluateSkew(@intCast(peer), 3);
+        try testing.expect(d.action != .refresh_now);
+    }
+    try testing.expect(evaluateSkew(null, 3).action != .refresh_now);
+}
+
+test "formatSkewConfirmText names both versions, and drops the pair when unknown" {
+    var buf: [1024]u8 = undefined;
+    const known = try formatSkewConfirmText(&buf, 2, 3);
+    try testing.expect(std.mem.indexOf(u8, known, "it speaks version 2, this app speaks 3") != null);
+
+    var buf2: [1024]u8 = undefined;
+    const unknown = try formatSkewConfirmText(&buf2, null, 3);
+    // No parenthetical at all rather than a placeholder to decode.
+    try testing.expect(std.mem.indexOf(u8, unknown, "(") == null);
+
+    // Both arms must carry the cost AND the do-nothing outcome: the sessions are
+    // unrecoverable either way, and the user is entitled to know that declining
+    // is a real option before they agree to lose them.
+    for ([_][]const u8{ known, unknown }) |text| {
+        try testing.expect(std.mem.indexOf(u8, text, "cannot be carried across") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "If you do nothing") != null);
+    }
+}
+
+test "the skew dialog shares the staleness dialog's title" {
+    // One outcome (the background process restarts) reached two ways is one
+    // dialog. Pinned so a later copy edit to one does not quietly fork them.
+    try testing.expectEqualStrings(confirm_title, skew_confirm_title);
 }
 
 test "baseName takes the last component with either separator" {

@@ -37,6 +37,7 @@ const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const LocalAgent = @import("LocalAgent.zig");
 const remote_connection = @import("../../remote/connection.zig");
+const protocol = @import("../../remote/protocol.zig");
 const tab_color = @import("tab_color.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
@@ -2608,6 +2609,16 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     // restart here would end them behind the user's back.
     if (self.quit_requested) return;
 
+    // A protocol skew is checked BEFORE the connection test below, because it is
+    // the one stale-agent state that leaves no connection to judge: the agent
+    // answered, we could not agree with it, and the dial was torn down. Falling
+    // through to "nothing dialed, nothing to judge" is exactly the silent
+    // give-up T125 exists to end.
+    if (self.local_agent.protocolSkew()) |skew| {
+        self.handleAgentProtocolSkew(skew, reason);
+        return;
+    }
+
     // Nothing dialed ⇒ no agent whose build we can judge. Deliberately does NOT
     // spawn one: a freshly spawned agent is by definition current, so spawning
     // to ask would only ever answer "not stale".
@@ -2778,6 +2789,114 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
     // retired connection and there is nothing behind them. Saying so is the
     // whole point — the failure the user reported was INVISIBLE, and an empty
     // desktop with no explanation is the worst outcome a confirmation can have.
+    if (rebuilt == null) self.showAgentRefreshFailed();
+}
+
+/// The second trigger for the mandatory-update path: the running agent speaks a
+/// protocol this build cannot negotiate (T125).
+///
+/// T147 answers "is the running agent an older BUILD?" and needs a working
+/// connection to ask. This is the case where there is no connection *because*
+/// the agent is stale — the handshake is where it failed — and until now the app
+/// simply gave up: no dialog, no explanation, session persistence quietly off
+/// for the rest of the run. CLAUDE.md's agent contract requires the opposite,
+/// that an incompatible skew take the mandatory-update path.
+///
+/// The DECISION is `agent_upgrade.evaluateSkew` (pure, unit-tested); everything
+/// here is its mechanism, and it is deliberately the same mechanism the stale
+/// path uses — same dialog, same refresh-guard, same relaunch guard, same honest
+/// failure notice — so there is one restart story rather than two.
+fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8) void {
+    const alloc = self.core_app.alloc;
+    const decision = agent_upgrade.evaluateSkew(skew.peer_proto_version, protocol.proto_version);
+
+    // Logged where it is made, before acting, for the same reason the staleness
+    // check logs there (T201): a modal can sit unanswered forever, and a `.none`
+    // would otherwise leave no trace that the check ran at all.
+    log.info(
+        "agent upgrade check: {s} (agent protocol {?d}, this app {d}) [{s}]",
+        .{ decision.reason.description(), skew.peer_proto_version, protocol.proto_version, reason },
+    );
+
+    switch (decision.action) {
+        // `.none` here means the app is the out-of-date side, or we could not
+        // tell. Either way nothing gets killed. New windows fall back to
+        // non-persistent shells, which is degraded but not destructive.
+        .none => return,
+        // A skew has no idle arm — see `evaluateSkew`, which is exhaustively
+        // tested for it. Handled rather than `unreachable` anyway: this is a
+        // destructive path, and in a release build `unreachable` would turn a
+        // future policy edit into undefined behavior instead of a log line.
+        .refresh_now => {
+            log.err("agent upgrade check: a protocol skew asked for a SILENT restart; refusing", .{});
+            return;
+        },
+        .confirm_first => {},
+    }
+
+    if (self.agent_upgrade_declined) {
+        log.info("local agent still protocol-skewed, but the user deferred this run [{s}]", .{reason});
+        return;
+    }
+    if (self.agent_upgrade_attempts >= max_agent_upgrade_attempts) {
+        log.info(
+            "agent upgrade check: attempt ceiling reached ({d}/{d}), not retrying this run [{s}]",
+            .{ self.agent_upgrade_attempts, max_agent_upgrade_attempts, reason },
+        );
+        return;
+    }
+
+    var text_buf: [1024]u8 = undefined;
+    const text = agent_upgrade.formatSkewConfirmText(
+        &text_buf,
+        skew.peer_proto_version,
+        protocol.proto_version,
+    ) catch return;
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
+    defer alloc.free(text_w);
+    const title_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, agent_upgrade.skew_confirm_title) catch return;
+    defer alloc.free(title_w);
+
+    const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
+
+    log.info("agent upgrade: showing mandatory protocol-skew confirmation; waiting for the user", .{});
+    const result = ConfirmDialog.show(
+        self,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        if (owner) |win| (if (win.getActiveSurface()) |s| s.hwnd else null) else null,
+        .{
+            .title = title_w.ptr,
+            .text = text_w,
+            .icon = .warning,
+            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Update Now"),
+            .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
+        },
+    );
+    if (result != .ok) {
+        self.agent_upgrade_declined = true;
+        log.info("user deferred the protocol-skew agent restart", .{});
+        return;
+    }
+
+    log.warn(
+        "user confirmed destructive agent restart to clear a protocol skew (agent protocol {?d} → this app's {d})",
+        .{ skew.peer_proto_version, protocol.proto_version },
+    );
+    self.agent_upgrade_attempts += 1;
+
+    // Same two guards as the confirmed staleness path, for the same reasons: the
+    // rebuild empties and refills the window list (so the app must not quit
+    // itself in between), and if the process ends anyway something outside it
+    // has to notice (T421).
+    self.beginAgentRefresh();
+    defer self.endAgentRefresh();
+    var guard = relaunch_guard.arm(alloc);
+    defer if (guard) |*g| g.disarm();
+
+    _ = self.local_agent.restartForUpgrade();
+    const rebuilt = self.recoverLocalAgentInPlace();
+    log.warn("protocol-skew agent restart finished: {d} window(s) rebuilt", .{rebuilt orelse 0});
     if (rebuilt == null) self.showAgentRefreshFailed();
 }
 

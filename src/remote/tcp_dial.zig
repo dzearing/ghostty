@@ -63,8 +63,25 @@ pub const Dialed = struct {
     }
 };
 
-/// The HELLO handshake failed (version/encoding mismatch or a dropped stream).
+/// The HELLO handshake failed (a dropped stream, a garbage payload, or a peer
+/// that answered something that isn't a HELLO). An INCOMPATIBLE peer is
+/// `error.ProtocolIncompatible` instead — see `DialReport`.
 pub const HandshakeFailed = error{HandshakeFailed};
+
+/// What a dial learned about the peer even though it failed. Filled in only
+/// when the caller passes one (`dialPipeTimeoutReport`); everything is
+/// best-effort and null means "we never found out".
+///
+/// It exists for exactly one decision: a `error.ProtocolIncompatible` says the
+/// two ends cannot talk, and the app's response to that is destructive (restart
+/// the local agent, ending its sessions). Doing that when the AGENT is the
+/// NEWER side is a silent downgrade, so the direction has to be knowable before
+/// anything is killed (T125).
+pub const DialReport = struct {
+    /// The `proto_version` the peer advertised in its HELLO, or null when no
+    /// HELLO was parsed at all (timeout, dropped stream, garbage).
+    peer_proto_version: ?u16 = null,
+};
 
 /// Default deadline for the HELLO handshake (WP-D1). A peer that TCP-accepts
 /// but never answers (frozen/SIGSTOPped agent: the kernel backlog completes the
@@ -113,7 +130,7 @@ pub fn dialTimeout(
     sock.* = socket_stream.SocketStream.init(stream.handle);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure), so no errdefer here.
-    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null);
 }
 
 /// Default deadline shared by `dialUnix`; the same rationale as
@@ -164,7 +181,7 @@ pub fn dialUnixTimeout(
     sock.* = socket_stream.SocketStream.init(fd);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure) — cancel the raw-fd errdefer above by returning through it.
-    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null);
 }
 
 /// Connect to a Windows named pipe at `name` (a full `\\.\pipe\...` path) —
@@ -189,6 +206,20 @@ pub fn dialPipeTimeout(
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
 ) !Dialed {
+    return dialPipeTimeoutReport(alloc, name, encoding, handshake_timeout_ns, null);
+}
+
+/// `dialPipeTimeout` that also fills in a `DialReport` about the peer. Only the
+/// local-agent dial needs this: it is the one caller whose response to
+/// `error.ProtocolIncompatible` is destructive, so it is the one caller that has
+/// to know which side is behind.
+pub fn dialPipeTimeoutReport(
+    alloc: Allocator,
+    name: []const u8,
+    encoding: protocol.TransferEncoding,
+    handshake_timeout_ns: u64,
+    report: ?*DialReport,
+) !Dialed {
     // Comptime gate: keeps the Windows pipe code out of POSIX analysis (the
     // same pattern as the agent's --listen-unix gate, mirrored).
     if (comptime builtin.os.tag != .windows) return error.PipeUnsupported;
@@ -203,7 +234,7 @@ pub fn dialPipeTimeout(
     pipe.* = pipe_stream.PipeStream.init(handle);
     // `dialConnected` takes ownership of `pipe` (closes + destroys it on any
     // failure).
-    return dialConnected(alloc, .{ .pipe = pipe }, pipe.connectionStream(), encoding, handshake_timeout_ns);
+    return dialConnected(alloc, .{ .pipe = pipe }, pipe.connectionStream(), encoding, handshake_timeout_ns, report);
 }
 
 /// Shared post-connect core for every transport (TCP, AF_UNIX, named pipe):
@@ -219,6 +250,7 @@ fn dialConnected(
     stream: connection.Stream,
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
+    report: ?*DialReport,
 ) !Dialed {
     errdefer {
         stream.close(); // closes the fd/handle
@@ -260,8 +292,26 @@ fn dialConnected(
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
         mux.joinPump();
+        // Read the peer's HELLO facts only AFTER the join, so the control
+        // reader that wrote them has certainly finished.
+        const peer_proto = conn.peerProtoVersion();
+        if (report) |r| r.peer_proto_version = peer_proto;
         return switch (err) {
             error.HandshakeTimeout => error.HandshakeTimeout,
+            // A peer we UNDERSTOOD and disagreed with is a different box state
+            // from one that never spoke, and the caller's response to it is
+            // different too (T125).
+            //
+            // `error.Incompatible` alone cannot tell them apart: the control
+            // reader also raises it for EOF before the HELLO, a malformed frame,
+            // and a HELLO payload that would not parse. A parsed peer proto
+            // version is the discriminator — it is written ONLY after
+            // `Hello.parse` succeeded, and the sole error left after that point
+            // is `negotiate` disagreeing.
+            error.Incompatible => if (peer_proto != null)
+                error.ProtocolIncompatible
+            else
+                error.HandshakeFailed,
             else => error.HandshakeFailed,
         };
     };
@@ -290,6 +340,9 @@ const MiniAgent = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
     err: ?anyerror = null,
+    /// Advertise a different `proto_version` than this build pins, to model the
+    /// agent-outlives-the-app skew (T125). Null = agree, like a real agent.
+    proto_version: ?u16 = null,
 
     fn run(self: *MiniAgent) void {
         var ss = socket_stream.SocketStream.init(self.fd);
@@ -315,7 +368,10 @@ const MiniAgent = struct {
             while (try reader.next()) |frame| {
                 switch (frame.type) {
                     .hello => {
-                        const reply: protocol.Hello = .{ .transfer_encoding = self.encoding };
+                        const reply: protocol.Hello = .{
+                            .proto_version = self.proto_version orelse protocol.proto_version,
+                            .transfer_encoding = self.encoding,
+                        };
                         const json = try reply.encode(self.alloc);
                         defer self.alloc.free(json);
                         try sendFrame(self.alloc, stream, self.encoding, .{
@@ -422,6 +478,78 @@ test "dial: stands up a Connection over a real loopback socket, OPEN + DATA roun
     agent_thread.join();
     listener.deinit();
     try testing.expect(agent.err == null);
+}
+
+test "dial: a peer on a different protocol version fails as ProtocolIncompatible" {
+    // The T125 skew, end to end over a real socket: a peer that ANSWERS and
+    // disagrees must be distinguishable from one that never spoke, because the
+    // app's response to it is destructive (restart the local agent) and its
+    // response to a dead agent is not (spawn one).
+    const alloc = testing.allocator;
+    const enc: protocol.TransferEncoding = .raw;
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    const bound = listener.listen_address;
+
+    const Accepter = struct {
+        listener: *std.net.Server,
+        agent: *MiniAgent,
+        fn run(self: *@This()) void {
+            const c = self.listener.accept() catch return;
+            self.agent.fd = c.stream.handle;
+            self.agent.run();
+        }
+    };
+    var agent = MiniAgent{
+        .fd = undefined,
+        .alloc = alloc,
+        .encoding = enc,
+        // An agent from a future build. The direction does not matter to the
+        // dialer — only that the two ends disagree.
+        .proto_version = protocol.proto_version + 1,
+    };
+    var accepter = Accepter{ .listener = &listener, .agent = &agent };
+    const agent_thread = try std.Thread.spawn(.{}, Accepter.run, .{&accepter});
+
+    try testing.expectError(
+        error.ProtocolIncompatible,
+        dial(alloc, "127.0.0.1", bound.getPort(), enc),
+    );
+
+    agent_thread.join();
+    listener.deinit();
+}
+
+test "dial: a peer that accepts and says nothing is NOT reported as incompatible" {
+    // The negative control for the test above. A silent peer times out; a torn
+    // one fails the handshake. Neither is a protocol disagreement, and treating
+    // either as one would hand the app a destructive answer to a transient
+    // problem.
+    const alloc = testing.allocator;
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    const bound = listener.listen_address;
+
+    const Silent = struct {
+        listener: *std.net.Server,
+        conn: ?std.net.Server.Connection = null,
+        fn run(self: *@This()) void {
+            self.conn = self.listener.accept() catch null;
+        }
+    };
+    var silent = Silent{ .listener = &listener };
+    const t = try std.Thread.spawn(.{}, Silent.run, .{&silent});
+
+    try testing.expectError(
+        error.HandshakeTimeout,
+        dialTimeout(alloc, "127.0.0.1", bound.getPort(), .raw, 200 * std.time.ns_per_ms),
+    );
+
+    t.join();
+    if (silent.conn) |c| c.stream.close();
+    listener.deinit();
 }
 
 test "dialUnix: stands up a Connection over a real AF_UNIX socket, OPEN + DATA round-trip" {
