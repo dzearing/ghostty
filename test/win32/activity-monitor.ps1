@@ -23,6 +23,9 @@
 #   I. (T286) Kill appears only with a selection, its confirmation names the
 #      process and its pid, CANCELLING LEAVES THE PROCESS ALIVE (the negative
 #      control for "the confirmation is mandatory") and confirming terminates it;
+#      (T292) the panel KEEPS POLLING behind that open dialog, and a kill
+#      confirmed after several snapshots have been retired underneath it still
+#      lands on the right pid;
 #   J. (T286) a failed action raises the dismissable error banner, and clicking
 #      its glyph removes it;
 #   K. (T290) a panel nobody can see does not enumerate: minimizing STOPS the
@@ -644,6 +647,20 @@ try {
             $ctitle = Get-TestWindowText -Window $confirm
             Assert ($ctitle -like "*(PID $spawnPid)*") "I the confirmation names the process and its pid (got '$ctitle')"
             if ($ctitle -like "*(PID $spawnPid)*") { $confirmedPid = $spawnPid }
+
+            # I.1a (T292) The panel keeps POLLING behind the open confirmation -
+            # Mac's sheet is presented over a model that never stops, and a chart
+            # that freezes for as long as a dialog is up is the divergence this
+            # arm exists to catch. Same oracle section B uses: each adopted
+            # snapshot logs one state line.
+            $duringBefore = Count-PanelLines
+            $deadline = (Get-Date).AddSeconds(8)
+            while ((Count-PanelLines) -lt ($duringBefore + 2) -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 300
+            }
+            $duringAfter = Count-PanelLines
+            Assert ($duringAfter -ge $duringBefore + 2) "I the gauges keep advancing while the confirmation is open ($duringBefore -> $duringAfter)"
+
             $cbtns = @(Get-TestChildWindows -Window $confirm -Class 'Button')
             $cancelBtn = $cbtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Cancel' } | Select-Object -First 1
             Assert ($null -ne $cancelBtn) 'I the confirmation offers Cancel'
@@ -666,6 +683,15 @@ try {
             $cbtns = @(Get-TestChildWindows -Window $confirm -Class 'Button')
             $okBtn = $cbtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Kill' } | Select-Object -First 1
             Assert ($null -ne $okBtn) 'I the affirmative button carries the Kill verb, not "OK"'
+            # (T292) Let a couple of polls land underneath before confirming, so
+            # the batch this kills was marshaled out of a snapshot that has since
+            # been retired. The result assertions below are what proves it: the
+            # kill still targets the right pid and its report still names it.
+            $killBefore = Count-PanelLines
+            $deadline = (Get-Date).AddSeconds(8)
+            while ((Count-PanelLines) -lt ($killBefore + 2) -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 300
+            }
             if ($okBtn -and $ctitle -like "*(PID $spawnPid)*") {
                 Send-TestControlClick -Control ([IntPtr]$okBtn.Hwnd) | Out-Null
             } else {

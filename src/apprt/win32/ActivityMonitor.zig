@@ -32,10 +32,13 @@
 //! `proc_spawn.zig` — the same two functions the agent's remote provider calls,
 //! so a local panel and a remote one cannot drift. Both are destructive or
 //! creative enough to be MODAL: `ConfirmDialog` / `NewProcessDialog` run a
-//! nested pump, and `modal` blocks snapshot adoption for its duration, so a poll
-//! landing mid-dialog cannot free the snapshot whose row names the confirmation
-//! is quoting. All wording, the failure aggregation, the empty state and the
-//! selection pruning are pure in `activity_actions.zig`.
+//! nested pump. That pump dispatches the panel's own posted messages, so
+//! sampling and adoption CARRY ON behind an open dialog and the gauges keep
+//! advancing — as they do on Mac (T292). What that costs is a copy: the
+//! confirmation quotes row names, and a poll landing mid-dialog retires the
+//! snapshot they came from, so `actions.copyNames` marshals the batch into a
+//! stack arena before the dialog opens. All wording, the failure aggregation,
+//! the empty state and the selection pruning are pure in `activity_actions.zig`.
 //!
 //! ## Remote sources (T295)
 //! A `.remote` panel samples through a `remote.Connection`, and who OWNS that
@@ -729,12 +732,6 @@ sampling: bool = false,
 /// failed" badge over a stale table and the "Couldn't connect" overlay over an
 /// empty one.
 refresh_failed: bool = false,
-
-/// A modal dialog owned by this panel is pumping. Snapshot adoption is
-/// SUSPENDED for its duration: the confirmation quotes row names borrowed from
-/// `snap`, and adopting a new snapshot mid-dialog would free them under it. The
-/// deferred sample is adopted the moment the dialog returns.
-modal: bool = false,
 
 /// The action-error banner's text (Mac's `actionError`), empty when absent.
 err_buf: [256]u8 = @splat(0),
@@ -2596,9 +2593,6 @@ fn gateHidden(self: *ActivityMonitor) void {
 /// must not accumulate a backlog of enumerations.
 fn kickSample(self: *ActivityMonitor) void {
     if (self.sampling) return;
-    // A modal dialog is quoting the current snapshot; do not start work whose
-    // result cannot be adopted anyway.
-    if (self.modal) return;
     // Mid-dial there is nothing to sample, and keeping the worker out of the
     // way is what lets `adoptDial` publish `remote_conn` without a lock.
     if (self.dialing) return;
@@ -2755,11 +2749,12 @@ fn selfPid() i64 {
 
 /// GUI thread: adopt whatever the worker parked.
 ///
-/// A no-op while a dialog is up — see `modal`. The dialog calls this itself on
-/// the way out, so a sample that landed mid-dialog is adopted immediately after
-/// rather than waiting for the next tick.
+/// Runs during a modal dialog's nested pump like any other posted message
+/// (T292), so the gauges and the table stay live behind the Kill confirmation.
+/// What makes that safe is that the confirmation OWNS its target names by then
+/// (`actions.copyNames`) rather than borrowing them from the snapshot this
+/// retires.
 fn adoptPending(self: *ActivityMonitor) void {
-    if (self.modal) return;
     self.sampling = false;
 
     self.pending_mutex.lock();
@@ -2990,7 +2985,22 @@ fn refreshChrome(self: *ActivityMonitor) void {
     // thread's keyboard focus entirely when the focused window is hidden, and
     // with no focus window WM_KEYDOWN arrives with a null hwnd and the panel
     // goes deaf — the same trap `MachineChooser.refreshActions` documents.
-    if (self.sel_len == 0 and self.focus == .kill) self.moveFocus(.new_proc);
+    //
+    // Only when the button REALLY holds the keyboard, though. Since T292 this
+    // can run behind an open Kill confirmation — the selection is pruned when
+    // the target exits on its own — and `SetFocus` there would take the
+    // keyboard off the dialog the user is answering. `GetFocus` answers for
+    // this thread's queue, so a dialog's control is exactly what it reports
+    // while one is up. The ring's own bookkeeping still moves: the button is
+    // about to be hidden either way, and `.kill` must not stay the focused
+    // slot.
+    if (self.sel_len == 0 and self.focus == .kill) {
+        if (w32.GetFocus() == self.kill_btn) {
+            self.moveFocus(.new_proc);
+        } else {
+            self.noteFocus(.new_proc);
+        }
+    }
     _ = w32.ShowWindow(self.kill_btn, if (self.sel_len > 0) w32.SW_SHOW else w32.SW_HIDE);
     self.applyLayout();
 }
@@ -4248,8 +4258,9 @@ fn utf16z(buf: []u16, text: []const u8) ?[:0]const u16 {
 /// background hop: `killProc` is `OpenProcess` + `TerminateProcess`, two
 /// syscalls that do not block, and hopping threads would mean copying the
 /// targets to keep them alive across the hop for no gain. What DOES need care is
-/// the snapshot: `targets` borrows its names from `snap`, so `modal` holds off
-/// adoption for the dialog's whole nested pump.
+/// the snapshot: `targetsFor` points each name into `snap`, and the dialog's
+/// nested pump adopts samples like any other, so the batch is COPIED out of the
+/// snapshot before the dialog opens (T292) — see `actions.copyNames`.
 fn onKill(self: *ActivityMonitor) void {
     if (self.sel_len == 0) return;
     const snap = self.snap orelse return;
@@ -4257,6 +4268,11 @@ fn onKill(self: *ActivityMonitor) void {
     var target_buf: [max_rows]actions.Target = undefined;
     const targets = actions.targetsFor(self.sel_pids[0..self.sel_len], snap.rows, &target_buf);
     if (targets.len == 0) return;
+
+    // Everything below outlives `snap`: the dialog pumps, a poll lands behind
+    // it, and `adoptPending` retires the arena these names point into. Own them.
+    var name_arena: [actions.name_arena_bytes]u8 = undefined;
+    actions.copyNames(targets, &name_arena);
 
     var title_utf8: [192]u8 = undefined;
     var title_w: [224]u16 = undefined;
@@ -4272,7 +4288,6 @@ fn onKill(self: *ActivityMonitor) void {
     const ok_label = utf16z(&label_w, actions.killButtonLabel(&label_utf8, targets.len)) orelse
         std.unicode.utf8ToUtf16LeStringLiteral("Kill");
 
-    self.modal = true;
     const choice = ConfirmDialog.show(self.app, self.hwnd, self.scale, self.filter, .{
         .title = title.ptr,
         .text = body,
@@ -4282,17 +4297,14 @@ fn onKill(self: *ActivityMonitor) void {
         .default_cancel = true,
         .ok_label = ok_label,
     });
-    self.modal = false;
 
     log.info("activity monitor: kill dialog n={d} choice={s}", .{
         targets.len,
         if (choice == .ok) "ok" else "cancel",
     });
-    if (choice != .ok) {
-        // Nothing was touched, but a sample may have landed behind the dialog.
-        self.adoptPending();
-        return;
-    }
+    // Nothing was touched, and any sample that landed behind the dialog was
+    // already adopted by its pump — there is nothing deferred to catch up on.
+    if (choice != .ok) return;
 
     var failed_buf: [max_rows]actions.Target = undefined;
     var nfail: usize = 0;
@@ -4318,9 +4330,8 @@ fn onKill(self: *ActivityMonitor) void {
         self.clearError();
     }
 
-    // Adopt anything the dialog held off, then force a fresh sample so the
-    // casualties leave the table without waiting out the poll interval.
-    self.adoptPending();
+    // Force a fresh sample so the casualties leave the table without waiting out
+    // the poll interval.
     self.refreshChrome();
     self.kickSample();
 }
@@ -4361,7 +4372,9 @@ fn onNewProcess(self: *ActivityMonitor) void {
     var cmd_buf: [NewProcessDialog.MAX_VALUE_LEN]u8 = undefined;
     var cwd_buf: [NewProcessDialog.MAX_VALUE_LEN]u8 = undefined;
 
-    self.modal = true;
+    // Nothing here borrows the snapshot — the fields are the caller's buffers
+    // and `source.label()` is the panel's own identity — so this dialog never
+    // needed adoption held off either (T292).
     const res = NewProcessDialog.prompt(
         self.app,
         self.hwnd,
@@ -4371,21 +4384,16 @@ fn onNewProcess(self: *ActivityMonitor) void {
         &cmd_buf,
         &cwd_buf,
     );
-    self.modal = false;
 
     const r = res orelse {
         log.info("activity monitor: spawn dialog choice=cancel", .{});
-        self.adoptPending();
         return;
     };
     // The dialog reports its fields verbatim (the `ConfirmDialog.prompt`
     // contract); trimming is ours.
     const cmd = rows_mod.trim(r.command);
     const cwd = rows_mod.trim(r.working_directory);
-    if (cmd.len == 0) {
-        self.adoptPending();
-        return;
-    }
+    if (cmd.len == 0) return;
     log.info("activity monitor: spawn dialog choice=start cmd=\"{s}\"", .{cmd});
 
     if (self.spawnOne(cmd, if (cwd.len == 0) null else cwd)) {
@@ -4395,7 +4403,6 @@ fn onNewProcess(self: *ActivityMonitor) void {
         self.setError(actions.spawnFailureText(&err_utf8, cmd));
     }
 
-    self.adoptPending();
     self.kickSample();
 }
 

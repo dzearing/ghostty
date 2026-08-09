@@ -23,9 +23,9 @@
 const std = @import("std");
 const rows_mod = @import("activity_rows.zig");
 
-/// One process the user asked to kill. `name` is borrowed from the snapshot the
-/// row came from, so a marshaled target must not outlive that snapshot — which
-/// it does not: the whole kill runs inside one message handler.
+/// One process the user asked to kill. `targetsFor` points `name` at the
+/// snapshot the row came from; `copyNames` repoints it at a caller-owned arena,
+/// which is what lets the batch outlive that snapshot (T292).
 pub const Target = struct {
     pid: i64,
     name: []const u8 = "",
@@ -231,6 +231,41 @@ pub fn targetsFor(sel: []const i64, rows: []const rows_mod.Row, out: []Target) [
     return out[0..n];
 }
 
+/// How many bytes of names one kill batch may own (T292). A selection is capped
+/// at `remote_proc.default_limit` = 512 rows and a Windows process name is a
+/// basename — 16 bytes each covers a full selection, and the overflow rule below
+/// makes a batch that wants more degrade instead of failing.
+pub const name_arena_bytes: usize = 8 * 1024;
+/// Copy every target's name into `arena` and repoint it at the copy, so the
+/// batch no longer borrows the snapshot it was read from (T292).
+///
+/// Without this the panel has to STOP ADOPTING SNAPSHOTS for the whole life of
+/// the confirmation dialog — its nested pump would otherwise retire the snapshot
+/// under the name the dialog is displaying — which freezes the gauges and the
+/// table while the dialog is up. Mac keeps polling behind its sheet; copying is
+/// what buys the same here.
+///
+/// A name that does not fit degrades to `""`, never to a truncated string: a
+/// nameless target is already handled everywhere (`killConfirmTitle` says
+/// "process", `killFailureText` lists it as `PID <n>`), whereas half a name is a
+/// confident lie about which process is about to be terminated. Overflow skips
+/// only the name that did not fit — a later, shorter one still gets copied.
+pub fn copyNames(targets: []Target, arena: []u8) void {
+    var used: usize = 0;
+    for (targets) |*t| {
+        const len = t.name.len;
+        if (len == 0) continue;
+        if (len > arena.len - used) {
+            t.name = "";
+            continue;
+        }
+        const dst = arena[used..][0..len];
+        @memcpy(dst, t.name);
+        t.name = dst;
+        used += len;
+    }
+}
+
 /// Whether the New Process dialog's Start button may commit: Mac disables it
 /// while the command field is blank (:1160), so a dialog can never spawn "".
 pub fn spawnCommandValid(cmd: []const u8) bool {
@@ -400,6 +435,83 @@ test "targetsFor: never writes past the caller's buffer" {
     var out: [2]Target = undefined;
     const t = targetsFor(&.{ 1, 2, 3, 4 }, &rows, &out);
     try testing.expectEqual(@as(usize, 2), t.len);
+}
+
+test "copyNames: the batch stops borrowing the snapshot it was read from" {
+    // The snapshot's strings live in a buffer we then SCRIBBLE OVER, which is
+    // what a retired arena does to the memory a borrowed name pointed at. A copy
+    // that is really a copy still reads back correctly.
+    var snap_names = "aa.exe\x00bb.exe".*;
+    var targets = [_]Target{
+        .{ .pid = 1, .name = snap_names[0..6] },
+        .{ .pid = 2, .name = snap_names[7..13] },
+    };
+    var arena: [64]u8 = undefined;
+    copyNames(&targets, &arena);
+    @memset(&snap_names, 0xAA);
+
+    try testing.expectEqualStrings("aa.exe", targets[0].name);
+    try testing.expectEqualStrings("bb.exe", targets[1].name);
+    // And the names really came out of the arena, not out of the snapshot.
+    const lo = @intFromPtr(&arena);
+    const hi = lo + arena.len;
+    for (targets) |t| {
+        try testing.expect(@intFromPtr(t.name.ptr) >= lo);
+        try testing.expect(@intFromPtr(t.name.ptr) < hi);
+    }
+}
+
+test "copyNames: an empty name stays empty and costs nothing" {
+    var targets = [_]Target{
+        .{ .pid = 1 },
+        .{ .pid = 2, .name = "b.exe" },
+    };
+    var arena: [5]u8 = undefined;
+    copyNames(&targets, &arena);
+    try testing.expectEqualStrings("", targets[0].name);
+    try testing.expectEqualStrings("b.exe", targets[1].name);
+}
+
+test "copyNames: a name that does not fit degrades to nameless, never truncated" {
+    var targets = [_]Target{
+        .{ .pid = 7, .name = "a_very_long_process_name.exe" },
+    };
+    var arena: [8]u8 = undefined;
+    copyNames(&targets, &arena);
+    try testing.expectEqualStrings("", targets[0].name);
+    // Which is a state the rest of the model already speaks: the confirmation
+    // says "process" and the failure list says "PID 7".
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Kill process (PID 7)?", killConfirmTitle(&buf, &targets));
+    try testing.expect(std.mem.indexOf(
+        u8,
+        killFailureText(&buf, 2, &targets).?,
+        "PID 7",
+    ) != null);
+}
+
+test "copyNames: overflow skips only what did not fit" {
+    var targets = [_]Target{
+        .{ .pid = 1, .name = "aaaa" },
+        .{ .pid = 2, .name = "bbbbbbbb" }, // too big for what is left
+        .{ .pid = 3, .name = "cc" }, // still fits, so it is still copied
+    };
+    var arena: [8]u8 = undefined;
+    copyNames(&targets, &arena);
+    try testing.expectEqualStrings("aaaa", targets[0].name);
+    try testing.expectEqualStrings("", targets[1].name);
+    try testing.expectEqualStrings("cc", targets[2].name);
+}
+
+test "copyNames: the arena holds a full selection of realistic names" {
+    // The sizing claim in `name_arena_bytes`, asserted rather than asserted-in-
+    // prose: 512 rows of a 16-byte name all fit.
+    const max = 512;
+    var targets: [max]Target = undefined;
+    for (&targets, 0..) |*t, i| t.* = .{ .pid = @intCast(i), .name = "chrome.exe______" };
+    var arena: [name_arena_bytes]u8 = undefined;
+    copyNames(&targets, &arena);
+    for (targets) |t| try testing.expectEqual(@as(usize, 16), t.name.len);
 }
 
 test "spawnCommandValid: whitespace is not a command" {

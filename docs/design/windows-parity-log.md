@@ -12154,3 +12154,43 @@ unpumped — it is why the wedged-agent first answer is 1 331 ms and not 250 ms)
 **T631** (a `-Dtest-filter` run that matches NOTHING exits 0, so the cheap way
 to prove a new test runs reports green either way — this task had to fall back
 to the full lane).
+
+## 2026-08-08 — T292: the Activity Monitor keeps measuring behind its own dialogs
+
+`ActivityMonitor.modal` suspended snapshot adoption AND sampling for the whole
+life of the Kill confirmation and the New Process dialog, so the CPU/memory
+trend charts stopped advancing and the table stopped updating for as long as
+either was open — the moment you most want the numbers to be honest. Mac
+presents its sheet over a model that never stops polling.
+
+The guard was solving a real hazard the wrong way round: `targetsFor` points
+each `Target.name` into the current snapshot, the dialogs run a nested pump that
+dispatches the panel's own posted messages, and the post-dialog failure text
+still reads those names — so a poll landing mid-dialog would retire the arena
+under them. Replaced borrowing with a copy: `actions.copyNames` marshals the
+batch into an 8 KiB stack arena before the dialog opens, and a name that does
+not fit degrades to `""` (never a truncated string) — a state the model already
+speaks, since `killConfirmTitle` says "process" and `killFailureText` lists it
+as `PID <n>`. `modal` and both its guards are gone; `onNewProcess` never
+borrowed the snapshot at all (its fields are the caller's buffers,
+`source.label()` is the panel's own identity), so it just loses the flag.
+
+One hazard the change made newly reachable, fixed with it: `refreshChrome` hands
+focus off the Kill button before hiding it, and adoption can now prune the
+selection to empty behind an open confirmation — `SetFocus` there would take the
+keyboard off the dialog the user is answering. It now moves the OS focus only
+when `GetFocus()` says the button really holds it, and otherwise just updates
+the panel's own focus bookkeeping.
+
+Lanes none/win32/agent PASS; P1–P3 ALL PASS; `test/win32/activity-monitor.ps1`
+ALL PASS (115 assertions) with a new arm that watches the panel log two more
+state lines with the confirmation open (`45 -> 47`), and with polls deliberately
+landing under the dialog before the confirm — so "the confirmation names the
+process and its pid" and "kill result total=1 killed=1 failed=0" are now also
+the proof the batch did not dangle. The win32 lane went red once on T592's
+known WebView2 environment refusal (`hr=0x80004005`) and passed on re-run.
+
+Filed: **T632** (a kill that failed because the process had already exited is
+still reported as "may require elevated privileges" — `killOne` knows the reason
+and throws it away; newly more reachable now that the table prunes behind an
+open confirmation).
