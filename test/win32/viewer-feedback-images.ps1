@@ -130,8 +130,10 @@ function Get-ChromeChild($paneHwnd, [string]$Class) {
 function Wait-WorktreeShown($errlog, $paneId) {
     for ($t = 0; $t -lt 40; $t++) {
         foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+            # `feedback=` is `shown`/`hidden`, not a bool -- the pane logs which
+            # affordance it decided on, not a flag.
             if ($line -match "viewer worktree pane=$([regex]::Escape($paneId)) feedback=(\w+)") {
-                if ($Matches[1] -eq 'true') { return $true }
+                if ($Matches[1] -eq 'shown') { return $true }
             }
         }
         Start-Sleep -Milliseconds 250
@@ -227,7 +229,9 @@ function Set-ClipboardPng([int]$W, [int]$H, [int]$Seed) {
     $do.SetData('PNG', $false, (New-Object System.IO.MemoryStream(, $bytes)))
     [System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
     Start-Sleep -Milliseconds 250
-    return $bytes
+    # The unary comma keeps this a byte[]: a bare `return $bytes` unrolls the
+    # array into the pipeline and the caller gets an Object[] of boxed bytes.
+    return , $bytes
 }
 
 # A plain bitmap -- CF_BITMAP + CF_DIB and no "PNG" at all, which is what

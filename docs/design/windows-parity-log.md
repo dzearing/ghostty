@@ -12488,3 +12488,56 @@ Proven pre-existing rather than assumed: the arm fails identically with this
 task's whole send path compiled out. Also filed **T645**: Mac's long-lived DRAFT
 staging folder, its footer link and its stale-draft pruning, which win32 does not
 have — its staging folder exists only for the moment between build and publish.
+
+## 2026-08-09 — Pasting a picture into a Windows feedback report (T637)
+
+The viewer's feedback composer on Windows takes images now. Paste a screenshot
+and an `[Image #1]` chip appears in the text; send, and the published report
+folder carries `images/image-1.png` beside `report.json`, linked from the body
+as `![Image #1](images/image-1.png)`.
+
+T637 arrived carrying three features — chips + paste, a thumbnail carousel, and
+screenshot capture — which is more than one context does well, so it was split
+first: the carousel is **T646**, the capture is **T647** (which takes decision
+D44's answer), and what landed is the vertical slice both of those build on.
+
+**Identity is the number, and it lives in the text.** RichEdit has no per-run
+user field to hang an image off — the same hole quoting works around — so a chip
+is literally the characters `[Image #3]`, and the report's `images` array is
+derived by scanning the composer text for chips exactly as `quotes` is derived
+by scanning it for passages. Delete a chip and its picture leaves the report,
+with nothing told about the deletion. Numbers only ever count up, so deleting #2
+leaves 1 and 3. Atomicity had to be restored by hand: Backspace or Delete
+against a chip selects the whole run first, because eating the `]` alone leaves
+text that still looks attached and no longer parses.
+
+**Reading the clipboard is Mac's `readablePasteboardTypes` trap in win32 dress.**
+A RichEdit asks for text and nothing else, so an image-only clipboard would
+paste as silence. The composer asks first, preferring the registered `"PNG"`
+format — copied byte for byte, never re-encoded — and falling back to
+CF_DIBV5/CF_DIB/CF_BITMAP, normalised through one `StretchDIBits` into a 32-bit
+top-down DIB section because GDI already knows every palette, mask and row order
+there is.
+
+**The PNG encoder is hand-written and pure, and not by preference.**
+`std.compress.flate.Compress` in zig 0.15.2 is a stub: its `drain` ends in
+`@panic("TODO")`, and the branch before it returns 0 for anything under ~32 KB,
+which makes `end()`'s `while (c.writer.end != 0)` an infinite loop. It does not
+fail, it spins — it cost the none lane 20 minutes of silent 100% CPU with a
+zero-byte log before it was diagnosed, and a stall detector cannot flag it
+because a spin burns CPU. `png_encode.zig` therefore carries fixed-Huffman
+deflate with a one-candidate hash match finder, asserted round-trip against
+std's `Decompress`, which is implemented.
+
+Lanes none/win32/agent PASS, P1–P3 ALL PASS, new
+`test/win32/viewer-feedback-images.ps1` **ALL PASS (39)** — it puts real bytes
+on the real clipboard from the test process (the background test desktop shares
+`WinSta0`, and the clipboard belongs to the station, not the desktop) and reads
+the published folder back off disk. `viewer-feedback.ps1` is 67 pass / 1 fail,
+the same pre-existing **T644** Ctrl+Z arm as last time.
+
+Filed while here: **T648**, the composer's byte-offset/UTF-16-index conflation,
+which lands a quote or a chip in the wrong place once the report holds
+non-ASCII text (pre-existing, from T641); and **T649**, the T400 stale-debounce
+test, which calibrates its fetch count on a cold cache and asserts it against a
+warm one — it failed once here and re-ran green with the other calibration.
