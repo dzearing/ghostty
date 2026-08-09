@@ -33,6 +33,7 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_nav_layout.zig");
 const viewer_nav = @import("viewer_nav.zig");
+const viewer_worktree = @import("viewer_worktree.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const input = @import("../../input.zig");
@@ -51,6 +52,13 @@ pub const WM_APP_SELECT_ALL: u32 = w32.WM_APP + 1;
 
 const edit_id: usize = 1;
 
+/// The feedback tooltip's tool id, in this bar's own tool space.
+const tip_id: usize = 2;
+
+/// UTF-16 units the tooltip text may hold. "Send feedback to " plus a full
+/// path, with room to spare.
+const tip_text_cap: usize = 320;
+
 hwnd: w32.HWND,
 edit: w32.HWND,
 pane: *ViewerPane,
@@ -64,6 +72,20 @@ can_forward: bool = false,
 /// Whether the leading contents toggle is shown (T160): true only while the
 /// pane's TOC is in its compact overlay layout, pushed by the pane.
 show_contents: bool = false,
+
+/// The worktree the trailing feedback button files into (T633), pushed by the
+/// pane whenever its provenance resolves. Empty ⇒ the pane's content belongs
+/// to no working tree and the button is ABSENT — not disabled: with nowhere to
+/// file a report the button would be a lie (Mac gates it the same way).
+worktree: [std.fs.max_path_bytes]u8 = undefined,
+worktree_len: usize = 0,
+
+/// The feedback button's tooltip, and the control that shows it. Created on
+/// first use and kept for the bar's life; `tip_text` is the buffer comctl32
+/// reads through, so it must outlive every message the control sends itself.
+tip: ?w32.HWND = null,
+tip_text: [tip_text_cap:0]u16 = undefined,
+tip_added: bool = false,
 
 hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
@@ -180,6 +202,7 @@ pub fn create(
         .pane = pane,
         .alloc = alloc,
     };
+    self.tip_text[0] = 0;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.applyTheme();
     return self;
@@ -190,6 +213,13 @@ pub fn destroy(self: *ViewerNavBar) void {
     // (WM_KILLFOCUS, WM_COMMAND) synchronously, and they must not find a
     // half-dead object.
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
+    // The tooltip is a POPUP owned by the bar, not a child of it, so
+    // DestroyWindow(self.hwnd) does not take it down — and it subclassed the
+    // bar, so it has to go first.
+    if (self.tip) |t| {
+        _ = w32.DestroyWindow(t);
+        self.tip = null;
+    }
     _ = w32.DestroyWindow(self.hwnd); // destroys the EDIT with it
     if (self.font) |f| _ = w32.DeleteObject(@ptrCast(f));
     if (self.edit_brush) |b| _ = w32.DeleteObject(@ptrCast(b));
@@ -258,11 +288,18 @@ pub fn applyTheme(self: *ViewerNavBar) void {
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
+/// Which conditional buttons this bar is currently showing — the one place
+/// the two flags become the layout's input, so the paint, the hit test and the
+/// placement cannot disagree about the strip they are describing.
+pub fn shown(self: *const ViewerNavBar) layout_mod.Shown {
+    return .{ .contents = self.show_contents, .feedback = self.worktree_len > 0 };
+}
+
 /// Position the bar across the top of the pane and its EDIT inside it.
 /// Idempotent and cheap; the pane calls it from every bounds sync while the
 /// bar is visible.
 pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
-    const l = layout_mod.Layout.init(scale, width, self.show_contents);
+    const l = layout_mod.Layout.init(scale, width, self.shown());
     _ = w32.MoveWindow(self.hwnd, 0, 0, width, l.bar_h, 1);
     _ = w32.MoveWindow(
         self.edit,
@@ -294,6 +331,7 @@ pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
         );
         if (self.font) |f| _ = w32.SendMessageW(self.edit, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
+    self.syncTip(l);
 }
 
 pub fn setVisible(self: *ViewerNavBar, visible: bool) void {
@@ -318,6 +356,133 @@ pub fn setContentsButton(self: *ViewerNavBar, show: bool) void {
     if (self.show_contents == show) return;
     self.show_contents = show;
     _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
+/// Point the trailing feedback button at `root`, or take it away (null / a
+/// path too long to hold). The pane calls this whenever provenance resolves;
+/// the bar re-lays itself on the next bounds sync, which the pane drives.
+///
+/// Returns whether the button's PRESENCE changed, so the pane only pays for a
+/// re-layout when the strip's shape actually moved — a re-resolution to the
+/// same worktree (the common case on a back/forward walk) costs nothing.
+pub fn setWorktree(self: *ViewerNavBar, root: ?[]const u8) bool {
+    const had = self.worktree_len > 0;
+    const next: []const u8 = if (root) |r|
+        (if (r.len <= self.worktree.len) r else "")
+    else
+        "";
+    if (next.len == self.worktree_len and
+        std.mem.eql(u8, self.worktree[0..self.worktree_len], next))
+    {
+        return false;
+    }
+    @memcpy(self.worktree[0..next.len], next);
+    self.worktree_len = next.len;
+    // The tooltip is re-synced HERE, not only from `place`: a pane that moves
+    // between two files in two different worktrees keeps the button and only
+    // changes where it files, so nothing would drive a bounds sync.
+    self.syncTip(self.currentLayout());
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+    return had != (next.len > 0);
+}
+
+// -------------------------------------------------------------------------
+// The feedback button's tooltip
+// -------------------------------------------------------------------------
+
+/// A rect tool in SUBCLASS mode, not the track mode the tab strip uses
+/// (`Window.tabTipEnsure`): the strip already tracks its own hover to paint
+/// tabs, so it has the hover state to drive a tip by hand, while this is one
+/// small rect whose whole behavior — the delay, the placement, the dismissal —
+/// is exactly what comctl32 does for free. Fewer moving parts, and the timing
+/// is the system's rather than ours.
+fn tipEnsure(self: *ViewerNavBar) ?w32.HWND {
+    if (self.tip) |h| return h;
+
+    var icc = w32.INITCOMMONCONTROLSEX{
+        .dwSize = @sizeOf(w32.INITCOMMONCONTROLSEX),
+        .dwICC = w32.ICC_TAB_CLASSES,
+    };
+    _ = w32.InitCommonControlsEx(&icc);
+
+    const tip = w32.CreateWindowExW(
+        w32.WS_EX_TOPMOST | w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE,
+        w32.TOOLTIPS_CLASS,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP | w32.TTS_ALWAYSTIP | w32.TTS_NOPREFIX,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        self.hwnd,
+        null,
+        null,
+        null,
+    ) orelse return null;
+
+    // The bar's own theme decides the tip's, the way the dialogs decide theirs
+    // — the bar is already dark or light for this pane's background.
+    if (self.dark) {
+        _ = w32.SetWindowTheme(
+            tip,
+            std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
+            null,
+        );
+    }
+    self.tip = tip;
+    return tip;
+}
+
+fn tipToolInfo(self: *ViewerNavBar, rect: w32.RECT) w32.TOOLINFOW {
+    return .{
+        .cbSize = @sizeOf(w32.TOOLINFOW),
+        .uFlags = w32.TTF_SUBCLASS,
+        .hwnd = self.hwnd,
+        .uId = tip_id,
+        .rect = rect,
+        .hinst = null,
+        .lpszText = @ptrCast(&self.tip_text),
+        .lParam = 0,
+        .lpReserved = null,
+    };
+}
+
+/// Bring the tooltip in line with the button's presence, rect and destination.
+/// Idempotent, and safe to call before the tip exists.
+fn syncTip(self: *ViewerNavBar, l: layout_mod.Layout) void {
+    const box = l.button(.feedback);
+    if (self.worktree_len == 0 or box.width() <= 0) {
+        if (self.tip_added) {
+            var ti = self.tipToolInfo(.{ .left = 0, .top = 0, .right = 0, .bottom = 0 });
+            if (self.tip) |t| _ = w32.SendMessageW(t, w32.TTM_DELTOOLW, 0, @bitCast(@intFromPtr(&ti)));
+            self.tip_added = false;
+        }
+        return;
+    }
+
+    var text_buf: [tip_text_cap]u8 = undefined;
+    const text = viewer_worktree.tooltipText(&text_buf, self.worktree[0..self.worktree_len]);
+    const n = std.unicode.utf8ToUtf16Le(self.tip_text[0 .. self.tip_text.len - 1], text) catch 0;
+    self.tip_text[n] = 0;
+
+    const tip = self.tipEnsure() orelse return;
+    // The HIT box, not the paint: the tip should follow the same forgiving
+    // target a click does (design system — a hit box may exceed its paint).
+    const m = icon_button.Metrics.init(self.scale);
+    const hit = icon_button.hitBox(m, box);
+    var ti = self.tipToolInfo(.{
+        .left = hit.left,
+        .top = hit.top,
+        .right = hit.right,
+        .bottom = hit.bottom,
+    });
+    if (!self.tip_added) {
+        if (w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti))) == 0) return;
+        self.tip_added = true;
+        return;
+    }
+    _ = w32.SendMessageW(tip, w32.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&ti)));
+    _ = w32.SendMessageW(tip, w32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&ti)));
 }
 
 /// Show `text` in the address field — unless the user is EDITING it, whose
@@ -425,7 +590,9 @@ fn buttonEnabled(self: *const ViewerNavBar, b: layout_mod.Button) bool {
         .contents => true,
         .back => self.can_back,
         .forward => self.can_forward,
-        .reload, .home => true,
+        // Never disabled: a feedback button with nowhere to file is ABSENT,
+        // which the layout expresses as an empty rect.
+        .reload, .home, .feedback => true,
     };
 }
 
@@ -436,6 +603,7 @@ fn buttonGlyph(b: layout_mod.Button) icon_button.Glyph {
         .forward => .forward,
         .reload => .refresh,
         .home => .home,
+        .feedback => .feedback,
     };
 }
 
@@ -447,11 +615,11 @@ fn paint(self: *ViewerNavBar, hdc: w32.HDC, width: i32, height: i32) void {
         _ = w32.FillRect(hdc, &r, brush);
     }
 
-    const l = layout_mod.Layout.init(self.scale, width, self.show_contents);
+    const l = layout_mod.Layout.init(self.scale, width, self.shown());
     const m = icon_button.Metrics.init(self.scale);
     for (std.enums.values(layout_mod.Button)) |b| {
         const box = l.button(b);
-        if (box.width() <= 0) continue; // absent contents toggle
+        if (box.width() <= 0) continue; // an absent conditional button
         const enabled = self.buttonEnabled(b);
 
         const state: icon_button.State = st: {
@@ -501,7 +669,7 @@ fn updateHover(self: *ViewerNavBar, x: i32, y: i32) void {
 fn currentLayout(self: *ViewerNavBar) layout_mod.Layout {
     var r: w32.RECT = undefined;
     const w = if (w32.GetClientRect(self.hwnd, &r) != 0) r.right - r.left else 0;
-    return layout_mod.Layout.init(self.scale, w, self.show_contents);
+    return layout_mod.Layout.init(self.scale, w, self.shown());
 }
 
 fn wndProc(
@@ -626,5 +794,6 @@ fn activate(self: *ViewerNavBar, b: layout_mod.Button) void {
         .forward => self.pane.goForward(),
         .reload => self.pane.reloadFromChrome(),
         .home => self.pane.goHome(),
+        .feedback => self.pane.toggleFeedback(),
     }
 }

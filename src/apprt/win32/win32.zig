@@ -1689,12 +1689,18 @@ pub const TOOLTIPS_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("tooltips_clas
 pub const TTS_ALWAYSTIP: u32 = 0x01;
 pub const TTS_NOPREFIX: u32 = 0x02;
 
+/// The tool's owner window is SUBCLASSED so comctl32 relays its own mouse
+/// messages — the viewer nav bar's feedback tooltip (T633), which wants the
+/// system's delay and placement rather than a hand-driven one.
+pub const TTF_SUBCLASS: u32 = 0x0001;
 pub const TTF_TRACK: u32 = 0x0020;
 pub const TTF_ABSOLUTE: u32 = 0x0080;
 
 pub const TTM_TRACKACTIVATE: u32 = WM_USER + 17;
 pub const TTM_TRACKPOSITION: u32 = WM_USER + 18;
 pub const TTM_ADDTOOLW: u32 = WM_USER + 50;
+pub const TTM_DELTOOLW: u32 = WM_USER + 51;
+pub const TTM_NEWTOOLRECTW: u32 = WM_USER + 52;
 pub const TTM_UPDATETIPTEXTW: u32 = WM_USER + 57;
 
 pub const TOOLINFOW = extern struct {

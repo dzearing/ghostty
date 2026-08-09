@@ -52,6 +52,7 @@ fn codepoint(which: icon_button.Glyph) u16 {
         .refresh => 0xE72C, // Refresh
         .home => 0xE80F, // Home
         .contents => 0xE700, // GlobalNavButton — Windows' own nav-pane toggle
+        .feedback => 0xED15, // Feedback — Windows' own "tell us about this"
     };
 }
 
@@ -67,7 +68,7 @@ fn fontDip(which: icon_button.Glyph) f32 {
         // The nav cluster renders at the strip size: back/forward/refresh/home
         // sit beside an address field the way the strip glyphs sit beside
         // tabs, and 10 is the caption's size, not a toolbar's.
-        .back, .forward, .refresh, .home, .contents => 12.0,
+        .back, .forward, .refresh, .home, .contents, .feedback => 12.0,
     };
 }
 

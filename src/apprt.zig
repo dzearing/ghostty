@@ -182,6 +182,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_nav_layout.zig");
 
+    // Pure win32 viewer worktree provenance — strategy D's classification and
+    // the 15s resolution cache (T633), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_worktree.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");

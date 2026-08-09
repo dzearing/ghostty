@@ -792,6 +792,18 @@ the queue; consuming it is separate and not built here).
   or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
   per (location, origin) for 15s so navigation never stutters and a dev server
   started later still makes the button appear.
+  **Windows has legs 1 and 3 and the button** (T633): the strategy, the
+  classification and the 15s cache are `src/apprt/win32/viewer_worktree.zig`
+  (pure, asserted in the none lane), and the `git rev-parse` runs on a worker
+  thread that posts `WM_APP_VIEWER_WORKTREE` back at the pane —
+  `ViewerWorktreeProbe.zig` — because the viewer's message loop is the one the
+  terminal next door draws on. Leg 2 is **T638**: Windows has no `lsof` and its
+  replacement is a real choice, so until it lands a `localhost:PORT` pane falls
+  through to leg 3, which is its origin directory and usually the right answer
+  anyway. The composer the button opens is **T634**; today a win32 click logs
+  the worktree it would file into. Acceptance:
+  `test/win32/viewer-worktree.ps1`.
+
   The button is **icon-only**, in the same 24pt square as the other chrome
   controls; the destination is on its tooltip and in the composer footer.
 - **Composer.** A **pill** that grows with its content (one line up to ~6),

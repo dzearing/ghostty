@@ -69,6 +69,7 @@ const viewer_prefs = @import("viewer_prefs.zig");
 const gdiplus_decode = @import("gdiplus_decode.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
+const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
@@ -107,6 +108,13 @@ pub const WM_APP_VIEWER_ACCEL: u32 = w32.WM_APP + 21;
 /// `focusAddressBar` would be stolen by that queued focus a moment later.
 /// Posting orders the caret behind it.
 pub const WM_APP_VIEWER_FOCUS_ADDRESS: u32 = w32.WM_APP + 22;
+
+/// The worktree probe's "I have an answer" post (T633). Its worker runs `git`,
+/// which is a process spawn on every navigation — far too much to do on the
+/// message loop the terminal next door draws on — so the resolution happens on
+/// a thread and only its RESULT lands here, on the GUI thread, where the nav
+/// bar can be re-laid and repainted.
+pub const WM_APP_VIEWER_WORKTREE: u32 = w32.WM_APP + 23;
 
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
@@ -356,6 +364,12 @@ watcher: viewer_watcher.Watcher = .{},
 /// the pane then has no bar, which is a degradation, not a broken pane.
 nav: ?*ViewerNavBar = null,
 
+/// Which git worktree this pane's content belongs to, and the machinery that
+/// answers that question off the UI thread (T633). Null until the pane has an
+/// allocator to hand it — which is every pane before `start`, and every unit
+/// test that drives a bare pane.
+worktree: ?ViewerWorktreeProbe = null,
+
 /// The table-of-contents card (T160). Created lazily the first time a
 /// document reports 2+ headings; null before that, and null when its window
 /// could not be created (a degradation, not a broken pane).
@@ -516,6 +530,13 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         nav.destroy();
         self.nav = null;
     }
+    // After the bar (which reads the probe's answer) and before the host
+    // window: `deinit` JOINS the worker, and a completion posted in the
+    // meantime is dropped with the window it was addressed to.
+    if (self.worktree) |*probe| {
+        probe.deinit();
+        self.worktree = null;
+    }
     // Destroy the dim overlay before the host window (its owner) is gone —
     // the same ordering Surface.deinit keeps for its own (T380).
     if (self.dim_overlay) |d| {
@@ -659,6 +680,61 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
     self.nav = ViewerNavBar.create(alloc, self, hinstance, hwnd);
     if (self.nav == null) log.warn("viewer nav bar could not be created; pane has no chrome", .{});
     self.pushAddress();
+    // The worktree probe needs the same two halves and lands with the bar it
+    // puts a button on. Its first resolution runs for wherever `navigate`
+    // already put the pane, which is normally before either half exists.
+    if (self.worktree == null) {
+        self.worktree = ViewerWorktreeProbe.init(alloc);
+        self.worktree.?.attach(hwnd, WM_APP_VIEWER_WORKTREE);
+        self.refreshWorktree();
+    }
+}
+
+/// Re-derive which worktree this pane's content belongs to, and move the nav
+/// bar's feedback button to match.
+///
+/// Called on EVERY location change rather than once at construction: a pane
+/// moves between a file, a dev server and a remote site over its life, and each
+/// is a different worktree or none (CLAUDE.md's provenance rule). A resolution
+/// that is already cached lands synchronously here; anything else arrives later
+/// on `WM_APP_VIEWER_WORKTREE`.
+fn refreshWorktree(self: *ViewerPane) void {
+    const probe = if (self.worktree) |*p| p else return;
+    if (probe.refresh(self.location orelse "", self.origin_directory) != .pending) {
+        self.pushWorktree();
+    }
+}
+
+/// A resolution settled: push it at the bar, and say so in the log.
+///
+/// A change in the button's PRESENCE re-lays the strip (the address field's
+/// width moved with it); a change of destination alone only repaints and
+/// re-labels, which the bar does itself.
+///
+/// The log line is the acceptance script's only oracle: the bar is native
+/// owner-painted chrome inside a background test desktop, where nothing can
+/// screenshot it, so "the button is there and points at this worktree" has to
+/// be readable in the GUI's own stderr.
+fn pushWorktree(self: *ViewerPane) void {
+    const probe = if (self.worktree) |*p| p else return;
+    const root = probe.worktreePath();
+    log.info("viewer worktree pane={s} feedback={s} worktree={s}", .{
+        self.paneId(),
+        if (root != null) "shown" else "hidden",
+        root orelse "<none>",
+    });
+    const nav = self.nav orelse return;
+    if (nav.setWorktree(root) and self.nav_visible) self.syncBounds();
+}
+
+/// The feedback button was clicked (T633). The composer itself is T634; until
+/// it lands this is deliberately a logged no-op rather than a missing button —
+/// the provenance and the affordance are what this task ships, and the log line
+/// is what the acceptance script reads to prove the button is live.
+pub fn toggleFeedback(self: *ViewerPane) void {
+    const probe = if (self.worktree) |*p| p else return;
+    const root = probe.worktreePath() orelse return;
+    log.info("viewer feedback requested for worktree {s} (composer is T634)", .{root});
 }
 
 /// Mirror of `Surface.setVisible`. A viewer has no renderer thread to park, so
@@ -800,6 +876,7 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
 
     self.pushAddress();
+    self.refreshWorktree();
     self.applyNavigation();
     self.syncWatcher(alloc);
 }
@@ -1127,7 +1204,7 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     if (self.nav_visible) {
         if (self.nav) |nav| {
             top = @min(
-                nav_layout.Layout.init(self.scale, width, nav.show_contents).bar_h,
+                nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
                 height,
             );
         }
@@ -2056,7 +2133,7 @@ pub fn syncBounds(self: *ViewerPane) void {
         if (self.nav) |nav| {
             nav.place(width, self.scale);
             top = @min(
-                nav_layout.Layout.init(self.scale, width, nav.show_contents).bar_h,
+                nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
                 height,
             );
         }
@@ -2527,7 +2604,7 @@ fn navHoverTick(self: *ViewerPane) void {
     const foreground = w32.GetForegroundWindow() == w32.GetAncestor(h, w32.GA_ROOT);
     const in_pane = foreground and
         pt.x >= 0 and pt.y >= 0 and pt.x < r.right and pt.y < r.bottom;
-    const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.show_contents);
+    const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.shown());
     // "Held" = the address field owns the keyboard, or the cursor is on the
     // revealed bar itself (its band is the top `bar_h` of the pane).
     const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit);
@@ -2771,6 +2848,10 @@ fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
 
     if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
     self.pushAddress();
+    // A BROWSER-initiated move is a location change like any other — an
+    // in-page link from a doc to a dev server crosses worktrees just as an
+    // address-bar navigation does.
+    self.refreshWorktree();
 }
 
 fn viewMode(src: []const u8) enum { web, other } {
@@ -3070,6 +3151,17 @@ pub fn wndProc(
         // stop.
         WM_APP_VIEWER_RELOAD => {
             _ = w32.SetTimer(hwnd, reload_timer_id, reload_debounce_ms, null);
+            return 0;
+        },
+
+        // The worktree worker has an answer (T633). This is the ONLY place the
+        // answer is read, and it runs on the GUI thread — which is what lets
+        // the bar be re-laid and repainted straight from it.
+        WM_APP_VIEWER_WORKTREE => {
+            if (self.worktree) |*probe| {
+                _ = probe.complete();
+                self.pushWorktree();
+            }
             return 0;
         },
 
@@ -4117,7 +4209,7 @@ test "host floor: a real controller on a real window, on this box" {
     {
         var cr: w32.RECT = undefined;
         try testing.expect(w32.GetClientRect(pane.hwnd.?, &cr) != 0);
-        const nl = nav_layout.Layout.init(pane.scale, cr.right - cr.left, nav.show_contents);
+        const nl = nav_layout.Layout.init(pane.scale, cr.right - cr.left, nav.shown());
         const nb = c.bounds().?;
         try testing.expectEqual(nl.bar_h, nb.top);
     }

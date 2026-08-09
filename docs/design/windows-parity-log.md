@@ -12233,3 +12233,51 @@ Lanes none/win32/agent PASS and P1–P3 ALL PASS (docs plus one comment; no
 behavior touched).
 
 Filed: **T633**–**T638**; decisions **D43**, **D44**.
+
+## 2026-08-08 — T633: a Windows viewer pane knows which checkout it is showing, and offers to file about it
+
+A viewer pane's navigation bar now grows a small feedback button whenever the
+thing the pane is showing belongs to one of your git checkouts, and its tooltip
+names the checkout a report would land in. A pane showing a website you have no
+copy of, or a file that lives outside every repo, shows nothing — an affordance
+with nowhere to file would be a lie, so it is absent rather than greyed out.
+This is the first half of the win32 worktree feedback capture (T384's split);
+the composer the button opens is T634, so a click today records the destination
+it would have used.
+
+Provenance is Mac's strategy D, re-derived on every location change rather than
+fixed when the pane opens — a pane moves between a file, a dev server and a
+remote site over its life, and each is a different checkout or none. Legs 1 and
+3 landed here (the viewed file's own directory; otherwise the directory the pane
+was opened from, which the manifest already persisted), and both are resolved to
+a working tree with `git rev-parse --show-toplevel`, so a linked worktree and a
+main checkout both count. Leg 2 — a `localhost:PORT` pane resolved through the
+listening process — is T638, because Windows has no `lsof` and its replacement
+is a real choice; until then such a pane falls back to its origin directory,
+which is usually the right answer anyway.
+
+The interesting constraint was where the git call happens. It is a process spawn
+on every navigation, and the viewer's message loop is the same one the terminal
+next door draws on, so a `CreateProcess` on a back/forward walk would be a
+visible stutter in an unrelated pane. `ViewerWorktreeProbe.zig` therefore runs
+one worker at a time and posts its answer back as `WM_APP_VIEWER_WORKTREE`; a
+request arriving mid-flight is re-issued from the completion instead of racing a
+second spawn, and a 15s cache keyed on (location, origin) means a back/forward
+walk answers synchronously and never flickers the button away and back. The
+strategy, the cache and the parsing are pure (`viewer_worktree.zig`) and assert
+in the none lane; only the spawning and the posting needed a window.
+
+The button trails the address field, alone on the far side of it, and is
+icon-only in the shared 28 DIP square — the tighter win32 strip settles the
+label question the same way Mac's own note does. The layout measures it in from
+the band's trailing edge and never lets it cross the leading cluster, so a
+violently narrow pane squeezes the field rather than overlapping two painted
+controls; that, and the absent case's empty rect, are asserted at
+1.0/1.25/1.5/2.0.
+
+Lanes none/win32/agent PASS and P1–P3 ALL PASS. New acceptance:
+`test\win32\viewer-worktree.ps1`, ALL PASS (25) — four provenance cases against
+one running app so the "no button" ones cannot pass while the "button" ones are
+broken, plus a click that reaches the pane. It refuses to run at all if `%TEMP%`
+is itself inside a working tree, since the negative cases would then prove
+nothing.

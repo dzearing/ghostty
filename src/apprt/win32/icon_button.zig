@@ -372,6 +372,14 @@ pub const Glyph = enum {
     /// the Store), and keeping the case separate means either host can move
     /// off the shared mark without dragging the other with it.
     contents,
+    /// "🗩" — file feedback about what this viewer pane is showing (T633,
+    /// Fluent Feedback; Mac uses `exclamationmark.bubble`). The FALLBACK is an
+    /// open speech bubble with a tail and no interior mark: an exclamation
+    /// inside a four-bar outline needs more quads than the shared buffer
+    /// carries, and a bare bubble already reads as "say something about this" —
+    /// a fallback's bar is "readable", not "identical" (see the header of
+    /// `icon_button_paint`).
+    feedback,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -670,6 +678,36 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             out[2] = bar(.{ .left = b.left + wi, .top = body_top, .right = b.left + wi + t, .bottom = b.bottom - t });
             out[3] = mirrorX(out[2], b.left + b.right);
             out[4] = bar(.{ .left = b.left + wi, .top = b.bottom - t, .right = b.right - wi, .bottom = b.bottom });
+            return out[0..5];
+        },
+        .feedback => {
+            // A speech bubble: a four-bar outline with a tail hanging off its
+            // bottom-left corner. Outlined at `stroke_outline`, not
+            // `stroke_w`, by the same rule the maximize box follows — in a
+            // CLOSED mark the eye reads the enclosed area, and a 2 DIP stroke
+            // on an 11 DIP box reads as a filled slab (Metrics.stroke_outline).
+            //
+            // The BODY owns the full mark box and the tail hangs inside its
+            // bottom edge, so the union is exactly the centered mark box and
+            // the glyph stays centered by construction — the tail cannot drag
+            // it off-center the way an appended shape would.
+            const b = centered(target, m.mark_close, m.mark_close);
+            const so = m.stroke_outline;
+            const body_bottom = b.bottom - @max(@divTrunc(b.height(), 4), so + 1);
+            out[0] = bar(.{ .left = b.left, .top = b.top, .right = b.right, .bottom = b.top + so });
+            out[1] = bar(.{ .left = b.left, .top = body_bottom - so, .right = b.right, .bottom = body_bottom });
+            out[2] = bar(.{ .left = b.left, .top = b.top + so, .right = b.left + so, .bottom = body_bottom - so });
+            out[3] = mirrorX(out[2], b.left + b.right);
+            // The tail: a wedge dropping from the body's bottom edge to the
+            // mark box's bottom, its vertical edge continuing the left wall so
+            // the two read as one silhouette.
+            const tail_w = @max(@divTrunc(b.width(), 3), so + 1);
+            out[4] = .{ .pts = .{
+                .{ .x = b.left + so, .y = body_bottom - so },
+                .{ .x = b.left + so + tail_w, .y = body_bottom - so },
+                .{ .x = b.left + so, .y = b.bottom },
+                .{ .x = b.left + so, .y = b.bottom },
+            } };
             return out[0..5];
         },
         .overflow => {
@@ -994,6 +1032,7 @@ const all_glyphs = [_]Glyph{
     .refresh,
     .home,
     .contents,
+    .feedback,
 };
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph

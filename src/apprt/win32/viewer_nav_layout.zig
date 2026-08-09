@@ -42,8 +42,22 @@ pub const poll_ms: u32 = 150;
 /// narrow viewer pane whose document has a table of contents (T160): the
 /// compact card's only opener lives in the chrome bar, which is why the bar
 /// pins open there. Mac puts the same button first in its chrome bar.
-pub const Button = enum { contents, back, forward, reload, home };
+///
+/// `feedback` TRAILS — it is the only button on the far side of the address
+/// field — and exists only when the pane's content resolves to a git worktree
+/// (T633). With nowhere to file a report the button would be a lie, so it is
+/// absent rather than disabled; Mac's chrome bar places and gates it the same
+/// way.
+pub const Button = enum { contents, back, forward, reload, home, feedback };
 pub const button_count = std.enums.values(Button).len;
+
+/// Which of the two conditional buttons this bar is showing. A struct rather
+/// than positional bools so a third condition cannot silently swap with a
+/// second at a call site.
+pub const Shown = struct {
+    contents: bool = false,
+    feedback: bool = false,
+};
 
 /// Everything the bar paints, in physical pixels, for one scale and width.
 pub const Layout = struct {
@@ -59,7 +73,7 @@ pub const Layout = struct {
     /// The address field (a real EDIT control fills this rect).
     address: Rect,
 
-    pub fn init(scale: f32, width: i32, with_contents: bool) Layout {
+    pub fn init(scale: f32, width: i32, shown: Shown) Layout {
         const m = icon_button.Metrics.init(scale);
         const pad = px(4.0, scale); // band edge + inter-button gap
         const field_gap = px(8.0, scale); // buttons cluster <-> field
@@ -69,7 +83,12 @@ pub const Layout = struct {
         var buttons: [button_count]Rect = undefined;
         var x = pad;
         for (&buttons, 0..) |*b, i| {
-            if (i == @intFromEnum(Button.contents) and !with_contents) {
+            const absent = switch (@as(Button, @enumFromInt(i))) {
+                .contents => !shown.contents,
+                .feedback => true, // placed from the trailing edge below
+                else => false,
+            };
+            if (absent) {
                 b.* = .{ .left = x, .top = top, .right = x, .bottom = top };
                 continue;
             }
@@ -82,11 +101,32 @@ pub const Layout = struct {
             x += m.target + pad;
         }
 
+        // The leading cluster's right edge — where the field may start, and the
+        // floor the trailing button may not cross.
+        const cluster_right = x - pad;
+
+        // Feedback trails: measured in from the band's own right edge, never
+        // past the leading cluster. A pane too narrow to hold both squeezes the
+        // FIELD to nothing rather than overlapping two painted controls.
+        if (shown.feedback) {
+            const left = @max(width - pad - m.target, cluster_right + pad);
+            buttons[@intFromEnum(Button.feedback)] = .{
+                .left = left,
+                .top = top,
+                .right = left + m.target,
+                .bottom = top + m.target,
+            };
+        }
+
         // The field takes what is left, floored so a violently narrow pane
         // yields an empty (never inverted) rect rather than a control painted
         // over the buttons.
-        const field_left = x - pad + field_gap;
-        const field_right = @max(width - field_gap, field_left);
+        const field_left = cluster_right + field_gap;
+        const field_limit = if (shown.feedback)
+            buttons[@intFromEnum(Button.feedback)].left - field_gap
+        else
+            width - field_gap;
+        const field_right = @max(field_limit, field_left);
         return .{
             .bar_h = bar_h,
             .reveal_h = px(reveal_dip, scale),
@@ -195,11 +235,16 @@ const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
 
 test "bar geometry holds the design system at every scale" {
     for (scales) |scale| {
-        // Both bar variants hold the same rules: the contents toggle either
-        // leads the strip or takes no room at all.
-        for ([_]bool{ false, true }) |with_contents| {
+        // Every bar variant holds the same rules: the two conditional buttons
+        // either take their slot or take no room at all.
+        for ([_]Shown{
+            .{},
+            .{ .contents = true },
+            .{ .feedback = true },
+            .{ .contents = true, .feedback = true },
+        }) |shown| {
             const m = icon_button.Metrics.init(scale);
-            const l = Layout.init(scale, px(600.0, scale), with_contents);
+            const l = Layout.init(scale, px(600.0, scale), shown);
             const gap = px(4.0, scale);
 
             // The band is the control plus 4 DIP above and below — sized to
@@ -223,12 +268,17 @@ test "bar geometry holds the design system at every scale" {
                 prev = b;
             }
 
-            // The field clears the last button by 8 DIP and the band edge by
-            // 8, and shares the buttons' vertical band.
-            const last = l.buttons[button_count - 1];
-            try testing.expect(l.address.left - last.right >= px(8.0, scale));
-            try testing.expectEqual(last.top, l.address.top);
+            // The field clears the leading cluster by 8 DIP and the band edge
+            // (or the trailing button) by 8, and shares the buttons' band.
+            try testing.expect(l.address.left - l.button(.home).right >= px(8.0, scale));
+            try testing.expectEqual(l.button(.home).top, l.address.top);
             try testing.expect(l.address.right < px(600.0, scale));
+            if (shown.feedback) {
+                const fb = l.button(.feedback);
+                try testing.expect(fb.left - l.address.right >= px(8.0, scale));
+                // And the trailing button keeps the band's own 4 DIP edge.
+                try testing.expect(px(600.0, scale) - fb.right >= gap - 1);
+            }
 
             // Reveal strip is 20 DIP.
             try testing.expectEqual(px(reveal_dip, scale), l.reveal_h);
@@ -236,11 +286,53 @@ test "bar geometry holds the design system at every scale" {
     }
 }
 
+test "the feedback button trails the field, and is absent when not asked for" {
+    for (scales) |scale| {
+        const m = icon_button.Metrics.init(scale);
+        const width = px(600.0, scale);
+        const without = Layout.init(scale, width, .{});
+        const with = Layout.init(scale, width, .{ .feedback = true });
+
+        // Absent: an empty rect that answers no hit, even dead on the spot the
+        // present one occupies.
+        try testing.expectEqual(@as(i32, 0), without.button(.feedback).width());
+        const at = with.button(.feedback);
+        try testing.expect(
+            without.hitButton(scale, at.left + 1, at.top + 1) != Button.feedback,
+        );
+
+        // Present: standard square, hard against the band's trailing 4 DIP
+        // edge, and the field gives up exactly that much width.
+        try testing.expectEqual(m.target, at.width());
+        try testing.expectEqual(m.target, at.height());
+        try testing.expectEqual(width - px(4.0, scale), at.right);
+        try testing.expect(with.address.right < without.address.right);
+        try testing.expectEqual(
+            Button.feedback,
+            with.hitButton(scale, @divTrunc(at.left + at.right, 2), @divTrunc(at.top + at.bottom, 2)).?,
+        );
+    }
+}
+
+test "a narrow pane squeezes the field, never overlaps two painted buttons" {
+    for (scales) |scale| {
+        const m = icon_button.Metrics.init(scale);
+        const gap = px(4.0, scale);
+        // Narrow enough that the trailing button would land inside the leading
+        // cluster if it were measured from the right edge alone.
+        for ([_]i32{ 10, m.target * 2, m.target * 5 }) |width| {
+            const l = Layout.init(scale, width, .{ .contents = true, .feedback = true });
+            try testing.expect(l.address.right >= l.address.left);
+            try testing.expect(l.button(.feedback).left - l.button(.home).right >= gap);
+        }
+    }
+}
+
 test "the contents toggle leads the strip, and is absent when not asked for" {
     for (scales) |scale| {
         const m = icon_button.Metrics.init(scale);
-        const without = Layout.init(scale, px(600.0, scale), false);
-        const with = Layout.init(scale, px(600.0, scale), true);
+        const without = Layout.init(scale, px(600.0, scale), .{});
+        const with = Layout.init(scale, px(600.0, scale), .{ .contents = true });
 
         // Absent: an empty rect, and the back button holds the lead slot.
         try testing.expectEqual(@as(i32, 0), without.button(.contents).width());
@@ -262,7 +354,7 @@ test "the contents toggle leads the strip, and is absent when not asked for" {
 
 test "a violently narrow pane never inverts the field rect" {
     for (scales) |scale| {
-        const l = Layout.init(scale, 10, true);
+        const l = Layout.init(scale, 10, .{ .contents = true });
         try testing.expect(l.address.right >= l.address.left);
     }
 }
@@ -270,7 +362,7 @@ test "a violently narrow pane never inverts the field rect" {
 test "hit testing answers on the hit box, not the paint" {
     const scale: f32 = 1.25;
     const m = icon_button.Metrics.init(scale);
-    const l = Layout.init(scale, 800, false);
+    const l = Layout.init(scale, 800, .{});
     const back = l.button(.back);
     // Dead center of the painted square.
     try testing.expectEqual(
