@@ -204,6 +204,62 @@ pub fn parseRoot(buf: []u8, stdout: []const u8) ?[]const u8 {
     return buf[0..trimmed.len];
 }
 
+// -----------------------------------------------------------------------------
+// Repo root -> revision (T636)
+// -----------------------------------------------------------------------------
+//
+// Mac's `ViewerWorktreeResolver.revision(at:)`, split into the same argv+parse
+// halves as the root query above so the whole thing asserts without a process.
+// A feedback report names the exact revision the user was looking at, which is
+// what lets a downstream agent replay it — so BOTH halves are optional and
+// BOTH report null rather than a guess: a detached HEAD has no branch, and a
+// repository with no commits has no HEAD at all.
+
+/// The argv for the branch query. `--abbrev-ref HEAD` prints the branch name,
+/// or the literal `HEAD` when there is not one — which `parseBranch` reads as
+/// "no branch".
+pub fn branchArgv(index: usize, root: []const u8) [6][]const u8 {
+    return .{ git_paths[index], "-C", root, "rev-parse", "--abbrev-ref", "HEAD" };
+}
+
+/// The argv for the commit query: the full 40-character object name, which is
+/// what a reader needs to check the revision out again.
+pub fn commitArgv(index: usize, root: []const u8) [5][]const u8 {
+    return .{ git_paths[index], "-C", root, "rev-parse", "HEAD" };
+}
+
+/// `git rev-parse --abbrev-ref HEAD`'s stdout as a branch name. Borrowed from
+/// `stdout`.
+///
+/// Null for the two states that are not a branch, both of which git spells
+/// `HEAD`: a detached checkout, and a repository with no commits yet (where it
+/// also exits non-zero). Null too for anything with whitespace in it, which is
+/// not a name git could have produced and is therefore output we do not
+/// understand.
+pub fn parseBranch(stdout: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.eql(u8, trimmed, "HEAD")) return null;
+    for (trimmed) |c| {
+        if (c <= ' ') return null;
+    }
+    return trimmed;
+}
+
+/// `git rev-parse HEAD`'s stdout as a commit id. Borrowed from `stdout`.
+///
+/// The hex check is what rejects an unborn repository: `rev-parse HEAD` there
+/// echoes the literal `HEAD` back on stdout, which would otherwise be filed as
+/// a commit id nobody can check out.
+pub fn parseCommit(stdout: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len != 40) return null;
+    for (trimmed) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return trimmed;
+}
+
 /// The last component of a worktree root — what the button and its accessible
 /// name say, so a user can see at a glance which repo a report would land in.
 pub fn worktreeName(root: []const u8) []const u8 {
@@ -444,6 +500,54 @@ test "the repo root is trimmed and normalized to backslashes" {
     // A directory in no repo prints nothing.
     try testing.expect(parseRoot(&buf, "") == null);
     try testing.expect(parseRoot(&buf, "\n") == null);
+}
+
+test "the revision query names the root, and the two argvs differ by one flag" {
+    const branch = branchArgv(0, "D:\\repo");
+    try testing.expectEqualStrings("-C", branch[1]);
+    try testing.expectEqualStrings("D:\\repo", branch[2]);
+    try testing.expectEqualStrings("rev-parse", branch[3]);
+    try testing.expectEqualStrings("--abbrev-ref", branch[4]);
+    try testing.expectEqualStrings("HEAD", branch[5]);
+
+    const commit = commitArgv(0, "D:\\repo");
+    try testing.expectEqualStrings("D:\\repo", commit[2]);
+    try testing.expectEqualStrings("HEAD", commit[4]);
+
+    // Both walk the same candidate binaries as the root query, so a box where
+    // `git` is only on the fallback path resolves all three or none.
+    try testing.expectEqualStrings(git_paths[0], branch[0]);
+    try testing.expectEqualStrings(git_paths[git_paths.len - 1], commitArgv(git_paths.len - 1, "x")[0]);
+}
+
+test "a branch is parsed; a detached HEAD and an unborn repo are not" {
+    try testing.expectEqualStrings(
+        "users/dzearing/windows-amd64",
+        parseBranch("users/dzearing/windows-amd64\n").?,
+    );
+    try testing.expectEqualStrings("main", parseBranch("  main \r\n").?);
+    // git spells BOTH "no branch" states `HEAD`, and a report that filed that
+    // as a branch name would be confidently wrong.
+    try testing.expect(parseBranch("HEAD\n") == null);
+    try testing.expect(parseBranch("") == null);
+    try testing.expect(parseBranch("\n") == null);
+    // Output we do not understand is not a branch either.
+    try testing.expect(parseBranch("two words\n") == null);
+}
+
+test "a commit is parsed only when it is a real object name" {
+    try testing.expectEqualStrings(
+        "426db6e83c1f0a2b3c4d5e6f708192a3b4c5d6e7",
+        parseCommit("426db6e83c1f0a2b3c4d5e6f708192a3b4c5d6e7\n").?,
+    );
+    // An unborn repository echoes the literal argument back on stdout; the hex
+    // check is what keeps that out of the report.
+    try testing.expect(parseCommit("HEAD\n") == null);
+    try testing.expect(parseCommit("") == null);
+    // An abbreviated id is not what `rev-parse HEAD` prints, so it is output we
+    // did not ask for rather than a shorter answer.
+    try testing.expect(parseCommit("426db6e8\n") == null);
+    try testing.expect(parseCommit("426db6e83c1f0a2b3c4d5e6f708192a3b4c5d6ez\n") == null);
 }
 
 test "the worktree's name is its last path component" {

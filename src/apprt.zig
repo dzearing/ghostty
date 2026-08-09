@@ -196,6 +196,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_doc.zig");
 
+    // Pure win32 viewer feedback REPORT — the shared JSON format, the source
+    // line resolver, and the staging+rename publish (T636), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_feedback_report.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");

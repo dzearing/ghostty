@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
 const worktree = @import("viewer_worktree.zig");
+const git_run = @import("git_run.zig");
 
 const log = std.log.scoped(.viewer_worktree);
 
@@ -288,37 +289,12 @@ fn repositoryRoot(alloc: Allocator, dir: []const u8, buf: []u8) ?[]const u8 {
     for (worktree.git_paths, 0..) |_, i| {
         const argv = worktree.rootArgv(i, dir);
         var out_buf: [stdout_cap]u8 = undefined;
-        const out = run(alloc, &argv, &out_buf) orelse continue;
+        const out = git_run.capture(alloc, &argv, &out_buf) orelse continue;
         // git prints nothing and exits non-zero outside a repository, which is
         // an ANSWER ("no worktree"), not a reason to try the next binary.
         return worktree.parseRoot(buf, out);
     }
     return null;
-}
-
-/// Run `argv`, returning its stdout in `buf`. Null when the binary could not be
-/// launched at all — the only case worth trying another path for.
-///
-/// `create_no_window` is load-bearing: `git.exe` is a console program and this
-/// is a GUI-subsystem process, so without it every navigation flashes a console
-/// window over the user's terminal.
-fn run(alloc: Allocator, argv: []const []const u8, buf: []u8) ?[]const u8 {
-    var child = std.process.Child.init(argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    // Ignored, not piped: with one pipe there is nothing to interleave, so the
-    // read below cannot deadlock against a full second pipe.
-    child.stderr_behavior = .Ignore;
-    child.create_no_window = true;
-    child.spawn() catch return null;
-
-    const stdout = child.stdout orelse {
-        _ = child.wait() catch {};
-        return null;
-    };
-    const n = stdout.readAll(buf) catch 0;
-    _ = child.wait() catch return null;
-    return buf[0..n];
 }
 
 // -------------------------------------------------------------------------

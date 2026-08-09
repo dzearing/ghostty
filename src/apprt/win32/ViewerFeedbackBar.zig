@@ -958,6 +958,25 @@ fn paintFooter(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) voi
     const hint_w = textWidth(hdc, hints);
     drawUtf8(hdc, @max(l.footer.right - hint_w, l.footer.left), l.footer.top, hints);
 
+    // A send that has landed replaces the destination with what happened to
+    // it — Mac's "Filed …". The destination is what the report is ABOUT to do;
+    // once it has been done, saying so is the more useful of the two, and the
+    // composer closes itself behind the confirmation anyway.
+    if (self.pane.feedbackStatus()) |status| {
+        const saved2 = w32.SaveDC(hdc);
+        defer _ = w32.RestoreDC(hdc, saved2);
+        _ = w32.IntersectClipRect(
+            hdc,
+            l.footer.left,
+            l.footer.top,
+            @max(l.footer.right - hint_w - 8, l.footer.left),
+            l.footer.bottom,
+        );
+        _ = w32.SetTextColor(hdc, self.text_ref);
+        drawUtf8(hdc, l.footer.left, l.footer.top, status);
+        return;
+    }
+
     if (self.pane.feedbackWorktree()) |root| {
         const saved2 = w32.SaveDC(hdc);
         defer _ = w32.RestoreDC(hdc, saved2);
@@ -1004,18 +1023,24 @@ fn updateHover(self: *ViewerFeedbackBar, x: i32, y: i32) void {
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
-/// A button click, delivered on mouse-up over the same button it went down
-/// on. Both destinations are still stubs by design: the screenshot is T636
-/// and the report writer is T637, and a button that logs its intent is what
-/// T633 established as the honest placeholder for a wired-but-unbuilt action.
+/// A button click, delivered on mouse-up over the same button it went down on.
+/// `↑` files the report (T636); `+` is still a stub, because screenshots are
+/// T637 — and a button that logs its intent is what T633 established as the
+/// honest placeholder for a wired-but-unbuilt action.
 fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
     switch (b) {
         .snapshot => log.info(
-            "viewer feedback pane={s} action=snapshot (screenshots are T636)",
+            "viewer feedback pane={s} action=snapshot (screenshots are T637)",
             .{self.pane.paneId()},
         ),
         .send => self.pane.sendFeedback(self.alloc),
     }
+}
+
+/// Repaint the composer's own chrome — what the pane calls when something it
+/// owns and this draws (the footer's status line) has changed.
+pub fn repaint(self: *ViewerFeedbackBar) void {
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
 /// The composer's own chords: Ctrl+Enter sends, Escape closes.

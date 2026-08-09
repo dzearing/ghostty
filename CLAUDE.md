@@ -835,9 +835,24 @@ the queue; consuming it is separate and not built here).
   the latter expands each paragraph mark to CR+LF and every quote offset the
   composer computes has to index the control and the pane's buffer the same
   way.
-  The report writer is **T636** and screenshots/image chips are **T637** (the
-  two were named the wrong way round here until T641); the quoted block landed
-  in **T641** (below).
+  **Send files the report on Windows too** (T636): `↑`/Ctrl+Enter writes the
+  same folder into the same queue, off the UI thread on a worker
+  (`ViewerFeedbackSend.zig`) because two `git rev-parse` spawns and a source
+  file read have no business on the message loop the terminal next door draws
+  on. The format, the `sourceLine` resolver and the staging+rename publish are
+  pure and asserted in the none lane
+  (`src/apprt/win32/viewer_feedback_report.zig`). Two Windows-shaped details:
+  the folder stem is `yyyymmddTHHMMSSZ-<6 hex>` because NTFS reserves `:`, so
+  a naive port of Mac's ISO-8601 stem cannot be a directory name here at all;
+  and the **selection** is TRACKED as it changes by the injected blob
+  (`viewer_bridge.selection_tracker_js`, debounced and capped) rather than
+  asked for at send time, so the send stays synchronous and a page that never
+  answers costs a missing field instead of a stranded composer (D48). The
+  revision is resolved on the SEND rather than cached with the worktree (D47),
+  so a pane left open across a branch switch still names what the user saw.
+  What Windows does not have yet: the long-lived DRAFT staging folder and its
+  footer link (**T645**) and screenshots/image chips (**T637**); the quoted
+  block landed in **T641** (below).
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
@@ -919,7 +934,10 @@ the queue; consuming it is separate and not built here).
   with a single **atomic `rename`** (same filesystem), so a watcher sees either
   nothing or a complete report with every image already present. Promoting one
   to an `in-progress/` queue is likewise a single `mv` — image paths in the
-  report are folder-relative, so they survive the move.
+  report are folder-relative, so they survive the move. On Windows the rename is
+  `std.fs`'s `MoveFileExW` **without** `MOVEFILE_COPY_ALLOWED`, so a staging
+  area that somehow ended up on another volume fails loudly rather than
+  degrading into the non-atomic copy this design exists to avoid.
   The queue lives under **`temp/`** because that name is already gitignored
   here (`.gitignore`) and conventionally elsewhere; a top-level `.feedback/`
   was not, so every filed report showed up as untracked in `git status`.
@@ -934,6 +952,12 @@ the queue; consuming it is separate and not built here).
   `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`,
   `quotes` (see above), and `images` (with pixel dimensions and byte size). On success the composer
   clears and the toolbar shows a "Filed …" confirmation before closing.
+  Absent optionals are **dropped, not written as `null`** (Swift's
+  `JSONEncoder` omits a nil property, and the win32 writer matches it), so a
+  report written on either platform has the same key set for the same content.
+  The JSON keys are the contract and are spelled exactly as Mac emits them —
+  `paneID` with a capital D and `headingId` with a small one, which disagree
+  with each other and stay that way, because the watcher reading them is shared.
 
 ## Session Persistence
 

@@ -71,7 +71,12 @@ const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
 const feedback_doc = @import("viewer_feedback_doc.zig");
+const feedback_report = @import("viewer_feedback_report.zig");
+const ViewerFeedbackSend = @import("ViewerFeedbackSend.zig");
+const viewer_worktree = @import("viewer_worktree.zig");
+const git_run = @import("git_run.zig");
 const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
+const build_config = @import("../../build_config.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
@@ -117,6 +122,21 @@ pub const WM_APP_VIEWER_FOCUS_ADDRESS: u32 = w32.WM_APP + 22;
 /// a thread and only its RESULT lands here, on the GUI thread, where the nav
 /// bar can be re-laid and repainted.
 pub const WM_APP_VIEWER_WORKTREE: u32 = w32.WM_APP + 23;
+
+/// The feedback sender's "the report is filed (or is not)" post (T636). Its
+/// worker runs `git rev-parse` twice, reads the quoted file and writes the
+/// report folder — all blocking work with no business on the message loop the
+/// terminal next door draws on — so only its RESULT lands here, on the GUI
+/// thread, where the composer can be cleared and the confirmation shown.
+pub const WM_APP_VIEWER_FEEDBACK_SENT: u32 = w32.WM_APP + 24;
+
+/// How long the "Filed …" confirmation stays up before the composer closes
+/// itself, matching Mac's 1.8s: long enough to read, short enough that the
+/// pane gives its space back without being asked.
+const feedback_close_delay_ms: u32 = 1800;
+
+/// The confirmation's timer id, in the host window's own timer space.
+const feedback_close_timer_id: usize = 3;
 
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
@@ -401,6 +421,23 @@ feedback_text: std.ArrayListUnmanaged(u8) = .empty,
 /// notice the deletion.
 feedback_quotes: feedback_doc.Registry = .{},
 
+/// The machinery that files a report off the UI thread (T636), created
+/// alongside the probe for the same reason it is: it needs a host window to
+/// post its completion at. Null for every pane that never opened one.
+feedback_send: ?ViewerFeedbackSend = null,
+
+/// What the composer's footer says instead of its destination — "Filed …" or a
+/// failure — set when a send lands and cleared when the composer next opens.
+/// Owned; on the PANE rather than the bar because it is the send's result, and
+/// the send outlives any one paint.
+feedback_status: ?[]u8 = null,
+
+/// What the user currently has SELECTED in the page, tracked by the injected
+/// blob's `selection_tracker_js` and read synchronously when a report is filed
+/// (see that script's comment for why win32 tracks rather than asks). Owned;
+/// null when nothing is selected, which is also its state on a fresh page.
+page_selection: ?[]u8 = null,
+
 /// The table-of-contents card (T160). Created lazily the first time a
 /// document reports 2+ headings; null before that, and null when its window
 /// could not be created (a degradation, not a broken pane).
@@ -571,12 +608,22 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     self.feedback_text.deinit(alloc);
     self.feedback_quotes.deinit(alloc);
     self.feedback_open = false;
+    if (self.feedback_status) |s| alloc.free(s);
+    self.feedback_status = null;
+    if (self.page_selection) |s| alloc.free(s);
+    self.page_selection = null;
     // After the bar (which reads the probe's answer) and before the host
     // window: `deinit` JOINS the worker, and a completion posted in the
-    // meantime is dropped with the window it was addressed to.
+    // meantime is dropped with the window it was addressed to. The feedback
+    // sender is joined on the same terms — a pane can be closed while `git` is
+    // still starting up for a report that was already staged.
     if (self.worktree) |*probe| {
         probe.deinit();
         self.worktree = null;
+    }
+    if (self.feedback_send) |*sender| {
+        sender.deinit();
+        self.feedback_send = null;
     }
     // Destroy the dim overlay before the host window (its owner) is gone —
     // the same ordering Surface.deinit keeps for its own (T380).
@@ -729,6 +776,12 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
         self.worktree.?.attach(hwnd, WM_APP_VIEWER_WORKTREE);
         self.refreshWorktree();
     }
+    // ...and so does the report writer (T636), which posts its own completion
+    // at this same window.
+    if (self.feedback_send == null) {
+        self.feedback_send = ViewerFeedbackSend.init(alloc);
+        self.feedback_send.?.attach(hwnd, WM_APP_VIEWER_FEEDBACK_SENT);
+    }
     // The composer (T634) needs the same two halves, and it is built HERE
     // rather than on first open for one concrete reason: it edits itself from
     // its own WndProc, which has no allocator to reach for. Hidden until the
@@ -808,12 +861,24 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
     const root = self.feedbackWorktree();
     if (open and root == null) return;
 
+    // Whatever the composer does next, it is not "close yourself in a moment
+    // because a report was just filed". A timer left armed across a manual
+    // close would fire into a composer the user had since REOPENED and shut it
+    // under them (T636).
+    if (self.hwnd) |h| _ = w32.KillTimer(h, feedback_close_timer_id);
+
     if (open) {
         const bar = self.feedback orelse {
             log.warn("viewer feedback composer could not be created", .{});
             return;
         };
         self.feedback_open = true;
+        // A "Filed …" line from the last report is not true of this one, and a
+        // confirmation still on screen while a fresh report is being typed is
+        // the footer lying about where the text will go. (Only a pane with a
+        // `pending` can have set a status in the first place — every path that
+        // sets one goes through its allocator.)
+        if (self.pending) |p| self.setFeedbackStatus(p.alloc, "");
         // The composer's only close affordance is the button that opened it,
         // so the nav bar has to stop auto-hiding while it is open — the same
         // reason the compact TOC layout pins it.
@@ -862,21 +927,149 @@ fn feedbackBarHeight(self: *ViewerPane) i32 {
     return bar.barHeight(@max(r.right - r.left, 0), self.scale);
 }
 
-/// Sending is T637 (the report writer). Wired now so the button and
-/// Ctrl+Enter are live rather than dead pixels, and so the path they take is
-/// the one T637 fills in.
+/// File the composed report into the detected worktree's queue (T636).
+///
+/// Everything that blocks — two `git rev-parse` spawns, reading the quoted
+/// file, writing the folder — happens on `ViewerFeedbackSend`'s worker; this
+/// only snapshots what the user composed and hands it over. The composer keeps
+/// its text until the write actually lands, so a failed send leaves the report
+/// in the box rather than swallowing it.
 pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
+    const root = self.feedbackWorktree() orelse {
+        self.setFeedbackStatus(alloc, "No worktree — nowhere to file this");
+        return;
+    };
+    const sender = if (self.feedback_send) |*s| s else return;
+    // A second press while the first send is out must not file twice.
+    if (sender.busy()) return;
+
+    // The quotes still in the text, and the metadata each one carries. Derived,
+    // never tallied: a block the user deleted is simply not in `spans`.
+    const spans = self.feedbackQuoteSpans(alloc) orelse &.{};
+    defer if (spans.len != 0) alloc.free(spans);
+
+    const body = feedback_report.renderBody(alloc, self.feedback_text.items, spans) catch {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer alloc.free(body);
+    if (std.mem.trim(u8, body, " \t\r\n").len == 0) return;
+
+    var quotes = alloc.alloc(feedback_report.Quote, spans.len) catch {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer alloc.free(quotes);
+    for (spans, 0..) |s, i| {
+        const e = self.feedback_quotes.entries.items[s.index];
+        quotes[i] = .{
+            .number = e.id,
+            .text = e.text,
+            .heading_id = e.heading_id,
+            .heading_text = e.heading_text,
+            .block_selector = e.block_selector,
+            .block_text = e.block_text,
+            .offset_in_block = e.offset_in_block,
+            .document_offset = e.document_offset,
+        };
+    }
+
+    var viewport_buf: [32]u8 = undefined;
+    const viewport = self.viewportText(&viewport_buf);
+
+    const started = sender.begin(.{
+        .worktree_path = root,
+        .worktree_name = viewer_worktree.worktreeName(root),
+        .location = self.location orelse "",
+        .kind = if (self.mode == .web) "web" else "file",
+        .file_path = self.file_path,
+        .page_title = self.title,
+        .selection = self.page_selection,
+        // Absent rather than a row of NULs when the pane was built without one
+        // — every pane the app makes has an id, and a report is not the place
+        // to discover that a test double did not.
+        .pane_id = if (pane_id_mod.isValid(self.paneId())) self.paneId() else null,
+        .viewport = viewport,
+        .app_version = build_config.version_string,
+        .body = body,
+        .quotes = quotes,
+        .epoch_secs = @intCast(@max(std.time.timestamp(), 0)),
+        // Only has to break a tie inside one second; the timestamp separates
+        // everything else.
+        .suffix = std.crypto.random.int(u24),
+    });
+    if (!started) {
+        self.setFeedbackStatus(alloc, "Could not file this report");
+        return;
+    }
+
+    // The acceptance oracle, and the same shape the rest of this chrome logs:
+    // owner-painted chrome inside a background test desktop cannot be
+    // screenshotted, so the pane states what it did in its own stderr.
+    // `buffer` is the composer's raw text and `bytes` the rendered body: the
+    // two differ (trimming, `> ` on quoted lines), and the acceptance script
+    // needs the first to check the control⇄pane mirror.
     log.info(
-        "viewer feedback pane={s} action=send len={d} quotes={d} (the report writer is T637)",
-        .{
-            self.paneId(),
-            self.feedback_text.items.len,
-            // Derived, not counted: this is the number that goes into the
-            // report's `quotes` array, so it has to be the same derivation the
-            // writer will use rather than a tally something has to maintain.
-            self.feedbackQuoteCount(alloc),
-        },
+        "viewer feedback pane={s} action=send bytes={d} buffer={d} quotes={d} worktree={s}",
+        .{ self.paneId(), body.len, self.feedback_text.items.len, quotes.len, root },
     );
+}
+
+/// The pane's size in DIPs, e.g. "820x540" — it tells a reader whether a
+/// layout complaint was made at a narrow width. Empty when the pane has no
+/// window to measure, which is every unit-test pane.
+fn viewportText(self: *ViewerPane, buf: []u8) []const u8 {
+    const h = self.hwnd orelse return "";
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return "";
+    const scale = if (self.scale > 0) self.scale else 1.0;
+    const w: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(r.right - r.left)) / scale));
+    const height: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(r.bottom - r.top)) / scale));
+    return std.fmt.bufPrint(buf, "{d}x{d}", .{ w, height }) catch "";
+}
+
+/// The send worker landed. On success the composer is emptied and closes
+/// itself behind a confirmation; on failure the text is kept, because a report
+/// the user has to retype is worse than one that took two presses.
+fn completeFeedbackSend(self: *ViewerPane) void {
+    const sender = if (self.feedback_send) |*s| s else return;
+    const p = self.pending orelse return;
+    const result = sender.complete() orelse return;
+
+    self.setFeedbackStatus(p.alloc, result.text);
+    if (result.ok) {
+        self.feedbackSetText(p.alloc, "");
+        // The registry goes with the text: its entries describe passages that
+        // are now in a filed report, and a quote that survived into the NEXT
+        // report would attach that report's context to this one's passage.
+        self.feedback_quotes.deinit(p.alloc);
+        if (self.feedback) |bar| bar.seedControl();
+        if (self.hwnd) |h| {
+            _ = w32.SetTimer(h, feedback_close_timer_id, feedback_close_delay_ms, null);
+        }
+    }
+    log.info("viewer feedback pane={s} filed={} stem={s} status={s}", .{
+        self.paneId(),
+        result.ok,
+        result.stem,
+        result.text,
+    });
+    if (self.feedback) |bar| bar.repaint();
+}
+
+/// What the composer's footer says instead of its destination. Owned by the
+/// pane; cleared when the composer next opens, so a stale "Filed …" never
+/// greets the next report.
+fn setFeedbackStatus(self: *ViewerPane, alloc: Allocator, text: []const u8) void {
+    const dup: ?[]u8 = if (text.len == 0) null else (alloc.dupe(u8, text) catch null);
+    if (self.feedback_status) |s| alloc.free(s);
+    self.feedback_status = dup;
+}
+
+/// The footer's status line, or null when the composer should show its
+/// destination instead.
+pub fn feedbackStatus(self: *const ViewerPane) ?[]const u8 {
+    return self.feedback_status;
 }
 
 // The composer's text. The editing happens in a RichEdit (T635, D43's answer)
@@ -988,6 +1181,9 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     // Left stale, a `+reload` arriving during a navigation would re-render the
     // OLD file into the NEW page (T390).
     self.page_loaded = false;
+    // ...and neither is the selection: whatever the user had highlighted is a
+    // fact about the OLD document, and the new one starts with none (T636).
+    self.setPageSelection(alloc, null);
     if (self.home_location == null) {
         self.home_location = alloc.dupeZ(u8, url) catch null;
     }
@@ -1266,7 +1462,20 @@ fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) vo
         .headings => |items| self.setHeadings(alloc, items),
         .active => |id| self.setActiveHeading(alloc, id),
         .quote => |q| self.acceptQuote(alloc, q),
+        .selection => |text| self.setPageSelection(alloc, text),
     }
+}
+
+/// Remember what the user has selected in the page, so a report can say what
+/// they were pointing at (T636). Null clears it — a click into the page must
+/// take the previous selection out of the next report.
+///
+/// Best-effort: a selection we could not copy is one the report goes without,
+/// which is strictly better than a send that fails over context.
+fn setPageSelection(self: *ViewerPane, alloc: Allocator, text: ?[]const u8) void {
+    const dup: ?[]u8 = if (text) |t| (alloc.dupe(u8, t) catch null) else null;
+    if (self.page_selection) |s| alloc.free(s);
+    self.page_selection = dup;
 }
 
 /// The page's Quote button: register the passage with its referential context
@@ -1704,6 +1913,12 @@ fn onNavigationCompleted(
         return com.S_OK;
     };
     self.page_loaded = true;
+    // A fresh document has no selection, and the outgoing one's last tracked
+    // selection can still be in flight when this lands — its `postMessage` was
+    // queued before the old page went away (T636). Clearing HERE, at the point
+    // the new document exists, is what keeps the previous page's highlight out
+    // of the next report.
+    self.setPageSelection(p.alloc, null);
     // Keyboard page zoom survives navigation (T161): re-push a non-default
     // factor so following a link or reloading keeps the chosen zoom — the
     // same re-apply Mac does after `didFinish`.
@@ -3404,9 +3619,23 @@ pub fn wndProc(
             return 0;
         },
 
+        // The feedback worker filed the report (or could not) — T636. Also the
+        // only place THAT answer is read, for the same reason.
+        WM_APP_VIEWER_FEEDBACK_SENT => {
+            self.completeFeedbackSend();
+            return 0;
+        },
+
         w32.WM_TIMER => {
             if (wparam == nav_timer_id) {
                 self.navHoverTick();
+                return 0;
+            }
+            if (wparam == feedback_close_timer_id) {
+                // One-shot: the confirmation has been read, so the composer
+                // gives the pane its band back.
+                _ = w32.KillTimer(hwnd, feedback_close_timer_id);
+                self.setFeedbackOpen(false);
                 return 0;
             }
             if (wparam != reload_timer_id) {
@@ -3629,6 +3858,14 @@ test "host floor: a real controller on a real window, on this box" {
 
     var pane: ViewerPane = .{};
     defer pane.deinit(alloc);
+    // `create` is what normally mints this, and this test builds the pane by
+    // hand — without it the pane's id is a row of NULs, which the feedback
+    // report below would have to have an opinion about.
+    {
+        var id_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&id_bytes);
+        _ = pane_id_mod.format(&pane.pane_id, id_bytes);
+    }
     try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 640, .bottom = 480 });
     pane.start(alloc, &host);
 
@@ -4744,6 +4981,17 @@ test "host floor: a real controller on a real window, on this box" {
         const quote_path = try std.fs.path.join(alloc, &.{ dir_path, "quote.md" });
         defer alloc.free(quote_path);
 
+        // A THROWAWAY repository, made out of the tmp dir itself (T636).
+        //
+        // Without this the probe resolves to the ghoztty checkout the tmp dir
+        // lives inside, and the send below would file a fake report into the
+        // real `temp/feedback/new/` queue — where the user's own feedback
+        // watcher would pick it up. A nested `git init` makes
+        // `rev-parse --show-toplevel` stop at the tmp dir, so the whole report
+        // lands inside what `tmp.cleanup()` deletes.
+        const repo_ready = gitInitTestRepo(alloc, dir_path);
+        if (!repo_ready) log.warn("quote: no throwaway repo; the send half is skipped", .{});
+
         try pane.navigate(alloc, quote_path);
         try waitFor(&msg, 30, struct {
             fn ready(p: *ViewerPane) bool {
@@ -4752,14 +5000,27 @@ test "host floor: a real controller on a real window, on this box" {
         }.ready, &pane);
 
         // The composer only opens for a pane that has somewhere to file, and
-        // that answer arrives from a worker thread (T633). The tmp dir is
-        // inside THIS repo, so the probe has a real worktree to find — waiting
-        // for it is waiting out the thread, not hoping.
-        try waitFor(&msg, 30, struct {
+        // that answer arrives from a worker thread (T633). Waiting for the
+        // worktree to be THE TMP DIR — not merely non-null — is what makes this
+        // a wait on the new resolution rather than on a stale one from a
+        // location visited earlier in this test.
+        const Wanted = struct {
+            var root: []const u8 = "";
             fn ready(p: *ViewerPane) bool {
-                return p.feedbackWorktree() != null;
+                const got = p.feedbackWorktree() orelse return false;
+                return std.ascii.eqlIgnoreCase(got, root);
             }
-        }.ready, &pane);
+        };
+        if (repo_ready) {
+            Wanted.root = dir_path;
+            try waitFor(&msg, 30, Wanted.ready, &pane);
+        } else {
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackWorktree() != null;
+                }
+            }.ready, &pane);
+        }
         log.warn("quote: worktree={?s}", .{pane.feedbackWorktree()});
 
         const driver = try selectionDriverJs(alloc, "ghoztty quoted this passage", "quote", true);
@@ -4803,16 +5064,165 @@ test "host floor: a real controller on a real window, on this box" {
         try testing.expect(std.mem.indexOf(u8, pane.feedbackText(), entry.text) != null);
         try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
 
-        // ...and deleting it takes its metadata out of the report without
+        // ------------------------------------------------------------------
+        // T636: press send, and read the report back off disk
+        // ------------------------------------------------------------------
+        //
+        // The end of the whole chain, with nothing stubbed: the composer's real
+        // text and the real quote go to the real worker, which runs `git
+        // rev-parse` against the throwaway repo, searches the source file for
+        // the passage, and publishes a folder into `temp/feedback/new/`. What
+        // is asserted is the FILE — a watcher's view of the report, not the
+        // pane's view of itself.
+        if (repo_ready) {
+            // What the user is POINTING AT when they hit send, tracked by the
+            // injected blob rather than asked for at send time (T636). Selected
+            // for real in the page, and waited for rather than slept on: the
+            // tracker debounces, so the wait IS the assertion that the message
+            // arrived at all.
+            const selected = "a paragraph under the first heading";
+            pane.executeScript(alloc,
+                \\(function () {
+                \\  var p = document.querySelectorAll("p")[0];
+                \\  var r = document.createRange();
+                \\  r.selectNodeContents(p);
+                \\  var s = window.getSelection();
+                \\  s.removeAllRanges();
+                \\  s.addRange(r);
+                \\})()
+            );
+            const Selected = struct {
+                fn ready(p: *ViewerPane) bool {
+                    const s = p.page_selection orelse return false;
+                    return std.mem.eql(u8, s, selected);
+                }
+            };
+            try waitFor(&msg, 30, Selected.ready, &pane);
+
+            // The user types under the quoted block, which is where quoting
+            // parked the caret.
+            const composed = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n\nthis heading is wrong\n",
+                .{pane.feedbackText()},
+            );
+            defer alloc.free(composed);
+            pane.feedbackSetText(alloc, composed);
+            try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
+
+            pane.sendFeedback(alloc);
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackStatus() != null;
+                }
+            }.ready, &pane);
+            log.warn("send: status={?s}", .{pane.feedbackStatus()});
+
+            // Exactly ONE folder, and its report is complete — the atomicity
+            // property, read the way a watcher reads it. A staging folder left
+            // visible in `new/` would be a half-written report; there is none,
+            // because the publish is a rename of a finished folder.
+            var queue = try tmp.dir.openDir("temp/feedback/new", .{ .iterate = true });
+            defer queue.close();
+            var folders: usize = 0;
+            var stem_buf: [64]u8 = undefined;
+            var stem: []const u8 = "";
+            var it = queue.iterate();
+            while (try it.next()) |e| {
+                folders += 1;
+                @memcpy(stem_buf[0..e.name.len], e.name);
+                stem = stem_buf[0..e.name.len];
+            }
+            try testing.expectEqual(@as(usize, 1), folders);
+
+            const report_path = try std.fmt.allocPrint(
+                alloc,
+                "temp/feedback/new/{s}/report.json",
+                .{stem},
+            );
+            defer alloc.free(report_path);
+            const raw = try tmp.dir.readFileAlloc(alloc, report_path, 256 * 1024);
+            defer alloc.free(raw);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            log.warn("send: report={s}", .{raw});
+
+            // The body is markdown, with the quote as a real blockquote and the
+            // user's own sentence under it.
+            const body = obj.get("body").?.string;
+            try testing.expect(std.mem.indexOf(u8, body, "> ghoztty quoted this passage") != null);
+            try testing.expect(std.mem.indexOf(u8, body, "this heading is wrong") != null);
+
+            // The revision the user was looking at — the half T633 did not
+            // ship, resolved here against the throwaway repo.
+            const worktree_obj = obj.get("worktree").?.object;
+            try testing.expectEqualStrings("main", worktree_obj.get("branch").?.string);
+            try testing.expectEqual(@as(usize, 40), worktree_obj.get("commit").?.string.len);
+
+            // Where they were, repo-relative and forward-slashed.
+            const source = obj.get("source").?.object;
+            try testing.expectEqualStrings("file", source.get("kind").?.string);
+            try testing.expectEqualStrings("quote.md", source.get("relativePath").?.string);
+            try testing.expectEqualStrings(pane.paneId(), source.get("paneID").?.string);
+            // What they had highlighted — the difference between "this is
+            // wrong" and a report that names what "this" was.
+            try testing.expectEqualStrings(selected, source.get("selection").?.string);
+
+            // ...and the quote, with the line of the SOURCE file it came from.
+            // Line 7 is `ghoztty quoted this passage` in the document written
+            // at the top of this block.
+            const q = obj.get("quotes").?.array.items[0].object;
+            try testing.expectEqualStrings("ghoztty quoted this passage", q.get("text").?.string);
+            try testing.expectEqualStrings("Beta", q.get("headingText").?.string);
+            try testing.expectEqual(@as(i64, 7), q.get("sourceLine").?.integer);
+
+            // The composer is empty behind its confirmation, so the next report
+            // does not start with the last one still in the box.
+            try testing.expectEqual(@as(usize, 0), pane.feedbackText().len);
+            try testing.expect(std.mem.startsWith(u8, pane.feedbackStatus().?, "Filed "));
+        }
+
+        // ...and deleting a block takes its metadata out of the report without
         // anything having to notice the deletion. (Done by rewriting the
         // buffer, which is exactly what the control's change mirror does when
         // a user selects the block and hits Delete.)
         pane.feedbackSetText(alloc, "just my own words\n");
         try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
-        // The entry is still in the registry — "not in the report" is derived,
-        // not destructive, which is what makes an undo bring the quote back.
-        try testing.expectEqual(@as(usize, 1), pane.feedback_quotes.entries.items.len);
     }
+}
+
+/// Test-only: turn `dir` into its own throwaway git repository, with one
+/// commit so `HEAD` resolves. False when git is not on this box or any step
+/// failed — the caller then skips the half of the test that needs a repo
+/// rather than filing a report into whatever repository `dir` sits inside.
+///
+/// `-c user.*` on the command line rather than in the repo config: the box's
+/// global identity may be anything, and a commit that fails for want of one
+/// would look like a bug in the code under test.
+fn gitInitTestRepo(alloc: Allocator, dir: []const u8) bool {
+    const runs = [_][]const []const u8{
+        &.{ "git", "-C", dir, "init", "--initial-branch=main" },
+        &.{ "git", "-C", dir, "add", "-A" },
+        &.{
+            "git",                        "-C",
+            dir,                          "-c",
+            "user.name=ghoztty test",     "-c",
+            "user.email=test@ghoztty",    "commit",
+            "--allow-empty",              "-m",
+            "throwaway",
+        },
+    };
+    var buf: [4096]u8 = undefined;
+    for (runs) |argv| {
+        _ = git_run.capture(alloc, argv, &buf) orelse return false;
+    }
+    // Proof rather than hope: the root git now reports for `dir` must BE `dir`.
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const argv = viewer_worktree.rootArgv(0, dir);
+    const out = git_run.capture(alloc, &argv, &buf) orelse return false;
+    const root = viewer_worktree.parseRoot(&root_buf, out) orelse return false;
+    return std.ascii.eqlIgnoreCase(root, dir);
 }
 
 /// A window's OWN visibility bit (T160's oracle). NOT `IsWindowVisible`,

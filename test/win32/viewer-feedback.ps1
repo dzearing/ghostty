@@ -14,8 +14,12 @@
 #   E. Escape closes it (a pane-scoped chord, live only in the composer).
 #   F. text typed into the composer SURVIVES closing and reopening -- the
 #      state lives on the pane, not on the toolbar window.
-#   G. Ctrl+Enter sends, and reports the length the pane still holds, which is
-#      the same assertion as F from the other side.
+#   G. Ctrl+Enter sends, and a COMPLETE report folder lands in the throwaway
+#      repo's `temp/feedback/new/` (T636): the queue is polled the way a
+#      watcher polls it, so a folder seen without its `report.json` would fail
+#      the atomicity assertion; the JSON's worktree branch/commit are the
+#      throwaway repo's exact revision; and the composer empties and closes
+#      itself behind the confirmation.
 #   H. the composer's chords are PANE-SCOPED: Escape and Ctrl+Enter delivered
 #      to a terminal pane produce no composer activity at all.
 #
@@ -30,8 +34,11 @@
 #   * the pane states each open/close in its own stderr:
 #         viewer feedback pane=<id> open=<bool> bar_h=<px> worktree=<path>
 #     and each send as
-#         viewer feedback pane=<id> action=send len=<n> ...
-#     which is what F and G read.
+#         viewer feedback pane=<id> action=send bytes=<n> quotes=<n> ...
+#         viewer feedback pane=<id> filed=<bool> stem=<name> status=<text>
+#     which is what F and G read. G's real oracle, though, is the FILE the
+#     send produced -- a watcher's view of the report rather than the pane's
+#     view of itself.
 #
 # KNOWN HARNESS LIMIT: a posted Ctrl+Enter needs the app's own GetKeyState to
 # see the modifier, which a plain PostMessage cannot arrange. Send-TestViewerChord
@@ -170,16 +177,41 @@ function Wait-FeedbackState($errlog, $paneId, [bool]$Open) {
     return (Get-FeedbackState $errlog $paneId)
 }
 
-# The last `action=send len=N` the pane reported, or $null.
+# The last `action=send bytes=N quotes=M` the pane reported, or $null.
 function Get-LastSendLen($errlog, $paneId) {
     if (-not (Test-Path $errlog) -or -not $paneId) { return $null }
     $hit = $null
     foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
-        if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) action=send len=(\d+)") {
+        if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) action=send bytes=(\d+)") {
             $hit = [int]$Matches[1]
         }
     }
     return $hit
+}
+
+# The last `buffer=N` (the composer's RAW text length) the pane reported.
+function Get-LastSendBuffer($errlog, $paneId) {
+    if (-not (Test-Path $errlog) -or -not $paneId) { return $null }
+    $hit = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) action=send bytes=\d+ buffer=(\d+)") {
+            $hit = [int]$Matches[1]
+        }
+    }
+    return $hit
+}
+
+# Every report folder currently in the queue, with whether it is COMPLETE. A
+# folder without its `report.json` is what a watcher must never see -- the
+# publish is a rename of a finished folder, so such a state cannot exist.
+function Get-QueueFolders($queueDir) {
+    if (-not (Test-Path $queueDir)) { return @() }
+    return @(Get-ChildItem -Path $queueDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{
+            Name     = $_.Name
+            Complete = (Test-Path (Join-Path $_.FullName 'report.json'))
+        }
+    })
 }
 
 function Wait-WorktreeShown($errlog, $paneId) {
@@ -210,10 +242,36 @@ function Invoke-FeedbackButton($view) {
     return (Send-TestMouse -Window $view.Top -Target $nb -X $x -Y $y)
 }
 
-$viewFile = Join-Path $repo 'README.md'
+# A THROWAWAY working tree, not this repo (T636).
+#
+# Since the report writer landed, arm G's Ctrl+Enter FILES a report into the
+# worktree the pane's content belongs to. Pointed at this checkout, every
+# acceptance run would drop a junk report into the user's own
+# `temp/feedback/new/` queue for their watcher to pick up. A temp repo is also
+# what makes the revision assertions exact: this one's branch and commit are
+# whatever the developer happens to be on.
+$work = Join-Path $env:TEMP ("ghoztty-feedback-accept-" + $PID)
+Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+Set-Content -Path (Join-Path $work 'README.md') -Encoding utf8 -Value @(
+    '# Throwaway',
+    '',
+    'a paragraph in the throwaway repo',
+    ''
+)
+& git -C $work init --initial-branch=main *> $null
+& git -C $work add -A *> $null
+& git -C $work -c user.name='ghoztty test' -c user.email='test@ghoztty' commit -m 'throwaway' *> $null
+# git prints FORWARD slashes on Windows; the app normalizes them at the one
+# place the string enters it (viewer_worktree.parseRoot), so the comparison
+# below has to be against the normalized form rather than git's own.
+$workRoot = (& git -C $work rev-parse --show-toplevel 2>$null | Out-String).Trim().Replace('/', '\')
+if (-not $workRoot) { Write-Host "SETUP FAIL: could not make a throwaway repo at $work"; exit 1 }
+$workCommit = (& git -C $work rev-parse HEAD 2>$null | Out-String).Trim()
+$queueDir = Join-Path $work 'temp\feedback\new'
+$stagingDir = Join-Path $work 'temp\feedback\.staging'
 
-$repoRoot = (& git -C $repo rev-parse --show-toplevel 2>$null | Out-String).Trim()
-if (-not $repoRoot) { Write-Host "SETUP FAIL: $repo is not a working tree"; exit 1 }
+$viewFile = Join-Path $work 'README.md'
 
 Stop-RepoInstances
 Start-TestForegroundWatch
@@ -369,7 +427,11 @@ try {
     Assert ($hBack -eq $h2) `
         "the reopened composer is still the size its TEXT makes it ($hBack vs $h2) -- state lives on the pane"
 
-    # --- G. Ctrl+Enter sends, and names the length the pane still holds ------
+    # --- G. Ctrl+Enter sends, and a complete report lands on disk (T636) -----
+    # `@(...)` at every call site, not just inside the function: PowerShell
+    # unrolls a one-element array on return, and `.Count` on the bare object is
+    # $null -- which reads as "0 folders" and passes a test that should fail.
+    Assert (@(Get-QueueFolders $queueDir).Count -eq 0) 'the queue starts empty'
     [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
     $len = $null
     for ($t = 0; $t -lt 20; $t++) {
@@ -377,9 +439,71 @@ try {
         if ($null -ne $len) { break }
         Start-Sleep -Milliseconds 250
     }
-    Assert ($null -ne $len) "Ctrl+Enter reaches the pane as a send (len=$len)"
+    Assert ($null -ne $len) "Ctrl+Enter reaches the pane as a send (bytes=$len)"
     Assert ($null -ne $len -and $len -gt 0) `
-        "...and the text typed before the close/reopen is still there (len=$len)"
+        "...and the text typed before the close/reopen is still there (bytes=$len)"
+
+    # Poll the queue the way a watcher does, and record whether one was ever
+    # observed WITHOUT its report.json. The publish is a single rename of a
+    # folder that is already finished, so the answer must be never -- that is
+    # the atomicity property, asserted rather than assumed.
+    $folders = @()
+    $sawPartial = $false
+    for ($t = 0; $t -lt 80; $t++) {
+        $folders = @(Get-QueueFolders $queueDir)
+        foreach ($f in $folders) { if (-not $f.Complete) { $sawPartial = $true } }
+        if ($folders.Count -gt 0 -and -not $sawPartial) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert ($folders.Count -eq 1) "exactly one report folder appeared (got $($folders.Count))"
+    Assert (-not $sawPartial) 'no folder was ever visible in the queue without its report.json'
+    Assert (-not (Test-Path (Join-Path $stagingDir $folders[0].Name))) `
+        'the staging folder is gone -- it WAS the published one, renamed'
+
+    $reportPath = Join-Path $queueDir (Join-Path $folders[0].Name 'report.json')
+    $report = $null
+    try { $report = Get-Content $reportPath -Raw | ConvertFrom-Json } catch { }
+    Assert ($null -ne $report) "the report parses as JSON ($reportPath)"
+    if ($report) {
+        Assert ($report.version -ge 2) "...with the shared schema version (got $($report.version))"
+        Assert ($report.body.Length -gt 0) "...a body ($($report.body.Length) chars)"
+        Assert ($report.source.kind -eq 'file') "...the source kind ('$($report.source.kind)')"
+        Assert ($report.source.relativePath -eq 'README.md') `
+            "...the path repo-relative and forward-slashed ('$($report.source.relativePath)')"
+        Assert ($report.source.paneID -eq $paneId) `
+            "...the pane it came from ('$($report.source.paneID)')"
+        Assert ($report.worktree.path -eq $workRoot) `
+            "...the worktree it was filed into ('$($report.worktree.path)')"
+        # The revision half T633 did not ship: this is the exact commit the
+        # throwaway repo is on, so a stale or guessed value cannot pass.
+        Assert ($report.worktree.branch -eq 'main') `
+            "...the branch the user was on ('$($report.worktree.branch)')"
+        Assert ($report.worktree.commit -eq $workCommit) `
+            "...and the commit ('$($report.worktree.commit)')"
+    }
+
+    # On success the composer empties and says so, then closes itself behind
+    # the confirmation.
+    $filed = $false
+    for ($t = 0; $t -lt 40; $t++) {
+        foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+            if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) filed=true stem=(\S+)") {
+                $filed = $true
+            }
+        }
+        if ($filed) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert $filed 'the pane reports the report as filed'
+    Assert ((Get-TestControlText $rich) -eq '') `
+        "the composer is empty after a successful send (got '$(Get-TestControlText $rich)')"
+    $sClosed = Wait-FeedbackState $errlog $paneId $false
+    Assert ($sClosed -and -not $sClosed.Open) 'the composer closes itself behind the confirmation'
+
+    # ...and the rest of the arms need it open again.
+    Assert (Invoke-FeedbackButton $view) 're-opening the composer after a send reaches the pane'
+    $s = Wait-FeedbackState $errlog $paneId $true
+    Assert ($s -and $s.Open) 'the composer is open again for the editing arms'
 
     # --- I. it edits like a text control: caret and selection (T635) ---------
     # The T634 surface could only append and backspace, so every check here is
@@ -486,18 +610,29 @@ try {
     # The pane's own buffer tracked all of it. The oracle is the CONTROL's own
     # text, canonicalised to LF the way the mirror does -- the invariant is
     # "the buffer is what the control holds", not a hard-coded number, and it
-    # is what the report writer (T637) will read.
+    # is what the report writer reads.
+    #
+    # `buffer=`, not `bytes=`: since T636 a send also reports the RENDERED body
+    # length, which is deliberately not the same number (it is trimmed, and
+    # quoted lines carry a `> `). This arm is about the mirror, so it reads the
+    # raw buffer.
     $ctlText = (Get-TestControlText $rich) -replace "`r`n", "`n" -replace "`r", "`n"
-    $lenBefore = Get-LastSendLen $errlog $paneId
+    $bufBefore = Get-LastSendBuffer $errlog $paneId
     [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
-    $lenAfter = $null
+    $bufAfter = $null
     for ($t = 0; $t -lt 20; $t++) {
-        $lenAfter = Get-LastSendLen $errlog $paneId
-        if ($lenAfter -ne $lenBefore) { break }
+        $bufAfter = Get-LastSendBuffer $errlog $paneId
+        if ($bufAfter -ne $bufBefore) { break }
         Start-Sleep -Milliseconds 250
     }
-    Assert ($lenAfter -eq $ctlText.Length) `
-        "the pane's buffer mirrors the control through all of it (len=$lenAfter, control holds $($ctlText.Length))"
+    Assert ($bufAfter -eq $ctlText.Length) `
+        "the pane's buffer mirrors the control through all of it (buffer=$bufAfter, control holds $($ctlText.Length))"
+
+    # That probe was a REAL send (T636), so it filed a second report and the
+    # composer is clearing and closing itself behind the confirmation. Wait it
+    # out rather than letting it land in the middle of the next arm, which
+    # compares the composer's open state across a terminal-pane chord.
+    [void](Wait-FeedbackState $errlog $paneId $false)
 
     # --- H. the chords are pane-scoped ---------------------------------------
     # A terminal pane gets the same two chords. Nothing composer-shaped may
@@ -535,6 +670,9 @@ try {
 } finally {
     Remove-TestDesktop
     Stop-RepoInstances
+    # The throwaway repo goes with the run, reports and all -- it exists so the
+    # send has somewhere to file that is not the user's own queue.
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

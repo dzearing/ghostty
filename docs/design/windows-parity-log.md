@@ -12421,3 +12421,70 @@ Lanes none/win32/agent PASS (win32 re-run alone after the last edit, PASS in
 `t400` stale-debounce assertion derives its expectation from an unpinned
 baseline and failed once in three runs of the same tree — the passing runs are
 vacuous, so neither outcome is evidence.
+
+## 2026-08-09 — T636: pressing Send in a Windows viewer pane files a real report
+
+The composer now produces something. `↑` (or Ctrl+Enter) writes one
+self-contained folder into `<worktree>/temp/feedback/new/` — `report.json`
+today, `images/` when T637 lands — carrying the user's markdown, every quote
+still in the text with its heading and block context, where the pane was, what
+they had selected, the pane size, and the exact branch and commit they were
+looking at. The format is Mac's, key for key, because the queue is drained by
+one shared watcher: `paneID` keeps its capital D and `headingId` its small one,
+absent optionals are dropped rather than written as `null` (what Swift's
+`JSONEncoder` does with a nil property), and the whole thing is asserted against
+a parsed document rather than a golden string.
+
+Atomicity is the load-bearing property and it is the reason the folder is built
+in `.staging/` and published with a single rename: a watcher scanning `new/`
+sees nothing or a complete report, never a folder whose `report.json` has not
+landed. On Windows that rename is `MoveFileExW` WITHOUT `MOVEFILE_COPY_ALLOWED`,
+so a staging area that somehow ended up on another volume fails loudly instead
+of degrading into the non-atomic copy the design exists to avoid. The folder
+name is `yyyymmddTHHMMSSZ-<6 hex>` — sortable, so a watcher drains oldest-first
+with a plain directory sort, and colon-free, because NTFS reserves `:` for
+alternate data streams and a naive port of Mac's ISO-8601 stem could not be a
+directory name here at all.
+
+Two calls are worth reading, and both are filed as decisions. **D47**: the task
+said to resolve `branch`/`commit` on the worktree probe's worker, and that would
+make them as old as the pane — the probe answers "which repo is this content
+in", which does not change when you switch branches, so its 15-second TTL never
+expires for a pane nobody navigates. A report exists to be replayed against the
+revision the user saw, so the two `git rev-parse` calls run on the SEND's own
+worker (the argv+parse halves still live in the pure `viewer_worktree.zig`
+beside the root query, where they assert without a process). **D48**: Mac reads
+the page selection at send time with one `evaluateJavaScript` and a 1.5-second
+timeout; WebView2 has no synchronous evaluation, so the same shape would mean
+holding a composer snapshot across an async round trip and inventing a timer for
+the case where a page never answers. Instead our own injected script tracks the
+selection as it changes — debounced 200 ms, posted only when the text actually
+moved, capped at 16 KB — and the send reads a value the pane already has. The
+failure mode moves from "the send hangs" to "the report has no selection", which
+the format already allows. `selection.js` is untouched: the tracker is in the
+win32 wrapper, and a unit test asserts the shared file knows nothing about it.
+
+Everything blocking is on a worker (`ViewerFeedbackSend.zig`) with the same job/
+post/join shape the worktree probe uses, because the viewer's message loop is
+the one the terminal next door draws on. A pane closed mid-send joins its
+worker; a completion posted to a dying window is dropped with it.
+
+The acceptance script now views a file in a `git init`'d TEMP repo rather than
+this checkout. That is not tidiness: since the writer is real, arm G's
+Ctrl+Enter files an actual report, and pointed here every acceptance run would
+drop junk into the user's own feedback queue for their watcher to pick up. The
+throwaway repo also makes the revision assertions exact — the branch is `main`
+and the commit is compared against that repo's `rev-parse HEAD`, so a stale or
+guessed value cannot pass. The same reasoning moved the live WebView2 arm: it
+`git init`s its tmp dir before quoting, then reads the filed `report.json` back
+off disk and checks the body's blockquote, `relativePath`, `paneID`, the tracked
+selection, and `sourceLine` = 7.
+
+Lanes none/win32/agent PASS, P1–P3 ALL PASS, `viewer-feedback.ps1` 67 pass / 1
+fail — the one failure is **T644**, filed here: Ctrl+Z in the composer undoes an
+invisible formatting record instead of the edit, almost certainly the
+`EM_SETCHARFORMAT` T641's `ensurePlainAtCaret` sends before every keystroke.
+Proven pre-existing rather than assumed: the arm fails identically with this
+task's whole send path compiled out. Also filed **T645**: Mac's long-lived DRAFT
+staging folder, its footer link and its stale-draft pruning, which win32 does not
+have — its staging folder exists only for the moment between build and publish.

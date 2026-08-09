@@ -71,6 +71,47 @@ const prologue =
     "  \"use strict\";\n" ++
     "  if (window.top !== window) return;\n";
 
+/// What the user currently has SELECTED in the page, kept current so the
+/// feedback report can name it (T636). Ours, not upstream's — `selection.js`
+/// only speaks when its Quote button is pressed.
+///
+/// Mac reads the selection at send time with one `evaluateJavaScript`, and
+/// win32 deliberately does not: an async round trip on the send path needs a
+/// timeout for a wedged or hostile page, and a page that never answers would
+/// strand the composer holding text it had already filed. Tracking it as it
+/// changes makes the send SYNCHRONOUS in the one place it matters — reading a
+/// value the pane already has — and moves the failure mode from "the send
+/// hangs" to "the report has no selection", which the format already allows.
+///
+/// Three properties keep an every-selection listener cheap on pages we do not
+/// own: it is debounced to one post per 200ms of settling, it posts only when
+/// the text actually CHANGED (a caret move inside the same selection is
+/// silent), and it caps what it sends — a select-all on a large document is
+/// not context, and nobody points at a megabyte.
+pub const selection_tracker_js =
+    \\  var ghozttyLastSelection = null;
+    \\  var ghozttySelectionTimer = 0;
+    \\  var ghozttyPostSelection = function () {
+    \\    ghozttySelectionTimer = 0;
+    \\    var s = "";
+    \\    try { s = String(window.getSelection()); } catch (e) {}
+    \\    s = s.replace(/^\s+|\s+$/g, "");
+    \\    if (s.length > 16384) s = s.slice(0, 16384);
+    \\    if (s === ghozttyLastSelection) return;
+    \\    ghozttyLastSelection = s;
+    \\    var mh = window.webkit && window.webkit.messageHandlers;
+    \\    var h = mh && mh.
+++ handler_name ++
+    \\;
+    \\    if (h) h.postMessage({ type: "selection", text: s });
+    \\  };
+    \\  document.addEventListener("selectionchange", function () {
+    \\    if (ghozttySelectionTimer) return;
+    \\    ghozttySelectionTimer = window.setTimeout(ghozttyPostSelection, 200);
+    \\  }, true);
+    \\
+;
+
 const epilogue = "\n})();\n";
 
 /// What win32 hands `AddScriptToExecuteOnDocumentCreated`: the P2 blob.
@@ -84,7 +125,8 @@ const epilogue = "\n})();\n";
 /// composer's quoted block), so the flag came out and Windows ships the same
 /// two-button toolbar Mac does. The flag itself still exists in the shared
 /// `selection.js`; nobody sets it.
-pub const injected_js = prologue ++ shim_js ++ selection_js ++ epilogue;
+pub const injected_js =
+    prologue ++ shim_js ++ selection_js ++ selection_tracker_js ++ epilogue;
 
 // -------------------------------------------------------------------------
 // Messages coming back up
@@ -111,8 +153,10 @@ pub const Quote = struct {
     document_offset: ?u32 = null,
 };
 
-/// The three messages the shared JS posts. Mac's `handleTOCMessage` switches on
-/// the same three strings and ignores everything else; so does `parse`.
+/// The messages the injected blob posts. The first three are the shared JS's,
+/// which Mac's `handleTOCMessage` switches on by the same strings; the fourth
+/// is `selection_tracker_js`'s, which only win32 has (see its doc comment).
+/// Everything else is ignored, here as there.
 pub const Message = union(enum) {
     /// The document's headings, in order. Empty is a real value — it is what
     /// `clearHeadingIndex` posts when a document goes away.
@@ -120,6 +164,10 @@ pub const Message = union(enum) {
     /// The heading the reader is in, or null when the page says there is none.
     active: ?[]const u8,
     quote: Quote,
+    /// What the user has selected right now, or null when the selection was
+    /// cleared. Null is a real value: it is how a click into the page takes
+    /// yesterday's selection back out of the next report.
+    selection: ?[]const u8,
 };
 
 /// A parsed message and the arena its strings live in.
@@ -176,6 +224,10 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
     }
     if (std.mem.eql(u8, kind, "quote")) {
         return .{ .quote = parseQuote(obj) orelse return null };
+    }
+    if (std.mem.eql(u8, kind, "selection")) {
+        const raw = stringField(obj, "text") orelse "";
+        return .{ .selection = nonEmpty(std.mem.trim(u8, raw, " \t\r\n")) };
     }
     return null;
 }
@@ -266,7 +318,8 @@ test "selection.js is embedded VERBATIM — P1's whole point" {
     // lines.
     try testing.expect(std.mem.indexOf(u8, injected_js, selection_js) != null);
     try testing.expectEqual(
-        prologue.len + shim_js.len + selection_js.len + epilogue.len,
+        prologue.len + shim_js.len + selection_js.len +
+            selection_tracker_js.len + epilogue.len,
         injected_js.len,
     );
     // And the shared file is the one on disk, not a copy under apprt/win32 —
@@ -479,6 +532,56 @@ test "parse: quote normalizes empties and negatives to null" {
     try testing.expectEqual(@as(?[]const u8, null), q.block_text);
     try testing.expectEqual(@as(?u32, null), q.offset_in_block);
     try testing.expectEqual(@as(?u32, null), q.document_offset);
+}
+
+test "the selection tracker is ours, is debounced, and is bounded" {
+    // It runs AFTER the shim, or its handler lookup finds nothing on the very
+    // first selection of a page.
+    const shim = std.mem.indexOf(u8, injected_js, "window.chrome && window.chrome.webview").?;
+    const tracker = std.mem.indexOf(u8, injected_js, "selectionchange").?;
+    try testing.expect(shim < tracker);
+
+    // The three properties that make an every-selection listener acceptable on
+    // a page we do not own: it settles before it speaks, it stays quiet when
+    // nothing changed, and it never ships an unbounded string.
+    try testing.expect(std.mem.indexOf(u8, selection_tracker_js, "setTimeout") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        selection_tracker_js,
+        "if (s === ghozttyLastSelection) return;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, selection_tracker_js, "s.slice(0, 16384)") != null);
+
+    // It posts through the same handler the shared scripts use, so there is
+    // exactly one bridge to keep working.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        selection_tracker_js,
+        "mh && mh." ++ handler_name,
+    ) != null);
+
+    // And it is not a fork: `selection.js` knows nothing about it.
+    try testing.expect(std.mem.indexOf(u8, selection_js, "selectionchange") == null);
+}
+
+test "parse: selection, including the empty one that clears it" {
+    const parsed = parse(testing.allocator,
+        \\{"type":"selection","text":"  the sentence they meant  "}
+    ).?;
+    defer parsed.deinit();
+    try testing.expectEqualStrings("the sentence they meant", parsed.message.selection.?);
+
+    // A click into the page clears the selection, and the report must stop
+    // claiming the user was pointing at something.
+    for ([_][]const u8{
+        "{\"type\":\"selection\",\"text\":\"\"}",
+        "{\"type\":\"selection\",\"text\":\"  \\n \"}",
+        "{\"type\":\"selection\"}",
+    }) |case| {
+        const cleared = parse(testing.allocator, case).?;
+        defer cleared.deinit();
+        try testing.expectEqual(@as(?[]const u8, null), cleared.message.selection);
+    }
 }
 
 test "parse: everything this side does not act on is ignored" {
