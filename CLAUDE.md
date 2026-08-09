@@ -883,10 +883,10 @@ the queue; consuming it is separate and not built here).
   revision is resolved on the SEND rather than cached with the worktree (D47),
   so a pane left open across a branch switch still names what the user saw.
   What Windows does not have yet: the long-lived DRAFT staging folder and its
-  footer link (**T645**), the thumbnail carousel (**T646**) and the screenshot
-  CAPTURE behind the `+` button (**T647**, whose primitive is decision D44);
-  the quoted block landed in **T641** (below) and the image half of the
-  composer in **T637**.
+  footer link (**T645**) and the screenshot CAPTURE behind the `+` button
+  (**T647**, whose primitive is decision D44); the quoted block landed in
+  **T641** (below), the image half of the composer in **T637** and its
+  thumbnail carousel in **T646**.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
@@ -924,6 +924,27 @@ the queue; consuming it is separate and not built here).
   (a clipboard DIB's fourth byte is routinely all zeroes, and honouring that
   turns a good screenshot into a blank one). Acceptance:
   `test/win32/viewer-feedback-images.ps1`.
+
+  **And Windows has the carousel** (T646): a row of square tiles under the pill,
+  one per live chip, with the two-way sync. It follows the same
+  derive-from-storage rule as everything else in the composer — the strip holds
+  no list of its own, it is `Store.carousel(text)`, the set the report's
+  `images` array comes from — so a deleted chip's thumbnail disappears with no
+  second bookkeeping path to get wrong. Three win32-shaped details: the row and
+  its gap **cost nothing when there are no images**, so a composer nobody
+  pasted into is exactly as tall as it was before (geometry in
+  `viewer_feedback_layout.zig`, asserted at 1.0/1.25/1.5/2.0 with the scroll
+  clamp and the hit test); a tile is **letterboxed, never stretched or
+  cropped**, because a cropped thumbnail of a screenshot is a thumbnail of its
+  middle; and tiles are decoded once through `gdiplus_decode.decodeBytes` and
+  **cached by (chip number, tile size)**, which is why filing a report has to
+  tell the bar its store was reset — the number sequence restarts at 1 and the
+  cache would otherwise paint the picture that was just sent. The sync is a
+  click on a tile → `EM_EXSETSEL` over its whole chip, and a caret inside a chip
+  → that tile ringed and scrolled into view (the caret side rides `EN_CHANGE`
+  plus the RichEdit subclass's post-dispatch hook, since RichEdit only notifies
+  what it is asked to). Acceptance:
+  `test/win32/viewer-feedback-carousel.ps1`.
 
   **⇧⌘S** adds a screenshot from the keyboard while the composer has focus
   (free: the app's shift+cmd letters are t/z/w/d/f/g/v/n/r/[/], and macOS's own

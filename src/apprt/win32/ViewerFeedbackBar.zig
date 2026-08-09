@@ -67,6 +67,7 @@ const layout_mod = @import("viewer_feedback_layout.zig");
 const doc = @import("viewer_feedback_doc.zig");
 const feedback_images = @import("viewer_feedback_images.zig");
 const clipboard_image = @import("clipboard_image.zig");
+const gdiplus_decode = @import("gdiplus_decode.zig");
 const system_colors = @import("system_colors.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -116,6 +117,24 @@ focused: bool = false,
 /// control from a number the control itself produces.
 lines: u32 = 1,
 
+/// Live image chips, i.e. how many tiles the carousel shows (T646). Cached for
+/// the same reason `lines` is: `barHeight` is asked on every bounds sync and
+/// deriving this means scanning the composer's text.
+images: u32 = 0,
+/// How far the thumbnail strip is scrolled, in physical pixels.
+carousel_scroll: i32 = 0,
+/// The tile whose chip the caret is sitting in, drawn with a selection ring —
+/// the visible half of "clicking a chip scrolls to its thumbnail".
+carousel_selected: ?usize = null,
+/// The tile the mouse went down on, so a click acts on mouse-UP over the same
+/// one, the way the two circular actions already do.
+pressed_thumb: ?usize = null,
+/// Decoded thumbnails, keyed by image number AND tile size. The size is part
+/// of the key rather than something a DPI change has to remember to clear: a
+/// new scale simply misses and decodes, and the stale entries age out with the
+/// composer.
+thumbs: std.ArrayListUnmanaged(Thumb) = .empty,
+
 /// True while `seedControl` is writing the buffer INTO the control, so the
 /// `EN_CHANGE` that write raises does not mirror straight back out again.
 seeding: bool = false,
@@ -149,6 +168,17 @@ secondary_ref: u32 = 0x00AAAAAA,
 quote_rgb: color_math.Rgb = .{ .r = 0x24, .g = 0x24, .b = 0x28 },
 accent_ref: u32 = 0x00D47800,
 dark: bool = true,
+
+/// One decoded carousel tile. `dib` is null for a picture GDI+ could not read —
+/// cached as a FAILURE on purpose, so an unreadable attachment costs one decode
+/// rather than one per repaint.
+const Thumb = struct {
+    number: u32,
+    box: i32,
+    dib: ?w32.HANDLE,
+    w: i32 = 0,
+    h: i32 = 0,
+};
 
 var class_registered: bool = false;
 var richedit_loaded: bool = false;
@@ -320,7 +350,32 @@ pub fn destroy(self: *ViewerFeedbackBar) void {
     _ = w32.DestroyWindow(self.hwnd);
     if (self.body_font) |f| _ = w32.DeleteObject(@ptrCast(f));
     if (self.caption_font) |f| _ = w32.DeleteObject(@ptrCast(f));
+    self.dropThumbs();
     self.alloc.destroy(self);
+}
+
+/// The pane's image store was emptied (a report was filed), so the carousel's
+/// cache is not just stale but WRONG: it is keyed by chip number and the store
+/// restarts that sequence at 1.
+/// The count itself is deliberately NOT reset here: `seedControl` runs next and
+/// re-derives it from the (now empty) text, and it is that discovery which
+/// reports the change and re-insets the page. Zeroing it here would make the
+/// discovery a no-op and leave the band still tall enough for a strip that has
+/// gone.
+pub fn imagesCleared(self: *ViewerFeedbackBar) void {
+    self.dropThumbs();
+    self.carousel_scroll = 0;
+    self.carousel_selected = null;
+}
+
+/// Free every cached tile bitmap. GDI objects are a process-wide budget, and a
+/// composer that was pasted into a dozen times holds a dozen DIBs.
+fn dropThumbs(self: *ViewerFeedbackBar) void {
+    for (self.thumbs.items) |t| {
+        if (t.dib) |d| _ = w32.DeleteObject(d);
+    }
+    self.thumbs.deinit(self.alloc);
+    self.thumbs = .empty;
 }
 
 fn fromHwnd(hwnd: w32.HWND) ?*ViewerFeedbackBar {
@@ -418,6 +473,35 @@ fn syncLines(self: *ViewerFeedbackBar) bool {
     return true;
 }
 
+/// Re-count the live image chips. Returns true when the count changed, i.e.
+/// when the carousel row appeared, disappeared, or grew — all of which move the
+/// page, so the pane has to re-inset.
+fn syncImages(self: *ViewerFeedbackBar) bool {
+    const n: u32 = @intCast(@min(
+        self.pane.feedbackImageCount(self.alloc),
+        std.math.maxInt(u32),
+    ));
+    if (n == self.images) return false;
+    self.images = n;
+    // A strip that just lost tiles can be scrolled past its own end.
+    self.carousel_scroll = self.currentLayout().clampScroll(self.carousel_scroll);
+    if (self.carousel_selected) |i| {
+        if (i >= n) self.carousel_selected = null;
+    }
+    self.logCarousel("tiles");
+    return true;
+}
+
+/// Both cached metrics at once. Kept as one call because every text change can
+/// move either — a pasted chip adds a tile AND can wrap a line — and asking for
+/// one while forgetting the other is exactly the bug that leaves the page inset
+/// by a stale band height.
+fn syncMetrics(self: *ViewerFeedbackBar) bool {
+    const grew_lines = self.syncLines();
+    const grew_images = self.syncImages();
+    return grew_lines or grew_images;
+}
+
 fn layoutInput(self: *const ViewerFeedbackBar, width: i32, scale: f32) layout_mod.Input {
     return .{
         .scale = scale,
@@ -425,6 +509,7 @@ fn layoutInput(self: *const ViewerFeedbackBar, width: i32, scale: f32) layout_mo
         .lines = self.lineCount(),
         .line_h = type_ramp.lineBox(type_ramp.body(scale), scale),
         .footer_h = type_ramp.lineBox(type_ramp.caption(scale), scale),
+        .images = self.images,
     };
 }
 
@@ -512,7 +597,11 @@ pub fn seedControl(self: *ViewerFeedbackBar) void {
     // registry the report is derived from, so the two cannot disagree.
     self.applyQuoteFormatting();
     self.ensurePlainAtCaret();
-    _ = self.syncLines();
+    // Seeding can change the band's height — most visibly after a report is
+    // filed, where the text and every chip in it went at once. Posted rather
+    // than called: the pane's own `setFeedbackOpen` calls this from inside its
+    // bounds sync, and re-entering that sync from here would nest it.
+    if (self.syncMetrics()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
 }
 
 /// Mirror the control's text back into the pane's buffer. The pane is what
@@ -641,7 +730,7 @@ pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
     // first character typed there would be born wearing the quote's wash.
     self.ensurePlainAtCaret();
 
-    if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    if (self.syncMetrics()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
     _ = w32.InvalidateRect(self.edit, null, 1);
 }
 
@@ -696,7 +785,10 @@ pub fn attachImage(self: *ViewerFeedbackBar, png: []const u8) bool {
     self.setCaret(ins.caret_after);
     self.ensurePlainAtCaret();
 
-    if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    if (self.syncMetrics()) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    // The strip scrolls to the picture that just arrived, which is what makes
+    // a paste visible once the ribbon is longer than the pane.
+    self.showThumb(number);
     _ = w32.InvalidateRect(self.edit, null, 1);
 
     log.info("viewer feedback pane={s} image=#{d} bytes={d} live={d}", .{
@@ -734,6 +826,176 @@ fn selectChipForDelete(self: *ViewerFeedbackBar, vk: u16) bool {
     const cr: w32.CHARRANGE = .{ .cpMin = @intCast(chip.start), .cpMax = @intCast(chip.end) };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
     return true;
+}
+
+// -------------------------------------------------------------------------
+// The thumbnail carousel (T646)
+//
+// The strip has NO state of its own about what is in it: every tile is derived
+// from the live chips in the composer's text, the same set the report's
+// `images` array comes from. Delete a chip and its thumbnail goes with it,
+// because there was never a second list to update.
+//
+// What IS state here is presentation: how far the ribbon is scrolled, which
+// tile is ringed, and the decoded bitmaps.
+// -------------------------------------------------------------------------
+
+/// Report the strip's whole state on every change: how many tiles, where they
+/// are in the BAND's own coordinates, how far the ribbon is scrolled and which
+/// tile is ringed.
+///
+/// This is the acceptance script's only oracle and the reason it is this
+/// detailed. The suite runs on a background desktop where nothing can look at
+/// painted pixels (T233), so "the thumbnails appeared" has to be a sentence the
+/// app says — and geometry it can point a click at, rather than one the script
+/// re-derives from design-system constants and gets subtly wrong at 1.25.
+fn logCarousel(self: *ViewerFeedbackBar, what: []const u8) void {
+    const l = self.currentLayout();
+    log.info(
+        "viewer feedback pane={s} carousel={s} tiles={d} scroll={d} selected={d} " ++
+            "left={d} top={d} thumb={d} stride={d}",
+        .{
+            self.pane.paneId(),
+            what,
+            self.images,
+            self.carousel_scroll,
+            if (self.carousel_selected) |i| @as(i64, @intCast(i)) else -1,
+            l.carousel.left,
+            l.carousel.top,
+            l.thumb,
+            l.thumb_stride,
+        },
+    );
+}
+
+/// The decoded tile for image `number`, at tile side `box`. Decoded on first
+/// paint and cached — a repaint of a six-image strip must not be six PNG
+/// decodes. Null when GDI+ could not read the picture, which is cached too.
+fn thumbFor(self: *ViewerFeedbackBar, number: u32, png: []const u8, box: i32) ?Thumb {
+    for (self.thumbs.items) |t| {
+        if (t.number == number and t.box == box) return t;
+    }
+    const size = feedback_images.pngSize(png) orelse return null;
+    const fit = layout_mod.fitInto(size.width, size.height, box);
+    var entry: Thumb = .{ .number = number, .box = box, .dib = null };
+    if (gdiplus_decode.decodeBytes(png, fit.w, fit.h)) |t| {
+        entry.dib = t.dib;
+        entry.w = t.w;
+        entry.h = t.h;
+        // Reported because a tile the strip COUNTS and a tile it can actually
+        // draw are two different claims, and the acceptance suite runs where
+        // no one can look at the pixels to tell them apart.
+        log.info("viewer feedback pane={s} thumb=#{d} box={d} decoded={d}x{d}", .{
+            self.pane.paneId(),
+            number,
+            box,
+            t.w,
+            t.h,
+        });
+    } else {
+        log.warn("viewer feedback thumbnail #{d} could not be decoded", .{number});
+    }
+    self.thumbs.append(self.alloc, entry) catch {
+        // Not cacheable, so it must not leak either: without the cache entry
+        // nothing would ever delete this bitmap.
+        if (entry.dib) |d| _ = w32.DeleteObject(d);
+        return null;
+    };
+    return entry;
+}
+
+/// Point the strip at whichever chip the caret is in: ring its tile and scroll
+/// it into view. This is the "vice versa" half of the sync — clicking a chip in
+/// the text (or arrowing into one) walks the strip to its picture.
+///
+/// A caret at either END of a chip counts as inside it, because clicking a chip
+/// parks the caret at one of them, and an end that did not count would make the
+/// gesture do nothing at all.
+fn syncCarouselToCaret(self: *ViewerFeedbackBar) void {
+    const spans = self.pane.feedbackImageSpans(self.alloc) orelse return;
+    defer self.alloc.free(spans);
+
+    const at = self.caret();
+    var found: ?usize = null;
+    for (spans, 0..) |s, i| {
+        if (at >= s.start and at <= s.end) {
+            found = i;
+            break;
+        }
+    }
+
+    const before_sel = self.carousel_selected;
+    const before_scroll = self.carousel_scroll;
+    self.carousel_selected = found;
+    if (found) |i| {
+        self.carousel_scroll = self.currentLayout().scrollToShow(i, self.carousel_scroll);
+    }
+    if (before_sel != self.carousel_selected or before_scroll != self.carousel_scroll) {
+        _ = w32.InvalidateRect(self.hwnd, null, 1);
+        self.logCarousel("caret");
+    }
+}
+
+/// Bring image `number`'s tile into view — what a fresh paste does, so the
+/// picture that just arrived is the one you can see even when the strip is
+/// already longer than the pane.
+///
+/// Driven by the NUMBER rather than by the caret, because the caret lands past
+/// the chip's trailing space and is therefore not "in" it: a paste knows
+/// exactly which picture it just added, and guessing from the caret would be a
+/// worse answer to a question nobody has to ask.
+fn showThumb(self: *ViewerFeedbackBar, number: u32) void {
+    const spans = self.pane.feedbackImageSpans(self.alloc) orelse return;
+    defer self.alloc.free(spans);
+    for (spans, 0..) |s, i| {
+        if (self.pane.feedbackImageEntry(s).number != number) continue;
+        const next = self.currentLayout().scrollToShow(i, self.carousel_scroll);
+        if (next != self.carousel_scroll) {
+            self.carousel_scroll = next;
+            _ = w32.InvalidateRect(self.hwnd, null, 1);
+            self.logCarousel("paste");
+        }
+        return;
+    }
+}
+
+/// A tile was clicked: select its chip in the composer and put the caret there.
+/// The forward half of the sync, and the reason it selects the whole chip
+/// rather than just moving the caret — the chip is one unit (see
+/// `selectChipForDelete`), so pointing at it means highlighting all of it.
+fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
+    const spans = self.pane.feedbackImageSpans(self.alloc) orelse return;
+    defer self.alloc.free(spans);
+    if (index >= spans.len) return;
+    const s = spans[index];
+
+    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(s.start), .cpMax = @intCast(s.end) };
+    _ = w32.SetFocus(self.edit);
+    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+    _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+
+    self.carousel_selected = index;
+    self.carousel_scroll = self.currentLayout().scrollToShow(index, self.carousel_scroll);
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+    log.info("viewer feedback pane={s} thumbnail=#{d} chip={d}..{d}", .{
+        self.pane.paneId(),
+        self.pane.feedbackImageEntry(s).number,
+        s.start,
+        s.end,
+    });
+    self.logCarousel("click");
+}
+
+/// Wheel over the band scrolls the strip, when there is anything to scroll.
+fn scrollCarousel(self: *ViewerFeedbackBar, delta: i32) void {
+    const l = self.currentLayout();
+    if (l.maxScroll() == 0) return;
+    // One notch moves one whole tile: a strip of discrete pictures reads
+    // better stepped than smeared.
+    const next = l.clampScroll(self.carousel_scroll - delta * l.thumb_stride);
+    if (next == self.carousel_scroll) return;
+    self.carousel_scroll = next;
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
 /// The live quote spans, in the pane's buffer coordinates. Caller frees.
@@ -966,7 +1228,99 @@ fn paint(self: *ViewerFeedbackBar, hdc: w32.HDC, width: i32, height: i32) void {
     // draws the pill AROUND it, which is why the control is created with no
     // border and its background pushed to match `pill_rgb`.
     self.paintButtons(hdc, l);
+    self.paintCarousel(hdc, l);
     self.paintFooter(hdc, l);
+}
+
+/// The thumbnail strip: one tile per live chip, clipped to the viewport, with
+/// the caret's own chip ringed.
+fn paintCarousel(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
+    if (l.carousel.isEmpty()) return;
+    const spans = self.pane.feedbackImageSpans(self.alloc) orelse return;
+    defer self.alloc.free(spans);
+    if (spans.len == 0) return;
+
+    const saved = w32.SaveDC(hdc);
+    defer _ = w32.RestoreDC(hdc, saved);
+    _ = w32.IntersectClipRect(
+        hdc,
+        l.carousel.left,
+        l.carousel.top,
+        l.carousel.right,
+        l.carousel.bottom,
+    );
+
+    for (spans, 0..) |s, i| {
+        const tile = l.thumbAt(i, self.carousel_scroll);
+        // Wholly off one end: nothing to draw, and no decode to pay for.
+        if (tile.right <= l.carousel.left or tile.left >= l.carousel.right) continue;
+
+        // The tile's own well, one step off the band exactly as the pill is,
+        // so an image with transparent or light edges still reads as a tile.
+        self.paintTileFrame(hdc, l, tile, self.carousel_selected == i);
+
+        const e = self.pane.feedbackImageEntry(s);
+        const box = l.thumb - 2 * l.thumb_inset;
+        const t = self.thumbFor(e.number, e.png, box) orelse continue;
+        const dib = t.dib orelse continue;
+        blitThumb(hdc, tile, t, dib);
+    }
+}
+
+fn paintTileFrame(
+    self: *ViewerFeedbackBar,
+    hdc: w32.HDC,
+    l: layout_mod.Layout,
+    tile: layout_mod.Rect,
+    selected: bool,
+) void {
+    const fill = w32.CreateSolidBrush(w32.RGB(self.pill_rgb.r, self.pill_rgb.g, self.pill_rgb.b));
+    // A selected tile is ringed in the accent at 2 px: the ring is the only
+    // thing saying "this is the picture the caret is in", so it has to survive
+    // sitting next to a bright screenshot.
+    const pen = if (selected)
+        w32.CreatePen(0, 2, self.accent_ref)
+    else
+        w32.CreatePen(0, 1, self.border_ref);
+    if (fill != null and pen != null) {
+        const prev_brush = w32.SelectObject(hdc, @ptrCast(fill.?));
+        const prev_pen = w32.SelectObject(hdc, pen.?);
+        _ = w32.RoundRect(
+            hdc,
+            tile.left,
+            tile.top,
+            tile.right,
+            tile.bottom,
+            l.thumb_r * 2,
+            l.thumb_r * 2,
+        );
+        _ = w32.SelectObject(hdc, prev_pen);
+        _ = w32.SelectObject(hdc, prev_brush);
+    }
+    if (fill) |b| _ = w32.DeleteObject(@ptrCast(b));
+    if (pen) |p| _ = w32.DeleteObject(p);
+}
+
+/// Blit one decoded picture into the middle of its tile. Already scaled to fit
+/// (see `thumbFor`), so this is a straight `BitBlt` — the aspect ratio was
+/// settled at decode time and cannot be got wrong twice.
+fn blitThumb(hdc: w32.HDC, tile: layout_mod.Rect, t: Thumb, dib: w32.HANDLE) void {
+    if (t.w <= 0 or t.h <= 0) return;
+    const src = w32.CreateCompatibleDC(hdc) orelse return;
+    defer _ = w32.DeleteDC(src);
+    const old = w32.SelectObject(src, dib);
+    defer _ = w32.SelectObject(src, old);
+    _ = w32.BitBlt(
+        hdc,
+        tile.left + @divTrunc(tile.width() - t.w, 2),
+        tile.top + @divTrunc(tile.height() - t.h, 2),
+        t.w,
+        t.h,
+        src,
+        0,
+        0,
+        w32.SRCCOPY,
+    );
 }
 
 fn paintPill(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
@@ -1253,6 +1607,17 @@ fn editProc(
     }
 
     const res = w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+
+    // AFTER the control moved the caret: every way a selection changes without
+    // the text changing (a click, an arrow key, Home/End) lands here, and the
+    // strip follows the caret into whichever chip it is now in (T646). The
+    // text-changing paths sync from `EN_CHANGE` instead, which is the one
+    // notification RichEdit does send.
+    switch (msg) {
+        w32.WM_LBUTTONUP, w32.WM_KEYUP, w32.WM_KEYDOWN => self.syncCarouselToCaret(),
+        else => {},
+    }
+
     if (msg != w32.WM_PAINT) return res;
 
     // The quote bars come first: they are content, the placeholder is only
@@ -1334,10 +1699,12 @@ fn wndProc(
                 if (was_empty != (self.pane.feedbackText().len == 0)) {
                     _ = w32.InvalidateRect(self.edit, null, 1);
                 }
-                // Only a line-count change moves the page; anything else is a
-                // repaint. Asking the pane to re-inset on every keystroke
-                // would resize the WebView2 while someone is typing into it.
-                if (self.syncLines()) self.textChanged() else _ = w32.InvalidateRect(hwnd, null, 1);
+                // Only a line- or tile-count change moves the page; anything
+                // else is a repaint. Asking the pane to re-inset on every
+                // keystroke would resize the WebView2 while someone is typing
+                // into it.
+                if (self.syncMetrics()) self.textChanged() else _ = w32.InvalidateRect(hwnd, null, 1);
+                self.syncCarouselToCaret();
             }
             return 0;
         },
@@ -1382,6 +1749,14 @@ fn wndProc(
                     _ = w32.SetCapture(hwnd);
                     _ = w32.InvalidateRect(hwnd, null, 1);
                 }
+                return 0;
+            }
+            // A tile acts on mouse-UP over the same tile, the way the two
+            // circular actions do — a click that slid off is a cancelled click
+            // everywhere else in this chrome.
+            if (l.hitThumb(self.carousel_scroll, x, y)) |i| {
+                self.pressed_thumb = i;
+                _ = w32.SetCapture(hwnd);
             }
             return 0;
         },
@@ -1391,12 +1766,22 @@ fn wndProc(
             const y: i32 = @intCast(@as(i16, @bitCast(@as(u16, @intCast((lparam >> 16) & 0xFFFF)))));
             _ = w32.ReleaseCapture();
             const was = self.pressed;
+            const was_thumb = self.pressed_thumb;
             self.pressed = null;
+            self.pressed_thumb = null;
             _ = w32.InvalidateRect(hwnd, null, 1);
+            const l = self.currentLayout();
             if (was) |b| {
-                const l = self.currentLayout();
                 if (l.hitButton(self.scale, x, y) == b) self.activate(b);
+            } else if (was_thumb) |i| {
+                if (l.hitThumb(self.carousel_scroll, x, y) == i) self.activateThumb(i);
             }
+            return 0;
+        },
+
+        w32.WM_MOUSEWHEEL => {
+            const raw: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
+            self.scrollCarousel(@divTrunc(@as(i32, raw), @as(i32, w32.WHEEL_DELTA)));
             return 0;
         },
 

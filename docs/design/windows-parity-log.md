@@ -13032,3 +13032,54 @@ the user's terminal; filed as **T667**.
 
 Floor: all three zig lanes PASS (none 299s, win32 342s, agent 322s); P1/P2/P3
 ALL PASS.
+
+## 2026-08-09 — You can see what you attached: the feedback composer grows a thumbnail strip (T646)
+
+Paste a picture into a Windows viewer's feedback box and you now see it. A row
+of square tiles sits under the pill, one per `[Image #N]` chip, and the two ends
+point at each other: click a tile and its chip is selected in the text, put the
+caret in a chip and its tile is ringed and scrolled into view. Before this the
+only evidence a paste had landed was the chip's own characters, which say a
+picture is attached but not which one.
+
+The strip keeps no list of its own. It IS `Store.carousel(text)` — the same
+derivation the report's `images` array comes from — so deleting a chip removes
+its thumbnail because there was never a second thing to update, and the
+survivors keep their numbers (1, 3 after #2 goes; never renumbered). That is the
+rule T637 established for the report, applied to the surface.
+
+Three win32-shaped decisions. The row and its gap **cost nothing when there are
+no images**, so a composer nobody pasted into is byte-for-byte as tall as it was
+before — the same absent-row rule the footer already followed, now asserted
+against the band's measured height on the box. A tile is **letterboxed, never
+stretched or cropped**: a cropped thumbnail of a screenshot is a thumbnail of
+its middle, which defeats the point of being able to tell two attachments apart.
+And tiles are decoded once through a new `gdiplus_decode.decodeBytes` (the PNG
+bytes wrapped in a `CreateStreamOnHGlobal` stream, since GDI+ reads streams and
+nothing else) and cached by **(chip number, tile size)** — which is why filing a
+report has to tell the bar its store was reset: the number sequence restarts at
+1, and the cache would otherwise paint the picture that had just been sent.
+
+Geometry is in `viewer_feedback_layout.zig` with the rest of the composer's:
+the row, the tile pitch, the scroll clamp, the hit test that refuses the half of
+a tile hanging outside the viewport, and the aspect fit — all asserted at
+1.0/1.25/1.5/2.0. The scroll is one number the bar keeps, so a tile's position
+is always a function of it rather than something accumulated per tile.
+
+Validated with a new `test\win32\viewer-feedback-carousel.ps1`, **ALL PASS
+(38)**. It runs off-desktop, where nothing can look at pixels, so the app
+reports the strip's whole state — count, scroll, ringed tile, and the geometry
+in band coordinates — and the script points its clicks at that geometry rather
+than re-deriving tile positions from design-system constants (it ran at 1.25
+here, where a hand-derived position would have been wrong). Two claims are kept
+apart deliberately: a tile the strip COUNTS and a tile it can actually DRAW.
+The app logs each rasterised bitmap, and the script checks both pictures came
+out at their own aspect ratios (60x45 and 60x36 in a 60 box). The click's
+selection is proved twice — the app names the chip's character range, and one
+Backspace right after the click removes that whole chip, which only a real
+selection does.
+
+Floor: all three zig lanes PASS through `floor-lane.ps1 -Lane all`; P1–P3 ALL
+PASS; `viewer-feedback-images.ps1` ALL PASS (39). `viewer-feedback.ps1` is 67
+pass / 1 fail — the same pre-existing **T644** Ctrl+Z arm as the last two
+composer tasks, unchanged in count.

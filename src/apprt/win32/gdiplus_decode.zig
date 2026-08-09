@@ -22,6 +22,8 @@
 const std = @import("std");
 
 const w32 = @import("win32.zig");
+const com = @import("com.zig");
+const iface = @import("webview2_iface.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -127,6 +129,42 @@ pub fn decodeScaled(stream: *anyopaque, dst_w: i32, dst_h: i32) ?Thumbnail {
     defer _ = w32.DeleteObject(hbm.?);
 
     return scaleInto(hbm.?, @intCast(src_w), @intCast(src_h), dst_w, dst_h);
+}
+
+/// The same decode from BYTES already in memory — what the feedback composer's
+/// thumbnail carousel needs (T646), where the picture is a PNG the store is
+/// holding rather than something a runtime is streaming to us.
+///
+/// GDI+ reads from an `IStream` and nothing else, so the bytes are wrapped in
+/// the cheapest one Windows offers. `fDeleteOnRelease` is TRUE: the HGLOBAL is
+/// then the stream's, and there is exactly one release path to get right
+/// instead of two.
+pub fn decodeBytes(bytes: []const u8, dst_w: i32, dst_h: i32) ?Thumbnail {
+    if (bytes.len == 0 or bytes.len > std.math.maxInt(u32)) return null;
+
+    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, bytes.len) orelse return null;
+    var owned = false;
+    defer if (!owned) {
+        _ = w32.GlobalFree(hglobal);
+    };
+    {
+        const dst = w32.GlobalLock(hglobal) orelse return null;
+        defer _ = w32.GlobalUnlock(hglobal);
+        @memcpy(dst[0..bytes.len], bytes);
+    }
+
+    var stream_ptr: ?*anyopaque = null;
+    if (com.failed(w32.CreateStreamOnHGlobal(hglobal, 1, &stream_ptr))) return null;
+    const stream: *iface.IStream = @ptrCast(@alignCast(stream_ptr orelse return null));
+    owned = true; // the stream frees the HGLOBAL now, in its own Release
+    defer stream.release();
+
+    // Created around a full buffer, the seek pointer is already at 0 — but
+    // saying so costs nothing and the one failure it prevents (a zero-byte
+    // decode that reports "corrupt image") is the one this module already
+    // documents twice.
+    if (!stream.rewind()) return null;
+    return decodeScaled(@ptrCast(stream), dst_w, dst_h);
 }
 
 /// Shrink `src` into a new DIB of exactly `dst_w` x `dst_h`.

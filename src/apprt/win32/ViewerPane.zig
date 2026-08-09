@@ -1091,7 +1091,13 @@ fn completeFeedbackSend(self: *ViewerPane) void {
         // ...and so do the images, for the same reason plus a plainer one:
         // they are megabytes, and the report that needed them has them now.
         self.feedback_images.deinit(p.alloc);
-        if (self.feedback) |bar| bar.seedControl();
+        if (self.feedback) |bar| {
+            // The carousel's cache is keyed by chip NUMBER, and the store just
+            // reset its counter — so without this the next paste's `#1` would
+            // paint the picture the report that has just been filed carried.
+            bar.imagesCleared();
+            bar.seedControl();
+        }
         if (self.hwnd) |h| {
             _ = w32.SetTimer(h, feedback_close_timer_id, feedback_close_delay_ms, null);
         }
@@ -1611,6 +1617,25 @@ pub fn feedbackImageCount(self: *const ViewerPane, alloc: Allocator) usize {
     const spans = self.feedback_images.live(alloc, self.feedback_text.items) catch return 0;
     defer if (spans.len != 0) alloc.free(spans);
     return spans.len;
+}
+
+/// Where the live chips SIT, in the composer's buffer — what the thumbnail
+/// carousel paints from and what a click on a tile selects (T646). Caller
+/// frees. Same derivation as `feedbackImageCount` and as the report's `images`
+/// array, so the strip cannot show a picture the report would not carry.
+pub fn feedbackImageSpans(
+    self: *const ViewerPane,
+    alloc: Allocator,
+) ?[]feedback_images_mod.Span {
+    return self.feedback_images.live(alloc, self.feedback_text.items) catch null;
+}
+
+/// The PNG behind a live chip's `index` into `feedbackImageSpans`.
+pub fn feedbackImageEntry(
+    self: *const ViewerPane,
+    span: feedback_images_mod.Span,
+) *const feedback_images_mod.Entry {
+    return &self.feedback_images.entries.items[span.index];
 }
 
 /// Replace the pane's heading list with its own copy of `items`.

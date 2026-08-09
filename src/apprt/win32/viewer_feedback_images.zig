@@ -159,6 +159,22 @@ pub const Store = struct {
         }
         return out.toOwnedSlice(alloc);
     }
+
+    /// What the thumbnail carousel shows (T646), in strip order: the NUMBER of
+    /// every live chip.
+    ///
+    /// The same derivation the report's `images` array uses, deliberately —
+    /// the strip is a picture of what is attached, and the only way it cannot
+    /// drift from what gets sent is for both to be computed from the composer's
+    /// text. Delete `[Image #2]` and the strip shows 1 and 3, in that order,
+    /// because that is what the report will carry.
+    pub fn carousel(self: *const Store, alloc: Allocator, text: []const u8) ![]u32 {
+        const spans = try self.live(alloc, text);
+        defer alloc.free(spans);
+        const out = try alloc.alloc(u32, spans.len);
+        for (spans, 0..) |s, i| out[i] = self.entries.items[s.index].number;
+        return out;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -397,6 +413,45 @@ test "chip numbers are stable across deletions, never positional" {
 
     // And the next paste is 4, not the freed 2.
     try testing.expectEqual(@as(u32, 4), try store.add(alloc, png));
+}
+
+test "the carousel shows the live chips, in strip order, with the hole kept" {
+    // T646's rule, and the reason the strip has no bookkeeping of its own:
+    // deleting a chip removes its thumbnail because the strip is DERIVED, not
+    // told. And the survivors keep their numbers — 1, 3, never 1, 2.
+    const alloc = testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    const png = try fakePng(alloc, 8, 8, 0);
+    defer alloc.free(png);
+    _ = try store.add(alloc, png);
+    _ = try store.add(alloc, png);
+    _ = try store.add(alloc, png);
+
+    {
+        const shown = try store.carousel(alloc, "a [Image #1] b [Image #2] c [Image #3]");
+        defer alloc.free(shown);
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, shown);
+    }
+    {
+        const shown = try store.carousel(alloc, "a [Image #1] b  c [Image #3]");
+        defer alloc.free(shown);
+        try testing.expectEqualSlices(u32, &.{ 1, 3 }, shown);
+    }
+    // Strip order is DOCUMENT order, not insertion order: the strip mirrors
+    // the text, so moving a chip moves its thumbnail.
+    {
+        const shown = try store.carousel(alloc, "[Image #3][Image #1]");
+        defer alloc.free(shown);
+        try testing.expectEqualSlices(u32, &.{ 3, 1 }, shown);
+    }
+    // An empty composer has an empty strip — which is the state that makes the
+    // whole row and its gap disappear.
+    {
+        const shown = try store.carousel(alloc, "");
+        defer alloc.free(shown);
+        try testing.expectEqual(@as(usize, 0), shown.len);
+    }
 }
 
 test "live: unknown chips are plain text and a duplicate attaches once" {

@@ -48,6 +48,19 @@ pub const pill_pad_dip: f32 = 4.0;
 /// Text region <-> the first action button. `md`: they are different groups.
 pub const text_gap_dip: f32 = 8.0;
 
+/// The carousel tile (T646): a square, big enough that a pasted screenshot is
+/// recognisable at a glance and small enough that the strip does not eat the
+/// pane the feedback is about. Off the 4 DIP spacing scale by construction —
+/// this is a CONTENT size, not a gap, and 56 is 14 steps of it.
+pub const thumb_dip: f32 = 56.0;
+
+/// Between two tiles. `md`: separate items, not one control's parts.
+pub const thumb_gap_dip: f32 = 8.0;
+
+/// The picture's own inset inside its tile, so the tile reads as a frame around
+/// the image rather than a border drawn on top of it. `sm`.
+pub const thumb_inset_dip: f32 = 4.0;
+
 /// How many lines the pill grows to before the text scrolls instead. Mac's
 /// `maxInputHeight` is ~6 lines and the reason is the same here: past this the
 /// composer is eating the pane the feedback is ABOUT.
@@ -72,6 +85,11 @@ pub const Input = struct {
     /// rather than derived: a font metric belongs to a DC, and this module
     /// must stay OS-free.
     line_h: i32,
+    /// How many thumbnails the carousel is showing — i.e. how many LIVE image
+    /// chips the composer's text holds. 0 means no carousel at all: the row and
+    /// its gap both go away, rather than leaving a band of blank pixels above
+    /// the footer.
+    images: u32 = 0,
     /// The footer row's height (the destination + key hints), or 0 for no
     /// footer at all — in which case its row gap goes away with it, rather
     /// than leaving a mysterious band of empty pixels.
@@ -92,6 +110,20 @@ pub const Layout = struct {
     text: Rect,
     /// The circular actions, indexed by `Button`.
     buttons: [button_count]Rect,
+    /// The thumbnail strip (T646), EMPTY when there are no images. It is the
+    /// VIEWPORT: tiles scroll inside it and are clipped to it.
+    carousel: Rect,
+    /// One tile's side, in physical pixels. 0 when there is no carousel.
+    thumb: i32,
+    /// Tile pitch — one tile plus the gap after it.
+    thumb_stride: i32,
+    /// The picture's inset inside its tile.
+    thumb_inset: i32,
+    /// A tile's corner radius — 4, the design system's control radius. A tile
+    /// is a small chip of content, not a card.
+    thumb_r: i32,
+    /// How many tiles there are, i.e. `Input.images`.
+    images: u32,
     /// The footer row, EMPTY when `footer_h` was 0.
     footer: Rect,
     /// Lines actually shown, i.e. `lines` clamped into [1, max_lines].
@@ -150,17 +182,40 @@ pub const Layout = struct {
         // backwards.
         const text_top = pill.top + pill_pad + @divTrunc(content_h - text_h, 2);
 
+        // Rows stack under the pill, each preceded by ONE gap and only when it
+        // is present — an absent row costs no pixels, which is what keeps a
+        // composer with no images exactly as tall as it was before T646.
+        const gap = px(row_gap_dip, in.scale);
+        var y = pill.bottom;
+
+        const thumb = if (in.images > 0) px(thumb_dip, in.scale) else 0;
+        const carousel: Rect = if (thumb > 0) c: {
+            y += gap;
+            const r: Rect = .{
+                .left = pill.left,
+                .top = y,
+                .right = pill.right,
+                .bottom = y + thumb,
+            };
+            y = r.bottom;
+            break :c r;
+        } else .{};
+
         const footer_h = @max(in.footer_h, 0);
-        const row_gap = if (footer_h > 0) px(row_gap_dip, in.scale) else 0;
-        const footer: Rect = if (footer_h > 0) .{
-            .left = pill.left,
-            .top = pill.bottom + row_gap,
-            .right = pill.right,
-            .bottom = pill.bottom + row_gap + footer_h,
+        const footer: Rect = if (footer_h > 0) f: {
+            y += gap;
+            const r: Rect = .{
+                .left = pill.left,
+                .top = y,
+                .right = pill.right,
+                .bottom = y + footer_h,
+            };
+            y = r.bottom;
+            break :f r;
         } else .{};
 
         return .{
-            .bar_h = pad + pill_h + row_gap + footer_h + pad,
+            .bar_h = y + pad,
             .pill = pill,
             .pill_r = @divTrunc(collapsedPillHeight(in.scale), 2),
             .text = .{
@@ -170,6 +225,12 @@ pub const Layout = struct {
                 .bottom = text_top + text_h,
             },
             .buttons = buttons,
+            .carousel = carousel,
+            .thumb = thumb,
+            .thumb_stride = thumb + px(thumb_gap_dip, in.scale),
+            .thumb_inset = px(thumb_inset_dip, in.scale),
+            .thumb_r = px(4.0, in.scale),
+            .images = in.images,
             .footer = footer,
             .lines = lines,
         };
@@ -189,7 +250,91 @@ pub const Layout = struct {
         }
         return null;
     }
+
+    // ---------------------------------------------------------------------
+    // The carousel (T646)
+    //
+    // Tiles live on one horizontal ribbon inside `carousel`, which is the
+    // viewport. `scroll` is how far that ribbon has been pulled left, in
+    // physical pixels — the ONE piece of state the caller keeps, so a tile's
+    // position is always a function of it rather than something accumulated
+    // per tile.
+    // ---------------------------------------------------------------------
+
+    /// Tile `index`'s rect in the band's coordinates, which may fall wholly or
+    /// partly outside `carousel` — the painter clips, the hit test does not
+    /// answer for a tile it cannot see.
+    pub fn thumbAt(self: *const Layout, index: usize, scroll: i32) Rect {
+        if (self.thumb <= 0) return .{};
+        const left = self.carousel.left + @as(i32, @intCast(index)) * self.thumb_stride - scroll;
+        return .{
+            .left = left,
+            .top = self.carousel.top,
+            .right = left + self.thumb,
+            .bottom = self.carousel.top + self.thumb,
+        };
+    }
+
+    /// The tile under a point, or null. A tile only answers for the part of it
+    /// that is inside the viewport: half a tile poking past the edge is half a
+    /// tile the user can see, and the half they cannot is not clickable.
+    pub fn hitThumb(self: *const Layout, scroll: i32, x: i32, y: i32) ?usize {
+        if (self.thumb <= 0) return null;
+        if (!self.carousel.containsPoint(x, y)) return null;
+        var i: usize = 0;
+        while (i < self.images) : (i += 1) {
+            if (self.thumbAt(i, scroll).containsPoint(x, y)) return i;
+        }
+        return null;
+    }
+
+    /// How far the ribbon can be pulled before its last tile sits flush with
+    /// the viewport's trailing edge. 0 when everything already fits, which is
+    /// what keeps a two-image strip from scrolling at all.
+    pub fn maxScroll(self: *const Layout) i32 {
+        if (self.thumb <= 0 or self.images == 0) return 0;
+        // No trailing gap: the ribbon ends at the last tile, not after it.
+        const content = @as(i32, @intCast(self.images)) * self.thumb_stride -
+            (self.thumb_stride - self.thumb);
+        return @max(content - self.carousel.width(), 0);
+    }
+
+    pub fn clampScroll(self: *const Layout, scroll: i32) i32 {
+        return std.math.clamp(scroll, 0, self.maxScroll());
+    }
+
+    /// The smallest scroll that brings tile `index` fully into view — what
+    /// "clicking a chip scrolls to its thumbnail" resolves to. A tile already
+    /// visible does not move the strip, so walking the caret across chips that
+    /// share a screen does not jitter it.
+    pub fn scrollToShow(self: *const Layout, index: usize, scroll: i32) i32 {
+        if (self.thumb <= 0 or index >= self.images) return self.clampScroll(scroll);
+        const left = @as(i32, @intCast(index)) * self.thumb_stride;
+        const right = left + self.thumb;
+        const view = self.carousel.width();
+        if (left < scroll) return self.clampScroll(left);
+        if (right > scroll + view) return self.clampScroll(right - view);
+        return self.clampScroll(scroll);
+    }
 };
+
+/// The largest `src_w` x `src_h` box that fits inside `box` x `box` with the
+/// source's aspect ratio intact, at least 1 px on each side.
+///
+/// A tile is square and a screenshot is not, so something has to give: this
+/// letterboxes rather than crops, because a cropped thumbnail of a screenshot
+/// is a thumbnail of its middle — and the whole job of the strip is to let a
+/// user tell one attachment from another.
+pub fn fitInto(src_w: u32, src_h: u32, box: i32) struct { w: i32, h: i32 } {
+    if (box <= 0 or src_w == 0 or src_h == 0) return .{ .w = 0, .h = 0 };
+    const sw: i64 = @intCast(src_w);
+    const sh: i64 = @intCast(src_h);
+    const b: i64 = box;
+    if (sw >= sh) {
+        return .{ .w = box, .h = @intCast(@max(@divTrunc(sh * b, sw), 1)) };
+    }
+    return .{ .w = @intCast(@max(@divTrunc(sw * b, sh), 1)), .h = box };
+}
 
 /// The pill's height with the text collapsed to a single line — the actions
 /// are the taller element there, so they set it.
@@ -431,4 +576,198 @@ test "hit testing answers on the hit box, not the paint" {
         l.hitButton(scale, l.text.left, @divTrunc(l.text.top + l.text.bottom, 2)),
     );
     try testing.expectEqual(@as(?Button, null), l.hitButton(scale, 0, l.bar_h * 3));
+}
+
+// ----------------------------------------------------------------- carousel
+
+test "no images means no carousel row and no gap left behind" {
+    // The same rule the footer follows, and the one T646 names explicitly: a
+    // composer nobody pasted into must be exactly as tall as it was before the
+    // strip existed.
+    for (scales) |scale| {
+        const base: Input = .{
+            .scale = scale,
+            .width = px(600.0, scale),
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .footer_h = lineAt(scale),
+        };
+        const none = Layout.init(base);
+        try testing.expect(none.carousel.isEmpty());
+        try testing.expectEqual(@as(i32, 0), none.thumb);
+        try testing.expectEqual(@as(i32, 0), none.maxScroll());
+        try testing.expect(none.thumbAt(0, 0).isEmpty());
+        try testing.expectEqual(@as(?usize, null), none.hitThumb(0, 0, 0));
+        // The footer sits one gap under the pill, exactly as it did with no
+        // carousel in the world at all.
+        try testing.expectEqual(none.pill.bottom + px(row_gap_dip, scale), none.footer.top);
+        try testing.expectEqual(
+            px(pad_dip, scale) * 2 + none.pill.height() +
+                px(row_gap_dip, scale) + lineAt(scale),
+            none.bar_h,
+        );
+    }
+}
+
+test "the carousel is a row of square tiles between the pill and the footer" {
+    for (scales) |scale| {
+        const gap = px(4.0, scale);
+        const row_gap = px(row_gap_dip, scale);
+        const width = px(600.0, scale);
+        for ([_]u32{ 1, 2, 7 }) |n| {
+            const l = Layout.init(.{
+                .scale = scale,
+                .width = width,
+                .lines = 1,
+                .line_h = lineAt(scale),
+                .footer_h = lineAt(scale),
+                .images = n,
+            });
+
+            // The strip is the pill's own column, one row gap below it, and
+            // the footer moves down by exactly the strip plus its gap.
+            try testing.expectEqual(l.pill.left, l.carousel.left);
+            try testing.expectEqual(l.pill.right, l.carousel.right);
+            try testing.expectEqual(l.pill.bottom + row_gap, l.carousel.top);
+            try testing.expectEqual(px(thumb_dip, scale), l.carousel.height());
+            try testing.expectEqual(l.carousel.bottom + row_gap, l.footer.top);
+
+            // Nothing touches anything, band edges included.
+            try testing.expect(l.carousel.left >= gap);
+            try testing.expect(width - l.carousel.right >= gap);
+            try testing.expect(l.bar_h - l.footer.bottom >= gap);
+
+            // The band is exactly its parts — this is the number the pane
+            // insets the page by.
+            try testing.expectEqual(
+                px(pad_dip, scale) * 2 + l.pill.height() +
+                    row_gap + l.carousel.height() +
+                    row_gap + lineAt(scale),
+                l.bar_h,
+            );
+
+            // Tiles are squares on one pitch, sharing the strip's vertical
+            // frame, with >= 4 DIP between two painted edges.
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const t = l.thumbAt(i, 0);
+                try testing.expectEqual(l.thumb, t.width());
+                try testing.expectEqual(l.thumb, t.height());
+                try testing.expectEqual(l.carousel.top, t.top);
+                try testing.expectEqual(l.carousel.bottom, t.bottom);
+                if (i > 0) {
+                    try testing.expect(t.left - l.thumbAt(i - 1, 0).right >= gap);
+                }
+            }
+        }
+    }
+}
+
+test "the strip scrolls only when it has to, and never past its ends" {
+    for (scales) |scale| {
+        // A 300 DIP pane holds three tiles comfortably and nine not at all:
+        // the interesting case is a ribbon LONGER than its viewport, which is
+        // where scroll exists at all.
+        const l3 = Layout.init(.{
+            .scale = scale,
+            .width = px(300.0, scale),
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .images = 3,
+        });
+        const l9 = Layout.init(.{
+            .scale = scale,
+            .width = px(300.0, scale),
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .images = 9,
+        });
+
+        // Three tiles fit, so there is nothing to scroll.
+        try testing.expectEqual(@as(i32, 0), l3.maxScroll());
+        try testing.expectEqual(@as(i32, 0), l3.scrollToShow(2, 0));
+        // Nine do not.
+        try testing.expect(l9.maxScroll() > 0);
+
+        // Scrolled to the end, the LAST tile sits flush with the trailing edge
+        // — an off-by-one here shows as a permanently clipped final tile.
+        const end = l9.maxScroll();
+        try testing.expectEqual(l9.carousel.right, l9.thumbAt(8, end).right);
+        try testing.expectEqual(l9.carousel.left, l9.thumbAt(0, 0).left);
+
+        // Clamped at both ends, whatever it is handed.
+        try testing.expectEqual(@as(i32, 0), l9.clampScroll(-9999));
+        try testing.expectEqual(end, l9.clampScroll(end + 9999));
+
+        // Bring the last tile into view; the first is then off the left.
+        const to_last = l9.scrollToShow(8, 0);
+        try testing.expectEqual(end, to_last);
+        try testing.expect(l9.thumbAt(0, to_last).right <= l9.carousel.left);
+        // Coming back to the first pulls the ribbon home.
+        try testing.expectEqual(@as(i32, 0), l9.scrollToShow(0, to_last));
+        // A tile already fully visible does not move the strip at all.
+        try testing.expectEqual(to_last, l9.scrollToShow(8, to_last));
+        // An index nobody has does not move it either.
+        try testing.expectEqual(to_last, l9.scrollToShow(99, to_last));
+    }
+}
+
+test "a tile only answers a click on the part of it that is on screen" {
+    const scale: f32 = 1.25;
+    const l = Layout.init(.{
+        .scale = scale,
+        .width = px(300.0, scale),
+        .lines = 1,
+        .line_h = lineAt(scale),
+        .footer_h = lineAt(scale),
+        .images = 9,
+    });
+    const mid_y = @divTrunc(l.carousel.top + l.carousel.bottom, 2);
+
+    // Every tile whose centre is inside the viewport answers for itself.
+    var i: usize = 0;
+    while (i < l.images) : (i += 1) {
+        const t = l.thumbAt(i, 0);
+        const cx = @divTrunc(t.left + t.right, 2);
+        const expected: ?usize = if (l.carousel.contains(cx)) i else null;
+        try testing.expectEqual(expected, l.hitThumb(0, cx, mid_y));
+    }
+
+    // The gap between two tiles is nobody's, and neither is the row above or
+    // below the strip.
+    const gap_x = l.thumbAt(0, 0).right + 1;
+    try testing.expectEqual(@as(?usize, null), l.hitThumb(0, gap_x, mid_y));
+    try testing.expectEqual(@as(?usize, null), l.hitThumb(0, l.thumbAt(0, 0).left + 1, l.pill.top));
+    try testing.expectEqual(@as(?usize, null), l.hitThumb(0, l.thumbAt(0, 0).left + 1, l.footer.top));
+
+    // A tile scrolled off the leading edge is not clickable ANYWHERE — the
+    // ribbon moved, and the hit test moved with it rather than answering for
+    // the pixels the tile used to own.
+    const end = l.maxScroll();
+    try testing.expect(end > 0);
+    var x = l.carousel.left;
+    while (x < l.carousel.right) : (x += 1) {
+        try testing.expect(l.hitThumb(end, x, mid_y) != @as(?usize, 0));
+    }
+    // ...and the LAST tile, which the same scroll brought flush with the
+    // trailing edge, answers there.
+    try testing.expectEqual(@as(?usize, 8), l.hitThumb(end, l.carousel.right - 2, mid_y));
+}
+
+test "fitInto letterboxes rather than crops, and never yields a zero side" {
+    // A landscape screenshot fills the tile's width; a portrait one its height.
+    try testing.expectEqual(@as(i32, 56), fitInto(1920, 1080, 56).w);
+    try testing.expectEqual(@as(i32, 31), fitInto(1920, 1080, 56).h);
+    try testing.expectEqual(@as(i32, 56), fitInto(600, 1200, 56).h);
+    try testing.expectEqual(@as(i32, 28), fitInto(600, 1200, 56).w);
+    // A square stays square.
+    try testing.expectEqual(@as(i32, 40), fitInto(10, 10, 40).w);
+    try testing.expectEqual(@as(i32, 40), fitInto(10, 10, 40).h);
+    // A 1x2000 sliver still has a pixel of width — a zero-width blit is a
+    // failure, and an invisible attachment is worse than a smudged one.
+    try testing.expectEqual(@as(i32, 1), fitInto(1, 2000, 56).w);
+    // Degenerate inputs answer empty rather than dividing by zero.
+    try testing.expectEqual(@as(i32, 0), fitInto(0, 10, 56).w);
+    try testing.expectEqual(@as(i32, 0), fitInto(10, 0, 56).h);
+    try testing.expectEqual(@as(i32, 0), fitInto(10, 10, 0).w);
 }
