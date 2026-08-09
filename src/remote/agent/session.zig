@@ -77,6 +77,18 @@ const proc = @import("proc.zig");
 /// Tombstones are bounded separately by `max_dead_sessions`.
 pub const max_sessions: usize = 256;
 
+/// The live cap every `SessionTable.init` starts from. Set ONCE at agent
+/// startup, before any table exists, from `--max-sessions` /
+/// `GHOSTTY_AGENT_MAX_SESSIONS`; read-only afterwards.
+///
+/// It exists so the refusal path can be exercised for real. The message a pane
+/// shows when the agent will not start a shell for it (T469) is only reachable
+/// through a genuine `error.TooManySessions`, and with a compile-time cap the
+/// only way to produce one on a box is to stand up 256 live shells — which is
+/// why that path shipped untested and silent for as long as it did. Two panes
+/// against `--max-sessions=1` reach the same code by the same route.
+pub var configured_max_sessions: usize = max_sessions;
+
 /// Maximum DEAD sessions (tombstones) the table retains alongside the live ones.
 /// Deliberately the same number as `max_sessions` rather than something smaller:
 /// every one of them is a pane a user may still Resume, so trimming harder would
@@ -787,11 +799,21 @@ pub const SessionTable = struct {
     /// Cryptographic RNG for id/channel minting (§7.1). Seeded from the OS by
     /// default; tests may inject a deterministic one.
     rng: std.Random,
+    /// The live-session ceiling `create` enforces. Defaults to `max_sessions`,
+    /// which is what every real agent runs with.
+    ///
+    /// It is a FIELD rather than the constant read directly so the refusal path
+    /// can be exercised for real: with a compile-time-only cap, the only way to
+    /// see a refusal on a box is to actually stand up 256 live shells, so the
+    /// path that tells a user why their pane is empty (T469) could never be
+    /// covered by an acceptance script. `ghoztty-agent --max-sessions=N` (and
+    /// `GHOSTTY_AGENT_MAX_SESSIONS`) set it; nothing in the product changes it.
+    max_live: usize = max_sessions,
 
     pub const Error = error{ TooManySessions, TooManyTombstones, IdCollision } || Allocator.Error;
 
     pub fn init(alloc: Allocator, rng: std.Random) SessionTable {
-        return .{ .alloc = alloc, .rng = rng };
+        return .{ .alloc = alloc, .rng = rng, .max_live = configured_max_sessions };
     }
 
     /// Free every session (terminating its child) and the maps. Called on shutdown.
@@ -859,7 +881,7 @@ pub const SessionTable = struct {
     ) Error!*Session {
         // LIVE sessions only (T278). A tombstone owns no process and must never
         // be the reason a user's next pane comes up without a shell.
-        if (self.liveCount() >= max_sessions) return error.TooManySessions;
+        if (self.liveCount() >= self.max_live) return error.TooManySessions;
 
         const id = self.mintId(&self.by_id);
         if (id == protocol.control_channel) return error.IdCollision;

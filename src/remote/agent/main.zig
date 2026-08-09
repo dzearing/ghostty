@@ -170,6 +170,25 @@ pub fn main() !void {
         } else |_| {}
     }
 
+    // Live-session cap (T469), same precedence: flag wins, else the env var.
+    // Resolved here, before any `SessionTable` exists, and read-only after.
+    if (!max_sessions_from_flag) {
+        if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_MAX_SESSIONS")) |v| {
+            defer alloc.free(v);
+            if (parseMaxSessions(v)) |n| session.configured_max_sessions = n;
+        } else |_| {}
+    }
+
+    // Capability suppression (T469 test seam): make this build advertise the
+    // HELLO of an OLDER agent, so an acceptance script can watch a capability's
+    // fallback happen for real instead of only in a unit test. Copied into the
+    // Server's own storage, so the env value need not outlive this scope.
+    if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_SUPPRESS_CAPS")) |v| {
+        defer alloc.free(v);
+        server.Server.suppressCapabilities(v);
+        std.log.warn("advertising a REDUCED capability set (suppressed: {s})", .{v});
+    } else |_| {}
+
     switch (mode) {
         .version => {
             var buf: [128]u8 = undefined;
@@ -446,6 +465,24 @@ fn parseRingBytes(text: []const u8) ?usize {
     return n;
 }
 
+/// True once `--max-sessions` set `session.configured_max_sessions`, so the env
+/// fallback in `main` knows the flag already won.
+var max_sessions_from_flag: bool = false;
+
+/// Parse a `--max-sessions` / `GHOSTTY_AGENT_MAX_SESSIONS` value.
+///
+/// Rejects 0 (an agent that can open nothing is not a configuration, it is a
+/// wedge) and anything above the compile-time `session.max_sessions`: this knob
+/// exists to make the refusal path reachable, never to RAISE a ceiling that the
+/// tombstone bookkeeping and the per-session ring budget were sized against.
+/// Pure + tested.
+fn parseMaxSessions(text: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const n = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    if (n == 0 or n > session.max_sessions) return null;
+    return n;
+}
+
 const Mode = union(enum) {
     /// `--version`: print the baked build version and exit.
     version,
@@ -635,6 +672,32 @@ fn parseArgs(alloc: Allocator) !Mode {
                     return error.InvalidArgs;
                 }
             }
+            // Live-session cap (T469): same order-independent shape as
+            // --ring-bytes. Lowering it is how the refusal path is reached on a
+            // box without standing up 256 real shells.
+            if (std.mem.eql(u8, a, "--max-sessions")) {
+                j += 1;
+                if (j >= args.len) {
+                    std.debug.print("ghoztty-agent: --max-sessions requires <n>\n", .{});
+                    return error.InvalidArgs;
+                }
+                if (parseMaxSessions(args[j])) |n| {
+                    session.configured_max_sessions = n;
+                    max_sessions_from_flag = true;
+                } else {
+                    std.debug.print("ghoztty-agent: invalid --max-sessions value '{s}'\n", .{args[j]});
+                    return error.InvalidArgs;
+                }
+            } else if (std.mem.startsWith(u8, a, "--max-sessions=")) {
+                const v = a["--max-sessions=".len..];
+                if (parseMaxSessions(v)) |n| {
+                    session.configured_max_sessions = n;
+                    max_sessions_from_flag = true;
+                } else {
+                    std.debug.print("ghoztty-agent: invalid --max-sessions value '{s}'\n", .{v});
+                    return error.InvalidArgs;
+                }
+            }
         }
     }
 
@@ -647,10 +710,13 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.eql(u8, a, allow_public_flag) or
             std.mem.startsWith(u8, a, "--port-file=") or
             std.mem.startsWith(u8, a, "--sessions-file=") or
-            std.mem.startsWith(u8, a, "--ring-bytes="))
+            std.mem.startsWith(u8, a, "--ring-bytes=") or
+            std.mem.startsWith(u8, a, "--max-sessions="))
         {
             continue; // handled in the pre-scan above
-        } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--sessions-file") or std.mem.eql(u8, a, "--ring-bytes")) {
+        } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--sessions-file") or
+            std.mem.eql(u8, a, "--ring-bytes") or std.mem.eql(u8, a, "--max-sessions"))
+        {
             i += 1; // value consumed in the pre-scan above
             continue;
         } else if (std.mem.eql(u8, a, "--version")) {
@@ -863,6 +929,10 @@ fn printUsage() void {
         \\  --ring-bytes=<N>                Per-session output-ring size in bytes (scrollback /
         \\                                  reconnect gap-fill). Default 2097152 (2 MB), min 65536.
         \\                                  Also settable via GHOSTTY_AGENT_RING_BYTES (flag wins).
+        \\  --max-sessions=<N>              Live-session ceiling, 1..256 (default 256). Lowering it
+        \\                                  is how the "could not start a shell" refusal path is
+        \\                                  exercised without standing up 256 real shells.
+        \\                                  Also settable via GHOSTTY_AGENT_MAX_SESSIONS (flag wins).
         \\  --sessions-file=<path>          Reboot-floor metadata store: keep this file's
         \\                                  {"version":1,"sessions":[…]} up to date with the live
         \\                                  session roster (id/argv/cwd/title/pinned) so sessions
@@ -2370,6 +2440,25 @@ test "parseRingBytes: plain byte count, floor, and junk rejection (T11)" {
     try std.testing.expectEqual(@as(?usize, null), parseRingBytes("2MB"));
     try std.testing.expectEqual(@as(?usize, null), parseRingBytes(""));
     try std.testing.expectEqual(@as(?usize, null), parseRingBytes("-1"));
+}
+
+test "parseMaxSessions: 1..max_sessions, and never a raised ceiling (T469)" {
+    // The useful range — 1 is what an acceptance script sets to make the second
+    // pane a refusal.
+    try std.testing.expectEqual(@as(?usize, 1), parseMaxSessions("1"));
+    try std.testing.expectEqual(@as(?usize, 8), parseMaxSessions(" 8\n"));
+    try std.testing.expectEqual(@as(?usize, session.max_sessions), parseMaxSessions("256"));
+
+    // 0 would be an agent that can open nothing — a wedge, not a configuration.
+    try std.testing.expectEqual(@as(?usize, null), parseMaxSessions("0"));
+    // Above the compile-time cap is refused: this knob exists to make the
+    // refusal path reachable, not to raise a ceiling the tombstone bookkeeping
+    // and ring budget were sized against.
+    try std.testing.expectEqual(@as(?usize, null), parseMaxSessions("257"));
+    // Junk / empty / negative → null (keep the default).
+    try std.testing.expectEqual(@as(?usize, null), parseMaxSessions("lots"));
+    try std.testing.expectEqual(@as(?usize, null), parseMaxSessions(""));
+    try std.testing.expectEqual(@as(?usize, null), parseMaxSessions("-1"));
 }
 
 test "port file: JSON body carries port/pid/startedAt" {

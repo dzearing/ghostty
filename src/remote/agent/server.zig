@@ -313,6 +313,52 @@ pub const Server = struct {
     /// Per-session ring size (from Options), read by `create`'s table inserts.
     ring_bytes: usize = session.default_ring_bytes,
 
+    /// Backing storage for `local_hello.capabilities` — `Options.capabilities`
+    /// minus the suppression set (see `suppressCapabilities`).
+    advertised_caps: [max_advertised_caps][]const u8 = undefined,
+
+    /// Capability strings this agent will NOT advertise, however `Options` lists
+    /// them — a comma-separated set copied here once at startup.
+    ///
+    /// A TEST SEAM (T469), and the reason it earns its place: the agent contract
+    /// says every capability must degrade gracefully in BOTH skew directions,
+    /// and until now that could only be checked in unit tests, because a single
+    /// tree builds both peers from the same capability list. There was no way to
+    /// produce an OLD agent on a box short of keeping an old binary around. This
+    /// turns any capability off at the source, so an acceptance script can watch
+    /// the real fallback happen against the real app.
+    ///
+    /// Set-once from `GHOSTTY_AGENT_SUPPRESS_CAPS` before any connection exists,
+    /// read-only afterwards → no synchronization. An env var rather than a flag
+    /// because the agent an acceptance script cares about is the one the APP
+    /// auto-spawns, and the script cannot add arguments to that — but the app
+    /// spawns it with an inherited environment block, so a var set around the
+    /// app reaches it. Empty in every real agent.
+    var suppress_buf: [256]u8 = undefined;
+    var suppress_len: usize = 0;
+
+    /// Record the suppression set (truncating past the buffer, which only a
+    /// nonsense value could reach). Idempotent; last call wins.
+    pub fn suppressCapabilities(list: []const u8) void {
+        suppress_len = @min(list.len, suppress_buf.len);
+        @memcpy(suppress_buf[0..suppress_len], list[0..suppress_len]);
+    }
+
+    /// True iff `name` appears in the suppression set. Whitespace around an
+    /// entry is ignored so `"a, b"` behaves like `"a,b"`.
+    fn isSuppressed(name: []const u8) bool {
+        if (suppress_len == 0) return false;
+        var it = std.mem.splitScalar(u8, suppress_buf[0..suppress_len], ',');
+        while (it.next()) |raw| {
+            if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t"), name)) return true;
+        }
+        return false;
+    }
+
+    /// Upper bound on advertised capabilities — the `Options` default is the
+    /// longest list that exists, and this is comfortably above it.
+    const max_advertised_caps = 32;
+
     pub const Options = struct {
         /// The pinned transfer encoding for this connection (§4.2). The agent
         /// echoes it in its HELLO; both sides must already agree.
@@ -334,6 +380,10 @@ pub const Server = struct {
             // `META{has_descendants}`, so a viewer can skip the close
             // confirmation for an idle CROSS-MACHINE pane (T356).
             protocol.capability.session_busy,
+            // This build ANSWERS a refused OPEN instead of dropping it, so the
+            // pane says why in milliseconds rather than blaming a timeout ten
+            // seconds later (T469).
+            protocol.capability.open_failed,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -385,6 +435,18 @@ pub const Server = struct {
             .store = store,
             .ring_bytes = opts.ring_bytes,
         };
+        // Advertise everything `opts` asked for, minus anything suppressed for a
+        // skew test. Points into `self`, which is heap-allocated and stable for
+        // the connection's life, so the HELLO encode below borrows safely.
+        var n: usize = 0;
+        for (opts.capabilities) |c| {
+            if (isSuppressed(c)) continue;
+            if (n == max_advertised_caps) break;
+            self.advertised_caps[n] = c;
+            n += 1;
+        }
+        self.local_hello.capabilities = self.advertised_caps[0..n];
+
         self.proc_sampler = proc.ProcSampler.init(alloc);
         return self;
     }
@@ -769,7 +831,7 @@ pub const Server = struct {
     /// payload or unknown id is ignored (never a crash, §15 M3).
     fn handleControlFrame(self: *Server, frame: protocol.Frame) void {
         switch (frame.type) {
-            .open => self.handleOpen(frame.payload),
+            .open => self.handleOpen(frame.channel, frame.payload),
             .attach => self.handleAttach(frame.payload),
             .resize => self.handleResize(frame.channel, frame.payload),
             .signal => self.handleSignal(frame.channel, frame.payload),
@@ -798,14 +860,58 @@ pub const Server = struct {
         }
     }
 
-    fn handleOpen(self: *Server, payload: []const u8) void {
-        var parsed = protocol.parseJson(protocol.Open, self.alloc, payload) catch return;
+    /// Tell the client we will NOT open a session, and why (T469).
+    ///
+    /// Silent on a peer that did not negotiate `capability.open_failed`: 0x06 is
+    /// a new opcode and an unknown opcode is a FATAL FRAMING ERROR for the
+    /// receiver, so emitting it to an older app would turn a refused pane into a
+    /// dropped connection — every other pane on that link with it. Such a peer
+    /// gets the pre-T469 behavior (silence, then its own 10 s timeout), which is
+    /// the graceful degradation the agent-contract rules require.
+    ///
+    /// Best-effort by design: if the reply cannot be enqueued the client still
+    /// has its timeout, so a failure here costs latency, never correctness.
+    fn sendOpenFailed(
+        self: *Server,
+        channel: u128,
+        reason: []const u8,
+        detail: ?[]const u8,
+    ) void {
+        const ok = if (self.negotiated) |n| n.open_failed else |_| false;
+        if (!ok) return;
+        self.sendJson(.open_failed, channel, protocol.OpenFailed{
+            .reason = reason,
+            .detail = detail,
+        }) catch {};
+    }
+
+    fn handleOpen(self: *Server, req_channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.Open, self.alloc, payload) catch |err| {
+            self.sendOpenFailed(
+                req_channel,
+                protocol.OpenFailed.Reason.malformed_request,
+                @errorName(err),
+            );
+            return;
+        };
         defer parsed.deinit();
         const open = parsed.value;
 
-        // Spawn the child (real pty). A spawn failure simply yields no OPENED; a real
-        // agent would reply with an error META (out of scope).
-        const spawned = self.spawner.spawn(open) catch return;
+        // Spawn the child (real pty).
+        const spawned = self.spawner.spawn(open) catch |err| {
+            // SAY SO (T469). A spawn failure is the most common refusal a user
+            // can actually fix — a shell path that does not exist, a command
+            // that is not on PATH — and it used to be the one that looked
+            // identical to every other: a blank pane and, ten seconds later,
+            // "error starting IO thread: error.Timeout".
+            std.log.warn("OPEN refused: spawn failed err={s}", .{@errorName(err)});
+            self.sendOpenFailed(
+                req_channel,
+                protocol.OpenFailed.Reason.spawn_failed,
+                @errorName(err),
+            );
+            return;
+        };
 
         // Stable copy of the child's tty path (wp3): `Result.tty` borrows storage
         // the child frees on terminate, so copy it before any window where an
@@ -836,11 +942,25 @@ pub const Server = struct {
             // "out of memory" are different problems with the same symptom.
             const live = self.store.table.liveCount();
             const dead = self.store.table.deadCount();
+            const cap = self.store.table.max_live;
             self.store.mutex.unlock();
             std.log.warn(
-                "OPEN refused: {s} (live={d}/{d} dead={d}/{d}) — the pane will come up with no shell",
-                .{ @errorName(err), live, session.max_sessions, dead, session.max_dead_sessions },
+                "OPEN refused: {s} (live={d}/{d} dead={d}/{d})",
+                .{ @errorName(err), live, cap, dead, session.max_dead_sessions },
             );
+            // ...and tell the CLIENT, which is the half T278 left undone: the
+            // log entry above only ever reached whoever went looking for it,
+            // while the person watching the blank pane learned nothing.
+            var detail_buf: [protocol.OpenFailedCopy.detail_max]u8 = undefined;
+            const detail = std.fmt.bufPrint(
+                &detail_buf,
+                "live={d}/{d} dead={d}/{d}",
+                .{ live, cap, dead, session.max_dead_sessions },
+            ) catch null;
+            self.sendOpenFailed(req_channel, switch (err) {
+                error.TooManySessions => protocol.OpenFailed.Reason.session_cap,
+                else => protocol.OpenFailed.Reason.out_of_memory,
+            }, detail);
             spawned.child.terminate();
             return;
         };
@@ -3175,6 +3295,129 @@ test "SESSION_CPU_SUB pushes per-session CPU; SESSION_CPU_UNSUB stops the pump c
         }
     };
     try testing.expect(waitUntil(P.pumpGone, .{h.server}));
+}
+
+test "suppressCapabilities: turns a capability off at the source, in the HELLO (T469)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(472);
+
+    // Restore the process-wide seam whatever happens — every later test in this
+    // file handshakes through the same `create`.
+    defer Server.suppressCapabilities("");
+    Server.suppressCapabilities("open_failed, session_cpu");
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // The CLIENT still asks for both, so a non-empty intersection would mean the
+    // agent advertised them anyway — which is the thing being ruled out.
+    const caps = [_][]const u8{ protocol.capability.open_failed, protocol.capability.session_cpu, protocol.capability.close_session };
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.open_failed);
+    try testing.expect(!neg.session_cpu);
+    // Everything NOT named is untouched: this suppresses, it does not reset.
+    try testing.expect(neg.close_session);
+}
+
+test "OPEN refused: the agent answers OPEN_FAILED with a reason, not silence (T469)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    // No children to hand out, so the very first spawn fails for real — the
+    // same route a bad shell path takes on a box.
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(469);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.open_failed};
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.open_failed);
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+
+    const f = try h.client.waitControl(.open_failed);
+    var p = try protocol.parseJson(protocol.OpenFailed, alloc, f.payload);
+    defer p.deinit();
+    // The token names the actionable cause, and the detail names the error the
+    // spawner actually raised — the two things the old silence threw away.
+    try testing.expectEqualStrings(protocol.OpenFailed.Reason.spawn_failed, p.value.reason);
+    try testing.expectEqualStrings("NoMoreChildren", p.value.detail.?);
+    // And nothing was created: a refusal must not leave a half-session behind.
+    h.store.mutex.lock();
+    defer h.store.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.store.table.count());
+}
+
+test "OPEN refused at the live cap: the reply names the cap and the counts (T469)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    // TWO children: the second spawn must SUCCEED so the refusal comes from
+    // `SessionTable.create` and not from the spawner running dry — those are
+    // different reasons and the point of the test is which one is reported.
+    var c0: FakeChild = .{ .alloc = alloc };
+    var c1: FakeChild = .{ .alloc = alloc };
+    var children = [_]*FakeChild{ &c0, &c1 };
+    var sp: FakeSpawner = .{ .children = &children };
+    var prng = std.Random.DefaultPrng.init(470);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    // One live session is the whole budget, so the second OPEN is refused by
+    // `SessionTable.create` itself — the genuine `error.TooManySessions` path,
+    // not a fault injected beside it.
+    h.store.mutex.lock();
+    h.store.table.max_live = 1;
+    h.store.mutex.unlock();
+
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.open_failed};
+    try h.client.handshakeCaps(&caps);
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    _ = try h.client.waitControl(.opened);
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    const f = try h.client.waitControl(.open_failed);
+    var p = try protocol.parseJson(protocol.OpenFailed, alloc, f.payload);
+    defer p.deinit();
+    try testing.expectEqualStrings(protocol.OpenFailed.Reason.session_cap, p.value.reason);
+    // The counts are the part a user (or a bug report) can act on: "at the
+    // limit" and "out of memory" look identical from the pane otherwise.
+    try testing.expect(std.mem.startsWith(u8, p.value.detail.?, "live=1/1 "));
+}
+
+test "OPEN refused: a client that did not negotiate open_failed gets today's silence (T469)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(471);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An OLDER app: it never advertises `open_failed`, and 0x06 would be a fatal
+    // framing error to it. The agent must stay silent and let it time out, which
+    // is exactly the pre-T469 behavior.
+    const old_caps = [_][]const u8{protocol.capability.close_session};
+    try h.client.handshakeCaps(&old_caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.open_failed);
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+
+    // Silence is not observable by waiting (a wait that ends is just a slower
+    // wait). Ask a question the agent WILL answer and prove that answer is the
+    // next frame: the writer is FIFO, so an OPEN_FAILED — sent before it — would
+    // have to arrive first.
+    try h.client.sendControlJson(.list_sessions, protocol.control_channel, struct {}{});
+    const next = (try h.client.nextControl()) orelse return error.Eof;
+    try testing.expectEqual(protocol.FrameType.sessions, next.type);
 }
 
 test "SESSIONS_SUB pushes the roster immediately and again when it changes" {

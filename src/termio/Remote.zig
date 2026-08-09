@@ -47,6 +47,7 @@ const connection = @import("../remote/connection.zig");
 const inbound_ring = @import("../remote/inbound_ring.zig");
 const protocol = @import("../remote/protocol.zig");
 const session_notice = @import("session_notice.zig");
+const open_failed_notice = @import("open_failed_notice.zig");
 
 const log = std.log.scoped(.io_remote);
 
@@ -225,6 +226,23 @@ applied_bytes: std.atomic.Value(u64) = .init(0),
 /// session-interrupted notice keeps only its in-stream copy. See
 /// `Config.pane_banner_restored`.
 pane_banner_restored: bool = false,
+
+/// The message to paint into the pane when bring-up failed for a reason we
+/// actually know (T469), rendered by `open_failed_notice` at the moment the
+/// agent refused the OPEN. Empty ⇒ nothing better than the generic text.
+///
+/// It lives HERE, on the stable backend (`Termio.backend.remote`), because of
+/// who reads it: `termio.Thread.threadMain`'s failure paint runs after
+/// `threadEnter` has already returned an error and its `ThreadData` is gone, so
+/// the only surviving handle is the `*Termio` — and the backend hangs off that.
+/// A fixed buffer rather than an allocation: this is written on the way out of a
+/// failing path, which is the worst possible place to add something else that
+/// can fail or leak.
+///
+/// Single-threaded by construction — written by the pane's IO thread inside
+/// `threadEnter`, read by that same thread in the paint that follows it.
+open_failed_notice_buf: [open_failed_notice.max_len]u8 = undefined,
+open_failed_notice_len: usize = 0,
 
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
@@ -489,6 +507,31 @@ pub fn remoteCommand(self: *const Remote) ?[]const u8 {
     return cmd;
 }
 
+/// Render and keep the pane message for an OPEN the agent refused (T469), so
+/// `termio.Thread`'s failure paint can show the reason instead of the generic
+/// "exhausting a system resource" text. Called on the IO thread, on the way out
+/// of a failing `threadEnter`.
+fn recordOpenRefusal(self: *Remote, refusal: protocol.OpenFailedCopy) void {
+    const msg = open_failed_notice.format(
+        &self.open_failed_notice_buf,
+        refusal.reason(),
+        refusal.detail(),
+    );
+    self.open_failed_notice_len = msg.len;
+    log.warn(
+        "OPEN refused by the agent reason={s} detail={?s}",
+        .{ refusal.reason(), refusal.detail() },
+    );
+}
+
+/// The message to paint instead of the generic IO-thread failure text, or null
+/// when this pane's bring-up failed for a reason we have nothing better to say
+/// about (a timeout, a dead link, an agent too old to answer a refusal).
+pub fn bringUpNotice(self: *const Remote) ?[]const u8 {
+    if (self.open_failed_notice_len == 0) return null;
+    return self.open_failed_notice_buf[0..self.open_failed_notice_len];
+}
+
 /// Initialize the terminal state for this backend (mirrors `Exec.initTerminal`):
 /// set the initial pwd if we have a working-directory hint and seed the grid /
 /// screen size from the terminal. The pwd is otherwise resolved lazily from the
@@ -691,8 +734,10 @@ pub fn threadEnter(
                 .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
                 .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
             };
-            const p = self.conn.openChannelCancellable(open, &self.canceller) catch |err| {
+            var refusal: protocol.OpenFailedCopy = .{};
+            const p = self.conn.openChannelRefusable(open, &self.canceller, &refusal) catch |err| {
                 log.warn("notify policy: fresh session open failed err={}", .{err});
+                if (err == error.OpenRefused) self.recordOpenRefusal(refusal);
                 return error.RemoteAttachFailed;
             };
             did_notify = true;
@@ -803,7 +848,15 @@ pub fn threadEnter(
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
             .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
         };
-        break :pane try self.conn.openChannelCancellable(open, &self.canceller);
+        var refusal: protocol.OpenFailedCopy = .{};
+        break :pane self.conn.openChannelRefusable(open, &self.canceller, &refusal) catch |err| {
+            // The agent told us WHY it will not open this pane (T469). Keep the
+            // sentence for the failure paint below — the error itself carries no
+            // payload, and without this the pane would come up blank and then
+            // blame `error.Timeout` for a refusal that took milliseconds.
+            if (err == error.OpenRefused) self.recordOpenRefusal(refusal);
+            return err;
+        };
     };
     // On any failure after this point we DETACH the pane (keep-alive teardown,
     // §3.3) so the remote session survives for a later re-attach.
@@ -1623,7 +1676,6 @@ pub const ThreadData = struct {
         self.* = undefined;
     }
 };
-
 
 // -----------------------------------------------------------------------------
 // Tests

@@ -52,6 +52,21 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// The message to paint when this backend's IO-thread bring-up failed for a
+    /// reason we can name, or null to fall back to the generic failure text
+    /// (`termio.Thread.threadMain`).
+    ///
+    /// Only the remote backend has one today: it is the side that can be told
+    /// "no, and here is why" by a process it does not own (T469). Exec's
+    /// failures are already distinguishable as error values it raises itself,
+    /// which is what the arms of that paint's switch are for.
+    pub fn bringUpNotice(self: *const Backend) ?[]const u8 {
+        return switch (self.*) {
+            .exec => null,
+            .remote => |*remote| remote.bringUpNotice(),
+        };
+    }
+
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),

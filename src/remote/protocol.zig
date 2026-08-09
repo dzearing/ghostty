@@ -49,6 +49,8 @@
 //! | v1 | `session_cpu` | pushed per-session CPU 0x79-0x7b | chooser shows no meter |
 //! | v1 | `sessions_push` | pushed session roster 0x7c-0x7d | client polls `LIST_SESSIONS` |
 //! | v1 | `cpu_units` | `cpu_pct` carries CORRECTED units everywhere | `% CPU` marked unverifiable |
+//! | v1 | `session_busy` | pushed `META{has_descendants}` per session | close always confirms |
+//! | v1 | `open_failed` | `OPEN_FAILED` 0x06 (refused OPEN, with a reason) | silence ⇒ client times out |
 //!
 //! Two rules make that table load-bearing rather than decorative:
 //!
@@ -108,6 +110,19 @@ pub const FrameType = enum(u8) {
     attach = 0x03, // C→A  {session_id, rows, cols, last_byte_offset}
     attached = 0x04, // A→C  {status, rows, cols, cwd, title, snapshot_at_offset, exit_code?}
     detached = 0x05, // A→C  server-initiated eviction notice (steal, §5.3)
+
+    // "I will not open this." The negative reply to `OPEN`, so a refusal is an
+    // ANSWER rather than silence. Without it a refused OPEN produced no frame at
+    // all and the client's parked `.opened` slot waited out the full
+    // `rpc_open_timeout_ns` (10 s) before failing with a bare `error.Timeout` —
+    // and because by-type OPEN RPCs serialize on one mutex, a window of N panes
+    // paid that 10 s N times, in turn, for a pane that was never coming.
+    //
+    // Gated on `capability.open_failed`: a new opcode is a fatal framing error to
+    // a peer that does not know it, so the agent sends this ONLY to a client that
+    // advertised the string. An older client gets today's silence-then-timeout,
+    // which is the graceful degradation the agent-contract rules ask for.
+    open_failed = 0x06, // A→C  {reason, detail?}  OPEN refused; no session exists
 
     data = 0x10, // both {byte_offset, bytes} for `channel`
     resize = 0x11, // C→A  {rows, cols, px_w, px_h}
@@ -523,6 +538,24 @@ pub const capability = struct {
     /// (client stays at confirm-always for remote panes), and an older client
     /// ignores an unknown JSON field.
     pub const session_busy = "session_busy";
+
+    /// Negative reply to `OPEN` (`open_failed`, 0x06): when the agent will not
+    /// open a session it says so, immediately, with a reason — instead of
+    /// dropping the request on the floor and letting the client's parked RPC
+    /// discover it 10 s later as `error.Timeout`.
+    ///
+    /// Gated because this is a NEW OPCODE, and an unknown opcode is a fatal
+    /// framing error for the receiver — so the agent must not emit it unless the
+    /// client advertised this string. Skew degrades exactly to today's behavior
+    /// in both directions: a new agent stays silent for an old client (which
+    /// times out as it always did), and a new client never receives the frame
+    /// from an old agent (same timeout). Neither garbles nor wedges.
+    ///
+    /// What the client does with it is the whole point: it fails the OPEN in
+    /// milliseconds and paints the reason into the pane, so a refused pane says
+    /// "the background terminal service is at its session limit" rather than
+    /// coming up blank and then blaming a timeout.
+    pub const open_failed = "open_failed";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -619,6 +652,13 @@ pub const Negotiated = struct {
     /// agent installs no sampling bridge (and does no walk) and the client keeps
     /// confirming every cross-machine close.
     session_busy: bool = false,
+
+    /// True iff BOTH peers advertised `capability.open_failed` — the agent
+    /// answers a refused `OPEN` with `open_failed{reason, detail}` and the
+    /// client understands it. False against any older peer, in which case the
+    /// agent stays silent (it must never emit an opcode the peer would treat as
+    /// a fatal framing error) and the client falls back to its 10 s timeout.
+    open_failed: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -655,6 +695,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.cpu_units),
         .session_busy = hasCapability(local.capabilities, capability.session_busy) and
             hasCapability(remote.capabilities, capability.session_busy),
+        .open_failed = hasCapability(local.capabilities, capability.open_failed) and
+            hasCapability(remote.capabilities, capability.open_failed),
     };
 }
 
@@ -723,6 +765,82 @@ pub const Opened = struct {
     /// older agents omit it (unknown-field-tolerant parser → null) and the
     /// client degrades to its pre-field behavior (no tty).
     tty: ?[]const u8 = null,
+};
+
+/// `OPEN_FAILED` (0x06) — the negative reply to `OPEN`. Sent ONLY when
+/// `Negotiated.open_failed` (a new opcode is a fatal framing error to a peer
+/// that does not know it); an older client sees today's silence and times out.
+///
+/// No `session_id`: nothing was created, which is the entire message. The
+/// session that would have existed does not, so there is nothing to close,
+/// attach to, or retry against.
+pub const OpenFailed = struct {
+    /// A STABLE MACHINE TOKEN from `reason` below, never prose. The client maps
+    /// it to the sentence a user reads, so the wording can be improved on the
+    /// client without an agent upgrade — which matters because the agent
+    /// routinely outlives the app that talks to it. A token this build does not
+    /// know maps to the generic sentence; it is never rendered raw.
+    reason: []const u8,
+
+    /// Free-form supporting text for the same failure, shown verbatim after the
+    /// sentence (e.g. `live=256/256 dead=3/256`, or the errno-ish name of a
+    /// failed spawn). Optional: absent from a peer that has nothing to add.
+    detail: ?[]const u8 = null,
+
+    /// The `reason` vocabulary. Additive: new tokens may be introduced at any
+    /// time and an older client renders the generic sentence for one it does
+    /// not recognize, so these never need a capability of their own.
+    pub const Reason = struct {
+        /// The agent is already running `max_sessions` live sessions.
+        pub const session_cap = "session_cap";
+        /// The child (shell or command) could not be started at all.
+        pub const spawn_failed = "spawn_failed";
+        /// The agent could not allocate the session's bookkeeping.
+        pub const out_of_memory = "out_of_memory";
+        /// The `OPEN` payload did not parse.
+        pub const malformed_request = "malformed_request";
+    };
+};
+
+/// A caller-owned, fixed-size copy of an `OPEN_FAILED` payload.
+///
+/// Why a copy and not the parsed value: the refusal has to outlive the frame
+/// (the connection frees the payload as soon as the parked RPC caller returns)
+/// and cross into the termio backend, which paints it into the pane after
+/// bring-up has already failed. A Zig error carries no payload, so the reason
+/// travels beside `error.OpenRefused` in a caller-provided struct rather than
+/// in a heap allocation somebody has to remember to free on every error path.
+///
+/// Over-long fields are TRUNCATED, never rejected: a refusal that arrives with
+/// a 4 KB detail is still a refusal, and losing the tail of the detail is
+/// strictly better than degrading back to a blank pane.
+pub const OpenFailedCopy = struct {
+    pub const reason_max = 40;
+    pub const detail_max = 160;
+
+    reason_buf: [reason_max]u8 = undefined,
+    reason_len: usize = 0,
+    detail_buf: [detail_max]u8 = undefined,
+    detail_len: usize = 0,
+
+    pub fn reason(self: *const OpenFailedCopy) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
+
+    /// Null when the peer sent no detail (or an empty one), so a caller can
+    /// tell "nothing to add" from "added an empty string".
+    pub fn detail(self: *const OpenFailedCopy) ?[]const u8 {
+        if (self.detail_len == 0) return null;
+        return self.detail_buf[0..self.detail_len];
+    }
+
+    pub fn set(self: *OpenFailedCopy, v: OpenFailed) void {
+        self.reason_len = @min(v.reason.len, reason_max);
+        @memcpy(self.reason_buf[0..self.reason_len], v.reason[0..self.reason_len]);
+        const d = v.detail orelse "";
+        self.detail_len = @min(d.len, detail_max);
+        @memcpy(self.detail_buf[0..self.detail_len], d[0..self.detail_len]);
+    }
 };
 
 /// `ATTACH` (0x03). `last_byte_offset` anchors the sequence-anchored resync
@@ -1895,6 +2013,97 @@ test "HELLO encode / parse / negotiate" {
     ));
 }
 
+test "negotiate: open_failed capability is the intersection of both HELLOs" {
+    const both = [_][]const u8{capability.open_failed};
+    const other = [_][]const u8{capability.rpc};
+
+    // Both advertise → the agent may answer a refused OPEN.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.open_failed);
+    }
+    // Either side missing → disabled, in BOTH directions. This is the whole
+    // skew guarantee: a new agent must stay silent for an old app (which would
+    // treat 0x06 as a fatal framing error), and a new app must not expect a
+    // frame an old agent will never send.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+        );
+        try testing.expect(!n.open_failed);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.open_failed);
+    }
+    // Neither: the pre-change world.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.open_failed);
+    }
+}
+
+test "OpenFailed: round-trips, and an absent detail stays absent" {
+    const alloc = testing.allocator;
+
+    const json = try encodeJson(alloc, OpenFailed{
+        .reason = OpenFailed.Reason.session_cap,
+        .detail = "live=256/256 dead=3/256",
+    });
+    defer alloc.free(json);
+
+    var parsed = try parseJson(OpenFailed, alloc, json);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("session_cap", parsed.value.reason);
+    try testing.expectEqualStrings("live=256/256 dead=3/256", parsed.value.detail.?);
+
+    // No detail is a legitimate refusal, not a malformed one.
+    const bare = try encodeJson(alloc, OpenFailed{ .reason = OpenFailed.Reason.spawn_failed });
+    defer alloc.free(bare);
+    var p2 = try parseJson(OpenFailed, alloc, bare);
+    defer p2.deinit();
+    try testing.expectEqualStrings("spawn_failed", p2.value.reason);
+    try testing.expect(p2.value.detail == null);
+
+    // An unknown reason from a NEWER agent must parse, not fail: the client
+    // renders the generic sentence for it rather than dropping the refusal and
+    // falling back to a blank pane.
+    var p3 = try parseJson(OpenFailed, alloc, "{\"reason\":\"quota_exceeded\",\"unknown\":1}");
+    defer p3.deinit();
+    try testing.expectEqualStrings("quota_exceeded", p3.value.reason);
+}
+
+test "OpenFailedCopy: copies, reports an empty detail as null, and truncates" {
+    var c: OpenFailedCopy = .{};
+    c.set(.{ .reason = "session_cap", .detail = "live=2/2" });
+    try testing.expectEqualStrings("session_cap", c.reason());
+    try testing.expectEqualStrings("live=2/2", c.detail().?);
+
+    // Empty and absent details are indistinguishable to a reader, on purpose.
+    c.set(.{ .reason = "spawn_failed" });
+    try testing.expect(c.detail() == null);
+    c.set(.{ .reason = "spawn_failed", .detail = "" });
+    try testing.expect(c.detail() == null);
+
+    // Over-long fields truncate rather than fail — a refusal with a huge detail
+    // is still a refusal, and a truncated tail beats a blank pane.
+    const long_reason = "r" ** (OpenFailedCopy.reason_max + 17);
+    const long_detail = "d" ** (OpenFailedCopy.detail_max + 400);
+    c.set(.{ .reason = long_reason, .detail = long_detail });
+    try testing.expectEqual(OpenFailedCopy.reason_max, c.reason().len);
+    try testing.expectEqual(OpenFailedCopy.detail_max, c.detail().?.len);
+}
+
 test "negotiate: close_session capability is the intersection of both HELLOs" {
     const both = [_][]const u8{capability.close_session};
     const other = [_][]const u8{capability.rpc};
@@ -2337,8 +2546,7 @@ test "PROC_SNAPSHOT/Proc JSON round-trips (incl. null cmd/user elision)" {
 
     // Back-compat: a snapshot JSON from an old agent (no agent_pid) parses with
     // agent_pid defaulting to 0.
-    var old = try parseJson(ProcSnapshot, alloc,
-        "{\"ok\":true,\"host\":{},\"procs\":[],\"truncated\":false}");
+    var old = try parseJson(ProcSnapshot, alloc, "{\"ok\":true,\"host\":{},\"procs\":[],\"truncated\":false}");
     defer old.deinit();
     try testing.expectEqual(@as(i64, 0), old.value.agent_pid);
 }

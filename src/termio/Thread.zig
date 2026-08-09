@@ -154,69 +154,85 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
         // Hide the cursor
         t.modes.set(.cursor_visible, false);
 
-        // This is weird but just ensures that no matter what our underlying
-        // implementation we have the errors below. For example, Windows doesn't
-        // have "OpenptyFailed".
-        const Err = @TypeOf(err) || error{
-            OpenptyFailed,
-            InputNotFound,
-            InputFailed,
-        };
+        // If the backend knows WHY bring-up failed in words a user can act on,
+        // that always beats anything we can say from the error value alone
+        // (T469). Today that is a remote pane whose OPEN the agent refused: it
+        // was told the reason on the wire, and the alternative below would tell
+        // the user their pane is blank because of a timeout — naming the symptom
+        // we produced rather than the cause we were handed.
+        //
+        // NOT an early `return`: the mailbox drain after this catch block is
+        // what lets the surface be closed at all, so every path through here
+        // must fall out the bottom.
+        if (io.backend.bringUpNotice()) |notice| {
+            t.eraseDisplay(.complete, false);
+            t.printString(notice) catch {};
+        } else {
 
-        switch (@as(Err, @errorCast(err))) {
-            error.OpenptyFailed => {
-                const str =
-                    \\Your system cannot allocate any more pty devices.
-                    \\
-                    \\Ghostty requires a pty device to launch a new terminal.
-                    \\This error is usually due to having too many terminal
-                    \\windows open or having another program that is using too
-                    \\many pty devices.
-                    \\
-                    \\Please free up some pty devices and try again.
-                ;
+            // This is weird but just ensures that no matter what our underlying
+            // implementation we have the errors below. For example, Windows doesn't
+            // have "OpenptyFailed".
+            const Err = @TypeOf(err) || error{
+                OpenptyFailed,
+                InputNotFound,
+                InputFailed,
+            };
 
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
+            switch (@as(Err, @errorCast(err))) {
+                error.OpenptyFailed => {
+                    const str =
+                        \\Your system cannot allocate any more pty devices.
+                        \\
+                        \\Ghostty requires a pty device to launch a new terminal.
+                        \\This error is usually due to having too many terminal
+                        \\windows open or having another program that is using too
+                        \\many pty devices.
+                        \\
+                        \\Please free up some pty devices and try again.
+                    ;
 
-            error.InputNotFound,
-            error.InputFailed,
-            => {
-                const str =
-                    \\A configured `input` path was not found, was not readable,
-                    \\was too large, or the underlying pty failed to accept
-                    \\the write.
-                    \\
-                    \\Ghostty can't continue since it can't guarantee that
-                    \\initial terminal state will be as desired. Please review
-                    \\the value of `input` in your configuration file and
-                    \\ensure that all the path values exist and are readable.
-                ;
+                    t.eraseDisplay(.complete, false);
+                    t.printString(str) catch {};
+                },
 
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
+                error.InputNotFound,
+                error.InputFailed,
+                => {
+                    const str =
+                        \\A configured `input` path was not found, was not readable,
+                        \\was too large, or the underlying pty failed to accept
+                        \\the write.
+                        \\
+                        \\Ghostty can't continue since it can't guarantee that
+                        \\initial terminal state will be as desired. Please review
+                        \\the value of `input` in your configuration file and
+                        \\ensure that all the path values exist and are readable.
+                    ;
 
-            else => {
-                const str = std.fmt.allocPrint(
-                    alloc,
-                    \\error starting IO thread: {}
-                    \\
-                    \\The underlying shell or command was unable to be started.
-                    \\This error is usually due to exhausting a system resource.
-                    \\If this looks like a bug, please report it.
-                    \\
-                    \\This terminal is non-functional. Please close it and try again.
-                ,
-                    .{err},
-                ) catch
-                    \\Out of memory. This terminal is non-functional. Please close it and try again.
-                ;
+                    t.eraseDisplay(.complete, false);
+                    t.printString(str) catch {};
+                },
 
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
+                else => {
+                    const str = std.fmt.allocPrint(
+                        alloc,
+                        \\error starting IO thread: {}
+                        \\
+                        \\The underlying shell or command was unable to be started.
+                        \\This error is usually due to exhausting a system resource.
+                        \\If this looks like a bug, please report it.
+                        \\
+                        \\This terminal is non-functional. Please close it and try again.
+                    ,
+                        .{err},
+                    ) catch
+                        \\Out of memory. This terminal is non-functional. Please close it and try again.
+                    ;
+
+                    t.eraseDisplay(.complete, false);
+                    t.printString(str) catch {};
+                },
+            }
         }
     };
 

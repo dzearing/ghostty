@@ -1032,6 +1032,40 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
 
   E2E: `test/win32/session-relaunch-notify.ps1`.
 
+**A refused pane says why, immediately** (T469). When the agent will not open a
+session — it is at its live-session cap, it is out of memory, or the shell/
+command could not be spawned at all — it answers `OPEN_FAILED` (0x06,
+`{reason, detail}`) instead of dropping the request, and the pane paints a
+plain-words message naming the cause and what to do about it. Before this there
+was no frame for "I will not open this": the app's parked OPEN waited out its
+full 10 s `rpc_open_timeout_ns` and then blamed `error.Timeout` and "exhausting
+a system resource" — a sentence true of no failure a user can act on. Because
+by-type OPEN RPCs serialize on one mutex, a window of N panes paid that 10 s N
+times, in turn, for panes that were never coming.
+
+- `reason` is a **stable machine token** (`session_cap`, `spawn_failed`,
+  `out_of_memory`, `malformed_request`), never prose, and the app owns the
+  sentence — the agent outlives the app talking to it, so an agent that shipped
+  wording would pin the text to whichever build happens to be resident. An
+  unknown token from a newer agent renders a generic sentence rather than being
+  echoed raw or dropped. Mapping: `src/termio/open_failed_notice.zig` (pure,
+  asserted in the none lane); the paint is `termio.Thread`'s existing failure
+  path, which a backend can now pre-empt via `Backend.bringUpNotice()`.
+- Capability-gated on `open_failed`, because a new opcode is a **fatal framing
+  error** to a peer that does not know it. Both skew directions degrade to
+  exactly the pre-T469 behavior (silence, then the client's own timeout, then
+  the generic message) — never a garble, never a wedge.
+- Two agent test seams make the refusal reproducible from one tree, which is
+  why this path shipped silent for as long as it did:
+  `GHOSTTY_AGENT_MAX_SESSIONS=<1..256>` (also `--max-sessions`) lowers the live
+  cap so two panes reach a genuine `error.TooManySessions`, and
+  `GHOSTTY_AGENT_SUPPRESS_CAPS=<comma list>` makes this binary advertise an
+  older agent's HELLO so the fallback can be watched happening. The app spawns
+  the agent with an inherited environment block, so both reach the agent an
+  acceptance script never launches itself. Empty/default in every real agent.
+- Acceptance: `test/win32/agent-open-refused.ps1` (control / fast refusal /
+  skew).
+
 **A launch command and a restore both happen.** `ghoztty -e <cmd…>` (or a
 `command`/`initial-command` in the config) asked for something on THIS launch;
 the windows restore rebuilds are what the user left behind. Neither silently

@@ -12740,3 +12740,53 @@ line reaches the distro as one quoted word (`/bin/bash: line 1: echo hi:
 command not found`). Same table, different bug, broken identically on both
 paths, and fixing it means deciding which shell inside the distro to exec back
 into. **T656.**
+
+## 2026-08-09 — A pane the agent refuses now says so, in 150 ms instead of 10 s (T469)
+
+There was no frame for "I will not open this". When the local agent would not
+start a shell — at its live-session cap, out of memory, or the spawn simply
+failed — `handleOpen` returned and said nothing. The app's parked OPEN sat out
+its full 10 s `rpc_open_timeout_ns`, then painted the generic bring-up failure,
+which blames `error.Timeout` and "exhausting a system resource": a sentence true
+of no failure a user can act on and naming none of the ones they can. And
+because by-type OPEN RPCs serialize on one mutex, a window of N panes paid that
+10 s N times, in turn, for panes that were never coming. T278 had already made
+the agent LOG the reason; this is the half that tells the client.
+
+`OPEN_FAILED` (0x06, `{reason, detail}`) is that frame, capability-gated per the
+agent contract — a new opcode is a fatal framing error to a peer that does not
+know it, so the agent stays silent for an older app and a newer app never
+expects it from an older agent. `reason` is a stable machine token
+(`session_cap`, `spawn_failed`, `out_of_memory`, `malformed_request`) and never
+prose: the agent outlives the app talking to it, so an agent that shipped wording
+would pin the text to whichever build happens to be resident. The app owns the
+sentence, in `src/termio/open_failed_notice.zig`, and renders an unrecognized
+token from a newer agent generically rather than echoing it raw or discarding a
+refusal it was told about.
+
+The pane message needed no new carrier. The task file claimed a second,
+independent defect — that the generic failure paint is invisible on win32 — and
+that does not reproduce: measured against the installed release, a forced spawn
+failure paints its 274 bytes and `+read` returns all of them. The 2026-08-04
+observation predates T181/T193. So the existing paint was working and merely
+saying the wrong thing; `Backend.bringUpNotice()` now lets a backend pre-empt it
+with something true, and the correction is recorded in T469 rather than left to
+mislead the next reader.
+
+Two agent seams were added because this path shipped silent for as long as it
+did partly because it was unreachable from one tree:
+`GHOSTTY_AGENT_MAX_SESSIONS` (also `--max-sessions`, 1..256) lowers the live cap
+so two panes hit a genuine `error.TooManySessions` instead of an injected fault,
+and `GHOSTTY_AGENT_SUPPRESS_CAPS` makes this binary advertise an older agent's
+HELLO so a capability's fallback can be watched happening rather than only
+asserted in a unit test. That second one is reusable by every future capability.
+
+Measured, `test/win32/agent-open-refused.ps1`, ALL PASS (19 checks): the refusal
+message appears at **150 ms** (the first poll) where the old path took ten
+seconds, and the skew arm lands at **10132 ms** with the generic text and a live
+`+list` afterwards — proving the fallback really is the old road and not the new
+one arriving late. Floor lanes green, `agent-session-cap.ps1` and P1–P3 ALL PASS.
+
+`ATTACH` has the identical hole and was filed rather than folded in: a resumed
+pane whose ATTACH is refused still blanks for ten seconds and blames a timeout.
+**T657.**

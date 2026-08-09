@@ -454,6 +454,13 @@ const PendingRpc = struct {
     /// pane's data-channel id. For a same-channel reply it simply equals the request
     /// channel.
     reply_channel: u128 = 0,
+    /// The frame type that actually satisfied this slot (filled by
+    /// `deliverRpcReply` before `done.set()`). Normally equals `want`; it
+    /// differs for the one reply that is legitimately a DIFFERENT type — a
+    /// refused OPEN answers `.open_failed` to a slot waiting on `.opened`
+    /// (T469), and the caller has to be able to tell the two apart before it
+    /// parses the payload as an `Opened`.
+    reply_type: protocol.FrameType = .hello,
     /// The cancellation token this RPC was issued with (or null). Lets
     /// `cancelRpcsFor` wake exactly the callers owned by one tearing-down pane
     /// without touching other panes' in-flight RPCs on the shared connection.
@@ -994,6 +1001,12 @@ pub const Connection = struct {
         // We consume `META{has_descendants}` for the close confirmation (T356).
         // Advertising it is what tells the agent the sampling is worth doing.
         protocol.capability.session_busy,
+        // We understand `OPEN_FAILED` (0x06), so a modern agent can refuse an
+        // OPEN out loud instead of dropping it and leaving us to discover it as
+        // `error.Timeout` ten seconds later (T469). An older agent never
+        // advertises it, the negotiated flag stays false, and we keep the
+        // timeout — the pane just takes the slow road to the same failure.
+        protocol.capability.open_failed,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1536,6 +1549,28 @@ pub const Connection = struct {
         open: protocol.Open,
         canceller: ?*const RpcCanceller,
     ) !*Pane {
+        return self.openChannelRefusable(open, canceller, null);
+    }
+
+    /// `openChannelCancellable` that also reports WHY the agent refused.
+    ///
+    /// When the agent answers `OPEN_FAILED` (0x06) this returns
+    /// `error.OpenRefused` and, if `refusal` is non-null, fills it with the
+    /// reason token and detail. A Zig error carries no payload, so the reason
+    /// travels beside the error in a caller-owned struct rather than in a heap
+    /// allocation every error path would have to remember to free.
+    ///
+    /// Every other failure is unchanged, `error.Timeout` included: an agent too
+    /// old to advertise `capability.open_failed` never sends the frame, so a
+    /// refusal there still surfaces as the 10 s timeout it always did, with
+    /// `refusal` untouched. Callers must therefore treat a filled `refusal` as
+    /// "known reason" and its absence as "no more than we knew before".
+    pub fn openChannelRefusable(
+        self: *Connection,
+        open: protocol.Open,
+        canceller: ?*const RpcCanceller,
+        refusal: ?*protocol.OpenFailedCopy,
+    ) !*Pane {
         // Mint a fresh channel id for the OUTBOUND OPEN frame (§7.1). The agent is
         // **channel-authoritative**: it mints its OWN session channel and replies
         // OPENED on it (see `deliverRpcReply`/`rpcCall`). So we send OPEN on our
@@ -1553,6 +1588,26 @@ pub const Connection = struct {
         defer self.alloc.free(open_json);
         const rpc = try self.rpcCall(req_channel, .open, .opened, open_json, self.rpc_open_timeout_ns, canceller);
         defer self.alloc.free(rpc.payload);
+
+        // The agent refused, and said so (T469). Nothing was created — no
+        // session, no channel, nothing registered — so there is nothing to undo
+        // here; we only carry the reason out to whoever can show it.
+        //
+        // A payload we cannot parse is still a refusal: a newer agent could add
+        // fields, and degrading a "refused, reason unknown" into a 10 s timeout
+        // would be strictly worse than saying so generically.
+        if (rpc.type == .open_failed) {
+            if (refusal) |out| {
+                if (protocol.parseJson(protocol.OpenFailed, self.alloc, rpc.payload)) |p| {
+                    defer p.deinit();
+                    out.set(p.value);
+                } else |_| {
+                    out.set(.{ .reason = "unparseable" });
+                }
+            }
+            return error.OpenRefused;
+        }
+
         const id = rpc.channel; // agent-authoritative data channel
 
         var parsed = protocol.parseJson(protocol.Opened, self.alloc, rpc.payload) catch
@@ -2491,7 +2546,9 @@ pub const Connection = struct {
     /// The result of an `rpcCall`: the duped reply payload (caller frees) plus the
     /// channel the reply actually arrived on (the agent-authoritative session channel
     /// for OPEN/ATTACH; equal to the request channel otherwise).
-    const RpcResult = struct { payload: []u8, channel: u128 };
+    /// `type` is the frame that satisfied the call — equal to `want` except for
+    /// a refused OPEN, which answers `.open_failed` (T469).
+    const RpcResult = struct { payload: []u8, channel: u128, type: protocol.FrameType };
 
     /// Issue a control-channel RPC and block until the matching reply (`want`)
     /// arrives, or the link closes. Parks a stack-owned `PendingRpc` and waits on its
@@ -2604,7 +2661,19 @@ pub const Connection = struct {
             slot.done.wait();
         }
         const owned = try slot.result; // []u8 (caller-owned) or a PendingError
-        return .{ .payload = owned, .channel = slot.reply_channel };
+        return .{ .payload = owned, .channel = slot.reply_channel, .type = slot.reply_type };
+    }
+
+    /// True iff `got` is a legitimate terminal reply for a slot waiting on
+    /// `want`. Normally that is only the same type; the one exception is the
+    /// NEGATIVE reply to OPEN — `open_failed` answers an `.opened` slot (T469).
+    ///
+    /// It is a reply, not a wrong-type frame, and the distinction is the whole
+    /// point: routed through `WrongReply` the caller would learn the OPEN failed
+    /// but never why, which is the blank pane this task exists to remove.
+    fn acceptsReply(want: protocol.FrameType, got: protocol.FrameType) bool {
+        if (want == got) return true;
+        return want == .opened and got == .open_failed;
     }
 
     /// Deliver a reply frame to a parked RPC caller. Called by the control reader's
@@ -2626,7 +2695,11 @@ pub const Connection = struct {
             // OPEN/ATTACH reply. The agent chose `frame.channel`; record it so the
             // caller registers its inbound ring on the right (agent) channel.
             const by_type: ?*PendingRpc = switch (frame.type) {
-                .opened => self.pending_opened,
+                // A refusal is the OPEN's answer, so it goes to the same slot
+                // (T469). There is no session and therefore no agent channel to
+                // adopt, but stamping `frame.channel` costs nothing and the
+                // caller never reaches the adopt step on this path.
+                .opened, .open_failed => self.pending_opened,
                 .attached => self.pending_attached,
                 else => null,
             };
@@ -2638,7 +2711,8 @@ pub const Connection = struct {
             return false;
         };
         // Fill the result under the lock so it is published before `done.set()`.
-        if (frame.type != slot.want) {
+        slot.reply_type = frame.type;
+        if (!acceptsReply(slot.want, frame.type)) {
             slot.result = error.WrongReply;
         } else if (self.alloc.dupe(u8, frame.payload)) |owned| {
             slot.result = owned;
@@ -2846,10 +2920,14 @@ pub const Connection = struct {
     /// Other frame types are ignored here (the user handler still sees them).
     fn handleControlInternal(self: *Connection, frame: protocol.Frame) void {
         switch (frame.type) {
-            .opened, .attached => {
+            .opened, .attached, .open_failed => {
                 // Reply to an OPEN/ATTACH RPC: hand the payload to the parked caller
                 // keyed by this channel id. If no caller is waiting (stale/duplicate
                 // reply), it's dropped here; the user handler still observes it.
+                //
+                // `.open_failed` rides the same path on purpose — it is the OPEN's
+                // negative answer, not a separate event (T469). An unsolicited one
+                // (no parked caller) is simply dropped, exactly like a late OPENED.
                 _ = self.deliverRpcReply(frame);
             },
             .cwd => {
