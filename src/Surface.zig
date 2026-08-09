@@ -110,6 +110,25 @@ pub const RemoteBackend = struct {
     restore_snapshot: ?[]const u8 = null,
     restore_offset: u64 = 0,
 
+    /// The FULL shell invocation that runs the apprt's explicit `--command`,
+    /// exec'd verbatim by the agent in place of its own `<shell> [/c|-lic] <cmd>`
+    /// synthesis (T468). It exists because the keep-alive convention is not
+    /// expressible the same way on both platforms: POSIX folds it into the
+    /// command STRING (`<cmd>; exec <shell> -li`), which survives being handed to
+    /// the agent as `OPEN.command`, while Windows spells it in ARGV (`cmd /K`,
+    /// `pwsh -NoExit -Command`) — and argv cannot ride a command string. Without
+    /// this the agent runs `cmd.exe /c <cmd>` and every `--command=` pane dies as
+    /// soon as its command returns.
+    ///
+    /// Set ONLY by a LOCAL-agent apprt (the agent is this machine, so the local
+    /// shell-flavor table applies); null for cross-machine windows, where the
+    /// agent's own convention is the only correct one. It does NOT replace the
+    /// command: the command still travels as `OPEN.command` so the agent records
+    /// it as the session's human-readable label (`+sessions`, the
+    /// session-interrupted notice). Borrowed for the construction call only
+    /// (duped by `termio.Remote.init`).
+    command_argv: ?[]const []const u8 = null,
+
     /// True ⇒ the apprt has already restored this pane's own sticky banner from
     /// its session-layout manifest (T422). It is the one signal `termio.Remote`
     /// cannot work out for itself: the banner is app-side overlay state, so from
@@ -1070,6 +1089,14 @@ pub fn init(
                 const forwarded_argv: ?[]const []const u8 =
                     if (remote_command == null) integ_argv else null;
 
+                // T468: the apprt's own keep-alive invocation for an explicit
+                // `--command` (Windows spells it in argv, so it cannot ride the
+                // command string the way POSIX's `<cmd>; exec <shell> -li`
+                // does). It is the command's FULL invocation, so it goes on the
+                // OPEN only — never on the `notify` fresh-shell open below,
+                // which exists precisely to NOT re-run the recorded command.
+                const command_argv: ?[]const []const u8 = rb.command_argv;
+
                 // User/apprt env overrides applied LAST (they win over the
                 // integration env above, mirroring exec's `env_override`).
                 {
@@ -1109,6 +1136,7 @@ pub fn init(
                     .term = config.term,
                     .env = remote_env.items,
                     .argv = forwarded_argv,
+                    .command_argv = command_argv,
                     // Pin persistent LOCAL-agent sessions against the agent's
                     // idle-TTL reaper (T11): the viewer's session-layout manifest
                     // references them, so they must survive the viewer quitting

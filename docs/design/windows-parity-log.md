@@ -12689,3 +12689,54 @@ the app's JSON parser rejects, and a *rejected* manifest is silently routed
 around — the app recovers the window from the agent on a fresh offset-0 attach —
 so every liveness assertion passes against a pane the repro never touched. D4
 now asserts the manifest was consumed, and D5/D7 are gated on it.
+
+## 2026-08-09 — Every `--command=` pane on Windows was dead on arrival (T468)
+
+`ghoztty +new-window --command="echo hi"` printed `hi` and then
+`Process exited. Press any key to close the terminal.`, and nothing sent to that
+pane afterwards did anything. Same for `+split --command=`, `--split-command=`,
+and CLAUDE.md's own headline three-pane example, which produced three corpses.
+It was invisible for `tail -f` and instant for anything that returns, which is
+probably how it survived this long — that, and `conformance.ps1` S8.5 failing
+for what looked like an OSC reason.
+
+**The wrap table was never the problem.** `wrapShellCommandArgv` has always
+produced `cmd /K`, `pwsh -NoExit -Command`, `bash -lic "<cmd>; exec bash -li"`,
+and its unit tests have always passed. It was only ever reached on the plain
+ConPTY path — and with `session-persistence` on, which it has been since T99,
+there is no plain ConPTY path for a local pane. Every one of them is agent-
+backed, and that branch forwarded the command as a raw string with the comment
+"never locally shell-wrapped — the agent applies its own shell's convention".
+The agent duly applied `cmd.exe /c <cmd>`, which exits.
+
+That comment is right for a cross-machine agent and wrong for the local one,
+and the reason this is a Windows-shaped hole is worth keeping: **POSIX spells
+keep-alive inside the command STRING and Windows spells it in ARGV.**
+`<cmd>; exec <shell> -li` rides `OPEN.command` through the agent untouched, so
+the Mac gets agent-backed keep-alive for free and never saw this. `/K` cannot
+ride a string. The fix sends the wrapped invocation as `OPEN.argv` — the
+agent's existing exec-verbatim seam, already carrying the shell-integration
+rewrite — while `OPEN.command` still travels so the session keeps its
+human-readable label for `+sessions` and the session-interrupted notice.
+
+The new `command_argv` is deliberately not a reuse of the `argv` field beside
+it. `argv` is replayed on the `notify` policy's fresh-shell open, and replaying
+a recorded command there is the exact thing T230 forbids; `auto` and `prompt`
+relaunch do send it, because those paths exist to re-run the command and it
+should come back the way it was opened. `-e` is wrapped on neither path: it
+means "exec exactly this", so its pane exiting with its command is correct, and
+the new acceptance script asserts that as a control alongside "the pane really
+is agent-backed" — without which the whole file goes vacuous the day
+persistence defaults off.
+
+`test/win32/ipc-command-keepalive.ps1` covers cmd, powershell, git-bash,
+`+split --command=` and `--split-command=` (pwsh/nu when installed), each
+asserting the command ran, no tombstone, and a follow-up `+send-keys` that
+executes. `conformance.ps1` is back to ALL PASS with S8.5 unmodified.
+
+Covering the flavors turned up a second defect and it was filed rather than
+folded in: `--shell=wsl.exe` never runs its command at all — the whole command
+line reaches the distro as one quoted word (`/bin/bash: line 1: echo hi:
+command not found`). Same table, different bug, broken identically on both
+paths, and fixing it means deciding which shell inside the distro to exec back
+into. **T656.**

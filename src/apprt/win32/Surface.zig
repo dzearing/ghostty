@@ -303,6 +303,12 @@ remote_is_local_agent: bool = false,
 remote_working_directory: ?[]const u8 = null,
 remote_shell: ?[]const u8 = null,
 
+/// T468: the keep-alive invocation of the OPEN's `--command`, forwarded to the
+/// agent as `OPEN.argv` so a `--command=` pane lands at a live shell instead of
+/// "Process exited". Same borrow contract as `remote_shell` — the IPC request
+/// arena owns it and `termio.Remote.init` dupes what it keeps.
+remote_command_argv: ?[]const []const u8 = null,
+
 /// Non-null ⇒ ATTACH to this existing agent session instead of OPENing a new
 /// one (session re-attach restore, T89f2). Set from `Overrides.Remote.session_id`
 /// at init; borrowed for the duration of `core_surface.init` ONLY (the same
@@ -433,6 +439,15 @@ pub const Overrides = struct {
         /// Command to run instead of an interactive shell (runs through the
         /// resolved remote shell, agent-side). Null ⇒ interactive shell.
         command: ?[]const u8 = null,
+        /// The LOCAL shell table's keep-alive invocation of `command`
+        /// (`wrapShellCommandArgv`), exec'd verbatim by the agent instead of its
+        /// own `<shell> /c <cmd>` synthesis (T468). Set ONLY alongside `command`
+        /// and ONLY when `local_agent` — the agent is this machine there, so the
+        /// local flavor table is the right one; a cross-machine agent must keep
+        /// applying its own. Without it a `--command=` pane runs `cmd.exe /c`
+        /// and dies the moment its command returns. `command` is still sent, as
+        /// the session's human-readable label.
+        command_argv: ?[]const []const u8 = null,
         /// True ⇒ this connection is the LOCAL session-persistence agent (same
         /// machine + same Ghoztty build), so the core injects ghoztty shell
         /// integration + the per-pane GHOSTTY_* env an exec pane would set, and
@@ -675,6 +690,12 @@ pub fn init(
             if (r.command) |cmd| {
                 config.command = .{ .shell = try carena.dupeZ(u8, cmd) };
                 config.@"wait-after-command" = true;
+                // T468: …with ONE exception to "not wrapped by the local shell
+                // table". For the LOCAL agent the flavor table IS the right
+                // one (the agent is this machine), and on Windows the
+                // keep-alive lives in argv, which cannot ride the command
+                // string. The command above still travels as the label.
+                self.remote_command_argv = r.command_argv;
             }
         }
     }
@@ -749,6 +770,7 @@ pub fn init(
     // it is owned by the parent Window and outlives this surface.
     self.remote_working_directory = null;
     self.remote_shell = null;
+    self.remote_command_argv = null;
     // T109: same rule, and here it is not merely tidy — the App reuses one
     // decode scratch buffer per restored leaf, so a pointer left behind would
     // name the NEXT pane's screen.
@@ -4367,6 +4389,13 @@ pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
         // T422: the restore already put this pane's sticky banner back, so a
         // dead-tombstone ATTACH keeps the notice to its in-stream copy.
         .pane_banner_restored = self.remote_pane_banner_restored,
+        // T468: the keep-alive invocation of `--command`, for the LOCAL agent
+        // only. An empty argv is treated as none — an OPEN carrying a zero-arg
+        // argv would leave the agent nothing to exec at all.
+        .command_argv = if (self.remote_is_local_agent)
+            (if (self.remote_command_argv) |a| (if (a.len > 0) a else null) else null)
+        else
+            null,
     };
 }
 

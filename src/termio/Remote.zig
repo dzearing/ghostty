@@ -91,6 +91,19 @@ env: []const protocol.Open.EnvPair,
 /// windows and for env-only shells. Each element is duped into `arena`.
 argv: ?[]const []const u8,
 
+/// The FULL shell invocation that runs `command`, exec'd verbatim by the agent
+/// instead of its own `<shell> [/c|-lic] <cmd>` synthesis (T468). Set only by a
+/// LOCAL-agent apprt whose platform spells the keep-alive convention in ARGV
+/// (Windows: `cmd /K`, `pwsh -NoExit -Command`) rather than inside the command
+/// string (POSIX: `<cmd>; exec <shell> -li`), which is why it cannot simply ride
+/// `command`. Coexists with `command`, which stays the session's label.
+///
+/// Used on the OPEN and on the two paths that deliberately RE-RUN the recorded
+/// command (`auto` / `prompt` relaunch) — never on the `notify` fresh-shell
+/// open, whose whole purpose is to not re-run it (T230). Each element is duped
+/// into `arena`. Null everywhere else, leaving `argv` in charge.
+command_argv: ?[]const []const u8,
+
 /// Pin this session against the agent's idle-TTL reaper (§7.1, T11). True only
 /// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
 pinned: bool,
@@ -261,6 +274,12 @@ pub const Config = struct {
     /// from the caller; `init` dupes each element into the backend arena.
     argv: ?[]const []const u8 = null,
 
+    /// The keep-alive invocation of an explicit `--command` for a LOCAL-agent
+    /// pane whose platform spells that convention in argv (T468). Unlike `argv`
+    /// it coexists with `command`. Null everywhere else. Borrowed from the
+    /// caller; `init` dupes each element into the backend arena.
+    command_argv: ?[]const []const u8 = null,
+
     /// Pin this session against the agent's idle-TTL reaper (§7.1, T11). Set true
     /// ONLY by the LOCAL-agent client for a persistent local pane the viewer's
     /// session-layout manifest (T05) references, so it survives the viewer
@@ -380,6 +399,13 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         break :argv dst;
     } else null;
 
+    // Same for the command's keep-alive invocation (T468).
+    const command_argv: ?[]const []const u8 = if (cfg.command_argv) |src| argv: {
+        const dst = try aa.alloc([]const u8, src.len);
+        for (src, 0..) |a, i| dst[i] = try aa.dupe(u8, a);
+        break :argv dst;
+    } else null;
+
     return .{
         .conn = cfg.conn,
         .session_id = session_id,
@@ -389,6 +415,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .term = term,
         .env = env,
         .argv = argv,
+        .command_argv = command_argv,
         .pinned = cfg.pinned,
         .local = cfg.local,
         .relaunch_policy = cfg.relaunch_policy,
@@ -696,8 +723,15 @@ pub fn threadEnter(
                 px_h,
                 // Respawn fidelity (wp3): the agent's on-disk record has no
                 // env/TERM/argv, so send our live copies — the respawned shell
-                // keeps GHOZTTY_PANE_ID & co. and its shell integration.
-                .{ .env = self.env, .term = self.term, .argv = self.argv },
+                // keeps GHOZTTY_PANE_ID & co. and its shell integration. A
+                // command pane sends its keep-alive invocation (T468): `auto`
+                // exists to re-run the recorded command, so it should come back
+                // the way it was opened, keep-alive included.
+                .{
+                    .env = self.env,
+                    .term = self.term,
+                    .argv = self.command_argv orelse self.argv,
+                },
                 &self.canceller,
             ) catch |err| {
                 log.warn("relaunch of dead session failed err={}", .{err});
@@ -759,7 +793,10 @@ pub fn threadEnter(
             .shell = self.shell,
             .term = self.term,
             .env = self.env,
-            .argv = self.argv,
+            // T468: the apprt's keep-alive invocation when it built one, else
+            // the shell-integration rewrite. Never both — a `command` pane gets
+            // no integration rewrite (see `Surface.forwarded_argv`).
+            .argv = self.command_argv orelse self.argv,
             .pinned = self.pinned,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
@@ -1166,7 +1203,11 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
         px_w,
         px_h,
         // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
-        .{ .env = self.env, .term = self.term, .argv = self.argv },
+        .{
+            .env = self.env,
+            .term = self.term,
+            .argv = self.command_argv orelse self.argv,
+        },
         &self.canceller,
     ) catch |err| {
         log.warn("awaited relaunch failed err={}", .{err});

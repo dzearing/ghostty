@@ -123,6 +123,37 @@ fn wrapCommandArgv(
     return verb_args.wrapShellCommandArgv(arena, shell, command);
 }
 
+/// The LOCAL-agent half of `wrapCommandArgv` (T468): the same per-flavor
+/// keep-alive invocation, sent to the agent as `OPEN.argv` so it execs it
+/// verbatim instead of synthesizing `<shell> /c <cmd>` — which exits the moment
+/// the command returns, leaving "Process exited. Press any key" and a pane that
+/// `+send-keys` cannot drive.
+///
+/// The keep-alive convention is argv-shaped on Windows (`cmd /K`, `pwsh -NoExit
+/// -Command`), and argv cannot ride a command string the way POSIX's `<cmd>;
+/// exec <shell> -li` does — so the agent-backed path cannot get it for free from
+/// `OPEN.command` the way the Mac one does. Applying the LOCAL table here is
+/// only correct because the session-persistence agent IS this machine; a
+/// cross-machine agent keeps applying its own (those call sites pass no
+/// `command_argv`).
+///
+/// Null for `-e` (verbatim argv is the whole point of `-e`; it is not a
+/// `--command`) and for a pane with no command at all.
+fn keepAliveArgv(
+    ctx: Context,
+    arena: Allocator,
+    shell_flag: ?[]const u8,
+    command: ?[]const u8,
+) Allocator.Error!?[]const []const u8 {
+    const cmd = nonEmpty(command orelse return null) orelse return null;
+    const argv = try wrapCommandArgv(ctx, arena, shell_flag, cmd);
+    // `[]const [:0]const u8` → `[]const []const u8`: the wire type is not
+    // sentinel-terminated (the agent re-dupes every element anyway).
+    const out = try arena.alloc([]const u8, argv.len);
+    for (argv, 0..) |a, i| out[i] = a;
+    return out;
+}
+
 extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) windows.BOOL;
 
 /// The pane a target names: the pane itself, or a window's focused pane.
@@ -284,6 +315,7 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .working_directory = nonEmpty(args.working_directory),
                 .shell = nonEmpty(args.shell),
                 .command = remote_command,
+                .command_argv = try keepAliveArgv(ctx, arena, args.shell, args.command),
                 .local_agent = true,
             },
             .env = env.items,
@@ -358,6 +390,7 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .remote = .{
                     .connection = conn,
                     .command = split_cmd,
+                    .command_argv = try keepAliveArgv(ctx, arena, args.shell, args.split_command),
                     .local_agent = true,
                 },
                 .env = split_env.items,
@@ -725,6 +758,7 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .working_directory = nonEmpty(args.working_directory),
                 .shell = nonEmpty(args.shell),
                 .command = remote_command,
+                .command_argv = try keepAliveArgv(ctx, arena, args.shell, command),
                 .local_agent = true,
             },
             .env = env.items,
