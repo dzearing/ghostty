@@ -120,6 +120,35 @@ Concretely, in order, with no stops in between:
      modified-date column must not read a bulk re-triage as work on 200
      tasks.
 
+0.7. **Daily feature ideas** (user, 2026-08-09) — runs with steps 0.5/0.6,
+   writing a third digest category, `## Feature ideas` (rendered as its own
+   tab). This is product imagination time, not backlog grooming:
+
+   - **Customer-facing only, UX first.** Ideas are things a USER of the
+     terminal would feel and thank you for — never internal plumbing dressed
+     up as a feature, and never tied to app-centric machinery. Group them:
+     user-facing UX improvements FIRST, then technical / performance /
+     stability / refactoring increasingly as it makes sense (soft ordering,
+     not a quota — a great perf idea beats a weak UX one only rarely).
+   - **Graded and sorted by user value.** Each idea: a bold name, a value
+     grade (High / Medium — skip filing Low, think of better ones instead),
+     and 1-2 sentences on what the user gets. Sort best-first within each
+     group.
+   - **Fresh every day — the ledger is the memory.** Before writing, read
+     `docs/design/windows-parity-feature-ideas.md` (every idea ever
+     suggested, dated). Do NOT re-suggest anything on it; an old idea may
+     return only with a materially new angle, marked as such. After
+     writing, append today's ideas to the ledger in the same commit. The
+     point of the tab is that each morning's read is NEW thinking.
+   - **5-8 ideas a day** is the shape — enough to be worth the tab, few
+     enough that each one got thought. Inspiration sources: what the user
+     struggled with this week (the reports), what other terminals and tools
+     do well, what the digest's own Reflection keeps circling, what main
+     shipped that suggests a next step.
+   - An idea the user likes becomes a TASK (filed normally, named in the
+     next digest); the tab itself is never a queue and carries no ids until
+     promotion.
+
 1. **Pick up a task — ONE command, which also claims it:**
 
    ```

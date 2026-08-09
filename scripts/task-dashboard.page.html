@@ -1252,7 +1252,7 @@ function splitDigestCategories(bodyText) {
   var cats = [];
   var curName = 'Commentary';
   var buf = [];
-  var known = { commentary: 'Commentary', 'task triage': 'Task triage' };
+  var known = { commentary: 'Commentary', 'task triage': 'Task triage', 'feature ideas': 'Feature ideas' };
   var flush = function () {
     var text = buf.join('\n').trim();
     if (!text) { buf = []; return; }
