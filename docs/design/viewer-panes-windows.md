@@ -245,6 +245,14 @@ deferral (`get_Deferral` usage stays available).
 
 ### P10. Feedback capture (deferred, design-first)
 
+**Split 2026-08-08 into T633 (provenance + nav-bar button), T634 (composer
+chrome), T635 (text model + quote insertion), T636 (report writer), T637
+(images + screenshot) and T638 (the localhost provenance leg).** T636 is where
+a win32 viewer pane can file a report end to end. The two decisions below that
+are genuine forks are filed as D43 (composer text control) and D44 (screenshot
+primitive); the third is T638 itself. T164 and T384 were the same umbrella
+filed twice and are both closed.
+
 Deferred as its own task because it needs decisions, not translation:
 
 - port -> cwd provenance has no Windows analog for `lsof`. Options to weigh:

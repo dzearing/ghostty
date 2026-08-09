@@ -12194,3 +12194,42 @@ Filed: **T632** (a kill that failed because the process had already exited is
 still reported as "may require elevated privileges" — `killOne` knows the reason
 and throws it away; newly more reachable now that the table prunes behind an
 open confirmation).
+
+## 2026-08-08 — T384: the missing win32 feedback capture becomes six buildable tasks
+
+T384 asked to be split before any code, and this is that split. Mac's viewer
+panes can file feedback — a written note, quoted passages, pasted screenshots —
+into the git worktree the pane's content belongs to; Windows has none of it, and
+the whole thing sat behind one umbrella task nobody could pick up.
+
+Six tasks now, in a chain: **T633** worktree provenance plus the nav-bar
+feedback button, **T634** the composer toolbar chrome, **T635** the text model
+and quote insertion (which deletes `viewer_bridge.hide_quote_js` and un-hides
+the page's Quote button), **T636** the `report.json` writer with its staging
+folder and single atomic rename, **T637** image chips and screenshot capture,
+**T638** the `localhost:PORT` → working-directory provenance leg. T636 is the
+line where a Windows viewer pane can file a report end to end; T637 and T638
+add on top of it. T638 hangs off T633 alone rather than sitting in the chain,
+because the origin-directory leg already covers most localhost panes.
+
+Two forks were filed rather than resolved silently, because both are one-way
+doors: **D43** — what the composer is built on (RichEdit with owner-drawn quote
+painting, a fully owner-drawn composer, or a second WebView2 hosting a
+contenteditable), which decides how IME, accessibility, undo, clipboard image
+paste and the quote accent bar all behave — and **D44** — how a screenshot is
+captured, where the Windows-obvious answers (`ms-screenclip`, `SnippingTool
+/clip`) do the one thing Mac's code explicitly forbids, clobbering the user's
+clipboard.
+
+Two corrections fell out of the reading. **T164 is the same feature filed
+twice** — the original T127-era deferral row, with the better design write-up of
+the pair — and is closed as a duplicate with its content folded into the
+sub-tasks. And T384's own summary claimed the symptom was a Quote button that
+appears to do nothing; it is not, because T162/T375 set
+`window.__ghozttyHideQuote` so `selection.js` ships the Copy half alone here.
+The comment on that flag pointed at T164 and now points at T635.
+
+Lanes none/win32/agent PASS and P1–P3 ALL PASS (docs plus one comment; no
+behavior touched).
+
+Filed: **T633**–**T638**; decisions **D43**, **D44**.

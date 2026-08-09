@@ -61,11 +61,14 @@ pub const shim_js =
 ++ handler_name ++ " = target;\n  }\n";
 
 /// T162: Windows v1 ships the toolbar's Copy half only — Quote has nowhere to
-/// put text until the feedback composer (T164) exists, and a Quote button
+/// put text until the feedback composer (T635) exists, and a Quote button
 /// wired to nothing is worse than none. `selection.js` reads this documented
 /// flag when it builds the bar and skips the Quote button; the shared file is
-/// NOT forked (Mac never sets the flag and keeps both buttons). T164 removes
+/// NOT forked (Mac never sets the flag and keeps both buttons). T635 removes
 /// this line to un-hide Quote.
+///
+/// (Was T164, which turned out to be the same feature filed twice as T384;
+/// both closed 2026-08-08 when T384 was split into T633-T638.)
 pub const hide_quote_js = "  window.__ghozttyHideQuote = true;\n";
 
 /// The shared selection toolbar, verbatim. Embedded rather than read off disk
