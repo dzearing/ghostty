@@ -12889,3 +12889,89 @@ including the positive control that an ordinary delivery still ships the agent
 and the negative control that a run with no app started reports itself
 `APP-REFRESH UNVERIFIED`); `upgrade-staleness`, `upgrade-no-fork` and
 `upgrade-resume-readiness` ALL PASS, since this changed the scripts they cover.
+
+## 2026-08-09 — The loop's own restart now checks that Enter did something (T562)
+
+The go loop restarts itself by typing `read go.md and go` into its own pane and
+pressing Enter. On 2026-08-07 the user found it stopped: fresh session, prompt
+sitting in the composer, never submitted, a whole night gone. One manual Enter
+resumed it instantly.
+
+The interesting part is not that a keypress went missing — that had been
+suspected and partly worked around (T428's framing, T438's `' ' Enter`). It is
+that **every check in the chain called the wedge a success.** `reset-context.sh`
+verified the continuation by looking for the prompt on screen, and a composer
+holding an unsubmitted prompt is *exactly* what that looks like; the log for
+that night says `verified: continuation is on screen`. The upgrade's reuse path
+had the same hole one layer up: it checked that `send-keys` exited 0 and printed
+`RESUME-REUSE OK` — which it did on three consecutive deliveries (08-04/05/06)
+that ended the same way. A gate whose passing state includes the failure it
+guards is not a gate.
+
+So the evidence changed from presence to **motion**. A Claude Code that took the
+prompt repaints — spinner, elapsed timer, streaming text — every second; an idle
+composer is static. That is not a hope, it is the same measured property
+`--when-idle` has been built on since T46. Presence now only decides *which*
+failure a still pane is: prompt on screen means it was typed and not submitted,
+and that state has a one-keystroke cure, so the helper presses Enter itself, up
+to three times, logging `UNSUBMITTED: … pressing Enter (attempt n/3)`. No prompt
+on screen means nothing landed, and no Enter is spent on it — pressing one there
+would only paper over a delivery failure.
+
+The same decision now lives in one place, `Wait-LoopSubmitted`
+(`scripts\loop-session.ps1`), and both other callers go through it: the
+watchdog's nudge — which additionally wipes the composer with `C-u` first,
+because the wedge it most often arrives at IS a full composer and typing over
+one produces a single run-together message — and the upgrade's RESUME-REUSE
+path, which can no longer print OK over a prompt the session never ran.
+
+Two things this cost, worth writing down. The gate's baseline must be **frozen**
+after the settle: re-reading it after each keypress absorbs the very repaint the
+keypress caused (the pane answers in milliseconds, the new baseline already
+contains the answer), and the gate then reports a wedge over a pane it just woke
+up — that made every happy-path section of `reset-context.ps1` fail on the first
+run. And the settle before the baseline is equally load-bearing in the other
+direction: the paste *painting* is motion, and baselining before it lands reads
+the arrival as the answer.
+
+One more thing surfaced while pushing this: **the box had been running a helper
+four days behind its own source repo.** Upstream `84b5c16` (2026-08-05) had
+already replaced typing the continuation with handing over a *file path* — the
+pane receives only `Read <path> - it contains your instructions for this
+session. Follow them.`, and the session reads the file itself — and this box
+never pulled it. So the gate is applied on top of THAT design rather than the
+one it was written against, the active plugin cache now carries it (byte-
+identical to the source repo, which is what D3 exists to assert), and the
+acceptance sections probe the cont file's basename instead of prose that no
+longer crosses the PTY. One correction went back the other way: that commit's
+message says `+send-keys` has no `--keys-file` flag "and never has". It does
+(T210) and it rejects an unknown `--flag` with exit 1 — the flag was missing
+from whichever build that box was running, which is a fact about a box, not
+about the CLI. The by-reference design is still the right one for a helper that
+outlives any single build.
+
+Measured: `test\win32\reset-context.ps1` ALL PASS — four end-to-end runs at 46
+assertions against the typing design, then 48 against the merged by-reference
+one — with two new sections. G stages a pane that takes the text and swallows
+the CR, and an out-of-band receipt file proves the handoff really ran after the
+gate pressed Enter; H cuts the keypress back out and the same pane stays wedged,
+so G measures the press and not merely the detection.
+`test\win32\go-loop-guard.ps1` ALL PASS with a new pure section S covering the
+decision table (moves on its own / frozen-and-holding / never wakes / nothing
+landed) including the frozen-baseline regression. `upgrade-staleness`,
+`upgrade-no-fork` and `upgrade-resume-readiness` ALL PASS.
+
+Found on the way: one run in five, section B's pane received
+`RC-TEXT[ontinue-marker-B]` — the FIRST character of a `--keys-file` text run
+was dropped, landing about a second after a bare Enter. In the loop that would
+silently truncate the resume prompt. T483 had already filed that section as
+"intermittent" without a cause; filed as **T664** with the cause to chase.
+
+Also found: the win32 lane went red once on
+`apprt.win32.ViewerPane.test.host floor` with
+`environment creation failed hr=0x80004005`, and passed on an immediate re-run
+— two WebView2 runtime versions were resident, i.e. the runtime was being
+replaced mid-run. A live-runtime test that cannot tell "the feature is broken"
+from "the OS component was mid-upgrade" costs a whole floor run to say nothing;
+filed as **T665**. This change touched no Zig at all, which is what made the
+attribution obvious.

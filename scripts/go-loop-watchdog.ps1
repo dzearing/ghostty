@@ -467,11 +467,30 @@ function Invoke-Tick {
         # routinely older than the repo. An exe without the flag would type
         # `--keys-file=C:\...` into the pane - the T241 failure, recreated by its
         # own fix.
+        # T562: wipe the composer before typing. The wedge this nudge most
+        # often arrives at IS a full composer - a continuation an earlier reset
+        # typed and never submitted - and typing on top of it concatenates into
+        # one run-together message that clears nothing (the 2026-07-28
+        # "nn/clear" failure, which reset-context.sh already guards with the
+        # same keystroke).
+        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", 'C-u')
+        Log "  wiped composer exit=$($r.Code) $($r.Out)"
+        Start-Sleep -Milliseconds 500
         $keys = New-LoopSendKeysText -Exe $GhozttyExe -Text $ResumePrompt -Tag 'watchdog-nudge'
         if ($keys.Degraded) { Log '  note: this ghoztty predates --keys-file; prompt sent through argv' }
         $r = Invoke-Ghoztty (@('+send-keys', "--target=$paneId") + $keys.Args + @('Enter'))
         Log "  send-keys exit=$($r.Code) $($r.Out)"
         if ($keys.File) { Remove-Item -LiteralPath $keys.File -ErrorAction SilentlyContinue }
+        # And VERIFY it was submitted, not merely typed (T562). Exit 0 says the
+        # bytes reached the pane; only motion says the session took them. A
+        # backstop that leaves the loop at a full composer has not backstopped
+        # anything - that is the exact state it was woken up to clear.
+        $gate = Wait-LoopSubmitted `
+            -Read { (Invoke-Ghoztty @('+read', "--name=$paneId", '--lines=60')).Out } `
+            -Submit { Invoke-Ghoztty (@('+send-keys', "--target=$paneId") + (Get-LoopSubmitArgs)) | Out-Null } `
+            -Text $ResumePrompt
+        if ($gate.Submitted) { Log "  NUDGE SUBMITTED: $($gate.Why)" }
+        else { Log "  NUDGE UNSUBMITTED: $($gate.Why)" }
         # The lock still names a dead pid, so every later tick would re-decide
         # from scratch. Hand it the pane's own claude when that is unambiguous.
         if (-not $ownerAlive) { Invoke-Adopt $lock $paneId }

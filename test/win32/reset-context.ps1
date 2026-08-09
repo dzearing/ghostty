@@ -46,6 +46,13 @@
 #   F  negative control for E: the same pane driven by a helper copy with the
 #        repaint branch cut out shouts FAILED over that same delivery, which
 #        is the bug as filed. E only means something because F still fails.
+#   G  T562: a composer that takes the text and swallows the CR - the
+#        2026-08-07 stall, where the loop sat all night at a full composer
+#        while "verified: continuation is on screen" was written over it. The
+#        gate must NAME that state and press Enter itself; a receipt file
+#        outside the pane proves the prompt really ran.
+#   H  negative control for G: the same wedge with the keypress cut out stays
+#        wedged and shouts - so G measures the press, not the detection.
 #
 # Oracles are the pane's own output (+read), the helper's log
 # (/tmp/reset-context-last.log), and the banner in +list --json.
@@ -140,6 +147,47 @@ while IFS= read -r l; do
   printf '\n'
 done
 '@
+Write-Sh (Join-Path $work 'proxy-swallow.sh') @'
+#!/bin/bash
+# The T562 wedge, modelled: a composer that TAKES the continuation, DISPLAYS
+# it, and swallows the CR that arrived with it. That is exactly what the loop
+# pane looked like on 2026-08-07 -- freshly cleared session, prompt intact in
+# the composer, never submitted -- and the cure the user applied by hand was a
+# single standalone Enter, which this proxy accepts. Before the clear it
+# behaves normally, so the helper's /clear path is unaffected.
+#
+# Echo is off and every character is painted by hand, so the pane holding an
+# unsubmitted prompt is STATIC: motion is what distinguishes it from a session
+# that took the prompt, which is the whole point of the gate under test.
+# Submitted lines are appended to $1 -- an oracle OUTSIDE the pane, so
+# "recovered" can be told apart from "looked recovered".
+R="${1:-$(dirname "$0")/received.txt}"
+stty -echo 2>/dev/null
+printf 'rc-ready\n'
+BUF=''
+CLEARED=0
+SWALLOWED=0
+while IFS= read -r -N1 c; do
+  case "$c" in
+    $'\r'|$'\n')
+      if [ "$CLEARED" = 0 ]; then
+        if [ "$BUF" = "/clear" ]; then printf '\033[2J\033[3J\033[H'; printf 'RC-CLEARED\n'; CLEARED=1; fi
+        BUF=''
+      elif [ -n "$BUF" ] && [ "$SWALLOWED" = 0 ]; then
+        SWALLOWED=1
+      elif [ -n "$BUF" ]; then
+        printf '%s\n' "$BUF" >> "$R"
+        BUF=''; SWALLOWED=0
+        i=0
+        while [ "$i" -lt 15 ]; do i=$((i + 1)); printf '\r  * Working... (%ss)  ' "$i"; sleep 1; done
+        printf '\n'
+      fi
+      ;;
+    $'\025') BUF=''; printf '\r\033[K' ;;
+    *) BUF="$BUF$c"; printf '%s' "$c" ;;
+  esac
+done
+'@
 
 function To-Unix([string]$p) { (& $bash -lc "cygpath -u '$($p -replace "'", "''")'").Trim() }
 $helperU = To-Unix $helper
@@ -158,7 +206,7 @@ if ((Get-Content $prefixWin | Select-String -SimpleMatch '--when-idle C-u')) {
 # is load-bearing rather than merely present. The sed program goes in a file:
 # it matches "$cur"/"$prev", which PowerShell would expand inside a "..." arg.
 Write-Sh (Join-Path $work 'drop-repaint.sed') @'
-/elif \[ "$cur" != "$prev" \]; then/,+1d
+/verdict="pane is repainting/d
 '@
 $norepaintWin = Join-Path $work 'reset-context-norepaint.sh'
 $sedU = To-Unix (Join-Path $work 'drop-repaint.sed')
@@ -171,8 +219,26 @@ $nrText = Get-Content $norepaintWin -Raw
 if ($nrText -match 'verdict="pane is repainting') {
     Write-Host 'SETUP FAIL: pre-T261 copy still has the repaint branch'; exit 1
 }
-if ($nrText -notmatch 'continuation is on screen') {
+if ($nrText -notmatch 'handoff is on screen') {
     Write-Host 'SETUP FAIL: pre-T261 copy lost the echoed-prompt branch too'; exit 1
+}
+# Third negative control (T562): the helper with the submission GATE's keypress
+# cut out - it still notices the wedge, it just never presses Enter. Section H
+# runs it against the same pane section G recovers, so G proves the press is
+# load-bearing rather than merely present.
+Write-Sh (Join-Path $work 'drop-submit.sed') @'
+/pressing Enter (attempt/,+1d
+'@
+$noretryWin = Join-Path $work 'reset-context-noretry.sh'
+$dropSubmitU = To-Unix (Join-Path $work 'drop-submit.sed')
+$noretryU = To-Unix $noretryWin
+& $bash -lc "sed -f '$dropSubmitU' '$helperU' > '$noretryU'" | Out-Null
+$nsText = Get-Content $noretryWin -Raw
+if ($nsText -match 'pressing Enter \(attempt') {
+    Write-Host 'SETUP FAIL: pre-T562 copy still presses Enter'; exit 1
+}
+if ($nsText -notmatch 'TYPED BUT NOT SUBMITTED') {
+    Write-Host 'SETUP FAIL: pre-T562 copy lost the wedge verdict too'; exit 1
 }
 $logWin = Join-Path (& $bash -lc 'cygpath -w /tmp' | ForEach-Object { $_.Trim() }) 'reset-context-last.log'
 
@@ -253,7 +319,15 @@ function Run-Helper([string]$script, [string]$paneId, [string]$contText) {
     $su = To-Unix $script
     $cu = To-Unix $cont
     & $bash -lc "bash '$su' '$paneId' '$cu'" | Out-Null
-    return @{ log = (Get-Content $logWin -Raw -ErrorAction SilentlyContinue); cont = $cont }
+    # The helper hands the continuation over BY REFERENCE - the pane only ever
+    # receives "Read <path> - it contains your instructions...", never the prose
+    # - so the cont file's basename, not the marker inside it, is what any
+    # oracle looking at the pane can check.
+    return @{
+        log   = (Get-Content $logWin -Raw -ErrorAction SilentlyContinue)
+        cont  = $cont
+        probe = (Split-Path $cont -Leaf)
+    }
 }
 
 Kill-RepoInstances
@@ -282,12 +356,15 @@ try {
     Assert (-not $t1.Contains('RC-TEXT[nn/clear]')) 'A2 no "nn/clear" arrived as ordinary text'
     Assert ($r.log -match 'cleared input line rc=0') 'A3 log records the composer wipe'
     Assert ($r.log -match 'verified: /clear landed') 'A4 log records the VERIFIED clear'
-    Assert (Wait-Tail $p1 'RC-TEXT[continue-marker-A]' 10) 'A5 continuation typed into the fresh session'
-    Assert ($r.log -match 'verified: continuation is on screen') 'A6 log records the VERIFIED continuation'
+    Assert (Wait-Tail $p1 "RC-TEXT[Read " 10) 'A5 the handoff sentence was typed into the fresh session'
+    Assert (Wait-Tail $p1 $r.probe 10) 'A5b naming the cont file the session must read'
+    Assert ($r.log -match 'verified: handoff is on screen') 'A6 log records the VERIFIED continuation'
     Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'A7 no failure shouted on the happy path'
     $b1 = Banner-Of $p1
     Assert ([string]::IsNullOrEmpty($b1)) "A8 no banner set on the happy path (got '$b1')"
-    Assert (-not (Test-Path $r.cont)) 'A9 continuation file cleaned up'
+    # Deliberately NOT deleted: the fresh session reads it after the helper has
+    # already exited, so cleaning up here would race the reader.
+    Assert (Test-Path $r.cont) 'A9 the cont file survives for the session to read'
 
     # --- B. negative control: the C-u line deleted ------------------------
     $p2 = New-ProxyWindow 'rc2' 'proxy-normal.sh'
@@ -305,7 +382,7 @@ try {
     # Seen to fail intermittently (T483). The shared helper log is overwritten
     # by the sections after this one, so print the evidence AT the failure or
     # it is gone by the time anyone reads the run.
-    $b7 = Wait-Tail $p2 'RC-TEXT[continue-marker-B]' 10
+    $b7 = Wait-Tail $p2 $r.probe 10
     if (-not $b7) {
         Write-Host '      B7 diag: helper log ->' -ForegroundColor Yellow
         ($r.log -split "`r?`n") | Where-Object { $_ -match 'continuation|send-keys|typed' } | ForEach-Object { Write-Host "        $_" }
@@ -320,7 +397,7 @@ try {
     # A silent, unchanging pane is the ONLY thing that still fails: no echo of
     # the prompt and no repaint. The wording moved with T261, so match the
     # thing the verdict is about, not the sentence it used to be phrased in.
-    Assert ($r.log -match 'never echoed the continuation and did not repaint') 'C2 the missing continuation is caught'
+    Assert ($r.log -match 'never echoed the handoff and did not repaint') 'C2 the missing continuation is caught'
     Assert ($r.log -match 'RESET-CONTEXT FAILED') 'C3 and shouted'
     $b3 = Banner-Of $p3
     Assert ($b3 -and $b3 -match 'reset-context FAILED') "C4 banner tells the user (got '$b3')"
@@ -340,10 +417,10 @@ try {
     # [string] because the receipt file does not exist until the pane writes it,
     # and a $null from Get-Content would make the NEXT .Contains() throw.
     $gotE = ''
-    for ($t = 0; $t -lt 25 -and -not $gotE.Contains('continue-marker-E'); $t++) {
+    for ($t = 0; $t -lt 25 -and -not $gotE.Contains($r.probe); $t++) {
         $gotE = [string](Get-Content $recvE -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
     }
-    Assert ($gotE -and $gotE.Contains('continue-marker-E')) 'E3 the pane really received the continuation'
+    Assert ($gotE -and $gotE.Contains($r.probe)) 'E3 the pane really received the handoff'
     Assert ($r.log -match 'verified: pane is repainting') 'E4 delivery verified by the repaint, not by the vanished echo'
     Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'E5 no failure shouted over a session that is answering'
     $b4 = Banner-Of $p4
@@ -356,13 +433,44 @@ try {
     $p5 = New-ProxyWindow 'rc5' 'proxy-working.sh' (To-Unix $recvF) 'rc-ready'
     $r = Run-Helper $norepaintWin $p5 'continue-marker-F'
     $gotF = ''
-    for ($t = 0; $t -lt 25 -and -not $gotF.Contains('continue-marker-F'); $t++) {
+    for ($t = 0; $t -lt 25 -and -not $gotF.Contains($r.probe); $t++) {
         $gotF = [string](Get-Content $recvF -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
     }
-    Assert ($gotF -and $gotF.Contains('continue-marker-F')) 'F1 pre-T261: the continuation arrived just the same'
+    Assert ($gotF -and $gotF.Contains($r.probe)) 'F1 pre-T261: the continuation arrived just the same'
     Assert ($r.log -match 'RESET-CONTEXT FAILED') 'F2 pre-T261: a delivered continuation is called a failure (the filed bug)'
     $b5 = Banner-Of $p5
     Assert ($b5 -and $b5 -match 'reset-context FAILED') "F3 pre-T261: and banners it at the user (got '$b5')"
+
+    # --- G. T562: the composer swallowed the submit -----------------------
+    # The filed defect: the text arrives, the Enter does not submit it, and the
+    # pane sits at a full composer looking - to the old verifier - exactly like
+    # a prompt that had just been echoed. "On screen" was called success and
+    # the loop was dead until morning. Now the still pane gets an Enter of its
+    # own, which is what the user pressed by hand to recover.
+    $recvG = Join-Path $work 'received-G.txt'
+    $p6 = New-ProxyWindow 'rc6' 'proxy-swallow.sh' (To-Unix $recvG) 'rc-ready'
+    $r = Run-Helper $helper $p6 'continue-marker-G'
+    Assert ($r.log -match 'UNSUBMITTED: the handoff is on screen') 'G1 the wedge is NAMED, not mistaken for success'
+    Assert ($r.log -match 'pressing Enter \(attempt 1/3\)') 'G2 the gate presses Enter itself'
+    $gotG = ''
+    for ($t = 0; $t -lt 40 -and -not $gotG.Contains($r.probe); $t++) {
+        $gotG = [string](Get-Content $recvG -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 250
+    }
+    Assert ($gotG -and $gotG.Contains($r.probe)) 'G3 the handoff really was submitted (out-of-band receipt)'
+    Assert ($r.log -match 'verified: handoff is on screen and the pane is moving') 'G4 verified as SUBMITTED, not merely typed'
+    Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'G5 no failure shouted over a recovered wedge'
+    $b6 = Banner-Of $p6
+    Assert ([string]::IsNullOrEmpty($b6)) "G6 no banner over a recovered wedge (got '$b6')"
+
+    # --- H. negative control: the same wedge, minus the keypress ----------
+    $recvH = Join-Path $work 'received-H.txt'
+    $p7 = New-ProxyWindow 'rc7' 'proxy-swallow.sh' (To-Unix $recvH) 'rc-ready'
+    $r = Run-Helper $noretryWin $p7 'continue-marker-H'
+    Assert ($r.log -match 'RESET-CONTEXT FAILED') 'H1 without the press the wedge is still a failure'
+    Assert ($r.log -match 'TYPED BUT NOT SUBMITTED') 'H2 and the log names what went wrong'
+    Assert ($r.log -notmatch 'verified: handoff is on screen') 'H3 a full composer is never reported as verified (the filed bug)'
+    $gotH = [string](Get-Content $recvH -Raw -ErrorAction SilentlyContinue)
+    Assert (-not ($gotH -and $gotH.Contains($r.probe))) 'H4 the handoff never reached the session'
 
     # --- D. durability of the fix (T130's lesson) -------------------------
     $cached = Get-Content $cacheHelper -Raw
@@ -370,6 +478,9 @@ try {
     Assert ($cached -match 'RESET-CONTEXT FAILED') 'D2 the ACTIVE plugin cache carries the loud verification'
     Assert ($cached -match 'verdict="pane is repainting') 'D5 the ACTIVE plugin cache accepts a repainting pane as delivery (T182)'
     Assert ($cached -notmatch 'continuation text never appeared') 'D6 and no longer carries the one-shot check that cried wolf'
+    Assert ($cached -match 'pressing Enter \(attempt') 'D7 the ACTIVE plugin cache carries the submission gate (T562)'
+    Assert ($cached -match 'it contains your instructions for this session') `
+        'D8 the ACTIVE plugin cache hands the continuation over by reference, never typing the prose'
     $srcRepo = 'D:\git\dzearing-claude-marketplace'
     $srcHelper = Join-Path $srcRepo 'skills\reset-context\scripts\reset-context.sh'
     if (Test-Path $srcHelper) {
@@ -384,7 +495,7 @@ try {
         Write-Host 'SKIP  D3/D4: dzearing-claude-marketplace not cloned on this box' -ForegroundColor Yellow
     }
 } finally {
-    foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5')) { & $exe +close --target=$w 2>$null | Out-Null }
+    foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5', 'rc6', 'rc7')) { & $exe +close --target=$w 2>$null | Out-Null }
     Start-Sleep -Milliseconds 500
     Kill-RepoInstances
 }

@@ -813,6 +813,22 @@ if ($action -eq 'reuse') {
         Invoke-WatchdogNow -Why 'the prompt arrived but the Enter failed' -PromptFile $promptFile
         exit 1
     }
+    # ...and then check that the SESSION took it, not just that the CLI exited 0
+    # (T562). Three consecutive deliveries (08-04/05/06) logged RESUME-REUSE OK
+    # over a prompt sitting unsubmitted in the composer, because a zero exit
+    # code is the last thing this path knew how to ask about. Motion is the
+    # evidence; another submit is the cure.
+    $gate = Wait-LoopSubmitted `
+        -Read { (& $oldExe +read "--name=$LoopPaneId" --lines=60 2>&1 | Out-String).Trim() } `
+        -Submit { & $oldExe +send-keys "--target=$LoopPaneId" @(Get-LoopSubmitArgs) 2>&1 | ForEach-Object { Log "reuse re-submit: $_" } } `
+        -Text $prompt
+    if (-not $gate.Submitted) {
+        Log "RESUME-REUSE FAIL: $($gate.Why) - pane $LoopPaneId is holding the prompt, so the loop is NOT running."
+        if ($promptFile) { Log "  prompt file kept for diagnosis: $promptFile" }
+        Invoke-WatchdogNow -Why 'the prompt was typed but never submitted' -PromptFile $promptFile
+        exit 1
+    }
+    Log "reuse: submission verified ($($gate.Why))"
     if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
     Log "RESUME-REUSE OK: prompt '$prompt' delivered AND submitted to pane $LoopPaneId (verified in the pane before Enter; claude pid=$loopPid, no second session)"
     Complete-Upgrade "reused claude pid=$loopPid in pane $LoopPaneId"

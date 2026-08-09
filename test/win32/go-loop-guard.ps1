@@ -719,6 +719,67 @@ $loopTable = @(
 Assert 'M19 a pid loop in the snapshot terminates with no match' `
     ((Find-ClaudeDescendant -ShellPid 100 -Procs $loopTable) -eq 0)
 
+# --- S. the submission gate (T562, pure) ----------------------------------
+# `send-keys` exiting 0 means the bytes reached the pane, not that the session
+# acted on them. On 2026-08-07 the loop sat all night at a composer holding an
+# unsubmitted `read go.md and go` while every log in the chain said OK. The gate
+# both the watchdog nudge and the upgrade's reuse path now run through decides
+# from MOTION, and presses the submit again when a pane holding the prompt will
+# not move. I/O is injected, so the decision is checkable without a pane.
+""
+"S. submission gate"
+. (Join-Path $Repo 'scripts\loop-session.ps1')
+$P562 = 'read go.md and go'
+# A pane that answers on its own is submitted, and nothing extra is pressed.
+$presses = 0
+$feed = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 3 `
+    -Read { $script:feed++; "working... $script:feed" } -Submit { $script:presses++ }
+Assert 'S1 a moving pane is submitted' ($g.Submitted)
+Assert 'S2 and nothing extra was pressed' ($g.Attempts -eq 0 -and $presses -eq 0)
+
+# The filed wedge: the prompt is on screen and the pane is frozen. Pressing the
+# submit wakes it - which is the ONE thing the old code never did, because it
+# read "on screen" as success.
+$presses = 0
+$woke = $false
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 2 `
+    -Read { if ($script:woke) { "answering $script:presses" } else { "> $P562" } } `
+    -Submit { $script:presses++; $script:woke = $true }
+Assert 'S3 a frozen pane holding the prompt is submitted by the gate' ($g.Submitted)
+Assert 'S4 with exactly one press' ($g.Attempts -eq 1 -and $presses -eq 1)
+# The regression that broke every happy-path run while this was being built:
+# the baseline must be FROZEN. Re-read it after the press and the pane's answer
+# lands inside the new baseline, so the one-shot change is invisible and the
+# gate reports a wedge over a pane it just woke up.
+Assert 'S5 a ONE-SHOT change counts as motion (the baseline is frozen)' `
+    ($g.Why -match 'after 1 extra submit')
+
+# A pane that will not wake is a failure, and it says which failure it is.
+$presses = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 1 -MaxSubmits 2 `
+    -Read { "> $P562" } -Submit { $script:presses++ }
+Assert 'S6 an unrecoverable wedge is NOT reported as submitted' (-not $g.Submitted)
+Assert 'S7 bounded: it presses MaxSubmits times and stops' ($presses -eq 2 -and $g.Attempts -eq 2)
+Assert 'S8 and names the state a human can act on' ($g.Why -match 'TYPED BUT NOT SUBMITTED')
+
+# Nothing on screen and nothing moving means nothing landed. Pressing Enter
+# cannot submit a prompt that was never typed, and doing so would paper over
+# the real failure - so this path presses nothing at all.
+$presses = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 1 `
+    -Read { 'an empty pane' } -Submit { $script:presses++ }
+Assert 'S9 an empty pane is a delivery failure, not a submit failure' `
+    (-not $g.Submitted -and $g.Why -match 'nothing landed to submit')
+Assert 'S10 and no Enter is spent on it' ($presses -eq 0)
+
+# Both callers must actually be wired to it, or the gate is decoration.
+$dogSrc = Get-Content $dogScript -Raw
+Assert 'S11 the watchdog nudge runs through the gate' ($dogSrc -match 'Wait-LoopSubmitted')
+Assert 'S12 and wipes the composer before typing over it' ($dogSrc -match "'C-u'")
+$upSrc = Get-Content (Join-Path $Repo 'scripts\upgrade-ghoztty-windows.ps1') -Raw
+Assert 'S13 the upgrade reuse path runs through the same gate' ($upSrc -match 'Wait-LoopSubmitted')
+
 # --- P. the supervisor's own liveness is observable (T440) ----------------
 # The watchdog died at 09:14 on 2026-08-03 and nothing noticed for thirteen
 # hours, because the only evidence it was gone was a log that stopped. It now

@@ -262,6 +262,74 @@ function Get-LoopSubmitArgs {
     return @(' ', 'Enter')
 }
 
+# Did the prompt we typed actually get SUBMITTED? (tracker T562)
+#
+# `send-keys` exiting 0 means the bytes reached the pane. It does NOT mean the
+# TUI acted on them, and every link in this chain used to stop at the exit
+# code: on 2026-08-07 the loop sat all night at a full composer holding an
+# unsubmitted `read go.md and go` while the delivery logs read OK, and the cure
+# a human applied was one Enter.
+#
+# The only external evidence that a session took the prompt is MOTION. A Claude
+# Code that is answering repaints - spinner, elapsed timer, streaming text -
+# every second; an idle composer is static. That is the same property
+# `--when-idle` is built on, so it is measured behaviour rather than a hope.
+#
+# Being ON SCREEN proves nothing either way, and mistaking it for proof is the
+# actual defect: a composer holding an unsubmitted prompt looks exactly like a
+# prompt that was just echoed. So a pane that will not move WHILE THE PROMPT IS
+# STILL THERE is the suspect state, and it gets the submit pressed again,
+# bounded, with every attempt reported to the caller.
+#
+# Two details are load-bearing:
+#
+#   * the baseline is taken AFTER a settle, because the paste painting is
+#     itself motion and would read as the answer;
+#   * the baseline is then FROZEN. Re-reading it after each press absorbs the
+#     very repaint the press caused - the pane answers in milliseconds, the new
+#     baseline already contains the answer, and the gate concludes "still not
+#     moving" over a pane it just woke up. (Measured: it made every happy-path
+#     run of test\win32\reset-context.ps1 fail.)
+#
+# I/O is injected so the decision is testable without a pane: -Read returns the
+# pane tail, -Submit presses the submit again.
+function Wait-LoopSubmitted {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Read,
+        [Parameter(Mandatory = $true)][scriptblock]$Submit,
+        [AllowEmptyString()][string]$Text = '',
+        [int]$SettleSeconds = 2,
+        [int]$WatchSeconds = 6,
+        [int]$MaxSubmits = 2
+    )
+    if ($SettleSeconds -gt 0) { Start-Sleep -Seconds $SettleSeconds }
+    $base = [string](& $Read)
+    $onscreen = (Test-LoopPromptArrived -Tail $base -Text $Text)
+    $attempts = 0
+    while ($true) {
+        for ($i = 0; $i -lt $WatchSeconds; $i++) {
+            Start-Sleep -Seconds 1
+            $cur = [string](& $Read)
+            if (-not $onscreen) { $onscreen = (Test-LoopPromptArrived -Tail $cur -Text $Text) }
+            if ($cur -ne $base) {
+                $why = if ($attempts) { "the pane moved after $attempts extra submit(s)" } else { 'the pane moved on its own' }
+                return @{ Submitted = $true; Attempts = $attempts; Why = $why }
+            }
+        }
+        # Nothing on screen and nothing moving means nothing landed - another
+        # Enter cannot submit a prompt that was never typed, and pressing one
+        # would only paper over the real failure.
+        if (-not $onscreen) {
+            return @{ Submitted = $false; Attempts = $attempts; Why = 'the pane never moved and the prompt is not on screen - nothing landed to submit' }
+        }
+        if ($attempts -ge $MaxSubmits) {
+            return @{ Submitted = $false; Attempts = $attempts; Why = "the prompt is on screen but the pane never moved after $attempts extra submit(s) - it looks TYPED BUT NOT SUBMITTED" }
+        }
+        $attempts++
+        & $Submit
+    }
+}
+
 # Reduce a prompt (or a pane tail) to what the two can be compared on.
 #
 # A TUI wraps the prompt inside its input box, so the tail holds the same
