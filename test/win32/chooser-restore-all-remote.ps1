@@ -84,6 +84,9 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $env:GHOZTTY_PIPE_SUFFIX = '-t336'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a rebuilt pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 . (Join-Path $PSScriptRoot 'lib\FakeRelay.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')
 
@@ -575,6 +578,16 @@ try {
     $paneIds = @(Get-WindowPaneIds 't336-multi')
     Assert (Wait-PaneText $paneIds $T413MARK) `
         "J the replay still brought the machine's own output back ('$T413MARK' readable in $($paneIds.Count) rebuilt pane(s))"
+
+    # K (T652): ATTACHED IS NOT ALIVE - and the replay assertion directly above
+    # is the sharpest case of it, because a replayed marker is BY DEFINITION a
+    # recording. G's `attached` is the agent's bookkeeping and E/F count windows
+    # and dials; a pane rebuilt as a frozen picture satisfies all of them. Typing
+    # is the only question a recording cannot answer, and here it crosses the
+    # whole cross-machine path: local keystroke -> relay -> agent -> child, and
+    # the child's answer all the way back onto this screen.
+    Assert (Test-PaneLive -Exe $Exe -Target 't336-multi' -Tmp $tmp -Tag 'CRR') `
+        'K a rebuilt REMOTE pane is LIVE: input crosses the relay and output comes back'
 
     # --- 7. the double-attach guard, across the relay -----------------------
     Write-Host ''

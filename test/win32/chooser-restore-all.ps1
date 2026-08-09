@@ -70,6 +70,9 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $env:GHOZTTY_PIPE_SUFFIX = '-t335'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a recovered pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -395,6 +398,14 @@ try {
     $attachedAuto = @(Get-Sessions | Where-Object { $autoIds -contains $_.id -and $_.attached }).Count
     Assert ($attachedAuto -eq 2) `
         "and both of the auto-named window's sessions ATTACHED ($attachedAuto of 2)"
+
+    # T652: ATTACHED IS NOT ALIVE, and this section is where the phrase is most
+    # literal - `attached` is the AGENT's bookkeeping about who last claimed the
+    # session, and a window shape is the APP's. Both are equally true of a pane
+    # that came back as a frozen picture, which is exactly what the user hit on
+    # 2026-08-06. Type into the recovered window and require the child to answer.
+    Assert (Test-PaneLive -Exe $Exe -Target 't335-multi' -Tag 'CRALL') `
+        'and a recovered pane is LIVE: input reaches the child, new output returns'
     $shapesAfter = $shapesBefore
 
     # --- 4. the double-attach guard ----------------------------------------

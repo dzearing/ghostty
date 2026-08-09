@@ -271,12 +271,15 @@ function Plant-Marker($pane, $marker, $tag) {
     return (Wait-PaneToken $pane $marker 20 $tag)
 }
 # Echo round-trip: proof the pane is live and interactive through the agent.
-$script:probe_n = 0
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a restored pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 function Test-RoundTrip($pane, $tag, $timeoutSec = 18) {
-    $script:probe_n++
-    $tok = "RTPROBE$($PID)N$($script:probe_n)"
-    & $Exe +send-keys --target=$pane "echo $tok" Enter 2>&1 | Out-Null
-    return (Wait-PaneToken $pane $tok $timeoutSec $tag)
+    # T652: delegated to the shared liveness oracle, so this script's arms move
+    # with GHOZTTY_TEST_LIVENESS_BREAK like every other restore script's do -
+    # an oracle nobody can watch go red is a decoration. Same probe as before:
+    # type an `echo <token>` and require the token back out of the pane.
+    return (Test-PaneLive -Exe $Exe -Target $pane -Tmp $script:tmp -TimeoutSec $timeoutSec -Tag 'SP')
 }
 
 # ---- console-geometry probe (the ConPTY winsize oracle) --------------------
@@ -497,7 +500,18 @@ for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
     Assert "B$cycle.8 recovery gap $([math]::Round($gap,1))s < 45s" ($gap -lt 45)
 
     # The restored pane is interactive (accepts input through the agent).
+    #
+    # T652: this arm is the "attached is not alive" oracle, and it predates the
+    # name - B.1-B.8 above are every one of them satisfied by a pane that came
+    # back as a frozen picture (a replayed marker is a recording; a session id
+    # is the agent's view of a child that may be wired to nothing). It is
+    # deliberately run once per WINDOW rather than once per cycle: spB lives in
+    # winA and spC in winB, the attach is wired per window, and a working winA
+    # says nothing about winB. (Sections C and D lean on the same property for
+    # spC and spA respectively, by typing `mode con` and reading a paced
+    # sequence back - both are liveness proofs in their own right.)
     Assert "B$cycle.9 restored spB accepts input (echo round-trip)" (Test-RoundTrip 'spB' "b$cycle-rt")
+    Assert "B$cycle.10 restored spC in the OTHER window accepts input too" (Test-RoundTrip 'spC' "b$cycle-rt2")
 }
 
 # ============================================================================

@@ -229,6 +229,9 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 # and drives relaunches; aimed at the user's release it would do that to their
 # live sessions.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a relaunched pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'sessrelaunch')
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
@@ -320,6 +323,15 @@ while ((Get-Date) -lt $deadline) {
 Assert "A10 the relaunched pane shows the '--- session restarted ---' divider" $autoDiv
 Assert "A11 the pre-kill ring scrollback (marker) precedes the divider" $autoOrder
 
+# A12 (T652): ATTACHED IS NOT ALIVE. A9-A11 read the pane's SCREEN, and every
+# one of them is satisfied by a recording: the replayed marker is by definition
+# a replay, the divider is a line the agent printed on its own, and an `alive`
+# row is the agent's view of a child that may be wired to nothing. Type into the
+# RESPAWNED shell and require it to answer - the half of RELAUNCH that a user
+# actually needs, and the half a frozen pane would fail.
+Assert "A12 the auto-relaunched pane is LIVE (input reaches the NEW child, output returns)" (
+    Test-PaneLive -Exe $Exe -Target 'relp' -Tmp $tmpA -Tag 'SRA')
+
 Stop-TestProcs
 
 # ============================================================================
@@ -383,6 +395,12 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 700
 }
 Assert "B7 the deferred relaunch printed the '--- session restarted ---' divider" $promptDiv
+
+# B8 (T652): the same claim on the deferred path. B6 says the agent reports the
+# id alive and B7 that a divider printed; neither says the keystroke path is
+# still wired to the shell that keystroke started.
+Assert "B8 the keystroke-relaunched pane is LIVE (input reaches the NEW child, output returns)" (
+    Test-PaneLive -Exe $Exe -Target 'prp' -Tmp $tmpB -Tag 'SRB')
 
 # ============================================================================
 if ($script:failures -gt 0) {

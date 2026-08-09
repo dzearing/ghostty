@@ -224,6 +224,9 @@ $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a recovered pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'crashrec')
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
@@ -311,6 +314,18 @@ if ($NegativeControl) {
     Assert "C2 the same three sessions are alive (ATTACH, not re-OPEN)" $sameThree
     Assert "C3 every recovered pane came back on its ORIGINAL shell pid" $samePids
     Assert "C4 no fourth session was opened (no blank startup window)" ($idsC.Count -eq 3)
+    # C5 (T652): ATTACHED IS NOT ALIVE. C1-C4 are all satisfied by a pane that
+    # came back as a frozen picture: a topology is app-side bookkeeping, and an
+    # alive session id with its original pid is the AGENT's view of a child that
+    # may no longer be wired to anything on screen. That was the shape of the
+    # 2026-08-06 regression, where every recovered pane painted correctly and
+    # accepted nothing. Type into one pane in EACH recovered window, because a
+    # window is where the attach is wired and one working window says nothing
+    # about the other.
+    Assert "C5 a recovered pane in the split window is LIVE (input in, new output back)" (
+        Test-PaneLive -Exe $Exe -Target 'cr-sib' -Tmp $tmp -Tag 'CRA')
+    Assert "C6 a recovered pane in the second window is LIVE (input in, new output back)" (
+        Test-PaneLive -Exe $Exe -Target 'cr-second' -Tmp $tmp -Tag 'CRB')
 }
 
 # ============================================================================

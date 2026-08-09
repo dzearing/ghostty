@@ -1444,6 +1444,21 @@ behavior → an on-box acceptance script. Win32 chrome geometry belongs in the
 pure geometry modules and must be asserted at 1.0, 1.25, 1.5 and 2.0 scaling
 (see the design-system section below).
 
+**A restore test must prove the pane is LIVE, not painted** (T532, T652). A
+pane that came back as a frozen picture is byte-identical to a working one for
+every assertion that reads the screen or `+list --json` — a replayed marker is
+by definition a recording, a restored banner is a picture of a banner, and the
+agent's `alive`/`attached` rows describe a child that may be wired to nothing.
+On 2026-08-06 a user hit exactly that, with the whole acceptance suite green
+over it. So every script that restores or re-attaches a pane types into it and
+requires an answer: `Test-PaneLive` in `test\win32\lib\PaneLiveness.ps1` (an
+`echo <token>`, matched **twice** — once as the echoed input line, once as the
+command's output, because one hit is only bytes going in). Re-running a script
+with `GHOZTTY_TEST_LIVENESS_BREAK=1` makes every liveness arm in it go red and
+nothing else move, which is how each arm was teeth-checked. A viewer pane has
+no shell; its equivalent claim is that the PAGE still responds — see the
+page-server oracle in `test\win32\viewer-restore.ps1`.
+
 ## Windows UI: the design system is mandatory
 
 **Before changing any pixel of the win32 chrome — tab strip, banner, dialogs,

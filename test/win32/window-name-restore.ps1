@@ -45,6 +45,9 @@ $script:fail = 0
 $root = Join-Path $env:TEMP "ghoztty-window-name-restore-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a restored pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 # T350: refuse a non-debug zig-out before anything is launched. This script
 # opens and CLOSES windows by auto name; against the user's endpoints that is
 # their terminal it would be closing.
@@ -224,6 +227,15 @@ try {
     foreach ($n in $restored) { $idOf[$n] = Get-PaneIdOf $n }
     Assert (@($restored | Where-Object { $idOf[$_] }).Count -eq 3) `
         'B3 each restored window resolves to a pane id'
+
+    # B4 (T652): ATTACHED IS NOT ALIVE. Everything above is app-side
+    # bookkeeping - a name in `+list` and a pane id in a tree are equally true
+    # of a pane that came back as a frozen picture. Type into one restored
+    # window and require new output, so the names C and D route by belong to
+    # panes that still work. One is enough here: all three restore by the same
+    # path, and this script's subject is the name allocator, not the attach.
+    Assert (Test-PaneLive -Exe $exe -Target 'window-1' -Tmp $root -Tag 'WNR') `
+        'B4 a restored window is LIVE: input reaches its child and output returns'
 
     # ---- C: fresh windows cannot re-mint an adopted name -------------------
     Say '== C: fresh windows after the restore'

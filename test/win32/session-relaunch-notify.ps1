@@ -61,6 +61,9 @@ $script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-relaunch-notify-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T652: the "attached is not alive" oracle. Read its header before adding an
+# assertion about a restored pane.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 
 # Write-Host, never the pipeline: a helper that asserts AND returns a value would
 # hand its caller @('  PASS ...', $realValue) and the caller would silently read
@@ -236,20 +239,12 @@ function Get-NoticePlacement($id, $tag, $timeoutSec = 40) {
 }
 
 # THE liveness oracle for a pane: type a unique marker and read it back.
+#
+# T652: this probe is where the shared oracle came from - including the
+# two-occurrence rule - so it now IS the shared oracle, which also brings this
+# script's arms under the GHOZTTY_TEST_LIVENESS_BREAK teeth-check.
 function Test-PaneResponsive($id, $tag, $timeoutSec = 30) {
-    $marker = "T230x$($tag)x$(Get-Random -Maximum 999999)"
-    Run-CliArgs @('+send-keys', "--target=$id", 'echo', 'Space', $marker, 'Enter') `
-        "$tmp\keys-$tag.txt" 12 | Out-Null
-    $deadline = (Get-Date).AddSeconds($timeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        $txt = (Read-Pane $id "resp-$tag") -replace '\s', ''
-        # Twice: once as the echoed input line, once as the command's output. One
-        # occurrence is just the keystrokes landing in a dead pane's line editor.
-        $hits = ([regex]::Matches($txt, [regex]::Escape($marker))).Count
-        if ($hits -ge 2) { return $true }
-        Start-Sleep -Milliseconds 700
-    }
-    return $false
+    return (Test-PaneLive -Exe $Exe -Target $id -Tmp $tmp -TimeoutSec $timeoutSec -Tag 'RN')
 }
 
 function Start-App($title, $extraArgs = @()) {
@@ -483,6 +478,12 @@ Assert "B1 the GUI came back" ($appPidB -ne 0)
 Wait-Leaves 'b2' 3 60 | Out-Null
 Assert "B2 '$CMD_A' WAS respawned under the auto policy" (Wait-MarkerPings $MARK_A 1 40)
 Assert "B3 '$CMD_B' WAS respawned under the auto policy" (Wait-MarkerPings $MARK_B 1 40)
+# T652 (why there is no echo-probe liveness arm here): the echo probe asks a
+# PROMPT a question, and under the auto policy these panes are not at a prompt -
+# they are running the respawned command. B2/B3 are the liveness claim in the
+# form this policy allows: the marker pings are produced by the new child, so a
+# pane that came back as a frozen picture cannot make them appear. The input
+# direction is covered on the same restore path by A9, C4 and E5b.
 Stop-TestProcs
 
 # ============================================================================
@@ -618,6 +619,17 @@ foreach ($leaf in $leavesE) {
 }
 Assert "E5 every restored pane still carries the notice in its scrollback ($textE/$($leavesE.Count))" `
     ($textE -eq $leavesE.Count)
+
+# E5b (T652): ATTACHED IS NOT ALIVE. E1-E5 are read off the SCREEN and out of
+# `+list --json`, and a pane that came back as a frozen picture satisfies every
+# one of them - a restored banner and a notice in the scrollback are exactly
+# what a recording looks like. Type into each one.
+$respE = 0
+foreach ($leaf in $leavesE) {
+    if (Test-PaneResponsive $leaf.id "elive$($leaf.id.Substring(0,4))") { $respE++ }
+}
+Assert "E5b every pane whose banner came back is on a LIVE shell ($respE/$($leavesE.Count))" `
+    ($respE -eq $leavesE.Count)
 
 # The other half of the report: the window title pin comes back too.
 $titleE = $false

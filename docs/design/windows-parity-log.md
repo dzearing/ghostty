@@ -12975,3 +12975,60 @@ replaced mid-run. A live-runtime test that cannot tell "the feature is broken"
 from "the OS component was mid-upgrade" costs a whole floor run to say nothing;
 filed as **T665**. This change touched no Zig at all, which is what made the
 attribution obvious.
+
+## 2026-08-09 — Every restore test now types into the pane it restored (T652)
+
+The acceptance scripts that prove your windows come back all read the screen,
+and a pane that comes back as a frozen picture reads exactly like a working
+one. That is how the 2026-08-06 regression — every restored pane painted
+correctly and accepting nothing — got past a green suite. T532 fixed two
+scripts; this closes the rest of the family.
+
+The probe had been written three times by then, so it is written once now:
+`test/win32/lib/PaneLiveness.ps1`. `Test-PaneLive` types `echo <token>` at a
+target and requires the token back **twice** — once as the echoed input line,
+once as the command's output, because one occurrence is only bytes going in and
+a pane whose child is gone can still show you what you typed. (The separator is
+the `Space` KEY: adjacent text positionals merge with no separator, so `echo`
+and the token as two arguments would arrive as `echoGLIVE…`.)
+
+Arms landed in all eight remaining scripts: `window-name-restore` (B4),
+`session-crash-recover` (C5/C6, one pane in each recovered window),
+`session-persistence` (B.10, the second window, every cycle),
+`session-relaunch` (A12/B8, both RELAUNCH policies), `session-relaunch-notify`
+(E5b, the banner-restore path), `chooser-restore-all`,
+`chooser-restore-all-remote` (K — keystroke across the relay to the child and
+back), and `viewer-restore` (H2 for its terminal). The three scripts that
+already had a probe of their own now delegate to the shared one, so they move
+with it.
+
+Two places deliberately do not get the echo probe, and say so in the source.
+`session-relaunch-notify` section B runs the respawned command rather than a
+prompt, so its marker pings ARE the liveness claim in the form that policy
+allows. And a viewer has no shell: `viewer-restore` grew a raw-TCP page server
+whose every response carries its own ordinal in `<title>`, so the restore must
+report a HIGHER ordinal than before the app died and a following `+reload` must
+raise it again — fetched from origin, executed, reported back. A pane holding a
+last painted frame keeps its number.
+
+An oracle nobody has watched go red is a decoration, so the teeth-check is a
+switch rather than a hand edit: `GHOZTTY_TEST_LIVENESS_BREAK=1` makes every
+liveness arm match a token that was never sent. Each script was run both ways
+on the box; the arms go red and nothing else moves (viewer-restore: 52 pass
+clean, 5 red under the switch, and `+reload`-exits-0 correctly stays green —
+an exit code is not a liveness claim). The rule itself is now in CLAUDE.md next
+to the test-lane guidance, which is where the next restore test will look.
+
+Two finds, neither this change's doing. `session-persistence` fails B2.7/B3.7:
+the SECOND re-attach in a row replays only the last screen, so a marker planted
+before the first kill is gone — 144 bytes of pane where the history should be.
+The unmodified script from HEAD fails identically, so it is a pre-existing
+regression, filed as **T666**. Its liveness arms pass in every cycle, which is
+the pairing worth noticing: the pane works and has lost its history, and it
+takes both kinds of assertion to tell those apart. And that script aborts
+outright when run from inside a Ghoztty pane — it never adopted
+`Isolation.ps1`'s private pipe suffix, so its guard correctly refuses to drive
+the user's terminal; filed as **T667**.
+
+Floor: all three zig lanes PASS (none 299s, win32 342s, agent 322s); P1/P2/P3
+ALL PASS.

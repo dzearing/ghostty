@@ -71,6 +71,11 @@ $script:fail = 0
 $root = Join-Path $env:TEMP "ghoztty-viewer-restore-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T652: the "attached is not alive" oracle for TERMINAL panes. The viewer half
+# of that claim has no shell to type into and is built below (Wait-ViewerTitleNum
+# over a local page server), honoring the same GHOZTTY_TEST_LIVENESS_BREAK
+# teeth-switch.
+. (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 
 # Write-Host, not the pipeline: a helper that asserts must never also return a
 # value, or its return silently becomes an array (T217 batch 5).
@@ -187,6 +192,45 @@ function Alive-Ids {
     return @(@($rows) | Where-Object { $_.alive -eq $true } | ForEach-Object { [string]$_.id })
 }
 
+# ---- the viewer liveness oracle (T652) --------------------------------------
+# A viewer has no shell, so "type into it and require an answer" has no meaning
+# here. The equivalent claim is that the PAGE still responds: a reload must
+# reach the WebView2, be fetched from origin, run, and have its result arrive
+# back in the app. This little raw-TCP server (viewer-panes.ps1's shape - no
+# HttpListener URL-ACL to register) answers every GET with a page whose <title>
+# carries that request's ordinal and Cache-Control: no-store. `+list --json`
+# reports a viewer leaf's title, so an ADVANCING number is proof of the whole
+# round trip; a pane holding a last painted frame keeps the number it had.
+$vrPort = 47652
+$vrHits = Join-Path $env:TEMP "ghoztty-vr-hits-$PID.txt"
+Remove-Item $vrHits -ErrorAction SilentlyContinue
+$vrUrl = "http://127.0.0.1:$vrPort/"
+
+# By WINDOW target: `--target=` names the window, and its lone viewer pane
+# carries only an auto-registered name of its own.
+function Get-ViewerTitle($target) {
+    $w = Get-Win $target
+    if ($null -eq $w) { return '' }
+    $leaves = @(Get-Leaves $w.tabs[0].splits)
+    if ($leaves.Count -lt 1) { return '' }
+    return [string]$leaves[0].title
+}
+
+# Poll until the pane reports a title ordinal greater than $afterN. Returns the
+# number, or -1 on timeout. GHOZTTY_TEST_LIVENESS_BREAK looks for a title the
+# server never serves, so this arm goes red with the terminal ones.
+function Wait-ViewerTitleNum($name, $afterN, $timeoutSec = 30) {
+    $pattern = '^vrlive(\d+)$'
+    if ($env:GHOZTTY_TEST_LIVENESS_BREAK -eq '1') { $pattern = '^vrliveBREAK(\d+)$' }
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $t = Get-ViewerTitle $name
+        if ($t -match $pattern -and [int]$Matches[1] -gt $afterN) { return [int]$Matches[1] }
+        Start-Sleep -Milliseconds 600
+    }
+    return -1
+}
+
 $docFile = Join-Path $repo 'README.md'
 $missingFile = Join-Path $env:TEMP "ghoztty-vr-missing-$PID.md"
 Remove-Item $missingFile -ErrorAction SilentlyContinue
@@ -206,6 +250,40 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $agent
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
+
+$script:vrJob = Start-Job -ScriptBlock {
+    param($port, $hitsFile)
+    $n = 0
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+    $listener.Start()
+    while ($true) {
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            Start-Sleep -Milliseconds 50
+            $buf = New-Object byte[] 8192
+            $req = ''
+            while ($stream.DataAvailable) {
+                $r = $stream.Read($buf, 0, $buf.Length)
+                if ($r -le 0) { break }
+                $req += [Text.Encoding]::UTF8.GetString($buf, 0, $r)
+            }
+            $line = ($req -split "`r`n")[0]
+            if ($line -match '^GET ') {
+                $n++
+                Add-Content -Path $hitsFile -Value "GET $n $line"
+                $html = '<html><head><title>vrlive' + $n + '</title></head><body>vrlive' + $n + '</body></html>'
+                $payload = [Text.Encoding]::UTF8.GetBytes($html)
+                $head = "HTTP/1.1 200 OK`r`nContent-Type: text/html`r`nCache-Control: no-store`r`n" +
+                    "Content-Length: $($payload.Length)`r`nConnection: close`r`n`r`n"
+                $out = [Text.Encoding]::UTF8.GetBytes($head) + $payload
+                $stream.Write($out, 0, $out.Length)
+                $stream.Flush()
+            }
+        } catch {}
+        $client.Close()
+    }
+} -ArgumentList $vrPort, $vrHits
 
 try {
     Assert (Test-Path $exe) "ghoztty exe exists in zig-out"
@@ -238,6 +316,15 @@ try {
     $r = Invoke-Verb @('+new-window', '--target=vrmiss', "--view=$missingFile")
     Assert ($r.Code -eq 0) "+new-window --view=<missing file> exits 0 (got $($r.Code))"
     Assert ((@(Wait-Panes 'vrmiss' 1)).Count -eq 1) 'the missing-file viewer window came up'
+
+    # A web viewer, for the T652 liveness claim: a restored FILE viewer's title
+    # is its basename either way, so only a served page can say whether the pane
+    # is still fetching and reporting or holding a picture.
+    $r = Invoke-Verb @('+new-window', '--target=vrweb', "--view=$vrUrl")
+    Assert ($r.Code -eq 0) "+new-window --view=<http> exits 0 (got $($r.Code))"
+    $vrN0 = Wait-ViewerTitleNum 'vrweb' 0 40
+    Assert ($vrN0 -gt 0) `
+        "L0 the page server's title reaches the app pre-restore (positive control, got $vrN0)"
 
     # ---- A: the manifest records viewer leaves as viewers --------------------
     Say '== A: capture'
@@ -354,7 +441,29 @@ try {
         Assert (-not $sameSession) 'H1 restore replaced the terminal session with a new one (inverted)'
     } else {
         Assert $sameSession 'H1 the terminal pane re-ATTACHed to its original agent session'
+        # H2 (T652): ATTACHED IS NOT ALIVE. H1 is the agent's answer about a
+        # session id, and D-G are read off `+list --json`; a pane that came back
+        # as a frozen picture satisfies every one of them. Type into the
+        # re-attached terminal that shares this window with the viewers.
+        Assert (Test-PaneLive -Exe $exe -Target 'vrterm' -Tmp $root -Tag 'VRT') `
+            'H2 the re-attached terminal is LIVE: input reaches the child, output returns'
     }
+
+    # ---- L: the restored VIEWERS still respond (the viewer half of T652) -----
+    # A viewer has no shell, so the equivalent of typing is asking the page for
+    # something new. The restore itself re-navigates, so the pane must first
+    # report a HIGHER ordinal than it did before the app died; then a `+reload`
+    # must fetch again and report higher still. E1/E2 above only say the pane is
+    # POINTED at a location - true of a dead WebView showing its last frame.
+    Say '== L: the restored viewers still respond'
+    $vrN1 = Wait-ViewerTitleNum 'vrweb' $vrN0 45
+    Assert ($vrN1 -gt $vrN0) `
+        "L1 the restored web viewer fetched its page again (title $vrN0 -> $vrN1)"
+    $r = Invoke-Verb @('+reload', '--target=vrweb')
+    Assert ($r.Code -eq 0) "L2 +reload of the restored viewer exits 0 (got $($r.Code))"
+    $vrN2 = Wait-ViewerTitleNum 'vrweb' $vrN1 30
+    Assert ($vrN2 -gt $vrN1) `
+        "L3 the reload LANDED: the page was re-fetched and its title came back (title $vrN1 -> $vrN2)"
 
     # The manifest the restored app writes must say the same thing the pre-quit
     # one did: a round-trip that loses a field is a restore that works once.
@@ -414,8 +523,18 @@ try {
     Assert ((@(Alive-Ids)).Count -eq 0) `
         'J6 no agent session is reachable (control: there was nothing to ATTACH to)'
 
+    # J7 (T652): the agentless restore rebuilds viewers on a path of its own, so
+    # it gets its own liveness reading rather than inheriting L's.
+    $vrN3 = Wait-ViewerTitleNum 'vrweb' $vrN2 45
+    Assert ($vrN3 -gt $vrN2) `
+        "J7 the agentless restore's web viewer is LIVE too (title $vrN2 -> $vrN3)"
+
 } finally {
     Say '== cleanup'
+    if ($null -ne $script:vrJob) {
+        Stop-Job $script:vrJob -ErrorAction SilentlyContinue
+        Remove-Job $script:vrJob -Force -ErrorAction SilentlyContinue
+    }
     Remove-TestDesktop
     Stop-RepoInstances
     $env:LOCALAPPDATA = $savedLocalAppData
