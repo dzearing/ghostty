@@ -175,10 +175,15 @@ ghoztty +sessions --json
 Send text input to a named pane's terminal PTY.
 
 ```
-ghoztty +send-keys --target=<name> <text|key>...
+ghoztty +send-keys --target=<name> [flags] <text|key>...
 ```
 
+> **To submit, end the text with `\n`** — `ghoztty +send-keys --target=t "prompt\n"`.
+> (`--enter`, or a separate `Enter` argument, do the same thing. Use one, not
+> two — they stack, and two of them submit twice.)
+
 - `--target`: Named pane or window to send input to. Required.
+- `--enter`: Press Enter after the text. Same as a trailing `\n` or a trailing `Enter` argument. On its own, with no text, it just presses Enter.
 - `--when-idle`: Poll the target pane's recent output every 500ms until it looks idle before sending: no `esc to interrupt` in the tail (older Claude Code's busy marker) AND the tail unchanged across ~1s (busy TUIs animate spinners/timers every second; an idle prompt is static — this catches Claude Code ≥ 2.1.207, which dropped the marker). Sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
 - `--keys-file=<path>`: Send the file's bytes **verbatim** — no key notation, no
   `\n` escape processing. It keeps its position among the positional arguments,
@@ -188,7 +193,14 @@ ghoztty +send-keys --target=<name> <text|key>...
   embedded `"` when it builds a native command line, so such text arrives as a
   positional argument with its quotes stripped, re-tokenized and concatenated
   without separators, or broken outright. Length is not the hazard — the
-  transport is byte-exact at 10,000 characters (T210).
+  transport is byte-exact at 10,000 characters (T210). **The trailing-newline
+  rule below does not apply to it**: the CLI sends a file exactly as it is on
+  disk, trailing newline included, because "verbatim" is the flag's whole reason
+  to exist and a generated prompt file routinely ends in a newline nobody meant
+  as "submit". Submit one with a following `Enter` (or `--enter`). (On Windows
+  the *server* still normalizes that trailing LF to CR before the write, so a
+  file ending in a newline submits here and does not on macOS — a divergence,
+  tracked as T661, not the intended contract.)
 - Positional arguments are text or key names, written to the PTY in order.
   Adjacent arguments of the same kind merge into one **run**, and the run
   boundaries survive to the PTY write: a text run is framed as a **bracketed
@@ -203,9 +215,18 @@ ghoztty +send-keys --target=<name> <text|key>...
 - Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
 
 ```bash
+ghoztty +send-keys --target=term "hello\tworld\n"   # types, then submits
 ghoztty +send-keys --target=term "ls -la" Enter
+ghoztty +send-keys --target=term --enter "ls -la"
 ghoztty +send-keys --target=term C-c
-ghoztty +send-keys --target=term "hello\tworld\n"
+```
+
+**A trailing newline is a keypress; an interior one is content.** The trailing run of `\n`/`\r` is peeled off a text argument and delivered as that many Enter presses, so `"a\nb\n"` pastes two lines and then submits. This runs after escape processing, so `\n` written as the two-character escape and a real newline byte behave identically. The accepted cost: there is no way to paste text ending in a literal newline without submitting — a trailing newline in a paste means "commit" essentially always, and a program that has not enabled bracketed paste sees `\r` mapped back to `\n` by the tty's `ICRNL` anyway. (`--keys-file=` is exempt; see above.) **On Windows the interior newline does not stay literal either** — the IPC server normalizes LF to CR inside text runs as well as key runs, so `"a\nb\n"` reaches the pane as `a␍b` framed, then `␍`. That is a divergence from the rule above, measured by rounds 11–12 of `test/win32/send-keys-bracketed.ps1` and tracked as T661.
+
+**Any unknown `--flag` is a hard error** (exit 1), naming the submit spellings. `--press-enter` used to become a text positional and get typed into the pane at exit 0, which is how agents got this wrong without noticing. Single-dash arguments (`-la`, `-p`) are ordinary text. To send literal text starting with `--`, put it after a bare `--`, which stops flag parsing but not key notation:
+
+```bash
+ghoztty +send-keys --target=term -- "--not-a-flag" Enter
 ```
 
 **Text and keys stay distinguishable.** Argument boundaries survive all the way to the write. When a call mixes text with keys, adjacent arguments of the same kind merge into a run, and each **text** run is written to the pane as a **bracketed paste** (`ESC[200~` … `ESC[201~`) while each **key** run is written bare, outside the frame.

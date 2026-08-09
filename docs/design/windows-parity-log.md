@@ -12790,3 +12790,52 @@ one arriving late. Floor lanes green, `agent-session-cap.ps1` and P1–P3 ALL PA
 `ATTACH` has the identical hole and was filed rather than folded in: a resumed
 pane whose ATTACH is refused still blanks for ten seconds and blames a timeout.
 **T657.**
+
+## 2026-08-09 — A trailing newline now submits, and the two seats' send-keys are one file again (T604)
+
+The user's directive was 100% parity with main's recent Enter work. The first
+useful finding was that this was never two rival fixes: the bracketed-paste
+framing (`9bac0250f`) is an ancestor of **both** branches, and main's
+`a7f7476e1` was built on top of it. So the job was not to choose a winner but
+to carry main's submission semantics onto a file this branch had restructured
+underneath them.
+
+Ported from main, whole: a trailing run of `\n`/`\r` is peeled off a text
+argument and delivered as that many Enter presses (interior newlines stay
+content); `--enter` appends a synthetic `Enter` **before** the "at least one
+text argument" check, so a bare `--enter` is a legal send; an unrecognized
+`--flag` is now a hard error naming the submit spellings instead of being
+typed into the pane at exit 0; `resolveArgument` returns a `Split` because one
+argument can contribute both a text half and a key half.
+
+Kept from this branch, all supersets of main's: `--keys-file=`, the
+`--segments=` wire format living in `apprt/ipc/segments.zig` beside the
+decoder that reads it, and motion-based `--when-idle`.
+
+Two merge points needed design rather than a port, both around `--keys-file=`,
+which main does not have. It is a **recognized** flag that must not be
+consumed by flag parsing, or it loses its position relative to a trailing
+`Enter`; and after a bare `--` the text `--keys-file=x` is literal content, so
+a positional now carries an `after_dashdash` flag instead of the resolver
+re-testing a prefix that cannot tell the two apart. Whether a file should be
+exempt from the peel was the one judgement call — exempted, as **D52**.
+
+**The validation is what earned its keep.** A new byte-level round asserting
+the exemption FAILED: the file's `0a` reached the pane as `0d`. The CLI is
+innocent — the none-lane test proves it emits `0a` — but the win32 server runs
+`normalizeConptyInput` over **every** run, text runs included, mapping LF to
+CR. So a `--keys-file=` trailing newline submits here and does not on macOS
+(pre-existing, and the docs had been claiming otherwise), and main's guarantee
+that *interior* newlines stay literal does not hold on Windows at all:
+`"a\nb\n"` arrives as `ESC[200~ 61 0d 62 ESC[201~ 0d`. Both `CLAUDE.md` claims
+were corrected rather than left aspirational, and the failed expectation became
+rounds 11–12 so the divergence is a measured fact instead of a future surprise.
+**T661** carries the narrowing fix.
+
+Measured: floor lanes none/win32/agent all PASS; `send-keys-bracketed.ps1` ALL
+PASS with rounds 6–8 untouched and 9–12 new; `ipc-send-keys-fidelity`,
+`ipc-when-idle` and P1–P3 ALL PASS. Also filed **T658** (a CRLF-terminated
+argument submits twice — inherited from main verbatim on purpose), **T659**
+(`seat: mac` validation against a real composer, which this seat cannot run),
+**T660** (the bundled `SKILL.md` does not exist on this branch, so main's doc
+half of `a7f7476e1` had nowhere to land).

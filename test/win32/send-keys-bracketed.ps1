@@ -260,6 +260,64 @@ $r8 = Invoke-Round 'off' 13 @("--keys-file=$pf") @(' ', 'Enter')
 Assert "unframed space then CR" ($r8 -eq ($msgHex + $SPACE + $CR))
 Assert "no fencepost anywhere" (-not ($r8.Contains($FRAME_START) -or $r8.Contains($FRAME_END)))
 
+# --- T604: main's submission semantics, at the byte level -------------------
+#
+# The peel and `--enter` are pinned in the none lane, but what they exist for
+# is what a TUI RECEIVES - and only this capture can see that. Each of the
+# three spellings below has to produce the same bytes as `"text" Enter` does
+# in round 1, or they are not the same feature.
+
+"== 9: a trailing \n is peeled into a keypress - framed text, CR outside"
+# The spelling agents reach for first. Before T604 this took the flat path: one
+# text run ending in a literal 0a, no frame, no keypress - typed into the
+# composer and never submitted.
+$r9 = Invoke-Round 'on' 24 @("$msg\n")
+"     got: $r9"
+Assert "same bytes as an explicit trailing Enter (round 1)" `
+    ($r9 -eq ($FRAME_START + $msgHex + $FRAME_END + $CR))
+Assert "no literal newline survived inside the frame" `
+    (-not $r9.Contains($FRAME_START + $msgHex + '0a'))
+
+"== 10: --enter is the same send as a trailing Enter argument"
+$r10 = Invoke-Round 'on' 24 @('--enter', $msg)
+"     got: $r10"
+Assert "framed text with the CR outside" `
+    ($r10 -eq ($FRAME_START + $msgHex + $FRAME_END + $CR))
+
+"== 11: --keys-file= is exempt from the peel, but ConPTY normalization is not"
+# Two layers, and only the first is the CLI's. The CLI genuinely exempts a file
+# from the trailing-newline peel (D52) and emits 0a - pinned in the none lane
+# by "keys-file: a trailing newline in the file stays content, unpeeled".
+#
+# The SERVER then runs verb_args.normalizeConptyInput over every run
+# (IpcHandlers.handleSendKeys), which turns LF and CRLF into CR because Enter
+# on a ConPTY is CR. So on Windows the file's trailing newline reaches the pane
+# as 0d and submits after all. That is pre-existing win32 behavior, older than
+# T604 - this round exists so it is a MEASURED fact rather than a surprise, and
+# so the docs cannot go on claiming a file is byte-exact on the wire here.
+# Tracked as T661.
+$pfn = Join-Path $tmp 'prompt-nl.txt'
+[IO.File]::WriteAllText($pfn, "$msg`n", (New-Object System.Text.UTF8Encoding($false)))
+$r11 = Invoke-Round 'on' 13 @("--keys-file=$pfn")
+"     got: $r11"
+Assert "one text run, so unframed (round 4's rule)" `
+    (-not ($r11.Contains($FRAME_START) -or $r11.Contains($FRAME_END)))
+Assert "the file's LF is normalized to CR by the server, not left as 0a" `
+    ($r11 -eq ($msgHex + $CR))
+
+"== 12: an INTERIOR newline is normalized to CR too (win32 divergence, T661)"
+# Main's contract for the peel is 'interior newlines stay literal inside the
+# paste, so "a\nb\n" pastes two lines and then submits'. The peel half holds
+# here - the trailing newline leaves the frame as a keypress - but the interior
+# 0a does NOT survive as 0a, because normalizeConptyInput rewrites it inside
+# the text run. The bytes below are what a TUI on Windows actually receives.
+$r12 = Invoke-Round 'on' 16 @("a\nb\n")
+"     got: $r12"
+Assert "the trailing newline still became a keypress outside the frame" `
+    ($r12.EndsWith($FRAME_END + $CR))
+Assert "the interior newline arrived as CR, not LF" `
+    ($r12 -eq ($FRAME_START + '610d62' + $FRAME_END + $CR))
+
 "== teardown"
 & $Exe +close "--target=$win" 2>&1 | Out-Null
 Reset-GhozttyTestState -Exe $Exe -SettleMs 500 | Out-Null

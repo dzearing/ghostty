@@ -6,15 +6,42 @@ const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 
+/// One surviving positional argument, plus whether it came after a bare
+/// `--`.
+///
+/// The flag stops flag parsing but NOT key notation, so `-- Enter` is still
+/// an Enter keypress. What it does stop is `--keys-file=`: after `--`, the
+/// text `--keys-file=x` is the literal string a caller asked to send, not a
+/// request to read a file. Carrying that as a field beats re-testing the
+/// prefix later, which cannot tell the two apart at all.
+const Positional = struct {
+    text: [:0]const u8,
+    after_dashdash: bool = false,
+};
+
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
 
-    _arguments: std.ArrayList([:0]const u8) = .empty,
+    _arguments: std.ArrayList(Positional) = .empty,
 
     _diagnostics: diagnostics.DiagnosticList = .{},
 
+    target: ?[:0]const u8 = null,
     when_idle: bool = false,
     idle_timeout: u32 = 30,
+    enter: bool = false,
+
+    /// The first argument that looked like a flag and was not one. Reported
+    /// by `runArgs` rather than thrown from `checkArg`, which has no writer
+    /// to explain itself with.
+    unknown_flag: ?[]const u8 = null,
+
+    /// Set by a bare `--`: everything after it is a positional.
+    flags_done: bool = false,
+
+    /// `--help` past the first position, which `args.parse` only checks for
+    /// at the front.
+    help_requested: bool = false,
 
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
@@ -28,20 +55,55 @@ pub const Options = struct {
         return false;
     }
 
-    fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        if (std.mem.eql(u8, arg, "--when-idle")) {
-            self.when_idle = true;
+    /// Classify one argument: a recognized flag is consumed and returns null,
+    /// anything else comes back as a positional.
+    ///
+    /// An unrecognized `--flag` is an error rather than text. Falling through
+    /// to text is how `--press-enter` used to get typed into the pane, exit 0,
+    /// and leave the caller with no way to notice. Single-dash arguments stay
+    /// text: `-la` and `-p` are ordinary content this command exists to send.
+    fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?Positional {
+        if (!self.flags_done and std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--")) {
+                self.flags_done = true;
+                return null;
+            }
+            if (std.mem.eql(u8, arg, "--help")) {
+                self.help_requested = true;
+                return null;
+            }
+            if (std.mem.eql(u8, arg, "--when-idle")) {
+                self.when_idle = true;
+                return null;
+            }
+            if (std.mem.eql(u8, arg, "--enter")) {
+                self.enter = true;
+                return null;
+            }
+            if (std.mem.startsWith(u8, arg, "--idle-timeout=")) {
+                self.idle_timeout = std.fmt.parseInt(u32, arg["--idle-timeout=".len..], 10) catch return error.InvalidValue;
+                return null;
+            }
+            if (std.mem.startsWith(u8, arg, "--target=")) {
+                self.target = try alloc.dupeZ(u8, arg);
+                return null;
+            }
+            // `--keys-file=` is a RECOGNIZED flag that is deliberately not
+            // consumed: it has to keep its position relative to the text
+            // arguments so `--keys-file=p.txt Enter` sends the file and THEN
+            // the carriage return. It rides along as a positional and is
+            // expanded in resolveSegments.
+            if (std.mem.startsWith(u8, arg, "--keys-file=")) {
+                return .{ .text = try alloc.dupeZ(u8, arg) };
+            }
+            if (self.unknown_flag == null) self.unknown_flag = try alloc.dupeZ(u8, arg);
             return null;
         }
-        // NOTE: `--keys-file=` is deliberately NOT consumed here. It has to
-        // keep its position relative to the positional text arguments so
-        // `--keys-file=p.txt Enter` sends the file and THEN the newline, so it
-        // rides along in _arguments and is handled in runArgs like --target=.
-        if (std.mem.startsWith(u8, arg, "--idle-timeout=")) {
-            self.idle_timeout = std.fmt.parseInt(u32, arg["--idle-timeout=".len..], 10) catch return error.InvalidValue;
-            return null;
-        }
-        return try alloc.dupeZ(u8, arg);
+
+        return .{
+            .text = try alloc.dupeZ(u8, arg),
+            .after_dashdash = self.flags_done,
+        };
     }
 
     pub fn deinit(self: *Options) void {
@@ -57,6 +119,13 @@ pub const Options = struct {
 
 /// Send text input to a named pane's terminal.
 ///
+/// TO SUBMIT, END THE TEXT WITH `\n`:
+///
+///   ghoztty +send-keys --target=term "hello\tworld\n"
+///
+/// `--enter`, or a separate `Enter` argument, do the same thing. Use
+/// one, not two — they stack, and two of them submit twice.
+///
 /// Text is written to the target pane's PTY as if the user typed it.
 /// Supports escape sequences and key notation for sending control
 /// characters and special keys.
@@ -66,6 +135,10 @@ pub const Options = struct {
 ///   * `--target=<name>`: The named pane or window to send input to.
 ///     Required. The target must have been created with
 ///     `+new-window --target=<name>` or `+split --name=<name>`.
+///
+///   * `--enter`: Press Enter after the text, submitting it. Same as
+///     ending the text with `\n` or passing a trailing `Enter`
+///     argument. On its own, with no text, it just presses Enter.
 ///
 ///   * `--when-idle`: Before sending, poll the target pane's recent
 ///     output every 500ms until it no longer looks busy: no
@@ -85,8 +158,21 @@ pub const Options = struct {
 ///     position among the positional arguments, so
 ///     `--keys-file=p.txt Enter` sends the file and then a carriage
 ///     return. May be given more than once. The file is sent exactly
-///     as it is on disk, trailing newline included, so write it with
-///     no trailing newline unless you want one typed.
+///     as it is on disk, trailing newline included — the trailing-
+///     newline peel below does NOT apply to it, because "verbatim" is
+///     the whole reason this flag exists and generated files routinely
+///     end in a newline nobody meant as "submit". Use a following
+///     `Enter` (or `--enter`) to submit a file.
+///
+/// Any other argument starting with `--` is an error rather than
+/// text, so a misspelled flag is rejected instead of being typed into
+/// the pane. To send literal text that starts with `--`, put it after
+/// a bare `--`, which stops flag parsing:
+///
+///   ghoztty +send-keys --target=term -- "--not-a-flag\n"
+///
+/// Single-dash arguments (`-la`, `-p`) are ordinary text and need no
+/// escaping.
 ///
 /// Positional arguments are the text to send. Each argument is
 /// checked for key notation first, then processed for escape
@@ -95,6 +181,10 @@ pub const Options = struct {
 ///   * Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), etc.
 ///   * Named keys: `Enter`, `Tab`, `Escape`, `Space`
 ///   * Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
+///
+/// A newline at the END of a text argument is a keypress, not content:
+/// it is peeled off and delivered as Enter. Newlines in the MIDDLE
+/// stay literal, so `"a\nb\n"` pastes two lines and then submits.
 ///
 /// A positional argument is the WRONG transport for generated text.
 /// PowerShell 5.1 does not escape an embedded `"` when it builds a
@@ -118,9 +208,10 @@ pub const Options = struct {
 ///
 /// Examples:
 ///
-///   ghoztty +send-keys --target=term "ls -la" Enter
-///   ghoztty +send-keys --target=term C-c
 ///   ghoztty +send-keys --target=term "hello\tworld\n"
+///   ghoztty +send-keys --target=term "ls -la" Enter
+///   ghoztty +send-keys --target=term --enter "ls -la"
+///   ghoztty +send-keys --target=term C-c
 ///   ghoztty +send-keys --target=term --keys-file=prompt.txt Enter
 ///
 /// Available since: 1.2.0
@@ -157,20 +248,39 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Extract --target and resolve the rest IN ORDER: a --keys-file= among
-    // the positional arguments contributes its bytes where it appears, so
-    // `--keys-file=p.txt Enter` sends the file and then the newline.
-    var target_arg: ?[:0]const u8 = null;
-    var bad_file: ?[]const u8 = null;
-    var text_count: usize = 0;
+    if (opts.help_requested) return Action.help_error;
 
-    const resolved = resolveArguments(
-        alloc,
-        opts._arguments.items,
-        &target_arg,
-        &bad_file,
-        &text_count,
-    ) catch |err| {
+    // A flag we don't know is a caller who thinks they're doing something we
+    // aren't doing. Name the submit spellings here rather than leaving them
+    // to the docs — this message is where a wrong guess actually lands.
+    if (opts.unknown_flag) |flag| {
+        try stderr.print(
+            \\+send-keys: unknown flag '{s}'.
+            \\To submit, use --enter, a trailing \n, or a separate Enter argument.
+            \\Valid flags: --target= --when-idle --idle-timeout= --keys-file= --enter
+            \\To send literal text starting with '--', put it after '--'.
+            \\
+        , .{flag});
+        return 1;
+    }
+
+    const target_arg = opts.target orelse {
+        try stderr.print("+send-keys: --target is required\n", .{});
+        return 1;
+    };
+
+    const text_args = try positionalArgs(alloc, &opts);
+
+    if (text_args.len == 0) {
+        try stderr.print("+send-keys: at least one text argument is required\n", .{});
+        return 1;
+    }
+
+    // Resolve IN ORDER: a --keys-file= among the positional arguments
+    // contributes its bytes where it appears, so `--keys-file=p.txt Enter`
+    // sends the file and then the carriage return.
+    var bad_file: ?[]const u8 = null;
+    const resolved = resolveSegments(alloc, text_args, &bad_file) catch |err| {
         if (bad_file) |path| {
             try stderr.print(
                 "+send-keys: cannot read --keys-file={s}: {s}\n",
@@ -181,17 +291,6 @@ fn runArgs(
         }
         return 1;
     };
-    const saw_text = text_count > 0;
-
-    if (target_arg == null) {
-        try stderr.print("+send-keys: --target is required\n", .{});
-        return 1;
-    }
-
-    if (!saw_text) {
-        try stderr.print("+send-keys: at least one text argument is required\n", .{});
-        return 1;
-    }
 
     if (resolved.bytes.len == 0) {
         try stderr.print("+send-keys: resolved text is empty\n", .{});
@@ -204,7 +303,7 @@ fn runArgs(
     @memcpy(keys_arg[0..prefix.len], prefix);
     @memcpy(keys_arg[prefix.len..][0..resolved.bytes.len], resolved.bytes);
 
-    var ipc_args_buf: [3][:0]const u8 = .{ target_arg.?, keys_arg, undefined };
+    var ipc_args_buf: [3][:0]const u8 = .{ target_arg, keys_arg, undefined };
     var ipc_args: [][:0]const u8 = ipc_args_buf[0..2];
 
     // Only send the segmented payload when there is a boundary worth
@@ -221,7 +320,7 @@ fn runArgs(
     if (opts.when_idle) {
         waitForIdle(
             alloc,
-            target_arg.?["--target=".len..],
+            target_arg["--target=".len..],
             opts.idle_timeout,
             stderr,
         );
@@ -249,6 +348,20 @@ fn runArgs(
     // sendIpc already printed the server's error text (if any) to stderr.
     try stderr.print("+send-keys failed.\n", .{});
     return 1;
+}
+
+/// The positional arguments to resolve: everything that survived flag
+/// parsing, plus the synthetic `Enter` that `--enter` stands for.
+///
+/// Appending the Enter here, rather than at resolve time, is what makes a
+/// bare `--enter` with no text a legal send that just presses Enter — it is
+/// already a positional by the time the "at least one text argument" check
+/// runs.
+fn positionalArgs(alloc: Allocator, opts: *const Options) Allocator.Error![]const Positional {
+    var out: std.ArrayList(Positional) = .empty;
+    for (opts._arguments.items) |arg| try out.append(alloc, arg);
+    if (opts.enter) try out.append(alloc, .{ .text = "Enter" });
+    return out.items;
 }
 
 /// Poll the target pane's recent output until it looks idle, then
@@ -322,10 +435,10 @@ const Resolved = struct {
     segments: []const Segment,
 };
 
-/// Resolve the whole argument list into ordered segments, IN ORDER, pulling
-/// the `--target=` argument out along the way. A `--keys-file=` among the
-/// positional arguments contributes its bytes where it appears — as a TEXT
-/// run, since it is content the caller did not type — so
+/// Resolve the positional arguments into ordered segments, merging runs of
+/// the same kind so the result alternates strictly between text and keys. A
+/// `--keys-file=` among them contributes its bytes where it appears — as a
+/// TEXT run, since it is content the caller did not type — so
 /// `--keys-file=p.txt Enter` sends the file and then the newline.
 ///
 /// The boundary between a text run and the key run after it is the whole
@@ -333,16 +446,13 @@ const Resolved = struct {
 /// receiving program a single burst of bytes ending in `\r`, which paste
 /// detection reads as a pasted newline instead of a submit.
 ///
-/// `text_count` receives the number of arguments that were not `--target=`;
-/// on a `--keys-file=` read failure, `bad_file` names the path so the caller
+/// On a `--keys-file=` read failure, `bad_file` names the path so the caller
 /// can say which one. The returned segments point into the returned `bytes`,
 /// and the scratch used along the way is never freed, so pass an arena.
-fn resolveArguments(
+fn resolveSegments(
     alloc: Allocator,
-    arguments: []const [:0]const u8,
-    target: *?[:0]const u8,
+    text_args: []const Positional,
     bad_file: *?[]const u8,
-    text_count: *usize,
 ) !Resolved {
     // Record spans rather than slices while filling `buf`: appending to it
     // can reallocate, which would dangle any slice taken earlier.
@@ -351,40 +461,52 @@ fn resolveArguments(
     var buf: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(Span) = .empty;
 
-    text_count.* = 0;
-    for (arguments) |arg| {
-        if (std.mem.startsWith(u8, arg, "--target=")) {
-            target.* = arg;
-            continue;
-        }
-        text_count.* += 1;
+    // Add one run, extending the previous span when the kind matches. Runs
+    // arrive contiguously, so extending its end is all a merge takes. An
+    // empty run — an empty argument, or an argument that is all text or all
+    // key — is not a segment.
+    const push = struct {
+        fn f(
+            alloc_: Allocator,
+            spans_: *std.ArrayList(Span),
+            kind: Kind,
+            start: usize,
+            end: usize,
+        ) Allocator.Error!void {
+            if (start == end) return;
 
+            if (spans_.items.len > 0) {
+                const prev = &spans_.items[spans_.items.len - 1];
+                if (prev.kind == kind) {
+                    prev.end = end;
+                    return;
+                }
+            }
+
+            try spans_.append(alloc_, .{ .kind = kind, .start = start, .end = end });
+        }
+    }.f;
+
+    for (text_args) |arg| {
         const start = buf.items.len;
-        const kind: Kind = if (std.mem.startsWith(u8, arg, "--keys-file=")) kind: {
-            const path = arg["--keys-file=".len..];
+
+        // A file payload is CONTENT and is sent VERBATIM: no key notation,
+        // no escape processing, and no trailing-newline peel. See the
+        // `--keys-file` note in this action's doc comment.
+        if (!arg.after_dashdash and std.mem.startsWith(u8, arg.text, "--keys-file=")) {
+            const path = arg.text["--keys-file=".len..];
             appendFile(alloc, &buf, path) catch |err| {
                 bad_file.* = path;
                 return err;
             };
-            break :kind .text;
-        } else try resolveArgument(alloc, &buf, arg);
-
-        // An empty argument resolves to no bytes and so is not a segment.
-        if (buf.items.len == start) continue;
-
-        if (spans.items.len > 0) {
-            const prev = &spans.items[spans.items.len - 1];
-            if (prev.kind == kind) {
-                prev.end = buf.items.len;
-                continue;
-            }
+            try push(alloc, &spans, .text, start, buf.items.len);
+            continue;
         }
 
-        try spans.append(alloc, .{
-            .kind = kind,
-            .start = start,
-            .end = buf.items.len,
-        });
+        const split = try resolveArgument(alloc, &buf, arg.text);
+
+        try push(alloc, &spans, .text, start, start + split.text_len);
+        try push(alloc, &spans, .key, start + split.text_len, buf.items.len);
     }
 
     const segments = try alloc.alloc(Segment, spans.items.len);
@@ -400,48 +522,73 @@ fn resolveArguments(
 /// lives in `apprt.ipc.segments` next to the decoder that reads it.
 const encodeSegments = segments_wire.encode;
 
+/// How one argument's resolved bytes divide, in order, into a leading text
+/// run and a trailing key run. Either half can be empty: a key name is all
+/// key, ordinary text is all text, and `"prompt\n"` is one of each.
+const Split = struct {
+    text_len: usize = 0,
+    key_len: usize = 0,
+};
+
 /// Resolve a single argument: if it matches a key name, append its byte(s);
-/// otherwise process escape sequences in the text. Returns which of the two
-/// it was.
-fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!Kind {
+/// otherwise process escape sequences in the text and peel any trailing
+/// newline off as a keypress. Returns how the appended bytes divide.
+fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!Split {
+    const start = buf.items.len;
+
     // Ctrl key notation: C-a through C-z (case insensitive)
     if (arg.len == 3 and arg[0] == 'C' and arg[1] == '-') {
         const ch = arg[2];
         if (ch >= 'a' and ch <= 'z') {
             try buf.append(alloc, ch - 'a' + 1);
-            return .key;
+            return .{ .key_len = 1 };
         }
         if (ch >= 'A' and ch <= 'Z') {
             try buf.append(alloc, ch - 'A' + 1);
-            return .key;
+            return .{ .key_len = 1 };
         }
     }
 
     // Named keys
     if (eqlIgnoreCase(arg, "Enter") or eqlIgnoreCase(arg, "Return") or eqlIgnoreCase(arg, "CR")) {
         try buf.append(alloc, '\r');
-        return .key;
+        return .{ .key_len = 1 };
     }
     if (eqlIgnoreCase(arg, "Tab")) {
         try buf.append(alloc, '\t');
-        return .key;
+        return .{ .key_len = 1 };
     }
     if (eqlIgnoreCase(arg, "Escape") or eqlIgnoreCase(arg, "Esc")) {
         try buf.append(alloc, 0x1b);
-        return .key;
+        return .{ .key_len = 1 };
     }
     if (eqlIgnoreCase(arg, "Space")) {
         try buf.append(alloc, ' ');
-        return .key;
+        return .{ .key_len = 1 };
     }
     if (eqlIgnoreCase(arg, "BSpace") or eqlIgnoreCase(arg, "Backspace")) {
         try buf.append(alloc, 0x7f);
-        return .key;
+        return .{ .key_len = 1 };
     }
 
     // Not a key name — process escape sequences in the text
     try processEscapes(alloc, buf, arg);
-    return .text;
+
+    // A newline at the END means submit, so it leaves the paste and becomes
+    // Enter. Newlines in the MIDDLE are line breaks in the pasted content and
+    // stay literal. This runs after escape processing, so `\n` written as the
+    // two-character escape and a real newline byte are the same input.
+    //
+    // The cost, accepted deliberately: there is no way to paste text ending
+    // in a literal newline without submitting. A trailing newline in a paste
+    // means "commit" essentially always, and for a program that has not
+    // enabled bracketed paste the tty's ICRNL maps the `\r` back to `\n`, so
+    // `cat` and a script's `read` see what they always saw.
+    var end = buf.items.len;
+    while (end > start and (buf.items[end - 1] == '\n' or buf.items[end - 1] == '\r')) end -= 1;
+    for (buf.items[end..]) |*byte| byte.* = '\r';
+
+    return .{ .text_len = end - start, .key_len = buf.items.len - end };
 }
 
 /// Process escape sequences within a text string.
@@ -501,7 +648,7 @@ test "resolveArgument C-c" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try std.testing.expectEqual(Kind.key, try resolveArgument(alloc, &buf, "C-c"));
+    try std.testing.expectEqual(Split{ .key_len = 1 }, try resolveArgument(alloc, &buf, "C-c"));
     try std.testing.expectEqual(@as(usize, 1), buf.items.len);
     try std.testing.expectEqual(@as(u8, 3), buf.items[0]);
 }
@@ -511,7 +658,7 @@ test "resolveArgument Enter" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try std.testing.expectEqual(Kind.key, try resolveArgument(alloc, &buf, "Enter"));
+    try std.testing.expectEqual(Split{ .key_len = 1 }, try resolveArgument(alloc, &buf, "Enter"));
     try std.testing.expectEqualStrings("\r", buf.items);
 }
 
@@ -520,7 +667,7 @@ test "resolveArgument plain text with escapes" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try std.testing.expectEqual(Kind.text, try resolveArgument(alloc, &buf, "hello\\nworld"));
+    try std.testing.expectEqual(Split{ .text_len = 11 }, try resolveArgument(alloc, &buf, "hello\\nworld"));
     try std.testing.expectEqualStrings("hello\nworld", buf.items);
 }
 
@@ -548,13 +695,18 @@ fn testKeysFile(alloc: Allocator, dir: std.fs.Dir, name: []const u8, contents: [
     return try alloc.dupeZ(u8, path);
 }
 
+/// Wrap plain strings as positionals, the way flag parsing hands them over.
+fn testPositionals(alloc: Allocator, arguments: []const [:0]const u8) ![]const Positional {
+    const out = try alloc.alloc(Positional, arguments.len);
+    for (arguments, out) |arg, *slot| slot.* = .{ .text = arg };
+    return out;
+}
+
 /// Resolve an argument list the way `runArgs` does, for tests that do not
-/// care about the target or the failure paths.
+/// care about the failure paths.
 fn testResolve(alloc: Allocator, arguments: []const [:0]const u8) !Resolved {
-    var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
-    var n: usize = 0;
-    return try resolveArguments(alloc, arguments, &target, &bad, &n);
+    return try resolveSegments(alloc, try testPositionals(alloc, arguments), &bad);
 }
 
 test "keys-file: bytes are verbatim, not escape-processed or key-matched" {
@@ -570,19 +722,66 @@ test "keys-file: bytes are verbatim, not escape-processed or key-matched" {
     const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", contents);
     const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
 
-    var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
-    var n: usize = 0;
-    const resolved = try resolveArguments(alloc, &.{ "--target=x", keys_arg }, &target, &bad, &n);
+    const resolved = try resolveSegments(
+        alloc,
+        try testPositionals(alloc, &.{keys_arg}),
+        &bad,
+    );
 
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("--target=x", target.?);
     try std.testing.expect(bad == null);
     try std.testing.expectEqualStrings(contents, resolved.bytes);
 
     // A file payload is CONTENT, so it is a text run — which is what makes
     // `--keys-file=p.txt Enter` frame the prompt and leave the CR outside it.
     try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+}
+
+// The trailing-newline peel is a property of TEXT ARGUMENTS. `--keys-file=`
+// is the "nothing interprets these bytes" transport, and a generated prompt
+// file routinely ends in a newline its author never meant as "submit" — so
+// the peel deliberately does not reach it. Submit a file with a following
+// `Enter` (or `--enter`), which is the documented shape.
+test "keys-file: a trailing newline in the file stays content, unpeeled" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", "do the thing\n");
+    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
+
+    var bad: ?[]const u8 = null;
+    const resolved = try resolveSegments(
+        alloc,
+        try testPositionals(alloc, &.{keys_arg}),
+        &bad,
+    );
+
+    // The `\n` is still a `\n`, still inside the one text run — not a `\r`
+    // in a key run of its own.
+    try std.testing.expectEqualStrings("do the thing\n", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+}
+
+// After a bare `--`, `--keys-file=x` is the literal text a caller asked to
+// send. Reading a file there would be the same class of silent wrong-thing
+// this command's unknown-flag error exists to prevent.
+test "keys-file: after a bare -- it is literal text, not a file read" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var bad: ?[]const u8 = null;
+    const resolved = try resolveSegments(alloc, &.{
+        .{ .text = "--keys-file=t604-never-read.txt", .after_dashdash = true },
+    }, &bad);
+
+    try std.testing.expect(bad == null);
+    try std.testing.expectEqualStrings("--keys-file=t604-never-read.txt", resolved.bytes);
     try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
 }
 
@@ -596,20 +795,9 @@ test "keys-file: keeps its position among positional arguments" {
     const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", "hello");
     const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
 
-    var target: ?[:0]const u8 = null;
-    var bad: ?[]const u8 = null;
-    var n: usize = 0;
-
     // `pre` then the file then Enter: the CR must land LAST, or the prompt is
     // submitted before its own text arrives.
-    const resolved = try resolveArguments(
-        alloc,
-        &.{ "pre-", keys_arg, "--target=x", "Enter" },
-        &target,
-        &bad,
-        &n,
-    );
-    try std.testing.expectEqual(@as(usize, 3), n);
+    const resolved = try testResolve(alloc, &.{ "pre-", keys_arg, "Enter" });
     try std.testing.expectEqualStrings("pre-hello\r", resolved.bytes);
 
     // The text before the file and the file itself are one run; the CR is its
@@ -626,14 +814,12 @@ test "keys-file: an unreadable path names itself in bad_file" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var target: ?[:0]const u8 = null;
     var bad: ?[]const u8 = null;
-    var n: usize = 0;
 
     const missing = "--keys-file=t210-no-such-file-8fbb1c.txt";
     try std.testing.expectError(
         error.FileNotFound,
-        resolveArguments(alloc, &.{ "--target=x", missing }, &target, &bad, &n),
+        resolveSegments(alloc, try testPositionals(alloc, &.{missing}), &bad),
     );
     try std.testing.expectEqualStrings("t210-no-such-file-8fbb1c.txt", bad.?);
 }
@@ -648,12 +834,7 @@ test "keys-file: an empty file contributes nothing but still counts as text" {
     const path = try testKeysFile(alloc, tmp.dir, "empty.txt", "");
     const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
 
-    var target: ?[:0]const u8 = null;
-    var bad: ?[]const u8 = null;
-    var n: usize = 0;
-
-    const resolved = try resolveArguments(alloc, &.{ "--target=x", keys_arg }, &target, &bad, &n);
-    try std.testing.expectEqual(@as(usize, 1), n);
+    const resolved = try testResolve(alloc, &.{keys_arg});
     try std.testing.expectEqual(@as(usize, 0), resolved.bytes.len);
     try std.testing.expectEqual(@as(usize, 0), resolved.segments.len);
 }
@@ -663,18 +844,7 @@ test "positional text is still key-matched and escape-processed" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var target: ?[:0]const u8 = null;
-    var bad: ?[]const u8 = null;
-    var n: usize = 0;
-
-    const resolved = try resolveArguments(
-        alloc,
-        &.{ "--target=x", "a\\tb", "Enter", "C-c" },
-        &target,
-        &bad,
-        &n,
-    );
-    try std.testing.expectEqual(@as(usize, 3), n);
+    const resolved = try testResolve(alloc, &.{ "a\\tb", "Enter", "C-c" });
     try std.testing.expectEqualStrings("a\tb\r\x03", resolved.bytes);
 }
 
@@ -682,7 +852,7 @@ test "positional text is still key-matched and escape-processed" {
 // followed by a key argument must survive as two ordered segments. Flatten
 // them and the receiving program cannot tell the trailing `\r` apart from a
 // newline inside a paste, so `"some message" Enter` never submits.
-test "resolveArguments keeps text and a following key apart" {
+test "resolveSegments keeps text and a following key apart" {
     var arena = ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -697,7 +867,7 @@ test "resolveArguments keeps text and a following key apart" {
     try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
 }
 
-test "resolveArguments merges runs of the same kind" {
+test "resolveSegments merges runs of the same kind" {
     var arena = ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -716,7 +886,7 @@ test "resolveArguments merges runs of the same kind" {
     try std.testing.expectEqualStrings("iabc", resolved.segments[2].bytes);
 }
 
-test "resolveArguments single-argument forms stay one segment" {
+test "resolveSegments single-argument forms stay one segment" {
     var arena = ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -729,7 +899,7 @@ test "resolveArguments single-argument forms stay one segment" {
     }
 }
 
-test "resolveArguments skips arguments that resolve to nothing" {
+test "resolveSegments skips arguments that resolve to nothing" {
     var arena = ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -750,4 +920,225 @@ test "encodeSegments" {
         "--segments=t6869,k0d",
         try encodeSegments(alloc, resolved.segments),
     );
+}
+
+// --- Trailing-newline peel (main a7f7476e1) -------------------------------
+//
+// A trailing newline is the spelling agents reach for first, so it has to be
+// the one that works. These pin the peel: the newline leaves the paste and
+// becomes a keypress after it.
+
+test "resolveSegments peels a trailing newline off as an Enter keypress" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"prompt\\n"});
+
+    try std.testing.expectEqualStrings("prompt\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments peels a real trailing newline byte the same way" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The peel runs after escape processing, so `\n` typed as a literal byte
+    // and `\n` written as the two-character escape are the same input.
+    const resolved = try testResolve(alloc, &.{"prompt\n"});
+
+    try std.testing.expectEqualStrings("prompt\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+}
+
+test "resolveSegments keeps an interior newline inside the pasted text" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"a\\nb\\n"});
+
+    try std.testing.expectEqualStrings("a\nb\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("a\nb", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments treats a trailing carriage return like a newline" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"prompt\\r"});
+
+    try std.testing.expectEqualStrings("prompt\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+}
+
+test "resolveSegments a newline-only argument is a key and nothing else" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"\\n"});
+
+    try std.testing.expectEqualStrings("\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.key, resolved.segments[0].kind);
+}
+
+test "resolveSegments multiple trailing newlines are multiple presses" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"prompt\\n\\n"});
+
+    try std.testing.expectEqualStrings("prompt\r\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments a trailing newline and a following Enter stack" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Both spellings submit, so writing both submits twice. Merging keeps the
+    // two presses in one key run, which is the honest description of what the
+    // pane receives.
+    const resolved = try testResolve(alloc, &.{ "prompt\\n", "Enter" });
+
+    try std.testing.expectEqualStrings("prompt\r\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqualStrings("\r\r", resolved.segments[1].bytes);
+}
+
+// --- Flag layer -----------------------------------------------------------
+//
+// The peel and `--enter` are only half the fix; the other half is that a
+// wrong guess is now LOUD. These drive `checkArg` directly, because that is
+// where this branch differs from main: `--keys-file=` is a recognized flag
+// that still has to come out the other side as a positional.
+
+/// Feed arguments through flag parsing the way `parseManuallyHook` does.
+fn testCheckArgs(alloc: Allocator, argv: []const []const u8) !Options {
+    var opts: Options = .{};
+    for (argv) |arg| {
+        if (try opts.checkArg(alloc, arg)) |p| try opts._arguments.append(alloc, p);
+    }
+    return opts;
+}
+
+test "flags: an unknown --flag is recorded, not turned into text" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // This is the exact shape that used to be typed into the pane at exit 0.
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--press-enter", "hi" });
+
+    try std.testing.expectEqualStrings("--press-enter", opts.unknown_flag.?);
+    try std.testing.expectEqualStrings("--target=x", opts.target.?);
+    try std.testing.expectEqual(@as(usize, 1), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("hi", opts._arguments.items[0].text);
+}
+
+test "flags: single-dash arguments stay ordinary text" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "-la", "-p" });
+
+    try std.testing.expect(opts.unknown_flag == null);
+    try std.testing.expectEqual(@as(usize, 2), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("-la", opts._arguments.items[0].text);
+}
+
+test "flags: a bare -- stops flag parsing but not key notation" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--", "--not-a-flag", "Enter" });
+
+    try std.testing.expect(opts.unknown_flag == null);
+    try std.testing.expectEqual(@as(usize, 2), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("--not-a-flag", opts._arguments.items[0].text);
+    try std.testing.expect(opts._arguments.items[0].after_dashdash);
+
+    // Key notation still applies after `--`, so the Enter is still a key.
+    var bad: ?[]const u8 = null;
+    const resolved = try resolveSegments(alloc, opts._arguments.items, &bad);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+}
+
+test "flags: --keys-file= survives flag parsing as a positional" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Recognized (so not an unknown flag) but NOT consumed (so its position
+    // relative to the trailing Enter is preserved).
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--keys-file=p.txt", "Enter" });
+
+    try std.testing.expect(opts.unknown_flag == null);
+    try std.testing.expectEqual(@as(usize, 2), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("--keys-file=p.txt", opts._arguments.items[0].text);
+    try std.testing.expect(!opts._arguments.items[0].after_dashdash);
+}
+
+test "flags: --enter becomes a synthetic trailing Enter positional" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--enter", "ls -la" });
+    try std.testing.expect(opts.enter);
+
+    const positionals = try positionalArgs(alloc, &opts);
+    try std.testing.expectEqual(@as(usize, 2), positionals.len);
+    try std.testing.expectEqualStrings("Enter", positionals[1].text);
+
+    var bad: ?[]const u8 = null;
+    const resolved = try resolveSegments(alloc, positionals, &bad);
+    try std.testing.expectEqualStrings("ls -la\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+}
+
+test "flags: a bare --enter with no text is a legal send that presses Enter" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--enter" });
+
+    // The synthetic Enter is a positional BEFORE the "at least one text
+    // argument" check runs, which is what makes this legal rather than an
+    // error about missing text.
+    const positionals = try positionalArgs(alloc, &opts);
+    try std.testing.expectEqual(@as(usize, 1), positionals.len);
+
+    var bad: ?[]const u8 = null;
+    const resolved = try resolveSegments(alloc, positionals, &bad);
+    try std.testing.expectEqualStrings("\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.key, resolved.segments[0].kind);
 }
