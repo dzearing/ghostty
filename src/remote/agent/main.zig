@@ -130,6 +130,7 @@ const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
 const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
+const agent_lineage = @import("../agent_lineage.zig");
 
 /// The agent's baked build version: `YYYYMMDD-<git short hash>` (commit date),
 /// or `"dev"` when git was unavailable at build time. Stamped by
@@ -211,7 +212,7 @@ pub fn main() !void {
             // TCP listen keeps the legacy (relay) guard identity — only the
             // local persistence transport (`--listen-pipe`) takes a distinct
             // instance key (T89d1).
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, .relay);
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, daemonInstance(.relay));
             defer lock.release();
             try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file, l.sessions_file);
         },
@@ -232,7 +233,7 @@ pub fn main() !void {
             // stays on the legacy guard for now — the analogous local/relay
             // collision is a latent Mac bug flagged for the Mac seat (T89d1);
             // this branch's lane is Windows.
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, .relay);
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, daemonInstance(.relay));
             defer lock.release();
             try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file, l.sessions_file);
         },
@@ -249,7 +250,7 @@ pub fn main() !void {
             // session-persistence agent, so it takes the DISTINCT `local[-debug]`
             // guard (T89d1) — it must coexist with a `--relay` agent, which
             // holds the legacy guard.
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, local_instance);
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, daemonInstance(local_instance_base));
             defer lock.release();
             try runListenPipe(alloc, encoding, l.name, l.headless, l.port_file, l.sessions_file);
         },
@@ -258,7 +259,7 @@ pub fn main() !void {
             // before the tray could flash an icon — and before a first-run
             // auto-enroll could pop a browser from a doomed duplicate). The
             // relay agent keeps the legacy guard identity (unchanged by T89d1).
-            var lock = acquireDaemonLockOrExit(alloc, r.force_replace, .relay);
+            var lock = acquireDaemonLockOrExit(alloc, r.force_replace, daemonInstance(.relay));
             defer lock.release();
             // The device token authenticates the relay WebSockets. Required.
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
@@ -367,11 +368,43 @@ fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool, instance: sing
 /// local agent, spawned by the app's find-or-spawn) coexists with a `--relay`
 /// agent. Debug and release lineages are separate instances too (own dir + pipe
 /// suffix per T89a decision 2), so the guard splits by `is_debug` as well.
-const local_instance: single_instance.Instance =
+const local_instance_base: single_instance.Instance =
     if (@import("agent_build_options").is_debug)
         single_instance.Instance.local_debug
     else
         single_instance.Instance.local;
+
+/// Backing store for a `GHOZTTY_AGENT_INSTANCE`-suffixed guard key. Process
+/// lifetime, because the `Instance` handed to `acquireDaemonLockOrExit` borrows
+/// it and the daemon holds its guard + heartbeat until it dies.
+var instance_key_buf: [64]u8 = undefined;
+
+/// The guard identity for this daemon: the build's own instance, forked by the
+/// `GHOZTTY_AGENT_INSTANCE` suffix when one is set (T167). Unset — every
+/// production run — returns `base` unchanged, so no existing agent's guard,
+/// lock file or heartbeat name moves. A set suffix is what lets a hermetic test
+/// sandbox run its own agent while the box's agent keeps the user's real panes;
+/// without it the sandbox's agent exits 183 and the sandbox quietly tests the
+/// NON-persistent path.
+fn daemonInstance(base: single_instance.Instance) single_instance.Instance {
+    var sfx_buf: [agent_lineage.max_len]u8 = undefined;
+    const suffix = agent_lineage.fromEnv(&sfx_buf) orelse return base;
+    const forked = single_instance.instanceWithSuffix(&instance_key_buf, base, suffix) catch {
+        // Only reachable if the key outgrows the buffer, which `max_len` rules
+        // out — but a silent fall back to the SHARED guard is the one outcome
+        // this feature must never produce quietly.
+        std.debug.print(
+            "ghoztty-agent: {s}='{s}' is unusable as a lineage suffix; using the shared '{s}' guard\n",
+            .{ agent_lineage.env_var, suffix, base.key },
+        );
+        return base;
+    };
+    std.debug.print(
+        "ghoztty-agent: single-instance: lineage suffix from {s} -> guard key '{s}'\n",
+        .{ agent_lineage.env_var, forked.key },
+    );
+    return forked;
+}
 
 /// How relay-daemon startup obtains its device credential — a PURE decision
 /// seam so the policy is unit-testable without env vars or files. Precedence:
@@ -2406,6 +2439,7 @@ test {
     _ = @import("relay_creds.zig");
     _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
+    _ = @import("../agent_lineage.zig");
     _ = @import("descendants.zig");
     _ = @import("proc.zig");
 }

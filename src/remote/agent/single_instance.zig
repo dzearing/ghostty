@@ -86,6 +86,15 @@
 //!      and, if the guard is SOMEHOW still held, yields — when in doubt, die:
 //!      never two daemons.
 //!
+//! ## Sandbox lineages (`GHOZTTY_AGENT_INSTANCE`, T167)
+//! The guard identity is otherwise a COMPILE-TIME fact (`local` / `local-debug`
+//! / relay), which means a debug agent already on the box refuses every test
+//! sandbox's agent — silently, since the app just falls back to non-persistent
+//! panes. `instanceWithSuffix` forks the key off the env var so a sandbox names
+//! its own mutex, lock file and heartbeat; unset (production) reproduces the
+//! legacy names byte for byte. See `../agent_lineage.zig` for the full story
+//! and for the other derivations the same suffix moves.
+//!
 //! `--force-replace` (daemon modes) skips the freshness check and kills the
 //! recorded holder unconditionally (still refusing confirmed-other PIDs), for
 //! a human who wants THIS launch to win. The decision matrix is the pure
@@ -94,6 +103,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const agent_lineage = @import("../agent_lineage.zig");
 
 /// Exit code used when another daemon instance already holds the lock.
 /// 183 == Windows ERROR_ALREADY_EXISTS, reused verbatim on POSIX so the code
@@ -121,6 +131,19 @@ pub const Instance = struct {
     /// suffix per T89a decision 2, so its own guard too).
     pub const local_debug: Instance = .{ .key = "local-debug" };
 };
+
+/// Compose a guard key for a SANDBOXED lineage: the build's own key plus the
+/// `GHOZTTY_AGENT_INSTANCE` suffix, into `buf` (T167). An absent suffix
+/// reproduces `base.key` byte for byte, which is every production run — so this
+/// can only ever ADD identities, never move an existing one.
+///
+/// This is what lets a test sandbox run its own agent while the box's agent
+/// keeps holding the user's real panes: without it the sandbox's agent exits
+/// 183 and the sandbox silently tests the non-persistent path. `buf` outlives
+/// the returned `Instance` (its `key` borrows it).
+pub fn instanceWithSuffix(buf: []u8, base: Instance, suffix: ?[]const u8) error{NameTooLong}!Instance {
+    return .{ .key = try agent_lineage.appendSuffix(buf, base.key, suffix) };
+}
 
 pub const AcquireError = error{
     /// Another daemon instance holds the guard in this user session.
@@ -1010,6 +1033,66 @@ test "local mutex name: empty key is the legacy literal; a key appends a segment
     const n = try std.unicode.utf8ToUtf16Le(&legacy16, legacy_name);
     const literal = std.unicode.utf8ToUtf16LeStringLiteral("Local\\GhozttyAgentDaemon");
     try std.testing.expectEqualSlices(u16, literal, legacy16[0..n]);
+}
+
+test "instance suffix: absent reproduces the build's own key; present forks it (T167)" {
+    var buf: [64]u8 = undefined;
+    // Production: no suffix anywhere, so every name is byte-identical to before.
+    try std.testing.expectEqualStrings(
+        Instance.local_debug.key,
+        (try instanceWithSuffix(&buf, .local_debug, null)).key,
+    );
+    var buf2: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        Instance.relay.key,
+        (try instanceWithSuffix(&buf2, .relay, null)).key,
+    );
+
+    // A sandbox names its own lineage — mutex, lock file and heartbeat all
+    // follow the key, so all three fork together.
+    var buf3: [64]u8 = undefined;
+    const sbx = try instanceWithSuffix(&buf3, .local_debug, "sbx1");
+    try std.testing.expectEqualStrings("local-debug-sbx1", sbx.key);
+
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    const box = try composeGlobalMutexName(&m1, Instance.local_debug.key, "S-1-5-21-1");
+    const sandbox = try composeGlobalMutexName(&m2, sbx.key, "S-1-5-21-1");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-local-debug-S-1-5-21-1", box);
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-local-debug-sbx1-S-1-5-21-1", sandbox);
+    try std.testing.expect(!std.mem.eql(u8, box, sandbox)); // ⇒ they coexist
+
+    var f1: [64]u8 = undefined;
+    var f2: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "agent-local-debug.heartbeat",
+        try composeStateFileName(&f1, Instance.local_debug.key, ".heartbeat"),
+    );
+    try std.testing.expectEqualStrings(
+        "agent-local-debug-sbx1.heartbeat",
+        try composeStateFileName(&f2, sbx.key, ".heartbeat"),
+    );
+}
+
+test "instance suffix: two sandboxes never share a guard" {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const one = try instanceWithSuffix(&a, .local_debug, "sbx1");
+    const two = try instanceWithSuffix(&b, .local_debug, "sbx2");
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        try composeGlobalMutexName(&m1, one.key, "S-1-5-21-1"),
+        try composeGlobalMutexName(&m2, two.key, "S-1-5-21-1"),
+    ));
+    var l1: [128]u8 = undefined;
+    var l2: [128]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        try composeLocalMutexName(&l1, one.key),
+        try composeLocalMutexName(&l2, two.key),
+    ));
 }
 
 test "state filename: legacy vs keyed, separator sanitized" {

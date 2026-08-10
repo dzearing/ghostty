@@ -325,6 +325,13 @@ test {
     _ = @import("remote/relay_session.zig");
     _ = @import("remote/relay_signin.zig");
 
+    // The `ghoztty-agent` lineage suffix (T167): pure naming logic shared by
+    // the agent's single-instance guard, the win32 app's state dir / pipe /
+    // autostart value, and `+sessions`. Reached through the agent build and the
+    // win32 apprt otherwise, so pull it in explicitly to run its unit tests in
+    // the `none` lane too.
+    _ = @import("remote/agent_lineage.zig");
+
     // Socket Reader/Writer with panic-free close-race error mappings (T81):
     // the ws transport teardown depends on these staying error-returning.
     _ = @import("remote/socket_rw.zig");

@@ -40,6 +40,7 @@ const Allocator = std.mem.Allocator;
 
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const connection = @import("../../remote/connection.zig");
+const agent_lineage = @import("../../remote/agent_lineage.zig");
 const build_config = @import("../../build_config.zig");
 const protocol = @import("../../remote/protocol.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
@@ -715,13 +716,19 @@ fn ensureAutostart(self: *LocalAgent) void {
         log.warn("agent autostart Run-key write failed err={}", .{err});
         return;
     };
-    log.info("agent autostart Run key refreshed ({s})", .{autostartValueName()});
+    var name_buf: [64]u8 = undefined;
+    log.info("agent autostart Run key refreshed ({s})", .{autostartValueName(&name_buf)});
 }
 
-/// `GhozttyAgent` for release, `GhozttyAgent-debug` for the debug lineage —
-/// so the force-hook test path can never clobber the user's real entry.
-fn autostartValueName() []const u8 {
-    return if (build_config.is_debug) "GhozttyAgent-debug" else "GhozttyAgent";
+/// `GhozttyAgent` for release, `GhozttyAgent-debug` for the debug lineage, plus
+/// the `GHOZTTY_AGENT_INSTANCE` suffix when a sandbox set one (T167) — so
+/// neither the force-hook test path nor a sandbox can ever clobber the user's
+/// real entry. Written into `buf` (>= 64 bytes); the suffix is length-capped
+/// by `agent_lineage.max_len`.
+fn autostartValueName(buf: []u8) []const u8 {
+    const base = if (build_config.is_debug) "GhozttyAgent-debug" else "GhozttyAgent";
+    var sfx_buf: [agent_lineage.max_len]u8 = undefined;
+    return agent_lineage.appendSuffix(buf, base, agent_lineage.fromEnv(&sfx_buf)) catch base;
 }
 
 fn writeAutostart(self: *LocalAgent, arena: Allocator) !void {
@@ -740,7 +747,8 @@ fn writeAutostart(self: *LocalAgent, arena: Allocator) !void {
     ) != w32.ERROR_SUCCESS) return error.RegOpenFailed;
     defer _ = w32.RegCloseKey(key);
 
-    const name_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, autostartValueName());
+    var name_buf: [64]u8 = undefined;
+    const name_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, autostartValueName(&name_buf));
     const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd);
     if (w32.RegSetValueExW(
         key,
@@ -971,10 +979,14 @@ fn agentCommandLine(self: *LocalAgent, arena: Allocator) ![]const u8 {
     );
 }
 
-/// `%LOCALAPPDATA%\ghoztty\local-agent[-debug]` — the per-lineage state dir.
-/// Same directory `+sessions` reads (design §T89a decision 2).
+/// `%LOCALAPPDATA%\ghoztty\local-agent[-debug][-<instance>]` — the per-lineage
+/// state dir. Same directory `+sessions` reads (design §T89a decision 2), and
+/// the same `GHOZTTY_AGENT_INSTANCE` suffix moves both (T167).
 fn agentDir(self: *LocalAgent, arena: Allocator) ![]const u8 {
-    const sub = if (build_config.is_debug) "local-agent-debug" else "local-agent";
+    const base = if (build_config.is_debug) "local-agent-debug" else "local-agent";
+    var sub_buf: [64]u8 = undefined;
+    var sfx_buf: [agent_lineage.max_len]u8 = undefined;
+    const sub = try agent_lineage.appendSuffix(&sub_buf, base, agent_lineage.fromEnv(&sfx_buf));
     const local = std.process.getEnvVarOwned(self.alloc, "LOCALAPPDATA") catch return error.NoLocalAppData;
     defer self.alloc.free(local);
     return std.fmt.allocPrint(arena, "{s}\\ghoztty\\{s}", .{ local, sub });
@@ -990,10 +1002,20 @@ fn infoFilePath(self: *LocalAgent, buf: []u8) ![]const u8 {
 }
 
 /// The pipe the local agent binds + advertises:
-/// `\\.\pipe\ghoztty-agent[-debug]-<user>` (T89c naming). User-scoped so two
-/// users' agents never collide; the owner-only DACL is the actual gate.
+/// `\\.\pipe\ghoztty-agent[-debug][-<instance>]-<user>` (T89c naming, plus the
+/// T167 lineage suffix). User-scoped so two users' agents never collide; the
+/// owner-only DACL is the actual gate, and the instance suffix is a NAMING
+/// device for test isolation, never a security boundary.
 fn pipeName(self: *LocalAgent, arena: Allocator) ![]const u8 {
-    const suffix = if (build_config.is_debug) "-debug" else "";
+    const lineage = if (build_config.is_debug) "-debug" else "";
+    var sfx_buf: [agent_lineage.max_len]u8 = undefined;
+    // NOT `appendSuffix` here: the lineage part is already written with its
+    // leading '-' (it is a fragment of the name, not a segment), so a release
+    // build's empty lineage still needs its own separator before the instance.
+    const tail = if (agent_lineage.fromEnv(&sfx_buf)) |instance|
+        try std.fmt.allocPrint(arena, "{s}-{s}", .{ lineage, instance })
+    else
+        lineage;
     const user = std.process.getEnvVarOwned(self.alloc, "USERNAME") catch
         try self.alloc.dupe(u8, "user");
     defer self.alloc.free(user);
@@ -1002,7 +1024,7 @@ fn pipeName(self: *LocalAgent, arena: Allocator) ![]const u8 {
     for (clean) |*c| {
         if (c.* == '\\' or c.* == '/') c.* = '_';
     }
-    return std.fmt.allocPrint(arena, "\\\\.\\pipe\\ghoztty-agent{s}-{s}", .{ suffix, clean });
+    return std.fmt.allocPrint(arena, "\\\\.\\pipe\\ghoztty-agent{s}-{s}", .{ tail, clean });
 }
 
 /// The agent binary to spawn: `GHOSTTY_LOCAL_AGENT_BIN` override (tests/dev),
@@ -1044,4 +1066,88 @@ test "pipeName is a valid pipe path and lineage-suffixed" {
     const name = try la.pipeName(arena.allocator());
     try std.testing.expect(std.mem.startsWith(u8, name, "\\\\.\\pipe\\ghoztty-agent"));
     try std.testing.expect(std.mem.indexOfScalar(u8, name, '-') != null);
+}
+
+/// `SetEnvironmentVariableW` — `std.process` has no portable setter, and these
+/// tests need the PROCESS environment to change (that is the channel the
+/// suffix travels on).
+fn setEnvForTest(name: []const u8, value: ?[]const u8) !void {
+    if (comptime builtin.os.tag != .windows) return;
+    var name_buf: [128]u16 = undefined;
+    var value_buf: [128]u16 = undefined;
+    const nl = try std.unicode.utf8ToUtf16Le(&name_buf, name);
+    name_buf[nl] = 0;
+    var val_ptr: ?[*:0]const u16 = null;
+    if (value) |v| {
+        const vl = try std.unicode.utf8ToUtf16Le(&value_buf, v);
+        value_buf[vl] = 0;
+        val_ptr = value_buf[0..vl :0].ptr;
+    }
+    if (w32.SetEnvironmentVariableW(name_buf[0..nl :0].ptr, val_ptr) == 0) return error.SetEnvFailed;
+}
+
+test "T167: GHOZTTY_AGENT_INSTANCE forks the dir, the pipe and the autostart value together" {
+    // The trap this closes is a HALF-isolated sandbox: private state but a
+    // shared guard (or a shared pipe), which comes up with no agent at all and
+    // silently exercises the non-persistent path. So all three derivations must
+    // move on the one knob, and all three must be unchanged without it.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var la = LocalAgent.init(std.testing.allocator);
+
+    // Baseline: no suffix. Capture what production composes today.
+    try setEnvForTest(agent_lineage.env_var, null);
+    const base_dir = try la.agentDir(a);
+    const base_pipe = try la.pipeName(a);
+    var nb: [64]u8 = undefined;
+    const base_name = try a.dupe(u8, autostartValueName(&nb));
+    try std.testing.expect(!std.mem.endsWith(u8, base_dir, "-sbx1"));
+    try std.testing.expect(std.mem.indexOf(u8, base_pipe, "sbx1") == null);
+
+    // With a suffix: every one of the three gains exactly that segment.
+    try setEnvForTest(agent_lineage.env_var, "sbx1");
+    defer setEnvForTest(agent_lineage.env_var, null) catch {};
+    const dir1 = try la.agentDir(a);
+    const pipe1 = try la.pipeName(a);
+    var nb1: [64]u8 = undefined;
+    const name1 = try a.dupe(u8, autostartValueName(&nb1));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}-sbx1", .{base_dir}), dir1);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}-sbx1", .{base_name}), name1);
+    // The pipe's suffix lands before the user segment, not after it.
+    try std.testing.expect(std.mem.indexOf(u8, pipe1, "-sbx1-") != null);
+    try std.testing.expect(!std.mem.eql(u8, base_pipe, pipe1));
+
+    // A second sandbox shares nothing with the first — the coexistence claim.
+    try setEnvForTest(agent_lineage.env_var, "sbx2");
+    try std.testing.expect(!std.mem.eql(u8, dir1, try la.agentDir(a)));
+    try std.testing.expect(!std.mem.eql(u8, pipe1, try la.pipeName(a)));
+
+    // An unusable value (empty) is NOT a lineage: it falls back to the shared
+    // names rather than inventing a nameless one.
+    try setEnvForTest(agent_lineage.env_var, "");
+    try std.testing.expectEqualStrings(base_dir, try la.agentDir(a));
+    try std.testing.expectEqualStrings(base_pipe, try la.pipeName(a));
+}
+
+test "T167: the spawned agent command line carries the sandbox's own dir and pipe" {
+    // The app is what tells the agent where to bind and where to write its
+    // state; the env var is what tells the agent which GUARD to take. If the
+    // command line did not follow the suffix, a sandbox agent would take its own
+    // guard and then fight the box's agent for one pipe name.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var la = LocalAgent.init(std.testing.allocator);
+
+    try setEnvForTest(agent_lineage.env_var, "sbx1");
+    defer setEnvForTest(agent_lineage.env_var, null) catch {};
+    const cmd = try la.agentCommandLine(a);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "-sbx1-") != null); // the pipe
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "-sbx1\\port.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "-sbx1\\sessions.json") != null);
+    // Still exactly 4 quoted tokens — the suffix must not add an argument.
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, cmd, "\""));
 }

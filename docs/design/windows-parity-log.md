@@ -13764,3 +13764,49 @@ Evidence: all three zig lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS;
 `viewer-popup.ps1` ALL PASS (19); `persistence-flag.ps1` ALL PASS. The one red
 in `viewer-panes.ps1` (178 passed) is the known open T526/T538/T540 cwd-fallback
 arm, unchanged and unrelated.
+
+## 2026-08-10 — A test sandbox can run its own session-persistence agent instead of killing the one holding your panes (T167)
+
+The local agent allows exactly one instance per user per *lineage*, and the
+lineage is decided at compile time: every debug build on this box is
+`local-debug`. So a debug agent already running — the loop's own, or a leftover
+from the previous suite — refused every test sandbox's agent with exit 183, and
+the app answered that by falling back to plain exec panes **silently**. A suite
+that did not first kill the incumbent did not go red; it quietly exercised the
+non-persistent path and then reported on session persistence. That is why so
+many scripts in `test/win32/` open by killing every `local-agent-debug` process
+on the box, which takes the user's own live panes with it and is also why two
+acceptance suites can never run at the same time.
+
+`GHOZTTY_AGENT_INSTANCE=<suffix>` now names a distinct lineage. The important
+part is not the env var, it is that it moves **every** derivation that spells
+the lineage out — the guard mutex, the lock and heartbeat files, the app's state
+dir, the agent pipe, the HKCU Run value, and the directory `+sessions` reads —
+because the bug being fixed is precisely a sandbox that is *half* isolated, and
+half a fix reproduces it. The naming itself is one pure module
+(`src/remote/agent_lineage.zig`): a whitelist, so a value can never smuggle a
+`\` into a mutex name or a `/` into a filename, and a 24-character cap where an
+over-long value is **rejected rather than truncated** — truncation would merge
+two sandboxes that differ only past the cap into one lineage, which is the very
+failure this exists to remove. Unset, which is every production run, reproduces
+each legacy name byte for byte, and that is asserted rather than assumed.
+
+The acceptance script proves it in the shape the defect had: two agents in the
+same lineage (the second still refused, so the guard still guards), two more
+lineages coming up alongside them — three live agents on one box — and then the
+same GUI launch twice, one env var apart. With a lineage another agent already
+holds, no agent publishes and the app comes up silently non-persistent: the
+original failure, reproduced on demand. With its own lineage, `port.json`
+appears and a live session sits behind the pane. `-TeethCheck` puts D2 back on a
+held lineage, and exactly those two assertions go red — without that knob, "D2
+passed" only proves the app can publish a `port.json`, not that the suffix is
+what let it.
+
+Spending the knob is deliberately not part of this: converting the ~40 suites
+off their kill-the-lineage step is T691, and the Swift half of the derivation is
+T692. The knob has to exist and be trusted before the suite is rewritten on top
+of it.
+
+Evidence: all three zig lanes PASS through `floor-lane.ps1`;
+`agent-instance-lineage.ps1` ALL PASS (22), and `-TeethCheck` gives exactly
+`2 FAILURE(S) (20 passed)`; P1–P3 ALL PASS.

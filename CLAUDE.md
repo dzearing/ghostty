@@ -1514,6 +1514,27 @@ Library: `scripts/lib/CrashCatch.ps1`, which documents the three cdb traps
 break, cdb echoes its own command back). Acceptance:
 `test\win32\crash-stacks.ps1`.
 
+**A test sandbox can have an agent of its own** (T167). The local agent's
+single-instance guard is per-user and per-LINEAGE, and the lineage is a
+compile-time fact (`local-debug` for every debug build), so a debug agent
+already running refuses a sandbox's agent with exit 183 — and the app then falls
+back to plain exec panes *silently*, leaving a suite that reports on session
+persistence while exercising the non-persistent path. That is why so many
+scripts open by killing every `local-agent-debug` process, which takes the
+loop's own panes with it and means two suites can never run at once.
+`GHOZTTY_AGENT_INSTANCE=<suffix>` names a distinct lineage instead, and it moves
+**every** derivation that spells the lineage out — the guard mutex, the lock and
+heartbeat files, the app's state dir (`local-agent-debug-<suffix>`), its agent
+pipe (`\\.\pipe\ghoztty-agent-debug-<suffix>-<user>`), the HKCU Run value name,
+and the dir `+sessions` reads — because a *half*-isolated sandbox is the bug,
+not the fix. Sanitized to a whitelist and capped at 24 characters, with an
+over-long value rejected rather than truncated (truncation would silently merge
+two sandboxes into one lineage). Unset — every production run — reproduces each
+legacy name byte for byte. Rules: `src/remote/agent_lineage.zig`; acceptance:
+`test/win32/agent-instance-lineage.ps1` (which carries a `-TeethCheck` self-test
+for its own end-to-end arm). Converting the existing suites onto it is T691; the
+Swift half is T692.
+
 **Tests must never touch live user state.** The WebView2 live-runtime tests run
 under `webview2.TestProfile`, which points `LOCALAPPDATA` at a private per-run
 root so they cannot contend with — or corrupt — the `EBWebView[-debug]` profile

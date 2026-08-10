@@ -9,6 +9,7 @@ const build_config = @import("../build_config.zig");
 const homedir = @import("../os/homedir.zig");
 const tcp_dial = @import("../remote/tcp_dial.zig");
 const connection = @import("../remote/connection.zig");
+const agent_lineage = @import("../remote/agent_lineage.zig");
 
 /// How long to wait for the agent's SESSIONS reply before giving up. Generous:
 /// the roster is a pure in-memory snapshot, but a wedged agent must not hang the
@@ -153,8 +154,15 @@ fn runArgs(
 /// `LocalAgentManager` writes (debug lineage gets its own directory so debug and
 /// release agents never share state). On Windows the local agent's state dir is
 /// `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\` instead (T89a decision 2).
+///
+/// A `GHOZTTY_AGENT_INSTANCE` suffix appends one more segment (T167), so
+/// `+sessions` run inside a test sandbox reads THAT sandbox's agent rather than
+/// the box's. Unset — every production run — leaves the path unchanged.
 fn agentInfoPath(alloc: Allocator) ![]const u8 {
-    const dir = if (build_config.is_debug) "local-agent-debug" else "local-agent";
+    const base = if (build_config.is_debug) "local-agent-debug" else "local-agent";
+    var dir_buf: [64]u8 = undefined;
+    var sfx_buf: [agent_lineage.max_len]u8 = undefined;
+    const dir = try agent_lineage.appendSuffix(&dir_buf, base, agent_lineage.fromEnv(&sfx_buf));
     if (comptime builtin.os.tag == .windows) {
         const local = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return error.NoHome;
         defer alloc.free(local);
