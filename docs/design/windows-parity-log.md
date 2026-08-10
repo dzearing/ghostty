@@ -9,6 +9,44 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-10 - **T681 (T707 filed) - closing a split pane now destroys its
+  window instead of hiding it and walking away.** Every terminal pane is a
+  `WS_CHILD` `GhozttyTerminal` window that WGL renders into, and
+  `Surface.deinit` never called `DestroyWindow` on it. The comment saying why
+  dates to the very first win32 commit (`e0118f682`, 2026-07-05): OPENGL32.dll
+  hooks window destruction and segfaulted on a stack that had just torn the WGL
+  context down, so the reap was left to the parent window's teardown. Measured
+  while building T126's script: ten seconds after `+close`, the dead pane was
+  still enumerable under the top window, hidden, at its last size. One USER
+  object per closed pane, held for the life of the app, against a per-process
+  quota of 10k — on a box whose sessions run for days across hundreds of panes.
+
+  The fix does not re-litigate the segfault, it steps around it. The handle is
+  POSTED to the app's message-only window (`WM_APP_REAP_SURFACE`) and destroyed
+  from the top of the message loop, with the renderer thread joined, the context
+  deleted, the DC released and no ghoztty frame underneath. What deferral costs
+  is that the handle may not be ours by the time the message is pumped: closing
+  a WINDOW deinits every pane and then destroys the parent, and Win32 frees the
+  children with it, so those reaps arrive at handles that are gone and may have
+  been recycled. Destroying one of those would take down an unrelated window —
+  a far worse bug than the leak. So `surface_reap.zig` (pure, asserted in the
+  `none` lane) gates each reap on two facts read at reap time: the handle still
+  names a `GhozttyTerminal`, and its `GWLP_USERDATA` is zero. Every LIVE surface
+  stores its own pointer there and only `deinit` clears it, so a handle recycled
+  onto a NEW pane is rejected by the second leg even though it passes the first.
+  The one window where a live pane would read as reapable is between
+  `CreateWindowExW` and the `SetWindowLongPtrW` after it, and nothing pumps the
+  queue across those two lines.
+
+  Acceptance: `test/win32/pane-hwnd-reap.ps1` — 3 panes, close 2, exactly 1
+  child window left and none hidden; the app survives the destroys; the
+  surviving pane and a freshly opened one are LIVE (`Test-PaneLive`, so a reap
+  that took the wrong window shows up rather than passing quietly). ALL PASS
+  (12 assertions), and teeth-checked: rebuilt with the post disabled, B1 reads
+  `saw 3, want 1` and B2 goes red too. Floor green (none/win32/agent lanes,
+  P1-P3). Filed T707: the persistence sweep is red on one pre-existing site
+  (`agent-attach-refused.ps1:276`), unrelated to this work.
+
 - 2026-08-10 - **T158 (T686 closed with it, T688/T689 filed) - every test
   launch now says whether it wants the terminal to restore its old windows,
   and a check fails the day one stops saying.** Session persistence is on by

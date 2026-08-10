@@ -229,6 +229,11 @@ test {
     // actually start (T637), same no-OS-imports deal.
     _ = @import("apprt/win32/dib_packed.zig");
 
+    // Pure win32 deferred pane-HWND reap gate — whether a posted reap is still
+    // aimed at the dead pane window that posted it (T681), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/surface_reap.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");

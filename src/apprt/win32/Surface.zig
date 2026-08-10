@@ -953,13 +953,23 @@ pub fn deinit(self: *Surface) void {
         self.palette_paint_font = null;
     }
 
-    // Don't call DestroyWindow on the child HWND here. The OPENGL32.dll
-    // driver hooks into window destruction and segfaults after we've already
-    // cleaned up the WGL context. The child HWND will be automatically
-    // destroyed when the parent Window HWND is destroyed by Win32.
-    // Just null the hwnd field so nothing else tries to use it.
+    // Reap the child HWND, but not from this stack (T681). Calling
+    // DestroyWindow here is what the first win32 commit found segfaulting
+    // inside OPENGL32.dll's window-destruction hook, on the same stack that
+    // had just deleted the WGL context — so the handle is POSTED to the app's
+    // message-only window and destroyed from the top of the message loop
+    // instead, with the renderer thread joined, the context deleted and the DC
+    // released. Leaving it for the parent window's own teardown (what this did
+    // until T681) leaked one USER object per closed pane for the life of the
+    // app, and USER objects are a per-process quota of 10k.
+    //
+    // Clearing GWLP_USERDATA first does double duty: it stops surfaceWndProc
+    // from touching this soon-to-be-freed Surface, and it is the second factor
+    // `App.performSurfaceReap` checks so a handle Win32 recycled in the
+    // meantime is never destroyed out from under its new owner.
     if (self.hwnd) |hwnd| {
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+        self.app.reapSurfaceHwnd(hwnd);
     }
     self.hwnd = null;
     log.debug("surface deinit: complete", .{});

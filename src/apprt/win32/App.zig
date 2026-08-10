@@ -53,6 +53,7 @@ const agent_upgrade = @import("agent_upgrade.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
+const surface_reap = @import("surface_reap.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -99,6 +100,14 @@ const WM_APP_AGENT_LINK_DOWN: u32 = w32.WM_APP + 11;
 /// still unwinding) before we count what is live — the Mac trigger defers for
 /// exactly the same reason.
 const WM_APP_AGENT_UPGRADE_CHECK: u32 = w32.WM_APP + 12;
+
+/// Posted to `msg_hwnd` by `reapSurfaceHwnd` to destroy a closed pane's child
+/// HWND (T681). wparam = the HWND. It lands here rather than being called
+/// inline in `Surface.deinit` so the `DestroyWindow` runs from the top of the
+/// message loop, with the renderer thread joined and the WGL context already
+/// deleted — see `surface_reap.zig` for the whole rationale and for the
+/// two-factor check that keeps a recycled handle safe.
+const WM_APP_REAP_SURFACE: u32 = w32.WM_APP + 26;
 
 /// Ceiling on agent restarts spent chasing the bundled build in one app run
 /// (T147). Two: one for the ordinary "the binary was swapped under us" case,
@@ -617,6 +626,46 @@ fn shouldPerformDeferredFocus(
 ) bool {
     if (on_input_desktop) return foreground == root;
     return if (active) |a| a == root else true;
+}
+
+/// Hand a closed pane's child HWND over to be destroyed from the top of the
+/// message loop (T681).
+///
+/// `Surface.deinit` cannot call `DestroyWindow` on its own stack — the first
+/// win32 commit recorded a segfault inside OPENGL32.dll's window-destruction
+/// hook when it did — and leaving the handle for the parent window's teardown
+/// leaks one USER object per closed pane for the life of the app. USER objects
+/// are a per-process quota (10k) and this box's sessions run for days, so the
+/// leak matters even though each close leaks only one.
+///
+/// The caller has already cleared `GWLP_USERDATA`, which is both what stops
+/// `surfaceWndProc` touching the freed `*Surface` and the second factor
+/// `performSurfaceReap` checks before it destroys anything.
+///
+/// With no `msg_hwnd` there is nowhere to defer TO — that is only true after
+/// `terminate` has torn the app down, at which point every window is going
+/// away anyway, so the handle is simply left to Win32.
+pub fn reapSurfaceHwnd(self: *App, hwnd: w32.HWND) void {
+    const msg = self.msg_hwnd orelse return;
+    _ = w32.PostMessageW(msg, WM_APP_REAP_SURFACE, @intFromPtr(hwnd), 0);
+}
+
+/// Perform a queued `WM_APP_REAP_SURFACE`: destroy the pane window, but only
+/// once the two facts `surface_reap.reapable` asks for still hold. By the time
+/// this runs the handle may have been freed with its parent window and even
+/// recycled onto something else — see `surface_reap.zig`.
+fn performSurfaceReap(hwnd: w32.HWND) void {
+    var cls: [40]u16 = undefined;
+    const n = w32.GetClassNameW(hwnd, &cls, cls.len);
+    const class_matches = n > 0 and
+        std.mem.eql(u16, cls[0..@intCast(n)], TERMINAL_CLASS_NAME);
+    const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (!surface_reap.reapable(.{
+        .class_matches = class_matches,
+        .userdata = @bitCast(userdata),
+    })) return;
+
+    _ = w32.DestroyWindow(hwnd);
 }
 
 /// Whether this process's GUI thread runs on the INPUT desktop (the one the
@@ -6790,6 +6839,12 @@ fn msgWndProc(
         // message (its work might land after tick already drained).
         app.wakeup_pending.store(false, .release);
         app.tick();
+        return 0;
+    }
+
+    if (msg == WM_APP_REAP_SURFACE) {
+        // wparam = the closed pane's HWND, already unhooked from its Surface.
+        if (wparam != 0) performSurfaceReap(@ptrFromInt(wparam));
         return 0;
     }
 
