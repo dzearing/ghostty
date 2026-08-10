@@ -14466,3 +14466,50 @@ column is selectable — Shift-extend, the caret box at 1.0/1.25/1.5/2.0, and
 that every status line fits the card's template). Floor lanes and P1-P3 green.
 Filed T706: the caret starts on the *pointer's* monitor, which says nothing
 about where a keyboard-only user is looking.
+
+## 2026-08-10 — every Mac change merged since June is now accounted for on the Windows list (T684)
+
+Two months of Mac work had been merged into this branch without anyone
+checking it against the Windows backlog. The T152 gate, pointed at that
+history, found 210 Mac-side commits of which **126 were cited nowhere** — not
+in a task, a log entry, a digest or a decision. That is the exact shape of
+failure the gate exists to catch: a Mac feature can be built, merged, and
+silently never arrive here, with nothing anywhere recording that it is owed.
+All 126 now carry a written disposition, and `parity-sweep.ps1 -Range
+680a07ed3..HEAD` exits **0** (210 mapped, 0 unmapped).
+
+Most of them turned out to be **port baseline**, and that is a claim about
+evidence rather than a shrug: this range is *already-merged* history, and the
+Windows ports of these features were written afterwards, in July and August,
+against Mac code that already contained the commit. So the commit is part of
+what the port copied, not a delta the port missed — which is why each block
+is cited against the port's own task (T21b/T22c/T68/T367 for remote windows
+and the chooser, T226 and its splits for the Activity Monitor, T89a for
+session persistence, T90a for viewer panes, T35/T131/T149/T377 for the banner
+markdown, T19a/T58/T59a/T59b for hero mode). A second, smaller class is
+**shared code already compiled in**: the substance sits in `src/`, which the
+Windows build compiles from the same tree, so nothing is owed unless a Mac
+*frontend* behavior rides on top. The rest are named individually with their
+reason — a Swift object-lifetime fix, AutoLayout thrash around the machine
+pill, an XCTest deadline, a bundle-identity rename.
+
+Seven were real holes, and they are now tasks rather than a prediction:
+**T709** (Activity Monitor reports no per-core %CPU and never says which pane
+owns a process), **T710** (the chooser polls the session roster instead of
+being pushed it, and never shows a window rename), **T711** (the chooser opens
+with an empty, unseeded device list and never refreshes while open), **T712**
+(the chooser is modal and freezes the terminal behind it, where Mac's is
+modeless), **T713** (relay sign-out leaves account remote windows running and
+new dials allowed), **T714** (the About box has no links — no fork release for
+the version, no Help), **T715** (no assistive-tech attribute for a remote
+window's link state, Mac's `AXGhosttyLinkState`). Each names its Mac commit in
+its own Summary, so the sweep stays clean even if the sweeps doc is rewritten.
+The youngest slice — August's chooser and Activity Monitor build-out —
+produced most of them, which is what you would expect: the Windows ports were
+written before it landed.
+
+Evidence: the sweep at 210/210/0, `parity-tasks.ps1 validate` ALL PASS (745
+tasks), and `test/win32/parity-sweep.ps1` ALL PASS re-run because this turn is
+entirely about what that script measures. No source file changed — the diff is
+`docs/design/**` only — so the zig lanes and P1-P3 are out of scope for this
+one and were not run.
