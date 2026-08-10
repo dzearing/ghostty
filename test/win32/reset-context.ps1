@@ -56,6 +56,18 @@
 #
 # Oracles are the pane's own output (+read), the helper's log
 # (/tmp/reset-context-last.log), and the banner in +list --json.
+#
+# T664: every section that delivers a handoff now also checks it arrived
+# WHOLE, not merely that the cont file's basename showed up somewhere. One run
+# in five once put `RC-TEXT[ontinue-marker-B]` on section B's screen - a text
+# run missing its FIRST character - and a basename needle in the middle of the
+# sentence is found either way, so the loss was caught by eye and nothing
+# failed. Receipt sections (E/F/G) compare the whole sentence byte for byte;
+# screen sections (A/B) require it to still begin with "Read ", which is the
+# shape that was reported. The same shape is measured on the WIRE, where a
+# truncation can be attributed rather than guessed at, by rounds 13-14 of
+# test\win32\send-keys-bracketed.ps1. Re-run with GHOZTTY_TEST_T664_BREAK=1 to
+# make those four arms go red and nothing else move (their teeth check).
 # Only touches ghoztty processes running from this repo's zig-out.
 param([string]$ExePath, [string]$HelperPath)
 $ErrorActionPreference = 'Stop'
@@ -323,10 +335,25 @@ function Run-Helper([string]$script, [string]$paneId, [string]$contText) {
     # receives "Read <path> - it contains your instructions...", never the prose
     # - so the cont file's basename, not the marker inside it, is what any
     # oracle looking at the pane can check.
+    # The exact sentence the helper types, rebuilt here from the same pieces it
+    # builds it from (T664). The basename probe alone cannot see a TRUNCATED
+    # handoff: one run in five once showed section B's pane receiving a text run
+    # with its first character gone, and a needle in the middle of the sentence
+    # is found either way. Sections with an out-of-band receipt compare the
+    # WHOLE sentence against this; screen sections check that it still begins
+    # with "Read ", which is the shape that was reported.
+    $mixed = (& $bash -lc "cygpath -m '$($cont -replace "'", "''")'").Trim()
+    $sentence = "Read $mixed - it contains your instructions for this session. Follow them."
+    # Teeth check, on demand: with GHOZTTY_TEST_T664_BREAK=1 the arms below
+    # expect the sentence MINUS its first character - the exact loss they exist
+    # to catch - so every T664 arm goes red against a healthy delivery and
+    # nothing else moves. An arm that cannot be made to fail is decoration.
+    if ($env:GHOZTTY_TEST_T664_BREAK -eq '1') { $sentence = $sentence.Substring(1) }
     return @{
-        log   = (Get-Content $logWin -Raw -ErrorAction SilentlyContinue)
-        cont  = $cont
-        probe = (Split-Path $cont -Leaf)
+        log      = (Get-Content $logWin -Raw -ErrorAction SilentlyContinue)
+        cont     = $cont
+        probe    = (Split-Path $cont -Leaf)
+        sentence = $sentence
     }
 }
 
@@ -389,6 +416,14 @@ try {
         Write-Host ('      B7 diag: pane tail -> ' + ((Tail $p2) -replace "`r?`n", ' | ')) -ForegroundColor Yellow
     }
     Assert $b7 'B7 continuation still sent despite the failure'
+    # T664: the section that flaked. A lost leading character left the basename
+    # intact, so B7 passed over `RC-TEXT[ead C:/...]` and the loss was noticed
+    # only by eye. The sentence's own first word is the assertion that sees it.
+    # The screen wraps a ~110-character sentence, so this checks where the line
+    # STARTS rather than comparing the whole of it: the echo must open with the
+    # sentence's own first word, which a dropped leading byte destroys.
+    Assert ((Tail $p2).Contains('RC-TEXT[' + $r.sentence.Substring(0, 5))) `
+        'B7b the handoff arrived whole, not missing its first character'
 
     # --- C. cleared, then the prompt was eaten ----------------------------
     $p3 = New-ProxyWindow 'rc3' 'proxy-amnesia.sh'
@@ -421,6 +456,10 @@ try {
         $gotE = [string](Get-Content $recvE -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
     }
     Assert ($gotE -and $gotE.Contains($r.probe)) 'E3 the pane really received the handoff'
+    # T664: the receipt is the submitted line itself, so compare it as a whole
+    # LINE - `Contains` cannot see a dropped leading byte, because the truncated
+    # sentence is still a substring of the intact one.
+    Assert ((($gotE -split "`r?`n") -contains $r.sentence)) 'E3b every byte of the handoff arrived, not just the file name'
     Assert ($r.log -match 'verified: pane is repainting') 'E4 delivery verified by the repaint, not by the vanished echo'
     Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'E5 no failure shouted over a session that is answering'
     $b4 = Banner-Of $p4
@@ -437,6 +476,7 @@ try {
         $gotF = [string](Get-Content $recvF -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
     }
     Assert ($gotF -and $gotF.Contains($r.probe)) 'F1 pre-T261: the continuation arrived just the same'
+    Assert ((($gotF -split "`r?`n") -contains $r.sentence)) 'F1b and arrived whole, byte for byte (T664)'
     Assert ($r.log -match 'RESET-CONTEXT FAILED') 'F2 pre-T261: a delivered continuation is called a failure (the filed bug)'
     $b5 = Banner-Of $p5
     Assert ($b5 -and $b5 -match 'reset-context FAILED') "F3 pre-T261: and banners it at the user (got '$b5')"
@@ -457,6 +497,7 @@ try {
         $gotG = [string](Get-Content $recvG -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 250
     }
     Assert ($gotG -and $gotG.Contains($r.probe)) 'G3 the handoff really was submitted (out-of-band receipt)'
+    Assert ((($gotG -split "`r?`n") -contains $r.sentence)) 'G3b and arrived whole, byte for byte (T664)'
     Assert ($r.log -match 'verified: handoff is on screen and the pane is moving') 'G4 verified as SUBMITTED, not merely typed'
     Assert ($r.log -notmatch 'RESET-CONTEXT FAILED') 'G5 no failure shouted over a recovered wedge'
     $b6 = Banner-Of $p6

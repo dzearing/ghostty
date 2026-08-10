@@ -25,6 +25,12 @@
 #     also the regression guard for every ordinary pane, which must keep
 #     receiving exactly what it received before.
 #
+# Rounds 13-14 (T664) extend the same capture to DELIVERY INTEGRITY: the shape
+# that once lost a text run's first character - a bare Enter, a beat, then a
+# `--keys-file` run plus `Enter` - measured byte for byte, with a payload long
+# enough to cross the 64-byte pooled write buffer in termio.Exec.queueWrite.
+# `test\win32\send-keys-soak.ps1` is the on-demand soak for the same shape.
+#
 # NOT interactive: everything here is IPC (+split / +send-keys / +read), so it
 # needs no foreground and does not belong on the T211 test desktop.
 param(
@@ -120,7 +126,19 @@ $script:round = 0
 # with - it verifies the prompt arrived before submitting - and the point of
 # capturing it is that no CLI-side framing can span two calls, so the bytes it
 # produces are the thing the fix has to work around rather than rely on.
-function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs, [string[]]$ThenArgs) {
+#
+# $FirstArgs, when given, is a `+send-keys` call made a beat BEFORE the payload
+# (T664). The one report of a lost first character described exactly that shape
+# — a framed text run landing about a second after a bare Enter — so the leading
+# keypress is part of what has to be measured, not context around it.
+function Invoke-Round(
+    [string]$Mode,
+    [int]$Expect,
+    [string[]]$SendArgs,
+    [string[]]$ThenArgs,
+    [string[]]$FirstArgs,
+    [int]$FirstGapMs = 1000
+) {
     $script:round++
     $tag = "R$($script:round)"
     $pane = "skb$PID-$($script:round)"
@@ -138,6 +156,11 @@ function Invoke-Round([string]$Mode, [int]$Expect, [string[]]$SendArgs, [string[
     }
     Start-Sleep -Milliseconds 600
 
+    if ($FirstArgs) {
+        $first = @("--target=$pane") + $FirstArgs
+        & $Exe +send-keys @first 2>&1 | Out-Null
+        Start-Sleep -Milliseconds $FirstGapMs
+    }
     $all = @("--target=$pane") + $SendArgs
     & $Exe +send-keys @all 2>&1 | Out-Null
     if ($ThenArgs) {
@@ -317,6 +340,41 @@ Assert "the trailing newline still became a keypress outside the frame" `
     ($r12.EndsWith($FRAME_END + $CR))
 Assert "the interior newline arrived as CR, not LF" `
     ($r12 -eq ($FRAME_START + '610d62' + $FRAME_END + $CR))
+
+# --- T664: a text run that follows a bare Enter arrives WHOLE ---------------
+#
+# One run of test\win32\reset-context.ps1 in five once showed section B's pane
+# receiving `RC-TEXT[ontinue-marker-B]` — the FIRST character of a `--keys-file`
+# text run gone, about a second after a bare Enter. A screen read cannot say
+# whether the byte never arrived or the grid lost it, and nothing in the suite
+# measured this shape on the wire; that is why the report stayed an anecdote.
+# These two rounds are that measurement, and they are byte-exact: the leading
+# `0d` is the Enter, then the frame, then the payload, then the frame, then the
+# submitting CR. A lost leading character shows up as a missing byte here and
+# nowhere else.
+
+"== 13: T664 shape - a keys-file text run a beat after a bare Enter, intact"
+$r13 = Invoke-Round 'on' 26 @("--keys-file=$pf", 'Enter') $null @('Enter')
+"     got: $r13"
+Assert "the Enter, then the framed payload with the CR outside" `
+    ($r13 -eq ($CR + $FRAME_START + $msgHex + $FRAME_END + $CR))
+Assert "the payload's FIRST byte survived the preceding keypress" `
+    ($r13.Contains($FRAME_START + $msgHex))
+
+"== 14: T664 shape with a payload that crosses the pty write chunk"
+# termio.Exec.queueWrite copies a write into 64-byte pooled buffers, so a run
+# longer than that is split across two pty writes — the only seam in our path
+# that can divide a frame. The realistic payload is the loop's own handoff
+# sentence, which is ~90 bytes before framing, so every real reset-context
+# delivery takes this path and none of the rounds above did.
+$long = 'Read C:/Users/David/AppData/Local/Temp/reset-context-cont-4182.txt - it contains your instructions.'
+$longHex = To-Hex $long
+$pfl = Join-Path $tmp 'prompt-long.txt'
+[IO.File]::WriteAllText($pfl, $long, (New-Object System.Text.UTF8Encoding($false)))
+$r14 = Invoke-Round 'on' ($long.Length + 14) @("--keys-file=$pfl", 'Enter') $null @('Enter')
+"     got: $r14"
+Assert "a chunk-crossing payload arrives whole, framed, CR outside" `
+    ($r14 -eq ($CR + $FRAME_START + $longHex + $FRAME_END + $CR))
 
 "== teardown"
 & $Exe +close "--target=$win" 2>&1 | Out-Null

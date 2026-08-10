@@ -13993,3 +13993,68 @@ Evidence: `upgrade-resume-readiness.ps1` ALL PASS (F and G live),
 `upgrade-no-fork.ps1`, `go-loop-guard.ps1`, `agent-instance-lineage.ps1`,
 `upgrade-staleness.ps1`, `persistence-flag.ps1` all ALL PASS. All three zig
 lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.
+
+## 2026-08-10 — The lost first character is now measured on the wire, and a truncated handoff fails a test instead of being caught by eye (T664)
+
+One run in five of `test\win32\reset-context.ps1` once showed section B's pane
+receiving `RC-TEXT[ontinue-marker-B]` — the leading `c` of a `--keys-file` text
+run gone, about a second after a bare Enter. Nothing in the suite could say
+whether that byte never reached the shell or whether the pane's grid lost it,
+because the only witness was a screen read, and screen reads cannot tell those
+apart. Worse, nothing FAILED: every check in that chain probes the cont file's
+basename, which sits in the middle of the sentence, so a loss at the front is
+invisible to it by construction. The defect was caught by a human reading a
+diagnostic line.
+
+**Both of those are now fixed, and the loss itself does not reproduce.** 315
+deliveries of the exact shape, byte-exact every one: the minimal form and the
+full section-B prelude (`nn`, `/clear`, Enter, extra Enter, `--when-idle`); at a
+fixed 1s gap and swept across 0–1500ms in 60ms steps; on a quiet box and under a
+concurrent `none` lane; judged both by a raw-VT capture pane and by a receipt
+file a git-bash `read -e` loop appends every submitted line to; with a 17-byte
+payload and with a ~100-byte one whose framed form crosses the 64-byte pooled
+write buffer in `termio.Exec.queueWrite`, which is the only seam in our path
+that splits one run across two pty writes. Ruled out by reading, each for a
+stated reason: the `--segments=` hex codec (round-trip tested over control bytes
+and non-UTF-8), `normalizeConptyInput` (stateless per call, so a preceding CR
+cannot reach into the next run), and `SegmentedPool` reuse (in-order puts on one
+stream). What remains unexplained is the leg our oracles cannot separate —
+conhost's VT input translation and cygwin's console reader — and the raw pane
+exercises a different conhost path than git-bash does, so 190 readline sends are
+the evidence there, not the raw ones.
+
+The lasting part is the instrumentation, in three places:
+
+- **On the wire.** Rounds 13–14 of `test\win32\send-keys-bracketed.ps1` send a
+  bare Enter, wait a beat, then a `--keys-file` text run plus `Enter`, and assert
+  the capture equals `0d` + frame + payload + frame + `0d` exactly. Round 14's
+  payload is long enough to cross the write chunk — which every real
+  reset-context delivery does and no earlier round did.
+- **In the delivery sections.** `B7b`, `E3b`, `F1b` and `G3b` of
+  `reset-context.ps1` require the handoff to have arrived WHOLE. The receipt
+  sections compare the line by EQUALITY rather than containment, because a
+  truncated sentence is still a substring of the intact one: the first draft of
+  those three arms passed under the break switch for exactly that reason, which
+  is the T648 lesson arriving a second time. Screen sections check that the echo
+  still OPENS with the sentence's first word, since a ~110-character sentence
+  wraps and cannot be compared whole there.
+- **As a soak anyone can re-run.** `test\win32\send-keys-soak.ps1` (on-demand,
+  deliberately not in P1–P3) repeats the shape with randomised gaps and both
+  payloads, judged by the receipt. That is the instrument the next occurrence
+  needs, and leaving it behind is the difference between "315 attempts were run"
+  and "315 attempts can be run".
+
+Both oracles are teeth-checked rather than assumed: `GHOZTTY_TEST_T664_BREAK=1`
+expects each handoff minus its first character, and takes all four new arms red
+(`4 FAILURE(S) (48 passed)`) while moving nothing else; the soak's `-Break` does
+the same for its own comparison (4 of 4 red).
+
+Production is still checking the basename — the helper's own delivery verdict
+has the blindness the acceptance suite just lost — filed as **T699**. A byte lost
+in the fixed prose is survivable there (a session handed `ead <path> - it
+contains your instructions.` still reads the file); a byte lost inside the PATH
+stalls the loop with nothing saying why.
+
+Evidence: `send-keys-bracketed.ps1` ALL PASS (14 rounds), `reset-context.ps1`
+ALL PASS (52), `send-keys-soak.ps1` ALL PASS (40 sends byte-exact). All three zig
+lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.
