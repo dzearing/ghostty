@@ -48,6 +48,7 @@ const inbound_ring = @import("../remote/inbound_ring.zig");
 const protocol = @import("../remote/protocol.zig");
 const session_notice = @import("session_notice.zig");
 const open_failed_notice = @import("open_failed_notice.zig");
+const attach_failed_notice = @import("attach_failed_notice.zig");
 
 const log = std.log.scoped(.io_remote);
 
@@ -228,8 +229,9 @@ applied_bytes: std.atomic.Value(u64) = .init(0),
 pane_banner_restored: bool = false,
 
 /// The message to paint into the pane when bring-up failed for a reason we
-/// actually know (T469), rendered by `open_failed_notice` at the moment the
-/// agent refused the OPEN. Empty ⇒ nothing better than the generic text.
+/// actually know — a refused OPEN (T469, `open_failed_notice`) or an ATTACH
+/// that yielded no pane (T657, `attach_failed_notice`). Empty ⇒ nothing better
+/// than the generic text.
 ///
 /// It lives HERE, on the stable backend (`Termio.backend.remote`), because of
 /// who reads it: `termio.Thread.threadMain`'s failure paint runs after
@@ -239,10 +241,13 @@ pane_banner_restored: bool = false,
 /// failing path, which is the worst possible place to add something else that
 /// can fail or leak.
 ///
+/// ONE buffer for both, because a bring-up fails once: a pane either never
+/// opened or never re-attached, and the paint shows exactly one message.
+///
 /// Single-threaded by construction — written by the pane's IO thread inside
 /// `threadEnter`, read by that same thread in the paint that follows it.
-open_failed_notice_buf: [open_failed_notice.max_len]u8 = undefined,
-open_failed_notice_len: usize = 0,
+bring_up_notice_buf: [@max(open_failed_notice.max_len, attach_failed_notice.max_len)]u8 = undefined,
+bring_up_notice_len: usize = 0,
 
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
@@ -511,25 +516,64 @@ pub fn remoteCommand(self: *const Remote) ?[]const u8 {
 /// `termio.Thread`'s failure paint can show the reason instead of the generic
 /// "exhausting a system resource" text. Called on the IO thread, on the way out
 /// of a failing `threadEnter`.
-fn recordOpenRefusal(self: *Remote, refusal: protocol.OpenFailedCopy) void {
+fn recordOpenRefusal(self: *Remote, refusal: protocol.RefusalCopy) void {
     const msg = open_failed_notice.format(
-        &self.open_failed_notice_buf,
+        &self.bring_up_notice_buf,
         refusal.reason(),
         refusal.detail(),
     );
-    self.open_failed_notice_len = msg.len;
+    self.bring_up_notice_len = msg.len;
     log.warn(
         "OPEN refused by the agent reason={s} detail={?s}",
         .{ refusal.reason(), refusal.detail() },
     );
 }
 
+/// The same, for an `ATTACH_FAILED` the agent sent (T657) — the refusals no
+/// `ATTACHED` payload could describe.
+fn recordAttachRefusal(self: *Remote, refusal: protocol.RefusalCopy) void {
+    const msg = attach_failed_notice.format(
+        &self.bring_up_notice_buf,
+        refusal.reason(),
+        refusal.detail(),
+    );
+    self.bring_up_notice_len = msg.len;
+    log.warn(
+        "ATTACH refused by the agent reason={s} detail={?s}",
+        .{ refusal.reason(), refusal.detail() },
+    );
+}
+
+/// ...and for an ATTACH the agent DID answer, with a status that yields no pane
+/// (T657). This is the common case by far — a session the agent no longer has,
+/// one whose process ended for good, one another window is already showing —
+/// and it needs no capability at all, because the status has ridden `ATTACHED`
+/// since long before there was a frame to refuse on. Before this the answer
+/// reached the pane as a bare `error.RemoteAttachFailed` and the generic paint
+/// blamed the system for "exhausting a system resource".
+fn recordAttachFailure(self: *Remote, outcome: *const connection.AttachOutcome) void {
+    const r = attach_failed_notice.reasonForStatus(
+        @tagName(outcome.status),
+        outcome.attached_elsewhere,
+    );
+    // The detail names the machine-readable state behind the sentence, so a bug
+    // report carries what the log line would have.
+    var detail_buf: [attach_failed_notice.max_detail_len]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "status={s} relaunchable={} attached_elsewhere={}", .{
+        @tagName(outcome.status),
+        outcome.relaunchable,
+        outcome.attached_elsewhere,
+    }) catch null;
+    const msg = attach_failed_notice.format(&self.bring_up_notice_buf, r, detail);
+    self.bring_up_notice_len = msg.len;
+}
+
 /// The message to paint instead of the generic IO-thread failure text, or null
 /// when this pane's bring-up failed for a reason we have nothing better to say
 /// about (a timeout, a dead link, an agent too old to answer a refusal).
 pub fn bringUpNotice(self: *const Remote) ?[]const u8 {
-    if (self.open_failed_notice_len == 0) return null;
-    return self.open_failed_notice_buf[0..self.open_failed_notice_len];
+    if (self.bring_up_notice_len == 0) return null;
+    return self.bring_up_notice_buf[0..self.bring_up_notice_len];
 }
 
 /// Initialize the terminal state for this backend (mirrors `Exec.initTerminal`):
@@ -614,7 +658,8 @@ pub fn threadEnter(
             self.attach_offset,
             if (self.restore_snapshot) |s| s.len else 0,
         });
-        var outcome = try self.conn.attachChannelCancellable(
+        var attach_refusal: protocol.RefusalCopy = .{};
+        var outcome = self.conn.attachChannelRefusable(
             sid,
             rows,
             cols,
@@ -626,7 +671,15 @@ pub fn threadEnter(
             self.attach_offset,
             false,
             &self.canceller,
-        );
+            &attach_refusal,
+        ) catch |err| {
+            // The agent told us it could not answer, and why (T657). Keep the
+            // sentence for the failure paint — the error itself carries no
+            // payload, and without this the pane would come up blank and blame
+            // a timeout for a refusal that took milliseconds.
+            if (err == error.AttachRefused) self.recordAttachRefusal(attach_refusal);
+            return err;
+        };
         // `attached_elsewhere` without force (§5.3): the session's bridge still
         // belongs to another connection — for THIS surface that is our own
         // superseded/zombie connection (the WP-D1 reconnect swap re-attaches
@@ -640,7 +693,18 @@ pub fn threadEnter(
         {
             outcome.deinit();
             log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
-            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, self.attach_offset, true, &self.canceller);
+            outcome = self.conn.attachChannelRefusable(
+                sid,
+                rows,
+                cols,
+                self.attach_offset,
+                true,
+                &self.canceller,
+                &attach_refusal,
+            ) catch |err| {
+                if (err == error.AttachRefused) self.recordAttachRefusal(attach_refusal);
+                return err;
+            };
         }
         defer outcome.deinit();
         if (outcome.pane) |p| {
@@ -734,7 +798,7 @@ pub fn threadEnter(
                 .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
                 .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
             };
-            var refusal: protocol.OpenFailedCopy = .{};
+            var refusal: protocol.RefusalCopy = .{};
             const p = self.conn.openChannelRefusable(open, &self.canceller, &refusal) catch |err| {
                 log.warn("notify policy: fresh session open failed err={}", .{err});
                 if (err == error.OpenRefused) self.recordOpenRefusal(refusal);
@@ -829,6 +893,13 @@ pub fn threadEnter(
             "attach did not yield a live pane status={} relaunchable={} attached_elsewhere={}",
             .{ outcome.status, outcome.relaunchable, outcome.attached_elsewhere },
         );
+        // ...and SAY it in the pane (T657). The agent answered — it named the
+        // state in `ATTACHED.status`, immediately, and has done so on every
+        // agent that has ever shipped — but that answer stopped here, at a log
+        // line, and the user got the generic "exhausting a system resource"
+        // paint. This is the resume path: a reboot, an app upgrade, a session
+        // picked from the chooser. It should say which of those went wrong.
+        self.recordAttachFailure(&outcome);
         return error.RemoteAttachFailed;
     } else pane: {
         // OPEN-new: start a brand-new remote session (§3.3 open-new).
@@ -848,7 +919,7 @@ pub fn threadEnter(
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
             .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
         };
-        var refusal: protocol.OpenFailedCopy = .{};
+        var refusal: protocol.RefusalCopy = .{};
         break :pane self.conn.openChannelRefusable(open, &self.canceller, &refusal) catch |err| {
             // The agent told us WHY it will not open this pane (T469). Keep the
             // sentence for the failure paint below — the error itself carries no
@@ -1779,4 +1850,38 @@ test "T144 openWorkingDirectory: nothing to forward stays null" {
     // then the only answer either flavor can give.
     try testing.expect(openWorkingDirectory(null, null, true) == null);
     try testing.expect(openWorkingDirectory(null, null, false) == null);
+}
+
+test "T657 every ATTACHED status that yields no pane maps to its own sentence" {
+    const testing = std.testing;
+
+    // The coupling this pins: `attach_failed_notice` is deliberately free of
+    // the protocol import and matches STATUS TAG NAMES as strings, so a rename
+    // of `AttachStatus` would not break the build — it would silently degrade
+    // every restore failure to the generic "does not recognize the reason"
+    // sentence. This is the one place both sides are in scope, so it is where
+    // that has to be caught.
+    const S = protocol.Attached.AttachStatus;
+    const reason = attach_failed_notice.reason;
+    try testing.expectEqualStrings(
+        reason.session_not_found,
+        attach_failed_notice.reasonForStatus(@tagName(S.not_found), false),
+    );
+    try testing.expectEqualStrings(
+        reason.session_ended,
+        attach_failed_notice.reasonForStatus(@tagName(S.dead), false),
+    );
+    // A steal reply carries `.alive`, so the elsewhere flag has to win.
+    try testing.expectEqualStrings(
+        reason.attached_elsewhere,
+        attach_failed_notice.reasonForStatus(@tagName(S.alive), true),
+    );
+
+    // ...and each of those renders a DIFFERENT message, or the status carries
+    // no information to the person reading the pane.
+    var a: [attach_failed_notice.max_len]u8 = undefined;
+    var b: [attach_failed_notice.max_len]u8 = undefined;
+    const missing = attach_failed_notice.format(&a, reason.session_not_found, null);
+    const ended = attach_failed_notice.format(&b, reason.session_ended, null);
+    try testing.expect(!std.mem.eql(u8, missing, ended));
 }

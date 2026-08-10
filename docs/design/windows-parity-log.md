@@ -14177,3 +14177,56 @@ registered channel, asserts `threadsLive()`, then destroys it with no
 rest. `floor-lane.ps1 -Lane win32 -Repeat 5` is 5/5 PASS (one green run proves
 nothing against a race); `-Lane none` and `-Lane agent` PASS; P1–P3 ALL PASS
 against a fresh Debug build.
+
+## 2026-08-10 — a pane that cannot rejoin its session now says which session, instead of blaming the system (T657)
+
+A restored pane whose agent session could not be handed back came up blank and
+then printed "The underlying shell or command was unable to be started. This
+error is usually due to exhausting a system resource." That sentence is true of
+none of the ways an ATTACH actually fails, and it names none of them. It is the
+resume path — a reboot, an app upgrade, a session picked out of the machine
+chooser — so it is the failure a user meets most often and the one that
+explained itself least. The pane now says "Ghoztty could not reconnect this pane
+to its session", names which of the reasons it was, and says what to do.
+
+The task was filed as the ATTACH half of T469, on the reading that
+`Server.handleAttach` drops its refusals the way `handleOpen` used to. Reading
+the code first changed the design. The agent already ANSWERS the refusals that
+matter — `ATTACHED{status: not_found}` and `ATTACHED{status: dead}` arrive in
+milliseconds, and have on every agent that ever shipped. The only genuinely
+silent path is a payload the agent cannot parse. So the ten-second timeout was
+the small half; the whole user-visible half was on the client, where
+`Remote.threadEnter` collapsed every one of those answers into a bare
+`error.RemoteAttachFailed` and let the generic paint speak for it.
+
+That splits the fix by what each mechanism can carry. The sentence a user reads
+for `not_found` / `dead` / `attached_elsewhere` is derived CLIENT-side from the
+status already on the wire (`src/termio/attach_failed_notice.zig`, pure), so it
+needs no capability and works against an agent of any age — which is the
+load-bearing property here, because the agent routinely outlives the app.
+Re-stating those three on the wire was rejected: two spellings of one fact
+across a compatibility boundary is what the agent contract exists to prevent,
+and it would have stranded every caller that reads `AttachOutcome.status` (the
+chooser, Restore All) behind a new error. `ATTACH_FAILED` (0x07) was added for
+what `ATTACHED` genuinely cannot express — the unparseable request today, a hard
+refusal with no `Attached` to fill in later — capability-gated exactly like
+0x06. `OpenFailedCopy` became `RefusalCopy` now that two refusals share it.
+
+Making it observable needed one seam, for the reason T469's two did. The win32
+launch restore probes the agent's roster first and gives a leaf whose session is
+not listed a null id, so it OPENs a fresh shell rather than ATTACHing — a good
+rule, and one that leaves this failure to the case where the probe DID NOT LAND
+(a slow or wedged agent past `restore_probe_timeout_ns`). That is a real branch
+but a racy one to reach from a script, so `AttachProbe.take` now honors
+`GHOZTTY_RESTORE_PROBE_UNKNOWN=1`, which forces the liveness tri-state to
+UNKNOWN and changes nothing else.
+
+Evidence: `test/win32/agent-attach-refused.ps1` ALL PASS (24 checks) — arm C
+restores a pane and proves it LIVE by typing into it, arm A gets the named
+message **314 ms** after the window exists (the criterion was 2 s) and asserts
+the absence of both `Timeout` and "exhausting a system resource", and arm B
+repeats arm A with `GHOSTTY_AGENT_SUPPRESS_CAPS=attach_failed` and requires the
+SAME message in 274 ms — which is the design claim, not a weaker lookalike.
+Teeth-checked twice: disabling `acceptsReply`'s new arm reddens three unit
+tests, and disabling `recordAttachFailure` reddens arms A and B with the exact
+pre-fix text. Floor lanes and P1–P3 green.

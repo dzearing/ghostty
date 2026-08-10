@@ -1007,6 +1007,9 @@ pub const Connection = struct {
         // advertises it, the negotiated flag stays false, and we keep the
         // timeout — the pane just takes the slow road to the same failure.
         protocol.capability.open_failed,
+        // ...and `ATTACH_FAILED` (0x07), the same courtesy on the resume path
+        // (T657). Same skew story: absent ⇒ the 10 s timeout we always had.
+        protocol.capability.attach_failed,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1590,7 +1593,7 @@ pub const Connection = struct {
         self: *Connection,
         open: protocol.Open,
         canceller: ?*const RpcCanceller,
-        refusal: ?*protocol.OpenFailedCopy,
+        refusal: ?*protocol.RefusalCopy,
     ) !*Pane {
         // Mint a fresh channel id for the OUTBOUND OPEN frame (§7.1). The agent is
         // **channel-authoritative**: it mints its OWN session channel and replies
@@ -1621,9 +1624,9 @@ pub const Connection = struct {
             if (refusal) |out| {
                 if (protocol.parseJson(protocol.OpenFailed, self.alloc, rpc.payload)) |p| {
                     defer p.deinit();
-                    out.set(p.value);
+                    out.set(p.value.reason, p.value.detail);
                 } else |_| {
-                    out.set(.{ .reason = "unparseable" });
+                    out.set("unparseable", null);
                 }
             }
             return error.OpenRefused;
@@ -2115,6 +2118,36 @@ pub const Connection = struct {
         force: bool,
         canceller: ?*const RpcCanceller,
     ) !AttachOutcome {
+        return self.attachChannelRefusable(session_id, rows, cols, last_byte_offset, force, canceller, null);
+    }
+
+    /// `attachChannelCancellable` that also reports WHY the agent could not
+    /// answer (T657), the `openChannelRefusable` shape exactly.
+    ///
+    /// When the agent answers `ATTACH_FAILED` (0x07) this returns
+    /// `error.AttachRefused` and, if `refusal` is non-null, fills it with the
+    /// reason token and detail.
+    ///
+    /// Note what does NOT come back this way: `not_found`, `dead` and
+    /// `attached_elsewhere` are ordinary `AttachOutcome`s carrying that status
+    /// — they always were, they arrive at once, and the client renders the
+    /// user-facing reason from the status itself. This error is for the
+    /// refusals no `Attached` payload could describe.
+    ///
+    /// Every other failure is unchanged, `error.Timeout` included: an agent too
+    /// old to advertise `capability.attach_failed` never sends the frame, so
+    /// such a refusal still surfaces as the 10 s timeout it always did, with
+    /// `refusal` untouched.
+    pub fn attachChannelRefusable(
+        self: *Connection,
+        session_id: []const u8,
+        rows: u16,
+        cols: u16,
+        last_byte_offset: u64,
+        force: bool,
+        canceller: ?*const RpcCanceller,
+        refusal: ?*protocol.RefusalCopy,
+    ) !AttachOutcome {
         // Mint a fresh channel id for the OUTBOUND ATTACH frame (§7.1). As with
         // OPEN, the agent is **channel-authoritative**: it replies ATTACHED on the
         // session's own channel (or on `control_channel` for `not_found`), so we
@@ -2142,6 +2175,26 @@ pub const Connection = struct {
         defer self.alloc.free(attach_json);
         const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json, self.rpc_open_timeout_ns, canceller);
         defer self.alloc.free(rpc.payload);
+
+        // The agent could not answer, and said so (T657). Nothing was attached
+        // — no channel, no ring, nothing registered — so there is nothing to
+        // undo; we only carry the reason out to whoever can show it.
+        //
+        // A payload we cannot parse is still a refusal: a newer agent could add
+        // fields, and degrading a "refused, reason unknown" into a 10 s timeout
+        // would be strictly worse than saying so generically.
+        if (rpc.type == .attach_failed) {
+            if (refusal) |out| {
+                if (protocol.parseJson(protocol.AttachFailed, self.alloc, rpc.payload)) |p| {
+                    defer p.deinit();
+                    out.set(p.value.reason, p.value.detail);
+                } else |_| {
+                    out.set("unparseable", null);
+                }
+            }
+            return error.AttachRefused;
+        }
+
         const id = rpc.channel; // agent-authoritative session channel
 
         var parsed = protocol.parseJson(protocol.Attached, self.alloc, rpc.payload) catch
@@ -2686,15 +2739,18 @@ pub const Connection = struct {
     }
 
     /// True iff `got` is a legitimate terminal reply for a slot waiting on
-    /// `want`. Normally that is only the same type; the one exception is the
-    /// NEGATIVE reply to OPEN — `open_failed` answers an `.opened` slot (T469).
+    /// `want`. Normally that is only the same type; the exceptions are the two
+    /// NEGATIVE replies — `open_failed` answers an `.opened` slot (T469) and
+    /// `attach_failed` answers an `.attached` slot (T657).
     ///
-    /// It is a reply, not a wrong-type frame, and the distinction is the whole
-    /// point: routed through `WrongReply` the caller would learn the OPEN failed
-    /// but never why, which is the blank pane this task exists to remove.
+    /// They are replies, not wrong-type frames, and the distinction is the
+    /// whole point: routed through `WrongReply` the caller would learn the
+    /// request failed but never why, which is the blank pane these tasks exist
+    /// to remove.
     fn acceptsReply(want: protocol.FrameType, got: protocol.FrameType) bool {
         if (want == got) return true;
-        return want == .opened and got == .open_failed;
+        if (want == .opened and got == .open_failed) return true;
+        return want == .attached and got == .attach_failed;
     }
 
     /// Deliver a reply frame to a parked RPC caller. Called by the control reader's
@@ -2721,7 +2777,11 @@ pub const Connection = struct {
                 // adopt, but stamping `frame.channel` costs nothing and the
                 // caller never reaches the adopt step on this path.
                 .opened, .open_failed => self.pending_opened,
-                .attached => self.pending_attached,
+                // Likewise for ATTACH: a refusal is the ATTACH's answer and
+                // goes to the same slot (T657). It arrives on the control
+                // channel — there is no session, so there is no session
+                // channel — and the caller never reaches the adopt step.
+                .attached, .attach_failed => self.pending_attached,
                 else => null,
             };
             if (by_type) |s| {
@@ -2941,14 +3001,15 @@ pub const Connection = struct {
     /// Other frame types are ignored here (the user handler still sees them).
     fn handleControlInternal(self: *Connection, frame: protocol.Frame) void {
         switch (frame.type) {
-            .opened, .attached, .open_failed => {
+            .opened, .attached, .open_failed, .attach_failed => {
                 // Reply to an OPEN/ATTACH RPC: hand the payload to the parked caller
                 // keyed by this channel id. If no caller is waiting (stale/duplicate
                 // reply), it's dropped here; the user handler still observes it.
                 //
-                // `.open_failed` rides the same path on purpose — it is the OPEN's
-                // negative answer, not a separate event (T469). An unsolicited one
-                // (no parked caller) is simply dropped, exactly like a late OPENED.
+                // `.open_failed`/`.attach_failed` ride the same path on purpose —
+                // each is its request's negative answer, not a separate event
+                // (T469, T657). An unsolicited one (no parked caller) is simply
+                // dropped, exactly like a late OPENED.
                 _ = self.deliverRpcReply(frame);
             },
             .cwd => {
@@ -4532,6 +4593,14 @@ const LifecycleAgent = struct {
     /// session whose command/cwd failed to spawn). Exercises the RPC timeout so a
     /// silent agent can't wedge the caller (the pane IO thread) forever.
     silent_open: bool = false,
+    /// When set, an ATTACH is answered with `ATTACH_FAILED{reason}` on the
+    /// CONTROL channel instead of an ATTACHED — the T657 refusal a real agent
+    /// sends for a request it cannot answer at all.
+    refuse_attach: ?[]const u8 = null,
+    /// When true the agent receives ATTACH and NEVER replies (the pre-T657
+    /// behavior for exactly that case). Exercises the fallback path an agent
+    /// too old to advertise `attach_failed` still takes.
+    silent_attach: bool = false,
 
     // GET_CWD reply contents. `cwd_reply == null` ⇒ reply CWD{ok=false}; else
     // reply CWD{ok=true, path}. When `silent_cwd` is true the agent receives
@@ -4653,6 +4722,17 @@ const LifecycleAgent = struct {
                     const n = self.attach_count.fetchAdd(1, .monotonic);
                     self.setSeenChannel(frame.channel);
                     self.saw_request.set();
+                    if (self.silent_attach) continue;
+                    if (self.refuse_attach) |reason| {
+                        // On the CONTROL channel, as the real agent sends it:
+                        // no session means no session channel.
+                        try self.ctrl.sendJson(
+                            .attach_failed,
+                            protocol.control_channel,
+                            protocol.AttachFailed{ .reason = reason, .detail = "why-it-said-no" },
+                        );
+                        continue;
+                    }
                     // If configured, the FIRST attach reports attached_elsewhere; a
                     // retry (which carries force=true) succeeds.
                     const elsewhere = self.attached_elsewhere_first and n == 0;
@@ -5937,6 +6017,79 @@ test "attachChannel: steal — attached_elsewhere without force, then force succ
 
     try testing.expectEqual(@as(u32, 2), a.attach_count.load(.monotonic));
     h.conn.closeChannel(pane);
+}
+
+test "attachChannelRefusable: ATTACH_FAILED is the ATTACH's answer, with its reason (T657)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.refuse_attach = protocol.AttachFailed.Reason.malformed_request;
+    try h.start();
+
+    var refusal: protocol.RefusalCopy = .{};
+    const err = h.conn.attachChannelRefusable("sess-1", 24, 80, 0, false, null, &refusal);
+
+    // A refusal, not a wrong-type frame and not a timeout: the whole point is
+    // that the caller learns WHY in milliseconds.
+    try testing.expectError(error.AttachRefused, err);
+    try testing.expectEqualStrings("malformed_request", refusal.reason());
+    try testing.expectEqualStrings("why-it-said-no", refusal.detail().?);
+}
+
+test "attachChannelRefusable: a reason we cannot parse is still a refusal, not a timeout (T657)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    // A NEWER agent could reshape the payload; degrading "refused, reason
+    // unknown" into a 10 s timeout would be strictly worse than saying so
+    // generically.
+    a.refuse_attach = "a_token_this_build_never_heard_of";
+    try h.start();
+
+    var refusal: protocol.RefusalCopy = .{};
+    try testing.expectError(
+        error.AttachRefused,
+        h.conn.attachChannelRefusable("sess-1", 24, 80, 0, false, null, &refusal),
+    );
+    // Carried through verbatim — the SENTENCE is chosen client-side by
+    // `termio/attach_failed_notice.zig`, which renders an unknown token
+    // generically rather than echoing it at a user.
+    try testing.expectEqualStrings("a_token_this_build_never_heard_of", refusal.reason());
+}
+
+test "attachChannel: an agent too old to refuse out loud still just times out (T657)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.silent_attach = true; // never advertised `attach_failed`; drops the request
+    try h.start();
+    // Keep the fallback quick: the point is WHICH error, not how long we wait.
+    h.conn.rpc_open_timeout_ns = 200 * std.time.ns_per_ms;
+
+    var refusal: protocol.RefusalCopy = .{};
+    try testing.expectError(
+        error.Timeout,
+        h.conn.attachChannelRefusable("sess-1", 24, 80, 0, false, null, &refusal),
+    );
+    // ...and the refusal is untouched, which is how a caller tells "known
+    // reason" from "no more than we knew before" and keeps the generic text.
+    try testing.expectEqual(@as(usize, 0), refusal.reason().len);
+}
+
+test "acceptsReply: each negative reply answers its own request, and nothing else" {
+    // `open_failed` answers OPEN and `attach_failed` answers ATTACH — never the
+    // other way round. Crossed, a refused OPEN would satisfy a parked ATTACH
+    // and the pane would report the wrong failure entirely.
+    try testing.expect(Connection.acceptsReply(.opened, .open_failed));
+    try testing.expect(Connection.acceptsReply(.attached, .attach_failed));
+    try testing.expect(!Connection.acceptsReply(.opened, .attach_failed));
+    try testing.expect(!Connection.acceptsReply(.attached, .open_failed));
+    // Same type is always a reply; an unrelated type never is.
+    try testing.expect(Connection.acceptsReply(.attached, .attached));
+    try testing.expect(!Connection.acceptsReply(.attached, .relaunched));
 }
 
 test "FLOW pause: a full undrained ring makes the agent receive FLOW{channel, pause} (§4.3)" {

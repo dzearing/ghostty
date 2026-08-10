@@ -1785,6 +1785,25 @@ pub const AttachProbe = struct {
     set: ?std.StringHashMap(void) = null,
 
     pub fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
+        // A TEST SEAM (T657), and it earns its place the way T469's two did.
+        // The probe is what normally spares a stale leaf an ATTACH it cannot
+        // win: a session the roster does not list gets `session_id = null` and
+        // OPENs fresh. So the refused-ATTACH path this build now explains is
+        // the one taken when the probe DID NOT LAND — a real production case
+        // (a slow or wedged agent past `restore_probe_timeout_ns`), and one an
+        // acceptance script otherwise cannot produce from a single tree
+        // without racing the agent. Forcing the tri-state to UNKNOWN
+        // reproduces exactly that branch, deterministically, with no other
+        // behavior changed.
+        //
+        // Unset (every real launch) leaves the code below byte-identical.
+        if (std.process.getEnvVarOwned(gpa, "GHOZTTY_RESTORE_PROBE_UNKNOWN")) |v| {
+            defer gpa.free(v);
+            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+                log.warn("session-restore: liveness probe forced UNKNOWN by GHOZTTY_RESTORE_PROBE_UNKNOWN", .{});
+                return .{};
+            }
+        } else |_| {}
         const roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
             log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
             return .{};

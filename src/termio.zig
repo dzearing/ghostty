@@ -40,5 +40,6 @@ test {
     _ = @import("termio/shell_integration.zig");
     _ = @import("termio/session_notice.zig");
     _ = @import("termio/open_failed_notice.zig");
+    _ = @import("termio/attach_failed_notice.zig");
     _ = @import("termio/history_guard.zig");
 }

@@ -384,6 +384,9 @@ pub const Server = struct {
             // pane says why in milliseconds rather than blaming a timeout ten
             // seconds later (T469).
             protocol.capability.open_failed,
+            // ...and the same for an ATTACH it cannot answer at all, which is
+            // the resume path a user meets after a reboot (T657).
+            protocol.capability.attach_failed,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -885,6 +888,26 @@ pub const Server = struct {
         }) catch {};
     }
 
+    /// Tell the client we cannot answer its ATTACH, and why (T657).
+    ///
+    /// Only for refusals `ATTACHED` has no way to express — `not_found`, `dead`
+    /// and `attached_elsewhere` are answered with an ordinary `ATTACHED`
+    /// carrying that status, and always have been. Same gate, same
+    /// best-effort posture and same reasoning as `sendOpenFailed`: an unknown
+    /// opcode is a fatal framing error, so an older peer gets silence and its
+    /// own timeout rather than a dropped connection.
+    ///
+    /// Sent on the CONTROL channel, like the `not_found` reply: there is no
+    /// session, so there is no session channel to speak on.
+    fn sendAttachFailed(self: *Server, reason: []const u8, detail: ?[]const u8) void {
+        const ok = if (self.negotiated) |n| n.attach_failed else |_| false;
+        if (!ok) return;
+        self.sendJson(.attach_failed, protocol.control_channel, protocol.AttachFailed{
+            .reason = reason,
+            .detail = detail,
+        }) catch {};
+    }
+
     fn handleOpen(self: *Server, req_channel: u128, payload: []const u8) void {
         var parsed = protocol.parseJson(protocol.Open, self.alloc, payload) catch |err| {
             self.sendOpenFailed(
@@ -1050,7 +1073,19 @@ pub const Server = struct {
     }
 
     fn handleAttach(self: *Server, payload: []const u8) void {
-        var parsed = protocol.parseJson(protocol.Attach, self.alloc, payload) catch return;
+        var parsed = protocol.parseJson(protocol.Attach, self.alloc, payload) catch |err| {
+            // SAY SO (T657). This was the one genuinely silent ATTACH path: the
+            // client's parked `.attached` slot had no frame to wake on, so a
+            // request we rejected in microseconds cost it the full 10 s
+            // `rpc_open_timeout_ns` and then surfaced as `error.Timeout` — the
+            // symptom we produced, never the cause we knew.
+            std.log.warn("ATTACH refused: payload did not parse err={s}", .{@errorName(err)});
+            self.sendAttachFailed(
+                protocol.AttachFailed.Reason.malformed_request,
+                @errorName(err),
+            );
+            return;
+        };
         defer parsed.deinit();
         const att = parsed.value;
 
@@ -3418,6 +3453,97 @@ test "OPEN refused: a client that did not negotiate open_failed gets today's sil
     try h.client.sendControlJson(.list_sessions, protocol.control_channel, struct {}{});
     const next = (try h.client.nextControl()) orelse return error.Eof;
     try testing.expectEqual(protocol.FrameType.sessions, next.type);
+}
+
+test "ATTACH the agent cannot parse: it answers ATTACH_FAILED instead of dropping it (T657)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(657);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.attach_failed};
+    try h.client.handshakeCaps(&caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.attach_failed);
+
+    // Not JSON at all — the one ATTACH path that used to `return` in silence,
+    // costing the client the full 10 s `rpc_open_timeout_ns` for a request the
+    // agent rejected in microseconds.
+    try h.client.sendControlRaw(.attach, protocol.control_channel, "{not json");
+
+    const f = try h.client.waitControl(.attach_failed);
+    // On the CONTROL channel: there is no session, so there is no session
+    // channel to speak on.
+    try testing.expectEqual(protocol.control_channel, f.channel);
+    var p = try protocol.parseJson(protocol.AttachFailed, alloc, f.payload);
+    defer p.deinit();
+    try testing.expectEqualStrings(protocol.AttachFailed.Reason.malformed_request, p.value.reason);
+    // The detail names the parse error, which is the part a bug report needs.
+    try testing.expect(p.value.detail.?.len > 0);
+}
+
+test "ATTACH refused: a client that did not negotiate attach_failed gets today's silence (T657)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(658);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An OLDER app: 0x07 would be a fatal framing error to it, so the agent
+    // must stay silent and let it time out — the pre-T657 behavior exactly.
+    const old_caps = [_][]const u8{protocol.capability.close_session};
+    try h.client.handshakeCaps(&old_caps);
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.attach_failed);
+
+    try h.client.sendControlRaw(.attach, protocol.control_channel, "{not json");
+
+    // Silence is not observable by waiting (a wait that ends is just a slower
+    // wait). Ask a question the agent WILL answer and prove that answer is the
+    // next frame: the writer is FIFO, so an ATTACH_FAILED — sent before it —
+    // would have to arrive first.
+    try h.client.sendControlJson(.list_sessions, protocol.control_channel, struct {}{});
+    const next = (try h.client.nextControl()) orelse return error.Eof;
+    try testing.expectEqual(protocol.FrameType.sessions, next.type);
+}
+
+test "ATTACH to an unknown session still answers ATTACHED{not_found}, not ATTACH_FAILED (T657)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(659);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    const caps = [_][]const u8{protocol.capability.attach_failed};
+    try h.client.handshakeCaps(&caps);
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = "no-such-session",
+        .rows = 24,
+        .cols = 80,
+    });
+
+    // THE INVARIANT this frame exists not to break: a missing session is a
+    // complete answer that `ATTACHED.status` has carried since long before
+    // 0x07, on every agent that ever shipped. Saying it a second way would be
+    // two vocabularies for one fact across a compatibility boundary — and it
+    // would strand every caller that reads `AttachOutcome.status` (the chooser,
+    // Restore All) behind a new error. The user-facing sentence is derived from
+    // this status on the CLIENT (`termio/attach_failed_notice.zig`), which is
+    // why it works against an agent of any age.
+    const f = (try h.client.nextControl()) orelse return error.Eof;
+    try testing.expectEqual(protocol.FrameType.attached, f.type);
+    var p = try protocol.parseJson(protocol.Attached, alloc, f.payload);
+    defer p.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.not_found, p.value.status);
 }
 
 test "SESSIONS_SUB pushes the roster immediately and again when it changes" {

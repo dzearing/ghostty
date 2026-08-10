@@ -51,6 +51,7 @@
 //! | v1 | `cpu_units` | `cpu_pct` carries CORRECTED units everywhere | `% CPU` marked unverifiable |
 //! | v1 | `session_busy` | pushed `META{has_descendants}` per session | close always confirms |
 //! | v1 | `open_failed` | `OPEN_FAILED` 0x06 (refused OPEN, with a reason) | silence ⇒ client times out |
+//! | v1 | `attach_failed` | `ATTACH_FAILED` 0x07 (ATTACH the agent cannot answer) | silence ⇒ client times out |
 //!
 //! Two rules make that table load-bearing rather than decorative:
 //!
@@ -123,6 +124,25 @@ pub const FrameType = enum(u8) {
     // advertised the string. An older client gets today's silence-then-timeout,
     // which is the graceful degradation the agent-contract rules ask for.
     open_failed = 0x06, // A→C  {reason, detail?}  OPEN refused; no session exists
+
+    // "I cannot answer this ATTACH." The negative reply to `ATTACH`, for the
+    // refusals `ATTACHED` has no way to express (T657).
+    //
+    // Note what this is NOT: `not_found`, `dead` and `attached_elsewhere` are
+    // already complete, immediate answers carried by `ATTACHED.status` — a
+    // second vocabulary for them would be two ways to say one thing across a
+    // compatibility boundary, which is exactly what the agent contract asks us
+    // not to build. This frame covers what the status enum cannot say at all:
+    // a request the agent could not even parse, and any future hard refusal
+    // (an attach cap, an internal error) where no `Attached` payload exists to
+    // fill in. Those paths used to `return` in silence, so the client's parked
+    // `.attached` slot waited out the full `rpc_open_timeout_ns` (10 s) and
+    // then blamed `error.Timeout`.
+    //
+    // Gated on `capability.attach_failed`, for the same reason `open_failed`
+    // is: an unknown opcode is a fatal framing error to a peer that does not
+    // know it, so an older client gets today's silence-then-timeout instead.
+    attach_failed = 0x07, // A→C  {reason, detail?}  ATTACH refused; nothing attached
 
     data = 0x10, // both {byte_offset, bytes} for `channel`
     resize = 0x11, // C→A  {rows, cols, px_w, px_h}
@@ -556,6 +576,25 @@ pub const capability = struct {
     /// "the background terminal service is at its session limit" rather than
     /// coming up blank and then blaming a timeout.
     pub const open_failed = "open_failed";
+
+    /// Negative reply to `ATTACH` (`attach_failed`, 0x07) for the refusals
+    /// `ATTACHED.status` cannot express — today a payload the agent could not
+    /// parse, tomorrow any hard refusal with no `Attached` to fill in. Those
+    /// paths dropped the request on the floor, so the client discovered them
+    /// 10 s later as `error.Timeout`.
+    ///
+    /// Deliberately NOT a re-statement of `not_found`/`dead`/
+    /// `attached_elsewhere`: those already ride `ATTACHED` and arrive at once.
+    /// What the user sees for THEM is a client-side mapping of that status
+    /// (`termio/attach_failed_notice.zig`), which needs no wire change and so
+    /// works against an agent of any age.
+    ///
+    /// Gated because this is a NEW OPCODE and an unknown opcode is a fatal
+    /// framing error for the receiver. Skew degrades to today's behavior in
+    /// both directions: a new agent stays silent for an old client, and a new
+    /// client never receives the frame from an old agent. Neither garbles nor
+    /// wedges.
+    pub const attach_failed = "attach_failed";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -659,6 +698,14 @@ pub const Negotiated = struct {
     /// agent stays silent (it must never emit an opcode the peer would treat as
     /// a fatal framing error) and the client falls back to its 10 s timeout.
     open_failed: bool = false,
+
+    /// True iff BOTH peers advertised `capability.attach_failed` — the agent
+    /// answers an unanswerable `ATTACH` with `attach_failed{reason, detail}`
+    /// and the client understands it. False against any older peer, in which
+    /// case the agent stays silent (it must never emit an opcode the peer
+    /// would treat as a fatal framing error) and the client falls back to its
+    /// 10 s timeout, exactly as before.
+    attach_failed: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -697,6 +744,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.session_busy),
         .open_failed = hasCapability(local.capabilities, capability.open_failed) and
             hasCapability(remote.capabilities, capability.open_failed),
+        .attach_failed = hasCapability(local.capabilities, capability.attach_failed) and
+            hasCapability(remote.capabilities, capability.attach_failed),
     };
 }
 
@@ -802,19 +851,56 @@ pub const OpenFailed = struct {
     };
 };
 
-/// A caller-owned, fixed-size copy of an `OPEN_FAILED` payload.
+/// `ATTACH_FAILED` (0x07) — the negative reply to an `ATTACH` the agent cannot
+/// answer with an `ATTACHED` at all. Sent ONLY when `Negotiated.attach_failed`
+/// (a new opcode is a fatal framing error to a peer that does not know it); an
+/// older client sees today's silence and times out.
+///
+/// Same shape as `OpenFailed` on purpose — one carrier (`RefusalCopy`), one
+/// client-side token→sentence mapping shape — but its own vocabulary, because
+/// the refusals differ: OPEN can hit a session cap, ATTACH cannot; ATTACH can
+/// be handed an unparseable id, OPEN cannot.
+pub const AttachFailed = struct {
+    /// A STABLE MACHINE TOKEN from `Reason` below, never prose (see
+    /// `OpenFailed.reason` for why the wording lives on the client).
+    reason: []const u8,
+
+    /// Free-form supporting text, shown verbatim after the sentence. Optional.
+    detail: ?[]const u8 = null,
+
+    /// The `reason` vocabulary. Additive: an older client renders the generic
+    /// sentence for a token it does not recognize, so new ones never need a
+    /// capability of their own.
+    ///
+    /// Note the absences. `session_not_found`, `session_ended` and
+    /// `attached_elsewhere` are NOT here: the agent answers all three with an
+    /// ordinary `ATTACHED` carrying the matching `AttachStatus`, immediately,
+    /// and it has done so since long before this frame existed. They are
+    /// reasons a USER sees — `termio/attach_failed_notice.zig` names them from
+    /// that status — not reasons that need a wire frame.
+    pub const Reason = struct {
+        /// The `ATTACH` payload did not parse.
+        pub const malformed_request = "malformed_request";
+        /// The agent will not take on another attachment right now.
+        pub const attach_refused = "attach_refused";
+    };
+};
+
+/// A caller-owned, fixed-size copy of an `OPEN_FAILED` / `ATTACH_FAILED`
+/// payload — the `{reason, detail}` pair either frame carries.
 ///
 /// Why a copy and not the parsed value: the refusal has to outlive the frame
 /// (the connection frees the payload as soon as the parked RPC caller returns)
 /// and cross into the termio backend, which paints it into the pane after
 /// bring-up has already failed. A Zig error carries no payload, so the reason
-/// travels beside `error.OpenRefused` in a caller-provided struct rather than
-/// in a heap allocation somebody has to remember to free on every error path.
+/// travels beside `error.OpenRefused`/`error.AttachRefused` in a
+/// caller-provided struct rather than in a heap allocation somebody has to
+/// remember to free on every error path.
 ///
 /// Over-long fields are TRUNCATED, never rejected: a refusal that arrives with
 /// a 4 KB detail is still a refusal, and losing the tail of the detail is
 /// strictly better than degrading back to a blank pane.
-pub const OpenFailedCopy = struct {
+pub const RefusalCopy = struct {
     pub const reason_max = 40;
     pub const detail_max = 160;
 
@@ -823,25 +909,29 @@ pub const OpenFailedCopy = struct {
     detail_buf: [detail_max]u8 = undefined,
     detail_len: usize = 0,
 
-    pub fn reason(self: *const OpenFailedCopy) []const u8 {
+    pub fn reason(self: *const RefusalCopy) []const u8 {
         return self.reason_buf[0..self.reason_len];
     }
 
     /// Null when the peer sent no detail (or an empty one), so a caller can
     /// tell "nothing to add" from "added an empty string".
-    pub fn detail(self: *const OpenFailedCopy) ?[]const u8 {
+    pub fn detail(self: *const RefusalCopy) ?[]const u8 {
         if (self.detail_len == 0) return null;
         return self.detail_buf[0..self.detail_len];
     }
 
-    pub fn set(self: *OpenFailedCopy, v: OpenFailed) void {
-        self.reason_len = @min(v.reason.len, reason_max);
-        @memcpy(self.reason_buf[0..self.reason_len], v.reason[0..self.reason_len]);
-        const d = v.detail orelse "";
+    pub fn set(self: *RefusalCopy, reason_in: []const u8, detail_in: ?[]const u8) void {
+        self.reason_len = @min(reason_in.len, reason_max);
+        @memcpy(self.reason_buf[0..self.reason_len], reason_in[0..self.reason_len]);
+        const d = detail_in orelse "";
         self.detail_len = @min(d.len, detail_max);
         @memcpy(self.detail_buf[0..self.detail_len], d[0..self.detail_len]);
     }
 };
+
+/// The pre-T657 name for `RefusalCopy`, from when a refused OPEN was the only
+/// thing that carried one. Kept so an out-of-tree reference still resolves.
+pub const OpenFailedCopy = RefusalCopy;
 
 /// `ATTACH` (0x03). `last_byte_offset` anchors the sequence-anchored resync
 /// (§7.3): the agent gap-fills `(last_byte_offset, snapshot_offset]`.
@@ -2053,6 +2143,73 @@ test "negotiate: open_failed capability is the intersection of both HELLOs" {
     }
 }
 
+test "negotiate: attach_failed capability is the intersection of both HELLOs" {
+    const both = [_][]const u8{capability.attach_failed};
+    const other = [_][]const u8{capability.open_failed};
+
+    // Both advertise → the agent may answer an unanswerable ATTACH.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.attach_failed);
+    }
+    // Either side missing → disabled, in BOTH directions: 0x07 is a fatal
+    // framing error to a peer that does not know it, and a new app must not
+    // expect a frame an old agent will never send. Note the `other` set here
+    // is `open_failed` — the two gates are independent, and negotiating one
+    // must never imply the other.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+        );
+        try testing.expect(!n.attach_failed);
+        try testing.expect(!n.open_failed);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.attach_failed);
+    }
+    // Neither: the pre-change world.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.attach_failed);
+    }
+}
+
+test "AttachFailed: round-trips, and an unknown reason from a newer agent parses" {
+    const alloc = testing.allocator;
+
+    const json = try encodeJson(alloc, AttachFailed{
+        .reason = AttachFailed.Reason.malformed_request,
+        .detail = "UnexpectedEndOfInput",
+    });
+    defer alloc.free(json);
+
+    var parsed = try parseJson(AttachFailed, alloc, json);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("malformed_request", parsed.value.reason);
+    try testing.expectEqualStrings("UnexpectedEndOfInput", parsed.value.detail.?);
+
+    const bare = try encodeJson(alloc, AttachFailed{ .reason = AttachFailed.Reason.attach_refused });
+    defer alloc.free(bare);
+    var p2 = try parseJson(AttachFailed, alloc, bare);
+    defer p2.deinit();
+    try testing.expect(p2.value.detail == null);
+
+    var p3 = try parseJson(AttachFailed, alloc, "{\"reason\":\"attach_cap\",\"unknown\":1}");
+    defer p3.deinit();
+    try testing.expectEqualStrings("attach_cap", p3.value.reason);
+}
+
 test "OpenFailed: round-trips, and an absent detail stays absent" {
     const alloc = testing.allocator;
 
@@ -2083,25 +2240,33 @@ test "OpenFailed: round-trips, and an absent detail stays absent" {
     try testing.expectEqualStrings("quota_exceeded", p3.value.reason);
 }
 
-test "OpenFailedCopy: copies, reports an empty detail as null, and truncates" {
-    var c: OpenFailedCopy = .{};
-    c.set(.{ .reason = "session_cap", .detail = "live=2/2" });
+test "RefusalCopy: copies, reports an empty detail as null, and truncates" {
+    var c: RefusalCopy = .{};
+    c.set("session_cap", "live=2/2");
     try testing.expectEqualStrings("session_cap", c.reason());
     try testing.expectEqualStrings("live=2/2", c.detail().?);
 
     // Empty and absent details are indistinguishable to a reader, on purpose.
-    c.set(.{ .reason = "spawn_failed" });
+    c.set("spawn_failed", null);
     try testing.expect(c.detail() == null);
-    c.set(.{ .reason = "spawn_failed", .detail = "" });
+    c.set("spawn_failed", "");
     try testing.expect(c.detail() == null);
 
     // Over-long fields truncate rather than fail — a refusal with a huge detail
     // is still a refusal, and a truncated tail beats a blank pane.
-    const long_reason = "r" ** (OpenFailedCopy.reason_max + 17);
-    const long_detail = "d" ** (OpenFailedCopy.detail_max + 400);
-    c.set(.{ .reason = long_reason, .detail = long_detail });
-    try testing.expectEqual(OpenFailedCopy.reason_max, c.reason().len);
-    try testing.expectEqual(OpenFailedCopy.detail_max, c.detail().?.len);
+    const long_reason = "r" ** (RefusalCopy.reason_max + 17);
+    const long_detail = "d" ** (RefusalCopy.detail_max + 400);
+    c.set(long_reason, long_detail);
+    try testing.expectEqual(RefusalCopy.reason_max, c.reason().len);
+    try testing.expectEqual(RefusalCopy.detail_max, c.detail().?.len);
+
+    // The same carrier serves an ATTACH refusal — that is the whole reason it
+    // stopped being named after OPEN (T657).
+    c.set(AttachFailed.Reason.malformed_request, "InvalidCharacter");
+    try testing.expectEqualStrings("malformed_request", c.reason());
+    try testing.expectEqualStrings("InvalidCharacter", c.detail().?);
+    // ...and the old name still resolves to it.
+    try testing.expectEqual(RefusalCopy, OpenFailedCopy);
 }
 
 test "negotiate: close_session capability is the intersection of both HELLOs" {

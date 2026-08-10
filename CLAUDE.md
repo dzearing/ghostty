@@ -1193,6 +1193,41 @@ times, in turn, for panes that were never coming.
 - Acceptance: `test/win32/agent-open-refused.ps1` (control / fast refusal /
   skew).
 
+**And a pane that cannot RE-JOIN its session says why too** (T657) — the resume
+half, which is the one a user meets after a reboot, an app upgrade, or picking a
+session out of the chooser. It used to arrive at the pane as a bare
+`error.RemoteAttachFailed` and paint the same "exhausting a system resource"
+text. It is two mechanisms, split by what each can carry, and the split is the
+design:
+
+- **The reason for `not_found` / `dead` / `attached_elsewhere` is derived on the
+  CLIENT** from the `AttachStatus` the agent already sends. Those are complete
+  answers that arrive in milliseconds and have on every agent that ever shipped,
+  so the sentence needs **no capability and no wire change** and works against an
+  agent of any age. Mapping: `src/termio/attach_failed_notice.zig` (pure,
+  asserted in the none lane), out through the same `Backend.bringUpNotice()`
+  seam. Deliberately NOT re-stated on the wire: two spellings of one fact across
+  a compatibility boundary is what the agent contract exists to prevent, and it
+  would strand every caller that reads `AttachOutcome.status` (the chooser,
+  Restore All) behind a new error.
+- **`ATTACH_FAILED` (0x07, `{reason, detail}`) covers only what `ATTACHED`
+  cannot express** — today a payload the agent could not parse, which was the
+  one genuinely silent ATTACH path and did cost the client the full 10 s.
+  Capability-gated on `attach_failed` for the same fatal-framing reason as 0x06,
+  degrading in both skew directions to exactly the pre-T657 silence-then-timeout.
+  Client entry point: `Connection.attachChannelRefusable` → `error.AttachRefused`
+  with a `protocol.RefusalCopy` (the verb-neutral rename of `OpenFailedCopy`,
+  now that both refusals share it).
+- **Reachability needed a seam**, for the reason T469's two did. The win32
+  launch restore probes the agent's roster first and gives a leaf whose session
+  is not listed a null id, so it OPENs fresh rather than ATTACHing (T89g) —
+  which leaves this failure to the case where the probe DID NOT LAND (a slow or
+  wedged agent past `restore_probe_timeout_ns`). `GHOZTTY_RESTORE_PROBE_UNKNOWN=1`
+  forces that liveness tri-state to UNKNOWN and changes nothing else, so the
+  branch is reproducible instead of racy. Unset in every real launch.
+- Acceptance: `test/win32/agent-attach-refused.ps1` (live-restore control /
+  fast named refusal / the same message against a suppressed capability).
+
 **A launch command and a restore both happen.** `ghoztty -e <cmd…>` (or a
 `command`/`initial-command` in the config) asked for something on THIS launch;
 the windows restore rebuilds are what the user left behind. Neither silently
