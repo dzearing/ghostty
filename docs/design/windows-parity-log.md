@@ -14327,3 +14327,60 @@ PowerShell's own calendar, not by the code under test. Teeth-checked with
 the C/D/E status arms go red (8 failures) and nothing else moves. 13 unit tests
 in the `none` lane, teeth-checked there too by breaking one assertion and
 watching the lane name it. Floor lanes and P1-P3 green.
+
+## 2026-08-10 — the screenshot picker can now be driven entirely from the keyboard (T671)
+
+Taking a screenshot into a feedback report used to require a mouse. The chord
+that starts one (Ctrl+Shift+S) worked from the keyboard and then put up a
+picker whose only key was Escape — which is worse than having no chord at all,
+because it promises a keyboard path and does not have one. Now:
+
+- **Arrows** move a caret, starting in the middle of the monitor you are on.
+- **Ctrl+arrow** steps 32 px, so crossing a 4K screen is ~120 presses instead
+  of ~3800. A coarse step is what makes the 1 px one usable, not a luxury on
+  top of it.
+- **Enter** pins the first corner; **Enter** again captures. That is the whole
+  gesture in one key, which is why nothing here needs a chord.
+- **Shift+arrow** does both in one press, anchoring at the caret it leaves.
+- **Escape** still cancels, and a pinned corner with no area is still a cancel
+  rather than a zero-pixel picture.
+
+Three decisions worth keeping:
+
+**A plain arrow never destroys a selection.** Once a corner is pinned, arrows
+resize from it exactly as dragging does. Collapsing it the way a text caret
+does would mean losing a rectangle you spent thirty presses framing, and there
+is no undo anywhere in this gesture.
+
+**The caret and the size are ANNOUNCED, not just drawn.** The live readout —
+`3843,1080  160x96  ·  Enter to capture  ·  Esc to cancel` — goes into the hint
+card *and* into the window's text, which is the name assistive tech reads. It
+also helps mouse users hit an exact size, which is why the card now shows it
+during a drag too. The card is measured once from the longest line it can ever
+show, so it does not re-center itself sideways while the number that is moving
+it is being read.
+
+**Modifiers are tracked from the key messages, not read from the OS.** Same
+reason coordinates come from `lparam` (T647): a posted message carries no key
+state, so a `GetKeyState` Shift would be unreachable from the acceptance
+harness and therefore untested. `begin` seeds the pair once from the creating
+thread, because Ctrl+Shift+S is itself a chord still held when the overlay
+appears. Space was deliberately left alone even though it is the obvious Enter
+alias — it is the key Mac's `screencapture -i` uses to switch to picking a
+whole window, which is T670's subject, and a binding is far worse to take away
+than never to have shipped. Noted in T670.
+
+Evidence: `test/win32/viewer-feedback-capture.ps1` ALL PASS (63 checks), 20 of
+them new, driven with posted `WM_KEYDOWN`/`WM_KEYUP` and **no mouse message of
+any kind** — three plain arrows move the caret three pixels, Shift+Ctrl+arrows
+select exactly 160x96, Escape cancels out of that state, and Enter captures a
+`160x96` PNG at the announced origin which lands as an `[Image #1]` chip. Its
+oracle is the overlay's own window text read back with `WM_GETTEXT`, which is
+the announcement itself rather than a test-only side channel; it read
+`3840,1080` → `3843,1080` → `3843,1080  160x96` across the arm, so it demonstrably
+tracks rather than answering a constant. 17 unit tests in `region_select.zig`
+cover the pure half (step sizes, clamping — far edge inclusive, so the last
+column is selectable — Shift-extend, the caret box at 1.0/1.25/1.5/2.0, and
+that every status line fits the card's template). Floor lanes and P1-P3 green.
+Filed T706: the caret starts on the *pointer's* monitor, which says nothing
+about where a keyboard-only user is looking.

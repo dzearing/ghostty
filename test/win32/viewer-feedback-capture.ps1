@@ -17,6 +17,16 @@
 #   G. The captured picture reaches the report at the size that was dragged --
 #      the end-to-end oracle for the crop math, read out of report.json's
 #      pixelWidth/pixelHeight.
+#   H. THE KEYBOARD DRIVES THE WHOLE GESTURE (T671), with no mouse message of
+#      any kind: arrows aim, Ctrl+arrow takes a coarse step, Shift+arrow starts
+#      the selection, Escape cancels out of a keyboard-driven state, and Enter
+#      captures a rect of exactly the predicted size.
+#
+#      Its oracle is the overlay's own WINDOW TEXT, which the selector keeps as
+#      a live readout of the caret and the selection. That is not a test hook:
+#      it is the window's accessible name, the half of "announce the selection"
+#      a screen reader can reach, and it happens to be the one handle a
+#      background-desktop script has on text that is otherwise only painted.
 #
 # ORACLES. This runs on the BACKGROUND test desktop, where SendInput and
 # CopyFromScreen are dead (T233), so nothing here looks at painted pixels and
@@ -159,6 +169,20 @@ function Wait-FeedbackOpen($errlog, $paneId) {
     return $false
 }
 
+# A send leaves its "Filed ..." confirmation up for 1.8s and THEN closes the
+# composer itself. Anything that re-opens the composer has to wait that out
+# first: a click landing inside the confirmation toggles the composer CLOSED,
+# and every arm after it then drives a window the user can no longer see (the
+# clicks still land, because a posted message skips hit testing).
+function Wait-FeedbackClosed($errlog, $paneId) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $s = Get-FeedbackState $errlog $paneId
+        if ($s -and -not $s.Open) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+
 # Counts of the three capture outcomes the app reports, so an arm can assert
 # "one MORE cancel happened" rather than "a cancel exists somewhere in the log".
 function Get-CaptureTally($errlog) {
@@ -213,6 +237,53 @@ function Wait-Image($errlog, $paneId, [int]$Number) {
         Start-Sleep -Milliseconds 250
     }
     return (Get-LastImage $errlog $paneId)
+}
+
+# The overlay's live readout, read with WM_GETTEXT so the answer comes from the
+# app rather than from a cross-process cache. DefWindowProcW serves it out of
+# the same window text SetWindowTextW stored, which is also what a screen reader
+# announces -- so this asserts the ANNOUNCEMENT, not a test-only side channel.
+function Get-Status($overlay) {
+    if (-not $overlay) { return '' }
+    return [string](Get-TestControlText $overlay)
+}
+
+# Wait for the readout to match, then hand back the leading "x,y" pair it always
+# starts with. Returns $null if it never matches.
+function Wait-Status($overlay, [string]$Pattern) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $s = Get-Status $overlay
+        if ($s -match $Pattern) {
+            if ($s -match '^(-?\d+),(-?\d+)') {
+                return [pscustomobject]@{ X = [int]$Matches[1]; Y = [int]$Matches[2]; Text = $s }
+            }
+            return [pscustomobject]@{ X = 0; Y = 0; Text = $s }
+        }
+        Start-Sleep -Milliseconds 125
+    }
+    return $null
+}
+
+# Post a run of key presses to the selector, optionally with modifiers held
+# across the whole run.
+#
+# The modifiers are POSTED as their own VK_SHIFT/VK_CONTROL key messages rather
+# than faked into the key state, because that is how the selector reads them --
+# a posted message carries no key state at all, so a GetKeyState-based modifier
+# would be unreachable from here (and therefore untested).
+function Send-TestSelectKeys($overlay, [int[]]$Keys, [switch]$Shift, [switch]$Ctrl) {
+    $down = 0x0100
+    $up = 0x0101
+    if ($Shift) { [void](Send-TestRawMessage -Window $overlay -Message $down -WParam ([IntPtr]0x10)) }
+    if ($Ctrl) { [void](Send-TestRawMessage -Window $overlay -Message $down -WParam ([IntPtr]0x11)) }
+    foreach ($k in $Keys) {
+        [void](Send-TestRawMessage -Window $overlay -Message $down -WParam ([IntPtr]$k))
+        [void](Send-TestRawMessage -Window $overlay -Message $up -WParam ([IntPtr]$k))
+        Start-Sleep -Milliseconds 40
+    }
+    if ($Ctrl) { [void](Send-TestRawMessage -Window $overlay -Message $up -WParam ([IntPtr]0x11)) }
+    if ($Shift) { [void](Send-TestRawMessage -Window $overlay -Message $up -WParam ([IntPtr]0x10)) }
+    Start-Sleep -Milliseconds 150
 }
 
 function Get-Overlay($appPid) {
@@ -443,6 +514,104 @@ try {
             "...at the size that was dragged ($($arr[0].pixelWidth)x$($arr[0].pixelHeight), want 160x120)"
         Assert ($report.body -match '!\[Image #1\]\(images/image-1\.png\)') `
             'the body links the screenshot as a markdown image reference'
+    }
+
+    # --- H. the keyboard drives the selector, with no mouse at all -----------
+    # Placed after G on purpose: the send resets the composer's image numbering,
+    # so this capture is #1 again and its assertions do not depend on how many
+    # pictures ran before it.
+    Assert (Wait-FeedbackClosed $errlog $paneId) 'the send closes the composer behind its confirmation'
+    Assert (Invoke-FeedbackButton $view) 'the nav bar re-opens the composer for the keyboard arms'
+    Assert (Wait-FeedbackOpen $errlog $paneId) '...and the pane reports it OPEN again'
+    $fb = $null
+    for ($t = 0; $t -lt 20; $t++) {
+        $fb = Get-ChromeChild $view.Pane 'GhozttyViewerFeedback'
+        if ($fb) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert ($null -ne $fb) '...and the composer window is back'
+    $rich = $null
+    if ($fb) {
+        foreach ($c in @(Get-TestChildWindows -Window $fb -Class $null)) {
+            if ([string]$c.Class -eq 'RichEdit50W') { $rich = [IntPtr]$c.Hwnd; break }
+        }
+    }
+
+    if ($fb) {
+        Assert (Invoke-SnapshotButton $view $fb) 'the + button opens a selector for the keyboard'
+        $overlay = Wait-Overlay $appPid $true
+        Assert ($null -ne $overlay) '...and the overlay is up'
+
+        # The caret starts in the middle of the monitor the user is on, which
+        # this script cannot predict - so it READS it, which is the point.
+        $start = Wait-Status $overlay '^(-?\d+),(-?\d+)\s'
+        Assert ($null -ne $start) "the overlay announces its caret position (says '$(Get-Status $overlay)')"
+
+        if ($start) {
+            # Three plain arrows: the FINE step is one pixel, and the readout
+            # follows it. A step that silently moved 8 px would pass a
+            # size-only assertion and fail here.
+            Send-TestSelectKeys $overlay @(0x27, 0x27, 0x27)
+            $aimed = Wait-Status $overlay ("^" + ([int]$start.X + 3) + "," + [int]$start.Y + "\s")
+            Assert ($null -ne $aimed) `
+                "three arrows move the caret three pixels (want $([int]$start.X + 3),$($start.Y); says '$(Get-Status $overlay)')"
+
+            # Shift+Ctrl+arrows: the selection starts at the caret being left
+            # behind and grows a coarse step at a time. 5 right + 3 down = 160x96.
+            Send-TestSelectKeys $overlay @(0x27, 0x27, 0x27, 0x27, 0x27, 0x28, 0x28, 0x28) -Shift -Ctrl
+            $ox = [int]$start.X + 3
+            $oy = [int]$start.Y
+            $sized = Wait-Status $overlay ("^" + $ox + "," + $oy + "\s+160x96\s")
+            Assert ($null -ne $sized) `
+                "Shift+Ctrl+arrows select exactly 160x96 at $ox,$oy (says '$(Get-Status $overlay)')"
+
+            # Escape out of that state: a keyboard-driven selection cancels the
+            # same way a dragged one does.
+            $before = (Get-CaptureTally $errlog).Cancel
+            [void](Send-TestRawMessage -Window $overlay -Message 0x0100 -WParam ([IntPtr]0x1B))
+            $tally = Wait-Tally $errlog 'Cancel' ($before + 1)
+            Assert ($tally.Cancel -ge $before + 1) `
+                "Escape cancels a keyboard-driven selection (cancel=$($tally.Cancel))"
+            Assert ($null -eq (Wait-Overlay $appPid $false)) '...and the overlay is gone'
+
+            # And now the same gesture, finished with Enter.
+            $doneBefore = (Get-CaptureTally $errlog).Done
+            Assert (Invoke-SnapshotButton $view $fb) 'the + button opens one last selector'
+            $overlay = Wait-Overlay $appPid $true
+            Assert ($null -ne $overlay) '...and the overlay is up for the keyboard capture'
+            $start2 = Wait-Status $overlay '^(-?\d+),(-?\d+)\s'
+            Assert ($null -ne $start2) '...announcing a fresh caret'
+
+            if ($start2) {
+                Send-TestSelectKeys $overlay @(0x27, 0x27, 0x27)
+                Send-TestSelectKeys $overlay @(0x27, 0x27, 0x27, 0x27, 0x27, 0x28, 0x28, 0x28) -Shift -Ctrl
+                $ox2 = [int]$start2.X + 3
+                $oy2 = [int]$start2.Y
+                Assert ($null -ne (Wait-Status $overlay ("^" + $ox2 + "," + $oy2 + "\s+160x96\s"))) `
+                    "the readout tracks the keyboard capture too ($ox2,$oy2 160x96)"
+
+                [void](Send-TestRawMessage -Window $overlay -Message 0x0100 -WParam ([IntPtr]0x0D))
+                $tally = Wait-Tally $errlog 'Done' ($doneBefore + 1)
+                Assert ($tally.Done -ge $doneBefore + 1) `
+                    "Enter captures from the keyboard (done=$($tally.Done))"
+                Assert ($tally.Rect -and $tally.Rect.W -eq 160 -and $tally.Rect.H -eq 96) `
+                    "...at exactly the keyed size ($($tally.Rect.W)x$($tally.Rect.H), want 160x96)"
+                Assert ($tally.Rect -and $tally.Rect.X -eq $ox2 -and $tally.Rect.Y -eq $oy2) `
+                    "...and at the announced origin ($($tally.Rect.X),$($tally.Rect.Y), want $ox2,$oy2)"
+                Assert ($null -eq (Wait-Overlay $appPid $false)) '...and the overlay came down'
+
+                if ($rich) {
+                    $ktext = $null
+                    for ($t = 0; $t -lt 20; $t++) {
+                        $ktext = (Get-TestControlText $rich)
+                        if ($ktext -match '\[Image #1\]') { break }
+                        Start-Sleep -Milliseconds 250
+                    }
+                    Assert ($ktext -match '\[Image #1\]') `
+                        "the keyboard capture attaches a chip (composer holds '$ktext')"
+                }
+            }
+        }
     }
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'

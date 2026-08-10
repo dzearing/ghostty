@@ -42,6 +42,31 @@
 //! `SendInput` is dead (T233), so a drag has to be postable. `PostMessageW` of
 //! `WM_LBUTTONDOWN` / `WM_MOUSEMOVE` / `WM_LBUTTONUP` (and `WM_KEYDOWN`
 //! `VK_ESCAPE`) is a complete script for this window.
+//!
+//! ## The keyboard (T671)
+//!
+//! That property is also what makes a real keyboard path possible, so the
+//! selector has one: arrows move a caret, Ctrl+arrow moves it 32 px at a time,
+//! Enter pins the first corner and Enter again captures, Shift+arrow is the
+//! shortcut that does both in one press, and Escape still cancels. Space is
+//! left alone on purpose — it is what Mac's `screencapture -i` uses to switch
+//! to picking a whole window, which is T670. The rules
+//! are pure (`region_select.zig`: `moveCaret` / `dropAnchor`), so the keyboard
+//! and the mouse drive the SAME `anchor`/`cursor` pair and can be interleaved.
+//!
+//! Modifiers are tracked from the `WM_KEYDOWN`/`WM_KEYUP` of `VK_SHIFT` and
+//! `VK_CONTROL` rather than read with `GetKeyState`, for the reason above: a
+//! posted message carries no key state, so a `GetKeyState`-based Shift would be
+//! unreachable from the harness and therefore untested. The one thing tracking
+//! cannot see is a modifier that was ALREADY down when the overlay appeared —
+//! Ctrl+Shift+S is exactly that — so `begin` seeds the pair once from the
+//! creating thread's own queue state, and every release after that is an
+//! ordinary `WM_KEYUP`.
+//!
+//! What the caret is doing is ANNOUNCED as well as drawn: the live position and
+//! selection size go into the hint card AND into the window's text, which is
+//! the name assistive tech reads (and, not by accident, the only oracle a
+//! background-desktop script has for painted text).
 
 const RegionSelector = @This();
 
@@ -64,8 +89,10 @@ const ui_face = std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face);
 /// than from the middle of the mouse message that ended the drag.
 const WM_APP_FINISH: u32 = w32.WM_APP + 7;
 
-/// What the overlay says while nothing is selected yet.
-const hint_text = "Drag to capture  ·  Esc to cancel";
+/// What the overlay says before the caret has been placed or anything dragged —
+/// the only status line that names both input devices, because it is the one a
+/// user reads before choosing one.
+const hint_text = "Drag, or arrows then Enter  ·  Esc to cancel";
 
 /// Called exactly once per selector, with the captured PNG or null when the
 /// user cancelled. The bytes belong to the SELECTOR and are freed as soon as
@@ -83,14 +110,37 @@ snap: screen_capture.Snapshot,
 /// The same picture, darkened. Owned here; `deinit` frees both.
 dim: w32.HANDLE,
 
-/// Where the drag started, in client (= snapshot buffer) coordinates. Null
-/// until the button goes down.
+/// The selection's pinned corner, in client (= snapshot buffer) coordinates.
+/// Null until the button goes down (or Enter pins one).
 anchor: ?region.Point = null,
-/// Where the pointer is now. Only meaningful while `anchor` is set.
+/// Where the pointer — or the keyboard's caret — is now. Seeded to the middle
+/// of the home monitor so the keyboard path starts somewhere sensible; the
+/// first mouse press overwrites it.
 cursor: region.Point = .{ .x = 0, .y = 0 },
 /// The selection painted last, so a mouse-move can invalidate the OLD rect as
 /// well as the new one instead of the whole desktop.
 painted: ?region.Rect = null,
+
+/// Which modifiers are held, tracked from key messages rather than read from
+/// the OS — see the header. Seeded once in `begin` so a chord that was still
+/// held when the overlay appeared is not missed.
+mods: region.Mods = .{},
+
+/// Whether the mouse was captured, so `finish` releases only what it took.
+captured: bool = false,
+
+/// Whether the keyboard has driven the caret yet. The caret mark is drawn only
+/// once it has, so a pure mouse capture paints exactly what it always did.
+keyboard: bool = false,
+
+/// The caret position painted last, for the same reason `painted` exists.
+painted_caret: ?region.Point = null,
+
+/// The live status line — the hint card's text and the window's accessible
+/// name. Held so a repaint does not have to recompute it and so an unchanged
+/// line does not re-set the window text.
+status_buf: [region.status_max]u8 = undefined,
+status_len: usize = 0,
 
 /// The monitor the pointer was on when the capture began, in client
 /// coordinates — where the hint card goes.
@@ -180,6 +230,7 @@ pub fn begin(
     };
 
     const b = snap.bounds;
+    const home = homeMonitor(b);
     self.* = .{
         .alloc = alloc,
         .hwnd = undefined,
@@ -187,8 +238,14 @@ pub fn begin(
         .on_done = on_done,
         .snap = snap,
         .dim = dim,
-        .home = homeMonitor(b),
+        .home = home,
         .scale = scale,
+        .cursor = region.caretStart(home),
+        // The ONE place this reads the OS's key state, and only because the
+        // keys that opened the overlay were pressed before it existed: a chord
+        // (Ctrl+Shift+S) is still held here, and its releases will arrive as
+        // ordinary WM_KEYUPs once this window has focus.
+        .mods = .{ .shift = keyDown(w32.VK_SHIFT), .ctrl = keyDown(w32.VK_CONTROL) },
     };
 
     // WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt-Tab; it is a modal
@@ -233,6 +290,7 @@ pub fn begin(
         ui_face,
     );
     self.measureHint();
+    self.refreshStatus();
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.SetForegroundWindow(hwnd);
@@ -340,17 +398,69 @@ fn selection(self: *const RegionSelector) ?region.Rect {
 /// Repaint just what moved: the rect that was drawn last and the one that
 /// replaces it, each grown by the outline so its two-pixel edge is included.
 ///
-/// Plus the hint card whenever it changes state. The card is drawn only while
-/// there is no selection, and `WM_PAINT` only ever touches the rect it was
-/// asked for — so a card whose rect nobody invalidates stays on screen
-/// underneath the drag it was telling the user to make.
+/// `WM_PAINT` only ever touches the rect it was asked for, so anything that
+/// stops being drawn has to be invalidated by whatever stopped drawing it —
+/// which is why the caret and the hint card have their own versions of this.
 fn invalidateSelection(self: *RegionSelector, next: ?region.Rect) void {
-    if ((self.painted == null) != (next == null)) self.invalidate(self.hint_rect, 0);
     const grow = region.px(region.border_dip, self.scale) + 1;
     for ([_]?region.Rect{ self.painted, next }) |maybe| {
         self.invalidate(maybe orelse continue, grow);
     }
     self.painted = next;
+}
+
+/// The same, for the keyboard caret's mark.
+fn invalidateCaret(self: *RegionSelector, next: ?region.Point) void {
+    for ([_]?region.Point{ self.painted_caret, next }) |maybe| {
+        const p = maybe orelse continue;
+        self.invalidate(region.caretBox(p, self.scale), 1);
+    }
+    self.painted_caret = next;
+}
+
+/// The caret mark, or null when there is nothing to draw one for: before the
+/// keyboard has been used at all, and once a selection with AREA exists, whose
+/// outline already says where the caret is.
+///
+/// Keyed on the drawn selection rather than on the anchor, because a pinned
+/// corner with nothing dragged off it yet draws no outline — and a user who
+/// presses Enter and watches the only mark on screen disappear has been told
+/// their keypress broke something.
+fn caretMark(self: *const RegionSelector) ?region.Point {
+    if (!self.keyboard or self.selection() != null) return null;
+    return self.cursor;
+}
+
+/// Recompute the status line, and if it changed, publish it in both places it
+/// lives: the window's text — which is what a screen reader announces and the
+/// only handle a background-desktop test has on painted text — and the hint
+/// card, which has to be invalidated by hand for the reason above.
+///
+/// Coordinates are rebased to the VIRTUAL SCREEN, so the numbers match what
+/// every other tool on the desktop would report for the same pixel.
+fn refreshStatus(self: *RegionSelector) void {
+    var buf: [region.status_max]u8 = undefined;
+    const origin = self.snap.bounds;
+    const sel: ?region.Rect = if (self.selection()) |r| .{
+        .x = r.x + origin.x,
+        .y = r.y + origin.y,
+        .w = r.w,
+        .h = r.h,
+    } else null;
+    const next = region.statusText(&buf, .{
+        .x = self.cursor.x + origin.x,
+        .y = self.cursor.y + origin.y,
+    }, sel);
+    if (std.mem.eql(u8, next, self.status_buf[0..self.status_len])) return;
+
+    @memcpy(self.status_buf[0..next.len], next);
+    self.status_len = next.len;
+
+    var wide: [region.status_max + 1]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, next) catch return;
+    wide[n] = 0;
+    _ = w32.SetWindowTextW(self.hwnd, wide[0..n :0]);
+    self.invalidate(self.hint_rect, 0);
 }
 
 fn invalidate(self: *RegionSelector, r: region.Rect, grow: i32) void {
@@ -367,6 +477,12 @@ fn invalidate(self: *RegionSelector, r: region.Rect, grow: i32) void {
 /// Measure the hint card once, at creation, into `hint_rect`. Measured rather
 /// than assumed because the card is sized to its TEXT, and the text is measured
 /// in whatever face and size the type ramp resolved to at this scale.
+///
+/// Measured from the TEMPLATE rather than from the line currently showing: the
+/// status line changes on every mouse move and every arrow press, and a card
+/// that resized with it would re-center itself sideways a few pixels at a time
+/// while the user is trying to read the number that is moving it. One fixed box,
+/// text centered inside.
 fn measureHint(self: *RegionSelector) void {
     const hdc = w32.GetDC(self.hwnd) orelse return;
     defer _ = w32.ReleaseDC(self.hwnd, hdc);
@@ -375,8 +491,8 @@ fn measureHint(self: *RegionSelector) void {
         _ = w32.SelectObject(hdc, old_font);
     };
 
-    var buf: [128]u16 = undefined;
-    const n = std.unicode.utf8ToUtf16Le(&buf, hint_text) catch return;
+    var buf: [region.status_max]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, region.status_template) catch return;
     var size: w32.SIZE = .{ .cx = 0, .cy = 0 };
     if (w32.GetTextExtentPoint32W(hdc, &buf, @intCast(n), &size) == 0) return;
     self.hint_rect = region.hintBox(self.home, self.scale, size.cx, size.cy);
@@ -407,10 +523,46 @@ fn paint(self: *RegionSelector, hdc: w32.HDC, clip: w32.RECT) void {
         _ = w32.BitBlt(hdc, sel.x, sel.y, sel.w, sel.h, mem, sel.x, sel.y, w32.SRCCOPY);
         _ = w32.SelectObject(mem, old_snap);
         self.drawOutline(hdc, sel);
-        return;
+    } else if (self.caretMark()) |p| {
+        self.drawCaret(hdc, p);
     }
 
+    // Last, so it is on top of a selection it overlaps — and always, because it
+    // is now a live readout of where the caret is and how big the selection is,
+    // not a one-off instruction that stops being true.
     self.drawHint(hdc);
+}
+
+/// The keyboard caret: a small cross, white over black, for the same
+/// any-wallpaper contrast reason the selection outline is two colours.
+///
+/// It exists because arrows that move nothing visible are arrows that appear
+/// not to work. It is drawn only while the keyboard is aiming and nothing is
+/// selected yet, so a mouse-only capture paints exactly what it always did.
+fn drawCaret(self: *RegionSelector, hdc: w32.HDC, p: region.Point) void {
+    const t = region.px(region.border_dip, self.scale);
+    const arm = region.px(region.caret_arm_dip, self.scale);
+    const bars = [_]region.Rect{
+        .{ .x = p.x - arm, .y = p.y - @divTrunc(t, 2), .w = 2 * arm, .h = t },
+        .{ .x = p.x - @divTrunc(t, 2), .y = p.y - arm, .w = t, .h = 2 * arm },
+    };
+    for (bars) |bar| {
+        // The black halo first, one outline thickness bigger on every side.
+        fill(hdc, .{
+            .x = bar.x - t,
+            .y = bar.y - t,
+            .w = bar.w + 2 * t,
+            .h = bar.h + 2 * t,
+        }, 0x00000000);
+    }
+    for (bars) |bar| fill(hdc, bar, 0x00FFFFFF);
+}
+
+fn fill(hdc: w32.HDC, r: region.Rect, color: u32) void {
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(@ptrCast(brush));
+    var rc: w32.RECT = .{ .left = r.x, .top = r.y, .right = r.right(), .bottom = r.bottom() };
+    _ = w32.FillRect(hdc, &rc, brush);
 }
 
 /// The selection's outline: a white inner edge over a black outer one.
@@ -458,8 +610,9 @@ fn drawHint(self: *RegionSelector, hdc: w32.HDC) void {
         _ = w32.SelectObject(hdc, old_font);
     };
 
-    var buf: [128]u16 = undefined;
-    const n = std.unicode.utf8ToUtf16Le(&buf, hint_text) catch return;
+    var buf: [region.status_max]u16 = undefined;
+    const text = if (self.status_len > 0) self.status_buf[0..self.status_len] else hint_text;
+    const n = std.unicode.utf8ToUtf16Le(&buf, text) catch return;
     const radius = region.px(region.hint_radius_dip, self.scale);
 
     // A near-black card with white text: the overlay is a dimmed desktop, so a
@@ -483,11 +636,18 @@ fn drawHint(self: *RegionSelector, hdc: w32.HDC) void {
     _ = w32.SelectObject(hdc, old_brush);
     _ = w32.SelectObject(hdc, old_pen);
 
+    // Centered in the fixed card rather than pinned to its padding: the card is
+    // sized to the widest line this can ever show (`measureHint`), so a shorter
+    // one left-aligned would hang off toward an empty right half.
+    var size: w32.SIZE = .{ .cx = card.w - 2 * region.px(region.hint_pad_x_dip, self.scale), .cy = 0 };
+    _ = w32.GetTextExtentPoint32W(hdc, &buf, @intCast(n), &size);
+    const x = card.x + @max(region.px(region.hint_pad_x_dip, self.scale), @divTrunc(card.w - size.cx, 2));
+
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
     _ = w32.SetTextColor(hdc, 0x00FFFFFF);
     _ = w32.TextOutW(
         hdc,
-        card.x + region.px(region.hint_pad_x_dip, self.scale),
+        x,
         card.y + region.px(region.hint_pad_y_dip, self.scale),
         &buf,
         @intCast(n),
@@ -496,10 +656,99 @@ fn drawHint(self: *RegionSelector, hdc: w32.HDC) void {
 
 // --------------------------------------------------------------------- input
 
+/// Whether `vk` is held right now, as far as the thread dispatching this
+/// message is concerned. Called exactly once, in `begin` — see the header.
+fn keyDown(vk: u16) bool {
+    // The high bit means "down", and this is a signed 16-bit answer, so that
+    // bit IS the sign.
+    return w32.GetKeyState(@intCast(vk)) < 0;
+}
+
+/// One key transition. Modifiers are remembered; everything else acts.
+///
+/// Both edges matter: without the `WM_KEYUP` half, a Shift released before the
+/// next arrow would still be extending, which is the stuck-modifier bug every
+/// hand-rolled tracker has.
+fn key(self: *RegionSelector, vk: u16, down: bool) void {
+    switch (vk) {
+        w32.VK_SHIFT, w32.VK_LSHIFT, w32.VK_RSHIFT => {
+            self.mods.shift = down;
+            return;
+        },
+        w32.VK_CONTROL, w32.VK_LCONTROL, w32.VK_RCONTROL => {
+            self.mods.ctrl = down;
+            return;
+        },
+        else => {},
+    }
+    if (!down) return;
+
+    switch (vk) {
+        w32.VK_ESCAPE => self.finish(null),
+
+        w32.VK_LEFT, w32.VK_RIGHT, w32.VK_UP, w32.VK_DOWN => {
+            const arrow: region.Arrow = switch (vk) {
+                w32.VK_LEFT => .left,
+                w32.VK_RIGHT => .right,
+                w32.VK_UP => .up,
+                else => .down,
+            };
+            const next = region.moveCaret(self.keyState(), arrow, self.mods, .{
+                .x = 0,
+                .y = 0,
+                .w = self.snap.bounds.w,
+                .h = self.snap.bounds.h,
+            });
+            self.keyboard = true;
+            self.anchor = next.anchor;
+            self.cursor = next.caret;
+            self.applied(self.selection());
+        },
+
+        // Enter pins the first corner and captures the second — the keyboard's
+        // whole gesture in one key, so nothing here needs a chord.
+        //
+        // Deliberately NOT Space as well, however button-shaped this window is:
+        // Space is what Mac's `screencapture -i` uses to switch to picking a
+        // WINDOW, which is T670's whole subject. A binding is much worse to take
+        // away than never to have shipped.
+        w32.VK_RETURN => {
+            if (self.anchor == null) {
+                self.keyboard = true;
+                const next = region.dropAnchor(self.keyState());
+                self.anchor = next.anchor;
+                self.applied(self.selection());
+            } else {
+                // A pin with no area is a cancel, exactly as a click with no
+                // drag is — never a zero-pixel picture.
+                self.finish(self.selection());
+            }
+        },
+
+        else => {},
+    }
+}
+
+fn keyState(self: *const RegionSelector) region.KeyState {
+    return .{ .caret = self.cursor, .anchor = self.anchor };
+}
+
+/// Everything that has to happen after `anchor`/`cursor` change, in one place
+/// so the mouse path and the keyboard path cannot drift: repaint what moved,
+/// and re-announce where things now are.
+fn applied(self: *RegionSelector, sel: ?region.Rect) void {
+    self.invalidateSelection(sel);
+    self.invalidateCaret(self.caretMark());
+    self.refreshStatus();
+}
+
 fn finish(self: *RegionSelector, sel: ?region.Rect) void {
     if (self.finished) return;
     self.finished = true;
-    if (self.anchor != null) _ = w32.ReleaseCapture();
+    // Only if we took it: the keyboard path sets an anchor without ever
+    // capturing the mouse, and releasing a capture this window does not hold
+    // takes it away from whoever in this thread does.
+    if (self.captured) _ = w32.ReleaseCapture();
     // Down before the callback runs: the composer inserts a chip and repaints,
     // and a full-desktop overlay still on screen while that happens is a
     // flicker with the user's own window behind it.
@@ -585,15 +834,19 @@ fn wndProc(
             const p: region.Point = .{ .x = xOf(lparam), .y = yOf(lparam) };
             self.anchor = p;
             self.cursor = p;
+            // The pointer owns the gesture again: a caret left over from an
+            // earlier arrow press must stop being drawn.
+            self.keyboard = false;
             _ = w32.SetCapture(hwnd);
-            self.invalidateSelection(null);
+            self.captured = true;
+            self.applied(null);
             return 0;
         },
 
         w32.WM_MOUSEMOVE => {
             if (self.anchor == null) return 0;
             self.cursor = .{ .x = xOf(lparam), .y = yOf(lparam) };
-            self.invalidateSelection(self.selection());
+            self.applied(self.selection());
             return 0;
         },
 
@@ -614,10 +867,12 @@ fn wndProc(
         },
 
         w32.WM_KEYDOWN => {
-            if (wparam == w32.VK_ESCAPE) {
-                self.finish(null);
-                return 0;
-            }
+            self.key(@intCast(wparam & 0xFFFF), true);
+            return 0;
+        },
+
+        w32.WM_KEYUP => {
+            self.key(@intCast(wparam & 0xFFFF), false);
             return 0;
         },
 

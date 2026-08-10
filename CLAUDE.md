@@ -1011,6 +1011,26 @@ the queue; consuming it is separate and not built here).
   than from `GetCursorPos`, which is what lets the acceptance script POST a
   drag on a desktop where `SendInput` is dead. Acceptance:
   `test/win32/viewer-feedback-capture.ps1`.
+
+  **The region can be selected from the keyboard alone** (T671) — a chord that
+  starts a capture nobody can finish without a mouse promises a keyboard path
+  that is not there. **Arrows** move a caret (starting in the middle of the
+  monitor you are on), **Ctrl+arrow** steps 32 px so crossing a 4K screen is not
+  a marathon, **Enter** pins the first corner and **Enter** again captures,
+  **Shift+arrow** is the shortcut that does both in one press, and **Escape**
+  still cancels. Keyboard and mouse drive the SAME `anchor`/`cursor` pair
+  (`region.moveCaret` / `dropAnchor`, pure), so they interleave freely, and a
+  plain arrow never collapses a selection the way a text caret would — losing a
+  rectangle you spent thirty presses framing has no undo anywhere in the
+  gesture. Modifiers are tracked from the `WM_KEYDOWN`/`WM_KEYUP` of `VK_SHIFT`
+  and `VK_CONTROL` rather than read with `GetKeyState`, for the same reason
+  coordinates come from `lparam`: a posted message carries no key state, so a
+  `GetKeyState` Shift would be unreachable from the harness and therefore
+  untested. `begin` seeds the pair once, because Ctrl+Shift+S is itself a chord
+  still held when the overlay appears. The live caret position and selection
+  size are **announced, not just drawn**: they go into the hint card AND into
+  the window's text, which is the name assistive tech reads — and, not by
+  accident, the only oracle a background-desktop script has for painted text.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
