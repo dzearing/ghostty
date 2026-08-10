@@ -1846,7 +1846,23 @@ pub const BannerOverlay = struct {
             },
             .open_in_new_window => self.openViewerWindow(url),
             .copy => self.copyLink(url),
+            .focus_target => self.focusTarget(url),
         }
+    }
+
+    /// A `ghoztty://` link: raise the window or pane it names, in process
+    /// (T695). Never leaves the app, so a link clicked in a debug build's
+    /// banner focuses a window of THAT build rather than whichever one
+    /// registered the scheme with the shell.
+    fn focusTarget(self: *BannerOverlay, url: []const u8) void {
+        const surface = self.surface orelse return;
+        // The banner's own window owns the warning if the target is gone, so
+        // it reads as "that link failed" rather than as an app-wide problem.
+        _ = surface.app.handleUrlSchemeLink(
+            surface.parent_window.hwnd,
+            self.scale,
+            url,
+        );
     }
 
     /// What a viewer pane is pointed at. `ViewerPane` reads any

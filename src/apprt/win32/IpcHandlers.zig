@@ -83,6 +83,8 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleSetBanner(ctx, request);
     } else if (std.mem.eql(u8, request.action, "reload")) {
         return try handleReload(ctx, request);
+    } else if (std.mem.eql(u8, request.action, "focus")) {
+        return try handleFocus(ctx, request);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});
@@ -169,7 +171,11 @@ fn targetPane(entry: App.IpcTarget) ?*PaneView {
 
 /// Raise and focus the window that owns `entry` (and the pane itself for
 /// pane targets).
-fn focusTarget(entry: App.IpcTarget) void {
+///
+/// Public because the `ghoztty://` URL scheme's in-app path focuses through it
+/// too (T695) — one focus implementation, so a link and a `--target` cannot
+/// raise a window two different ways.
+pub fn focusTarget(entry: App.IpcTarget) void {
     const window = switch (entry) {
         .window => |w| w,
         .pane => |p| p.parentWindow(),
@@ -1216,6 +1222,37 @@ fn handleReload(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     view.reloadContent();
     log.info("IPC: reloaded viewer '{s}'", .{target});
+    return try ctx.alloc.dupe(u8, "{\"success\":true}");
+}
+
+/// `focus` — raise the window owning `--target` and focus the pane within it,
+/// or do nothing at all if the target names nothing currently open. The whole
+/// of what the `ghoztty://` URL scheme can do (T695; `apprt/ipc/url_scheme.zig`
+/// carries the reasoning for why that is the only verb).
+///
+/// **There is deliberately no `+focus` CLI verb**, on either platform: the Mac
+/// half reaches `IPCServer.focusTarget` straight from its LaunchServices
+/// callback, and a verb that exists on one CLI and not the other is the
+/// divergence this project does not ship. This is the wire action the Windows
+/// URL launcher sends, and nothing else calls it.
+///
+/// It never creates: a link that LAUNCHED nothing finds an empty registry and
+/// correctly answers "not found" rather than opening a window as a side effect,
+/// which would smuggle window creation back into the scheme's surface.
+fn handleFocus(ctx: Context, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try errorResponse(ctx.alloc, "--target is required for focus", .{});
+
+    const entry = ctx.app.ipcLookup(target) orelse
+        return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
+
+    focusTarget(entry);
+    log.info("IPC: focused '{s}'", .{target});
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 

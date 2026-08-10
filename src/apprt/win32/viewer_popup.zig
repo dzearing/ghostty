@@ -37,6 +37,9 @@
 
 const std = @import("std");
 
+/// The `ghoztty://` grammar (T695) — `handles` only.
+const url_scheme = @import("../ipc/url_scheme.zig");
+
 /// Where a popup goes. Mac's `ViewerView.PopupDestination`, minus the payload:
 /// the URI is already in the caller's hand there.
 pub const Destination = enum {
@@ -45,12 +48,21 @@ pub const Destination = enum {
     /// Open it as its own Ghoztty viewer window, adopting the web view so the
     /// opener↔popup relationship (and therefore `window.close()`) survives.
     ghoztty_window,
+    /// A `ghoztty://` command: run it in process and cancel the popup (T695).
+    ghoztty_command,
 };
 
 /// Decide where a popup goes. `uri` is what the runtime reported (null when it
 /// could not be read at all, which is treated as "no URL"); `ctrl_held` is the
 /// Ctrl-held escape hatch.
 pub fn destination(uri: ?[]const u8, ctrl_held: bool) Destination {
+    // A `ghoztty://` link is a command, not a destination, and it outranks the
+    // Ctrl modifier: there is nothing to put in a window. Without this it fell
+    // through the "non-web scheme ⇒ keep it here" rule below and a
+    // `target="_blank"` focus link OPENED A VIEWER WINDOW pointed at the
+    // command — window creation from the one scheme that must never create
+    // anything (T695).
+    if (uri) |u| if (url_scheme.handles(u)) return .ghoztty_command;
     if (ctrl_held) return .ghoztty_window;
     const u = uri orelse return .ghoztty_window;
     if (u.len == 0) return .ghoztty_window;
@@ -157,6 +169,36 @@ test "a popup the browser cannot be handed stays in ghoztty" {
     try testing.expectEqual(Destination.ghoztty_window, destination("ghoztty-viewer://page/", false));
     // No scheme at all is not a web URL either.
     try testing.expectEqual(Destination.ghoztty_window, destination("example.com", false));
+}
+
+test "a ghoztty:// popup is a command, not a window — under every modifier" {
+    // The bug this case exists for: it used to fall through "non-web scheme ⇒
+    // keep it in ghoztty" and open a viewer window pointed at the command
+    // string, which is window creation from the one scheme that creates
+    // nothing.
+    try testing.expectEqual(
+        Destination.ghoztty_command,
+        destination("ghoztty://focus/dev", false),
+    );
+    try testing.expectEqual(
+        Destination.ghoztty_command,
+        destination("ghoztty-debug://focus/dev", false),
+    );
+    // Ctrl is the escape hatch for CONTENT; a command has none to escape to.
+    try testing.expectEqual(
+        Destination.ghoztty_command,
+        destination("ghoztty://focus/dev", true),
+    );
+    // A malformed one is still ours — it must not leak to the browser.
+    try testing.expectEqual(
+        Destination.ghoztty_command,
+        destination("ghoztty://open/dev", false),
+    );
+    // ...and a lookalike scheme is not.
+    try testing.expectEqual(
+        Destination.ghoztty_window,
+        destination("ghoztty-viewer://page/", false),
+    );
 }
 
 test "about:blank's prefix is not enough on its own" {

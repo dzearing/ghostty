@@ -51,6 +51,7 @@ const agent_recovery = @import("agent_recovery.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
+const url_scheme = @import("url_scheme.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
@@ -543,6 +544,11 @@ pub fn init(
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
     // thread; only acts when running from the canonical install dir.
     PathInstaller.ensureOnPathAsync();
+
+    // Tell the shell that `ghoztty://` links belong to this build (T695).
+    // Background thread; a debug build registers `ghoztty-debug://` only, so a
+    // dev instance never takes over the user's links.
+    url_scheme.registerAsync();
 
     // One-time Claude Code integration offer (T71). Background thread;
     // same canonical-install gate as the PATH self-heal.
@@ -6253,6 +6259,30 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
 /// `startQuitTimer`, instead of importing a win32 module directly.
 pub fn runRelaunchGuard(alloc: Allocator) ?u8 {
     return relaunch_guard.runFromEnv(alloc);
+}
+
+/// Was this process launched BY a `ghoztty://` link (T695)? If so, focus what
+/// the link names and hand `main` the exit code — an activation never becomes a
+/// terminal, and in particular never forwards a `new-window` to the running
+/// instance the way an ordinary second launch does.
+///
+/// A DECL on the apprt for the same reason as `runRelaunchGuard`: `main_ghostty`
+/// reaches it without importing a win32 module directly.
+pub fn runUrlSchemeActivation(alloc: Allocator) ?u8 {
+    return url_scheme.runActivation(alloc);
+}
+
+/// Focus what a `ghoztty://` link clicked INSIDE Ghoztty names — a banner link,
+/// a viewer page's link or popup. Handled in process so it always means "this
+/// app" rather than "whichever build registered the scheme", which is what lets
+/// a generated document hardcode `ghoztty://` and still work in a debug build.
+pub fn handleUrlSchemeLink(
+    self: *App,
+    owner: ?w32.HWND,
+    scale: f32,
+    url: []const u8,
+) bool {
+    return url_scheme.handleInApp(self, owner, scale, url);
 }
 
 /// Start the quit timer. Called when the last surface closes.

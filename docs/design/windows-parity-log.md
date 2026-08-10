@@ -14572,3 +14572,60 @@ job from the tool change, and mixing the two would have made neither
 reviewable. It also supersedes T684's "every Mac change merged since June is
 accounted for" claim under the wider definition, which T716 is asked to amend
 where that claim lives.
+
+## 2026-08-10 — a link can now raise a Windows Ghoztty window (T695)
+
+`ghoztty://focus/<target>` works on Windows. A document — a dashboard, a build
+report, a rendered README in a viewer pane — can carry a clickable "jump to
+that terminal", and clicking it raises the window or pane the link names. The
+Mac half landed upstream in `c36456863`; here the same link was dead, because
+nothing told Windows the scheme belonged to Ghoztty.
+
+The scheme's ONE verb is focus, and that is the design rather than a first
+increment: a registered scheme is reachable by any web page with no prompt and
+no same-origin check, so a verb that could spawn a shell or type into a pane
+would be remote code execution behind an `<a href>`. The grammar, the strictness
+(unknown verb, empty target and a bare `ghoztty://<name>` all yield nothing) and
+the failure wording live in one place, `src/apprt/ipc/url_scheme.zig`, so the
+launcher, the banner and the viewer cannot disagree about what a link means.
+
+Four Windows-shaped pieces. **Registration** has no `Info.plist` to declare it,
+so the app writes its own `HKCU\Software\Classes\<scheme>` handler at launch —
+per-user (HKLM would need elevation), rewritten every launch so an upgrade
+re-points it, and named by build mode, so a debug build registers
+`ghoztty-debug://` and can never take over the user's links. **Activation** is a
+process the shell launches with the URL as argv; it is answered before the
+single-instance bind, because otherwise it would forward a `new-window` and open
+a terminal from the one scheme that must never create anything. The scan for a
+URL argument stops at `-e`, so `ghoztty -e echo ghoztty://focus/x` still prints a
+string rather than vanishing into an activation. It forwards an internal `focus`
+IPC action — there is deliberately no `+focus` CLI verb on either platform. **The in-app paths** (a banner link, a viewer page's link, a
+`target="_blank"` popup) are short-circuited in process, so a document that
+hardcodes `ghoztty://` focuses the build that is rendering it; a banner command
+link ignores every modifier and offers Focus in Ghoztty + Copy Link, and the
+popup path answers a command rather than opening a viewer window pointed at the
+command string. **Rendered markdown** needed `viewer.js` to widen DOMPurify's
+URI allowlist by the two schemes, which is shared with the Mac.
+
+A link that resolves to nothing says so, because a click that appears to do
+nothing is indistinguishable from a broken app — and never ACTS: no window is
+created, no "closest" window focused as a consolation. The warning is coalesced
+across PROCESSES with a named mutex, since on Windows every click is its own
+short-lived process and the Mac's flag cannot see the burst.
+
+Two calls are filed rather than assumed: a cold click does NOT start Ghoztty
+(D61), and registration is not gated to the install directory the way the PATH
+self-heal is (D62). Follow-ups: T717 (the activation process warns with a system
+message box, not the themed dialog) and T718 (the agent skill still does not
+know the scheme exists, so nothing generates such a link yet).
+
+Evidence: `test/win32/url-scheme.ps1` **ALL PASS** at 32 checks — including
+`Start-Process ghoztty-debug://focus/<t>` with no exe path in the call (so the
+registry entry is what resolves it), a bare `ghoztty-debug://urlwin` where
+`urlwin` IS open (the case a lenient parser would "helpfully" focus), and the
+dialog-coalescing arm with its own positive control. 9 parser tests in the
+`none` lane, the banner-link and popup models extended in place, and the live
+WebView2 click in `ViewerPane.zig`'s host-floor test, which routes
+`focus:ghoztty://focus/dev` into the link sink and thereby also proves the
+sanitizer change (a stripped href would leave no anchor to click). All three
+floor lanes PASS, P1–P3 ALL PASS.

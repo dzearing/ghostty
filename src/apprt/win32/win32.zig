@@ -927,6 +927,17 @@ pub extern "kernel32" fn CloseHandle(
     hObject: HANDLE,
 ) callconv(.winapi) i32;
 
+/// Cross-process coalescing (T695): the URL-scheme activation processes race
+/// for this, and whoever creates it first owns the failure dialog. We never
+/// wait on it — `ERROR_ALREADY_EXISTS` from `GetLastError` IS the answer.
+pub extern "kernel32" fn CreateMutexW(
+    lpMutexAttributes: ?*anyopaque,
+    bInitialOwner: i32,
+    lpName: ?[*:0]const u16,
+) callconv(.winapi) ?HANDLE;
+
+pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
 pub const WAIT_FAILED: u32 = 0xFFFFFFFF;
 
 pub extern "kernel32" fn WaitForMultipleObjects(
@@ -2467,6 +2478,21 @@ pub extern "advapi32" fn RegSetValueExW(
     dwType: u32,
     lpData: [*]const u8,
     cbData: u32,
+) callconv(.winapi) u32;
+
+/// Open, creating it (and every missing parent) when absent. The URL-scheme
+/// handler (T695) writes a three-level key path into a hive that has none of it
+/// yet, which `RegOpenKeyExW` cannot do.
+pub extern "advapi32" fn RegCreateKeyExW(
+    hKey: HKEY,
+    lpSubKey: [*:0]const u16,
+    Reserved: u32,
+    lpClass: ?[*:0]const u16,
+    dwOptions: u32,
+    samDesired: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    phkResult: *HKEY,
+    lpdwDisposition: ?*u32,
 ) callconv(.winapi) u32;
 
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;

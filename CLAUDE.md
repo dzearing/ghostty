@@ -615,6 +615,104 @@ ghoztty +close --target=term
 ghoztty +close --target=ide
 ```
 
+## The `ghoztty://` URL scheme
+
+A **link** can raise a Ghoztty window or pane. This is the piece that makes a
+generated document (a worktree dashboard, a status report) able to say "jump to
+that terminal" — from a browser, from a doc rendered in a viewer pane, or from
+a pane banner.
+
+```
+ghoztty://focus/<target>
+```
+
+One verb, one shape. `<target>` is percent-decoded and passed to the same
+target resolver `--target` uses, so there is one naming system, not two: a
+registered window name, an auto `window-N`, a registered pane name, or a pane
+id (`$GHOZTTY_PANE_ID`, case-insensitive). Everything after the verb is ONE
+target, so a name containing `/` survives encoded (`focus/feat%2Flogin`) or not
+(`focus/feat/login`). The path form is canonical over `ghoztty://<target>`
+(nowhere to put a verb) and over `ghoztty://focus?target=…` (a second escaping
+context for no gain). Parsing is strict: unknown verb, empty target, and bare
+`ghoztty://<name>` all yield nothing rather than a lenient guess. **There is no
+`+focus` CLI verb on either platform** — the scheme is a link surface, and a
+verb that existed on one CLI and not the other is the divergence this project
+does not ship.
+
+**Focus is the only capability, and that is the design, not a first
+increment.** A registered URL scheme is reachable by any web page the user
+visits — no prompt, no gesture beyond a click, no same-origin check, no way to
+know who asked. Everything the IPC endpoint exposes is safe there only because
+a 0600 unix socket (an owner-only-DACL named pipe on Windows) is reachable only
+by code already running as the user; none of that holds for a link. A scheme
+that could spawn a shell (`--command`), type into a pane (`+send-keys`), or open
+a viewer would be remote code execution behind an `<a href>`. Raising an
+already-existing window is the one verb whose worst case is a nuisance. The
+parser reads a verb rather than hardcoding one shape so a future verb *could* be
+added — but wanting a second verb to make something work is a signal to stop and
+ask, not to add one.
+
+Consequences, all deliberate and the same on both platforms:
+
+- **The debug build registers `ghoztty-debug://`**, the release builds
+  `ghoztty://` — the same split as the IPC endpoint (and, on macOS, the bundle
+  id). Otherwise the shell picks between them and the user's links start landing
+  in a debug build. macOS declares it in `CFBundleURLTypes` (the
+  `GHOSTTY_URL_SCHEME` build setting); Windows has no `Info.plist`, so the app
+  writes its own per-user handler at launch —
+  `HKCU\Software\Classes\<scheme>` with the `URL Protocol` marker and
+  `shell\open\command` = `"<this exe>" "%1"`, off the GUI thread, idempotent and
+  rewritten every launch so an upgrade or a move re-points it. `HKCU`, never
+  `HKLM`: Ghoztty installs per user and a machine-wide association would need
+  elevation. `GHOZTTY_URL_SCHEME=0`/`off` skips registration.
+- **Both spellings parse in both builds.** Links clicked *inside* Ghoztty are
+  short-circuited in process and never reach the shell, so a document that
+  hardcodes `ghoztty://` still focuses the right pane when a debug build is
+  rendering it.
+- **A link that resolves to nothing says so** (`url_scheme.Failure`): a warning
+  naming the target for `target_not_found`, or naming the URL plus the one
+  supported form for `unsupported_link`. A click that appears to do nothing is
+  indistinguishable from a broken app, and both failures are ordinary (the
+  window was closed; the document predates this build). What failure never does
+  is *act*: no window is created and no "closest" window is focused as a
+  consolation. Presentation is **coalesced** so a burst — any page can fire a
+  scheme — is one dialog, not one per link: macOS behind an
+  `isPresentingFailure` flag (`application(_:open:)` takes a whole array),
+  Windows behind a named mutex as well, because there every click is its own
+  short-lived process and a flag cannot see the burst. A URL that isn't ours at
+  all is ignored silently; nobody clicked a Ghoztty link. The wording lives on
+  `Failure` rather than in the presenter so it is testable.
+- **App not running:** the honest answer is the same as any other miss —
+  nothing is open by that name — because a focus link must never create a
+  window as a side effect. macOS cannot decline the launch LaunchServices does,
+  so the app comes up with its normal `initial-window` behavior (that belongs to
+  *launching Ghoztty*, exactly as `open -a` does, not to the focus verb) and the
+  link reports not-found. On Windows the activation process reports it and
+  exits without starting a terminal at all.
+- **Viewer panes** intercept `ghoztty://` ahead of the live-page passthrough
+  (the engine cannot load the scheme, so an allowed navigation is a dead click,
+  and handing it to the shell would route it to whichever BUILD registered the
+  scheme). A `target="_blank"` focus link resolves to a *command* destination
+  instead of falling through "non-web scheme ⇒ open a Ghoztty window", which is
+  how it used to create a viewer window pointed at the command string.
+- **Rendered markdown** needs `viewer.js` to widen DOMPurify's
+  `ALLOWED_URI_REGEXP` by exactly these two schemes. markdown-it keeps a
+  `ghoztty://` href, and the sanitizer then stripped it — the link rendered as
+  dead text. Keep the regex in sync when the vendored DOMPurify is bumped.
+- **Banner links** ignore the Cmd / Ctrl modifier scheme: the link names a
+  window, not content, so there is nothing to open in a side pane or a new
+  window. The right-click menu is **Focus in Ghoztty** + **Copy Link**.
+
+The grammar and the failure wording are ONE definition per platform —
+`src/apprt/ipc/url_scheme.zig` on Windows, `GhozttyURLScheme.swift` on macOS —
+so the launcher, the viewer and the banner cannot disagree about what a link
+means. Windows entry points: `main_ghostty.zig` (an activation is answered
+before the single-instance bind, or it would forward a `new-window` and open a
+terminal), `ViewerPane` for viewer link clicks and popups, `BannerOverlay` for
+banner clicks; all funnel into `apprt/win32/url_scheme.zig` →
+`IpcHandlers.focusTarget` (the external path through the internal `focus` IPC
+action). Acceptance: `test/win32/url-scheme.ps1`.
+
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a

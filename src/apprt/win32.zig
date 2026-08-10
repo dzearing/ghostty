@@ -50,4 +50,9 @@ test {
     // thing that must never re-mint a name a restored window already adopted,
     // and that is pure logic worth checking in its own right.
     _ = @import("win32/IpcRegistry.zig");
+    // The `ghoztty://` URL scheme's win32 half (T695): the registry entry a
+    // clicked link is resolved through, and the activation process that
+    // answers it. The registration strings decide whether a link reaches this
+    // build at all, so the lane checks them rather than only the grammar.
+    _ = @import("win32/url_scheme.zig");
 }

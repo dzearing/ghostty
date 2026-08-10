@@ -1652,6 +1652,14 @@ fn onNewWindowRequested(
             const u = uri orelse return com.S_OK;
             self.openExternal(p.alloc, u);
         },
+        .ghoztty_command => {
+            // Non-null by construction, same as the browser arm. Nothing is
+            // adopted and no deferral is taken: the popup simply does not open,
+            // which is what `window.open()` returning null already means to a
+            // script — and the link does its one job instead (T695).
+            const u = uri orelse return com.S_OK;
+            self.focusLinkTarget(u);
+        },
         .ghoztty_window => self.adoptPopup(p.alloc, a, uri),
     }
     return com.S_OK;
@@ -2364,19 +2372,32 @@ fn onNavigationStarting(
     const a = args orelse return com.S_OK;
     const self = p.pane orelse return com.S_OK;
 
-    // Websites navigate freely within the pane, and so do the pane's own
-    // reloads and history walks (`syncCommitted` reconciles those after the
-    // fact). Both checks are cheap and neither reads the URI.
-    if (!self.mode.isFile()) return com.S_OK;
-    if (!content.routesAsLink(navKind(a))) return com.S_OK;
-
     const raw = a.uriRaw() orelse return com.S_OK;
     // The runtime allocated it on the COM heap; we free it on ours.
     defer w32.CoTaskMemFree(@ptrCast(raw));
     const uri = std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(raw)) catch return com.S_OK;
     defer p.alloc.free(uri);
 
-    switch (content.classifyLink(self.mode, uri)) {
+    const class = content.classifyLink(self.mode, uri);
+
+    // A `ghoztty://` link is answered in EVERY mode and for every navigation
+    // kind, which is why the URI is read before the two gates below (T695).
+    // WebView2 cannot load the scheme at all, so letting a website pane's
+    // navigation through would be a dead click rather than a passthrough.
+    if (class == .ghoztty_command) {
+        _ = a.setCancel(true);
+        self.focusLinkTarget(uri);
+        return com.S_OK;
+    }
+
+    // Websites navigate freely within the pane, and so do the pane's own
+    // reloads and history walks (`syncCommitted` reconciles those after the
+    // fact).
+    if (!self.mode.isFile()) return com.S_OK;
+    if (!content.routesAsLink(navKind(a))) return com.S_OK;
+
+    switch (class) {
+        .ghoztty_command => unreachable, // answered above, in every mode
         .allow => {},
         .browser => {
             _ = a.setCancel(true);
@@ -2463,6 +2484,16 @@ fn openLinkedViewerSplit(self: *ViewerPane, location: []const u8) void {
     const pv = self.pane_view orelse return;
     const open = self.open_link_split orelse return;
     open(pv, location, self.origin_directory);
+}
+
+/// A `ghoztty://` link clicked in this pane's page: raise what it names, in
+/// process (T695). Never leaves the app and never navigates — the pane keeps
+/// showing what it was showing.
+fn focusLinkTarget(self: *ViewerPane, url: []const u8) void {
+    if (link_sink) |s| return s.append("focus", url);
+    const pv = self.pane_view orelse return;
+    const window = pv.parentWindow();
+    _ = window.app.handleUrlSchemeLink(window.hwnd, self.scale, url);
 }
 
 /// Hand `target` (a URL or a file path) to the shell — the default browser
@@ -5223,7 +5254,8 @@ test "host floor: a real controller on a real window, on this box" {
     try tmp.dir.writeFile(.{
         .sub_path = "links.md",
         .data = "[missing](nope-linked.md)\n\n[doc](linked.md)\n\n" ++
-            "[code](t90e.zig)\n\n[ext](https://example.com/x)\n",
+            "[code](t90e.zig)\n\n[ext](https://example.com/x)\n\n" ++
+            "[jump](ghoztty://focus/dev)\n",
     });
     const links_path = try std.fs.path.join(alloc, &.{ dir_path, "links.md" });
     defer alloc.free(links_path);
@@ -5266,8 +5298,21 @@ test "host floor: a real controller on a real window, on this box" {
         }
     }.ready, &pane);
 
+    // T695: a `ghoztty://` link is answered IN PROCESS and never navigates.
+    // Clicking it at all is also the sanitizer's test: DOMPurify's default URI
+    // allowlist does not carry the scheme, so before `viewer.js` widened it the
+    // anchor rendered with NO href — `querySelector('a[href=…]')` would find
+    // nothing and no entry would ever arrive here.
+    pane.executeScript(alloc, "document.querySelector('a[href=\"ghoztty://focus/dev\"]').click()");
+    try waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            _ = p;
+            return link_sink.?.entries.items.len >= 4;
+        }
+    }.ready, &pane);
+
     log.warn("link routing: {d} routed", .{sink.entries.items.len});
-    try testing.expectEqual(@as(usize, 3), sink.entries.items.len);
+    try testing.expectEqual(@as(usize, 4), sink.entries.items.len);
     {
         const linked_path = try std.fs.path.join(alloc, &.{ dir_path, "linked.md" });
         defer alloc.free(linked_path);
@@ -5282,6 +5327,9 @@ test "host floor: a real controller on a real window, on this box" {
         try testing.expectEqualStrings(want_app, sink.entries.items[1]);
         // An external URL goes to the default browser, byte-for-byte.
         try testing.expectEqualStrings("browser:https://example.com/x", sink.entries.items[2]);
+        // A `ghoztty://` link stays here — not the browser, not a split, not
+        // the shell — and carries the whole URL to the in-process handler.
+        try testing.expectEqualStrings("focus:ghoztty://focus/dev", sink.entries.items[3]);
     }
 
     // Every routed click was CANCELLED: the pane never left the template, and

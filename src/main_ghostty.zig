@@ -74,6 +74,21 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T695: this process may be a `ghoztty://` URL activation — the shell
+    // launching our registered protocol handler with a clicked link as argv.
+    // Asked before the single-instance bind, because an activation must never
+    // look like a second instance: that path forwards a `new-window` and would
+    // open a terminal from the one scheme that must never create anything.
+    //
+    // Gated on there being no `+action` for the same reason the guard above is:
+    // an explicit CLI verb is always itself.
+    if (@hasDecl(apprt.App, "runUrlSchemeActivation") and state.action == null) {
+        if (apprt.App.runUrlSchemeActivation(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     // T245: this process may be `ghoztty.com`, the console-subsystem twin of
     // ghoztty.exe that exists so PowerShell waits for (and wires redirection
     // to) CLI verbs. A GUI launch through the twin respawns the sibling

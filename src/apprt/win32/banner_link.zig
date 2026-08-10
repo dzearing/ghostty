@@ -20,10 +20,20 @@
 
 const std = @import("std");
 
-/// Which of the two link families a target belongs to. Binary on purpose —
-/// Mac keys everything off `URL.isFileURL` and a third case would give the
-/// menu a shape neither platform has.
-pub const Kind = enum { web, file };
+/// The `ghoztty://` grammar (T695). Imported for `handles` only: whether a
+/// target is a Ghoztty command at all is the scheme's answer to give, not a
+/// prefix test duplicated here.
+const url_scheme = @import("../ipc/url_scheme.zig");
+
+/// Which link family a target belongs to.
+///
+/// `web` and `file` are the two DESTINATIONS — content that can be opened
+/// somewhere. `command` is not a destination at all: a `ghoztty://` link
+/// addresses Ghoztty itself (T695), so there is nothing to put in a pane, a
+/// window or a browser, and it ignores every modifier. Mac's `BannerLinkOpener`
+/// draws the same line by asking `GhozttyURLScheme.handles` before it looks at
+/// the modifiers.
+pub const Kind = enum { web, file, command };
 
 /// Classify a link target.
 ///
@@ -36,6 +46,10 @@ pub const Kind = enum { web, file };
 /// single character.
 pub fn kindOf(target: []const u8) Kind {
     if (target.len == 0) return .web;
+    // Asked first, and asked with the scheme's own `handles` rather than a
+    // prefix test here, so a malformed `ghoztty://` link is still OURS — it
+    // must never leak out to the browser as a bogus location.
+    if (url_scheme.handles(target)) return .command;
     if (std.ascii.startsWithIgnoreCase(target, "file:")) return .file;
     if (isDrivePath(target)) return .file;
     // UNC (`\\server\share`) and rooted/relative paths carry no scheme at
@@ -72,21 +86,32 @@ pub const Action = enum {
     open_in_new_window,
     /// Put the link on the clipboard.
     copy,
+    /// A `ghoztty://` link: raise the window or pane it names, in process. Not
+    /// a destination, so none of the "open it somewhere" actions apply.
+    focus_target,
 };
 
 /// What a LEFT click on a link of `kind` does with `ctrl`/`shift` held.
 /// Plain click leaves Ghoztty; `Ctrl` opens a side pane; `Ctrl+Shift` asks
 /// for a surface of the link's own — which for a file is the app that owns
 /// it, since a viewer can display a file but never edit one.
+///
+/// A `command` link sits outside that scheme entirely and ignores every
+/// modifier — it names a window rather than content. Handling it here also
+/// keeps it out of the viewer path it would otherwise fall into: a Ctrl-click
+/// would open a side pane whose "location" was the command string.
 pub fn clickAction(kind: Kind, ctrl: bool, shift: bool) Action {
+    if (kind == .command) return .focus_target;
     if (!ctrl) return switch (kind) {
         .web => .open_with_system,
         .file => .reveal_in_explorer,
+        .command => unreachable,
     };
     if (!shift) return .open_in_side_pane;
     return switch (kind) {
         .web => .open_in_new_window,
         .file => .open_with_system,
+        .command => unreachable,
     };
 }
 
@@ -99,6 +124,7 @@ pub const Id = enum(usize) {
     new_window = 4,
     open_default_app = 5,
     copy = 6,
+    focus = 7,
 };
 
 /// The action behind a menu row. `open_browser` and `open_default_app` are
@@ -112,6 +138,7 @@ pub fn action(id: Id) Action {
         .side_pane => .open_in_side_pane,
         .new_window => .open_in_new_window,
         .copy => .copy,
+        .focus => .focus_target,
     };
 }
 
@@ -146,6 +173,15 @@ pub const MAX_ITEMS: usize = 8;
 /// uses for non-dialog rows.
 pub fn build(kind: Kind, buf: *[MAX_ITEMS]Item) []const Item {
     var n: usize = 0;
+    // A `ghoztty://` link has exactly one thing it can do, so the menu is that
+    // plus Copy Link. Offering Side Pane / New Window here would advertise
+    // destinations the command has no content for.
+    if (kind == .command) {
+        buf[0] = .{ .cmd = .{ .id = .focus, .title = u16lit("Focus in Ghoztty") } };
+        buf[1] = .separator;
+        buf[2] = .{ .cmd = .{ .id = .copy, .title = u16lit("Copy Link") } };
+        return buf[0..3];
+    }
     switch (kind) {
         .file => {
             buf[n] = .{ .cmd = .{ .id = .reveal, .title = u16lit("Reveal in File Explorer") } };
@@ -155,6 +191,7 @@ pub fn build(kind: Kind, buf: *[MAX_ITEMS]Item) []const Item {
             buf[n] = .{ .cmd = .{ .id = .open_browser, .title = u16lit("Open in Default Browser") } };
             n += 1;
         },
+        .command => unreachable, // handled above
     }
     buf[n] = .separator;
     n += 1;
@@ -298,14 +335,56 @@ test "clickAction: Ctrl brings it back in, Ctrl+Shift gives it its own surface" 
     try testing.expectEqual(Action.open_with_system, clickAction(.file, true, true));
 }
 
-test "menu: the first row IS the left-click default, for both kinds" {
+test "kindOf: a ghoztty:// link is a command, not a destination" {
+    try testing.expectEqual(Kind.command, kindOf("ghoztty://focus/dev"));
+    try testing.expectEqual(Kind.command, kindOf("ghoztty-debug://focus/dev"));
+    try testing.expectEqual(Kind.command, kindOf("GHOZTTY://focus/dev"));
+    // A malformed one is still ours: it must never leak to the browser as a
+    // bogus location just because the verb is wrong.
+    try testing.expectEqual(Kind.command, kindOf("ghoztty://open/dev"));
+    // ...and a scheme that merely starts the same way is not.
+    try testing.expectEqual(Kind.web, kindOf("ghozttyx://focus/dev"));
+}
+
+test "clickAction: a command link ignores every modifier" {
+    // It names a window rather than content, so there is nothing to put in a
+    // pane, a window or a browser — the Ctrl-click that would have opened a
+    // side pane pointed at the command string is exactly the bug this fixes.
+    for ([_][2]bool{
+        .{ false, false }, .{ false, true }, .{ true, false }, .{ true, true },
+    }) |m| {
+        try testing.expectEqual(Action.focus_target, clickAction(.command, m[0], m[1]));
+    }
+}
+
+test "menu: the first row IS the left-click default, for every kind" {
     // The contract the surface context menu already keeps, and what makes
     // the menu self-teaching: whatever a click would have done is at the top.
     var buf: [MAX_ITEMS]Item = undefined;
-    for ([_]Kind{ .web, .file }) |k| {
+    for ([_]Kind{ .web, .file, .command }) |k| {
         const items = build(k, &buf);
         try testing.expectEqual(clickAction(k, false, false), action(items[0].cmd.id));
     }
+}
+
+test "menu: a command link offers focus and copy, and nothing that opens" {
+    var buf: [MAX_ITEMS]Item = undefined;
+    const items = build(.command, &buf);
+    const expected = [_]?Id{ .focus, null, .copy };
+    try testing.expectEqual(expected.len, items.len);
+    for (items, expected) |item, exp| switch (item) {
+        .separator => try testing.expect(exp == null),
+        .cmd => |c| try testing.expectEqual(exp.?, c.id),
+    };
+    try testing.expectEqualSlices(u16, u16lit("Focus in Ghoztty"), items[0].cmd.title);
+    // No destination rows: the command has no content for them.
+    for (items) |item| switch (item) {
+        .separator => {},
+        .cmd => |c| try testing.expect(switch (action(c.id)) {
+            .open_in_side_pane, .open_in_new_window, .open_with_system, .reveal_in_explorer => false,
+            .focus_target, .copy => true,
+        }),
+    };
 }
 
 test "menu: web rows and order" {
@@ -344,7 +423,7 @@ test "menu: no kind offers a row for an action its click scheme cannot reach" {
     // is the discoverable form of the same set, which is the whole point of
     // pairing the two halves in one task.
     var buf: [MAX_ITEMS]Item = undefined;
-    for ([_]Kind{ .web, .file }) |k| {
+    for ([_]Kind{ .web, .file, .command }) |k| {
         var seen = std.EnumSet(Action).initEmpty();
         for (build(k, &buf)) |item| switch (item) {
             .separator => {},
@@ -362,7 +441,7 @@ test "menu: no kind offers a row for an action its click scheme cannot reach" {
 
 test "menu: command ids are unique and nonzero" {
     var buf: [MAX_ITEMS]Item = undefined;
-    for ([_]Kind{ .web, .file }) |k| {
+    for ([_]Kind{ .web, .file, .command }) |k| {
         var seen = std.StaticBitSet(64).initEmpty();
         for (build(k, &buf)) |item| switch (item) {
             .separator => {},

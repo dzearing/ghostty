@@ -29,6 +29,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+/// The `ghoztty://` grammar (T695) — `handles` only, so link routing asks the
+/// scheme itself whether a URI is a Ghoztty command rather than re-spelling it.
+const url_scheme = @import("../ipc/url_scheme.zig");
+
 const ipc_args = @import("../ipc/args.zig");
 
 /// The synthetic origin file-mode panes load from. Everything under it is
@@ -603,6 +607,8 @@ pub const LinkClass = enum {
     /// Cancel it and do nothing. Mac maps everything else (`mailto:`,
     /// `about:`, unknown schemes) to a nil file URL and returns.
     drop,
+    /// Cancel it and run it as a `ghoztty://` command in process (T695).
+    ghoztty_command,
 };
 
 /// Classify a navigation target for `mode`. The virtual-host check runs
@@ -611,6 +617,14 @@ pub const LinkClass = enum {
 /// test would ship every relative link to the default browser as a URL that
 /// resolves nowhere.
 pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
+    // A `ghoztty://` link is Ghoztty addressing itself, and it is classified
+    // FIRST — ahead of the web-mode passthrough below — for two reasons.
+    // WebView2 cannot load the scheme at all, so an allowed navigation is a
+    // dead click; and letting it out to the shell would route it to whichever
+    // BUILD registered the scheme, so a link clicked in a debug build's pane
+    // would raise a window in the release app. Handled here it always means
+    // "this app" (T695).
+    if (url_scheme.handles(uri)) return .ghoztty_command;
     if (!mode.isFile()) return .allow;
     // The template itself (with or without a query/fragment): the pane's own
     // document, never a link target to route.

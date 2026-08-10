@@ -145,10 +145,16 @@ pub const segments = @import("ipc/segments.zig");
 /// an ANSWER rather than a failure (T181).
 pub const read_tail = @import("ipc/read_tail.zig");
 
+/// The `ghoztty://focus/<target>` URL scheme grammar and its failure wording
+/// (T695). One definition for the launcher that decodes a clicked link and the
+/// in-app paths that short-circuit one, so a link cannot mean two things.
+pub const url_scheme = @import("ipc/url_scheme.zig");
+
 test {
     _ = args;
     _ = segments;
     _ = read_tail;
+    _ = url_scheme;
     _ = @import("ipc/list.zig");
 }
 
