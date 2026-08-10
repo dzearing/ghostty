@@ -354,5 +354,27 @@
 </description>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.31.0/Ghoztty-1.31.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="mKjnL04LAN9+0G21RGuemWb/Pxi/qbMQarsew3UVPaBzfSrBUay3Wc1KTfv1DcnsP+4W4aLpeNRE96CkROPDDw==" length="25783093" />
         </item>
+        <item>
+            <title>Version 1.32.0</title>
+            <sparkle:version>1.32.0</sparkle:version>
+            <sparkle:shortVersionString>1.32.0</sparkle:shortVersionString>
+            <pubDate>Mon, 10 Aug 2026 13:35:21 +0000</pubDate>
+            <description>{
+  "version": "1.32.0",
+  "sections": [
+    {
+      "title": "Links that jump to a terminal",
+      "items": [
+        { "title": "A `ghoztty://` link can raise a window or pane", "text": "Write `ghoztty://focus/&lt;name&gt;` anywhere a link can live and clicking it brings that Ghoztty window or pane to the front. `&lt;name&gt;` is anything `--target` already accepts: a window name, an auto `window-3`, a pane name, or a pane id (`$GHOZTTY_PANE_ID`). A generated dashboard, a build report, or a status page can finally say \"jump to that terminal\" and have it work." },
+        { "title": "It works everywhere a link renders", "text": "From your browser, from a page or rendered markdown in a viewer pane, and from a pane banner. Banner focus links get their own right-click menu (Focus in Ghoztty / Copy Link) instead of the side-pane and new-window options, which don't mean anything for a link that names a window rather than content." },
+        { "title": "Focus is the only thing a link can do, on purpose", "text": "Any web page you visit can fire a registered URL scheme with no prompt and no way to tell who asked. A link that could open a shell or type into a pane would be remote code execution behind an `&lt;a href&gt;`, so raising an existing window is the whole feature. Nothing is ever created: a link naming a window that's gone tells you so instead of quietly focusing something else, and a burst of links produces one message rather than one per link." },
+        { "title": "Debug builds keep their links to themselves", "text": "The debug build registers `ghoztty-debug://`, so macOS can't decide to route your links into a development build. Links clicked inside Ghoztty are handled in-process, so a document that hardcodes `ghoztty://` still lands in whichever build is rendering it." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.32.0/Ghoztty-1.32.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="rEURiI5dVR2iBh3rl6r/oVNN8yQCHwEX/nvivTsEFyLlLQ6FSoVHFyzAnPNREjI+Y6DbnDBCTy8xJmJWMbeLCw==" length="25790855" />
+        </item>
     </channel>
 </rss>
