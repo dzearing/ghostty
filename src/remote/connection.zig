@@ -1497,8 +1497,29 @@ pub const Connection = struct {
         }
     }
 
-    /// Free the connection. Must be called after `shutdown` has joined the threads.
+    /// True while any of this connection's own threads is still unjoined. Read
+    /// under `state_mutex` because `shutdown` claims the handles under it.
+    fn threadsLive(self: *Connection) bool {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        return self.writer_thread != null or
+            self.control_thread != null or
+            self.data_thread != null or
+            self.heartbeat_thread != null;
+    }
+
+    /// Free the connection. `shutdown` is the caller's job and normally ran
+    /// already; when it did not, `destroy` runs it here rather than asserting.
+    ///
+    /// It used to assert instead, and an assert is the wrong instrument for
+    /// this: it fires only when a thread happens to still be live at teardown,
+    /// which makes it a crash in Debug and silence — a use-after-free, since
+    /// the reader keeps pushing into memory the caller is about to free — in
+    /// ReleaseFast. An error path that returns before `shutdown` is easy to
+    /// write and the failure surfaces far away from it (T693).
     pub fn destroy(self: *Connection, alloc: Allocator) void {
+        if (self.threadsLive()) self.shutdown();
+
         // Defensive: ensure no thread is still live and the queue is drained.
         assert(self.writer_thread == null);
         assert(self.control_thread == null);
@@ -3704,6 +3725,15 @@ test "inbound DATA routing: bytes land in the right channel; unknown is dropped"
         var data_lb = Loopback.init(alloc);
         defer data_lb.deinit();
 
+        // The channel is created BEFORE the connection so its `deinit` defer
+        // runs LAST: defers are LIFO, so the connection — whose data reader
+        // pushes into this ring — is torn down first. Registered the other way
+        // round, an early `return` from the body freed the ring under a live
+        // reader thread (T693).
+        const ch_id: u128 = 0x1234_5678;
+        var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 4096 });
+        defer ch.deinit(alloc);
+
         const conn = try Connection.create(
             alloc,
             ctrl_lb.clientStream(),
@@ -3711,10 +3741,6 @@ test "inbound DATA routing: bytes land in the right channel; unknown is dropped"
             .{ .transfer_encoding = enc },
         );
         defer conn.destroy(alloc);
-
-        const ch_id: u128 = 0x1234_5678;
-        var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 4096 });
-        defer ch.deinit(alloc);
         try conn.registerChannel(&ch);
 
         // Agent handshakes on control, then sends DATA on the data stream.
@@ -3722,10 +3748,20 @@ test "inbound DATA routing: bytes land in the right channel; unknown is dropped"
         defer ctrl_agent.deinit();
         var ictx: InboundAgentCtx = .{ .agent = &ctrl_agent, .channel = ch_id };
         const ath = try std.Thread.spawn(.{}, InboundAgentCtx.run, .{&ictx});
+        // On an early failure the agent thread is still parked on its
+        // handshake read; `shutdown` closes the loopback under it so the join
+        // returns EOF instead of hanging, and it cannot outlive `ctrl_agent`.
+        // The flag disarms it once the body has joined — a second join is UB.
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         _ = try conn.waitHandshake();
         ath.join();
+        ath_joined = true;
         try testing.expect(ictx.err == null);
 
         var data_agent = MockAgent.init(alloc, data_lb.agentStream(), enc);
@@ -3748,6 +3784,47 @@ test "inbound DATA routing: bytes land in the right channel; unknown is dropped"
         // Deregister only after shutdown (data reader joined) so the ring is safe.
         conn.deregisterChannel(ch_id);
     }
+}
+
+test "T693: destroy without a prior shutdown joins the threads instead of asserting" {
+    const alloc = testing.allocator;
+
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    const ch_id: u128 = 0x0693;
+    var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 4096 });
+    defer ch.deinit(alloc);
+
+    const conn = try Connection.create(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+    );
+    try conn.registerChannel(&ch);
+
+    var ctrl_agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer ctrl_agent.deinit();
+    var ictx: InboundAgentCtx = .{ .agent = &ctrl_agent, .channel = ch_id };
+    const ath = try std.Thread.spawn(.{}, InboundAgentCtx.run, .{&ictx});
+    try conn.start();
+    _ = try conn.waitHandshake();
+    ath.join();
+
+    // The live threads are the point: this is the state an error path leaves
+    // behind when it returns before `shutdown`, and the state in which the old
+    // `destroy` asserted (Debug) or freed the ring under the data reader
+    // (ReleaseFast).
+    try testing.expect(conn.threadsLive());
+
+    conn.destroy(alloc);
+
+    // Returning at all is the claim — `destroy` joined every thread rather
+    // than tripping its assert — and `testing.allocator` covers the rest: the
+    // write queue and pending map are only freed on the path that ran.
 }
 
 // --- Test 3: outbound DATA ----------------------------------------------------
@@ -5870,6 +5947,14 @@ test "FLOW pause: a full undrained ring makes the agent receive FLOW{channel, pa
     var data_lb = Loopback.init(alloc);
     defer data_lb.deinit();
 
+    // A small channel (no pane needed for the pure FLOW path); capacity 64,
+    // high_water 48 so ~48 undrained bytes trip the pause edge. Created BEFORE
+    // the connection so its `deinit` defer runs LAST — the data reader that
+    // pushes into this ring must be joined before the ring is freed (T693).
+    const ch_id: u128 = 0xF10F10;
+    var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 64, .high_water = 48, .low_water = 8 });
+    defer ch.deinit(alloc);
+
     const conn = try Connection.createOpts(
         alloc,
         ctrl_lb.clientStream(),
@@ -5878,26 +5963,29 @@ test "FLOW pause: a full undrained ring makes the agent receive FLOW{channel, pa
         .{ .heartbeat_interval_ms = 100_000 },
     );
     defer conn.destroy(alloc);
+    try conn.registerChannel(&ch);
 
     var ctrl_agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
     defer ctrl_agent.deinit();
     var data_agent = MockAgent.init(alloc, data_lb.agentStream(), .raw);
     defer data_agent.deinit();
 
-    // Register a small channel directly (no pane needed for the pure FLOW path);
-    // capacity 64, high_water 48 so ~48 undrained bytes trip the pause edge.
-    const ch_id: u128 = 0xF10F10;
-    var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 64, .high_water = 48, .low_water = 8 });
-    defer ch.deinit(alloc);
-    try conn.registerChannel(&ch);
-
     // The control agent answers the handshake (and would PONG, but we never PING).
     var hctx = HandshakeAgentCtx{ .agent = &ctrl_agent };
     const cth = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&hctx});
+    // Same disarming errdefer as the inbound-routing test: an early failure
+    // must not leave this thread parked on a read into `ctrl_agent` after the
+    // body returns, and a second join after the explicit one is UB.
+    var cth_joined = false;
+    errdefer if (!cth_joined) {
+        conn.shutdown();
+        cth.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
     cth.join();
+    cth_joined = true;
 
     // Drive enough DATA (never draining the ring) to cross high-water.
     const block = [_]u8{'x'} ** 16;

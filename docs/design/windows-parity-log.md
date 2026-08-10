@@ -14140,3 +14140,40 @@ pair collapse — exactly three go red (77/80). Round 17 of
 to round 9's bare `\n` and round 1's explicit `Enter`. All three zig lanes PASS
 through `floor-lane.ps1 -Lane all`; `send-keys-bracketed.ps1` ALL PASS; P1–P3
 ALL PASS.
+
+## 2026-08-10 — tearing a remote connection down no longer races its own reader thread (T693)
+
+The win32 test lane had been failing at random, and the failure never named the
+test that caused it: two threads panicked at once, one on an `unreachable` and
+one on a bounds check with an index of `0xAAAA_AAAA_AAAA_AAAB` — Zig's
+undefined-memory poison, i.e. a read of freed memory wearing a bounds check's
+clothes. A red lane you cannot attribute is worse than a red test, and the
+standing floor is what the merge-back leans on, so this was the whole turn.
+
+Root cause was defer order, not timing. `connection.zig`'s inbound-DATA-routing
+test registered `defer conn.destroy(alloc)` before `defer ch.deinit(alloc)`, and
+defers run LIFO — so the channel's ring buffer was freed FIRST, while the
+connection's data-reader thread was still alive and still holding that channel
+in its map. Whether the run crashed came down to whether the reader happened to
+be mid-`push` at teardown, which is exactly the shape of an intermittent
+failure. The same ordering sat in the FLOW-pause test.
+
+Two changes, because the test was only half the defect. The tests now create the
+`ring.Channel` BEFORE the `Connection`, so the LIFO order tears the connection
+down first and frees the ring last. And `Connection.destroy` stops defending
+itself with an assert: it asserted that every thread handle was already null,
+which is a crash in Debug and a silent use-after-free in ReleaseFast, and it can
+only fire when a caller returned before `shutdown` — an easy error path to
+write, with the damage landing far from where it was caused. `destroy` now calls
+`shutdown` itself when any thread is still live (`threadsLive`), and the normal
+path — where `shutdown` already ran — is byte-identical to before, so no stream
+is closed twice. Both tests also grew a disarming `errdefer` that joins their
+mock-agent thread on an early failure, since that thread reads into a
+`MockAgent` the body is about to deinit.
+
+Evidence: a new none-lane unit test builds a started connection with a
+registered channel, asserts `threadsLive()`, then destroys it with no
+`shutdown` — returning at all is the claim, and `testing.allocator` covers the
+rest. `floor-lane.ps1 -Lane win32 -Repeat 5` is 5/5 PASS (one green run proves
+nothing against a race); `-Lane none` and `-Lane agent` PASS; P1–P3 ALL PASS
+against a fresh Debug build.
