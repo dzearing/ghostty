@@ -261,6 +261,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # ============================================================================
 Say "== A: a live agent-backed pane records a screen snapshot + offset"
 # ============================================================================
+# persistence: on (default) - the relaunch below has to RESTORE what this launch left.
 $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t109-snapshot') -StdErr $logA
 $rowsA = Wait-AliveCount $tmp 'a' 1 25
 Assert "A1 startup pane is agent-backed (one live session)" (@(Alive-Ids $rowsA).Count -eq 1)
@@ -346,6 +347,7 @@ Assert "C1c the final snapshot still holds the marker" (
     $null -ne $leafFinal -and
     (Snapshot-Text (Decode-Snapshot $leafFinal.screen_snapshot)) -match $marker)
 
+# persistence: on (default) - session persistence IS this script's subject.
 $relaunched = Start-OnTestDesktop -Exe $Exe -StdErr $logB
 $hit = Wait-LogMatch $logB "attach: session=$sid offset=(\d+) snapshot=(\d+)" 40
 Assert "C2 the restored pane logged its ATTACH" ($null -ne $hit)

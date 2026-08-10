@@ -289,6 +289,7 @@ try {
     Assert (Test-Path $exe) "ghoztty exe exists in zig-out"
     Assert (Test-Path $agent) "ghoztty-agent exe exists in zig-out"
 
+    # persistence: on (default) - the relaunch below has to RESTORE what this launch left.
     $app = Start-OnTestDesktop -Exe $exe
     if ((Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow') -eq [IntPtr]::Zero) {
         Say 'SETUP FAIL: no GhozttyWindow'; exit 1
@@ -390,6 +391,7 @@ try {
 
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $agent
+    # persistence: on (default) - this is the restore under test.
     $relaunched = Start-OnTestDesktop -Exe $exe
     if ((Wait-TestWindow -ProcessId $relaunched.Pid -Class 'GhozttyWindow') -eq [IntPtr]::Zero) {
         Say 'SETUP FAIL: relaunched app has no GhozttyWindow'
@@ -493,6 +495,7 @@ try {
     Assert (-not (Test-Path $env:GHOSTTY_LOCAL_AGENT_BIN)) `
         'J0 the agent binary override points at nothing (setup control)'
 
+    # persistence: on (default) - the agentless arm still restores from the manifest.
     $agentless = Start-OnTestDesktop -Exe $exe
     if ((Wait-TestWindow -ProcessId $agentless.Pid -Class 'GhozttyWindow') -eq [IntPtr]::Zero) {
         Say 'SETUP FAIL: agentless app has no GhozttyWindow'

@@ -146,6 +146,7 @@ try {
     $jobSet = [T426Job]::SetInformationJobObject($job, 9, [ref]$jobInfo, $jobLen)
     Assert "A0 premise: a kill-on-close job exists" ($job -ne [IntPtr]::Zero -and $jobSet)
 
+    # persistence: on (default) - the pane shell must be the AGENT's child for the job-escape assertion to mean anything.
     $appProc = Start-Process -FilePath $Exe -ArgumentList @('--title=t426a') -PassThru
     $appPid = $appProc.Id
     $ready = $false

@@ -166,6 +166,7 @@ Assert "human tree lists panes" ((Get-List) -match '(?m)^Window: "CONF-OVERRIDE'
 
 "== S8.7: second GUI launch forwards to first instance"
 $before = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
+# persistence: n/a - this launch forwards its new-window to the live instance and exits; it restores nothing.
 $second = Start-Process $Exe -PassThru
 $exited = $second.WaitForExit(15000)
 Assert "second instance exited" $exited

@@ -189,6 +189,7 @@ function Launch($tmp, $title, $restore) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     $launchArgs = @('--session-relaunch=auto')
     if (-not $restore) { $launchArgs += "--title=$title" }
+    # persistence: on (default), into a throwaway $env:LOCALAPPDATA - the restore leg is what proves the pane id is stable. Launch-NoPersist is the =false twin.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
 }
 

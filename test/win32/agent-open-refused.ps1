@@ -60,6 +60,7 @@ function Stop-TestProcs {
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: on (default) - the agent under test only owns sessions when persistence is on.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     # Cache the handle BEFORE the process can exit: reading `.Handle` afterwards
@@ -143,6 +144,7 @@ function Measure-PaneMessage($target, $tag, $pattern, $timeoutSec) {
 
 function Start-App($title) {
     $script:AppLog = Join-Path $tmp "applog-$title.err.txt"
+    # persistence: on (default) - the agent under test only owns sessions when persistence is on.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @() -StdErr $script:AppLog
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -TimeoutMs 40000
     if ($top -eq [IntPtr]::Zero) { return 0 }

@@ -102,7 +102,11 @@ Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 try {
     "== setup: launch the debug build on the background desktop"
-    $app = Start-OnTestDesktop -Exe $Exe -StdErr (Join-Path $tmp 'app.err')
+    # persistence: off. Nothing here is about sessions, and with it on the launch
+    # RESTORES the panes an earlier run left behind - which every `+read`
+    # assertion below would then be reading (T158).
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') `
+        -StdErr (Join-Path $tmp 'app.err')
     $hwnd = Wait-TestWindow -ProcessId $app.Pid
     if ($hwnd -eq [IntPtr]::Zero) {
         "  SETUP FAIL app window never appeared"

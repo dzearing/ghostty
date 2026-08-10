@@ -195,6 +195,7 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 # T267: control the window's own size rather than inheriting whatever the last
 # GUI script left in window_placement-debug. Nothing here measures pixels, but a
 # window restored offscreen by a stale placement cannot be driven either.
+# persistence: on (default) - the agent under test only owns sessions when persistence is on.
 Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
     '--title=t334-layout-blobs', '--window-width=100', '--window-height=30') | Out-Null
 
@@ -319,6 +320,7 @@ Remove-Item (Join-Path $tmp 'ghoztty\session-layout-debug.json') -Force -ErrorAc
 Assert "F1 the local manifest really is gone before the relaunch" (
     -not (Test-Path (Join-Path $tmp 'ghoztty\session-layout-debug.json')))
 
+# persistence: on (default) - the agent under test only owns sessions when persistence is on.
 Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
     '--title=t338-relaunch', '--window-width=100', '--window-height=30') | Out-Null
 

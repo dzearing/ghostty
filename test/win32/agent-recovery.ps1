@@ -85,6 +85,7 @@ function Run-Cli($argsLine, $out, $timeoutSec = 15) {
 # which is how the first run of this script reported a healthy pane as
 # unresponsive. Nothing that carries a space may go through Run-Cli.
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: on (default) - the agent under test only owns sessions when persistence is on.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
@@ -229,6 +230,7 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 # ============================================================================
 "== A: baseline - a 2-pane agent-backed window, both panes responsive"
 # ============================================================================
+# persistence: on (default) - the agent under test only owns sessions when persistence is on.
 Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t145-recovery') | Out-Null
 
 $appProc = $null

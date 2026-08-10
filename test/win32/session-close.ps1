@@ -144,6 +144,7 @@ function Start-Backed($label) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    # persistence: on (default) - session persistence IS this script's subject.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t89e-session-close') | Out-Null
     $pane = Wait-FirstPane $tmp 25
     $paneId = if ($null -ne $pane) { $pane.id } else { '' }

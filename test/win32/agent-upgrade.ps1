@@ -126,6 +126,7 @@ function Wait-AgentPid($tmp, $timeoutSec = 25, $notPid = 0) {
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: on (default) unless a caller passes its own - section F launches with =false as its negative control.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     # Cache the handle BEFORE the process can exit. Touching `.Handle` after
@@ -260,6 +261,7 @@ function Start-App($tmp, $title, $extraArgs = @()) {
     $argv = @("--title=$title") + $extraArgs
     $script:AppLog = Join-Path $tmp "applog-$title.err.txt"
     $script:AppTop = [IntPtr]::Zero
+    # persistence: on (default) - the agent under test only owns sessions when persistence is on.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $argv -StdErr $script:AppLog
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -TimeoutMs 40000
     $script:AppTop = $top

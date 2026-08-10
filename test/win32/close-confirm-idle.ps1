@@ -216,6 +216,7 @@ function Get-TargetPaneShellPid([string]$Target) {
 }
 
 function Launch-Gui([string[]]$ExtraArgs) {
+    # persistence: caller supplies - section A runs with =false and section B with =true, and the PAIR is what this script is for.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $ExtraArgs
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { return $null }

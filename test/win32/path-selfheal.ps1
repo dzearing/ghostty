@@ -65,7 +65,11 @@ function Launch-Gui([string]$healEnv) {
     Kill-RepoInstances
     if ($null -ne $healEnv) { $env:GHOZTTY_PATH_SELFHEAL = $healEnv }
     try {
-        $proc = Start-Process -FilePath $exe -PassThru
+        # persistence: off. This helper launches and kills the GUI several times
+        # in a row; with it on, each launch writes the manifest the NEXT one
+        # restores, so the later arms start with panes the self-heal check never
+        # asked for (T158).
+        $proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' -PassThru
     } finally {
         Remove-Item Env:GHOZTTY_PATH_SELFHEAL -ErrorAction SilentlyContinue
     }

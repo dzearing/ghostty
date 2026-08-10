@@ -165,11 +165,14 @@ function Start-Instance {
     if ($InheritedSocket) { $env:GHOZTTY_IPC_SOCKET = $InheritedSocket }
     else { Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue }
     $appArgs = @('--window-width=100', '--window-height=30')
-    # `=false`, NOT `=off`: the flag is a plain bool and the CLI parser accepts
-    # only 1/t/T/true/0/f/F/false. `off` is an InvalidValue that is logged and
-    # ignored, so persistence stays ON - and the instance then RESTORES the
-    # other instance's manifest and attaches its panes, which is a fixture that
-    # quietly answers a different question than the one being asked.
+    # A value the CLI parser accepts - `parseBool` (src/cli/args.zig) takes
+    # 1/t/T/true/on/yes and 0/f/F/false/off/no, and anything else is an
+    # InvalidValue that is logged and dropped, leaving persistence ON. The
+    # instance then RESTORES the other instance's manifest and attaches its
+    # panes, which is a fixture that quietly answers a different question than
+    # the one being asked. (`off` was in that rejected set when this comment was
+    # written; 8f7af4466 added on/off/yes/no on 2026-08-04. Corrected in T158,
+    # where lib\PersistenceSweep.ps1 now checks the VALUE, not just the flag.)
     if ($NoPersistence) { $appArgs += '--session-persistence=false' }
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $appArgs -StdErr $ErrLog
     Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue

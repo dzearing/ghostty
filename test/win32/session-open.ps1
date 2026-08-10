@@ -147,6 +147,7 @@ function Start-Gui($label, $agentBin, $extraArgs) {
     if ($null -ne $agentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $agentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
     $argList = @('--title=t89d-session-open') + $extraArgs
+    # persistence: on (default) - session persistence IS this script's subject.
     $p = Start-Process -FilePath $Exe -PassThru -WindowStyle Minimized -ArgumentList $argList
     return @{ Tmp = $tmp; Proc = $p }
 }

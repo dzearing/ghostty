@@ -194,6 +194,7 @@ function Launch-From($tmp, $fromDir) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    # persistence: on (default), into a throwaway $env:LOCALAPPDATA - the agent under test is spawned from there, and there is no shared manifest to restore.
     Start-Process -FilePath $Exe -WindowStyle Minimized -WorkingDirectory $fromDir | Out-Null
 }
 

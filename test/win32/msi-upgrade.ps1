@@ -78,6 +78,7 @@ function Get-UserPathEntryCount {
 function Test-ExeRuns([string]$label) {
     $exe = Join-Path $installDir 'ghoztty.exe'
     $out = Join-Path $env:TEMP 't23-version-out.txt'
+    # persistence: n/a - a CLI invocation, which opens no window.
     $p = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $out `
         -NoNewWindow -PassThru
     if (-not $p.WaitForExit(15000)) {

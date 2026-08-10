@@ -66,7 +66,12 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
         # instance occasionally dies during startup.
         $proc = $null
         foreach ($attempt in 1, 2) {
-            $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errFile
+            # persistence: off. Each scenario launches and kills the GUI, so with
+            # it on every later scenario restores the windows the earlier ones
+            # left - and the update banner would be looked for in a pane this
+            # run never opened (T158).
+            $proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' `
+                -PassThru -RedirectStandardError $errFile
             $deadline = (Get-Date).AddSeconds($waitSecs)
             while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
             if (-not $proc.HasExited) { break }
@@ -116,6 +121,7 @@ Assert ($log3 -notmatch 'showing update balloon') 'older: no balloon'
 # section prints).
 $env:GHOZTTY_PIPE_SUFFIX = '-t24probe'
 $verOut = Join-Path $env:TEMP 'ghoztty-t24-version.txt'
+# persistence: n/a - a CLI invocation, which opens no window.
 $vp = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOut -NoNewWindow -PassThru
 if (-not $vp.WaitForExit(15000)) { try { $vp.Kill() } catch {}; Write-Host 'SETUP FAIL: +version hung'; exit 1 }
 Remove-Item Env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue

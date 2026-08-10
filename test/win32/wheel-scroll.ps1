@@ -83,7 +83,10 @@ $wheelLines = 3
 Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 Assert-GhozttyPrivateEndpoint -Exe $exe
 
-$proc = Start-Process -FilePath $exe -PassThru
+# persistence: off. The wheel assertions want the ONE pane this launch opens; a
+# restored second window would take the foreground and the scroll would land in
+# it (T158).
+$proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' -PassThru
 Start-Sleep -Seconds 3
 if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 Assert-GhozttyIsolated -Exe $exe

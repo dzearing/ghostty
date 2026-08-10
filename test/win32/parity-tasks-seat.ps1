@@ -467,6 +467,7 @@ else {
     $port = 7913
     $dash = Join-Path $Repo 'scripts\task-dashboard.js'
     $env:GHOZTTY_TASK_DIR = $fixture
+    # persistence: n/a - this starts node (the dashboard server), not ghoztty.
     $srv = Start-Process -FilePath $node.Source `
         -ArgumentList @($dash, '--port', "$port") `
         -PassThru -WindowStyle Hidden

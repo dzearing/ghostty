@@ -208,6 +208,7 @@ function Launch($tmp, $title, $relaunch, $restore) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     $launchArgs = @("--session-relaunch=$relaunch")
     if (-not $restore) { $launchArgs += "--title=$title" }
+    # persistence: on (default) - session persistence IS this script's subject.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
 }
 

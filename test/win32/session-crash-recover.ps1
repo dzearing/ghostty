@@ -85,6 +85,7 @@ function Run-Cli($argsLine, $out, $timeoutSec = 15) {
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
 function Start-App($title) {
+    # persistence: on (default) - session persistence IS this script's subject.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
         "--title=$title", '--window-width=100', '--window-height=30') | Out-Null
 }

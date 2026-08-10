@@ -145,6 +145,7 @@ function Start-TwoPane($label) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    # persistence: on (default) - the dropped pane's SESSION is what this script asserts about.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t128-rearrange') | Out-Null
     $pane = Wait-FirstPane $tmp 25
     $paneId = if ($null -ne $pane) { $pane.id } else { '' }

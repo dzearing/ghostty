@@ -1524,6 +1524,24 @@ behavior → an on-box acceptance script. Win32 chrome geometry belongs in the
 pure geometry modules and must be asserted at 1.0, 1.25, 1.5 and 2.0 scaling
 (see the design-system section below).
 
+**Every launch in an acceptance script declares its session persistence**
+(T158). Persistence is ON by default, so a GUI launched without
+`--session-persistence=false` restores whatever panes the last launch left —
+and each section writes the manifest the next one restores, so a script
+poisons itself on a clean box (T131, then T155, where two scripts failed
+`default setup: 2 visible panes` against a build whose geometry was verified
+correct by hand). But a third of the suite WANTS it on — the `session-*`,
+`agent-*` and restore families — so the rule is not "always pass the flag", it
+is **state which you want**: pass the flag, pass something built from it, have
+every caller of your helper pass it, or write a `# persistence: <reason>`
+marker for a site where none of those fit (a CLI verb, a throwaway-
+`LOCALAPPDATA` launch, a forward-and-exit second instance). The value must be
+one `parseBool` accepts (`1/t/T/true/on/yes`, `0/f/F/false/off/no`) — anything
+else is logged, dropped, and leaves a launch that looks explicit and restores
+anyway. Enumerator: `test/win32/lib/PersistenceSweep.ps1`; acceptance (and the
+live control that the flag really stops a restore):
+`test/win32/persistence-flag.ps1`.
+
 **A restore test must prove the pane is LIVE, not painted** (T532, T652). A
 pane that came back as a frozen picture is byte-identical to a working one for
 every assertion that reads the screen or `+list --json` — a replayed marker is

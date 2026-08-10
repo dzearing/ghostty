@@ -334,6 +334,7 @@ function Start-Backed($label, $title) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    # persistence: on (default) - the relaunch below has to RESTORE what this launch left.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @("--title=$title")
     $pane = Wait-FirstPane $tmp 25
     $rows = Wait-AliveCount $tmp 'setup' 1 18
@@ -512,6 +513,7 @@ Assert "F4 the agent kept all 3 sessions alive after the app died" (
 # a normal visible one, so this is the shape that runs.
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+# persistence: on (default) - session persistence IS this script's subject.
 $relaunched = Start-OnTestDesktop -Exe $Exe -StdErr "$tmp\restore1-err.txt"
 
 $winCount = Wait-Windows $tmp 'f-post' 2 30
@@ -638,6 +640,7 @@ Say "== F10: restore-time focus settling across a second relaunch (T105/T223)"
 Stop-AppOnly
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+# persistence: on (default) - session persistence IS this script's subject.
 $relaunch2 = Start-OnTestDesktop -Exe $Exe -StdErr "$tmp\restore2-err.txt"
 $wins = @()
 $deadline = (Get-Date).AddSeconds(30)

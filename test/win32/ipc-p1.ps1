@@ -145,6 +145,7 @@ Assert "exit 0" ($LASTEXITCODE -eq 0)
 
 "== 9: second GUI launch forwards new-window and exits"
 $before = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
+# persistence: n/a - this launch forwards its new-window to the live instance and exits; it restores nothing.
 $second = Start-Process $Exe -PassThru
 $exited = $second.WaitForExit(15000)
 Assert "second instance exited" $exited

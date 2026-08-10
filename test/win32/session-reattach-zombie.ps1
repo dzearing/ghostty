@@ -310,6 +310,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # ============================================================================
 Say "== A: an alt-screen pane is agent-backed, on the alt screen, and interactive"
 # ============================================================================
+# persistence: on (default) - the relaunch below has to RESTORE what this launch left.
 $app = Start-OnTestDesktop -Exe $Exe -StdErr $logA -Arguments @(
     '--title=t532-alt', '-e', 'powershell', '-NoProfile', '-File', $fixture)
 $rowsA = Wait-AliveCount $tmp 'a' 1 40
@@ -370,6 +371,7 @@ $offsetFinal = if ($null -ne $leafFinal) { [uint64]$leafFinal.screen_snapshot_of
 # ============================================================================
 Say "== C: relaunch - the restored alt-screen pane must be LIVE, not a picture"
 # ============================================================================
+# persistence: on (default) - session persistence IS this script's subject.
 $relaunched = Start-OnTestDesktop -Exe $Exe -StdErr $logB
 $hit = Wait-LogMatch $logB "attach: session=$sid offset=(\d+) snapshot=(\d+)" 45
 Assert "C1 the restored pane logged its ATTACH" ($null -ne $hit)
@@ -433,6 +435,7 @@ $json = $mStale | ConvertTo-Json -Depth 40 -Compress
 [System.IO.File]::WriteAllText(
     (Manifest-Path $tmp), $json, (New-Object System.Text.UTF8Encoding $false))
 
+# persistence: on (default) - session persistence IS this script's subject.
 $relaunched2 = Start-OnTestDesktop -Exe $Exe -StdErr $logC
 $hit2 = Wait-LogMatch $logC "attach: session=$sid offset=$phantom " 45
 Assert "D3 the app attached with the phantom offset (the repro took)" ($null -ne $hit2)

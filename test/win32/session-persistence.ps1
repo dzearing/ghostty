@@ -127,6 +127,7 @@ function Crash-App {
 function Relaunch-App {
     $env:LOCALAPPDATA = $script:tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    # persistence: on (default) - session persistence IS this script's subject.
     Start-Process -FilePath $Exe | Out-Null
 }
 
@@ -405,6 +406,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # ============================================================================
 "== A: build the 2-window / 5-pane scenario with distinct ratios"
 # ============================================================================
+# persistence: on (default) - session persistence IS this script's subject.
 Start-Process -FilePath $Exe | Out-Null
 $n = Wait-Windows 'a0' 1 30
 Assert "A1 startup window opened" ($n -eq 1)

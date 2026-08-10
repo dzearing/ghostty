@@ -88,6 +88,7 @@ function Stop-TestApps {
 # Start the app under test, detached, and wait until it answers its own IPC.
 # Returns the pid, or 0.
 function Start-TestApp($tag) {
+    # persistence: on (default) - the guard path under test is the one a persistent app takes; this script counts PROCESSES, not panes.
     $p = Start-Process -FilePath $Exe -ArgumentList @("--title=$tag") -PassThru
     $appPid = $p.Id
     $deadline = (Get-Date).AddSeconds(40)
@@ -105,6 +106,7 @@ function Start-TestApp($tag) {
 function Start-Guard($appPid, $marker) {
     $env:GHOZTTY_RELAUNCH_GUARD = "$appPid|$marker|$Exe"
     try {
+        # persistence: on (default) - see Start-TestApp above.
         return (Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden)
     } finally {
         Remove-Item env:GHOZTTY_RELAUNCH_GUARD -ErrorAction SilentlyContinue
@@ -235,6 +237,7 @@ try {
     $before = @($allD).Count
     $env:GHOZTTY_RELAUNCH_GUARD = 'this-is-not-a-spec'
     try {
+        # persistence: on (default) - see Start-TestApp above.
         $bad = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden
     } finally {
         Remove-Item env:GHOZTTY_RELAUNCH_GUARD -ErrorAction SilentlyContinue

@@ -141,6 +141,7 @@ function Wait-AgentPid($t, $timeoutSec = 25, $notPid = 0) {
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: on (default) - session persistence IS this script's subject.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     # Cache the handle BEFORE the process can exit: touching `.Handle` afterwards
@@ -249,6 +250,7 @@ function Test-PaneResponsive($id, $tag, $timeoutSec = 30) {
 
 function Start-App($title, $extraArgs = @()) {
     $script:AppLog = Join-Path $tmp "applog-$title.err.txt"
+    # persistence: on (default) - session persistence IS this script's subject.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $extraArgs -StdErr $script:AppLog
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -TimeoutMs 40000
     if ($top -eq [IntPtr]::Zero) { return 0 }

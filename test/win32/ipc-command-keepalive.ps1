@@ -133,6 +133,7 @@ Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 try {
     "== setup: launch the debug build on the background desktop"
+    # persistence: on (default) - the keep-alive path under test is the agent-backed one (T468).
     $app = Start-OnTestDesktop -Exe $Exe -StdErr (Join-Path $tmp 'app.err')
     $hwnd = Wait-TestWindow -ProcessId $app.Pid
     if ($hwnd -eq [IntPtr]::Zero) {

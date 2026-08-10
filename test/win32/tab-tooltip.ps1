@@ -71,6 +71,7 @@ function Kill-RepoInstances {
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: n/a - a CLI invocation, which opens no window.
     $p = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     $null = $p.Handle
@@ -146,6 +147,7 @@ try {
     # persistence stays ON (the default) - arm C is a restore.
     # -----------------------------------------------------------------------
     $errlog = Join-Path $root 'app1-stderr.log'
+    # persistence: on (default) - section C asserts the tooltip right after a session-persistence RESTORE, so this launch has to be the one that gets restored.
     $app = Start-OnTestDesktop -Exe $exe -StdErr $errlog -Arguments @(
         '--config-default-files=false',
         '--window-show-tab-bar=always',
@@ -210,6 +212,7 @@ try {
         Start-Sleep -Seconds 2
 
         $errlog2 = Join-Path $root 'app2-stderr.log'
+        # persistence: on (default) - this is the RESTORE launch section C is about.
         $app2 = Start-OnTestDesktop -Exe $exe -StdErr $errlog2 -Arguments @(
             '--config-default-files=false',
             '--window-show-tab-bar=always'

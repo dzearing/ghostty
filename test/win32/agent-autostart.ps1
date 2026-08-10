@@ -105,6 +105,7 @@ function Start-Gui($label) {
     $tmp = Join-Path $root $label
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
+    # persistence: on (default) - a launch with persistence off never autostarts an agent, which is the subject.
     $p = Start-Process -FilePath $Exe -PassThru -WindowStyle Minimized `
         -ArgumentList @('--title=t89h-agent-autostart')
     return @{ Tmp = $tmp; Proc = $p }

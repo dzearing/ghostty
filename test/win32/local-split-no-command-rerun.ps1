@@ -85,6 +85,7 @@ try {
     New-Item -ItemType Directory -Force $root | Out-Null
 
     "== 0: start the GUI (session persistence ON - the default)"
+    # persistence: on (default), as the section header says - the agent-backed split is the subject.
     $app = Start-OnTestDesktop -Exe $Exe
     Start-Sleep -Seconds 3
     Assert "GUI is running" (-not ($app.Process -and $app.Process.HasExited))

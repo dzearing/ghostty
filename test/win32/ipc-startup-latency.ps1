@@ -117,6 +117,7 @@ function Wait-AgentPid($t, $timeoutSec = 25) {
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
+    # persistence: n/a - a CLI invocation, which opens no window.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     # Cache the handle BEFORE the process can exit - reading .ExitCode after an
@@ -172,6 +173,7 @@ counted too.
 function Measure-Startup($tag, $extraArgs = @(), $windowTimeoutSec = 60) {
     $script:AppLog = Join-Path $tmp "applog-$tag.err.txt"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    # persistence: on (default) - the interval being measured IS the restore, so a launch with nothing to restore would measure nothing.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $extraArgs -StdErr $script:AppLog
     $tAnswer = -1
     $tWindow = -1

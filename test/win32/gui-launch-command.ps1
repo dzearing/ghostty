@@ -187,8 +187,10 @@ function Launch($tmp, $launchArgs) {
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     if ($null -eq $launchArgs -or $launchArgs.Count -eq 0) {
+        # persistence: on (default), into a throwaway $env:LOCALAPPDATA - section D asserts a launch command and a RESTORE both happen.
         Start-Process -FilePath $Exe -WindowStyle Minimized | Out-Null
     } else {
+        # persistence: on (default), into a throwaway $env:LOCALAPPDATA - see the launch above.
         Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
     }
 }

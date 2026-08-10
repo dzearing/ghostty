@@ -9,6 +9,68 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-10 - **T158 (T686 closed with it, T688/T689 filed) - every test
+  launch now says whether it wants the terminal to restore its old windows,
+  and a check fails the day one stops saying.** Session persistence is on by
+  default, so an acceptance script that launches the GUI without
+  `--session-persistence=false` gets back whatever panes the previous launch
+  left, and then measures those. It has cost two rounds of chasing a
+  regression that was never in the product (T131, then T155, where two scripts
+  failed `default setup: 2 visible panes` against geometry verified correct by
+  hand).
+
+  The task was filed as "check the other ~28 scripts". The suite is 144 scripts
+  now, and half of them launch through raw `Start-Process` rather than
+  `Start-OnTestDesktop`, so the sweep was written as code:
+  `test/win32/lib/PersistenceSweep.ps1` enumerates every launch of the app
+  under test and resolves its arguments through variables, splats and helper
+  parameters. **145 sites. 61 already passed the flag; 23 more reached it
+  through a variable; 60 had never answered the question.**
+
+  The plan this replaced was a runtime guard in `Start-OnTestDesktop` that
+  refused a launch with no explicit choice. Two things killed it: it sits on
+  only one of the two launch paths, and it would have forced ~60 behavior edits
+  into the `session-*`/`agent-*` family purely to state a default they already
+  depend on - every one of which would then need re-validating to prove it
+  changed nothing. What the suite actually needs is not "always pass the flag"
+  (a third of it wants persistence ON; there the flag's absence is the fixture)
+  but "state which you want", which a comment can do. So 56 of the 60 got a
+  `# persistence: <reason>` marker - 56 inserted comment lines, zero behavior
+  moved, verified by a filtered `git diff` and a parse of all 156 scripts - and
+  **4 were the real defect** and now pass the flag: `ipc-read-race`,
+  `path-selfheal`, `wheel-scroll`, `update-check`. The last two relaunch the
+  GUI repeatedly inside one run, which is exactly the self-poisoning shape T155
+  measured.
+
+  `test/win32/persistence-flag.ps1` is the standing check: section A sweeps the
+  suite, section B proves the sweep can say NO against synthetic fixtures (one
+  per declaration form, plus an undeclared launch and a launch of a different
+  image), and section C is the live control the task asked for - build a
+  two-pane window, kill the app, relaunch twice, and watch the panes come back
+  without the flag (proving the hazard is real, with `Test-PaneLive` proving
+  the restored pane is not a picture) and NOT come back with it. Running it
+  under `GHOZTTY_TEST_LIVENESS_BREAK=1` reds that one arm and nothing else.
+
+  Two surprises. **T686**, filed one turn earlier for 12 scripts of this same
+  class, is a strict subset - closed as superseded, and 2 of its 12 were false
+  positives that launch `powershell`/`cmd`, not ghoztty, which is the
+  difference between a file-level grep and an enumeration. And chasing its
+  `color-contrast.ps1` case (which spells the flag `=off`) turned up a comment
+  in the suite asserting that `off` is rejected and silently ignored: true when
+  written on 2026-08-03, false since `8f7af4466` added on/off/yes/no the next
+  day. The comment is corrected, and the sweep now checks the VALUE against
+  `parseBool`'s list - because a flag the parser drops leaves a launch that
+  looks explicit and restores anyway, which is worse than no flag at all.
+
+  Evidence: `persistence-flag.ps1` ALL PASS (20) x3; the four edited scripts
+  ALL PASS x2 each; `ipc-instance-addressability` ALL PASS (16); P1-P3 ALL
+  PASS; `floor-lane.ps1 -Lane all` none/win32/agent all PASS. Filed **T688**
+  (34 copies of `Kill-RepoInstances` kill once without verifying, so a
+  survivor turns a healthy launch into `SETUP FAIL: GUI died at launch`) and
+  **T689** (launches that capture no stderr leave a dead GUI undiagnosable) -
+  both are 34-file sweeps of their own and both were named in T158's own
+  Details as "worth folding in", which they are not.
+
 - 2026-08-09 - **T89i / T485 - the crash-and-restart test could not be run
   from a terminal, so for 19 days nobody found out its blocker had been
   fixed.** T89i is the harness that proves session persistence: it builds a

@@ -59,6 +59,7 @@ Assert "setup: exe exists" (Test-Path $Exe)
 # One warm-up run alone: its line count IS the per-process contribution, so the
 # expected total is derived from the binary under test rather than hard-coded
 # (a build that changes its banner must not silently turn this into a no-op).
+# persistence: n/a - a CLI invocation, which opens no window.
 $p = Start-Process -FilePath $Exe -ArgumentList @('+list') -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $root 'warm.out') -RedirectStandardError (Join-Path $root 'warm.err')
 $null = $p.Handle
@@ -73,6 +74,7 @@ Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 # All writers at once. Start-Process returns immediately, so they overlap.
 $procs = @()
 for ($i = 0; $i -lt $Writers; $i++) {
+    # persistence: n/a - a CLI invocation, which opens no window.
     $procs += Start-Process -FilePath $Exe -ArgumentList @('+list') -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $root "w$i.out") -RedirectStandardError (Join-Path $root "w$i.err")
 }
