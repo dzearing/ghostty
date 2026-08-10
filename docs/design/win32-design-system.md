@@ -288,6 +288,38 @@ over the surface), a level-0 element never draws a shadow to fake depth it does
 not have, and a level-2 popup never draws its own fake shadow when it is a real
 window that DWM will shadow for it.
 
+### 3.3 Card material: hand-composited, lit from one overhead point
+
+An in-pane card (banner, TOC) is **not** a system backdrop — no Mica, no
+Acrylic, no `DwmSetWindowAttribute` backdrop (T124). Two reasons, and the
+second is the disqualifying one:
+
+- A system material re-renders when the window's key state changes, so the
+  card visibly shifts color every time you switch windows, and its frost
+  washes the pane's hue toward grey. (Mac reached the same verdict about
+  `glassEffect` and hand-draws `GlassCardBackground` for exactly this.)
+- Mica and Acrylic sample what is **behind the window** — the desktop. A card
+  floating inside a pane must be tinted off the **pane**, which is the one
+  surface those materials cannot see.
+
+So the card is composited once into a DIB over the pane's own background
+(`banner_card.render`), which also keeps the overlay window fully opaque —
+nothing behind it can bleed through.
+
+Its two speculars are **elliptical gradients centered half a card-height
+ABOVE the card**, horizontally centered: a sheen bulging down into the top,
+and the hairline rim lit by the same point. Not a vertical ramp. A ramp that
+varies only with height lights the far ends of a wide banner exactly as
+brightly as its middle, which reads as a painted stripe rather than a lit
+surface — and a banner spans the whole pane, so "wide" is the normal case.
+The radii are fractions of the card's own width and height, so the falloff is
+identical at any banner width and at any DPI (asserted at 1.0/1.25/1.5/2.0).
+
+Consequence worth knowing: the gradient's first stop sits at the ellipse's
+center, which is off the card, so **no pixel is ever lit at the first stop's
+alpha**. Anything reading `banner_card.RIM_TOP` as "the brightness of a top
+edge" is wrong by about 35%.
+
 ---
 
 ## 4. Glyphs

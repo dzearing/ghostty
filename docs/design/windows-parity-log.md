@@ -13348,3 +13348,49 @@ means rendering the content into an offscreen DIB and `AlphaBlend`-ing it, which
 also means untangling the link hit rects the content pass builds on its way
 through — a real change for a difference visible for a fifth of a second, so it
 is a follow-up rather than part of this task.
+
+## 2026-08-09 — The banner card catches the light instead of wearing a stripe (T124)
+
+A pane banner is meant to read as a piece of glass with a light above it:
+brightest in the middle of its top edge, falling away toward both ends. On
+Windows the highlight varied only with height, so every column got the same
+brightness — and a banner spans the whole pane, which meant the normal case was
+one evenly-lit band across the top rather than a lit surface. Same for the
+hairline rim. Now both are real elliptical gradients centered half a
+card-height above the card, matching what Mac's `GlassCardBackground` has been
+drawing. The viewer's table-of-contents card renders through the same code, so
+it gets it too.
+
+T124 was filed against six macOS commits, and the first job was working out how
+many of them were still open. Five were not: the floating glass card and its
+stable collapse geometry landed as T131, the collapse timing that moves the
+terminal inset exactly once landed as T149 this morning, and the pane-hued tint
+composited off a single element was how T131 built the card in the first place —
+win32 never had the focus-reactive material that Mac spent two commits removing.
+What remained was one thing, `286078a2f`/`755af5c97`'s *elliptical* sheen, which
+the port had approximated as a vertical ramp.
+
+The approximation is invisible on a narrow card and obvious on a wide one, which
+is why it survived. The fix is `banner_card.Ellipse` plus a piecewise stop
+evaluator: sheen `0.10 → 0.03 @ 0.6 → clear` at radius 1.15, rim
+`0.28 → 0.10 @ 0.7 → 0.04` at radius 1.3, both centered at Mac's
+`UnitPoint(0.5, -0.5)`, and the bottom grounding shade switched from a
+`smoothstep` to the linear ramp Mac's `LinearGradient` stop actually describes.
+Radii are fractions of the card's own width and height rather than pixels, so
+the falloff is identical whether the banner is 200px or 2000px wide and at every
+DPI — both asserted, the second at 1.0/1.25/1.5/2.0.
+
+The Liquid Glass question the task left open is answered NO, and recorded in the
+design system (§3.3) rather than only here. Mica and Acrylic sample what is
+behind the *window* — the desktop — and a card floating inside a pane has to be
+tinted off the *pane*, which is the one surface those materials cannot see. They
+also re-render on window key-state changes, which is the same objection Mac's own
+comment raises against `glassEffect`. So the adopted items are the two that are
+about light rather than about material, and no system backdrop is introduced.
+
+One surface is left inconsistent and is filed rather than papered over: the tab
+chiclet reads the card's `RIM_TOP`/`RIM_BOT` as the endpoints of a straight
+ramp, whose premise ("indistinguishable over a short tab") held while the card's
+ramp also started at `RIM_TOP`. It no longer does — that stop sits at the
+ellipse's center, above the card, so the card's brightest rim pixel is about 35%
+dimmer than a tab's top edge. **T679.**

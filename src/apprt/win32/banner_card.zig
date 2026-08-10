@@ -6,11 +6,14 @@
 //!
 //! Two things make this a pure module rather than GDI calls:
 //!
-//! 1. GDI has no antialiased rounded rectangle and no soft shadow. Both are
-//!    computed here per pixel — an analytic rounded-rect SDF for the card
-//!    (coverage = the pixel's overlap with the shape) and a smoothstep of
-//!    the same SDF for the shadow, which approximates a gaussian blur of the
-//!    shape without an actual blur pass.
+//! 1. GDI has no antialiased rounded rectangle, no soft shadow, and no
+//!    elliptical gradient. All three are computed here per pixel — an
+//!    analytic rounded-rect SDF for the card (coverage = the pixel's overlap
+//!    with the shape), a smoothstep of the same SDF for the shadow, which
+//!    approximates a gaussian blur of the shape without an actual blur pass,
+//!    and an `Ellipse` for each specular gradient (T124), which is what makes
+//!    the highlight read as a lit object rather than a stripe laid across the
+//!    card's top edge.
 //! 2. The card is composited against the pane background ONCE, here, so the
 //!    overlay window can stay fully opaque. The old strip was a translucent
 //!    layered window, which let stale terminal pixels behind the band show
@@ -54,20 +57,50 @@ pub const SHADOW_ALPHA: f32 = 0.30;
 pub const FILL_LIGHTEN: f32 = 0.06;
 pub const FILL_DARKEN: f32 = 0.04;
 
-/// Specular rim (hairline border) alpha, brightest at the top and nearly
-/// gone along the bottom. Mac: elliptical gradient 0.28 → 0.10 → 0.04.
-/// Public because the tab strip's rim is the SAME rim (T206 — "tabs should
-/// have similar borders to the banner. It should feel cohesive"). Importing
-/// these beats copying them: a copy stops matching the first time either side
-/// is tuned, and nobody notices until the user does.
+/// Specular rim (hairline border) alpha stops, along the same overhead
+/// ellipse the sheen uses: brightest toward the top-center, softening around
+/// the upper corners, nearly gone along the bottom. Mac: `EllipticalGradient`
+/// 0.28 @ 0 → 0.10 @ 0.7 → 0.04 @ 1.
+///
+/// `RIM_TOP`/`RIM_BOT` are public because the tab strip's rim is the SAME rim
+/// (T206 — "tabs should have similar borders to the banner. It should feel
+/// cohesive"). Importing these beats copying them: a copy stops matching the
+/// first time either side is tuned, and nobody notices until the user does.
+/// Note the tab reads them as the endpoints of a straight vertical ramp
+/// (`tab_shape.rimAlpha`) — these are the GRADIENT's stops, and the ellipse's
+/// bright center sits above the card, so no pixel of a card is ever lit at
+/// the full `RIM_TOP`. See T679.
 pub const RIM_TOP: f32 = 0.28;
+pub const RIM_MID: f32 = 0.10;
 pub const RIM_BOT: f32 = 0.04;
+const RIM_MID_AT: f32 = 0.7;
 
-/// Specular sheen: white at 10% bulging down into the top of the card and
-/// falling away, plus a faint darkening along the bottom edge to ground it.
-/// Mac: an elliptical gradient centered above the card + a linear one below.
+/// Specular sheen: white bulging down into the top of the card and falling
+/// away, plus a faint darkening along the bottom edge to ground it. Mac: an
+/// elliptical gradient centered above the card + a linear one below.
 const SHEEN_TOP: f32 = 0.10;
+const SHEEN_MID: f32 = 0.03;
+const SHEEN_MID_AT: f32 = 0.6;
 const SHEEN_BOTTOM_DARK: f32 = 0.05;
+/// Where the bottom darkening starts, as a fraction of the card's height.
+/// Mac: a `LinearGradient` stop, so the ramp from there is LINEAR — an eased
+/// one would ground the card a shade later than the Mac card does.
+const BOTTOM_DARK_AT: f32 = 0.75;
+
+/// The specular ellipse's center, in fractions of the card's own size: half a
+/// card-height ABOVE the top edge, horizontally centered. Mac:
+/// `UnitPoint(x: 0.5, y: -0.5)` on both the sheen and the rim gradient.
+///
+/// This is the whole reason the highlight reads as a lit object rather than a
+/// band: a vertical-only ramp lights the card's far ends exactly as brightly
+/// as its middle, which on a banner spanning a wide pane is a flat stripe.
+const SPECULAR_CX: f32 = 0.5;
+const SPECULAR_CY: f32 = -0.5;
+
+/// End radius of each gradient, as a fraction of the card's size. Mac:
+/// `endRadiusFraction` 1.15 (sheen) and 1.3 (rim).
+const SHEEN_RADIUS: f32 = 1.15;
+const RIM_RADIUS: f32 = 1.3;
 
 /// The card's fill color: the wash already composited over `bg`, so callers
 /// that need a solid color (text antialiasing backdrop, harness oracles)
@@ -136,6 +169,100 @@ pub const Rect = struct {
         return self.bottom - self.top;
     }
 };
+
+/// One of the two overhead specular gradients, in its own parameter space:
+/// `t` is 0 at the ellipse's center and 1 on its boundary.
+///
+/// The radii are fractions of the CARD's width and height separately, which
+/// is how SwiftUI's `EllipticalGradient` normalizes — and it is the property
+/// that matters here: the falloff across the card is the same whether the
+/// banner is 200px wide or 2000, so a wide pane's banner does not end up with
+/// a uniformly lit top edge.
+pub const Ellipse = struct {
+    cx: f32,
+    cy: f32,
+    /// Reciprocal radii, so evaluating is multiplies rather than divides.
+    inv_rx: f32,
+    inv_ry: f32,
+
+    pub fn init(c: Rect, radius: f32) Ellipse {
+        const w = @max(c.width(), 1.0);
+        const h = @max(c.height(), 1.0);
+        return .{
+            .cx = c.left + w * SPECULAR_CX,
+            .cy = c.top + h * SPECULAR_CY,
+            .inv_rx = 1.0 / (w * radius),
+            .inv_ry = 1.0 / (h * radius),
+        };
+    }
+
+    /// The row-constant half of `t`: the squared vertical term. Hoisted out
+    /// of the inner loop — every pixel of a row shares it.
+    pub fn rowTerm(self: Ellipse, y: f32) f32 {
+        const dy = (y - self.cy) * self.inv_ry;
+        return dy * dy;
+    }
+
+    /// `t` at `x` given a row term from `rowTerm`.
+    pub fn atRow(self: Ellipse, x: f32, row_term: f32) f32 {
+        const dx = (x - self.cx) * self.inv_rx;
+        return @sqrt(dx * dx + row_term);
+    }
+
+    pub fn at(self: Ellipse, x: f32, y: f32) f32 {
+        return self.atRow(x, self.rowTerm(y));
+    }
+};
+
+/// One stop of a gradient: alpha `a` at parameter `t`.
+const Stop = struct { t: f32, a: f32 };
+
+/// Piecewise-linear gradient lookup, clamped at both ends the way SwiftUI's
+/// gradients are — past the last stop the last color continues, which is why
+/// the sheen's final stop is explicitly clear and the rim's is not.
+fn gradient(stops: []const Stop, t: f32) f32 {
+    if (t <= stops[0].t) return stops[0].a;
+    for (stops[1..], 1..) |s1, i| {
+        if (t > s1.t) continue;
+        const s0 = stops[i - 1];
+        const span = s1.t - s0.t;
+        if (span <= 0.0) return s1.a;
+        return mix(s0.a, s1.a, (t - s0.t) / span);
+    }
+    return stops[stops.len - 1].a;
+}
+
+const SHEEN_STOPS = [_]Stop{
+    .{ .t = 0.0, .a = SHEEN_TOP },
+    .{ .t = SHEEN_MID_AT, .a = SHEEN_MID },
+    .{ .t = 1.0, .a = 0.0 },
+};
+
+const RIM_STOPS = [_]Stop{
+    .{ .t = 0.0, .a = RIM_TOP },
+    .{ .t = RIM_MID_AT, .a = RIM_MID },
+    .{ .t = 1.0, .a = RIM_BOT },
+};
+
+/// White alpha of the specular sheen at (`x`, `y`) on card `c`.
+pub fn sheenAlpha(x: f32, y: f32, c: Rect) f32 {
+    return gradient(&SHEEN_STOPS, Ellipse.init(c, SHEEN_RADIUS).at(x, y));
+}
+
+/// White alpha of the hairline rim at (`x`, `y`) on card `c`.
+pub fn rimAlpha(x: f32, y: f32, c: Rect) f32 {
+    return gradient(&RIM_STOPS, Ellipse.init(c, RIM_RADIUS).at(x, y));
+}
+
+/// Black alpha of the linear darkening that grounds the card's bottom edge.
+/// Row-constant: it depends only on height within the card.
+pub fn bottomShadeAlpha(y: f32, c: Rect) f32 {
+    const h = c.height();
+    if (h <= 0.0) return 0.0;
+    const t = std.math.clamp((y - c.top) / h, 0.0, 1.0);
+    if (t <= BOTTOM_DARK_AT) return 0.0;
+    return SHEEN_BOTTOM_DARK * (t - BOTTOM_DARK_AT) / (1.0 - BOTTOM_DARK_AT);
+}
 
 /// Signed distance from (`x`, `y`) to a rounded rect: negative inside,
 /// positive outside, in px. The standard IQ formulation.
@@ -217,7 +344,6 @@ pub fn render(pixels: []u32, m: Metrics, bg: Rgb) void {
     const bg_packed = bg_f.pack();
     const fill_f = Frgb.from(fillColor(bg));
     const card = m.card();
-    const ch = card.height();
 
     // Shadow shape: the card, pushed down. Blurred by a smoothstep of its
     // own SDF, which is what a gaussian of a large rounded shape looks like
@@ -233,14 +359,17 @@ pub fn render(pixels: []u32, m: Metrics, bg: Rgb) void {
     // coverage, no rim, no shadow. That is the bulk of a wide banner.
     const inner = m.radius + 1.0;
 
+    // The two overhead specular gradients. Built once — only their row and
+    // column terms vary per pixel.
+    const sheen_e = Ellipse.init(card, SHEEN_RADIUS);
+    const rim_e = Ellipse.init(card, RIM_RADIUS);
+
     for (0..h) |row| {
         const y = @as(f32, @floatFromInt(row)) + 0.5;
         const y_inside = y >= card.top + inner and y <= card.bottom - inner;
-        // Vertical position within the card, for the sheen and rim ramps.
-        const t = if (ch > 0) std.math.clamp((y - card.top) / ch, 0.0, 1.0) else 0.0;
-        const sheen_a = SHEEN_TOP * (1.0 - t) * (1.0 - t);
-        const sheen_dark = SHEEN_BOTTOM_DARK * smoothstep(0.75, 1.0, t);
-        const rim_a = mix(RIM_TOP, RIM_BOT, smoothstep(0.0, 1.0, t));
+        const sheen_row = sheen_e.rowTerm(y);
+        const rim_row = rim_e.rowTerm(y);
+        const sheen_dark = bottomShadeAlpha(y, card);
         const line = pixels[row * w ..][0..w];
 
         for (line, 0..) |*p, col| {
@@ -272,9 +401,13 @@ pub fn render(pixels: []u32, m: Metrics, bg: Rgb) void {
             }
             if (cov_card > 0.0) {
                 c = c.over(fill_f, cov_card);
+                const sheen_a = gradient(&SHEEN_STOPS, sheen_e.atRow(x, sheen_row));
                 if (sheen_a > 0.0) c = c.over(WHITE, sheen_a * cov_card);
                 if (sheen_dark > 0.0) c = c.over(BLACK, sheen_dark * cov_card);
-                if (cov_rim > 0.0) c = c.over(WHITE, rim_a * cov_rim);
+                if (cov_rim > 0.0) {
+                    const rim_a = gradient(&RIM_STOPS, rim_e.atRow(x, rim_row));
+                    c = c.over(WHITE, rim_a * cov_rim);
+                }
             }
             p.* = if (cov_card == 0.0 and cov_shadow == 0.0) bg_packed else c.pack();
         }
@@ -395,6 +528,131 @@ test "render: a soft shadow falls below the card" {
     // ...and the darkening fades out toward the band edge.
     const far = lum(at(&px, m, 100, 79));
     try testing.expect(far >= near);
+}
+
+test "Ellipse: the specular center sits half a card-height above the top" {
+    const c = Rect{ .left = 12, .top = 12, .right = 188, .bottom = 68 };
+    const e = Ellipse.init(c, SHEEN_RADIUS);
+    try testing.expectApproxEqAbs(@as(f32, 100), e.cx, 0.001);
+    // 12 - 56/2: above the card, which is what curves the highlight down
+    // into the top edge instead of laying a band across it.
+    try testing.expectApproxEqAbs(@as(f32, -16), e.cy, 0.001);
+    try testing.expect(e.cy < c.top);
+    // t == 1 exactly on the ellipse's own boundary, straight down from the
+    // center: cy + h * radius.
+    try testing.expectApproxEqAbs(@as(f32, 1), e.at(100, -16 + 56 * SHEEN_RADIUS), 0.001);
+    // ...and 0 at the center itself.
+    try testing.expectApproxEqAbs(@as(f32, 0), e.at(100, -16), 0.001);
+}
+
+test "Ellipse: falloff is aspect-independent, so a wide banner is not a stripe" {
+    // The same point in card-relative terms lands at the same t whether the
+    // card is 200px wide or 2000. Per-axis normalization is what buys this;
+    // a screen-space circle would light a wide banner's whole top edge.
+    const narrow = Rect{ .left = 0, .top = 0, .right = 200, .bottom = 60 };
+    const wide = Rect{ .left = 0, .top = 0, .right = 2000, .bottom = 60 };
+    const tn = Ellipse.init(narrow, SHEEN_RADIUS).at(200 * 0.9, 30);
+    const tw = Ellipse.init(wide, SHEEN_RADIUS).at(2000 * 0.9, 30);
+    try testing.expectApproxEqAbs(tn, tw, 0.001);
+}
+
+test "gradient: linear between stops, clamped past both ends" {
+    const stops = [_]Stop{
+        .{ .t = 0.0, .a = 1.0 },
+        .{ .t = 0.5, .a = 0.2 },
+        .{ .t = 1.0, .a = 0.0 },
+    };
+    try testing.expectApproxEqAbs(@as(f32, 1.0), gradient(&stops, -1.0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), gradient(&stops, 0.25), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), gradient(&stops, 0.5), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), gradient(&stops, 0.75), 0.001);
+    // Past the last stop the last value continues — SwiftUI's clamp, and the
+    // reason the sheen's final stop must be an explicit zero.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), gradient(&stops, 4.0), 0.001);
+}
+
+test "sheenAlpha: bulges into the top-center and falls away toward the ends" {
+    const c = Rect{ .left = 0, .top = 0, .right = 400, .bottom = 80 };
+    const top_center = sheenAlpha(200, 1, c);
+    const top_end = sheenAlpha(4, 1, c);
+    const middle = sheenAlpha(200, 40, c);
+    // Brightest at the top-center...
+    try testing.expect(top_center > top_end);
+    try testing.expect(top_center > middle);
+    // ...and gone well before the bottom edge (the ellipse's t passes 1).
+    try testing.expectApproxEqAbs(@as(f32, 0), sheenAlpha(200, 79, c), 0.0001);
+    // Never brighter than the gradient's own first stop, which sits above
+    // the card and so is never reached.
+    try testing.expect(top_center < SHEEN_TOP);
+}
+
+test "rimAlpha: lit from the same overhead ellipse as the sheen" {
+    const c = Rect{ .left = 0, .top = 0, .right = 400, .bottom = 80 };
+    const top_center = rimAlpha(200, 0.5, c);
+    const top_corner = rimAlpha(0.5, 0.5, c);
+    const bottom = rimAlpha(200, 79.5, c);
+    try testing.expect(top_center > top_corner);
+    try testing.expect(top_corner > bottom);
+    // The bottom has run past the ellipse, so it holds the last stop.
+    try testing.expectApproxEqAbs(RIM_BOT, bottom, 0.001);
+    // No pixel of the card reaches RIM_TOP: that stop is at the ellipse's
+    // center, which is above the card. This is the difference the tab strip's
+    // straight ramp does NOT model (T679).
+    try testing.expect(top_center < RIM_TOP);
+    try testing.expect(top_center > RIM_MID);
+}
+
+test "bottomShadeAlpha: nothing until 75%, then a straight ramp" {
+    const c = Rect{ .left = 0, .top = 0, .right = 400, .bottom = 80 };
+    try testing.expectApproxEqAbs(@as(f32, 0), bottomShadeAlpha(0, c), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0), bottomShadeAlpha(60, c), 0.0001);
+    // Halfway through the ramp is half the darkening — linear, not eased.
+    try testing.expectApproxEqAbs(SHEEN_BOTTOM_DARK * 0.5, bottomShadeAlpha(70, c), 0.001);
+    try testing.expectApproxEqAbs(SHEEN_BOTTOM_DARK, bottomShadeAlpha(80, c), 0.001);
+}
+
+test "specular gradients are scale-invariant at 1.0/1.25/1.5/2.0" {
+    // The design system asks every piece of win32 chrome to be asserted at
+    // these four scales. The gradients are normalized to the card's own rect
+    // rather than to DIPs, so the CLAIM here is that a given relative point
+    // on the card takes the same alpha at every DPI — a highlight that
+    // drifted with scale would read as a different material at 150%.
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
+    var want_sheen: f32 = 0;
+    var want_rim: f32 = 0;
+    for (scales, 0..) |s, i| {
+        const m = Metrics.init(
+            @intFromFloat(@round(400 * s)),
+            @intFromFloat(@round(90 * s)),
+            s,
+        );
+        const c = m.card();
+        const x = c.left + c.width() * 0.5;
+        const y = c.top + c.height() * 0.02;
+        const sheen = sheenAlpha(x, y, c);
+        const rim = rimAlpha(x, y, c);
+        if (i == 0) {
+            want_sheen = sheen;
+            want_rim = rim;
+            continue;
+        }
+        try testing.expectApproxEqAbs(want_sheen, sheen, 0.002);
+        try testing.expectApproxEqAbs(want_rim, rim, 0.002);
+    }
+}
+
+test "render: a wide card's top edge is a highlight, not a stripe" {
+    // The regression this whole gradient exists to prevent: with a
+    // vertical-only ramp, the far ends of a wide banner's top edge are lit
+    // exactly as brightly as its middle.
+    const m = Metrics.init(800, 90, 1.0);
+    var px: [800 * 90]u32 = undefined;
+    render(&px, m, DARK);
+    const center = lum(at(&px, m, 400, 20));
+    const near_end = lum(at(&px, m, 30, 20));
+    try testing.expect(center > near_end);
+    // ...and the same row well below the card's top is dimmer than both.
+    try testing.expect(near_end > lum(at(&px, m, 400, 60)));
 }
 
 test "render: the rim lights the card's top edge" {
