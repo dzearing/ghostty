@@ -448,6 +448,20 @@ Assert "an unmarked send is unframed, as a flat payload always was" `
 Assert "every LF in an unmarked send still arrives as CR, mode 2004 or not" `
     ($r16 -eq ('61' + $CR + '62' + $CR))
 
+"== 17: T658 - a trailing CRLF submits ONCE, not twice"
+# The peel counts LINE ENDINGS, not bytes. `\r\n` is one ending written the
+# Windows way - and Windows is where a caller's CRLF text comes from - so it
+# has to produce exactly the bytes round 9's bare `\n` does. Counting its two
+# bytes pressed Enter twice: the caller's message, then an empty line after it,
+# which a chat-style TUI reads as a second, blank turn nobody asked for. Only a
+# byte-exact capture can tell one trailing CR from two.
+$r17 = Invoke-Round 'on' 24 @("$msg\r\n")
+"     got: $r17"
+Assert "same bytes as a trailing \n (round 9) and an explicit Enter (round 1)" `
+    ($r17 -eq ($FRAME_START + $msgHex + $FRAME_END + $CR))
+Assert "exactly one submitting CR, not two" `
+    (-not $r17.EndsWith($CR + $CR))
+
 "== teardown"
 & $Exe +close "--target=$win" 2>&1 | Out-Null
 Reset-GhozttyTestState -Exe $Exe -SettleMs 500 | Out-Null

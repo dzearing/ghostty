@@ -597,11 +597,27 @@ fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) A
     // means "commit" essentially always, and for a program that has not
     // enabled bracketed paste the tty's ICRNL maps the `\r` back to `\n`, so
     // `cat` and a script's `read` see what they always saw.
+    //
+    // What is counted is LINE ENDINGS, not bytes: a `\r\n` pair is one line
+    // ending written the Windows way and presses Enter ONCE. Counting bytes
+    // submitted a CRLF-terminated argument twice — the caller's message, then
+    // an empty line after it, which in a chat-style TUI is a whole extra turn
+    // nobody asked for. Repeated endings still count separately, so
+    // `"a\n\n"` and `"a\r\n\r\n"` both press twice.
     var end = buf.items.len;
-    while (end > start and (buf.items[end - 1] == '\n' or buf.items[end - 1] == '\r')) end -= 1;
-    for (buf.items[end..]) |*byte| byte.* = '\r';
+    var presses: usize = 0;
+    while (end > start) {
+        switch (buf.items[end - 1]) {
+            '\n' => end -= if (end - 1 > start and buf.items[end - 2] == '\r') 2 else 1,
+            '\r' => end -= 1,
+            else => break,
+        }
+        presses += 1;
+    }
+    buf.items.len = end;
+    try buf.appendNTimes(alloc, '\r', presses);
 
-    return .{ .text_len = end - start, .key_len = buf.items.len - end };
+    return .{ .text_len = end - start, .key_len = presses };
 }
 
 /// Process escape sequences within a text string.
@@ -1022,6 +1038,62 @@ test "resolveSegments multiple trailing newlines are multiple presses" {
     try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
     try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
     try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments a trailing CRLF is ONE press, not two" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `\r\n` is one line ending written the Windows way — and Windows is
+    // where such text comes from. Counting its two bytes submitted the
+    // caller's message and then an empty line after it.
+    const resolved = try testResolve(alloc, &.{"prompt\\r\\n"});
+
+    try std.testing.expectEqualStrings("prompt\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments repeated CRLF endings are still one press each" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"prompt\\r\\n\\r\\n"});
+
+    try std.testing.expectEqualStrings("prompt\r\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqualStrings("prompt", resolved.segments[0].bytes);
+    try std.testing.expectEqualStrings("\r\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments a CRLF-only argument is one Enter and nothing else" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try testResolve(alloc, &.{"\\r\\n"});
+
+    try std.testing.expectEqualStrings("\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    try std.testing.expectEqual(Kind.key, resolved.segments[0].kind);
+}
+
+test "resolveSegments a bare CR run is still one press per CR" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Only `\r\n` pairs collapse. Two carriage returns are two Enter
+    // presses, the same way two newlines are.
+    const resolved = try testResolve(alloc, &.{"prompt\\r\\r"});
+
+    try std.testing.expectEqualStrings("prompt\r\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
     try std.testing.expectEqualStrings("\r\r", resolved.segments[1].bytes);
 }
 

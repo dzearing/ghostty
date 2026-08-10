@@ -14110,3 +14110,33 @@ not tell "the marker is honored" from "the rewrite was deleted outright".
 Evidence: `send-keys-bracketed.ps1` ALL PASS (16 rounds),
 `ipc-send-keys-fidelity.ps1` ALL PASS, `reset-context.ps1` ALL PASS (52). All
 three zig lanes PASS through `floor-lane.ps1 -Lane all`; P1–P3 ALL PASS.
+
+## 2026-08-10 — a Windows-style line ending at the end of a `+send-keys` message submits it once, not twice (T658)
+
+Ending a message with `\r\n` used to send it twice: the caller's prompt, then
+an empty line right behind it, which a chat-style TUI reads as a second, blank
+turn nobody asked for. The trailing-newline peel that T604 ported from main
+walks back over the trailing bytes and turns each `\n`/`\r` into its own Enter
+press — deliberate for `"prompt\n\n"`, wrong for `"prompt\r\n"`, which is ONE
+line ending written the Windows way. Windows is where CRLF text comes from, so
+this was a live hazard here rather than a corner case.
+
+`resolveArgument` (`src/cli/send_keys.zig`) now counts LINE ENDINGS instead of
+bytes: a trailing `\r\n` pair consumes two bytes and contributes one press,
+everything else contributes one press per byte. Repeated endings still count
+separately — `"a\n\n"` and `"a\r\n\r\n"` both press twice, and a bare
+`"a\r\r"` still presses twice, because only the pair collapses.
+
+This is a deliberate divergence from upstream main's `a7f7476e1`, which T658
+carried verbatim on purpose so the wart would be visible rather than silently
+fixed on one seat. D57 files the call (fix in shared core and offer it
+upstream) for the user to overturn; T701 has the Mac seat verify the shared-core
+change there.
+
+Evidence: four new unit tests in the none lane, teeth-checked by removing the
+pair collapse — exactly three go red (77/80). Round 17 of
+`test\win32\send-keys-bracketed.ps1` is the on-wire oracle and captured
+`1b5b3230307e…1b5b3230317e0d`: framed text, one trailing `0d`, byte-identical
+to round 9's bare `\n` and round 1's explicit `Enter`. All three zig lanes PASS
+through `floor-lane.ps1 -Lane all`; `send-keys-bracketed.ps1` ALL PASS; P1–P3
+ALL PASS.
