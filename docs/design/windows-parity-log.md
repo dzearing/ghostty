@@ -9,6 +9,54 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-09 - **T426 - the app and its background agent shared a
+  kill-on-close job, which is why the app vanished mid-refresh. Measured, then
+  removed.** Four times a user confirmed the agent-upgrade dialog and Ghoztty
+  ended between one log line and the next: no crash record, no
+  `terminate returned`, no windows. T421 made it recoverable and T524 named a
+  candidate mechanism it could not test. This turn tested it.
+
+  The refresh now writes the job facts down BEFORE it kills anything, because
+  by the time it matters the app is gone and nobody can ask. In a real
+  destructive refresh it printed `self_in_job=yes self_job_flags=0x2000
+  kill_on_close agent_in_job=yes SHARED_JOB=yes`. One kill-on-close job, both
+  processes in it. A job teardown kills every member at once, with no chance to
+  log — which is the signature, all four times. The flags also carry no
+  `breakaway_ok`, which is separately why tier-1 breakaway is ACCESS_DENIED
+  here. Fields that cannot be measured print `?`, never `no`: an unanswerable
+  question reading as a negative answer is what sends the next investigation
+  down the wrong path.
+
+  The cause is removed on the agent side. `spawnAgent` used a plain
+  `CreateProcessW` with `DETACHED_PROCESS`, and `DETACHED_PROCESS` does not
+  leave a job — so the daemon whose whole purpose is outliving the app was a
+  member of a group that could kill it on the app's account. It now goes
+  through the tiered escape T524 built for the relaunch guard, extracted here
+  into `job_spawn.zig` because both callers want the identical thing for the
+  identical reason; the probes live in `job_object.zig`.
+
+  Proven by outcome, not by log scraping: `test\win32\agent-job-escape.ps1`
+  jails the app in a kill-on-close job, probes the agent it then spawns with
+  `IsProcessInJob` against that exact handle, and tears the job down — **ALL
+  PASS (9)**. Teeth-checked with the pre-fix spawn rebuilt: B2 and C1 both
+  FAIL, i.e. the agent really was a member and really did die with the
+  teardown. Arm D is the negative control that keeps a job which kills nothing
+  from passing the other two.
+
+  Surprise worth carrying: the escape is environment-dependent and now says
+  so. Tier 1 is refused on this box and tier 2 needs a shell window, which the
+  acceptance harness's background test desktop does not have — so both the
+  agent spawn and the relaunch-guard arm degrade to in-job there and log it.
+  `agent-upgrade.ps1` therefore asserts the invariant that holds everywhere (it
+  names its tier, and is loud when it degrades) and leaves the membership claim
+  to the direct probe. Filed **T674** (a tier that needs no shell) and **T675**
+  (who puts the APP itself in a kill-on-close job, and whether it should break
+  out at startup — that one is still unanswered).
+
+  Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS; P1-P3 ALL PASS;
+  `agent-upgrade.ps1` ALL PASS (111, was 107) and `relaunch-guard.ps1` ALL PASS
+  (25) after the extraction.
+
 - 2026-08-09 - **T647 - the feedback composer's `+` button takes a screenshot,
   and it does not touch your clipboard.** The last hole in the win32 composer:
   the button was drawn (T633), the storage, chip numbering and carousel behind

@@ -40,6 +40,12 @@ test {
     // waits on the wrong pid, so the lane compiles and checks it in its own
     // right.
     _ = @import("win32/relaunch_guard.zig");
+    // Escaping the app's job object, and measuring who is in it (T524, T426).
+    // Both are what stands between a daemon/supervisor and dying with the
+    // process it exists to outlive, so the lane compiles and checks them in
+    // their own right rather than only through their callers.
+    _ = @import("win32/job_spawn.zig");
+    _ = @import("win32/job_object.zig");
     // The named-target registry (T121). Its auto `window-N` allocator is the
     // thing that must never re-mint a name a restored window already adopted,
     // and that is pure logic worth checking in its own right.

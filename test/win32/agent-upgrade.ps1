@@ -572,6 +572,33 @@ Assert "H19 T421: the kill target was VERIFIED as the agent binary first" `
     (Wait-LogMatch $logH "agent restart: pid \d+ verified as '.*ghoztty-agent\.exe'" 30)
 Assert "H20 T421: ... and the terminate step reports that it returned" `
     (Wait-LogMatch $logH 'agent restart: pid \d+ terminate returned' 30)
+# T426. Four times the app ended cleanly INSIDE that terminate call, and the
+# only mechanism consistent with all four is a shared kill-on-close job dying
+# with the process being killed. The refresh now measures that BEFORE the kill,
+# because by the time it matters the app is gone and nobody can ask.
+Assert "H21 T426: the refresh records the job facts before the kill" `
+    (Wait-LogMatch $logH 'agent restart: job facts before the kill' 30)
+# ... and records the ANSWER, not just the question. `?` for every field would
+# satisfy the line above while measuring nothing.
+Assert "H22 T426: ... including whether the agent shares OUR job" `
+    (Wait-LogMatch $logH 'SHARED_JOB=(yes|no)' 30)
+# The structural half: the agent this build spawns is not in the app's job in
+# the first place, so there is no shared job left to tear down. Direct
+# membership probe: test\win32\agent-job-escape.ps1.
+Assert "H23 T426: the agent spawn NAMES which job escape it got" `
+    (Wait-LogMatch $logH 'spawned local agent pid \d+ \(job escape=[^)]+\)' 30)
+# Escaping is environment-dependent - tier 1 needs a job chain that permits
+# breakaway (this box's does not: ACCESS_DENIED, measured) and tier 2 needs a
+# shell window, which THIS harness's background test desktop does not have. So
+# the invariant asserted here is the one that holds everywhere: a degraded
+# spawn is LOUD. The outcome itself - the agent is not a member of the app's
+# job, and survives its teardown - is measured directly by
+# test\win32\agent-job-escape.ps1, which runs on a desktop that has a shell.
+$logTextH = Read-AppLog $logH
+$escapedH = $logTextH -match 'spawned local agent pid \d+ \(job escape=(breakaway|shell-parent)\)'
+$loudH = $logTextH -match 'local agent pid \d+ is INSIDE this app''s job object'
+Assert "H24 T426: it either escaped, or said out loud that it did not" `
+    ($escapedH -or $loudH)
 Stop-TestProcs
 
 # ============================================================================

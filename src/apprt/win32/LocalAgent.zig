@@ -44,6 +44,8 @@ const build_config = @import("../../build_config.zig");
 const protocol = @import("../../remote/protocol.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const gui_pump = @import("gui_pump.zig");
+const job_object = @import("job_object.zig");
+const job_spawn = @import("job_spawn.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_local_agent);
@@ -624,6 +626,21 @@ fn terminateAgent(self: *LocalAgent, pid: i64) bool {
         );
     }
 
+    // THE MEASUREMENT (T426). Four times the app has ended cleanly inside this
+    // very call — no WER record, no `terminate returned` line — and the only
+    // mechanism consistent with all four is a shared kill-on-close job going
+    // down with the process we are about to end. Nobody has ever measured
+    // whether that job is shared, because by the time it matters the app is
+    // gone. So write it down BEFORE the call, every time: the next occurrence
+    // then either names the cause or rules it out, instead of funding another
+    // round of hypotheses.
+    {
+        var line_buf: [256]u8 = undefined;
+        log.info("agent restart: job facts before the kill — {s}", .{
+            job_object.describe(&line_buf, job_object.probe(@intCast(pid), h)),
+        });
+    }
+
     if (windows.kernel32.TerminateProcess(h, 0) == 0) {
         log.warn("TerminateProcess(agent pid {d}) failed err={}", .{ pid, windows.kernel32.GetLastError() });
         return false;
@@ -871,6 +888,17 @@ const InfoFile = struct {
 /// us, CREATE_NEW_PROCESS_GROUP so a Ctrl-C to us never reaches it, no handle
 /// inheritance. Env is inherited (the single-instance guard is keyed by mode,
 /// not env — T89d1 — and the listen-pipe agent never self-updates).
+///
+/// **And it leaves our JOB OBJECT** (T426, after T524). "Outlives the app" was
+/// only ever true of the app EXITING: a child joins its parent's job by
+/// default, this box's jobs are kill-on-close, and a job teardown kills every
+/// member at once — which is exactly how four relaunch guards died with the app
+/// before executing one instruction. A daemon that owns every persistent PTY
+/// must not be a member of anything that can kill it on the app's account, and
+/// `DETACHED_PROCESS` does not leave a job; only `job_spawn`'s tiers do. This
+/// also removes the leading candidate mechanism for the app's own clean death
+/// inside `TerminateProcess(agent)`: with no shared job there is no shared job
+/// to tear down.
 fn spawnAgent(self: *LocalAgent) !void {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     const windows = std.os.windows;
@@ -898,27 +926,32 @@ fn spawnAgent(self: *LocalAgent) !void {
     const cmd_utf8 = try self.agentCommandLine(arena);
     const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd_utf8);
 
-    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
-    si.cb = @sizeOf(windows.STARTUPINFOW);
-    var pi: windows.PROCESS_INFORMATION = undefined;
-    if (windows.kernel32.CreateProcessW(
-        null,
+    const spawned = job_spawn.spawnEscapingJob(
+        arena,
         cmd_w.ptr,
-        null,
-        null,
-        windows.FALSE, // no handle inheritance
-        .{ .detached_process = true, .create_new_process_group = true },
-        null,
-        null,
-        &si,
-        &pi,
-    ) == 0) {
-        log.warn("CreateProcessW(ghoztty-agent) failed err={}", .{windows.kernel32.GetLastError()});
+        job_spawn.DETACHED_PROCESS | job_spawn.CREATE_NEW_PROCESS_GROUP,
+        "local agent",
+    ) catch |err| {
+        log.warn("CreateProcessW(ghoztty-agent) failed err={}", .{err});
         return error.SpawnFailed;
+    };
+    const agent_pid = w32.GetProcessId(spawned.pi.hProcess);
+    windows.CloseHandle(spawned.pi.hProcess);
+    windows.CloseHandle(spawned.pi.hThread);
+    log.info(
+        "spawned local agent pid {d} (job escape={s}): {s}",
+        .{ agent_pid, spawned.tier.name(), cmd_utf8 },
+    );
+    if (!spawned.tier.escaped()) {
+        // Not fatal — an agent inside our job is better than no agent, and it
+        // only dies with us if something tears the job down. But it is the
+        // condition T426 exists to remove, so it says so at warn level rather
+        // than hiding inside the line above.
+        log.warn(
+            "local agent pid {d} is INSIDE this app's job object; a job teardown will kill it with us",
+            .{agent_pid},
+        );
     }
-    windows.CloseHandle(pi.hProcess);
-    windows.CloseHandle(pi.hThread);
-    log.info("spawned local agent: {s}", .{cmd_utf8});
 }
 
 /// The full daemon command line — the ONE way this app starts its local
