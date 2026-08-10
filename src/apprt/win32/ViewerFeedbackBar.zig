@@ -68,6 +68,7 @@ const doc = @import("viewer_feedback_doc.zig");
 const feedback_images = @import("viewer_feedback_images.zig");
 const clipboard_image = @import("clipboard_image.zig");
 const gdiplus_decode = @import("gdiplus_decode.zig");
+const RegionSelector = @import("RegionSelector.zig");
 const system_colors = @import("system_colors.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -146,6 +147,11 @@ swallow_paste_char: bool = false,
 /// The RichEdit's own window procedure, kept so the subclass can hand every
 /// message it does not add to.
 prev_edit_proc: ?*const anyopaque = null,
+
+/// The screenshot region selector while one is up (T647). Non-null means a
+/// capture is in flight, which is what makes `+` and Ctrl+Shift+S idempotent
+/// rather than a way to stack full-desktop overlays.
+selector: ?*RegionSelector = null,
 
 /// Whether the control answered `EM_SETCUEBANNER`. False everywhere measured
 /// so far, which is why `editProc` paints the placeholder instead.
@@ -338,6 +344,12 @@ pub fn owningEdit(hwnd: w32.HWND) ?*ViewerFeedbackBar {
 }
 
 pub fn destroy(self: *ViewerFeedbackBar) void {
+    // A capture still up has nowhere to deliver to once this is gone, and its
+    // overlay covers the whole desktop — so it comes down first, silently.
+    if (self.selector) |s| {
+        self.selector = null;
+        s.cancel();
+    }
     // Un-subclass the control BEFORE the back-pointer goes: `editProc` finds
     // its bar through the parent, so a teardown message arriving in between
     // would reach a proc that can no longer route it.
@@ -1479,18 +1491,52 @@ fn updateHover(self: *ViewerFeedbackBar, x: i32, y: i32) void {
 }
 
 /// A button click, delivered on mouse-up over the same button it went down on.
-/// `↑` files the report (T636); `+` is still a stub, because the CAPTURE
-/// primitive is T647 — the storage and the chip it would feed are here (T637),
-/// and a button that logs its intent is what T633 established as the honest
-/// placeholder for a wired-but-unbuilt action.
+/// `↑` files the report (T636); `+` takes a screenshot (T647).
 fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
     switch (b) {
-        .snapshot => log.info(
-            "viewer feedback pane={s} action=snapshot (screenshot capture is T647)",
-            .{self.pane.paneId()},
-        ),
+        .snapshot => self.beginSnapshot(),
         .send => self.pane.sendFeedback(self.alloc),
     }
+}
+
+/// Put the region selector up (T647) — the `+` button and Ctrl+Shift+S.
+///
+/// Idempotent while one is already up: both entry points can be reached while
+/// the overlay has focus, and a second full-desktop window over the first is
+/// not a second screenshot, it is a stuck screen.
+fn beginSnapshot(self: *ViewerFeedbackBar) void {
+    if (self.selector != null) return;
+    const hinstance: ?w32.HINSTANCE = @ptrCast(w32.GetModuleHandleW(null));
+    self.selector = RegionSelector.begin(
+        self.alloc,
+        hinstance,
+        w32.GetAncestor(self.hwnd, w32.GA_ROOT),
+        self.scale,
+        self,
+        captureDone,
+    );
+    if (self.selector == null) {
+        log.warn("viewer feedback pane={s} capture=unavailable", .{self.pane.paneId()});
+    }
+}
+
+/// The selector's one callback: attach what it captured, or note the cancel.
+///
+/// The bytes belong to the selector and are freed as soon as this returns —
+/// `attachImage` copies into the pane's store, the same contract the clipboard
+/// paste path already relies on.
+fn captureDone(ctx: *anyopaque, png: ?[]const u8) void {
+    const self: *ViewerFeedbackBar = @ptrCast(@alignCast(ctx));
+    // Cleared BEFORE anything else: the selector destroys itself the moment
+    // this returns, so the pointer is dead from here on either way.
+    self.selector = null;
+
+    if (png) |bytes| {
+        _ = self.attachImage(bytes);
+    }
+    // The overlay took the keyboard to get its Escape; the composer is where
+    // the user was typing, and where the chip just landed.
+    _ = w32.SetFocus(self.edit);
 }
 
 /// Repaint the composer's own chrome — what the pane calls when something it
@@ -1517,6 +1563,7 @@ pub fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
         switch (chord) {
             .send => self.pane.sendFeedback(self.alloc),
             .close => self.pane.setFeedbackOpen(false),
+            .snapshot => self.beginSnapshot(),
         }
         return true;
     }

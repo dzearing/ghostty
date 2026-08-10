@@ -276,6 +276,10 @@ pub const ComposerChord = enum {
     send,
     /// escape — close the composer, leaving its contents on the pane.
     close,
+    /// ctrl+shift+s — take a screenshot into the report (T647). Mac's ⇧⌘S,
+    /// respelled with ctrl. SHIFT is part of it on purpose: a bare ctrl+s in a
+    /// text field means "save" to everyone, and there is nothing here to save.
+    snapshot,
 };
 
 /// Classify a chord as one of the composer's, or null if it is not one —
@@ -290,9 +294,11 @@ pub fn composerChord(vk: u16, mods: input.Mods) ?ComposerChord {
     if (mods.super) return null;
     const bare = !mods.ctrl and !mods.shift and !mods.alt;
     const ctrl_only = mods.ctrl and !mods.shift and !mods.alt;
+    const ctrl_shift = mods.ctrl and mods.shift and !mods.alt;
     return switch (vk) {
         0x0D => if (ctrl_only) .send else null, // VK_RETURN
         0x1B => if (bare) .close else null, // VK_ESCAPE
+        0x53 => if (ctrl_shift) .snapshot else null, // 'S'
         else => null,
     };
 }
@@ -447,6 +453,19 @@ test "composerChord: ctrl+enter sends, plain enter does not" {
     try testing.expect(composerChord(0x0D, .{ .ctrl = true, .super = true }) == null);
     try testing.expect(composerChord(0x1B, ctrl) == null);
     try testing.expect(composerChord(0x1B, .{ .alt = true }) == null);
+
+    // ctrl+shift+s captures a screenshot (Mac's shift+cmd+S). Shift is
+    // REQUIRED: a bare ctrl+s in a text field reads as "save", and typing an
+    // 's' must obviously never take a picture.
+    try testing.expectEqual(
+        ComposerChord.snapshot,
+        composerChord(0x53, .{ .ctrl = true, .shift = true }).?,
+    );
+    try testing.expect(composerChord(0x53, ctrl) == null);
+    try testing.expect(composerChord(0x53, .{ .shift = true }) == null);
+    try testing.expect(composerChord(0x53, .{}) == null);
+    try testing.expect(composerChord(0x53, .{ .ctrl = true, .shift = true, .alt = true }) == null);
+    try testing.expect(composerChord(0x53, .{ .ctrl = true, .shift = true, .super = true }) == null);
 
     // And nothing else is a composer chord — typing must reach the buffer.
     try testing.expect(composerChord(0x41, .{}) == null); // 'A'

@@ -883,10 +883,29 @@ the queue; consuming it is separate and not built here).
   revision is resolved on the SEND rather than cached with the worktree (D47),
   so a pane left open across a branch switch still names what the user saw.
   What Windows does not have yet: the long-lived DRAFT staging folder and its
-  footer link (**T645**) and the screenshot CAPTURE behind the `+` button
-  (**T647**, whose primitive is decision D44); the quoted block landed in
-  **T641** (below), the image half of the composer in **T637** and its
-  thumbnail carousel in **T646**.
+  footer link (**T645**); the quoted block landed in
+  **T641** (below), the image half of the composer in **T637**, its
+  thumbnail carousel in **T646** and the screenshot capture in **T647**.
+
+  **The `+` button takes a screenshot on Windows too** (T647), and it is
+  D44's answer rather than a translation: the two obvious Windows equivalents
+  (`ms-screenclip:`, `SnippingTool /clip`) publish their result through the
+  CLIPBOARD, which is the one thing Mac's `screencapture -i -o` comment
+  forbids. So Ghoztty draws its own region selector. The desktop is
+  photographed ONCE before the overlay exists (`screen_capture.zig`:
+  `BitBlt` + `CAPTUREBLT` of the whole virtual screen into a top-down 32bpp
+  DIB, so layered chrome is in the shot and the origin may be negative); a
+  darkened copy of that photograph is what the full-desktop opaque popup
+  paints (`RegionSelector.zig`), with the original showing bright inside the
+  drag rectangle; mouse-up crops the original. Nothing on the path opens the
+  clipboard. **Ctrl+Shift+S** is Mac's ⇧⌘S while the composer has focus.
+  Escape, a right-click, losing activation, and a click with no drag all
+  cancel — a zero-area drag is a cancel, never a zero-pixel picture. Rect math
+  and the hint card's geometry are pure (`region_select.zig`, asserted at
+  1.0/1.25/1.5/2.0); every input is read out of a message's `lparam` rather
+  than from `GetCursorPos`, which is what lets the acceptance script POST a
+  drag on a desktop where `SendInput` is dead. Acceptance:
+  `test/win32/viewer-feedback-capture.ps1`.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input

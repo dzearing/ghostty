@@ -206,6 +206,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_images.zig");
 
+    // Pure win32 region-selector rect math — a drag pulled in any direction,
+    // clipped to the desktop, with a zero-area drag as a cancel (T647), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/region_select.zig");
+
     // Pure win32 PNG encoder — what a clipboard bitmap becomes on its way into
     // a feedback report (T637), same no-OS-imports deal.
     _ = @import("apprt/win32/png_encode.zig");

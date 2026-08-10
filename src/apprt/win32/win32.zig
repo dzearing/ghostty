@@ -834,6 +834,16 @@ pub extern "user32" fn GetSystemMetrics(
     nIndex: i32,
 ) callconv(.winapi) i32;
 
+/// The VIRTUAL SCREEN: the bounding box of every monitor, whose origin is the
+/// primary monitor's top-left and can therefore be NEGATIVE (a monitor placed
+/// left of or above it). The manifest declares PerMonitorV2, so these come back
+/// in physical pixels with no per-monitor scaling applied — which is exactly
+/// what a screen-pixel capture wants (T647).
+pub const SM_XVIRTUALSCREEN: i32 = 76;
+pub const SM_YVIRTUALSCREEN: i32 = 77;
+pub const SM_CXVIRTUALSCREEN: i32 = 78;
+pub const SM_CYVIRTUALSCREEN: i32 = 79;
+
 pub extern "shell32" fn ShellExecuteW(
     hwnd: ?HWND,
     lpOperation: ?[*:0]const u16,
@@ -1792,6 +1802,11 @@ pub const PAINTSTRUCT = extern struct {
 };
 
 pub const SRCCOPY: u32 = 0x00CC0020;
+/// OR'd into a `BitBlt` rop to include LAYERED windows in the result. Without
+/// it a screen grab silently omits every layered popup — which here is the
+/// scrollbars, the dim overlays and the banner cards, i.e. most of Ghoztty's
+/// own chrome (T647).
+pub const CAPTUREBLT: u32 = 0x40000000;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
 pub const DT_CENTER: u32 = 1;

@@ -9,6 +9,67 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-09 - **T647 - the feedback composer's `+` button takes a screenshot,
+  and it does not touch your clipboard.** The last hole in the win32 composer:
+  the button was drawn (T633), the storage, chip numbering and carousel behind
+  it were built (T637, T646), and pressing it logged its intent. Now it opens a
+  region selector over the whole desktop and the drag becomes an `[Image #N]`
+  chip. **Ctrl+Shift+S** is Mac's ⇧⌘S.
+
+  This is D44's recommended option built rather than a translation, and the
+  reason is the clipboard. The two obvious Windows equivalents — `ms-screenclip:`
+  and `SnippingTool /clip` — deliver their result BY putting it on the
+  clipboard, which is exactly what Mac's `screencapture -i -o` comment forbids
+  (`-c` would "clobber the user's clipboard"). Save-and-restore around them is
+  lossy for some formats and races any other app that writes, so the honest
+  answer was to draw our own. Nothing on this path opens the clipboard at all,
+  and the acceptance script proves it rather than asserting it: a GUID string
+  goes on the clipboard before the first capture and is read back unchanged
+  after three captures and a send.
+
+  Three pieces. `screen_capture.zig` photographs the virtual screen ONCE —
+  `BitBlt` with `CAPTUREBLT` (without it every layered window is missing, which
+  here means most of Ghoztty's own chrome) into a top-down 32bpp DIB, whose
+  origin may be negative because a monitor can sit left of the primary one.
+  Once, not twice: a second grab when the drag ends would photograph the
+  overlay instead of the desktop, and the picture would stop being what the
+  user was looking at when they pressed the button. `RegionSelector.zig` is the
+  overlay — opaque, not layered, since it shows a picture of the desktop and
+  has nothing to be transparent to — painting a precomputed DARKENED copy
+  everywhere and the original bright inside the selection, so a mouse-move is
+  two `BitBlt`s rather than a per-pixel pass. `region_select.zig` is the pure
+  rect math: a drag normalized out of any of its four directions, clipped to
+  the desktop, and — the one that matters — a **zero-area drag is a cancel**,
+  never a zero-pixel picture that looks like the capture worked.
+
+  Two things worth knowing for the next person. The selector reads every
+  coordinate out of a message's `lparam` and never asks the OS where the
+  pointer is; that is deliberate, and it is what lets the acceptance script
+  POST a whole drag on the background test desktop where `SendInput` is dead.
+  And the hint card has to be INVALIDATED when it stops being drawn — paint
+  only touches the rect it was asked for, so a card nobody invalidates stays
+  on screen underneath the drag it was telling the user to make.
+
+  Validated with a new `test\win32\viewer-feedback-capture.ps1`, **ALL PASS
+  (43)**: the overlay covers the whole 7680x2160 virtual screen, a posted drag
+  reports `capture=done rect=120,140 160x120`, the chip appears, and
+  `report.json` carries `images/image-1.png` at 160x120 — the end-to-end oracle
+  for the crop math. Escape cancels, a click with no drag cancels, and
+  Ctrl+Shift+S raises the selector like the button does.
+
+  Floor: all three zig lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS;
+  `viewer-feedback-images.ps1` ALL PASS (39), `viewer-feedback-carousel.ps1`
+  ALL PASS (38), `viewer-feedback.ps1` 67 pass / 1 fail — the same pre-existing
+  **T644** Ctrl+Z arm as the last three composer tasks, unchanged in count. One
+  win32-lane run went red on ViewerPane's t400 stale-debounce assertion and was
+  green on a re-run; that flake is already filed three times over (**T615**,
+  with T596/T597 alongside it), so it got no fourth task. Filed **T670**
+  (Space captures a whole window, which Mac's `-i` also offers) and **T671**
+  (the selector has no keyboard-only path — a chord that starts a capture you
+  can only finish with a mouse is a promise it does not keep). **D44 stays
+  open**: the recommended option is now built, and the decision is still there
+  for the user to overturn.
+
 - 2026-08-09 - **T532 investigated, not fixed - the freeze does not reproduce,
   and the arms that would have caught it now exist (T652, D50 filed).** The P0
   is the 2026-08-06 report where a hard app kill plus a manual relaunch brought
