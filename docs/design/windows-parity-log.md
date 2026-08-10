@@ -14513,3 +14513,62 @@ tasks), and `test/win32/parity-sweep.ps1` ALL PASS re-run because this turn is
 entirely about what that script measures. No source file changed — the diff is
 `docs/design/**` only — so the zig lanes and P1-P3 are out of scope for this
 one and were not run.
+
+## 2026-08-10 — The parity gate now watches the shared core, not just `macos/` (T685)
+
+`scripts\parity-sweep.ps1` decides whether a slice of Mac history has been
+written down as Windows work. It was watching `macos/` and `src/viewer/` —
+which is what the 2026-07-29 audit happened to measure, and therefore what the
+gate inherited without anyone choosing it. But a parity obligation arrives
+through the SHARED core just as often. T604 exists precisely because main
+rewrote `src/cli/send_keys.zig` underneath this branch's bracketed-paste work,
+and nothing flagged the divergence.
+
+**The blind spot was measured before it was fixed.** Since 2026-06-01, main has
+**152 commits touching `src/`, 87 of which touch no `macos/` path at all** —
+`fix(termio): route RESIZE around the bounded mailbox so re-attach can't drop
+it`, `fix(remote): elide null optionals from the HELLO encoding`,
+`fix(cli): serialize the +sessions arena` — every one of them invisible to a
+gate that reported clean.
+
+**Widen by subtraction, not by allowlist.** The default is now `macos/` plus
+all of `src/`, minus the two frontends that owe Windows nothing:
+`:(exclude)src/apprt/win32/` (ours) and `:(exclude)src/apprt/gtk/` (Linux's).
+An allowlist of high-signal subtrees would be quieter today and blind to
+whatever main adds next month — which is this exact defect, re-committed. The
+noise objection turned out to be bounded: the daily intake range is the
+watermark, and it evaluates 0–2 commits a day. Filed as **D60** because it is a
+fork the user might want to overturn.
+
+**The guard against our own history is topological, and it has to be.** Widening
+the paths puts this branch in scope: 187 of our commits since the merge-base
+touch shared `src/`, and no path rule separates them from main's, because we
+edit `src/cli/`, `src/termio/` and `src/remote/` too. So the sweep enumerates
+only the INCOMING side — a commit in the range not reachable from
+`-IncomingRef` (`origin/main`, else `main`) is branch-local, dropped, and
+**counted in the report** rather than silently discarded. For the daily intake
+range that is a no-op. For `-Range <merge-base>..HEAD` it is the difference
+between a usable report and 187 lines of our own work: `680a07ed3..HEAD` is 481
+commits raw → 294 enumerated, 187 excluded.
+
+**The frozen test range is a MIXED one on purpose.** A range holding only our
+side would report zero either way, so it cannot tell a guard that separates the
+two sides from one that merely zeroes the report — the first attempt at arm 9
+made that mistake and passed. It now asserts the split (294/187), that one of
+our own shared-`src/` commits is absent, and that a Mac-side one in the same
+range is present. Each new arm carries its own control: arm 8 runs the
+pre-T685 path list over the same range to show it saw nothing, and arm 10
+re-runs its commit without the exclusion to show the arm has teeth.
+
+Evidence: `test/win32/parity-sweep.ps1` **ALL PASS** at 33 arms (was 20), all
+three floor lanes PASS (none 277s, win32 334s, agent 330s), P1–P3 ALL PASS, and
+the live daily intake range still sweeps clean.
+
+What the widening revealed is filed rather than absorbed: sweeping back to June
+now reports **81 unmapped of 349** (39 June, 40 July, 2 August), dominated by
+the `src/remote/` WP1–WP4 build-out whose Windows half is what `ghoztty-agent`
+already is. Reconciling them is **T716** — a historical audit is a different
+job from the tool change, and mixing the two would have made neither
+reviewable. It also supersedes T684's "every Mac change merged since June is
+accounted for" claim under the wider definition, which T716 is asked to amend
+where that claim lives.

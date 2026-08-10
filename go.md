@@ -116,9 +116,21 @@ Concretely, in order, with no stops in between:
      ```
 
      which enumerates every non-merge commit in
-     `<lastEvaluated>..origin/main` touching `macos/` or `src/viewer/` and
-     reports the ones no Windows task, log entry, digest or decision has ever
-     cited. **Exit 1 means unmapped commits — file a task for each (or cite
+     `<lastEvaluated>..origin/main` touching `macos/` or **`src/`** (minus the
+     two frontends that owe Windows nothing — `src/apprt/win32/` is ours,
+     `src/apprt/gtk/` is Linux's) and reports the ones no Windows task, log
+     entry, digest or decision has ever cited. The shared core is in the watch
+     list since **T685**: a parity obligation arrives through it as often as
+     through `macos/` (T604 exists because main rewrote `src/cli/send_keys.zig`
+     underneath this branch and nothing flagged it), and subtracting from
+     `src/` rather than listing subtrees means a directory main adds next month
+     is watched by default. Widening it puts OUR work in scope too, so only the
+     **incoming side** is enumerated — a commit in the range that is not
+     reachable from `-IncomingRef` (`origin/main`, else `main`) is branch-local,
+     dropped, and counted separately in the report. That is a no-op for the
+     daily intake range and the difference between a usable report and 187
+     lines of our own history for `-Range <merge-base>..HEAD`.
+     **Exit 1 means unmapped commits — file a task for each (or cite
      it as no-parity-owed in the intake note) and re-run until it exits 0**;
      only then move the watermark. This exists because the sweeps before it
      (T88, T117) recorded a *narrative* of what a merge contained, and a

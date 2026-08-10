@@ -26,6 +26,26 @@
   Deliberately NOT a heuristic about subjects or file paths: a commit is either
   written down somewhere or it is not, and only the second kind is a leak.
 
+  WHAT COUNTS AS MAC-SIDE (T685). The original watch list was macos/ and
+  src/viewer/, which is what the 2026-07-29 audit happened to measure. But a
+  parity obligation arrives just as often through the SHARED core: T604 exists
+  because main rewrote src/cli/send_keys.zig underneath this branch's
+  bracketed-paste work, and nothing flagged it. So the default is now the whole
+  of macos/ plus the whole of src/, minus the two frontends that owe Windows
+  nothing - src/apprt/win32/ (ours) and src/apprt/gtk/ (Linux). Subtracting
+  from src/ rather than listing an allowlist of subtrees is deliberate: a gate
+  that misses a directory main adds next month is this exact defect again.
+
+  WHICH SIDE IS ENUMERATED. Widening the paths puts this branch's own work in
+  scope too - 187 of our commits touch shared src/ since the merge-base - so a
+  range that spans this branch would drown the finding in our own history and
+  the gate would be ignored within a day. Only the INCOMING side is therefore
+  enumerated: a commit in the range that is not reachable from -IncomingRef
+  (origin/main, else main) is branch-local, dropped, and counted separately in
+  the report. For the daily intake range (<watermark>..origin/main) that is a
+  no-op; for "-Range <merge-base>..HEAD" it is the difference between a usable
+  report and 187 lines of noise.
+
   ASCII-only by design (PS 5.1 on this box mangles non-ASCII on rewrite).
 
 .EXAMPLE
@@ -50,10 +70,24 @@ param(
     # Shorthand for "-Range <sha>..origin/main".
     [string]$Since,
 
-    # The Mac-side paths a parity-relevant commit touches. macos/ is the Swift
-    # frontend; src/viewer/ is the shared viewer page assets, which ship in
-    # both apps and so are Mac-authored parity work just as often.
-    [string[]]$Paths = @('macos/', 'src/viewer/'),
+    # The paths a parity-relevant commit touches. macos/ is the Swift frontend;
+    # src/ is the shared core (CLI surface, termio, the agent, the viewer page
+    # assets), every part of which can hand Windows an obligation. The two
+    # exclusions are the frontends that cannot: src/apprt/win32/ is ours, and
+    # src/apprt/gtk/ is Linux's. See the T685 note in the header.
+    [string[]]$Paths = @(
+        'macos/',
+        'src/',
+        ':(exclude)src/apprt/win32/',
+        ':(exclude)src/apprt/gtk/'
+    ),
+
+    # The ref that defines the INCOMING side. A commit in the range that is not
+    # reachable from here is this branch's own work, and is excluded from the
+    # enumeration rather than reported as an unmapped Mac change. Defaults to
+    # origin/main, else main; empty in a clone that has neither, which disables
+    # the exclusion (and says so in the report).
+    [string]$IncomingRef,
 
     # Where the parity docs live. Overridable so the acceptance test can point
     # the reference index at a fixture instead of the real tracker.
@@ -154,6 +188,20 @@ function Resolve-Range {
     return ("{0}..{1}" -f $intake.lastEvaluated, $head)
 }
 
+function Resolve-IncomingRef {
+    if ($IncomingRef) {
+        if (-not (Test-Rev $IncomingRef)) {
+            throw "-IncomingRef '$IncomingRef' does not resolve to a commit"
+        }
+        return $IncomingRef
+    }
+    foreach ($candidate in @('origin/main', 'main')) {
+        if (Test-Rev $candidate) { return $candidate }
+    }
+    # A clone with neither: enumerate the range as given rather than refuse.
+    return ''
+}
+
 # ---------------------------------------------------------------------------
 # The reference index: every commit-sha-shaped token in the parity docs, and
 # the file each came from.
@@ -227,15 +275,30 @@ function Find-Mapping {
 # ---------------------------------------------------------------------------
 
 $resolvedRange = Resolve-Range
+$resolvedIncoming = Resolve-IncomingRef
 
 $logArgs = @('log', '--no-merges', '--format=%H%x09%s', $resolvedRange, '--')
 $logArgs += $Paths
 $lines = @(Invoke-Git $logArgs)
 
+# The branch-local set: in the range, touching the watched paths, but NOT
+# reachable from the incoming ref. These are this branch's own commits, which
+# are not Mac changes owed a Windows task and must never be reported as such.
+$local = @{}
+if ($resolvedIncoming) {
+    $localArgs = @('rev-list', '--no-merges', $resolvedRange, '--not', $resolvedIncoming, '--')
+    $localArgs += $Paths
+    foreach ($s in @(Invoke-Git $localArgs)) {
+        $s = ([string]$s).Trim()
+        if ($s) { $local[$s] = $true }
+    }
+}
+
 $index = Build-ReferenceIndex -Root $DocsPath
 
 $mapped = New-Object System.Collections.ArrayList
 $unmapped = New-Object System.Collections.ArrayList
+$excluded = 0
 
 foreach ($line in $lines) {
     $line = [string]$line
@@ -243,6 +306,8 @@ foreach ($line in $lines) {
     $parts = $line.Split("`t", 2)
     $sha = $parts[0]
     $subject = if ($parts.Length -gt 1) { $parts[1] } else { '' }
+
+    if ($local.ContainsKey($sha)) { $excluded++; continue }
 
     $labels = Find-Mapping -Index $index -Sha $sha
     $row = [pscustomobject]@{
@@ -263,11 +328,13 @@ $total = $mapped.Count + $unmapped.Count
 switch ($Format) {
     'json' {
         [pscustomobject]@{
-            range    = $resolvedRange
-            paths    = $Paths
-            total    = $total
-            mapped   = @($mapped)
-            unmapped = @($unmapped)
+            range           = $resolvedRange
+            paths           = $Paths
+            incoming_ref    = $resolvedIncoming
+            excluded_local  = $excluded
+            total           = $total
+            mapped          = @($mapped)
+            unmapped        = @($unmapped)
         } | ConvertTo-Json -Depth 5
     }
 
@@ -278,6 +345,9 @@ switch ($Format) {
         ''
         ("- Commits evaluated: {0}" -f $total)
         ("- Mapped to Windows work items: {0}" -f $mapped.Count)
+        if ($excluded -gt 0) {
+            ("- Excluded as branch-local (not reachable from ``{0}``): {1}" -f $resolvedIncoming, $excluded)
+        }
         if ($unmapped.Count -gt 0) {
             ("- **Unmapped: {0}** - file a task for each before closing this merge." -f $unmapped.Count)
             ''
@@ -308,6 +378,12 @@ switch ($Format) {
         ("PARITY SWEEP {0}" -f $resolvedRange)
         ("  paths:   {0}" -f ($Paths -join ' '))
         ("  docs:    {0}" -f $DocsPath)
+        if ($resolvedIncoming) {
+            ("  incoming: {0}   branch-local excluded: {1}" -f $resolvedIncoming, $excluded)
+        }
+        else {
+            "  incoming: (unresolved - branch-local exclusion disabled)"
+        }
         ("  commits: {0}   mapped: {1}   unmapped: {2}" -f $total, $mapped.Count, $unmapped.Count)
         if ($ShowMapped -and $mapped.Count -gt 0) {
             ''

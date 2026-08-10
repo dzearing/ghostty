@@ -15,6 +15,14 @@
   NOT map it (that is the difference between a sha reference and a hex-shaped
   coincidence), and a "#rrggbbaa" color must not either.
 
+  Arms 8-10 are T685: the watch list now covers the shared src/ core, and the
+  two things that keeps honest. 8 proves a commit touching only src/termio/ is
+  caught where the old macos/+src/viewer/ default saw nothing. 9 proves a range
+  spanning THIS branch reports none of our own commits (the topological guard).
+  10 proves a src/apprt/win32/ commit is dropped by the path exclusion even
+  when the topological guard cannot see it, so the two mechanisms are tested
+  apart rather than covering for each other.
+
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
   ASCII-only by design (PS 5.1 on this box mangles non-ASCII on rewrite).
@@ -41,6 +49,27 @@ $Expected = @(
     'dfa54ff3cb428534a235dbfdd68cf438ef5486da'
 )
 
+# The watch list as it stood before T685, kept here so an arm can show what the
+# widened default now catches that this one did not.
+$LegacyPaths = @('macos/', 'src/viewer/')
+
+# T685 oracles, all frozen shas.
+#   SharedRange - one commit, eb1876f09, whose only files are src/termio/*.
+#   MixedRange  - an old main sha to this branch's tip, which is 481 commits of
+#                 BOTH kinds: 294 Mac changes we merged in, and 187 of our own.
+#                 A range with only one kind could not tell a guard that
+#                 separates the sides from one that zeroes the report.
+#   Win32Range  - one commit whose only src/ files are under src/apprt/win32/.
+$SharedRange = 'ba76e3f93f04a79ffa56e7523a65b7d37600b543..eb1876f09ce054be8f5095e5e2b49d3e8c6cd64a'
+$SharedSha = 'eb1876f09ce054be8f5095e5e2b49d3e8c6cd64a'
+$MixedRange = '680a07ed398f064d106b6ea476f43ce0d143d21a..95b3f35b4269e3f83c3de408c55447b5407aabf7'
+$MixedIncoming = 'b388bb62c25c8a4564c88aec8e211b2d4fdc6bf0'
+$MixedIncomingCount = 294
+$MixedLocalCount = 187
+$BranchOwnSha = '029ae4b1238c0e7ac8ee729d283b6fe7ec7ec926'
+$Win32Range = '839a1b812941901088169c92d512bcd55b2bd7cb..c72220cd7420f720cd2cde1ff9de5d33922ce556'
+$Win32Incoming = 'c72220cd7420f720cd2cde1ff9de5d33922ce556'
+
 $script:Failures = 0
 function Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = '')
@@ -55,22 +84,33 @@ function Check {
 
 # Run the sweep against a fixture docs tree. Returns the captured stdout lines
 # plus the exit code; the sweep's exit code IS its verdict, so both matter.
+#
+# Invoked through -Command rather than -File: PS 5.1's -File parser binds only
+# the FIRST value of a multi-value argument and drops the rest silently, so
+# "-File ... -Paths macos/ src/viewer/" would sweep macos/ alone and the arm
+# that depends on the narrower list would pass for the wrong reason.
 function Invoke-Sweep {
-    param([string]$DocsPath, [string]$Format = 'text', [switch]$ShowMapped)
-
-    $sweepArgs = @(
-        '-NoProfile', '-File', $Sweep,
-        '-Range', $Range,
-        '-DocsPath', $DocsPath,
-        '-Format', $Format,
-        '-RepoRoot', $RepoRoot
+    param(
+        [string]$DocsPath,
+        [string]$Format = 'text',
+        [switch]$ShowMapped,
+        [string]$UseRange,
+        [string[]]$Paths,
+        [string]$IncomingRef
     )
-    if ($ShowMapped) { $sweepArgs += '-ShowMapped' }
+
+    $r = if ($UseRange) { $UseRange } else { $Range }
+    $cmd = "& '$Sweep' -Range '$r' -DocsPath '$DocsPath' -Format '$Format' -RepoRoot '$RepoRoot'"
+    if ($Paths) {
+        $cmd += ' -Paths @(' + (($Paths | ForEach-Object { "'" + $_ + "'" }) -join ',') + ')'
+    }
+    if ($IncomingRef) { $cmd += " -IncomingRef '$IncomingRef'" }
+    if ($ShowMapped) { $cmd += ' -ShowMapped' }
 
     # Capture through a pipe: powershell.exe is a console binary here, so
     # stdout redirects normally, but $LASTEXITCODE is only trustworthy when the
     # whole stream has been drained (never -First; see go.md).
-    $out = & powershell.exe @sweepArgs 2>&1
+    $out = & powershell.exe -NoProfile -Command $cmd 2>&1
     return [pscustomobject]@{ Lines = @($out); Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
 }
 
@@ -192,6 +232,69 @@ try {
         $detail = "parse failed: $_"
     }
     Check '7a json parses and its counts match the text report' $ok $detail
+
+    # --- 8. T685: the shared core is watched --------------------------------
+    # eb1876f09 touches src/termio/ and nothing else. It is exactly the shape
+    # that produced T604 (main rewriting shared code underneath this branch),
+    # and the pre-T685 default could not see it at all.
+    $sharedFixture = New-FixtureDocs -Shas @()
+    [void]$created.Add($sharedFixture)
+
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $SharedRange -Paths $LegacyPaths
+    Check '8a the old macos/+src/viewer/ list saw nothing here' `
+        ($r.Text -match 'commits: 0\s') ("got: " + (($r.Lines | Where-Object { $_ -match 'commits:' }) -join '; '))
+    Check '8b and therefore reported clean' ($r.Exit -eq 0) ("exit=" + $r.Exit)
+
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $SharedRange
+    Check '8c the default now enumerates the src/termio/ commit' `
+        ($r.Text -match 'commits: 1\s') ("got: " + (($r.Lines | Where-Object { $_ -match 'commits:' }) -join '; '))
+    Check '8d unreferenced, it is unmapped and the gate fails' `
+        (($r.Text -match 'unmapped: 1') -and $r.Exit -eq 1) ("exit=" + $r.Exit)
+    Check '8e the report names it' ($r.Text -match [regex]::Escape($SharedSha.Substring(0, 9)))
+    Check '8f the default path list carries both frontend exclusions' `
+        (($r.Text -match [regex]::Escape(':(exclude)src/apprt/win32/')) -and `
+         ($r.Text -match [regex]::Escape(':(exclude)src/apprt/gtk/')))
+
+    # --- 9. T685: this branch's own commits are never reported ---------------
+    # A range holding both sides at once. Without the incoming-side guard,
+    # widening the paths would report all 481 - our 187 included - and the gate
+    # would be noise within a day. The two counts below must SPLIT the range,
+    # which is the claim a single-sided range cannot check.
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $MixedRange -IncomingRef $MixedIncoming
+    Check '9a only the incoming side is enumerated' `
+        ($r.Text -match ("commits: {0}\s" -f $MixedIncomingCount)) `
+        ("got: " + (($r.Lines | Where-Object { $_ -match 'commits:' }) -join '; '))
+    Check '9b and the branch-local remainder is reported, not silently dropped' `
+        ($r.Text -match ("branch-local excluded: {0}\b" -f $MixedLocalCount)) `
+        ("got: " + (($r.Lines | Where-Object { $_ -match 'branch-local' }) -join '; '))
+    Check '9c one of our own shared-src commits is not in the report' `
+        ($r.Text -notmatch [regex]::Escape($BranchOwnSha.Substring(0, 9)))
+    Check '9d a Mac-side shared-src commit in the same range IS in it' `
+        ($r.Text -match [regex]::Escape($SharedSha.Substring(0, 9)))
+
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $MixedRange -IncomingRef $MixedIncoming -Format json
+    $ok = $false; $detail = ''
+    try {
+        $obj = $r.Text | ConvertFrom-Json
+        $ok = ($obj.excluded_local -eq $MixedLocalCount -and $obj.total -eq $MixedIncomingCount -and `
+               $obj.incoming_ref -eq $MixedIncoming)
+        $detail = ("excluded_local={0} total={1} incoming_ref={2}" -f $obj.excluded_local, $obj.total, $obj.incoming_ref)
+    }
+    catch { $detail = "parse failed: $_" }
+    Check '9e json carries the exclusion count and the incoming ref' $ok $detail
+
+    # --- 10. T685: src/apprt/win32/ is dropped by PATH, not by topology ------
+    # Same commit, but pointed at an incoming ref that reaches it - so the
+    # topological guard cannot help and the path exclusion has to. The second
+    # half removes the exclusion to prove the arm has teeth.
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $Win32Range -IncomingRef $Win32Incoming
+    Check '10a a win32-only commit is not a Mac change' `
+        (($r.Text -match 'commits: 0\s') -and ($r.Text -match 'branch-local excluded: 0')) `
+        ("got: " + (($r.Lines | Where-Object { $_ -match 'commits:|branch-local' }) -join '; '))
+
+    $r = Invoke-Sweep -DocsPath $sharedFixture -UseRange $Win32Range -IncomingRef $Win32Incoming -Paths @('src/')
+    Check '10b without the exclusion the same commit IS enumerated' `
+        ($r.Text -match 'commits: 1\s') ("got: " + (($r.Lines | Where-Object { $_ -match 'commits:' }) -join '; '))
 }
 finally {
     foreach ($d in $created) {
