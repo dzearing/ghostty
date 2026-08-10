@@ -29,64 +29,16 @@
 //!     window closes, not just at launch.
 
 const std = @import("std");
+const agent_build = @import("../../remote/agent_build.zig");
 
-/// The build stamp the agent bakes and prints: `YYYYMMDD-<git short hash>`, or
-/// the literal `dev` when git was unavailable at build time.
-///
-/// Parses `ghoztty-agent --version` output ("ghoztty-agent 20260730-e69d41755")
-/// into just the stamp: the LAST whitespace-separated token of the first
-/// non-empty line. Returns a slice INTO `out` (no allocation), or null when
-/// there is no such token — an empty or whitespace-only output is "unknown",
-/// which rule 1 turns into "don't judge".
-pub fn parseVersionOutput(out: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, out, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        var it = std.mem.tokenizeAny(u8, line, " \t");
-        var last: ?[]const u8 = null;
-        while (it.next()) |tok| last = tok;
-        return last;
-    }
-    return null;
-}
-
-/// The `YYYYMMDD` date prefix of a stamp as a number, or 0 when it has none
-/// (`dev`, or any stamp shape we don't recognize). 0 compares as "no opinion".
-fn datePrefix(stamp: []const u8) u64 {
-    var n: u64 = 0;
-    var digits: usize = 0;
-    for (stamp) |c| {
-        if (!std.ascii.isDigit(c)) break;
-        // A stamp with an absurd digit run is not a date; stop rather than
-        // overflow.
-        if (digits >= 18) break;
-        n = n * 10 + (c - '0');
-        digits += 1;
-    }
-    return if (digits == 0) 0 else n;
-}
-
-/// True iff stamp `a` is a NEWER build than `b`, ordered by the `YYYYMMDD`
-/// prefix. Equal (or unparseable) dates ⇒ false, so an equal or unknown date
-/// never *blocks* a refresh — stamp equality decides that — while a genuinely
-/// newer running agent is never downgraded (rule 2).
-pub fn stampIsNewer(a: []const u8, b: []const u8) bool {
-    return datePrefix(a) > datePrefix(b);
-}
-
-/// Is the connected agent an OLDER build than the one this app ships beside?
-///
-/// `running == null` ⇒ an agent too old to advertise a stamp in its HELLO ⇒
-/// stale (it predates the whole feature). Exact match ⇒ current. Newer than
-/// bundled ⇒ NOT stale (rule 2).
-pub fn isStale(running: ?[]const u8, bundled: []const u8) bool {
-    const r = running orelse return true;
-    if (r.len == 0) return true;
-    if (std.mem.eql(u8, r, bundled)) return false;
-    if (stampIsNewer(r, bundled)) return false;
-    return true;
-}
+/// The stamp primitives are SHARED with the CLI (`+sessions --agent`, T662) and
+/// live in `remote/agent_build.zig`, so "stale" has exactly one definition on
+/// both platforms rather than a second spelling here that can drift. Re-exported
+/// under their original names because this module's rules are written in terms
+/// of them and every caller already spells them this way.
+pub const parseVersionOutput = agent_build.parseVersionOutput;
+pub const stampIsNewer = agent_build.stampIsNewer;
+pub const isStale = agent_build.isStale;
 
 /// What the app should do about the agent it is connected to.
 pub const Action = enum {
@@ -332,10 +284,7 @@ pub const skew_confirm_title = confirm_title;
 
 /// What to print for a stamp that may be absent. `running == null` is an agent
 /// too old to advertise one; `bundled == null` is an unreadable binary.
-pub fn stampForLog(stamp: ?[]const u8) []const u8 {
-    const s = stamp orelse return "<pre-versioned>";
-    return if (s.len == 0) "<pre-versioned>" else s;
-}
+pub const stampForLog = agent_build.stampForLog;
 
 /// The mandatory-confirmation body, Mac's wording (`makeUpgradeAlert`) with the
 /// session count pluralized. Written into `buf`; the caller widens it to UTF-16
@@ -411,53 +360,19 @@ pub fn imageIsAgent(image: []const u8, expected: ?[]const u8) bool {
 
 const testing = std.testing;
 
-test "parseVersionOutput: the stamp is the last token of the first real line" {
-    try testing.expectEqualStrings(
-        "20260730-e69d41755",
-        parseVersionOutput("ghoztty-agent 20260730-e69d41755\n").?,
-    );
-    // CRLF is the norm when the child writes through a Windows console.
+test "the shared stamp primitives are the ones this policy is written against" {
+    // Re-exports, not copies (T662): a second spelling of "stale" is exactly the
+    // drift `remote/agent_build.zig` exists to prevent. Pinned here so a later
+    // edit that re-inlines one of them has to come through this test — the
+    // behavior itself is asserted in that module, in the `none` lane.
+    try testing.expect(isStale("20260719-574fe0805", "20260730-e69d41755"));
+    try testing.expect(!isStale("20260731-aaa", "20260730-e69d41755"));
+    try testing.expect(stampIsNewer("20260730-aaa", "20260719-zzz"));
     try testing.expectEqualStrings(
         "20260730-e69d41755",
         parseVersionOutput("ghoztty-agent 20260730-e69d41755\r\n").?,
     );
-    // A leading blank line (or leading spaces) doesn't hide the stamp.
-    try testing.expectEqualStrings("dev", parseVersionOutput("\n\n  ghoztty-agent dev  \n").?);
-    // Trailing noise lines never win over the first real one.
-    try testing.expectEqualStrings(
-        "20260101-abcdef012",
-        parseVersionOutput("ghoztty-agent 20260101-abcdef012\nsome warning\n").?,
-    );
-    // No output at all ⇒ unknown, not a crash and not an empty stamp.
-    try testing.expect(parseVersionOutput("") == null);
-    try testing.expect(parseVersionOutput("   \r\n\t\n") == null);
-}
-
-test "stampIsNewer orders by the date prefix only" {
-    try testing.expect(stampIsNewer("20260730-aaa", "20260719-zzz"));
-    try testing.expect(!stampIsNewer("20260719-zzz", "20260730-aaa"));
-    // Same date, different hash ⇒ not newer (equality is the caller's business).
-    try testing.expect(!stampIsNewer("20260730-aaa", "20260730-bbb"));
-    // A dateless stamp has no opinion in either direction against another
-    // dateless one, and always loses to a dated one.
-    try testing.expect(!stampIsNewer("dev", "dev"));
-    try testing.expect(!stampIsNewer("dev", "20260101-a"));
-    try testing.expect(stampIsNewer("20260101-a", "dev"));
-}
-
-test "isStale: pre-versioned is stale, newer is not, exact match is current" {
-    // An agent too old to advertise a stamp predates this feature ⇒ stale.
-    try testing.expect(isStale(null, "20260730-e69d41755"));
-    try testing.expect(isStale("", "20260730-e69d41755"));
-    // Exact match: the common steady state.
-    try testing.expect(!isStale("20260730-e69d41755", "20260730-e69d41755"));
-    // The defect T147 exists for: an agent from an earlier delivery.
-    try testing.expect(isStale("20260719-574fe0805", "20260730-e69d41755"));
-    // Same day, different build ⇒ still stale (any agent-side change counts,
-    // including fixes that bump no protocol version).
-    try testing.expect(isStale("20260730-aaaaaaaaa", "20260730-e69d41755"));
-    // Rule 2: never downgrade a newer running agent.
-    try testing.expect(!isStale("20260731-aaaaaaaaa", "20260730-e69d41755"));
+    try testing.expectEqualStrings("<pre-versioned>", stampForLog(null));
 }
 
 test "decide: unknown never restarts, idle refreshes, live always confirms" {
@@ -553,12 +468,6 @@ test "Reason.description is a distinct non-empty clause for every reason" {
     // The two arms an operator greps for must say what they mean.
     try testing.expect(std.mem.indexOf(u8, Reason.stale_live.description(), "confirmation") != null);
     try testing.expect(std.mem.indexOf(u8, Reason.running_newer.description(), "NEWER") != null);
-}
-
-test "stampForLog never yields an empty field in a log line" {
-    try testing.expectEqualStrings("<pre-versioned>", stampForLog(null));
-    try testing.expectEqualStrings("<pre-versioned>", stampForLog(""));
-    try testing.expectEqualStrings("20260730-e69d41755", stampForLog("20260730-e69d41755"));
 }
 
 test "formatConfirmText pluralizes and names the count" {

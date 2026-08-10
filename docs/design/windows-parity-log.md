@@ -14271,3 +14271,59 @@ asserts the ABSENCE of `command not found`, and then drives the pane with
 arm I reports 2 FAIL (the send-keys probe and the `command not found` check) and
 nothing else in the file moves. Two `wrapShellCommandArgv` cases cover the row
 in the none lane. Floor lanes and P1–P3 green.
+
+## 2026-08-10 — you can now ask which build of the background agent is actually running (T662)
+
+`ghoztty +sessions --agent` prints the running agent's build stamp next to the
+one this install ships beside, how many calendar days apart they are, how many
+sessions are live, and which process it is:
+
+```
+running:  20260719-574fe0805  (pid 24228)
+bundled:  20260730-e69d41755
+status:   stale - 11 days behind, 4 live sessions
+next:     Ghoztty restarts it onto the bundled build when no sessions are open, or when you confirm the restart it offers.
+```
+
+The agent outlives the app on purpose, so it is routinely a different build than
+everything around it — and until now that comparison happened in exactly one
+place, an app log line, written on a box where the app had already been
+restarted past the interesting moment. `--json` carries the same as keys
+(`status`, `running`, `bundled`, `days_behind`, `live_sessions`, `sessions`,
+`agent_pid`), with `status` a machine token. No agent running is an ANSWER, not
+an error: exit 0 with `not_running`, because the next persistent session simply
+starts the bundled build.
+
+`days_behind` is absent rather than 0 or negative whenever there is no honest
+number to give — a `dev` stamp, a pre-versioned agent, a same-day rebuild, a
+running agent that is newer. A confidently wrong distance is worse than none,
+which is also why the date parse is stricter than the one that merely ORDERS two
+stamps: nine leading digits is not a `YYYYMMDD`, and truncating it to eight
+would invent a date the stamp never claimed.
+
+The staleness rule itself moved to `src/remote/agent_build.zig` and the win32
+policy (`agent_upgrade.zig`) now re-exports it, so the number a user reads and
+the decision the app acts on come from one definition rather than two spellings
+that can drift. Nothing in the policy, the dialog or the restart path was
+touched — this is read-only.
+
+What it makes visible is the actual defect, which is not fixed here: the running
+agent advances only when the app's check finds it stale with ZERO live sessions,
+or when the user accepts the mandatory confirmation — and a box whose panes
+never all close reaches neither, since the morning app-only refresh (T525)
+deliberately defers that confirmation and the check re-runs only at launch and
+when the last persistent window closes. CLAUDE.md now says so where someone will
+find it, **D59** puts the choice in front of the user, and **T705** is the
+non-destructive handoff the agent contract already calls the preferred path.
+
+Evidence: `test/win32/sessions-agent-build.ps1` ALL PASS (38 checks) — no agent,
+a real agent this tree just started, a fabricated newer bundled stamp, a
+fabricated older one, and the JSON keys. Arms C/D reach their states through the
+same DEBUG-ONLY `GHOZTTY_AGENT_BUNDLED_VERSION` hook the app's probe honors,
+because every stamp in one tree comes from one binary and without it only the
+`current` arm would ever be measured; the expected day count is computed by
+PowerShell's own calendar, not by the code under test. Teeth-checked with
+`-TeethCheck`, which collapses both fabrications onto the running stamp: exactly
+the C/D/E status arms go red (8 failures) and nothing else moves. 13 unit tests
+in the `none` lane, teeth-checked there too by breaking one assertion and
+watching the lane name it. Floor lanes and P1-P3 green.

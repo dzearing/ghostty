@@ -10,6 +10,7 @@ const homedir = @import("../os/homedir.zig");
 const tcp_dial = @import("../remote/tcp_dial.zig");
 const connection = @import("../remote/connection.zig");
 const agent_lineage = @import("../remote/agent_lineage.zig");
+const agent_build = @import("../remote/agent_build.zig");
 
 /// How long to wait for the agent's SESSIONS reply before giving up. Generous:
 /// the roster is a pure in-memory snapshot, but a wedged agent must not hang the
@@ -22,6 +23,10 @@ pub const Options = struct {
 
     /// Output machine-readable JSON instead of the human-readable table.
     json: bool = false,
+
+    /// Report the RUNNING agent's build next to the bundled one instead of
+    /// listing sessions (T662).
+    agent: bool = false,
 
     pub fn deinit(self: *Options) void {
         if (self._arena) |arena| arena.deinit();
@@ -63,6 +68,14 @@ const InfoFile = struct {
 /// Flags:
 ///
 ///   * `--json`: Output as JSON instead of the human-readable table.
+///
+///   * `--agent`: Report the RUNNING agent's build stamp next to the one this
+///     CLI ships beside, plus how far behind it is, instead of listing
+///     sessions. The agent outlives the app on purpose, so it is routinely a
+///     different build than everything around it; this is how you find out
+///     WHICH build without reading app logs, and it works with the app closed.
+///     Never an error: no agent running is an answer (`not_running`), not a
+///     failure.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -117,11 +130,16 @@ fn runArgs(
 
     // Locate the local agent's info file and read what to dial.
     const info_path = agentInfoPath(alloc) catch {
+        if (opts.agent) return reportAgentBuild(alloc, stdout, opts.json, null, null);
         try stderr.print("+sessions: could not resolve the home directory.\n", .{});
         return 1;
     };
 
     const info = readInfoFile(alloc, info_path) catch {
+        // `--agent` treats "no agent" as a state to report, not an error: it is
+        // the answer to "how far behind is it?" (nothing is), and it is the
+        // normal shape on a box where persistence has never engaged.
+        if (opts.agent) return reportAgentBuild(alloc, stdout, opts.json, null, null);
         try stderr.print(
             "+sessions: no local agent found (session persistence is off, or the agent is not running).\n",
             .{},
@@ -131,16 +149,34 @@ fn runArgs(
 
     // Dial the agent: prefer the UDS `socket`, fall back to a legacy TCP `port`.
     var dialed = dialAgent(alloc, info) catch |err| {
+        // A `port.json` whose agent is gone is the same state as no file at all
+        // — a stale info file outlives its writer routinely.
+        if (opts.agent) return reportAgentBuild(alloc, stdout, opts.json, null, null);
         try stderr.print("+sessions: could not connect to the local agent: {s}.\n", .{@errorName(err)});
         return 1;
     };
     defer dialed.deinit();
 
     var roster = dialed.conn.requestSessions(list_timeout_ns) catch |err| {
+        // We reached the agent, so its build IS knowable even though the roster
+        // is not — and a wedged agent is exactly when someone asks which build
+        // it is. Report what we have rather than throwing the answer away.
+        if (opts.agent) return reportAgentBuild(alloc, stdout, opts.json, &dialed, info.pid);
         try stderr.print("+sessions: the agent did not answer: {s}.\n", .{@errorName(err)});
         return 1;
     };
     defer roster.deinit();
+
+    if (opts.agent) {
+        return reportAgentBuildWithRoster(
+            alloc,
+            stdout,
+            opts.json,
+            &dialed,
+            info.pid,
+            roster.sessions,
+        );
+    }
 
     if (opts.json) {
         try printJson(alloc, stdout, roster.sessions);
@@ -148,6 +184,135 @@ fn runArgs(
         try printTable(stdout, roster.sessions);
     }
     return 0;
+}
+
+// =============================================================================
+// `--agent`: which build is actually running (T662)
+// =============================================================================
+
+/// One JSON object for `--agent --json`. A dedicated struct so the keys are a
+/// stable contract; `status` is the machine token from `agent_build.Status`,
+/// never the human sentence beside it.
+const AgentJson = struct {
+    status: []const u8,
+    running: ?[]const u8,
+    bundled: ?[]const u8,
+    days_behind: ?i64,
+    live_sessions: ?u32,
+    sessions: ?u32,
+    agent_pid: ?i64,
+};
+
+fn reportAgentBuild(
+    alloc: Allocator,
+    stdout: *std.Io.Writer,
+    json: bool,
+    dialed: ?*tcp_dial.Dialed,
+    pid: ?i64,
+) !u8 {
+    return emitAgentReport(alloc, stdout, json, .{
+        .agent_running = dialed != null,
+        .running = if (dialed) |d| peerStamp(d) else null,
+        .bundled = bundledAgentVersion(alloc),
+        .agent_pid = if (dialed != null) pid else null,
+    });
+}
+
+fn reportAgentBuildWithRoster(
+    alloc: Allocator,
+    stdout: *std.Io.Writer,
+    json: bool,
+    dialed: *tcp_dial.Dialed,
+    pid: i64,
+    sessions: []const connection.OwnedSession,
+) !u8 {
+    var live: u32 = 0;
+    for (sessions) |s| if (s.alive) {
+        live += 1;
+    };
+    return emitAgentReport(alloc, stdout, json, .{
+        .agent_running = true,
+        .running = peerStamp(dialed),
+        .bundled = bundledAgentVersion(alloc),
+        .live_sessions = live,
+        .total_sessions = @intCast(sessions.len),
+        .agent_pid = pid,
+    });
+}
+
+fn emitAgentReport(
+    alloc: Allocator,
+    stdout: *std.Io.Writer,
+    json: bool,
+    in: agent_build.Input,
+) !u8 {
+    const rep = agent_build.report(in);
+    if (!json) {
+        try rep.write(stdout);
+        return 0;
+    }
+    const row: AgentJson = .{
+        .status = rep.status.token(),
+        .running = rep.running,
+        .bundled = rep.bundled,
+        .days_behind = rep.days_behind,
+        .live_sessions = rep.live_sessions,
+        .sessions = rep.total_sessions,
+        .agent_pid = rep.agent_pid,
+    };
+    const text = try std.json.Stringify.valueAlloc(alloc, row, .{ .whitespace = .indent_2 });
+    try stdout.writeAll(text);
+    try stdout.writeAll("\n");
+    return 0;
+}
+
+/// The stamp the connected agent advertised in its HELLO, widened from the
+/// sentinel-terminated wire string. Null for an agent too old to advertise one,
+/// which the report reads as pre-versioned (and therefore stale).
+fn peerStamp(dialed: *tcp_dial.Dialed) ?[]const u8 {
+    const v = dialed.conn.peerBuildVersion() orelse return null;
+    return v;
+}
+
+/// The build stamp of the `ghoztty-agent` binary sitting beside this CLI, by
+/// running its `--version` — the same probe the app makes (`LocalAgent
+/// .bundledVersion`), from the one process that is guaranteed to exist when
+/// someone asks the question.
+///
+/// Null on any failure at all (no binary, spawn refused, nothing printed): the
+/// bundled side being unknown is a REPORTABLE state (`unknown`), never an error
+/// and never a guess. Honors `GHOSTTY_LOCAL_AGENT_BIN` so a dev tree or a test
+/// sandbox reports the agent it would actually spawn.
+fn bundledAgentVersion(alloc: Allocator) ?[]const u8 {
+    // The same DEBUG-ONLY test hook the app's probe honors
+    // (`LocalAgent.bundledVersion`), deliberately spelled with the same name:
+    // every stamp in a real tree comes from the one binary, so without it an
+    // acceptance script could only ever reach the `current` arm — there is no
+    // way to fabricate an old agent from a new tree. Never honored in a release
+    // build, where a stray env var must not be able to misreport a user's box.
+    if (build_config.is_debug) {
+        if (std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_BUNDLED_VERSION")) |v| {
+            if (v.len > 0) return v;
+        } else |_| {}
+    }
+
+    const exe = agentBinaryPath(alloc) catch return null;
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ exe, "--version" },
+        .max_output_bytes = 4096,
+    }) catch return null;
+    return agent_build.parseVersionOutput(result.stdout);
+}
+
+fn agentBinaryPath(alloc: Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(alloc, "GHOSTTY_LOCAL_AGENT_BIN")) |override| {
+        if (override.len > 0) return override;
+    } else |_| {}
+    const exe_dir = try std.fs.selfExeDirPathAlloc(alloc);
+    const name = if (comptime builtin.os.tag == .windows) "ghoztty-agent.exe" else "ghoztty-agent";
+    const sep = if (comptime builtin.os.tag == .windows) "\\" else "/";
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ exe_dir, sep, name });
 }
 
 /// `~/.config/ghoztty/local-agent[-debug]/port.json` — the same path

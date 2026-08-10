@@ -181,7 +181,7 @@ server since T332; the Mac server half is T553.)
 List the persistent terminal sessions owned by the local `ghoztty-agent` (the daemon that keeps session-persistence PTYs alive across app restarts). Unlike the other IPC commands, this dials the agent **directly** over its 0600 unix socket (`~/.config/ghoztty/local-agent[-debug]/agent.sock`) — NOT the app's IPC socket — so it works even when the Ghoztty app is not running (as long as the agent is). Requires `session-persistence = on`. On Windows the agent's local transport is instead an owner-only-DACL **named pipe** (`\\.\pipe\ghoztty-agent[-debug]-<user>`); the endpoint is discovered from the agent's `pipe` field in `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\port.json`, and the same-uid guarantee comes from the pipe DACL rather than a peercred check.
 
 ```
-ghoztty +sessions [--json]
+ghoztty +sessions [--json] [--agent]
 ```
 
 Each row reports the session id, liveness (`alive`; `dead(relaunchable)` for a tombstone that RELAUNCH can still revive — e.g. after a reboot or agent restart; or `dead(<code>)` for a genuinely exited session), whether a viewer is currently `attached`, the activity state (`idle`/`busy`/`needs_input`), the child pid, `pinned` when the session is protected from the agent's idle-TTL reaper (persistent local panes are pinned so they survive the viewer quitting indefinitely; cross-machine sessions are not), the working directory (when known), and the command. `--json` emits one object per session for scripts and agents.
@@ -190,6 +190,45 @@ Each row reports the session id, liveness (`alive`; `dead(relaunchable)` for a t
 ghoztty +sessions
 ghoztty +sessions --json
 ```
+
+**`--agent` answers which BUILD is running** (T662), instead of listing
+sessions. The agent outlives the app on purpose, so it is routinely a different
+build than everything around it — and until this existed that comparison
+happened only in an app log line, on a box where the app had already been
+restarted past the interesting moment:
+
+```
+running:  20260719-574fe0805  (pid 24228)
+bundled:  20260730-e69d41755
+status:   stale - 11 days behind, 4 live sessions
+next:     Ghoztty restarts it onto the bundled build when no sessions are open, or when you confirm the restart it offers.
+```
+
+`status` is a machine token — `current`, `stale`, `newer`, `unknown` (the
+bundled binary could not be read), `not_running` — and `--json` emits it with
+`running`, `bundled`, `days_behind`, `live_sessions`, `sessions` and
+`agent_pid`. **No agent running is an answer, not an error**: it exits 0 with
+`not_running`, because the next persistent session simply starts the bundled
+build. `days_behind` is calendar days between the two `YYYYMMDD` stamps, and is
+absent rather than 0 or negative whenever there is no honest number to give (a
+`dev` stamp, a pre-versioned agent, a same-day rebuild, a newer running agent).
+Staleness itself is defined in exactly one place for both readers —
+`src/remote/agent_build.zig`, shared by this CLI and the win32 upgrade policy
+(`agent_upgrade.zig`) — so the number a user reads and the decision the app acts
+on cannot disagree. Acceptance: `test/win32/sessions-agent-build.ps1`.
+
+**How a long-lived box adopts a newer agent** (the state this command exists to
+make visible): the running agent is restarted onto the bundled build when the
+app's check finds it stale AND there are zero live sessions, or when the user
+accepts the mandatory confirmation. Both can go unreached indefinitely on a box
+whose panes never all close — the morning app-only refresh (T525) deliberately
+never swaps `ghoztty-agent.exe` and defers that confirmation, and the check
+re-runs only at launch and when the last persistent window closes. So today the
+documented path is an **attended full delivery** (`scripts/launch-upgrade.ps1`
+without `-AppOnly`, which does prompt), and `+sessions --agent` is how you know
+whether one is due. The non-destructive alternative CLAUDE.md's agent contract
+calls the preferred path — drain, snapshot, re-exec, re-attach, no dialog and no
+lost sessions — is filed as **T705**.
 
 ### `ghoztty +send-keys`
 
