@@ -14058,3 +14058,55 @@ stalls the loop with nothing saying why.
 Evidence: `send-keys-bracketed.ps1` ALL PASS (14 rounds), `reset-context.ps1`
 ALL PASS (52), `send-keys-soak.ps1` ALL PASS (40 sends byte-exact). All three zig
 lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.
+
+## 2026-08-10 — a newline inside a `+send-keys` text run now means what it means on a Mac (T661)
+
+`+send-keys --target=t "a\nb\n"` is documented to paste two lines and then
+submit. On Windows it pasted ONE line: the IPC server ran
+`normalizeConptyInput` over every run, text runs included, so the interior
+newline reached the pane as CR — indistinguishable, to the TUI receiving it,
+from the user pressing Enter in the middle of the message. The same rewrite hit
+`--keys-file=`, whose whole contract is "verbatim", so a generated prompt file
+ending in a newline submitted itself here and did not on macOS. Both are gone.
+
+**The right rule was already in the codebase, one directory over.**
+`src/input/paste.zig` implements what xterm has always done with a paste: a
+program in bracketed-paste mode gets newlines verbatim, because a newline is a
+line break in the content it is receiving; a program that never asked gets LF
+mapped to CR. `IpcHandlers.prepareSendKeysRun` now applies exactly that to text
+runs, and `Surface.pasteIsBracketed` (extracted from `writePtyBracketed`'s own
+branch, no behavior change) is how it asks.
+
+**That split is the parity, and the first cut proved it by breaking.** Writing
+every resolved run byte-for-byte looked like the faithful port — main writes
+verbatim and macOS never normalized at all. A probe on the box said otherwise:
+`+send-keys "echo AAA\necho BBB\n"` reached a `cmd.exe` pane as
+`echo AAAecho BBB`, because conhost's VT input translation SWALLOWS a bare LF.
+macOS runs both commands there for free, since a POSIX pty accepts LF as a line
+terminator. Copying main's *bytes* would therefore have shipped a new
+divergence in main's clothes; copying its *behavior* means mapping the byte
+here. The probe is now round 15 of the acceptance script, so the next person to
+reach for verbatim finds a red test instead of a user report.
+
+**A flat payload cannot say which CLI wrote it, so the CLI now says.** The
+reported `--keys-file=` symptom lands on the flat path — a lone file resolves to
+one segment, and `--segments=` is only sent when there are two or more — and on
+that path a resolved CLI's bytes and a pre-T604 CLI's are byte-identical, while
+meaning opposite things by `\n`. So every `+send-keys` request carries
+`--keys-resolved=1` (`apprt/ipc/args.zig`), and an unmarked one is normalized
+unconditionally exactly as before. Purely additive: the macOS server reads only
+`--target`/`--keys`/`--segments` and ignores it forever, an older win32 server
+ignores it too, and both skews land on today's behavior rather than a garble.
+The fork and its two rejected alternatives are **D56** — notably "always send
+`--segments=`", which was rejected because macOS ACTS on that argument and
+would have started framing single text runs on a platform this seat cannot
+validate.
+
+Both halves are measured on the wire, not on screen. Round 15 is an unbracketed
+pane getting CR; round 16 is a hand-built, length-prefixed JSON request with no
+marker, still getting CR against a mode-2004 pane — without it a green run could
+not tell "the marker is honored" from "the rewrite was deleted outright".
+
+Evidence: `send-keys-bracketed.ps1` ALL PASS (16 rounds),
+`ipc-send-keys-fidelity.ps1` ALL PASS, `reset-context.ps1` ALL PASS (52). All
+three zig lanes PASS through `floor-lane.ps1 -Lane all`; P1–P3 ALL PASS.

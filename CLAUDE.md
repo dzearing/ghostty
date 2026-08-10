@@ -218,10 +218,10 @@ ghoztty +send-keys --target=<name> [flags] <text|key>...
   rule below does not apply to it**: the CLI sends a file exactly as it is on
   disk, trailing newline included, because "verbatim" is the flag's whole reason
   to exist and a generated prompt file routinely ends in a newline nobody meant
-  as "submit". Submit one with a following `Enter` (or `--enter`). (On Windows
-  the *server* still normalizes that trailing LF to CR before the write, so a
-  file ending in a newline submits here and does not on macOS — a divergence,
-  tracked as T661, not the intended contract.)
+  as "submit". Submit one with a following `Enter` (or `--enter`). Like any
+  text run it follows the paste convention below, so the file's own trailing
+  newline reaches a bracketed-paste program (every TUI) as a literal newline
+  and does not submit.
 - Positional arguments are text or key names, written to the PTY in order.
   Adjacent arguments of the same kind merge into one **run**, and the run
   boundaries survive to the PTY write: a text run is framed as a **bracketed
@@ -242,7 +242,11 @@ ghoztty +send-keys --target=term --enter "ls -la"
 ghoztty +send-keys --target=term C-c
 ```
 
-**A trailing newline is a keypress; an interior one is content.** The trailing run of `\n`/`\r` is peeled off a text argument and delivered as that many Enter presses, so `"a\nb\n"` pastes two lines and then submits. This runs after escape processing, so `\n` written as the two-character escape and a real newline byte behave identically. The accepted cost: there is no way to paste text ending in a literal newline without submitting — a trailing newline in a paste means "commit" essentially always, and a program that has not enabled bracketed paste sees `\r` mapped back to `\n` by the tty's `ICRNL` anyway. (`--keys-file=` is exempt; see above.) **On Windows the interior newline does not stay literal either** — the IPC server normalizes LF to CR inside text runs as well as key runs, so `"a\nb\n"` reaches the pane as `a␍b` framed, then `␍`. That is a divergence from the rule above, measured by rounds 11–12 of `test/win32/send-keys-bracketed.ps1` and tracked as T661.
+**A trailing newline is a keypress; an interior one is content.** The trailing run of `\n`/`\r` is peeled off a text argument and delivered as that many Enter presses, so `"a\nb\n"` pastes two lines and then submits. This runs after escape processing, so `\n` written as the two-character escape and a real newline byte behave identically. The accepted cost: there is no way to paste text ending in a literal newline without submitting — a trailing newline in a paste means "commit" essentially always, and a program that has not enabled bracketed paste sees `\r` mapped back to `\n` by the tty's `ICRNL` anyway. (`--keys-file=` is exempt; see above.)
+
+**A newline inside a text run follows the paste convention, on both platforms** (T661). A program that has enabled bracketed paste receives it as a literal `\n` — it is a line break in the pasted content, which is what makes `"a\nb\n"` type two lines into a composer and then submit. A program that has NOT receives `\n` mapped to `\r`, which is what xterm has always done for an unbracketed paste (`src/input/paste.zig`) and what makes the same send run two commands in a shell. macOS reaches the second half for free, because a POSIX pty accepts LF as a line terminator; Windows has to do the mapping, because conhost's VT input translation **swallows a bare LF** — without it `+send-keys "echo A\necho B\n"` reaches `cmd.exe` as `echo Aecho B`. The win32 rule is `IpcHandlers.prepareSendKeysRun`; rounds 11, 12 and 15 of `test/win32/send-keys-bracketed.ps1` measure both halves on the wire.
+
+That rule needs to know the CLI already spelled `Enter` as CR, and a flat `--keys=` payload cannot say so by itself, so **every `+send-keys` request carries `--keys-resolved=1`**. A request without it came from a CLI old enough that a bare `\n` meant Enter and is normalized unconditionally, exactly as before — a server ignores the argument it does not know, and macOS, which never normalized at all, ignores it forever. Round 16 is that control.
 
 **Any unknown `--flag` is a hard error** (exit 1), naming the submit spellings. `--press-enter` used to become a text positional and get typed into the pane at exit 0, which is how agents got this wrong without noticing. Single-dash arguments (`-la`, `-p`) are ordinary text. To send literal text starting with `--`, put it after a bare `--`, which stops flag parsing but not key notation:
 

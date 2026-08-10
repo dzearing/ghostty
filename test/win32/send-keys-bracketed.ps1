@@ -104,6 +104,41 @@ while ($total -lt $N -and (Get-Date) -lt $deadline) {
 $capPath = Join-Path $tmp 'capture.ps1'
 [IO.File]::WriteAllText($capPath, $capture, (New-Object System.Text.UTF8Encoding($false)))
 
+# A `+send-keys` request built BY HAND, without the CLI (T661). It is the only
+# way to reach the server the way a pre-T604 `ghoztty` does: that CLI meant
+# "Enter" by a bare `\n` and sent no `--keys-resolved=` marker, and today's CLI
+# cannot be made to emit that shape. Frame: 4-byte big-endian length, then the
+# JSON body (IpcServer.serveOne).
+function Send-LegacyKeys([string]$Pane, [string]$JsonKeys) {
+    $pipeName = "ghoztty$($env:GHOZTTY_PIPE_SUFFIX)-$env:USERNAME"
+    $json = '{"action":"send-keys","arguments":["--target=' + $Pane + '","--keys=' + $JsonKeys + '"]}'
+    $body = [Text.Encoding]::UTF8.GetBytes($json)
+    $len = [BitConverter]::GetBytes([int]$body.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(
+        '.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+    try {
+        $pipe.Connect(5000)
+        $pipe.Write($len, 0, 4)
+        $pipe.Write($body, 0, $body.Length)
+        $pipe.Flush()
+        # Drain the response before dropping the connection: a client that
+        # disappears mid-write is a different test than the one we mean.
+        $rl = New-Object byte[] 4
+        if ($pipe.Read($rl, 0, 4) -eq 4) {
+            if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($rl) }
+            $n = [BitConverter]::ToInt32($rl, 0)
+            if ($n -gt 0 -and $n -lt 65536) {
+                $resp = New-Object byte[] $n
+                [void]$pipe.Read($resp, 0, $n)
+                return [Text.Encoding]::UTF8.GetString($resp)
+            }
+        }
+        return ''
+    } finally { $pipe.Dispose() }
+}
+
 function Read-Pane([string]$name, [int]$lines = 20) {
     return ((& $Exe +read "--name=$name" "--lines=$lines" 2>&1) | Out-String)
 }
@@ -137,7 +172,11 @@ function Invoke-Round(
     [string[]]$SendArgs,
     [string[]]$ThenArgs,
     [string[]]$FirstArgs,
-    [int]$FirstGapMs = 1000
+    [int]$FirstGapMs = 1000,
+    # T661: send this JSON-escaped `--keys=` payload as a hand-built request
+    # instead of driving the CLI, so the round measures the legacy (unmarked)
+    # server path. Mutually exclusive with $SendArgs.
+    [string]$LegacyKeys
 ) {
     $script:round++
     $tag = "R$($script:round)"
@@ -161,8 +200,12 @@ function Invoke-Round(
         & $Exe +send-keys @first 2>&1 | Out-Null
         Start-Sleep -Milliseconds $FirstGapMs
     }
-    $all = @("--target=$pane") + $SendArgs
-    & $Exe +send-keys @all 2>&1 | Out-Null
+    if ($LegacyKeys) {
+        [void](Send-LegacyKeys $pane $LegacyKeys)
+    } else {
+        $all = @("--target=$pane") + $SendArgs
+        & $Exe +send-keys @all 2>&1 | Out-Null
+    }
     if ($ThenArgs) {
         # A real gap, not a race: the reuse path polls the pane for seconds
         # between its two calls, so the capture must see them as two separate
@@ -307,39 +350,37 @@ $r10 = Invoke-Round 'on' 24 @('--enter', $msg)
 Assert "framed text with the CR outside" `
     ($r10 -eq ($FRAME_START + $msgHex + $FRAME_END + $CR))
 
-"== 11: --keys-file= is exempt from the peel, but ConPTY normalization is not"
-# Two layers, and only the first is the CLI's. The CLI genuinely exempts a file
-# from the trailing-newline peel (D52) and emits 0a - pinned in the none lane
-# by "keys-file: a trailing newline in the file stays content, unpeeled".
-#
-# The SERVER then runs verb_args.normalizeConptyInput over every run
-# (IpcHandlers.handleSendKeys), which turns LF and CRLF into CR because Enter
-# on a ConPTY is CR. So on Windows the file's trailing newline reaches the pane
-# as 0d and submits after all. That is pre-existing win32 behavior, older than
-# T604 - this round exists so it is a MEASURED fact rather than a surprise, and
-# so the docs cannot go on claiming a file is byte-exact on the wire here.
-# Tracked as T661.
+"== 11: --keys-file= reaches the pane byte-exact, trailing newline included"
+# The file is exempt from the trailing-newline peel (D52) - pinned in the none
+# lane by "keys-file: a trailing newline in the file stays content, unpeeled" -
+# and since T661 the SERVER no longer undoes that exemption. It used to run
+# verb_args.normalizeConptyInput over every run, turning the file's 0a into 0d,
+# so a generated prompt file ending in a newline submitted itself here and did
+# not on macOS. The CLI now marks its payload `--keys-resolved=1` (it has
+# already spelled every keypress as the byte a terminal sends), and a marked
+# request is written verbatim.
 $pfn = Join-Path $tmp 'prompt-nl.txt'
 [IO.File]::WriteAllText($pfn, "$msg`n", (New-Object System.Text.UTF8Encoding($false)))
 $r11 = Invoke-Round 'on' 13 @("--keys-file=$pfn")
 "     got: $r11"
 Assert "one text run, so unframed (round 4's rule)" `
     (-not ($r11.Contains($FRAME_START) -or $r11.Contains($FRAME_END)))
-Assert "the file's LF is normalized to CR by the server, not left as 0a" `
-    ($r11 -eq ($msgHex + $CR))
+Assert "the file's trailing LF arrives as 0a, so it does not submit" `
+    ($r11 -eq ($msgHex + '0a'))
 
-"== 12: an INTERIOR newline is normalized to CR too (win32 divergence, T661)"
+"== 12: an INTERIOR newline stays literal inside the paste (T661)"
 # Main's contract for the peel is 'interior newlines stay literal inside the
-# paste, so "a\nb\n" pastes two lines and then submits'. The peel half holds
-# here - the trailing newline leaves the frame as a keypress - but the interior
-# 0a does NOT survive as 0a, because normalizeConptyInput rewrites it inside
-# the text run. The bytes below are what a TUI on Windows actually receives.
+# paste, so "a\nb\n" pastes two lines and then submits'. Both halves now hold
+# here: the trailing newline leaves the frame as a keypress, and the interior
+# 0a survives as 0a inside it. This is the byte-level oracle for the win32
+# divergence T604 documented and T661 removed - a regression puts 0d back in
+# the middle of the frame and nothing on screen would say so.
 $r12 = Invoke-Round 'on' 16 @("a\nb\n")
 "     got: $r12"
 Assert "the trailing newline still became a keypress outside the frame" `
     ($r12.EndsWith($FRAME_END + $CR))
-Assert "the interior newline arrived as CR, not LF" `
-    ($r12 -eq ($FRAME_START + '610d62' + $FRAME_END + $CR))
+Assert "the interior newline arrived as LF, not CR" `
+    ($r12 -eq ($FRAME_START + '610a62' + $FRAME_END + $CR))
 
 # --- T664: a text run that follows a bare Enter arrives WHOLE ---------------
 #
@@ -375,6 +416,37 @@ $r14 = Invoke-Round 'on' ($long.Length + 14) @("--keys-file=$pfl", 'Enter') $nul
 "     got: $r14"
 Assert "a chunk-crossing payload arrives whole, framed, CR outside" `
     ($r14 -eq ($CR + $FRAME_START + $longHex + $FRAME_END + $CR))
+
+"== 15: an interior newline to a pane WITHOUT mode 2004 is still CR (T661)"
+# The other half of the paste convention, and the reason the fix is a fork
+# rather than 'write it verbatim'. `input.paste.encode` maps LF to CR for an
+# unbracketed paste (xterm's rule), and on ConPTY that is not cosmetic:
+# conhost's VT input translation SWALLOWS a bare LF outright, so a verbatim
+# multi-line send reaches cmd.exe as `echo AAAecho BBB` - measured on box
+# 2026-08-10, on a build that had just stopped normalizing. A Mac user running
+# the same send gets two commands (a POSIX pty accepts LF as a line
+# terminator), so mapping it here is the parity, not a Windows quirk.
+$r15 = Invoke-Round 'off' 4 @("a\nb\n")
+"     got: $r15"
+Assert "unframed, since the pane never asked for bracketed paste" `
+    (-not ($r15.Contains($FRAME_START) -or $r15.Contains($FRAME_END)))
+Assert "the interior newline arrived as CR, so the line breaks land" `
+    ($r15 -eq ('61' + $CR + '62' + $CR))
+
+"== 16: T661 legacy control - an UNMARKED request still gets the CR rewrite"
+# Rounds 11, 12 and 15 only hold because the CLI marks its payload
+# `--keys-resolved=1`. This round is the other half of that fork, and without it
+# a green run cannot tell "the marker is honored" from "the rewrite was deleted
+# outright": a pre-T604 `ghoztty` on the box - the share copy, a stale portable -
+# still means Enter by a bare `\n`, and its sends must submit exactly as they
+# always did, INCLUDING against a mode-2004 pane like this one. Hand-built
+# request, no marker, real LF bytes in `--keys=`.
+$r16 = Invoke-Round 'on' 4 $null $null $null 1000 'a\nb\n'
+"     got: $r16"
+Assert "an unmarked send is unframed, as a flat payload always was" `
+    (-not ($r16.Contains($FRAME_START) -or $r16.Contains($FRAME_END)))
+Assert "every LF in an unmarked send still arrives as CR, mode 2004 or not" `
+    ($r16 -eq ('61' + $CR + '62' + $CR))
 
 "== teardown"
 & $Exe +close "--target=$win" 2>&1 | Out-Null

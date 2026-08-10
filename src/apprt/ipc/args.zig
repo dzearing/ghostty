@@ -394,10 +394,50 @@ pub fn wrapShellCommandArgv(
     return argv.items;
 }
 
+/// The `+send-keys` argument that says "these bytes are final" (T661).
+///
+/// The CLI resolves every keypress to the byte a terminal sends for it before
+/// the request leaves: `Enter` and a trailing newline both become CR, and a
+/// newline in the MIDDLE of a text argument stays LF because it is content.
+/// So every newline still in a marked request is CONTENT, and a server may
+/// only touch it under the terminal-wide paste convention (`input.paste`:
+/// verbatim to a program in bracketed-paste mode, LF mapped to CR otherwise)
+/// — never unconditionally. Rewriting an interior LF for a TUI is the
+/// divergence T604 documented and T661 removed, and rewriting a
+/// `--keys-file=` trailing LF makes a prompt file submit itself against D52.
+///
+/// It exists because the flat `--keys=` payload from a resolved CLI and from a
+/// pre-T604 one — where `\n` did mean Enter — are byte-indistinguishable. A
+/// single all-text send carries no `--segments=` to key off (the CLI only
+/// emits that when there is a boundary to preserve), so the generation has to
+/// be stated rather than guessed.
+///
+/// Purely additive: a server that predates it ignores an argument it does not
+/// know and normalizes as it always did, and the macOS server — which never
+/// normalized in the first place — ignores it forever.
+pub const keys_resolved_prefix = "--keys-resolved=";
+
+/// The argument the CLI sends. A value is carried rather than a bare flag so
+/// the wire shape matches every other `+send-keys` argument.
+pub const keys_resolved_arg = keys_resolved_prefix ++ "1";
+
+/// Whether a `--keys-resolved=` VALUE (everything after the prefix) means
+/// resolved. Anything but an explicit `0` counts, so a value this build does
+/// not recognize errs toward the newer, correct behavior rather than silently
+/// reinstating the rewrite.
+pub fn keysResolvedValue(value: []const u8) bool {
+    return !std.mem.eql(u8, value, "0");
+}
+
 /// ConPTY input convention: Enter is CR. A bare LF never comes from a real
 /// keyboard and Windows shells don't execute on it, but the send-keys `\n`
 /// notation means "Enter" to the user — normalize LF and CRLF to CR.
 /// Returns an owned slice (length <= bytes.len).
+///
+/// Unconditional, so it is only for a request WITHOUT `keys_resolved_arg`
+/// above. A resolved CLI has already spelled Enter as CR, and every LF still
+/// in its payload is content — content a bracketed-paste receiver must get
+/// verbatim. See `IpcHandlers.prepareSendKeysRun` for the three-way rule.
 pub fn normalizeConptyInput(alloc: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     const normalized = try alloc.alloc(u8, bytes.len);
     errdefer alloc.free(normalized);
@@ -852,6 +892,28 @@ test "normalizeConptyInput: LF and CRLF become CR, lone CR unchanged" {
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(case.out, got);
     }
+}
+
+// T661: the marker that turns the rewrite above OFF. Its whole job is to be
+// unambiguous on the wire, so the two ways it could go wrong are pinned here.
+test "keys_resolved_arg: spelling a server can key off" {
+    try testing.expect(std.mem.startsWith(u8, keys_resolved_arg, keys_resolved_prefix));
+    try testing.expect(keysResolvedValue(keys_resolved_arg[keys_resolved_prefix.len..]));
+
+    // A server parses `--keys=` in the same loop, so the marker must not be
+    // mistaken for a payload — which would send the literal text "resolved=1"
+    // to the pane and drop the real keys entirely.
+    try testing.expect(!std.mem.startsWith(u8, keys_resolved_arg, "--keys="));
+}
+
+test "keysResolvedValue: only an explicit 0 means unresolved" {
+    try testing.expect(keysResolvedValue("1"));
+    try testing.expect(keysResolvedValue("true"));
+    // A value from a newer CLI errs toward verbatim rather than quietly
+    // reinstating the newline rewrite this marker exists to prevent.
+    try testing.expect(keysResolvedValue("2"));
+    try testing.expect(keysResolvedValue(""));
+    try testing.expect(!keysResolvedValue("0"));
 }
 
 test "validateLayout: valid nested layout collects names in order" {

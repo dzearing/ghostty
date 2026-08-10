@@ -303,8 +303,20 @@ fn runArgs(
     @memcpy(keys_arg[0..prefix.len], prefix);
     @memcpy(keys_arg[prefix.len..][0..resolved.bytes.len], resolved.bytes);
 
-    var ipc_args_buf: [3][:0]const u8 = .{ target_arg, keys_arg, undefined };
-    var ipc_args: [][:0]const u8 = ipc_args_buf[0..2];
+    // T661: every keypress in the payload above is already the byte a terminal
+    // sends for it — `Enter` and a peeled trailing newline are both CR — so an
+    // interior LF that survived is content and must reach the pane as LF. The
+    // marker says so, because the win32 server cannot tell these bytes from a
+    // pre-T604 CLI's, where a bare `\n` did mean Enter, and rewrites them all
+    // to CR when nobody says otherwise. A server that does not know the
+    // argument ignores it.
+    var ipc_args_buf: [4][:0]const u8 = .{
+        target_arg,
+        keys_arg,
+        verb_args.keys_resolved_arg,
+        undefined,
+    };
+    var ipc_args: [][:0]const u8 = ipc_args_buf[0..3];
 
     // Only send the segmented payload when there is a boundary worth
     // preserving. A send that is all text or all keys has nothing to
@@ -313,8 +325,8 @@ fn runArgs(
     // a CLI newer than the app it is driving degrades to that behaviour
     // rather than failing.
     if (resolved.segments.len > 1) {
-        ipc_args_buf[2] = try encodeSegments(alloc, resolved.segments);
-        ipc_args = ipc_args_buf[0..3];
+        ipc_args_buf[3] = try encodeSegments(alloc, resolved.segments);
+        ipc_args = ipc_args_buf[0..4];
     }
 
     if (opts.when_idle) {
@@ -423,6 +435,7 @@ fn appendFile(alloc: Allocator, buf: *std.ArrayList(u8), path: []const u8) !void
 /// A run of resolved bytes, tagged with how the receiving program should
 /// understand it. The wire format lives with the IPC server that reads it
 /// (`apprt.ipc.segments`) so the encoder and the decoder cannot drift.
+const verb_args = apprt.ipc.args;
 const segments_wire = apprt.ipc.segments;
 const Segment = segments_wire.Segment;
 const Kind = segments_wire.Kind;

@@ -4057,14 +4057,26 @@ const paste_end = "\x1b[201~";
 /// Unlike a clipboard paste this does NOT strip control bytes: `+send-keys`
 /// is a byte-level channel whose callers deliberately send escape sequences
 /// inside text arguments.
+/// Whether the program running in this surface has asked for bracketed paste
+/// (DEC mode 2004) — i.e. whether `writePtyBracketed` would actually frame.
+///
+/// Exposed because the mode says more than "frame or don't": it is the only
+/// signal for whether the receiver understands a newline as content. A caller
+/// preparing pasted bytes has to answer that before it writes them, the way
+/// `input.paste.encode` does (an unbracketed paste maps LF to CR, xterm's
+/// convention). `+send-keys` on Windows is such a caller — a bare LF is
+/// swallowed outright by conhost's VT input translation, so a multi-line send
+/// to a shell would run `echo AAAecho BBB` if it did not ask first.
+pub fn pasteIsBracketed(self: *Surface) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    return input.paste.Options.fromTerminal(&self.io.terminal).bracketed;
+}
+
 pub fn writePtyBracketed(self: *Surface, data: []const u8) !void {
     if (data.len == 0) return;
 
-    const bracketed = bracketed: {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        break :bracketed input.paste.Options.fromTerminal(&self.io.terminal).bracketed;
-    };
+    const bracketed = self.pasteIsBracketed();
 
     // Data carrying the closing fencepost would end the frame early and
     // leave the remainder outside it. Send it unframed rather than emit a

@@ -15,6 +15,7 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
+const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
@@ -1244,6 +1245,42 @@ fn handleRename(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 
+/// The bytes of one `+send-keys` run as they should reach the ConPTY, owned by
+/// the caller (T661).
+///
+/// Three cases, and the shape of the answer is the whole point:
+///
+///   * NOT resolved — a CLI old enough that a bare `\n` meant Enter. Rewrite
+///     every newline to CR exactly as this server always did, whatever the
+///     pane is running. Nothing else can be inferred about those bytes.
+///   * a `.key` run — a keypress the CLI already spelled as its terminal byte.
+///     Verbatim; there is no newline in it to decide about.
+///   * a `.text` run — pasted content, so it follows the terminal-wide paste
+///     convention `input.paste.encode` implements: a program that asked for
+///     bracketed paste understands a newline as a line break in the content
+///     and gets it verbatim, while one that did not gets LF mapped to CR the
+///     way xterm has always done it.
+///
+/// That last split is what makes this parity rather than a Windows quirk. On a
+/// POSIX pty an unframed LF is a line terminator for a shell, so macOS needs
+/// no mapping to run `a` then `b`; conhost's VT input translation SWALLOWS a
+/// bare LF, so without the mapping `+send-keys "echo A\necho B\n"` reaches
+/// cmd.exe as `echo Aecho B` — measured, 2026-08-10. Mapping it restores the
+/// behavior a Mac user sees, while a TUI's composer still receives the literal
+/// line break main's contract promises it.
+fn prepareSendKeysRun(
+    alloc: Allocator,
+    surface: *CoreSurface,
+    bytes: []const u8,
+    kind: verb_segments.Kind,
+    resolved: bool,
+) Allocator.Error![]u8 {
+    if (!resolved) return try verb_args.normalizeConptyInput(alloc, bytes);
+    if (kind == .text and !surface.pasteIsBracketed())
+        return try verb_args.normalizeConptyInput(alloc, bytes);
+    return try alloc.dupe(u8, bytes);
+}
+
 fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // The CLI resolves all key notation (C-x, Enter, \n escapes) before
     // sending; the server receives `--target=` and raw `--keys=` bytes and
@@ -1256,15 +1293,26 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // instead of landing in the composer as a pasted newline (T428). Without
     // it — an older CLI, or a send with nothing to disambiguate — the flat
     // payload is written exactly as it always was.
+    //
+    // `--keys-resolved=1` (T661) says the CLI already spelled every keypress
+    // as the byte a terminal sends for it, so every LF still in a text run is
+    // CONTENT — an interior line break, or a `--keys-file=`'s own trailing
+    // newline — and only the paste convention may touch it. Absent, the
+    // request came from a CLI old enough that a bare `\n` did mean Enter and
+    // is normalized exactly as it always was. `prepareSendKeysRun` above owns
+    // both cases; nothing here writes bytes it did not return.
     var target: ?[]const u8 = null;
     var text: ?[]const u8 = null;
     var segments_value: ?[]const u8 = null;
+    var resolved = false;
     if (request.arguments) |arguments| {
         for (arguments) |arg| {
             if (dropPrefix(arg, "--target=")) |v| {
                 target = v;
             } else if (dropPrefix(arg, verb_segments.prefix)) |v| {
                 segments_value = v;
+            } else if (dropPrefix(arg, verb_args.keys_resolved_prefix)) |v| {
+                resolved = verb_args.keysResolvedValue(v);
             } else if (dropPrefix(arg, "--keys=")) |v| {
                 text = v;
             }
@@ -1313,7 +1361,13 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
         for (runs) |run| {
             if (run.bytes.len == 0) continue;
-            const run_bytes = try verb_args.normalizeConptyInput(ctx.alloc, run.bytes);
+            const run_bytes = try prepareSendKeysRun(
+                ctx.alloc,
+                &surface.core_surface,
+                run.bytes,
+                run.kind,
+                resolved,
+            );
             defer ctx.alloc.free(run_bytes);
             const written = switch (run.kind) {
                 .text => surface.core_surface.writePtyBracketed(run_bytes),
@@ -1325,7 +1379,17 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try ctx.alloc.dupe(u8, "{\"success\":true}");
     }
 
-    const normalized = try verb_args.normalizeConptyInput(ctx.alloc, bytes);
+    // No `--segments=`, so the kind is unknown — but the rule above does not
+    // need it. A flat payload is all text or all keys, and a key run from a
+    // resolved CLI is already CR with no LF for either branch to touch, so
+    // calling it text is right for both of the things it can be.
+    const normalized = try prepareSendKeysRun(
+        ctx.alloc,
+        &surface.core_surface,
+        bytes,
+        .text,
+        resolved,
+    );
     defer ctx.alloc.free(normalized);
 
     const write_req = termio.Message.WriteReq.init(ctx.alloc, normalized) catch
