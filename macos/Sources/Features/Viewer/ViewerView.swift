@@ -3055,6 +3055,19 @@ extension ViewerView: WKNavigationDelegate {
             return
         }
 
+        // A `ghoztty://` link is Ghoztty addressing itself: handle it here, in
+        // process, and never navigate. This comes FIRST — ahead of the live-page
+        // allow below — for two reasons. WebKit cannot load the scheme at all,
+        // so an allowed navigation is a dead click; and handing it to
+        // LaunchServices instead would route it to whichever BUILD registered
+        // the scheme, so a link clicked in a debug build's pane would raise a
+        // window in the release app. Handled here it always means "this app".
+        if GhozttyURLScheme.handles(url) {
+            decisionHandler(.cancel)
+            GhozttyURLScheme.handle(url)
+            return
+        }
+
         // Websites navigate freely within the pane — and so does a local HTML
         // file, which is a page in every way that matters. Its links behave
         // exactly as they would if the folder were served over http, which is
@@ -3129,6 +3142,8 @@ extension ViewerView: WKUIDelegate {
     enum PopupDestination: Equatable {
         /// Hand the URL to the system default browser and cancel the popup.
         case defaultBrowser(URL)
+        /// A `ghoztty://` command: run it in process and cancel the popup.
+        case ghozttyCommand(URL)
         /// Open it as its own Ghoztty viewer window.
         case ghosttyWindow
     }
@@ -3143,6 +3158,13 @@ extension ViewerView: WKUIDelegate {
         for url: URL?,
         modifiers: NSEvent.ModifierFlags
     ) -> PopupDestination {
+        // A `ghoztty://` link is a command, not a destination, and it outranks
+        // the Cmd modifier: there is nothing to put in a window. Without this
+        // it fell through to `.ghosttyWindow` as a "non-web scheme" and a
+        // `target="_blank"` focus link OPENED A VIEWER WINDOW pointed at the
+        // command — window creation from the one scheme that must never create
+        // anything.
+        if let url, GhozttyURLScheme.handles(url) { return .ghozttyCommand(url) }
         guard !modifiers.contains(.command),
               let url,
               url.scheme == "http" || url.scheme == "https"
@@ -3175,11 +3197,17 @@ extension ViewerView: WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if case .defaultBrowser(let url) = Self.popupDestination(
+        switch Self.popupDestination(
             for: navigationAction.request.url,
             modifiers: navigationAction.modifierFlags) {
+        case .defaultBrowser(let url):
             NSWorkspace.shared.open(url)
             return nil
+        case .ghozttyCommand(let url):
+            GhozttyURLScheme.handle(url)
+            return nil
+        case .ghosttyWindow:
+            break
         }
 
         // Without a host controller there is nowhere to put a window; drop the

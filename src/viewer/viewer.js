@@ -24,6 +24,20 @@
     },
   }).use(window.markdownitTaskLists, { enabled: false, label: true });
 
+  // DOMPurify's default URI allowlist plus `ghoztty:` / `ghoztty-debug:` —
+  // the focus-only custom scheme (GhozttyURLScheme.swift). Without this an
+  // `[open the worktree](ghoztty://focus/dev)` link in a rendered document
+  // survives markdown-it and is then stripped of its href by the sanitizer,
+  // rendering as dead text. Everything else is verbatim DOMPurify default, so
+  // `javascript:`/`data:` stay blocked; keep it in sync when the vendored copy
+  // is bumped.
+  const ALLOWED_URI_REGEXP =
+    /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|ghoztty|ghoztty-debug):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+
+  function sanitize(html) {
+    return window.DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP: ALLOWED_URI_REGEXP });
+  }
+
   const content = document.getElementById("content");
 
   function restoreScroll(y) {
@@ -44,7 +58,7 @@
     // default DOMPurify profile keeps the tags/attributes a README header needs
     // (<h1>, <p align>, <img width>, <a href>, <br>) and highlight.js/task-list
     // markup (<span class>, <input type=checkbox disabled>).
-    content.innerHTML = window.DOMPurify.sanitize(md.render(source));
+    content.innerHTML = sanitize(md.render(source));
     // Heading ids are assigned AFTER sanitization, on the live nodes, so the
     // TOC's anchors can never be stripped by DOMPurify (and a file that ships
     // its own heading ids keeps them).

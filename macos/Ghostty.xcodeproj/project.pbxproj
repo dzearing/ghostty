@@ -761,6 +761,7 @@
 				EXECUTABLE_NAME = ghoztty;
 				GCC_OPTIMIZATION_LEVEL = fast;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Ghoztty;
 				INFOPLIST_KEY_CFBundleName = Ghoztty;
@@ -1161,6 +1162,7 @@
 				ENABLE_PREVIEWS = YES;
 				EXECUTABLE_NAME = ghoztty;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty-debug";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Ghoztty[DEBUG]";
 				INFOPLIST_KEY_CFBundleName = Ghoztty;
@@ -1218,6 +1220,7 @@
 				EXECUTABLE_NAME = ghoztty;
 				GCC_OPTIMIZATION_LEVEL = fast;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Ghoztty;
 				INFOPLIST_KEY_CFBundleName = Ghoztty;
