@@ -304,6 +304,8 @@ Banners also support standard markdown pipe tables, rendered as an aligned grid 
 
 **The collapse chevron owns the card's right strip.** Content — every block, not just the first line — stops a clear 4 DIP short of the chevron's box, so no paragraph, heading, list row, table cell or rule ever paints under it. The reservation is pure geometry (`banner_layout.contentWidth`, asserted at 1.0/1.25/1.5/2.0) and applies only when the banner is collapsible, i.e. when a chevron is actually drawn.
 
+**Collapsing animates the card and only the card.** The card eases between its expanded and collapsed heights over 180ms (`banner_layout.COLLAPSE_MS`, Mac's `easeInOut(0.18)`), while the band the window layout reserves — and therefore the terminal grid below it — moves to the settled height in ONE step per click. Both platforms arrive there from opposite directions: Mac drives its inset off a hidden, animation-free copy of the banner content so the Metal surface never chases intermediate frames; win32 simply never lets the animation into `stripHeight()`, and lets the still-tall card overhang the terminal for the length of a collapse. A second click mid-flight reverses from the height the card is actually at, and users who turned off Windows' "animation effects" (`SPI_GETCLIENTAREAANIMATION`, read in one place: `App.clientAreaAnimationsEnabled`) get the instant toggle. What win32 does NOT do yet is Mac's parallel cross-fade of the body — it clips the content to the animating card with the existing bottom fade instead, filed as T677. Acceptance: section 6f2 of `test/win32/pane-banner.ps1` (T149).
+
 ```bash
 ghoztty +set-banner --target=dev "**Build status**\n| Job | State |\n|---|---:|\n| lint | ok |\n| tests | **3 failed** |"
 ```

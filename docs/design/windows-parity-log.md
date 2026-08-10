@@ -13289,3 +13289,62 @@ work has been closing the same ground from the other direction — so the open
 cards depending on either audit want one pass to say, with evidence, which are
 still real. Left uncorrected it costs twice: M1's denominator counts work that
 does not exist, and each phantom card burns a full turn's context to discover.
+
+## 2026-08-09 — Folding a banner away now looks like folding, not like a cut (T149)
+
+A multi-line banner has folded to a single line on click here since T91, and the
+chevron that does it has been a proper button since T204. What it never had is
+the motion: the card went from tall to short in one frame, so the fold read as
+the banner being *replaced* rather than closed, and you had to work out where the
+text went. It now eases between the two heights over 180ms — Mac's own
+`easeInOut(0.18)`, from `89465f320` — while the terminal below still moves in a
+single step, immediately.
+
+That split is the whole design, and both platforms reach it from opposite
+directions. Mac animates its card in SwiftUI and drives the terminal inset off a
+*hidden, animation-free copy* of the banner content, so the Metal surface never
+chases intermediate frames. win32 has the simpler version of the same guarantee:
+`stripHeight()` — what the window layout reserves — never consults the animation
+at all, so the one `relayoutOwnerWindow` a toggle issues moves the grid once and
+the eleven frames after it move only the overlay popup. Collapsing, that leaves
+the still-tall card overhanging a terminal that has already reflowed up under it,
+which is exactly what Mac's overlay does and the reason the inset can snap at
+all. A second click mid-flight reverses from the height the card is actually at,
+not from the settled height of the state being left, so a double-click does not
+jump before it moves; and `SPI_GETCLIENTAREAANIMATION` is honored, from the one
+place it is now read for the whole app (`App.clientAreaAnimationsEnabled`, which
+the hero slide's own gate was collapsed into).
+
+The card audit that filed this task claimed three things, and two of them had
+already landed: the collapse toggle (T204/T209) and the terminal content inset
+(T101/T131), plus the symmetric padding, the shaded card fill and the 8px block
+gaps the same Mac commit carried. Only the animation was genuinely missing. That
+is the second stale audit card in two days (T122 was the first), and T676 already
+exists to sweep the rest.
+
+Validated: `collapseHeight` is pure and asserted in the none lane (exact
+endpoints in both directions — a card that stops a pixel short leaves a seam
+against a terminal that snapped a frame earlier — eased midpoint, monotonic with
+no overshoot, and a zero-distance toggle). The motion itself cannot be captured:
+180ms of card heights do not survive to a `PrintWindow` on the background test
+desktop, so section 6f2 of `pane-banner.ps1` reads it from a per-frame debug
+oracle the way the chevron's hover trigger is read — one animation logged per
+click, ≥3 distinct intermediate heights, frames monotonic toward the target, the
+last one exactly on the settled height, in both directions.
+
+The first version of that section was toothless and the negative control caught
+it: with `T149_NEUTERED = true` it SKIPPED at ALL PASS rather than failing,
+because the oracle line lived inside `startCollapseAnim` and a neutered build
+never logged one — indistinguishable from a release build with no debug logging.
+Moving the toggle line to `toggleCollapsed`, which runs either way, splits the two
+apart: a release build skips, a build that stopped animating fails. Re-measured,
+the control now turns exactly 6 of the section's 14 assertions red and moves
+nothing else in the script.
+
+Filed **T677** and **D53** for the one nuance left: Mac cross-fades the body's
+opacity in parallel with the resize, and GDI has no free text opacity, so win32
+does a clipped reveal with the existing bottom fade instead. Doing it Mac's way
+means rendering the content into an offscreen DIB and `AlphaBlend`-ing it, which
+also means untangling the link hit rects the content pass builds on its way
+through — a real change for a difference visible for a fifth of a second, so it
+is a follow-up rather than part of this task.

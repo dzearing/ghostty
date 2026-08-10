@@ -700,6 +700,28 @@ test "shouldPerformDeferredFocus: background desktop with no active window still
 /// expand) so the terminal band under the strip grows/shrinks to match.
 /// Resolves the Surface via GWLP_USERDATA with the same guard as
 /// surfaceWndProc; silently no-ops for anything else.
+/// Does the user want in-window motion at all? `SPI_GETCLIENTAREAANIMATION`
+/// is the OS switch behind Settings ▸ Accessibility ▸ Visual effects ▸
+/// "Animation effects" ("animate controls and elements inside windows"), and
+/// turning it off means every chrome animation degrades to the instant state
+/// swap it animates between (T58 decision 5, T149).
+///
+/// ONE resolution site on purpose: an accessibility preference honored by
+/// some of the chrome and not the rest is worse than one honored by none of
+/// it, because the half that keeps moving is the half the setting exists for.
+/// Fails OPEN — an SPI call that errors leaves animations on, which is the
+/// default every Windows install ships with.
+pub fn clientAreaAnimationsEnabled() bool {
+    var enabled: i32 = 1;
+    if (w32.SystemParametersInfoW(
+        w32.SPI_GETCLIENTAREAANIMATION,
+        0,
+        @ptrCast(&enabled),
+        0,
+    ) == 0) return true;
+    return enabled != 0;
+}
+
 pub fn relayoutOwnerWindow(hwnd: w32.HWND) void {
     const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
     if (userdata == 0) return;

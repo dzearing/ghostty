@@ -12,6 +12,7 @@
 //! Unit tested in every app-runtime lane (the hero_math/dim_math pattern).
 
 const std = @import("std");
+const hero_math = @import("hero_math.zig");
 
 /// Height reserved above the terminal for a banner strip of `strip_h` px
 /// in a pane slot `slot_h` px tall. The full strip height when it fits;
@@ -88,6 +89,41 @@ pub fn contentWidth(
     else
         plain;
     return @max(right - inner, 1);
+}
+
+/// How long a collapse/expand takes, in ms — Mac's
+/// `withAnimation(.easeInOut(duration: 0.18))` in
+/// `SurfacePaneBanner.toggleCollapsed` (T149).
+///
+/// Only the CARD animates. The band this module's `bandHeight` reserves —
+/// and therefore the terminal grid below it — moves to the settled height
+/// in ONE step per toggle, because a terminal that tracked the animation
+/// would reflow its grid eleven times per click. Mac reaches the same
+/// place from the other side: it drives its inset off a hidden,
+/// animation-free copy of the banner content so the Metal surface never
+/// chases intermediate frames.
+pub const COLLAPSE_MS: f32 = 180.0;
+
+/// Frame interval of the collapse animation's timer, ms (~60Hz) — the same
+/// heartbeat the hero slide and the scrollbar fade already run on.
+pub const COLLAPSE_TICK_MS: u32 = 16;
+
+/// The card height to PAINT at linear progress `linear` (0→1) of a
+/// collapse or expand that started the card at `from` px and settles it at
+/// `to` px. The easing is applied here rather than by the caller, so the
+/// curve has one home and one test.
+///
+/// Endpoints are exact in both directions (a card that stops one pixel
+/// short of its settled height leaves a seam against the terminal), and
+/// the eased value never leaves `[from, to]`, so the card cannot overshoot
+/// past the band the layout already reserved.
+pub fn collapseHeight(from: i32, to: i32, linear: f32) i32 {
+    const p = hero_math.easeInOutCubic(linear);
+    if (p <= 0.0) return from;
+    if (p >= 1.0) return to;
+    const f: f32 = @floatFromInt(from);
+    const t: f32 = @floatFromInt(to);
+    return @intFromFloat(@round(f + (t - f) * p));
 }
 
 /// The hover affordance for a banner link (T165, Mac `BannerText`'s
@@ -466,4 +502,54 @@ test "clampInset: degenerate inputs" {
     try std.testing.expectEqual(@as(i32, 0), clampInset(-5, 400));
     try std.testing.expectEqual(@as(i32, 0), clampInset(31, 0));
     try std.testing.expectEqual(@as(i32, 0), clampInset(31, -10));
+}
+
+// T149: the collapse/expand animation's card height.
+
+test "collapseHeight: endpoints are exact in both directions" {
+    // Collapsing 156 -> 54 and expanding back. An endpoint that lands a
+    // pixel short leaves a seam between the card and the terminal that
+    // snapped to the settled band a frame earlier.
+    try std.testing.expectEqual(@as(i32, 156), collapseHeight(156, 54, 0.0));
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(156, 54, 1.0));
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(54, 156, 0.0));
+    try std.testing.expectEqual(@as(i32, 156), collapseHeight(54, 156, 1.0));
+    // A tick that arrives late (or a clock that jumped) is past the end,
+    // not beyond it.
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(156, 54, 2.5));
+    try std.testing.expectEqual(@as(i32, 156), collapseHeight(156, 54, -1.0));
+}
+
+test "collapseHeight: eased, symmetric, and never overshooting" {
+    // easeInOutCubic is symmetric about its midpoint, so half the time is
+    // half the distance — the property that makes a collapse and the
+    // expand that undoes it read as the same motion played backwards.
+    try std.testing.expectEqual(@as(i32, 105), collapseHeight(156, 54, 0.5));
+    try std.testing.expectEqual(@as(i32, 105), collapseHeight(54, 156, 0.5));
+
+    // Monotonic and in range across the whole run, both directions. An
+    // overshoot would push the card past the band the layout reserved.
+    var prev_down: i32 = 156;
+    var prev_up: i32 = 54;
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / 20.0;
+        const down = collapseHeight(156, 54, t);
+        const up = collapseHeight(54, 156, t);
+        try std.testing.expect(down <= prev_down and down >= 54);
+        try std.testing.expect(up >= prev_up and up <= 156);
+        prev_down = down;
+        prev_up = up;
+    }
+    try std.testing.expectEqual(@as(i32, 54), prev_down);
+    try std.testing.expectEqual(@as(i32, 156), prev_up);
+}
+
+test "collapseHeight: a toggle with nowhere to go stays put" {
+    // A banner whose collapsed and expanded heights coincide (content
+    // shorter than the collapsed preview) animates over a zero distance
+    // rather than dividing by it.
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(54, 54, 0.0));
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(54, 54, 0.5));
+    try std.testing.expectEqual(@as(i32, 54), collapseHeight(54, 54, 1.0));
 }

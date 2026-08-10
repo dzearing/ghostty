@@ -2129,15 +2129,11 @@ pub fn heroOnPaneFocused(self: *Window, pane: *PaneView) void {
 
 /// SPI_GETCLIENTAREAANIMATION: users who disabled "animate controls and
 /// elements inside windows" get instant selection swaps (T58 decision 5).
+/// The switch itself is read in exactly one place (T149) — the banner's
+/// collapse animation honors the same preference and must not read it from
+/// a second, separately-maintained copy.
 fn heroAnimationsEnabled() bool {
-    var enabled: i32 = 1;
-    if (w32.SystemParametersInfoW(
-        w32.SPI_GETCLIENTAREAANIMATION,
-        0,
-        @ptrCast(&enabled),
-        0,
-    ) == 0) return true;
-    return enabled != 0;
+    return App.clientAreaAnimationsEnabled();
 }
 
 /// Eased 0→1 progress of an animation started at `start`, or null once

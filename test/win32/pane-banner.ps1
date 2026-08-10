@@ -500,6 +500,121 @@ try {
         Write-Host 'FAIL  collapse overlay not found' -ForegroundColor Red
     }
 
+    # --- 6f2. T149: the CARD animates the collapse; the terminal snaps --------
+    #
+    # Mac (89465f320) resizes the card with an easeInOut(0.18) while the
+    # terminal inset moves to its settled height in ONE step - it drives that
+    # inset off a hidden, animation-free copy of the content precisely so the
+    # Metal surface never chases intermediate frames. win32 snapped BOTH, so a
+    # collapse was a jump cut with no sense of where the content went.
+    #
+    # The frames cannot be captured: 180ms of card heights do not survive to a
+    # PrintWindow on the background desktop, and each one re-glues the popup.
+    # So the motion is read from the debug oracle the same way the chevron's
+    # TRIGGER is in 6g - `banner collapse from=/to=` once per toggle, `banner
+    # collapse h=` once per painted frame - while the SETTLED geometry is
+    # asserted from the windows themselves.
+    #
+    # "The terminal moved once" is carried by the toggle line being logged
+    # exactly ONCE per click: the relayout that moves the grid is issued with
+    # it, and `stripHeight()` (what the layout reserves) never consults the
+    # animation, so the eleven frames after it move only this popup.
+    & $exe +set-banner --target=bw "anim1\nanim2\nanim3\nanim4" | Out-Null
+    $null = Wait-Banner 'bw' 0 "anim1`nanim2`nanim3`nanim4"
+    Start-Sleep -Milliseconds 500
+    $ovA = Get-Overlay $appPid $top
+    if (-not $ovA -or -not (Test-Path $errlog)) {
+        Write-Host 'SKIP T149 collapse animation: no overlay or no debug oracle (release build?)'
+    } else {
+        # Read the log window a toggle produced: the single from=/to= line and
+        # every painted frame after it, in order.
+        function Get-AnimFrames {
+            $from = $null; $to = $null; $toggles = 0
+            $frames = @()
+            foreach ($l in @(Get-Content $errlog -ErrorAction SilentlyContinue)) {
+                if ($l -match 'banner collapse from=(-?\d+) to=(-?\d+)') {
+                    $toggles++
+                    $from = [int]$Matches[1]; $to = [int]$Matches[2]
+                } elseif ($l -match 'banner collapse h=(-?\d+)') {
+                    $frames += [int]$Matches[1]
+                }
+            }
+            return [pscustomobject]@{ From = $from; To = $to; Toggles = $toggles; Frames = $frames }
+        }
+
+        $animMid = $ovA.Left + [int]($ovA.Width / 2)
+        $animExpandH = $ovA.Height
+        foreach ($dir in @('collapse', 'expand')) {
+            Clear-Content $errlog -ErrorAction SilentlyContinue
+            $ovNow = Get-Overlay $appPid $top
+            if (-not $ovNow) { Assert $false "T149 ($dir): overlay missing before the toggle"; continue }
+            # Click the card's FIRST line: reachable in both states (the
+            # collapsed card is only a first-line sliver) and clear of the
+            # chevron column at mid-width.
+            Send-TestMouse -Window $top -Target ([IntPtr]$ovNow.Hwnd) `
+                -X $animMid -Y ($ovNow.Top + [int]($oneLineH / 2)) | Out-Null
+            Start-Sleep -Milliseconds 700   # 180ms of animation, generously
+
+            $a = Get-AnimFrames
+            # No toggle line at all means no debug logging at all - a release
+            # build. It is NOT the signal for "the animation is gone": the
+            # toggle is logged whether or not frames follow it, precisely so
+            # a build that stopped animating fails the frame assertions below
+            # instead of skipping past them.
+            if ($a.Toggles -eq 0) {
+                Write-Host "SKIP T149 ($dir): no `"banner collapse`" oracle in the log (release build?)"
+                break
+            }
+            Write-Host "INFO  T149 $dir : from=$($a.From) to=$($a.To) toggles=$($a.Toggles) frames=$($a.Frames -join ',')"
+
+            Assert ($a.Toggles -eq 1) `
+                "T149 ($dir): ONE animation per click - the grid is relaid out once, not per frame (toggles=$($a.Toggles))"
+            if ($dir -eq 'collapse') {
+                Assert ($a.To -lt $a.From) "T149 (collapse): the card is headed shorter ($($a.From) -> $($a.To))"
+            } else {
+                Assert ($a.To -gt $a.From) "T149 (expand): the card is headed taller ($($a.From) -> $($a.To))"
+            }
+
+            # The frames themselves: real intermediate heights, in order,
+            # ending exactly on the settled height. A card that jump-cut would
+            # log one frame, already at the target.
+            $lo = [Math]::Min($a.From, $a.To); $hi = [Math]::Max($a.From, $a.To)
+            $between = @($a.Frames | Where-Object { $_ -gt $lo -and $_ -lt $hi } | Sort-Object -Unique)
+            Assert ($between.Count -ge 3) `
+                "T149 ($dir): the card passes through real intermediate heights ($($between.Count) distinct, between $lo and $hi)"
+
+            $ordered = $true
+            for ($k = 1; $k -lt $a.Frames.Count; $k++) {
+                if ($a.To -lt $a.From) { if ($a.Frames[$k] -gt $a.Frames[$k - 1]) { $ordered = $false } }
+                else { if ($a.Frames[$k] -lt $a.Frames[$k - 1]) { $ordered = $false } }
+            }
+            Assert ($ordered -and $a.Frames.Count -gt 0) `
+                "T149 ($dir): the frames only ever move toward the target - no bounce, no overshoot"
+            Assert ($a.Frames[-1] -eq $a.To) `
+                "T149 ($dir): the last frame lands EXACTLY on the settled height ($($a.Frames[-1]) = $($a.To))"
+
+            # ...and once it settles the popup is glued back over the pane at
+            # the band the layout reserved, which is what Get-Overlay matches
+            # on (overlay bottom == pane top).
+            $ovEnd = $null
+            for ($t = 0; $t -lt 15; $t++) {
+                $ovEnd = Get-Overlay $appPid $top
+                if ($ovEnd) { break }
+                Start-Sleep -Milliseconds 150
+            }
+            Assert ($null -ne $ovEnd) "T149 ($dir): the settled card is re-glued above the pane"
+            if ($ovEnd) {
+                if ($dir -eq 'collapse') {
+                    Assert ($ovEnd.Height -lt $animExpandH) `
+                        "T149 (collapse): the band really shrank ($animExpandH -> $($ovEnd.Height) px)"
+                } else {
+                    Assert ($ovEnd.Height -eq $animExpandH) `
+                        "T149 (expand): the band came back to its full height ($($ovEnd.Height) px)"
+                }
+            }
+        }
+    }
+
     # --- 6g. T209 / T204: the chevron is an ICON BUTTON, and hot-tracks ------
     #
     # The user's report named it directly: "why doesn't the chevron in the

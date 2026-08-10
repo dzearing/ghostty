@@ -93,6 +93,19 @@ fn wrapWidth(content_w: i32) i32 {
 /// Collapsed content height: first line fully visible plus a sliver that
 /// fades out (Mac: 24 at 12pt → 30 at 15px).
 const COLLAPSED_H: f32 = 30.0;
+/// Timer id for the collapse/expand animation heartbeat (T149). The only
+/// timer this window class owns.
+const COLLAPSE_TIMER_ID: usize = 1;
+
+/// Negative control for `pane-banner.ps1`'s T149 section, the same seam
+/// `T377_NEUTERED` gives the wrap work above. Flipping it restores the
+/// pre-T149 jump cut — card and terminal both snapping in one frame — and
+/// re-running the script must fail exactly the 6f2 assertions that are about
+/// MOTION and nothing else. (Measured 2026-08-09: 6 of the 14 go red — the
+/// three frame assertions in each direction — while the eight survivors are
+/// the toggle and settled-geometry ones, which are 6f's claim restated, and
+/// no assertion outside 6f2 moves.)
+const T149_NEUTERED = false;
 /// Chevron toggle glyph half-width / height.
 const CHEV_W: f32 = 5.0;
 const CHEV_H: f32 = 3.5;
@@ -140,6 +153,17 @@ pub const BannerOverlay = struct {
     /// hover can be dropped when the pointer leaves the overlay.
     mouse_tracked: bool = false,
     collapsed: bool = false,
+    /// The in-flight collapse/expand, if any (T149): the card height the
+    /// toggle started from, and when it started. Null when settled.
+    ///
+    /// The TARGET height is deliberately not stored — it is whatever
+    /// `cardHeight()` answers for the (already flipped) `collapsed` state,
+    /// so a banner whose text changes mid-flight animates to the new
+    /// settled height instead of to a stale one.
+    collapse_anim: ?struct {
+        from_h: i32,
+        start: std.time.Instant,
+    } = null,
     /// Expanded content height in px (excludes padding), lazily computed;
     /// -1 means stale (recompute on next use).
     content_h: i32 = -1,
@@ -345,7 +369,21 @@ pub const BannerOverlay = struct {
         // clamp engaged in a degenerate short pane). `inset` == 0: no
         // layout pass ran yet — fall back to overlapping the owner top so
         // the strip is never lost.
-        const height = if (self.inset > 0) @min(self.inset, strip) else strip;
+        const settled = if (self.inset > 0) @min(self.inset, strip) else strip;
+        // While the card animates (T149) the popup has to cover BOTH the
+        // band the layout reserved and the card's height right now.
+        // Collapsing, the terminal has ALREADY snapped up under the settled
+        // (short) band while the card is still tall, so the card overhangs
+        // the terminal for the length of the animation — exactly what Mac's
+        // overlay does, and the reason the inset can snap at all. Expanding,
+        // the card is shorter than the band and the window keeps the band.
+        // Capped at the pane slot so a degenerate short pane is never
+        // covered outright.
+        const height = if (self.collapse_anim == null) settled else blk: {
+            const anim = banner_layout.bandHeight(self.paintedCardHeight(), self.px(MARGIN));
+            const slot = @max(self.inset, 0) + (rect.bottom - rect.top);
+            break :blk @max(settled, @min(anim, slot));
+        };
         const top = rect.top - @max(self.inset, 0);
         const new_w = @max(rect.right - rect.left, 1);
         const new_h = @max(height, 1);
@@ -417,12 +455,37 @@ pub const BannerOverlay = struct {
     }
 
     /// Height of the card itself: uniform inner padding around the content.
+    /// The SETTLED height — what the window layout reserves, and what a
+    /// running collapse/expand is heading for. `paintedCardHeight` is what
+    /// gets drawn.
     fn cardHeight(self: *BannerOverlay) i32 {
         const content = if (self.collapsed)
             self.px(COLLAPSED_H)
         else
             self.ensureContentHeight();
         return self.px(PAD) * 2 + content;
+    }
+
+    /// The card height with a running collapse/expand applied (T149) — the
+    /// settled height when nothing is animating, which is every paint but
+    /// the ~11 frames after a toggle.
+    fn paintedCardHeight(self: *BannerOverlay) i32 {
+        const target = self.cardHeight();
+        const a = self.collapse_anim orelse return target;
+        const p = self.collapseProgress() orelse return target;
+        return banner_layout.collapseHeight(a.from_h, target, p);
+    }
+
+    /// Linear 0→1 progress of the collapse animation, or null when none is
+    /// running, it has run out, or the monotonic clock is unavailable — in
+    /// every one of those the caller uses the settled height, which is the
+    /// pre-T149 behavior.
+    fn collapseProgress(self: *const BannerOverlay) ?f32 {
+        const a = self.collapse_anim orelse return null;
+        const now = std.time.Instant.now() catch return null;
+        const ms = @as(f32, @floatFromInt(now.since(a.start))) / std.time.ns_per_ms;
+        if (ms >= banner_layout.COLLAPSE_MS) return null;
+        return ms / banner_layout.COLLAPSE_MS;
     }
 
     /// Width available to the content INSIDE the card: the pane slot less
@@ -1349,7 +1412,25 @@ pub const BannerOverlay = struct {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
 
-        self.paintCardBackdrop(hdc, client);
+        // The band the CARD occupies. The whole client when settled; while
+        // the card animates OPEN it is shorter than the window, which is
+        // already sized to the taller settled band (T149).
+        var band = client;
+        if (self.collapse_anim != null) {
+            const h = banner_layout.bandHeight(
+                self.paintedCardHeight(),
+                self.px(MARGIN),
+            );
+            if (h < band.bottom) {
+                band.bottom = h;
+                // Whatever the shrunken card no longer covers is band
+                // background — the pane's own color, the same thing the
+                // margins around the card show.
+                self.fillBand(hdc, client);
+            }
+        }
+
+        self.paintCardBackdrop(hdc, band);
 
         self.links.clearRetainingCapacity();
 
@@ -1362,24 +1443,40 @@ pub const BannerOverlay = struct {
         // rounded shape, so a collapsed banner's overflow (and any block
         // wider than the card) stops at the card edge instead of spilling
         // across the margin the terminal sees.
-        const clip = self.cardClipRegion(client);
+        const clip = self.cardClipRegion(band);
         defer if (clip) |rgn| {
             _ = w32.SelectClipRgn(hdc, null);
             _ = w32.DeleteObject(rgn);
         };
         if (clip) |rgn| _ = w32.SelectClipRgn(hdc, rgn);
 
-        if (self.collapsed) {
-            // Clip content to the collapsed card: the band is already
-            // collapsed-height, so painting just overflows past the
-            // bottom; the fade below dissolves it (Mac mask parity).
-            _ = self.renderContent(hdc, inner, inner, content_w, true);
-            self.paintCollapseFade(hdc, client);
-        } else {
-            _ = self.renderContent(hdc, inner, inner, content_w, true);
-        }
+        _ = self.renderContent(hdc, inner, inner, content_w, true);
+
+        // Content overflows the card — collapsed, and every frame of a
+        // collapse or expand on the way there — so its tail dissolves into
+        // the card fill instead of being guillotined by the clip region
+        // (Mac mask parity). ONE rule for all three states: the card is
+        // shorter than the content wants.
+        const wanted = self.px(PAD) * 2 + self.ensureContentHeight();
+        const shown = (band.bottom - band.top) - self.px(MARGIN) * 2;
+        if (shown < wanted) self.paintCollapseFade(hdc, band);
 
         if (self.collapsible) self.paintChevron(hdc, client);
+    }
+
+    /// Fill `rect` with the pane's own background — the color the band
+    /// around the card shows. Only needed while the card animates SHORTER
+    /// than the window (T149): every settled paint has the card backdrop
+    /// covering every pixel of the client already.
+    fn fillBand(self: *BannerOverlay, hdc: w32.HDC, rect: w32.RECT) void {
+        const brush = w32.CreateSolidBrush(w32.RGB(
+            self.pane_bg_rgb.r,
+            self.pane_bg_rgb.g,
+            self.pane_bg_rgb.b,
+        )) orelse return;
+        defer _ = w32.DeleteObject(@ptrCast(brush));
+        var r = rect;
+        _ = w32.FillRect(hdc, &r, brush);
     }
 
     /// The card's rounded shape as a GDI region (client coords), for
@@ -1575,12 +1672,75 @@ pub const BannerOverlay = struct {
 
     fn toggleCollapsed(self: *BannerOverlay) void {
         if (!self.collapsible) return;
+        // Start the animation from where the card IS, not from the settled
+        // height of the state being left: a second click mid-flight has to
+        // reverse out of the current frame, or the card jumps before it
+        // moves.
+        const from = self.paintedCardHeight();
         self.collapsed = !self.collapsed;
+        // Debug-build oracle for pane-banner.ps1's T149 section, logged HERE
+        // rather than inside `startCollapseAnim`: the toggle happens whether
+        // or not an animation follows it, so its line is what tells a release
+        // build (no oracle at all — skip) apart from a build whose animation
+        // stopped working (a toggle with no frames after it — fail). Same
+        // deal as `banner chevron hover=`: 180ms of card heights cannot
+        // survive to a screen capture on the background test desktop.
+        log.debug("banner collapse from={} to={}", .{ from, self.cardHeight() });
+        self.startCollapseAnim(from);
         // The strip height changed: re-run the owning window's layout so
         // the terminal band under the strip grows/shrinks to match (T101).
         // The layout pass repositions this popup via updatePaneBanners.
+        //
+        // What it reserves is the SETTLED height, so the terminal reflows
+        // in ONE step per toggle while the card animates over it (T149,
+        // Mac 89465f320). An inset that tracked the animation would drag
+        // the whole grid through eleven resizes per click — the flicker
+        // Mac's hidden measurement copy exists to avoid.
         App.relayoutOwnerWindow(self.owner);
         _ = w32.InvalidateRect(self.hwnd, null, 1);
+    }
+
+    /// Begin a card resize from `from_h` to the settled `cardHeight()`.
+    /// Silently does nothing (leaving the instant toggle) when the user has
+    /// turned in-window animation off, when the clock is unavailable, or
+    /// when there is no distance to cover.
+    fn startCollapseAnim(self: *BannerOverlay, from_h: i32) void {
+        self.stopCollapseAnim();
+        if (T149_NEUTERED) return;
+        if (from_h == self.cardHeight()) return;
+        if (!App.clientAreaAnimationsEnabled()) return;
+        const start = std.time.Instant.now() catch return;
+        self.collapse_anim = .{ .from_h = from_h, .start = start };
+        _ = w32.SetTimer(
+            self.hwnd,
+            COLLAPSE_TIMER_ID,
+            banner_layout.COLLAPSE_TICK_MS,
+            null,
+        );
+    }
+
+    fn stopCollapseAnim(self: *BannerOverlay) void {
+        if (self.collapse_anim == null) return;
+        self.collapse_anim = null;
+        _ = w32.KillTimer(self.hwnd, COLLAPSE_TIMER_ID);
+    }
+
+    /// ~60Hz heartbeat while the card resizes (T149): re-glue the popup to
+    /// the animated height and repaint. The band the LAYOUT reserved does
+    /// not move — only this window does, which is what keeps the terminal
+    /// grid out of the animation.
+    fn onCollapseTick(self: *BannerOverlay) void {
+        const done = self.collapseProgress() == null;
+        // The frame this tick is about to draw, for pane-banner.ps1's T149
+        // section (the other half of the oracle `toggleCollapsed` opens).
+        // Read BEFORE the animation is retired, so the last line logged is
+        // the settled height rather than a frame short of it.
+        log.debug("banner collapse h={}", .{self.paintedCardHeight()});
+        if (done) self.stopCollapseAnim();
+        // `updatePosition` invalidates and repaints synchronously whenever
+        // the height actually changed, which is every frame of a resize; a
+        // frame that rounds to the same height has nothing new to draw.
+        self.updatePosition(self.scale);
     }
 
     fn linkAt(self: *const BannerOverlay, x: i32, y: i32) ?[]const u8 {
@@ -1825,6 +1985,11 @@ fn bannerWndProc(
         w32.WM_MOUSEACTIVATE => return w32.MA_NOACTIVATE,
 
         w32.WM_ERASEBKGND => return 1, // WM_PAINT covers everything
+
+        w32.WM_TIMER => {
+            if (wparam == COLLAPSE_TIMER_ID) self.onCollapseTick();
+            return 0;
+        },
 
         w32.WM_PAINT => {
             var ps: w32.PAINTSTRUCT = undefined;
