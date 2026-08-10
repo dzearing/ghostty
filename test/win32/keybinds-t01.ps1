@@ -262,9 +262,23 @@ for ($t = 0; $t -lt 20; $t++) {
 }
 Assert ($popup -ne [IntPtr]::Zero) 'ctrl+shift+p opens the command palette popup'
 if ($popup -ne [IntPtr]::Zero) {
-    # Posted straight at the popup: Send-TestKeys would SetFocus the pane
-    # first and dismiss the palette out from under the key.
-    [void](Send-TestControlKey -Control $popup -Key Escape)
+    # Posted straight at the palette's own EDIT, and at the edit rather than
+    # at the popup frame for a reason: the app routes palette keys in its
+    # message loop on `msg.hwnd == surface.palette_edit` (App.zig:1051), which
+    # is where a real user's Escape arrives too - setCommandPaletteActive
+    # SetFocus()es the edit as it shows the popup, so the frame never holds
+    # focus and never sees a key. Escape posted at the frame was silently
+    # dropped, which is what made this assertion the run's only red (T157).
+    # Send-TestKeys is still wrong here: it would SetFocus the pane first and
+    # dismiss the palette out from under the key.
+    # Find-TestWindowEx, not Get-TestChildWindow: the latter compares class
+    # names with a case-SENSITIVE ==, and the control's registered class is
+    # "Edit", so 'EDIT' silently found nothing. FindWindowExW is
+    # case-insensitive, which is why the confirm-dialog 'BUTTON' lookup above
+    # has never had this problem.
+    $palEdit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
+    Assert ($palEdit -ne [IntPtr]::Zero) 'palette has a focused search edit to receive keys'
+    [void](Send-TestControlKey -Control $palEdit -Key Escape)
     Start-Sleep -Milliseconds 500
     Assert ((Get-TestWindow -ProcessId $script:appPid -Class 'GhozttyTerminal' -Exclude $script:top) -eq [IntPtr]::Zero) 'Escape closes the palette'
 }

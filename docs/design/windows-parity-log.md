@@ -13596,3 +13596,43 @@ slice of real history and a fixture docs tree it writes itself, so the
 expected mapped/unmapped split is exact rather than whatever the live tracker
 says today. Two of the arms test the gate's teeth rather than its function,
 and both were confirmed to go red against a deliberately broken sweep.
+
+## 2026-08-10 — The Windows keybind acceptance script passes again, and the last red was a key aimed at the wrong window (T157)
+
+`keybinds-t01.ps1` is the only regression coverage the whole Windows
+ctrl-mirror keybind set has — new tab, tab selection, splits, close pane,
+command palette, SIGINT, copy, paste, new window. T157 filed it as structurally
+broken: 14 of 21 assertions red including its own positive control, from two
+proven causes (keys posted at a window that never held focus, and a launch that
+inherited another run's restored layout).
+
+Re-measured on a HEAD debug build before anything was changed, that premise no
+longer held. T218 had already moved the script onto the background test desktop
+and fixed both causes in passing — `Send-TestKeys` names the surface, and the
+launch carries `--session-persistence=false`. The baseline was 29 of 30 with
+the positive control green.
+
+What was actually left was one assertion, and it was a real defect in the
+script rather than in the product: Escape was posted at the palette's popup
+FRAME, while the app routes palette keys in its message loop on
+`msg.hwnd == surface.palette_edit` (`App.zig:1051`). A real user's Escape
+arrives at the edit, because `setCommandPaletteActive` `SetFocus()`es it as it
+shows the popup — the frame never holds focus and never sees a key, so the post
+was dropped in silence. Retargeting it at the edit turns the run ALL PASS (31
+assertions) and, because it is now the same HWND a user's keypress lands on,
+the assertion tests the product instead of the harness.
+
+Finding the edit turned up a second trap worth naming: `Get-TestChildWindow`
+compares class names with a case-SENSITIVE `==`, so `-Class 'EDIT'` finds
+nothing against a control whose registered class is `Edit`. Win32's own
+`FindWindowExW` is case-insensitive, which is why the confirm-dialog `'BUTTON'`
+lookup a few lines up has never had this problem. Worked around here with
+`Find-TestWindowEx`; the helper itself is filed as **T687**.
+
+Evidence: ALL PASS three consecutive runs, plus a `-NegativeControl` run that
+reds exactly its one inverted assertion, so the script still discriminates. The
+audit T157 asked for: cause 1 has no remaining instances anywhere in the suite,
+and cause 2 is wider than one flag — 12 non-persistence scripts launch without
+`--session-persistence=false` and still read `+list` layout, filed as **T686**
+with a per-script call rather than mass-edited blind, since a blanket flag
+would break the scripts whose subject IS persistence.
