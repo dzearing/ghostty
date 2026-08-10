@@ -13698,3 +13698,69 @@ and cause 2 is wider than one flag — 12 non-persistence scripts launch without
 `--session-persistence=false` and still read `+list` layout, filed as **T686**
 with a per-script call rather than mass-edited blind, since a blanket flag
 would break the scripts whose subject IS persistence.
+
+## 2026-08-10 — A `window.open()` popup can now be a Ghoztty window, and the popup really is the window the page is holding (T163, T690)
+
+Windows used to hand every popup a viewer pane opened — `window.open()`,
+`target="_blank"` — to the default browser, unconditionally. Reading the Mac
+source rather than the task turned up that the deferral had been written down
+slightly wrong: macOS does not adopt every popup either. `popupDestination`
+sends an `http(s)` popup to the **default browser** and keeps it in Ghoztty
+only when Cmd is held, when there is no URL at all, or when the scheme is not
+web. Adopting everything would have been a regression, not parity — the browser
+hand-off exists because Ghoztty's web view has its own cookie store, so an
+authenticated site opened here renders logged out.
+
+So what was actually missing on Windows was the two popups a browser *cannot*
+be handed. A bare `window.open()` — where the script goes on to draw into the
+window it was given — reached `ShellExecuteW` as the literal string
+`about:blank` and produced nothing at all; a non-web scheme would have reached
+whatever is registered for it. Both now open as their own small Ghoztty window,
+and Ctrl (Mac's Cmd) keeps any popup here on demand.
+
+The mechanism is the part worth recording, because the obvious implementation
+is wrong in a way that looks right: it is not "open a pane at the same URL".
+The runtime has to be handed a web view **we** created and then navigate it
+itself — Mac returns a `WKWebView` built from WebKit's own `configuration`;
+win32 parks the request on a WebView2 deferral and answers it with
+`put_NewWindow` once the new pane's controller exists. A pane we navigated
+ourselves would be a *different* window as far as the opening script is
+concerned, so `window.opener`, a write through the handle `window.open()`
+returned, and `window.close()` would all be silent no-ops.
+
+That is exactly what the live test asserts, and it is the reason it can be
+believed: the opener keeps its handle, writes a document through it, and the
+title arrives on **our** pane. Restoring the wrong implementation
+(`answer(null)` + navigate ourselves) turns it red. The same run reads the
+window features back — the opener asked for 520×680, deliberately non-square
+because `ICoreWebView2WindowFeatures` puts `Height` before `Width` in its
+vtable and a square request could not tell a swapped pair from a correct one —
+and closes the popup from the opener over `add_WindowCloseRequested` (slot 59,
+two past the resource filter). An acceptance script makes the same four claims
+from outside the app through `+list --json`, driven by a two-route loopback
+page server whose `/gate` route is what makes the close scripted rather than
+timed. The default-browser leg is deliberately covered in the unit lane and not
+in the acceptance script: exercising it there would open the user's real
+browser over a green run.
+
+Two hazards closed on the way. A popup URI longer than the conversion buffer
+would have overrun it inside a COM callback with the browser process blocked on
+us — it now goes to the shell in its original UTF-16, which loses nothing and
+is what the handler did before. And a deferral is a promise: taking one and
+dropping it hangs the calling script's `window.open()` forever, so the request
+is refcounted and **the last owner out answers the page**, on the failure paths
+as much as the success one.
+
+**T690** was filed and fixed in the same turn because it failed this task's
+standing floor twice, in two different lanes. The host-floor test's T400 arm
+measured a navigation's fetch cost once against a cold browser cache and then
+compared it to a warm-cache measurement — over four runs with no source change
+the expectation read 1, 0, 1, 0 while the measured value was 0 every time, so
+the *expectation* was the unstable side and the arm went red about one run in
+three. It now calibrates twice and keeps the second number. A flaky floor is
+worse than it sounds: it is what teaches a reader to wave a real red away.
+
+Evidence: all three zig lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS;
+`viewer-popup.ps1` ALL PASS (19); `persistence-flag.ps1` ALL PASS. The one red
+in `viewer-panes.ps1` (178 passed) is the known open T526/T538/T540 cwd-fallback
+arm, unchanged and unrelated.

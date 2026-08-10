@@ -185,6 +185,17 @@ pub const IID_ICoreWebView2NewWindowRequestedEventArgs: GUID = .{
     .Data4 = .{ 0x91, 0x32, 0xF9, 0xC2, 0x1D, 0x1E, 0xAF, 0xB9 },
 };
 
+// {5C19E9E0-092F-486B-AFFA-CA8231913039}
+// `ICoreWebView2WindowCloseRequestedEventHandler` — the page called
+// `window.close()` (T163). Its `Invoke` takes `(sender, args)` like every other
+// event handler, and the args object carries nothing at all.
+pub const IID_WindowCloseRequestedHandler: GUID = .{
+    .Data1 = 0x5C19E9E0,
+    .Data2 = 0x092F,
+    .Data3 = 0x486B,
+    .Data4 = .{ 0xAF, 0xFA, 0xCA, 0x82, 0x31, 0x91, 0x30, 0x39 },
+};
+
 // {B99369F3-9B11-47B5-BC6F-8E7895FCEA17}
 // `ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler`.
 pub const IID_AddScriptCompletedHandler: GUID = .{
@@ -331,15 +342,16 @@ pub const IID_ICoreWebView2AcceleratorKeyPressedEventArgs: GUID = .{
 pub const EventRegistrationToken = extern struct { value: i64 = 0 };
 
 // ---------------------------- ICoreWebView2NewWindowRequestedEventArgs
-/// The `window.open()` / target=_blank request. We answer exactly two of its
-/// eight slots: read the URI, and mark the request handled.
+/// The `window.open()` / target=_blank request. All eleven slots are declared
+/// as of T163, which needs the four the browser hand-off never did:
+/// `put_NewWindow`, `GetDeferral` and `get_WindowFeatures` are how a popup
+/// becomes a real ghoztty window.
 ///
-/// **`GetDeferral` is deliberately NOT declared.** Taking a deferral and
-/// dropping it wedges the requesting page forever, and T163 (adopting popups
-/// as real ghoztty windows) is the task that will need one — declaring it now
-/// would be an unused slot with a guessed signature, which this file's header
-/// calls a crash waiting for the day somebody calls it. Handing the URL to the
-/// default browser needs no deferral at all: it is synchronous.
+/// **A deferral is a promise, not a convenience.** Taking one and dropping it
+/// wedges the requesting page forever — the script's `window.open()` call never
+/// returns — so every path that reaches `getDeferral` here owes exactly one
+/// `Complete`, on success AND on every failure. `ViewerPane.PopupRequest` is
+/// the one owner of that obligation; nothing else in the tree calls this.
 pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
     vtable: *const Vtbl,
 
@@ -348,10 +360,22 @@ pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
         AddRef: *const fn (*ICoreWebView2NewWindowRequestedEventArgs) callconv(.winapi) u32,
         Release: *const fn (*ICoreWebView2NewWindowRequestedEventArgs) callconv(.winapi) u32,
         get_Uri: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?[*:0]u16) callconv(.winapi) HRESULT,
-        put_NewWindow: *const anyopaque,
+        put_NewWindow: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *ICoreWebView2) callconv(.winapi) HRESULT,
         get_NewWindow: *const anyopaque,
         put_Handled: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, BOOL) callconv(.winapi) HRESULT,
+        get_Handled: *const anyopaque,
+        get_IsUserInitiated: *const anyopaque,
+        GetDeferral: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?*ICoreWebView2Deferral) callconv(.winapi) HRESULT,
+        get_WindowFeatures: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?*ICoreWebView2WindowFeatures) callconv(.winapi) HRESULT,
     };
+
+    pub fn addRef(self: *ICoreWebView2NewWindowRequestedEventArgs) void {
+        _ = self.vtable.AddRef(self);
+    }
+
+    pub fn release(self: *ICoreWebView2NewWindowRequestedEventArgs) void {
+        _ = self.vtable.Release(self);
+    }
 
     /// The requested URL. Caller frees it with `CoTaskMemFree`.
     pub fn uriRaw(self: *ICoreWebView2NewWindowRequestedEventArgs) ?[*:0]u16 {
@@ -363,6 +387,120 @@ pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
     /// "We dealt with it; do not open a WebView2 popup window."
     pub fn setHandled(self: *ICoreWebView2NewWindowRequestedEventArgs, handled: bool) bool {
         return !com.failed(self.vtable.put_Handled(self, if (handled) 1 else 0));
+    }
+
+    /// Hand the runtime the web view the popup should BE. It navigates that
+    /// view itself — which is the whole point: a view we navigated ourselves
+    /// would be a different window as far as the opener is concerned, and
+    /// `window.close()` and `window.opener` would both be dead.
+    ///
+    /// Must be paired with `setHandled(true)`, and (because our view is created
+    /// asynchronously) with a deferral.
+    pub fn setNewWindow(
+        self: *ICoreWebView2NewWindowRequestedEventArgs,
+        web: *ICoreWebView2,
+    ) bool {
+        return !com.failed(self.vtable.put_NewWindow(self, web));
+    }
+
+    /// Park the request until `Complete` is called on the returned deferral.
+    /// Caller owns the reference and OWES the `Complete`; see the type comment.
+    pub fn getDeferral(self: *ICoreWebView2NewWindowRequestedEventArgs) ?*ICoreWebView2Deferral {
+        var out: ?*ICoreWebView2Deferral = null;
+        if (com.failed(self.vtable.GetDeferral(self, &out))) return null;
+        return out;
+    }
+
+    /// What the opener asked its window to look like. Caller owns the
+    /// reference. Null is not an error — a size the popup did not ask for is
+    /// simply a window at the default size.
+    pub fn windowFeatures(self: *ICoreWebView2NewWindowRequestedEventArgs) ?*ICoreWebView2WindowFeatures {
+        var out: ?*ICoreWebView2WindowFeatures = null;
+        if (com.failed(self.vtable.get_WindowFeatures(self, &out))) return null;
+        return out;
+    }
+};
+
+// ---------------------------------------------- ICoreWebView2Deferral
+
+/// A parked event. One slot past `IUnknown`, and it is the whole interface:
+/// `Complete` says "the answer I owed you is on the object now, carry on".
+///
+/// Completing twice is not defined behavior we want to explore, and never
+/// completing hangs the page, so exactly one caller may own one of these —
+/// `ViewerPane.PopupRequest`, which completes it in its own `finish`.
+pub const ICoreWebView2Deferral = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2Deferral, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2Deferral) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2Deferral) callconv(.winapi) u32,
+        Complete: *const fn (*ICoreWebView2Deferral) callconv(.winapi) HRESULT,
+    };
+
+    pub fn release(self: *ICoreWebView2Deferral) void {
+        _ = self.vtable.Release(self);
+    }
+
+    pub fn complete(self: *ICoreWebView2Deferral) bool {
+        return !com.failed(self.vtable.Complete(self));
+    }
+};
+
+// ----------------------------------------- ICoreWebView2WindowFeatures
+
+/// The `window.open(url, name, "width=600,height=700")` feature string, parsed
+/// by the runtime. Ten slots; we read three.
+///
+/// **`Height` comes before `Width` in this vtable.** That is the interface's
+/// own order, not a typo, and it is the single easiest slot pair in the whole
+/// file to swap — which is why the live host-floor test reads both back and
+/// compares them against a page that deliberately asks for a NON-SQUARE window.
+/// A square test page could not tell the two apart.
+pub const ICoreWebView2WindowFeatures = extern struct {
+    vtable: *const Vtbl,
+
+    pub const Vtbl = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2WindowFeatures, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ICoreWebView2WindowFeatures) callconv(.winapi) u32,
+        Release: *const fn (*ICoreWebView2WindowFeatures) callconv(.winapi) u32,
+        get_HasPosition: *const anyopaque,
+        get_HasSize: *const fn (*ICoreWebView2WindowFeatures, *BOOL) callconv(.winapi) HRESULT,
+        get_Left: *const anyopaque,
+        get_Top: *const anyopaque,
+        get_Height: *const fn (*ICoreWebView2WindowFeatures, *u32) callconv(.winapi) HRESULT,
+        get_Width: *const fn (*ICoreWebView2WindowFeatures, *u32) callconv(.winapi) HRESULT,
+        get_ShouldDisplayMenuBar: *const anyopaque,
+        get_ShouldDisplayStatus: *const anyopaque,
+        get_ShouldDisplayToolbar: *const anyopaque,
+        get_ShouldDisplayScrollBars: *const anyopaque,
+    };
+
+    pub fn release(self: *ICoreWebView2WindowFeatures) void {
+        _ = self.vtable.Release(self);
+    }
+
+    /// Whether the opener named a size at all. False ⇒ the width/height slots
+    /// below are meaningless, not zero.
+    pub fn hasSize(self: *ICoreWebView2WindowFeatures) bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_HasSize(self, &out))) return false;
+        return out != 0;
+    }
+
+    /// CSS pixels. Zero on failure, which `viewer_popup.requestedSize` reads as
+    /// "asked for nothing usable".
+    pub fn width(self: *ICoreWebView2WindowFeatures) u32 {
+        var out: u32 = 0;
+        if (com.failed(self.vtable.get_Width(self, &out))) return 0;
+        return out;
+    }
+
+    pub fn height(self: *ICoreWebView2WindowFeatures) u32 {
+        var out: u32 = 0;
+        if (com.failed(self.vtable.get_Height(self, &out))) return 0;
+        return out;
     }
 };
 
@@ -742,7 +880,7 @@ pub const ICoreWebView2Profile = extern struct {
 /// `add_WebMessageReceived` (slot 34), which is why what used to be one
 /// 38-slot opaque block is now three shorter ones.
 ///
-/// Declaring 58 slots of an interface that has 61 is safe and deliberate: the
+/// Declaring 60 slots of an interface that has 61 is safe and deliberate: the
 /// vtable pointer is the runtime's, we only ever index the ones named here,
 /// and a slot that is not declared cannot be called by mistake. The ones we do
 /// not call are opaque — individually where a named neighbor makes the
@@ -755,9 +893,10 @@ pub const ICoreWebView2Profile = extern struct {
 /// shorter again. T390 added `+reload`'s two: `Reload` (31) and
 /// `CallDevToolsProtocolMethod` (36), T383 the title pair
 /// `add_DocumentTitleChanged` (46) and `get_DocumentTitle` (48), and T392 the
-/// link-routing interception `add_NavigationStarting` (7). Every block's
-/// LENGTH is what holds the named slots in place, and `@offsetOf` asserts all
-/// of them at the bottom of this file.
+/// link-routing interception `add_NavigationStarting` (7), and T163 the
+/// popup-adoption `add_WindowCloseRequested` (59), which is the last slot the
+/// declaration reaches. Every block's LENGTH is what holds the named slots in
+/// place, and `@offsetOf` asserts all of them at the bottom of this file.
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
@@ -794,6 +933,8 @@ pub const ICoreWebView2 = extern struct {
     pub const post_title_slots = 6;
     /// Slot 56: `remove_WebResourceRequested`.
     pub const remove_resource_slots = 1;
+    /// Slot 58: `RemoveWebResourceRequestedFilter`.
+    pub const remove_resource_filter_slots = 1;
 
     pub const Vtbl = extern struct {
         QueryInterface: *const fn (*ICoreWebView2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -845,6 +986,8 @@ pub const ICoreWebView2 = extern struct {
         add_WebResourceRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         remove_resource: [remove_resource_slots]*const anyopaque,
         AddWebResourceRequestedFilter: *const fn (*ICoreWebView2, [*:0]const u16, WebResourceContext) callconv(.winapi) HRESULT,
+        remove_resource_filter: [remove_resource_filter_slots]*const anyopaque,
+        add_WindowCloseRequested: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
     };
 
     pub fn release(self: *ICoreWebView2) void {
@@ -929,6 +1072,16 @@ pub const ICoreWebView2 = extern struct {
     pub fn addNewWindowRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
         var token: EventRegistrationToken = .{};
         return !com.failed(self.vtable.add_NewWindowRequested(self, handler, &token));
+    }
+
+    /// Subscribe to the page calling `window.close()` — Mac's
+    /// `webViewDidClose` (T163). Chromium only honors the call on a window it
+    /// opened by script, so on a pane the user opened this simply never fires;
+    /// it is registered on every viewer anyway, because that is what makes the
+    /// popup path need no special case.
+    pub fn addWindowCloseRequested(self: *ICoreWebView2, handler: *anyopaque) bool {
+        var token: EventRegistrationToken = .{};
+        return !com.failed(self.vtable.add_WindowCloseRequested(self, handler, &token));
     }
 
     /// Subscribe to `document.title` changing — including the title a page
@@ -1402,12 +1555,17 @@ test "vtable slot counts match the SDK's own layout" {
     // one place the numbers live.
     const ptr = @sizeOf(*const anyopaque);
     try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2Profile.Vtbl));
-    // 58 of ICoreWebView2's 61: everything through
-    // `AddWebResourceRequestedFilter`. Declaring a PREFIX is the point — the
-    // runtime's vtable is longer and the slots past the last one we name are
+    // 60 of ICoreWebView2's 61: everything through `add_WindowCloseRequested`
+    // (T163). Declaring a PREFIX is the point — the runtime's vtable is longer
+    // and the one slot past the last we name (`remove_WindowCloseRequested`) is
     // simply never indexed.
-    try testing.expectEqual(58 * ptr, @sizeOf(ICoreWebView2.Vtbl));
-    try testing.expectEqual(7 * ptr, @sizeOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl));
+    try testing.expectEqual(60 * ptr, @sizeOf(ICoreWebView2.Vtbl));
+    // The popup args, in full: T163 needs `put_NewWindow`, `GetDeferral` and
+    // `get_WindowFeatures`, which sit at 4, 9 and 10 — so the whole interface is
+    // declared rather than the 7-slot prefix the browser hand-off needed.
+    try testing.expectEqual(11 * ptr, @sizeOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl));
+    try testing.expectEqual(4 * ptr, @sizeOf(ICoreWebView2Deferral.Vtbl));
+    try testing.expectEqual(13 * ptr, @sizeOf(ICoreWebView2WindowFeatures.Vtbl));
     try testing.expectEqual(6 * ptr, @sizeOf(ICoreWebView2WebMessageReceivedEventArgs.Vtbl));
     try testing.expectEqual(8 * ptr, @sizeOf(ICoreWebView2WebResourceRequestedEventArgs.Vtbl));
     try testing.expectEqual(10 * ptr, @sizeOf(ICoreWebView2WebResourceRequest.Vtbl));
@@ -1500,6 +1658,11 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(48 * ptr, @offsetOf(ICoreWebView2.Vtbl, "get_DocumentTitle"));
     try testing.expectEqual(55 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebResourceRequested"));
     try testing.expectEqual(57 * ptr, @offsetOf(ICoreWebView2.Vtbl, "AddWebResourceRequestedFilter"));
+    // T163's `window.close()` hook, two slots past the filter. The slot between
+    // them is `RemoveWebResourceRequestedFilter`, which takes a string and an
+    // enum — subscribing there would hand the runtime a handler pointer as a
+    // URI and an event token as a context flag.
+    try testing.expectEqual(59 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WindowCloseRequested"));
 
     // The resource-request trio: read the URI off the request, then hand back
     // a response built by the environment's factory (slot 4, right after the
@@ -1537,9 +1700,24 @@ test "the slots we actually call sit where the header puts them" {
     try testing.expectEqual(4 * ptr, @offsetOf(IStream.Vtbl, "Write"));
     try testing.expectEqual(5 * ptr, @offsetOf(IStream.Vtbl, "Seek"));
 
-    // The new-window args: read the URI, then say we handled it.
+    // The new-window args: read the URI, then say we handled it — plus T163's
+    // three. `put_NewWindow` (4) sits immediately before its own GETTER, which
+    // takes an out-parameter, so a one-off there would have the runtime write a
+    // pointer through the web view we passed. `GetDeferral` (9) and
+    // `get_WindowFeatures` (10) are the last two slots of the interface.
     try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "get_Uri"));
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "put_NewWindow"));
     try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "put_Handled"));
+    try testing.expectEqual(9 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "GetDeferral"));
+    try testing.expectEqual(10 * ptr, @offsetOf(ICoreWebView2NewWindowRequestedEventArgs.Vtbl, "get_WindowFeatures"));
+
+    // The deferral's one method, and the window features' three. `Height`
+    // really does come before `Width` here (slots 7 and 8) — see the type's own
+    // comment for why that pair is asserted rather than assumed.
+    try testing.expectEqual(3 * ptr, @offsetOf(ICoreWebView2Deferral.Vtbl, "Complete"));
+    try testing.expectEqual(4 * ptr, @offsetOf(ICoreWebView2WindowFeatures.Vtbl, "get_HasSize"));
+    try testing.expectEqual(7 * ptr, @offsetOf(ICoreWebView2WindowFeatures.Vtbl, "get_Height"));
+    try testing.expectEqual(8 * ptr, @offsetOf(ICoreWebView2WindowFeatures.Vtbl, "get_Width"));
 
     // The web-message args: the source URI, then the JSON. Reading the JSON out
     // of slot 4 is the whole bridge; slot 5 (`TryGetWebMessageAsString`) fails
@@ -1564,6 +1742,8 @@ test "every interface puts its vtable pointer first" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Controller3, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Environment, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2NewWindowRequestedEventArgs, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2Deferral, "vtable"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WindowFeatures, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebMessageReceivedEventArgs, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceRequestedEventArgs, "vtable"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(ICoreWebView2WebResourceRequest, "vtable"));

@@ -643,12 +643,32 @@ ghoztty +close --target=doc
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane
   navigation is untouched: a website viewer follows ordinary links in place.
-  **Cmd-click** keeps the popup in Ghoztty as its own viewer window (honoring
-  the size the opener asked for), and so does a popup the browser can't be
-  handed — a bare `window.open()` with no URL, or a non-web scheme. The
-  tradeoff: a popup that lands in the browser can't `window.close()` itself
-  back to the Ghoztty page that opened it, so an OAuth flow finishes in the
-  browser. That flow wasn't authenticating in Ghoztty anyway.
+  **Cmd-click** (**Ctrl** on Windows) keeps the popup in Ghoztty as its own
+  viewer window (honoring the size the opener asked for), and so does a popup
+  the browser can't be handed — a bare `window.open()` with no URL, or a
+  non-web scheme. The tradeoff: a popup that lands in the browser can't
+  `window.close()` itself back to the Ghoztty page that opened it, so an OAuth
+  flow finishes in the browser. That flow wasn't authenticating in Ghoztty
+  anyway.
+
+  **A kept popup is ADOPTED, never re-opened** (T163). The window's one pane
+  hands its own web view to the runtime — Mac returns a `WKWebView` built from
+  WebKit's `configuration` out of `createWebViewWith`; win32 parks the request
+  on a WebView2 deferral and answers it with `put_NewWindow` once its pane's
+  controller exists — and the runtime navigates that view itself. Opening a
+  pane at the same URL instead is the mistake the whole path exists to avoid:
+  it is a *different* window as far as the opening script is concerned, so
+  `window.opener`, a write through the handle `window.open()` returned, and
+  `window.close()` are all dead. `window.close()` closes the popup's pane and
+  nothing else (Mac `webViewDidClose`, win32 `add_WindowCloseRequested` →
+  posted, never handled inline, because closing a pane tears down the very
+  controller whose callback you are in). The one thing win32 cannot copy is
+  where the modifier comes from: WebView2 puts no modifier state on the popup
+  args, so Ctrl is read with `GetAsyncKeyState` — `GetKeyState` there answers
+  for the browser-process message being dispatched, not for the click.
+  Acceptance: `test/win32/viewer-popup.ps1`, plus the live ABI test in the
+  win32 unit lane (`ViewerPane.zig`, "T163: a popup is adopted as a pane,
+  sized, and can close itself").
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a

@@ -489,6 +489,18 @@ pub const InitOptions = struct {
     /// with `--command`/`-e` before either is built.
     viewer_open: ?ViewerPane.Open = null,
 
+    /// An explicit CONTENT size for the new window, in physical pixels (T163).
+    /// Set only by the adopted-popup path, where the opening script asked for
+    /// one — `window.open(url, name, "width=600,height=700")`. Sign-in and
+    /// OAuth popups open at a deliberate small size and look broken at a full
+    /// terminal-window size, which is why Mac stamps the same number onto the
+    /// popup's view before wrapping it.
+    ///
+    /// It outranks the remembered/configured size, and the frame is added on
+    /// top of it: a popup asks for the size of its PAGE, not of its titlebar.
+    /// Null ⇒ the ordinary sizing rules.
+    initial_size: ?ViewerPane.PopupSize = null,
+
     /// The stable layout identity to ADOPT instead of generating a fresh one
     /// (T338): `session_layout.Window.uuid` for the window being restored,
     /// whether from the local manifest or from an agent-held layout blob. A
@@ -838,6 +850,23 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         // (Mac/GTK honor it; the remembered/config size stays the restored
         // size underneath).
         if (app.config.maximize) self.start_maximized = true;
+    }
+    // An adopted popup asked for a specific PAGE size (T163), which outranks
+    // everything above — including `maximize`, because a maximized sign-in
+    // popup is exactly the "looks broken" case the request exists to avoid.
+    // `AdjustWindowRectEx` turns the content size into the outer size; a
+    // failure there leaves the content size, which is small by at most the
+    // frame.
+    if (options.initial_size) |want| {
+        var rc: w32.RECT = .{ .left = 0, .top = 0, .right = want.w, .bottom = want.h };
+        if (w32.AdjustWindowRectEx(&rc, style, 0, ex_style) != 0) {
+            width = rc.right - rc.left;
+            height = rc.bottom - rc.top;
+        } else {
+            width = want.w;
+            height = want.h;
+        }
+        self.start_maximized = false;
     }
     // Honor an explicit configured window position; it takes precedence over
     // the cascade below. Only when BOTH coordinates are set — passing
@@ -1579,6 +1608,17 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
     // matters.
     viewer.open_link_split = &openViewerSplitFromLink;
     viewer.perform_accel_action = &performAccelActionFromViewer;
+    viewer.open_popup_window = &openPopupWindowFromViewer;
+    viewer.close_from_page = &closeViewerPaneFromPage;
+    // Taken BEFORE the first fallible step below (T163), so every failure from
+    // here on unwinds through the `errdefer` above — and `ViewerPane.deinit`
+    // releasing the pane's reference is what answers the opening script. A
+    // transfer done later would leave a window of failures that drop the
+    // request on the floor and hang the page.
+    if (open.popup) |req| {
+        req.retain();
+        viewer.popup = req;
+    }
     try viewer.createHostWindow(self.app.hinstance, hwnd, self.surfaceRect());
     // Before `start`, so the location is already recorded when the controller
     // arrives and `adoptController` replays it. A viewer that is told where to
@@ -1603,6 +1643,41 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
 fn performAccelActionFromViewer(pv: *PaneView, action: input.Binding.Action) void {
     const window = pv.parentWindow();
     _ = window.performViewerBindingAction(pv, action);
+}
+
+/// A viewer pane's `window.open()` becomes its own ghoztty window (T163, Mac's
+/// `createWebViewWith` → `TerminalController.newWindow`). The target of
+/// `ViewerPane.open_popup_window`, and the indirection is the same one
+/// `openViewerSplitFromLink` documents.
+///
+/// The window's ONE pane carries the parked request; it answers the runtime
+/// when its own controller arrives. A failure here is not silent — the request
+/// is still released on the way out (the caller's `defer`), which turns the
+/// script's `window.open()` into a null return rather than a permanent wait.
+fn openPopupWindowFromViewer(v: *ViewerPane, open: ViewerPane.PopupOpen) void {
+    const window = v.parent_window;
+    _ = window.app.createWindow(.{
+        .viewer_open = .{
+            .location = open.location,
+            .origin_directory = open.origin_directory,
+            .popup = open.req,
+        },
+        .initial_size = open.size,
+    }) catch |err| {
+        log.warn("popup window from viewer failed err={}", .{err});
+        return;
+    };
+}
+
+/// A viewer pane's page called `window.close()` (T163, Mac's
+/// `webViewDidClose`). Routed through the same binding action a close chord
+/// performs, so an adopted popup closing itself and a user closing it are one
+/// path: for the single-pane popup window that is the whole window, and if the
+/// user has since split it, only the popup pane goes. A viewer owns no process,
+/// so nothing is confirmed.
+fn closeViewerPaneFromPage(v: *ViewerPane) void {
+    const pv = v.pane_view orelse return;
+    _ = v.parent_window.performViewerBindingAction(pv, .{ .close_surface = {} });
 }
 
 fn openViewerSplitFromLink(pv: *PaneView, location: []const u8, origin: ?[]const u8) void {

@@ -59,6 +59,7 @@ const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
 const viewer_watcher = @import("viewer_watcher.zig");
 const viewer_accel = @import("viewer_accel.zig");
+const viewer_popup = @import("viewer_popup.zig");
 // `inputpkg`, not `input`: `navigateFromAddress` has a parameter named
 // `input` and zig refuses the shadow.
 const inputpkg = @import("../../input.zig");
@@ -130,6 +131,13 @@ pub const WM_APP_VIEWER_WORKTREE: u32 = w32.WM_APP + 23;
 /// terminal next door draws on — so only its RESULT lands here, on the GUI
 /// thread, where the composer can be cleared and the confirmation shown.
 pub const WM_APP_VIEWER_FEEDBACK_SENT: u32 = w32.WM_APP + 24;
+
+/// The page called `window.close()` (T163) — Mac's `webViewDidClose`. Posted
+/// rather than acted on for exactly the reason `WM_APP_VIEWER_ACCEL` is:
+/// closing the pane destroys the controller, and a controller must never be
+/// torn down from inside its own event callback (the browser process is
+/// synchronously blocked for the length of the `Invoke`).
+pub const WM_APP_VIEWER_CLOSE: u32 = w32.WM_APP + 25;
 
 /// How long the "Filed …" confirmation stays up before the composer closes
 /// itself, matching Mac's 1.8s: long enough to read, short enough that the
@@ -292,6 +300,38 @@ title_handler: ?*DocumentTitleChangedHandler = null,
 
 /// Our reference on the `AcceleratorKeyPressed` handler (T394), same rule.
 accel_handler: ?*AcceleratorKeyPressedHandler = null,
+
+/// Our reference on the `WindowCloseRequested` handler (T163), same rule.
+window_close_handler: ?*WindowCloseRequestedHandler = null,
+
+/// The `window.open()` this pane exists to BE, from the moment the popup
+/// trampoline builds the window until the pane's controller arrives and is
+/// handed to the runtime (T163). Null for every ordinary pane.
+///
+/// While it is set the pane must NOT navigate itself: WebView2 drives the
+/// navigation on the web view it is given, and a `Navigate` of our own would
+/// race it and break the opener↔popup relationship. `adoptController` is where
+/// the two branches part.
+popup: ?*PopupRequest = null,
+
+/// How an adopted popup becomes its own ghoztty window (T163). INSTALLED by
+/// `Window.createViewerPane`, and the indirection is the same load-bearing one
+/// `open_link_split` documents: `App.createWindow` pulls the whole surface and
+/// renderer world into comptime analysis, and this file has unit tests that
+/// must compile without it. Null for a bare test pane, which has no app to open
+/// a window in — the popup then simply does not open, and `Handled` has already
+/// seen to it that nothing else does either.
+///
+/// Keyed on the PANE rather than on its leaf, unlike `open_link_split`: a popup
+/// opens a whole new window, so there is no leaf to open it beside, and a
+/// pane_view is exactly what a bare test pane must not have (setting one makes
+/// `notifyTitle` dereference an undefined `parent_window`).
+open_popup_window: ?*const fn (v: *ViewerPane, open: PopupOpen) void = null,
+
+/// How a page's `window.close()` closes this pane (T163) — Mac's
+/// `webViewDidClose`. Same indirection and the same pane-keyed signature as
+/// `open_popup_window`, for the same two reasons.
+close_from_page: ?*const fn (v: *ViewerPane) void = null,
 
 // --- Hero-mode thumbnail (T397) -------------------------------------------
 // A viewer is a full citizen of the hero carousel, so it owes the carousel a
@@ -579,6 +619,17 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.accel_handler) |h| {
         h.release();
         self.accel_handler = null;
+    }
+    if (self.window_close_handler) |h| {
+        h.release();
+        self.window_close_handler = null;
+    }
+    // A pane that dies before its controller arrives still owes the opening
+    // script an answer (T163). Releasing the last reference here is what turns
+    // its `window.open()` into a null return instead of a permanent wait.
+    if (self.popup) |req| {
+        req.release();
+        self.popup = null;
     }
     if (self.source_handler) |h| {
         h.release();
@@ -1343,6 +1394,12 @@ pub const Open = struct {
 
     /// The directory the pane was opened from (`--working-directory`).
     origin_directory: ?[]const u8 = null,
+
+    /// The parked `window.open()` this pane is being built to adopt (T163).
+    /// Non-null ONLY on the popup path. The pane takes its own reference on it
+    /// and answers it when its controller arrives; until then it must not
+    /// navigate. Every other open path leaves this null and navigates normally.
+    popup: ?*PopupRequest = null,
 };
 
 /// Apply the non-location half of an `Open` — the two values `navigate` cannot
@@ -1414,6 +1471,115 @@ fn releasePendingToken(p: *Pending) void {
     p.release();
 }
 
+/// A popup this app has agreed to ADOPT, parked on a WebView2 deferral until
+/// the window that will host it has a web view of its own (T163).
+///
+/// The whole point of the type is that the answer is owed exactly once. A
+/// deferral that is never completed hangs the calling script's `window.open()`
+/// forever, and a `NewWindowRequested` that completes with neither a
+/// `NewWindow` nor `Handled` lets the runtime open a chrome-less window we do
+/// not own — so the request has to survive every path out of the creation
+/// chain, including the ones that fail. It is therefore REFCOUNTED, on the same
+/// two-owner model `Pending` uses: the trampoline that starts the window holds
+/// one reference, the pane it hands the request to takes a second, and whoever
+/// drops the last one answers the page.
+pub const PopupRequest = struct {
+    args: *iface.ICoreWebView2NewWindowRequestedEventArgs,
+    deferral: *iface.ICoreWebView2Deferral,
+    alloc: Allocator,
+    refs: u8,
+
+    /// Whether the runtime has been told what to do. Answering twice is not a
+    /// contract WebView2 defines, so the second attempt is dropped rather than
+    /// explored.
+    answered: bool = false,
+
+    /// Take the args and a deferral off a live event. Null when the runtime
+    /// refuses the deferral or we cannot allocate — the caller then falls back
+    /// to the synchronous answer, which is always available.
+    fn take(
+        alloc: Allocator,
+        args: *iface.ICoreWebView2NewWindowRequestedEventArgs,
+    ) ?*PopupRequest {
+        const self = alloc.create(PopupRequest) catch return null;
+        // Order matters: the deferral is what can fail, so nothing is retained
+        // until it is in hand.
+        const deferral = args.getDeferral() orelse {
+            alloc.destroy(self);
+            return null;
+        };
+        args.addRef();
+        self.* = .{
+            .args = args,
+            .deferral = deferral,
+            .alloc = alloc,
+            .refs = 1,
+        };
+        return self;
+    }
+
+    /// Take a second reference. Called by `Window.createViewerPane` as it hands
+    /// the request to the pane that will answer it.
+    pub fn retain(self: *PopupRequest) void {
+        self.refs += 1;
+    }
+
+    /// Give the parked request `web` as its window. Idempotent, and it does NOT
+    /// free — `release` is what ends the object's life, so a pane that answers
+    /// early still holds its reference until it lets go.
+    fn answer(self: *PopupRequest, web: ?*iface.ICoreWebView2) void {
+        if (self.answered) return;
+        self.answered = true;
+        if (web) |w| {
+            // `Handled` was already set by the handler, unconditionally, so a
+            // failure HERE degrades to `window.open()` returning null rather
+            // than to a rogue WebView2 window.
+            if (!self.args.setNewWindow(w)) {
+                log.warn("put_NewWindow failed; the popup will not open", .{});
+            }
+        }
+        if (!self.deferral.complete()) {
+            log.warn("popup deferral Complete failed; the opener may hang", .{});
+        }
+    }
+
+    /// Drop one reference. The last one out answers the page — with nothing, if
+    /// nobody managed to build a window — because a request that is simply
+    /// dropped is a script waiting forever.
+    fn release(self: *PopupRequest) void {
+        std.debug.assert(self.refs > 0);
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        self.answer(null);
+        self.deferral.release();
+        self.args.release();
+        self.alloc.destroy(self);
+    }
+};
+
+/// Everything the popup trampoline needs to build the window. One struct
+/// because it travels through a function POINTER — see `open_popup_window` for
+/// why that indirection is load-bearing — and a pointer type with six
+/// parameters is unreadable at both ends.
+pub const PopupOpen = struct {
+    /// The parked request. The trampoline consumes exactly one reference on it,
+    /// whether or not it manages to build anything.
+    req: *PopupRequest,
+    /// Where the popup is going. Borrowed for the duration of the call.
+    location: []const u8,
+    /// The opener's origin directory, inherited so feedback filed from a popup
+    /// still lands in the same repo (Mac passes its `originDirectory` the same
+    /// way). Borrowed.
+    origin_directory: ?[]const u8,
+    /// The size `window.open(…, "width=…,height=…")` asked for, in physical
+    /// pixels, or null when it asked for none.
+    size: ?PopupSize,
+};
+
+/// Re-exported so `Window.InitOptions` can name the type without importing the
+/// pure module: the popup size travels from here to there and nowhere else.
+pub const PopupSize = viewer_popup.Size;
+
 fn onNewWindowRequested(
     p: *Pending,
     sender: ?*iface.ICoreWebView2,
@@ -1424,26 +1590,148 @@ fn onNewWindowRequested(
 
     // Handled FIRST, and unconditionally: whatever else goes wrong below, a
     // popup must not open a chrome-less WebView2 window we do not own and
-    // cannot close. This is also the line T163 replaces — it will adopt the
-    // request as a real ghoztty window instead of handing it to the browser —
-    // which is why the deferral is left untaken rather than taken and dropped.
+    // cannot close. Every other path in this function is then free to fail into
+    // "the popup does not open", which a script sees as `window.open()`
+    // returning null — a documented outcome, unlike a stray browser window.
     _ = a.setHandled(true);
 
-    // A pane that is already gone does not get to open browser tabs: the token
-    // outlives it precisely so this check can be made.
-    if (p.pane == null) return com.S_OK;
+    // A pane that is already gone does not get to open windows or browser tabs:
+    // the token outlives it precisely so this check can be made.
+    const self = p.pane orelse return com.S_OK;
 
-    const raw = a.uriRaw() orelse return com.S_OK;
-    // The runtime allocated it on the COM heap; we free it on ours.
-    defer w32.CoTaskMemFree(@ptrCast(raw));
-    _ = w32.ShellExecuteW(
-        null,
-        std.unicode.utf8ToUtf16LeStringLiteral("open"),
-        raw,
-        null,
-        null,
-        w32.SW_SHOW,
+    // The URI, as UTF-8, for the decision and for the window that may follow.
+    //
+    // Three outcomes, and they are deliberately not the same one:
+    //   - no URI at all ⇒ Mac's nil URL, which keeps the popup here;
+    //   - a URI we cannot REPRESENT — too long for the buffer, or not decodable
+    //     — goes straight to the shell in its original UTF-16, which is exactly
+    //     what this handler did before T163. Nothing is lost by not reasoning
+    //     about it, and the alternative (adopting it as a blank pane) would
+    //     silently drop the destination the page asked for.
+    //   - anything else gets the real decision below.
+    //
+    // The length guard is the load-bearing half: UTF-8 needs up to 3 bytes per
+    // UTF-16 unit, and `utf16LeToUtf8` writes into the destination without
+    // bounds-checking it — an overrun here is a crash inside a COM callback,
+    // with the browser process blocked on us.
+    var uri_buf: [location_cap]u8 = undefined;
+    var too_long = false;
+    const uri: ?[]const u8 = uri: {
+        const raw = a.uriRaw() orelse break :uri null;
+        defer w32.CoTaskMemFree(@ptrCast(raw));
+        const wide = std.mem.span(raw);
+        if (wide.len * 3 > uri_buf.len) {
+            log.warn("popup URI is too long to route ({d} units); handing it to the shell", .{wide.len});
+            too_long = true;
+            _ = w32.ShellExecuteW(
+                null,
+                std.unicode.utf8ToUtf16LeStringLiteral("open"),
+                raw,
+                null,
+                null,
+                w32.SW_SHOW,
+            );
+            break :uri null;
+        }
+        const len = std.unicode.utf16LeToUtf8(&uri_buf, wide) catch break :uri null;
+        break :uri uri_buf[0..len];
+    };
+    if (too_long) return com.S_OK;
+
+    // WebView2 puts no modifier state on the args — there is no win32 analog of
+    // `navigationAction.modifierFlags` — so the Ctrl escape hatch is read off
+    // the keyboard directly. `GetAsyncKeyState`, not `GetKeyState`: the latter
+    // answers for the message this thread is currently dispatching, which is a
+    // browser-process message here and not the click at all.
+    const ctrl_held = (w32.GetAsyncKeyState(w32.VK_CONTROL) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+
+    switch (viewer_popup.destination(uri, ctrl_held)) {
+        .default_browser => {
+            // Non-null by construction: `destination` only ever routes a
+            // readable http(s) URI here.
+            const u = uri orelse return com.S_OK;
+            self.openExternal(p.alloc, u);
+        },
+        .ghoztty_window => self.adoptPopup(p.alloc, a, uri),
+    }
+    return com.S_OK;
+}
+
+/// Turn a `window.open()` into a real ghoztty window whose single pane IS the
+/// popup (T163).
+///
+/// The mechanism is the whole point and it is not "open a window at the same
+/// URL": the runtime must be handed a web view WE created, which it then
+/// navigates itself. That is what preserves `window.opener` and therefore
+/// `window.close()` — a view we navigated ourselves is a different window as
+/// far as the opening script is concerned, and both would be dead. Since our
+/// web view is created asynchronously, the request is parked on a deferral
+/// until it exists.
+fn adoptPopup(
+    self: *ViewerPane,
+    alloc: Allocator,
+    args: *iface.ICoreWebView2NewWindowRequestedEventArgs,
+    uri: ?[]const u8,
+) void {
+    // No trampoline installed means there is nowhere to put a window, so the
+    // popup does not open. `Handled` is already true, so nothing leaks out.
+    const open_window = self.open_popup_window orelse return;
+
+    const req = PopupRequest.take(alloc, args) orelse {
+        log.warn("could not defer the popup; it will not open", .{});
+        return;
+    };
+    // The trampoline's own reference. Released unconditionally on the way out —
+    // if the window came up, the pane took a second one and this is not the last.
+    defer req.release();
+
+    // A popup that named no URL is the blank page its script writes into, which
+    // is exactly what `--view=about:blank` opens (CLAUDE.md's blank browser
+    // pane). Naming it here rather than leaving the location empty is what
+    // gives the pane a title and an address before WebView2 navigates it.
+    const location = if (uri) |u| u else content.blank_page;
+
+    open_window(self, .{
+        .req = req,
+        .location = location,
+        .origin_directory = self.origin_directory,
+        .size = self.popupSize(args),
+    });
+}
+
+/// The size the opener asked for, in physical pixels for THIS pane's monitor.
+/// Null when it asked for none, which is a window at the ordinary default.
+fn popupSize(self: *ViewerPane, args: *iface.ICoreWebView2NewWindowRequestedEventArgs) ?PopupSize {
+    const features = args.windowFeatures() orelse return null;
+    defer features.release();
+    return viewer_popup.requestedSize(
+        features.hasSize(),
+        features.width(),
+        features.height(),
+        self.scale,
     );
+}
+
+/// `ICoreWebView2WindowCloseRequestedEventHandler`: the page called
+/// `window.close()` — Mac's `webViewDidClose` (T163).
+const WindowCloseRequestedHandler = com.CallbackOwning(
+    iface.IID_WindowCloseRequestedHandler,
+    onWindowCloseRequested,
+    releasePendingToken,
+);
+
+fn onWindowCloseRequested(
+    p: *Pending,
+    sender: ?*iface.ICoreWebView2,
+    args: ?*anyopaque,
+) com.HRESULT {
+    _ = sender;
+    _ = args; // the event carries nothing at all
+    const self = p.pane orelse return com.S_OK;
+    const hwnd = self.hwnd orelse return com.S_OK;
+    // Posted, never done here: closing the pane destroys this very controller,
+    // and the browser process is synchronously blocked inside this call.
+    _ = w32.PostMessageW(hwnd, WM_APP_VIEWER_CLOSE, 0, 0);
     return com.S_OK;
 }
 
@@ -2886,6 +3174,7 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     _ = c.setVisible(self.visible);
     self.applyColorScheme();
     self.subscribeNewWindowRequested();
+    self.subscribeWindowCloseRequested();
     self.subscribeAcceleratorKey();
     self.subscribeDocumentTitle();
     // Before the navigation below, and that ordering is the contract: a script
@@ -2907,7 +3196,25 @@ fn adoptController(self: *ViewerPane, c: *iface.ICoreWebView2Controller) void {
     // Last, so the page starts loading into a view that is already the right
     // size, scale and scheme — a navigation that begins before the bounds are
     // set lays the document out twice and the user sees the reflow.
-    self.applyNavigation();
+    //
+    // An ADOPTED popup takes the other branch (T163): the runtime navigates the
+    // view we hand it, and a `Navigate` of our own would race that and sever the
+    // opener↔popup relationship this whole path exists to keep. Every
+    // subscription above is deliberately already in place — completing the
+    // deferral is what starts the popup's navigation, so a bridge script or a
+    // link policy registered afterwards would miss the popup's first document.
+    if (self.popup) |req| {
+        self.popup = null;
+        defer req.release();
+        if (c.coreWebView()) |web| {
+            defer web.release();
+            req.answer(web);
+        } else {
+            log.warn("adopted popup has no web view; it will not open", .{});
+        }
+    } else {
+        self.applyNavigation();
+    }
 
     // Stop painting the empty background: from here the controller owns the
     // pixels.
@@ -2936,6 +3243,35 @@ fn subscribeNewWindowRequested(self: *ViewerPane) void {
         return;
     }
     self.new_window_handler = handler;
+}
+
+/// Register the `window.close()` hook on a freshly adopted controller (T163).
+/// Non-fatal like every other subscription: a pane that fails to subscribe
+/// still shows its page, an adopted popup just cannot close itself — which is
+/// a degradation the user can work around with the pane's own close, not a
+/// broken pane.
+///
+/// Registered on EVERY viewer, not only on adopted popups, and that is the
+/// simplification: Chromium only honors `window.close()` on a window a script
+/// opened, so on a pane the user opened this never fires and there is no second
+/// case to keep in step.
+fn subscribeWindowCloseRequested(self: *ViewerPane) void {
+    std.debug.assert(self.window_close_handler == null);
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+
+    const handler = WindowCloseRequestedHandler.create(p.alloc, p) catch return;
+    // Same ordering rule as above: the borrowed token reference is taken BEFORE
+    // the object can reach a runtime that might release it.
+    p.refs += 1;
+    if (!web.addWindowCloseRequested(@ptrCast(handler))) {
+        log.warn("add_WindowCloseRequested failed; window.close() will do nothing", .{});
+        handler.release(); // takes the borrowed token reference with it
+        return;
+    }
+    self.window_close_handler = handler;
 }
 
 /// `ICoreWebView2AcceleratorKeyPressedEventHandler` (T394): the browser saw
@@ -3459,6 +3795,14 @@ fn fail(self: *ViewerPane, reason: webview2.Failure) void {
     self.state = .failed;
     self.failure = reason;
     log.info("viewer pane has no web view: {s}", .{@tagName(reason)});
+    // A pane that will never have a web view cannot adopt a popup (T163).
+    // Answer NOW rather than at deinit: the opening script is blocked in
+    // `window.open()`, and the failed pane may sit on screen with its error
+    // card for as long as the user leaves it there.
+    if (self.popup) |req| {
+        req.release();
+        self.popup = null;
+    }
     if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 1);
 }
 
@@ -3721,6 +4065,19 @@ pub fn wndProc(
                 _ = probe.complete();
                 self.pushWorktree();
             }
+            return 0;
+        },
+
+        // The page called `window.close()` (T163) — Mac's `webViewDidClose`.
+        // Closes this pane and nothing else: for the single-pane popup window
+        // that IS the window, matching browser semantics, and if the user has
+        // since split it, only the popup pane goes. Viewers own no process, so
+        // there is nothing to confirm. NOTHING may touch `self` afterwards —
+        // `close_surface` frees this very pane and this HWND, the same hazard
+        // `WM_APP_VIEWER_ACCEL` documents.
+        WM_APP_VIEWER_CLOSE => {
+            const close = self.close_from_page orelse return 0;
+            close(self);
             return 0;
         },
 
@@ -4622,24 +4979,36 @@ test "host floor: a real controller on a real window, on this box" {
     // timer with the very message the watcher thread posts, then navigate
     // WITHOUT pumping in between, which is the whole window the bug lives in.
     //
-    // Calibrate first. Whether a repeat navigation to the page costs a fetch
-    // at all is Chromium's cache's business (the response is `max-age=600`
-    // and still fresh), so measure that cost rather than assume it — the
-    // assertion below is "the navigation's own fetch and NOTHING else".
-    const t400_base = reload_page.requests.load(.acquire);
-    try pane.navigate(alloc, reload_url);
-    try waitFor(&msg, 30, struct {
-        fn ready(p: *ViewerPane) bool {
-            return p.mode == .web and p.page_loaded;
-        }
-    }.ready, &pane);
-    const nav_cost = reload_page.requests.load(.acquire) - t400_base;
-    try pane.navigate(alloc, md_path);
-    try waitFor(&msg, 30, struct {
-        fn ready(p: *ViewerPane) bool {
-            return p.mode.isFile() and p.page_loaded;
-        }
-    }.ready, &pane);
+    // Calibrate first, and calibrate against the SAME cache the assertion below
+    // will be measured against. Whether a repeat navigation to the page costs a
+    // fetch at all is Chromium's cache's business (the response is `max-age=600`
+    // and still fresh), so it is measured rather than assumed — the assertion
+    // below is "the navigation's own fetch and NOTHING else".
+    //
+    // Measuring it ONCE is what made this arm flaky (T690): the first repeat and
+    // every later one are not the same cache state. Measured over four runs on
+    // 2026-08-10 with no source change, the first cost 1 fetch twice and 0
+    // fetches twice, while the number the assertion reads was 0 every single
+    // time — so the EXPECTATION was the unstable side and the arm went red about
+    // one run in three. Running the round trip twice and keeping the second
+    // number puts both measurements on the same footing.
+    var nav_cost: u32 = 0;
+    for (0..2) |_| {
+        const t400_base = reload_page.requests.load(.acquire);
+        try pane.navigate(alloc, reload_url);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.mode == .web and p.page_loaded;
+            }
+        }.ready, &pane);
+        nav_cost = reload_page.requests.load(.acquire) - t400_base;
+        try pane.navigate(alloc, md_path);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.mode.isFile() and p.page_loaded;
+            }
+        }.ready, &pane);
+    }
     log.warn("t400: a repeat navigation costs {d} fetch(es)", .{nav_cost});
 
     const t400_host = pane.hwnd.?;
@@ -6021,4 +6390,389 @@ test "T380: the dim overlay glues to the host window and follows it" {
 
     // The heal pass runs against a live overlay without complaint (T142).
     pane.healOverlayZOrders();
+}
+
+// -------------------------------------------------------------------------
+// T163: popup adoption, against the live runtime
+// -------------------------------------------------------------------------
+
+/// A loopback HTTP server whose one page opens a popup, for the T163 test.
+///
+/// The opener does its `window.open()` from `onload` and keeps the returned
+/// handle on `window.__w`, which is what makes the whole thing checkable: a
+/// popup that was really ADOPTED is the window that handle names, so writing
+/// through it lands in our pane and `__w.close()` closes it. A popup we merely
+/// re-navigated to the same location would be a different window, and both
+/// would be silent no-ops.
+const PopupPage = struct {
+    /// Non-square on purpose: `ICoreWebView2WindowFeatures` puts `Height`
+    /// before `Width` in its vtable, and a square request could not tell a
+    /// swapped pair from a correct one.
+    const want_w = 520;
+    const want_h = 680;
+    /// What the opener writes into the adopted popup, read back off the popup
+    /// pane's title (which arrives over `DocumentTitleChanged`).
+    const popup_title = "t163-adopted";
+
+    const html = std.fmt.comptimePrint(
+        \\<!doctype html><meta charset="utf-8"><title>t163-opener</title>
+        \\<body>opener
+        \\<script>
+        \\window.addEventListener("load", function () {{
+        \\  window.__w = window.open("", "t163", "width={d},height={d}");
+        \\  if (window.__w) {{
+        \\    window.__w.document.write(
+        \\      "<!doctype html><title>{s}</title><body>popup");
+        \\    window.__w.document.close();
+        \\  }}
+        \\}});
+        \\</script>
+        \\
+    , .{ want_w, want_h, popup_title });
+
+    server: std.net.Server,
+    port: u16,
+    thread: std.Thread,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *PopupPage) !void {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.server = try addr.listen(.{ .reuse_address = true });
+        errdefer self.server.deinit();
+        self.port = self.server.listen_address.getPort();
+        self.stopping = .init(false);
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    /// Wake the accept, then close — `TestPage.stop`'s rule, same reason (T430).
+    fn stop(self: *PopupPage) void {
+        self.stopping.store(true, .monotonic);
+        if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
+        self.thread.join();
+        self.server.deinit();
+    }
+
+    fn serve(self: *PopupPage) void {
+        while (true) {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            if (self.stopping.load(.monotonic)) return;
+            setRecvTimeout(conn.stream.handle, 2000);
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = socket_rw.readStream(conn.stream, buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            // A Chromium preconnect that asked nothing; see `TestPage.serve`.
+            if (total == 0) continue;
+
+            var head_buf: [160]u8 = undefined;
+            const head = std.fmt.bufPrint(
+                &head_buf,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
+                    "Content-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{html.len},
+            ) catch return;
+            socket_rw.writeAllStream(conn.stream, head) catch continue;
+            socket_rw.writeAllStream(conn.stream, html) catch continue;
+            _ = std.os.windows.ws2_32.shutdown(
+                conn.stream.handle,
+                std.os.windows.ws2_32.SD_SEND,
+            );
+        }
+    }
+};
+
+/// Test seam for the popup trampoline (the live T163 test only). It stands in
+/// for `Window.openPopupWindowFromViewer` under the same contract — take a
+/// reference on the request, build a pane that carries it, and let that pane
+/// answer the runtime — without an `App` or a split tree to build a real
+/// window in.
+const PopupSink = struct {
+    alloc: Allocator,
+    hinstance: ?w32.HINSTANCE,
+    parent: w32.HWND,
+    host: *webview2.Host,
+
+    /// How many popups the trampoline was asked to open, and what the last one
+    /// asked for.
+    seen: u32 = 0,
+    size: ?PopupSize = null,
+    location_buf: [256]u8 = undefined,
+    location_len: usize = 0,
+
+    /// The adopted pane. Deliberately WITHOUT a `pane_view`: a leaf implies a
+    /// live `parent_window` (that is what `notifyTitle` dereferences), and this
+    /// pane has none. Both seams the popup path uses are keyed on the pane for
+    /// exactly this reason.
+    pane: ?*ViewerPane = null,
+
+    /// Whether the pane's close seam ran — the observable end of
+    /// `window.close()`.
+    closed: bool = false,
+
+    fn location(self: *const PopupSink) []const u8 {
+        return self.location_buf[0..self.location_len];
+    }
+
+    fn deinit(self: *PopupSink) void {
+        if (self.pane) |p| {
+            p.deinit(self.alloc);
+            self.alloc.destroy(p);
+            self.pane = null;
+        }
+    }
+};
+var popup_sink: ?*PopupSink = null;
+
+fn testPopupOpen(v: *ViewerPane, open: PopupOpen) void {
+    _ = v;
+    const sink = popup_sink orelse return;
+    sink.seen += 1;
+    sink.size = open.size;
+    sink.location_len = @min(open.location.len, sink.location_buf.len);
+    @memcpy(sink.location_buf[0..sink.location_len], open.location[0..sink.location_len]);
+
+    // Everything below mirrors `Window.createViewerPane`, in the same order and
+    // for the same reasons — most of all the retain before anything fallible.
+    const viewer = sink.alloc.create(ViewerPane) catch return;
+    viewer.* = .{};
+    {
+        var id_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&id_bytes);
+        _ = pane_id_mod.format(&viewer.pane_id, id_bytes);
+    }
+    viewer.close_from_page = &testPopupClose;
+    open.req.retain();
+    viewer.popup = open.req;
+    sink.pane = viewer;
+
+    viewer.createHostWindow(
+        sink.hinstance,
+        sink.parent,
+        .{ .left = 0, .top = 0, .right = 400, .bottom = 300 },
+    ) catch return;
+    viewer.navigate(sink.alloc, open.location) catch {};
+    viewer.start(sink.alloc, sink.host);
+}
+
+fn testPopupClose(v: *ViewerPane) void {
+    _ = v;
+    if (popup_sink) |s| s.closed = true;
+}
+
+fn popupWasSeen(p: *ViewerPane) bool {
+    _ = p;
+    const s = popup_sink orelse return false;
+    return s.seen > 0;
+}
+
+fn popupSettled(p: *ViewerPane) bool {
+    return p.state != .waiting_env and p.state != .creating;
+}
+
+fn popupWroteTitle(p: *ViewerPane) bool {
+    const t = p.title orelse return false;
+    return std.mem.eql(u8, t, PopupPage.popup_title);
+}
+
+fn popupWasClosed(p: *ViewerPane) bool {
+    _ = p;
+    const s = popup_sink orelse return false;
+    return s.closed;
+}
+
+fn aLinkWasRouted(p: *ViewerPane) bool {
+    _ = p;
+    const s = link_sink orelse return false;
+    return s.entries.items.len > 0;
+}
+
+test "T163: a popup is adopted as a pane, sized, and can close itself" {
+    // The claim under test is an ABI handshake — `GetDeferral`,
+    // `put_NewWindow`, `WindowFeatures`, `add_WindowCloseRequested` — so it can
+    // only be made against the live runtime, exactly like the host floor above.
+    // On a box with no runtime the pane lands in `.failed` and the test says so
+    // loudly rather than passing empty (T372's rule).
+    const alloc = testing.allocator;
+
+    var test_profile = try webview2.TestProfile.begin(alloc);
+    defer test_profile.end();
+
+    _ = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED);
+
+    const hinstance = w32.GetModuleHandleW(null);
+    _ = registerClass(hinstance);
+    defer _ = w32.UnregisterClassW(CLASS_NAME, hinstance);
+
+    const parent_class = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyPopupTestParent");
+    const pc = w32.WNDCLASSEXW{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &w32.DefWindowProcW,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = parent_class,
+        .hIconSm = null,
+    };
+    _ = w32.RegisterClassExW(&pc);
+    defer _ = w32.UnregisterClassW(parent_class, hinstance);
+
+    const parent = w32.CreateWindowExW(
+        0,
+        parent_class,
+        std.unicode.utf8ToUtf16LeStringLiteral("popup test"),
+        w32.WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        800,
+        600,
+        null,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(parent);
+
+    var host = webview2.Host.init(alloc);
+    defer host.deinit();
+
+    var sink: PopupSink = .{
+        .alloc = alloc,
+        .hinstance = hinstance,
+        .parent = parent,
+        .host = &host,
+    };
+    defer sink.deinit();
+    popup_sink = &sink;
+    defer popup_sink = null;
+
+    // The browser leg must never reach `ShellExecuteW` from a test lane: it
+    // would open the user's real browser over a green run.
+    var links: LinkSink = .{ .alloc = alloc };
+    defer links.deinit();
+    link_sink = &links;
+    defer link_sink = null;
+
+    var page: PopupPage = undefined;
+    try page.start();
+    defer page.stop();
+
+    var url_buf: [64]u8 = undefined;
+    const opener_url = try std.fmt.bufPrint(
+        &url_buf,
+        "http://127.0.0.1:{d}/opener.html",
+        .{page.port},
+    );
+
+    var opener: ViewerPane = .{};
+    defer opener.deinit(alloc);
+    {
+        var id_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&id_bytes);
+        _ = pane_id_mod.format(&opener.pane_id, id_bytes);
+    }
+    // No `pane_view` on either pane in this test, on purpose: setting one makes
+    // `notifyTitle` dereference `parent_window`, which a bare pane leaves
+    // undefined. The popup seams are pane-keyed so this stays possible.
+    opener.open_popup_window = &testPopupOpen;
+
+    try opener.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 640, .bottom = 480 });
+    try opener.navigate(alloc, opener_url);
+    opener.start(alloc, &host);
+
+    var msg: w32.MSG = undefined;
+    const settled = webview2.pumpUntil(&opener, struct {
+        fn f(ctx: *const anyopaque) bool {
+            const p: *const ViewerPane = @ptrCast(@alignCast(ctx));
+            return p.state != .waiting_env and p.state != .creating;
+        }
+    }.f);
+    if (!settled) {
+        log.err("T163: no controller within the deadline (still {s})", .{@tagName(opener.state)});
+        return error.WebView2ControllerTimeout;
+    }
+    if (opener.state == .failed) {
+        log.warn(
+            "SKIPPED live popup test, no usable runtime: {s}",
+            .{@tagName(opener.failure.?)},
+        );
+        return;
+    }
+    log.warn("T163: opener controller ready, scale={d}", .{opener.scale});
+
+    // ------------------------------------------------------------------
+    // The page's `window.open("", "t163", "width=…,height=…")` is adopted.
+    // ------------------------------------------------------------------
+    try waitFor(&msg, 30, popupWasSeen, &opener);
+    try testing.expectEqual(@as(u32, 1), sink.seen);
+    // A popup that named no URL is the blank page its script writes into —
+    // Mac's nil-URL case, which WebView2 spells `about:blank`.
+    try testing.expectEqualStrings(content.blank_page, sink.location());
+
+    // The size the opener asked for, scaled to this monitor. Non-square, so a
+    // swapped Height/Width pair in the WindowFeatures vtable shows up here and
+    // nowhere else in the tree.
+    const want = viewer_popup.requestedSize(
+        true,
+        PopupPage.want_w,
+        PopupPage.want_h,
+        opener.scale,
+    ).?;
+    try testing.expectEqual(want, sink.size.?);
+    log.warn("T163: popup asked for {d}x{d} physical", .{ want.w, want.h });
+
+    const popup = sink.pane orelse return error.NoPopupPane;
+    try waitFor(&msg, 30, popupSettled, popup);
+    try testing.expectEqual(State.ready, popup.state);
+
+    // THE ORACLE. The opener kept the handle `window.open()` returned and wrote
+    // a document through it. That document can only land in this pane if the
+    // pane IS the window the runtime handed the script — which is precisely
+    // what `put_NewWindow` buys, and what opening a pane of our own at the same
+    // location would not. The title arrives over `DocumentTitleChanged`.
+    try waitFor(&msg, 30, popupWroteTitle, popup);
+    try testing.expectEqualStrings(PopupPage.popup_title, popup.title.?);
+    log.warn("T163: the opener wrote into the adopted pane", .{});
+
+    // ------------------------------------------------------------------
+    // `window.close()` on that handle closes the adopted pane.
+    // ------------------------------------------------------------------
+    try testing.expect(!sink.closed);
+    opener.executeScript(alloc, "window.__w.close()");
+    try waitFor(&msg, 30, popupWasClosed, &opener);
+    try testing.expect(sink.closed);
+    log.warn("T163: window.close() reached the pane's close action", .{});
+
+    // ------------------------------------------------------------------
+    // …and the OTHER leg: an http(s) popup still leaves for the browser. This
+    // is the positive control for every "was adopted" claim above — without it
+    // a routing bug that adopted everything would look identical.
+    // ------------------------------------------------------------------
+    var web_buf: [96]u8 = undefined;
+    const web_url = try std.fmt.bufPrint(
+        &web_buf,
+        "http://127.0.0.1:{d}/elsewhere.html",
+        .{page.port},
+    );
+    var script_buf: [192]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "window.open('{s}')", .{web_url});
+    opener.executeScript(alloc, script);
+    try waitFor(&msg, 30, aLinkWasRouted, &opener);
+    try testing.expectEqual(@as(usize, 1), links.entries.items.len);
+    var expect_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expect_buf, "browser:{s}", .{web_url});
+    try testing.expectEqualStrings(expected, links.entries.items[0]);
+    // And it did NOT also become a pane.
+    try testing.expectEqual(@as(u32, 1), sink.seen);
+    log.warn("T163: an http popup still reached the default browser", .{});
 }

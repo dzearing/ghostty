@@ -672,6 +672,15 @@ pub extern "user32" fn GetKeyState(
     nVirtKey: i32,
 ) callconv(.winapi) i16;
 
+/// The PHYSICAL key state right now, rather than the state as of the message
+/// this thread is currently dispatching. The distinction matters wherever the
+/// dispatched message is not the user's input at all — a WebView2 event
+/// callback, where `GetKeyState` answers for a browser-process message and
+/// never reports the Ctrl the user is holding (T163).
+pub extern "user32" fn GetAsyncKeyState(
+    vKey: i32,
+) callconv(.winapi) i16;
+
 pub extern "kernel32" fn GetModuleHandleW(
     lpModuleName: ?[*:0]const u16,
 ) callconv(.winapi) ?HINSTANCE;

@@ -186,6 +186,11 @@ test {
     // the 15s resolution cache (T633), same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_worktree.zig");
 
+    // Pure win32 viewer popup routing — which `window.open()` requests leave
+    // for the default browser and which become ghoztty windows, plus the size
+    // the opener asked for (T163), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_popup.zig");
+
     // Pure win32 viewer feedback-composer geometry — the pill, its two
     // circular actions and the band the pane insets by (T634), same
     // no-OS-imports deal.

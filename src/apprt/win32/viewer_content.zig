@@ -40,6 +40,11 @@ pub const virtual_host = "ghoztty-viewer";
 /// the file's bytes arrive afterwards through `window.__viewer`.
 pub const page_url = "https://" ++ virtual_host ++ "/viewer.html";
 
+/// The blank browser page — what `--view=about:blank` and the palette's
+/// "Viewer: Open Browser Pane" open, and the location an adopted popup carries
+/// when its opener named no URL at all (Mac's `ViewerView.blankPage`, T163).
+pub const blank_page = "about:blank";
+
 /// What `AddWebResourceRequestedFilter` is given, so the handler sees every
 /// request the template makes (the document, its CSS, its vendor scripts, and
 /// any image the rendered markdown references).
