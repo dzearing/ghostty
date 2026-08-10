@@ -13810,3 +13810,49 @@ of it.
 Evidence: all three zig lanes PASS through `floor-lane.ps1`;
 `agent-instance-lineage.ps1` ALL PASS (22), and `-TeethCheck` gives exactly
 `2 FAILURE(S) (20 passed)`; P1–P3 ALL PASS.
+
+## 2026-08-10 — The two scripts that decide who owns the loop now share one answer (T168)
+
+The loop lock decides which session may WORK; the upgrade script decides whether
+to RELAUNCH claude after a swap. Both turn on the same fact — is the claude that
+owned this loop still the same live process? — and each carried its own copy of
+the resolver that answers it. They agreed, but only because nobody had touched
+either: a fix applied to one copy leaves the other making the opposite call,
+which is exactly the shape of the bug T138 fixed when two sessions resumed one
+transcript and both started building T131.
+
+So `go-loop-lock.ps1` dot-sources `loop-session.ps1` and its private
+`Resolve-ClaudePid` and `Get-ProcStamp` are deleted. `Test-OwnerAlive` keeps its
+name and its signature — it takes a LOCK, not a stamp — and is now four lines
+that rehydrate `claude_pid` / `claude_name` / `claude_start` into a stamp and
+delegate to `Test-LoopProcAlive`. The rule (pid alive AND name matches AND start
+time within 2s) lives in one place.
+
+Two behavior differences came along with the shared version, both in its favour.
+The env-var path now accepts a process named `claude*` rather than exactly
+`claude`, which is what the ancestry path in BOTH copies already did — the
+private copy could reject via `$env:CLAUDE_PID` a process its very next branch
+would have accepted. And a non-numeric `$env:CLAUDE_PID` no longer takes the
+script down: the private copy cast it with an unguarded `[int]`, a TERMINATING
+error under `$ErrorActionPreference = 'Stop'`, so a stray value in the
+environment failed `status` outright instead of falling through to the walk.
+
+Anti-drift is a test now rather than a comment. `go-loop-guard.ps1` gained
+section U: U1–U3 go red if either private function returns, and U4 is
+behavioral — it runs `status` with a junk `CLAUDE_PID` and requires a normal
+answer. Teeth-checked by running the old expression in isolation, which exits 1
+with `Cannot convert value "not-a-pid"` and never reaches the walk.
+
+Evidence: `go-loop-guard.ps1` ALL PASS x3; `upgrade-no-fork.ps1 -PureOnly` ALL
+PASS; the live lock still reads `held ... alive=True(by=pid) ... mine=True` with
+`go-loop-exec.ps1 list` and `go-loop-watchdog.ps1 -Status` agreeing; all three
+zig lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.
+
+The floor's first win32 run crashed, and it was not this change — no Zig was
+touched. The `remote.connection` test "inbound DATA routing" freed its channel
+while the connection's reader thread was still pushing into it: the panic's
+index `0xAAAA_AAAA_AAAA_AAAB` against len `0xAAAA_AAAA_AAAA_AAAA` is Zig's
+undefined-memory poison, so it is a use-after-free being reported as a bounds
+check. `defer conn.destroy(alloc)` is registered before `defer ch.deinit(alloc)`
+and defers are LIFO. Filed as **T693**; the lane then passed twice in a row,
+which is what makes it intermittent rather than fixed.

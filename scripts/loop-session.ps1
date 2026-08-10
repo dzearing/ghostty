@@ -17,9 +17,12 @@
 # in `+list --json`, see T98) and without confusing the loop's session with any
 # OTHER Claude the user has open.
 #
-# NOTE: `go-loop-lock.ps1` carries its own copy of the pid/stamp resolution it
-# needs for the lock file. Converging the two is filed as its own task rather
-# than folded in here, so this change cannot destabilize the loop lock.
+# NOTE: `go-loop-lock.ps1` dot-sources these too, as of T168 - it used to carry
+# its own copy of the pid/stamp resolution. There is now exactly ONE
+# implementation of "which claude owns this loop session, and is it still the
+# same process?", so a fix to it cannot leave the lock and the upgrade making
+# opposite calls about the same session. Anything added here loads into the
+# LOCK's process as well: keep this file free of top-level side effects.
 
 # --- process identity -------------------------------------------------------
 

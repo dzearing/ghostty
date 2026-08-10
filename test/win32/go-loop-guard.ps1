@@ -569,6 +569,35 @@ Assert 'M5 an interrupt hint is claude' ((Get-PaneOccupant -Tail "Determining...
 Assert 'M6 an empty pane is unknown' ((Get-PaneOccupant -Tail '') -eq 'unknown')
 Assert 'M7 unrecognised output is unknown' ((Get-PaneOccupant -Tail "building...`r`nlink ok") -eq 'unknown')
 
+# --- U. one identity implementation (T168) --------------------------------
+""
+"U. process identity has exactly one implementation"
+# The lock decides who may WORK and the upgrade decides whether to RELAUNCH,
+# both from the same fact: is the claude that owned this loop still the same
+# live process? They used to answer it from separate copies of one resolver,
+# which is the shape of the bug T138 fixed - a fix applied to one copy leaves
+# the other making the opposite call. These arms go red if a copy comes back.
+$lockSrc = Get-Content $lockScript -Raw
+Assert 'U1 the lock dot-sources the shared helpers' ($lockSrc -match 'loop-session\.ps1')
+Assert 'U2 the lock keeps no private pid resolver' (-not ($lockSrc -match 'function\s+Resolve-ClaudePid'))
+Assert 'U3 the lock keeps no private process stamp' (-not ($lockSrc -match 'function\s+Get-ProcStamp'))
+
+# ...and the convergence is not only textual. A junk $env:CLAUDE_PID must not
+# take the lock down with it: the private copy cast it to [int] unguarded, which
+# is a TERMINATING error under this script's ErrorActionPreference, so a stray
+# value in the environment would have failed `status` outright instead of
+# falling through to the ancestry walk. The shared resolver TryParses.
+$savedClaudePid = $env:CLAUDE_PID
+try {
+    $env:CLAUDE_PID = 'not-a-pid'
+    $r = Lock-Run @('status', '-NoPaneProbe')
+} finally {
+    if ($null -eq $savedClaudePid) { Remove-Item Env:\CLAUDE_PID -ErrorAction SilentlyContinue }
+    else { $env:CLAUDE_PID = $savedClaudePid }
+}
+Assert 'U4 a non-numeric CLAUDE_PID does not fail the lock' `
+    ($r.Code -eq 0 -and $r.Out -notmatch 'Cannot convert' -and $r.Out -match '^(FREE|held|stale)')
+
 # --- R. a working turn is never nudged (T253, pure) ------------------------
 ""
 "R. a long turn beats the staleness window by itself"

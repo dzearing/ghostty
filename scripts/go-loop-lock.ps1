@@ -76,6 +76,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Process identity is SHARED with the upgrade script, never re-derived here
+# (T168). Both decide the same fact about the same loop - the lock decides who
+# may work, the upgrade decides whether to relaunch - so a fix applied to one
+# private copy would leave the other making the opposite call. That is the exact
+# shape of the bug T138 fixed, so there is exactly one implementation:
+# Resolve-LoopClaudePid / Get-LoopProcStamp / Test-LoopProcAlive.
+. (Join-Path $PSScriptRoot 'loop-session.ps1')
+
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 if (-not $LockPath) { $LockPath = Join-Path (Join-Path $Repo 'temp') 'go-loop.lock.json' }
 
@@ -90,25 +98,13 @@ function Parse-Iso($s) {
 }
 
 # --- identity -------------------------------------------------------------
-
-# The claude process that owns this session. $env:CLAUDE_PID is set by Claude
-# Code for its tool shells; when it is missing (or points at something that is
-# not claude any more) walk our own ancestry looking for claude.exe.
-function Resolve-ClaudePid {
-    if ($ClaudePid -gt 0) { return $ClaudePid }
-    if ($env:CLAUDE_PID) {
-        $p = Get-Process -Id ([int]$env:CLAUDE_PID) -ErrorAction SilentlyContinue
-        if ($p -and $p.ProcessName -eq 'claude') { return [int]$env:CLAUDE_PID }
-    }
-    $walk = $PID
-    for ($i = 0; $i -lt 8 -and $walk; $i++) {
-        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue
-        if (-not $proc) { break }
-        if ($proc.Name -like 'claude*') { return [int]$proc.ProcessId }
-        $walk = $proc.ParentProcessId
-    }
-    return 0
-}
+#
+# The claude process that owns this session, and whether a recorded owner is
+# still that same live process, both come from loop-session.ps1 (dot-sourced
+# above): Resolve-LoopClaudePid -Explicit $ClaudePid, Get-LoopProcStamp,
+# Test-LoopProcAlive. The only thing left here is the translation between the
+# LOCK FILE's shape (claude_pid / claude_name / claude_start, an ISO string) and
+# the stamp objects those helpers speak - see Test-OwnerAlive.
 
 # The session's own transcript - the file Claude Code appends to on every
 # message and every tool result (T253).
@@ -166,15 +162,6 @@ function Get-ActivityStamp($lock) {
     return @{ At = $at; By = $by }
 }
 
-function Get-ProcStamp($procId) {
-    if (-not $procId -or $procId -le 0) { return $null }
-    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
-    if (-not $p) { return $null }
-    $start = $null
-    try { $start = $p.StartTime } catch { $start = $null }
-    return @{ Name = $p.ProcessName; Start = $start }
-}
-
 # --- lock file ------------------------------------------------------------
 
 function Read-Lock {
@@ -193,16 +180,17 @@ function Write-Lock($lock) {
 
 # Is the recorded owner still a live claude process? A pid alone is not proof:
 # pids get recycled, so the recorded process name and start time must match.
+#
+# The rule itself is Test-LoopProcAlive's; this only rehydrates the lock file's
+# three flat fields into the stamp that function takes. A missing claude_pid
+# reads as pid 0, which is dead - the same answer the private copy gave.
 function Test-OwnerAlive($lock) {
     if (-not $lock) { return $false }
-    $stamp = Get-ProcStamp ([int]$lock.claude_pid)
-    if (-not $stamp) { return $false }
-    if ($lock.claude_name -and $stamp.Name -ne $lock.claude_name) { return $false }
-    $recorded = Parse-Iso $lock.claude_start
-    if ($recorded -and $stamp.Start) {
-        if ([math]::Abs(($stamp.Start - $recorded).TotalSeconds) -gt 2) { return $false }
-    }
-    return $true
+    return (Test-LoopProcAlive ([pscustomobject]@{
+        Pid   = [int]$lock.claude_pid
+        Name  = [string]$lock.claude_name
+        Start = (Parse-Iso $lock.claude_start)
+    }))
 }
 
 # The pid is not the loop; the PANE is (T440). The upgrade script kills claude
@@ -257,8 +245,8 @@ function Emit($lock, $line) {
     if ($Json) { ($lock | ConvertTo-Json -Depth 5) } else { $line }
 }
 
-$myPid = Resolve-ClaudePid
-$myStamp = Get-ProcStamp $myPid
+$myPid = Resolve-LoopClaudePid -Explicit $ClaudePid
+$myStamp = Get-LoopProcStamp $myPid
 
 switch ($Action) {
 
