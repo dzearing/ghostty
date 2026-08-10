@@ -13,6 +13,10 @@ import AppKit
 /// `Cmd-Shift` gives it a surface of its own — a new Ghoztty viewer window for
 /// a URL, the file's own default app for a path.
 ///
+/// A `ghoztty://` link is the exception to all of that: it names a window or
+/// pane rather than content, so it runs in process (see `GhozttyURLScheme`)
+/// under every modifier and never opens anything.
+///
 /// A URL leaves by default because Ghoztty's `WKWebView` keeps its own cookie
 /// store with no relationship to Safari or Chrome: anything behind a login
 /// renders logged-out in a viewer pane and OAuth sign-in never completes. The
@@ -48,13 +52,24 @@ struct BannerLinkOpener {
         case openInSidePane
         /// A new one-pane Ghoztty viewer window.
         case openInNewWindow
+        /// A `ghoztty://` link: run the command in process. Not a destination,
+        /// so none of the "open it somewhere" actions apply.
+        case runGhozttyCommand
     }
 
     /// What a click on `url` with `modifiers` held does. Plain click leaves
     /// Ghoztty, `Cmd` opens a side pane, `Cmd-Shift` asks for a surface of the
     /// link's own — which for a file is the app that owns it, since a viewer
     /// can display a file but never edit one.
+    ///
+    /// A `ghoztty://` link sits outside that scheme entirely and ignores every
+    /// modifier: it addresses Ghoztty itself rather than naming content, so
+    /// there is nothing to put in a pane, a window, or a browser. Handling it
+    /// here also keeps it out of the viewer path it would otherwise fall into
+    /// — a Cmd-click used to open a side pane whose "location" was the
+    /// command string.
     static func action(for url: URL, modifiers: NSEvent.ModifierFlags) -> Action {
+        if GhozttyURLScheme.handles(url) { return .runGhozttyCommand }
         guard modifiers.contains(.command) else {
             return url.isFileURL ? .revealInFinder : .openWithSystem
         }
@@ -69,6 +84,7 @@ struct BannerLinkOpener {
         case .revealInFinder: revealInFinder(url)
         case .openInSidePane: openInSidePane(url)
         case .openInNewWindow: openInNewWindow(url)
+        case .runGhozttyCommand: GhozttyURLScheme.handle(url)
         }
     }
 
@@ -142,6 +158,17 @@ struct BannerLinkOpener {
     /// only system handoff, so it appears once.
     func menu(for url: URL) -> NSMenu {
         let menu = NSMenu()
+        // A `ghoztty://` link has exactly one thing it can do, so the menu is
+        // that plus Copy Link. Offering Side Pane / New Window here would
+        // advertise destinations the command has no content for.
+        if GhozttyURLScheme.handles(url) {
+            menu.addItem(item("Focus in Ghoztty", symbol: "macwindow", url) {
+                GhozttyURLScheme.handle($0)
+            })
+            menu.addItem(.separator())
+            menu.addItem(item("Copy Link", symbol: "doc.on.doc", url) { copy($0) })
+            return menu
+        }
         if url.isFileURL {
             menu.addItem(item("Reveal in Finder", symbol: "folder", url) { revealInFinder($0) })
         } else {

@@ -1,6 +1,6 @@
 ---
 name: ghoztty
-description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a live HTML page, a code file, or a website in a viewer ("side") pane, showing a git diff in a pane (current branch vs main, `git status`, a single commit, or an arbitrary range), listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, listing persistent terminal sessions, opening a shell on a remote machine, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, a live HTML page, syntax-highlighted code, or a webpage), show changes for a branch, commit, or range, query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", or "preview this markdown", use `+split --view=<path-or-url>`; when they say "show me changes in this branch", "what's on my branch vs main", "show me my git status", or "what changed in <sha>", use `+split --view=git-diff:<revspec>` or `--view=git-status:`.
+description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a live HTML page, a code file, or a website in a viewer ("side") pane, showing a git diff in a pane (current branch vs main, `git status`, a single commit, or an arbitrary range), listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, listing persistent terminal sessions, opening a shell on a remote machine, emitting `ghoztty://focus/<target>` links so a generated document can jump to a terminal window or pane, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, a live HTML page, syntax-highlighted code, or a webpage), show changes for a branch, commit, or range, query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", or "preview this markdown", use `+split --view=<path-or-url>`; when they say "show me changes in this branch", "what's on my branch vs main", "show me my git status", or "what changed in <sha>", use `+split --view=git-diff:<revspec>` or `--view=git-status:`.
 ---
 
 # Ghoztty CLI Reference
@@ -682,6 +682,120 @@ ghoztty +new-remote-window --host=winbox --port=7777 --shell=wsl.exe --working-d
 ```
 
 Your local shell and cwd are **not** forwarded — they wouldn't exist on a different OS such as a Windows ConPTY agent. The remote machine's own defaults apply unless a per-host default (machine chooser → row `⋯` → "Host Settings…") or an explicit flag says otherwise. A remote pane's IPC still belongs to the **local** app, so `+split`, `+close`, and `+set-banner` target it like any other pane.
+
+## Focus links: the `ghoztty://` URL scheme
+
+A **link** can bring a Ghoztty window or pane to the front. This is the piece
+that makes a generated document useful: a worktree dashboard, a status report,
+a build summary can each carry a "jump to that terminal" link that works from a
+browser, from a rendered doc in a viewer pane, or from a pane banner.
+
+```
+ghoztty://focus/<target>
+```
+
+That is the **only** form and `focus` is the **only** verb. `<target>` is
+percent-decoded and handed to the same resolver `--target` uses, so it accepts
+everything a `--target` accepts:
+
+| `<target>` | Example |
+|---|---|
+| a registered window name | `ghoztty://focus/dev` |
+| an auto-assigned window name | `ghoztty://focus/window-3` |
+| a registered pane name | `ghoztty://focus/logs` |
+| a pane id (`$GHOZTTY_PANE_ID`, case-insensitive) | `ghoztty://focus/8b1f1a2c-3d4e-4f50-9a6b-7c8d9e0f1a2b` |
+
+Percent-encode anything awkward: `ghoztty://focus/my%20window`. Everything
+after the verb is ONE target, so a name containing `/` survives either way
+(`focus/feat%2Flogin` and `focus/feat/login` both mean `feat/login`).
+
+**Nothing else is possible through a link — by design.** There is no
+`ghoztty://new-window`, no `ghoztty://send-keys`, no way to run a command. Any
+web page the user visits can fire a URL scheme with no prompt and no
+same-origin check, so anything that could spawn a shell or type into a pane
+would be remote code execution behind an `<a href>`. Raising a window that
+already exists is the one verb whose worst case is a nuisance. If you find
+yourself wanting a second verb, use the CLI — it is reachable only by code
+already running as the user — and do not propose widening the scheme.
+
+**A link that can't be followed says so.** If the target isn't open — it was
+closed, it was never named, or Ghoztty was only just launched by this very
+click — Ghoztty shows a warning naming the target ("Can't focus "dev""), and a
+`ghoztty://` link it doesn't understand gets a warning naming the URL. What it
+never does is act on a failure: no window is created and no "closest" window is
+focused as a consolation. A burst of links produces one dialog, not one each.
+
+So a stale link in a generated document is visible rather than mysterious —
+but it is still a bad link. Regenerate dashboards rather than letting them rot,
+and prefer targets that will still exist (below).
+
+### Emitting links from a generated document
+
+Write ordinary anchors:
+
+```html
+<a href="ghoztty://focus/ghoztty-url-protocol">ghoztty-url-protocol</a>
+<a href="ghoztty://focus/8b1f1a2c-3d4e-4f50-9a6b-7c8d9e0f1a2b">that pane</a>
+```
+
+**Pick the target so the link survives.** This is the part that decides whether
+a dashboard still works tomorrow:
+
+| Situation | Target to write | Why |
+|---|---|---|
+| You are *creating* the window (e.g. one per worktree) | the `--target=` name you gave it | You chose it, so you can regenerate the same link without asking the app anything. |
+| The window already exists and you are just describing it | the pane `id` from `+list --json` | Stable for the pane's whole life, including across app relaunch and session restore. |
+| Linking to the pane you are running in | `$GHOZTTY_PANE_ID` | Already in your environment — no `+list` round trip. |
+
+Prefer a **name you control** over an auto-assigned `window-N`: the auto names
+are handed out per app run, so `window-3` can point at a different window after
+a relaunch. Name the window when you open it and the link is stable by
+construction:
+
+```bash
+# one window per worktree, named after it — the link is then predictable
+for wt in ~/git/*/; do
+  name="$(basename "$wt")"
+  ghoztty +new-window --target="$name" --working-directory="$wt"
+  echo "<li><a href=\"ghoztty://focus/$name\">$name</a></li>" >> dashboard.html
+done
+```
+
+To build a dashboard from what is *already* open, walk `+list --json`. `splits`
+is a recursive tree, so use `..` to pick out the `terminal` objects:
+
+```bash
+ghoztty +list --json | jq -r '
+  .data.windows[] | .tabs[] | [.. | .terminal? | select(.)] | .[] |
+  "<li><a href=\"ghoztty://focus/\(.id)\">\(.title)</a></li>"'
+```
+
+Markdown works too, in a viewer pane or anywhere else that renders links:
+
+```markdown
+| Worktree | Terminal |
+|---|---|
+| `ghoztty` | [open](ghoztty://focus/ghoztty) |
+```
+
+And in a banner (`[label](url)` needs the scheme, which this has):
+
+```bash
+ghoztty +set-banner --target=dev "Tests failing in [the build pane](ghoztty://focus/build)"
+```
+
+Clicking a `ghoztty://` link **inside** Ghoztty — a viewer pane, a pane banner
+— is handled in process rather than routed back through macOS, so it always
+means "this app". A banner link ignores the usual Cmd / Cmd-Shift modifiers
+(there is no content to put in a pane or a window) and its right-click menu
+offers just **Focus in Ghoztty** and **Copy Link**.
+
+> **Debug builds use `ghoztty-debug://`.** The two builds register different
+> schemes so LaunchServices never has to choose between them. Both builds
+> *accept* both spellings for links clicked inside Ghoztty, so a document that
+> hardcodes `ghoztty://` still works when a debug build renders it — but a link
+> clicked in a **browser** reaches only the build that registered that exact
+> scheme. Write `ghoztty://` unless you are specifically driving a debug build.
 
 ## Naming System
 

@@ -2065,6 +2065,40 @@ class IPCServer {
         return DispatchQueue.main.sync(execute: scan)
     }
 
+    /// Raise the window owning `target` and focus the pane within it, or do
+    /// nothing at all if the target names nothing that is currently open.
+    /// Returns whether a target was found.
+    ///
+    /// This is the whole of what the `ghoztty://` URL scheme can do (see
+    /// `GhozttyURLScheme`), factored out so the untrusted caller shares the
+    /// resolver — and therefore the naming system — with `--target`, rather
+    /// than getting a parallel one. Never creates anything: a link that
+    /// LAUNCHED the app finds an empty registry and correctly does nothing.
+    @MainActor
+    @discardableResult
+    func focusTarget(_ target: String) -> Bool {
+        pruneStaleTargets()
+        guard let entry = resolveTarget(target), entry.isAlive else { return false }
+
+        // Same two shapes the idempotent `+split --name=` / `+new-window
+        // --target=` focus paths use: a terminal pane gets real focus inside
+        // its window (which `focusSurface` also raises and activates), while a
+        // viewer pane has no surface to focus, so raising its window is all
+        // there is.
+        if let surface = entry.surfaceView, let controller = entry.controller {
+            controller.focusSurface(surface)
+        } else if let pane = entry.viewerPaneView {
+            pane.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else if let controller = entry.controller {
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            return false
+        }
+        return true
+    }
+
     private func windowName(for controller: TerminalController) -> String? {
         for (name, entry) in targetRegistry {
             if case .window(let ref) = entry, ref.value === controller {

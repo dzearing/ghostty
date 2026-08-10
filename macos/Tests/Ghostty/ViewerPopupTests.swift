@@ -41,6 +41,20 @@ struct ViewerPopupTests {
             for: URL(string: "about:blank")!, modifiers: []) == .ghosttyWindow)
     }
 
+    /// A `target="_blank"` link to `ghoztty://` is a command, not a
+    /// destination. Left as a "non-web scheme" it fell to `.ghosttyWindow` and
+    /// OPENED A VIEWER WINDOW pointed at the command string — window creation
+    /// from the one scheme that must never create anything.
+    @Test func aGhozttyPopupIsRunInProcessNotWindowed() {
+        let url = URL(string: "ghoztty://focus/dev")!
+        #expect(ViewerView.popupDestination(for: url, modifiers: []) == .ghozttyCommand(url))
+        // Outranks Cmd too: there is no window form of this to escape to.
+        #expect(ViewerView.popupDestination(for: url, modifiers: .command) == .ghozttyCommand(url))
+
+        let debug = URL(string: "ghoztty-debug://focus/dev")!
+        #expect(ViewerView.popupDestination(for: debug, modifiers: []) == .ghozttyCommand(debug))
+    }
+
     /// Every viewer wires itself as the web view's UI delegate. Without this
     /// `window.open()` and `target="_blank"` do nothing at all.
     @Test func viewerIsItsWebViewsUIDelegate() {

@@ -12,6 +12,7 @@ struct BannerLinkOpenerTests {
     private let opener = BannerLinkOpener(surface: nil)
     private let web = URL(string: "https://example.com")!
     private let file = URL(fileURLWithPath: "/tmp/a.md")
+    private let ghoztty = URL(string: "ghoztty://focus/dev")!
 
     private func titles(_ menu: NSMenu) -> [String] {
         menu.items.map { $0.isSeparatorItem ? "-" : $0.title }
@@ -42,6 +43,24 @@ struct BannerLinkOpenerTests {
             == .openInNewWindow)
         #expect(BannerLinkOpener.action(for: file, modifiers: [.command, .shift])
             == .openWithSystem)
+    }
+
+    @Test func aGhozttyLinkRunsInProcessUnderEveryModifier() {
+        // It addresses Ghoztty itself rather than naming content, so there is
+        // nothing to put in a browser, a side pane, or a window — and letting
+        // Cmd-click route it to a viewer would open a pane whose "location" is
+        // the command string.
+        for modifiers: NSEvent.ModifierFlags in [[], .command, [.command, .shift], .shift] {
+            #expect(BannerLinkOpener.action(for: ghoztty, modifiers: modifiers)
+                == .runGhozttyCommand)
+        }
+    }
+
+    @Test func theDebugSchemeIsRecognizedToo() {
+        // A banner written by a release-build agent must still work when a
+        // debug build renders it, and the reverse.
+        #expect(BannerLinkOpener.action(
+            for: URL(string: "ghoztty-debug://focus/dev")!, modifiers: []) == .runGhozttyCommand)
     }
 
     @Test func modifiersWithoutCommandAreAPlainClick() {
@@ -80,6 +99,16 @@ struct BannerLinkOpenerTests {
             "Open with Default App",
             "-",
             "Copy Path",
+        ])
+    }
+
+    @Test func ghozttyLinkMenuOffersOnlyTheOneThingItCanDo() {
+        // Side Pane / New Window would advertise destinations a command has no
+        // content for. Copy Link stays, because the link is still a link.
+        #expect(titles(opener.menu(for: ghoztty)) == [
+            "Focus in Ghoztty",
+            "-",
+            "Copy Link",
         ])
     }
 
