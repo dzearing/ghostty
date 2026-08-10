@@ -5078,12 +5078,11 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const win = core_surface.rt_surface.parent_window;
                     // Return to the configured default (window-width/height
                     // × cell size, Mac returnToDefaultSize parity); 800×600
-                    // only when the config never set one (T66).
-                    win.setClientSize(win.default_client_size orelse
-                        .{ .width = 800, .height = 600 });
+                    // only when the config never set one (T66). The viewer
+                    // chord path reaches the same method (T682).
+                    core_surface.rt_surface.parent_window.resetToDefaultSize();
                 },
             }
             return true;

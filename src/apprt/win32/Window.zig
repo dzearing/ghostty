@@ -3593,6 +3593,65 @@ pub fn toggleSplitZoom(self: *Window) void {
     self.layoutSplits();
 }
 
+/// The action tags `performViewerBindingAction` has an arm for, spelled once
+/// so the comptime block below can hold them against
+/// `viewer_accel.forwardsTag`. Keep this in step with that switch.
+pub const viewer_dispatch_tags = [_]std.meta.Tag(input.Binding.Action){
+    .quit,
+    .new_window,
+    .new_tab,
+    .close_surface,
+    .close_tab,
+    .close_window,
+    .close_all_windows,
+    .previous_tab,
+    .next_tab,
+    .last_tab,
+    .goto_tab,
+    .move_tab,
+    .new_split,
+    .goto_split,
+    .swap_split,
+    .resize_split,
+    .equalize_splits,
+    .toggle_split_zoom,
+    .toggle_hero_mode,
+    .toggle_fullscreen,
+    .toggle_maximize,
+    .toggle_window_decorations,
+    .reset_window_size,
+    .toggle_tab_overview,
+    .toggle_command_palette,
+    .open_config,
+    .reload_config,
+    .prompt_window_title,
+};
+
+comptime {
+    // The forwarded set and the switch below are two spellings of one
+    // decision, and they used to be kept in step by hand with a runtime
+    // `log.warn` in the `else` arm as the only alarm. That alarm fires into a
+    // log nobody reads while the user's chord does nothing, which is exactly
+    // how `reset_window_size` and `toggle_tab_overview` stayed unreachable
+    // from a focused viewer after T126 added `toggle_hero_mode` beside them
+    // (T682). Asserted here instead: a forwarded action with no arm — or an
+    // arm for something the list does not admit — fails the win32 build.
+    //
+    // The sweep is |actions| × |arms| ≈ 4k branches, well past the default
+    // quota.
+    @setEvalBranchQuota(50_000);
+    for (std.enums.values(std.meta.Tag(input.Binding.Action))) |tag| {
+        var dispatched = false;
+        for (viewer_dispatch_tags) |handled| {
+            if (handled == tag) dispatched = true;
+        }
+        if (viewer_accel.forwardsTag(tag) != dispatched) @compileError(
+            "viewer_accel.forwards and Window.performViewerBindingAction " ++
+                "disagree about ." ++ @tagName(tag),
+        );
+    }
+}
+
 /// Perform a bound action ON BEHALF OF a viewer pane (T394). This is the
 /// dispatch half of viewer accelerator forwarding: a viewer has no core
 /// surface, so a matched chord cannot ride `performBindingAction` — instead
@@ -3602,7 +3661,8 @@ pub fn toggleSplitZoom(self: *Window) void {
 ///
 /// The action vocabulary is `viewer_accel.forwards` — the window/app-scoped
 /// subset with a meaning when no terminal underlies the focused pane — and
-/// this switch must handle everything that list admits. Returns false for an
+/// this switch must handle everything that list admits, which
+/// `viewer_dispatch_tags` asserts at compile time. Returns false for an
 /// action outside it.
 ///
 /// Callers beware: the closing arms (`close_surface`, `close_tab`,
@@ -3719,6 +3779,19 @@ pub fn performViewerBindingAction(
             }
         },
         .toggle_window_decorations => self.toggleWindowDecorations(),
+
+        // The App arm reaches the window through a core surface, which a
+        // viewer has not — so this performs the same action on `self`, via
+        // the one method both paths share, rather than restating the default
+        // (T682).
+        .reset_window_size => self.resetToDefaultSize(),
+
+        // Deliberately a no-op on this platform (see `viewer_accel.forwards`),
+        // routed through App so there is exactly one place that decides what
+        // an overview means here.
+        .toggle_tab_overview => _ = self.app.performAction(.app, .toggle_tab_overview, {}) catch |err| {
+            log.err("viewer chord toggle_tab_overview failed err={}", .{err});
+        },
 
         // The palette UI is owned by a terminal Surface, so it opens on one
         // of this window's terminals (the active tab's first, by preference).
@@ -5170,6 +5243,16 @@ pub fn setClientSize(self: *Window, size: ClientSize) void {
         outer.?.h,
         w32.SWP_NOZORDER | w32.SWP_NOMOVE,
     );
+}
+
+/// Return the client area to this window's configured default size — the
+/// `reset_window_size` action (T66). 800×600 only when the config never set
+/// one. Shared by the App action arm (which addresses the window through a
+/// core surface) and the viewer-chord dispatch (which has no surface to
+/// address it through, T682), so the fallback is spelled exactly once.
+pub fn resetToDefaultSize(self: *Window) void {
+    self.setClientSize(self.default_client_size orelse
+        .{ .width = 800, .height = 600 });
 }
 
 /// Toggle window decorations (title bar + borders) on/off.

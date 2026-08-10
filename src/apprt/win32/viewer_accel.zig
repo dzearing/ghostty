@@ -197,8 +197,21 @@ pub fn keyEventFor(vk: u16, extended: bool, mods: input.Mods) ?input.KeyEvent {
 /// commands. Everything else (clipboard, scrollback, font size, search,
 /// terminal state) stays with the page, which has its own meaning for those
 /// keys or none at all.
+///
+/// No arm here depends on the action's PAYLOAD — `close_tab:other` forwards
+/// exactly as `close_tab:this` does — so the decision is really a decision
+/// about the tag, and `forwardsTag` is the form of it that a comptime check
+/// can enumerate. `Window.performViewerBindingAction` uses that to assert its
+/// dispatch switch handles everything this list admits, which is what turns
+/// the gap T682 fixed (forwarded, then quietly unhandled) into a build
+/// failure instead of a log line nobody reads.
 pub fn forwards(action: input.Binding.Action) bool {
-    return switch (action) {
+    return forwardsTag(std.meta.activeTag(action));
+}
+
+/// `forwards`, over the action's tag alone. See `forwards` for the rule.
+pub fn forwardsTag(tag: std.meta.Tag(input.Binding.Action)) bool {
+    return switch (tag) {
         .quit,
         .new_window,
         .new_tab,
@@ -222,14 +235,21 @@ pub fn forwards(action: input.Binding.Action) bool {
         // while one holds focus. Without this, a selected viewer swallowed
         // ctrl+shift+space into the page and the user could not leave hero
         // mode without first navigating to a terminal tile (T126).
-        // A viewer is a full citizen of the hero carousel (T397 gave it a
-        // tile), so the chord that enters and leaves hero mode has to work
-        // while one holds focus. Without this, a selected viewer swallowed
-        // ctrl+shift+space into the page and the user could not leave hero
-        // mode without first navigating to a terminal tile (T126).
         .toggle_hero_mode,
         .toggle_fullscreen,
         .toggle_maximize,
+        // The window's size is the window's, and a viewer-only window has no
+        // terminal to press this from at all — so a bound "back to the
+        // default size" chord has to answer from a focused viewer (T682).
+        .reset_window_size,
+        // A no-op on this platform, as on Mac (only the GTK apprt has an
+        // overview to show) — and forwarded anyway, because a terminal pane
+        // CLAIMS this chord and does nothing with it. Leaving it out is not
+        // "no behavior", it is a different behavior: the page underneath a
+        // viewer would see a chord the same keystroke never reaches from any
+        // other pane. If win32 ever grows an overview, the arm already routes
+        // to the one implementation (T682).
+        .toggle_tab_overview,
         .toggle_window_decorations,
         .toggle_command_palette,
         .open_config,
@@ -536,6 +556,11 @@ test "forwards: window/app commands yes, terminal-content commands no" {
     try testing.expect(forwards(.toggle_hero_mode));
     try testing.expect(forwards(.{ .swap_split = .down }));
 
+    // The two the same sweep left behind (T682). Both are the WINDOW's, and
+    // a viewer-only window has no terminal to press them from at all.
+    try testing.expect(forwards(.reset_window_size));
+    try testing.expect(forwards(.toggle_tab_overview));
+
     // Content-scoped actions stay with the page.
     try testing.expect(!forwards(.{ .copy_to_clipboard = .mixed }));
     try testing.expect(!forwards(.paste_from_clipboard));
@@ -545,4 +570,27 @@ test "forwards: window/app commands yes, terminal-content commands no" {
     try testing.expect(!forwards(.start_search));
     try testing.expect(!forwards(.clear_screen));
     try testing.expect(!forwards(.prompt_surface_banner));
+}
+
+test "forwards is decided by the tag, not the payload" {
+    // Every arm of the list is payload-independent, which is what lets
+    // `Window.performViewerBindingAction` assert its dispatch switch against
+    // `forwardsTag` over the whole tag space at compile time (T682). If some
+    // future action ever needs to forward on one payload and not another,
+    // this test is where that shows up first.
+    inline for (@typeInfo(input.Binding.Action).@"union".fields) |field| {
+        const tag = @field(std.meta.Tag(input.Binding.Action), field.name);
+        if (field.type == void) {
+            const action = @unionInit(input.Binding.Action, field.name, {});
+            try testing.expectEqual(forwardsTag(tag), forwards(action));
+        }
+    }
+
+    // The payload-carrying ones the viewer path actually uses, both ways.
+    try testing.expectEqual(forwards(.{ .close_tab = .this }), forwards(.{ .close_tab = .other }));
+    try testing.expectEqual(forwards(.{ .new_split = .up }), forwards(.{ .new_split = .auto }));
+    try testing.expectEqual(
+        forwards(.{ .increase_font_size = 1 }),
+        forwards(.{ .increase_font_size = 4 }),
+    );
 }

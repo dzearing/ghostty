@@ -9,6 +9,50 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-10 - **T682 (T708 filed) - two window shortcuts now answer from a
+  focused viewer pane, and the list that decides which ones can no longer drift
+  in silence.** `viewer_accel.forwards()` names the bound actions a focused
+  viewer hands back to the app; everything else stays with the WebView2 page.
+  T126 found `toggle_hero_mode` missing from it. The same sweep left
+  `reset_window_size` and `toggle_tab_overview` behind - both window-scoped,
+  both implemented here, both dead while a viewer held focus, and in a
+  viewer-only window there is no terminal to press them from at all. Fixed by
+  adding both to the list with an arm each: `reset_window_size` through a new
+  `Window.resetToDefaultSize()` that App.zig's own arm now shares (the 800x600
+  fallback had been spelled twice), `toggle_tab_overview` through
+  `App.performAction` so its single no-op site stays single.
+  The interesting half is the second defect. The two spellings of that one
+  decision - the list, and the dispatch switch - were kept in step by hand,
+  with a `log.warn` in the switch's `else` arm as the only alarm. That alarm
+  fires into a log nobody reads while the user's chord does nothing, which is
+  exactly how these two sat unreachable after T126 added a third beside them.
+  `forwards()` is now decided by the action's TAG (no arm ever depended on the
+  payload, asserted), which lets a comptime block in Window.zig hold the whole
+  tag space against a `viewer_dispatch_tags` list: a forwarded action with no
+  arm fails the win32 build. Teeth-checked by deleting one entry - the lane
+  fails naming it.
+  New acceptance `test\win32\viewer-window-chords.ps1`, ALL PASS (23). Its
+  oracles are the window's client rect for the resize, and the served page's
+  OWN keydown log (mirrored into `document.title`, read back through `+list
+  --json`) for the no-op - because `toggle_tab_overview` does nothing here by
+  design, so the only observable claim is that the app CLAIMS the chord instead
+  of leaking it to the page, which is what a terminal pane does with it. Three
+  positive controls: an already-forwarded chord (f8), an unbound chord the page
+  must see, and a bound-but-not-forwarded chord (clear_screen) the page must
+  also see. Teeth-checked by rebuilding with both entries removed: exactly the
+  three subject arms go red, controls all green.
+  Two things the script cost, both now documented on `Send-TestViewerChord`:
+  most bare F-keys are Chromium's own accelerators and never reach a page
+  keydown, and F10 MOVES the browser's focus - so every chord posted after one
+  silently lands nowhere. Three arms read as clean passes that way before the
+  key vocabulary was pinned to F2/F4/F8/F9. Every send now proves it arrived
+  (the `accel key vk=` debug line) before any verdict is drawn from it, which
+  is the general rule for a claim of the form "X did not happen".
+  Filed T708: `toggle_tab_overview` returning true and doing nothing makes it a
+  dead key from EVERY pane, while win32 already ships hero mode - a full-window
+  carousel of every pane, which is what an overview is. Either it should drive
+  that, or it should stop being offered.
+
 - 2026-08-10 - **T681 (T707 filed) - closing a split pane now destroys its
   window instead of hiding it and walking away.** Every terminal pane is a
   `WS_CHILD` `GhozttyTerminal` window that WGL renders into, and

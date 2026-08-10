@@ -2097,6 +2097,16 @@ The target hwnd lives in the msedgewebview2 process; the app's UI thread is
 who resolves the chord in its AcceleratorKeyPressed callback, so the helper
 attaches to BOTH threads and holds the modifier state across the round trip.
 #>
+# A chord posted at a viewer pane's Chromium input child. CHOOSE THE KEY WITH
+# CARE (T682): most bare F-keys are Chromium's OWN accelerators and never reach
+# a page keydown - F1 help, F3 find, F5 reload, F6 address bar, F7 caret
+# browsing, F10 menu, F11 fullscreen, F12 devtools. F10 is the nasty one: it
+# MOVES the browser's focus, so every chord posted after one silently lands
+# nowhere and a script full of "the page did not see X" assertions passes for
+# free. F2/F4/F8/F9 are inert. When a claim rests on a chord NOT arriving
+# somewhere, prove it arrived at all first - the `accel key vk=…` debug line
+# from ViewerPane.onAcceleratorKeyPressed is logged for every chord WebView2
+# hands us, claimed or not (viewer-window-chords.ps1's Send-AtViewer).
 function Send-TestViewerChord {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
