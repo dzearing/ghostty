@@ -9,6 +9,50 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-09 - **T89i / T485 - the crash-and-restart test could not be run
+  from a terminal, so for 19 days nobody found out its blocker had been
+  fixed.** T89i is the harness that proves session persistence: it builds a
+  five-pane layout across two windows, kills the app three times, resizes,
+  floods panes with output, and checks everything comes back. It had sat
+  `blocked(T111)` since 2026-07-21 because the app really did go unresponsive
+  under its double storm. T111 was split and fixed (T111a + T111b) days ago,
+  and the row stayed blocked anyway.
+
+  The reason is the second bug. `session-persistence.ps1` was written twelve
+  days before T441 built `lib\Isolation.ps1` and never adopted it, so run from
+  a Ghoztty pane it inherited the pane's baked `$GHOZTTY_IPC_SOCKET` and every
+  CLI call named the user's INSTALLED release. The first such call is the
+  harness's own "is anything already answering?" pre-flight — the user's live
+  terminal answered it, and the run aborted with exit 2 having done nothing.
+  The guard was right: it exists so this harness never `+close`s someone
+  else's panes. What was missing is the private endpoint that makes its
+  question answerable. `Set-GhozttyTestIsolation -Tag 'sesspersist'` now runs
+  ABOVE the guard rather than beside the `LOCALAPPDATA` switch below it, and
+  `Assert-GhozttyIsolated` runs once the first window is up, so "whose panes
+  are these" is settled before anything is typed or closed. That is T485.
+
+  With it, three consecutive full runs at 112s each. **Section E is green in
+  all twelve arms** — `+list` 40/40 under the double agent-backed storm where
+  T111 measured 1/40, echo-storm `+read` 322ms against the 2s T62 bound,
+  `+close` 188ms and 1016ms against the 10s T63 bound, IPC back to 211ms after
+  a mid-storm crash relaunch re-attached all seven sessions. The blocker is
+  retired by measurement, not by assumption.
+
+  One red remains, 3/3 runs: B2.7/B3.7, where a second crash-restore replays
+  only the newest cycle's output. That is **T484**, already open at P1, and
+  the artifacts sharpen it — the restored pane holds *exactly the last command
+  block*, 144 bytes, and cycle 1 loses the shell banner the same way without
+  tripping an assertion. So the rule is not "older cycles are evicted" but "a
+  restore seeds one screen and never reaches further back", which points at
+  the snapshot-seeded attach rather than at scrollback limits. Recorded there;
+  T89i closes rather than re-blocking on it, since the harness is the
+  deliverable and it is now delivered AND runnable.
+
+  Filed **T680**: seven other `test\win32` scripts make CLI calls with no
+  private endpoint at all, and `context-menu-real-input.ps1` `+read`s whatever
+  panes it finds. The durable fix there is a meta-check, not seven edits — a
+  hand-curated list goes stale the next time someone adds a script.
+
 - 2026-08-09 - **T426 - the app and its background agent shared a
   kill-on-close job, which is why the app vanished mid-refresh. Measured, then
   removed.** Four times a user confirmed the agent-upgrade dialog and Ghoztty

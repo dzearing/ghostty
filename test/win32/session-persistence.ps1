@@ -363,7 +363,17 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 # already listening. On a cold box nothing answers, the harness proceeds, and it
 # is the release build's own auto-launch that lands on the user's endpoints -
 # the same incident, arriving through the gap in the guard written for it.
+#
+# T89i: this harness was written 2026-07-21, before T441 built lib\Isolation.ps1,
+# and never adopted it -- so run from one of the user's own panes it inherited
+# their baked `$GHOZTTY_IPC_SOCKET`, every CLI call named their INSTALLED
+# release, and the guard below fired on their live instance (exit 2, nothing
+# ever ran). The suffix has to be set before ANY CLI call, which is why it sits
+# above the guard rather than beside the LOCALAPPDATA switch further down: the
+# guard's own `+list` is a CLI call.
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'sesspersist')
 if (-not (Test-GhozttyIsolatedBuildMode -Mode (Get-GhozttyBuildMode -Exe $Exe))) {
     Write-Host ""
     Write-Host "ABORT: '$Exe' is not a Debug/ReleaseSafe build, so it speaks the" -ForegroundColor Red
@@ -398,6 +408,10 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 Start-Process -FilePath $Exe | Out-Null
 $n = Wait-Windows 'a0' 1 30
 Assert "A1 startup window opened" ($n -eq 1)
+# T441's safety oracle: the instance answering is the exe under test, and the
+# caller's own pane is nowhere in its tree. Everything after this point types
+# into panes and closes them, so prove whose panes they are first.
+Assert-GhozttyIsolated -Exe $Exe
 $startupTree = Get-Tree 'a1'
 $startupLeaves = @()
 foreach ($w in @(Tree-Windows $startupTree)) { $startupLeaves += @(Window-Leaf-Names $w) }
