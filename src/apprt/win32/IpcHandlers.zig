@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 
 const App = @import("App.zig");
+const agent_recovery = @import("agent_recovery.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
@@ -959,6 +960,19 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         try surfaces.put(arena, name, pane);
     }
 
+    // T128: the session ids the NEW layout still references. Collected here,
+    // where allocating is still free to fail, and consumed below in the
+    // infallible stretch around the swap. Read-only — nothing is marked yet.
+    var surviving_ids: std.ArrayList([]const u8) = .empty;
+    {
+        var kept = surfaces.valueIterator();
+        while (kept.next()) |pane_ptr| {
+            const s = pane_ptr.*.surface() orelse continue;
+            if (!s.core_surface_ready) continue;
+            if (s.core_surface.remoteSessionId()) |sid| try surviving_ids.append(arena, sid);
+        }
+    }
+
     // Build the replacement tree in its own arena (SplitTree owns it).
     const gpa = ctx.alloc;
     var tree_arena = std.heap.ArenaAllocator.init(gpa);
@@ -977,6 +991,37 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     var kept_it = surfaces.valueIterator();
     while (kept_it.next()) |pane_ptr| {
         _ = pane_ptr.*.ref(gpa) catch {};
+    }
+
+    // T128: a pane the new layout OMITS is destroyed by the swap below — a
+    // close written as a layout — so its agent session must END rather than
+    // detach, exactly as `+close` on that pane would. Without this the child
+    // kept running under the agent forever, pinned and unreachable, with no
+    // pane anywhere that could reach it.
+    //
+    // Marked per leaf through `agent_recovery.closesDepartingLeaf`, so the
+    // `e65cfa4d5` invariant holds: a session the new tree still references is
+    // never ended. Nothing here can fail, and it runs after the response has
+    // been allocated, so no error path can leave a still-in-tree pane wearing a
+    // close intent it never earned.
+    {
+        var it = tree.iterator();
+        while (it.next()) |view_entry| {
+            const view = view_entry.view;
+            const in_new_tree = in_new_tree: {
+                var kept = surfaces.valueIterator();
+                while (kept.next()) |pane_ptr| {
+                    if (pane_ptr.* == view) break :in_new_tree true;
+                }
+                break :in_new_tree false;
+            };
+            const sid: ?[]const u8 = if (view.surface()) |s|
+                (if (s.core_surface_ready) s.core_surface.remoteSessionId() else null)
+            else
+                null;
+            if (agent_recovery.closesDepartingLeaf(in_new_tree, sid, surviving_ids.items))
+                view.setSessionCloseIntent(true);
+        }
     }
 
     // Swap trees. Old-tree deinit unrefs every old view: panes not in the

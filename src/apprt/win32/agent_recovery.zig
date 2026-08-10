@@ -130,6 +130,35 @@ pub fn sessionSpared(session_id: ?[]const u8, surviving_ids: []const []const u8)
     return false;
 }
 
+/// Whether a departing leaf's agent session must be ENDED (marked close-intent)
+/// when a tree swap is a partial CLOSE rather than a rebuild — `+rearrange`
+/// (T128).
+///
+/// `sessionSpared` above answers the recovery half of the question: which
+/// departing leaves must NOT be ended. This answers the other half, for the one
+/// caller whose swap genuinely destroys panes. A `+rearrange` layout that omits
+/// a pane is a close of that pane written as a layout, so its session must end
+/// the way `+close` ends one; a pane the new layout still names is only being
+/// moved, and ending its session would kill the child of a pane the user is
+/// looking at. That is why the answer runs through `sessionSpared` rather than
+/// stopping at "did this leaf leave the tree" — the id check is the invariant,
+/// and it is what makes this safe for any future partially-destructive swap.
+///
+/// `in_new_tree` is the caller's own membership answer (pointer identity for
+/// `+rearrange`); `surviving_ids` are the session ids the new tree references.
+///
+/// A leaf with no session id (a plain exec pane, a viewer) reads as "end it",
+/// which is correct and inert: `setSessionCloseIntent` is a no-op for both, and
+/// an exec child dies with its surface regardless.
+pub fn closesDepartingLeaf(
+    in_new_tree: bool,
+    session_id: ?[]const u8,
+    surviving_ids: []const []const u8,
+) bool {
+    if (in_new_tree) return false;
+    return !sessionSpared(session_id, surviving_ids);
+}
+
 /// One node of a tab, reduced to the only thing recovery needs to know about
 /// it. Both the live `SplitTree` and the captured manifest tab project down to
 /// this, which is what lets the correspondence rule below be pure.
@@ -261,6 +290,24 @@ test "sessionSpared: a session the new tree still uses is never close-intented" 
     try testing.expect(!sessionSpared(null, &surviving));
     // An empty surviving set cannot spare anything.
     try testing.expect(!sessionSpared("0123456789abcdef0123456789abcdef", &.{}));
+}
+
+test "closesDepartingLeaf: a dropped pane's session ends, a kept one's never does" {
+    const surviving = [_][]const u8{
+        "0123456789abcdef0123456789abcdef",
+        "fedcba9876543210fedcba9876543210",
+    };
+    // The T128 defect: a leaf the new layout omits, whose session nothing else
+    // references, must be ENDED — it detached and lingered forever before.
+    try testing.expect(closesDepartingLeaf(false, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &surviving));
+    // A leaf the new tree still holds is not departing at all.
+    try testing.expect(!closesDepartingLeaf(true, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &surviving));
+    // And the invariant: even a leaf that LEFT is spared when the new tree
+    // still references its session (a rebuild-style swap, `e65cfa4d5`).
+    try testing.expect(!closesDepartingLeaf(false, "fedcba9876543210fedcba9876543210", &surviving));
+    // An id-less leaf (exec pane / viewer) reads as "end it" and is inert.
+    try testing.expect(closesDepartingLeaf(false, null, &surviving));
+    try testing.expect(!closesDepartingLeaf(true, null, &surviving));
 }
 
 test "rebuildsLeaf: only terminals ride the connection that dropped" {

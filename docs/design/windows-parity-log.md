@@ -13519,3 +13519,38 @@ counting corpses. T682: the same sweep shows `reset_window_size` and
 focused viewer, for the identical reason. The `else` arm in
 `performViewerBindingAction` logs a drift warning nobody reads, which is how a
 gap like this stays quiet.
+
+## 2026-08-09 — A pane dropped from a rearranged layout no longer keeps running where nobody can reach it (T128)
+
+`+rearrange` replaces a window's whole split layout with one handed to it, and a
+layout that omits a pane destroys that pane. It did not, until today, end that
+pane's agent session. The surface tore down with its default DETACH intent — the
+keep-alive one, meant for app quit — so the shell went on running under
+`ghoztty-agent`, pinned against the idle-TTL reaper the way every local
+persistent session is, with no pane anywhere that could reach it. One leaked
+process per dropped pane, for the life of the agent.
+
+T128 was filed as an investigation rather than a bug, and the measurement came
+first: `test\win32\rearrange-session-drop.ps1` stands up two agent-backed panes,
+`+rearrange`s to a layout naming only one, and reads `+sessions --json` back.
+Pre-fix, both sessions were still alive and the dropped one was referenced by
+nothing. The same script's section B measured the other direction and found it
+already correct — a rearrange that KEEPS every pane ended nothing — which is
+what made it safe to mark only the departing leaves.
+
+The fix is one loop in `handleRearrange` over the old tree's leaves, and it asks
+`agent_recovery.closesDepartingLeaf` rather than "did this leaf leave". That
+routes the answer through `sessionSpared`, so main's `e65cfa4d5` invariant holds
+by construction: a session the NEW tree still references is never marked
+close-on-free. It is the same invariant that keeps recovery-style swaps
+(`replaceTabRoot`, `replaceTabLeaf`, the reconnect swap) safe, stated once and
+now honored by the one caller whose swap genuinely destroys panes. The loop is
+infallible and runs after the response has been allocated, so no error path can
+leave a still-in-tree pane wearing a close intent it never earned.
+
+A sweep of every other `old_tree.deinit()` on win32 found no second offender:
+split, swap, resize and equalize all keep every pane, and the two close paths
+(`closeSplitPane`, `closeTabByIndex`) have marked intent since T89e. Filed
+alongside: T683, the same measurement on the Mac seat, where `e65cfa4d5`
+deliberately removed the departure inference and may have left the mirror-image
+hole this one had.

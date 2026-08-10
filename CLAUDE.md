@@ -103,6 +103,27 @@ GUI. Only an app quit keeps sessions alive for re-attach.
 ghoztty +close --target=<name>
 ```
 
+### `ghoztty +rearrange`
+
+Replace a window's active tab's whole split layout with one given as JSON —
+every leaf names an already-existing pane, so this MOVES panes rather than
+creating them.
+
+```
+ghoztty +rearrange --target=<name> --layout='{"direction":"horizontal","ratio":30,"left":{"pane":"a"},"right":{"pane":"b"}}'
+```
+
+**A pane the new layout omits is CLOSED, session and all** (T128, win32; the
+Mac half is T683). Dropping a pane out of the layout destroys it, so it ends
+its agent session exactly as `+close` on that pane would — it used to DETACH
+instead, leaving the child running under the agent forever, pinned against the
+idle reaper with no pane anywhere that could reach it. A pane the new layout
+still names is only being moved and is never touched: the marking runs through
+`agent_recovery.closesDepartingLeaf` → `sessionSpared`, so a session the new
+tree still references is never ended (main's `e65cfa4d5` invariant, which is
+what keeps recovery-style tree swaps safe). Acceptance:
+`test/win32/rearrange-session-drop.ps1`.
+
 ### `ghoztty +read`
 
 Read the last N lines of terminal output from a named pane and print to stdout.
