@@ -2164,11 +2164,16 @@ fn heroStartAnims(self: *Window, old_index: usize, new_index: usize, old_top0: ?
     const out_view = self.leafAt(tab, old_index) orelse return false;
     const in_view = self.leafAt(tab, new_index) orelse return false;
     // The slide owner-paints both SNAPSHOTS; without both DIBs (e.g.
-    // immediately after entering hero mode) swap instantly instead. A
-    // viewer pane has no renderer and therefore never has one.
-    const out_surface = out_view.surface() orelse return false;
-    const in_surface = in_view.surface() orelse return false;
-    if (out_surface.snap_dib == null or in_surface.snap_dib == null) return false;
+    // immediately after entering hero mode) swap instantly instead.
+    //
+    // Asked KIND-GENERICALLY, through the same accessor `paintSlideSnap`
+    // resolves its frames with (T126). This used to narrow through
+    // `surface()`, which is the T397 defect one level up: a viewer produces a
+    // thumbnail of its own now (`ICoreWebView2::CapturePreview`) and paints a
+    // real carousel tile, but every selection change touching one still fell
+    // out here and swapped instantly — so navigating past a viewer animated
+    // on some steps of the same strip and not others.
+    if (out_view.heroSnapshot() == null or in_view.heroSnapshot() == null) return false;
     const start = std.time.Instant.now() catch return false;
 
     self.hero_slide = .{ .from_index = old_index, .to_index = new_index, .start = start };
@@ -3624,6 +3629,10 @@ pub fn performViewerBindingAction(
         }),
         .equalize_splits => self.equalizeSplits(),
         .toggle_split_zoom => self.toggleSplitZoom(),
+        // Hero mode is window-scoped and needs no terminal underneath: a
+        // viewer already gets a carousel tile (T397) and already answers the
+        // hero nav chords, so the toggle belongs here too (T126).
+        .toggle_hero_mode => self.toggleHeroMode(),
 
         .toggle_fullscreen => self.toggleFullscreen(),
         .toggle_maximize => {

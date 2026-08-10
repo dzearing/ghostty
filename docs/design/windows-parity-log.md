@@ -13475,3 +13475,47 @@ ship bits that are not HEAD, and to the once-a-day `scripts\morning-refresh.ps1`
 this morning and put that commit on the user's PATH. The installed exe sits 18
 commits behind HEAD tonight, which is the once-a-day cadence working as designed,
 not drift.
+
+## 2026-08-09 — Hero mode had a one-way door, and the audit that found it left evidence behind (T126)
+
+T126 was filed as an audit with no observed defect: main patched hero-mode key
+navigation on the Mac three times (`280f2449e`, `4eb13a651`) and win32 has its
+own implementation, so the question was whether any of those defects exist here.
+Two of the three cannot: win32 reads the split tree at the instant the key lands
+rather than from a captured copy, and a bound action rides its surface to
+`parent_window` rather than through an app-wide monitor, so there is no stale
+snapshot to navigate and no way to step a window nobody aimed at. The third —
+one press stepping twice from a web pane — is prevented by
+`setHandled(true)` before the single posted message.
+
+Construction is an argument, not evidence, so `test\win32\hero-nav.ps1` now
+measures all three. Its sharpest oracle is the debug log's
+`heroSelect req= clamped= cur= n=`: `n` is the LIVE leaf count at the keystroke,
+so a split made while hero mode is on reads `n=5` on the very next press and a
+close reads `n=4`, which is exactly what a stale snapshot could not do. Arm A
+walks the strip top to bottom and requires one log line per press; arm D puts
+two windows in hero mode and requires each press to move one of them.
+
+The audit did turn up a real defect, and it is the kind that only exists because
+something else was fixed properly. T397 made a viewer pane a full carousel
+citizen — its own thumbnail, its own tile, selectable and navigable — but
+`viewer_accel.forwards()` never admitted `toggle_hero_mode`. So ctrl+shift+space
+went to the page: you could step onto a viewer tile and had no keyboard way back
+out of hero mode short of stepping onto a terminal first. Teeth-checked by
+removing the entry again and rebuilding, where the arm fails with `visible 1 of
+3 leaves`. Alongside it, `heroStartAnims` still gated the selection slide on
+`surface().snap_dib` — the same narrowing T397 removed from the tile painter,
+one level up — so every selection change touching a viewer silently degraded to
+an instant swap while its neighbours animated. It now asks `heroSnapshot()`, the
+accessor the slide painter itself resolves frames with.
+
+Two things filed rather than folded in. T681: a closed split pane's child window
+is never destroyed — `Surface.deinit` declines deliberately, because OPENGL32
+hooks window destruction and segfaults after WGL teardown — so the HWND survives
+hidden for the app's life, measured 10s after `+close`. That is why this script
+counts leaves from `+list --json`; a test that counted child windows would be
+counting corpses. T682: the same sweep shows `reset_window_size` and
+`toggle_tab_overview` are implemented on win32 and still unreachable from a
+focused viewer, for the identical reason. The `else` arm in
+`performViewerBindingAction` logs a drift warning nobody reads, which is how a
+gap like this stays quiet.

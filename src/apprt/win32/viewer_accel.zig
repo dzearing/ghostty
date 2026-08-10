@@ -217,6 +217,17 @@ pub fn forwards(action: input.Binding.Action) bool {
         .resize_split,
         .equalize_splits,
         .toggle_split_zoom,
+        // A viewer is a full citizen of the hero carousel (T397 gave it a
+        // tile), so the chord that enters and leaves hero mode has to work
+        // while one holds focus. Without this, a selected viewer swallowed
+        // ctrl+shift+space into the page and the user could not leave hero
+        // mode without first navigating to a terminal tile (T126).
+        // A viewer is a full citizen of the hero carousel (T397 gave it a
+        // tile), so the chord that enters and leaves hero mode has to work
+        // while one holds focus. Without this, a selected viewer swallowed
+        // ctrl+shift+space into the page and the user could not leave hero
+        // mode without first navigating to a terminal tile (T126).
+        .toggle_hero_mode,
         .toggle_fullscreen,
         .toggle_maximize,
         .toggle_window_decorations,
@@ -518,6 +529,12 @@ test "forwards: window/app commands yes, terminal-content commands no" {
     try testing.expect(forwards(.{ .new_split = .right }));
     try testing.expect(forwards(.{ .goto_split = .right }));
     try testing.expect(forwards(.quit));
+
+    // Hero mode: the nav chords were already forwarded, so a viewer that
+    // could be navigated INTO but not out of was the one-way door T126
+    // found. All three of hero's chords answer from a focused viewer.
+    try testing.expect(forwards(.toggle_hero_mode));
+    try testing.expect(forwards(.{ .swap_split = .down }));
 
     // Content-scoped actions stay with the page.
     try testing.expect(!forwards(.{ .copy_to_clipboard = .mixed }));
