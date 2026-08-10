@@ -30,6 +30,13 @@
 #   D  `+split --command=`
 #   E  `+new-window --split=right --split-command=` (the inline split)
 #   F  `--shell=pwsh.exe` / `nu.exe` when installed on this box, else SKIP
+#   I  `--shell=wsl.exe` (T656). This row was the odd one out: `wsl -- <cmd>`
+#      hands the rest of the WINDOWS command line to the distro's shell as
+#      written, so the quoting Windows applies to a spaced argument survived
+#      into the distro and bash answered `command not found` naming the whole
+#      line. It is now `wsl -e /bin/sh -lic "<cmd>; exec \"$SHELL\" -li"`, so
+#      the arm asserts the marker, the ABSENCE of `command not found`, and a
+#      live prompt afterwards like every other flavor.
 # Controls, which must hold in BOTH builds:
 #   G  the `--command=` pane really is agent-backed (`session_id` in
 #      `+list --json`). Without this the whole file goes vacuous the day
@@ -38,12 +45,6 @@
 #   H  `-e` is NOT keep-alived. `-e` means "exec exactly this"; widening the
 #      wrap to it would be a different defect, so the tombstone line is the
 #      CORRECT outcome there.
-#
-# NOT covered, deliberately: `--shell=wsl.exe`. Its row of the table is broken
-# in its own right and identically on both paths (the command reaches the
-# distro as one quoted word: `/bin/bash: line 1: echo X: command not found`),
-# which is a separate defect from "the table is not applied" - filed as its own
-# task rather than fixed under cover of this one.
 #
 # Runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1) so it
 # never takes the user's foreground.
@@ -113,14 +114,14 @@ function Wait-Read($name, $Pattern, $TimeoutSec = 25) {
 # The whole assertion for one flavor, in the order that makes a broken build
 # fail on the RIGHT line: the command ran, the pane did not die, and it still
 # accepts input.
-function Test-KeepAlive($Label, $Pane, $Marker) {
-    $tail = Wait-Read $Pane ([regex]::Escape($Marker))
+function Test-KeepAlive($Label, $Pane, $Marker, $TimeoutSec = 25) {
+    $tail = Wait-Read $Pane ([regex]::Escape($Marker)) $TimeoutSec
     Assert "$Label the command ran" ($tail -match [regex]::Escape($Marker))
     Assert "$Label the pane did not exit (no 'Process exited' tombstone)" (
         $tail -notmatch 'Process exited')
     $probe = "ALIVE$($Marker)"
     Invoke-Ghoztty "+send-keys --target=$Pane `"echo $probe`" Enter" "$tmp\keys.txt" | Out-Null
-    $after = Wait-Read $Pane "$probe\s*[\r\n]"
+    $after = Wait-Read $Pane "$probe\s*[\r\n]" $TimeoutSec
     # The echoed command line matches too, so require the OUTPUT: the marker on
     # a line of its own, i.e. at least twice in the tail.
     $hits = ([regex]::Matches($after, [regex]::Escape($probe))).Count
@@ -218,6 +219,35 @@ try {
         $leaves = @(Get-WindowLeaves $flavor.Target)
         AssertAlways "F $($flavor.Exe) +list reports the pane" ($leaves.Count -eq 1)
         if ($leaves.Count -eq 1) { Test-KeepAlive "F $($flavor.Exe)" $leaves[0].id $flavor.Marker }
+    }
+
+    # ------------------------------------------------------------------
+    "== I: --shell=wsl.exe (T656 - the argv row, not a command-string row)"
+    # ------------------------------------------------------------------
+    # Gate on a distro that actually RUNS, not on wsl.exe existing: the exe
+    # ships with Windows and answers even with nothing installed, so keying on
+    # the binary would turn a real regression into a green run.
+    $wslOk = $false
+    if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+        cmd /c "wsl.exe -e /bin/true > `"$tmp\wsl-probe.txt`" 2>&1" | Out-Null
+        $wslOk = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $wslOk) {
+        Skip 'I wsl.exe' 'no WSL distro on this box that can run /bin/true'
+    } else {
+        Invoke-Ghoztty "+new-window --target=kawsl --shell=wsl.exe `"--command=echo KAMARKERWSL`"" "$tmp\new-wsl.txt" | Out-Null
+        $leaves = @(Get-WindowLeaves 'kawsl')
+        AssertAlways "I +list reports the pane" ($leaves.Count -eq 1)
+        if ($leaves.Count -eq 1) {
+            # A cold distro takes seconds to boot before the marker can appear.
+            Test-KeepAlive 'I wsl' $leaves[0].id 'KAMARKERWSL' 60
+            # The defect's exact signature, asserted apart from the marker: a
+            # broken build printed `command not found` naming the whole command
+            # line, which no amount of "the pane is alive" would catch.
+            $tail = Invoke-Ghoztty "+read --name=$($leaves[0].id) --lines=40" "$tmp\read-wsl.txt"
+            Assert "I the command was not swallowed as one quoted word" (
+                $tail.Text -notmatch 'command not found')
+        }
     }
 
     # ------------------------------------------------------------------

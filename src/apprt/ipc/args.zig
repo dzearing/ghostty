@@ -337,6 +337,11 @@ pub fn parseSetBannerArgs(
     return result;
 }
 
+/// The interpreter the wsl row runs the command through inside the distro, and
+/// the fallback it execs back into when `$SHELL` is unset. Absolute and POSIX:
+/// a distro without `/bin/sh` cannot run anything.
+pub const wsl_inner_shell = "/bin/sh";
+
 /// The Windows shell-flavor table (spec, "Architecture decisions"): build
 /// the argv that runs `command` inside `shell`. The config Command
 /// `.direct` argv form is required on Windows — the `.shell` path
@@ -347,11 +352,25 @@ pub fn parseSetBannerArgs(
 ///
 ///   pwsh / powershell  -> shell -NoExit -Command <cmd>
 ///   cmd                -> shell /K <cmd>
-///   wsl                -> shell -- <cmd>   (runs in the default distro;
-///                         exits with the command — no login shell there)
+///   wsl                -> shell -e /bin/sh -lic "<cmd>; exec \"$SHELL\" -li"
+///                         (runs in the default distro — see below)
 ///   nu / nushell       -> shell -e <cmd>
 ///   anything else      -> shell -lic "<cmd>; exec \"shell\" -li"
 ///                         (posix shells, e.g. git-bash)
+///
+/// The wsl row is the one that takes an ARGV rather than a command string, and
+/// that is why it needs `-e` and an inner shell (T656). `wsl -- <cmd>` hands
+/// the rest of the Windows command line to the distro's default shell **as
+/// written**, so the quoting Windows applies to a spaced argument survives into
+/// the distro and bash looks for a program literally named `"echo hi"` —
+/// `command not found`, naming the whole line. `-e` execs an argv instead, so
+/// the command reaches `/bin/sh -lic` as one properly-unquoted argument.
+///
+/// `/bin/sh` because it is the one interpreter every distro is guaranteed to
+/// have (it is dash on Ubuntu, and dash accepts `-lic`); `exec "$SHELL" -li`
+/// because the pane must be left in the user's REAL login shell, exactly as the
+/// posix row leaves it. `$SHELL` is set by WSL from the distro's passwd entry,
+/// and falls back to `/bin/sh` if it somehow is not.
 pub fn wrapShellCommandArgv(
     arena: Allocator,
     shell: []const u8,
@@ -372,8 +391,15 @@ pub fn wrapShellCommandArgv(
         try argv.append(arena, "/K");
         try argv.append(arena, try arena.dupeZ(u8, command));
     } else if (std.ascii.eqlIgnoreCase(base, "wsl")) {
-        try argv.append(arena, "--");
-        try argv.append(arena, try arena.dupeZ(u8, command));
+        try argv.append(arena, "-e");
+        try argv.append(arena, wsl_inner_shell);
+        try argv.append(arena, "-lic");
+        try argv.append(arena, try std.fmt.allocPrintSentinel(
+            arena,
+            "{s}; exec \"${{SHELL:-{s}}}\" -li",
+            .{ command, wsl_inner_shell },
+            0,
+        ));
     } else if (std.ascii.eqlIgnoreCase(base, "nu") or
         std.ascii.eqlIgnoreCase(base, "nushell"))
     {
@@ -864,7 +890,10 @@ test "wrapShellCommandArgv: every flavor branch" {
         .{ .shell = "PowerShell.exe", .expect = &.{ "PowerShell.exe", "-NoExit", "-Command", "echo hi" } },
         .{ .shell = "cmd.exe", .expect = &.{ "cmd.exe", "/K", "echo hi" } },
         .{ .shell = "CMD", .expect = &.{ "CMD", "/K", "echo hi" } },
-        .{ .shell = "wsl.exe", .expect = &.{ "wsl.exe", "--", "echo hi" } },
+        // T656: an argv, not a command string — `wsl -- <cmd>` lets Windows'
+        // own quoting reach the distro's shell as part of the command.
+        .{ .shell = "wsl.exe", .expect = &.{ "wsl.exe", "-e", "/bin/sh", "-lic", "echo hi; exec \"${SHELL:-/bin/sh}\" -li" } },
+        .{ .shell = "WSL", .expect = &.{ "WSL", "-e", "/bin/sh", "-lic", "echo hi; exec \"${SHELL:-/bin/sh}\" -li" } },
         .{ .shell = "nu", .expect = &.{ "nu", "-e", "echo hi" } },
         .{ .shell = "nushell.exe", .expect = &.{ "nushell.exe", "-e", "echo hi" } },
         .{ .shell = "C:\\Program Files\\Git\\bin\\bash.exe", .expect = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "-lic", "echo hi; exec \"C:\\Program Files\\Git\\bin\\bash.exe\" -li" } },

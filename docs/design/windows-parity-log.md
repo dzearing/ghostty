@@ -14230,3 +14230,44 @@ SAME message in 274 ms — which is the design claim, not a weaker lookalike.
 Teeth-checked twice: disabling `acceptsReply`'s new arm reddens three unit
 tests, and disabling `recordAttachFailure` reddens arms A and B with the exact
 pre-fix text. Floor lanes and P1–P3 green.
+
+## 2026-08-10 — a WSL pane now runs the command you asked for, and stays at a prompt after it (T656)
+
+`--shell=wsl.exe --command="echo hi"` printed `/bin/bash: line 1: echo hi:
+command not found` and then died. Every other shell in the documented `--shell`
+table ran its command and left a live prompt, so a user who picks WSL was the
+one user who got an error where everybody else got their output.
+
+The cause is that wsl is the only row of that table which takes an **argv**
+rather than a command string. `cmd /K <str>`, `pwsh -NoExit -Command <str>` and
+`sh -lic <str>` each hand their shell exactly one string; `wsl -- <cmd>` instead
+passes the rest of the *Windows* command line to the distro's default shell **as
+written**. So the quoting Windows applies to any argument containing a space
+survived the crossing, and bash dutifully looked for a program named `"echo hi"`
+— the whole line, quotes and all, which is why the error read the way it did.
+Nothing about it was specific to the agent-backed path; both paths spawn the
+same argv through the same Windows quoting, which is why T468 measured it and
+left it alone rather than widening its fix.
+
+The row is now `wsl -e /bin/sh -lic "<cmd>; exec \"${SHELL:-/bin/sh}\" -li"`.
+`-e` execs an argv, so the command reaches the inner shell as one properly
+unquoted argument. `/bin/sh` is the interpreter every distro is guaranteed to
+have (dash on this box's Ubuntu, and dash accepts `-lic`), and `exec "$SHELL"
+-li` leaves the pane in the user's real login shell exactly as the posix row
+does — `$SHELL` comes from the distro's passwd entry, with a fallback for a
+distro that does not set it. That settles the doc conflict the task named, in
+CLAUDE.md's favor: the wsl row keeps the shell alive like every other row, and
+`wrapShellCommandArgv`'s comment now says the same thing. The remaining fork —
+whether the command itself should run under `$SHELL` rather than `/bin/sh`,
+which would cost a second layer of quoting around the user's own text — is filed
+as **D58**.
+
+Evidence: `test/win32/ipc-command-keepalive.ps1` ALL PASS with a new arm I, and
+the arm is built around the trap this defect sets. "The command ran" is not a
+sufficient assertion here, because the broken build printed the marker *inside*
+its error line — that half of the arm passes on a pre-fix binary. So arm I also
+asserts the ABSENCE of `command not found`, and then drives the pane with
+`+send-keys` like every other flavor. Teeth-checked by rebuilding the old wrap:
+arm I reports 2 FAIL (the send-keys probe and the `command not found` check) and
+nothing else in the file moves. Two `wrapShellCommandArgv` cases cover the row
+in the none lane. Floor lanes and P1–P3 green.
