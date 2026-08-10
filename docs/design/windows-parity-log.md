@@ -13394,3 +13394,40 @@ ramp, whose premise ("indistinguishable over a short tab") held while the card's
 ramp also started at `RIM_TOP`. It no longer does — that stop sits at the
 ellipse's center, above the card, so the card's brightest rim pixel is about 35%
 dimmer than a tab's top edge. **T679.**
+
+## 2026-08-09 — A session clearing itself was proof of T36 all along, and nobody had said so (T36)
+
+Nothing about the installed-release flow changed this turn. T36 asked for one
+last thing — watch the skill-driven `/reset-context` clear a session running
+inside the installed release, the workflow the whole task existed to unblock —
+and that item had sat unverified since 2026-07-15 while the loop performed it
+at every single task boundary in between. The task was carrying an unverified
+claim about machinery that was, by then, load-bearing.
+
+So the verification is a reading of what the box already does. `ghoztty` on PATH
+resolves to `%LOCALAPPDATA%\Programs\Ghoztty\ghoztty.com`; the only
+`ghoztty.exe` running is that install; this pane's baked `$GHOZTTY_IPC_SOCKET`
+is `\\.\pipe\ghoztty-David`, with no `-debug` suffix, so the instance answering
+is the release and not a dev build sitting on the same box. `+list` from a plain
+shell exits 0 with the live window tree. `+list --pid=$PID` from inside the pane
+answers `F08888B0-…`, the same value the pane's own `$GHOZTTY_PANE_ID` carries.
+And `%TEMP%\reset-context-last.log` holds the last leg end to end at
+21:02:33→21:02:52 — cleared the input line, typed `/clear`, verified it landed,
+handed off the continuation file, verified the pane was repainting — where the
+session writing this entry is the one that came up on that continuation. The
+proof and the thing proved are the same event.
+
+Worth naming as a process point rather than a task: an item can stay open for
+25 days while being exercised hourly, because "the loop is running" and "the
+loop's own precondition is recorded as verified" are two different facts and
+only one of them writes itself down. The task file now carries the log excerpt
+and the pane ids, so the next reader does not have to take it on trust.
+
+Two things the task description had also outgrown. Its refresh half still
+described re-running a hand-run copy + PATH script; delivery has since moved to
+`scripts\launch-upgrade.ps1`, which builds the staging release and refuses to
+ship bits that are not HEAD, and to the once-a-day `scripts\morning-refresh.ps1`
+(T525) — both their own tasks, and the watermark shows the latter fired at 10:56
+this morning and put that commit on the user's PATH. The installed exe sits 18
+commits behind HEAD tonight, which is the once-a-day cadence working as designed,
+not drift.
