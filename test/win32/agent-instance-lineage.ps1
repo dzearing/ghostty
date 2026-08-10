@@ -111,6 +111,9 @@ function Run-Cli($argv, $out, $instance, $lad, $timeoutSec = 20) {
     if ($null -eq $instance) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
     else { $env:GHOZTTY_AGENT_INSTANCE = $instance }
     if ($null -ne $lad) { $env:LOCALAPPDATA = $lad }
+    # persistence: a CLI invocation - it opens no window, so there is nothing to
+    # restore. (Repeated here rather than only on the function's own header: the
+    # sweep looks six lines above the launch statement, and the header is seven.)
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     $null = $p.Handle

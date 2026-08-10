@@ -274,6 +274,186 @@ Assert 'D8 the reuse path submits through Get-LoopSubmitArgs' `
 Assert 'D9 PRE-FIX ORACLE: the bare `Enter` submit is gone' `
     (-not ($src -match '\+send-keys "--target=\$LoopPaneId" Enter'))
 
+# ============================================================================
+"== E: the gate reads through a binary PowerShell can actually capture (T663)"
+# ============================================================================
+# Every gate above is only as good as the tail it reads, and for its whole life
+# it read NOTHING. `ghoztty.exe` is GUI-subsystem; PowerShell decides from that
+# field whether to wait for a native command and whether its stdout is
+# capturable at all, so `(& $exe +read ... 2>$null) | Out-String` yields zero
+# bytes and an EMPTY $LASTEXITCODE. Measured 2026-08-10 against a live pane: 0
+# characters through ghoztty.exe, 2856 through ghoztty.com, same pane, same
+# second. That is why every delivery since the gate shipped logged either
+# "not seen in the pane tail" or RESUME-REUSE FAIL, whatever the prompt said -
+# and why the '>'-stripping this task was filed against was never the cause
+# (Get-LoopPromptNeedle strips '>' from BOTH sides before comparing, section E5).
+
+$eRoot = Join-Path $env:TEMP "ghoztty-t663-$PID"
+New-Item -ItemType Directory -Force -Path $eRoot | Out-Null
+$eExe = Join-Path $eRoot 'ghoztty.exe'
+$eCom = Join-Path $eRoot 'ghoztty.com'
+Set-Content $eExe 'x' -Encoding ascii
+
+AssertEq 'E1 with no console twin on disk, the .exe is returned unchanged' `
+    $eExe (Resolve-GhozttyCliExe $eExe)
+Set-Content $eCom 'x' -Encoding ascii
+AssertEq 'E2 with the twin present, the twin is what a reader runs' `
+    $eCom (Resolve-GhozttyCliExe $eExe)
+AssertEq 'E3 a path that is already the twin is left alone' `
+    $eCom (Resolve-GhozttyCliExe $eCom)
+AssertEq 'E4 a bare command name is left alone (PATHEXT resolves .COM first)' `
+    'ghoztty' (Resolve-GhozttyCliExe 'ghoztty')
+AssertEq 'E5 an empty exe is not turned into ".com"' '' (Resolve-GhozttyCliExe '')
+Remove-Item $eRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# The needle has stripped '>' and '|' from both sides since it was written, so
+# a prompt full of them compares equal to a tail full of them. Pinned here
+# because this task was FILED as "the '>' characters are stripped somewhere",
+# and a later reader deserves to see that hypothesis refuted rather than
+# repeated.
+$gt = '/reset-context Verify: run `ghoztty +version` > out.txt | Select-String abc. Then read go.md and go'
+Assert 'E6 a prompt full of > and | still matches a tail that wrapped it' `
+    (Test-LoopPromptArrived -Tail ("| $gt |" -replace '>', '') -Text $gt)
+
+# Wiring: the gates must read through the resolved CLI, not through $oldExe.
+Assert 'E7 the readiness gate reads through the resolved CLI' `
+    ($src -match 'Wait-LoopPaneReady -ReadTail \{ \(& \$cliExe \+read')
+Assert 'E8 the arrival gate reads through the resolved CLI' `
+    ($src -match '-ReadTail \{ \(& \$cliExe \+read')
+Assert 'E9 the submitted gate reads through the resolved CLI' `
+    ($src -match '-Read \{ \(& \$cliExe \+read')
+# Comments are stripped first: this file's own history narrates the old
+# invocation in prose, and an oracle that trips on prose is not an oracle.
+$srcCode = (($src -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+Assert 'E10 PRE-FIX ORACLE: no reader is left on the GUI-subsystem exe' `
+    (-not ($srcCode -match '& \$oldExe \+(read|sessions|list)'))
+Assert 'E11 the CLI is re-resolved after the swap, when the twin may be new' `
+    ($src -match '(?s)ghoztty\.com swapped.*\$cliExe = Resolve-GhozttyCliExe \$oldExe')
+Assert 'E12 the watchdog pane probe reads through the resolved CLI too' `
+    ((Get-Content (Join-Path $Repo 'scripts\go-loop-pane-probe.ps1') -Raw) -match 'Resolve-GhozttyCliExe')
+
+# ============================================================================
+"== F: LIVE - the round trip a delivery depends on"
+# ============================================================================
+# Sections A-E are the rules; this is the measurement, because the whole defect
+# was that a rule about reading a pane was never checked against a pane. A
+# prompt carrying the characters this task was filed about is typed into a real
+# pane and read back through both binaries: the resolved one must see it, and
+# the raw .exe must see nothing at all. If that second assertion ever starts
+# passing through the .exe, this fix has become unnecessary - which is worth
+# knowing loudly rather than silently.
+if ($PureOnly) {
+    "  SKIP F (-PureOnly)"
+} else {
+    . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+    $fExe = Join-Path $Repo 'zig-out\bin\ghoztty.exe'
+    $fCom = Join-Path $Repo 'zig-out\bin\ghoztty.com'
+    if (-not (Test-Path $fExe)) {
+        "  FAIL F0 no debug build at $fExe - build it first"
+        $script:failures++
+    } else {
+        Assert 'F0 the build ships the console twin as a sibling' (Test-Path $fCom)
+        Reset-GhozttyTestState -Exe $fExe -SettleMs 1000 | Out-Null
+
+        # persistence: stated false - this section builds its own pane and must
+        # not have the debug manifest's panes restored on top of it.
+        $fApp = Start-Process -FilePath $fExe -ArgumentList '--session-persistence=false' -PassThru
+        Start-Sleep -Seconds 3
+        $fPane = 't663pane'
+        & $fExe +new-window "--target=$fPane" 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+
+        $fCli = Resolve-GhozttyCliExe $fExe
+        AssertEq 'F1 the resolver picks the twin for the build under test' $fCom $fCli
+
+        # The exact prompt shape a delivery sends, plus the characters this task
+        # was filed against.
+        $fPrompt = '/reset-context T663 check > and | survive. Then read go.md and go'
+        $fKeys = New-LoopSendKeysText -Exe $fCli -Text $fPrompt -Tag 't663'
+        $fVerified = Send-LoopPromptVerified -Text $fPrompt `
+            -SendText {
+                & $fCli +send-keys "--target=$fPane" @($fKeys.Args) 2>&1 | Out-Null
+                return ($LASTEXITCODE -eq 0)
+            } `
+            -ReadTail { (& $fCli +read "--name=$fPane" --lines=40 2>$null) | Out-String } `
+            -Clear { & $fCli +send-keys "--target=$fPane" C-u 2>&1 | Out-Null } `
+            -Attempts 2 -ReadsPerAttempt 6 -PollMs 700
+        if ($fKeys.File) { Remove-Item $fKeys.File -Force -ErrorAction SilentlyContinue }
+
+        Assert 'F2 the prompt round-trips through send + read, gate satisfied' $fVerified.Arrived
+        Assert 'F3 and the tail really carries the > and | characters' `
+            ($fVerified.Tail -match '>' -and $fVerified.Tail -match '\|')
+
+        $fVia = (& $fCli +read "--name=$fPane" --lines=40 2>$null) | Out-String
+        Assert 'F4 and the twin captures the same pane fine' ($fVia.Length -gt 0)
+
+        & $fCli +close "--target=$fPane" 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 500
+        if ($fApp -and -not $fApp.HasExited) { Stop-Process -Id $fApp.Id -Force -ErrorAction SilentlyContinue }
+        Reset-GhozttyTestState -Exe $fExe -SettleMs 500 | Out-Null
+    }
+}
+
+# ============================================================================
+"== G: the PRE-FIX oracle, which needs a GUI-subsystem binary"
+# ============================================================================
+# Section F cannot show the defect and it is important to say why rather than
+# to leave a green suite implying it did: DEBUG builds link the CONSOLE
+# subsystem (so std.log reaches the shell you launched from), and PowerShell
+# captures a console binary perfectly. The failure only exists against a
+# GUI-subsystem binary - which is precisely what the upgrade script drives, the
+# installed RELEASE. So the oracle runs against the release STAGING prefix, our
+# own build, using `+version`: a verb that opens no window, dials no pipe and
+# touches nothing, so nothing here can reach the user's app.
+function Get-PeSubsystem([string]$Path) {
+    $fs = [System.IO.File]::OpenRead($Path)
+    try {
+        $br = New-Object System.IO.BinaryReader($fs)
+        $fs.Position = 0x3C
+        $pe = $br.ReadInt32()
+        # Subsystem sits at optional-header offset 68 in PE32 and PE32+ alike:
+        # the 8-byte ImageBase of PE32+ is paid for by its missing BaseOfData.
+        $fs.Position = $pe + 0x18 + 0x44
+        return $br.ReadUInt16()
+    } finally { $fs.Dispose() }
+}
+
+$gDebug = Join-Path $Repo 'zig-out\bin\ghoztty.exe'
+if (Test-Path $gDebug) {
+    AssertEq 'G1 the debug exe is CONSOLE-subsystem (3), which is why F cannot show the bug' `
+        3 (Get-PeSubsystem $gDebug)
+}
+
+$gRelExe = Join-Path $Repo 'zig-out-release\bin\ghoztty.exe'
+$gRelCom = Join-Path $Repo 'zig-out-release\bin\ghoztty.com'
+if ($PureOnly) {
+    "  SKIP G (-PureOnly)"
+} elseif (-not (Test-Path $gRelExe)) {
+    "  SKIP G2-G6: no release staging build at $gRelExe - the pre-fix oracle needs a GUI-subsystem binary"
+} else {
+    AssertEq 'G2 the release exe is GUI-subsystem (2)' 2 (Get-PeSubsystem $gRelExe)
+    Assert 'G3 and it ships the console twin beside it' (Test-Path $gRelCom)
+    if (Test-Path $gRelCom) {
+        AssertEq 'G4 the twin is CONSOLE-subsystem (3)' 3 (Get-PeSubsystem $gRelCom)
+    }
+    # The measurement the whole fix rests on. `+version` needs nothing running.
+    #
+    # $LASTEXITCODE is STICKY - it holds whatever the last native command left,
+    # so "it is 0/empty afterwards" proves nothing. A sentinel does: set it with
+    # a real native command, then show the GUI-subsystem call never touched it.
+    & cmd.exe /c exit 77
+    $gRaw = (& $gRelExe +version 2>$null) | Out-String
+    $gRawCode = $LASTEXITCODE
+    Assert 'G5 PRE-FIX ORACLE: a GUI-subsystem exe captures ZERO bytes' ($gRaw.Length -eq 0)
+    AssertEq 'G6 and PowerShell never even waits for it, so the sentinel exit code survives' `
+        77 $gRawCode
+    if (Test-Path $gRelCom) {
+        $gVia = (& $gRelCom +version 2>$null) | Out-String
+        Assert 'G7 and the twin answers the same question with bytes and a real exit code' `
+            ($gVia.Length -gt 0 -and $LASTEXITCODE -eq 0)
+    }
+}
+
 ""
 if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
 exit ([int]($script:failures -gt 0))

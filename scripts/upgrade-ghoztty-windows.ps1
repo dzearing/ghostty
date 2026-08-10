@@ -225,6 +225,13 @@ $oldExe = Join-Path $InstallDir 'ghoztty.exe'
 if (-not (Test-Path $newExe)) { Log "ABORT: staging exe not found: $newExe"; exit 1 }
 if (-not (Test-Path $oldExe)) { Log "ABORT: installed exe not found: $oldExe"; exit 1 }
 
+# T663: $oldExe is the GUI-subsystem binary and PowerShell cannot capture its
+# stdout, so every verb whose ANSWER this script reads goes through the console
+# twin instead. $oldExe stays the thing we copy over, verify and LAUNCH.
+# Re-resolved after the swap, because the .com may only exist in the new build.
+$cliExe = Resolve-GhozttyCliExe $oldExe
+Log ("cli reader: $cliExe" + $(if ($cliExe -eq $oldExe) { ' (no .com sibling - readers rely on 2>&1)' } else { '' }))
+
 # ---- T208: is the staged binary actually this tree? -------------------------
 #
 # launch-upgrade.ps1 checks this before it launches; this is the same check at
@@ -310,7 +317,9 @@ Start-Sleep -Seconds $DelaySeconds
 # as a whole (ConvertFrom-GhozttySessionsJson tolerates both shapes).
 $preSessions = @()
 try {
-    $preRaw = (& $oldExe +sessions --json 2>$null) | Out-String
+    # T663: through $oldExe (GUI subsystem) this captured nothing, so the probe
+    # reported 0 sessions on every run and the survive-assert below never fired.
+    $preRaw = (& $cliExe +sessions --json 2>$null) | Out-String
     if ($LASTEXITCODE -eq 0 -and $preRaw) { $preSessions = Get-GhozttySessionIds $preRaw }
 } catch {}
 Log "pre-kill agent sessions: $($preSessions.Count) ($($preSessions -join ', '))"
@@ -371,6 +380,14 @@ if (Test-Path $newCom) {
     Log 'no ghoztty.com in staging; kept existing (pre-T245 staging build?)'
 }
 
+# T663: re-resolve now that the swap is done. An install that had no console
+# twin before this delivery has one after it, and everything that READS a CLI
+# answer from here on - the post-swap session probe, the pane readiness gate,
+# the arrival gate - depends on which binary it asks.
+$prevCli = $cliExe
+$cliExe = Resolve-GhozttyCliExe $oldExe
+if ($cliExe -ne $prevCli) { Log "cli reader: now $cliExe" }
+
 # T89h: swap ghoztty-agent.exe too, WITHOUT killing the running agent. A
 # running exe's file can be RENAMED (the image stays mapped), just not
 # overwritten — so move the old one aside and copy the new one in. The old
@@ -430,7 +447,7 @@ if (Test-Path $stagingShare) {
 if ($preSessions.Count -gt 0) {
     $postSessions = @()
     try {
-        $postRaw = (& $oldExe +sessions --json 2>$null) | Out-String
+        $postRaw = (& $cliExe +sessions --json 2>$null) | Out-String
         if ($LASTEXITCODE -eq 0 -and $postRaw) { $postSessions = Get-GhozttySessionIds $postRaw }
     } catch {}
     $lost = @($preSessions | Where-Object { $postSessions -notcontains $_ })
@@ -567,7 +584,7 @@ try { Set-Location -LiteralPath $WorkingDirectory -ErrorAction Stop } catch {
 # loop ever iterating, and the deadline then reported the app as DEAD. Running it
 # as a child with a hard wait makes the deadline mean what it says.
 function Get-ListJson([int]$callTimeoutSec = 10) {
-    $r = Invoke-GhozttyListJson -Exe $oldExe -WorkingDirectory $WorkingDirectory -TimeoutSec $callTimeoutSec
+    $r = Invoke-GhozttyListJson -Exe $cliExe -WorkingDirectory $WorkingDirectory -TimeoutSec $callTimeoutSec
     # A single answered +list is the whole of "a live app is up on the new exe";
     # recorded once, here, because every caller below has a different reason for
     # asking and none of them is the reporting site (T525).
@@ -724,7 +741,10 @@ if ($action -eq 'reuse') {
     # stop changing before typing into it. `--when-idle` cannot substitute: an
     # un-replayed pane reads as empty and unchanged, which is exactly what it
     # calls idle.
-    $ready = Wait-LoopPaneReady -ReadTail { (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String }
+    # T663: through $oldExe this read ZERO bytes every time - the pane was
+    # always "produced no text", and the gate below always missed - so the
+    # reader is the console twin.
+    $ready = Wait-LoopPaneReady -ReadTail { (& $cliExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String }
     # Not fatal. A pane that never settles may just be one whose session is
     # printing, and the arrival gate below is the real evidence either way -
     # refusing to type here would trade a recoverable miss for a certain stall.
@@ -740,10 +760,10 @@ if ($action -eq 'reuse') {
     # leave an older exe here, and an exe without the flag types
     # `--keys-file=C:\...` into the pane as text. So ask, and say which transport
     # was used - a degraded send is exactly when the gate below matters most.
-    $keys = New-LoopSendKeysText -Exe $oldExe -Text $prompt -Tag 'upgrade-resume'
+    $keys = New-LoopSendKeysText -Exe $cliExe -Text $prompt -Tag 'upgrade-resume'
     $promptFile = $keys.File
     if ($keys.Degraded) {
-        Log "WARNING: $oldExe does not support +send-keys --keys-file, so the prompt is going through argv where PowerShell can mangle its quotes (T210). The arrival gate below is what protects the run."
+        Log "WARNING: $cliExe does not support +send-keys --keys-file, so the prompt is going through argv where PowerShell can mangle its quotes (T210). The arrival gate below is what protects the run."
     }
 
     # Type the prompt, VERIFY it, and only then submit it.
@@ -775,13 +795,13 @@ if ($action -eq 'reuse') {
     # attempt N's fragment.
     $verified = Send-LoopPromptVerified -Text $prompt `
         -SendText {
-            & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" @($keys.Args) 2>&1 |
+            & $cliExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" @($keys.Args) 2>&1 |
                 ForEach-Object { Log "reuse send-keys: $_" }
             return ($LASTEXITCODE -eq 0)
         } `
-        -ReadTail { (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String } `
+        -ReadTail { (& $cliExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String } `
         -Clear {
-            & $oldExe +send-keys "--target=$LoopPaneId" Escape 2>&1 | ForEach-Object { Log "reuse clear: $_" }
+            & $cliExe +send-keys "--target=$LoopPaneId" Escape 2>&1 | ForEach-Object { Log "reuse clear: $_" }
         } `
         -Log { param($m) Log $m }
     if (-not $verified.Arrived) {
@@ -807,7 +827,7 @@ if ($action -eq 'reuse') {
     # single space is the payload that cannot turn a verified prompt into a
     # fragment.
     $submit = Get-LoopSubmitArgs
-    & $oldExe +send-keys "--target=$LoopPaneId" @($submit) 2>&1 | ForEach-Object { Log "reuse submit: $_" }
+    & $cliExe +send-keys "--target=$LoopPaneId" @($submit) 2>&1 | ForEach-Object { Log "reuse submit: $_" }
     if ($LASTEXITCODE -ne 0) {
         Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the submit exited $LASTEXITCODE, so it was never submitted."
         Invoke-WatchdogNow -Why 'the prompt arrived but the Enter failed' -PromptFile $promptFile
@@ -819,8 +839,8 @@ if ($action -eq 'reuse') {
     # code is the last thing this path knew how to ask about. Motion is the
     # evidence; another submit is the cure.
     $gate = Wait-LoopSubmitted `
-        -Read { (& $oldExe +read "--name=$LoopPaneId" --lines=60 2>&1 | Out-String).Trim() } `
-        -Submit { & $oldExe +send-keys "--target=$LoopPaneId" @(Get-LoopSubmitArgs) 2>&1 | ForEach-Object { Log "reuse re-submit: $_" } } `
+        -Read { (& $cliExe +read "--name=$LoopPaneId" --lines=60 2>&1 | Out-String).Trim() } `
+        -Submit { & $cliExe +send-keys "--target=$LoopPaneId" @(Get-LoopSubmitArgs) 2>&1 | ForEach-Object { Log "reuse re-submit: $_" } } `
         -Text $prompt
     if (-not $gate.Submitted) {
         Log "RESUME-REUSE FAIL: $($gate.Why) - pane $LoopPaneId is holding the prompt, so the loop is NOT running."
@@ -877,7 +897,7 @@ if ($listBefore -match '"target"\s*:\s*"main"') {
 # request was swallowed by an existing target and the loop would stall - retry
 # under a name nothing can already own.
 $relaunchTarget = 'main'
-& $oldExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
+& $cliExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
     ForEach-Object { Log "relaunch: $_" }
 for ($i = 0; $i -lt 14; $i++) {
     Start-Sleep -Milliseconds 750
@@ -889,7 +909,7 @@ if ($relaunched) {
     $alt = 'main-' + (Get-Date -Format 'HHmmss')
     $relaunchTarget = $alt
     Log "relaunch: no new window appeared - an existing 'main' was focused instead of created; retrying as $alt"
-    & $oldExe +new-window "--target=$alt" "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
+    & $cliExe +new-window "--target=$alt" "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
         ForEach-Object { Log "relaunch: $_" }
     for ($i = 0; $i -lt 14; $i++) {
         Start-Sleep -Milliseconds 750

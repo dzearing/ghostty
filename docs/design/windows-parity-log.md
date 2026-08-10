@@ -13912,3 +13912,84 @@ Eleven other acceptance scripts still bind a guessed port, and three pairs of
 them guess the *same* number (47931, 47941/47942, 47911) — so those pairs cannot
 safely run near each other, a constraint nobody had written down. Filed as
 **T694** with the pattern to copy.
+
+## 2026-08-10 — The terminal's own restart instruction was arriving fine; the check on it was reading an empty screen (T663)
+
+Every unattended delivery since the arrival gate shipped has ended one of two
+ways: `RESUME-REUSE SENT … but was not seen in the pane tail (the TUI may have
+consumed it)` in July, and `RESUME-REUSE FAIL … the prompt did not arrive
+intact` in August — four of them in the last two days, including this morning's
+05:46 refresh. The task was filed against a hypothesis: the prompt's `>`
+characters were being stripped somewhere between the file and the composer.
+
+They were not. **The gate was reading nothing at all.**
+
+`ghoztty.exe` is a GUI-subsystem binary, and PowerShell decides from that field
+whether to wait for a native command and whether its stdout can be captured. The
+readiness gate, the arrival gate and both `+sessions` probes all read the pane
+through the installed `ghoztty.exe` with `(& $exe +read … 2>$null) | Out-String`
+— which returns **zero bytes with an empty `$LASTEXITCODE`**, silently, every
+time. Measured against a live pane: 0 characters through `ghoztty.exe`, 2856
+through its `ghoztty.com` sibling, same pane, same second. So the prompt almost
+certainly arrived intact on every one of those runs; the gate could not see it,
+correctly refused to submit text it had not verified (T210 working as designed),
+and handed off to the watchdog. The line that had been saying so all along —
+`pane produced no text in 60 read(s)` — was a true sentence about the wrong
+subject, and is now its own task (**T698**).
+
+The `>` hypothesis is refuted twice over: `Get-LoopPromptNeedle` has stripped
+`>` and `|` from **both** sides since it was written, and the last three
+failures carried `/reset-context read go.md and go`, which has no `>` in it.
+
+Why the `+send-keys` calls next door worked and the readers did not: `2>&1`
+forces PowerShell to build a pipeline and wait; `2>$null` does not. Every send
+used the former and every reader used the latter, which is exactly the shape
+that hides a defect for months — the half that was verifiable kept working.
+
+**The fix is T245's twin, used.** `Resolve-GhozttyCliExe` in
+`scripts/loop-session.ps1` is now the one place that decides which binary a CLI
+*answer* is read from: prefer the sibling `ghoztty.com` (the same binary with
+its subsystem WORD flipped to console, already shipped as a required sibling),
+fall back to the `.exe` for a pre-T245 install where the caller's `2>&1` is all
+there is. `upgrade-ghoztty-windows.ps1` resolves it into `$cliExe` before the
+swap and **again after it** — the twin may only exist in the build just
+installed — and every verb whose answer it reads goes through that, while
+`$oldExe` stays the thing that is copied, verified and launched.
+
+The same defect was elsewhere in the loop and is fixed with it:
+`go-loop-pane-probe.ps1`'s `Get-PaneShellPid` captured nothing from
+`+list --json`, so the watchdog's pane probe answered 0 for every pane; the
+`Ghoz` / `Invoke-Ghoztty` wrappers in `go-loop-exec.ps1` and
+`go-loop-watchdog.ps1` now resolve too. And the standing `pre-kill agent
+sessions: 0` in every delivery log was this as well, which had quietly made the
+sessions-survive assert a no-op.
+
+**The test needed a shape of its own, because a debug build cannot show this
+bug.** Debug builds link the *console* subsystem, so PowerShell captures them
+perfectly — section F of `test\win32\upgrade-resume-readiness.ps1` types a
+prompt carrying `>` and `|` into a real pane and round-trips it through the real
+`Send-LoopPromptVerified`, and it passes with or without the fix. Section G is
+the oracle: it reads the PE subsystem WORD of the debug exe (3, console — which
+is *why* F cannot show it), the release staging exe (2, GUI) and its twin (3),
+then measures the capture with `+version`, a verb that opens no window and dials
+no pipe, so nothing reaches the user's app. Through the GUI-subsystem binary:
+zero bytes, and a `cmd /c exit 77` sentinel still standing afterwards because
+PowerShell never even waited for it. Section E pins the wiring, with E10 (no
+reader left on `$oldExe`) teeth-checked by re-introducing one reader in a copy
+of the source.
+
+One criterion is deliberately left unticked: a real delivery logging
+`RESUME-REUSE OK`. That can only be carried by the next morning refresh, since
+the failure exists only against a GUI-subsystem release build and an acceptance
+script must never drive one.
+
+Also fixed on the way past: `agent-instance-lineage.ps1` (T167, yesterday) had
+written a correct `# persistence:` declaration on its helper's function header,
+seven lines above the launch inside it, and the sweep looks six — so a site that
+had been thought about read as one that had not. Marker repeated next to the
+statement; the window itself is **T697**.
+
+Evidence: `upgrade-resume-readiness.ps1` ALL PASS (F and G live),
+`upgrade-no-fork.ps1`, `go-loop-guard.ps1`, `agent-instance-lineage.ps1`,
+`upgrade-staleness.ps1`, `persistence-flag.ps1` all ALL PASS. All three zig
+lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.

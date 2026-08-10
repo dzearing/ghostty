@@ -60,6 +60,15 @@ param(
     [switch]$ProbeClassify
 )
 
+# T663: Resolve-GhozttyCliExe lives in loop-session.ps1 (one place decides which
+# binary a CLI answer is read from). This file is dot-sourced by callers that
+# have already loaded it and run standalone by callers that have not, so load it
+# only when the function is missing. loop-session.ps1 is documented as free of
+# top-level side effects, which is what makes that safe.
+if (-not (Get-Command Resolve-GhozttyCliExe -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'loop-session.ps1')
+}
+
 # ASCII only, deliberately: these scripts are read by PowerShell 5.1, which
 # decodes a BOM-less UTF-8 file as ANSI and mojibakes every box-drawing glyph.
 # So the markers are the TUI's words, never its border characters.
@@ -145,7 +154,13 @@ function Get-PaneShellPid {
 
     if (-not $PaneId) { return 0 }
     $json = ''
-    try { $json = (& $GhozttyExe +list --json 2>$null | Out-String) } catch { return 0 }
+    # T663: `2>$null` against the GUI-subsystem ghoztty.exe captures NOTHING and
+    # leaves $LASTEXITCODE empty, so this probe answered 0 for every pane. The
+    # console twin is what makes the capture real; `--json` is also why `2>&1`
+    # (the other thing that forces the capture) is not the fix here - it would
+    # fold any warning line into the payload ConvertFrom-Json has to parse.
+    $cli = Resolve-GhozttyCliExe $GhozttyExe
+    try { $json = (& $cli +list --json 2>$null | Out-String) } catch { return 0 }
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) { return 0 }
     $tree = $null
     try { $tree = $json | ConvertFrom-Json } catch { return 0 }
@@ -237,7 +252,9 @@ function Read-PaneOccupant {
     if (-not $PaneId) { return 'unknown' }
     if (Test-ClaudeInPane -PaneId $PaneId -GhozttyExe $GhozttyExe) { return 'claude' }
     $out = ''
-    try { $out = (& $GhozttyExe +read "--name=$PaneId" "--lines=$Lines" 2>&1 | Out-String) } catch { return 'unknown' }
+    # T663: the console twin, and therefore `2>$null` rather than `2>&1` - a
+    # merged stderr line becomes part of the text this function CLASSIFIES.
+    try { $out = (& (Resolve-GhozttyCliExe $GhozttyExe) +read "--name=$PaneId" "--lines=$Lines" 2>$null | Out-String) } catch { return 'unknown' }
     if ($LASTEXITCODE -ne 0) { return 'unknown' }
     return Get-PaneOccupant -Tail $out
 }

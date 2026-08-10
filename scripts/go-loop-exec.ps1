@@ -59,7 +59,11 @@ $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 
 function Ghoz([string[]]$argList) {
-    $out = & $GhozttyExe @argList 2>&1 | Out-String
+    # T663: the console twin when there is one. `2>&1` is what has been keeping
+    # this capture alive against the GUI-subsystem exe (it forces PowerShell to
+    # build a pipeline and wait); it stays as the fallback for an install with
+    # no twin, but the twin is what makes the exit code below mean anything.
+    $out = & (Resolve-GhozttyCliExe $GhozttyExe) @argList 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 

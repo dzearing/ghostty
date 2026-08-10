@@ -187,6 +187,38 @@ function New-LoopPromptFile {
     return $path
 }
 
+# Which binary to run for a CLI verb whose OUTPUT or EXIT CODE is read (T663).
+#
+# `ghoztty.exe` is a GUI-subsystem binary, and PowerShell decides whether to
+# wait for a native command - and whether its stdout can be captured at all -
+# from that subsystem field. So this, the shape every reader here used:
+#
+#     (& $exe +read "--name=$pane" --lines=40 2>$null) | Out-String
+#
+# returns ZERO bytes with an EMPTY $LASTEXITCODE, silently. Measured 2026-08-10
+# against a live pane: 0 characters through ghoztty.exe, 2856 through its
+# ghoztty.com sibling, same pane, same second. That one line is why the
+# upgrade's arrival gate had never once seen a prompt come back - it was reading
+# nothing at all, for every prompt, since the gate was written. `2>&1` happens
+# to force the wait (PowerShell has to build a pipeline for the merge), which is
+# why the send-keys calls next door worked and the readers did not; but it also
+# merges stderr into the data, which a `--json` reader cannot carry.
+#
+# T245 shipped `ghoztty.com` for exactly this: the same binary with the
+# optional-header Subsystem WORD flipped to console, installed as a REQUIRED
+# sibling of `ghoztty.exe`. Prefer it whenever it is on disk. An install that
+# predates T245 has none, and there the caller's own `2>&1` is the only thing
+# that works - so the fallback is the .exe rather than a hard failure, and the
+# call sites keep their `2>&1` on the paths that must survive an old install.
+function Resolve-GhozttyCliExe {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Exe)
+    if (-not $Exe) { return $Exe }
+    if ([System.IO.Path]::GetExtension($Exe) -ne '.exe') { return $Exe }
+    $com = [System.IO.Path]::ChangeExtension($Exe, '.com')
+    if (Test-Path -LiteralPath $com) { return $com }
+    return $Exe
+}
+
 # Does THIS exe understand `--keys-file`? Ask it, never assume.
 #
 # The scripts run against whichever ghoztty is INSTALLED, which is routinely an

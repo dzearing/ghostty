@@ -263,7 +263,10 @@ function Get-Lock {
 }
 
 function Invoke-Ghoztty($argList) {
-    $out = & $GhozttyExe @argList 2>&1 | Out-String
+    # T663: read through the console twin when the install has one - see
+    # Resolve-GhozttyCliExe. `2>&1` stays as the fallback that keeps this
+    # capture working against a pre-T245 install.
+    $out = & (Resolve-GhozttyCliExe $GhozttyExe) @argList 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 
