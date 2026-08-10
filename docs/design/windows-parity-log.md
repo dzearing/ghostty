@@ -13554,3 +13554,45 @@ split, swap, resize and equalize all keep every pane, and the two close paths
 alongside: T683, the same measurement on the Mac seat, where `e65cfa4d5`
 deliberately removed the departure inference and may have left the mirror-image
 hole this one had.
+
+## 2026-08-09 — The parity sweep stopped being a story and became a check (T152)
+
+Every Mac feature that arrives on Windows arrives because someone wrote it
+down. The check that this had happened was, until now, a paragraph: T88 and
+T117 each summarized what a merge contained. A summary reads fine and cannot
+be audited, which is how 16 Mac commits were merged into this branch in July
+and mapped to no work item at all — the finding that filed this task.
+
+`scripts\parity-sweep.ps1` replaces the paragraph with an enumeration. Given a
+range it lists every non-merge commit touching `macos/` or `src/viewer/`, then
+reports which of them no Windows task, log entry, digest, decision or intake
+note has ever cited, and exits 1 if that list is not empty. Coverage is keyed
+on the commit sha, because that is the one identifier a Mac commit and a
+Windows task can share; a reference counts at any abbreviation of seven
+characters or longer, and the indexed token is re-checked as a real prefix of
+the candidate sha, so a hex-shaped coincidence — or a `#rrggbbaa` color — does
+not quietly mark a commit as handled. The report names the file that did the
+citing, so the "filed as" column is derived rather than maintained.
+
+Wired into the daily main intake (go.md step 0.6): the watermark does not move
+until the sweep exits 0. `-Format markdown` emits the `## Parity coverage`
+block that go.md asked for, which is what makes the enumeration the evidence
+instead of prose about the evidence.
+
+Its first run found the leak still happening. The 2026-08-08 intake had filed
+T598–T606 over 54 Mac-side commits and left 7 of them uncited — none a missing
+feature, all of them later content of T598: the banner hook's state-file
+mutex and its markdown-escaping of untrusted fields, the de-attributed
+`process-feedback` skill template, the load-bearing `TERM_PROGRAM=ghostty`
+spelling. Uncited, they would have been invisible when T598 is picked up, and
+T598 would have vendored the pre-hardening copies and shipped known defects on
+day one. They are now dispositioned in a new ledger,
+`docs/design/windows-parity-sweeps.md`, and named in T598 itself with what
+each one requires; one macOS-only XCTest deadline change is recorded as no
+parity owed. The range now sweeps clean.
+
+Acceptance: `test\win32\parity-sweep.ps1`, 20 arms over a frozen six-commit
+slice of real history and a fixture docs tree it writes itself, so the
+expected mapped/unmapped split is exact rather than whatever the live tracker
+says today. Two of the arms test the gate's teeth rather than its function,
+and both were confirmed to go red against a deliberately broken sweep.

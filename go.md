@@ -107,6 +107,26 @@ Concretely, in order, with no stops in between:
      is that main's changes are IN THE QUEUE within a day of landing, and
      the lag is worked off task by task instead of accumulating into a
      merge cliff.
+
+     **Gate the intake on the sweep, not on your reading of it** (T152).
+     After filing, run
+
+     ```
+     powershell -NoProfile -File scripts\parity-sweep.ps1
+     ```
+
+     which enumerates every non-merge commit in
+     `<lastEvaluated>..origin/main` touching `macos/` or `src/viewer/` and
+     reports the ones no Windows task, log entry, digest or decision has ever
+     cited. **Exit 1 means unmapped commits — file a task for each (or cite
+     it as no-parity-owed in the intake note) and re-run until it exits 0**;
+     only then move the watermark. This exists because the sweeps before it
+     (T88, T117) recorded a *narrative* of what a merge contained, and a
+     narrative cannot be checked for holes: 16 Mac commits were merged and
+     never mapped to any work item, which is how a Mac feature silently never
+     arrives here. `-Format markdown` emits the `## Parity coverage` block —
+     paste it into the intake note so the enumeration is the evidence rather
+     than prose about it. Acceptance: `test\win32\parity-sweep.ps1`.
    - **Write `## Task triage`** into today's digest: counts (filed
      yesterday, closed yesterday, net flow, M1 closed/total), **main intake
      (N commits evaluated, M tasks filed, current lag in commits)**, what
