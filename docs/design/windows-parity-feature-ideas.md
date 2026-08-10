@@ -17,3 +17,14 @@ as the digest that showed them.
 - Keyboard copy mode (mouse-free selection)
 - Scrollback search with a results minimap
 - Pre-warmed instant first window
+
+## 2026-08-10
+
+- Clickable file paths in terminal output
+- Command blocks (per-command jump, fold, copy)
+- Select-and-act toolbar in terminal panes
+- Open a pane's scrollback as a viewer document
+- Search across every open pane at once
+- Drag-and-drop a file onto a pane to insert its path
+- Dim inactive panes
+- A pane whose shell died stays readable, with restart in place
