@@ -47,6 +47,21 @@
 #   * sections 5-7 used to let `+new-window` AUTO-SPAWN the GUI, which puts a
 #     window on the user's desktop. They launch it on the test desktop now.
 #
+# T171 hardened three things after one unreproducible failure whose text was
+# lost - a run that produced 30 assertions out of a full 53 and then simply
+# stopped, with no SKIP line to explain it:
+#
+#   * PORTS ARE PER-RUN, not fixed numbers. Each fake relay (and the live relay
+#     in section 7) gets a port the OS just handed out, and the port is asserted
+#     FREE immediately before it is bound.
+#   * A fake relay is up when it ANSWERS ITS OWN NONCE, not when a TCP connect
+#     succeeds. A connect also succeeds against a dying listener from the
+#     previous run and against any unrelated process holding the port.
+#   * A TERMINATING error is an assertion failure with its message and line,
+#     not a silent end of run - and a failing run KEEPS its temp directory
+#     (both GUIs' stderr, every CLI's stdout, both hit logs) and prints the
+#     path. Losing that evidence is what made the original failure a mystery.
+#
 # Self-contained and non-interactive. A raw-TCP "fake relay" serves the
 # brokered endpoints (POST /oauth/exchange | /oauth/renew | /oauth/signout) and
 # logs every hit; the account store is redirected to a temp path
@@ -56,9 +71,13 @@ param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
     [string]$RelaySrc = 'D:\git\ghoztty\relay',
-    [int]$FakeAPort = 47921,
-    [int]$FakeBPort = 47922,
-    [int]$RelayPort = 47912,
+    # 0 = pick a port nobody holds, per run (see Get-FreePort). These used to be
+    # fixed numbers, which is a latent trap: two runs back to back can meet on
+    # the same port while the previous run's listener is still dying, and then
+    # "something is listening" is true of a socket that will never answer.
+    [int]$FakeAPort = 0,
+    [int]$FakeBPort = 0,
+    [int]$RelayPort = 0,
     [switch]$NegativeControl,
     [switch]$Interactive
 )
@@ -79,11 +98,41 @@ $tmp = Join-Path $env:TEMP "ghoztty-relay-acct-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 New-Item -ItemType Directory -Force "$tmp\state" | Out-Null
 
+# A port nobody holds: bind an ephemeral one and let it go. A port that WAS free
+# a moment ago beats a guessed number - the fixed 47921/47922/47912 could still
+# be held (or be in TIME_WAIT) from the previous run of this very script, which
+# is hypothesis 1 of T171.
+function Get-FreePort {
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $l.Start()
+    $p = $l.LocalEndpoint.Port
+    $l.Stop()
+    return $p
+}
+
+# Is this port bindable RIGHT NOW? Asserted before each fake relay starts, so a
+# port that is still held fails loudly here instead of turning into a fake relay
+# that never came up and a section that mysteriously produces no assertions.
+function Test-PortFree([int]$port) {
+    try {
+        $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+        $l.Start(); $l.Stop()
+        return $true
+    } catch { return $false }
+}
+
+if ($FakeAPort -eq 0) { $FakeAPort = Get-FreePort }
+if ($FakeBPort -eq 0) { $FakeBPort = Get-FreePort }
+if ($RelayPort -eq 0) { $RelayPort = Get-FreePort }
+
 $AccountStore = "$tmp\account.dat"
 $FakeABase = "http://127.0.0.1:$FakeAPort"
 $FakeBBase = "http://127.0.0.1:$FakeBPort"
 $RelayBase = "http://127.0.0.1:$RelayPort"
 $SessTok = 'sess-e2e-1'
+# Unique per run: what a fake relay echoes back so the harness can tell its own
+# listener from any other process that has the port (T171).
+$ProbeNonce = "n$PID-$(Get-Random -Minimum 100000 -Maximum 999999)"
 $RenewedTok = 'sess-e2e-renewed'
 $HitsA = "$tmp\hits-a.log"
 $HitsB = "$tmp\hits-b.log"
@@ -203,9 +252,15 @@ function Test-InsideChooser([IntPtr]$chooser, [IntPtr]$h) {
 #   POST /oauth/signout     -> 204
 #   GET  /v1/client/devices -> 200 {devices:[...]}
 #   anything else           -> 404
-function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile) {
+#
+# It also answers GET /__probe/<nonce> with that same nonce, which is how the
+# harness tells THIS run's listener from whatever else happens to accept on the
+# port (T171). Probe hits are deliberately not written to $hitsFile - the hit log
+# is evidence about the app's traffic, and a harness probe in it would be a
+# second thing every "did the app call X" assertion has to reason around.
+function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile, $nonce) {
     Start-Job -ScriptBlock {
-        param($port, $tok, $ttl, $renewTok, $hitsFile)
+        param($port, $tok, $ttl, $renewTok, $hitsFile, $nonce)
         function Resp200($body) {
             $p = [Text.Encoding]::UTF8.GetBytes($body)
             $h = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($p.Length)`r`nConnection: close`r`n`r`n"
@@ -230,9 +285,15 @@ function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile) {
                 $line = ($req -split "`r`n")[0]
                 $auth = ''
                 if ($req -match 'Authorization:\s*Bearer\s+(\S+)') { $auth = $matches[1] }
-                Add-Content -Path $hitsFile -Value "$line|auth=$auth"
                 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-                if ($line -match '^POST /oauth/exchange') {
+                # The nonce guard is not paranoia: the first cut of this forgot to
+                # pass $nonce into the job, and an empty one turns the pattern
+                # into "any /__probe/ path", i.e. a probe that answers itself.
+                $isProbe = ($nonce -and ($line -match "^GET /__probe/$nonce"))
+                if (-not $isProbe) { Add-Content -Path $hitsFile -Value "$line|auth=$auth" }
+                if ($isProbe) {
+                    $out = Resp200 "{`"probe`":`"$nonce`"}"
+                } elseif ($line -match '^POST /oauth/exchange') {
                     $body = "{`"session_token`":`"$tok`",`"expiry`":$($now + $ttl),`"email`":`"e2e@example.com`",`"picture`":`"https://x/p.png`"}"
                     $out = Resp200 $body
                 } elseif ($line -match '^POST /oauth/renew') {
@@ -250,17 +311,29 @@ function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile) {
             } catch {}
             $client.Close()
         }
-    } -ArgumentList $port, $tok, $ttl, $renewTok, $hitsFile
+    } -ArgumentList $port, $tok, $ttl, $renewTok, $hitsFile, $nonce
 }
 
-function Wait-Listening($port) {
+# Wait until the fake relay ANSWERS - not merely until something accepts on the
+# port (T171). A TCP connect succeeds against a listener that is being torn down
+# and against any unrelated process that happened to grab the port; only the
+# nonce coming back proves the thing behind it is this run's fake relay and that
+# it is serving requests. Returns the failure reason so the assertion can say
+# what it saw.
+function Wait-FakeRelay($port, $nonce) {
+    $why = 'never tried'
     foreach ($i in 1..20) {
         try {
-            $t = [System.Net.Sockets.TcpClient]::new(); $t.Connect('127.0.0.1', $port); $t.Close()
-            return $true
-        } catch { Start-Sleep -Milliseconds 250 }
+            $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 `
+                -Uri "http://127.0.0.1:$port/__probe/$nonce"
+            if ($r.StatusCode -eq 200 -and $r.Content -match [regex]::Escape($nonce)) {
+                return @{ Ok = $true; Why = '' }
+            }
+            $why = "answered $($r.StatusCode) without the nonce"
+        } catch { $why = $_.Exception.Message }
+        Start-Sleep -Milliseconds 250
     }
-    return $false
+    return @{ Ok = $false; Why = $why }
 }
 
 # Launch a GUI ON THE TEST DESKTOP, wired to a fake relay + a temp account
@@ -368,11 +441,18 @@ $jobA = $null; $jobB = $null
 
 try {
     "== 0: start the fake brokered relays"
-    $jobA = Start-FakeRelay $FakeAPort $SessTok 3600 $RenewedTok $HitsA
-    $jobB = Start-FakeRelay $FakeBPort $SessTok 30 $RenewedTok $HitsB
-    Assert "fake relay A listening" (Wait-Listening $FakeAPort)
-    $fakeBUp = Wait-Listening $FakeBPort
-    Assert "fake relay B listening" $fakeBUp
+    "  ports: A=$FakeAPort B=$FakeBPort relay=$RelayPort  logs: $tmp"
+    Assert "fake relay A port $FakeAPort is free before we bind it" (Test-PortFree $FakeAPort)
+    Assert "fake relay B port $FakeBPort is free before we bind it" (Test-PortFree $FakeBPort)
+    $jobA = Start-FakeRelay $FakeAPort $SessTok 3600 $RenewedTok $HitsA $ProbeNonce
+    $jobB = Start-FakeRelay $FakeBPort $SessTok 30 $RenewedTok $HitsB $ProbeNonce
+    $upA = Wait-FakeRelay $FakeAPort $ProbeNonce
+    if (-not $upA.Ok) { "  (relay A never answered: $($upA.Why))" }
+    Assert "fake relay A answers its probe" $upA.Ok
+    $upB = Wait-FakeRelay $FakeBPort $ProbeNonce
+    if (-not $upB.Ok) { "  (relay B never answered: $($upB.Why))" }
+    $fakeBUp = $upB.Ok
+    Assert "fake relay B answers its probe" $fakeBUp
 
     "== 1: the +relay-login / +relay-logout CLI verbs are gone (T141)"
     $code = Run-Cli '+relay-login --no-browser' 'gone1.out' 10
@@ -391,12 +471,12 @@ try {
     $errlog = "$tmp\gui-a.stderr.log"
     Remove-Item $AccountStore -ErrorAction SilentlyContinue
     $g = Launch-Gui $FakeABase $errlog
-    if (-not $g) { Write-Host 'SETUP FAIL: GUI did not come up for the sign-in section'; exit 1 }
+    if (-not $g) { Write-Host 'SETUP FAIL: GUI did not come up for the sign-in section'; $script:failures++; exit 1 }
     Assert "sign-in GUI is NOT enumerable on the interactive desktop" (
         -not (Test-TestDesktopLeak -ProcessId $g.Pid))
 
     $chooser = Open-Chooser $g
-    if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: ctrl+shift+n opened no chooser'; exit 1 }
+    if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: ctrl+shift+n opened no chooser'; $script:failures++; exit 1 }
     Assert "chooser opened" ($chooser -ne [IntPtr]::Zero)
     # A chooser is modal over its own window: the owner is disabled for exactly
     # as long as it is up. Cross-process, that is the only checkable form of
@@ -483,7 +563,7 @@ try {
     $errlog2 = "$tmp\gui-dead.stderr.log"
     Remove-Item $AccountStore -ErrorAction SilentlyContinue
     $g2 = Launch-Gui 'http://127.0.0.1:1' $errlog2
-    if (-not $g2) { Write-Host 'SETUP FAIL: GUI did not come up for the dead-relay section'; exit 1 }
+    if (-not $g2) { Write-Host 'SETUP FAIL: GUI did not come up for the dead-relay section'; $script:failures++; exit 1 }
     Assert "dead-relay GUI is NOT enumerable on the interactive desktop" (
         -not (Test-TestDesktopLeak -ProcessId $g2.Pid))
     $ch2 = Open-Chooser $g2
@@ -516,7 +596,7 @@ try {
     Assert "legacy store staged" (Test-Path $AccountStore)
     $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
     $g3 = Launch-Gui $FakeABase "$tmp\gui-cli.stderr.log"
-    if (-not $g3) { Write-Host 'SETUP FAIL: GUI did not come up for the CLI sections'; exit 1 }
+    if (-not $g3) { Write-Host 'SETUP FAIL: GUI did not come up for the CLI sections'; $script:failures++; exit 1 }
     Assert "CLI-section GUI is NOT enumerable on the interactive desktop" (
         -not (Test-TestDesktopLeak -ProcessId $g3.Pid))
     $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
@@ -568,6 +648,7 @@ try {
             # DEV_CLIENT_TOKEN. The account tier presents the stored relay session
             # token, so set DEV_CLIENT_TOKEN to that same value - then the
             # account-tier bearer is accepted end to end.
+            Assert "relay port $RelayPort is free before we bind it" (Test-PortFree $RelayPort)
             $env:LISTEN_ADDR = "127.0.0.1:$RelayPort"; $env:METRICS_ADDR = '127.0.0.1:0'
             $env:DEV_AUTH = 'true'; $env:DEV_CLIENT_TOKEN = $SessTok
             $env:DEV_EMAIL = 'dev@example.com'; $env:STATE_DIR = "$tmp\state"
@@ -619,6 +700,15 @@ try {
 
     "== cleanup"
     Run-Cli '+close --target=acctbase' 'acctclosebase.out' | Out-Null
+} catch {
+    # $ErrorActionPreference is Continue, so a NON-terminating error prints and
+    # the run carries on - but a terminating one (a marshalling failure, a
+    # web-request throw) used to end the run with the remaining sections simply
+    # never producing assertions, and no line saying why. That is the shape T171
+    # was filed over: assertions stop, no SKIP, nothing to read.
+    Write-Host "  FAIL script terminated: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "       at $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
+    $script:failures++
 } finally {
     Remove-TestDesktop
     Remove-Item env:GHOSTTY_ACCOUNT_STORE -ErrorAction SilentlyContinue
@@ -627,7 +717,14 @@ try {
     foreach ($j in @($jobA, $jobB)) {
         if ($j) { Stop-Job $j -ErrorAction SilentlyContinue; Remove-Job $j -Force -ErrorAction SilentlyContinue }
     }
-    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    # A failing run keeps its evidence (both GUIs' stderr, every CLI's stdout,
+    # both relays' hit logs). Deleting it was how T171's failure text was lost -
+    # a tidy summary line is worth less than the run's own logs.
+    if ($script:failures -eq 0) {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  logs kept: $tmp"
+    }
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

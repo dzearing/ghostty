@@ -13856,3 +13856,59 @@ undefined-memory poison, so it is a use-after-free being reported as a bounds
 check. `defer conn.destroy(alloc)` is registered before `defer ch.deinit(alloc)`
 and defers are LIFO. Filed as **T693**; the lane then passed twice in a row,
 which is what makes it intermittent rather than fixed.
+
+## 2026-08-10 — The relay-account acceptance script keeps the evidence its one mystery failure threw away (T171)
+
+`test/win32/relay-account.ps1` failed once during T141's validation — 30
+assertions of a 53-assertion run, then nothing, no SKIP line — and could never
+be made to fail again. The reason it stayed a mystery is the reason it became a
+task: the loop that ran it printed a tidy summary line and the script deleted
+its own temp directory on the way out, so the only two things that could have
+named the cause were both gone before anyone read the number.
+
+Four changes, one per way the old script could lose an answer.
+
+**Ports are per-run.** The fake relays bound 47921/47922/47912 by hand. A
+back-to-back run can meet its own previous listener still dying in that port,
+and a fixed number is also the thing two different scripts collide on. Each port
+now comes from `Get-FreePort` (bind `:0`, read it, let it go) and is asserted
+free immediately before it is bound; the run prints the three it drew. The
+parameters still exist, defaulting to `0`, so a port can still be pinned.
+
+**"The fake relay is up" now means it answered.** `Wait-Listening` was a
+`TcpClient.Connect`, which succeeds against a listener being torn down and
+against any unrelated process holding the port — it can only ever prove that
+*something* accepted. Each relay now answers `GET /__probe/<nonce>` with a nonce
+unique to this run, and `Wait-FakeRelay` requires that nonce back. Probe hits
+are deliberately not written to the hit log: that log is evidence about the
+app's traffic, and a harness probe in it is one more thing every "did the app
+call X" assertion would have to reason around.
+
+That assertion earned its place on its first run. It went red — `answered 200
+without the nonce` — because the nonce was never added to the `Start-Job`
+`-ArgumentList`, so inside the job it was `$null`, the probe pattern degraded to
+"any `/__probe/` path", and the relay cheerfully answered `{"probe":""}`. The
+old bare-connect check passed that build without comment. The job now also
+refuses to treat an empty nonce as a probe at all.
+
+**A terminating error is a named failure.** `$ErrorActionPreference` is
+`Continue`, so a non-terminating error prints and the run carries on — but a
+terminating one ended the run with the remaining sections simply never producing
+assertions and no line saying why. That is exactly the shape of the original
+report. The `try` now has a `catch` that reports the message and the line as a
+`FAIL`, and the four `SETUP FAIL` bailouts count themselves as failures instead
+of exiting silently green-ish.
+
+**A failing run keeps its logs.** The temp directory (both GUIs' stderr, every
+CLI's stdout, both relays' hit logs) is deleted only when the run passed;
+otherwise the path is printed. A tidy summary line is worth less than the run's
+own logs, which is the whole lesson of this task.
+
+Evidence: 10 consecutive runs, `exit=0 / ALL PASS`, 64 assertions each, ~277s
+each, one retained log per run under `%TEMP%\ghoztty-t171-runs\`. All three zig
+lanes PASS through `floor-lane.ps1`; P1–P3 ALL PASS.
+
+Eleven other acceptance scripts still bind a guessed port, and three pairs of
+them guess the *same* number (47931, 47941/47942, 47911) — so those pairs cannot
+safely run near each other, a constraint nobody had written down. Filed as
+**T694** with the pattern to copy.
