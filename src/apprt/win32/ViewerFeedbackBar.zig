@@ -66,6 +66,7 @@ const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_feedback_layout.zig");
 const doc = @import("viewer_feedback_doc.zig");
 const feedback_images = @import("viewer_feedback_images.zig");
+const utf16_offset = @import("utf16_offset.zig");
 const clipboard_image = @import("clipboard_image.zig");
 const gdiplus_decode = @import("gdiplus_decode.zig");
 const RegionSelector = @import("RegionSelector.zig");
@@ -623,10 +624,11 @@ pub fn seedControl(self: *ViewerFeedbackBar) void {
 /// Read with `EM_GETTEXTEX`/`GT_DEFAULT` rather than `WM_GETTEXT`, and that is
 /// load-bearing rather than a style choice (T641): `WM_GETTEXT` translates each
 /// paragraph mark into CR+LF, so a document with N line breaks comes back N
-/// characters longer than the control believes it is. Every quote offset this
-/// file computes in the pane's buffer is handed straight to `EM_EXSETSEL`, so
-/// the two indexings have to be the same one. `GT_DEFAULT` leaves the bare CRs,
-/// which map to LF one-for-one.
+/// characters longer than the control believes it is. `GT_DEFAULT` leaves the
+/// bare CRs, which map to LF one-for-one — so a line break is one byte here and
+/// one character there, and `units`/`bytes` are left with nothing to say about
+/// line endings. What they DO convert is the encoding: this buffer is UTF-8 and
+/// the control counts UTF-16 code units, which agree only for ASCII (T648).
 fn readBack(self: *ViewerFeedbackBar) void {
     const n = w32.GetWindowTextLengthW(self.edit);
     if (n <= 0) {
@@ -689,16 +691,44 @@ fn readBack(self: *ViewerFeedbackBar) void {
 /// at every scale.
 const quote_indent_twips: i32 = 16 * 15;
 
-/// Where the caret is, as a character index — which is also a byte offset into
-/// the pane's buffer, because the two indexings agree (see `readBack`).
+// -------------------------------------------------------------------------
+// The offset boundary (T648)
+//
+// Every pure module here works in BYTES into the pane's UTF-8 buffer — which
+// is right, because that buffer is what the report is written from. Every edit
+// message works in UTF-16 CODE UNITS, because that is what a `W` control
+// stores. The two are the same number only for ASCII, so a `CHARRANGE` is
+// never filled from a byte offset directly: it goes through `charIndex`, and a
+// number that came back out of the control goes through `byteOffset`.
+//
+// The conversion itself is pure and lives in `utf16_offset.zig`; what these
+// two add is the buffer to convert against, which is always the pane's — the
+// control and the pane are kept in step by `readBack`.
+// -------------------------------------------------------------------------
+
+/// A byte offset in the pane's buffer, as the character index the control
+/// understands.
+fn charIndex(self: *const ViewerFeedbackBar, byte: usize) i32 {
+    return @intCast(utf16_offset.unitsBeforeByte(self.pane.feedbackText(), byte));
+}
+
+/// A character index out of the control, as a byte offset into the pane's
+/// buffer — what every pure module here expects.
+fn byteOffset(self: *const ViewerFeedbackBar, unit: i32) usize {
+    if (unit <= 0) return 0;
+    return utf16_offset.byteForUnits(self.pane.feedbackText(), @intCast(unit));
+}
+
+/// Where the caret is, as a byte offset into the pane's buffer.
 fn caret(self: *const ViewerFeedbackBar) usize {
     var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
     _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
-    return if (sel.cpMin > 0) @intCast(sel.cpMin) else 0;
+    return self.byteOffset(sel.cpMin);
 }
 
 fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
-    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(at), .cpMax = @intCast(at) };
+    const u = self.charIndex(at);
+    const cr: w32.CHARRANGE = .{ .cpMin = u, .cpMax = u };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
     _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
 }
@@ -729,7 +759,11 @@ pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
     const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, crlf.items) catch return;
     defer self.alloc.free(wide);
 
-    const at: w32.CHARRANGE = .{ .cpMin = @intCast(ins.at), .cpMax = @intCast(ins.at) };
+    // `ins.at` is a byte offset into the PRE-insert buffer, which is what the
+    // pane still holds at this point, so it converts against the same text the
+    // control is showing.
+    const at_u = self.charIndex(ins.at);
+    const at: w32.CHARRANGE = .{ .cpMin = at_u, .cpMax = at_u };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&at)));
     // wparam TRUE: the insertion is undoable, so Ctrl+Z takes a quote back out
     // the way it takes typing back out.
@@ -785,7 +819,9 @@ pub fn attachImage(self: *ViewerFeedbackBar, png: []const u8) bool {
     // it would read as part of the quote, and its metadata is its NUMBER, not
     // its styling.
     self.ensurePlainAtCaret();
-    const at: w32.CHARRANGE = .{ .cpMin = @intCast(ins.at), .cpMax = @intCast(ins.at) };
+    // Byte offset into the pre-insert buffer; see `insertQuote`.
+    const at_u = self.charIndex(ins.at);
+    const at: w32.CHARRANGE = .{ .cpMin = at_u, .cpMax = at_u };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&at)));
     // wparam TRUE, so Ctrl+Z takes the chip back out the way it takes typing
     // out — and the picture leaves the report with it, because the report is
@@ -828,14 +864,14 @@ fn selectChipForDelete(self: *ViewerFeedbackBar, vk: u16) bool {
     if (sel.cpMin != sel.cpMax or sel.cpMin < 0) return false;
 
     const text = self.pane.feedbackText();
-    const at: usize = @intCast(sel.cpMin);
+    const at: usize = self.byteOffset(sel.cpMin);
     const chip = switch (vk) {
         w32.VK_BACK => feedback_images.chipEndingAt(text, at),
         w32.VK_DELETE => feedback_images.chipStartingAt(text, at),
         else => null,
     } orelse return false;
 
-    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(chip.start), .cpMax = @intCast(chip.end) };
+    const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(chip.start), .cpMax = self.charIndex(chip.end) };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
     return true;
 }
@@ -981,7 +1017,7 @@ fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
     if (index >= spans.len) return;
     const s = spans[index];
 
-    const cr: w32.CHARRANGE = .{ .cpMin = @intCast(s.start), .cpMax = @intCast(s.end) };
+    const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(s.start), .cpMax = self.charIndex(s.end) };
     _ = w32.SetFocus(self.edit);
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
     _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
@@ -1041,7 +1077,7 @@ fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
     _ = w32.SendMessageW(self.edit, w32.WM_SETREDRAW, 0, 0);
     self.formatRange(0, -1, false);
     if (spans) |list| {
-        for (list) |s| self.formatRange(@intCast(s.start), @intCast(s.end), true);
+        for (list) |s| self.formatRange(self.charIndex(s.start), self.charIndex(s.end), true);
     }
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&sel)));
     _ = w32.SendMessageW(self.edit, w32.WM_SETREDRAW, 1, 0);
@@ -1050,7 +1086,8 @@ fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
     _ = w32.InvalidateRect(self.edit, null, 1);
 }
 
-/// Character wash + paragraph indent over one range. `to` of -1 is "to the
+/// Character wash + paragraph indent over one range, in the control's own
+/// CHARACTER indices (callers convert with `charIndex`). `to` of -1 is "to the
 /// end", which is how the flat pass covers the whole document.
 fn formatRange(self: *ViewerFeedbackBar, from: i32, to: i32, quoted: bool) void {
     const cr: w32.CHARRANGE = .{ .cpMin = from, .cpMax = to };
@@ -1088,7 +1125,7 @@ fn ensurePlainAtCaret(self: *ViewerFeedbackBar) void {
     _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
     // A non-empty selection is about to be REPLACED; the format that matters
     // is the one at its start, which is where the new text lands.
-    const pos: usize = if (sel.cpMin > 0) @intCast(sel.cpMin) else 0;
+    const pos: usize = self.byteOffset(sel.cpMin);
 
     const spans = self.quoteSpans();
     defer if (spans) |s| self.alloc.free(s);
@@ -1136,10 +1173,13 @@ fn paintQuoteBars(self: *ViewerFeedbackBar, hdc: w32.HDC) void {
         if (s.end == 0) continue;
         var top: w32.POINTL = .{ .x = 0, .y = 0 };
         var bottom: w32.POINTL = .{ .x = 0, .y = 0 };
-        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&top), @intCast(s.start));
+        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&top), self.charIndex(s.start));
         // The block's LAST character, not the position after it: one past the
-        // end is the next line, and the bar would run a line too far.
-        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&bottom), @intCast(s.end - 1));
+        // end is the next line, and the bar would run a line too far. Stepped
+        // back a CODE UNIT rather than a byte — `s.end - 1` can land inside a
+        // multi-byte character, and a byte is not a position here.
+        const last = @max(0, self.charIndex(s.end) - 1);
+        _ = w32.SendMessageW(self.edit, w32.EM_POSFROMCHAR, @intFromPtr(&bottom), last);
         var r: w32.RECT = .{
             .left = x,
             .top = top.y,

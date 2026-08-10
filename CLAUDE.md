@@ -867,6 +867,23 @@ the queue; consuming it is separate and not built here).
   the latter expands each paragraph mark to CR+LF and every quote offset the
   composer computes has to index the control and the pane's buffer the same
   way.
+  **The composer's two indexings are BYTES and CODE UNITS, and it converts
+  between them** (T648). Every pure module here works in byte offsets into the
+  pane's UTF-8 buffer — which is right, since that buffer is what the report is
+  written from — and every edit message (`EM_EXSETSEL`, `EM_EXGETSEL`,
+  `EM_POSFROMCHAR`) works in UTF-16 code units. Those agree **only for ASCII**:
+  `é` is 2 bytes and 1 unit, an emoji is 4 bytes and 2 units. Handed straight
+  across, a quote or an image chip landed short by the accumulated difference —
+  silent corruption of what the user wrote, invisible to anyone typing plain
+  English. So a `CHARRANGE` is never filled from a byte offset directly: it
+  goes through `ViewerFeedbackBar.charIndex`, and a number out of the control
+  goes through `.byteOffset`, both over the pure `utf16_offset.zig`. The
+  conversion has exactly ONE home — the address bar and the banner editor only
+  ever `EM_SETSEL(0, -1)`, so they compute no offset to get wrong. Line endings
+  need no conversion (see `GT_DEFAULT` above); the encoding does. Acceptance:
+  `test/win32/viewer-feedback-utf16.ps1`, whose every arm compares the WHOLE
+  composer text — its first draft used a `[Image` substring needle and passed
+  against a deliberately broken build that had left `[Imag` behind.
   **Send files the report on Windows too** (T636): `↑`/Ctrl+Enter writes the
   same folder into the same queue, off the UI thread on a worker
   (`ViewerFeedbackSend.zig`) because two `git rev-parse` spawns and a source

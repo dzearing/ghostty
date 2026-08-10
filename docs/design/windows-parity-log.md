@@ -13144,3 +13144,58 @@ Floor: all three zig lanes PASS through `floor-lane.ps1 -Lane all`; P1–P3 ALL
 PASS; `viewer-feedback-images.ps1` ALL PASS (39). `viewer-feedback.ps1` is 67
 pass / 1 fail — the same pre-existing **T644** Ctrl+Z arm as the last two
 composer tasks, unchanged in count.
+
+## 2026-08-09 — Write feedback in your own language and it lands where you put it (T648)
+
+Type an accent or an emoji into a Windows viewer's feedback box and everything
+after it used to drift. Quote a passage and the block landed in the wrong
+place; paste a picture and its chip did too, further off the more non-English
+text sat above it. Backspace next to a chip ate into the middle of it instead
+of removing it, which silently drops the picture from the report while the text
+still looks like it is attached. None of it was visible to anyone typing plain
+English, which is why it shipped and why T637 only tripped over it in passing.
+
+One cause underneath all of that. Every pure module behind the composer works
+in BYTES into the pane's UTF-8 buffer — correctly, because that buffer is what
+the report is written from — and every win32 edit message works in UTF-16 CODE
+UNITS, because that is what the control stores. Those are the same number only
+for ASCII: `é` is two bytes and one unit, an emoji is four bytes and two. The
+composer handed one straight across as the other.
+
+The fix is a conversion at that boundary, not a change to either side.
+`utf16_offset.zig` is pure and does the counting both directions;
+`ViewerFeedbackBar.charIndex`/`.byteOffset` add the buffer to count against,
+and every `CHARRANGE` and `EM_POSFROMCHAR` index in the file now goes through
+them. Malformed bytes clamp rather than crash, and an offset that lands inside
+a character answers the boundary at or before it — never half of one. The
+conversion has exactly ONE home: the two other suspects the task named, the
+address bar and the banner editor, only ever select-all, so they compute no
+offset to get wrong. Line endings needed nothing — `readBack` already reads
+with `GT_DEFAULT`, so a paragraph mark is one byte here and one character
+there.
+
+**The first acceptance draft had no teeth, and that is the part worth
+remembering.** It passed against a build with the conversion deliberately
+stubbed out. Two mistakes of the same shape: the Backspace arm asked for "no
+`[Image` left", and the corruption leaves `[Imag`, which does not match that
+needle either; and the caret was parked at a position where both readings of
+the offset happen to sit just after a space, so the insertion agreed by
+accident. A substring needle cannot tell "correct" from "damaged in a way I did
+not picture." Every arm now compares the WHOLE composer text, and the fixture
+parks the caret where the two readings genuinely disagree. Re-checked against
+the stubbed build: four arms go red — a doubled space before the chip, the
+caret at unit 16 instead of 15, a chip eaten down to `[Im` that took the emoji
+with it, and a mangled report body.
+
+Validated by `test\win32\viewer-feedback-utf16.ps1` (**ALL PASS (29)**) for the
+chip, caret and Backspace halves, and by a new arm in the live win32-lane
+`ViewerPane` quote test for the quote half — pressing the page's own Quote
+button means running script IN the page, which the acceptance harness cannot
+do, so that half belongs in the lane. Ten unit tests cover the conversion
+itself in the `none` lane.
+
+Floor: all three zig lanes PASS through `floor-lane.ps1 -Lane all` (none 294s,
+win32 352s, agent 327s); P1–P3 ALL PASS; `viewer-feedback-images.ps1` ALL PASS
+(39) and `viewer-feedback-carousel.ps1` ALL PASS (38). `viewer-feedback.ps1` is
+67 pass / 1 fail — the same pre-existing **T644** Ctrl+Z arm as the last three
+composer tasks, unchanged in count.

@@ -206,6 +206,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_images.zig");
 
+    // Pure win32 byte-offset ⇄ UTF-16 code-unit conversion — the boundary
+    // between the pane's UTF-8 buffer and a `W` edit control's character
+    // indices (T648), same no-OS-imports deal.
+    _ = @import("apprt/win32/utf16_offset.zig");
+
     // Pure win32 region-selector rect math — a drag pulled in any direction,
     // clipped to the desktop, with a zero-area drag as a cancel (T647), same
     // no-OS-imports deal.

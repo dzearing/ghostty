@@ -5128,6 +5128,33 @@ test "host floor: a real controller on a real window, on this box" {
         }
         log.warn("quote: worktree={?s}", .{pane.feedbackWorktree()});
 
+        // T648: quote into a composer that ALREADY holds non-ASCII text, with
+        // the caret parked in the middle of it.
+        //
+        // The composer's pure modules work in BYTES into the pane's UTF-8
+        // buffer; the control works in UTF-16 CODE UNITS. They are the same
+        // number only for ASCII, which is why every offset now goes through
+        // `charIndex`/`byteOffset` — and why an all-ASCII quote test cannot
+        // see the difference.
+        //
+        // `\u{e9}` five times, a blank line, then `TAIL` is 16 bytes and 11
+        // code units. With the caret at unit 7 — the start of `TAIL`, just
+        // past the blank line — the block needs NO leading newlines, because
+        // it is already at the start of a line with air above it. Read as a
+        // byte offset, 7 lands inside the fourth `\u{e9}`, where the preceding
+        // byte is not a newline and two would be inserted.
+        const seeded = "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\n\nTAIL";
+        pane.feedbackSetText(alloc, seeded);
+        pane.setFeedbackOpen(true);
+        try testing.expect(pane.feedback_open);
+        {
+            // Straight at the control, because the caret is what this arm is
+            // about and the bar's own `setCaret` is the thing under test.
+            const bar = pane.feedback.?;
+            const cr: w32.CHARRANGE = .{ .cpMin = 7, .cpMax = 7 };
+            _ = w32.SendMessageW(bar.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+        }
+
         const driver = try selectionDriverJs(alloc, "ghoztty quoted this passage", "quote", true);
         defer alloc.free(driver);
         pane.executeScript(alloc, driver);
@@ -5168,6 +5195,15 @@ test "host floor: a real controller on a real window, on this box" {
         // LIVE: that is the number the report's `quotes` array will have.
         try testing.expect(std.mem.indexOf(u8, pane.feedbackText(), entry.text) != null);
         try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
+
+        // T648: it landed exactly at the caret — one blank line above the
+        // block and one below, with the tail intact. Two extra newlines here
+        // would be the byte offset having been read as a character index.
+        {
+            const want = "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\n\n" ++
+                "ghoztty quoted this passage" ++ "\n\nTAIL";
+            try testing.expectEqualStrings(want, pane.feedbackText());
+        }
 
         // ------------------------------------------------------------------
         // T636: press send, and read the report back off disk
