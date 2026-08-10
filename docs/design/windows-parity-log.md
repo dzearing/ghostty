@@ -13247,3 +13247,45 @@ win32 352s, agent 327s); P1–P3 ALL PASS; `viewer-feedback-images.ps1` ALL PASS
 (39) and `viewer-feedback-carousel.ps1` ALL PASS (38). `viewer-feedback.ps1` is
 67 pass / 1 fail — the same pre-existing **T644** Ctrl+Z arm as the last three
 composer tasks, unchanged in count.
+
+## 2026-08-09 — Pane notes already survive a restart; the card asking for it was six days stale (T122)
+
+T122 asked for what T422 shipped on 2026-08-03. Picked up, it produced no code —
+only the check that the behavior is real, and a close that says so.
+
+The card was filed off the T117 main-merge audit from a grep: win32's
+`session_layout.zig` had zero `banner` hits, so banners could not be persisted.
+T422 reached the same missing field from the opposite end, the user's report that
+every restored pane showed the same session-interrupted notice, and fixed it
+there. Point by point, the card's own list is covered: `Leaf.banner` is written
+in `captureLeaf` from `Surface.banner_text` as raw markdown source, re-applied by
+`restoreLeafPresentation` (which also put `Leaf.title` back — captured but never
+applied before T422), the agent-RELAUNCH path is covered by D2's precedence rule
+via `pane_banner_restored`, and both skew directions hold because the field is
+optional and the parse sets `ignore_unknown_fields`.
+
+The close was held to the standard a build would have been. Both acceptance
+scripts were re-run at HEAD against a fresh `-Doptimize=Debug` build rather than
+taken on the earlier turn's report: `session-reattach.ps1` **ALL PASS (44)**,
+including `F1b` (the positive control — the banner is set before the quit) and
+`F9b` (it is back after the relaunch, read through `+list --json`, which reports
+the live overlay rather than the manifest); `session-relaunch-notify.ps1` **ALL
+PASS (93)**, including arm E, where two panes keep their own banners across an
+agent restart, the bannerless third takes the notice, and `E5b` requires all
+three to be on a LIVE shell rather than a painted picture. No source changed, so
+the zig lanes and P1–P3 are untouched by this turn and were not re-run.
+
+Two other cards moved without being worked. T169 (`+version`'s Running Instance
+section) and T170 (`+list --pid`) are both Swift-only — the fix is a `case` in
+`macos/Sources/Features/IPC/IPCServer.swift` and every validation criterion is
+Mac-side, with the win32 handler already the reference the Mac must match. They
+carried no `seat:` field, so `next` kept handing them to this box; both are now
+`seat: "mac"` and back on todo. A sweep found no other open card with the same
+mis-seating.
+
+Filed **T676**: the shape T122 turned out to have is unlikely to be unique. The
+T117 and T141 audits filed cards in bulk from greps, and weeks of user-report
+work has been closing the same ground from the other direction — so the open
+cards depending on either audit want one pass to say, with evidence, which are
+still real. Left uncorrected it costs twice: M1's denominator counts work that
+does not exist, and each phantom card burns a full turn's context to discover.
