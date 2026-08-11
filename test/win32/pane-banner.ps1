@@ -1116,6 +1116,122 @@ try {
     & $exe +set-banner --target=bw --clear | Out-Null
     $null = Wait-Banner 'bw' 0 'NONE'
 
+    # --- 6j. T539: a BARE path in banner text is a link -----------------------
+    # The user's report: a path printed into a banner by a tool did nothing
+    # when clicked, because only [label](target) ever became a link here -
+    # win32 had no autolink pass at all. Mac autolinks bare paths and URLs;
+    # this is that pass, with the Windows-native spellings added.
+    #
+    # Three oracles, all of them BINARY and none of which launches anything
+    # on the user's box:
+    #   * the right-click MENU: a menu opens at all only over a link, and its
+    #     first row is by contract the left-click default - so "Reveal in
+    #     File Explorer" IS the promise that a plain click reveals the file
+    #     rather than opening it.
+    #   * Ctrl+click, end to end: a viewer pane pointed at that exact path,
+    #     which proves the TARGET carried the whole path, backslashes and all.
+    #   * the negative control, the other direction: the same text with its
+    #     drive prefix removed opens NO menu at the same spot. The sigil IS
+    #     the signal, and prose must never sprout links.
+    #
+    # Deliberately NOT a pixel count of link-colored ink, which is what this
+    # section tried first: ClearType fringes put a few blue-dominant pixels
+    # on the edge of every glyph, so plain text scored 393 "link" px against
+    # a real link's 2413 and the two could not be told apart by a threshold
+    # that would survive a font or theme change. 6i's rule-row oracle is the
+    # one that works in pixels, and it is already asserted there.
+    $t539Path = Join-Path $env:TEMP 'ghoztty-t539-target.md'
+    Set-Content -LiteralPath $t539Path -Value '# T539 target' -Encoding ascii
+    & $exe +set-banner --target=bw $t539Path | Out-Null
+    $null = Wait-Banner 'bw' 0 $t539Path
+    Start-Sleep -Milliseconds 700
+    $ovA = Get-Overlay $appPid $top
+    if (-not $ovA) {
+        $script:fail += 1
+        Write-Host 'FAIL  T539: no banner overlay for the bare-path banner' -ForegroundColor Red
+    } else {
+        $aHwnd = [IntPtr]$ovA.Hwnd
+        $aScale = (Get-TestWindowDpi -Window $aHwnd) / 96.0
+        $aPad = (Get-TestChromeDip -Dip 12.0 -Scale $aScale) * 2
+        $aLine = Get-TestChromeDip -Dip 20.0 -Scale $aScale
+        $ay = $aPad + [int][Math]::Truncate($aLine / 2)
+
+        Write-Host "INFO  T539 overlay $($ovA.Width)x$($ovA.Height) scale=$aScale, probing at x=$($aPad + 2) y=$ay"
+
+        # The menu says what a plain click would do. A FILE link leads with
+        # Reveal - which is the whole of what T539 asked for.
+        Send-TestMouse -Window $top -Target $aHwnd -X ($ovA.Left + $aPad + 2) -Y ($ovA.Top + $ay) `
+            -Button right -Action up | Out-Null
+        $menuA = Wait-TestPopupMenu -ProcessId $appPid -TimeoutMs 4000
+        Assert ($menuA -ne [IntPtr]::Zero) 'T539: right-clicking the autolinked path opens a menu'
+        if ($menuA -ne [IntPtr]::Zero) {
+            $r = Invoke-TestMessage -Window $menuA -Message 0x01E1  # MN_GETHMENU
+            $itemsA = if ($r -eq [long]::MinValue -or $r -eq 0) { @() } else { [BannerMenuRead]::Items([IntPtr]$r) }
+            Write-Host "      T539 menu items: $($itemsA -join ' | ')"
+            Assert ($itemsA.Count -gt 0 -and $itemsA[0] -eq 'Reveal in File Explorer') `
+                'T539: ...and it is a FILE menu, so a plain click reveals in Explorer'
+            Assert ($itemsA -contains 'Copy Path') 'T539: the file menu offers Copy Path'
+            $paneForCancel = Get-Pane $top 0
+            if ($paneForCancel) {
+                [void](Invoke-TestMessage -Window ([IntPtr]$paneForCancel.Hwnd) -Message 0x001F)  # WM_CANCELMODE
+            }
+            $goneA = $false
+            for ($t = 0; $t -lt 40; $t++) {
+                if ((Get-TestWindow -ProcessId $appPid -Class '#32768') -eq [IntPtr]::Zero) { $goneA = $true; break }
+                Start-Sleep -Milliseconds 50
+            }
+            Assert $goneA 'T539: the file menu dismisses without choosing a row'
+        }
+
+        # Ctrl+click: a viewer pane pointed at the path itself.
+        $beforeA = @(Get-Leaves (Get-Win 'bw').tabs[0].splits).Count
+        Send-TestMouse -Window $top -Target $aHwnd -X ($ovA.Left + $aPad + 2) -Y ($ovA.Top + $ay) `
+            -Action up -Modifiers ctrl | Out-Null
+        $viewerUrl = $null
+        for ($t = 0; $t -lt 25; $t++) {
+            Start-Sleep -Milliseconds 200
+            $w = Get-Win 'bw'
+            if (-not $w) { continue }
+            $v = @(Get-Leaves $w.tabs[0].splits | Where-Object { $_.type -eq 'viewer' })
+            if ($v.Count -ge 1) { $viewerUrl = $v[0].url; break }
+        }
+        Write-Host "INFO  T539 ctrl+click viewer url: $viewerUrl (panes were $beforeA)"
+        Assert ($null -ne $viewerUrl) 'T539: Ctrl+click on the autolinked path opens a viewer pane'
+        Assert ($viewerUrl -and ($viewerUrl -replace '/', '\') -eq $t539Path) `
+            "T539: ...pointed at the whole path (got '$viewerUrl')"
+        $w = Get-Win 'bw'
+        if ($w) {
+            foreach ($leaf in @(Get-Leaves $w.tabs[0].splits)) {
+                if ($leaf.type -eq 'viewer') { & $exe +close --target=$($leaf.id) | Out-Null }
+            }
+        }
+        Start-Sleep -Milliseconds 800
+
+        # Negative control: the SAME path with its drive prefix removed is
+        # not a link, so the same right-click lands on prose and no menu
+        # opens. Same text, same pixel, one sigil of difference.
+        $t539Plain = $t539Path.Substring(3)
+        & $exe +set-banner --target=bw $t539Plain | Out-Null
+        $null = Wait-Banner 'bw' 0 $t539Plain
+        Start-Sleep -Milliseconds 700
+        Send-TestMouse -Window $top -Target $aHwnd -X ($ovA.Left + $aPad + 2) -Y ($ovA.Top + $ay) `
+            -Button right -Action up | Out-Null
+        $menuP = Wait-TestPopupMenu -ProcessId $appPid -TimeoutMs 2500
+        Assert ($menuP -eq [IntPtr]::Zero) `
+            'T539: the same path with no drive prefix stays prose (no link menu)'
+        if ($menuP -ne [IntPtr]::Zero) {
+            $paneForCancel = Get-Pane $top 0
+            if ($paneForCancel) {
+                [void](Invoke-TestMessage -Window ([IntPtr]$paneForCancel.Hwnd) -Message 0x001F)
+            }
+            Start-Sleep -Milliseconds 400
+        }
+    }
+    Remove-Item -LiteralPath $t539Path -ErrorAction SilentlyContinue
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T539 section: GUI alive'
+    & $exe +set-banner --target=bw --clear | Out-Null
+    $null = Wait-Banner 'bw' 0 'NONE'
+
     # --- 7. per-pane: named split pane gets its own banner ---------------------
     & $exe +split --target=bw --name=bp1 --direction=down | Out-Null
     Start-Sleep -Seconds 1

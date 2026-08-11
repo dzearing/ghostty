@@ -35,6 +35,7 @@ const Surface = @import("Surface.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
+const homedir = @import("../../os/homedir.zig");
 
 const log = std.log.scoped(.win32_banner);
 
@@ -304,7 +305,19 @@ pub const BannerOverlay = struct {
         // The reset above freed every URL, so the hover's identity pointer
         // now names nothing (T165).
         self.hover_link = null;
-        self.blocks = markdown.parseBlocks(self.arena.allocator(), text) catch &.{};
+        // Bare relative paths in the text resolve against the pane, here
+        // and not at click time, because the parser is what decides whether
+        // they are links at all: with nothing to resolve against they stay
+        // plain text rather than becoming a link that goes nowhere (T539).
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        self.blocks = markdown.parseBlocks(
+            self.arena.allocator(),
+            .{
+                .cwd = if (self.surface) |s| s.pwd else null,
+                .home = homedir.home(&home_buf) catch null,
+            },
+            text,
+        ) catch &.{};
         self.collapsible = std.mem.indexOfScalar(u8, text, '\n') != null;
         if (!self.collapsible) self.collapsed = false;
         self.content_h = -1;

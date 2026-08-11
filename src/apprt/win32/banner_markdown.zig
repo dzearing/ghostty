@@ -9,6 +9,11 @@
 //!   - `` `code` `` (monospaced, contents not further parsed)
 //!   - `[text](url)` clickable links (url must have a scheme); the label
 //!     may contain other styles
+//!   - bare URLs and bare file paths, linkified with no markdown syntax
+//!     (T539 — see `autolink`): `https://…`/`http://…`, a drive path
+//!     (`D:\…`, `D:/…`), a UNC share (`\\server\share\…`), `/…`, `~\…`
+//!     and `.\…`/`..\…` (either slash), each resolved to an absolute
+//!     target via `PathContext`
 //!   - `[x]`/`[X]`/`[ ]` task-list checkboxes, drawn natively by the view
 //!     (a `[x](url)` token stays a link; a checkbox nested inside a
 //!     styled span or link label falls back to the `☑`/`☐` glyph)
@@ -37,6 +42,23 @@ const Allocator = std.mem.Allocator;
 
 /// Display cap, matching the Mac banner's `maxDisplayLines`.
 pub const max_lines: usize = 10;
+
+/// What a bare relative path in the banner text resolves against (T539).
+///
+/// The pane supplies both: `cwd` is its working directory, which moves as
+/// the user `cd`s, and `home` is `%USERPROFILE%`. Either may be absent — a
+/// pane that never reported a cwd, a caller with no pane at all — and the
+/// paths that need the missing one then stay **plain text** rather than
+/// resolving against a guess, which is Mac's rule for the same field
+/// (`SurfacePaneBanner`'s `fileURL(_:cwd:)` returns nil with no cwd).
+///
+/// Absolute forms — `D:\…`, `\\server\share\…`, `/…`, and every URL — need
+/// neither, so the T539 case (a build tool printing an absolute path into a
+/// banner) links with no context at all.
+pub const PathContext = struct {
+    cwd: ?[]const u8 = null,
+    home: ?[]const u8 = null,
+};
 
 pub const Style = struct {
     bold: bool = false,
@@ -120,7 +142,11 @@ pub const Block = union(enum) {
 /// Parse banner source into displayable blocks, truncated to at most
 /// `max_lines` display lines. The caller owns the arena; all slices are
 /// arena-allocated.
-pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block {
+pub fn parseBlocks(
+    arena: Allocator,
+    paths: PathContext,
+    source: []const u8,
+) Allocator.Error![]Block {
     var blocks: std.ArrayList(Block) = .empty;
     var remaining: usize = max_lines;
 
@@ -137,7 +163,7 @@ pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block
                 remaining -= 1;
                 try blocks.append(arena, .{ .heading = .{
                     .level = h.level,
-                    .content = try parseSegs(arena, h.text, false),
+                    .content = try parseSegs(arena, paths, h.text, false),
                 } });
             }
             i += 1;
@@ -172,7 +198,7 @@ pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block
 
                 const header = try arena.alloc([]const Inline, columns);
                 for (header_cells, 0..) |cell, col| {
-                    header[col] = try parseSegs(arena, cell, true);
+                    header[col] = try parseSegs(arena, paths, cell, true);
                 }
                 const alignments = try arena.alloc(?ColumnAlignment, columns);
                 for (sep_cells, 0..) |cell, col| alignments[col] = columnAlignment(cell);
@@ -181,7 +207,7 @@ pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block
                     const row = try arena.alloc([]const Inline, columns);
                     for (0..columns) |col| {
                         row[col] = if (col < raw.len)
-                            try parseSegs(arena, raw[col], true)
+                            try parseSegs(arena, paths, raw[col], true)
                         else
                             &.{};
                     }
@@ -208,7 +234,7 @@ pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block
                     remaining -= 1;
                     try items.append(arena, .{
                         .marker = item.marker,
-                        .content = try parseSegs(arena, item.content, true),
+                        .content = try parseSegs(arena, paths, item.content, true),
                     });
                 }
             }
@@ -221,7 +247,7 @@ pub fn parseBlocks(arena: Allocator, source: []const u8) Allocator.Error![]Block
         if (!isBlank(line)) {
             if (remaining > 0) {
                 remaining -= 1;
-                try blocks.append(arena, .{ .text = try parseSegs(arena, line, false) });
+                try blocks.append(arena, .{ .text = try parseSegs(arena, paths, line, false) });
             }
         }
         i += 1;
@@ -477,16 +503,18 @@ const delimiters = [_]Delim{
 /// and plain text/heading lines get the `☑`/`☐` glyph fallback instead.
 pub fn parseSegs(
     arena: Allocator,
+    paths: PathContext,
     s: []const u8,
     native_checkbox: bool,
 ) Allocator.Error![]const Inline {
     var out: std.ArrayList(Inline) = .empty;
-    try parseInline(arena, &out, s, .{}, null, native_checkbox, true);
+    try parseInline(arena, paths, &out, s, .{}, null, native_checkbox, true);
     return out.items;
 }
 
 fn parseInline(
     arena: Allocator,
+    paths: PathContext,
     out: *std.ArrayList(Inline),
     s: []const u8,
     style: Style,
@@ -499,6 +527,32 @@ fn parseInline(
 
     while (i < s.len) {
         const c = s[i];
+
+        // Bare URLs and file paths, linkified with no markdown syntax
+        // (T539). FIRST in the loop, ahead of the escape branch, because a
+        // UNC path opens with the escape character itself — `\\server\s`
+        // would otherwise be eaten one `\` at a time and rendered as
+        // `\servers`. A `\` that does not open a UNC path falls straight
+        // through to the escape branch below, so `\*` still escapes.
+        //
+        // Never inside an explicit link's label (`link != null`): that link
+        // owns its whole label, exactly as on Mac. Never inside a code span
+        // either — the delimiter branch takes those literally and does not
+        // recurse here.
+        if (link == null and canStartAutolink(s, i)) {
+            if (try autolink(arena, paths, s, i)) |a| {
+                try flushLiteral(arena, out, &literal, style, link);
+                var linked_style = style;
+                linked_style.underline = true;
+                try out.append(arena, .{ .seg = .{
+                    .text = try arena.dupe(u8, s[i..a.end]),
+                    .style = linked_style,
+                    .link = a.target,
+                } });
+                i = a.end;
+                continue;
+            }
+        }
 
         // Backslash escapes the next character.
         if (c == '\\' and i + 1 < s.len) {
@@ -544,6 +598,7 @@ fn parseInline(
             linked_style.underline = true;
             try parseInline(
                 arena,
+                paths,
                 out,
                 s[i + 1 .. close_bracket],
                 linked_style,
@@ -578,7 +633,7 @@ fn parseInline(
                     .link = link,
                 } });
             } else {
-                try parseInline(arena, out, inner, styled, link, false, false);
+                try parseInline(arena, paths, out, inner, styled, link, false, false);
             }
             i = close + d.token.len;
             continue;
@@ -641,6 +696,219 @@ fn hasScheme(url: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------
+// Autolinking (T539)
+// ---------------------------------------------------------------------
+
+/// Schemes that linkify on their own. Scheme-only by design, matching Mac:
+/// a bare `www.example.com`, `config.io`, or `see foo.md` in prose must stay
+/// text, so there is no bare-domain or TLD matching here.
+const autolink_schemes = [_][]const u8{ "https://", "http://" };
+
+/// Characters a bare link may start immediately after (besides whitespace
+/// and the start of the run), so `(D:\out\a.mp4)` links while `and/or` and
+/// `xhttps://x.com` do not.
+fn isAutolinkOpener(c: u8) bool {
+    return switch (c) {
+        '(', '[', '{', '<', '"', '\'' => true,
+        else => false,
+    };
+}
+
+/// Trailing characters that read as the surrounding sentence's rather than
+/// the link's. Closing brackets are handled separately — balanced pairs
+/// inside a path are common (`…\Foo_(bar)\a.txt`).
+fn isAutolinkTrailing(c: u8) bool {
+    return switch (c) {
+        '.', ',', ';', ':', '!', '?', '"', '\'', '>' => true,
+        else => false,
+    };
+}
+
+fn isPathSep(c: u8) bool {
+    return c == '\\' or c == '/';
+}
+
+/// Which family a matched prefix belongs to, i.e. what has to happen to the
+/// matched text before it can be handed to Explorer or the shell.
+const AutolinkKind = enum {
+    /// A URL: linked verbatim.
+    web,
+    /// Already absolute (`D:\…`, `\\srv\share\…`, `/…`): linked verbatim.
+    absolute,
+    /// `~\…` — needs `PathContext.home`.
+    home,
+    /// `.\…`/`..\…` — needs `PathContext.cwd`.
+    relative,
+};
+
+const AutolinkPrefix = struct { len: usize, kind: AutolinkKind };
+
+/// Cheap first-character gate, so the matcher below runs on a handful of
+/// positions per line rather than all of them.
+fn canStartAutolink(s: []const u8, i: usize) bool {
+    return switch (s[i]) {
+        'h', '/', '~', '.', '\\' => true,
+        // A drive letter is only a candidate with its colon behind it.
+        else => |c| std.ascii.isAlphabetic(c) and i + 1 < s.len and s[i + 1] == ':',
+    };
+}
+
+/// The prefix that marks a bare link, or null. Mac's four sigils (`/`,
+/// `~/`, `./`, `../`) plus the spellings that are native here: a drive
+/// path, a UNC share, and the backslash form of each relative sigil. The
+/// sigil IS the signal — it is what lets a path linkify with no filesystem
+/// check, and why a bare `docs\design\foo.md` stays text.
+fn autolinkPrefix(s: []const u8) ?AutolinkPrefix {
+    for (autolink_schemes) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(s, scheme))
+            return .{ .len = scheme.len, .kind = .web };
+    }
+    // `D:\…` / `D:/…`. One letter and a colon is never a scheme (no
+    // registered URI scheme is a single character), which is the same call
+    // `banner_link.kindOf` makes for the click side.
+    if (s.len >= 3 and std.ascii.isAlphabetic(s[0]) and s[1] == ':' and isPathSep(s[2]))
+        return .{ .len = 3, .kind = .absolute };
+    // `\\server\share\…`. The prefix is the two slashes; a third character
+    // that is neither a separator nor a space is what tells it apart from
+    // an escaped `\\` in prose.
+    if (s.len >= 3 and s[0] == '\\' and s[1] == '\\' and
+        !isPathSep(s[2]) and !std.ascii.isWhitespace(s[2]))
+        return .{ .len = 2, .kind = .absolute };
+    // `..` before `.`, and both before the bare `/`.
+    if (s.len >= 3 and s[0] == '.' and s[1] == '.' and isPathSep(s[2]))
+        return .{ .len = 3, .kind = .relative };
+    if (s.len >= 2 and s[0] == '.' and isPathSep(s[1]))
+        return .{ .len = 2, .kind = .relative };
+    if (s.len >= 2 and s[0] == '~' and isPathSep(s[1]))
+        return .{ .len = 2, .kind = .home };
+    if (s[0] == '/') return .{ .len = 1, .kind = .absolute };
+    return null;
+}
+
+const Autolink = struct {
+    /// Where the target points; arena-allocated for anything resolved.
+    target: []const u8,
+    /// One past the last character of the LINKED TEXT, which stays as the
+    /// user wrote it even when the target was resolved elsewhere.
+    end: usize,
+};
+
+/// If a bare URL or file path begins at `i`, return where it points and
+/// where its text ends. Null when nothing starts there, when the match is a
+/// bare prefix with no body (`https://`, `D:\`), or when the form needs a
+/// context path this pane does not have.
+fn autolink(
+    arena: Allocator,
+    paths: PathContext,
+    s: []const u8,
+    i: usize,
+) Allocator.Error!?Autolink {
+    // Only at a word boundary, so a link is always a whole token.
+    if (i > 0) {
+        const prev = s[i - 1];
+        if (!std.ascii.isWhitespace(prev) and !isAutolinkOpener(prev)) return null;
+    }
+
+    const rest = s[i..];
+    const prefix = autolinkPrefix(rest) orelse return null;
+    const end = autolinkEnd(s, i);
+    const text = s[i..end];
+    // A bare scheme or sigil with nothing after it is not a link.
+    if (text.len <= prefix.len) return null;
+
+    return switch (prefix.kind) {
+        .web, .absolute => .{ .target = try arena.dupe(u8, text), .end = end },
+        .home => .{
+            .target = try joinPath(arena, paths.home orelse return null, text[prefix.len..]),
+            .end = end,
+        },
+        .relative => .{
+            .target = try joinPath(arena, paths.cwd orelse return null, text),
+            .end = end,
+        },
+    };
+}
+
+/// Where the bare link starting at `from` ends: up to whitespace (or a
+/// backtick or pipe, neither of which can sit inside banner link text),
+/// minus any trailing sentence punctuation.
+fn autolinkEnd(s: []const u8, from: usize) usize {
+    var end = from;
+    while (end < s.len and !std.ascii.isWhitespace(s[end]) and
+        s[end] != '`' and s[end] != '|') end += 1;
+
+    while (end > from) {
+        const last = s[end - 1];
+        if (isAutolinkTrailing(last)) {
+            end -= 1;
+            continue;
+        }
+        // A closing bracket is the sentence's only when the link has no
+        // matching opener: `(see D:\a.txt)` sheds it, `D:\Foo_(bar)\a.txt`
+        // keeps it.
+        const opener: ?u8 = switch (last) {
+            ')' => '(',
+            ']' => '[',
+            else => null,
+        };
+        if (opener) |o| {
+            var opens: usize = 0;
+            var closes: usize = 0;
+            for (s[from..end]) |c| {
+                if (c == o) opens += 1;
+                if (c == last) closes += 1;
+            }
+            if (closes > opens) {
+                end -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    return end;
+}
+
+/// Join a relative path onto an absolute base, collapsing `.` and `..`
+/// segments and normalizing every separator to `\`. Kept here rather than
+/// reached for from `std.fs.path` because `resolveWindows` falls back to
+/// the PROCESS working directory when its first path is not absolute —
+/// this module is pure by contract, and a banner must never silently point
+/// at whatever directory the app happens to have been launched from.
+fn joinPath(arena: Allocator, base: []const u8, rel: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (base) |c| try out.append(arena, if (c == '/') '\\' else c);
+    while (out.items.len > 0 and out.items[out.items.len - 1] == '\\')
+        _ = out.pop();
+    // Everything before the first separator of the base is its root (`D:`,
+    // or `\\server\share`'s leading slashes) and `..` never climbs past it.
+    const root_len = rootLen(out.items);
+
+    var it = std.mem.splitAny(u8, rel, "/\\");
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            while (out.items.len > root_len and out.items[out.items.len - 1] != '\\')
+                _ = out.pop();
+            while (out.items.len > root_len and out.items[out.items.len - 1] == '\\')
+                _ = out.pop();
+            continue;
+        }
+        try out.append(arena, '\\');
+        try out.appendSlice(arena, part);
+    }
+    return out.items;
+}
+
+/// Length of the un-poppable root of an already-normalized path: `D:` for a
+/// drive, the leading `\\` of a UNC path, `\` for a rooted one.
+fn rootLen(path: []const u8) usize {
+    if (path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') return 2;
+    if (path.len >= 2 and path[0] == '\\' and path[1] == '\\') return 2;
+    if (path.len >= 1 and path[0] == '\\') return 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -663,7 +931,7 @@ fn seg(inl: Inline) Seg {
 test "plain text is a single unstyled run" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "hello world");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "hello world");
     try testing.expectEqual(@as(usize, 1), blocks.len);
     const segs = textSegs(blocks[0]);
     try testing.expectEqual(@as(usize, 1), segs.len);
@@ -675,7 +943,7 @@ test "plain text is a single unstyled run" {
 test "bold italic underline code" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "**b** *i* _i2_ __u__ `c`");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "**b** *i* _i2_ __u__ `c`");
     const segs = textSegs(blocks[0]);
     try testing.expectEqual(@as(usize, 9), segs.len); // 5 styled + 4 spaces
     try testing.expect(seg(segs[0]).style.bold);
@@ -690,7 +958,7 @@ test "bold italic underline code" {
 test "code span contents are literal" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "`**not bold**`");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "`**not bold**`");
     const segs = textSegs(blocks[0]);
     try testing.expectEqual(@as(usize, 1), segs.len);
     try testing.expect(seg(segs[0]).style.code);
@@ -701,13 +969,13 @@ test "code span contents are literal" {
 test "link with scheme; without scheme renders literally" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const linked = textSegs((try parseBlocks(arena.allocator(), "[view](https://example.com/pr)"))[0]);
+    const linked = textSegs((try parseBlocks(arena.allocator(), .{}, "[view](https://example.com/pr)"))[0]);
     try testing.expectEqual(@as(usize, 1), linked.len);
     try testing.expectEqualStrings("view", seg(linked[0]).text);
     try testing.expect(seg(linked[0]).style.underline);
     try testing.expectEqualStrings("https://example.com/pr", seg(linked[0]).link.?);
 
-    const plain = textSegs((try parseBlocks(arena.allocator(), "[view](example.com)"))[0]);
+    const plain = textSegs((try parseBlocks(arena.allocator(), .{}, "[view](example.com)"))[0]);
     try testing.expectEqual(@as(usize, 1), plain.len);
     try testing.expectEqualStrings("[view](example.com)", seg(plain[0]).text);
     try testing.expectEqual(@as(?[]const u8, null), seg(plain[0]).link);
@@ -716,7 +984,7 @@ test "link with scheme; without scheme renders literally" {
 test "styles nest: bold containing a link" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const segs = textSegs((try parseBlocks(arena.allocator(), "**PR [123](https://x.io/1)**"))[0]);
+    const segs = textSegs((try parseBlocks(arena.allocator(), .{}, "**PR [123](https://x.io/1)**"))[0]);
     try testing.expectEqual(@as(usize, 2), segs.len);
     try testing.expect(seg(segs[0]).style.bold);
     try testing.expectEqualStrings("PR ", seg(segs[0]).text);
@@ -728,7 +996,7 @@ test "styles nest: bold containing a link" {
 test "unterminated delimiters render literally" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const segs = textSegs((try parseBlocks(arena.allocator(), "**open _tail `code"))[0]);
+    const segs = textSegs((try parseBlocks(arena.allocator(), .{}, "**open _tail `code"))[0]);
     try testing.expectEqual(@as(usize, 1), segs.len);
     try testing.expectEqualStrings("**open _tail `code", seg(segs[0]).text);
     try testing.expectEqual(Style{}, seg(segs[0]).style);
@@ -737,15 +1005,21 @@ test "unterminated delimiters render literally" {
 test "escapes suppress styling" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const segs = textSegs((try parseBlocks(arena.allocator(), "\\*\\*not bold\\*\\* \\\\ \\[x](https://y.io)"))[0]);
-    try testing.expectEqual(@as(usize, 1), segs.len);
-    try testing.expectEqualStrings("**not bold** \\ [x](https://y.io)", seg(segs[0]).text);
+    const segs = textSegs((try parseBlocks(arena.allocator(), .{}, "\\*\\*not bold\\*\\* \\\\ \\[x](https://y.io)"))[0]);
+    // Three runs since T539: the escaped brackets stop the link SYNTAX, but
+    // the URL left sitting in parens is a bare URL and autolinks on its own
+    // (Mac's parser splits it the same way).
+    try testing.expectEqual(@as(usize, 3), segs.len);
+    try testing.expectEqualStrings("**not bold** \\ [x](", seg(segs[0]).text);
+    try testing.expectEqualStrings("https://y.io", seg(segs[1]).text);
+    try testing.expectEqualStrings("https://y.io", seg(segs[1]).link.?);
+    try testing.expectEqualStrings(")", seg(segs[2]).text);
 }
 
 test "line cap: 12 text lines keep 10" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl");
     try testing.expectEqual(@as(usize, max_lines), blocks.len);
     try testing.expectEqual(@as(usize, max_lines), displayLines(blocks));
     try testing.expectEqualStrings("j", seg(textSegs(blocks[9])[0]).text);
@@ -754,7 +1028,7 @@ test "line cap: 12 text lines keep 10" {
 test "blank lines drop; styling spans one line only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "**a\n\n   \nb**");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "**a\n\n   \nb**");
     try testing.expectEqual(@as(usize, 2), blocks.len);
     try testing.expectEqualStrings("**a", seg(textSegs(blocks[0])[0]).text);
     try testing.expectEqualStrings("b**", seg(textSegs(blocks[1])[0]).text);
@@ -763,7 +1037,7 @@ test "blank lines drop; styling spans one line only" {
 test "empty source yields no blocks" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "");
     try testing.expectEqual(@as(usize, 0), blocks.len);
     try testing.expectEqual(@as(usize, 1), displayLines(blocks));
 }
@@ -771,7 +1045,7 @@ test "empty source yields no blocks" {
 test "headings: levels, no-space and 7-hash are text" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "# Title\n###### deep\n#nospace\n####### seven");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "# Title\n###### deep\n#nospace\n####### seven");
     try testing.expectEqual(@as(usize, 4), blocks.len);
     try testing.expectEqual(@as(u8, 1), blocks[0].heading.level);
     try testing.expectEqualStrings("Title", seg(blocks[0].heading.content[0]).text);
@@ -783,7 +1057,7 @@ test "headings: levels, no-space and 7-hash are text" {
 test "heading text carries inline styles" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "## a **b**");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "## a **b**");
     const content = blocks[0].heading.content;
     try testing.expectEqual(@as(usize, 2), content.len);
     try testing.expect(seg(content[1]).style.bold);
@@ -792,7 +1066,7 @@ test "heading text carries inline styles" {
 test "thematic breaks vs bullets and bold lines" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "---\n***\n___\n- - -\n**bold**\n- item\n--");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "---\n***\n___\n- - -\n**bold**\n- item\n--");
     try testing.expectEqual(@as(usize, 7), blocks.len);
     try testing.expect(blocks[0] == .rule);
     try testing.expect(blocks[1] == .rule);
@@ -808,6 +1082,7 @@ test "list run: mixed markers form one block, content parsed" {
     defer arena.deinit();
     const blocks = try parseBlocks(
         arena.allocator(),
+        .{},
         "- bullet\n* star\n1. first\n12. twelfth\n[x] done\n[ ] todo\n- [X] dashed",
     );
     try testing.expectEqual(@as(usize, 1), blocks.len);
@@ -827,7 +1102,7 @@ test "list run: mixed markers form one block, content parsed" {
 test "decimal 1.5 is not a list; checkbox link stays a link" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "1.5 things\n[x](https://x.io) go");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "1.5 things\n[x](https://x.io) go");
     try testing.expectEqual(@as(usize, 2), blocks.len);
     try testing.expect(blocks[0] == .text);
     try testing.expect(blocks[1] == .text);
@@ -839,7 +1114,7 @@ test "decimal 1.5 is not a list; checkbox link stays a link" {
 test "checkbox mid-paragraph falls back to glyph" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "status [x] shipped");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "status [x] shipped");
     const segs = textSegs(blocks[0]);
     try testing.expectEqual(@as(usize, 1), segs.len);
     try testing.expectEqualStrings("status \u{2611} shipped", seg(segs[0]).text);
@@ -850,6 +1125,7 @@ test "table: header, alignments, body, inline styles" {
     defer arena.deinit();
     const blocks = try parseBlocks(
         arena.allocator(),
+        .{},
         "| Job | State |\n|:---|---:|\n| lint | ok |\n| tests | **3 failed** |",
     );
     try testing.expectEqual(@as(usize, 1), blocks.len);
@@ -870,6 +1146,7 @@ test "table: center alignment, escaped pipe, ragged rows" {
     defer arena.deinit();
     const blocks = try parseBlocks(
         arena.allocator(),
+        .{},
         "| a | b | c |\n|:---:|---|---|\n| one \\| two | x |\n| 1 | 2 | 3 | 4 |",
     );
     const t = blocks[0].table;
@@ -883,7 +1160,7 @@ test "table: center alignment, escaped pipe, ragged rows" {
 test "table: all-empty header is headerless" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "|  |  |\n|---|---|\n| k | v |");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "|  |  |\n|---|---|\n| k | v |");
     const t = blocks[0].table;
     try testing.expect(!t.hasVisibleHeader());
     try testing.expectEqual(@as(usize, 1), t.rows.len);
@@ -892,7 +1169,7 @@ test "table: all-empty header is headerless" {
 test "table: pipe line without separator stays text" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "| a | b |\n| not sep |");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "| a | b |\n| not sep |");
     try testing.expectEqual(@as(usize, 2), blocks.len);
     try testing.expect(blocks[0] == .text);
     try testing.expect(blocks[1] == .text);
@@ -901,7 +1178,7 @@ test "table: pipe line without separator stays text" {
 test "table cell checkbox is native" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const blocks = try parseBlocks(arena.allocator(), "| t | done |\n|---|---|\n| build | [x] |");
+    const blocks = try parseBlocks(arena.allocator(), .{}, "| t | done |\n|---|---|\n| build | [x] |");
     const cell = blocks[0].table.rows[0][1];
     try testing.expectEqual(@as(usize, 1), cell.len);
     try testing.expect(cell[0].checkbox);
@@ -918,7 +1195,7 @@ test "line cap counts table rows and drops the tail" {
         try src.writer(testing.allocator).print("| r{d} | v |\n", .{n});
     }
     try src.appendSlice(testing.allocator, "tail after cap");
-    const blocks = try parseBlocks(arena.allocator(), src.items);
+    const blocks = try parseBlocks(arena.allocator(), .{}, src.items);
     try testing.expectEqual(@as(usize, 4), blocks.len); // 3 text + table
     const t = blocks[3].table;
     try testing.expectEqual(@as(usize, 6), t.rows.len); // 10 - 3 - 1
@@ -946,6 +1223,165 @@ test "wrapTokens: greedy fill, leading-space drop, wide token" {
     // Empty input still yields one (empty) line.
     const empty = try wrapTokens(arena.allocator(), &.{}, &.{}, 100);
     try testing.expectEqual(@as(usize, 1), empty.len);
+}
+
+// --- Autolinking (T539) -----------------------------------------------
+
+/// The one linked segment of a single-line banner, or null when the line
+/// produced no link at all.
+fn onlyLink(arena: Allocator, paths: PathContext, src: []const u8) !?Seg {
+    const blocks = try parseBlocks(arena, paths, src);
+    var found: ?Seg = null;
+    for (textSegs(blocks[0])) |item| {
+        const s = seg(item);
+        if (s.link == null) continue;
+        try testing.expect(found == null); // exactly one link per case
+        found = s;
+    }
+    return found;
+}
+
+test "autolink: a bare drive path links to itself, backslashes intact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The T539 report, verbatim: a path printed into a banner by a tool.
+    const link = (try onlyLink(
+        arena.allocator(),
+        .{},
+        "rendered D:\\Users\\David\\output\\MiniMax_H3_00001_.mp4 ok",
+    )).?;
+    try testing.expectEqualStrings("D:\\Users\\David\\output\\MiniMax_H3_00001_.mp4", link.text);
+    try testing.expectEqualStrings("D:\\Users\\David\\output\\MiniMax_H3_00001_.mp4", link.link.?);
+    try testing.expect(link.style.underline);
+}
+
+test "autolink: forward-slash drive path and UNC share" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "C:/tools/run.bat",
+        (try onlyLink(a, .{}, "see C:/tools/run.bat")).?.link.?,
+    );
+    try testing.expectEqualStrings(
+        "\\\\homeassistant\\share\\ghoztty-windows\\ghoztty.exe",
+        (try onlyLink(a, .{}, "\\\\homeassistant\\share\\ghoztty-windows\\ghoztty.exe")).?.link.?,
+    );
+    // A rooted POSIX-style path still links, as it does on Mac.
+    try testing.expectEqualStrings("/etc/hosts", (try onlyLink(a, .{}, "/etc/hosts")).?.link.?);
+}
+
+test "autolink: bare URLs, and only with a scheme" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "https://example.com/pr/1",
+        (try onlyLink(a, .{}, "opened https://example.com/pr/1")).?.link.?,
+    );
+    // Trailing sentence punctuation belongs to the sentence...
+    try testing.expectEqualStrings(
+        "https://x.com",
+        (try onlyLink(a, .{}, "See https://x.com.")).?.link.?,
+    );
+    // ...but brackets balanced inside the link are the link's.
+    try testing.expectEqualStrings(
+        "D:\\Foo_(bar)\\a.txt",
+        (try onlyLink(a, .{}, "(D:\\Foo_(bar)\\a.txt)")).?.link.?,
+    );
+    // Angle brackets and quotes are the sentence's, not the link's.
+    try testing.expectEqualStrings(
+        "https://x.com",
+        (try onlyLink(a, .{}, "See <https://x.com>")).?.link.?,
+    );
+    // No scheme, no link: prose must not sprout links.
+    try testing.expect((try onlyLink(a, .{}, "www.example.com and config.io")) == null);
+    try testing.expect((try onlyLink(a, .{}, "docs\\design\\foo.md")) == null);
+    // Only http(s) autolinks — `ftp:`/`mailto:` stay text, as on Mac.
+    try testing.expect((try onlyLink(a, .{}, "ftp://x.com and mailto:a@b.com")) == null);
+}
+
+test "autolink: only whole tokens link" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect((try onlyLink(a, .{}, "and/or either")) == null);
+    try testing.expect((try onlyLink(a, .{}, "xhttps://x.com")) == null);
+    // A bare sigil with no body after it is not a link.
+    try testing.expect((try onlyLink(a, .{}, "D:\\ and https://")) == null);
+}
+
+test "autolink: home and cwd resolve, and stay text without them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const paths: PathContext = .{ .cwd = "D:\\git\\ghoztty", .home = "C:\\Users\\David" };
+
+    const home = (try onlyLink(a, paths, "~/.claude/settings.json")).?;
+    // The TEXT is what the user wrote; only the target is resolved.
+    try testing.expectEqualStrings("~/.claude/settings.json", home.text);
+    try testing.expectEqualStrings("C:\\Users\\David\\.claude\\settings.json", home.link.?);
+    try testing.expectEqualStrings(
+        "C:\\Users\\David\\Desktop\\a.txt",
+        (try onlyLink(a, paths, "~\\Desktop\\a.txt")).?.link.?,
+    );
+
+    try testing.expectEqualStrings(
+        "D:\\git\\ghoztty\\zig-out\\bin\\ghoztty.exe",
+        (try onlyLink(a, paths, ".\\zig-out\\bin\\ghoztty.exe")).?.link.?,
+    );
+    try testing.expectEqualStrings(
+        "D:\\git\\other\\x.md",
+        (try onlyLink(a, paths, "../other/x.md")).?.link.?,
+    );
+    // `..` never climbs out of the root.
+    try testing.expectEqualStrings(
+        "D:\\x",
+        (try onlyLink(a, paths, "../../../../x")).?.link.?,
+    );
+
+    // Nothing to resolve against ⇒ plain text, never a link that goes
+    // nowhere (Mac's rule for a pane with no cwd).
+    try testing.expect((try onlyLink(a, .{}, "./zig-out/bin/ghoztty.exe")) == null);
+    try testing.expect((try onlyLink(a, .{}, "~/notes.md")) == null);
+}
+
+test "autolink: never inside a code span or an explicit link's label" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect((try onlyLink(a, .{}, "run `D:\\bin\\x.exe` now")) == null);
+    // The explicit link owns its whole label, target and all.
+    const explicit = (try onlyLink(a, .{}, "[D:\\a\\b.mp4](https://x.io/1)")).?;
+    try testing.expectEqualStrings("https://x.io/1", explicit.link.?);
+}
+
+test "autolink: escapes still work, and one can suppress a link" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const blocks = try parseBlocks(a, .{}, "\\*\\*not bold\\*\\*");
+    try testing.expectEqualStrings("**not bold**", seg(textSegs(blocks[0])[0]).text);
+    // An escaped leading character breaks the sigil, so the path stays text.
+    try testing.expect((try onlyLink(a, .{}, "\\D:\\tmp\\x.txt")) == null);
+}
+
+test "autolink: links survive styling and list/table cells" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bold = (try onlyLink(a, .{}, "**D:\\out\\a.mp4**")).?;
+    try testing.expect(bold.style.bold and bold.style.underline);
+
+    const blocks = try parseBlocks(a, .{}, "- D:\\out\\a.mp4\n");
+    const item = blocks[0].list[0];
+    try testing.expectEqualStrings("D:\\out\\a.mp4", seg(item.content[0]).link.?);
+
+    const table = try parseBlocks(a, .{}, "| file |\n|---|\n| D:\\out\\a.mp4 |");
+    try testing.expectEqualStrings(
+        "D:\\out\\a.mp4",
+        seg(table[0].table.rows[0][0][0]).link.?,
+    );
 }
 
 test "hasScheme accepts letter-led schemes only" {
