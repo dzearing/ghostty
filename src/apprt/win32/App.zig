@@ -55,6 +55,7 @@ const url_scheme = @import("url_scheme.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
+const window_active = @import("window_active.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -584,54 +585,11 @@ pub fn deferSetFocus(hwnd: w32.HWND) void {
 /// next genuine activation of its window.
 pub fn performDeferredFocus(hwnd: w32.HWND) void {
     const root = w32.GetAncestor(hwnd, w32.GA_ROOT) orelse return;
-    if (!shouldPerformDeferredFocus(
-        onInputDesktop(),
-        w32.GetForegroundWindow(),
-        w32.GetActiveWindow(),
-        root,
+    if (!window_active.shouldForwardFocus(
+        w32.activation(),
+        @intFromPtr(root),
     )) return;
     _ = w32.SetFocus(hwnd);
-}
-
-/// The `performDeferredFocus` decision, split out so it is unit-testable
-/// (the win32 calls around it are not).
-///
-/// The predicate the guard actually wants is "has activation moved since
-/// this assert was queued?" — because `SetFocus` activates the target's
-/// top-level parent when it is not already active, and that steal is what
-/// re-fires the loser's `WM_SETFOCUS` forwarding into a perpetual ping-pong.
-/// Foreground and thread activation are two different proxies for it, and
-/// which one is meaningful depends on the desktop:
-///
-/// - **On the input desktop** the rule is the T89f2 one: only forward focus
-///   the window ALREADY holds, measured with `GetForegroundWindow`. Left
-///   exactly as it was — this is the interactive path the T105 fix shipped
-///   on and it is not what T223 changed.
-/// - **Off it** — a background desktop created with `CreateDesktopW`, which
-///   is how the acceptance harness runs the GUI without stealing the user's
-///   foreground, and equally a locked workstation, a UAC secure desktop or a
-///   disconnected RDP session — `GetForegroundWindow` returns null for every
-///   window, so the foreground proxy carries no information. T211 therefore
-///   waved the guard through unconditionally, which restored the *whole*
-///   T105 live-lock there (measured 43 focus flips in 3s, vs 0 guarded).
-///   `GetActiveWindow` is queue-scoped rather than input-desktop-scoped, so
-///   it still names exactly one of our windows on a background desktop and
-///   is the proxy that survives: it keeps focus moving (T211) while still
-///   dropping the stale assert of a window that activation has moved off
-///   (T105).
-///
-/// A null active window off the input desktop means the query told us
-/// nothing, and forwarding is the safe answer there: dropping every assert
-/// would leave keyboard focus unable to move at all, which is the failure
-/// T211 was fixed to prevent.
-fn shouldPerformDeferredFocus(
-    on_input_desktop: bool,
-    foreground: ?w32.HWND,
-    active: ?w32.HWND,
-    root: w32.HWND,
-) bool {
-    if (on_input_desktop) return foreground == root;
-    return if (active) |a| a == root else true;
 }
 
 /// Hand a closed pane's child HWND over to be destroyed from the top of the
@@ -672,82 +630,6 @@ fn performSurfaceReap(hwnd: w32.HWND) void {
     })) return;
 
     _ = w32.DestroyWindow(hwnd);
-}
-
-/// Whether this process's GUI thread runs on the INPUT desktop (the one the
-/// user sees). Cached: a thread's desktop is bound at startup and never
-/// changes for the app. Failure to determine it is reported as `true`, so
-/// the interactive path keeps its exact behavior when the query is denied.
-var on_input_desktop_cache: ?bool = null;
-
-fn onInputDesktop() bool {
-    if (on_input_desktop_cache) |v| return v;
-    const v = queryOnInputDesktop();
-    on_input_desktop_cache = v;
-    return v;
-}
-
-fn queryOnInputDesktop() bool {
-    const mine = w32.GetThreadDesktop(w32.GetCurrentThreadId()) orelse return true;
-    const input_desk = w32.OpenInputDesktop(0, 0, w32.DESKTOP_READOBJECTS) orelse return true;
-    defer _ = w32.CloseDesktop(input_desk);
-
-    // Handles differ even for the same desktop object, so compare names.
-    var mine_name: [256]u16 = undefined;
-    var input_name: [256]u16 = undefined;
-    var mine_len: u32 = 0;
-    var input_len: u32 = 0;
-    if (w32.GetUserObjectInformationW(
-        mine,
-        w32.UOI_NAME,
-        &mine_name,
-        @sizeOf(@TypeOf(mine_name)),
-        &mine_len,
-    ) == 0) return true;
-    if (w32.GetUserObjectInformationW(
-        input_desk,
-        w32.UOI_NAME,
-        &input_name,
-        @sizeOf(@TypeOf(input_name)),
-        &input_len,
-    ) == 0) return true;
-    if (mine_len != input_len) return false;
-    const n = mine_len / @sizeOf(u16);
-    return std.mem.eql(u16, mine_name[0..n], input_name[0..n]);
-}
-
-test "shouldPerformDeferredFocus: input desktop forwards only to the foreground window" {
-    const root: w32.HWND = @ptrFromInt(0x1000);
-    const other: w32.HWND = @ptrFromInt(0x2000);
-    try std.testing.expect(shouldPerformDeferredFocus(true, root, root, root));
-    try std.testing.expect(!shouldPerformDeferredFocus(true, other, root, root));
-    // No foreground window at all still means "not ours" on the input
-    // desktop (a transient state there, e.g. the window being destroyed).
-    try std.testing.expect(!shouldPerformDeferredFocus(true, null, root, root));
-    // The active window is not consulted on the input desktop: foreground
-    // alone decides, exactly as it did before T223.
-    try std.testing.expect(shouldPerformDeferredFocus(true, root, other, root));
-    try std.testing.expect(shouldPerformDeferredFocus(true, root, null, root));
-}
-
-test "shouldPerformDeferredFocus: background desktop guards on the active window" {
-    const root: w32.HWND = @ptrFromInt(0x1000);
-    const other: w32.HWND = @ptrFromInt(0x2000);
-    // Foreground is always null off the input desktop and carries no
-    // information there, so it must not change the answer either way.
-    try std.testing.expect(shouldPerformDeferredFocus(false, null, root, root));
-    try std.testing.expect(shouldPerformDeferredFocus(false, other, root, root));
-    // The stale assert of a window that is no longer this thread's active
-    // window is dropped — that steal is the T105 restore ping-pong.
-    try std.testing.expect(!shouldPerformDeferredFocus(false, null, other, root));
-    try std.testing.expect(!shouldPerformDeferredFocus(false, root, other, root));
-}
-
-test "shouldPerformDeferredFocus: background desktop with no active window still forwards" {
-    const root: w32.HWND = @ptrFromInt(0x1000);
-    // Nothing known about activation: forward, because dropping every
-    // assert would leave keyboard focus unable to move at all (T215).
-    try std.testing.expect(shouldPerformDeferredFocus(false, null, null, root));
 }
 
 /// Re-run the split layout of the window owning the given terminal-surface
@@ -4671,13 +4553,13 @@ pub fn performAction(
             // Audio bell.
             _ = w32.MessageBeep(0xFFFFFFFF);
             // Visual bell: flash the taskbar button if the window owning
-            // this surface isn't currently the foreground window. Without
+            // this surface isn't currently the active window. Without
             // this, BEL on a backgrounded terminal is invisible.
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
-                        if (w32.GetForegroundWindow() != win_hwnd) {
+                        if (!w32.windowIsActive(win_hwnd)) {
                             var fwi: w32.FLASHWINFO = .{
                                 .cbSize = @sizeOf(w32.FLASHWINFO),
                                 .hwnd = win_hwnd,
@@ -5456,7 +5338,7 @@ pub fn performAction(
                         // Flash the taskbar button when backgrounded so the
                         // bell is visible too.
                         if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
-                            if (w32.GetForegroundWindow() != win_hwnd) {
+                            if (!w32.windowIsActive(win_hwnd)) {
                                 var fwi: w32.FLASHWINFO = .{
                                     .cbSize = @sizeOf(w32.FLASHWINFO),
                                     .hwnd = win_hwnd,

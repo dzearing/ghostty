@@ -234,6 +234,11 @@ test {
     // deal.
     _ = @import("apprt/win32/surface_reap.zig");
 
+    // Pure win32 activation reading — which proxy for "is this window the
+    // active one" still carries information off the input desktop (T215),
+    // same no-OS-imports deal.
+    _ = @import("apprt/win32/window_active.zig");
+
     // Pure win32 viewer TOC-card geometry + policy (T160), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");

@@ -21,6 +21,7 @@ const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(PaneView);
 const w32 = @import("win32.zig");
+const window_active = @import("window_active.zig");
 const color_math = @import("color_math.zig");
 const apprt = @import("../../apprt.zig");
 const termio = @import("../../termio.zig");
@@ -1440,13 +1441,19 @@ fn handleSendKeys(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 
-/// The window the user is most plausibly working in: the foreground window
-/// if it is one of ours, else the most recently created one.
+/// The window the user is most plausibly working in: the ACTIVE window if it
+/// is one of ours, else the most recently created one.
+///
+/// "Active" rather than "foreground" since T215: on a background desktop
+/// there is no foreground window at all, so the old reading matched nothing
+/// and every default-target verb silently fell through to "most recently
+/// created" — which is not the same window as soon as a test opens two.
+/// `window_active.isActive` keeps the interactive answer byte-identical.
 fn frontWindow(app: *App) ?*Window {
-    const foreground = w32.GetForegroundWindow();
+    const activation = w32.activation();
     for (app.windows.items) |window| {
         if (window.is_quick_terminal) continue;
-        if (window.hwnd != null and foreground != null and window.hwnd.? == foreground.?)
+        if (window_active.isActive(activation, @intFromPtr(window.hwnd)))
             return window;
     }
     var i = app.windows.items.len;
@@ -1600,7 +1607,11 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         );
     }
 
-    const foreground = w32.GetForegroundWindow();
+    // T215: `focused` is the ACTIVE window, not `GetForegroundWindow() ==
+    // hwnd`. Off the input desktop the latter is null for every window, so
+    // `+list --json` used to report no focused window at all — a caller
+    // cannot tell that apart from "the app lost focus".
+    const activation = w32.activation();
 
     var window_list: std.ArrayList(apprt.ipc.List.Window) = .empty;
     for (app.windows.items) |window| {
@@ -1641,7 +1652,7 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             .id = try std.fmt.allocPrint(arena, "{d}", .{@intFromPtr(hwnd)}),
             .title = win_title,
             .target = window.ipc_name,
-            .focused = foreground != null and foreground.? == hwnd,
+            .focused = window_active.isActive(activation, @intFromPtr(hwnd)),
             .tabs = tabs.items,
         });
     }

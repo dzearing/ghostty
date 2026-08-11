@@ -845,12 +845,16 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
     }
 }
 
-/// True when this card's top-level window is the foreground window — the
-/// Windows reading of Mac's "key window", which decides whether the selection
-/// pill paints in the accent or the neutral unemphasized gray.
+/// True when this card's top-level window is the ACTIVE window — the Windows
+/// reading of Mac's "key window", which decides whether the selection pill
+/// paints in the accent or the neutral unemphasized gray.
+///
+/// `w32.windowIsActive` rather than a bare `GetForegroundWindow` comparison
+/// (T215): the latter is null for every window on a background desktop, so
+/// the pill painted unemphasized there forever — including under the pixel
+/// probes that are supposed to prove it does not.
 fn isEmphasized(self: *const ViewerTOCPanel) bool {
-    const root = w32.GetAncestor(self.hwnd, w32.GA_ROOT);
-    return w32.GetForegroundWindow() == root;
+    return w32.windowIsActive(w32.GetAncestor(self.hwnd, w32.GA_ROOT));
 }
 
 /// The unemphasized selection wash: a visible step off the card fill.

@@ -2076,6 +2076,8 @@ pub const HDESK = HANDLE;
 pub const UOI_NAME: i32 = 2;
 pub const DESKTOP_READOBJECTS: u32 = 0x0001;
 
+const window_active = @import("window_active.zig");
+
 pub extern "user32" fn GetThreadDesktop(dwThreadId: u32) callconv(.winapi) ?HDESK;
 
 pub extern "user32" fn OpenInputDesktop(
@@ -2093,6 +2095,68 @@ pub extern "user32" fn GetUserObjectInformationW(
     nLength: u32,
     lpnLengthNeeded: ?*u32,
 ) callconv(.winapi) i32;
+
+/// Whether this process's GUI thread runs on the INPUT desktop (the one the
+/// user sees). Cached: a thread's desktop is bound at startup and never
+/// changes for the app. Failure to determine it is reported as `true`, so
+/// the interactive path keeps its exact behavior when the query is denied.
+var on_input_desktop_cache: ?bool = null;
+
+pub fn onInputDesktop() bool {
+    if (on_input_desktop_cache) |v| return v;
+    const v = queryOnInputDesktop();
+    on_input_desktop_cache = v;
+    return v;
+}
+
+fn queryOnInputDesktop() bool {
+    const mine = GetThreadDesktop(GetCurrentThreadId()) orelse return true;
+    const input_desk = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) orelse return true;
+    defer _ = CloseDesktop(input_desk);
+
+    // Handles differ even for the same desktop object, so compare names.
+    var mine_name: [256]u16 = undefined;
+    var input_name: [256]u16 = undefined;
+    var mine_len: u32 = 0;
+    var input_len: u32 = 0;
+    if (GetUserObjectInformationW(
+        mine,
+        UOI_NAME,
+        &mine_name,
+        @sizeOf(@TypeOf(mine_name)),
+        &mine_len,
+    ) == 0) return true;
+    if (GetUserObjectInformationW(
+        input_desk,
+        UOI_NAME,
+        &input_name,
+        @sizeOf(@TypeOf(input_name)),
+        &input_len,
+    ) == 0) return true;
+    if (mine_len != input_len) return false;
+    const n = mine_len / @sizeOf(u16);
+    return std.mem.eql(u16, mine_name[0..n], input_name[0..n]);
+}
+
+/// Read activation for `window_active`'s two decisions (T215): the one place
+/// the GUI thread calls the OS about "which of our windows is active". Call
+/// it on the GUI thread — `GetActiveWindow` answers for the CALLING thread's
+/// message queue, which is the property that makes it survive off the input
+/// desktop, and equally the reason it is meaningless from any other thread.
+pub fn activation() window_active.Activation {
+    return .{
+        .on_input_desktop = onInputDesktop(),
+        .foreground = @intFromPtr(GetForegroundWindow()),
+        .active = @intFromPtr(GetActiveWindow()),
+    };
+}
+
+/// True when `hwnd` is the window activation currently sits on. The whole
+/// rule — and why it is not simply `GetForegroundWindow() == hwnd` — is in
+/// `window_active.zig`.
+pub fn windowIsActive(hwnd: ?HWND) bool {
+    return window_active.isActive(activation(), @intFromPtr(hwnd));
+}
 
 pub const GA_ROOT: u32 = 2;
 

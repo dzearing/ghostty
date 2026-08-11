@@ -3512,10 +3512,13 @@ fn navHoverTick(self: *ViewerPane) void {
     var r: w32.RECT = undefined;
     if (w32.GetClientRect(h, &r) == 0) return;
 
-    // Only a FOREGROUND window's cursor reveals chrome: hovering across a
+    // Only an ACTIVE window's cursor reveals chrome: hovering across a
     // background app should not animate it (and the cursor's absolute screen
     // position is meaningless to a window the user is not in — the live test
     // depends on that, since a test window never owns the real cursor).
+    // Active, not foreground, since T215: there is no foreground window at
+    // all on a background desktop, which pinned this false and made the
+    // hover reveal unreachable by any script running there.
     // The compact TOC layout pins the bar open: its contents button is the
     // card's only opener, so a bar that auto-hides strands the card (T160,
     // Mac's `setChromeVisible(true)` on entering compact).
@@ -3526,8 +3529,8 @@ fn navHoverTick(self: *ViewerPane) void {
     const toc_pinned = self.toc_mode == .compact or self.feedback_open;
     if (toc_pinned and !self.nav_visible) self.setNavVisible(true);
 
-    const foreground = w32.GetForegroundWindow() == w32.GetAncestor(h, w32.GA_ROOT);
-    const in_pane = foreground and
+    const window_active_now = w32.windowIsActive(w32.GetAncestor(h, w32.GA_ROOT));
+    const in_pane = window_active_now and
         pt.x >= 0 and pt.y >= 0 and pt.x < r.right and pt.y < r.bottom;
     const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.shown());
     // "Held" = the address field owns the keyboard, or the cursor is on the

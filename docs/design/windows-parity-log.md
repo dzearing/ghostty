@@ -15000,3 +15000,60 @@ a child that registers and then throws leaving nothing, and the teeth: the same
 child without the registration leaks. `harness-exitcode-audit.ps1` stays ALL PASS
 with this turn's new `Start-Process` site in it. T728 was filed for the red
 persistence sweep and closed as a duplicate of **T726**, which already had it.
+
+## 2026-08-10 - the app can tell which of its windows is in front again, even where Windows says none of them is (T215)
+
+A background desktop - the one every GUI acceptance script has run on since
+T211 - has no foreground window at all. `GetForegroundWindow` returns null for
+every window on it. So each product site that asked "am I the foreground
+window?" stopped being a guard and became a permanent "no", with nothing logged
+and nothing failing. T211 found the first instance by its symptom (keyboard
+focus could not move between panes); this turn enumerated the rest.
+
+Eleven activation reads in the win32 apprt and the agent, and the table is in
+`T215.md`. Four answered "no" forever and are fixed:
+
+- **`+list --json`'s `focused`** was false for every window, always - which a
+  caller cannot tell apart from "the app is in the background".
+- **The default target** (`frontWindow`) matched nothing and fell through to
+  "the most recently created window", so an untargeted `+split` landed in a
+  DIFFERENT window than the one activation was on the moment a script had
+  opened two.
+- **The viewer TOC's selection pill** never painted accent, so a pixel probe
+  could only ever see the unemphasized state - the exact shape of assertion the
+  T211 audit warned would get "fixed" by weakening it.
+- **The viewer nav bar's hover reveal** could not fire at all.
+
+Two more (the bell and command-finished taskbar flashes) read foreground with
+inverted polarity and so always fired rather than never; converted for
+consistency rather than as a defect fix, and filed as **D65** since that is a
+scope call the user may want back. The rest were already correct
+(`Surface.focusFollowsMouse` reads `GetActiveWindow`; `w32.setTopmost` was fixed
+the same way by T277) or benign actions.
+
+The fix is T223's lesson generalised: `GetForegroundWindow` was a PROXY for a
+question that still has an answer off the input desktop, and `GetActiveWindow`
+- queue-scoped rather than input-desktop-scoped - is the proxy that survives.
+That now lives in one place, the pure `src/apprt/win32/window_active.zig`, with
+two decisions differing only in what "nothing known" means: `isActive` (unknown
+=> false, never claim focus we cannot prove) and `shouldForwardFocus` (unknown
+=> true, T211's rule, and the only caller that wants it). `w32.activation()` is
+the single site that asks the OS, and `App.shouldPerformDeferredFocus` is gone
+into the module with its three tests. On the input desktop every one of these
+is byte-identical to what shipped: foreground, and nothing else, is consulted.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all`, P1-P3 ALL PASS,
+`focus-defer.ps1` (the T211/T223 regression) ALL PASS (17),
+`focus-follows-mouse.ps1` ALL PASS (14). `viewer-panes.ps1` is `1 FAILURE(S)
+(178 passed)` on the known-red **T526** arm, same assertion and same value it
+has reported at HEAD since 2026-08-06.
+
+New `test/win32/window-active.ps1` is ALL PASS (10) and teeth-checked the
+expensive way: the two IPC reads were reverted, the app rebuilt, and the same
+script reported **5 FAILED** measuring exactly the documented pre-fix behaviour
+- `saw 0` focused windows, and the untargeted split landing in the newest
+window rather than the active one. Its `-NegativeControl` (arm D inverted to
+the pre-fix answer) fails as required. Filed **T729** to cover the two GUI
+behaviours that only became reachable here, and **T730** for a sweep that fails
+the suite when a new site reaches for `GetForegroundWindow` again - this
+mistake is invisible at runtime, which is how four of them survived.
