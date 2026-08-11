@@ -14757,3 +14757,53 @@ and a sweep arm. Which binary landed is decided by searching the installed bytes
 for the `-Dagent-version` stamp that build was given, not by a timestamp. All
 three floor lanes PASS, P1-P3 ALL PASS. Auxiliary Windows install steps are not
 guarded yet - filed as **T722**.
+
+## 2026-08-10 - a momentary agent hiccup is now proven, on the box, to leave every pane alone (T195)
+
+In-place agent-crash recovery had only its DESTRUCTIVE half measured on the box:
+kill the agent, assert the windows rebuild (T145's sections B-E). The half that
+keeps recovery from being destructive - the 5s settle window that makes a
+transient link drop a no-op - existed only as unit tests over
+`agent_recovery.evaluate`. Nothing anywhere proved that a heal inside the window
+really reaches `link_recovered` and really leaves the panes alone. That is the
+exact failure Mac shipped and had to fix in `e65cfa4d5`: recovery fired on a link
+that healed 27ms later and destroyed the sessions it had just re-attached.
+
+`test/win32/agent-recovery.ps1` now measures it, in both directions, from one
+stimulus. **G** suspends this run's `ghoztty-agent` (`NtSuspendProcess`, no new
+product test hook), waits for the app's own settle watch to open, resumes inside
+the window, and requires that nothing moved. **H** is the same blip held until
+the app says it is recovering, and requires that everything moved. The resume in
+both is timed against the app's observable state rather than a clock - a fixed
+sleep would race the very window under test.
+
+**The oracle the task was filed with does not work, and finding that out is most
+of the value here.** Child pids answer the KILL - the children die with the agent,
+so the respawned one relaunches them - but they cannot answer a SUSPEND: a frozen
+agent never loses a child, so a rebuild after a blip re-ATTACHes the very same
+sessions. Held past the window on purpose, recovery demonstrably ran and the pid
+assertion still passed. The oracle is instead the set of `GhozttyTerminal` child
+windows: recovery keeps the window HWND and replaces the surfaces inside it
+(`rebuildTabLeavesInPlace` -> `replaceTabLeaf`), so a fresh set is positive proof
+a rebuild ran and an unchanged set positive proof none did. Pids are still
+asserted - as the documented negative result (H7), so that fact cannot silently
+stop being true - and E7 takes the same surface measurement across the kill.
+
+One real flake was found and fixed rather than retried away: the departing
+surfaces are destroyed asynchronously, so a sample taken the instant a rebuild
+finishes legitimately shows FOUR terminal surfaces and read as "recovery reused a
+surface" - the opposite of what happened - on 2 runs in 5. `Wait-SurfacesReplaced`
+waits for the set to settle, which is what makes the instrument measure the
+rebuild instead of the teardown's clock.
+
+Evidence: `test/win32/agent-recovery.ps1` **ALL PASS (57)**, 4/4 consecutive
+after the flake fix (7 green runs in total). Teeth-checked before H was made
+permanent by holding the suspend past the window against a copy of the script:
+G6/G7/G8/G9 all go red and nothing else moves. All three floor lanes PASS, P1-P3
+ALL PASS.
+
+Two threads filed rather than left loose: **T723** - a WEDGED agent (alive but not
+answering) takes recovery's abort branch, and whether anything retries once it
+unwedges is unmeasured; the teeth run was a near miss, its resume landing ~4s into
+the re-dial. **T724** (`seat: mac`) - the Mac half of this test, carrying the
+pid-oracle trap so that seat does not have to rediscover it.

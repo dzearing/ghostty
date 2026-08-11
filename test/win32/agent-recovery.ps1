@@ -25,6 +25,21 @@
 #      must never have been a CLOSE).
 #   E: topology is preserved, not flattened: still one window, one tab, a split
 #      of exactly two leaves, and the pane's registered IPC name still resolves.
+#   G: T195 - the other half of the policy, and the one that keeps recovery from
+#      being destructive: a link BLIP must be a no-op. The agent is SUSPENDED
+#      until the app says it has started its settle watch, then RESUMED well
+#      inside the 5s window, and nothing may move - same terminal surfaces, same
+#      children, same sessions, same responsive pane.
+#   H: the negative control for G - the identical blip HELD past the window, which
+#      must rebuild. One variable between the two sections: how long the link
+#      stayed down.
+#
+# The oracle for "did a rebuild run" is the set of GhozttyTerminal child windows,
+# not the child pids. Recovery keeps the window HWND and replaces the SURFACES
+# inside it, so a fresh set is positive proof a rebuild ran and an unchanged set
+# is positive proof none did. Sections E7 and H6 take that same measurement where
+# a rebuild IS expected, which is what makes G's "nothing changed" a claim rather
+# than a tautology.
 #
 # Fully hermetic: a per-run $env:LOCALAPPDATA and GHOSTTY_LOCAL_AGENT_BIN, and
 # it ONLY ever kills ghoztty / ghoztty-agent processes launched from the repo
@@ -206,6 +221,133 @@ function Test-PaneResponsive($tmp, $target, $tag, $timeoutSec = 20) {
     return $false
 }
 
+# --- T195: suspend/resume a process, and enumerate the app's pane surfaces ---
+#
+# SUSPENDING is how a link BLIP is induced with no new test hook and no
+# debugger: a frozen agent answers no heartbeats, so the app's transport FSM
+# walks to `reconnecting` exactly as it does for a real drop
+# (`remote/connection.zig` §5.1, 3 missed heartbeats at 3s), and a resume puts it
+# back on the very next authentic packet.
+#
+# ENUMERATING is the outcome oracle. In-place recovery keeps the window HWND and
+# replaces the surfaces inside it (`rebuildTabLeavesInPlace` ->
+# `replaceTabLeaf`), so the tab's `GhozttyTerminal` child windows are a fresh set
+# after a rebuild and the same set after a no-op.
+#
+# Child PIDS deliberately are NOT the oracle here, and that is a correction to
+# the plan T195 was filed with. Pids answer the KILL (the children died with the
+# agent, so the respawned one relaunches them - section C), but they cannot
+# answer a SUSPEND: a frozen agent never loses a child, so a rebuild after a blip
+# would re-ATTACH the very same pids and read as "nothing happened". The surface
+# set separates the two cases under either stimulus.
+if (-not ('GhozttyRecoveryNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class GhozttyRecoveryNative {
+    [DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr h);
+    [DllImport("ntdll.dll")] static extern int NtResumeProcess(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+
+    delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lparam);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr lparam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder buf, int max);
+    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr hwnd, out int pid);
+
+    const int PROCESS_SUSPEND_RESUME = 0x0800;
+
+    static string ClassOf(IntPtr h) {
+        StringBuilder sb = new StringBuilder(256);
+        int n = GetClassName(h, sb, sb.Capacity);
+        return n > 0 ? sb.ToString() : "";
+    }
+
+    // 0 on success. -1 means the process could not be opened at all (gone, or
+    // no PROCESS_SUSPEND_RESUME right), which is a different failure from a
+    // suspend that was refused.
+    public static int SetSuspended(int pid, bool suspended) {
+        IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+        if (h == IntPtr.Zero) return -1;
+        int rc = suspended ? NtSuspendProcess(h) : NtResumeProcess(h);
+        CloseHandle(h);
+        return rc;
+    }
+
+    // Every window of class `cls` owned by `pid` - top-levels and all their
+    // descendants - sorted, so two samples compare as sets.
+    public static long[] WindowsOfClass(int pid, string cls) {
+        List<long> acc = new List<long>();
+        EnumWindows(delegate(IntPtr top, IntPtr lp) {
+            int owner;
+            GetWindowThreadProcessId(top, out owner);
+            if (owner == pid) {
+                if (ClassOf(top) == cls) acc.Add(top.ToInt64());
+                EnumChildWindows(top, delegate(IntPtr child, IntPtr lp2) {
+                    if (ClassOf(child) == cls) acc.Add(child.ToInt64());
+                    return true;
+                }, IntPtr.Zero);
+            }
+            return true;
+        }, IntPtr.Zero);
+        acc.Sort();
+        return acc.ToArray();
+    }
+}
+'@
+}
+
+function Set-AgentSuspended($procId, [bool]$suspended) {
+    return [GhozttyRecoveryNative]::SetSuspended([int]$procId, $suspended)
+}
+# Unary comma: every caller does arithmetic on .Count, and PowerShell unwraps a
+# one-element array return into a scalar whose .Count is $null.
+function Get-TerminalSurfaces($procId) {
+    return , @([GhozttyRecoveryNative]::WindowsOfClass([int]$procId, 'GhozttyTerminal'))
+}
+
+# The settled surface set after a rebuild. The departing surfaces are destroyed
+# ASYNCHRONOUSLY (the same teardown window section D waits out), so a sample
+# taken the instant the rebuild finishes legitimately shows FOUR terminal
+# surfaces - the two fresh ones and the two on their way out. Asserting on the
+# first sample read that as "recovery reused a surface", the exact opposite of
+# what had happened, and did so on 2 runs in 5. Waiting for the set to settle is
+# what makes the instrument measure the rebuild instead of the teardown's clock.
+function Wait-SurfacesReplaced($procId, $before, $want, $timeoutSec = 25) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $now = Get-TerminalSurfaces $procId
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-TerminalSurfaces $procId
+        $reused = @($now | Where-Object { $before -contains $_ })
+        if ($now.Count -eq $want -and $reused.Count -eq 0) { return , $now }
+        Start-Sleep -Milliseconds 500
+    }
+    return , $now
+}
+
+# The app's stderr. A Debug build links the CONSOLE subsystem, so std.log lands
+# there line by line (each line is flushed), which is what makes "has the settle
+# watch started yet?" answerable without a fixed sleep. It is a TIMING signal,
+# never an oracle - every assertion below is an outcome.
+function Get-AppLogText {
+    if (-not $appLog) { return '' }
+    if (-not (Test-Path $appLog)) { return '' }
+    $t = $null
+    try { $t = Get-Content $appLog -Raw -ErrorAction Stop } catch { return '' }
+    if ($null -eq $t) { return '' }
+    return $t
+}
+function Get-AppLogLength { return (Get-AppLogText).Length }
+function Read-AppLog($from) {
+    $t = Get-AppLogText
+    if ($from -ge $t.Length) { return '' }
+    return $t.Substring($from)
+}
+
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
@@ -231,7 +373,13 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 "== A: baseline - a 2-pane agent-backed window, both panes responsive"
 # ============================================================================
 # persistence: on (default) - the agent under test only owns sessions when persistence is on.
-Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t145-recovery') | Out-Null
+# stderr goes to a file so section G can tell WHEN the app entered its settle
+# watch (a Debug build logs to stderr; see Get-AppLogText). Redirecting to a
+# FILE, never a pipe: nothing here drains a pipe, and a full one would block the
+# app's logger.
+$appLog = Join-Path $tmp 'app.err'
+Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t145-recovery') `
+    -RedirectStandardOutput (Join-Path $tmp 'app.out') -RedirectStandardError $appLog | Out-Null
 
 $appProc = $null
 $deadline = (Get-Date).AddSeconds(30)
@@ -292,6 +440,13 @@ $pidsA = Alive-Pids $rowsA
 Assert "A4 both live sessions report a real child pid" (@($pidsA | Where-Object { $_ -gt 0 }).Count -eq 2)
 
 Assert "A5 the named pane is responsive before the crash" (Test-PaneResponsive $tmp 't145b' 'a' 25)
+
+# The pane surfaces as they are BEFORE anything drops. Section E7 compares
+# against this across the kill (they must all be new); section G compares its own
+# baseline across a blip (they must all be the same).
+$surfA = Get-TerminalSurfaces $appPid
+if ($surfA.Count -ne 2) { "    [A6] terminal surfaces: $($surfA -join ',')" }
+Assert "A6 the two terminal panes have two terminal surfaces" ($surfA.Count -eq 2)
 
 # ============================================================================
 "== B: kill ONLY the agent - the app survives with the SAME pid"
@@ -374,6 +529,16 @@ Assert "E5 the pane's IPC name still resolves after the rebuild" ($rcE -eq 0)
 $paneE = (Terminal-Leaves $treeE)[0]
 Assert "E6 the rebuilt pane kept its stable pane id" ($paneE.id -eq $paneA.id)
 
+# The CONTROL for section G, taken with G's own instrument. A rebuild keeps the
+# window HWND and replaces the surfaces inside it, so nothing here may be one of
+# the surfaces from A - and that is what makes "the surfaces are unchanged" a
+# measurement of no-rebuild rather than of a blunt instrument.
+$surfE = Wait-SurfacesReplaced $appPid $surfA 2
+$reusedE = @($surfE | Where-Object { $surfA -contains $_ })
+if ($reusedE.Count -ne 0) { "    [E7] before=$($surfA -join ',') after=$($surfE -join ',')" }
+Assert "E7 recovery REPLACED every terminal surface (the control for G)" (
+    $surfE.Count -eq 2 -and $reusedE.Count -eq 0)
+
 # ============================================================================
 "== F: T399 - the viewer pane was never touched by the recovery"
 # ============================================================================
@@ -397,6 +562,165 @@ Assert "F3 it still shows the file it was opened with" (
 # viewer answering to the name it was registered under before the crash.
 $rcF = Run-Cli "+reload --target=t399v" "$tmp\reload-f.txt" 12
 Assert "F4 the viewer still answers +reload by its registered name" ($rcF -eq 0)
+
+# ============================================================================
+"== G: T195 - a link BLIP inside the settle window must change nothing"
+# ============================================================================
+# The destructive half of recovery is what sections B-E measure. THIS is the half
+# that keeps it from being destructive: `agent_recovery.settle_ms` (5s) exists
+# because Mac shipped in-place recovery without it and the 2026-07-21 incident
+# (`e65cfa4d5`) had it fire on a link that healed 27ms later, destroying the
+# sessions it had just re-attached. The policy is unit-tested in
+# `agent_recovery.zig`; what is measured here is the WIRING - that a heal inside
+# the window really does reach `link_recovered` and really does leave the panes
+# alone.
+$settleMs = 5000    # agent_recovery.settle_ms
+
+$agentsG = Get-RunAgents $tmp
+if ($agentsG.Count -ne 1) { Show-Agents $tmp 'G' }
+Assert "G1 exactly one agent belongs to this run before the blip" ($agentsG.Count -eq 1)
+$agentPidG = if ($agentsG.Count -ge 1) { [int]$agentsG[0].ProcessId } else { 0 }
+
+$rowsG0 = Wait-AliveCount $tmp 'g0' 2 25
+$pidsG0 = Alive-Pids $rowsG0
+$surfG0 = Get-TerminalSurfaces $appPid
+Assert "G2 two live sessions and two terminal surfaces before the blip" (
+    (Alive-Rows $rowsG0).Count -eq 2 -and $surfG0.Count -eq 2)
+
+# Everything after this point is judged against log text written from here on,
+# so a line from the section-C recovery cannot be mistaken for a fresh one.
+$logMark = Get-AppLogLength
+Assert "G3 the agent was suspended" (
+    $agentPidG -gt 0 -and (Set-AgentSuspended $agentPidG $true) -eq 0)
+
+# Wait for the app's OBSERVABLE state, never a fixed sleep: reaching
+# `reconnecting` takes 3 missed heartbeats 3s apart, and a fixed wait would race
+# the very window under test. The log line is the timing signal - it is emitted
+# as the settle window opens, so the resume below is timed from the window's own
+# start rather than from the suspend.
+$watchSeen = $false
+$deadline = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadline) {
+    if ((Read-AppLog $logMark) -match 'before deciding on in-place recovery') {
+        $watchSeen = $true
+        break
+    }
+    Start-Sleep -Milliseconds 100
+}
+$watchAt = Get-Date
+# Resume unconditionally, including on the timeout path: a suspended agent left
+# behind would poison every section after this one and outlive the script.
+$resumeRc = Set-AgentSuspended $agentPidG $false
+$blipMs = [int]((Get-Date) - $watchAt).TotalMilliseconds
+
+Assert "G4 the app noticed the drop and opened its settle watch" $watchSeen
+Assert "G5 the agent was resumed" ($resumeRc -eq 0)
+if ($blipMs -ge 2000) { "    [G6] resume landed +${blipMs}ms into a ${settleMs}ms window" }
+# The heal itself costs one PING/PONG round-trip after the resume, so the resume
+# must land with room to spare inside the window rather than merely inside it.
+Assert "G6 the resume landed early in the ${settleMs}ms settle window" ($blipMs -lt 2000)
+
+# Past the window plus several poll ticks (`agent_recovery.poll_ms` = 250): if a
+# verdict were going to trigger recovery, it has by now.
+Start-Sleep -Seconds 8
+
+$tailG = Read-AppLog $logMark
+Assert "G7 the link healed on its own - the app says no recovery was needed" (
+    $tailG -match 'link recovered on its own')
+Assert "G8 no in-place recovery was triggered by the blip" (
+    $tailG -notmatch 'recovering local windows in place')
+
+# The outcome, and the one that would still be true if every log line were
+# missing: recovery replaces surfaces (E7), so surfaces that are still the same
+# objects were never rebuilt.
+$surfG1 = Get-TerminalSurfaces $appPid
+$sameG = ($surfG1.Count -eq $surfG0.Count) -and
+    (@($surfG1 | Where-Object { $surfG0 -notcontains $_ }).Count -eq 0)
+if (-not $sameG) { "    [G9] before=$($surfG0 -join ',') after=$($surfG1 -join ',')" }
+Assert "G9 every terminal SURFACE survived the blip - nothing was rebuilt" $sameG
+
+$rowsG1 = Wait-AliveCount $tmp 'g1' 2 25
+$pidsG1 = Alive-Pids $rowsG1
+Assert "G10 still exactly 2 live sessions after the blip" ((Alive-Rows $rowsG1).Count -eq 2)
+if ("$($pidsG1 -join ',')" -ne "$($pidsG0 -join ',')") {
+    "    [G11] before=$($pidsG0 -join ',') after=$($pidsG1 -join ',')"
+}
+Assert "G11 the shells are the SAME children" (
+    "$($pidsG1 -join ',')" -eq "$($pidsG0 -join ',')")
+Assert "G12 the app pid never changed across the blip" (
+    $null -ne (Get-Process -Id $appPid -ErrorAction SilentlyContinue))
+
+# And the pane is a working pane, not a picture of one: a blip that left the
+# panes intact but wedged would satisfy every assertion above it.
+Assert "G13 the pane is still responsive after the blip" (
+    Test-PaneResponsive $tmp 't145b' 'g' 30)
+
+$treeG = Get-List $tmp 'g' 12
+$viewerG = @(Viewer-Leaves $treeG)
+Assert "G14 the viewer pane is untouched by the blip" (
+    $viewerG.Count -eq 1 -and $viewerG[0].id -eq $viewerA.id)
+Assert "G15 the topology is unchanged: 2 terminals in one window" (
+    (Windows-Of $treeG).Count -eq 1 -and (Terminal-Leaves $treeG).Count -eq 2)
+
+# ============================================================================
+"== H: the negative control - the SAME blip, held past the window, DOES rebuild"
+# ============================================================================
+# Section G is only a claim if the same stimulus can produce the other answer.
+# So: suspend again, and this time hold it until the app has said it is
+# recovering, then resume. Everything is identical to G except the duration,
+# which is the one variable the settle window is a function of.
+#
+# The resume is triggered by the app's own decision rather than by a clock, for
+# the same reason G's is: recovery re-dials, and an agent still frozen when that
+# dial runs would make this measure a WEDGED agent instead of a late heal.
+#
+# And note what H does NOT get to assert: the children are the same pids here as
+# in G. A suspended agent never loses a child, so a rebuild re-ATTACHes the very
+# sessions it had - which is exactly why the surface set, and not the pid set, is
+# the oracle for both sections.
+$logMarkH = Get-AppLogLength
+$surfH0 = Get-TerminalSurfaces $appPid
+$pidsH0 = Alive-Pids (Get-Sessions $tmp 'h0')
+Assert "H1 two terminal surfaces before the second blip" ($surfH0.Count -eq 2)
+Assert "H2 the agent was suspended again" (
+    (Set-AgentSuspended $agentPidG $true) -eq 0)
+
+$recoverSeen = $false
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {
+    if ((Read-AppLog $logMarkH) -match 'recovering local windows in place') {
+        $recoverSeen = $true
+        break
+    }
+    Start-Sleep -Milliseconds 100
+}
+$resumeRcH = Set-AgentSuspended $agentPidG $false
+Assert "H3 the agent was resumed" ($resumeRcH -eq 0)
+Assert "H4 a drop held past the window DID trigger in-place recovery" $recoverSeen
+
+# Recovery re-dials, re-attaches and rebuilds; give it the same room section C
+# gives it.
+$rowsH = Wait-AliveCount $tmp 'h' 2 45
+Assert "H5 two sessions are alive after the rebuild" ((Alive-Rows $rowsH).Count -eq 2)
+
+$surfH1 = Wait-SurfacesReplaced $appPid $surfH0 2
+$reusedH = @($surfH1 | Where-Object { $surfH0 -contains $_ })
+if ($reusedH.Count -ne 0) { "    [H6] before=$($surfH0 -join ',') after=$($surfH1 -join ',')" }
+Assert "H6 every terminal surface was REPLACED - G's instrument reads both ways" (
+    $surfH1.Count -eq 2 -and $reusedH.Count -eq 0)
+
+# The documented negative result, asserted so it cannot quietly stop being true:
+# pids are blind to this rebuild.
+$pidsH1 = Alive-Pids $rowsH
+Assert "H7 the children are UNCHANGED across a real rebuild (pids cannot judge this)" (
+    "$($pidsH1 -join ',')" -eq "$($pidsH0 -join ',')")
+
+Assert "H8 the pane is responsive again after the rebuild" (
+    Test-PaneResponsive $tmp 't145b' 'h' 30)
+$treeH = Get-List $tmp 'h' 12
+Assert "H9 the topology survived: one window, 2 terminals, the viewer intact" (
+    (Windows-Of $treeH).Count -eq 1 -and (Terminal-Leaves $treeH).Count -eq 2 -and
+    @(Viewer-Leaves $treeH).Count -eq 1)
 
 # ============================================================================
 Stop-TestProcs
