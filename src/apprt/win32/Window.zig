@@ -1239,6 +1239,54 @@ fn stripClientWidth(self: *const Window, client_w: i32) i32 {
     return @max(l.band_left + tab_strip.Metrics.init(self.scale).strip_pad_r, 0);
 }
 
+/// The strip's clickable regions, in CLIENT coordinates (T231) — what
+/// `+list --json` publishes so a test can ask the product where the "+" is
+/// instead of re-deriving `tab_strip_layout` in PowerShell.
+///
+/// These are the rects the HIT TESTS read, not a fresh `layout()` call. That
+/// is deliberate and is the whole guarantee: a re-layout here would need an
+/// HDC and the tab font to measure the titles again, so it could answer with
+/// geometry the window is not currently hit-testing — which is precisely the
+/// class of drift publishing exists to end. `paintTabBar` stores them; a strip
+/// that has not painted yet reports empty regions, which is exactly what its
+/// hit tests currently do.
+pub const StripRegions = struct {
+    band: tab_strip.Rect,
+    /// One per tab, `tab_count` long. Empty where the strip did not lay a tab
+    /// out — the report turns an empty rect into a JSON `null`.
+    tabs: [MAX_TABS]tab_strip.Rect = std.mem.zeroes([MAX_TABS]tab_strip.Rect),
+    new_tab: tab_strip.Rect = .{},
+    menu: tab_strip.Rect = .{},
+};
+
+/// Null when this window shows no tab strip at all — there are no regions,
+/// which is a different answer from "every region is empty".
+pub fn stripRegions(self: *const Window) ?StripRegions {
+    if (!self.tab_bar_visible) return null;
+    const top = self.tabBarTop();
+    var out: StripRegions = .{
+        .band = tab_strip.contentBand(
+            tab_strip.Metrics.init(self.scale),
+            self.stripClientWidth(self.clientWidth()),
+            top,
+        ),
+        .new_tab = tab_strip.clientRect(layoutRect(self.new_tab_rect), top),
+        .menu = tab_strip.clientRect(layoutRect(self.menu_btn_rect), top),
+    };
+    for (0..@min(self.tab_count, MAX_TABS)) |i| {
+        out.tabs[i] = tab_strip.clientRect(layoutRect(self.tab_rects[i]), top);
+    }
+    return out;
+}
+
+/// This window's client width in physical pixels, or 0 with no HWND.
+fn clientWidth(self: *const Window) i32 {
+    const hwnd = self.hwnd orelse return 0;
+    var rc: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rc) == 0) return 0;
+    return rc.right - rc.left;
+}
+
 /// Is a CLIENT y inside the tab strip's band?
 pub fn inTabBar(self: *const Window, y: i32) bool {
     const top = self.tabBarTop();

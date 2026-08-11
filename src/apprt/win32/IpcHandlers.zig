@@ -20,6 +20,7 @@ const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(PaneView);
+const tab_strip = @import("tab_strip_layout.zig");
 const w32 = @import("win32.zig");
 const window_active = @import("window_active.zig");
 const color_math = @import("color_math.zig");
@@ -1654,6 +1655,7 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             .target = window.ipc_name,
             .focused = window_active.isActive(activation, @intFromPtr(hwnd)),
             .tabs = tabs.items,
+            .chrome = try windowChrome(arena, window),
         });
     }
 
@@ -1673,6 +1675,49 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     }).serializeResponse(arena) catch
         return error.OutOfMemory;
     return try ctx.alloc.dupe(u8, json);
+}
+
+/// This window's published chrome geometry (T231): the tab strip's hit
+/// regions, in client coordinates, exactly as the window's own hit tests hold
+/// them. A test asks for these instead of re-implementing `tab_strip_layout`
+/// in PowerShell, which is a second source of truth for a layout the product
+/// owns and had already rotted twice.
+///
+/// The rects come from `Window.stripRegions`, which does no arithmetic of its
+/// own beyond moving them into client coordinates — so this cannot report
+/// something the window would not hit.
+fn windowChrome(arena: Allocator, window: *Window) Allocator.Error!apprt.ipc.List.Chrome {
+    const dpi: i64 = @intFromFloat(@round(window.scale * 96.0));
+    const regions = window.stripRegions() orelse return .{ .dpi = dpi };
+
+    // An EMPTY rect is `null` on the wire: "there is nothing here to hit" —
+    // the "≡" on a caption window (T260), a tab that did not fit, and every
+    // region of a strip that has not painted yet. A consumer that took a
+    // zero rect's center would click x = 0, which is tab 1.
+    const rect = struct {
+        fn opt(r: tab_strip.Rect) ?apprt.ipc.List.Rect {
+            if (r.isEmpty()) return null;
+            return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
+        }
+    };
+
+    const tabs = try arena.alloc(?apprt.ipc.List.Rect, window.tab_count);
+    for (tabs, 0..) |*t, i| t.* = rect.opt(regions.tabs[i]);
+
+    return .{
+        .dpi = dpi,
+        .tab_strip = .{
+            .band = .{
+                .left = regions.band.left,
+                .top = regions.band.top,
+                .right = regions.band.right,
+                .bottom = regions.band.bottom,
+            },
+            .tabs = tabs,
+            .new_tab = rect.opt(regions.new_tab),
+            .menu = rect.opt(regions.menu),
+        },
+    };
 }
 
 /// Recursively build the split-node model for one tree node. Every leaf is

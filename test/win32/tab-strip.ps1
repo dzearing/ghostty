@@ -568,8 +568,30 @@ try {
     #     all four fail together and sections 1-7 do not.
     # -----------------------------------------------------------------------
     Close-TestWindowPixels $shot; $shot = Get-Shot
+    # MEASURED here on purpose, and it is the one place in this file that has to
+    # be: the claim below is that an inactive tab PAINTS something, and only a
+    # capture can say that. The published rects (T231) cannot - the app reports
+    # a rect for a tab it laid out whether or not the paint made it visible -
+    # so they are used as the ORACLE instead: a scan that disagrees with them is
+    # finding the wrong runs, which is the failure mode that made this scan a
+    # heuristic rather than a measurement.
     $tabs = @(Get-TestTabExtents -Window $top -Shot $shot -Metrics $m)
     Write-Host "INFO  shape: $($tabs.Count) tabs measured"
+    $pub = @((Get-TestStripRegions -Window $top -Exe $exe).Tabs | Where-Object { $null -ne $_ })
+    if ($tabs.Count -eq $pub.Count) {
+        $worst = 0
+        for ($i = 0; $i -lt $pub.Count; $i++) {
+            $worst = [Math]::Max($worst, [Math]::Abs($tabs[$i].Left - $pub[$i].Left))
+            $worst = [Math]::Max($worst, [Math]::Abs($tabs[$i].Right - $pub[$i].Right))
+        }
+        # 2px: a chiclet's rounded corners antialias into the strip, so the scan
+        # is generous by a pixel at each end. Anything past that is the scan
+        # locking onto something that is not a tab.
+        Assert ($worst -le 2) `
+            "T231: the measured chiclets match the rects the app publishes (worst edge delta ${worst}px)"
+    } else {
+        Write-Host "INFO  shape: published $($pub.Count) tab rects vs $($tabs.Count) measured"
+    }
     if ($tabs.Count -lt 3) {
         # Three tabs are open (section 4 proved it by index), so "fewer than
         # three are MEASURABLE" is not a setup problem - it is assertion 5
@@ -940,13 +962,15 @@ try {
     }
 
     # ...and the "+" is still there and still works, wherever the run left it.
-    # MEASURED, not assumed at the limit: under pressure the tabs divide the run
+    # PUBLISHED, not assumed at the limit: under pressure the tabs divide the run
     # evenly and the remainder can leave the "+" most of a tab short of its
-    # limit, which is exactly the kind of re-derivation T256/T259 are about.
+    # limit. This used to measure the run off a capture and then re-apply the
+    # layout's own `min(runRight + gap, plus_limit)` rule, which is the second
+    # copy of a product rule that T231 exists to delete.
     $tabsNow = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count
-    $runRight = Get-TestTabRunRight -Window $top -Metrics $m
-    $plusLeft = [Math]::Min($runRight + $gap, $m.PlusLimit)
-    Strip-Click ($plusLeft + [int]($btnPaint / 2))
+    $plus = (Get-TestStripRegions -Window $top -Exe $exe).NewTab
+    Assert ($null -ne $plus) 'the strip still reports a "+" with the run overrun by tabs'
+    Strip-Click $plus.CenterX
     Start-Sleep -Milliseconds 500
     Assert (@(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count -gt $tabsNow) `
         'the "+" survives the strip being full and still opens a tab'

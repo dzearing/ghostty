@@ -41,23 +41,34 @@
 # silently modelled the wrong chrome measured last year's geometry and passed.
 #
 # ---------------------------------------------------------------------------
-# DERIVED vs MEASURED - the line this file draws, and why
+# PUBLISHED vs DERIVED vs MEASURED - the line this file draws, and why
 #
-# Everything here is DERIVED from the window's own DPI by the same construction
-# the Zig layout modules use, EXCEPT `Get-TestTabRunRight`, which is MEASURED
-# off a capture. That split is not arbitrary:
+# Three ways to learn where a thing is, in descending order of preference:
 #
-#   * Positions and gaps come from DIP constants (`caption_layout.Metrics`,
-#     `tab_strip_layout.Metrics`, `icon_button.Metrics`). A script can restate
-#     those exactly, and SHOULD - a derived value that disagrees with the app
-#     is a real failure the script must be able to see.
-#   * A tab's WIDTH does not. Since T235 it is the measured title plus padding
-#     (capped at 50% of the run), so it comes out of text metrics that a
-#     PowerShell script cannot reproduce. T256 already learned this the
-#     expensive way: menu-bar.ps1 modelled "equal share capped at 200 DIP",
-#     got ~250px against a real ~344px tab, and clicked the "+" inside tab 1.
-#     A script cannot re-derive a width that comes from text metrics, so this
-#     file does not offer one - it offers the run's measured right edge.
+#   * PUBLISHED (`Get-TestStripRegions`, T231). The app REPORTS the tab strip's
+#     hit regions in `+list --json`, in client coordinates, and they are the
+#     very rects its hit tests read. **Ask for a click target this way.** It
+#     cannot rot, because there is no second copy of the layout to rot against.
+#   * DERIVED - a DIP constant resolved the way the Zig modules resolve it
+#     (`caption_layout.Metrics`, `tab_strip_layout.Metrics`,
+#     `icon_button.Metrics`). A script can restate those exactly, and where it
+#     does, a disagreement with the app is a real failure the script must be
+#     able to see. Keep this for CONSTANTS (a 4 DIP step, the 28 DIP square),
+#     never for a position that depends on the tab run.
+#   * MEASURED off a capture (`Get-TestTabExtents`). This is the only one that
+#     can prove something is PAINTED, so it stays - but it answers "where is
+#     there ink", not "where will a click land", and using it for the latter is
+#     what T256/T259 cost.
+#
+# What forced the split: a tab's WIDTH is not derivable. Since T235 it is the
+# measured title plus padding (capped at 50% of the run), so it comes out of
+# text metrics a PowerShell script cannot reproduce. T256 learned that the
+# expensive way - menu-bar.ps1 modelled "equal share capped at 200 DIP", got
+# ~250px against a real ~344px tab, and clicked the "+" inside tab 1. The
+# answer then was to MEASURE the run; T231 made the product publish it, which
+# is better still: exact, available before the window has a stable capture, and
+# unambiguous about what is absent (a tab that did not fit reports `null`, and
+# a pixel scan cannot tell that from a tab that painted nothing).
 #
 # ---------------------------------------------------------------------------
 # ROUNDING - the trap that made the private copies disagree
@@ -325,9 +336,125 @@ function Get-TestChromeMetrics {
 }
 
 <#
+The tab strip's hit regions as the APP publishes them (T231), in CLIENT
+coordinates - `+list --json` -> `windows[].chrome.tab_strip`.
+
+This is the answer to "where do I click", and it is the app's own rects rather
+than a second implementation of `tab_strip_layout.layout()` in PowerShell. The
+re-implementation it replaced rotted twice (a fixed 46px offset that landed
+inside the menu button at 125% DPI; then a modelled tab width that stopped
+matching when T235 sized tabs to their titles), each time producing failures
+against a completely healthy product.
+
+Returns $null when the window shows no tab strip. THROWS when the server does
+not report chrome at all - that means a build older than T231, and answering
+$null there would read as "this window has no strip", which is the exact
+silent-wrong-model failure T259 is about.
+
+Every rect carries Left/Top/Right/Bottom plus Width/Height/CenterX/CenterY, and
+a region with nothing to hit is $null: the strip's "=" on a window whose
+caption hosts the menu (T260), a tab the strip could not fit, and every region
+of a strip that has not painted yet. Because of that last one this POLLS until
+the "+" is reported (a strip always lays one out) or -TimeoutMs elapses, so a
+caller never has to know that a freshly shown window reports empty regions for
+a few frames.
+
+  Band    - where the strip's content may sit: inside both insets, and the
+            buttons' own vertical band. Its Right is the strip's right END,
+            which on a merged caption row (T205) is the seam, not the window
+            edge.
+  Tabs    - one entry per tab, in tab order; $null where a tab did not fit.
+  TabsRight - the last laid-out tab's right edge (Band.Left when there are none).
+  NewTab  - the "+"'s hit box.
+  Menu    - the "="'s hit box, or $null (T260).
+#>
+function Get-TestStripRegions {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        # The ghoztty CLI to ask. Explicit, because a script that asked the
+        # `ghoztty` on PATH would be interrogating the user's installed release
+        # about a window this build owns.
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [int]$TimeoutMs = 5000
+    )
+
+    $want = [int64]$Window
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $sawWindow = $false
+    while ($true) {
+        # A native command writing to stderr is a TERMINATING error under
+        # $ErrorActionPreference=Stop (PS5.1 wraps each line in a
+        # NativeCommandError), and +list is chatty on a busy box.
+        $old = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $raw = & $Exe +list --json 2>$null | Out-String } finally { $ErrorActionPreference = $old }
+
+        $j = $null
+        if ($raw -and $raw.Trim()) { $j = $raw | ConvertFrom-Json }
+        if ($j -and $j.data -and $j.data.windows) {
+            foreach ($w in $j.data.windows) {
+                if ([int64]$w.id -ne $want) { continue }
+                $sawWindow = $true
+                if (-not ($w.PSObject.Properties.Name -contains 'chrome')) {
+                    throw ("Get-TestStripRegions: this ghoztty reports no 'chrome' in +list --json. " +
+                           "That is a build older than T231, not a window without a strip - rebuild " +
+                           "with 'zig build -Dapp-runtime=win32 -Doptimize=Debug' rather than " +
+                           "treating the absence as an answer.")
+                }
+                if ($null -eq $w.chrome.tab_strip) { return $null }
+                $r = $w.chrome.tab_strip
+                if ($null -ne $r.new_tab -or (Get-Date) -ge $deadline) {
+                    return [pscustomobject]@{
+                        Dpi = [int]$w.chrome.dpi
+                        Scale = [double]$w.chrome.dpi / 96.0
+                        Band = ConvertTo-TestChromeRect $r.band
+                        Tabs = @($r.tabs | ForEach-Object { ConvertTo-TestChromeRect $_ })
+                        TabsRight = $(
+                            $last = $null
+                            foreach ($t in $r.tabs) { if ($null -ne $t) { $last = $t } }
+                            if ($null -ne $last) { [int]$last.right } else { [int]$r.band.left }
+                        )
+                        NewTab = ConvertTo-TestChromeRect $r.new_tab
+                        Menu = ConvertTo-TestChromeRect $r.menu
+                    }
+                }
+            }
+        }
+        if ((Get-Date) -ge $deadline) {
+            if (-not $sawWindow) {
+                throw ("Get-TestStripRegions: window $want is not in +list --json after ${TimeoutMs}ms " +
+                       "(is -Exe the build that owns it?)")
+            }
+            return $null
+        }
+        Start-Sleep -Milliseconds 150
+    }
+}
+
+# One published rect as a probe-friendly object, or $null for a region with
+# nothing to hit. Centers are integers because every click site takes one.
+function ConvertTo-TestChromeRect($r) {
+    if ($null -eq $r) { return $null }
+    $l = [int]$r.left; $t = [int]$r.top; $rt = [int]$r.right; $b = [int]$r.bottom
+    return [pscustomobject]@{
+        Left = $l; Top = $t; Right = $rt; Bottom = $b
+        Width = $rt - $l; Height = $b - $t
+        CenterX = $l + [int](($rt - $l) / 2)
+        CenterY = $t + [int](($b - $t) / 2)
+    }
+}
+
+<#
 Every painted tab chiclet's extent, in CLIENT x, as an array of
-`{ Left, Right, Center }` (Right exclusive) - MEASURED, never modelled (see
-this file's header for why a width cannot be derived).
+`{ Left, Right, Center }` (Right exclusive) - MEASURED off a capture.
+
+**Since T231 this is for assertions about the PAINT, not for click targets.**
+`Get-TestStripRegions` reports the app's own tab rects exactly and needs no
+capture; what this adds is the only thing a report cannot say - that something
+was actually drawn there. Reach for it when "an inactive tab is visible against
+the strip" is the claim, and for nothing else. A scan cannot tell a tab that
+did not fit from one that painted nothing, and it is 1-2px generous either way
+(chiclet antialiasing).
 
 Scans a row near the strip's BOTTOM: inside a chiclet at its full width (the
 chiclet's rounding is on the TOP corners only) and below the "+" glyph's
@@ -415,7 +542,9 @@ function Get-TestTabExtents {
 }
 
 <#
-The last tab's painted right edge, in CLIENT x, exclusive.
+The last tab's painted right edge, in CLIENT x, exclusive - MEASURED, with the
+same caveat as `Get-TestTabExtents`: since T231, prefer
+`(Get-TestStripRegions ...).TabsRight`, which is the app's own answer.
 
 Falls back to `PadL` (an empty run) when there are no tabs or the window never
 captures with real content, which is what a strip with no tabs measures - the

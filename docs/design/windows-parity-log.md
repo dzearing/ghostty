@@ -15282,3 +15282,54 @@ predicates fails exactly the six new assertions and moves nothing else.
 Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 135s, win32
 334s, agent 367s); P1-P3 ALL PASS; `split-divider.ps1` ALL PASS (57 assertions,
 up from 51) three times, with `-NegativeControl` still failing.
+
+## 2026-08-11 - the app now tells tests where its tabs are (T231)
+
+`+list --json` reports each window's tab-strip hit regions - the content band,
+every tab, the "+" and the "=" - as a `chrome` object in client coordinates.
+They are not a fresh layout pass: `Window.stripRegions` hands back the very
+rects `paintTabBar` published and the hit tests read, moved into client space
+by `tab_strip_layout.clientRect`. So what a caller is told and what a click
+reaches cannot disagree, which a second implementation of the layout can never
+promise.
+
+That second implementation is what this deletes. The win32 harness kept one and
+it rotted twice against a completely healthy product: a fixed "46px left of the
+right edge" written when a single tab still stretched to fill the strip, which
+at 125% DPI landed inside the menu button (five failing menu-bar assertions);
+then a modelled tab width that stopped matching the moment T235 sized tabs to
+their titles (~250px modelled against a real ~344px tab, so the "+" click
+landed inside tab 1). T257's answer - measure the run off a capture - fixed the
+width but still kept a private copy of the "+"'s own travel rule.
+
+The rule the report hangs on is that an EMPTY rect goes on the wire as `null`:
+the "=" on a window whose caption hosts the menu, a tab that did not fit, every
+region of a strip that has not painted. Offsetting a zero rect into client
+space instead would publish `{0, 40, 0, 72}` - still unhittable, no longer
+recognizable as absent - and a consumer taking its center clicks x = 0, which
+is tab 1. `tab_strip: null` (no strip on this window) stays distinct from the
+whole `chrome` key being absent (a server that cannot say), and the harness
+throws on the latter rather than reading it as "no tabs".
+
+Harness side, `ChromeGeometry.ps1`'s header now names THREE sources of truth
+where it named two: PUBLISHED (ask the product - for any click target),
+DERIVED (a DIP constant restated exactly), MEASURED (a capture - the only one
+that can prove something was PAINTED, and now used only for that). `menu-bar`'s
+`Strip-Geometry` models nothing at all any more, and `Strip-Top` - a datum that
+moved three times in three tasks - is gone, since every point is client-space
+to begin with. `tab-strip.ps1` keeps its chiclet scan, because "an inactive tab
+is visible against the strip" is a claim only pixels can settle, and now checks
+that scan against the published rects; that turned a heuristic into a measured
+one on the first run (the scan is 1px generous at each end, chiclet
+antialiasing).
+
+Deciding to publish in `+list --json` rather than behind a debug-only verb is
+D66 - a debug-gated surface would mean the acceptance suite exercising a path
+that does not exist in a shipped build, which is T350's mistake in a new place.
+The Mac server half is T735.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 130s, win32
+178s, agent 335s); P1-P3 ALL PASS. `menu-bar.ps1` (78), `tab-strip.ps1` (58, 1
+pre-existing SKIP) and `tab-color.ps1` (17) each ALL PASS three times, with
+`menu-bar -NegativeControl` still failing. The three harness sweeps
+(exit-code, skip-visibility, verdict-exit) stay at zero.

@@ -281,108 +281,95 @@ function Send-MenuKey([IntPtr]$w, [string]$key) {
     [void](Send-TestControlKey -Control $w -Key $key)
 }
 
-# Height of the caption band that T254 moved INTO the client area, in physical
-# pixels: `caption_layout.Metrics.caption_h`, which is 4 + 28 + 4 DIP resolved
-# at this window's own DPI - the same GetDpiForWindow the app derives
-# `Window.scale` from.
+# Where the strip STARTS used to live here, as `Strip-Top`, and it moved three
+# times in three tasks: client y = 0, then y = captionHeight when T254 pulled
+# the caption band into the client area, then back to 0 when T205 merged the
+# strip INTO that band. Each move cost this script a pile of assertions that
+# were pointing at the caption (where a click drags the window or hits
+# minimize/maximize/close) while the product was healthy.
 #
-# T256: the tab strip used to start at client y = 0 and every y below was
-# written that way. It now starts at y = captionHeight, so a strip-relative y
-# has to be offset by this or it lands in the caption (where it drags the
-# window, or hits minimize/maximize/close). Derived, never a fixed 36: T205
-# moves this datum again when the strip goes INTO the caption row.
-#
-# T257: derived in lib\ChromeGeometry.ps1 now, which is also where tab-strip.ps1
-# and tab-color.ps1 read it from. This wrapper stays only because the call sites
-# below read better as `Strip-Top $top`.
-#
-# T205 moved it a third time, exactly as predicted above - and renamed it, since
-# what both call sites always wanted was the STRIP's origin, which is no longer
-# the caption's height: merged, the strip IS the caption row and starts at
-# client y = 0 again. Every window this script launches passes
-# --window-show-tab-bar=always, so -StripVisible is $true throughout.
-function Strip-Top([IntPtr]$top) {
-    return (Get-TestChromeMetrics -Window $top -StripVisible $true).StripTopClient
-}
+# It is gone since T231: every point below comes from a rect the app published
+# in CLIENT coordinates, so there is no strip-relative y left to offset and
+# nothing here to move a fourth time. `Strip-Geometry(...).Band` is the strip's
+# own band when a section needs one.
 
-# Click in the tab strip at (client x, STRIP-relative y); x < 0 counts back from
-# the right edge. The strip is painted AND hit-tested by the top-level window,
-# so that is where the click is posted (T216: name the window a real click would
-# reach).
-function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
+# Click a CLIENT point in the window. The strip is painted AND hit-tested by
+# the top-level window, so that is where the click is posted (T216: name the
+# window a real click would reach).
+#
+# CLIENT, not strip-relative, since T231: every point below now comes from a
+# rect the app PUBLISHED in client coordinates, so converting it back into the
+# strip's space just to add the strip's top again would reintroduce the one
+# number T254 moved out from under this script.
+function Click-Client([IntPtr]$top, [int]$x, [int]$y) {
     $cr = Get-TestWindowRect -Window $top -Client
-    $sx = if ($x -lt 0) { $cr.Right + $x } else { $cr.Left + $x }
-    $sy = $cr.Top + (Strip-Top $top) + $y
-    [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action click)
+    [void](Send-TestMouse -Window $top -Target $top -X ($cr.Left + $x) -Y ($cr.Top + $y) -Button left -Action click)
 }
 
-# Where the strip's three regions ARE, in client x, for a window at this DPI
-# with this many tabs.
+# Where the strip's regions ARE, in CLIENT coordinates - ASKED OF THE PRODUCT
+# (T231), not re-derived here.
 #
-# The section used to click a hard-coded "46px left of the right edge" for the
-# "+". That constant was written when a SINGLE tab stretched to fill the strip,
-# which parked the "+" hard against the menu button; T202 stopped the stretch
-# and the "+" now TRAVELS with the last tab, so with one tab it sits ~260px
-# from the LEFT. The offset was doubly wrong at 125% DPI, where the scaled
-# button group is wide enough that 46px from the right edge lands INSIDE the
-# menu button - which is what the migration measured (the "+" click opened the
-# menu and no tab ever appeared).
+# The history is the argument. The section first clicked a hard-coded "46px
+# left of the right edge" for the "+". That constant was written when a SINGLE
+# tab stretched to fill the strip, which parked the "+" hard against the menu
+# button; T202 stopped the stretch and the "+" now TRAVELS with the last tab,
+# so with one tab it sits ~260px from the LEFT. It was doubly wrong at 125%
+# DPI, where the scaled button group is wide enough that 46px from the right
+# edge lands INSIDE the menu button - the "+" click opened the menu and no tab
+# ever appeared.
 #
-# T256: what replaced it - a re-implementation of `tab_strip_layout`'s tab
-# SIZING - then broke the same way one rule change later. T235 made a tab's
-# width its measured TITLE plus padding, so the modelled "equal share, capped at
-# 200 DIP" width was ~250px against a real ~344px tab and the "+" click landed
-# back inside tab 1. A script cannot re-derive a width that comes from text
-# metrics, and it should not try (that is T249's point).
+# T256 replaced it with a re-implementation of `tab_strip_layout`'s tab SIZING,
+# which broke the same way one rule change later: T235 made a tab's width its
+# measured TITLE plus padding, so the modelled "equal share, capped at 200 DIP"
+# width was ~250px against a real ~344px tab and the click landed back inside
+# tab 1. T257 then measured the run off a capture instead, and kept a private
+# copy of the "+"'s own rule - `min(tabsRight + group_gap, plus_limit)` - which
+# is still a second implementation of a layout the product owns.
 #
-# So the tab run is no longer modelled at all - it is MEASURED. Only the two
-# right-anchored buttons are derived (`padR` + the shared 28 DIP square, which
-# is anchoring, not sizing), and the last tab's painted right edge is read off a
-# capture: scanning leftward from just inside the menu button along a row near
-# the strip's BOTTOM, the first pixel that is not strip background is the tab.
-# That row is below the "+" glyph's extent, so nothing between the tab and the
-# menu button can be mistaken for it.
-#
-# T257: the derivation AND the leftward scan both moved to
-# lib\ChromeGeometry.ps1, because tab-strip.ps1 had its own copy of the first
-# and tab-color.ps1 needed both. What is left here is the part that is specific
-# to THIS script - naming the three click targets the sections below aim at.
+# T231 ended that: `+list --json` reports the strip's hit regions, which ARE
+# the rects the app hit-tests. All this function does now is name the four
+# points the sections below aim at. Nothing here models a width, an anchor or a
+# travel rule, so there is nothing left to rot.
 function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
     $m = Get-TestChromeMetrics -Window $top -StripVisible $true
-    $tabsRight = Get-TestTabRunRight -Window $top -Metrics $m
-    $plusLeft = [Math]::Min($tabsRight + $m.Gap, $m.PlusLimit)
+    $r = Get-TestStripRegions -Window $top -Exe $exe
+    if ($null -eq $r) { throw "Strip-Geometry: window $top reports no tab strip" }
+    if ($null -eq $r.NewTab) { throw "Strip-Geometry: the strip reports no '+' (did it never paint?)" }
+
     # Where the strip's own half ENDS. On a merged row (T205) that is the seam,
-    # not the window edge: right of `BandLeft` is the caption's half, and a
-    # point picked there would be the close button rather than bare strip.
-    $stripRight = if ($null -ne $m.BandLeft) { $m.BandLeft } else { $m.ClientW - $m.PadR }
-    $deadRight = if ($null -ne $m.MenuLeft) { $m.MenuLeft } else { $stripRight }
+    # not the window edge: right of it is the caption's half, and a point picked
+    # there would be the close button rather than bare strip. Published, so this
+    # is right on both window shapes with no branch.
+    $stripRight = $r.Band.Right
+    $deadRight = if ($null -ne $r.Menu) { $r.Menu.Left } else { $stripRight }
 
     [pscustomobject]@{
-        Dpi = $m.Dpi; ClientW = $m.ClientW; BtnW = $m.BtnPaint; TabsRight = $tabsRight
+        Dpi = $r.Dpi; ClientW = $m.ClientW; BtnW = $m.BtnPaint; TabsRight = $r.TabsRight
         # The floor a tab shrinks to under pressure - the one width constant
         # T235 kept. Used only to size the reflow section's tab count.
         MinTabW = $m.MinTabW
+        # The strip's content band, so a caller has the strip's y without
+        # re-deriving where the strip starts (the datum T254 moved).
+        Band = $r.Band
         # $null on a caption window - there is no strip menu button there
         # (T260); `Menu-Host` is what names the host that DOES exist.
-        MenuX = $m.MenuX
-        PlusX = $plusLeft + [int]($m.BtnPaint / 2)
+        MenuX = if ($null -ne $r.Menu) { $r.Menu.CenterX } else { $null }
+        PlusX = $r.NewTab.CenterX
+        PlusY = $r.NewTab.CenterY
         # Strip that belongs to neither a tab, the "+", nor any button: halfway
-        # between the "+"'s painted right edge and the next painted thing right
-        # of it - the menu button where there is one, else the strip's own
-        # right inset. Measuring it against MenuLeft alone stopped working the
-        # moment MenuLeft could be $null (T260).
-        DeadX = [int](($plusLeft + $m.BtnPaint + $deadRight) / 2)
+        # between the "+"'s HIT box and the next thing right of it - the menu
+        # button where there is one, else the strip's own right end. Hit boxes
+        # on purpose: the claim is that a click there reaches nothing, and a hit
+        # box is exactly what a click can reach.
+        DeadX = [int](($r.NewTab.Right + $deadRight) / 2)
         # The center of the RIGHT-MOST square slot in the STRIP: where the "="
-        # button is on a caption-less window, and where it used to be on every
-        # window. On a caption window this is bare strip and must behave like
-        # it - that is T260's user-visible claim.
-        #
-        # T205: measured from the strip's own right end, which on a merged row
-        # is the seam. Keeping the old `ClientW - PadR` would have aimed this
-        # at the caption's CLOSE button - the assertion below would still have
-        # passed (a posted CLIENT click cannot press a caption button, which
-        # takes WM_NCLBUTTONDOWN), and it would have been asserting nothing.
-        StripRightX = $stripRight - [int]($m.BtnPaint / 2)
+        # button is on a caption-less window (and where it used to be on every
+        # window). On a caption window this is bare strip and must behave like
+        # it - that is T260's user-visible claim - so there is no published rect
+        # to ask for and the slot is placed against the published band's right
+        # end with the shared 28 DIP square, which is a constant, not a layout.
+        StripRightX = if ($null -ne $r.Menu) { $r.Menu.CenterX } else { $stripRight - [int]($m.BtnPaint / 2) }
+        StripY = $r.Band.CenterY
     }
 }
 
@@ -607,7 +594,8 @@ Close-Menu $g
 # is on a caption-less window (section H) - has to do nothing at all.
 Assert ($host0.Kind -eq 'caption') 'A: a normal window hosts the menu in its caption, not in the strip'
 $tabsAtStripRight = Tab-Count
-Click-Strip $g.Top (Strip-Geometry $g.Top).StripRightX 8
+$geoRight = Strip-Geometry $g.Top
+Click-Client $g.Top $geoRight.StripRightX $geoRight.StripY
 $m = Wait-Menu $g.Pid 1200
 Assert ($m -eq [IntPtr]::Zero) 'A(T260): the strip has no menu button on a caption window'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
@@ -617,14 +605,14 @@ Assert ((Tab-Count) -eq $tabsAtStripRight) 'A(T260): ...and clicking there opens
 # strip's right end is dead space, and the "+" is its own hit box.
 $tabsBefore = Tab-Count
 $geo = Strip-Geometry $g.Top $tabsBefore
-Write-Host "      A: dpi=$($geo.Dpi) client=$($geo.ClientW) -> plus@$($geo.PlusX) dead@$($geo.DeadX) stripRight@$($geo.StripRightX)"
-Click-Strip $g.Top $geo.DeadX 8
+Write-Host "      A: dpi=$($geo.Dpi) client=$($geo.ClientW) -> plus@$($geo.PlusX) dead@$($geo.DeadX) stripRight@$($geo.StripRightX) tabsRight@$($geo.TabsRight)"
+Click-Client $g.Top $geo.DeadX $geo.StripY
 $m = Wait-Menu $g.Pid 1200
 Assert ($m -eq [IntPtr]::Zero) 'A: clicking bare strip does NOT open the menu'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 Assert ((Tab-Count) -eq $tabsBefore) 'A: ...and does not open a tab either (it is dead space)'
 
-Click-Strip $g.Top $geo.PlusX 8
+Click-Client $g.Top $geo.PlusX $geo.PlusY
 Start-Sleep -Milliseconds 900
 $m = Wait-Menu $g.Pid 300
 Assert ($m -eq [IntPtr]::Zero) 'A: the "+" button did not open the menu'
@@ -644,9 +632,14 @@ try {
     Assert ($colors -ge 8) "A: the window capture holds real content ($colors distinct colors)"
 
     $cr = Get-TestWindowRect -Window $g.Top -Client
-    $cw = $cr.Width
-    # The strip's first row, not the client's (T256).
-    $stripTop = $cr.Top + (Strip-Top $g.Top)
+    # Re-read, not `$geo`: the "+" click above opened a tab, so the run is
+    # longer and the "+" and the dead space right of it have both moved.
+    #
+    # `Band` is the strip's published content band (T231); its top is where
+    # every strip button's square starts, which is the datum T254 moved out
+    # from under the private `caption_h` this block used to add.
+    $geoInk = Strip-Geometry $g.Top
+    $band = $geoInk.Band
     # Ink = pixels far from the rect's own most-common color (the band
     # background), measured in SCREEN coordinates against the capture.
     # `$yTop` is a SCREEN y, because since T260 the two things this probes -
@@ -683,14 +676,15 @@ try {
     # one frame with the "+" and the tab close "x".
     $probeW = $hm.BtnPaint + 4
     $capY = $cr.Top + $hm.CaptionBtnTop
-    $stripY = $stripTop + $hm.TabTopPad + $hm.PadSm
+    # A strip button's painted square starts `pad_sm` below the content band's
+    # own top (the band IS the buttons' band - see tab_strip_layout.buttonHit).
+    $stripY = $cr.Top + $band.Top + $hm.PadSm
     # The strip's own right-most square. T205: on a merged row the strip ends at
-    # the seam, and `$cw - PadR - BtnPaint` is the caption's CLOSE button - which
+    # the seam, and `clientW - PadR - BtnPaint` is the caption's CLOSE button - which
     # does paint a glyph, so the "no menu glyph here" probe below would have
-    # failed against a correct build.
-    $stripRightL = if ($null -ne $hm.BandLeft) {
-        $hm.BandLeft - $hm.BtnPaint
-    } else { $cw - $hm.PadR - $hm.BtnPaint }
+    # failed against a correct build. The published band's right edge is that
+    # end on both window shapes, so there is no branch to get wrong.
+    $stripRightL = $band.Right - $hm.BtnPaint
     $hostInk = if ($host0.Kind -eq 'caption') {
         Ink ($hm.CaptionOverflowLeft - 2) $capY $probeW $hm.BtnPaint
     } else {
@@ -698,12 +692,11 @@ try {
     }
     # The "does this probe measure ink at all?" control, in a square that is
     # blank BY CONSTRUCTION rather than by luck: `DeadX` is the midpoint between
-    # the "+"'s painted right edge and the next painted thing right of it, which
-    # `Strip-Geometry` derives from the MEASURED tab run. It used to be `cw / 2`,
-    # and that stopped being blank when T205 shortened the strip's half of the
-    # row - mid-strip landed inside a tab's title and read 63-282 ink pixels
-    # against a correct build.
-    $blankInk = Ink ((Strip-Geometry $g.Top).DeadX - [int]($probeW / 2)) $stripY $probeW $hm.BtnPaint
+    # the "+"'s PUBLISHED hit box and the next thing right of it (T231). It used
+    # to be `clientW / 2`, and that stopped being blank when T205 shortened the
+    # strip's half of the row - mid-strip landed inside a tab's title and read
+    # 63-282 ink pixels against a correct build.
+    $blankInk = Ink ($geoInk.DeadX - [int]($probeW / 2)) $stripY $probeW $hm.BtnPaint
     # T260's pixel half: the strip's right-most square is BARE. The hit test
     # above says nothing lands there; this says nothing is drawn there either,
     # which is the part the user actually complained about seeing twice.
@@ -981,9 +974,10 @@ $needTabs = [int][Math]::Floor(($geo.ClientW - 2 * $geo.BtnW) / $geo.MinTabW) + 
 Write-Host "      A(reflow): client=$($geo.ClientW) dpi=$($geo.Dpi) -> opening $needTabs tabs (min tab $($geo.MinTabW)px)"
 $have = Tab-Count
 while ((Tab-Count) -lt $needTabs -and $have -lt $needTabs + 8) {
-    # The "+" travels as tabs are added, so its x is re-derived every click
+    # The "+" travels as tabs are added, so its rect is re-read every click
     # rather than assumed to sit next to the menu button.
-    Click-Strip $g.Top (Strip-Geometry $g.Top (Tab-Count)).PlusX 8
+    $gp = Strip-Geometry $g.Top (Tab-Count)
+    Click-Client $g.Top $gp.PlusX $gp.PlusY
     $have++
     Start-Sleep -Milliseconds 250
 }

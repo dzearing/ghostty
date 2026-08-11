@@ -170,6 +170,30 @@ ghoztty +list [--json] [--tty=<tty>]
 
 - `--tty`: Print only the registered name of the pane whose terminal matches the given tty (`ttys014` or `/dev/ttys014`; raw padded `ps -o tty=` output is accepted), then exit. Exits 1 if no match. Lets a process find its own pane: `ghoztty +list --tty="$(ps -o tty= -p $PPID)"`.
 
+`--json` windows carry a **`chrome`** object reporting where the tab strip's
+clickable regions ARE (T231) — `{"dpi": 120, "tab_strip": {"band", "tabs",
+"new_tab", "menu"}}`, every rect in the window's CLIENT coordinates, physical
+pixels, right/bottom exclusive. They are not a fresh layout pass: they are the
+rects the window's own hit tests read, so what is reported and what a click
+reaches cannot drift. **`null` means there is nothing there to hit** — the
+`menu` on a window whose caption hosts the menu (T260), a tab the strip could
+not fit, every region of a strip that has not painted yet — and `tab_strip:
+null` means the window shows no strip at all, which is a different answer from
+the whole `chrome` key being absent (a server that cannot say). `band` is where
+strip content may sit: inside both insets, the buttons' own vertical band, and
+on a merged caption row its right edge is the seam rather than the window edge.
+
+This exists because the alternative is a second implementation of
+`tab_strip_layout` in whatever language the caller is written in, and that
+cannot be type-checked against the first: the win32 acceptance harness kept one
+and it rotted twice — a fixed "46px left of the right edge" that landed inside
+the menu button at 125% DPI, then a modelled tab width that stopped matching
+when T235 sized tabs to their titles. Both produced failing assertions against
+a completely healthy product. Consumers ask
+`Get-TestStripRegions` (`test/win32/lib/ChromeGeometry.ps1`); a pixel scan is
+now only for asserting that something is PAINTED, never for finding a click
+target. (win32 server since T231; the Mac server half is T735.)
+
 `--json` terminal panes carry a `session_id` field when the pane is bound to a
 session-persistence agent session — the join key against `+sessions --json`,
 so a script can answer "which pane is this session open in" (and vice versa)

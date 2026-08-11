@@ -226,12 +226,19 @@ try {
     $stripeTop = [int]($stripTopScreen + $m.TabTopPad)
     $barMidY = [int]($stripTopScreen + [math]::Floor($barH / 2))
 
-    $tabs = @(Get-TestTabExtents -Window $top -Metrics $m)
-    Assert ($tabs.Count -eq 2) "positive control: both tab chiclets are measurable off the strip (found $($tabs.Count))"
+    # T231: the app PUBLISHES its tab rects, so where to right-click is asked
+    # rather than measured. The measured scan is still taken, as the control
+    # that the chiclets are actually PAINTED where they are reported - a
+    # right-click landing on a rect nothing drew would fail every stripe probe
+    # below with no hint as to why.
+    $tabs = @((Get-TestStripRegions -Window $top -Exe $exe).Tabs | Where-Object { $null -ne $_ })
+    Assert ($tabs.Count -eq 2) "positive control: the strip publishes both tab rects (found $($tabs.Count))"
     if ($tabs.Count -lt 2) { exit 1 }
+    $painted = @(Get-TestTabExtents -Window $top -Metrics $m)
+    Assert ($painted.Count -eq 2) "positive control: both tab chiclets are measurable off the strip (found $($painted.Count))"
     # Extents are CLIENT x; the probes below are in SCREEN x.
-    $tab0x = [int]($m.ClientLeft + $tabs[0].Center)
-    $tab1x = [int]($m.ClientLeft + $tabs[1].Center)
+    $tab0x = [int]($m.ClientLeft + $tabs[0].CenterX)
+    $tab1x = [int]($m.ClientLeft + $tabs[1].CenterX)
     Write-Host "INFO  scale=$scale stripeH=$stripeH stripeTop=$stripeTop tab0=[$($tabs[0].Left),$($tabs[0].Right)) tab1=[$($tabs[1].Left),$($tabs[1].Right)) tab0x=$tab0x tab1x=$tab1x"
 
     # Baseline: no stripe anywhere before tagging.

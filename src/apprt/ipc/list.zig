@@ -82,12 +82,66 @@ pub const List = struct {
         splits: *const Node,
     };
 
+    /// A rectangle in the window's CLIENT coordinates, physical pixels,
+    /// right/bottom exclusive — the same convention the win32 chrome's own
+    /// geometry modules use, so a published region is the rect the app hit
+    /// tests and nothing has to be re-expressed on the way out.
+    pub const Rect = struct {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    };
+
+    /// Where the tab strip's clickable regions ARE (T231), so a caller —
+    /// today an acceptance script, tomorrow anything that wants to point at a
+    /// tab — can ask the product instead of re-deriving `tab_strip_layout`'s
+    /// arithmetic in another language. A second implementation of a layout
+    /// cannot be type-checked against the first, and the harness's copy had
+    /// already rotted twice (a fixed "46px from the right edge" that landed
+    /// inside the menu button at 125% DPI, then a modelled tab width that
+    /// stopped matching when T235 sized tabs to their titles).
+    ///
+    /// Every rect is the HIT box the app tests, not the painted square: this
+    /// answers "where do I click", and the painted square is that box deflated
+    /// by the shared `icon_button` hit padding.
+    ///
+    /// **`null` means there is nothing there to hit** — a `menu` on a window
+    /// whose caption hosts the menu (T260), a tab the strip could not fit, and
+    /// every region of a strip that has not painted yet. That is the same
+    /// answer the hit tests give, which is the point.
+    pub const TabStrip = struct {
+        /// The band the strip's content occupies: inside both insets, and the
+        /// buttons' own vertical band rather than the full bar. On a merged
+        /// caption row (T205) its right edge is the seam, not the window edge.
+        band: Rect,
+        /// One entry per tab, in `tabs` order.
+        tabs: []const ?Rect,
+        new_tab: ?Rect,
+        menu: ?Rect,
+    };
+
+    /// The window's chrome, as the app resolved it (T231). Additive and
+    /// optional: absent from a server that does not report it, which is how a
+    /// caller tells "this build cannot say" from "this window has no strip"
+    /// (`tab_strip: null`).
+    pub const Chrome = struct {
+        /// The window's DPI, as the APP believes it — the number every DIP
+        /// constant below was resolved with, which is not always what
+        /// `GetDpiForWindow` answers at the instant a caller asks.
+        dpi: i64,
+        tab_strip: ?TabStrip = null,
+    };
+
     pub const Window = struct {
         id: []const u8,
         title: []const u8,
         target: ?[]const u8,
         focused: bool,
         tabs: []const Tab,
+        /// T231. Windows-only for now (the Mac half is filed); null omits the
+        /// field entirely, so the golden Mac shape below is unchanged.
+        chrome: ?Chrome = null,
     };
 
     /// A leaf for an empty tree, matching the Mac server's placeholder.
@@ -162,6 +216,46 @@ pub const List = struct {
         try jws.beginArray();
         for (w.tabs) |t| try writeTab(jws, t);
         try jws.endArray();
+        if (w.chrome) |c| try writeChrome(jws, c);
+        try jws.endObject();
+    }
+
+    fn writeRect(jws: *std.json.Stringify, r: ?Rect) !void {
+        const rect = r orelse return jws.write(null);
+        try jws.beginObject();
+        try jws.objectField("left");
+        try jws.write(rect.left);
+        try jws.objectField("top");
+        try jws.write(rect.top);
+        try jws.objectField("right");
+        try jws.write(rect.right);
+        try jws.objectField("bottom");
+        try jws.write(rect.bottom);
+        try jws.endObject();
+    }
+
+    fn writeChrome(jws: *std.json.Stringify, c: Chrome) !void {
+        try jws.objectField("chrome");
+        try jws.beginObject();
+        try jws.objectField("dpi");
+        try jws.write(c.dpi);
+        try jws.objectField("tab_strip");
+        if (c.tab_strip) |s| {
+            try jws.beginObject();
+            try jws.objectField("band");
+            try writeRect(jws, s.band);
+            try jws.objectField("tabs");
+            try jws.beginArray();
+            for (s.tabs) |t| try writeRect(jws, t);
+            try jws.endArray();
+            try jws.objectField("new_tab");
+            try writeRect(jws, s.new_tab);
+            try jws.objectField("menu");
+            try writeRect(jws, s.menu);
+            try jws.endObject();
+        } else {
+            try jws.write(null);
+        }
         try jws.endObject();
     }
 
@@ -457,6 +551,93 @@ test "List: viewer leaf reports type/url (T90b)" {
             "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"doc\"," ++
             "\"focused\":true,\"exit_code\":null,\"type\":\"viewer\"," ++
             "\"url\":\"D:\\\\git\\\\ghoztty\\\\README.md\"}}}]}]}}",
+        json,
+    );
+}
+
+test "List: chrome regions are additive (T231)" {
+    const testing = std.testing;
+
+    const leaf: List.Node = .{ .leaf = .{
+        .id = "11",
+        .title = "pwsh",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "11",
+        .focused = true,
+        .exit_code = null,
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &leaf,
+    }};
+    // Two tabs' worth of rects with the second one absent — a tab the strip
+    // could not fit — beside a menu-less strip (T260). Both nulls are the
+    // shape a consumer keys "there is nothing to hit" off.
+    const tab_rects = [_]?List.Rect{
+        .{ .left = 4, .top = 4, .right = 200, .bottom = 40 },
+        null,
+    };
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+        .chrome = .{
+            .dpi = 120,
+            .tab_strip = .{
+                .band = .{ .left = 4, .top = 4, .right = 1396, .bottom = 40 },
+                .tabs = &tab_rects,
+                .new_tab = .{ .left = 206, .top = 4, .right = 244, .bottom = 40 },
+                .menu = null,
+            },
+        },
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+            "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
+            "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
+            "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
+            "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null}}}]," ++
+            "\"chrome\":{\"dpi\":120,\"tab_strip\":{" ++
+            "\"band\":{\"left\":4,\"top\":4,\"right\":1396,\"bottom\":40}," ++
+            "\"tabs\":[{\"left\":4,\"top\":4,\"right\":200,\"bottom\":40},null]," ++
+            "\"new_tab\":{\"left\":206,\"top\":4,\"right\":244,\"bottom\":40}," ++
+            "\"menu\":null}}}]}}",
+        json,
+    );
+}
+
+test "List: a window with no tab strip reports chrome with a null tab_strip (T231)" {
+    // The tri-state a consumer needs: no `chrome` key at all means the server
+    // cannot say (the Mac, or a build older than T231); `tab_strip: null`
+    // means this window is showing no strip. Collapsing those two would make
+    // an un-upgraded server look like a window with no tabs.
+    const testing = std.testing;
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &.{},
+        .chrome = .{ .dpi = 96 },
+    }};
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true," ++
+            "\"tabs\":[],\"chrome\":{\"dpi\":96,\"tab_strip\":null}}]}}",
         json,
     );
 }

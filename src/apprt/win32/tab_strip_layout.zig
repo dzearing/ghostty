@@ -402,6 +402,50 @@ pub fn layout(m: Metrics, client_w: i32, has_menu: bool, prefer: []const i32, ou
     return s;
 }
 
+/// One resolved region moved out of the strip's own coordinate space (top at
+/// 0) and into CLIENT coordinates, by the one number that places the strip:
+/// `Window.tabBarTop()`. Used to PUBLISH the strip's hit regions (T231), so a
+/// test can ask the product where the "+" is instead of re-deriving `layout()`
+/// in PowerShell.
+///
+/// An EMPTY rect stays empty, and that is the whole reason this is a function
+/// rather than an addition at the call site. The strip reports a zero rect for
+/// anything there is nothing to hit — the "≡" on a window whose caption hosts
+/// the menu (T260), a tab that did not fit, every region before the first paint
+/// — and offsetting one blindly would publish `{0, 40, 0, 72}`: still
+/// unhittable, but no longer recognizable as absent, so a consumer that takes
+/// its center would click x = 0 in the strip and hit tab 1.
+pub fn clientRect(r: Rect, strip_top: i32) Rect {
+    if (r.isEmpty()) return .{};
+    return .{
+        .left = r.left,
+        .top = r.top + strip_top,
+        .right = r.right,
+        .bottom = r.bottom + strip_top,
+    };
+}
+
+/// The band the strip's CONTENT occupies, in CLIENT coordinates: inside both
+/// insets horizontally, and the buttons' own vertical band
+/// (`tab_top_pad`..`bar_h`) rather than the full bar — the same band
+/// `buttonHit` puts every control in.
+///
+/// `strip_client_w` is the width `layout` was called with, which on a merged
+/// row (T205) stops at the seam rather than at the window edge, so `right` is
+/// the strip's own right END on every window shape. Published beside the
+/// regions (T231) because the two questions a test asks about empty strip —
+/// "where is there no control" and "where does the strip stop" — are answers
+/// about the band, and deriving it from DIP constants in a script is the rot
+/// this exists to remove.
+pub fn contentBand(m: Metrics, strip_client_w: i32, strip_top: i32) Rect {
+    return .{
+        .left = m.strip_pad_l,
+        .top = strip_top + m.tab_top_pad,
+        .right = @max(strip_client_w - m.strip_pad_r, m.strip_pad_l),
+        .bottom = strip_top + m.bar_h,
+    };
+}
+
 /// The chiclet's clip shape, expressed as the rect to hand
 /// `CreateRoundRectRgn`. The bottom is pushed past the strip so only the TOP
 /// corners round — the tab merges into the pane below it, which is how a
@@ -946,6 +990,115 @@ test "the buttons share the tabs' vertical band, not the full bar" {
     try testing.expectEqual(m.tab_top_pad, s.menu.top);
     try testing.expectEqual(buf[0].top, s.new_tab.top);
     try testing.expectEqual(m.bar_h, s.menu.bottom);
+}
+
+test "T231: the published regions ARE layout()'s, moved by the strip's top" {
+    // The point of publishing them: a consumer that reads the report and a
+    // consumer that reads the hit tests must be looking at the same rectangles.
+    // The only difference allowed is the one number that places the strip in
+    // the client — which is also the number a PowerShell re-derivation got
+    // wrong when T254 moved the strip off client y = 0.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        for ([_]i32{ 0, 40, 50 }) |strip_top| {
+            _, const s = layoutN(scale, WIDE, 4, &buf);
+            for (buf[0..s.visible]) |r| {
+                const c = clientRect(r, strip_top);
+                try testing.expectEqual(r.left, c.left);
+                try testing.expectEqual(r.right, c.right);
+                try testing.expectEqual(r.top + strip_top, c.top);
+                try testing.expectEqual(r.bottom + strip_top, c.bottom);
+                try testing.expectEqual(r.width(), c.width());
+                try testing.expectEqual(r.height(), c.height());
+            }
+            for ([_]Rect{ s.new_tab, s.menu }) |btn| {
+                const c = clientRect(btn, strip_top);
+                try testing.expectEqual(btn.left, c.left);
+                try testing.expectEqual(btn.top + strip_top, c.top);
+            }
+        }
+    }
+}
+
+test "T231: an absent region publishes as EMPTY, not as a rect at the strip top" {
+    // The menu-less strip (T260) and the tabs that did not fit both report a
+    // zero rect, and that has to survive the move into client coordinates —
+    // `isEmpty()` is how a consumer tells "no such control" from "a control at
+    // x = 0", and a naive `+ strip_top` breaks exactly that test.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        _, const s = layoutMenu(scale, WIDE, 64, TITLE_DIP, false, &buf);
+        try testing.expect(s.menu.isEmpty());
+        for ([_]i32{ 0, 40, 1000 }) |strip_top| {
+            const menu = clientRect(s.menu, strip_top);
+            try testing.expect(menu.isEmpty());
+            try testing.expectEqual(@as(i32, 0), menu.top);
+            try testing.expectEqual(@as(i32, 0), menu.bottom);
+            // The dropped tabs, which are the same shape of answer.
+            for (buf[s.visible..64]) |r| {
+                try testing.expect(clientRect(r, strip_top).isEmpty());
+            }
+        }
+    }
+}
+
+test "T231: the published band contains every published region" {
+    // What the band is FOR: a consumer picks empty strip out of it, and a point
+    // it reports as inside the band but outside every region has to actually be
+    // strip. A band that did not contain the controls would make that reasoning
+    // wrong in the direction that reads as a passing test.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        for ([_]bool{ true, false }) |has_menu| {
+            for ([_]usize{ 1, 3, 40 }) |n| {
+                const m = Metrics.init(scale);
+                const strip_top: i32 = 37;
+                _, const s = layoutMenu(scale, WIDE, n, TITLE_DIP, has_menu, &buf);
+                const band = contentBand(m, WIDE, strip_top);
+
+                // Vertically the band IS the buttons' band, exactly.
+                try testing.expectEqual(strip_top + m.tab_top_pad, band.top);
+                try testing.expectEqual(strip_top + m.bar_h, band.bottom);
+                // Horizontally it runs between the two insets, which is where
+                // the first tab starts and where the right-anchored control's
+                // painted edge lands.
+                try testing.expectEqual(m.strip_pad_l, band.left);
+                try testing.expectEqual(WIDE - m.strip_pad_r, band.right);
+
+                // A hit box reaches `btn_pad` past its painted square and is
+                // allowed to overhang the inset — it is invisible. The PAINT
+                // never does, and the paint is what the band claims.
+                const squares = [_]Rect{
+                    clientRect(painted(scale, s.new_tab), strip_top),
+                    clientRect(painted(scale, s.menu), strip_top),
+                };
+                for (squares) |r| {
+                    if (r.isEmpty()) continue;
+                    try testing.expect(r.left >= band.left);
+                    try testing.expect(r.right <= band.right);
+                    try testing.expect(r.top >= band.top);
+                    try testing.expect(r.bottom <= band.bottom);
+                }
+                for (buf[0..s.visible]) |t| {
+                    const r = clientRect(t, strip_top);
+                    try testing.expect(r.left >= band.left);
+                    try testing.expect(r.right <= band.right);
+                }
+            }
+        }
+    }
+}
+
+test "T231: a strip too narrow for its own insets still reports a sane band" {
+    // A degenerate window must not publish a band whose right is left of its
+    // left — a consumer computing a midpoint inside it would get a point
+    // outside the window entirely.
+    const m = Metrics.init(1.0);
+    for ([_]i32{ 0, 1, 4, 8 }) |w| {
+        const band = contentBand(m, w, 0);
+        try testing.expect(band.right >= band.left);
+        try testing.expectEqual(m.strip_pad_l, band.left);
+    }
 }
 
 test "the separator is a 1px hairline inset inside the tab" {
