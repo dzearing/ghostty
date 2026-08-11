@@ -2470,6 +2470,21 @@ pub const Connection = struct {
         if (self.negotiated) |n| return n.close_session else |_| return false;
     }
 
+    /// True iff the negotiated peer advertised `capability.grid_snapshot` — i.e.
+    /// every ATTACH is followed by a self-contained repaint of the session's
+    /// CURRENT visible screen (`agent/grid_snapshot.zig`), which homes to row 1
+    /// and erases the display before it draws.
+    ///
+    /// The client needs to know this BEFORE it paints anything of its own: a
+    /// repaint that is certain to arrive is what makes it safe to park a restored
+    /// screen into scrollback rather than leave it on the viewport for that
+    /// repaint to overwrite (T666). False for an older agent and for a handshake
+    /// that has not completed, which is the safe direction — no repaint is
+    /// promised, so nothing is parked.
+    pub fn peerRepaintsOnAttach(self: *Connection) bool {
+        if (self.negotiated) |n| return n.grid_snapshot else |_| return false;
+    }
+
     /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`
     /// it reports is in CORRECTED units and may be shown as fact.
     ///

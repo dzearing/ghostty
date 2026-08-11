@@ -49,6 +49,7 @@ const protocol = @import("../remote/protocol.zig");
 const session_notice = @import("session_notice.zig");
 const open_failed_notice = @import("open_failed_notice.zig");
 const attach_failed_notice = @import("attach_failed_notice.zig");
+const restore_park = @import("restore_park.zig");
 
 const log = std.log.scoped(.io_remote);
 
@@ -1114,8 +1115,21 @@ pub fn threadEnter(
     // to the live grid exactly when the replay is fully applied (`applied_bytes`
     // reaches the ring head S carried by ATTACHED). An older agent omits the
     // capture geometry (0) → keep today's live-width replay.
+    //
+    // T666: this applies to the SNAPSHOT attach path (`attach_offset > 0`) too,
+    // and it used to be gated away from it. The gap-fill there is the same raw,
+    // geometry-bound ConPTY bytes — only shorter — so at a different live width
+    // its in-place redraws overwrite the wrong columns and the pane comes back
+    // holding shredded text ("…>SPMKal or external command,MK…C1' is not"). That
+    // went unnoticed for as long as the repaint erased it a frame later; parking
+    // the screen into scrollback keeps it, so it has to be replayed correctly
+    // rather than thrown away. The persisted snapshot is painted AFTER this
+    // reflow on purpose: the agent's `replay_*` geometry is the geometry the
+    // session had when the app last saved it, which is the geometry that
+    // snapshot was captured at, and the reflow back at the boundary re-wraps the
+    // restored history and the gap-fill together, in one pass, to the live grid.
     if (!did_relaunch and !did_notify and !self.awaiting_relaunch and
-        self.attach_offset == 0 and attach_snapshot_at > 0 and
+        attach_snapshot_at > 0 and
         attach_replay_cols != 0 and attach_replay_rows != 0 and
         (attach_replay_cols != live_cols or attach_replay_rows != live_rows))
     {
@@ -1140,7 +1154,22 @@ pub fn threadEnter(
     // apply.
     if (!did_relaunch and !did_notify and !self.awaiting_relaunch and self.attach_offset > 0) {
         if (self.restore_snapshot) |snap| {
-            if (snap.len > 0) @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+            if (snap.len > 0) {
+                @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+
+                // T666: the paint we just made sits on the VISIBLE SCREEN, and
+                // the next thing the agent sends is a repaint of the session's
+                // current viewport that homes to row 1 and erases as it goes
+                // (`agent/grid_snapshot.zig`, then ConPTY's own fresh paint
+                // behind it). Left where it is, every row of restored history is
+                // overwritten — which is why a re-attached pane used to come back
+                // holding one screen and nothing above it. Park it into
+                // scrollback instead, at the exact offset the repaint starts at
+                // so the replay that CONTINUES this screen still lands on it
+                // first. Gated on the peer promising that repaint: without one
+                // there is nothing coming to fill the viewport we would blank.
+                if (rd.conn.peerRepaintsOnAttach()) rd.park_target = attach_snapshot_at;
+            }
         }
     }
 
@@ -1156,6 +1185,17 @@ pub fn threadEnter(
     // that read `attach_offset` (each already excludes these paths) and before
     // the first drain, which is the first thing to advance `applied_bytes`.
     if (did_relaunch or did_notify or self.awaiting_relaunch) self.attach_offset = 0;
+
+    // A post-attach boundary can be satisfied before a single byte arrives: when
+    // the resume point was clamped to the agent's head there is no gap to fill,
+    // so the repaint is ALL that is coming. Settle it here rather than leaving
+    // the park (and any reflow) waiting on a chunk with nothing below the
+    // boundary in it — the drain's own check only runs once it has bytes.
+    if (rd.attach_reflow_target > 0 or rd.park_target > 0) {
+        if (self.appliedOffset() >= @max(rd.attach_reflow_target, rd.park_target)) {
+            finishAttachBoundary(rd);
+        }
+    }
 
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).
@@ -1476,6 +1516,19 @@ fn wakeFromDemux(ctx: *anyopaque) void {
         log.warn("error notifying ring async err={}", .{err});
 }
 
+/// Everything that happens at the post-attach boundary, in the order it has to
+/// happen in: reflow back to the live grid FIRST, so the park then scrolls the
+/// restored history at the geometry the user is actually looking at rather than
+/// at the replay geometry it was reconstructed under. Either half may be
+/// inactive; both clear themselves.
+fn finishAttachBoundary(rd: *ThreadData) void {
+    if (rd.attach_reflow_target > 0) finishAttachReflow(rd);
+    if (rd.park_target > 0) {
+        parkRestoredScreen(rd.io);
+        rd.park_target = 0;
+    }
+}
+
 /// T106: the attach replay is fully applied — reflow the local grid from the
 /// capture geometry back to the CURRENT live grid (read fresh from the backend,
 /// so a user resize that raced the replay wins) and disarm. The authoritative
@@ -1576,6 +1629,45 @@ fn ringReady(
     return .rearm;
 }
 
+/// T666: push the pane's current screen into SCROLLBACK, leaving a blank
+/// viewport for the repaint that is about to land on it.
+///
+/// Called on the pane's IO thread with a restored WP-D3 screen (plus whatever
+/// replay continued it) sitting on the visible rows. See `restore_park.zig` for
+/// why a repaint would otherwise destroy all of it.
+///
+/// Two things are deliberately NOT parked. The ALTERNATE screen has no
+/// scrollback at all, so line feeds there discard rows instead of saving them —
+/// and an alt-screen session's repaint re-enters alt and redraws the whole frame
+/// anyway, so there is nothing to protect. And a screen whose geometry reads as
+/// zero rows is left alone rather than guessed at.
+fn parkRestoredScreen(io: *termio.Termio) void {
+    var cup_buf: [restore_park.cup_max_len]u8 = undefined;
+
+    // Read the geometry the paint actually produced. One short hold, on the same
+    // mutex `processOutput` takes, so nothing else is mid-parse underneath us.
+    io.renderer_state.mutex.lock();
+    const on_primary = io.terminal.screens.active_key == .primary;
+    const rows = io.terminal.rows;
+    const cursor_y = io.terminal.screens.active.cursor.y;
+    io.renderer_state.mutex.unlock();
+
+    if (!on_primary) return;
+    const p = restore_park.plan(&cup_buf, rows, cursor_y) orelse return;
+
+    @call(.always_inline, termio.Termio.processOutput, .{ io, p.cup });
+
+    // One line feed per occupied row, streamed from a fixed buffer: the count is
+    // bounded only by the pane's height, which is not a size to put on the stack.
+    var feeds: [64]u8 = @splat('\n');
+    var left: usize = p.newlines;
+    while (left > 0) {
+        const n = @min(left, feeds.len);
+        @call(.always_inline, termio.Termio.processOutput, .{ io, feeds[0..n] });
+        left -= n;
+    }
+}
+
 /// Drain the pane's inbound ring fully into the terminal. Called on the pane's IO
 /// thread (from `ringReady` or once eagerly in `threadEnter`). For each chunk:
 ///   1. pop from the ring (SPSC consumer side),
@@ -1632,14 +1724,24 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         // the live grid — so a chunk that straddles the boundary is split and
         // the reflow-back runs exactly at the boundary.
         var chunk: []const u8 = buf[0..res.read];
-        if (rd.attach_reflow_target > 0) {
-            const applied = rd.io.backend.remote.applied_bytes.load(.monotonic);
-            if (applied >= rd.attach_reflow_target) {
-                finishAttachReflow(rd);
-            } else if (applied + chunk.len > rd.attach_reflow_target) {
-                const head: usize = @intCast(rd.attach_reflow_target - applied);
+
+        // The post-attach boundary: the absolute offset where our replay of the
+        // stream the pane ALREADY had ends and the agent's repaint of the
+        // session's CURRENT screen begins. Two things fire there — the T106
+        // reflow back to the live grid, and the T666 park of the restored screen
+        // into scrollback — and both are anchored at the same offset, so they
+        // share one split of a straddling chunk. A chunk can hold both sides of
+        // it (the boundary is a byte offset, not a frame), and feeding the head
+        // twice would double-paint it.
+        const boundary = @max(rd.attach_reflow_target, rd.park_target);
+        if (boundary > 0) {
+            const applied = rd.io.backend.remote.appliedOffset();
+            if (applied >= boundary) {
+                finishAttachBoundary(rd);
+            } else if (applied + chunk.len > boundary) {
+                const head: usize = @intCast(boundary - applied);
                 feedSliced(rd, chunk[0..head]);
-                finishAttachReflow(rd);
+                finishAttachBoundary(rd);
                 chunk = chunk[head..];
             }
         }
@@ -1734,10 +1836,22 @@ pub const ThreadData = struct {
     /// reflowed to the agent-reported capture geometry so the raw ring replay
     /// lands correctly. Holds the absolute stream offset of the replay's end
     /// (ATTACHED's `snapshot_at_offset`); once `applied_bytes` reaches it the
-    /// drain reflows back to the live grid and clears this. Only ever set on
-    /// the full-ring attach path (`attach_offset == 0`), so `applied_bytes`
-    /// IS the absolute stream offset. Touched only on the pane's IO thread.
+    /// drain reflows back to the live grid and clears this. Set on BOTH attach
+    /// paths since T666 — the snapshot path's gap-fill is the same geometry-bound
+    /// ConPTY bytes as the full ring's — so it is compared against
+    /// `appliedOffset()` (absolute), never against `applied_bytes`, which is only
+    /// the same number when `attach_offset` is 0. Touched only on the pane's IO
+    /// thread.
     attach_reflow_target: u64 = 0,
+
+    /// T666: nonzero while a restored WP-D3 screen is still waiting to be parked
+    /// into scrollback. Holds the absolute stream offset the agent will repaint
+    /// at (ATTACHED's `snapshot_at_offset`) — the boundary between the replay
+    /// that continues our restored screen and the repaint that would overwrite
+    /// it. When the drain reaches that offset it emits the park and clears this.
+    /// Only ever set on the snapshot attach path (`attach_offset > 0`) with a
+    /// peer that promises the repaint. Touched only on the pane's IO thread.
+    park_target: u64 = 0,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         _ = alloc;

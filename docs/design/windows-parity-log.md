@@ -15449,3 +15449,73 @@ four-element array and `$p[1]` was only `'a'`, truncating 13 lines. Both were
 caught and reversed before anything was committed, by a guard in the repair
 script and by requiring `git diff` to show a pure-addition diff. Use the Edit
 tool on repo text files; PowerShell is for running things, not rewriting them.
+
+## 2026-08-11 - a terminal that comes back twice keeps its history both times (T666)
+
+Quit or crash Ghoztty and your panes came back with their scrollback. Do it a
+second time and the scrollback was gone: the pane came back holding only what
+was on screen when it died, with no warning and no way to get the rest back.
+`test/win32/session-persistence.ps1` had been red on exactly that for days
+(B2.7, B3.7), and the shape of the failure - "the pane is 144 bytes" - was in
+the task from the start.
+
+**Neither side was dropping it.** The app delivers the history and the agent
+delivers the history; a repaint then paints over it. A re-attaching pane paints
+the app's own persisted VT snapshot of the screen it had when it was last saved
+(WP-D3), and a repaint has no line feeds in it, so every row lands on the
+VISIBLE screen and nothing scrolls. The very next thing on the wire is a
+full-viewport repaint that homes to row 1: the agent's own `grid_snapshot`,
+which opens `ESC[H ESC[2J`, and behind it ConPTY's post-attach fresh paint
+(`ESC[?25l ESC[H` + per-line `ESC[K`). Both overwrite exactly the rows the
+restore had just drawn. Only what had already reached SCROLLBACK survived - and
+in a freshly restored pane, nothing has. That is why the first restore looked
+fine (its whole history still fitted in the viewport) and every one after it
+came back holding one screen.
+
+This was read off the wire rather than deduced: `drainRing` was temporarily
+instrumented to dump each post-attach chunk, and the first chunk of the second
+restore is the eraser, in full. Suppressing the agent's `grid_snapshot`
+capability (`GHOSTTY_AGENT_SUPPRESS_CAPS=grid_snapshot`, the T469 seam) removed
+that chunk and lost the history anyway - which is how ConPTY's own repaint was
+identified as the second, independent eraser. A fix aimed at either one alone
+would have looked right and changed nothing.
+
+**The fix is the invariant T106 already named for the other attach path**: on
+Windows, content survives an attach only if it is in scrollback before the
+repaint lands. The pane now PARKS its restored screen - puts the cursor on the
+last row and emits one line feed per occupied row, the one operation that moves
+a row into scrollback - at the agent's snapshot head, the exact offset where the
+replay that continues that screen ends and the repaint of the current one
+begins. The repaint then gets a blank viewport, and the history sits above it.
+The rule is `src/termio/restore_park.zig` (pure, six none-lane tests), and it is
+gated on the peer advertising `grid_snapshot`: a peer that promises no repaint
+never has its viewport blanked with nothing coming to fill it.
+
+Parking then exposed a second thing the eraser had been hiding. T106's
+replay-geometry reflow was gated to the full-ring attach path, so on the
+snapshot path the gap-fill - the same raw, geometry-bound ConPTY bytes, only
+shorter - was parsed at whatever width the pane happened to have mid-restore,
+and its in-place redraws overwrote the wrong columns. The result was legible
+only as shredded text (`...>SPMKal or external command,MK...C1' is not`), and
+for as long as the repaint erased it a frame later nobody could see it. Keeping
+the history means replaying it correctly, so that reflow now covers both paths;
+both boundaries fire at the same offset and share one split of a straddling
+chunk (`finishAttachBoundary`, reflow back first so the park scrolls at the
+geometry the user is actually looking at).
+
+`session-persistence.ps1` is ALL PASS, including section D's
+no-runaway-duplication arm - one screenful may legitimately appear twice now
+(the restored tail, then the repaint of it), which is the duplication that
+section has always allowed. `session-snapshot-reattach.ps1` (28) and
+`session-reattach.ps1` (44) stay ALL PASS.
+
+The fix lives in shared core, so macOS gets it too and has not been watched
+doing it (**T741**). Two other things fell out of the measurement. Every
+re-attach records a resume offset a few hundred bytes PAST the end of the
+agent's stream, because `appliedOffset` counts the repaint bytes the agent
+injects as if they were stream bytes; the T532 clamp catches it, which is why it
+has only ever surfaced as a warning line, but the bytes between the true
+position and the head are then skipped (**T739**). And every VT-stripping regex
+in `test\win32` is written with `` `e `` for ESC, which PowerShell 5.1 reads as
+the letter `e` - so those helpers delete every `e` from the text and leave the
+escape sequences in (**T740**).

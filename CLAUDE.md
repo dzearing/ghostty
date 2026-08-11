@@ -1429,6 +1429,32 @@ never prompts for persistent windows — their sessions re-attach on relaunch).
 E2E: `scripts/e2e/session-persistence.py` (incl. `--winsize` for re-attach
 PTY-geometry integrity).
 
+**A restored screen is PARKED into scrollback before anything repaints over
+it** (T666). A re-attaching pane paints the app's own persisted VT repaint of
+the screen it had when it was last saved (WP-D3, `Remote.restore_snapshot`) —
+and that paint lands on the VISIBLE rows, where the very next thing on the wire
+is a full-viewport repaint that homes to row 1: the agent's `grid_snapshot`
+(which opens `ESC[H ESC[2J`) and, behind it, ConPTY's own post-attach fresh
+paint. Every row of restored history was overwritten in place, so a pane came
+back holding one screen and nothing above it — which is why the SECOND restore
+in a row looked like total scrollback loss while the first looked fine (with
+little history, everything still fitted in the viewport). The pane now scrolls
+the restored screen off the top at the agent's snapshot head — the exact offset
+where the replay that CONTINUES that screen ends and the repaint of the current
+one begins — so the repaint gets a blank viewport and the history sits above it.
+The rule is `src/termio/restore_park.zig` (pure, asserted in the none lane) and
+it is gated on `Connection.peerRepaintsOnAttach`: a peer that promises no
+repaint never has its viewport blanked. This is the same invariant T106 named —
+on Windows content survives an attach only if it is in scrollback before the
+repaint lands — and T106's replay-geometry reflow now covers the snapshot attach
+path too, because the gap-fill there is the same geometry-bound ConPTY bytes and
+keeping it means replaying it correctly rather than letting the repaint erase
+the shredded result. One screenful may legitimately appear twice (the restored
+tail and the repaint of it), which is the duplication section D of
+`test/win32/session-persistence.ps1` has always allowed. Acceptance: the B\*.7
+arms of that script (a marker planted before the FIRST kill must still be
+readable after the third).
+
 The agent owns the PTYs, keeps a per-session output ring (2 MB default;
 snapshotted to disk for reboot scrollback), persists session metadata to
 `sessions.json`, and is packaged as a per-user LaunchAgent so it comes back
