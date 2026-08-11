@@ -15186,3 +15186,51 @@ about: `chooser-menu.ps1` clean exit=0 / `ALL PASS (57 assertions)` and
 `-NegativeControl` exit=1 / `1 FAILURE(S) (56 passed)`; `host-settings.ps1`
 clean exit=0 / `ALL PASS (65 assertions)` and `-NegativeControl` exit=1 /
 `1 FAILURE(S) (64 passed)`.
+
+## 2026-08-11 - the rule that lets screen readers type is now a tested rule (T222)
+
+Injected text - a screen reader, an on-screen keyboard, `SendInput` with
+`KEYEVENTF_UNICODE` - arrives as `VK_PACKET`, and only `TranslateMessage` turns
+that packet into the `WM_CHAR` carrying its character. Ghoztty deliberately
+SKIPS `TranslateMessage` for keys aimed at a terminal surface (handleKeyEvent
+calls ToUnicode itself, and translating a second time races the per-queue
+dead-key state - that is what broke ABNT2 composition). So the packet needs an
+exemption, and the key handler needs a matching one on its own side: drop the
+synthetic key, and clear the produced-text flag first or the injected character
+is eaten as a duplicate.
+
+Both halves were bare `if`s - one buried in the message loop, one a third of
+the way down a 200-line key handler - and NEITHER had a test, because the thing
+that reaches them cannot be delivered to an automated run. A real
+`SendInput(KEYEVENTF_UNICODE)` is refused off the input desktop (T207), and the
+obvious workaround was measured and does not work: a POSTED `WM_KEYDOWN`
+carrying `VK_PACKET` is never translated, since a real packet carries its 16-bit
+character out of band and a posted lParam has only the 8-bit scan-code field to
+put it in. Delete either `if` and the whole floor stays green; the first person
+to notice is someone using a screen reader.
+
+The policy now lives in `src/apprt/win32/translate_policy.zig` - pure, no OS
+import - as `isKeyMessage` / `skipTranslate` / `keyDisposition`, with the
+reasons written where the rules are. `App.run` and `Surface.handleKeyEvent` both
+read it, and `App.zig` carries the drift guard that pins each literal to the
+real `w32.*` constant, the same shape `viewer_accel.zig` uses. The loop keeps
+its `GetClassLongW` behind `isKeyMessage` so no class-atom syscall lands on a
+mouse move or a timer tick, and a unit test sweeps `0..0x1000` requiring
+`skipTranslate` to answer false for every message that gate rejects - so the
+cheap gate and the real policy cannot drift apart either.
+
+What makes this coverage rather than a refactor is the negative control, run on
+the box: dropping the `VK_PACKET` arm of `skipTranslate` exits the win32 lane 1
+naming both packet assertions, and restoring it goes green. The interactive
+`kb-actions.ps1 -Interactive` still drives the true `SendInput` round trip by
+hand; that stays a fallback, not coverage, exactly as T222 required.
+
+Filed T733: running that same broken tree under `-Dtest-filter="T64"` exited 0
+with no output, twice, while the unfiltered lane failed immediately. A narrow
+re-run is the shortcut `go.md` step 3 points at (`floor-lane.ps1 -Filter`), and
+a filter that matches nothing must not be indistinguishable from a filter whose
+tests all passed - the same vacuous-green shape as T216/T217/T219, hiding inside
+the tool those are run with.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 286s, win32
+344s, agent 340s); P1-P3 ALL PASS; `kb-actions.ps1` ALL PASS (42 assertions).

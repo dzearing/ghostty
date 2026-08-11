@@ -56,6 +56,7 @@ const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
 const window_active = @import("window_active.zig");
+const translate_policy = @import("translate_policy.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -1065,32 +1066,26 @@ pub fn run(self: *App) !void {
         // mode) calls ToUnicode directly, and TranslateMessage's internal
         // ToUnicodeEx mutates the same per-queue dead-key state — racing
         // it broke dead-key composition on ABNT2 (`~`+`a` → `~a`). Edit
-        // controls (search, palette, tab rename) still need it.
-        const skip_translate = switch (msg.message) {
-            w32.WM_KEYDOWN, w32.WM_KEYUP, w32.WM_SYSKEYDOWN, w32.WM_SYSKEYUP => blk: {
-                // Keys claimed by the IME arrive as VK_PROCESSKEY and MUST
-                // go through TranslateMessage: that is what forwards them to
-                // the IME (ImmTranslateMessage) to generate the
-                // WM_IME_STARTCOMPOSITION/WM_IME_COMPOSITION messages and
-                // drive the candidate window. Skipping it made CJK input
-                // dead. This does not disturb the ToUnicode dead-key state:
-                // handleKeyEvent never calls ToUnicode for VK_PROCESSKEY.
-                if (msg.wParam == w32.VK_PROCESSKEY) break :blk false;
-
-                // VK_PACKET (SendInput KEYEVENTF_UNICODE: screen readers,
-                // on-screen keyboards, automation) MUST also be translated:
-                // TranslateMessage is the only thing that turns the packet
-                // into the WM_CHAR carrying the injected character —
-                // handleKeyEvent deliberately ignores VK_PACKET (T64).
-                // Safe for the dead-key state: a packet bypasses layout
-                // translation entirely.
-                if (msg.wParam == w32.VK_PACKET) break :blk false;
-
-                const h = msg.hwnd orelse break :blk false;
-                const atom: u16 = @truncate(w32.GetClassLongW(h, w32.GCW_ATOM));
-                break :blk atom != 0 and atom == self.terminal_class_atom;
-            },
-            else => false,
+        // controls (search, palette, tab rename) still need it, and so do
+        // VK_PROCESSKEY (IME) and VK_PACKET (injected text) — the rules and
+        // their reasons live in `translate_policy.zig`, which is where they
+        // are asserted (T222). The only thing that needs the OS here is the
+        // target window's class.
+        const skip_translate = blk: {
+            // The class lookup is a syscall on the message loop's hot path, so
+            // it runs only for the messages the policy can answer "skip" for
+            // at all — every other message translates unconditionally.
+            if (!translate_policy.isKeyMessage(msg.message)) break :blk false;
+            const class_atom: u16 = if (msg.hwnd) |h|
+                @truncate(w32.GetClassLongW(h, w32.GCW_ATOM))
+            else
+                0;
+            break :blk translate_policy.skipTranslate(
+                msg.message,
+                msg.wParam,
+                class_atom,
+                self.terminal_class_atom,
+            );
         };
         if (!skip_translate) _ = w32.TranslateMessage(&msg);
         _ = w32.DispatchMessageW(&msg);
@@ -1966,6 +1961,26 @@ test "countUnattachedLive counts live sessions outside the attached set only" {
     // The zero case is a real answer, not a missing line.
     const all_attached = [_]remote_connection.OwnedSession{mk.s("alive-attached", true)};
     try std.testing.expectEqual(@as(usize, 0), countUnattachedLive(&all_attached, &attached));
+}
+
+test "translate_policy never drifts from the win32 constants (T222)" {
+    // `translate_policy.zig` takes no OS import, so its message and virtual-key
+    // values are literals. This lane CAN name the real constants, so a
+    // transcription error over there fails here rather than shipping as a
+    // TranslateMessage skip that eats every injected character.
+    try std.testing.expectEqual(w32.WM_KEYDOWN, translate_policy.WM_KEYDOWN);
+    try std.testing.expectEqual(w32.WM_KEYUP, translate_policy.WM_KEYUP);
+    try std.testing.expectEqual(w32.WM_SYSKEYDOWN, translate_policy.WM_SYSKEYDOWN);
+    try std.testing.expectEqual(w32.WM_SYSKEYUP, translate_policy.WM_SYSKEYUP);
+    try std.testing.expectEqual(w32.VK_PROCESSKEY, translate_policy.VK_PROCESSKEY);
+    try std.testing.expectEqual(w32.VK_PACKET, translate_policy.VK_PACKET);
+
+    // And the loop's own gate: every key message the runtime can deliver is one
+    // the policy claims, so the class-atom lookup is never skipped for a
+    // message that would have answered "skip".
+    for ([_]u32{ w32.WM_KEYDOWN, w32.WM_KEYUP, w32.WM_SYSKEYDOWN, w32.WM_SYSKEYUP }) |m| {
+        try std.testing.expect(translate_policy.isKeyMessage(m));
+    }
 }
 
 /// Which transport a rebuild's panes ride, and what the rebuilt window owns of

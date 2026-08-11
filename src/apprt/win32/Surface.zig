@@ -30,6 +30,7 @@ const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const ReadonlyBadge = @import("ReadonlyBadge.zig").ReadonlyBadge;
 const KeyStateIndicator = @import("KeyStateIndicator.zig").KeyStateIndicator;
 const key_state = @import("key_state.zig");
+const translate_policy = @import("translate_policy.zig");
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
@@ -2940,22 +2941,21 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     if (!self.core_surface_ready) return;
     const vk: u16 = @intCast(wparam & 0xFFFF);
 
-    // When the IME is active, physical key presses arrive as VK_PROCESSKEY.
-    // The IME will produce the composed text via WM_IME_COMPOSITION — skip
-    // the key event so we don't feed garbage to the terminal.
-    if (vk == w32.VK_PROCESSKEY) return;
-
-    // VK_PACKET is sent by SendInput with KEYEVENTF_UNICODE (used by
-    // accessibility tools, on-screen keyboards, and Unicode injection).
-    // The actual character follows as WM_CHAR (App.run exempts VK_PACKET
-    // from its TranslateMessage skip, T64). CLEAR the produced-text flag —
-    // ordinary keys never get their WM_CHAR under the translate skip, so
-    // the flag is still stuck from the last text-producing keydown and
-    // would eat the injected character.
-    if (vk == w32.VK_PACKET) {
-        self.key_event_produced_text = false;
-        return;
-    }
+    // The two synthetic keys the terminal must never be handed: VK_PROCESSKEY
+    // (the IME owns the press and delivers its text through
+    // WM_IME_COMPOSITION) and VK_PACKET (SendInput KEYEVENTF_UNICODE — screen
+    // readers, on-screen keyboards, automation — whose character follows as its
+    // own WM_CHAR, since App.run exempts the packet from the TranslateMessage
+    // skip, T64). A packet additionally clears the produced-text flag: under
+    // that skip an ordinary key never gets a WM_CHAR of its own, so the flag is
+    // still stuck from the last text-producing keydown and would eat the
+    // injected character. The rules and their reasons live in
+    // `translate_policy.zig` alongside App.run's half, and are asserted there
+    // (T222) — a real SendInput packet cannot be delivered off the input
+    // desktop, so this branch has no automated path of its own.
+    const disposition = translate_policy.keyDisposition(vk);
+    if (disposition.clearsProducedText()) self.key_event_produced_text = false;
+    if (disposition.dropsKey()) return;
 
     // F10 / a lone Alt press open the menu system (T190). Runs before the
     // key reaches the terminal so the disarm bookkeeping sees every key.
