@@ -1591,6 +1591,21 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   runner panics in `convertPathArg` (`assert(!isAbsolute(child_cwd_rel))` in std
   `Run.zig`) — it aborts the run before any test executes, which reads like a
   test failure and is not one.
+
+  **`build.zig` now refuses that shell before the panic can happen** (T243): the
+  first thing `build()` does is compare the build root's drive letter against the
+  resolved global cache's, and a mismatch is `error:
+  GlobalCacheOnDifferentDrive` with the `$env:`/`set` line to paste. A doc note
+  was not enough — this trap was paid at least four separate times (T242,
+  T257/T262, T225), and one of those turns re-ran the identical command on the
+  assumption of a transient, because a panic with no `error:` line naming this
+  repo is exactly the shape of a flake. It never *sets* the variable for you: a
+  build script that silently relocates a user's cache is its own surprise.
+  Decision logic is pure (`src/build/drive_check.zig`, asserted by `zig build
+  test` via the `src/build/build_test.zig` aggregator — the main test binary
+  roots at `src/main.zig` and reaches no build logic at all); "cannot tell" is
+  always answered as "no mismatch", so a POSIX seat, a UNC checkout, or a
+  same-drive CI box is untouched.
 - **`-Doptimize=Debug` is not optional**, and the reason is not speed — it is
   **endpoint isolation** (T350). The IPC pipe, the local agent's pipe and the
   state directory are all derived from the build mode: `is_debug` (Debug or

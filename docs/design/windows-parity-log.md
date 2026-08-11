@@ -15333,3 +15333,58 @@ Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 130s, win32
 pre-existing SKIP) and `tab-color.ps1` (17) each ALL PASS three times, with
 `menu-bar -NegativeControl` still failing. The three harness sweeps
 (exit-code, skip-visibility, verdict-exit) stay at zero.
+
+## 2026-08-11 - a wrong-drive zig cache is now an error sentence, not a panic (T243)
+
+`zig build` from a shell that had not exported `ZIG_GLOBAL_CACHE_DIR` did not
+fail here, it PANICKED: `reached unreachable code` out of
+`std/Build/Step/Run.zig`, with no `error:` line naming anything in this repo.
+The cause is environmental and has nothing to do with whatever was being built -
+zig 0.15.2's `Run.convertPathArg` makes an argument relative to the child's cwd
+with `std.fs.path.relative`, and across two Windows drives there is no relative
+path, so `relative` hands back an absolute one and the assert on the next line
+fires. The repo is on `D:`, the default global cache is under `C:\Users\...`,
+and a dependency that sets a cwd (uucode's `setCwd(b.path(""))`) is enough to
+reach it.
+
+The expensive part was never the failure, it was the misattribution. A panic
+with no repo-relative error reads as a transient, so it earns a verbatim retry -
+which is exactly what happened in the T225 turn, where the first `zig build` of
+the turn panicked, was re-run unchanged on the assumption of a flake, and
+panicked identically. Four separate turns paid this (T242, T257/T262, T225), and
+two of them searched, failed to find each other's task, and filed a duplicate.
+Documentation that has to be *found* kept failing; a diagnostic that fires at
+the moment of the panic cannot be missed.
+
+So `build()`'s first statement is now `checkGlobalCacheDrive(b)`, ahead of
+anything that could reach the assert. It compares the build root's drive letter
+against the resolved global cache's and refuses with one `std.log.err` naming
+both drives, the `$env:` and `set` lines to paste, and
+`error.GlobalCacheOnDifferentDrive`. It never *sets* the variable: a build
+script that silently relocates a user's global cache is its own surprise, and
+removing surprises is the whole point.
+
+The decision is pure (`src/build/drive_check.zig`) and **"cannot tell" is always
+answered as "no mismatch"** - a POSIX path, a UNC share, a relative path or a
+null `Cache.Directory.path` all mean silence. That is what makes this inherently
+a no-op on the Mac seat and on any single-drive checkout, rather than something
+gated off by OS that could rot. `absoluteRootPath` falls back to the open
+handle's `realpathAlloc` when `Cache.Directory.path` is null or relative,
+because otherwise the guard would no-op in exactly the shell it exists for; the
+`\?\` prefix that comes back from there is understood, `\?\UNC\` is not.
+
+Wiring the tests turned up a second hole worth naming: the main test binary
+roots at `src/main.zig` and reaches **no** build logic at all, so a `test` block
+written next to a build helper runs in no step. `src/build/build_test.zig` is
+the aggregator that fixes that, wired into `test_step` outside the
+`emit_lib_vt` guard since it depends on nothing.
+`wasm_patch_growable_table.zig`'s blocks are still orphaned and are filed as
+**T736** (with a note that a sweep would be better than remembering).
+
+Measured both directions at this HEAD, only the variable changing: unset ->
+exit 1 with the diagnostic and no `panic:` in the output; `D:\zig-global-cache`
+-> unchanged. Floor: `floor-lane.ps1 -Lane all` PASS (none 141s, win32 339s,
+agent 372s), P1-P3 ALL PASS, and `--summary all` shows `run test
+ghoztty-build-helpers-test 9 passed`. Docs in CLAUDE.md's Windows build bullet
+and in go.md beside the `Select-Object -First N` rule - same trap shape, same
+place a turn is already reading when a build fails oddly.

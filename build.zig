@@ -17,6 +17,13 @@ comptime {
 }
 
 pub fn build(b: *std.Build) !void {
+    // Before anything else, because everything else is what trips it: a global
+    // cache on a different Windows drive than the repo makes the build runner
+    // PANIC (see src/build/drive_check.zig), and a panic with no `error:` line
+    // naming this repo reads as a transient rather than as an environment
+    // problem. Refuse with a sentence instead.
+    try checkGlobalCacheDrive(b);
+
     // This defines all the available build options (e.g. `-D`). If you
     // want to know what options are available, you can run `--help` or
     // you can read `src/build/Config.zig`.
@@ -497,6 +504,24 @@ pub fn build(b: *std.Build) !void {
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
     }
 
+    // The pure, std-only helpers under src/build/. The main test binary roots
+    // at src/main.zig and so reaches none of the build logic, which is how a
+    // `test` block next to a build helper used to run in no step at all. Kept
+    // outside the emit_lib_vt guard below: it depends on nothing.
+    {
+        const build_helpers_test = b.addTest(.{
+            .name = "ghoztty-build-helpers-test",
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/build_test.zig"),
+                .target = config.baselineTarget(),
+                .optimize = test_optimize,
+            }),
+            .use_llvm = test_llvm,
+        });
+        test_step.dependOn(&b.addRunArtifact(build_helpers_test).step);
+    }
+
     // Tests (skip when building libghostty-vt)
     if (!config.emit_lib_vt) {
         // Full unit tests
@@ -551,4 +576,45 @@ pub fn build(b: *std.Build) !void {
     } else {
         try translations_step.addError("cannot update translations when i18n is disabled", .{});
     }
+}
+
+/// T243: refuse the build when the global cache sits on a different Windows
+/// drive than the repo, instead of letting the build runner panic on an
+/// unrelated-looking assert deep in `std.Build.Step.Run`. See
+/// `src/build/drive_check.zig` for what goes wrong and why a diagnostic here
+/// beats a line in a doc.
+fn checkGlobalCacheDrive(b: *std.Build) !void {
+    const mismatch = buildpkg.drive_check.check(
+        absoluteRootPath(b, b.build_root),
+        absoluteRootPath(b, b.graph.global_cache_root),
+    ) orelse return;
+
+    var buf: [64]u8 = undefined;
+    const suggestion = buildpkg.drive_check.suggestedCacheDir(&buf, mismatch.build_root);
+    std.log.err(
+        \\the zig global cache is on drive {c}: but this repo is on drive {c}:.
+        \\
+        \\  Zig 0.15.2's build runner cannot make a path on one drive relative to a
+        \\  cwd on another, and asserts instead of reporting it — so this build would
+        \\  end in "panic: reached unreachable code" from std/Build/Step/Run.zig with
+        \\  nothing pointing at your change. Point the cache at this drive first:
+        \\
+        \\      $env:ZIG_GLOBAL_CACHE_DIR = '{s}'      # PowerShell
+        \\      set ZIG_GLOBAL_CACHE_DIR={s}           # cmd.exe
+        \\
+        \\  Export it in every build/test shell. Nothing here changes it for you: a
+        \\  build script that silently relocates your cache is its own surprise.
+    , .{ mismatch.cache_root, mismatch.build_root, suggestion, suggestion });
+    return error.GlobalCacheOnDifferentDrive;
+}
+
+/// A root directory's path with a drive letter on it when one can be had.
+/// `Cache.Directory.path` is null for the cwd and may be relative, neither of
+/// which can be compared to another drive — the open handle can still say
+/// where it really is.
+fn absoluteRootPath(b: *std.Build, dir: std.Build.Cache.Directory) ?[]const u8 {
+    if (dir.path) |p| {
+        if (buildpkg.drive_check.driveLetter(p) != null) return p;
+    }
+    return dir.handle.realpathAlloc(b.allocator, ".") catch null;
 }

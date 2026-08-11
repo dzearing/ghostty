@@ -482,6 +482,17 @@ $LASTEXITCODE"; Select-String -Path $log -Pattern 'error:' | Select-Object
 -First 10`. Rule of thumb: a lane that "fails" with warnings but no `error:`
 line did not fail — re-run it unfiltered before believing it.
 
+**Set `ZIG_GLOBAL_CACHE_DIR` to a path on the repo's drive** —
+`$env:ZIG_GLOBAL_CACHE_DIR = 'D:\zig-global-cache'` — in every shell you build
+or test from. Zig 0.15.2's build runner cannot make a path on one drive relative
+to a cwd on another and asserts instead of saying so, so the default `C:` cache
+turns any build here into `panic: reached unreachable code` out of
+`std/Build/Step/Run.zig` with nothing pointing at your change. Same trap shape as
+the `-First N` rule above, and it has been paid at least four times: since T243
+`build.zig` refuses such a shell up front with `error:
+GlobalCacheOnDifferentDrive` and the line to paste, so if you see that message
+the fix is the message.
+
 ## What to do
 
 1. **Tasks live one-per-file** in `docs/design/windows-parity-tasks/`
