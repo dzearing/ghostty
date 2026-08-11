@@ -68,6 +68,59 @@ function Get-WindowHwnd([string]$target) {
     return [IntPtr][int64]$w[0].id
 }
 
+# Path compare that tolerates separator/case differences: `+list` reports the
+# cwd as the shell sees it.
+function Test-SameDir([string]$a, [string]$b) {
+    if (-not $a -or -not $b) { return $false }
+    return ($a.Replace('/', '\').TrimEnd('\')) -ieq ($b.Replace('/', '\').TrimEnd('\'))
+}
+
+function Get-Leaves($node) {
+    if ($node.type -eq 'leaf') { return @($node.terminal) }
+    return @(Get-Leaves $node.left) + @(Get-Leaves $node.right)
+}
+
+# A leaf's reported cwd, retried: it lands on the leaf a moment after the pane
+# does (seeded from termio by the first `+list` that sees it).
+function Get-LeafCwd([string]$name, [string]$want) {
+    $cwd = ''
+    for ($t = 0; $t -lt 25; $t++) {
+        $raw = Get-ListJson
+        $j = $null
+        try { $j = $raw | ConvertFrom-Json } catch { }
+        if ($j) {
+            foreach ($w in @($j.data.windows)) {
+                foreach ($tab in @($w.tabs)) {
+                    foreach ($leaf in @(Get-Leaves $tab.splits)) {
+                        if ($leaf.name -eq $name) { $cwd = $leaf.working_directory }
+                    }
+                }
+            }
+        }
+        if (Test-SameDir $cwd $want) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    return $cwd
+}
+
+# The same, for a window's first pane (which carries no name of our choosing).
+function Get-WindowCwd([string]$target, [string]$want) {
+    $cwd = ''
+    for ($t = 0; $t -lt 25; $t++) {
+        $raw = Get-ListJson
+        $j = $null
+        try { $j = $raw | ConvertFrom-Json } catch { }
+        if ($j) {
+            foreach ($w in @($j.data.windows | Where-Object { $_.target -eq $target })) {
+                foreach ($leaf in @(Get-Leaves $w.tabs[0].splits)) { $cwd = $leaf.working_directory }
+            }
+        }
+        if (Test-SameDir $cwd $want) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    return $cwd
+}
+
 function Read-Pane($name, $outfile) {
     cmd /c "`"$Exe`" +read --name=$name --lines=40 > `"$tmp\$outfile`" 2>&1" | Out-Null
     Get-Content "$tmp\$outfile" -Raw
@@ -144,6 +197,46 @@ try {
     Start-Sleep -Seconds 3
     $dump = Read-Pane 'sp2' 'read-sp2.txt'
     Assert "explicit split ran its own command" ($dump -like "*T148-EXPLICIT*")
+    # T515: an explicit command must not cost the split its parent's cwd. The
+    # local-agent branch used to build an override with a null working
+    # directory whenever a command was given, so the agent opened the session
+    # in ITS default cwd (%USERPROFILE%) - a split that silently walked away
+    # from where the user was.
+    Assert "explicit split still inherited the parent's cwd (T515)" ($dump -like "*t148-root*")
+
+    "== 5: an explicit --working-directory still WINS over the parent's cwd (T515)"
+    $other = Join-Path $tmp 't515-elsewhere'
+    New-Item -ItemType Directory -Force $other | Out-Null
+    cmd /c "`"$Exe`" +split --pane=$($parentPane[0]) --name=sp3 `"--working-directory=$other`" `"--command=echo T515-WD`" > `"$tmp\split3.txt`" 2>&1"
+    Assert "explicit-wd split exit 0" ($LASTEXITCODE -eq 0)
+    Start-Sleep -Seconds 3
+    $dump = Read-Pane 'sp3' 'read-sp3.txt'
+    Assert "explicit-wd split ran its own command" ($dump -like "*T515-WD*")
+    Assert "explicit --working-directory beat the parent's cwd" ($dump -like "*t515-elsewhere*")
+    Assert "explicit --working-directory did not fall back to the parent's cwd" (-not ($dump -like "*t148-root*"))
+
+    "== 6: the parent's cwd wins over the FOCUSED window's (T515)"
+    # The teeth of section 4. When the split parent IS the focused pane, a
+    # split with no explicit cwd lands right for the wrong reason: the core's
+    # own inheritance is app-GLOBAL (`apprt/surface.zig` newConfig reads
+    # `app.focusedSurface`), so it happened to name the same pane. Park the
+    # focus in a second window in a different directory first, and only a split
+    # that asked ITS OWN parent can still answer t148-root.
+    $far = Join-Path $tmp 't515-far'
+    New-Item -ItemType Directory -Force $far | Out-Null
+    cmd /c "`"$Exe`" +new-window --target=farwin `"--working-directory=$far`" > `"$tmp\far.txt`" 2>&1"
+    Assert "far window exit 0" ($LASTEXITCODE -eq 0)
+    Start-Sleep -Seconds 3
+    $farCwd = Get-WindowCwd 'farwin' $far
+    Assert "the far window's pane is in the far directory (control)" (Test-SameDir $farCwd $far)
+    cmd /c "`"$Exe`" +split --pane=$($parentPane[0]) --name=sp4 `"--command=echo T515-CROSS`" > `"$tmp\split4.txt`" 2>&1"
+    Assert "cross-window split exit 0" ($LASTEXITCODE -eq 0)
+    Start-Sleep -Seconds 3
+    $crossCwd = Get-LeafCwd 'sp4' $root
+    Assert "the split opened in its own parent's cwd (got '$crossCwd')" (Test-SameDir $crossCwd $root)
+    Assert "and NOT in the focused window's cwd" (-not (Test-SameDir $crossCwd $far))
+    & $Exe +close --target=farwin 2>&1 | Out-Null
+    Start-Sleep -Seconds 1
 
     "== cleanup"
     & $Exe +close --target=cmdwin 2>&1 | Out-Null

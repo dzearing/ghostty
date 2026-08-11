@@ -1511,7 +1511,7 @@ pub fn setRemoteMachine(self: *Window, machine: RemoteMachine) Allocator.Error!v
 /// overrides (termio.Remote dupes what it keeps).
 const RemoteInherit = struct {
     overrides: Surface.Overrides,
-    cwd: ?[]u8,
+    cwd: ?[]const u8,
     /// Backs `overrides.remote.shell` when it came from the per-host defaults
     /// store (T174). Owned like `cwd` — and heap-owned rather than an inline
     /// buffer BECAUSE this struct is returned by value: a pointer into its own
@@ -1531,6 +1531,37 @@ const RemoteInherit = struct {
     }
 };
 
+/// The cwd a new agent/remote pane should inherit from `parent`: that pane's
+/// LIVE working directory, asked of the agent that owns its session (GET_CWD,
+/// bounded by `RemoteInherit.cwd_timeout_ns`). Null when the parent runs no
+/// agent session or the query fails — the caller then opens in the agent's
+/// default cwd, which is the pre-existing behavior.
+///
+/// One resolution site on purpose (T515). The other answer to "where does a new
+/// pane start" is the CORE's inheritance, and that one is app-GLOBAL —
+/// `apprt/surface.zig` `newConfig` reads `app.focusedSurface` — so it answers
+/// with whatever pane last had focus anywhere, or with the shell's home when
+/// the app is in the background. A split must open where ITS parent is, so
+/// every path that builds a `.remote` override resolves the cwd here rather
+/// than leaving it null and hoping the focused surface happens to be the right
+/// pane.
+///
+/// The returned slice is owned by `alloc` (the connection's own copy is freed
+/// here), so a caller may hand it an arena and forget about it.
+pub fn inheritedCwd(
+    alloc: Allocator,
+    conn: *remote_connection.Connection,
+    parent: *Surface,
+) ?[]const u8 {
+    const sid = parent.core_surface.remoteSessionId() orelse return null;
+    const owned = conn.queryCwdTimeout(sid, RemoteInherit.cwd_timeout_ns) catch |err| {
+        log.debug("remote inherit: cwd query failed err={}", .{err});
+        return null;
+    };
+    defer conn.alloc.free(owned);
+    return alloc.dupe(u8, owned) catch null;
+}
+
 /// Build the T68 remote-inheriting overrides for the NEXT surface in this
 /// window, or null if this window is local. `parent` is the pane the new
 /// frame conceptually splits from (the active surface for tabs); null skips
@@ -1549,7 +1580,7 @@ fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
             return null;
 
     var command: ?[]const u8 = null;
-    var cwd: ?[]u8 = null;
+    var cwd: ?[]const u8 = null;
     if (parent) |p| {
         // Command inheritance is for GENUINE remote machines ONLY (T148, the
         // Mac's cdb689025). There, re-running the parent's command on a new
@@ -1562,12 +1593,7 @@ fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
         // below stays for both flavors: a local split still opens where its
         // parent is.
         if (!is_local_agent) command = p.core_surface.remoteCommand();
-        if (p.core_surface.remoteSessionId()) |sid| {
-            cwd = conn.queryCwdTimeout(sid, RemoteInherit.cwd_timeout_ns) catch |err| cwd: {
-                log.debug("remote inherit: cwd query failed err={}", .{err});
-                break :cwd null;
-            };
-        }
+        cwd = inheritedCwd(self.app.core_app.alloc, conn, p);
     }
 
     // T174: a tab/split OPENs a fresh session on the same machine, so the

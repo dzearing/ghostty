@@ -741,13 +741,38 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     else
         nonEmpty(command);
 
+    // T515: a split opens where its PARENT pane is unless `--working-directory`
+    // says otherwise — and an explicit `--command` must not cost it that. The
+    // override branches below used to carry a null cwd whenever no path was
+    // passed, and what filled it in was the CORE's own inheritance, which is
+    // app-GLOBAL (`apprt/surface.zig` `newConfig` reads `app.focusedSurface`):
+    // it answers with whatever pane last had focus — another window's pane when
+    // one is in front, and the shell's home when nothing is focused at all —
+    // and a cross-machine window never gets even that, because a local path is
+    // withheld from a remote agent (`termio.Remote.openWorkingDirectory`). So
+    // resolve the split-parent's live cwd here, through the same GET_CWD
+    // `Window.buildRemoteInherit` uses. Only when there IS an override to fill:
+    // with nothing explicit the branches break to a null baton and
+    // `buildRemoteInherit` does this itself.
+    const split_cwd: ?[]const u8 = nonEmpty(args.working_directory) orelse inherited: {
+        if (remote_command == null) break :inherited null;
+        const parent = at.surface() orelse break :inherited null;
+        const conn: *remote_connection.Connection = if (window.remote_dialed) |d|
+            d.conn()
+        else if (window.local_agent_conn) |c|
+            c
+        else
+            break :inherited null;
+        break :inherited Window.inheritedCwd(arena, conn, parent);
+    };
+
     const overrides: ?Surface.Overrides = if (window.remote_dialed) |dialed| ov: {
         if (remote_command == null and nonEmpty(args.working_directory) == null)
             break :ov null; // full inheritance in newSplitAt
         break :ov .{
             .remote = .{
                 .connection = dialed.conn(),
-                .working_directory = nonEmpty(args.working_directory),
+                .working_directory = split_cwd,
                 .shell = nonEmpty(args.shell),
                 .command = remote_command,
             },
@@ -765,7 +790,7 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         break :ov .{
             .remote = .{
                 .connection = conn,
-                .working_directory = nonEmpty(args.working_directory),
+                .working_directory = split_cwd,
                 .shell = nonEmpty(args.shell),
                 .command = remote_command,
                 .command_argv = try keepAliveArgv(ctx, arena, args.shell, command),
