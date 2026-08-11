@@ -1601,21 +1601,40 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   release. `GHOZTTY_PIPE_SUFFIX` overrides the suffix; `GHOZTTY_IPC_SOCKET`
   (baked into every pane) overrides the whole endpoint, see Instance
   addressability.
-- **A leftover debug agent fails the build, not the code.** The agent outlives
-  the app on purpose, so a `ghoztty-agent.exe` left running from `zig-out\bin`
-  by an earlier test run holds its own exe open and the install step dies with
-  `unable to update file … AccessDenied`. Stop *that* process — match on
-  `ExecutablePath`, never on name — and re-run:
+- **A leftover agent no longer fails the build** (T192). The agent outlives the
+  app on purpose, so a `ghoztty-agent.exe` left running from `zig-out\bin` by an
+  earlier test run holds its own image file open — and Windows will not let
+  anything replace a running image, so the install step used to die with
+  `unable to update file … AccessDenied` **after `ghoztty.exe` had already
+  installed**. That shape is the expensive part: exit 1 over a binary that
+  really did change, which reads as "my change did not build" and turns a real
+  test result into a suspected stale-binary artifact.
+
+  A build-time host tool (`src/build/install_unlock_main.zig`, wired by
+  `InstallUnlock.zig`) now runs ahead of every Windows install step and moves a
+  locked destination aside as `<name>.old-<n>`, so the install's own atomic
+  rename lands on an empty path; the leftover is deleted by a later build once
+  the process holding it exits. Renaming, not killing: a build that terminated
+  processes would take a concurrently-running acceptance suite's agent, and its
+  live sessions, with it. The move must go through `MoveFileExW` — Zig's
+  `std.fs.Dir.rename` opens the source with `GENERIC_WRITE | DELETE`, which a
+  running image's share mode denies, so it fails on exactly the file this
+  exists for. A still-running process keeps the `ExecutablePath` it was created
+  with, so the path-filtered kills below still find it after the move.
+
+  `GHOZTTY_INSTALL_UNLOCK=0` turns the guard off and reproduces the original
+  failure from the same tree; acceptance:
+  `test\win32\build-locked-artifact.ps1`.
+
+  To stop a repo agent by hand, match on `ExecutablePath`, never on name — the
+  installed release runs its own agent from `%LOCALAPPDATA%\Programs\Ghoztty`
+  and owns the user's live sessions:
 
   ```powershell
   Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
       Where-Object { $_.ExecutablePath -eq 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe' } |
       ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
   ```
-
-  The installed release runs its own agent from `%LOCALAPPDATA%\Programs\
-  Ghoztty` and owns the user's live sessions — killing it by name would take
-  the user's terminal sessions with it.
 - **`ghoztty.com` is the CLI entry point from PowerShell/cmd** (T245).
   PowerShell keys its wait-and-redirect decision on the PE subsystem field, so
   `ghoztty +verb > file` against the GUI-subsystem `ghoztty.exe` writes 0 bytes

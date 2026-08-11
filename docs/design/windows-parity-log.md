@@ -14706,3 +14706,54 @@ section E has been SKIPping since T277, because the quick terminal's
 `setTopmost` sticks where `toggle_window_float_on_top` does not (filed as
 **T720**). Remaining unhealed popups swept and filed as **T721**. All three
 floor lanes PASS, P1-P3 ALL PASS.
+
+## 2026-08-10 - a leftover background agent no longer fails the build (T192)
+
+`zig build` on this box died with `unable to update file ... AccessDenied` on
+`zig-out\bin\ghoztty-agent.exe` whenever a repo-lineage agent from an earlier
+test run was still alive - which, since the agent outliving the app is the whole
+point of session persistence, was most of the time. Windows holds an
+executable's image file open for the life of the process and will not let
+anything replace it.
+
+The trap was never the failure, it was its shape: `ghoztty.exe` had already
+installed by the time the agent's install step ran, so the build reported exit 1
+over a binary that really had changed. A session that trusts the exit code
+concludes "my change did not build" and re-runs against a binary that is in fact
+new - or writes off a real test result as a stale-binary artifact. That is the
+T49 lesson class with the sign flipped, and CLAUDE.md's answer up to now was a
+remembered `Stop-Process` incantation.
+
+`src/build/install_unlock_main.zig` is a small build-time host tool, wired by
+`InstallUnlock.zig` ahead of every Windows install step (`ghoztty.exe`,
+`ghoztty.com`, `ghoztty-agent.exe`, `ghoztty-agent-ca.dll`). Per artifact it
+sweeps leftovers, returns immediately when the destination is absent or already
+current (`updateFile` skips the copy on matching size+mtime, so a lock on a
+current file is in nobody's way and must not cost a rename every build), and
+otherwise moves the locked destination aside as `<name>.old-<n>` so the install's
+own atomic rename lands on an empty path. The moved file is deleted by a later
+build once the process holding it exits.
+
+Two things had to be right. **`MoveFileExW`, not `std.fs.Dir.rename`**: Zig's
+rename opens the source with `GENERIC_WRITE | DELETE`, which a running image's
+share mode denies, so the first implementation failed on exactly the file it
+existed for - measured, with the tool's own "could not be moved aside" warning
+sitting above zig's error. And **rename, never kill**: a build that terminated
+repo-lineage processes would take a concurrently running acceptance suite's
+agent, and its live sessions, with it. Filed as **D63**. A still-running process
+keeps the `ExecutablePath` it was created with (verified on the box), so the
+path-filtered kills every acceptance script uses still find a moved-aside agent -
+that is asserted rather than assumed.
+
+No Mac half is owed: POSIX lets a running binary's file be replaced, so the
+tool is only created for Windows targets and is a no-op elsewhere.
+
+Evidence: `test/win32/build-locked-artifact.ps1`, **ALL PASS** - a control arm
+(nothing held, nothing moved aside), a **teeth** arm that turns the guard off
+with `GHOZTTY_INSTALL_UNLOCK=0` and requires the original AccessDenied to come
+back, the fix arm (exit 0, the new binary on disk, exactly one leftover carrying
+the OLD binary, the held agent still alive and still matching the kill filter),
+and a sweep arm. Which binary landed is decided by searching the installed bytes
+for the `-Dagent-version` stamp that build was given, not by a timestamp. All
+three floor lanes PASS, P1-P3 ALL PASS. Auxiliary Windows install steps are not
+guarded yet - filed as **T722**.

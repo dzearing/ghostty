@@ -323,7 +323,22 @@ pub fn build(b: *std.Build) !void {
             // (LocalAgent.agentBinary), so every install layout — zig-out,
             // the MSI, the portable zip — must carry the pair together
             // (T89h). macOS instead embeds the agent inside the app bundle.
-            if (config.target.result.os.tag == .windows) agent.install();
+            if (config.target.result.os.tag == .windows) {
+                agent.install();
+
+                // T192: an artifact whose destination is currently RUNNING
+                // cannot be replaced in place on Windows — the image file is
+                // held open for the life of the process, and the agent
+                // outliving the app is the point of session persistence. Move
+                // a locked destination aside before the install steps run so
+                // a leftover agent from an earlier test run cannot fail the
+                // build (and, worse, fail it AFTER ghoztty.exe installed).
+                const unlock = buildpkg.InstallUnlock.create(b);
+                unlock.guardArtifact(exe.install_step);
+                if (exe.com_install_step) |com| unlock.guardInstallFile(com);
+                unlock.guardArtifact(agent.install_step);
+                if (agent.ca_dll_install_step) |ca| unlock.guardArtifact(ca);
+            }
         }
     } else if (!config.emit_lib_vt) {
         // The macOS Ghostty Library
