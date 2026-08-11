@@ -15109,3 +15109,80 @@ Floor: all three lanes PASS via `floor-lane.ps1 -Lane all`, P1-P3 ALL PASS.
 converted scripts parses; the three cheap pure ones were run live
 (`build-mode-guard.ps1`, `website-windows-download.ps1`,
 `upgrade-resume-readiness.ps1 -PureOnly`).
+
+## 2026-08-11 - a test script that prints failure now reports failure (T221)
+
+The verdict line is written for a human; the exit code is what everything else
+reads. They were able to disagree. `chooser-menu.ps1` and `host-settings.ps1`
+ended with a bare `if ... { "ALL PASS" } else { "$fail FAILURE(S)" }` and no
+`exit` in sight, so a run with red assertions printed exactly the right thing
+and then fell off the end of the script with `$LASTEXITCODE` at 0. A person
+reading the output saw the failure; a suite driver, a `; if ($?)` chain or CI
+scoring the same run saw a pass. `config-errors.ps1` had the identical bug,
+found and fixed in T217.
+
+By the time this task was claimed the two named scripts were already fixed -
+`chooser-menu.ps1` in T218 (`65ed2bfba`), `host-settings.ps1` in T219
+(`5320141f1`), both in passing while those tasks rewrote the same lines for
+other reasons. That is the argument for the rest of it. Three instances of one
+shape, each fixed by whoever happened to be standing there, is not a closed
+class; it is a class nobody has counted. T221 said as much in its own step 3:
+sweep for the shape "rather than trusting the 'no `exit 1` anywhere' search that
+found these two", because a script can carry an `exit 1` in a SETUP-FAIL branch
+and still fall off the end after a real assertion failure.
+
+So the rule is mechanical now, and it runs both directions: the failure path
+must terminate the script nonzero, AND the pass path must not fall into the
+failure verdict on its way out. The second half is not decoration - the suite's
+other common shape is an early return (`if (...) { "ALL PASS"; exit 0 }` /
+`"$fail FAILURE(S)"` / `exit 1`), and dropping that `exit 0` makes a GREEN run
+announce failure and exit 1. One rule, both of the directions T221 asked for.
+
+`test/win32/lib/VerdictExitAudit.ps1` answers it from the **AST**, unlike its
+two sibling audits, and that is not a style preference. A line-oriented draft
+written first reported 128 of 160 scripts, because in most of this suite the
+exit shares the verdict's line (`else { "$fail FAILURE(S)"; exit 1 }`) and a
+text reader then has to invent a definition of "near". Branch membership is a
+structural question, so it asks the parser: find the last `ALL PASS` this script
+EMITS - not one it compares against, which is what `go-loop-guard`,
+`crash-stacks` and `skip-visibility` all do to somebody else's output - find its
+enclosing `if`, and walk the failure path looking for an exit that is not the
+constant 0. Four findings: `fallthrough` (the defect), `exits-zero`,
+`pass-falls-through` (the other direction) and `no-verdict`.
+
+What it deliberately does not claim is a COMPUTED exit code
+(`exit ([int]($failures -gt 0))`), which two scripts legitimately use and no
+static reader can evaluate. That gap is where the acceptance script's section C
+goes: real exit codes on the wire, both canonical shapes run green and red, plus
+the unfixed shape as a negative control - so a green run demonstrates the defect
+is real rather than only that the guarded shapes pass.
+
+The sweep is clean at 161 acceptance scripts, 0 violations, and the number is
+printed on every run rather than recorded here once. One exemption, stated:
+`ipc-fake-server.ps1` is a helper process with nothing to score and carries the
+`# verdict-audit:` marker - the same convention `# persistence:`,
+`# exitcode-audit:` and `# skip-audit:` use. `scripts\` is not swept and was
+checked by hand instead: two files there mention ALL PASS and only
+`floor-lane.ps1` emits one as its own verdict, correctly. A blanket sweep there
+would be 60 `no-verdict` findings about tools that were never supposed to have
+one, and a sweep that cries wolf is a sweep nobody reads.
+
+`-TeethCheck` plants a real violating script INSIDE the swept directory and
+requires the sweep to walk the tree and find it. Appending a name to the results
+afterwards - the cheaper shape - would assert that a list somebody just added to
+is non-empty, which is true whatever the analyzer does.
+
+Filed T732: there are now four harness-rule audits (persistence, exit-code,
+skip, verdict), each with its own analyzer, its own acceptance script and its
+own marker, and NONE of them runs as part of the standing floor. A new script
+author meets them one red run at a time, weeks apart, if anyone remembers to run
+the right one.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 287s, win32
+329s, agent 335s), P1-P3 ALL PASS. `verdict-exit-audit.ps1` ALL PASS (24
+assertions) and `-TeethCheck` green; the two sibling audits still ALL PASS. The
+two scripts T221 named were measured on the box both ways rather than reasoned
+about: `chooser-menu.ps1` clean exit=0 / `ALL PASS (57 assertions)` and
+`-NegativeControl` exit=1 / `1 FAILURE(S) (56 passed)`; `host-settings.ps1`
+clean exit=0 / `ALL PASS (65 assertions)` and `-NegativeControl` exit=1 /
+`1 FAILURE(S) (64 passed)`.

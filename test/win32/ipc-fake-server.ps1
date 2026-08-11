@@ -12,6 +12,11 @@
 #   Debug       -> \\.\pipe\ghoztty-debug-<username>    (use -DebugPipe)
 #
 # Framing (both directions): 4-byte big-endian length + UTF-8 JSON.
+#
+# verdict-audit: a helper process, not an acceptance script. It asserts nothing
+# and has no verdict to report, so it prints no ALL PASS and scores no exit code
+# (T221). Do not give it one - an invented verdict would be a green line about a
+# script that never checked anything.
 
 param(
     [switch]$DebugPipe,

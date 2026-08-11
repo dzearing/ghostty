@@ -1795,6 +1795,34 @@ audited). Acceptance: `test\win32\skip-visibility.ps1`, whose `$SkipAuditPending
 list of not-yet-converted scripts can only SHRINK — an entry that no longer
 violates fails the run just as an unlisted violator does.
 
+**And a script that PRINTS failure EXITS failure** (T221). The verdict line is
+for the human; the exit code is for everything else, and they used to be able to
+disagree. `chooser-menu.ps1` and `host-settings.ps1` ended with a bare `if …
+{ "ALL PASS" } else { "$fail FAILURE(S)" }` and no `exit` in sight, so a run with
+red assertions fell off the end with `$LASTEXITCODE` at 0 — correct on screen, a
+pass to any suite driver, `; if ($?)` chain or CI that scored it. (`config-errors.ps1`
+had the identical bug, fixed in T217; all three are fixed, so what T221 delivered
+is what keeps them fixed.) The rule runs **both** directions: the failure path
+must terminate the script nonzero, AND the pass path must not fall into the
+failure verdict on its way out — dropping the `exit 0` from the suite's
+early-return shape makes a *green* run announce `FAILURE(S)` and exit 1.
+
+Analyzer: `test\win32\lib\VerdictExitAudit.ps1`, reporting `fallthrough` (the
+defect), `exits-zero`, `pass-falls-through` (the other direction) and
+`no-verdict`. It reads the **AST**, unlike its two sibling audits, and that is
+load-bearing rather than stylistic: in most of this suite the exit shares the
+verdict's line (`else { "$fail FAILURE(S)"; exit 1 }`), so a line-oriented reader
+must decide what "near" means — the first draft of one reported 128 of 160
+scripts. Branch membership is a structural question, so ask the parser. What it
+deliberately does not claim is a **computed** exit code (`exit ([int]($failures
+-gt 0))`, which two scripts legitimately use); section C of the acceptance script
+measures real codes on the wire instead, both shapes and both directions, with
+the unfixed shape as a negative control. Exemption: the same stated-intent
+`# verdict-audit: <reason>` marker, carried today only by `ipc-fake-server.ps1`,
+a helper process with nothing to score. Acceptance:
+`test\win32\verdict-exit-audit.ps1`, whose `-TeethCheck` plants a real violator
+inside the swept directory and requires the sweep to find it.
+
 **A test sandbox can have an agent of its own** (T167). The local agent's
 single-instance guard is per-user and per-LINEAGE, and the lineage is a
 compile-time fact (`local-debug` for every debug build), so a debug agent
