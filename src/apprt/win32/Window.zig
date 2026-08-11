@@ -7073,13 +7073,20 @@ pub fn windowWndProc(
             if (w32.GetCursorPos_(&pt) != 0) {
                 if (window.hwnd) |h| _ = w32.ScreenToClient(h, &pt);
                 if (window.heroHitDivider(pt.x, pt.y) or window.hero_divider_drag) {
-                    if (w32.LoadCursorW(null, w32.IDC_SIZEWE)) |cursor| {
+                    if (w32.LoadCursorW(null, split_geometry.HERO_DIVIDER_CURSOR.idc())) |cursor| {
                         _ = w32.SetCursor(cursor);
                     }
                     return 1;
                 }
                 if (window.hitTestDivider(pt.x, pt.y)) |hit| {
-                    const cursor_id: usize = if (hit.layout == .horizontal) w32.IDC_SIZEWE else w32.IDC_SIZENS;
+                    // Which glyph is a named, tested decision (T228) rather
+                    // than a conditional here: no on-box test can read the
+                    // cursor off a background desktop, so a swap would be
+                    // invisible to the whole acceptance suite.
+                    const cursor_id: usize = split_geometry.dividerCursor(switch (hit.layout) {
+                        .horizontal => .horizontal,
+                        .vertical => .vertical,
+                    }).idc();
                     if (w32.LoadCursorW(null, cursor_id)) |cursor| {
                         _ = w32.SetCursor(cursor);
                     }
@@ -7111,4 +7118,15 @@ pub fn windowWndProc(
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+test "T228: split_geometry's divider cursor ids ARE the OS's IDC_* values" {
+    // The other half of `DividerCursor`'s trade. `split_geometry` carries the
+    // numbers so its tests run in every lane (no OS imports); this lane is
+    // where the numbers meet the constants `WM_SETCURSOR` actually loads, so a
+    // drift between the two is a red test rather than a wrong glyph nobody can
+    // observe on a background desktop.
+    try std.testing.expectEqual(w32.IDC_SIZEWE, split_geometry.DividerCursor.size_we.idc());
+    try std.testing.expectEqual(w32.IDC_SIZENS, split_geometry.DividerCursor.size_ns.idc());
+    try std.testing.expectEqual(w32.IDC_SIZEWE, split_geometry.HERO_DIVIDER_CURSOR.idc());
 }

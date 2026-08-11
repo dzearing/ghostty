@@ -15234,3 +15234,51 @@ the tool those are run with.
 
 Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 286s, win32
 344s, agent 340s); P1-P3 ALL PASS; `kb-actions.ps1` ALL PASS (42 assertions).
+
+## 2026-08-11 - the divider's resize arrow now has to point the right way (T228)
+
+Point at the line between two split panes and the cursor becomes a double
+arrow, which is how you know the line can be dragged. Which arrow was decided
+by a bare conditional inside a 7000-line window procedure and checked by
+nothing: `WM_SETCURSOR` carries no coordinates, so the handler reads
+`GetCursorPos`, which answers `-1,-1` on a background desktop and takes the
+whole path through to `DefWindowProcW`. T218 measured that when it moved
+`split-divider.ps1` off the input desktop and dropped four cursor assertions;
+a build that showed a left-right arrow on a line you drag up and down would
+have shipped with every lane and every acceptance script green.
+
+The recovery is off the box rather than a weaker probe on it.
+`split_geometry.dividerCursor` names the rule - a `horizontal` split puts its
+children side by side, so its divider is a VERTICAL line dragged east-west -
+and carries the `IDC_*` numbers rather than importing `win32.zig`, which is
+what keeps its tests running in every lane, the Mac seat's `none` included.
+`Window.zig` calls it for both the split and the hero/carousel divider, and
+holds the staple: a win32-lane test asserting those numbers still equal
+`w32.IDC_SIZEWE` / `w32.IDC_SIZENS`. Without that second half the pure module
+could drift from the constants the handler actually loads and nothing would go
+red. Both halves were teeth-checked by breaking them (`67 passed; 1 failed`
+standalone, `4466/4536 passed, 1 failed` in the lane) - which is also how the
+win32-lane test was proven to be COMPILED into that lane, since T733 makes a
+`-Dtest-filter` re-run indistinguishable from a filter that matched nothing.
+
+T228's other half was the cross-pane stale-line scan, and its filed direction -
+"fold into T214" - turned out to be closed: T214 finished by deciding routes
+1-4 and deliberately NOT building route 0, the app-side GL readback, which is
+T275. Re-measuring also narrowed what is worth wanting. The 13 divider-colored
+runs a `PrintWindow` capture shows are not a defect any build could fix: the
+parent never erases and only repaints the band region, so a healthy product
+genuinely leaves old lines in its backing store under the panes, and scoring
+them needs a composite the parent is not part of. So the pixel-perfect version
+is re-pointed at T275 (filed T734 as its consumer) and the expressible margin
+was put back instead, as two assertions per axis that the old wide scan never
+made either: the band is solid at THREE points along its length rather than at
+its midpoint alone, and the panes tile the split across the other axis, so the
+gap is the only parent-visible strip there is. That second one is
+`split_geometry`'s tiling invariant - the reason an under-pane stale line is
+unreachable on screen - measured on the live layout instead of assumed. Both
+come out of one capture, so neither adds a SKIP site; inverting the two
+predicates fails exactly the six new assertions and moves nothing else.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all` (none 135s, win32
+334s, agent 367s); P1-P3 ALL PASS; `split-divider.ps1` ALL PASS (57 assertions,
+up from 51) three times, with `-NegativeControl` still failing.

@@ -259,6 +259,57 @@ pub fn inGrabBand(a: Axis, coord: i32, scale: f32) bool {
     return coord >= a.split_pos - half and coord <= a.split_pos + half;
 }
 
+/// Which way a split arranges its two children. A local mirror of
+/// `SplitTree(View).Node.Split.Layout`, which is nested inside a generic and so
+/// has no importable spelling; `Window.zig` converts with an exhaustive switch,
+/// which is what makes a new variant over there a compile error over here.
+pub const Layout = enum { horizontal, vertical };
+
+/// The system resize cursor a divider shows while the pointer is in its grab
+/// band, carrying the Windows `IDC_*` NUMBER rather than importing `win32.zig`
+/// — this module has no OS imports, which is what lets its tests run in every
+/// lane. `Window.zig` asserts the numbers still equal `w32.IDC_SIZEWE` /
+/// `w32.IDC_SIZENS` in the win32 lane, so the two halves cannot drift apart.
+///
+/// **This is a named decision because no on-box test can see it** (T228).
+/// `WM_SETCURSOR` carries no coordinates, so the handler has to read
+/// `GetCursorPos` — which returns `-1,-1` on a background desktop, taking the
+/// whole path through to `DefWindowProcW`. `split-divider.ps1` covers the
+/// band's EXTENT with `WM_NCHITTEST` probes and its AXIS with drags along both
+/// axes; the GLYPH is covered here and nowhere else.
+pub const DividerCursor = enum {
+    /// East–west double arrow (`IDC_SIZEWE`).
+    size_we,
+    /// North–south double arrow (`IDC_SIZENS`).
+    size_ns,
+
+    pub fn idc(self: DividerCursor) usize {
+        return switch (self) {
+            .size_we => 32644,
+            .size_ns => 32645,
+        };
+    }
+};
+
+/// The cursor for a split divider, from the split's layout.
+///
+/// The arrow points along the axis the divider MOVES on, which is perpendicular
+/// to the line the user sees: a `horizontal` split puts its children side by
+/// side, so its divider is a vertical line dragged left and right — east–west.
+/// A build that swapped these would hit-test the band correctly, drag
+/// correctly, and show the wrong glyph the whole time.
+pub fn dividerCursor(layout: Layout) DividerCursor {
+    return switch (layout) {
+        .horizontal => .size_we,
+        .vertical => .size_ns,
+    };
+}
+
+/// The hero/carousel divider's cursor. The carousel is a COLUMN beside the hero
+/// pane (`HeroCarousel.splitRects`), so its divider is always a vertical line —
+/// there is no layout to consult.
+pub const HERO_DIVIDER_CURSOR: DividerCursor = .size_we;
+
 /// Map a dragged pointer position to a split's new ratio (T495).
 ///
 /// `region_start`/`region_end` are the DRAGGED NODE's own layout rect on the
@@ -602,6 +653,30 @@ test "dragRatio: vertical analog (same function, rows for columns)" {
     const kept = dragRatio(root.band_hi, h, nested.split_pos);
     const region_h: f32 = @floatFromInt(h - root.band_hi);
     try testing.expectApproxEqAbs(@as(f32, 0.5), kept, 1.5 / region_h);
+}
+
+test "dividerCursor: the arrow points along the DRAG axis, not along the line" {
+    // T228, and the whole content of the rule: a `horizontal` split puts its
+    // children side by side, so what the user sees is a VERTICAL line and what
+    // they do to it is drag left/right.
+    try testing.expectEqual(DividerCursor.size_we, dividerCursor(.horizontal));
+    try testing.expectEqual(DividerCursor.size_ns, dividerCursor(.vertical));
+
+    // The hero/carousel divider is a column boundary, always east–west.
+    try testing.expectEqual(DividerCursor.size_we, HERO_DIVIDER_CURSOR);
+
+    // A mapping that answered the SAME cursor for both axes passes every probe
+    // `split-divider.ps1` can still run on a background desktop — the hit test,
+    // the drags, the band extent. Pin the distinction itself.
+    try testing.expect(dividerCursor(.horizontal) != dividerCursor(.vertical));
+}
+
+test "DividerCursor.idc: the OS cursor ids, pinned by number" {
+    // Here rather than only in the win32 lane so the none lane catches a swap
+    // too; `Window.zig` checks these against `w32.IDC_*` where those exist.
+    try testing.expectEqual(@as(usize, 32644), DividerCursor.size_we.idc());
+    try testing.expectEqual(@as(usize, 32645), DividerCursor.size_ns.idc());
+    try testing.expect(DividerCursor.size_we.idc() != DividerCursor.size_ns.idc());
 }
 
 test "grab band is wider than the visible band on both sides" {

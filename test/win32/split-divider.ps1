@@ -58,7 +58,12 @@
 #   at the source rather than inferred from a glyph. The band's AXIS (the
 #   vertical/horizontal choice that picked SIZENS over SIZEWE) stays covered by
 #   the drags, which move along it, and by the T155 section running both axes.
-#   The literal glyph is what is lost; see the task file.
+#   The literal glyph is not observable here and never will be.
+#   T228 recovered it OFF the box instead of weakening anything on it: the
+#   layout -> cursor decision is now `split_geometry.dividerCursor`, a named
+#   pure function with unit tests in every lane, and `Window.zig` asserts its
+#   IDC numbers against `w32.IDC_SIZEWE`/`IDC_SIZENS` in the win32 lane. What
+#   is left untested is `LoadCursorW` + `SetCursor` themselves.
 #
 #   THE DRAG. Real SendInput drags are gone; a drag is a posted
 #   down / moves / up on the TOP-LEVEL window, which is where the OS routes a
@@ -141,16 +146,40 @@ function Get-TestStrip {
         [Parameter(Mandatory = $true)][int]$B,
         [switch]$Horizontal
     )
+    $many = Get-TestStrips -Window $Window -Fixed @($Fixed) -A $A -B $B -Horizontal:$Horizontal
+    if ($null -eq $many) { return $null }
+    return ,$many[0]
+}
+
+# Several parallel strips out of ONE capture (T228). Sampling the band at more
+# than one point along its LENGTH is what tells a full-length band from one
+# painted only where the last drag happened to repaint - but a capture per
+# point would be three chances to read an empty window and three more SKIP
+# sites. One PrintWindow, N strips, one emptiness verdict for all of them.
+function Get-TestStrips {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][int[]]$Fixed,
+        [Parameter(Mandatory = $true)][int]$A,
+        [Parameter(Mandatory = $true)][int]$B,
+        [switch]$Horizontal
+    )
     $shot = Get-TestWindowPixels -Window $Window
     try {
         if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
-        $out = New-Object System.Collections.Generic.List[string]
-        for ($i = $A; $i -le $B; $i++) {
-            $c = if ($Horizontal) { Get-TestPixel -Shot $shot -X $i -Y $Fixed }
-                 else { Get-TestPixel -Shot $shot -X $Fixed -Y $i }
-            if ($null -eq $c) { $out.Add('-1,-1,-1') } else { $out.Add("$($c.R),$($c.G),$($c.B)") }
+        $strips = New-Object System.Collections.Generic.List[object]
+        foreach ($f in $Fixed) {
+            $out = New-Object System.Collections.Generic.List[string]
+            for ($i = $A; $i -le $B; $i++) {
+                $c = if ($Horizontal) { Get-TestPixel -Shot $shot -X $i -Y $f }
+                     else { Get-TestPixel -Shot $shot -X $f -Y $i }
+                if ($null -eq $c) { $out.Add('-1,-1,-1') } else { $out.Add("$($c.R),$($c.G),$($c.B)") }
+            }
+            $strips.Add($out.ToArray())
         }
-        return $out.ToArray()
+        # Unary comma: a bare array return UNROLLS, so a one-element request
+        # would hand the caller its first PIXEL instead of its strip.
+        return ,$strips.ToArray()
     } finally {
         Close-TestWindowPixels $shot
     }
@@ -174,9 +203,14 @@ function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb) {
     return $false
 }
 
-# The parent-visible gap between the two pane rects: its pixel strip and its
+# The parent-visible gap between the two pane rects: its pixel strips and its
 # width. Win32 rects are half-open, so pane A owns rows up to Bottom-1 and the
 # gap is [A.Bottom .. B.Top-1]. Strip is $null if the capture held no content.
+#
+# `Strips` crosses the gap at three points ALONG the band (20% / 50% / 80% of
+# the pane's cross-axis extent), out of one capture; `Strip` is the middle one,
+# which is the single point every probe here used before T228. `A`/`B` are the
+# two pane rects, for the tiling assertion in the T155 section.
 function Get-GapStrip([IntPtr]$top, [string]$axis) {
     $panes = Get-Panes $top
     if ($panes.Count -ne 2) { return $null }
@@ -184,18 +218,28 @@ function Get-GapStrip([IntPtr]$top, [string]$axis) {
         $pa = $panes | Sort-Object Top | Select-Object -First 1
         $pb = $panes | Sort-Object Top | Select-Object -Last 1
         $lo = $pa.Bottom; $hi = $pb.Top - 1
-        $strip = if ($hi -lt $lo) { @() } else {
-            Get-TestStrip -Window $top -Fixed ([int](($pa.Left + $pa.Right) / 2)) -A $lo -B $hi
-        }
+        $at = @(0.2, 0.5, 0.8) | ForEach-Object { [int]($pa.Left + ($pa.Right - $pa.Left) * $_) }
+        $horiz = $false
     } else {
         $pa = $panes | Sort-Object Left | Select-Object -First 1
         $pb = $panes | Sort-Object Left | Select-Object -Last 1
         $lo = $pa.Right; $hi = $pb.Left - 1
-        $strip = if ($hi -lt $lo) { @() } else {
-            Get-TestStrip -Window $top -Fixed ([int](($pa.Top + $pa.Bottom) / 2)) -A $lo -B $hi -Horizontal
-        }
+        $at = @(0.2, 0.5, 0.8) | ForEach-Object { [int]($pa.Top + ($pa.Bottom - $pa.Top) * $_) }
+        $horiz = $true
     }
-    return [pscustomobject]@{ Strip = $strip; Gap = ($hi - $lo + 1) }
+    # No parent-visible gap at all (panes abutting or overlapping) is a
+    # RESULT, not a missing measurement: it fails `gap == bandPx` below. Keep
+    # it out of the empty-capture skip path it used to share.
+    if ($hi -lt $lo) {
+        $empty = New-Object object[] 3
+        for ($k = 0; $k -lt 3; $k++) { $empty[$k] = @() }
+        return [pscustomobject]@{ Strip = @(); Strips = $empty; Gap = ($hi - $lo + 1); A = $pa; B = $pb }
+    }
+    $strips = Get-TestStrips -Window $top -Fixed $at -A $lo -B $hi -Horizontal:$horiz
+    $mid = if ($null -eq $strips) { $null } else { $strips[1] }
+    return [pscustomobject]@{
+        Strip = $mid; Strips = $strips; Gap = ($hi - $lo + 1); A = $pa; B = $pb
+    }
 }
 
 function Dump-Strip([IntPtr]$top, $A, $B, [string]$label) {
@@ -626,8 +670,28 @@ Stop-Process -Id $app251.Pid -Force -ErrorAction SilentlyContinue
 #
 # What is NOT covered any more is a stale line that ends up UNDER a pane. On
 # screen the pane covers it, so it is invisible - which is why it was only ever
-# a proxy - but it was a proxy with margin, and that margin is gone. See the
-# task file.
+# a proxy - but it was a proxy with margin.
+#
+# T228 re-measured that margin and put back the half a background desktop CAN
+# express. The other half is not recoverable and, on the evidence, is not a
+# defect to recover: a healthy product genuinely leaves those pixels in the
+# parent's backing store (the parent never erases, and only ever repaints the
+# band region), which is exactly why the capture showed 13 runs against a
+# working build. Scoring them needs a composite the parent is not part of.
+# So the two additions here are the parts that stand on their own:
+#
+#   * the band is solid at THREE points along its length, not one. The old
+#     scan crossed the band once; a band painted only where the last drag
+#     repainted it reads as solid at the midpoint.
+#   * the panes tile the split across the other axis, so the gap is the ONLY
+#     parent-visible strip there is. That is the invariant that makes an
+#     under-pane stale line unreachable on screen, measured on the live layout
+#     instead of assumed - `split_geometry`'s `axis()` tests assert the same
+#     tiling in pure arithmetic, and this asserts the layout code that uses it.
+#
+# The pixel-perfect version still wants a composited capture; that lives with
+# T275 (an app-side snapshot over IPC), NOT with T214, which considered route 0
+# and deliberately did not build it.
 #
 # Green is used so no earlier run's red/blue can be mistaken for a band.
 # ---------------------------------------------------------------------------
@@ -652,6 +716,34 @@ function Max-RunLength([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
         else { $cur = 0 }
     }
     return $best
+}
+
+# "one solid divider fill" at every point the gap was crossed, not only at the
+# midpoint (T228). Returns "runs 1 filled 3/3; ..." for the assertion label,
+# and $false in $ok if ANY crossing is not a single full-width run.
+function Measure-GapSolid($gap) {
+    $ok = $true; $detail = @()
+    for ($i = 0; $i -lt $gap.Strips.Count; $i++) {
+        $s = $gap.Strips[$i]
+        $r = Count-ColorRuns $s 0 255 0
+        $w = Max-RunLength $s 0 255 0
+        if ($r -ne 1 -or $w -ne $gap.Gap) { $ok = $false }
+        $detail += "runs $r filled $w/$($gap.Gap)"
+    }
+    return [pscustomobject]@{ Ok = $ok; Detail = ($detail -join '; ') }
+}
+
+# The panes span the SAME cross-axis extent, so the only parent-visible pixels
+# inside their union are the gap itself (T228). Half of the retired cross-pane
+# scan restated as geometry: a background desktop cannot say what a stale line
+# UNDER a pane looks like, but it can say there is nowhere else for one to be
+# visible. Together with `gap == bandPx` that IS split_geometry's tiling
+# invariant, measured on the live layout rather than in pure arithmetic.
+function Test-PanesTile($gap, [string]$axis) {
+    if ($axis -eq 'down') {
+        return ($gap.A.Left -eq $gap.B.Left) -and ($gap.A.Right -eq $gap.B.Right)
+    }
+    return ($gap.A.Top -eq $gap.B.Top) -and ($gap.A.Bottom -eq $gap.B.Bottom)
 }
 
 # (Get-GapStrip moved up to the helper block: the T233 section in run 2 uses
@@ -718,6 +810,16 @@ foreach ($axis in @('down', 'right')) {
         "T155/$axis : the gap is ONE solid divider fill after 3 drags (runs $runs, filled ${width}/$($gap.Gap)px)"
     if ($runs -ne 1 -or $width -ne $gap.Gap) { Dump-Green $gap.Strip 'drags' }
 
+    # T228: the same claim at 20% and 80% of the band's LENGTH, not only at its
+    # midpoint. A band painted just where the last drag repainted it, or one
+    # that stops short at a nested split, reads as solid at the middle.
+    $solid = Measure-GapSolid $gap
+    Assert $solid.Ok "T155/$axis : the band is solid ALONG its length after 3 drags ($($solid.Detail))"
+    Assert (Test-PanesTile $gap $axis) `
+        ("T155/$axis : the panes tile the split across the other axis, so the gap is the only " +
+         "parent-visible strip (A $($gap.A.Left),$($gap.A.Top),$($gap.A.Right),$($gap.A.Bottom) " +
+         "B $($gap.B.Left),$($gap.B.Top),$($gap.B.Right),$($gap.B.Bottom))")
+
     # THE case that actually reproduces the user's report. Drags alone do
     # NOT: a big ratio change moves the line clear of the old gap, so the
     # growing pane covers the stale pixels and the count stays at 1 even on
@@ -745,6 +847,9 @@ foreach ($axis in @('down', 'right')) {
     Assert ($runs2 -eq 1 -and $width2 -eq $gap.Gap) `
         "T155/$axis : the gap is STILL one solid fill after resizes (runs $runs2, filled ${width2}/$($gap.Gap)px)"
     if ($runs2 -ne 1 -or $width2 -ne $gap.Gap) { Dump-Green $gap.Strip 'resizes' }
+    $solid2 = Measure-GapSolid $gap
+    Assert $solid2.Ok `
+        "T155/$axis : the band is STILL solid along its length after resizes ($($solid2.Detail))"
 
     Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) "T155/$axis : no crash"
     Stop-Process -Id $g.App.Pid -Force -ErrorAction SilentlyContinue
