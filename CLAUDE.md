@@ -505,10 +505,25 @@ wrong. That is also what keeps the three states apart without relying on hue
 Clicking **Reconnect** starts from ANY disconnected tier, terminal included,
 resets the poisoned-session breaker (a click is fresh evidence) and dials
 immediately instead of waiting out a backoff. It re-attaches when the session
-survived — **but on Windows a session that did NOT survive still ends the
-window rather than opening a fresh shell on the machine** (T611), so a click
-after the remote box rebooted currently dials, finds nothing to re-attach, and
-leaves the pill red.
+survived, and **opens a fresh shell in every pane when it did not** — a rebooted
+box, a restarted agent — rebuilding the window IN PLACE, so the split layout the
+user arranged and every pane's `$GHOZTTY_PANE_ID` come through the swap
+unchanged and only the contents are new (T611).
+
+That second answer is licensed by the CLICK and by nothing else. The automatic
+ladder still goes terminal on a session it can no longer find: replacing a grid
+somebody arranged with a wall of empty prompts is a surprise unless they asked
+for it, and the pill's button is how they ask. So "did the user ask" rides the
+ATTEMPT — set when the ladder starts, carried out to the redial worker and back
+with its reply — rather than being read off the window when the dial lands,
+where a second drop arriving mid-dial would answer for a ladder it did not
+start. The whole end-of-attempt rule is one pure function
+(`remote_reconnect.decideAttempt`) precisely because the two halves of it were
+each correct and separately tested for months while the driver called them with
+a hardcoded "no". Acceptance: `test/win32/remote-reconnect-fresh.ps1` (layout,
+pane ids, and both panes LIVE across the swap; the automatic arm as the
+control), plus section 4 of `test/win32/remote-pill.ps1` (the pill goes green
+again).
 
 macOS renders this as Mac's machine pill plus a separate status capsule
 (`MachinePillView.swift`); Windows merges the two into one capsule in the

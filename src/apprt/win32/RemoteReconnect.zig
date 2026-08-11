@@ -34,7 +34,10 @@
 //!  4. **Swap.** `applySwap` re-ATTACHes the recorded sessions on the NEW
 //!     connection FIRST and only then retires the old one, guarded by
 //!     `policy.SwapGuard`. Backwards, this ends the session it is trying to
-//!     save.
+//!     save. When the machine is back but its sessions are NOT — a reboot, an
+//!     agent restart — a swap the USER asked for rebuilds the same split layout
+//!     with a fresh shell in every pane instead (T611); the automatic ladder
+//!     goes terminal there rather than replacing a grid nobody asked it to.
 //!
 //! ## Two rules that are not obvious
 //!
@@ -111,6 +114,20 @@ pub const State = struct {
     gen: policy.Generation = .{},
     /// The 1-based fast-ladder attempt currently being paced or run.
     attempt: u32 = 0,
+    /// Whether the ladder now running was started by the user clicking
+    /// Reconnect. It licenses ONE thing (T611): answering "the session is gone"
+    /// by opening a fresh shell instead of going terminal, because replacing a
+    /// grid the user arranged with empty prompts is a surprise unless they
+    /// asked for it.
+    ///
+    /// It belongs to the LADDER, not to one dial: every retry behind a click,
+    /// and the slow background re-dial that click's exhaustion arms, are still
+    /// the same request — a box that is still booting when the user clicks must
+    /// not lose their intent to a 2s backoff. It is copied onto each attempt as
+    /// that attempt is started, so a reply landing after the ladder ended
+    /// carries the flag it was dialed with rather than reading whatever the
+    /// window has since become.
+    manual: bool = false,
     /// Wall-clock ms at which the next dial is due (0 ⇒ nothing scheduled).
     due_ms: i64 = 0,
     /// A worker is dialing right now. Keeps `tick` from stacking attempts and
@@ -215,6 +232,7 @@ fn drive(app: *App, window: *Window, now: i64) void {
             _ = rc.gen.bump();
             rc.attempt = 0;
             rc.due_ms = 0;
+            rc.manual = false;
             setLadder(window, .connected);
             rc.breaker.reset();
             log.info("remote reconnect: link recovered on its own for '{s}'", .{windowName(window)});
@@ -278,6 +296,7 @@ fn beginLadder(app: *App, window: *Window, now: i64, manual: bool) void {
         .start => |s| {
             _ = rc.gen.bump();
             rc.attempt = s.attempt;
+            rc.manual = manual;
             setLadder(window, .{ .reconnecting = .{ .attempt = s.attempt } });
             const delay = policy.backoffMs(s.attempt, manual);
             rc.due_ms = now + @as(i64, @intCast(delay));
@@ -317,6 +336,9 @@ fn goTerminal(window: *Window) void {
     _ = rc.gen.bump();
     rc.attempt = 0;
     rc.due_ms = 0;
+    // The ladder this click (if any) started is over. The next one gets its own
+    // answer to "did the user ask for this", from its own beginning.
+    rc.manual = false;
     setLadder(window, policy.terminal_state);
 }
 
@@ -378,6 +400,9 @@ const Request = struct {
     /// carries. A pointer would dangle the moment the window closed.
     uuid: pane_id_mod.Buf,
     gen: u64,
+    /// Whether the ladder this attempt belongs to was started by a click. Rides
+    /// the attempt out and back (see `State.manual`).
+    manual: bool,
     target: Target,
 
     fn destroy(self: *Request) void {
@@ -391,6 +416,10 @@ pub const Result = struct {
     alloc: Allocator,
     uuid: pane_id_mod.Buf,
     gen: u64,
+    /// Carried back verbatim from the `Request`, and read instead of the
+    /// window's current state: what licenses a fresh-session swap is the ladder
+    /// this dial was started for, not whatever happened while it was in flight.
+    manual: bool = false,
     dial: policy.DialResult,
     /// The transport this attempt opened, or null when the dial failed. The GUI
     /// thread either hands it to the window or frees it.
@@ -465,6 +494,7 @@ fn startAttempt(app: *App, window: *Window) void {
         .hwnd = hwnd,
         .uuid = window.layout_uuid,
         .gen = rc.gen.value,
+        .manual = rc.manual,
         .target = target,
     };
 
@@ -589,6 +619,7 @@ fn worker(req: *Request) void {
         .alloc = alloc,
         .uuid = req.uuid,
         .gen = req.gen,
+        .manual = req.manual,
         .dial = dial,
         .dialed = dialed,
         .roster = roster,
@@ -629,20 +660,24 @@ pub fn onDialed(app: *App, res: *Result) void {
     res.roster = null; // ownership moved into the probe
     defer probe.deinit();
 
-    const outcome = policy.outcomeFromAttempt(res.dial, sessionPresent(window, &probe));
-    switch (policy.onProbeOutcome(outcome, false)) {
-        // `fresh_session_on_gone` is false: only a MANUAL reconnect may answer
-        // "the session is gone" with an empty shell, because silently replacing
-        // a user's grid with fresh prompts is a surprise, not a recovery.
+    // `manual` comes off the ATTEMPT, never off the window: only a reconnect the
+    // user asked for may answer "the session is gone" with a fresh shell, and
+    // which ladder this dial belongs to is settled at the moment it was started
+    // (T611).
+    const decided = policy.decideAttempt(.{
+        .dial = res.dial,
+        .session_present = sessionPresent(window, &probe),
+        .manual = res.manual,
+    });
+    switch (decided.action) {
         .swap => |s| {
-            std.debug.assert(!s.fresh_session);
             const dialed = res.dialed orelse {
                 // Cannot happen (a `.ok` dial always carries one) but the ladder
                 // must not read the swap arm as a success it did not get.
                 failAttempt(app, window);
                 return;
             };
-            if (applySwap(app, window, dialed, &probe)) {
+            if (applySwap(app, window, dialed, &probe, s.fresh_session)) {
                 res.dialed = null; // the window owns it now
             } else {
                 failAttempt(app, window);
@@ -652,7 +687,7 @@ pub fn onDialed(app: *App, res: *Result) void {
         .terminal => {
             log.warn(
                 "remote reconnect: '{s}' is terminal after attempt {d} ({s})",
-                .{ windowName(window), rc.attempt, @tagName(outcome) },
+                .{ windowName(window), rc.attempt, @tagName(decided.outcome) },
             );
             goTerminal(window);
         },
@@ -696,11 +731,18 @@ fn windowByUuid(app: *App, uuid: *const pane_id_mod.Buf) ?*Window {
 /// that could come back has come back. Retiring first would tear down the
 /// connection the departing surfaces DETACH over while their sessions are still
 /// the ones we are re-attaching — the `sessionSpared` hazard, from the other end.
+///
+/// `fresh_session` is the T611 arm: the agent answered and owns NONE of this
+/// window's sessions (a rebooted box, a restarted agent), and the user asked for
+/// the window back anyway. Every pane then OPENs a new shell in the slot it
+/// already holds — the split layout the user arranged is the thing they will
+/// still want, so it is preserved and only its contents are new.
 fn applySwap(
     app: *App,
     window: *Window,
     fresh: Window.RemoteDialed,
     probe: *const App.AttachProbe,
+    fresh_session: bool,
 ) bool {
     const rc = &window.reconnect;
     const gpa = app.core_app.alloc;
@@ -718,29 +760,49 @@ fn applySwap(
         return false;
     };
 
+    // A fresh-session swap hands the rebuild an EMPTY attach set rather than the
+    // probe's. The probe's would very nearly do — a `session_gone` verdict means
+    // the roster listed none of this window's sessions — but "very nearly" is
+    // not what the pane's contents should hang on: liveness is judged only over
+    // surfaces that are `core_surface_ready`, so a pane still coming up when the
+    // verdict was taken could otherwise be re-ATTACHed inside a swap whose whole
+    // premise is that nothing is attachable. Empty makes "fresh" mean fresh for
+    // every pane, uniformly.
+    var no_attach = std.StringHashMap(void).init(gpa);
+    defer no_attach.deinit();
+    const attach: ?*const std.StringHashMap(void) =
+        if (fresh_session) &no_attach else probe.attachSet();
+
     const old = window.remote_dialed;
     // The window's transport pointer moves first: every surface the rebuild
     // creates below reads it, as does every future tab or split in this window.
     window.remote_dialed = fresh;
 
-    const attached = app.rebuildWindowInPlace(arena, window, captured, .{
+    // The count is "terminal leaves that now ride the NEW transport", which is
+    // the right success test for BOTH arms — a re-ATTACHed pane and a
+    // freshly-OPENed one are equally riding it, and a swap that produced neither
+    // has nothing to justify retiring the old transport for.
+    const rebuilt = app.rebuildWindowInPlace(arena, window, captured, .{
         .conn = fresh.conn(),
         // Cross-machine: `createWindow` must not hand these panes the LOCAL
         // agent, and `restoreAttachOverride` records the difference on each
         // surface's remote backend.
         .local_agent = false,
-    }, probe.attachSet()) catch |err| {
+    }, attach) catch |err| {
         log.warn("remote reconnect: rebuild failed err={}", .{err});
         window.remote_dialed = old;
         guard.onAbandoned();
         return false;
     };
 
-    if (attached == 0) {
-        // Nothing re-attached, so nothing is riding the new transport and the
-        // old one is still the only thing that knows these sessions. Put it
-        // back and let the ladder count this as a failed attempt.
-        log.warn("remote reconnect: rebuild attached no panes; keeping the old transport", .{});
+    if (rebuilt == 0) {
+        // Nothing came back, so nothing is riding the new transport and the old
+        // one is still the only thing that knows these sessions. Put it back and
+        // let the ladder count this as a failed attempt.
+        log.warn(
+            "remote reconnect: rebuild {s} no panes; keeping the old transport",
+            .{if (fresh_session) "opened" else "attached"},
+        );
         window.remote_dialed = old;
         guard.onAbandoned();
         return false;
@@ -759,16 +821,25 @@ fn applySwap(
 
     rc.attempt = 0;
     rc.due_ms = 0;
+    rc.manual = false;
     setLadder(window, .connected);
     // Not `breaker.reset()`: a swap is not yet proof of recovery. The breaker
     // judges it if and when this link dies — that is what catches a session
     // that probes alive and then kills every connection attached to it.
     rc.breaker.onSwapCompleted(std.time.milliTimestamp());
 
-    log.info(
-        "remote reconnect: '{s}' is back on a fresh transport ({d} pane(s) re-attached)",
-        .{ windowName(window), attached },
-    );
+    if (fresh_session) {
+        log.info(
+            "remote reconnect: '{s}' is back on a fresh transport " ++
+                "({d} pane(s) opened fresh; the recorded sessions are gone)",
+            .{ windowName(window), rebuilt },
+        );
+    } else {
+        log.info(
+            "remote reconnect: '{s}' is back on a fresh transport ({d} pane(s) re-attached)",
+            .{ windowName(window), rebuilt },
+        );
+    }
     return true;
 }
 

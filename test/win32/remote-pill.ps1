@@ -18,23 +18,25 @@
 #   3. DROPPED turns the pill red and MAKES it a button. The agent is killed;
 #      the script polls until the capsule paints red and WM_NCHITTEST answers
 #      HTOBJECT at the same point.
-#   4. The button ACTS. The WM_NCLBUTTONDOWN/UP pair Windows posts after its own
-#      hit test is sent on HTOBJECT, and the app dials IMMEDIATELY - a manual
-#      attempt, distinguishable in the log from an automatic one because an
-#      automatic attempt waits out a backoff and a manual one does not.
+#   4. The button ACTS, and the window COMES BACK. The WM_NCLBUTTONDOWN/UP pair
+#      Windows posts after its own hit test is sent on HTOBJECT; the app dials
+#      IMMEDIATELY - a manual attempt, distinguishable in the log from an
+#      automatic one because an automatic attempt waits out a backoff and a
+#      manual one does not - and the pill goes GREEN again, which is the answer
+#      the button exists to give.
 #   5. A LOCAL window has no pill at all. Same strip of band, plain chrome.
 #
 # LIMITS, stated rather than glossed:
 #   * Section 4 posts the messages the OS would post. It proves the handler is
 #     right; it does not prove Windows routes a real pointer to it (T240).
 #     Section 3's hit-test assertion is what proves the OS would ask.
-#   * Section 4 asserts the ATTEMPT, not the recovery, and that is a statement
-#     about a known bug rather than a weak test: T611. A manual reconnect whose
-#     remote session is gone - which is what a restarted agent and a rebooted
-#     remote box both look like - still takes the driver's `.terminal` arm
-#     instead of opening a fresh shell, so the pill correctly stays red. When
-#     T611 lands, this section goes back to asserting the pill turns green
-#     again, which is the assertion this file was written with first.
+#   * Section 4's recovery arm was suspended between T367 and T611, when a
+#     manual reconnect whose remote session was gone - a restarted agent, a
+#     rebooted box - still took the driver's `.terminal` arm and the pill
+#     correctly stayed red. T611 made the click open a fresh shell per pane, so
+#     the arm is back to the assertion this file was written with first. What
+#     the recovered pane CONTAINS (the same split layout, live shells) is
+#     `remote-reconnect-fresh.ps1`; here it is only the pill.
 #
 # NEGATIVE CONTROL: -NegativeControl inverts section 1 (asserts the connected
 # pill is ABSENT) and MUST fail.
@@ -186,16 +188,17 @@ try {
     Check ($redAt -ge 0) "a dropped link turns the pill red (after ${redAt}s)"
     Check ($hitAt -ge 0) "and makes it a button - WM_NCHITTEST answers HTOBJECT (after ${hitAt}s)"
 
-    # --- 4. the button acts -------------------------------------------------
-    # What "acts" means here is DELIBERATELY the manual attempt and not the
-    # recovery, because the recovery is blocked on T611: a manual reconnect
-    # whose session is gone (which is every restarted agent, and every rebooted
-    # remote box) still takes the driver's `.terminal` arm instead of opening a
-    # fresh shell. Asserting recovery here would be asserting a bug is fixed.
+    # --- 4. the button acts, and the window comes back ----------------------
+    # Two arms, and the second is the one that matters to a user: the click has
+    # to DIAL, and it has to leave the window working. The agent is restarted
+    # before the click, so its sessions are gone - the ordinary case (T611), and
+    # the one the recovery arm was suspended over until the driver learned to
+    # answer it with a fresh shell per pane.
     #
     # The attempt is unambiguous in the log: an automatic ladder attempt waits
     # out a backoff (`in 1000ms`), a MANUAL one dials immediately (`in 0ms`), so
-    # a 0ms line that was not there before the click is the click.
+    # a 0ms line that was not there before the click is the click. The recovery
+    # is measured in PIXELS at the same point section 1 measured green.
     $before4 = 0
     if (Test-Path $applog) {
         $before4 = @(Get-Content $applog | Select-String -Pattern 'attempt 1/5 in 0ms').Count
@@ -215,7 +218,18 @@ try {
         if ($now -gt $before4) { $firedAt = $i; break }
     }
     Check ($firedAt -ge 0) "clicking Reconnect dials immediately - a manual attempt, no backoff (after ${firedAt}s)"
-    if ($firedAt -lt 0 -and (Test-Path $applog)) {
+
+    # ...and the window is LIVE again. The machine is back but its sessions are
+    # not, so this is the fresh-shell swap - the pill going quiet-green is the
+    # window saying it has a working transport under it once more.
+    $greenAt = -1
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 1000
+        if (IsGreenish (PillPixel $sxDot)) { $greenAt = $i; break }
+    }
+    Check ($greenAt -ge 0) "and the window comes BACK - the pill is green again (after ${greenAt}s)"
+
+    if (($firedAt -lt 0 -or $greenAt -lt 0) -and (Test-Path $applog)) {
         Write-Host "  -- app log, remote reconnect lines --"
         Get-Content $applog | Select-String -Pattern 'remote reconnect' | Select-Object -Last 12 | ForEach-Object { "    $($_.Line)" }
     }

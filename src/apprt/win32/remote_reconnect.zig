@@ -364,6 +364,40 @@ pub fn outcomeFromAttempt(dial: DialResult, session_present: ?bool) ProbeOutcome
     };
 }
 
+/// Everything one finished attempt knows, as the DRIVER sees it.
+///
+/// `manual` belongs to the ATTEMPT rather than to the window (T611): a dial is
+/// in flight for seconds, and whether the ladder behind it was started by a
+/// user's click is a fact about the ladder that started it, not about whatever
+/// the window's state has become since. The driver carries it out to the worker
+/// and back for exactly that reason.
+pub const Attempt = struct {
+    dial: DialResult,
+    session_present: ?bool,
+    manual: bool,
+};
+
+/// The outcome an attempt collapsed to, and what to do with it.
+pub const AttemptDecision = struct {
+    outcome: ProbeOutcome,
+    action: OutcomeAction,
+};
+
+/// The WHOLE end-of-attempt rule, in one pure place.
+///
+/// It exists because the composition is where this went wrong: both halves were
+/// already correct and tested, and the driver still called `onProbeOutcome` with
+/// a hardcoded `false`, so a manual reconnect against a machine whose sessions
+/// are gone — a rebooted remote box, the single most common real case — took the
+/// `.terminal` arm and left the window dead (T611). A rule spread across two
+/// pure functions and a call site is only as tested as the call site, and a call
+/// site inside a GUI driver is not testable at all. This is that call site,
+/// moved somewhere it can be asserted.
+pub fn decideAttempt(a: Attempt) AttemptDecision {
+    const outcome = outcomeFromAttempt(a.dial, a.session_present);
+    return .{ .outcome = outcome, .action = onProbeOutcome(outcome, a.manual) };
+}
+
 // =============================================================================
 // Swap ordering
 // =============================================================================
@@ -833,6 +867,78 @@ test "outcomeFromAttempt: an UNKNOWN roster attempts the swap, an empty one does
     try testing.expectEqual(
         OutcomeAction.terminal,
         onProbeOutcome(outcomeFromAttempt(.ok, false), false),
+    );
+}
+
+test "decideAttempt: a clicked reconnect opens a fresh shell where an automatic one gives up" {
+    // T611's whole subject. The two halves of this rule were each correct and
+    // each tested before, and the composition — which is what the driver
+    // actually runs — was not: it passed a hardcoded `false`, so the user's
+    // click could never reach the fresh-session arm.
+    const gone_manual = decideAttempt(.{ .dial = .ok, .session_present = false, .manual = true });
+    try testing.expectEqual(ProbeOutcome.session_gone, gone_manual.outcome);
+    try testing.expectEqual(
+        OutcomeAction{ .swap = .{ .fresh_session = true } },
+        gone_manual.action,
+    );
+
+    // And the automatic ladder still gives up rather than replacing a grid the
+    // user arranged with a wall of empty prompts.
+    const gone_auto = decideAttempt(.{ .dial = .ok, .session_present = false, .manual = false });
+    try testing.expectEqual(ProbeOutcome.session_gone, gone_auto.outcome);
+    try testing.expectEqual(OutcomeAction.terminal, gone_auto.action);
+}
+
+test "decideAttempt: manual changes nothing about any other outcome" {
+    // A click is permission to open a fresh shell, not permission to ignore the
+    // rest of the ladder: an unreachable machine still retries (a click that
+    // landed 200ms before the box finished booting must not be terminal), a 401
+    // is still terminal (no amount of clicking signs anyone in), and a live
+    // session is still RE-ATTACHed rather than replaced.
+    inline for (.{ true, false }) |manual| {
+        try testing.expectEqual(
+            OutcomeAction.retry,
+            decideAttempt(.{ .dial = .failed, .session_present = null, .manual = manual }).action,
+        );
+        try testing.expectEqual(
+            OutcomeAction.terminal,
+            decideAttempt(.{ .dial = .unauthorized, .session_present = null, .manual = manual }).action,
+        );
+        try testing.expectEqual(
+            OutcomeAction{ .swap = .{ .fresh_session = false } },
+            decideAttempt(.{ .dial = .ok, .session_present = true, .manual = manual }).action,
+        );
+        // The tri-state's third leg survives the composition: an UNKNOWN roster
+        // is attempted as a re-ATTACH, never turned into a fresh-shell swap by
+        // a click. The sessions may well still be there.
+        try testing.expectEqual(
+            OutcomeAction{ .swap = .{ .fresh_session = false } },
+            decideAttempt(.{ .dial = .ok, .session_present = null, .manual = manual }).action,
+        );
+    }
+}
+
+test "decideAttempt: a manual ladder that reaches the machine LATE still opens fresh" {
+    // The shape a rebooted remote box actually produces: the click dials while
+    // the box is still coming up (retry), and an attempt behind that click
+    // finally reaches the agent — which now owns nothing. The manual flag has to
+    // survive the retries, or the recovery lands on the one attempt that could
+    // not use it.
+    var attempt: u32 = 1;
+    const manual = true;
+    while (true) {
+        const d = decideAttempt(.{ .dial = .failed, .session_present = null, .manual = manual });
+        try testing.expectEqual(OutcomeAction.retry, d.action);
+        switch (onAttemptFailed(attempt, true)) {
+            .retry => |r| attempt = r.attempt,
+            .exhausted => break,
+        }
+        if (attempt == 3) break;
+    }
+    try testing.expectEqual(@as(u32, 3), attempt);
+    try testing.expectEqual(
+        OutcomeAction{ .swap = .{ .fresh_session = true } },
+        decideAttempt(.{ .dial = .ok, .session_present = false, .manual = manual }).action,
     );
 }
 
