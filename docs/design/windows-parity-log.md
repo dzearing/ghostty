@@ -9,6 +9,31 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-11 - **T255 (T766 filed) - the window that "ignored WM_CLOSE on the
+  test desktop" was showing a dialog nobody could see.** The report had a
+  long-lived Ghoztty window dropping WM_CLOSE and every WM_SYSCOMMAND while
+  still answering hit tests and painting, and blamed the background test
+  desktop; `caption-bar.ps1` SKIPPED its whole window-state section on that
+  basis, leaving the caption buttons' minimize/maximize/close effects and the
+  maximized `WM_NCCALCSIZE` inset with no coverage. The desktop was never
+  involved. `WM_CLOSE` runs `confirmCloseIfNeeded`, which for a pane whose
+  shell has a child raises `ConfirmDialog.show` → `EnableWindow(owner, FALSE)`,
+  and `DefWindowProc` discards every `WM_SYSCOMMAND` for a disabled window —
+  while a second `WM_CLOSE` just raises another dialog, so the state is
+  self-perpetuating. The thread pumps the whole time, which is why blocked
+  looked exactly like wedged. Reproduced on demand and reversed (dismiss the
+  dialog, the same `SC_MINIMIZE` iconifies) in the new
+  `test/win32/window-modal-block.ps1`; `TestDesktop.ps1` gains
+  `Get-TestModalBlocker`/`Clear-TestModalBlocker`, which identify the blocker
+  by behaviour (owner disabled + an owned popup that can take activation)
+  rather than by class, since every overlay this app owns is a visible owned
+  popup too and all are `WS_EX_NOACTIVATE`. `caption-bar.ps1` section 5 is
+  un-SKIPped, 24 → 27 assertions, and a control close that does not close is
+  now interrogated instead of excused. Surprise on the way past:
+  `persistence-flag.ps1` is red at HEAD over four launch sites in
+  `url-scheme.ps1` and `agent-attach-refused.ps1` that this task never
+  touched — filed as T766.
+
 - 2026-08-11 - **T252 (T765 filed) - the two ways win32 chrome repaints are now
   sorted, and the reason we had written down for it was wrong.** Chrome here is
   painted either by invalidating a rect and letting `WM_PAINT` derive the pixels

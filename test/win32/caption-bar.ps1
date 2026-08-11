@@ -274,109 +274,125 @@ try {
     Check ($null -ne $afterC -and $afterC.R -le ($restC.R + 6)) `
         "a release off the button un-lights it and cancels (back to $($afterC.R), rest $($restC.R))"
 
-    # --- 5. the ACTIONS, guarded by a positive control -----------------------
+    # --- 5. the ACTIONS ------------------------------------------------------
     # A caption button's job ends at posting WM_SYSCOMMAND; whether the window
-    # then minimizes is DefWindowProc's business, not ours. On this background
-    # test desktop it is not anybody's business: a plain WM_CLOSE - which has
-    # nothing to do with T254 - does not close a Ghoztty window there either.
-    # So the desktop is asked first, the window-size-memory.ps1 ABORT idiom:
-    # a control that fails means "this desktop cannot adjudicate", not "T254
-    # is broken". Filed as its own task rather than papered over.
-    # The control runs against THIS window and it runs FIRST, because it is
-    # destructive: if a plain WM_CLOSE closes it, the desktop can adjudicate
-    # window-state changes and a relaunched window carries the assertions; if
-    # it does not, nothing about SC_* is decidable here and the section is
-    # SKIPPED with its reason, not silently passed.
+    # then minimizes is DefWindowProc's business, not ours. This section used
+    # to be guarded by an ABORT and SKIPPED wholesale, because a plain
+    # WM_CLOSE - which has nothing to do with T254 - sometimes did not close
+    # the window here, and the desktop was blamed for it.
+    #
+    # T255 measured it: nothing about the desktop is involved. The window was
+    # DISABLED, by the app's own close-confirmation dialog. ConfirmDialog.show
+    # calls EnableWindow(owner, FALSE) for the length of its message loop, and
+    # DefWindowProc discards every WM_SYSCOMMAND for a disabled window - so
+    # SC_MINIMIZE/SC_MAXIMIZE/SC_CLOSE become no-ops while it is up, and a
+    # second WM_CLOSE only re-enters confirmCloseIfNeeded and raises another.
+    # Hit testing and painting keep working throughout, which is what made it
+    # look like a wedge instead of a block. On the interactive desktop you
+    # would simply see the dialog; here nobody does.
+    #
+    # So the control still runs FIRST (it is destructive, and a relaunched
+    # window carries the assertions), but a window that does not close is now
+    # INTERROGATED rather than treated as an unknowable desktop: the one thing
+    # that can block it is named, answered, and reported as a failure. This
+    # window's shell is an idle cmd.exe with no descendants, so
+    # confirmCloseIfNeeded should not prompt at all - a dialog here is a
+    # finding about the product, not a reason to stop testing.
     Send-TestRawMessage -Window $h -Message 0x0010 -WParam ([IntPtr]0) -LParam ([IntPtr]0) | Out-Null
     Start-Sleep -Milliseconds 1800
-    $canAdjudicate = -not (Test-TestWindowExists -Window $h)
-    if ($canAdjudicate) {
-        # The first INSTANCE outlives its last window on purpose
-        # (`quit-after-last-window-closed` defaults to false off Linux, the
-        # Mac idiom), and it still owns the debug IPC pipe - so a relaunch
-        # would single-instance-forward its new-window to the dying process
-        # and exit, and Wait-TestWindow (which filters by the NEW pid) would
-        # report no window. Stop the windowless first instance before
-        # relaunching; it is the exact pid this script started.
-        Stop-Process -Id $proc.Pid -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 600
-        $proc2 = Start-OnTestDesktop -Exe $exe -Arguments @(
-            '--config-default-files=false', '--session-persistence=false',
-            '--background=#000000', '--window-show-tab-bar=never'
-        )
-        $h = Wait-TestWindow -ProcessId $proc2.Pid -Class 'GhozttyWindow' -TimeoutMs 25000
-        if ($h -eq [IntPtr]::Zero) { throw 'SETUP FAIL: relaunch for the action section produced no window' }
-        Start-Sleep -Milliseconds 2500
-        Set-TestWindowSize -Window $h -Width 1100 -Height 700 | Out-Null
-        Start-Sleep -Milliseconds 1000
-    }
-    if (-not $canAdjudicate) {
-        $script:skipped++
-        Write-Host "  SKIP  window-state actions: this window ignores even a plain WM_CLOSE on"
-        Write-Host "        this desktop, so SC_MINIMIZE/SC_MAXIMIZE/SC_CLOSE cannot be"
-        Write-Host "        adjudicated here. The press/release half IS asserted above. T255."
-    } else {
-        ClickCaption $h $HTMINBUTTON $HTMINBUTTON
-        # WS_MINIMIZE, not the rect: the -32000,-32000 caption stub is
-        # Explorer's arrangement, and this desktop has no Explorer - an iconic
-        # window here parks at a real on-screen rect (measured: 0,2066 199x34),
-        # so a rect oracle calls a working minimize broken.
-        $minStyle = Get-TestWindowStyle -Window $h
-        Check (($minStyle -band 0x20000000) -ne 0) "minimize click iconified the window (WS_MINIMIZE set)"
-        Send-TestSysCommand -Window $h -Command 'restore' | Out-Null
-        Start-Sleep -Milliseconds 700
+    # -Answer ok: let a surprise confirmation PROCEED, so the close the control
+    # asked for still happens and the section below runs on a clean relaunch.
+    $blocker = Clear-TestModalBlocker -Window $h -Answer ok
+    if ($blocker -ne 'none') { Start-Sleep -Milliseconds 1500 }
+    Check ($blocker -eq 'none') `
+        "the control close raised no modal dialog on an idle shell (got '$blocker')"
+    Check (-not (Test-TestWindowExists -Window $h)) `
+        "positive control: a plain WM_CLOSE closes the window, so window state IS adjudicable here (T255)"
 
-        ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
-        $zoomed = Test-TestWindowZoomed -Window $h
-        Check $zoomed "maximize click maximized the window"
+    # The first INSTANCE outlives its last window on purpose
+    # (`quit-after-last-window-closed` defaults to false off Linux, the
+    # Mac idiom), and it still owns the debug IPC pipe - so a relaunch
+    # would single-instance-forward its new-window to the dying process
+    # and exit, and Wait-TestWindow (which filters by the NEW pid) would
+    # report no window. Stop the windowless first instance before
+    # relaunching; it is the exact pid this script started.
+    Stop-Process -Id $proc.Pid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 600
+    $proc2 = Start-OnTestDesktop -Exe $exe -Arguments @(
+        '--config-default-files=false', '--session-persistence=false',
+        '--background=#000000', '--window-show-tab-bar=never'
+    )
+    $h = Wait-TestWindow -ProcessId $proc2.Pid -Class 'GhozttyWindow' -TimeoutMs 25000
+    if ($h -eq [IntPtr]::Zero) { throw 'SETUP FAIL: relaunch for the action section produced no window' }
+    Start-Sleep -Milliseconds 2500
+    Set-TestWindowSize -Window $h -Width 1100 -Height 700 | Out-Null
+    Start-Sleep -Milliseconds 1000
 
-        # --- 6. maximized, the caption is still on screen --------------------
-        if ($zoomed) {
-            # A maximized window's FRAME legitimately hangs off every monitor
-            # edge (rect top is -sysFrameY); what must be on screen is the
-            # CLIENT area, whose top row is the caption band's first row -
-            # that is exactly what the WM_NCCALCSIZE maximized inset exists
-            # to guarantee, and what these two assert.
-            $mw = Get-TestWindowRect -Window $h
-            $mcli = Get-TestWindowRect -Window $h -Client
-            $work = Get-TestWorkArea
-            Check ($mcli.Top -ge $work.Top) `
-                "maximized: the caption row is on screen (client top $($mcli.Top) vs work top $($work.Top))"
-            # Scan from the CLIENT top, not the window top: the rows above it
-            # are the off-screen frame, which PrintWindow renders black, and
-            # counting them measured the frame instead of the band.
-            $mshot = Get-TestWindowPixels -Window $h
-            $mProbe = $mw.Left + [int]($mw.Width / 2)
-            $mChrome = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + 2)
-            $mEdge = -1
-            for ($y = 0; $y -lt 200; $y++) {
-                $c = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + $y)
-                if ($null -eq $c) { break }
-                $d = [math]::Abs($c.R - $mChrome.R) + [math]::Abs($c.G - $mChrome.G) + [math]::Abs($c.B - $mChrome.B)
-                if ($d -gt 24) { $mEdge = $y; break }
-            }
-            Close-TestWindowPixels $mshot
-            Check ($mEdge -ge $expectCapH) `
-                "maximized: the whole caption band is painted on screen (band bottom $mEdge >= $expectCapH)"
-        } else {
-            Bad "maximized: caption-on-screen check could not run"
+    ClickCaption $h $HTMINBUTTON $HTMINBUTTON
+    # WS_MINIMIZE, not the rect: the -32000,-32000 caption stub is
+    # Explorer's arrangement, and this desktop has no Explorer - an iconic
+    # window here parks at a real on-screen rect (measured: 0,2066 199x34),
+    # so a rect oracle calls a working minimize broken.
+    $minStyle = Get-TestWindowStyle -Window $h
+    Check (($minStyle -band 0x20000000) -ne 0) "minimize click iconified the window (WS_MINIMIZE set)"
+    Send-TestSysCommand -Window $h -Command 'restore' | Out-Null
+    Start-Sleep -Milliseconds 700
+
+    ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
+    $zoomed = Test-TestWindowZoomed -Window $h
+    Check $zoomed "maximize click maximized the window"
+
+    # --- 6. maximized, the caption is still on screen ------------------------
+    if ($zoomed) {
+        # A maximized window's FRAME legitimately hangs off every monitor
+        # edge (rect top is -sysFrameY); what must be on screen is the
+        # CLIENT area, whose top row is the caption band's first row -
+        # that is exactly what the WM_NCCALCSIZE maximized inset exists
+        # to guarantee, and what these two assert.
+        $mw = Get-TestWindowRect -Window $h
+        $mcli = Get-TestWindowRect -Window $h -Client
+        $work = Get-TestWorkArea
+        Check ($mcli.Top -ge $work.Top) `
+            "maximized: the caption row is on screen (client top $($mcli.Top) vs work top $($work.Top))"
+        # Scan from the CLIENT top, not the window top: the rows above it
+        # are the off-screen frame, which PrintWindow renders black, and
+        # counting them measured the frame instead of the band.
+        $mshot = Get-TestWindowPixels -Window $h
+        $mProbe = $mw.Left + [int]($mw.Width / 2)
+        $mChrome = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + 2)
+        $mEdge = -1
+        for ($y = 0; $y -lt 200; $y++) {
+            $c = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + $y)
+            if ($null -eq $c) { break }
+            $d = [math]::Abs($c.R - $mChrome.R) + [math]::Abs($c.G - $mChrome.G) + [math]::Abs($c.B - $mChrome.B)
+            if ($d -gt 24) { $mEdge = $y; break }
         }
-
-        ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
-        Check (-not (Test-TestWindowZoomed -Window $h)) "a second maximize click restored the window"
-
-        ClickCaption $h $HTCLOSE $HTMINBUTTON
-        Check (Test-TestWindowExists -Window $h) `
-            "a close PRESS released over minimize does not close the window"
-
-        ClickCaption $h $HTCLOSE $HTCLOSE
-        Start-Sleep -Milliseconds 900
-        Check (-not (Test-TestWindowExists -Window $h)) "close click closed the window"
+        Close-TestWindowPixels $mshot
+        Check ($mEdge -ge $expectCapH) `
+            "maximized: the whole caption band is painted on screen (band bottom $mEdge >= $expectCapH)"
+    } else {
+        Bad "maximized: caption-on-screen check could not run"
     }
+
+    ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
+    Check (-not (Test-TestWindowZoomed -Window $h)) "a second maximize click restored the window"
+
+    ClickCaption $h $HTCLOSE $HTMINBUTTON
+    Check (Test-TestWindowExists -Window $h) `
+        "a close PRESS released over minimize does not close the window"
+
+    ClickCaption $h $HTCLOSE $HTCLOSE
+    Start-Sleep -Milliseconds 900
+    # Same interrogation as the control: if the close did not take, say WHAT
+    # held it rather than leaving a bare "closed the window" failure to guess at.
+    $endBlocker = Clear-TestModalBlocker -Window $h -Answer ok
+    if ($endBlocker -ne 'none') { Start-Sleep -Milliseconds 1500 }
+    Check ($endBlocker -eq 'none') "the close click raised no modal dialog (got '$endBlocker')"
+    Check (-not (Test-TestWindowExists -Window $h)) "close click closed the window"
 
     Write-Host ""
     if ($script:fail -eq 0) {
-        Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))"
+        Write-Host "ALL PASS ($script:pass assertions)"
         $exitCode = 0
     } else {
         Write-Host "$script:fail FAILURE(S) ($script:pass passed)"

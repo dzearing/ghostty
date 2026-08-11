@@ -2324,6 +2324,95 @@ function Send-TestWindowClose {
 }
 
 <#
+T255. The hwnd of a MODAL dialog the app has put in front of $Window, or
+IntPtr::Zero when there is none.
+
+This is the answer to "why does this window ignore everything I post at it".
+`ConfirmDialog.show` calls `EnableWindow(owner, FALSE)` for the length of its
+own message loop, and a DISABLED window is one `DefWindowProc` discards every
+`WM_SYSCOMMAND` for - so SC_MINIMIZE / SC_MAXIMIZE / SC_RESTORE / SC_CLOSE all
+become no-ops while it is up, and a second WM_CLOSE only re-enters
+`confirmCloseIfNeeded` and raises another one. Meanwhile `WM_NCHITTEST`,
+`WM_PAINT` and our own `WM_NCLBUTTONDOWN` handler all keep answering, because
+the thread is pumping perfectly well. The window is not wedged; it is blocked.
+
+On the INTERACTIVE desktop that state is obvious - there is a dialog on screen.
+On a background test desktop nobody sees it, which is how it read for a while
+as "this desktop cannot adjudicate window state" (the original T255 report).
+Measured: a pane whose shell has a child process ("ping -n 60 127.0.0.1")
+answers WM_CLOSE with enabled=False + a GhozttyConfirmDialog and ignores
+SC_MINIMIZE; dismiss the dialog and the same SC_MINIMIZE iconifies the window.
+
+Identified by BEHAVIOUR, not by class - so it finds the confirm dialog, the
+rename dialog and anything else modal, with no list to keep in sync:
+
+  1. the window must be DISABLED. That is what "blocked" means here, and it
+     is the whole reason the posted commands vanish.
+  2. among its owned, visible top-levels, the blocker is one that can take
+     ACTIVATION. Every overlay this app owns - the scrollbar, the banner, the
+     dim layer, the key-state indicator - is a visible owned popup too, and
+     they are all WS_EX_NOACTIVATE precisely so they never steal focus. A
+     window that cannot be activated cannot be the thing holding a modal
+     loop, so that bit is the discriminator rather than a class allowlist.
+#>
+function Get-TestModalBlocker {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    if (-not (Test-TestWindowExists -Window $Window -Desktop $Desktop)) { return [IntPtr]::Zero }
+    if (Test-TestWindowEnabled -Window $Window -Desktop $Desktop) { return [IntPtr]::Zero }
+    $WS_EX_NOACTIVATE = 0x08000000
+    # ProcessId 0 = every process on the desktop. An owned dialog belongs to
+    # the same process in practice, but the owner test is the real filter and
+    # asking for all of them keeps this honest if that ever stops being true.
+    foreach ($w in (Get-TestWindows -ProcessId 0 -Class '*' -Desktop $Desktop)) {
+        $h = [IntPtr]$w.Hwnd
+        if ($h -eq $Window) { continue }
+        if ((Get-TestWindowOwner -Window $h -Desktop $Desktop) -ne $Window) { continue }
+        if (((Get-TestWindowStyle -Window $h -ExStyle -Desktop $Desktop) -band $WS_EX_NOACTIVATE) -ne 0) { continue }
+        return $h
+    }
+    return [IntPtr]::Zero
+}
+
+<#
+T255. Clear whatever modal dialog is blocking $Window and hand back what was
+found, so a test can drive window state instead of guessing why it cannot.
+
+Returns a string: 'none' (nothing was blocking), or "<class>" of the dialog it
+dismissed, or "<class>:stuck" if the dialog outlived the dismissal. Answering
+with the class rather than a bool is deliberate - a script that had to clear a
+dialog should be able to SAY which one in its output, because a confirm dialog
+appearing where none was expected is itself a finding.
+
+-Answer cancel (the default) posts WM_CLOSE, which every dialog here treats as
+its cancel path, so the blocked window is left in the state the test set up.
+-Answer ok presses the default button instead, for a test that WANTS the
+confirmed action to proceed.
+#>
+function Clear-TestModalBlocker {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [ValidateSet('cancel', 'ok')][string]$Answer = 'cancel',
+        [int]$TimeoutMs = 3000,
+        $Desktop
+    )
+    $dlg = Get-TestModalBlocker -Window $Window -Desktop $Desktop
+    if ($dlg -eq [IntPtr]::Zero) { return 'none' }
+    $cls = Get-TestWindowClass -Window $dlg -Desktop $Desktop
+    if ($Answer -eq 'ok') {
+        # IDOK through the dialog's own command path. WM_CLOSE would cancel.
+        Send-TestKeys -Window $dlg -Key 'RETURN' -Desktop $Desktop | Out-Null
+    } else {
+        Send-TestWindowClose -Window $dlg -Desktop $Desktop | Out-Null
+    }
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ([Environment]::TickCount -lt $deadline) {
+        if (-not (Test-TestWindowExists -Window $dlg -Desktop $Desktop)) { return $cls }
+        Start-Sleep -Milliseconds 100
+    }
+    return "${cls}:stuck"
+}
+
+<#
 Activate a BUTTON control (BM_CLICK), for a script whose claim is about what
 the button DOES rather than about hit testing. Sent, not posted, so the
 handler has already run when this returns.
