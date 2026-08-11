@@ -78,6 +78,10 @@
 #      window. This is the case that makes the fix owner-RELATIVE.
 #   F. the same healing reaches the dim overlay and the scrollbar popup,
 #      which share the helper.
+#   G. (T180) so does the hovered-URL bubble, which T142 skipped as
+#      "short-lived" - only its visibility is; the HWND outlives every hover.
+#   H. (T180) the quick terminal, which topmosts ITSELF, keeps both its own
+#      band and the propagated bit on its owned popup across a heal.
 #
 # Only touches ghoztty processes running from this repo's zig-out.
 param(
@@ -178,7 +182,8 @@ try {
     $app = Start-OnTestDesktop -Exe $exe -Arguments @(
         '--background=#101014',
         '--session-persistence=false',
-        '--keybind=ctrl+shift+f9=toggle_window_float_on_top')
+        '--keybind=ctrl+shift+f9=toggle_window_float_on_top',
+        '--keybind=ctrl+shift+f10=toggle_quick_terminal')
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
     $appPid = $app.Pid
@@ -430,6 +435,148 @@ try {
             $sbHealed = (-not (Test-Topmost $sbHwnd))
         }
         Assert $sbHealed 'F/scrollbar: reposition cleared the stray WS_EX_TOPMOST'
+    }
+
+    # -----------------------------------------------------------------------
+    # G (T180). The hovered-URL bubble is on the list too.
+    #
+    # T142 skipped it as a "short-lived popup". Only its VISIBILITY is short:
+    # the HWND is created on the first link hover and lives until the surface
+    # is destroyed (Surface.deinit), so a stray topmost on it survives every
+    # later hover - the same permanent defect sections B/C are about, on a
+    # popup that appears over whatever the user is reading.
+    #
+    # Driving it needs a CTRL-HELD hover: both link paths in core
+    # (`linkAtPos`) gate on ctrlOrSuper, and the win32 side reads the modifier
+    # with GetKeyState - which is why this is posted through Send-TestMouse
+    # (AttachThreadInput + SetKeyboardState), MEASURED to work here before the
+    # section was written. The bubble is a STATIC popup owned by the window and
+    # is identified by its TEXT being the URL, which is what tells it apart
+    # from the resize overlay (also a STATIC popup, owned by the same window).
+    # -----------------------------------------------------------------------
+    # Its OWN window: section F split oz1, so "the focused pane of oz1" is no
+    # longer $paneA and a send-keys against the window would print the URL
+    # into the wrong pane.
+    & $exe +new-window --target=oz3 | Out-Null
+    $winC = Wait-Win 'oz3'
+    $C = if ($winC) { [IntPtr]([int64]$winC.id) } else { [IntPtr]::Zero }
+    $paneC = if ($C -ne [IntPtr]::Zero) { Get-TestChildWindow -Window $C -Class 'GhozttyTerminal' } else { [IntPtr]::Zero }
+    if ($paneC -eq [IntPtr]::Zero) {
+        Write-Host 'SKIP G: could not open oz3 for the hovered-URL bubble'
+    } else {
+    Set-TestWindowPos -Window $C -X 140 -Y 140 -Width 900 -Height 600 | Out-Null
+    Start-Sleep -Milliseconds 600
+    & $exe +send-keys --target=oz3 'echo https://example.com/t180-bubble' Enter | Out-Null
+    Start-Sleep -Seconds 2
+    $paneRect = Get-TestWindowRect -Window $paneC
+    function Get-UrlBubble {
+        foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'Static' -AllowHidden)) {
+            if ((Get-TestWindowText -Window ([IntPtr]$w.Hwnd)) -like 'http*') { return $w }
+        }
+        return $null
+    }
+    # Scan the pane for the printed URL: the cell the link sits in is not
+    # something the harness can compute (font metrics, prompt length), so the
+    # hover walks a coarse grid until the bubble appears.
+    $hitX = 0; $hitY = 0
+    $bubble = $null
+    :hover for ($y = $paneRect.Top + 8; $y -lt $paneRect.Top + 300 -and -not $bubble; $y += 14) {
+        for ($x = $paneRect.Left + 8; $x -lt $paneRect.Left + 420; $x += 24) {
+            Send-TestMouse -Window $C -Target $paneC -X $x -Y $y -Action move -Modifiers ctrl | Out-Null
+            $b = Get-UrlBubble
+            if ($b) { $bubble = $b; $hitX = $x; $hitY = $y; break hover }
+        }
+    }
+    if (-not $bubble) {
+        Write-Host 'SKIP G: the ctrl-hover never raised the hovered-URL bubble - no T180 verdict'
+    } else {
+        $bubbleHwnd = [IntPtr]$bubble.Hwnd
+        Assert ((Get-TestWindowOwner -Window $bubbleHwnd) -eq [int64]$C) 'G: the hovered-URL bubble is OWNED by oz3'
+        Assert (-not (Test-Topmost $bubbleHwnd)) 'G: the bubble is not topmost to begin with'
+
+        Set-TestWindowTopmost -Window $bubbleHwnd -On $true | Out-Null
+        Start-Sleep -Milliseconds 300
+        if (-not (Test-Topmost $bubbleHwnd)) {
+            Write-Host 'SKIP G: injection did not stick on the bubble'
+        } else {
+            Assert $true 'G: injection took (bubble now carries WS_EX_TOPMOST)'
+            # Off the link and back on: the core dedupes a hover that stays in
+            # the same CELL, so leaving and returning is what guarantees a
+            # fresh setMouseOverLink - the reposition this task adds the heal
+            # to. (Moving off also clears the bubble, which is the hide path.)
+            Send-TestMouse -Window $C -Target $paneC -X ($paneRect.Right - 24) -Y $hitY -Action move -Modifiers ctrl | Out-Null
+            Start-Sleep -Milliseconds 300
+            Send-TestMouse -Window $C -Target $paneC -X $hitX -Y $hitY -Action move -Modifiers ctrl | Out-Null
+            $bubbleHealed = $false
+            for ($t = 0; $t -lt 25 -and -not $bubbleHealed; $t++) {
+                Start-Sleep -Milliseconds 200
+                $bubbleHealed = (-not (Test-Topmost $bubbleHwnd))
+            }
+            Assert $bubbleHealed 'G: re-hovering the link cleared the stray WS_EX_TOPMOST on the bubble'
+            $zBub = Get-TestZIndex -Window $bubbleHwnd
+            $zC = Get-TestZIndex -Window $C
+            Assert ($zBub -ge 0 -and $zBub -lt $zC) "G: the bubble is still above its own window after healing (bubble=$zBub < oz3=$zC)"
+        }
+    }
+    }
+
+    # -----------------------------------------------------------------------
+    # H (T180). The quick terminal is the case the owner-RELATIVE rule exists
+    # to protect, and section E cannot reach it when float-on-top is unwell.
+    # The quick terminal topmosts ITSELF (QuickTerminal.animateIn ->
+    # w32.setTopmost), Windows propagates the bit to its owned popups, and the
+    # heal must leave BOTH alone: demoting an owned popup drags its owner out
+    # of the topmost band with it, so a heal that "fixed" the propagated bit
+    # would silently un-float the quick terminal.
+    #
+    # The scrollbar is the popup used here because every surface creates one -
+    # no banner has to be set on a window +list may not name.
+    # -----------------------------------------------------------------------
+    $before = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' -AllowHidden | ForEach-Object { $_.Hwnd })
+    if (-not (Set-Active $A $paneA)) {
+        Write-Host 'SKIP H: could not activate oz1 to send it the quick-terminal keybind'
+    } else {
+        Send-TestKeys -Window $A -Target $paneA -Key F10 -Modifiers ctrl, shift | Out-Null
+        $qt = [IntPtr]::Zero
+        for ($t = 0; $t -lt 30 -and $qt -eq [IntPtr]::Zero; $t++) {
+            Start-Sleep -Milliseconds 200
+            foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' -AllowHidden)) {
+                if ($before -notcontains $w.Hwnd) { $qt = [IntPtr]$w.Hwnd; break }
+            }
+        }
+        if ($qt -eq [IntPtr]::Zero) {
+            Write-Host 'SKIP H: the quick terminal never appeared'
+        } elseif (-not (Test-Topmost $qt)) {
+            Write-Host 'SKIP H: the quick terminal came up NON-topmost, so the "legitimate topmost owner" case cannot be set up here'
+        } else {
+            Assert $true 'H: the quick terminal is topmost (positive control)'
+            $qtSb = $null
+            for ($t = 0; $t -lt 25 -and -not $qtSb; $t++) {
+                foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyScrollbar' -AllowHidden)) {
+                    if ((Get-TestWindowOwner -Window ([IntPtr]$w.Hwnd)) -eq [int64]$qt) { $qtSb = $w; break }
+                }
+                if (-not $qtSb) { Start-Sleep -Milliseconds 200 }
+            }
+            if (-not $qtSb) {
+                Write-Host 'SKIP H: the quick terminal has no owned scrollbar popup to heal'
+            } else {
+                $qtSbHwnd = [IntPtr]$qtSb.Hwnd
+                $propagated = Test-Topmost $qtSbHwnd
+                Assert $propagated 'H: the quick terminal float propagates to its owned popup (positive control)'
+                if ($propagated) {
+                    # A resize runs the layout path, which repositions the
+                    # scrollbar - and therefore heals it.
+                    $qtRect = Get-TestWindowRect -Window $qt
+                    Set-TestWindowPos -Window $qt -X $qtRect.Left -Y $qtRect.Top `
+                        -Width ($qtRect.Right - $qtRect.Left - 40) -Height ($qtRect.Bottom - $qtRect.Top) | Out-Null
+                    Start-Sleep -Milliseconds 1200
+                    Assert (Test-Topmost $qtSbHwnd) 'H: the heal PRESERVED the propagated topmost bit on the quick terminal popup'
+                    Assert (Test-Topmost $qt) 'H: the quick terminal itself was never dragged out of the topmost band'
+                }
+            }
+            Send-TestKeys -Window $A -Target $paneA -Key F10 -Modifiers ctrl, shift | Out-Null
+            Start-Sleep -Milliseconds 800
+        }
     }
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'

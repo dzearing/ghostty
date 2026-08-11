@@ -1198,6 +1198,11 @@ pub fn healOverlayZOrders(self: *Surface) void {
     if (self.readonly_badge) |b| w32.healOverlayZOrder(b.hwnd, owner);
     if (self.key_state_indicator) |k| w32.healOverlayZOrder(k.hwnd, owner);
     if (self.scrollbar) |s| w32.healOverlayZOrder(s.hwnd, owner);
+    // The hovered-URL bubble belongs on this list too (T180). It was left out
+    // of T142 as a "short-lived popup", but only its VISIBILITY is short-lived:
+    // the HWND is created on the first link hover and lives until the surface
+    // is destroyed, so a stray topmost on it outlives every hover that follows.
+    if (self.link_preview_hwnd) |h| w32.healOverlayZOrder(h, owner);
 }
 
 /// Set (or clear, with null/empty text) this pane's sticky banner (T35).
@@ -1911,6 +1916,13 @@ pub fn setMouseOverLink(self: *Surface, url: []const u8) void {
     _ = w32.ClientToScreen(hwnd, &pt);
     _ = w32.SetWindowPos(preview, null, pt.x, pt.y, pw, ph, w32.SWP_NOACTIVATE | w32.SWP_NOZORDER);
     _ = w32.ShowWindow(preview, w32.SW_SHOWNOACTIVATE);
+    // AFTER the show, because the show is half the reason to heal (T180):
+    // `SW_SHOWNOACTIVATE` lifts a popup to the top of the non-topmost band,
+    // and a link hovered in a BACKGROUND window then parks its bubble over
+    // whatever application is actually in front. The other half is the stray
+    // `WS_EX_TOPMOST` T142 was filed for, which on this popup would survive
+    // every later hover — see `overlay_zorder.zig` for both.
+    w32.healOverlayZOrder(preview, hwnd);
 }
 
 /// Store the total match count from the search_total action and refresh

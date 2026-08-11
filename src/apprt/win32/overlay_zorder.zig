@@ -1,6 +1,8 @@
 //! Z-order policy for the win32 layered overlays — the banner strip
 //! (`BannerOverlay`), the dim overlay (`DimOverlay`), the themed scrollbar
-//! (`Scrollbar`) and the resize overlay (`Window.showResizeOverlay`). All of
+//! (`Scrollbar`), the read-only badge, the key-state indicator, the
+//! hovered-URL bubble (`Surface.setMouseOverLink`, T180) and the resize
+//! overlay (`Window.showResizeOverlay`). All of
 //! them are `WS_POPUP` windows owned by the pane/window they decorate, which
 //! is what keeps them glued above the terminal content: Windows never lets
 //! an owned window sink below its owner, so the *relative* ordering is an

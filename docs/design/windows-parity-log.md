@@ -14670,3 +14670,39 @@ WebView2 click in `ViewerPane.zig`'s host-floor test, which routes
 `focus:ghoztty://focus/dev` into the link sink and thereby also proves the
 sanitizer change (a stripped href would leave no anchor to click). All three
 floor lanes PASS, P1–P3 ALL PASS.
+
+
+## 2026-08-10 - T180: the hovered-URL bubble joins the z-order heal (and there is no pane drag preview)
+
+T180 was filed as a 15-minute check on two popups T142 had skipped as
+"short-lived". The first of them is not what the task says it is: `Surface.zig`
+at the filing commit is `setMouseOverLink` - the **hovered-URL bubble**, the
+browser-style popup naming the link under the pointer - and no pane drag preview
+popup exists anywhere in `src/apprt/win32`. It is also not short-lived: the HWND
+is created on the first link hover and destroyed only in `Surface.deinit`, so a
+stray `WS_EX_TOPMOST` on it lasts for the life of the pane, and it is shown with
+`SW_SHOWNOACTIVATE`, which lifts a popup to the top of the non-topmost band.
+Hover a link in a BACKGROUND Ghoztty window and its bubble parks over whichever
+application is actually in front - failure mode 2 from `overlay_zorder.zig`,
+verbatim, on the one popup nobody was healing.
+
+So it heals now, on both paths every other owned popup already uses: after the
+show in `setMouseOverLink`, and from `Surface.healOverlayZOrders` so a window
+activation heals it too.
+
+The quick-terminal half needed no change, and is confirmed rather than reasoned:
+`healOverlayZOrder`'s only `SetWindowPos` target is the overlay, never the owner,
+and `isStray` leaves a propagated bit alone.
+
+Evidence: two new sections in `test/win32/overlay-zorder.ps1`, **ALL PASS (34
+assertions)**. G prints a URL, raises the bubble with a posted CTRL-hover
+(measured to work on the background desktop before the section was written -
+both link paths in core gate on ctrlOrSuper), injects a stray topmost, and
+requires a re-hover to clear it; it is teeth-checked, going red on exactly that
+assertion when built with the heal disabled. H toggles the quick terminal and
+requires that a heal leave BOTH its own band and the propagated bit on its owned
+popup untouched - which incidentally reaches the legitimate-topmost-owner case
+section E has been SKIPping since T277, because the quick terminal's
+`setTopmost` sticks where `toggle_window_float_on_top` does not (filed as
+**T720**). Remaining unhealed popups swept and filed as **T721**. All three
+floor lanes PASS, P1-P3 ALL PASS.
