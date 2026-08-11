@@ -5058,10 +5058,12 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         pal.text_secondary.b,
     );
 
-    // Close button colors. The hover red is the palette's `danger`, i.e. the
-    // same red the caption's close button fills with.
+    // Close button colors. The hover red is the palette's `danger_ink` — the
+    // same red as the caption close button's fill, resolved for a MARK on the
+    // band instead of a fill under a white glyph (T528): this one has to lift
+    // 3:1 off the bar, and nothing is ever drawn on top of it.
     const close_normal_color = inactive_text_color;
-    const close_hover_color = w32.RGB(pal.danger.r, pal.danger.g, pal.danger.b);
+    const close_hover_color = w32.RGB(pal.danger_ink.r, pal.danger_ink.g, pal.danger_ink.b);
 
     // --- Fill bar background ---
     // Straight into the DIB rather than FillRect: the tab compositing below

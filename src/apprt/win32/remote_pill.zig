@@ -294,21 +294,23 @@ pub const Ink = struct {
 /// from the tint, so the label carries the 4.5:1 text floor against the surface
 /// it is really drawn on. The action mode fills solid `pal.danger` — the same
 /// red the caption's close-hover uses, so there is one red in the chrome and
-/// not two — and takes its foreground from the SHADED fill rather than the
-/// palette's `on_danger`, which was resolved against the unshaded red and so
-/// answers for a surface the hovered pill no longer has.
+/// not two — and takes the same white foreground with it.
+///
+/// White, not `contrastForeground(fill)` (T528). A searched foreground on a red
+/// fill is exactly what put a BLACK X on the caption's close button: the red is
+/// resolved to carry white, so a foreground that re-decides per state can only
+/// disagree with the fill's own constraint. It firms DARKER on hover and press
+/// for the same reason the caption slab does — a saturated fill that lightens
+/// walks toward the ceiling white needs, and away from the color it is.
 pub fn ink(bar: Rgb, pal: chrome_theme.Palette, mode: Mode, state: icon_button.State) Ink {
     if (mode == .disconnected) {
-        // Hover and press firm the red up the way every other chrome control
-        // firms its fill, through the shared delta rather than a second curve.
-        const d = if (icon_button.paintsFill(state)) icon_button.fillDelta(state, true) else 0;
+        const d = if (icon_button.paintsFill(state)) icon_button.fillDelta(state, false) else 0;
         const fill: Rgb = .{
             .r = icon_button.shadeChannel(pal.danger.r, d),
             .g = icon_button.shadeChannel(pal.danger.g, d),
             .b = icon_button.shadeChannel(pal.danger.b, d),
         };
-        const fg = color_math.contrastForeground(fill);
-        return .{ .fill = fill, .mark = fg, .text = fg };
+        return .{ .fill = fill, .mark = pal.on_danger, .text = pal.on_danger };
     }
 
     // The quiet modes have NO interaction states, and that is not an oversight
@@ -549,6 +551,16 @@ test "ink: every state clears its contrast floor on a sweep of bands" {
                     // fill they are really drawn on, in every state.
                     try testing.expect(ratio(c.mark, c.fill) >= mark_floor);
                     try testing.expect(ratio(c.text, c.fill) >= text_floor);
+
+                    // And the red capsule carries the chrome's one destructive
+                    // foreground in EVERY state (T528) — a searched one flips
+                    // to black the moment a lit fill crosses the crossover,
+                    // which is the caption close button's defect wearing the
+                    // pill's shape.
+                    if (mode == .disconnected) {
+                        try testing.expectEqual(pal.on_danger, c.text);
+                        try testing.expectEqual(pal.on_danger, c.mark);
+                    }
                 }
             }
         }

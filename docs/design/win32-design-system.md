@@ -146,6 +146,30 @@ both floors — so a light theme took the sublines, the status rings and the
 glyphs out together (T310). Derive de-emphasized foregrounds from the surface
 (`chrome_theme.textSecondaryOn`) and let the search enforce the floor.
 
+**Where a CONVENTION names the foreground, cap the fill instead of searching
+the foreground** (T528). The close button's X is white on its red hover in
+every native Windows window, so white is the spec and the only free variable
+left is the red. Letting the search decide the foreground instead produced a
+**black** X on a mid-dark band — legally, at 4.9:1 — because the red had
+already been lightened past white's reach on its way to clearing 3:1 off the
+band. Two correct rules, one wrong button, and no floor to catch it.
+
+So the destructive FILL and the destructive MARK are two derivations, not one
+color used twice:
+
+| Palette entry | Role | Rule |
+|---|---|---|
+| `danger` | a FILL under a white glyph (caption close hover, the connection pill's Reconnect) | luminance capped so **white** clears 4.5:1 on it (`chrome_theme.dangerFillOn`) |
+| `on_danger` | the foreground on `danger` | **white**, always |
+| `danger_ink` | a red MARK on the band (the tab strip's close glyph) | 3:1 off the bar like any other chrome glyph |
+
+The general form: when a fill's foreground is fixed by convention, the fill is
+what must move. Where the cap and the 3:1 lift cannot both hold — a band around
+`#2F2F2F`..`#595959`, where no red is light enough to clear the band and dark
+enough to carry white — the convention wins and the fill sits at the cap. A red
+slab still reads as a red slab against a grey band, which no luminance ratio
+measures; a black X on it is a defect a user reports.
+
 ### 2.4 Type ramp
 
 **Three sizes, one module: `src/apprt/win32/type_ramp.zig`.**
@@ -551,8 +575,9 @@ The minimize/maximize/close trio is a **NAMED platform exception** to the
 28-square / 4-DIP-gap rules: it paints as **native Windows 11 caption
 buttons** — 46 DIP wide, full band height, flush to the window's top and right
 edges, ZERO gaps between them, rectangular hover/pressed fills (square
-corners, no inset), close hovering the palette's `danger` red with an
-`on_danger` glyph. T254 originally drew the trio as the app's own rounded
+corners, no inset), close hovering the palette's `danger` red with its
+**white** `on_danger` glyph (§2.3 — the convention names that foreground, so
+the red is what the contrast search may move). T254 originally drew the trio as the app's own rounded
 squares; the user saw it against a real Win11 titlebar and overrode it
 (2026-08-05): *"the minimize/restore/close buttons at the top right do not
 match the windows 11 look and feel. This makes the app seem off."* The trio

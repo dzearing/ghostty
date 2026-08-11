@@ -397,6 +397,47 @@ pub fn contrastAdjustedTo(base: Rgb, bg: Rgb, target: f64) Rgb {
     return contrastForeground(bg);
 }
 
+/// `base` darkened along its own CIELAB lightness axis — hue and chroma
+/// preserved — until its WCAG luminance is at or under `max_lum`. Unchanged
+/// when it already is.
+///
+/// The sibling of `contrastAdjustedTo`, and the half that one cannot express:
+/// that function asks "how far must this color move to read against THAT
+/// surface", and answers with the nearest lightness in either direction. This
+/// one states a CEILING the color may not cross whatever the surface wants —
+/// which is what "white must read on this fill" means (T528). A ceiling on the
+/// fill and a searched foreground are not interchangeable: letting the
+/// foreground flip is how the close button's X turned black on a red hover
+/// while every contrast floor still passed.
+///
+/// The search evaluates the QUANTIZED color, not the continuous one, so the
+/// 8-bit result it returns is itself under the cap — a continuous search can
+/// round back over the line it was enforcing.
+pub fn cappedLuminance(base: Rgb, max_lum: f64) Rgb {
+    if (wcagLuminance(base) <= max_lum) return base;
+
+    var lab: Lab = .fromRgb(base);
+    // L* = 0 is black, whose luminance is 0 and so under any non-negative cap:
+    // the direction always has an answer, unlike `searchLightness`.
+    var lo: f64 = 0;
+    var hi: f64 = lab.l;
+    var best_l: f64 = 0;
+
+    for (0..30) |_| {
+        const mid = (lo + hi) / 2.0;
+        lab.l = mid;
+        if (wcagLuminance(lab.toRgb()) <= max_lum) {
+            best_l = mid;
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    lab.l = best_l;
+    return lab.toRgb();
+}
+
 /// Binary-search `base`'s CIELAB lightness toward black (`darker`) or white,
 /// hue and chroma preserved, for the SMALLEST change that clears
 /// `contrast_target` against `bg_lum`. Null when even the endpoint of that
@@ -695,6 +736,49 @@ test "contrastAdjustedTo: a lower floor moves the color less" {
     // Both cleared their own floor, and the 3.0 answer stayed closer to the
     // color the user picked.
     try testing.expect(r3 < r45);
+}
+
+test "cappedLuminance: the ceiling holds on the 8-bit color it returns" {
+    // The ceiling white needs to read at 4.5:1 (T528's whole point).
+    const cap: f64 = 1.05 / 4.5 - 0.05;
+    const white: Rgb = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+
+    // A color already under the cap comes back untouched — no gratuitous
+    // re-quantization of a color that was fine.
+    const red: Rgb = .{ .r = 0xC4, .g = 0x2B, .b = 0x1C };
+    try testing.expectEqual(red, cappedLuminance(red, cap));
+
+    // The whole hue circle at full saturation, plus the greys, capped.
+    var h: f64 = 0;
+    while (h < 360) : (h += 5) {
+        for ([_]f64{ 0.4, 0.7, 1.0 }) |s| {
+            const base = hsbToRgb(.{ .h = h, .s = s, .b = 1.0 });
+            const capped = cappedLuminance(base, cap);
+            // Under the cap, measured on the quantized result...
+            try testing.expect(wcagLuminance(capped) <= cap);
+            // ...which is exactly what makes white legible on it.
+            try testing.expect(wcagContrastRatio(1.0, wcagLuminance(capped)) >= 4.5);
+            // ...and it is a DARKENING, never a swap for something else: the
+            // capped color is no lighter than the one it came from and is
+            // still a COLOR, not a grey the L* move collapsed.
+            try testing.expect(wcagLuminance(capped) <= wcagLuminance(base));
+            try testing.expect(rgbToHsb(capped).s >= s * 0.5);
+        }
+    }
+
+    // Hue, on the color this exists for: an over-light red comes back a
+    // darker RED. (Checked here rather than across the whole sweep because
+    // the L* move holds CIELAB's hue angle, not HSB's, and the two disagree
+    // by more than a few degrees for blues.)
+    const pale_red = hsbToRgb(.{ .h = 5, .s = 0.85, .b = 1.0 });
+    const dark_red = cappedLuminance(pale_red, cap);
+    try testing.expect(wcagLuminance(dark_red) <= cap);
+    const hue_delta = @abs(rgbToHsb(dark_red).h - 5);
+    try testing.expect(@min(hue_delta, 360 - hue_delta) < 15.0);
+
+    // Degenerate caps: 0 admits only black, 1 admits everything.
+    try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, cappedLuminance(white, 0.0));
+    try testing.expectEqual(white, cappedLuminance(white, 1.0));
 }
 
 test "wash: direction follows the background, and a light background darkens" {

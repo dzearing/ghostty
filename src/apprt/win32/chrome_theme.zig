@@ -225,11 +225,55 @@ pub const Palette = struct {
     accent: Rgb,
     /// A foreground that reads on top of `accent`.
     on_accent: Rgb,
-    /// Destructive red, clamped to 3:1 against `bar`.
+    /// Destructive red as a FILL — the caption close slab's hover, the
+    /// connection pill's Reconnect capsule. Kept dark enough that WHITE reads
+    /// on it (see `dangerFillOn`), which is why it is not simply `danger_ink`.
     danger: Rgb,
-    /// A foreground that reads on top of `danger`.
+    /// The foreground on `danger`: always white, per Windows' convention.
     on_danger: Rgb,
+    /// Destructive red as INK on the bar — the tab strip's close glyph on
+    /// hover, which is a red mark rather than a red fill. Clamped to 3:1
+    /// against `bar` like any other chrome glyph.
+    danger_ink: Rgb,
 };
+
+/// The luminance a destructive FILL must stay at or under for white to clear
+/// the 4.5:1 text floor on it: `1.05 / (L + 0.05) >= 4.5`.
+pub const danger_fill_max_luminance: f64 = 1.05 / 4.5 - 0.05;
+
+/// The one foreground a destructive fill ever takes.
+pub const on_danger_fixed: Rgb = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+
+/// The destructive red as INK on `surface` — a red MARK, floored to the 3:1
+/// chrome target like every other glyph.
+pub fn dangerInkOn(surface: Rgb) Rgb {
+    return accentOn(surface, danger_base);
+}
+
+/// The destructive red as a FILL on `surface`, with white as its foreground.
+///
+/// Windows' convention IS the spec for this one: every native window paints a
+/// WHITE X on the close button's red hover, and a black one reads as broken
+/// chrome at the single most-looked-at control on the window (T528, user-
+/// reported). So the constraint goes on the FILL — the red may not be lightened
+/// past the point where white clears 4.5:1 on it — instead of on the
+/// foreground, which is what used to give way.
+///
+/// It gave way silently because every floor still passed: on a mid-dark bar
+/// (`#202020`'s band is one) the 3:1 ink search lightens `#C42B1C` until the
+/// lightened red's own luminance crosses `contrastForeground`'s crossover, and
+/// black-on-light-red is WCAG-clean at 4.9:1. Two correct rules, one wrong
+/// button.
+///
+/// Where the ceiling and the 3:1 lift off the bar cannot both hold — bars in
+/// roughly `#2F2F2F`..`#595959`, where no red is light enough to clear the band
+/// and dark enough to carry white — the convention wins and the fill sits at
+/// the ceiling, i.e. as far off the bar as a white-safe red can get. The fill
+/// is still a saturated red against a grey band, which no luminance ratio
+/// measures; a black X on it is a defect a user reports.
+pub fn dangerFillOn(surface: Rgb) Rgb {
+    return color_math.cappedLuminance(dangerInkOn(surface), danger_fill_max_luminance);
+}
 
 /// Primary chrome text for a surface that is NOT the bar — the owner-drawn
 /// STATIC popups (hovered-URL preview, resize overlay) sit directly on the
@@ -278,8 +322,9 @@ pub fn resolve(chrome_bg: Rgb, accent: Rgb) Palette {
         .text_secondary = textSecondaryOn(bar),
         .accent = accentOn(bar, accent),
         .on_accent = color_math.contrastForeground(accentOn(bar, accent)),
-        .danger = accentOn(bar, danger_base),
-        .on_danger = color_math.contrastForeground(accentOn(bar, danger_base)),
+        .danger = dangerFillOn(bar),
+        .on_danger = on_danger_fixed,
+        .danger_ink = dangerInkOn(bar),
     };
 }
 
@@ -290,6 +335,47 @@ fn ratio(a: Rgb, b: Rgb) f64 {
         color_math.wcagLuminance(a),
         color_math.wcagLuminance(b),
     );
+}
+
+/// The close-button convention, as one assertion every sweep can make (T528):
+/// the glyph on a destructive fill IS white, and white really reads on it.
+///
+/// The second half is what makes the first one honest — a palette could always
+/// have answered "white" and left the fill too pale to see it on.
+fn expectWhiteOnDanger(p: Palette) !void {
+    try testing.expectEqual(on_danger_fixed, p.on_danger);
+    try testing.expect(ratio(p.on_danger, p.danger) >= 4.5);
+
+    // And the fill is still as far off the bar as that ceiling allows: it
+    // clears the 3:1 chrome floor, or it is sitting ON the ceiling because no
+    // white-safe red could.
+    try testing.expect(
+        ratio(p.danger, p.bar) >= ui_contrast_target - 0.05 or
+            color_math.wcagLuminance(p.danger) >= danger_fill_max_luminance - 0.004,
+    );
+}
+
+test "resolve: the close glyph is WHITE on every theme (T528)" {
+    // The user's report, as a number. `#202020` is Fluent's dark surface, so
+    // its band is the one a default dark theme actually paints — and the old
+    // `contrastForeground(danger)` answered BLACK there, at a perfectly legal
+    // 4.9:1, because the 3:1 ink search had lightened the red past white's
+    // reach first.
+    const p = resolve(surface_dark, default_accent);
+    try testing.expectEqual(on_danger_fixed, p.on_danger);
+    try testing.expect(ratio(p.on_danger, p.danger) >= 4.5);
+    try testing.expect(color_math.wcagLuminance(p.danger) > color_math.wcagLuminance(p.bar));
+
+    // The INK is a different answer to a different question and keeps its own
+    // floor: the tab strip's close glyph is a red mark ON the band, so it has
+    // to lift off the band rather than carry a foreground.
+    try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
+
+    // A light theme never needed the cap and must not be moved by it: Windows'
+    // own red already carries white there.
+    const light = resolve(surface_light, default_accent);
+    try testing.expectEqual(danger_base, light.danger);
+    try testing.expectEqual(on_danger_fixed, light.on_danger);
 }
 
 test "accentFromDword: ABGR, against the value measured on this box" {
@@ -460,9 +546,9 @@ test "debugChromeBase: the marker survives resolve with every floor intact" {
                 try testing.expect(ratio(p.text, p.bar) >= 4.4);
                 try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
                 try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
-                try testing.expect(ratio(p.danger, p.bar) >= ui_contrast_target - 0.05);
+                try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
                 try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
-                try testing.expect(ratio(p.on_danger, p.danger) >= 4.4);
+                try expectWhiteOnDanger(p);
 
                 // And the marked band is distinguishable from the band the
                 // same background would have produced unmarked — which is the
@@ -510,9 +596,9 @@ test "resolve: every floor holds across the whole background x accent space" {
 
             // UI floors.
             try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
-            try testing.expect(ratio(p.danger, p.bar) >= ui_contrast_target - 0.05);
+            try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
             try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
-            try testing.expect(ratio(p.on_danger, p.danger) >= 4.4);
+            try expectWhiteOnDanger(p);
 
             // The band reads as a band, and hover reads as a lift off it —
             // the "mutually distinguishable" half of T203's validation, which
