@@ -48,6 +48,14 @@ const icon_button = @import("icon_button.zig");
 /// below pin the shipped (`false`) behavior on every build.
 const T202_NEUTERED = false;
 
+/// Negative control for section 8 of `test/win32/tab-strip.ps1`, same contract
+/// as `T202_NEUTERED` above. Flip to `true`, rebuild `-Dapp-runtime=win32`, and
+/// re-run: `applySticky` becomes a pass-through, restoring the pre-T249 rule
+/// where a tab's width tracks its title in BOTH directions — so the three
+/// "nothing moves when the title shortens" assertions must fail, and the two
+/// grow controls beside them must NOT.
+const T249_NEUTERED = false;
+
 /// The strip speaks the same rectangle the rest of the chrome does — one
 /// definition, in `icon_button.zig`, re-exported here so existing
 /// `tab_strip.Rect` call sites are unchanged.
@@ -297,6 +305,53 @@ pub fn capWidth(m: Metrics, tabs_avail: i32) i32 {
 /// tests can reason about a single tab without replaying `layout`.
 pub fn slotWidth(m: Metrics, tabs_avail: i32, preferred_paint: i32) i32 {
     return std.math.clamp(preferred_paint + m.tab_gap, m.min_tab_w, capWidth(m, tabs_avail));
+}
+
+/// GROW-ONLY tab widths (T249). Raises each entry of `sticky` — the caller's
+/// per-tab high-water PAINTED width, in tab order — to its tab's current
+/// preferred width, and hands back the array `layout` should be given.
+///
+/// Why a ratchet at all. Since T235 a tab's width is its TITLE's width, and a
+/// shell rewrites that string on every command: with no configuration at all,
+/// `cmd.exe` retitles itself `<cmd.exe path> - <command>` for the duration of
+/// each command and back afterwards. Measured on 2026-08-11 (3 tabs, 1400x800,
+/// 125%): one ordinary `ping` moved tab 2 and the "+" **+186 px on start and
+/// -186 px on finish**, and the point that had been tab 2's centre was, while
+/// the command ran, inside TAB 1 — a click there selects the wrong tab. Across
+/// realistic shell titles the swings reached 30% of the window width. Under
+/// T202's fixed cap none of that could happen, because a tab's width did not
+/// depend on a string.
+///
+/// The rule splits the motion by who caused it. A tab GROWS the moment its
+/// title needs more room — that happens as the user submits a command, and
+/// refusing it would ellipsize a title with empty strip beside it, which is the
+/// whole of T235. A tab NARROWS only at a structural relayout (a tab opened or
+/// closed, the window resized, the DPI changed, a tab reordered), where the
+/// caller drops `sticky` back to the measured preferences; the shrink half of
+/// the dance is the half that fires minutes later, attributable to nothing the
+/// user did, which is exactly when a moving click target is a hazard.
+///
+/// The ratchet is RELEASED rather than allowed to truncate: if the sticky
+/// widths no longer all fit, every entry falls back to its true preferred
+/// width. Grow-only must never be the reason a title gets an ellipsis, and it
+/// must never be the reason the strip goes under pressure — otherwise a tab
+/// that once ran a long command would keep the whole strip squeezed for a
+/// string nobody can see any more.
+pub fn applySticky(m: Metrics, tabs_avail: i32, prefer: []const i32, sticky: []i32) []const i32 {
+    std.debug.assert(sticky.len >= prefer.len);
+    const n = @min(prefer.len, MAX_TABS);
+    if (T249_NEUTERED) return prefer[0..n];
+    var sticky_total: i32 = 0;
+    for (prefer[0..n], sticky[0..n]) |p, *s| {
+        s.* = @max(s.*, p);
+        sticky_total += slotWidth(m, tabs_avail, s.*);
+    }
+    if (sticky_total > tabs_avail) {
+        // Release. `sticky == prefer` afterwards, so the next grow starts from
+        // the honest measurement rather than from a stale high-water mark.
+        for (prefer[0..n], sticky[0..n]) |p, *s| s.* = p;
+    }
+    return sticky[0..n];
 }
 
 /// Resolve the strip for `client_w` pixels of client width and one entry per
@@ -653,6 +708,114 @@ test "T235: mixed titles each get their own width" {
     for (prefer, buf[0..3]) |p, r| try testing.expectEqual(p, r.width());
     // Laid out end to end with one gap between, in order.
     for (buf[1..3], 0..) |r, i| try testing.expectEqual(buf[i].right + m.tab_gap, r.left);
+}
+
+test "T249: a tab grows with its title and never narrows on its own" {
+    // The measured defect: one `ping` in tab 1 moved tab 2 and the "+" +186 px
+    // out and -186 px back, because cmd.exe retitles per command. The ratchet
+    // keeps the outward move (a title must never be ellipsized with strip to
+    // spare) and deletes the return trip.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const avail = runWidth(m, WIDE, true);
+        const px = struct {
+            fn f(s: f32, dip: f32) i32 {
+                return @intFromFloat(@round(dip * s));
+            }
+        }.f;
+        const short = m.preferredWidth(px(scale, 90));
+        const long = m.preferredWidth(px(scale, 260));
+
+        var sticky = [_]i32{ short, short };
+
+        // Idle: both tabs at their own width, tab 2 immediately after tab 1.
+        {
+            const eff = applySticky(m, avail, &[_]i32{ short, short }, &sticky);
+            const s = layout(m, WIDE, true, eff, &buf);
+            try testing.expectEqual(@as(usize, 2), s.visible);
+            try testing.expectEqual(short, buf[0].width());
+        }
+        const idle_t2 = buf[1].left;
+        const idle_plus = layout(m, WIDE, true, &[_]i32{ short, short }, &buf).new_tab.left;
+
+        // A command starts: tab 1's title needs more room, so it takes it.
+        {
+            const eff = applySticky(m, avail, &[_]i32{ long, short }, &sticky);
+            const s = layout(m, WIDE, true, eff, &buf);
+            try testing.expectEqual(long, buf[0].width());
+            try testing.expect(buf[1].left > idle_t2);
+            try testing.expect(s.new_tab.left > idle_plus);
+        }
+        const busy_t2 = buf[1].left;
+        const busy_plus = layout(m, WIDE, true, &[_]i32{ long, short }, &buf).new_tab.left;
+
+        // The command finishes and the title goes back. NOTHING moves.
+        {
+            const eff = applySticky(m, avail, &[_]i32{ short, short }, &sticky);
+            const s = layout(m, WIDE, true, eff, &buf);
+            try testing.expectEqual(long, buf[0].width());
+            try testing.expectEqual(busy_t2, buf[1].left);
+            try testing.expectEqual(busy_plus, s.new_tab.left);
+        }
+        // ...and a shorter title still than the original moves nothing either.
+        {
+            const tiny = m.preferredWidth(px(scale, 10));
+            const eff = applySticky(m, avail, &[_]i32{ tiny, short }, &sticky);
+            const s = layout(m, WIDE, true, eff, &buf);
+            try testing.expectEqual(busy_t2, buf[1].left);
+            try testing.expectEqual(busy_plus, s.new_tab.left);
+        }
+        // Only tab 1 ever ratcheted; tab 2's own width is untouched by its
+        // neighbour's history.
+        try testing.expectEqual(short, sticky[1]);
+    }
+}
+
+test "T249: the ratchet is released rather than allowed to truncate" {
+    // Grow-only must never be the reason a title ellipsizes or the strip goes
+    // under pressure. Once the high-water marks no longer fit, every tab drops
+    // back to what its own title actually needs.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const avail = runWidth(m, WIDE, true);
+        const slot = slotOf(m, scale);
+        const fits: usize = @intCast(@divTrunc(avail, slot));
+        const cap = capWidth(m, avail);
+
+        // Two tabs ratcheted to half the run each: as wide as a tab may get.
+        var sticky = [_]i32{ cap, cap };
+        const wide_pref = [_]i32{ cap, cap };
+        _ = applySticky(m, avail, &wide_pref, &sticky);
+        try testing.expectEqual(cap, sticky[0]);
+
+        // Their titles then collapse to something small AND a third tab's
+        // worth of preference arrives. Honouring the marks would leave no room
+        // for the modest widths everyone now wants, so they are dropped.
+        const modest = m.preferredWidth(@intFromFloat(@round(120.0 * scale)));
+        var sticky3 = [_]i32{ cap, cap, 0 };
+        var pref3: [MAX_TABS]i32 = undefined;
+        for (pref3[0..3]) |*e| e.* = modest;
+        const eff = applySticky(m, avail, pref3[0..3], sticky3[0..3]);
+        for (eff) |e| try testing.expectEqual(modest, e);
+        const s = layout(m, WIDE, true, eff, &buf);
+        // No pressure: everyone got their own width, nothing ellipsizes.
+        try testing.expectEqual(@as(i32, 0), s.tab_w);
+        try testing.expectEqual(@as(usize, 3), s.visible);
+
+        // And a strip that is genuinely over-full still behaves exactly as it
+        // did before the ratchet existed: uniform, floored, some tabs dropped.
+        var stickyN: [MAX_TABS]i32 = undefined;
+        for (stickyN[0 .. fits + 2]) |*e| e.* = 0;
+        var prefN: [MAX_TABS]i32 = undefined;
+        for (prefN[0 .. fits + 2]) |*e| e.* = m.preferredWidth(@intFromFloat(@round(TITLE_DIP * scale)));
+        const effN = applySticky(m, avail, prefN[0 .. fits + 2], stickyN[0 .. fits + 2]);
+        const sN = layout(m, WIDE, true, effN, &buf);
+        _, const plain = layoutN(scale, WIDE, fits + 2, &buf);
+        try testing.expectEqual(plain.tab_w, sN.tab_w);
+        try testing.expectEqual(plain.visible, sN.visible);
+    }
 }
 
 test "the tab area never reaches the button band" {

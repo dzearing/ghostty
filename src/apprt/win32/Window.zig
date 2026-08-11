@@ -156,6 +156,10 @@ const HERO_DRAG_RESIZE_MS: i64 = 80;
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
 
+/// The strip shape a set of grow-only tab widths was fitted to (T249). See
+/// `tab_sticky_key`.
+const StickyKey = struct { count: usize, strip_w: i32, scale: f32 };
+
 /// The parent App.
 app: *App,
 
@@ -285,6 +289,25 @@ tab_title_lens: [64]u16 = undefined,
 /// pane-driven updates until cleared with an empty rename (Mac
 /// BaseTerminalController.titleOverride parity).
 tab_title_pinned: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+
+/// Grow-only high-water PAINTED width per tab (T249), in tab order — what
+/// `tab_strip.applySticky` ratchets and `tab_strip.layout` is actually handed.
+/// A tab widens the instant its title needs the room and narrows only when
+/// `tab_sticky_key` below says the strip was re-fitted; see that field.
+tab_sticky_w: [MAX_TABS]i32 = [_]i32{0} ** MAX_TABS,
+
+/// The strip geometry `tab_sticky_w` was fitted to. `null` — or any
+/// disagreement with the strip being painted — re-fits every tab to its
+/// current title on the next paint, which is how a tab NARROWS.
+///
+/// The three components are the whole definition of a structural relayout: a
+/// tab opened or closed (`count`), the window resized (`strip_w`), the DPI
+/// changed (`scale`). Two more null it explicitly because they change none of
+/// the three: a reorder (`moveTabTo`), whose per-index marks now belong to the
+/// wrong tabs, and an explicit tab rename (`setTabTitlePin`), which is the user
+/// changing what the tab IS while looking at it — the ratchet is for the string
+/// a shell rewrites behind your back, not for one you typed.
+tab_sticky_key: ?StickyKey = null,
 
 /// User-assigned accent color per tab (T72, Mac TerminalTabColor parity).
 /// Set from the tab context menu; painted as a stripe in the tab bar.
@@ -4115,6 +4138,11 @@ pub fn setTabTitlePin(self: *Window, tab_idx: usize, title: ?[]const u8) void {
         self.refreshTabTitle(tab_idx);
     }
     if (tab_idx == self.active_tab) self.updateWindowTitle();
+    // T249: an explicit rename is a structural act, not title churn — the user
+    // is changing what the tab IS and is looking straight at it, so the width
+    // follows immediately in BOTH directions. The grow-only ratchet exists for
+    // the string a shell rewrites behind your back, not for one you typed.
+    self.tab_sticky_key = null;
     self.invalidateTabBar();
     self.app.markLayoutDirty(); // T89f: tab title pin changed → re-persist
 }
@@ -5000,7 +5028,32 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // stop at the seam, and `stripClientWidth` is the one place that width is
     // decided. Everything downstream — the chiclets, the "+", every published
     // hit rect — falls out of it unchanged.
-    const strip = tab_strip.layout(m, self.stripClientWidth(client_w), self.stripHasMenu(), prefer[0..self.tab_count], &tabs);
+    const strip_client_w = self.stripClientWidth(client_w);
+    const has_menu = self.stripHasMenu();
+
+    // T249: the widths handed to the layout are RATCHETED, not the raw
+    // measurements above. A shell retitles itself per command — cmd.exe does it
+    // with no configuration at all — and before this the strip moved out and
+    // back by ~190 px for every command, walking a tab out from under a
+    // stationary pointer. `applySticky` keeps the outward move (a title must
+    // never ellipsize with strip to spare) and drops the return trip; the marks
+    // are re-fitted here whenever the strip's shape actually changed.
+    const sticky_key: StickyKey = .{
+        .count = self.tab_count,
+        .strip_w = strip_client_w,
+        .scale = self.scale,
+    };
+    if (self.tab_sticky_key == null or !std.meta.eql(self.tab_sticky_key.?, sticky_key)) {
+        self.tab_sticky_key = sticky_key;
+        @memcpy(self.tab_sticky_w[0..self.tab_count], prefer[0..self.tab_count]);
+    }
+    const effective = tab_strip.applySticky(
+        m,
+        tab_strip.runWidth(m, strip_client_w, has_menu),
+        prefer[0..self.tab_count],
+        self.tab_sticky_w[0..self.tab_count],
+    );
+    const strip = tab_strip.layout(m, strip_client_w, has_menu, effective, &tabs);
 
     // Publish hit-test rects. Tabs past `strip.visible` did not fit and get a
     // ZERO rect on purpose — invisible and unhittable — instead of being laid
@@ -5586,6 +5639,11 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_hero_scroll[to] = saved_hero_scroll;
 
     self.active_tab = to;
+    // T249: the grow-only marks are indexed by tab position, so the shuffle
+    // above left every one of them on the wrong tab. A reorder is a structural
+    // relayout — the strip is already moving — so re-fit rather than shuffle a
+    // tenth parallel array.
+    self.tab_sticky_key = null;
     self.invalidateTabBar();
     self.app.markLayoutDirty(); // T89f: tab reordered → re-persist the layout
 }

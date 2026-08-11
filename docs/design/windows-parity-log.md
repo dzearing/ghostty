@@ -15388,3 +15388,64 @@ agent 372s), P1-P3 ALL PASS, and `--summary all` shows `run test
 ghoztty-build-helpers-test 9 passed`. Docs in CLAUDE.md's Windows build bullet
 and in go.md beside the `Select-Object -First N` rule - same trap shape, same
 place a turn is already reading when a build fails oddly.
+
+## 2026-08-11 - the tab strip stops dancing when a shell retitles itself (T249)
+
+T235 made a tab's width its title's width, which is what the user asked for and
+is right. T249 was filed to go and LOOK at the consequence nobody had checked: a
+tab's width is now a function of a string the shell rewrites constantly.
+
+It jumps, and nothing has to be configured for it to. Measured with the app's
+own published tab rects (T231's `chrome.tab_strip` in `+list --json` - the rects
+its hit tests read, so no second model to rot), 3 tabs, 1400x800, 125% DPI,
+default `cmd.exe`, no synthetic titles anywhere: one ordinary
+`ping -n 6 127.0.0.1` moved tab 2 and the "+" **+186 px when it started and
+-186 px when it finished**, because stock `cmd.exe` retitles itself
+`<cmd.exe path> - <command>` for the duration of every command. Mid-command, the
+point that had been tab 2's centre was **inside tab 1** - a click there selects
+the wrong tab. Over a sweep of six realistic shell titles the per-command deltas
+were +152, -363, +46, +365, -423 px, up to 30% of the window width; two of the
+five transitions put tab 2's old centre inside tab 1 and two more put it on
+empty strip, where a click does nothing at all. Repaint COUNT was never the
+issue and is unchanged: `onPaneTitleChanged` dirtied the whole strip band before
+T235 too, and only the layout inside it now varies.
+
+The fix is a grow-only ratchet (`tab_strip_layout.applySticky`, pure, asserted
+at 1.0/1.25/1.5/2.0). A tab widens the instant its title needs the room; it
+narrows only at a structural relayout - a tab opened, closed or reordered, the
+window resized, the DPI changed, or the user explicitly renaming the tab. The
+split is by who caused the motion: the grow happens as you press Enter, the
+shrink fires minutes later attributable to nothing, and an unattributable move
+is what walks a click target out from under a stationary hand. The marks are
+**released rather than allowed to truncate** - once they no longer fit, every
+tab drops back to what its own title needs, so grow-only can never be the reason
+a title ellipsizes or the strip goes under pressure. That is the whole reason
+the obvious "grow-only forever" shape was not shipped: a tab that once ran
+`zig build test -Dapp-runtime=win32` would have kept 546 px for a string nobody
+can see.
+
+Same fixture afterwards: 186 px out, **0 px back**; the six-title sweep went
+from 1349 px of total strip motion to 200, with the wrong-tab hit gone from
+every transition. `test/win32/tab-strip.ps1` grew a section 8 that asserts the
+no-motion rule and the re-fit, with two GROW controls beside them so the arm
+cannot pass against a frozen strip - and it was shown to fail: `T249_NEUTERED =
+true` makes `applySticky` a pass-through, and that build failed exactly the
+three no-motion assertions plus the re-fit one (the tab went 526 -> 70 px, the
+"+" walked 456) while both grow controls stayed green.
+
+Alternatives are in **D67** (freeze entirely / quantise / debounce - each gives
+back something T235 bought, or delays the jump instead of removing it). The
+residual is **T737**: a first-ever-longer title still moves the strip once, so
+the wrong-tab hit is rare rather than impossible; the candidate is freezing
+widths while the pointer is inside the strip, to be measured before it is built.
+Design-system §6b gained the rule as its point 5, since it applies to any run of
+content-bearing chrome, not just tabs.
+
+One self-inflicted lesson worth the line: a `Get-Content -Raw | Set-Content
+-Encoding utf8` round-trip on `tab_strip_layout.zig` mojibaked every em dash and
+added a BOM (the known PS5.1 trap), and the repair script then hit a SECOND
+PS5.1 trap - comma binds tighter than `+`, so `@('find', 'a' + $x + 'b')` is a
+four-element array and `$p[1]` was only `'a'`, truncating 13 lines. Both were
+caught and reversed before anything was committed, by a guard in the repair
+script and by requiring `git diff` to show a pure-addition diff. Use the Edit
+tool on repo text files; PowerShell is for running things, not rewriting them.

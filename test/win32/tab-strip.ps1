@@ -1068,6 +1068,87 @@ try {
         Write-Host "INFO  skipped the retired-cap comparison: this window's 50% cap ($capW) is tighter than 200 DIP ($maxTabWOld)"
     }
     Close-TestWindowPixels $shot
+
+    # -----------------------------------------------------------------------
+    # 8. T249: a tab GROWS with its title and never narrows on its own.
+    #
+    # T235 made a tab's width its title's width, and a shell rewrites that
+    # string per command with no configuration at all: cmd.exe retitles itself
+    # "<cmd.exe path> - <command>" for the duration of every command and back
+    # afterwards. Measured before the fix (3 tabs, this window size, 125%): one
+    # ordinary `ping` moved tab 2 and the "+" +186 px on start and -186 px on
+    # finish, and the point that had been tab 2's centre was, mid-command,
+    # inside TAB 1 - a click there selects the wrong tab.
+    #
+    # The rule splits the motion by who caused it: the grow happens as the user
+    # submits a command (and refusing it would ellipsize a title with strip to
+    # spare, which is the whole of T235), the shrink fires minutes later
+    # attributable to nothing. So the grow stays and the return trip goes.
+    #
+    # Rects come from the app's own published regions (T231), which are the
+    # rects its hit tests read - so "did a click target move" is answered
+    # exactly, not scanned for.
+    # -----------------------------------------------------------------------
+    $t8 = & $exe +list --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+    $w8 = $t8.data.windows | Where-Object { [int64]$_.id -eq [int64]$top }
+    $pane8 = $w8.tabs[0].splits.terminal.id
+    function Set-Tab1Title([string]$t) {
+        [void](& $exe +send-keys --target=$pane8 "title $t" Enter 2>$null)
+        Start-Sleep -Milliseconds 900
+    }
+    if (-not $pane8) {
+        Write-Host 'SKIP  T249 grow-only: could not resolve tab 1 pane id from +list --json'
+        $script:skipped++
+    } else {
+        # Start from a tab that is NOT already at the 50% cap: section 7 left
+        # tab 1 pinned there, and a tab at the cap cannot grow, so the control
+        # below would fail against a perfectly good ratchet. Shortening the
+        # title deliberately does nothing on its own - that is the feature - so
+        # a structural relayout re-fits it. A RESIZE is used for that here
+        # rather than a third tab: it is the commonest structural event, and a
+        # strip left near capacity would legitimately RELEASE the ratchet
+        # mid-arm (which is correct behaviour and would read as a failure).
+        Set-Tab1Title 'aa'
+        Set-TestWindowSize -Window $top -Width 1360 -Height 800 | Out-Null
+        Start-Sleep -Milliseconds 900
+        $r0 = Get-TestStripRegions -Window $top -Exe $exe
+        Set-Tab1Title 'a-title-long-enough-to-widen-a-tab-well-short-of-the-cap'
+        $r1 = Get-TestStripRegions -Window $top -Exe $exe
+        Write-Host ("INFO  T249 grow: t1w $($r0.Tabs[0].Width) -> $($r1.Tabs[0].Width), " +
+                    "t2.left $($r0.Tabs[1].Left) -> $($r1.Tabs[1].Left), " +
+                    "plus.left $($r0.NewTab.Left) -> $($r1.NewTab.Left)")
+        # Teeth on the grow side: a longer title must still take the room, or
+        # the two no-motion assertions below would pass against a frozen strip.
+        Assert ($r1.Tabs[0].Width -gt $r0.Tabs[0].Width) `
+            "T249 control: a longer title still WIDENS its tab ($($r0.Tabs[0].Width) -> $($r1.Tabs[0].Width))"
+        Assert ($r1.Tabs[1].Left -gt $r0.Tabs[1].Left) `
+            "T249 control: growing tab 1 still moves tab 2 right ($($r0.Tabs[1].Left) -> $($r1.Tabs[1].Left))"
+
+        # THE assertion: the title goes back to something tiny and NOTHING moves.
+        Set-Tab1Title 'x'
+        $r2 = Get-TestStripRegions -Window $top -Exe $exe
+        Write-Host ("INFO  T249 shrink: t1w $($r1.Tabs[0].Width) -> $($r2.Tabs[0].Width), " +
+                    "t2.left $($r1.Tabs[1].Left) -> $($r2.Tabs[1].Left), " +
+                    "plus.left $($r1.NewTab.Left) -> $($r2.NewTab.Left)")
+        Assert ($r2.Tabs[0].Width -eq $r1.Tabs[0].Width) `
+            "T249: a shorter title does NOT narrow the tab ($($r1.Tabs[0].Width) -> $($r2.Tabs[0].Width))"
+        Assert ($r2.Tabs[1].Left -eq $r1.Tabs[1].Left) `
+            "T249: tab 2 does not slide when tab 1's title shortens ($($r1.Tabs[1].Left) -> $($r2.Tabs[1].Left))"
+        Assert ($r2.NewTab.Left -eq $r1.NewTab.Left) `
+            "T249: the '+' does not walk when tab 1's title shortens ($($r1.NewTab.Left) -> $($r2.NewTab.Left))"
+
+        # ... and the strip is not frozen: a structural relayout re-fits it, so
+        # the ratchet cannot leave a tab permanently wide for a string nobody
+        # can see. A resize is one; so are opening or closing a tab, reordering
+        # one, and a DPI change.
+        Set-TestWindowSize -Window $top -Width 1400 -Height 800 | Out-Null
+        Start-Sleep -Milliseconds 900
+        $r3 = Get-TestStripRegions -Window $top -Exe $exe
+        Write-Host "INFO  T249 re-fit: t1w $($r2.Tabs[0].Width) -> $($r3.Tabs[0].Width) after a resize"
+        Assert ($r3.Tabs[0].Width -lt $r2.Tabs[0].Width) `
+            "T249: a structural relayout re-fits the ratcheted tab ($($r2.Tabs[0].Width) -> $($r3.Tabs[0].Width))"
+    }
+
     Assert (-not ($app2.Process -and $app2.Process.HasExited)) 'no crash (long-title instance)'
 } finally {
     Remove-TestDesktop

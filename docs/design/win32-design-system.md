@@ -656,6 +656,29 @@ later):
 4. **A single item never stretches to fill.** Sizing to content means a short
    title gets a short tab; the leftover strip stays empty (this is what
    Windows Terminal does and T202 correctly kept).
+5. **Grow with the content, shrink only at a structural relayout** (T249). The
+   moment a slot's width is a function of a string, it is a function of however
+   often that string changes — and in a terminal the answer is "every command".
+   Windows' own `cmd.exe` retitles itself `<cmd.exe path> - <command>` for the
+   duration of each command, with nothing configured; measured on 2026-08-11,
+   one `ping` moved the next tab and the "+" **186 px out and 186 px back**, and
+   the point that had been that tab's centre sat inside its neighbour while the
+   command ran, so a click there selected the wrong tab. Across realistic shell
+   titles the swings reached 30% of the window width.
+
+   So the run keeps a per-slot **high-water width**. A slot widens the instant
+   its content needs the room — refusing that is rule 3's ellipsis with strip to
+   spare, which is the defect this whole section exists to name. It narrows only
+   when the run is being re-laid-out anyway: an item added or removed, the
+   container resized, the DPI changed, the order changed. That is the honest
+   split — the grow happens as the user acts, the shrink fires later,
+   attributable to nothing, and an unattributable move is what walks a click
+   target out from under a stationary pointer.
+
+   **The ratchet is released, never allowed to truncate.** Once the high-water
+   marks no longer fit, every slot drops back to its measured preference; rule 3
+   is the only thing that may ever ellipsize. A marked width outliving the
+   string that earned it must not squeeze the run.
 
 Note this **supersedes T202's fixed `max_tab_w = 200 DIP`**, which came from
 measuring Windows Terminal's `TabWidthMode="Equal"`. The measurement was
