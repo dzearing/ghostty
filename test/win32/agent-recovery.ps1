@@ -87,6 +87,7 @@ function Show-Agents($tmp, $tag) {
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null
@@ -103,17 +104,17 @@ function Run-CliArgs($argv, $out, $timeoutSec = 15) {
     # persistence: on (default) - the agent under test only owns sessions when persistence is on.
     $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    # Touching .Handle caches the process handle, and it has to happen HERE:
+    # after the timed wait below has returned, the child has already exited and
+    # PowerShell reads ExitCode back empty - which every caller scores as a
+    # failure. See lib\ExitCodeAudit.ps1.
+    $null = $p.Handle
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null
     }
-    # The TIMED WaitForExit returns before the Process object has published
-    # ExitCode; the argument-less overload is what makes it readable. Without
-    # this every call reads back $null and a healthy pane looks unresponsive.
-    # Touching .Handle caches the process handle; without it PowerShell cannot
-    # read ExitCode once the process has exited (it comes back empty, which
-    # every caller reads as failure).
-    $null = $p.Handle
+    # The TIMED WaitForExit can return before the Process object has published
+    # ExitCode; the argument-less overload is what makes it readable.
     $p.WaitForExit()
     return $p.ExitCode
 }

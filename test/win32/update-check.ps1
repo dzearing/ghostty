@@ -72,6 +72,9 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
             # run never opened (T158).
             $proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' `
                 -PassThru -RedirectStandardError $errFile
+            # Before any HasExited poll, or the exit code in the SETUP FAIL
+            # message below reads back empty (lib\ExitCodeAudit.ps1).
+            $null = $proc.Handle
             $deadline = (Get-Date).AddSeconds($waitSecs)
             while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
             if (-not $proc.HasExited) { break }

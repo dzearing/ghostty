@@ -673,6 +673,7 @@ function Invoke-WatchdogNow {
     Log "  watchdog handoff: re-entering now ($Why)"
     try {
         $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList $a
+        $null = $p.Handle   # before the wait, or ExitCode logs empty (test\win32\lib\ExitCodeAudit.ps1)
         if ($p.WaitForExit(120000)) { Log "  watchdog handoff: exited $($p.ExitCode) (see ghoztty-go-loop-watchdog.log)" }
         else { Log '  watchdog handoff: still running after 120s; left to finish on its own' }
     } catch {
@@ -694,6 +695,10 @@ if ($action -eq 'reuse') {
     if (-not $listJson) {
         Log 'reuse: no running instance; starting the freshly installed exe'
         $appProc = Start-Process -FilePath $oldExe -WorkingDirectory $WorkingDirectory -PassThru
+        # Cache the handle now: the "EXITED with <code>" branch below is how a
+        # dead app is told from an unreachable one, and without this it reports
+        # an empty code (test\win32\lib\ExitCodeAudit.ps1).
+        $null = $appProc.Handle
         # 180s, not 60s: the deadline exists to catch an app that never starts,
         # and the cost of calling a LIVE app dead is a stalled loop (2026-07-30).
         $listJson = Wait-Instance 180 $appProc

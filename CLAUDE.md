@@ -1731,6 +1731,40 @@ Library: `scripts/lib/CrashCatch.ps1`, which documents the three cdb traps
 break, cdb echoes its own command back). Acceptance:
 `test\win32\crash-stacks.ps1`.
 
+**A harness must never fabricate a failure, and one shape of that is now
+checked** (T197). `Start-Process -PassThru` hands back a process object whose
+`ExitCode` reads back **empty** unless something touched `$p.Handle` while the
+child was still alive — so `if ($code -ne 0) { fail }` scores a *working* CLI as
+broken. A fabricated failure costs more than a missed one: it sends the next
+session hunting a defect that is not there, which it did twice (T145, then a
+whole T147 turn spent on six red assertions against a build whose complete
+`+list` output was sitting in the redirect file).
+
+The trigger is now measured rather than remembered: it fires **only when
+`Start-Process` is given `-RedirectStandardOutput` / `-RedirectStandardError`**
+(0 of 8 reads survive, whether the handle is cached late or never; 8 of 8 with
+it cached first, and 8 of 8 without any redirect). That is why it read as
+flakiness — most helpers here redirect *inside* `cmd /c … > file`, which is
+unaffected, and the two spellings sit line-for-line next to each other. So the
+rule is mechanical and applies to every site:
+
+```powershell
+$p = Start-Process ... -PassThru
+$null = $p.Handle          # FIRST, before any wait
+if (-not $p.WaitForExit($ms)) { ... }
+$p.WaitForExit()
+return $p.ExitCode
+```
+
+Better still, **gate on the OUTPUT when the output is the answer** — parse the
+JSON, look for the marker — rather than on a shell-plumbing detail. Exemptions
+are `-Wait` (Start-Process holds the handle itself) and an explicit
+`# exitcode-audit: <reason>` marker, the same state-your-intent convention the
+`# persistence:` markers use. The analyzer is
+`test\win32\lib\ExitCodeAudit.ps1`; acceptance (and the sweep that must stay at
+zero across `test\win32\` **and** `scripts\`):
+`test\win32\harness-exitcode-audit.ps1`.
+
 **A test sandbox can have an agent of its own** (T167). The local agent's
 single-instance guard is per-user and per-LINEAGE, and the lineage is a
 compile-time fact (`local-debug` for every debug build), so a debug agent

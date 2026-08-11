@@ -168,6 +168,7 @@ Assert "human tree lists panes" ((Get-List) -match '(?m)^Window: "CONF-OVERRIDE'
 $before = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
 # persistence: n/a - this launch forwards its new-window to the live instance and exits; it restores nothing.
 $second = Start-Process $Exe -PassThru
+$null = $second.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
 $exited = $second.WaitForExit(15000)
 Assert "second instance exited" $exited
 if ($exited) { Assert "exit code 0" ($second.ExitCode -eq 0) }

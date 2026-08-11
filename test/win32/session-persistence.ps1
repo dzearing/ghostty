@@ -135,6 +135,7 @@ function Relaunch-App {
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         # Kill the TREE, not just cmd.exe. Stop-Process leaves the ghoztty CLI
         # child alive, and that orphan keeps the redirect target ($out) open --

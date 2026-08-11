@@ -576,6 +576,7 @@ function New-ResumeCommand($markerFile) { return "cmd /c echo started > $markerF
 function Run-Sandbox($argsLine, $out, $timeoutSec = 30) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru -WorkingDirectory $workDir `
         -ArgumentList "/c `"`"$sandboxExe`" $argsLine > `"$out`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null
@@ -639,6 +640,7 @@ function Invoke-Upgrade($tag, $extraArgs, $timeoutSec = 300) {
     Remove-Item $upgradeLog -Force -ErrorAction SilentlyContinue
     $p = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru `
         -WorkingDirectory 'C:\Windows\System32' -ArgumentList $quoted
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     $code = $null
     if ($p.WaitForExit($timeoutSec * 1000)) { $code = $p.ExitCode }
     else { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }

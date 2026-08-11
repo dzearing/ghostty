@@ -528,6 +528,10 @@ function Invoke-GhozttyListJson {
         $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
             -WorkingDirectory $WorkingDirectory `
             -ArgumentList "/c `"`"$Exe`" +list --json > `"$out`" 2>&1`""
+        # Before any wait: touched later, ExitCode reads back EMPTY and this
+        # probe reports "no windows" over a complete answer sitting in $out.
+        # See test\win32\lib\ExitCodeAudit.ps1.
+        $null = $p.Handle
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             return @{ Json = ''; Why = "+list hung past ${TimeoutSec}s" }

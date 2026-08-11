@@ -37,6 +37,7 @@ function Assert($name, $cond) {
 function Run-Cli($argsLine, $outfile, $timeoutSec = 20) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$tmp\$outfile`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null

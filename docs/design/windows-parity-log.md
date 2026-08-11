@@ -14807,3 +14807,63 @@ answering) takes recovery's abort branch, and whether anything retries once it
 unwedges is unmeasured; the teeth run was a near miss, its resume landing ~4s into
 the re-dial. **T724** (`seat: mac`) - the Mac half of this test, carrying the
 pid-oracle trap so that seat does not have to rediscover it.
+
+## 2026-08-10 - the test suite can no longer invent a failure out of an empty exit code (T197)
+
+`Start-Process -PassThru` hands back a process object whose `ExitCode` reads back
+**empty** unless something touched `$p.Handle` while the child was still alive.
+Every harness helper that gates on `if ($code -ne 0) { fail }` therefore had a way
+to score a *working* CLI as broken - and a fabricated failure costs more than a
+missed one, because it sends the next session hunting a defect that is not there.
+It did exactly that twice: T145 ("the harness lied three times"), then a whole
+T147 turn spent on six red assertions against a build whose complete `+list`
+output was sitting in the redirect file.
+
+**The trigger is now measured instead of remembered, and that is the part that
+was missing.** It fires *only* when `Start-Process` is given
+`-RedirectStandardOutput` / `-RedirectStandardError`. With a child that is always
+over before the read (`cmd /c exit 7`), on PowerShell 5.1.26100:
+
+| shape | reads the code |
+|---|---|
+| redirect, handle cached first | 8/8 |
+| redirect, handle cached AFTER the timed wait | 0/8 |
+| redirect, handle never cached | 0/8 |
+| no redirect, handle never cached | 8/8 |
+
+That is why two turns read this as flakiness. Most helpers here redirect *inside*
+`cmd /c ... > file`, which is unaffected, and they sit line-for-line next to the
+ones that pass `-RedirectStandardOutput` and are not - the two are
+indistinguishable by eye. It also settles the middle case: a handle cached after
+the wait loses the code just as completely as never caching one, so
+`agent-recovery.ps1`'s comment claiming that shape worked was wrong.
+
+31 sites are fixed - 28 in `test/win32/`, 3 in `scripts/`. Two of those three are
+not tests at all: `loop-session.ps1`'s `+list --json` probe, which sits on the
+loop's own resume path and would have reported "no windows" over a complete
+answer, and `upgrade-ghoztty-windows.ps1`'s "is the app dead or merely
+unreachable" discriminator, which needs a real exit code to tell those apart.
+
+The durable half is a guard rather than a grep: `test/win32/lib/ExitCodeAudit.ps1`
+analyses every `Start-Process -PassThru` site (joining backtick continuations,
+tracking each variable independently, exempting `-Wait` and an explicit
+`# exitcode-audit:` marker in the same state-your-intent style as the
+`# persistence:` markers), and `test/win32/harness-exitcode-audit.ps1` sweeps
+`test/win32/` **and** `scripts/` to zero. Output-gated sites are never reported:
+judging the OUTPUT is the preferred shape, not a lesser workaround for this.
+
+Evidence: `test/win32/harness-exitcode-audit.ps1` **ALL PASS** (17 fixture arms,
+the two-root sweep, the live measurement above). Teeth-checked the hard way -
+section A ran 12-red against a real bug in its own fixture harness (a `return
+@(...)` that unrolls to a scalar whose `.Count` is `$null`, so every assertion
+silently passed) before going green, and section B then caught an unmarked probe
+inside the audit script itself. All three floor lanes PASS, P1-P3 ALL PASS,
+`agent-recovery.ps1` **ALL PASS (57)**, `session-open.ps1` ALL PASS. The other
+touched scripts were parse-checked rather than re-run, and the table above is why
+that is a bounded claim and not a hope: every site that actually lost the code was
+already output-gated, and every site that gated on the code is a `cmd` wrapper
+that never lost it.
+
+One thread filed: **T725** - these harness guards (this one, `build-mode-guard`,
+`persistence-flag`, `parity-sweep`) all cost a turn to write and none is in a
+standing lane, so each runs only when someone remembers it.

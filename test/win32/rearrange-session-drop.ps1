@@ -50,6 +50,7 @@ function Stop-TestProcs {
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null

@@ -40,6 +40,7 @@ $script:PaneLiveSeq = 0
 function Invoke-LivenessCli([string]$Exe, [string]$ArgsLine, [string]$Out, [int]$TimeoutSec = 15) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $ArgsLine > `"$Out`" 2>&1`""
+    $null = $p.Handle   # before any wait, or ExitCode reads empty (ExitCodeAudit.ps1)
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         return $null
