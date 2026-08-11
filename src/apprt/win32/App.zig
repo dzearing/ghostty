@@ -55,6 +55,7 @@ const url_scheme = @import("url_scheme.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
+const surface_window_role = @import("surface_window_role.zig");
 const window_active = @import("window_active.zig");
 const translate_policy = @import("translate_policy.zig");
 const w32 = @import("win32.zig");
@@ -6326,11 +6327,17 @@ fn surfaceWndProc(
     else
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
-    // Guard: verify this is a surface window or one of its popups.
-    const is_surface_window = surface.hwnd != null and surface.hwnd.? == hwnd;
-    const is_search_popup = surface.search_hwnd != null and surface.search_hwnd.? == hwnd;
-    const is_palette_popup = surface.palette_hwnd != null and surface.palette_hwnd.? == hwnd;
-    if (!is_surface_window and !is_search_popup and !is_palette_popup)
+    // Guard: verify this is a surface window or one of its popups. One
+    // definition for both the guard and the WM_DESTROY routing below, so the
+    // two cannot disagree about which window this is (T613).
+    const role = surface_window_role.roleOf(.{
+        .surface = if (surface.hwnd) |h| @intFromPtr(h) else null,
+        .search = if (surface.search_hwnd) |h| @intFromPtr(h) else null,
+        .palette = if (surface.palette_hwnd) |h| @intFromPtr(h) else null,
+    }, @intFromPtr(hwnd));
+    const is_surface_window = role == .surface;
+    const is_palette_popup = role == .palette_popup;
+    if (role == .foreign)
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
@@ -6387,12 +6394,33 @@ fn surfaceWndProc(
         },
 
         w32.WM_DESTROY => {
-            // The child HWND is being destroyed (by Surface.deinit or
-            // parent Window destruction). Clear state so deinit()
-            // doesn't double-destroy. Lifecycle is managed by Window.
+            // One of this Surface's three windows is being destroyed (by
+            // Surface.deinit or by parent Window destruction). Clear the state
+            // belonging to THAT window, so deinit doesn't double-destroy it.
+            // Lifecycle is managed by Window.
+            //
+            // T613: clearing `surface.hwnd` here unconditionally is what
+            // crashed the app. `Surface.deinit` destroys the two popups a few
+            // lines before it clears the terminal window's GWLP_USERDATA, so a
+            // popup's WM_DESTROY zeroed `hwnd`, the `if (self.hwnd)` at the end
+            // of deinit then did nothing, and the terminal window went into
+            // `DestroyWindow` still holding a `*Surface` about to be freed —
+            // read back through OPENGL32's wglWndProc subclass as a segfault.
             _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
-            surface.hwnd = null;
-            surface.core_surface_ready = false;
+            const clears = surface_window_role.destroyClears(role);
+            if (clears.surface_window) {
+                surface.hwnd = null;
+                surface.core_surface_ready = false;
+            }
+            if (clears.search_popup) {
+                surface.search_hwnd = null;
+                surface.search_edit = null;
+                surface.search_count_label = null;
+            }
+            if (clears.palette_popup) {
+                surface.palette_hwnd = null;
+                surface.palette_edit = null;
+            }
             return 0;
         },
 

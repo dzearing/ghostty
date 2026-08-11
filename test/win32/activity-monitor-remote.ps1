@@ -46,8 +46,8 @@
 #   G. switching BACK to a machine a live WINDOW is connected to keeps that
 #      machine's CARD reachable and BORROWS the window's connection instead of
 #      re-dialing one - and when that window closes underneath, the panel is
-#      told to let go rather than reading freed memory. (The app then crashes
-#      for an OLDER, unrelated reason - see G4's note and T613.)
+#      told to let go rather than reading freed memory, the APP SURVIVES the
+#      close (T613), and the panel stays open.
 #
 # WHY B NEEDS AN ORACLE AT ALL. The loopback agent enumerates the same box, so
 # "the table populated" proves nothing: a panel that silently sampled THIS
@@ -736,17 +736,28 @@ try {
     # memory, and nothing refcounts it - so the window's teardown has to hand
     # the panel its notice, which is what this asserts.
     #
-    # WHY SURVIVAL IS NOT ASSERTED HERE. The app crashes moments later, and it
-    # is NOT this dangler: the same close crashes with T301's release neutered
-    # to a no-op (T296-era behavior) and does NOT crash with no panel open at
-    # all. The fault lands after `Window.onDestroy` has fully run, back inside
-    # DestroyWindow while Win32 destroys the child HWNDs, with an OPENGL32
-    # frame on the stack - the hazard `Surface.deinit` already names in a
-    # comment. It is filed as T613, which owns the survival assertions; adding
-    # them here would only make this script red about somebody else's bug.
+    # SURVIVAL IS ASSERTED HERE (T613). This close used to take the whole
+    # process down - every other window and terminal with it - for a reason
+    # that had nothing to do with the panel's borrowed connection: reaching the
+    # panel means opening the command PALETTE, and a popup's WM_DESTROY used to
+    # clear `Surface.hwnd`, which left the terminal window in DestroyWindow
+    # still holding a `*Surface` freed moments later (read back through
+    # OPENGL32's wglWndProc subclass). The panel was only the trigger's
+    # passenger, so the arm belongs on the sequence that reaches it.
     cmd /c "`"$exe`" +close --target=remact > nul 2>&1" | Out-Null
     Start-Sleep -Seconds 4
     Assert (Select-String -Path $errlog -Pattern 'borrowed connection is going away' -Quiet) 'G4 the closing window told the panel to let go of its connection'
+    $aliveG4 = $null -ne (Get-Process -Id $app.Pid -ErrorAction SilentlyContinue)
+    Assert $aliveG4 'G4 the app survived closing the borrowed-from window (T613)'
+    if ($aliveG4) {
+        Assert (@(Get-TestWindows -ProcessId $app.Pid -Class 'GhozttyWindow').Count -ge 1) `
+            'G4 the other window is still open'
+        # `@(...)` is load-bearing: a function's array return UNROLLS, so a
+        # single panel arrives as a scalar whose `.Count` is $null - and
+        # `$null -ge 1` is false, which reads as a closed panel. Every other
+        # Get-Panels site here wraps it for the same reason.
+        Assert ((@(Get-Panels)).Count -ge 1) 'G4 the panel is still open, reporting the machine it can no longer reach'
+    }
 } finally {
     # cmd, not `& $exe ... 2>&1`: under $ErrorActionPreference='Stop' a native
     # command writing to stderr inside a redirected pipeline is a TERMINATING

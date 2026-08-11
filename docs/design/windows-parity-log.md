@@ -9,6 +9,55 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-11 - **T613 (T742, T743 filed) - opening the command palette no longer arms
+  a crash that fires when you close the window.** Filed as an Activity Monitor
+  bug, and the Activity Monitor turned out to be a passenger: reaching the panel
+  means opening the PALETTE, and that is what did the damage. A plain local
+  window, palette opened once, then closed, took the whole process down — every
+  other window and every terminal in it — with no message. The search bar
+  (ctrl+shift+f) did it too.
+
+  A first-chance `cdb` stack named it in one line where three days of theory had
+  not: `ghoztty!surfaceWndProc` reading a freed `*Surface`, under
+  `OPENGL32!wglWndProc` (OPENGL32 subclasses the GL window), under
+  `NtUserDestroyWindow` from `Window.close`. One window procedure serves THREE
+  windows — the terminal child HWND, the search popup and the palette popup all
+  store the same `*Surface` in `GWLP_USERDATA` — and its `WM_DESTROY` arm cleared
+  `Surface.hwnd` for all of them. `Surface.deinit` destroys the two popups a few
+  lines BEFORE it clears the terminal window's `GWLP_USERDATA`, so the popup's
+  synchronous `WM_DESTROY` nulled `hwnd`, the trailing `if (self.hwnd)` did
+  nothing, and the terminal window entered `DestroyWindow` still advertising a
+  pointer freed moments earlier. It also silently disarmed T681's deferred reap
+  for that pane, so the USER-object leak T681 had just fixed came back for any
+  pane that had ever opened a popup.
+
+  The fix is one definition instead of two: `surface_window_role.zig` (pure,
+  `none` lane) classifies a handle against the three windows and says which
+  fields a `WM_DESTROY` for that role may reset, and `surfaceWndProc` derives
+  both its guard and its clears from it. Regression arms:
+  `test/win32/palette-close-crash.ps1` — agent-free, three arms (`+close` after
+  the palette, the real title-bar `SC_CLOSE` after the palette, `+close` after
+  the SEARCH bar) — plus `activity-monitor-remote.ps1` G4, which now asserts
+  survival instead of documenting the crash. Teeth-checked: putting the
+  unconditional clear back makes arm A red and the app gone.
+
+  What the old evidence was really saying, worth keeping: "does not crash with
+  no panel open" was "does not crash without ever opening the palette", and
+  "still crashes with T301's release neutered" was true because T301 was never
+  involved. Both controls were sound; the variable they isolated was mislabelled.
+  Filed T742: the rest of `surfaceWndProc` is still unrouted — `WM_SIZE` in
+  particular resizes the terminal grid to the palette's dimensions every time
+  `positionCommandPalette` calls `MoveWindow`. Filed T743: running the harness
+  audits over the new script found `persistence-flag.ps1` standing red on four
+  pre-existing undeclared launches (`url-scheme.ps1` ×3, `agent-attach-refused.ps1`).
+
+  One self-inflicted detour worth the line: the G4 panel arm first failed
+  against a healthy build because it read `(Get-Panels).Count` without the
+  `@()` every other site in that script has — a function's array return unrolls,
+  a single panel arrives as a scalar whose `.Count` is `$null`, and `$null -ge 1`
+  is false. The same fabricated-failure shape the exit-code audit exists for,
+  in a different trap.
+
 - 2026-08-10 - **T179 (T719 filed) - a test probe can no longer leave a window
   stuck on top, even if the script that pinned it dies.** T142 cost a day
   chasing "background windows have banners that overlap foreground windows",

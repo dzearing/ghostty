@@ -234,6 +234,11 @@ test {
     // deal.
     _ = @import("apprt/win32/surface_reap.zig");
 
+    // Pure win32 surface-window routing — which of a Surface's three windows a
+    // message arrived for, and what a WM_DESTROY on it may clear (T613), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/surface_window_role.zig");
+
     // Pure win32 activation reading — which proxy for "is this window the
     // active one" still carries information off the input desktop (T215),
     // same no-OS-imports deal.
