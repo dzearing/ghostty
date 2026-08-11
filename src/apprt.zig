@@ -122,6 +122,10 @@ test {
     // Pure win32 split-divider geometry (T155), same no-OS-imports deal.
     _ = @import("apprt/win32/split_geometry.zig");
 
+    // Pure win32 split-divider drag SEMANTICS — which other boundaries hold
+    // their pixel when one divider moves (T533), same no-OS-imports deal.
+    _ = @import("apprt/win32/split_resize.zig");
+
     // Pure win32 tab-strip geometry (T202), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_strip_layout.zig");
 

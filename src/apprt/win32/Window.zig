@@ -89,6 +89,13 @@ const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
+const split_resize = @import("split_resize.zig");
+
+/// How large a tab's split tree may be for a divider drag to compensate the
+/// rest of it (T533). 128 nodes is 64 panes in one tab — far past anything a
+/// person arranges — and a tree past it simply drags the old way rather than
+/// costing the window a heap allocation on the message loop.
+const MAX_DRAG_NODES: usize = 128;
 const tab_strip = @import("tab_strip_layout.zig");
 const caption_layout = @import("caption_layout.zig");
 const frame_size = @import("frame_size.zig");
@@ -336,6 +343,17 @@ dragging_split: bool = false,
 drag_split_handle: SplitTree(PaneView).Node.Handle = .root,
 drag_split_layout: SplitTree(PaneView).Split.Layout = .horizontal,
 drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
+/// The active tab's tree as it was when the divider was GRABBED, flattened for
+/// `split_resize.plan` (T533). Every motion tick re-solves the compensation
+/// against this rather than against the last tick's answer — an `f16` ratio
+/// re-derived a few hundred times drifts, and a drag that goes out and comes
+/// back has to land on the pixels it started on. Zero length means "no
+/// compensation this drag" (a tree too big for the buffer, or a divider whose
+/// own region could not be resolved), which degrades to the pre-T533 behavior
+/// rather than to a wrong one.
+drag_nodes: [MAX_DRAG_NODES]split_resize.Node = undefined,
+drag_node_len: usize = 0,
 
 /// The split node whose divider grab band the pointer is currently over
 /// (T233). Design system §5: hover is a COLOR change, not only a cursor
@@ -3229,7 +3247,12 @@ fn startDividerDrag(self: *Window, handle: SplitTree(PaneView).Node.Handle, layo
     // split's ratio is relative to its sub-rectangle, and mapping the
     // pointer against the whole surface teleported the second divider of a
     // 3-column layout ~200px right on the first motion tick.
-    self.drag_start_rect = self.splitRegionRect(handle) orelse self.surfaceRect();
+    const region = self.splitRegionRect(handle);
+    self.drag_start_rect = region orelse self.surfaceRect();
+    // T533: freeze the tree the drag is solved against. Only when the node's
+    // own region resolved — compensating against the surface rect would pin
+    // boundaries to positions the layout never puts them at.
+    self.drag_node_len = if (region != null) self.snapshotDragNodes() else 0;
     // Held hover: the band must not drop back to rest the instant it is
     // grabbed, and mid-drag the pointer routinely leaves the band.
     self.hover_split = handle;
@@ -3237,23 +3260,92 @@ fn startDividerDrag(self: *Window, handle: SplitTree(PaneView).Node.Handle, layo
     if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
 }
 
+/// Flatten the active tab's tree into `drag_nodes` for `split_resize.plan`.
+/// Returns how many nodes were captured, or 0 when the tree does not fit —
+/// which the drag reads as "no compensation", never as an error.
+fn snapshotDragNodes(self: *Window) usize {
+    if (self.tab_count == 0) return 0;
+    const tree = self.tab_trees[self.active_tab];
+    if (tree.nodes.len == 0 or tree.nodes.len > self.drag_nodes.len) return 0;
+    for (tree.nodes, 0..) |node, i| {
+        self.drag_nodes[i] = switch (node) {
+            .leaf => .leaf,
+            .split => |s| .{ .split = .{
+                // Exhaustive on purpose: a new SplitTree layout variant has to
+                // become a compile error here rather than a silent axis.
+                .layout = switch (s.layout) {
+                    .horizontal => .horizontal,
+                    .vertical => .vertical,
+                },
+                .ratio = @floatCast(s.ratio),
+                .left = @intFromEnum(s.left),
+                .right = @intFromEnum(s.right),
+            } },
+        };
+    }
+    return tree.nodes.len;
+}
+
+/// Whether the snapshot still describes the tree we are about to resize. A
+/// pane can exit mid-drag and rebuild the tree under us; applying stale
+/// handles would then resize whatever now sits at those indices. Cheap and
+/// conservative — a mismatch drops to the uncompensated path for the rest of
+/// the drag, which is exactly the pre-T533 behavior.
+fn dragSnapshotMatches(self: *Window) bool {
+    if (self.drag_node_len == 0) return false;
+    if (self.tab_count == 0) return false;
+    const tree = self.tab_trees[self.active_tab];
+    if (tree.nodes.len != self.drag_node_len) return false;
+    const idx = self.drag_split_handle.idx();
+    if (idx >= tree.nodes.len) return false;
+    return switch (tree.nodes[idx]) {
+        .leaf => false,
+        .split => |s| s.layout == self.drag_split_layout,
+    };
+}
+
 fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
     if (!self.dragging_split) return;
     const rect = self.drag_start_rect;
     const handle = self.drag_split_handle;
 
-    const new_ratio: f16 = switch (self.drag_split_layout) {
-        .horizontal => @floatCast(split_geometry.dragRatio(rect.left, rect.right, x)),
-        .vertical => @floatCast(split_geometry.dragRatio(rect.top, rect.bottom, y)),
+    const start, const end, const pos = switch (self.drag_split_layout) {
+        .horizontal => .{ rect.left, rect.right, x },
+        .vertical => .{ rect.top, rect.bottom, y },
     };
+    const new_ratio = split_geometry.dragRatio(start, end, pos);
 
-    self.tab_trees[self.active_tab].resizeInPlace(handle, new_ratio);
+    // T533: the dragged divider exchanges space with its two adjacent PANES,
+    // so every other boundary in the tab holds its absolute position. `plan`
+    // returns the dragged node's ratio first and the compensating ratios
+    // behind it; a tree it cannot solve returns 0 and we resize just the one
+    // node, which is what this did before.
+    var adjustments: [split_resize.MAX_ADJUSTMENTS]split_resize.Adjust = undefined;
+    const n = if (self.dragSnapshotMatches()) split_resize.plan(
+        self.drag_nodes[0..self.drag_node_len],
+        @intFromEnum(handle),
+        start,
+        end,
+        new_ratio,
+        self.scale,
+        &adjustments,
+    ) else 0;
+
+    if (n == 0) {
+        self.tab_trees[self.active_tab].resizeInPlace(handle, @floatCast(new_ratio));
+    } else for (adjustments[0..n]) |a| {
+        self.tab_trees[self.active_tab].resizeInPlace(
+            @enumFromInt(a.handle),
+            @floatCast(a.ratio),
+        );
+    }
     self.layoutSplits();
 }
 
 fn endDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
+    self.drag_node_len = 0;
     _ = w32.ReleaseCapture();
     // Re-derive hover from where the pointer actually ended up: the ratio is
     // clamped to [0.1, 0.9], so a drag pushed to the limit leaves the band

@@ -935,6 +935,46 @@ if ($a495.Process -and $a495.Process.HasExited) {
             Assert ([math]::Abs($f1 - $ftarget) -le 20) `
                 "T495: first (root) divider still tracks (+60px: wanted ~$ftarget, got $f1)"
 
+            # ---------------------------------------------------------------
+            # T533: dragging the FIRST divider moves ONLY the first divider.
+            #
+            # The user's report, 2026-08-06, right after confirming T495:
+            # "resizing the 1st sizer moves the 2nd sizer. I expect ... only
+            # the 2 panels being sized are [affected]." The root ratio is the
+            # boundary between p1 and the whole right SUBTREE, so leaving the
+            # nested ratio alone slides divider 2 by half of whatever divider 1
+            # travels. It now holds its absolute x, and p3 keeps its width.
+            #
+            # Oracle: pane rects again. The drag is deliberately large (+120px)
+            # so the uncompensated answer (~60px of slide) is nowhere near the
+            # few pixels of f16/DPI rounding this allows.
+            # ---------------------------------------------------------------
+            $b0 = Get-SecondDividerX $t495
+            $p3w0 = (@(Get-Panes $t495 | Sort-Object Left)[2]).Right - (@(Get-Panes $t495 | Sort-Object Left)[2]).Left
+            $btarget = $b0.FirstX + 120
+            Invoke-DividerDrag -Top $t495 -X0 $b0.FirstX -Y0 $b0.Y -X1 $btarget -Y1 $b0.Y
+            $b1 = Get-SecondDividerX $t495
+            $p3w1 = (@(Get-Panes $t495 | Sort-Object Left)[2]).Right - (@(Get-Panes $t495 | Sort-Object Left)[2]).Left
+            # Control first: if the first divider did not actually move, the
+            # assertions below would pass on a build that does nothing at all.
+            Assert ([math]::Abs($b1.FirstX - $btarget) -le 20) `
+                "T533 control: first divider tracked the +120px drag (wanted ~$btarget, got $($b1.FirstX))"
+            Assert ([math]::Abs($b1.X - $b0.X) -le 6) `
+                "T533: second divider held its position while the first was dragged ($($b0.X) -> $($b1.X))"
+            Assert ([math]::Abs($p3w1 - $p3w0) -le 6) `
+                "T533: the far pane kept its width ($p3w0 -> $p3w1)"
+
+            # And back the other way, so the hold is not a one-direction fluke
+            # — and so the reversibility the pure module asserts is measured on
+            # the real thing too.
+            $btarget2 = $b1.FirstX - 120
+            Invoke-DividerDrag -Top $t495 -X0 $b1.FirstX -Y0 $b0.Y -X1 $btarget2 -Y1 $b0.Y
+            $b2 = Get-SecondDividerX $t495
+            Assert ([math]::Abs($b2.FirstX - $btarget2) -le 20) `
+                "T533 control: first divider tracked the -120px drag (wanted ~$btarget2, got $($b2.FirstX))"
+            Assert ([math]::Abs($b2.X - $b0.X) -le 6) `
+                "T533: second divider still held after dragging back ($($b0.X) -> $($b2.X))"
+
             Assert (-not ($a495.Process -and $a495.Process.HasExited)) 'T495: no crash'
         }
         Stop-Process -Id $a495.Pid -Force -ErrorAction SilentlyContinue

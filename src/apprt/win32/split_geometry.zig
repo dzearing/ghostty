@@ -322,11 +322,25 @@ pub const HERO_DIVIDER_CURSOR: DividerCursor = .size_we;
 /// after which the divider tracks OFFSET from the pointer instead of under it.
 /// Mapping against the node's own region makes a grabbed-but-unmoved divider
 /// reproduce its current ratio, and makes the [0.1, 0.9] clamp per-node.
+///
+/// This answers where the DRAGGED divider goes. What the rest of the tree does
+/// about it — every other boundary holds its absolute position, so a drag
+/// exchanges space between two panes and no others — is `split_resize.plan`
+/// (T533), which is this function's sibling and lives next door.
 pub fn dragRatio(region_start: i32, region_end: i32, pos: i32) f32 {
     const total: f32 = @floatFromInt(@max(region_end - region_start, 1));
     const p: f32 = @floatFromInt(pos - region_start);
-    return std.math.clamp(p / total, 0.1, 0.9);
+    return std.math.clamp(p / total, MIN_RATIO, MAX_RATIO);
 }
+
+/// The band a split's ratio is held in: neither child of a split may be
+/// squeezed below a tenth of the region they share. Named because a SECOND
+/// caller now obeys it — `split_resize.holdRatio`, which pins the OTHER
+/// boundaries during a drag (T533) and must give way at the same floor a
+/// dragged divider does, or a compensated pane could vanish where a dragged
+/// one cannot.
+pub const MIN_RATIO: f32 = 0.1;
+pub const MAX_RATIO: f32 = 0.9;
 
 test "bandPx: 2 DIP, and never a single physical pixel at any scale" {
     try testing.expectEqual(@as(i32, 2), bandPx(1.0));
