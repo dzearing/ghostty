@@ -2965,6 +2965,30 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             self.cancel();
             return true;
         },
+        // Ctrl+W — the Windows spelling of Mac's Cmd-W ("Close"), and its
+        // Ctrl+Shift+W sibling. Over a dialog, "close" means CLOSE THE DIALOG,
+        // so both route to the one teardown path the close button and Escape
+        // already use (upstream `11fe14bc3`, T603).
+        //
+        // On Mac that fix was load-bearing: the menu item sends its action to
+        // the first responder, and with nothing in the panel's chain answering
+        // it, AppKit walked on into the MAIN window and closed a pane behind
+        // the dialog. Win32 cannot reach that state — the chord arrives as a
+        // WM_KEYDOWN at whichever chooser control has the keyboard, the owner
+        // window is DISABLED while the chooser is up, and only a Surface's own
+        // WndProc turns a key into a binding — so this is the second half of
+        // the parity: the chord now DOES something here rather than nothing.
+        // The regression arm asserts both halves (`chooser-close-chord.ps1`).
+        //
+        // Alt is required to be UP: AltGr reports as ctrl+alt, so an AltGr+W
+        // that types a character on someone's layout must still reach the
+        // filter EDIT. Shift is not consulted — ctrl+shift+w is the same verb.
+        'W' => {
+            if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) >= 0) return false;
+            if (w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0) return false;
+            self.cancel();
+            return true;
+        },
         w32.VK_RETURN => {
             // Enter on a non-default button presses IT, not the default Open
             // button — this loop intercepts Enter before the control sees it.
