@@ -44,6 +44,29 @@ pub const virtual_host = "ghoztty-viewer";
 /// the file's bytes arrive afterwards through `window.__viewer`.
 pub const page_url = "https://" ++ virtual_host ++ "/viewer.html";
 
+/// The synthetic origin a directly-rendered `.html` FILE loads from (T601).
+///
+/// A second host rather than a path under the first, because the two grants are
+/// different: everything under `ghoztty-viewer` is the bundled template we
+/// wrote, and everything under this one is the user's page and its own assets,
+/// resolved against the viewed file's directory and nothing else. Keeping them
+/// apart is what stops a page asking for `vendor/markdown-it.min.js` and being
+/// handed ours, and what makes the grant a single lexical prefix check.
+///
+/// Deliberately NOT `file://`. Mac loads the file with
+/// `loadFileURL(allowingReadAccessTo:)`, whose whole point is that the grant is
+/// the file's own directory, recursively — narrow by default. WebView2 has no
+/// per-navigation grant to pass: a `file://` document's subresource loads reach
+/// the entire filesystem, which is a wider grant than the feature asks for and
+/// one that cannot be taken back per-pane.
+pub const page_virtual_host = "ghoztty-page";
+
+/// What `AddWebResourceRequestedFilter` is given for the page host.
+pub const page_resource_filter = "https://" ++ page_virtual_host ++ "/*";
+
+/// The prefix a request URI carries when it belongs to a rendered `.html` page.
+const page_origin_prefix = "https://" ++ page_virtual_host;
+
 /// The blank browser page — what `--view=about:blank` and the palette's
 /// "Viewer: Open Browser Pane" open, and the location an adopted popup carries
 /// when its opener named no URL at all (Mac's `ViewerView.blankPage`, T163).
@@ -66,10 +89,37 @@ pub const Mode = enum {
     markdown,
     /// Render as syntax-highlighted text in the bundled template.
     code,
+    /// A local `.html` file, loaded into the web view AS A PAGE (T601): its own
+    /// CSS, scripts, images and fonts run exactly as they would if it were
+    /// hosted. Mac's fourth `Mode` case, same extensions.
+    html,
 
-    /// Whether this mode loads the bundled template rather than the location.
+    /// Whether this mode has a FILE on disk behind it. True for a rendered
+    /// HTML page as much as for a markdown document — the pane is titled by
+    /// its basename, watches it for saves, and reports itself as a file to
+    /// `+list`.
     pub fn isFile(self: Mode) bool {
         return self != .web;
+    }
+
+    /// Whether this mode loads the BUNDLED TEMPLATE and injects the file's
+    /// bytes into it, rather than loading a page directly.
+    ///
+    /// Split from `isFile` by T601: `.html` is a file the web view loads
+    /// itself, so everything the template implies — the injection call, the
+    /// heading bridge behind the table of contents, the "re-render in place"
+    /// reload, the relative-link routing that only exists because the template
+    /// cannot navigate — is false for it, while everything the FILE implies is
+    /// still true.
+    pub fn usesTemplate(self: Mode) bool {
+        return self == .markdown or self == .code;
+    }
+
+    /// Whether the pane navigates like a browser here (Mac's `isLivePage`):
+    /// links follow in place, Back and Forward walk real history, and the
+    /// document, not us, decides what loads next.
+    pub fn isLivePage(self: Mode) bool {
+        return self == .web or self == .html;
     }
 };
 
@@ -82,6 +132,12 @@ pub fn modeFor(location: []const u8) Mode {
     const ext = extension(location);
     for ([_][]const u8{ "md", "markdown", "mdown", "mkd", "mdwn" }) |m| {
         if (std.ascii.eqlIgnoreCase(ext, m)) return .markdown;
+    }
+    // A local page, not a document about one: `.html`/`.htm` render (T601).
+    // Rendering is unconditional — there is no source-view toggle to carry
+    // through history and session restore, exactly as on Mac.
+    for ([_][]const u8{ "html", "htm" }) |h| {
+        if (std.ascii.eqlIgnoreCase(ext, h)) return .html;
     }
     return .code;
 }
@@ -227,16 +283,83 @@ pub fn initialTitle(mode: Mode, location: []const u8, file_path: ?[]const u8) []
 /// Returns null for a URI that is not ours, or one whose path is empty (the
 /// bare origin names no resource).
 pub fn requestPath(buf: []u8, uri: []const u8) ?[]const u8 {
-    if (uri.len < origin_prefix.len) return null;
-    if (!std.ascii.eqlIgnoreCase(uri[0..origin_prefix.len], origin_prefix)) return null;
-    var rest = uri[origin_prefix.len..];
+    return underOrigin(buf, origin_prefix, uri);
+}
+
+/// The relative path a PAGE-host request is asking for, decoded into `buf`
+/// (T601). `https://ghoztty-page/sub/app.css` -> `sub/app.css`.
+///
+/// A separate function from `requestPath` rather than a parameterized one: the
+/// two origins get different resolution — this one is the viewed page's own
+/// directory and nothing else, with no bundled-assets tier in front of it — and
+/// a shared parser whose caller has to remember which root to use is exactly
+/// how the page would end up served OUR `viewer.css`.
+pub fn pageRequestPath(buf: []u8, uri: []const u8) ?[]const u8 {
+    return underOrigin(buf, page_origin_prefix, uri);
+}
+
+fn underOrigin(buf: []u8, prefix: []const u8, uri: []const u8) ?[]const u8 {
+    if (uri.len < prefix.len) return null;
+    if (!std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return null;
+    var rest = uri[prefix.len..];
     // The origin has to end here or at a path separator — otherwise
-    // `https://ghoztty-viewer.example.com/` would look like ours.
+    // `https://ghoztty-page.example.com/` would look like ours.
     if (rest.len == 0) return null;
     if (rest[0] != '/') return null;
     rest = stripQuery(rest[1..]);
     if (rest.len == 0) return null;
     return percentDecode(buf, rest);
+}
+
+/// Whether `uri` names something on the page host at all — the test
+/// `syncCommitted` runs BEFORE its generic "https means the web" one, so a
+/// rendered page committing its own URL is not mistaken for a website (T601).
+pub fn isPageOrigin(uri: []const u8) bool {
+    if (uri.len < page_origin_prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(uri[0..page_origin_prefix.len], page_origin_prefix)) return false;
+    return uri.len == page_origin_prefix.len or uri[page_origin_prefix.len] == '/';
+}
+
+/// The page-host URL that serves `path`, whose grant root is `root` (T601).
+///
+/// Null when `path` does not sit under `root` — a page cannot be served from a
+/// grant that does not contain it, and answering with a URL that the request
+/// handler would then refuse is a worse failure than not navigating.
+///
+/// Separators are normalized to `/` and every byte outside the unreserved set
+/// is percent-encoded, so a path with a space, a `#`, or a non-ASCII name
+/// survives the round trip through `pageRequestPath`. Caller owns the result.
+pub fn pageUrlFor(
+    alloc: Allocator,
+    root: []const u8,
+    path: []const u8,
+) Allocator.Error!?[:0]u8 {
+    if (root.len == 0 or path.len == 0) return null;
+    if (!isUnder(path, root)) return null;
+    var rel = path[root.len..];
+    while (rel.len > 0 and isSep(rel[0])) rel = rel[1..];
+    if (rel.len == 0) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, page_origin_prefix);
+    try out.append(alloc, '/');
+    for (rel) |c| {
+        if (isSep(c) or c == '/') {
+            try out.append(alloc, '/');
+        } else if (isUnreserved(c)) {
+            try out.append(alloc, c);
+        } else {
+            var hex: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&hex, "%{X:0>2}", .{c}) catch unreachable;
+            try out.appendSlice(alloc, &hex);
+        }
+    }
+    return try out.toOwnedSliceSentinel(alloc, 0);
+}
+
+fn isUnreserved(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
 }
 
 /// A candidate path under `root`, or null when `rel` would escape it.
@@ -336,6 +459,14 @@ pub fn isUnder(path: []const u8, root: []const u8) bool {
     // `root` may or may not already end in a separator (a drive root does).
     if (isSep(root[root.len - 1])) return true;
     return isSep(path[root.len]);
+}
+
+/// Whether two paths name the same file, by the platform's own case rules.
+/// Purely textual, like everything else here — two spellings of one path (a
+/// short name, a symlink) are not equal, and the callers only ever compare
+/// paths this module produced.
+pub fn samePath(a: []const u8, b: []const u8) bool {
+    return a.len == b.len and eqlPath(a, b);
 }
 
 fn isSep(c: u8) bool {
@@ -562,18 +693,37 @@ pub const ReloadPlan = enum {
     /// exists to pick up server-side changes, so a cache hit is a wrong
     /// answer that looks exactly like a right one.
     refetch,
-    /// File mode: re-read the file and re-render it in place (the page
+    /// Template mode: re-read the file and re-render it in place (the page
     /// preserves scroll for us — `viewer.js`'s `restoreScroll`).
     rerender,
+    /// A rendered `.html` file that CHANGED ON DISK: reload the page normally
+    /// (T601). Mac's `reload()` rather than `reloadFromOrigin()` — the reload
+    /// replaces its history entry instead of filling the Back stack, and the
+    /// engine restores the scroll offset across it, so a save does not throw
+    /// you back to the top of a long page. Page-host responses carry
+    /// `Cache-Control: no-store`, so a normal reload still re-reads disk.
+    reload_in_place,
+};
+
+/// Why a reload is happening. The two differ for exactly one mode — a rendered
+/// `.html` file, where a SAVE must keep the reader where they were and an
+/// explicit reload must get past every cache in the way (T601).
+pub const ReloadReason = enum {
+    /// `+reload`, or the chrome's reload button / Ctrl+R.
+    chrome,
+    /// The file watcher saw the viewed file change.
+    file_changed,
 };
 
 /// `mode` is where the pane currently points; `page_loaded` is whether a
-/// navigation has COMPLETED there. Deliberately a function of those two and
+/// navigation has COMPLETED there. Deliberately a function of those three and
 /// nothing else — a plan that also depended on the controller's liveness would
 /// be untestable, and "no controller" is already "no completed load".
-pub fn reloadPlan(mode: Mode, page_loaded: bool) ReloadPlan {
+pub fn reloadPlan(mode: Mode, page_loaded: bool, reason: ReloadReason) ReloadPlan {
     if (!page_loaded) return .full_load;
-    return if (mode.isFile()) .rerender else .refetch;
+    if (mode.usesTemplate()) return .rerender;
+    if (mode == .html and reason == .file_changed) return .reload_in_place;
+    return .refetch;
 }
 
 /// The DevTools method that re-fetches bypassing caches, and its parameters.
@@ -625,7 +775,11 @@ pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
     // would raise a window in the release app. Handled here it always means
     // "this app" (T695).
     if (url_scheme.handles(uri)) return .ghoztty_command;
-    if (!mode.isFile()) return .allow;
+    // A website — and a local `.html` file, which IS a page (T601) — navigates
+    // freely in the pane. That is Mac's `isLivePage` branch of `decidePolicyFor`,
+    // and for the html half it is what the `python3 -m http.server` workaround
+    // this replaces already did: links, Back and Forward all follow in place.
+    if (mode.isLivePage()) return .allow;
     // The template itself (with or without a query/fragment): the pane's own
     // document, never a link target to route.
     if (std.ascii.eqlIgnoreCase(stripQuery(uri), page_url)) return .allow;
@@ -684,12 +838,19 @@ pub fn navCandidate(
 }
 
 /// What a routed FILE target opens in (Mac `handleFileModeLink`'s final
-/// switch): markdown gets a viewer split next to this pane; everything else —
-/// code, images, archives — goes to its default app.
+/// switch): a document Ghoztty can RENDER gets a viewer split next to this
+/// pane; everything else — code, images, archives — goes to its default app.
+///
+/// `.html` joined markdown on that side with T601: it renders here now, so
+/// handing it to the default app would open the user's browser for a page the
+/// pane next door was about to show them.
 pub const FileLinkAction = enum { viewer_split, default_app };
 
 pub fn fileLinkAction(path: []const u8) FileLinkAction {
-    return if (modeFor(path) == .markdown) .viewer_split else .default_app;
+    return switch (modeFor(path)) {
+        .markdown, .html => .viewer_split,
+        .code, .web => .default_app,
+    };
 }
 
 // -------------------------------------------------------------------------
@@ -733,14 +894,52 @@ test "modeFor: the Mac extension table, and web wins over it" {
     // `file://` is a FILE, not a web page — the whole reason viewMode does not
     // key on "://".
     try testing.expectEqual(Mode.markdown, modeFor("file:///c:/src/README.md"));
+
+    // T601: `.html`/`.htm` is a fourth mode, not code. Before this the pane
+    // showed you the markup, which is why anything wanting to SEE the page had
+    // to stand up an http server for a file already on disk.
+    try testing.expectEqual(Mode.html, modeFor("/site/index.html"));
+    try testing.expectEqual(Mode.html, modeFor("C:\\site\\INDEX.HTM"));
+    try testing.expectEqual(Mode.html, modeFor("file:///c:/site/index.html"));
+    // A URL is still the web, extension or not.
+    try testing.expectEqual(Mode.web, modeFor("https://example.com/index.html"));
+    // Neighbours that only LOOK like it.
+    try testing.expectEqual(Mode.code, modeFor("/site/index.html.tmpl"));
+    try testing.expectEqual(Mode.code, modeFor("/site/x.xhtml"));
+}
+
+test "the three mode predicates split file, template and live page" {
+    // The T601 split: `.html` has a file behind it AND is a live page, and is
+    // the only mode for which those two are true at once. Everything that used
+    // to key on `isFile` had to choose which of the two it meant.
+    for ([_]Mode{ .markdown, .code, .html }) |m| try testing.expect(m.isFile());
+    try testing.expect(!Mode.web.isFile());
+
+    for ([_]Mode{ .markdown, .code }) |m| try testing.expect(m.usesTemplate());
+    for ([_]Mode{ .web, .html }) |m| try testing.expect(!m.usesTemplate());
+
+    for ([_]Mode{ .web, .html }) |m| try testing.expect(m.isLivePage());
+    for ([_]Mode{ .markdown, .code }) |m| try testing.expect(!m.isLivePage());
 }
 
 test "reloadPlan: the branch is the verb's whole contract" {
     // A completed page reloads in the way its mode can: the web re-fetches,
     // a file re-renders. These two are the ordinary cases.
-    try testing.expectEqual(ReloadPlan.refetch, reloadPlan(.web, true));
-    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.markdown, true));
-    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.code, true));
+    try testing.expectEqual(ReloadPlan.refetch, reloadPlan(.web, true, .chrome));
+    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.markdown, true, .chrome));
+    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.code, true, .chrome));
+
+    // T601, and the one place the REASON matters. A save must leave the reader
+    // where they were, so it is a normal reload (the engine restores scroll and
+    // replaces the history entry); an explicit `+reload` is the user saying the
+    // bytes on screen are stale, so it bypasses every cache.
+    try testing.expectEqual(ReloadPlan.reload_in_place, reloadPlan(.html, true, .file_changed));
+    try testing.expectEqual(ReloadPlan.refetch, reloadPlan(.html, true, .chrome));
+    // The reason changes nothing for any other mode: a template re-render reads
+    // the file either way, and a website has no local file to have changed.
+    try testing.expectEqual(ReloadPlan.rerender, reloadPlan(.markdown, true, .file_changed));
+    try testing.expectEqual(ReloadPlan.refetch, reloadPlan(.web, true, .file_changed));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.html, false, .file_changed));
 
     // Nothing has finished loading yet — a pane whose first navigation failed
     // or is still in flight. Re-rendering into a page that has no
@@ -748,9 +947,9 @@ test "reloadPlan: the branch is the verb's whole contract" {
     // never fetched, both end in a pane that stays blank and says nothing; the
     // recovery is to load it again from scratch. This is the case `+reload`
     // exists for on a pane the user is staring at BECAUSE it is empty.
-    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.web, false));
-    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.markdown, false));
-    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.code, false));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.web, false, .chrome));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.markdown, false, .chrome));
+    try testing.expectEqual(ReloadPlan.full_load, reloadPlan(.code, false, .chrome));
 }
 
 test "the DevTools reload really asks to bypass the cache" {
@@ -861,6 +1060,86 @@ test "requestPath: ours, decoded, and nobody else's" {
     // The bare origin names no resource.
     try testing.expect(requestPath(&buf, "https://ghoztty-viewer/") == null);
     try testing.expect(requestPath(&buf, "https://ghoztty-viewer") == null);
+
+    // T601: the page host is a DIFFERENT origin, and the two parsers must not
+    // answer for each other — a page asking for `vendor/markdown-it.min.js`
+    // would otherwise be handed the bundled template's copy.
+    try testing.expect(requestPath(&buf, "https://ghoztty-page/index.html") == null);
+    try testing.expect(pageRequestPath(&buf, "https://ghoztty-viewer/viewer.html") == null);
+}
+
+test "pageRequestPath and isPageOrigin: the rendered page's own origin (T601)" {
+    var buf: [256]u8 = undefined;
+
+    try testing.expectEqualStrings(
+        "index.html",
+        pageRequestPath(&buf, "https://ghoztty-page/index.html").?,
+    );
+    try testing.expectEqualStrings(
+        "assets/app.css",
+        pageRequestPath(&buf, "https://ghoztty-page/assets/app.css").?,
+    );
+    try testing.expectEqualStrings(
+        "my page.html",
+        pageRequestPath(&buf, "https://ghoztty-page/my%20page.html#top").?,
+    );
+    try testing.expect(pageRequestPath(&buf, "https://ghoztty-page.evil.com/x") == null);
+    try testing.expect(pageRequestPath(&buf, "https://ghoztty-page/") == null);
+
+    // `isPageOrigin` is the coarser test `syncCommitted` runs BEFORE deciding
+    // "https means the web": it must say yes for the bare origin too, where
+    // there is no resource path to extract.
+    try testing.expect(isPageOrigin("https://ghoztty-page/index.html"));
+    try testing.expect(isPageOrigin("https://ghoztty-page"));
+    try testing.expect(isPageOrigin("HTTPS://GHOZTTY-PAGE/x.html"));
+    try testing.expect(!isPageOrigin("https://ghoztty-pages/x.html"));
+    try testing.expect(!isPageOrigin("https://ghoztty-viewer/viewer.html"));
+    try testing.expect(!isPageOrigin("https://example.com/"));
+}
+
+test "pageUrlFor: round-trips back through pageRequestPath (T601)" {
+    const alloc = testing.allocator;
+    const sep = std.fs.path.sep_str;
+
+    {
+        const root = "C:" ++ sep ++ "site";
+        const path = "C:" ++ sep ++ "site" ++ sep ++ "index.html";
+        const url = (try pageUrlFor(alloc, root, path)).?;
+        defer alloc.free(url);
+        try testing.expectEqualStrings("https://ghoztty-page/index.html", url);
+
+        // The whole point of the pair: what the pane navigates to is what the
+        // request handler resolves back to the same file.
+        var buf: [256]u8 = undefined;
+        const rel = pageRequestPath(&buf, url).?;
+        const back = (try candidateUnder(alloc, root, rel)).?;
+        defer alloc.free(back);
+        try testing.expect(isUnder(back, root));
+    }
+
+    // A page in a subdirectory of the grant, and a name needing escapes. The
+    // separators become `/` and everything outside the unreserved set is
+    // percent-encoded, or the URL would carry a `#` that truncates the path.
+    {
+        const root = "C:" ++ sep ++ "site";
+        const path = "C:" ++ sep ++ "site" ++ sep ++ "docs" ++ sep ++ "a b#c.html";
+        const url = (try pageUrlFor(alloc, root, path)).?;
+        defer alloc.free(url);
+        try testing.expectEqualStrings("https://ghoztty-page/docs/a%20b%23c.html", url);
+
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings("docs/a b#c.html", pageRequestPath(&buf, url).?);
+    }
+
+    // A path outside the grant has no URL at all: navigating to one the handler
+    // would then refuse is a blank pane with no explanation.
+    {
+        const root = "C:" ++ sep ++ "site";
+        const outside = "C:" ++ sep ++ "other" ++ sep ++ "index.html";
+        try testing.expect((try pageUrlFor(alloc, root, outside)) == null);
+        try testing.expect((try pageUrlFor(alloc, root, root)) == null);
+        try testing.expect((try pageUrlFor(alloc, "", "x.html")) == null);
+    }
 }
 
 test "the bundled stylesheet names fonts that resolve on Windows" {
@@ -1116,6 +1395,22 @@ test "classifyLink: the Mac policy, with the virtual host carved out first" {
     try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "mailto:a@b.c"));
     try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "about:blank"));
     try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "vscode://open"));
+
+    // T601: a rendered `.html` file is a PAGE. It navigates like a website —
+    // its own links, its own relative targets, its own external ones — because
+    // that is exactly what it did behind the http server this replaces. Routing
+    // its relative links out to a viewer split would break every multi-page
+    // local site.
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "https://ghoztty-page/two.html"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "file:///C:/a.md"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "mailto:a@b.c"));
+    // Except the one thing no engine can load: a `ghoztty://` link still means
+    // "this app", in every mode.
+    try testing.expectEqual(
+        LinkClass.ghoztty_command,
+        classifyLink(.html, "ghoztty://focus/dev"),
+    );
 }
 
 test "routesAsLink: new documents route, the pane's own kinds do not" {
@@ -1160,8 +1455,14 @@ test "navCandidate: next to the viewed file, unguarded on purpose" {
     try testing.expect((try navCandidate(alloc, "", "a.md")) == null);
 }
 
-test "fileLinkAction: markdown splits, everything else opens in its app" {
+test "fileLinkAction: what Ghoztty can render splits, the rest opens in its app" {
     for ([_][]const u8{ "a.md", "a.markdown", "a.MD", "docs/b.mdown" }) |p| {
+        try testing.expectEqual(FileLinkAction.viewer_split, fileLinkAction(p));
+    }
+    // T601: an `.html` link from a markdown doc opens a viewer split too, now
+    // that the viewer renders one. Handing it to the default app would launch
+    // the browser for a page the pane next door was about to show.
+    for ([_][]const u8{ "a.html", "site/b.HTM" }) |p| {
         try testing.expectEqual(FileLinkAction.viewer_split, fileLinkAction(p));
     }
     for ([_][]const u8{ "a.zig", "a.png", "a.pdf", "Makefile", "a.txt" }) |p| {

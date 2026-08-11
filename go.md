@@ -538,9 +538,12 @@ the fix is the message.
    recently focused window and lands somewhere else. Both halves are
    idempotent: re-running reuses the server and focuses the existing pane.
    `-Stop` kills the server, `-NoPane` skips the split, `-Port` moves it off
-   7788. It is served over http and NOT written to a `.html` file on purpose:
-   a viewer renders `.md` and treats every other extension as code, so a local
-   `.html` would display its own source. After a reboot, run it again.
+   7788. It is served over http rather than written to a `.html` file, which
+   since T601 is for its own reasons and no longer because a viewer would show
+   the source: the dashboard fetches its data from the server and re-renders as
+   task files change, which a static file cannot do. A local `.html` pane now
+   renders the page (with live reload on save), so a page that needs no server
+   does not need one. After a reboot, run it again.
 2. Work **one** task, per the context rule above. At the boundary, record
    status and evidence in the task's own file, and append ONE short entry to
    `windows-parity-log.md` (no build output, no diffs). Run

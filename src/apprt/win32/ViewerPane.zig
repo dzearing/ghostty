@@ -524,6 +524,37 @@ nav_deadline: u64 = 0,
 /// the moment the pane goes web so the watcher disarms.
 file_location: ?[:0]u8 = null,
 
+/// The directory a rendered `.html` page is allowed to read from (T601): the
+/// viewed file's OWN directory, recursively, and nothing above it. Owned; null
+/// in every other mode.
+///
+/// PINNED when the pane enters html mode, not re-derived per navigation. A
+/// local site whose index links into `docs/` navigates the pane to
+/// `docs/page.html`, and re-deriving the root from the new file would move the
+/// grant down with it — the page's own `../style.css` would then be an escape
+/// out of a root it defined, and a link back up would 404. Mac's grant has the
+/// same shape for the same reason: it is passed once, to `loadFileURL`.
+html_root: ?[]u8 = null,
+
+/// The page-host URL `html_root`'s current file is served at, derived once per
+/// navigation. Owned; null in every other mode.
+///
+/// Stored rather than rebuilt because `applyNavigation` has no allocator — it
+/// runs from the reload path and from controller adoption as well as from
+/// `navigate`, and a navigation target it could fail to build is a pane that
+/// silently shows nothing.
+html_url: ?[:0]u8 = null,
+
+/// Whether the html pane is showing the TEMPLATE's error card instead of its
+/// page, because the file could not be read when the navigation was issued
+/// (T601). Cleared by every navigation that finds the file again.
+///
+/// A missing file is the one case where an html pane loads the template: our
+/// resource handler would answer 404 and Chromium would paint its own
+/// can't-be-reached page, which says nothing about which file or why. Mac gets
+/// its card from `renderFileContent` for the same reason.
+html_fallback: bool = false,
+
 /// History availability as of the last `HistoryChanged`. Mirrored onto the
 /// bar; read directly by the live test.
 can_go_back: bool = false,
@@ -703,6 +734,8 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     if (self.file_path) |p| alloc.free(p);
     if (self.file_location) |l| alloc.free(l);
     if (self.resources_dir) |d| alloc.free(d);
+    if (self.html_root) |d| alloc.free(d);
+    if (self.html_url) |u| alloc.free(u);
     self.title = null;
     self.location = null;
     self.home_location = null;
@@ -710,6 +743,9 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     self.file_path = null;
     self.file_location = null;
     self.resources_dir = null;
+    self.html_root = null;
+    self.html_url = null;
+    self.html_fallback = false;
     self.state = .idle;
 }
 
@@ -1297,15 +1333,18 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     // same pane moves between a file and the web over its life (the address
     // bar, an in-page link), and a stale mode would render a website through
     // the markdown template.
-    const was_file = self.mode.isFile();
+    const was_template = self.mode.usesTemplate();
     self.mode = content.modeFor(url);
-    // Leaving file mode for the web: whatever headings the template last
-    // reported are gone with it, and nothing will arrive to clear them — the
-    // bridge only exists in our template. (`syncCommitted` applies the same
-    // rule to BROWSER-initiated moves, where the pane's mode has not flipped
-    // yet by the time the commit event lands; this is the pane-initiated
-    // half, which flips the mode right here.)
-    if (was_file and !self.mode.isFile()) self.clearHeadings(alloc);
+    // Leaving the TEMPLATE — for the web, or for a rendered `.html` page, which
+    // the web view loads itself: whatever headings the template last reported
+    // are gone with it, and nothing will arrive to clear them, because the
+    // bridge only exists in our template. Keying this on `usesTemplate` rather
+    // than `isFile` is what keeps a markdown document's table of contents from
+    // hanging over the HTML page that replaced it (T601). (`syncCommitted`
+    // applies the same rule to BROWSER-initiated moves, where the pane's mode
+    // has not flipped yet by the time the commit event lands; this is the
+    // pane-initiated half, which flips the mode right here.)
+    if (was_template and !self.mode.usesTemplate()) self.clearHeadings(alloc);
     if (self.file_path) |p| alloc.free(p);
     self.file_path = null;
     if (self.mode.isFile()) {
@@ -1315,14 +1354,22 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
         } else {
             log.warn("viewer location is not a usable file path", .{});
         }
+    }
+    if (self.mode.usesTemplate()) {
         // Remember the file separately from `file_path`: this copy SURVIVES
         // the pane going web, because it is what Back re-renders when the
         // browser walks history onto the template again (T159).
+        //
+        // A rendered `.html` file is deliberately NOT recorded here (T601,
+        // Mac's `fileLocation` note): this field means "the file the TEMPLATE
+        // page is holding", and overwriting it with a directly-loaded page
+        // would lose the markdown document still sitting behind it in history.
         if (alloc.dupeZ(u8, url)) |copy| {
             if (self.file_location) |l| alloc.free(l);
             self.file_location = copy;
         } else |_| {}
     }
+    self.syncHtmlGrant(alloc);
 
     // Name the pane NOW, from the location alone. A website's real title
     // arrives later over `DocumentTitleChanged`; a file's never does (the
@@ -1343,6 +1390,76 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     self.refreshWorktree();
     self.applyNavigation();
     self.syncWatcher(alloc);
+}
+
+/// Re-derive the read grant and the page URL a rendered `.html` file loads
+/// from (T601), for a navigation the PANE issued — an open, the address bar,
+/// Home, a session restore. Every one of those names a file outright, so the
+/// grant is re-derived from it; a navigation the PAGE issued is handled by
+/// `syncCommitted`, which keeps the grant it was given.
+///
+/// Non-fatal throughout: a pane that cannot build a page URL falls back to the
+/// template and its error card, which says which file and why, rather than
+/// leaving a blank pane behind a silent failure.
+fn syncHtmlGrant(self: *ViewerPane, alloc: Allocator) void {
+    if (self.html_root) |d| alloc.free(d);
+    if (self.html_url) |u| alloc.free(u);
+    self.html_root = null;
+    self.html_url = null;
+    self.html_fallback = false;
+    if (self.mode != .html) return;
+
+    const path = self.file_path orelse {
+        self.html_fallback = true;
+        return;
+    };
+    // Resolved against the process cwd when it is not already absolute: the
+    // grant is a prefix check, and a relative root would match nothing the
+    // page asks for. The CLI resolves `--view=` paths already, so this is the
+    // belt for a location that reached the pane another way.
+    const abs = std.fs.path.resolve(alloc, &.{path}) catch {
+        self.html_fallback = true;
+        return;
+    };
+    errdefer alloc.free(abs);
+
+    const dir = content.baseDirectory(abs) orelse {
+        alloc.free(abs);
+        self.html_fallback = true;
+        return;
+    };
+    const root = alloc.dupe(u8, dir) catch {
+        alloc.free(abs);
+        self.html_fallback = true;
+        return;
+    };
+    const url = content.pageUrlFor(alloc, root, abs) catch null;
+    alloc.free(abs);
+    self.html_root = root;
+    self.html_url = url orelse {
+        self.html_fallback = true;
+        return;
+    };
+    // A file that is not there has no page to load, and the resource handler's
+    // 404 would surface as Chromium's own error page. Answer with the pane's
+    // card instead, which names the file (`applyNavigation` reads this).
+    self.html_fallback = !isReadableFile(path);
+    // The pane STATES its grant. This is the only place the decision is made,
+    // and the acceptance harness runs on a background desktop where nothing can
+    // see a rendered page — so what proves an `.html` file is being rendered
+    // rather than shown as source is this line plus the resource requests that
+    // follow it, both of which only a page load can produce.
+    log.info("viewer html pane={s} page={s} root={s} fallback={}", .{
+        self.paneId(),
+        self.html_url orelse "",
+        root,
+        self.html_fallback,
+    });
+}
+
+fn isReadableFile(path: []const u8) bool {
+    const stat = std.fs.cwd().statFile(path) catch return false;
+    return stat.kind == .file;
 }
 
 /// Point the live-reload watcher at wherever the pane now IS (T391).
@@ -1431,7 +1548,14 @@ fn applyNavigation(self: *ViewerPane) void {
     // §6). Navigating to the file itself would hand markdown to Chromium's
     // plain-text viewer, which is the "renders as raw text" defect the whole
     // offline renderer exists to avoid.
-    const loc: []const u8 = if (self.mode.isFile())
+    // A rendered `.html` file is the exception: the web view loads the PAGE
+    // itself, from its own virtual host, so its CSS, scripts, images and fonts
+    // run exactly as they would if it were served (T601). The fallback is the
+    // template, whose error card is the only thing that can name a file that
+    // could not be read.
+    const loc: []const u8 = if (self.mode == .html)
+        (if (self.html_fallback) content.page_url else self.html_url orelse content.page_url)
+    else if (self.mode.usesTemplate())
         content.page_url
     else
         self.location orelse return;
@@ -2277,6 +2401,18 @@ fn subscribeFileMode(self: *ViewerPane) void {
             handler.release();
             break :resources;
         }
+        // The PAGE host (T601), registered alongside rather than instead: the
+        // two origins are served from different roots, and a pane crosses
+        // between them over its life (a markdown doc linking to an html file,
+        // and Back out of it again).
+        //
+        // A failure here is NOT fatal to the subscription, unlike the one
+        // above: it costs rendered `.html` panes and nothing else, and taking
+        // markdown down with it would trade one mode for two.
+        const page_filter = std.unicode.utf8ToUtf16LeStringLiteral(content.page_resource_filter);
+        if (!web.addWebResourceRequestedFilter(page_filter, .all)) {
+            log.warn("AddWebResourceRequestedFilter failed; .html files cannot render", .{});
+        }
         if (!web.addWebResourceRequested(@ptrCast(handler))) {
             log.warn("add_WebResourceRequested failed; file viewers cannot load", .{});
             handler.release();
@@ -2324,8 +2460,20 @@ fn onNavigationCompleted(
     // factor so following a link or reloading keeps the chosen zoom — the
     // same re-apply Mac does after `didFinish`.
     if (self.zoom_factor != 1.0) self.pushZoom();
+    // A rendered `.html` file has nothing to inject either — the web view
+    // loaded the page, and the page is the content (T601). The one exception is
+    // the fallback, where the template is on screen precisely so the pane can
+    // say which file it could not read.
+    if (self.mode == .html) {
+        if (self.html_fallback) self.injectError(
+            p.alloc,
+            content.error_unreadable,
+            self.file_path orelse self.location orelse "",
+        );
+        return com.S_OK;
+    }
     // Web mode has nothing to inject — the page IS the content.
-    if (!self.mode.isFile()) return com.S_OK;
+    if (!self.mode.usesTemplate()) return com.S_OK;
     self.renderFileContent();
     return com.S_OK;
 }
@@ -2390,10 +2538,10 @@ fn onNavigationStarting(
         return com.S_OK;
     }
 
-    // Websites navigate freely within the pane, and so do the pane's own
-    // reloads and history walks (`syncCommitted` reconciles those after the
-    // fact).
-    if (!self.mode.isFile()) return com.S_OK;
+    // Websites — and rendered `.html` files, which are pages (T601) — navigate
+    // freely within the pane, and so do the pane's own reloads and history
+    // walks (`syncCommitted` reconciles those after the fact).
+    if (self.mode.isLivePage()) return com.S_OK;
     if (!content.routesAsLink(navKind(a))) return com.S_OK;
 
     switch (class) {
@@ -2549,12 +2697,35 @@ fn subscribeNavigationStarting(self: *ViewerPane) void {
 /// Safe to call in any state — a pane with no controller has no completed load
 /// either, so it takes the `full_load` branch, and `applyNavigation` is already
 /// a no-op until there is something to navigate.
-pub fn reloadContent(self: *ViewerPane) void {
-    switch (content.reloadPlan(self.mode, self.page_loaded)) {
+pub fn reloadContent(self: *ViewerPane, reason: content.ReloadReason) void {
+    // An html pane sitting on the fallback template has no page to reload: the
+    // file it wants is the one that was missing, so the recovery is to try the
+    // navigation again — which is exactly what a save of that file should do.
+    if (self.mode == .html and self.html_fallback) {
+        if (self.pending) |p| self.syncHtmlGrant(p.alloc);
+        self.applyNavigation();
+        return;
+    }
+    switch (content.reloadPlan(self.mode, self.page_loaded, reason)) {
         .full_load => self.applyNavigation(),
         .rerender => self.renderFileContent(),
         .refetch => self.refetchFromOrigin(),
+        .reload_in_place => self.reloadInPlace(),
     }
+}
+
+/// A plain reload: the page is re-fetched, its history entry is replaced rather
+/// than pushed, and the engine restores the scroll offset across it.
+///
+/// This is what a SAVE does to a rendered `.html` file (T601) — Mac's `reload()`
+/// against its `reloadFromOrigin()`. Editing a long page must not throw the
+/// reader back to the top of it, and page-host responses carry
+/// `Cache-Control: no-store`, so "plain" still means the bytes now on disk.
+fn reloadInPlace(self: *ViewerPane) void {
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    if (!web.reload()) log.warn("Reload failed for this pane", .{});
 }
 
 /// Re-fetch the current web page from its ORIGIN, bypassing caches.
@@ -2619,7 +2790,9 @@ fn renderFileContent(self: *ViewerPane) void {
             text,
             content.highlightLanguage(content.extension(path)),
         ),
-        .web => return,
+        // Neither has content to inject: a website is its own page, and so is a
+        // rendered `.html` file (T601) — the web view loaded it directly.
+        .web, .html => return,
     } catch return;
     defer alloc.free(js);
     self.executeScript(alloc, js);
@@ -2671,8 +2844,19 @@ fn onWebResourceRequested(
 
     var uri_buf: [4096]u8 = undefined;
     const uri_len = std.unicode.utf16LeToUtf8(&uri_buf, std.mem.span(raw)) catch return com.S_OK;
+    const uri = uri_buf[0..uri_len];
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const rel = content.requestPath(&path_buf, uri_buf[0..uri_len]) orelse {
+
+    // The PAGE host first (T601), and served from its own root alone: the
+    // viewed file's directory, recursively. It deliberately does NOT fall
+    // through to the bundled-assets tier — a page asking for `viewer.css` must
+    // get its own or nothing, never ours.
+    if (content.pageRequestPath(&path_buf, uri)) |rel| {
+        self.servePageResource(env, a, alloc, rel);
+        return com.S_OK;
+    }
+
+    const rel = content.requestPath(&path_buf, uri) orelse {
         // Not ours after all: leave the request alone rather than answering it
         // with a 404 we have no business sending.
         return com.S_OK;
@@ -2685,24 +2869,92 @@ fn onWebResourceRequested(
         if (!std.mem.eql(u8, rel, "favicon.ico")) {
             log.warn("viewer resource not found: {s}", .{rel});
         }
-        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason);
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .default);
         return com.S_OK;
     };
     defer alloc.free(resolved);
 
     const bytes = std.fs.cwd().readFileAlloc(alloc, resolved, content.max_file_bytes) catch {
         log.warn("viewer resource is unreadable: {s}", .{resolved});
-        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason);
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .default);
         return com.S_OK;
     };
     defer alloc.free(bytes);
 
-    self.respond(env, a, alloc, bytes, content.mimeType(content.extension(rel)), 200, ok_reason);
+    self.respond(
+        env,
+        a,
+        alloc,
+        bytes,
+        content.mimeType(content.extension(rel)),
+        200,
+        ok_reason,
+        .default,
+    );
     return com.S_OK;
 }
 
 const ok_reason = std.unicode.utf8ToUtf16LeStringLiteral("OK");
 const not_found_reason = std.unicode.utf8ToUtf16LeStringLiteral("Not Found");
+
+/// Answer one request a rendered `.html` page made (T601), from the pane's read
+/// grant and nothing else.
+///
+/// One tier, not three: `candidateUnder` against `html_root`, which is exactly
+/// the "the file's own directory, recursively" grant Mac passes to
+/// `loadFileURL(allowingReadAccessTo:)`. A page reaching UP out of its folder
+/// (`../shared/app.css`) is refused, which is the documented cost of a
+/// narrow-by-default grant: widening one later is easy, taking one back is not.
+///
+/// Every answer is `no-store`. A local page is edited and re-saved while it is
+/// on screen, so a cached response is a wrong answer that looks exactly like a
+/// right one — and it is what lets a plain in-place reload (which keeps the
+/// reader's scroll) still show the bytes now on disk.
+fn servePageResource(
+    self: *ViewerPane,
+    env: *iface.ICoreWebView2Environment,
+    a: *iface.ICoreWebView2WebResourceRequestedEventArgs,
+    alloc: Allocator,
+    rel: []const u8,
+) void {
+    const root = self.html_root orelse {
+        // No grant means no page: a request on this host with nothing behind it
+        // is a stale load from a pane that has since moved on.
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .no_store);
+        return;
+    };
+    const resolved = self.takeIfFile(alloc, content.candidateUnder(alloc, root, rel) catch null) orelse {
+        // Chromium asks every origin for a favicon it was never offered.
+        if (!std.mem.eql(u8, rel, "favicon.ico")) {
+            log.warn("viewer page resource not found or outside its grant: {s}", .{rel});
+        }
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .no_store);
+        return;
+    };
+    defer alloc.free(resolved);
+
+    const bytes = std.fs.cwd().readFileAlloc(alloc, resolved, content.max_file_bytes) catch {
+        log.warn("viewer page resource is unreadable: {s}", .{resolved});
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .no_store);
+        return;
+    };
+    defer alloc.free(bytes);
+
+    // A subresource request is proof the page was PARSED as HTML: a document
+    // rendered as source never asks for its own stylesheet. That is what the
+    // acceptance harness reads, so it is logged at info rather than debug.
+    log.info("viewer page pane={s} served={s} bytes={d}", .{ self.paneId(), rel, bytes.len });
+    self.respond(
+        env,
+        a,
+        alloc,
+        bytes,
+        content.mimeType(content.extension(rel)),
+        200,
+        ok_reason,
+        .no_store,
+    );
+}
 
 /// The 3-tier resolution (design §6, Mac's `ViewerSchemeHandler.resolve`):
 /// bundled assets, then the viewed file's directory, then an absolute
@@ -2742,6 +2994,8 @@ fn takeIfFile(self: *ViewerPane, alloc: Allocator, candidate: ?[]u8) ?[]u8 {
 /// left it — at the END. Rewinding is not tidiness: without it the response is
 /// a zero-byte body that reports success, which renders as a blank page with
 /// no error anywhere.
+const Caching = enum { default, no_store };
+
 fn respond(
     self: *ViewerPane,
     env: *iface.ICoreWebView2Environment,
@@ -2751,6 +3005,7 @@ fn respond(
     mime: []const u8,
     status: i32,
     reason: [*:0]const u16,
+    caching: Caching,
 ) void {
     _ = self;
     var stream_ptr: ?*anyopaque = null;
@@ -2761,7 +3016,13 @@ fn respond(
     if (!stream.rewind()) return;
 
     // The runtime parses a CRLF-joined header block, not a single header.
-    const headers = std.fmt.allocPrint(alloc, "Content-Type: {s}", .{mime}) catch return;
+    const headers = std.fmt.allocPrint(alloc, "Content-Type: {s}{s}", .{
+        mime,
+        switch (caching) {
+            .default => "",
+            .no_store => "\r\nCache-Control: no-store",
+        },
+    }) catch return;
     defer alloc.free(headers);
     const headers_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, headers) catch return;
     defer alloc.free(headers_w);
@@ -3383,7 +3644,7 @@ fn handleZoom(self: *ViewerPane, action: viewer_accel.ZoomAction) void {
 /// Perform a pane-scoped chord (T161) — Mac's `handle(_:)`.
 fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
     switch (chord) {
-        .reload => self.reloadContent(),
+        .reload => self.reloadContent(.chrome),
         .focus_address => _ = self.focusAddressBar(),
     }
 }
@@ -3612,7 +3873,7 @@ pub fn goForward(self: *ViewerPane) void {
 /// file. A pane with no completed load falls back to a full load.
 pub fn reloadFromChrome(self: *ViewerPane) void {
     if (!self.page_loaded) {
-        self.reloadContent();
+        self.reloadContent(.chrome);
         return;
     }
     const c = self.controller orelse return;
@@ -3729,11 +3990,22 @@ fn onHistoryChanged(
 /// lands on the TEMPLATE page again, and the pane must go back to rendering
 /// the file rather than sitting in web mode over a blank template.
 fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
+    // The page host is tested FIRST, ahead of the generic "https means the
+    // web" branch below (T601). A rendered `.html` file commits an `https://`
+    // URL of its own, so without this an html pane would flip itself into web
+    // mode on its own very first commit — losing its file, its watcher and its
+    // title to a navigation it did not make.
+    if (content.isPageOrigin(src)) {
+        self.syncCommittedPage(alloc, src);
+        return;
+    }
     if (std.mem.eql(u8, src, content.page_url)) {
         // The template is back on screen. If the pane already knows it is a
-        // file pane, this is the initial load (or a same-file reload) and
-        // `navigate` said everything already.
-        if (self.mode.isFile()) return;
+        // TEMPLATE pane, this is the initial load (or a same-file reload) and
+        // `navigate` said everything already. An html pane landing here is
+        // walking BACK onto the markdown document behind it, which is a real
+        // mode change and does need the work below.
+        if (self.mode.usesTemplate()) return;
         const floc = self.file_location orelse return;
         self.mode = content.modeFor(floc);
         self.page_loaded = false;
@@ -3775,11 +4047,74 @@ fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
         }
     } else return;
 
+    // Neither destination is a rendered page, so the html grant that may have
+    // been in force goes with it (T601). Safe to call here and nowhere else on
+    // this path: `mode` is never `.html` by now, so this only ever CLEARS — the
+    // pinned grant is never re-derived behind a navigation the page made.
+    self.syncHtmlGrant(alloc);
+
     if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
     self.pushAddress();
     // A BROWSER-initiated move is a location change like any other — an
     // in-page link from a doc to a dev server crosses worktrees just as an
     // address-bar navigation does.
+    self.refreshWorktree();
+}
+
+/// The web view committed a URL on the PAGE host: a rendered `.html` file
+/// (T601), either the one this pane was opened with or another one the page
+/// itself navigated to — a link into `docs/`, a Back out of a website, a
+/// same-page reload.
+///
+/// The grant is NOT re-derived here. It was pinned when the pane entered html
+/// mode and it stays where it was put: a page that links into a subdirectory
+/// must still be able to reach the stylesheet next to its index, and a page
+/// that links back up must not find itself outside a root that moved down.
+/// What DOES move is the file the pane is looking at — its path, its title, and
+/// the file the watcher re-loads on save.
+fn syncCommittedPage(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
+    const root = self.html_root orelse return;
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = content.pageRequestPath(&rel_buf, src) orelse return;
+    const path = (content.candidateUnder(alloc, root, rel) catch null) orelse {
+        // Outside the grant: the handler would have refused to serve it, so
+        // there is nothing here to point the pane at.
+        log.warn("viewer page committed a URL outside its read grant", .{});
+        return;
+    };
+    defer alloc.free(path);
+
+    // The same file again — a reload, or the initial load `navigate` already
+    // described. Re-pointing the watcher and re-titling on every reload would
+    // be churn with no change behind it.
+    if (self.file_path) |cur| if (content.samePath(cur, path)) return;
+
+    self.mode = .html;
+    if (alloc.dupe(u8, path)) |dup| {
+        if (self.file_path) |old| alloc.free(old);
+        self.file_path = dup;
+    } else |_| {}
+    // `location` is the FILESYSTEM path, not the synthetic URL: it is what
+    // `+list --json` reports, what the address bar shows, and what the session
+    // manifest restores the pane from — and the page host exists only inside
+    // this process. Mac normalizes the committed `file://` URL back the same
+    // way, for the same reason.
+    if (alloc.dupeZ(u8, path)) |dup| {
+        if (self.location) |l| alloc.free(l);
+        self.location = dup;
+    } else |_| {}
+    if (content.pageUrlFor(alloc, root, path) catch null) |url| {
+        if (self.html_url) |old| alloc.free(old);
+        self.html_url = url;
+    }
+    self.html_fallback = false;
+    self.setTitle(alloc, content.initialTitle(.html, path, self.file_path)) catch {};
+    // Only the viewed file is watched, on both platforms: an edited sibling
+    // stylesheet needs an explicit reload.
+    self.syncWatcher(alloc);
+
+    if (self.pane_view) |pv| pv.parentWindow().app.markLayoutDirty();
+    self.pushAddress();
     self.refreshWorktree();
 }
 
@@ -4140,7 +4475,9 @@ pub fn wndProc(
             // One-shot: killed BEFORE the render, so a slow render cannot be
             // re-entered by its own timer still firing underneath it.
             _ = w32.KillTimer(hwnd, reload_timer_id);
-            self.reloadContent();
+            // The watcher's reason, not the chrome's: a rendered `.html` page
+            // reloads in place here so a save keeps the reader's scroll (T601).
+            self.reloadContent(.file_changed);
             return 0;
         },
 
@@ -4888,7 +5225,7 @@ test "host floor: a real controller on a real window, on this box" {
     // so the flag is the only thing that navigation-completed leaves behind).
     try testing.expect(pane.page_loaded);
 
-    pane.reloadContent();
+    pane.reloadContent(.chrome);
     try waitFor(&msg, 30, struct {
         fn ready(p: *ViewerPane) bool {
             return p.active_heading != null and std.mem.eql(u8, p.active_heading.?, "req2");
@@ -4927,7 +5264,7 @@ test "host floor: a real controller on a real window, on this box" {
     // as well as the count, which is what separates "re-read the file" from
     // "re-showed the two headings it already had".
     try tmp.dir.writeFile(.{ .sub_path = "t90e.md", .data = "# Delta\n\n## Epsilon\n" });
-    pane.reloadContent();
+    pane.reloadContent(.chrome);
     try waitFor(&msg, 30, struct {
         fn ready(p: *ViewerPane) bool {
             return p.headings.len == 2 and std.mem.eql(u8, p.headings[0].text, "Delta");

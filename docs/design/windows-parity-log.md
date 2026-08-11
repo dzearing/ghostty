@@ -15626,3 +15626,5 @@ zig lanes pass.
 One thing the validation turned up that is not ours: `persistence-flag.ps1` is
 red with `undeclared: 4 of 169`, in `agent-attach-refused.ps1` and
 `url-scheme.ps1` - files T506 never touched. Filed as **T744**.
+
+- 2026-08-11: T601 - a local .html file now RENDERS in a viewer pane instead of showing its markup, and reloads in place on save. viewer_content gains Mode.html (html/htm) with usesTemplate()/isLivePage() split out from isFile(), a second virtual host (ghoztty-page) whose grant is the file's own directory, and ReloadReason (a save reloads in place and keeps scroll; +reload bypasses caches). ViewerPane pins the grant per navigation, serves the page host strictly under it with Cache-Control: no-store, recognises the page origin ahead of its https=>web test, and falls back to the template's error card for a missing file. Floor: none/win32/agent PASS, P1-P3 ALL PASS, new test\win32\viewer-html.ps1 ALL PASS (40). Filed T749 (a split off a viewer lands in the app's launch folder - a T506 regression, found by viewer-panes.ps1) and T750 (the MIME table has no fonts/wasm/video; must move on both seats).

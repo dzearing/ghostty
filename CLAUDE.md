@@ -69,7 +69,7 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
   On Windows the fallback is `command-shell` then `cmd.exe`, and the invocation is per-flavor (the shell stays alive after the command): `pwsh`/`powershell` → `-NoExit -Command`, `cmd` → `/K`, `wsl` → `-e /bin/sh -lic "<cmd>; exec \"$SHELL\" -li"` in the default distro, `nu` → `-e`, anything else (e.g. git-bash) → `-lic "<cmd>; exec shell -li"`.
   **The keep-alive is argv-shaped here, and that is why the agent-backed path needs its own wiring** (T468). With `session-persistence` on — the default — every local pane's shell is spawned by `ghoztty-agent`, which synthesizes its own `<shell> /c <cmd>` and exits the moment the command returns. POSIX hides this because its keep-alive lives INSIDE the command string (`<cmd>; exec <shell> -li`), which rides `OPEN.command` untouched; `cmd /K` and `-NoExit -Command` cannot. So a local-agent pane sends the wrapped invocation as `OPEN.argv` (the agent's exec-verbatim seam) while `OPEN.command` still carries the raw command as the session's label. Only for the LOCAL agent — a cross-machine agent is a different machine and applies its own convention. `-e` is never wrapped, on either path: it means "exec exactly this". Acceptance: `test/win32/ipc-command-keepalive.ps1`.
   **`wsl` is the row that takes an ARGV rather than a command string, which is why it looks different** (T656). `wsl -- <cmd>` hands the rest of the *Windows* command line to the distro's default shell **as written**, so the quoting Windows applies to a spaced argument survived into the distro and bash looked for a program literally named `"echo hi"` — `command not found` naming the whole line, on both paths, with the pane dying with it. `-e` execs an argv instead, so the command reaches the inner shell as one properly-unquoted argument. `/bin/sh` because it is the one interpreter every distro is guaranteed to have (dash on Ubuntu, and dash accepts `-lic`); `exec "$SHELL" -li` because the pane must be left in the user's REAL login shell, exactly as the posix row leaves it — `$SHELL` comes from the distro's passwd entry, with `/bin/sh` as the fallback. Acceptance: arm I of `test/win32/ipc-command-keepalive.ps1`.
-- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
+- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file, a local **HTML page**, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
 - `--title`: Set the **window title**. A window title pins the titlebar — it wins over any tab or pane title and survives pane focus changes and shell OSC title updates — until cleared. The titlebar falls back to window title → active tab's title → active pane's title. Interactive equivalents: Cmd+Shift+R ("Change Window Title", also sets/clears it), plus separate "Change Tab Title" and "Change Pane Title" commands in the menu and command palette. `ghoztty +rename --target=<name> --title=<title>` changes it later (`--title=""` clears the pin).
 
 ### `ghoztty +split`
@@ -83,7 +83,7 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 - `--direction`: Split direction. Default: `right`.
 - `--target`: Named window to split in (default: most recently focused).
 - `--name`: Register the new pane with a name for later targeting.
-- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
+- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file, a local **HTML page**, a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
 On Windows, `ghoztty +list --pid=<pid>` prints just the name of the pane
 whose shell is an ancestor of the given process id — the tty-less way for a
@@ -416,7 +416,10 @@ close/reopen. Website viewers re-fetch the page from origin (bypassing
 caches); file viewers re-render the file preserving scroll position (they
 already live-reload on their own, so this mainly matters for URL viewers);
 **diff viewers re-run their git command**, picking up commits, staging, and
-edits, and keeping the open file and its scroll position.
+edits, and keeping the open file and its scroll position. A rendered `.html`
+file is re-fetched bypassing caches like a website — the verb is the explicit
+"these bytes are stale" one, which is how it picks up an edited sibling
+stylesheet that the file watcher never saw.
 
 ```
 ghoztty +reload --target=<name>
@@ -740,9 +743,9 @@ action). Acceptance: `test/win32/url-scheme.ps1`.
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a
-markdown file, a plain text/code file, a website, or a **git diff**. Viewers
-live in the normal split tree — they resize, focus, zoom, close, and persist
-like any pane. View-only, no editing.
+markdown file, a local **HTML page**, a plain text/code file, a website, or a
+**git diff**. Viewers live in the normal split tree — they resize, focus, zoom,
+close, and persist like any pane. View-only, no editing.
 
 ```bash
 ghoztty +new-window --view=README.md                 # viewer window
@@ -800,12 +803,47 @@ ghoztty +close --target=doc
   pane next door line up at their corners, and the text starts exactly one
   margin right of the card. Per-component fudges are what break that; there
   are none. Enforced by `documentAlignsToTheCard` in `ViewerTOCTests`.
+- **HTML files** (`.html`, `.htm`): rendered as the **live page**, not as
+  markup — its own CSS, scripts, images and fonts run exactly as they would if
+  it were hosted. Rendering is unconditional; there is no source-view toggle to
+  carry through history and session restore. This is what removes the
+  `python3 -m http.server` (or `scripts\task-dashboard.ps1`'s localhost server)
+  workaround for something already sitting on disk.
+
+  **Read access is the file's own directory, recursively** — narrow by default,
+  because widening a grant later is easy and taking one back is not. The cost is
+  a page reaching UP out of its folder (`../shared/app.css`), which needs the
+  assets moved under the page or the project served. **A local HTML file is a
+  page, not a document**: it navigates in the pane like a website (links, Back,
+  Forward), and what it adds over a plain website is the file watcher — a save
+  re-loads it in place, keeping the reader's scroll and replacing its history
+  entry rather than filling the Back stack. Only the viewed file is watched, so
+  an edited sibling stylesheet needs `+reload`, which bypasses caches.
+
+  One structural subtlety, on both platforms: an HTML file is **not** recorded
+  as the pane's file location. That field means "the file the bundled TEMPLATE
+  page is holding" and is what Back out of a website re-renders, so overwriting
+  it with a directly-loaded page would lose the markdown document still sitting
+  behind it in history.
+
+  **Windows serves it from a second virtual host** (`https://ghoztty-page/…`,
+  T601) through the pane's existing `WebResourceRequested` handler, rather than
+  from `file://`. Mac passes its grant to `loadFileURL(allowingReadAccessTo:)`;
+  WebView2 has no per-navigation grant to pass, and a `file://` document's
+  subresource loads reach the whole filesystem — a wider grant than the feature
+  asks for and one that cannot be taken back per pane. The host is separate from
+  the template's `ghoztty-viewer` because the two roots differ: a page asking
+  for `vendor/markdown-it.min.js` must get its own or nothing, never ours. Every
+  page-host response is `Cache-Control: no-store`, which is what lets a plain
+  in-place reload still show the bytes now on disk. Acceptance:
+  `test/win32/viewer-html.ps1`.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
 - **Links** in file viewers: http(s) opens the default browser; a relative
-  `.md` link opens another viewer split; other local files open in their
-  default app.
+  `.md` or `.html` link opens another viewer split (both render here, so handing
+  either to the default app would launch the browser for a page the pane next
+  door was about to show); other local files open in their default app.
 - **Links that open a new surface** in a website viewer — `target="_blank"` or
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane
@@ -837,7 +875,9 @@ ghoztty +close --target=doc
   win32 unit lane (`ViewerPane.zig`, "T163: a popup is adopted as a pane,
   sized, and can close itself").
 - **Live reload**: file viewers watch the file (including atomic saves) and
-  re-render preserving scroll position.
+  re-render preserving scroll position. A rendered `.html` file reloads the
+  page in place instead of re-rendering into the template — same promise, the
+  engine's own scroll restoration rather than the template's.
 - **Navigation chrome**: hovering the thin strip at a pane's top slides in a
   bar with back / forward / reload / **home** and an **editable address
   field** — in every mode, files included. Typing an `http(s)` address (or a

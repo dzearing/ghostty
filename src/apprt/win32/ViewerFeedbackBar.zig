@@ -1624,7 +1624,7 @@ pub fn handleChord(self: *ViewerFeedbackBar, vk: u16) bool {
     };
     const chord = viewer_accel.paneChord(vk, mods) orelse return false;
     switch (chord) {
-        .reload => self.pane.reloadContent(),
+        .reload => self.pane.reloadContent(.chrome),
         .focus_address => _ = self.pane.focusAddressBar(),
     }
     return true;

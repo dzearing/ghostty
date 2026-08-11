@@ -1222,7 +1222,9 @@ fn handleReload(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         },
     };
 
-    view.reloadContent();
+    // `+reload` is the explicit "these bytes are stale" verb, so it bypasses
+    // caches rather than reloading in place (T601's `ReloadReason`).
+    view.reloadContent(.chrome);
     log.info("IPC: reloaded viewer '{s}'", .{target});
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
