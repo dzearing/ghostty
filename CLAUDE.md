@@ -855,6 +855,21 @@ ghoztty +close --target=doc
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
+- **A terminal split off a viewer starts where that WINDOW is.** A viewer runs
+  no shell, so there is no parent cwd to inherit: a file viewer contributes the
+  viewed file's own directory (Mac's `splitConfigFromViewer`), and a viewer with
+  no file — a website, a blank browser pane, a diff — contributes nothing. What
+  answers then is the terminal the user was last in **in the window being
+  split**: the app's focused surface when it belongs to that window, else the
+  nearest terminal pane in the viewer's own tab (`SplitTree.nearestLeaf`, whose
+  facing-side search returns the pane the viewer shares a divider with — almost
+  always the pane it was split off). The core's own inheritance is app-GLOBAL
+  (`apprt/surface.zig` `newConfig` reads `app.focusedSurface`), so leaving the
+  answer to it opened the new pane in whatever window last had focus, or — with
+  nothing focused at all — in the shell's home directory (T538, win32; the Mac
+  half is T759). Acceptance: section 11 of `test/win32/viewer-panes.ps1`, whose
+  cross-window arm parks the focus in a second window first, so the assertion
+  cannot pass by luck.
 - **Links** in file viewers: http(s) opens the default browser; a relative
   `.md` or `.html` link opens another viewer split (both render here, so handing
   either to the default app would launch the browser for a page the pane next

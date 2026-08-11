@@ -3393,10 +3393,22 @@ pub fn newSplitAt(
     // inherit — Mac takes the viewed FILE's own directory instead
     // (`splitConfigFromViewer`). Borrowed from the viewer, which outlives this
     // call; null (a website, or no usable path) means "no override".
-    const viewer_cwd: ?[]const u8 = if (at.viewer()) |v|
-        viewer_content.splitWorkingDirectory(v.file_path)
-    else
-        null;
+    //
+    // T538: a viewer with no file — a website, a blank browser pane — used to
+    // contribute nothing and leave the answer to the core's global "last
+    // focused surface", which is a pane in whatever window last had focus.
+    // That is a different WINDOW's directory (or, with nothing focused at all,
+    // the shell's home fallback), so a terminal split off a browser pane
+    // landed somewhere the user was never working. It asks this window
+    // instead. Owned here (it is read out of a live process), freed on the way
+    // out — the surface init that consumes it is synchronous.
+    var owned_cwd: ?[]const u8 = null;
+    defer if (owned_cwd) |c| alloc.free(c);
+    const viewer_cwd: ?[]const u8 = if (at.viewer()) |v| cwd: {
+        if (viewer_content.splitWorkingDirectory(v.file_path)) |dir| break :cwd dir;
+        owned_cwd = self.viewerSplitFallbackCwd(tab, handle, alloc);
+        break :cwd owned_cwd;
+    } else null;
 
     // T68: a plain split in a remote window opens a fresh session on the
     // SAME machine/connection, inheriting the split-parent pane's command +
@@ -4003,6 +4015,55 @@ fn anyTerminalSurface(self: *Window) ?*Surface {
         }
     }
     return null;
+}
+
+/// True for a pane that runs a shell — the predicate `nearestLeaf` searches
+/// with when a viewer needs a terminal to inherit from (T538).
+fn paneIsTerminal(pane: *PaneView) bool {
+    return pane.surface() != null;
+}
+
+/// The working directory a terminal split off the VIEWER at `handle` should
+/// start in, when the viewer itself contributes none (T538). Caller owns the
+/// returned slice; null means "nothing here can answer", which leaves the
+/// pre-T538 behavior (the core's inheritance, then the shell's own default).
+///
+/// Two legs, in order:
+///
+///  1. The app's focused surface, IF it belongs to this window. That is the
+///     terminal the user was last typing in, which is what macOS inherits
+///     from (`newConfig` → `app.focusedSurface`), and keeping it first means
+///     the ordinary case behaves exactly as it did.
+///  2. Otherwise the nearest terminal pane in the viewer's own tab. The
+///     global focused surface is a poor answer when it names a pane in
+///     ANOTHER window — its directory has nothing to do with the window being
+///     split, and when nothing is focused at all there is no answer — while
+///     the pane the viewer sits beside is almost always the pane it was split
+///     off in the first place.
+///
+/// The directory itself follows T185's rule: the shell's real, current cwd
+/// when the shell does not report one (cmd.exe has no prompt hook, so the
+/// terminal's own pwd is frozen at its starting directory), else the reported
+/// pwd. A cross-machine pane has no local pid to walk, so it answers with the
+/// pwd its agent reported — a path on the machine the new session will open
+/// on, which is the only one that could be valid there.
+fn viewerSplitFallbackCwd(
+    self: *Window,
+    tab: usize,
+    handle: SplitTree(PaneView).Node.Handle,
+    alloc: Allocator,
+) ?[]const u8 {
+    const source: *Surface = source: {
+        if (self.app.core_app.focusedSurface()) |core| {
+            const rt = core.rt_surface;
+            if (rt.parent_window == self) break :source rt;
+        }
+        const pane = self.tab_trees[tab].nearestLeaf(handle, paneIsTerminal) orelse
+            return null;
+        break :source pane.surface() orelse return null;
+    };
+    if (source.livePwd(alloc)) |live| return live;
+    return source.core_surface.pwd(alloc) catch null;
 }
 
 /// Navigate to a tab by GotoTab target (previous, next, last, or index).

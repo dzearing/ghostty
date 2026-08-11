@@ -292,6 +292,70 @@ pub fn SplitTree(comptime V: type) type {
             }
         }
 
+        /// The nearest leaf to `from` that satisfies `pred`, searching
+        /// OUTWARD through the layout: the sibling subtree at each ancestor,
+        /// starting with the ancestor closest to `from`, and within a sibling
+        /// the leaf on the side facing `from` (a sibling to our right is
+        /// entered leftmost, and vice versa). `from` itself is never
+        /// considered. Null when nothing in the tree matches.
+        ///
+        /// This answers "which pane is adjacent to this one", which is what a
+        /// pane with nothing of its own to contribute — a viewer showing a
+        /// website, which runs no shell and so has no working directory —
+        /// needs in order to inherit something (T538).
+        pub fn nearestLeaf(
+            self: *const Self,
+            from: Node.Handle,
+            pred: *const fn (*View) bool,
+        ) ?*View {
+            if (self.isEmpty()) return null;
+            var child = from;
+            while (self.parentOf(child)) |parent| {
+                const s = self.nodes[parent.idx()].split;
+                const facing: Side, const sibling: Node.Handle = if (s.left == child)
+                    .{ .left, s.right }
+                else
+                    .{ .right, s.left };
+                if (self.nearestLeafIn(sibling, facing, pred)) |view| return view;
+                child = parent;
+            }
+            return null;
+        }
+
+        /// The split node that has `handle` as a child, or null for the root
+        /// (or a handle that is not in this tree).
+        fn parentOf(self: *const Self, handle: Node.Handle) ?Node.Handle {
+            for (self.nodes, 0..) |node, i| switch (node) {
+                .leaf => {},
+                .split => |s| if (s.left == handle or s.right == handle) {
+                    return @enumFromInt(@as(Node.Handle.Backing, @intCast(i)));
+                },
+            };
+            return null;
+        }
+
+        /// The first leaf under `handle` matching `pred`, descending the
+        /// `facing` side of every split first — the side of that subtree that
+        /// sits nearest whatever we came from.
+        fn nearestLeafIn(
+            self: *const Self,
+            handle: Node.Handle,
+            facing: Side,
+            pred: *const fn (*View) bool,
+        ) ?*View {
+            return switch (self.nodes[handle.idx()]) {
+                .leaf => |view| if (pred(view)) view else null,
+                .split => |s| {
+                    const near, const far = switch (facing) {
+                        .left => .{ s.left, s.right },
+                        .right => .{ s.right, s.left },
+                    };
+                    if (self.nearestLeafIn(near, facing, pred)) |view| return view;
+                    return self.nearestLeafIn(far, facing, pred);
+                },
+            };
+        }
+
         /// Returns the previous view from the given node handle (which itself
         /// doesn't need to be a view). If there is no previous (this is the
         /// most previous view) then this will return null.
@@ -2483,6 +2547,99 @@ test "SplitTree: replaceLeaf swaps one leaf and leaves the rest of the tree alon
         \\    (zoomed) leaf: C
         \\
     );
+}
+
+// T538: the labels a `nearestLeaf` test treats as "a pane that can answer"
+// (a terminal) are the ones starting with `t`; `v` is a viewer, which cannot.
+fn isTerminalLabel(view: *TestTree.View) bool {
+    return view.label.len > 0 and view.label[0] == 't';
+}
+
+test "SplitTree: nearestLeaf finds the adjacent match, not the first in order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // t1 | (v | t2): from v, BOTH terminals are reachable, and the answer
+    // must be the one it shares a divider with.
+    var v1: TestTree.View = .{ .label = "t1" };
+    var tree1: TestTree = try .init(alloc, &v1);
+    defer tree1.deinit();
+    var vv: TestTree.View = .{ .label = "v" };
+    var tree2: TestTree = try .init(alloc, &vv);
+    defer tree2.deinit();
+    var pair = try tree1.split(alloc, .root, .right, 0.5, &tree2);
+    defer pair.deinit();
+    var v2: TestTree.View = .{ .label = "t2" };
+    var tree3: TestTree = try .init(alloc, &v2);
+    defer tree3.deinit();
+    var trio = try pair.split(
+        alloc,
+        handleOf(&pair, "v") orelse return error.NotFound,
+        .right,
+        0.5,
+        &tree3,
+    );
+    defer trio.deinit();
+
+    const near = trio.nearestLeaf(
+        handleOf(&trio, "v") orelse return error.NotFound,
+        isTerminalLabel,
+    ) orelse return error.NotFound;
+    try testing.expectEqualStrings("t2", near.label);
+}
+
+test "SplitTree: nearestLeaf enters a sibling subtree from the facing side" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // (t1 | t2) | v: from v, the sibling subtree holds both terminals, and
+    // the one against the divider is t2.
+    var v1: TestTree.View = .{ .label = "t1" };
+    var tree1: TestTree = try .init(alloc, &v1);
+    defer tree1.deinit();
+    var v2: TestTree.View = .{ .label = "t2" };
+    var tree2: TestTree = try .init(alloc, &v2);
+    defer tree2.deinit();
+    var pair = try tree1.split(alloc, .root, .right, 0.5, &tree2);
+    defer pair.deinit();
+    var vv: TestTree.View = .{ .label = "v" };
+    var tree3: TestTree = try .init(alloc, &vv);
+    defer tree3.deinit();
+    var trio = try pair.split(alloc, .root, .right, 0.5, &tree3);
+    defer trio.deinit();
+
+    const near = trio.nearestLeaf(
+        handleOf(&trio, "v") orelse return error.NotFound,
+        isTerminalLabel,
+    ) orelse return error.NotFound;
+    try testing.expectEqualStrings("t2", near.label);
+}
+
+test "SplitTree: nearestLeaf answers null when nothing matches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A viewer-only window: there is no terminal to inherit from, and the
+    // honest answer is "nobody", not the nearest leaf of the wrong kind.
+    var v1: TestTree.View = .{ .label = "v1" };
+    var tree1: TestTree = try .init(alloc, &v1);
+    defer tree1.deinit();
+    var v2: TestTree.View = .{ .label = "v2" };
+    var tree2: TestTree = try .init(alloc, &v2);
+    defer tree2.deinit();
+    var pair = try tree1.split(alloc, .root, .right, 0.5, &tree2);
+    defer pair.deinit();
+
+    try testing.expect(pair.nearestLeaf(
+        handleOf(&pair, "v2") orelse return error.NotFound,
+        isTerminalLabel,
+    ) == null);
+
+    // And a single-leaf tree has no sibling to search at all.
+    var only: TestTree.View = .{ .label = "v" };
+    var single: TestTree = try .init(alloc, &only);
+    defer single.deinit();
+    try testing.expect(single.nearestLeaf(.root, isTerminalLabel) == null);
 }
 
 fn handleOf(tree: *const TestTree, label: []const u8) ?TestTree.Node.Handle {

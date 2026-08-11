@@ -666,6 +666,26 @@ try {
     $wcwd = Get-LeafCwd 'vp' 't395webterm' $t395other
     Assert (Test-SameDir $wcwd $t395other) "a web viewer contributes no cwd, so the fallback stands (got '$wcwd')"
 
+    # T538: and the fallback is THIS window's terminal, not whatever pane the
+    # app last focused. The core's inheritance is app-global (`newConfig` reads
+    # `app.focusedSurface`), so with focus in another window a split off a
+    # browser pane used to open in that other window's directory -- or, with
+    # nothing focused at all, in the shell's home. A second window here takes
+    # the focus away first, so the assertion above cannot pass by accident.
+    $t395far = Join-Path $env:TEMP 'ghoztty-t538-far'
+    New-Item -ItemType Directory -Force -Path $t395far | Out-Null
+    $r = Invoke-Verb @('+new-window', '--target=t538far', "--working-directory=$t395far")
+    Assert ($r.Code -eq 0) "+new-window in a far directory exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Win 't538far')) 'the far window exists'
+    $r = Invoke-Verb @('+split', '--pane=t395web', '--name=t538crossterm')
+    Assert ($r.Code -eq 0) "+split off the web viewer again exits 0 (got $($r.Code))"
+    Assert ($null -ne (Wait-Leaf 'vp' 't538crossterm')) 'the second terminal split off the web viewer exists'
+    $ccwd = Get-LeafCwd 'vp' 't538crossterm' $t395other
+    Assert (Test-SameDir $ccwd $t395other) "it inherits its OWN window's terminal (got '$ccwd')"
+    Assert (-not (Test-SameDir $ccwd $t395far)) 'and never the focused window next door'
+    Invoke-Verb @('+close', '--target=t538far') | Out-Null
+    Invoke-Verb @('+close', '--target=t538crossterm') | Out-Null
+
     # And the case under test: a FILE viewer's directory beats that fallback.
     $r = Invoke-Verb @('+split', '--target=vp', '--name=t395doc', "--view=$t395doc")
     Assert ($r.Code -eq 0) "+split --view=<file in the fixture dir> exits 0 (got $($r.Code))"
