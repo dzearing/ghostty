@@ -1765,6 +1765,36 @@ are `-Wait` (Start-Process holds the handle itself) and an explicit
 zero across `test\win32\` **and** `scripts\`):
 `test\win32\harness-exitcode-audit.ps1`.
 
+**A section the suite SKIPPED is named in the line anybody reads** (T219).
+Skipping is legitimate — pwsh is not installed, there is no network, a release
+build compiled the debug oracle out. A skip the RESULT cannot see is not: it is
+an un-run assertion wearing a green hat, and an assertion inside one can rot for
+months. `ipc-version.ps1` asserted the About box was a `#32770` MessageBox long
+after it became a native `GhozttyConfirmDialog`, and every run still printed
+`ALL PASS` because the foreground grab kept losing and the whole palette section
+took its SKIP branch (T217 found it by making the chord land). Since the loop
+reads exactly ONE line (`| Select-Object -Last 1`), a `(2 section(s) SKIPPED)`
+line printed *above* the verdict is invisible to the only reader there is — five
+scripts printed one there. So the count goes in the verdict itself:
+
+```powershell
+Write-Host 'SKIP  pwsh: not installed on this box'; $script:skipped++
+...
+"ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"
+"ALL PASS (12 assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))"
+```
+
+Consumers match `ALL PASS` as a substring, so the suffix breaks nothing.
+Exemptions are narrow and stated: a site that prints and immediately `exit`s is
+its own last line, and a `# skip-audit: <reason>` marker is the same
+state-your-intent convention `# persistence:` and `# exitcode-audit:` use.
+Analyzer: `test\win32\lib\SkipAudit.ps1`, which reports `unreported` (skips
+exist, the verdict is silent) and `uncounted` (a site the counter misses — a
+number that under-reports is worse than no number, because it reads as
+audited). Acceptance: `test\win32\skip-visibility.ps1`, whose `$SkipAuditPending`
+list of not-yet-converted scripts can only SHRINK — an entry that no longer
+violates fails the run just as an unlisted violator does.
+
 **A test sandbox can have an agent of its own** (T167). The local agent's
 single-instance guard is per-user and per-LINEAGE, and the lineage is a
 compile-time fact (`local-debug` for every debug build), so a debug agent

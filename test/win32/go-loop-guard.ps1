@@ -886,6 +886,7 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
     if ($dashOut -notmatch 'ALL PASS') { $dashOut.Trim() }
 } else {
     "  SKIP P13 (node not on PATH)"
+    $script:skipped++
 }
 
 # --- Q. the lock follows a relaunch, not a pid (T440) ---------------------
@@ -945,5 +946,5 @@ Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $env:TEMP 'ghoztty-go-loop-resume.cmd') -Force -ErrorAction SilentlyContinue
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" ; exit 0 }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" ; exit 0 }
 else { "$($script:failures) FAILURE(S)" ; exit 1 }

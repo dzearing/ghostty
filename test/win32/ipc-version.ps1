@@ -105,6 +105,7 @@ foreach ($try in 1..3) {
 }
 if (-not $sent) {
     "  SKIP palette test: chord not delivered"
+    $script:skipped++
 } else {
     Assert "palette popup opened (positive control)" ($popup -ne [IntPtr]::Zero)
     $edit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
@@ -164,7 +165,7 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 
 ""
 if ($script:failures -eq 0) {
-    "T52 ACCEPTANCE: ALL PASS"
+    "T52 ACCEPTANCE: ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"
     exit 0
 } else {
     "T52 ACCEPTANCE: $script:failures FAILURE(S)"

@@ -771,6 +771,7 @@ try {
         }
         if (-not $hoverLogged) {
             Write-Host 'SKIP T204 hover trigger: no debug oracle in the log (release build?)'
+            $script:skipped++
         }
 
         # --- the FILL, and that it is ROUNDED --------------------------------
@@ -830,6 +831,7 @@ try {
                     "x rest=$(if($restClose){$restClose.Edge}) hot=$(if($hotClose){$hotClose.Edge})")
         if (-not $plusLit) {
             Write-Host 'SKIP T204 hover fill: the + fill (the positive control) was never caught - the harness lost every race, so the x probe would be meaningless'
+            $script:skipped++
         } else {
             Assert ($null -ne $hotClose -and $hotClose.Edge -ge ($restClose.Edge + 8)) `
                 "T204: hovering the close x lights a FILL, not just a red glyph (rest=$($restClose.Edge) hot=$($hotClose.Edge))"
@@ -1058,5 +1060,5 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }

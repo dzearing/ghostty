@@ -79,7 +79,7 @@ foreach ($e in ($userPath -split ';')) {
 
 if ($null -eq $marker) {
     "  SKIP no usable HKCU\Environment\Path entry on this box - nothing to assert"
-    "ALL PASS"
+    "ALL PASS (1 SKIPPED)"
     exit 0
 }
 "  marker (user PATH entry): $marker"

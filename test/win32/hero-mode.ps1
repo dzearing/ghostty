@@ -601,6 +601,7 @@ if ($null -ne $big4) {
         Assert $swapped 'selection slide: click-swap completed (new hero visible after the slide)'
     } else {
         Write-Host 'SKIP  slide oracle: OS client-area animations disabled (reduced motion)'
+        $script:skipped++
     }
 
     # (b) Hover chrome: a posted WM_MOUSEMOVE over the carousel sets the
@@ -769,5 +770,5 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }

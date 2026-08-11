@@ -631,7 +631,7 @@ if ($script:fail -gt 0 -and $env:CM_DEBUG) {
 Remove-Item $errlog -ErrorAction SilentlyContinue
 if ($script:skip -gt 0) { Write-Host "($($script:skip) section(s) SKIPPED)" }
 if ($script:fail -eq 0) {
-    Write-Host "CHOOSER-MENU ACCEPTANCE: ALL PASS ($($script:pass) assertions)"
+    Write-Host "CHOOSER-MENU ACCEPTANCE: ALL PASS ($($script:pass) assertions$(if ($script:skip) { ", $($script:skip) SKIPPED" }))"
     exit 0
 } else {
     Write-Host "CHOOSER-MENU ACCEPTANCE: $($script:fail) FAILURE(S) ($($script:pass) passed)" -ForegroundColor Red

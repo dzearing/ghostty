@@ -344,6 +344,7 @@ Assert 'E12 the watchdog pane probe reads through the resolved CLI too' `
 # knowing loudly rather than silently.
 if ($PureOnly) {
     "  SKIP F (-PureOnly)"
+    $script:skipped++
 } else {
     . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
     $fExe = Join-Path $Repo 'zig-out\bin\ghoztty.exe'
@@ -428,8 +429,10 @@ $gRelExe = Join-Path $Repo 'zig-out-release\bin\ghoztty.exe'
 $gRelCom = Join-Path $Repo 'zig-out-release\bin\ghoztty.com'
 if ($PureOnly) {
     "  SKIP G (-PureOnly)"
+    $script:skipped++
 } elseif (-not (Test-Path $gRelExe)) {
     "  SKIP G2-G6: no release staging build at $gRelExe - the pre-fix oracle needs a GUI-subsystem binary"
+    $script:skipped++
 } else {
     AssertEq 'G2 the release exe is GUI-subsystem (2)' 2 (Get-PeSubsystem $gRelExe)
     Assert 'G3 and it ships the console twin beside it' (Test-Path $gRelCom)
@@ -455,5 +458,5 @@ if ($PureOnly) {
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { "$($script:failures) FAILURE(S)" }
 exit ([int]($script:failures -gt 0))

@@ -747,5 +747,5 @@ if ($NegativeControl -and -not $script:negReached) {
 }
 
 if ($script:skipped -gt 0) { "($($script:skipped) section(s) SKIPPED)" }
-if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

@@ -356,5 +356,5 @@ if (-not $haveLive) {
 
 ""
 if ($script:skipped -gt 0) { "$($script:skipped) SKIPPED" }
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { "$($script:failures) FAILURE(S)" }
 exit ([int]($script:failures -gt 0))

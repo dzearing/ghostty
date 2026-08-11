@@ -145,6 +145,7 @@ if (Test-Path $Exe) {
         ($null -eq (Get-Throw { Assert-GhozttyIsolatedBuild -Exe $Exe }))
 } else {
     "  SKIP F: $Exe not built"
+    $script:skipped++
 }
 
 # ============================================================================
@@ -160,5 +161,5 @@ Assert "G3 go.md carries the same warning" ($goMd -match 'endpoint isolation')
 
 ""
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { "$($script:failures) FAILURE(S)" }
 exit ($script:failures -gt 0)

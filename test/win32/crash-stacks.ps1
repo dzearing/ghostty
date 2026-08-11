@@ -233,6 +233,7 @@ foreach ($lane in @('none', 'win32', 'agent')) {
     $bins = @(Get-LaneTestBinary -Lane $lane -Repo $Repo)
     if ($bins.Count -eq 0) {
         Write-Host "SKIP lane '$lane' has no built test binary to resolve"
+        $script:skipped++
         continue
     }
     Check "lane '$lane' resolves to a real exe" ((Test-Path -LiteralPath $bins[0]) -and $bins[0] -match '\.exe$') $bins[0]
@@ -278,5 +279,5 @@ Check 'floor-lane self-test still passes with the catcher wired in' ($laneText -
 
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 
-if ($failures -eq 0) { Write-Host 'ALL PASS' } else { Write-Host "$failures FAILURE(S)" }
+if ($failures -eq 0) { Write-Host "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { Write-Host "$failures FAILURE(S)" }
 exit $(if ($failures -eq 0) { 0 } else { 1 })

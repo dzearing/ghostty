@@ -534,6 +534,7 @@ try {
         Assert ([version]$v -ge [version]'0.11.0') "D4 source plugin version bumped to carry it (got $v)"
     } else {
         Write-Host 'SKIP  D3/D4: dzearing-claude-marketplace not cloned on this box' -ForegroundColor Yellow
+        $script:skipped++
     }
 } finally {
     foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5', 'rc6', 'rc7')) { & $exe +close --target=$w 2>$null | Out-Null }
@@ -542,6 +543,6 @@ try {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" -ForegroundColor Green; exit 0 }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" -ForegroundColor Green; exit 0 }
 Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red
 exit 1

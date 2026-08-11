@@ -306,6 +306,7 @@ for ($t = 0; $t -lt 20 -and -not $dirUp; $t++) {
     } catch { Start-Sleep -Milliseconds 250 }
 }
 if (-not $dirUp) {
+    $script:skip++
     Write-Host "  SKIP whole run: the fake relay directory never came up on port $DirPort (port in use?)"
     Stop-Job $dirJob -ErrorAction SilentlyContinue | Out-Null
     Remove-Job $dirJob -Force -ErrorAction SilentlyContinue | Out-Null
@@ -665,7 +666,7 @@ if ($script:fail -gt 0 -and $env:HS_DEBUG) {
 }
 if ($script:skip -gt 0) { Write-Host "($($script:skip) section(s) SKIPPED)" }
 if ($script:fail -eq 0) {
-    Write-Host "HOST-SETTINGS ACCEPTANCE: ALL PASS ($($script:pass) assertions)"
+    Write-Host "HOST-SETTINGS ACCEPTANCE: ALL PASS ($($script:pass) assertions$(if ($script:skip) { ", $($script:skip) SKIPPED" }))"
     exit 0
 } else {
     Write-Host "HOST-SETTINGS ACCEPTANCE: $($script:fail) FAILURE(S) ($($script:pass) passed)" -ForegroundColor Red

@@ -311,6 +311,7 @@ try {
         Start-Sleep -Milliseconds 1000
     }
     if (-not $canAdjudicate) {
+        $script:skipped++
         Write-Host "  SKIP  window-state actions: this window ignores even a plain WM_CLOSE on"
         Write-Host "        this desktop, so SC_MINIMIZE/SC_MAXIMIZE/SC_CLOSE cannot be"
         Write-Host "        adjudicated here. The press/release half IS asserted above. T255."
@@ -375,7 +376,7 @@ try {
 
     Write-Host ""
     if ($script:fail -eq 0) {
-        Write-Host "ALL PASS ($script:pass assertions)"
+        Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))"
         $exitCode = 0
     } else {
         Write-Host "$script:fail FAILURE(S) ($script:pass passed)"

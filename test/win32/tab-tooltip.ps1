@@ -168,6 +168,7 @@ try {
     $probe = Probe-TipText $top $m $errlog
     if ($null -eq $probe) {
         Write-Host 'SKIP: no debug oracle in the log (release build?) - the tooltip text arms need a Debug build'
+        $script:skipped++
     } else {
         # -------------------------------------------------------------------
         # A: the starting directory, ~-abbreviated (dirA is under %TEMP%,
@@ -259,5 +260,5 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" }
 else { Write-Host "$script:fail FAILURE(S) / $script:pass passed" -ForegroundColor Red; exit 1 }

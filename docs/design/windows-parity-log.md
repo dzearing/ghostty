@@ -15057,3 +15057,55 @@ the pre-fix answer) fails as required. Filed **T729** to cover the two GUI
 behaviours that only became reachable here, and **T730** for a sweep that fails
 the suite when a new site reaches for `GetForegroundWindow` again - this
 mistake is invisible at runtime, which is how four of them survived.
+
+## 2026-08-11 - a test run that skipped a section now says so on the line anybody reads (T219)
+
+The suite is allowed to skip. pwsh is not installed on every box, there is not
+always a network, and a release build compiles the debug oracle out - a section
+that cannot run is a section that must not fail. What it must also not do is
+disappear. Until now a skipped section left no mark on the verdict, so the run
+ended `ALL PASS` whether it had run 37 assertions or 12, and go.md reads exactly
+one line (`| Select-Object -Last 1`). `ipc-version.ps1` spent months asserting
+the About box was a `#32770` MessageBox - it has been a native
+`GhozttyConfirmDialog` since the T50 chrome pass - and every run said fine,
+because the foreground grab kept losing the race and the whole palette section
+took its SKIP branch instead. T217 found it by making the chord land.
+
+So the count rides the verdict itself: `ALL PASS (2 SKIPPED)`,
+`ALL PASS (37 assertions, 2 SKIPPED)`. Consumers match `ALL PASS` as a
+substring, so nothing that reads these scripts had to change. Five scripts
+already KEPT a count and printed it on the line above the verdict, where the
+only reader there is cannot see it.
+
+The rule is mechanical rather than remembered. `test/win32/lib/SkipAudit.ps1`
+reports `unreported` (the script emits SKIP and no ALL PASS line names a count)
+and `uncounted` (a site the counter misses - a number that under-reports is
+worse than none, because it reads as audited). A site that prints and
+immediately exits is exempt: it IS the last line. A `# skip-audit: <reason>`
+marker is the same state-your-intent convention `# persistence:` and
+`# exitcode-audit:` use. 21 scripts converted.
+
+`test/win32/skip-visibility.ps1` is the acceptance. Its 12 analyzer fixtures
+include the three shapes a looser first draft reported - tracker fixture data
+(`skipped(split -> T2)`), prose about a negative control, a `WARN ... skipped` -
+and the bug that emptied the sweep to zero while looking like a tightening: the
+`-Host` in `Write-Host "SKIP ..."` matched an operand pattern of `-\w+`. Section
+B is the sweep, where the pending list can only SHRINK - an entry that no longer
+violates fails the run exactly as an unlisted violator does - and `-TeethCheck`
+synthesizes both so it keeps its teeth once that list reaches empty. Section C
+measures the rule on the wire rather than asserting it:
+`upgrade-resume-readiness.ps1 -PureOnly` ends `ALL PASS (2 SKIPPED)`.
+
+What no reader could answer is the audit's step 2, "how often is each branch
+taken on this box": a branch that fires every run and one that has never fired
+look identical in the text, and sampling 80 GUI scripts would still only
+describe this box on this day. The answer that holds either way is that when one
+does fire, the result says so. The three heavy scripts - overlay-zorder (14
+sites), split-divider (11), pane-banner (6) - are the pending list, filed as
+T731.
+
+Floor: all three lanes PASS via `floor-lane.ps1 -Lane all`, P1-P3 ALL PASS.
+`skip-visibility.ps1` ALL PASS x3 and `-TeethCheck` green. Every one of the 21
+converted scripts parses; the three cheap pure ones were run live
+(`build-mode-guard.ps1`, `website-windows-download.ps1`,
+`upgrade-resume-readiness.ps1 -PureOnly`).

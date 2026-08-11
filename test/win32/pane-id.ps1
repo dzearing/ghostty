@@ -525,6 +525,7 @@ if (-not (Test-Path (Join-Path $jqDir 'jq.exe'))) { $missing += 'jq' }
 
 if ($missing.Count -gt 0) {
     "  SKIP G (end-to-end hook check needs: $($missing -join ', '))"
+    $script:skipped++
 } else {
     $tmpG = Join-Path $root 'g'
     New-Item -ItemType Directory -Force (Join-Path $tmpG 'home') | Out-Null
@@ -575,5 +576,5 @@ if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 
-if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

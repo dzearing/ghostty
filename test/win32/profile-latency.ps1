@@ -384,7 +384,7 @@ Assert (($hashTop -notmatch 'FAIL|EMPTY|NORECT') -and ($hashTop -ne $hashBottom)
 Rep "GUI thread RTT right after scroll_to_top: ${rttTop}ms"
 
 $burst = [ProfDrv]::SeekBurst($top, 0x22, $SeekKeys, 2000)  # shift+pgdn from top
-if ($burst -like 'ABORT*') { Rep "SKIP idle seek burst: $burst" }
+if ($burst -like 'ABORT*') { Rep "SKIP idle seek burst: $burst"; $script:skipped++ }
 else {
     $rtts = @($burst -split ',' | ForEach-Object { [long]$_ })
     $i = 0; foreach ($v in $rtts) { Add-Content -Encoding ascii $rttCsv "idle,$i,$v"; $i++ }
@@ -412,12 +412,12 @@ Rep "+read mid-storm: $($sw.ElapsedMilliseconds)ms"
 Assert ($sw.ElapsedMilliseconds -lt 2000) "+read mid-storm < 2s (T62 bound on this build: $($sw.ElapsedMilliseconds)ms)"
 
 $f2 = [ProfDrv]::Focus($top, $surface)
-if ($f2 -ne 'OK') { Rep "SKIP storm seek: $f2" }
+if ($f2 -ne 'OK') { Rep "SKIP storm seek: $f2"; $script:skipped++ }
 else {
     $r = [ProfDrv]::Chord($top, @([uint16]0x11), 0x24)  # ctrl+home
     Start-Sleep -Milliseconds 300
     $burst2 = [ProfDrv]::SeekBurst($top, 0x22, $SeekKeys, 5000)
-    if ($burst2 -like 'ABORT*') { Rep "SKIP storm seek burst: $burst2" }
+    if ($burst2 -like 'ABORT*') { Rep "SKIP storm seek burst: $burst2"; $script:skipped++ }
     else {
         $rtts2 = @($burst2 -split ',' | ForEach-Object { [long]$_ })
         $i = 0; foreach ($v in $rtts2) { Add-Content -Encoding ascii $rttCsv "storm,$i,$v"; $i++ }
@@ -450,6 +450,6 @@ if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction Silent
 } finally { $env:LOCALAPPDATA = $realLocalAppData }
 
 Rep ''
-if ($script:fail -eq 0) { Rep "ALL PASS ($script:pass assertions) - report: $report" }
+if ($script:fail -eq 0) { Rep "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" })) - report: $report" }
 else { Rep "$script:fail FAILURE(S) / $script:pass passed - report: $report"; exit 1 }
 

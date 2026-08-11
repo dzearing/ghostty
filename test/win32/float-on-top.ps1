@@ -142,6 +142,7 @@ try {
     }
     if (-not $ov) {
         Write-Host 'SKIP B: no banner overlay window appeared'
+        $script:skipped++
     } else {
         $ovHwnd = [IntPtr]$ov.Hwnd
         Set-Active $A $pane | Out-Null
@@ -174,6 +175,6 @@ try {
     Stop-RepoInstances
 }
 
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" }
 else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" }
 exit ([int]($script:fail -gt 0))

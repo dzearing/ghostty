@@ -65,7 +65,7 @@ function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
-function Skip([string]$label) { Write-Host "SKIP  $label" -ForegroundColor Yellow }
+function Skip([string]$label) { Write-Host "SKIP  $label" -ForegroundColor Yellow; $script:skipped++ }
 
 function Stop-RepoInstances {
     foreach ($name in @('ghoztty.exe', 'ghoztty-agent.exe')) {
@@ -507,5 +507,5 @@ $leaked = @($fgSeen | Where-Object { $launched -contains $_ })
 Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
 Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
 
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" -ForegroundColor Green; exit 0 }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" -ForegroundColor Green; exit 0 }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }

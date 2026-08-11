@@ -66,7 +66,7 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 function AssertAlways($name, $cond) { Assert $name $cond }
-function Skip($name, $why) { "  SKIP $name - $why" }
+function Skip($name, $why) { $script:skipped++; "  SKIP $name - $why" }
 
 # `ghoztty +verb > file` from PowerShell writes 0 bytes (T245); go through cmd.
 function Invoke-Ghoztty([string]$ArgLine, [string]$OutFile) {
@@ -273,5 +273,5 @@ try {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
+if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { "$($script:failures) FAILURE(S)" }
 exit ([int]($script:failures -gt 0))
