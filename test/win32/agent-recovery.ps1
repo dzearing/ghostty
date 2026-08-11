@@ -33,6 +33,14 @@
 #   H: the negative control for G - the identical blip HELD past the window, which
 #      must rebuild. One variable between the two sections: how long the link
 #      stayed down.
+#   I: T723 - the blip held past the RE-DIAL, so recovery ABORTS (a wedged agent
+#      holds the single-instance guard and never completes a handshake), and then
+#      the wedged agent is KILLED. Nothing but a retry can save those panes: the
+#      settle watch never re-opens, because a link already in `reconnecting`
+#      produces no further DOWN edge. They must come back with no app relaunch.
+#   J: the same abort, ended by a RESUME instead of a kill - the softer half,
+#      where a healed link is also an acceptable cure. The panes must be
+#      responsive either way.
 #
 # The oracle for "did a rebuild run" is the set of GhozttyTerminal child windows,
 # not the child pids. Recovery keeps the window HWND and replaces the SURFACES
@@ -305,6 +313,22 @@ public static class GhozttyRecoveryNative {
 function Set-AgentSuspended($procId, [bool]$suspended) {
     return [GhozttyRecoveryNative]::SetSuspended([int]$procId, $suspended)
 }
+
+# Death is not instant, and it is least instant for a SUSPENDED target: the
+# terminate is accepted immediately but the threads only unwind once they run
+# again, so a process object (and a `Get-Process` hit) legitimately outlives the
+# kill by a moment. Sampling once right after `Stop-Process` scored a killed
+# agent as still running while every assertion after it - the rebuild, the fresh
+# agent, the responsive pane - proved it was gone.
+function Wait-ProcGone($procId, $timeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($null -eq $p -or $p.HasExited) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
 # Unary comma: every caller does arithmetic on .Count, and PowerShell unwraps a
 # one-element array return into a scalar whose .Count is $null.
 function Get-TerminalSurfaces($procId) {
@@ -347,6 +371,20 @@ function Read-AppLog($from) {
     $t = Get-AppLogText
     if ($from -ge $t.Length) { return '' }
     return $t.Substring($from)
+}
+# Only ever printed next to a FAILED wait on a log line. The waits are timing
+# signals, so when one times out the useful question is "what did the app say
+# instead", and the run dir is deleted on the way out - there is no log to go
+# back to afterwards.
+function Dump-AppLog($from, $tag) {
+    "    [$tag] app log since the mark:"
+    $t = Read-AppLog $from
+    if (-not $t) { "      <empty>"; return }
+    # Renderer/OpenGL chatter drowns everything at debug level, so this keeps
+    # the lines that speak about the connection under test.
+    ($t -split "`r?`n" |
+        Where-Object { $_ -match 'agent|recovery|link|remote|persist' } |
+        Select-Object -Last 30) | ForEach-Object { "      $_" }
 }
 
 Stop-TestProcs
@@ -722,6 +760,158 @@ $treeH = Get-List $tmp 'h' 12
 Assert "H9 the topology survived: one window, 2 terminals, the viewer intact" (
     (Windows-Of $treeH).Count -eq 1 -and (Terminal-Leaves $treeH).Count -eq 2 -and
     @(Viewer-Leaves $treeH).Count -eq 1)
+
+# ============================================================================
+"== I: T723 - a wedge held past the RE-DIAL aborts recovery, and a retry saves it"
+# ============================================================================
+# Section H resumes the agent as soon as the app says it is recovering, so the
+# re-dial always lands on a running agent. THIS section holds the suspend
+# through the re-dial, which is the branch nothing had ever measured: the agent
+# is alive (so its single-instance guard blocks a replacement) and its pipe
+# accepts a connection the handshake never completes, so `findOrSpawn` spends
+# its whole budget and `recoverLocalAgentInPlace` ABORTS.
+#
+# What made that abort terminal before T723: the settle watch only opens on a
+# link DOWN EDGE, and `Connection` fires its observer only on a real state
+# CHANGE. The link is already `reconnecting` by then and its only remaining
+# transition is to `dead`, which needs a server-sent DETACHED frame - which a
+# wedged (or killed) agent never sends. So no second edge ever arrived, nothing
+# re-armed the watch, and the panes stayed frozen until the app was relaunched.
+#
+# This arm is the WORST case, and the one with no other cure at all: after the
+# abort the wedged agent is KILLED while still frozen, so there is no healed link
+# to fall back on. Its death produces no new down edge either (the link is
+# already `reconnecting`, and a dead pipe only re-signals a transport error,
+# which is not a state CHANGE), so the retry is the only thing that can bring
+# these panes back.
+#
+# Order matters between this section and J: each arm must start on a
+# freshly-healthy agent. A wedge held long enough for the agent's OWN
+# single-instance guard to go stale (`single_instance.heartbeat_stale_after_ms`,
+# 45s) lets the app's spawned challenger kill and replace the holder, at which
+# point recovery succeeds on its first try and the abort under test never
+# happens. Both arms reach their verdict ~15s into the wedge, well inside that,
+# but only if the agent they suspend has been heartbeating normally - which is
+# why the kill arm runs FIRST and hands J a brand-new agent, rather than J
+# inheriting one this section has already frozen.
+$logMarkI = Get-AppLogLength
+$surfI0 = Get-TerminalSurfaces $appPid
+$agentsI = Get-RunAgents $tmp
+if ($agentsI.Count -ne 1) { Show-Agents $tmp 'I' }
+Assert "I1 exactly one agent belongs to this run before the wedge" ($agentsI.Count -eq 1)
+$agentPidI = if ($agentsI.Count -ge 1) { [int]$agentsI[0].ProcessId } else { 0 }
+Assert "I2 the agent was suspended" (
+    $agentPidI -gt 0 -and (Set-AgentSuspended $agentPidI $true) -eq 0)
+
+# Wait for the app's own verdict, never a clock: the settle window (5s) plus a
+# find-or-spawn budget spent entirely on handshake timeouts is several seconds
+# and depends on box load.
+$abortSeen = $false
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    if ((Read-AppLog $logMarkI) -match 'in-place recovery ABORTED') { $abortSeen = $true; break }
+    Start-Sleep -Milliseconds 200
+}
+if (-not $abortSeen) { Dump-AppLog $logMarkI 'I3' }
+Assert "I3 a wedge held past the re-dial really does ABORT recovery" $abortSeen
+
+# The fix, at the seam where the old build simply returned: an abort must leave a
+# retry armed rather than nothing at all.
+$armSeen = $false
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    if ((Read-AppLog $logMarkI) -match 'in-place recovery: retry 1/') { $armSeen = $true; break }
+    Start-Sleep -Milliseconds 200
+}
+Assert "I4 the abort armed a retry instead of giving up silently" $armSeen
+
+# Kill it while it is still frozen: TerminateProcess does not need the target to
+# run, so the app never gets a healthy moment between the abort and the death.
+# The children die with the agent (section B's finding), so the retry has to
+# spawn a fresh agent and RELAUNCH the sessions - a full rebuild, not a
+# re-attach, and nothing but the retry can start it.
+if ($agentPidI -gt 0) {
+    Stop-Process -Id $agentPidI -Force -ErrorAction SilentlyContinue
+    # Let the corpse unwind. A terminated process whose threads are still frozen
+    # keeps its process object, and leaving one behind would also leave this
+    # run's single-instance guard held against the retry's spawn. The rc is
+    # ignored on purpose: it is nonzero once the process is really gone, which is
+    # the outcome being asked for.
+    [void](Set-AgentSuspended $agentPidI $false)
+}
+Assert "I5 the wedged agent is gone" (Wait-ProcGone $agentPidI 20)
+
+# The retry schedule is 2s/4s/8s/15s/30s/30s, and a spawn+dial+rebuild is
+# seconds more, so this waits generously - but not so long that the schedule
+# could have run out, or a pass would say nothing about the retry.
+$surfI1 = Wait-SurfacesReplaced $appPid $surfI0 2 90
+$reusedI = @($surfI1 | Where-Object { $surfI0 -contains $_ })
+if ($reusedI.Count -ne 0) { "    [I6] before=$($surfI0 -join ',') after=$($surfI1 -join ',')" }
+Assert "I6 a retry rebuilt every terminal surface with no app relaunch" (
+    $surfI1.Count -eq 2 -and $reusedI.Count -eq 0)
+Assert "I7 the app pid never changed - this was recovery, not a relaunch" (
+    $null -ne (Get-Process -Id $appPid -ErrorAction SilentlyContinue))
+
+$agentsI1 = Get-RunAgents $tmp
+if ($agentsI1.Count -ne 1) { Show-Agents $tmp 'I8' }
+Assert "I8 a FRESH agent was spawned by the retry" (
+    $agentsI1.Count -eq 1 -and [int]$agentsI1[0].ProcessId -ne $agentPidI)
+
+$rowsI = Wait-AliveCount $tmp 'i' 2 60
+Assert "I9 two sessions are alive again" ((Alive-Rows $rowsI).Count -eq 2)
+Assert "I10 the pane is a WORKING pane, not a picture of one" (
+    Test-PaneResponsive $tmp 't145b' 'i' 60)
+$treeI = Get-List $tmp 'i' 12
+Assert "I11 the topology survived: one window, 2 terminals, the viewer intact" (
+    (Windows-Of $treeI).Count -eq 1 -and (Terminal-Leaves $treeI).Count -eq 2 -and
+    @(Viewer-Leaves $treeI).Count -eq 1)
+
+# And the give-up notice must NOT be showing: it is for a recovery that ran out
+# of retries, and this one succeeded. A pane wearing "your shell is frozen" over
+# a working shell is its own defect.
+$bannersI = @(Terminal-Leaves $treeI | Where-Object { $_.banner -like '*Session helper unreachable*' })
+Assert "I12 no pane is left wearing the give-up banner after a successful retry" (
+    $bannersI.Count -eq 0)
+
+# ============================================================================
+"== J: the same abort, but the wedge ENDS - the panes must come back either way"
+# ============================================================================
+# The literal shape T723 names: hold the suspend well past the re-dial timeout,
+# then RESUME, and the panes must end up responsive. Softer than section I,
+# because two different things can cure it and the user cannot tell them apart:
+# the old link can heal on its own (the abort left the panes riding it - recovery
+# retires a connection only when the re-dial SUCCEEDS), or a retry re-dials the
+# revived agent and rebuilds. The assertion is the user's question - "does my
+# pane work" - not which path answered it. Before T723 neither did.
+$logMarkJ = Get-AppLogLength
+$agentsJ = Get-RunAgents $tmp
+Assert "J1 one agent belongs to this run before the wedge" ($agentsJ.Count -eq 1)
+$agentPidJ = if ($agentsJ.Count -ge 1) { [int]$agentsJ[0].ProcessId } else { 0 }
+Assert "J2 the agent was suspended" (
+    $agentPidJ -gt 0 -and (Set-AgentSuspended $agentPidJ $true) -eq 0)
+
+$abortSeenJ = $false
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    if ((Read-AppLog $logMarkJ) -match 'in-place recovery ABORTED') { $abortSeenJ = $true; break }
+    Start-Sleep -Milliseconds 200
+}
+if (-not $abortSeenJ) { Dump-AppLog $logMarkJ 'J3' }
+Assert "J3 the wedge aborted recovery again" $abortSeenJ
+
+# Resume unconditionally, including on the timeout path above: a suspended agent
+# left behind would outlive this script.
+$resumeRcJ = Set-AgentSuspended $agentPidJ $false
+Assert "J4 the agent was resumed" ($resumeRcJ -eq 0)
+
+Assert "J5 the panes are responsive again after the wedge ended" (
+    Test-PaneResponsive $tmp 't145b' 'j' 60)
+Assert "J6 the app pid never changed" (
+    $null -ne (Get-Process -Id $appPid -ErrorAction SilentlyContinue))
+$treeJ = Get-List $tmp 'j' 12
+Assert "J7 the topology survived: one window, 2 terminals, the viewer intact" (
+    (Windows-Of $treeJ).Count -eq 1 -and (Terminal-Leaves $treeJ).Count -eq 2 -and
+    @(Viewer-Leaves $treeJ).Count -eq 1)
 
 # ============================================================================
 Stop-TestProcs

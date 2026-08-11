@@ -148,6 +148,11 @@ const LAYOUT_SYNC_MAX_RETRIES: u16 = 40;
 /// EDGE arrives as `WM_APP_AGENT_LINK_DOWN`.
 const AGENT_WATCH_TIMER_ID: usize = 5;
 
+/// Timer ID (on `msg_hwnd`) for the in-place recovery RETRY (T723). Armed only
+/// after a recovery aborted with no reachable agent, one-shot per attempt, and
+/// disarmed the moment the link is back or the schedule is spent.
+const AGENT_RETRY_TIMER_ID: usize = 7;
+
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
 
@@ -299,6 +304,17 @@ agent_settle_deadline_ms: ?i64 = null,
 /// surfaces, which re-enters the layout-sync and IPC paths; a link transition
 /// arriving mid-rebuild must not start a second recovery on top of the first.
 agent_recovering: bool = false,
+
+/// How many in-place recovery RETRIES have already run since the last abort
+/// (T723), indexing `agent_recovery.retry_delays_ms`. Reset to 0 by any
+/// successful re-dial, so a later, unrelated agent death gets the full schedule
+/// again rather than inheriting a spent one.
+agent_retry_attempts: usize = 0,
+
+/// True while `AGENT_RETRY_TIMER_ID` is armed. Also the "a recovery is already
+/// pending" flag: while it is set, a fresh settle watch would only race the
+/// retry to the same re-dial.
+agent_retry_armed: bool = false,
 
 /// Non-zero while a destructive agent refresh is tearing the app's terminals
 /// down and rebuilding them (T229). The app deliberately has zero — or
@@ -3113,6 +3129,12 @@ fn onLocalAgentLinkChange(
 fn beginAgentSettleWatch(self: *App) void {
     if (self.agent_settle_deadline_ms != null) return;
     if (self.agent_recovering) return;
+    // A retry IS a pending recovery (T723). Opening a settle window alongside it
+    // would race the same re-dial and, worse, restart the judgement from
+    // `evaluate` — which on a link that has been down for a minute would arrive
+    // at the same verdict a second time and double the GUI-thread cost of a
+    // wedged agent's handshake timeouts.
+    if (self.agent_retry_armed) return;
     const hwnd = self.msg_hwnd orelse return;
     const state = self.local_agent.linkState() orelse return;
     if (!agent_recovery.isDown(state)) return;
@@ -3130,6 +3152,157 @@ fn endAgentSettleWatch(self: *App) void {
     self.agent_settle_deadline_ms = null;
     if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, AGENT_WATCH_TIMER_ID);
 }
+
+/// Arm the next in-place recovery retry, or give up and say so (T723). GUI
+/// thread; called only from the re-dial-failure site in
+/// `recoverLocalAgentInPlace`, so every caller of recovery inherits it.
+fn armAgentRecoveryRetry(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    const delay = agent_recovery.retryDelayMs(self.agent_retry_attempts) orelse {
+        self.cancelAgentRecoveryRetry();
+        self.reportAgentUnreachable();
+        return;
+    };
+    self.agent_retry_armed = true;
+    _ = w32.SetTimer(hwnd, AGENT_RETRY_TIMER_ID, delay, null);
+    log.warn(
+        "in-place recovery: retry {d}/{d} in {d}ms",
+        .{ self.agent_retry_attempts + 1, agent_recovery.retry_delays_ms.len, delay },
+    );
+}
+
+/// Disarm the retry and forget the attempt count. GUI thread.
+fn cancelAgentRecoveryRetry(self: *App) void {
+    self.agent_retry_armed = false;
+    self.agent_retry_attempts = 0;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, AGENT_RETRY_TIMER_ID);
+}
+
+/// One retry tick: re-check the link, then either stand down or run recovery
+/// again. GUI thread.
+///
+/// The timer is one-shot per attempt (killed here before anything else), so a
+/// slow re-dial can never queue a second tick behind itself — the next attempt
+/// is armed by `recoverLocalAgentInPlace`'s failure path only after this one has
+/// finished.
+fn tickAgentRecoveryRetry(self: *App) void {
+    self.agent_retry_armed = false;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, AGENT_RETRY_TIMER_ID);
+
+    switch (agent_recovery.evaluateRetry(
+        self.local_agent.linkState(),
+        self.agent_retry_attempts,
+    )) {
+        .link_recovered => {
+            // The wedge ended. The panes were never rebuilt — the abort left
+            // them on the old connection, which is the one that just healed —
+            // so replacing their surfaces now would destroy working panes for
+            // an event that cured itself.
+            log.warn("in-place recovery: the shared link came back on its own; retries stood down", .{});
+            self.cancelAgentRecoveryRetry();
+            return;
+        },
+        .no_owner => {
+            log.info("in-place recovery: no shared connection left to retry for", .{});
+            self.cancelAgentRecoveryRetry();
+            return;
+        },
+        .exhausted => {
+            self.cancelAgentRecoveryRetry();
+            self.reportAgentUnreachable();
+            return;
+        },
+        .retry => {},
+    }
+
+    // Nothing left that rode the dropped connection ⇒ nothing to recover, and
+    // re-dialing would only spawn an agent for windows that no longer exist.
+    var any_agent_window = false;
+    for (self.windows.items) |win| {
+        if (win.local_agent_conn != null) {
+            any_agent_window = true;
+            break;
+        }
+    }
+    if (!any_agent_window) {
+        log.info("in-place recovery: no local-agent windows are left; retries stood down", .{});
+        self.cancelAgentRecoveryRetry();
+        return;
+    }
+
+    self.agent_retry_attempts += 1;
+    log.warn(
+        "in-place recovery: retry {d}/{d} starting",
+        .{ self.agent_retry_attempts, agent_recovery.retry_delays_ms.len },
+    );
+    self.beginAgentRefresh();
+    _ = self.recoverLocalAgentInPlace();
+    self.endAgentRefresh();
+}
+
+/// Tell the user, in the pane itself, that their shell is frozen and why (T723).
+///
+/// The whole defect this task names is a pane that sits silently dead, so the
+/// give-up point has to be visible somewhere a person is already looking. A
+/// BANNER rather than a modal: the app is otherwise working, the user may have
+/// several unaffected windows, and a dialog that steals focus from a terminal
+/// they are typing in is its own defect. It is per-pane because the condition is
+/// per-pane.
+///
+/// A pane that already carries a banner keeps it (T422's rule): the user's own
+/// banner holds live task state, and this notice is not entitled to that slot.
+/// Those panes still have the log line and the frozen prompt itself.
+fn reportAgentUnreachable(self: *App) void {
+    const notice = agent_unreachable_notice;
+
+    var frozen: usize = 0;
+    var claimed: usize = 0;
+    for (self.windows.items) |win| {
+        if (win.local_agent_conn == null) continue;
+        for (0..win.tab_count) |t| {
+            var it = win.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                const surface = entry.view.surface() orelse continue;
+                frozen += 1;
+                if (surface.banner_text != null) continue;
+                surface.setPaneBanner(notice);
+                claimed += 1;
+            }
+        }
+    }
+
+    log.err(
+        "in-place recovery GAVE UP after {d} retries: no local agent could be reached; " ++
+            "{d} pane(s) are frozen ({d} told in their banner)",
+        .{ agent_recovery.retry_delays_ms.len, frozen, claimed },
+    );
+}
+
+/// Take back the give-up notice from every pane still showing it, and ONLY from
+/// those (T723). Ownership is proven by the text: the notice is a fixed literal
+/// nothing else writes, so an exact match is ours and anything else is the
+/// user's own banner, which this must never touch.
+fn clearAgentUnreachableNotice(self: *App) void {
+    for (self.windows.items) |win| {
+        for (0..win.tab_count) |t| {
+            var it = win.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                const surface = entry.view.surface() orelse continue;
+                const text = surface.banner_text orelse continue;
+                if (!std.mem.eql(u8, text, agent_unreachable_notice)) continue;
+                surface.setPaneBanner(null);
+            }
+        }
+    }
+}
+
+/// The give-up banner's exact text. One definition because `reportAgentUnreachable`
+/// writes it and `clearAgentUnreachableNotice` identifies it by comparing against
+/// it — two spellings would leave a stale notice on a recovered pane forever.
+const agent_unreachable_notice =
+    "**Session helper unreachable** — this pane's shell is frozen. " ++
+    "Ghoztty could not reach the background agent that owns it. " ++
+    "Close and reopen the pane, or restart Ghoztty to recover.";
 
 /// One tick of the settle window: sample the link, ask the pure policy what it
 /// means, and act. GUI thread.
@@ -3234,6 +3407,12 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
     self.agent_recovering = true;
     defer self.agent_recovering = false;
 
+    // Before the capture, never after (T723): the rebuild restores each leaf's
+    // banner FROM the capture (`restoreLeafPresentation`), so a give-up notice
+    // still on a pane at capture time would be re-applied to the fresh pane that
+    // just came back — a "your shell is frozen" banner over a working shell.
+    self.clearAgentUnreachableNotice();
+
     const gpa = self.core_app.alloc;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -3262,8 +3441,21 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
                 "{d} window(s) are left on the retired connection",
             .{captured.windows.len},
         );
+        // …and that used to be the end of it (T723). The abort is terminal on
+        // its own: the settle watch is already closed, and the link cannot
+        // produce a second DOWN edge to re-open one — `reconnecting` only
+        // leaves for `dead` on a DETACHED frame, which a wedged or killed agent
+        // never sends. So a wedge that outlasts the re-dial, or an agent that
+        // dies right after one, left every pane frozen until the app was
+        // relaunched. Arm a bounded, backed-off retry instead.
+        self.armAgentRecoveryRetry();
         return null;
     };
+
+    // A re-dial that worked ends the retry story, whichever path got us here:
+    // the schedule resets so a LATER, unrelated agent death gets a full budget
+    // rather than inheriting a spent one.
+    self.cancelAgentRecoveryRetry();
 
     // A respawned agent materializes its recorded sessions from disk as
     // relaunchable tombstones, so ATTACH is still the right verb — the shared
@@ -7035,6 +7227,13 @@ fn msgWndProc(
     // periodic SetTimer), killed by `endAgentSettleWatch` once a verdict lands.
     if (msg == w32.WM_TIMER and wparam == AGENT_WATCH_TIMER_ID) {
         app.tickAgentSettleWatch();
+        return 0;
+    }
+
+    // Timer ID 7: the in-place recovery retry (T723). Armed only after a
+    // recovery aborted with no reachable agent; one-shot per attempt.
+    if (msg == w32.WM_TIMER and wparam == AGENT_RETRY_TIMER_ID) {
+        app.tickAgentRecoveryRetry();
         return 0;
     }
 

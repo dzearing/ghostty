@@ -44,6 +44,62 @@ pub const settle_ms: i64 = 5000;
 /// of the FSM state) and during a settle window.
 pub const poll_ms: u32 = 250;
 
+/// Backoff schedule for RE-TRYING a recovery that aborted because no agent
+/// could be re-dialed (T723). One entry per retry, in order; running off the end
+/// is the give-up point.
+///
+/// Why a retry is needed at all: the settle watch only opens on a link DOWN
+/// EDGE, and `Connection` fires its observer only when the state actually
+/// CHANGES. Once the shared link is `reconnecting` the sole remaining transition
+/// is to `dead`, which only a server-sent DETACHED frame produces — and a wedged
+/// or killed agent never sends one. So the abort was terminal: no second edge
+/// ever arrived, nothing re-armed the watch, and the panes stayed frozen until
+/// the user relaunched the app. The exact failure in-place recovery exists to
+/// remove.
+///
+/// The shape is short-then-patient: a wedged agent that is going to come back
+/// usually does so in seconds (a swapped-out process, a disk stall), and a dead
+/// one needs only enough time for a fresh agent to be spawnable. Past ~90s the
+/// cause is not transient and re-dialing forever is noise, so we stop and SAY
+/// so — a silent frozen pane is the thing being fixed, and an infinite quiet
+/// retry loop is only a slower version of it.
+pub const retry_delays_ms = [_]u32{ 2_000, 4_000, 8_000, 15_000, 30_000, 30_000 };
+
+/// The delay before retry number `attempts_made` (0-based), or null once the
+/// schedule is spent.
+pub fn retryDelayMs(attempts_made: usize) ?u32 {
+    if (attempts_made >= retry_delays_ms.len) return null;
+    return retry_delays_ms[attempts_made];
+}
+
+/// What a retry tick should do.
+pub const RetryVerdict = enum {
+    /// Re-run in-place recovery now.
+    retry,
+    /// The old link came back on its own while we were waiting. Nothing to do:
+    /// the panes were never rebuilt, so they are still riding the very
+    /// connection that just healed, and their sessions are the agent's own.
+    link_recovered,
+    /// There is no shared connection to recover — a racing re-dial replaced it,
+    /// or the app is tearing down. Stand down.
+    no_owner,
+    /// The schedule is spent. Give up and tell the user.
+    exhausted,
+};
+
+/// Decide one retry tick. `state` is the CURRENT shared link state (null when
+/// there is no shared connection at all) and `attempts_made` counts the retries
+/// already run.
+pub fn evaluateRetry(
+    state: ?connection.LinkState.State,
+    attempts_made: usize,
+) RetryVerdict {
+    const s = state orelse return .no_owner;
+    if (!isDown(s)) return .link_recovered;
+    if (retryDelayMs(attempts_made) == null) return .exhausted;
+    return .retry;
+}
+
 /// Whether a transport state counts as DOWN (Mac `LinkState.isDown`).
 /// `degraded` is a live link with missed heartbeats, not a drop.
 pub fn isDown(state: connection.LinkState.State) bool {
@@ -273,6 +329,57 @@ test "a different (or absent) agent pid after the window ⇒ agent_restarted" {
         .agent_restarted => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "T723 retry schedule: bounded, monotonic, and it runs out" {
+    // Every retry must wait longer than (or as long as) the one before it: a
+    // flat schedule spends the whole budget in the first few seconds, which is
+    // exactly when a wedged agent is least likely to have come back.
+    var prev: u32 = 0;
+    for (retry_delays_ms) |d| {
+        try testing.expect(d >= prev);
+        prev = d;
+    }
+    // The first retry is soon enough to catch a brief wedge…
+    try testing.expectEqual(@as(?u32, 2_000), retryDelayMs(0));
+    // …and the schedule is spent rather than looping forever.
+    try testing.expectEqual(@as(?u32, null), retryDelayMs(retry_delays_ms.len));
+    try testing.expectEqual(@as(?u32, null), retryDelayMs(retry_delays_ms.len + 100));
+
+    // The total budget is the number that matters to a user staring at a frozen
+    // pane: long enough for a swapped-out agent or a respawn, short enough that
+    // the honest "I gave up" notice is not half a working day away.
+    var total: u64 = 0;
+    for (retry_delays_ms) |d| total += d;
+    try testing.expect(total >= 60_000);
+    try testing.expect(total <= 180_000);
+}
+
+test "T723 evaluateRetry: a link that healed on its own cancels the retry" {
+    // The wedge-then-unwedge case. The abort left the panes on the OLD
+    // connection (recovery retires it only on success), so a heal there is the
+    // whole cure — rebuilding on top of it would replace working panes.
+    try testing.expectEqual(RetryVerdict.link_recovered, evaluateRetry(.connected, 0));
+    // `degraded` is a live link with missed heartbeats, not a drop.
+    try testing.expectEqual(RetryVerdict.link_recovered, evaluateRetry(.degraded, 3));
+
+    // Still down ⇒ retry, for every state `isDown` covers.
+    try testing.expectEqual(RetryVerdict.retry, evaluateRetry(.reconnecting, 0));
+    try testing.expectEqual(RetryVerdict.retry, evaluateRetry(.reattaching, 0));
+    try testing.expectEqual(RetryVerdict.retry, evaluateRetry(.dead, 0));
+    // …and right up to the last scheduled attempt.
+    try testing.expectEqual(RetryVerdict.retry, evaluateRetry(.dead, retry_delays_ms.len - 1));
+
+    // No shared connection at all: a racing re-dial (or teardown) owns this now.
+    try testing.expectEqual(RetryVerdict.no_owner, evaluateRetry(null, 0));
+    // A missing owner outranks exhaustion — there is nobody to tell, and no
+    // frozen pane to blame on us.
+    try testing.expectEqual(RetryVerdict.no_owner, evaluateRetry(null, 99));
+
+    // The give-up point, which is what makes the notice honest rather than a
+    // pane that is still silently waiting.
+    try testing.expectEqual(RetryVerdict.exhausted, evaluateRetry(.dead, retry_delays_ms.len));
+    try testing.expectEqual(RetryVerdict.exhausted, evaluateRetry(.reconnecting, retry_delays_ms.len + 1));
 }
 
 test "sessionSpared: a session the new tree still uses is never close-intented" {

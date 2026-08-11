@@ -1410,6 +1410,35 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
 
   E2E: `test/win32/session-relaunch-notify.ps1`.
 
+**An agent that dies while the app stays up is recovered IN PLACE** (T145), and
+**a recovery that cannot reach an agent keeps trying** (T723). A dropped shared
+link is judged before it is acted on — only a link still down after
+`agent_recovery.settle_ms` (5s) counts, because the transport returns to
+`connected` on the next authentic packet and the Mac shipped this without a
+settle window and had recovery destroy the sessions it had just re-attached
+(`e65cfa4d5`). A confirmed drop re-dials (spawning a fresh agent if needed) and
+rebuilds each local window's split topology onto the new connection: same window,
+same layout, same pane ids, no app relaunch.
+
+The re-dial can fail, and a WEDGED agent — alive, so its single-instance guard
+blocks a replacement, but never completing a handshake — is how. That abort used
+to be terminal, and silently: the settle watch opens on a link DOWN EDGE, and
+`Connection` fires its observer only when the state actually CHANGES, so a link
+already in `reconnecting` never produced a second edge (the only transition left
+is to `dead`, which needs a server-sent DETACHED frame a wedged or killed agent
+never sends). Nothing re-armed anything and the panes stayed frozen until the
+user quit — the exact failure in-place recovery exists to remove. An abort now
+arms a **bounded, backed-off retry** (`agent_recovery.retry_delays_ms`, ~90s over
+six attempts), which stands down the moment the old link heals on its own — the
+abort left the panes riding it, since recovery retires a connection only when the
+re-dial SUCCEEDS, so a heal is the whole cure and rebuilding over it would replace
+working panes. When the schedule is spent the app says so in the pane itself, as a
+banner naming the state and the remedy; a pane already carrying a banner keeps it
+(T422's rule — the user's banner holds live state and this notice is not entitled
+to that slot). Acceptance: sections I and J of `test/win32/agent-recovery.ps1`
+(the wedge held past the re-dial, ended by a kill and by a resume). The Mac half
+is T763.
+
 **A refused pane says why, immediately** (T469). When the agent will not open a
 session — it is at its live-session cap, it is out of memory, or the shell/
 command could not be spawned at all — it answers `OPEN_FAILED` (0x06,
