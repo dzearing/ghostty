@@ -1709,6 +1709,20 @@ fn editProc(
 
     // The quote bars come first: they are content, the placeholder is only
     // ever shown over an EMPTY control, and the two therefore never overlap.
+    //
+    // T252 audited these two `GetDC` paints and they STAY, as the third case
+    // the rule allows: an overlay on a control we do not own. RichEdit does its
+    // own `BeginPaint`/`EndPaint` inside `CallWindowProcW` above and validates
+    // the region on the way out, so there is no paint cycle left to join —
+    // invalidating here would only ask the control to paint itself again and
+    // land right back at this line. What makes it safe is that it is DRIVEN by
+    // `WM_PAINT`: every repaint of the control re-runs it, so the bars and the
+    // placeholder are reproduced from state like anything painted inside the
+    // cycle, rather than existing only until something paints over them. The
+    // one thing it is not is capturable through the control's own
+    // `WM_PRINT`/`WM_PRINTCLIENT`, which this subclass ignores — hence
+    // viewer-feedback.ps1 reads the placeholder off the debug log
+    // (`composer created … painted_placeholder=`) rather than off pixels.
     {
         const bars = w32.GetDC(hwnd);
         if (bars) |dc| {

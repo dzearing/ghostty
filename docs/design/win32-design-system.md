@@ -542,6 +542,54 @@ means "this one"; the divider joining it reads as part of that surface.
 
 ---
 
+## 5b. A color change goes through `WM_PAINT`; `GetDC` is only for a region nothing will invalidate (T252)
+
+Chrome here is painted two ways, and the choice is not a style preference:
+
+| | What it is | When it is right |
+|---|---|---|
+| `InvalidateRect` + `UpdateWindow` | Mark the region dirty, let `WM_PAINT` derive the pixels from state | **Default.** Anything whose appearance changed: a hover, a config re-color, a caption whose content moved |
+| `GetDC` + draw + `ReleaseDC` | Draw straight to the window DC, outside the paint cycle | Only when nothing will ever invalidate that region — a band that MOVED, whose old pixels a child window now covers |
+
+The test is **"did the region move, or did its color change?"** — not "is this
+cheaper". A `GetDC` paint is not reproducible: nothing recorded that the region
+needs drawing, so those pixels stand only until the first `WM_PAINT` that covers
+them, and then whatever the paint routine derives from state replaces them. When
+the state IS the source of truth (it always is here — `paintDividers` reads the
+config and the hover handle), invalidating is both shorter and self-healing, and
+the shortcut buys nothing.
+
+Two call sites in `Window.zig` looked identical and were not, which is the
+whole reason this is written down: `layoutSplits` paints dividers via `GetDC`
+after `MoveWindow`ing every pane (a moved band — legitimate, and commented as
+such at the call site), while `onConfigChange` used the same three lines for a
+`split-divider-color` re-color where nothing moved. That one is now
+`refreshAllDividerBands`.
+
+A third case is allowed and is neither of the above: an **overlay on a control
+we do not own** (`ViewerFeedbackBar`'s quote bars and placeholder over a
+RichEdit). The control validates its own region inside `CallWindowProcW`, so
+there is no cycle left to join; what makes it safe is that the paint is *driven
+by* `WM_PAINT`, so it is reproduced on every repaint like anything inside the
+cycle.
+
+**What this rule is NOT about is capture visibility.** T233 recorded that
+`GetDC` pixels "never reach the backing store" and are therefore invisible to
+`PrintWindow` — the capture every acceptance script on the T211 background
+desktop uses. Re-measured for T252 (2026-08-11, three builds of
+`split-divider.ps1`): they are visible. With `paintWindow`'s divider pass
+compiled out and only the `GetDC` painters left, the capture read both the
+startup red band and a live re-color to cyan; the control build with neither
+painter kept the stale red. What actually made T233's hover invisible is that
+the hover STATE does not survive on that desktop — a posted `WM_MOUSEMOVE` sets
+it and the OS posts `WM_MOUSELEAVE` within a frame, because `TrackMouseEvent`
+watches a real cursor that is not there. `split-divider.ps1`'s own header says
+so, and its hover oracle is the debug log for exactly that reason. Keep the
+paint rule; drop the reason, because a wrong reason sends the next reader
+hunting a capture bug that is not there.
+
+---
+
 ## 6. Vertical space is expensive
 
 A terminal's vertical space belongs to the terminal. Chrome that is always

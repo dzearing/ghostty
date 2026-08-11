@@ -736,15 +736,13 @@ pub fn onConfigChange(self: *Window) void {
     }
     // Re-apply unfocused-split-opacity/-fill (T74).
     self.updateDimOverlays();
-    // Re-paint split dividers so split-divider-color takes effect live
-    // (T73). Same GetDC path as layoutSplits — the lines sit in the
-    // inter-pane gaps that WM_PAINT never covers.
-    if (self.hwnd) |hwnd| {
-        if (w32.GetDC(hwnd)) |dc| {
-            self.paintDividers(dc);
-            _ = w32.ReleaseDC(hwnd, dc);
-        }
-    }
+    // Re-color split dividers so `split-divider-color` takes effect live
+    // (T73), through the paint cycle rather than the `GetDC` shortcut
+    // `layoutSplits` uses (T252): this is a COLOR change to bands that are
+    // exactly where they were, so the repaint is something to ASK for, not
+    // something to do behind the paint cycle's back. See
+    // `refreshDividerBand` for the whole rule.
+    self.refreshAllDividerBands();
     // Recreate the tab-bar font so window-title-font-family reloads live
     // (T78).
     self.createTabFont();
@@ -2802,6 +2800,15 @@ pub fn layoutSplits(self: *Window) void {
 
     // Paint divider lines directly using GetDC (not BeginPaint, which
     // clips to the invalid region and misses the content area gaps).
+    //
+    // T252 audited this and it STAYS: it is the moved-band case the rule
+    // carves out. Every pane child has just been `MoveWindow`d, so a band
+    // that shifted left its old pixels somewhere a child now covers —
+    // nothing marks that region dirty and nothing else would repaint it.
+    // The sibling site in `onConfigChange` looked identical and was NOT this
+    // case (colors changed, nothing moved); it went to `refreshAllDividerBands`.
+    // The distinction is "did the region move" vs "did its color change", and
+    // it is invisible at the call site, which is why it is written down here.
     if (self.hwnd) |hwnd| {
         const hdc = w32.GetDC(hwnd);
         if (hdc) |dc| {
@@ -3204,22 +3211,74 @@ fn splitRegionRectNode(
 /// Repaint ONE divider band through the normal paint cycle (T233).
 ///
 /// InvalidateRect + UpdateWindow, deliberately NOT the `GetDC` + `paintDividers`
-/// shortcut `layoutSplits` uses. That shortcut exists for a band that MOVED —
-/// its old pixels are already covered by a child and nothing would invalidate
-/// them — and it draws straight to the window DC without ever marking the
-/// region dirty. For a band that only changed COLOR that is not enough:
-/// measured 2026-07-31, the pixels never reach the window's backing store, so
-/// the next `PrintWindow` (and anything else that re-renders rather than
-/// re-composites) still shows the rest color. The hover looked correct on
-/// screen and was invisible to the capture — a state that exists on the glass
-/// and nowhere else. Only the band rect is invalidated, so the panes never
-/// repaint and there is no flicker.
+/// shortcut `layoutSplits` uses. **A chrome change that alters only COLOR goes
+/// through `WM_PAINT`; `GetDC` is only for a region nothing will invalidate**
+/// (T252). The shortcut exists for a band that MOVED — its old pixels are
+/// already covered by a child and nothing would invalidate them — and it draws
+/// straight to the window DC, outside the paint cycle, so the pixels it leaves
+/// are not reproducible: they exist until the first `WM_PAINT` that covers that
+/// region and then whatever `paintWindow` derives from state replaces them. For
+/// a state change that IS derivable from state, invalidating is both shorter and
+/// self-healing. Only the band rect is invalidated, so the panes never repaint
+/// and there is no flicker.
+///
+/// The measured reason, re-measured for T252 (2026-08-11) because the reason
+/// T233 recorded was wrong and would have mis-taught the next reader: a
+/// `GetDC` paint IS visible to `PrintWindow(PW_RENDERFULLCONTENT)` — with
+/// `paintWindow`'s divider pass compiled out, `split-divider.ps1` still captured
+/// both the startup red band and a live re-color to cyan, against a control
+/// build with neither painter where the band stayed red. What actually made
+/// T233's HOVER invisible to the capture is that the hover state does not
+/// survive: a posted `WM_MOUSEMOVE` sets it and the OS posts `WM_MOUSELEAVE`
+/// within a frame, because `TrackMouseEvent` watches a real cursor that is not
+/// there (`split-divider.ps1`'s own header says so, and its hover oracle is the
+/// debug log for exactly that reason). So the rule above is about which paints
+/// are REPRODUCIBLE, not about which pixels a capture can see.
 fn refreshDividerBand(self: *Window, handle: ?SplitTree(PaneView).Node.Handle) void {
     const hwnd = self.hwnd orelse return;
     const h = handle orelse return;
     var r = self.dividerBandRect(h) orelse return;
     _ = w32.InvalidateRect(hwnd, &r, 0);
     _ = w32.UpdateWindow(hwnd);
+}
+
+/// Repaint EVERY divider band of the active tab through the paint cycle
+/// (T252) — `refreshDividerBand` for the whole tree, one `UpdateWindow` at the
+/// end. The config reload's re-color is the caller: `split-divider-color`
+/// changed, no band moved.
+///
+/// Band by band rather than one invalidation of the surface rect: the gaps are
+/// the only thing `paintWindow` draws down there, and a rect spanning the panes
+/// would hand every pane child an erase-background it does not need.
+fn refreshAllDividerBands(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.tab_count == 0) return;
+    if (self.tab_hero_active[self.active_tab]) return;
+    const tree = self.tab_trees[self.active_tab];
+    if (!tree.isSplit()) return;
+    if (tree.zoomed != null) return;
+
+    var bands: usize = 0;
+    for (tree.nodes, 0..) |node, i| {
+        switch (node) {
+            .leaf => continue,
+            .split => {},
+        }
+        const handle: SplitTree(PaneView).Node.Handle = @enumFromInt(
+            @as(SplitTree(PaneView).Node.Handle.Backing, @intCast(i)),
+        );
+        var r = self.dividerBandRect(handle) orelse continue;
+        _ = w32.InvalidateRect(hwnd, &r, 0);
+        bands += 1;
+    }
+    // Debug-build oracle for split-divider.ps1: the pixel probe proves the new
+    // color reached the capture, and this proves THIS code is what asked for
+    // it. Without it the re-color assertion passes on a build with the repaint
+    // deleted, because something else in the reload path invalidates the
+    // client area too (measured T252: not the DWM chrome calls, not the dim
+    // overlays, not `DarkMode.apply`, and not a relayout).
+    log.debug("divider bands invalidated count={d}", .{bands});
+    if (bands > 0) _ = w32.UpdateWindow(hwnd);
 }
 
 /// Set (or clear) the hovered split divider, repainting when it changed.
@@ -4376,10 +4435,12 @@ pub fn invalidateTabBar(self: *Window) void {
 /// Invalidate the caption band so it gets repainted (T254).
 ///
 /// `InvalidateRect`, never a `GetDC` paint: a GetDC paint does not mark the
-/// region dirty, so its pixels never reach the backing store and
-/// `PrintWindow` — i.e. every acceptance script — sees the OLD frame while the
-/// screen shows the new one. That cost T233 two hours of debugging a build
-/// that was behaving correctly.
+/// region dirty, so nothing will ever reproduce it — the pixels stand until the
+/// first `WM_PAINT` that covers the caption band and are then replaced by
+/// whatever `paintCaption` derives from state. A caption whose CONTENT changed
+/// therefore has to ask for a repaint; `GetDC` is only for a region nothing
+/// will invalidate (T252, which re-measured T233's claim that such pixels are
+/// invisible to `PrintWindow` — they are not; see `refreshDividerBand`).
 pub fn invalidateCaption(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     const h = self.captionHeight();

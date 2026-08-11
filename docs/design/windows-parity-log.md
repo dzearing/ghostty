@@ -9,6 +9,44 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-11 - **T252 (T765 filed) - the two ways win32 chrome repaints are now
+  sorted, and the reason we had written down for it was wrong.** Chrome here is
+  painted either by invalidating a rect and letting `WM_PAINT` derive the pixels
+  from state, or by `GetDC` + draw + `ReleaseDC` straight to the window DC. Both
+  were in use three lines apart in `Window.onConfigChange`/`layoutSplits` with
+  nothing at the call site saying which job needed which. `onConfigChange` now
+  calls `refreshAllDividerBands` (invalidate the bands, one `UpdateWindow`),
+  `layoutSplits` keeps its `GetDC` pass with the moved-band reason written at the
+  call site, and the rule is section 5b of `win32-design-system.md`. The audit
+  covered every `w32.GetDC` in the frontend: only three paint to their own window
+  at all (the third is `ViewerFeedbackBar`'s overlay on a RichEdit, which stays —
+  the control validates its own region, and the paint is re-run by every
+  `WM_PAINT`, so it is reproducible).
+
+  The surprise is what the audit did to T233's recorded root cause. That said a
+  `GetDC` paint "never reaches the backing store" and is therefore invisible to
+  `PrintWindow`, i.e. to every acceptance script on the background test desktop.
+  Three builds of `split-divider.ps1` say otherwise: with `paintWindow`'s divider
+  pass compiled out and only the `GetDC` painters left, the capture read both the
+  startup red band and a live re-colour to cyan; the control build with neither
+  painter kept the stale red. What actually made T233's hover invisible is that
+  the hover STATE cannot survive there — a posted `WM_MOUSEMOVE` sets it and the
+  OS posts `WM_MOUSELEAVE` within a frame, which `split-divider.ps1`'s own header
+  has said all along, and which is why its hover oracle is the debug log. So the
+  rule survives with a different reason (a `GetDC` paint is not *reproducible*),
+  and the wrong reason is corrected in `refreshDividerBand`, `invalidateCaption`
+  and `hero-mode.ps1` rather than left to mis-teach the next reader.
+
+  The other half the task suspected was true: the red→cyan assertion was passing
+  by luck. It still passed with `onConfigChange`'s repaint deleted outright,
+  because something in the reload path invalidates the client area anyway — not
+  the DWM chrome calls, not `updateDimOverlays`, not `DarkMode.apply`, not a
+  relayout, all four ruled out by measurement and the leftover filed as T765. It
+  now has a second oracle naming `refreshAllDividerBands` and the band count, and
+  that arm was teeth-checked (1 FAILED / 62 passed on a build with the call
+  compiled out). Floor: all three zig lanes, P1–P3, `split-divider.ps1` (63),
+  `tab-strip.ps1`, `pane-banner.ps1`.
+
 - 2026-08-11 - **T613 (T742, T743 filed) - opening the command palette no longer arms
   a crash that fires when you close the window.** Filed as an Activity Monitor
   bug, and the Activity Monitor turned out to be a passenger: reaching the panel

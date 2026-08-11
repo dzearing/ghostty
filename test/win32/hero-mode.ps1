@@ -42,8 +42,11 @@
 # PrintWindow returns as a flat fill. The carousel is the other half: it has NO
 # child HWNDs, HeroCarousel.paint draws it into the PARENT window's DC inside
 # BeginPaint/EndPaint, and every thumbnail refresh goes through InvalidateRect
-# (Window.zig, WM_APP_HERO_SNAP) - so it reaches the backing store PrintWindow
-# reads, unlike a GetDC paint (T233's lesson). The thumbnails themselves are
+# (Window.zig, WM_APP_HERO_SNAP) - so what the capture reads is a repaint from
+# current state rather than whatever was last drawn there. (This used to say
+# "unlike a GetDC paint", citing T233. T252 re-measured that: a GetDC paint IS
+# visible to PrintWindow(PW_RENDERFULLCONTENT); what it is not is reproducible,
+# which is the actual rule - win32-design-system.md 5b.) The thumbnails themselves are
 # renderer output: the pane's own renderer thread captures its GL content into
 # a DIB (Surface.heroSnap*) and the GUI thread blits it with GDI. So a changing
 # carousel is direct evidence that the hidden panes are really rendering.

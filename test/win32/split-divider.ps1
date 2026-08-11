@@ -13,10 +13,20 @@
 # system's 3:1 chrome floor, in BOTH the rest and the hovered state - measured
 # as WCAG contrast against the pane background, not as "some other color".
 #
+# T252 acceptance (run 1): the live re-color is asserted by TWO oracles, and
+# the second one is why the section changed. The pixel proves the new color
+# reached the capture; it does not prove OUR code asked for it - measured
+# 2026-08-11, deleting onConfigChange's repaint outright left the pixel
+# assertion passing, because something else in the reload path invalidates the
+# client area. The debug-log oracle names `refreshAllDividerBands` and the
+# number of bands it invalidated, so the assertion fails on a build with its
+# subject removed.
+#
 # paintDividerNode previously hardcoded a 0x808080 pen; it now uses the
 # config color (COLORREF from Config.Color RGB) with the same gray as the
-# fallback, and Window.onConfigChange repaints dividers so a config reload
-# re-colors live.
+# fallback, and Window.onConfigChange invalidates the divider bands so a config
+# reload re-colors live (T252: invalidate + WM_PAINT, not the GetDC shortcut -
+# a color change goes through the paint cycle, see win32-design-system.md 5b).
 #
 # Two GUI launches (hermetic: --config-default-files=false):
 #   run 1 (config file with split-divider-color = ff0000):
@@ -340,11 +350,17 @@ Assert (-not (Divider-HasColor $top $A $B 128 128 128)) 'red: hardcoded gray div
 # Positive control: ctrl+k reaches binding dispatch (debug log only).
 [void](Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl -Key K)
 Start-Sleep -Milliseconds 400
+$debugLogging = $false
 if (Test-Path $errlog) {
     if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
         Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T73 verdict'
         Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1
     }
+    # Same line doubles as the "log.debug survives in this build" probe, which
+    # the T252 log oracle below needs: without it, a debug build that stopped
+    # emitting its marker is indistinguishable from a release build that never
+    # could, and the oracle would pass by falling into its degraded branch.
+    $debugLogging = $true
     Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
 } else {
     Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
@@ -360,6 +376,8 @@ if (Test-Path $errlog) {
 # a config reload re-colors the divider live. The floor itself is asserted in
 # its own section below, against a color chosen to trip it.
 Set-Content -Path $conf -Value 'split-divider-color = 00ffff' -Encoding Ascii
+# Dropped before the chord so the log oracle below cannot read a leftover.
+if (Test-Path $errlog) { Clear-Content $errlog -ErrorAction SilentlyContinue }
 Assert (Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl, shift -Key comma) `
     'red->cyan: reload chord delivered'
 $cyan = $false
@@ -369,6 +387,25 @@ for ($t = 0; $t -lt 25; $t++) {
 }
 Assert $cyan 'red->cyan: config reload re-colored the divider live'
 if (-not $cyan) { Dump-Strip $top $A $B 'red->cyan' }
+
+# THE PIXEL ABOVE PROVES THE COLOR, NOT THE CALLER (T252). Measured
+# 2026-08-11 across three builds: with onConfigChange's divider repaint
+# deleted outright, the cyan assertion still passed - something else in the
+# reload path invalidates the client area, so the band got repainted by
+# `paintWindow` anyway. An assertion that passes on a build with its subject
+# removed is not testing its subject, so the second half is the debug-log
+# oracle (the hero-mode.ps1 idiom): `refreshAllDividerBands` names itself and
+# how many bands it asked to repaint. Degrades to a note on a release build,
+# where log.debug is compiled out - the pixel half still stands there.
+if ($debugLogging) {
+    $bandLog = @(Select-String -Path $errlog -Pattern 'divider bands invalidated count=(\d+)' `
+            -ErrorAction SilentlyContinue)
+    $bands = if ($bandLog.Count -gt 0) { [int]$bandLog[-1].Matches[0].Groups[1].Value } else { -1 }
+    Assert ($bands -gt 0) `
+        "red->cyan: the reload itself asked for the repaint (refreshAllDividerBands invalidated $bands band(s))"
+} else {
+    Write-Host 'OK    log oracle degraded: no debug log (release build), pixel half only'
+}
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'red: no crash'
 Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
