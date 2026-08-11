@@ -92,6 +92,11 @@ function Say($m) { Write-Host $m }
 # instead of spawning its own: measured 2026-08-03 as 33 failures on a re-run of
 # a script that had just passed 85. Match the temp root too.
 $script:TestProcRoot = Join-Path $env:TEMP 'ghoztty-agent-upgrade-'
+# T199: Stop-TestProcs below is the deliberate teardown; this is the one that
+# runs when the script does NOT reach it (a throw, an early exit, a failed
+# assertion), which is when a leak actually happens. Same rule, one root.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-HarnessGhozttyRoot -Root $root | Out-Null
 function Stop-TestProcs {
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
         Get-CimInstance Win32_Process -Filter "Name='$n'" |

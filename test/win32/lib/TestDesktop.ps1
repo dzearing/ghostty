@@ -2715,8 +2715,14 @@ function Remove-TestDesktop {
 # here may not be resolvable from it, while a loaded type always is. Armed once
 # per session, and left visible to Get-EventSubscriber so the harness's own
 # test can assert the net is actually there.
-if (-not (Get-EventSubscriber -SourceIdentifier 'PowerShell.Exiting' -ErrorAction SilentlyContinue)) {
+#
+# The guard is a flag OF THIS FILE, not "is any PowerShell.Exiting subscriber
+# armed" (T199): lib\HarnessLeak.ps1 arms its own handler on the same event, so
+# a script that dot-sources that one first would have silently skipped this
+# registration and lost the topmost net.
+if (-not $global:GhozttyTestDesktopExitHooked) {
     Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
         [GhozttyTestDesktop]::RestoreTopmost() | Out-Null
     } | Out-Null
+    $global:GhozttyTestDesktopExitHooked = $true
 }

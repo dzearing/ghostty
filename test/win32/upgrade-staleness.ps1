@@ -54,6 +54,12 @@ function AssertEq($name, $expected, $actual) {
 
 . (Join-Path $Repo 'scripts\delivery-version.ps1')
 
+# T199: a stand-in INSTALL dir lives under $root, and the delivery script's job
+# ends by launching the app out of one. Arm the teardown so a run that dies
+# mid-way still takes its ghoztty processes with it.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-HarnessGhozttyRoot -Root $root | Out-Null
+
 # ============================================================================
 "== A: reading and comparing the baked commit (pure)"
 # ============================================================================

@@ -51,6 +51,11 @@ function AssertEq($name, $expected, $actual) {
 }
 
 New-Item -ItemType Directory -Force $root | Out-Null
+# T199: a stand-in INSTALL dir lives under $root, and a refresh ends by
+# launching the app out of one. Arm the teardown so a run that dies mid-way
+# still takes its ghoztty processes with it.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-HarnessGhozttyRoot -Root $root | Out-Null
 $refresh = Join-Path $Repo 'scripts\morning-refresh.ps1'
 Assert "0 morning-refresh.ps1 exists" (Test-Path -LiteralPath $refresh -PathType Leaf)
 

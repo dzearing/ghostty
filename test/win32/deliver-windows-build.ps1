@@ -56,6 +56,11 @@ function AssertEq($name, $expected, $actual) {
 }
 
 . (Join-Path $Repo 'scripts\delivery-manifest.ps1')
+# T199: this run delivers real binaries into stand-in install dirs under $root
+# and runs them for their +version. Arm the teardown so a run that dies mid-way
+# still takes its ghoztty processes with it.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-HarnessGhozttyRoot -Root $root | Out-Null
 $deliver = Join-Path $Repo 'scripts\deliver-windows-build.ps1'
 
 # ============================================================================

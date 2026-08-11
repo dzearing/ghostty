@@ -61,6 +61,14 @@ function AssertEq($name, $expected, $actual) {
 
 . (Join-Path $Repo 'scripts\loop-session.ps1')
 
+# T199: this script hands the delivery script stand-in INSTALL dirs under its
+# own temp roots, and delivering is the job that ENDS by launching the app. Arm
+# the teardown for both roots up front so a run that dies mid-way - which is
+# exactly when a leak happens - still takes its ghoztty processes with it.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-HarnessGhozttyRoot -Root $root | Out-Null
+Register-HarnessGhozttyRoot -Root (Join-Path $env:TEMP "ghoztty-launch-t200-$PID") | Out-Null
+
 # ============================================================================
 "== A: the resume decision, in isolation"
 # ============================================================================

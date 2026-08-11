@@ -14944,3 +14944,59 @@ ALL PASS (arms A-E, including a sandbox seeded with a Debug build), and
 this delivery at the real install locations). Also filed: **T726**, because
 `test/win32/persistence-flag.ps1` is red on four launch sites this turn did not
 touch - a sweep that is always red has stopped being a sweep.
+
+## 2026-08-10 - a test that pretends to install Ghoztty now cleans up the Ghoztty it started (T199)
+
+A harness can hand the delivery script a stand-in install dir under `%TEMP%`.
+Delivering is the job that ENDS by launching the app, so such a run leaves a live
+GUI ghoztty behind - and on 2026-07-29 one did, from `%TEMP%\gh-dbg2\install`,
+still running nineteen hours later when it was noticed by eye. A stray file is
+litter; a stray app is an oracle problem, because every later process or pipe
+assertion has to answer "is that ghoztty mine or the leak's?".
+
+`test/win32/lib/HarnessLeak.ps1` is the teardown that was missing, and the reason
+it was missing is worth stating: `lib/CleanSlate.ps1`'s `Stop-RepoGhoztty`
+REFUSES any exe outside the repo, by design, so a mistyped `-Exe` can never reach
+the user's install - and a stand-in install dir is outside the repo by
+definition. So every such harness rolled its own, and `agent-upgrade.ps1` had
+already hand-rolled half of one on 2026-08-03 after a leftover agent owned the
+agent pipe and turned a passing run into 33 failures on re-run. The new helper is
+the same path-exact discipline pointed at a different sanctioned root:
+`Stop-HarnessGhoztty -Root`, a root check that refuses an empty root, a relative
+root, a drive root, the user's install dir and `%TEMP%` **itself** (a root that
+broad is a kill-everything switch waiting for a variable to be empty), and
+`Get-LeakedGhozttyProcess`, which names any ghoztty running out of a temp
+directory with its pid, path and age in hours. Zero is an achievable answer
+there, because nobody runs their terminal out of `%TEMP%`.
+
+**The teardown that matters is the one that runs when the harness dies**, so
+`Register-HarnessGhozttyRoot` hangs it on `PowerShell.Exiting` rather than on a
+tidy ending. Getting that to actually fire took two measured discoveries, both of
+which make a handler that LOOKS right do nothing at all, silently: an exiting
+action resolves **no** variable from the registering scope (a `$global:`
+reference never fired; `.GetNewClosure()` never fired; pure literals fired on
+both a normal exit and an unhandled throw), and module auto-loading does not work
+at exit, so `Get-CimInstance` - the process query every other helper here uses -
+is dead there. The block is therefore GENERATED with the root baked in as a
+literal and runs on `Get-Process`/`Stop-Process`, one block per root; the same
+generated block is what the explicit call runs, so the failure path is not a
+second implementation nobody exercises. `lib/TestDesktop.ps1` guarded its own
+T179 exit hook on "is ANY `PowerShell.Exiting` subscriber armed", which this new
+one would have satisfied - silently disarming the topmost net for any script that
+loaded HarnessLeak first. Its guard is now a flag of its own.
+
+Five harnesses that build stand-in install dirs register their roots
+(`upgrade-no-fork.ps1` for both of its, `upgrade-staleness.ps1`,
+`morning-refresh.ps1`, `deliver-windows-build.ps1`, `agent-upgrade.ps1`).
+
+Floor: all three lanes PASS (win32 green alone; the first `-Lane all` run hit the
+known **T472** flake under three-lane load, evidence appended there), P1-P3 ALL
+PASS, all five adopting harnesses still ALL PASS with the registration in them,
+and the new
+`test/win32/harness-process-leak.ps1` is ALL PASS (23) - a real GUI launched from
+a scratch install dir found by path and killed (with `Stop-RepoGhoztty`'s refusal
+of that same exe asserted next to it, so the gap is stated rather than implied),
+a child that registers and then throws leaving nothing, and the teeth: the same
+child without the registration leaks. `harness-exitcode-audit.ps1` stays ALL PASS
+with this turn's new `Start-Process` site in it. T728 was filed for the red
+persistence sweep and closed as a duplicate of **T726**, which already had it.
