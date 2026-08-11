@@ -78,7 +78,14 @@ param(
     # -DelaySeconds sleep, so this only has to cover process startup.
     [int]$StartTimeoutSeconds = 30,
     # Anything else to forward verbatim (e.g. -ForceRelaunch, -NoResume).
-    [string[]]$ExtraArgs = @()
+    [string[]]$ExtraArgs = @(),
+    # T198: skip install locations 2 and 3 entirely and let the detached upgrade
+    # mirror them best-effort, as it did before this step existed.
+    [switch]$NoDeliver,
+    # Forwarded to deliver-windows-build.ps1: the portable zip's entry set is
+    # allowed to change on this delivery. Needed whenever the shipped file set
+    # legitimately moves; never the default.
+    [switch]$AcceptZipShape
 )
 
 $ErrorActionPreference = 'Stop'
@@ -193,6 +200,56 @@ if (-not (Test-CommitsMatch $staged.Commit $head)) {
     Write-Host "WARNING: shipping +$($staged.Commit) against HEAD $head because -AllowStaleStaging was passed"
 }
 
+# ---- T198: install locations 2 and 3, before the detached upgrade ------------
+#
+# The primary install has to be upgraded by a detached child - nothing in this
+# process tree can swap the exe out from under its own GUI. The two portable
+# locations have no such constraint, so they are delivered HERE, in-process,
+# while someone is still watching, and every delivered file is read back
+# (length + mtime, `+version`, PE subsystem). The old path mirrored them from
+# inside the child and checked nothing: on 2026-08-10 both portable locations
+# held a DEBUG ghoztty.exe beside a release ghoztty.com an hour after the log
+# line `extra install '...': ghoztty.exe, ghoztty.com, ...`.
+#
+# A failure over there is loud but NOT fatal - the installed release is the one
+# the user is sitting in front of, and a sleeping NAS must not hold it up. When
+# the delivery succeeds the child is told -NoExtraInstalls, so the verified path
+# and the best-effort one never both copy; when it does not, the child's mirror
+# stays as the fallback it has always been.
+$deliveredExtras = $false
+if (-not $NoDeliver) {
+    $deliverScript = Join-Path $PSScriptRoot 'deliver-windows-build.ps1'
+    if (-not (Test-Path -LiteralPath $deliverScript -PathType Leaf)) {
+        Write-Host "deliver-windows-build.ps1 not found beside this script; leaving locations 2 and 3 to the upgrade's best-effort mirror"
+    } else {
+        $deliverArgs = @{ Staging = $Staging; ExpectedCommit = $head }
+        if ($ExtraArgs -contains '-AppOnly') { $deliverArgs['AppOnly'] = $true }
+        if ($AcceptZipShape) { $deliverArgs['AcceptZipShape'] = $true }
+        Write-Host '== delivering to install locations 2 and 3'
+        # Splatted as a HASHTABLE: array splatting binds POSITIONALLY, and the
+        # deliver script sets PositionalBinding=$false, so an array would be
+        # rejected before its first line.
+        # The code is captured INSIDE the try and seeded to a non-zero sentinel:
+        # a script that throws before it can exit (a binding error, a missing
+        # dependency) never assigns $LASTEXITCODE, so reading it afterwards
+        # returns whatever the last native command left there - which is 0 often
+        # enough to turn "it never ran" into "it succeeded".
+        $deliverCode = 99
+        try {
+            & $deliverScript @deliverArgs
+            $deliverCode = $LASTEXITCODE
+        } catch {
+            Write-Host "the delivery script threw before it could report: $($_.Exception.Message)"
+        }
+        if ($deliverCode -eq 0) {
+            $deliveredExtras = $true
+        } else {
+            Write-Host ("DELIVERY TO LOCATIONS 2/3 FAILED (exit $deliverCode). The installed release upgrade continues " +
+                'and the child will mirror them best-effort, but read the lines above before calling this delivery done.')
+        }
+    }
+}
+
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $promptFile = Join-Path $env:TEMP "ghoztty-upgrade-prompt-$stamp.txt"
 $errFile = Join-Path $env:TEMP "ghoztty-upgrade-launch-$stamp.err.txt"
@@ -230,6 +287,9 @@ $argv = @(
     '-ExpectedCommit', $head
 )
 if ($AllowStaleStaging) { $argv += '-AllowStaleStaging' }
+# T198: locations 2 and 3 are already delivered AND verified, so the child's
+# unverified mirror has nothing left to do.
+if ($deliveredExtras) { $argv += '-NoExtraInstalls' }
 if ($LoopClaudePid -gt 0) { $argv += @('-LoopClaudePid', "$LoopClaudePid") }
 $argv += $ExtraArgs
 

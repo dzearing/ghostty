@@ -24,8 +24,9 @@
 #
 # Hermetic: every install/staging directory is under
 # %TEMP%\ghoztty-staleness-<pid>, TEMP is redirected for every child so the
-# box's real upgrade log is untouched, no build is ever run, and -NoExtraInstalls
-# keeps section D away from the real portable/share copies. The one shared
+# box's real upgrade log is untouched, no build is ever run, -NoExtraInstalls
+# keeps section D away from the real portable/share copies, and -NoDeliver keeps
+# section C's launcher from running the T198 delivery step against them. The one shared
 # resource it touches is read-only: `+sessions` against the live agent.
 #
 #   powershell -NoProfile -File test\win32\upgrade-staleness.ps1
@@ -205,7 +206,7 @@ function Get-MarkerCount([string]$Log) {
 # This is 2026-07-30 exactly: a staging prefix left behind by an older build.
 $before = Get-MarkerCount $cLog
 $stale = Invoke-InSandboxTemp -TempDir $cRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk,
+    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk, '-NoDeliver',
     '-Repo', $Repo, '-SkipBuild', '-ExpectedCommit', 'deadbee0f', '-StartTimeoutSeconds', '10')
 Assert "C1 NEGATIVE CONTROL: a stale staging prefix fails the launch (exit $($stale.Code))" ($stale.Code -eq 3)
 Assert "C2 and says so in the words a turn would grep for" ($stale.Out -match 'STALE STAGING')
@@ -215,7 +216,7 @@ AssertEq "C4 THE HALF THAT MATTERS: no upgrade was started" $before (Get-MarkerC
 # --- C5 the same prefix, delivered on purpose --------------------------------
 $before = Get-MarkerCount $cLog
 $forced = Invoke-InSandboxTemp -TempDir $cRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk,
+    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk, '-NoDeliver',
     '-Repo', $Repo, '-SkipBuild', '-ExpectedCommit', 'deadbee0f', '-AllowStaleStaging', '-StartTimeoutSeconds', '20')
 AssertEq "C5 -AllowStaleStaging ships it anyway" 0 $forced.Code
 Assert "C6 loudly" ($forced.Out -match 'WARNING')
@@ -226,7 +227,7 @@ Assert "C8 the expectation is handed DOWN, so the child measures the same number
 # --- C9 the healthy delivery -------------------------------------------------
 $before = Get-MarkerCount $cLog
 $fresh = Invoke-InSandboxTemp -TempDir $cRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk,
+    '-PromptFile', $promptFile, '-Staging', $cStaging, '-UpgradeScript', $stubOk, '-NoDeliver',
     '-Repo', $Repo, '-SkipBuild', '-ExpectedCommit', $exeCommit, '-StartTimeoutSeconds', '20')
 AssertEq "C9 a staged exe that IS the delivery launches" 0 $fresh.Code
 Assert "C10 and reports what it compared" ($fresh.Out -match 'staging freshness')
@@ -237,7 +238,7 @@ $emptyStaging = Join-Path $cRoot 'empty-staging'
 New-Item -ItemType Directory -Force (Join-Path $emptyStaging 'bin') | Out-Null
 $before = Get-MarkerCount $cLog
 $noExe = Invoke-InSandboxTemp -TempDir $cRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $emptyStaging, '-UpgradeScript', $stubOk,
+    '-PromptFile', $promptFile, '-Staging', $emptyStaging, '-UpgradeScript', $stubOk, '-NoDeliver',
     '-Repo', $Repo, '-SkipBuild', '-ExpectedCommit', $exeCommit, '-StartTimeoutSeconds', '10')
 Assert "C12 a staging prefix with no exe fails (exit $($noExe.Code))" ($noExe.Code -eq 3)
 Assert "C13 and says the installed release was not touched" ($noExe.Out -match 'NOT upgraded')

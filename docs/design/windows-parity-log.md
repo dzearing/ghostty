@@ -14867,3 +14867,80 @@ that never lost it.
 One thread filed: **T725** - these harness guards (this one, `build-mode-guard`,
 `persistence-flag`, `parity-sweep`) all cost a turn to write and none is in a
 standing lane, so each runs only when someone remembers it.
+
+## 2026-08-10 - a delivery to the portable install locations now reads back what it wrote (T198)
+
+Two of the three install locations were delivered by hand every time, from prose
+in this log, by a session that had never done it before. `scripts/deliver-windows-build.ps1`
+owns them now - the Desktop portable, the share's portable copy, the share's
+loose `ghoztty-agent.exe`, and the `Ghoztty-portable-x64.zip` people download -
+and `launch-upgrade.ps1` runs it in-process, after the staging build and before
+it launches the detached upgrade, so a failure over there happens while someone
+is still watching. On success the child is passed `-NoExtraInstalls`, so the
+verified path and the old best-effort mirror never both copy.
+
+**The copying was never the hard part.** T196's hand-built zip exited 0 and was
+wrong twice over. And the first thing this turn did was find the same shape live
+on the box: **both portable locations were holding a Debug `ghoztty.exe`**
+(`+edc526574`, PE subsystem 3 = console) beside a release `ghoztty.com`
+(`+213a21f0d`) - an hour after the 05:43 morning refresh had logged
+`extra install '...': ghoztty.exe, ghoztty.com, ghoztty.pdb, ghostty-vt.dll,
+share\(robocopy 1)` for both of them. The copy reported success, the bytes on
+disk were from another build, and nothing anywhere read the result back. The
+vector was never identified (that day's log shows only `zig-out-release`
+staging, and no script in the repo names those directories except
+`upgrade-ghoztty-windows.ps1`); the most likely explanation is a hand-run copy
+from an earlier turn, which is exactly what a delivery-time check cannot prevent
+and a periodic audit would catch - filed as **T727**.
+
+So every claim the script makes is measured:
+
+| claim | how it is measured |
+|---|---|
+| the bytes arrived | length + mtime against the staging source (`-DeepVerify` for SHA-256) |
+| they are the right build | `+version` on the delivered `ghoztty.exe` AND `ghoztty.com` |
+| it is a RELEASE build | PE subsystem: 2 (GUI) for `.exe`, 3 (console) for `.com` |
+| the archive is the right shape | its entry set diffed against the artifact it replaces |
+
+The subsystem row is the one that would have caught 2026-08-10 at the source: a
+console-subsystem `ghoztty.exe` is a Debug build, and a staging prefix carrying
+one is now refused before anything is written. The zip is built from an explicit
+manifest - root entry `Ghoztty\`, no `.pdb`, no `.bak*`, no `.locked-*` - and an
+unannounced entry-set change fails the run and leaves the published artifact
+untouched (`-AcceptZipShape` is how a deliberate change ships).
+
+Reachability is not failure: an absent or unreachable location is SKIPPED and
+named in the verdict, because a sleeping NAS must not hold up the install the
+user is sitting in front of. A location that is present and WRONG is a failure -
+the distinction the old mirror could not make. And `-AppOnly` (the morning
+refresh) publishes no zip at all: the archive is built FROM a portable directory
+whose agent that mode deliberately leaves alone, so publishing it would ship a
+new app beside an old agent as a matched pair nobody claimed.
+
+**The first real run repaired the box and immediately earned its own diff.** Both
+portable locations now report `+213a21f0d` with subsystem 2. The published
+archive went from 556 entries to 567 and from 20.3 MB to 37.7 MB - almost all of
+that is `ghoztty.com`, a byte-for-byte 32 MB twin of `ghoztty.exe` that the
+T196-era zip predates entirely, so the artifact people download has been missing
+the binary PATHEXT actually resolves (T245) since the day that rule landed. The
+diff also caught a mistake in the manifest rule as it was published: a blanket
+"no dotfiles" clause dropped
+`share/ghostty/shell-integration/zsh/.zshenv`, which is shipped content, not
+junk. The rule now refuses dotfiles only at the archive root, and the entry-set
+diff is what made a silently-missing file loud enough to fix in the same turn.
+
+Retention: the `.bak-*` pile had reached 62 files in the Desktop portable dir and
+is now 72 across 22 generations / 1.8 GB (three validation runs of my own on top
+of it), with the same again on the share. The script reports the count,
+generations and megabytes on every run and prints the command to trim them, but
+`-PruneBackups <keep>` only ever runs when asked - deleting is user-gated. What
+gets backed up is the five files you RUN, never the two `.pdb` files, which is
+where most of that gigabyte came from; that call is filed as **D64**.
+
+Floor: all three lanes PASS, P1-P3 ALL PASS, `test/win32/deliver-windows-build.ps1`
+ALL PASS (arms A-E, including a sandbox seeded with a Debug build), and
+`test/win32/upgrade-staleness.ps1` ALL PASS with the new step wired in
+(its section C now passes `-NoDeliver`, so a stub-driven launch can never point
+this delivery at the real install locations). Also filed: **T726**, because
+`test/win32/persistence-flag.ps1` is red on four launch sites this turn did not
+touch - a sweep that is always red has stopped being a sweep.

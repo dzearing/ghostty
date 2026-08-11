@@ -584,6 +584,37 @@ line did not fail — re-run it unfiltered before believing it.
   (`D:\Users\David\Desktop\Ghoztty-portable-x64`), and the share copy
   (`\\homeassistant\share\ghoztty-windows`). A fix that only lives in
   zig-out does not exist as far as the user can tell (the T49 lesson).
+
+  **Locations 2 and 3 are scripted now, and every claim they make is measured**
+  (T198). `launch-upgrade.ps1` runs `scripts\deliver-windows-build.ps1`
+  in-process, after the staging build and before it launches the detached
+  upgrade, so a failure over there happens while someone is still watching; the
+  child upgrade is then told `-NoExtraInstalls` so the verified path and the old
+  best-effort mirror never both copy. What the script proves, rather than
+  asserts: every delivered file matches its staging source (length + mtime;
+  SHA-256 under `-DeepVerify`), every delivered `ghoztty.exe`/`ghoztty.com`
+  answers `+version` with the commit being shipped, their PE subsystems are
+  GUI/console (a console `ghoztty.exe` is a Debug build), the share's loose
+  `ghoztty-agent.exe` is refreshed, and the portable ZIP is rebuilt from an
+  explicit manifest — root entry `Ghoztty\`, no `.pdb`, no `.bak*` — with its
+  entry set diffed against the artifact it replaces. An unannounced shape change
+  fails the run and the zip is NOT published; pass `-AcceptZipShape` (through
+  `launch-upgrade.ps1` too) when the shipped file set legitimately moved.
+
+  Why the checking rather than just the copying: T196's hand-built zip exited 0
+  and was wrong twice over (double-nested root, both `.pdb` files, 20.3 MB →
+  41.9 MB), and on 2026-08-10 both portable locations were found holding a
+  **Debug** `ghoztty.exe` beside a release `ghoztty.com` an hour after the
+  morning refresh had logged `extra install '...': ghoztty.exe, ghoztty.com,
+  ...`. The copy reported success; nothing read the result back.
+
+  An unreachable location is SKIPPED and named in the verdict, never a failure —
+  a sleeping NAS must not hold up the install the user is sitting in front of. A
+  location that is present and WRONG is a failure, which is the distinction the
+  old best-effort mirror could not make. Run it standalone with `-DryRun` to see
+  what it would replace; `-PruneBackups <keep>` is how the `.bak-*` pile is
+  trimmed (it is only ever OFFERED, since deleting is user-gated). Acceptance:
+  `test\win32\deliver-windows-build.ps1`.
 - **Never override `-ResumeCommand` on `scripts/upgrade-ghoztty-windows.ps1`**
   (2026-07-18): the default (`claude --dangerously-skip-permissions
   --continue "read go.md and go"`) is what re-enters this loop after the
