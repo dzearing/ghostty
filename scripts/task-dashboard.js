@@ -1075,7 +1075,8 @@ function fillDays(perDay, fromTs, toTs) {
 // ---------------------------------------------------------------------------
 
 function warn(msg) {
-  process.stderr.write('task-dashboard: ' + msg + '\n');
+  process.stderr.write(
+    '[' + new Date().toISOString() + '] task-dashboard: ' + msg + '\n');
 }
 
 /**
@@ -1237,8 +1238,23 @@ function serve(port) {
     process.exit(1);
   });
 
+  // A dashboard that drops ONE request is worth far more than one that
+  // vanishes. Every request path above is already guarded, so anything
+  // reaching here is asynchronous — a socket error, a rejected promise nobody
+  // awaited — and node's default for both is to print to stderr and exit. The
+  // server is detached and hidden, so that exit is what the user meets as "the
+  // tracker died": a pane showing a dead page, with no crash record anywhere
+  // (2026-08-11). Log it and keep serving instead.
+  process.on('uncaughtException', (e) => {
+    warn('uncaught: ' + (e && e.stack ? e.stack : String(e)));
+  });
+  process.on('unhandledRejection', (e) => {
+    warn('unhandled rejection: ' + (e && e.stack ? e.stack : String(e)));
+  });
+
   server.listen(port, '127.0.0.1', () => {
-    process.stdout.write('http://localhost:' + port + '/\n');
+    process.stdout.write(
+      '[' + new Date().toISOString() + '] http://localhost:' + port + '/\n');
   });
 }
 

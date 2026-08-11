@@ -84,9 +84,24 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 if (Test-Listening -P $Port) {
     Write-Host "task-dashboard: already serving $Url"
 } else {
+    # The server is detached and hidden, so without this its output goes
+    # nowhere and a death leaves NO evidence at all - which is exactly what
+    # "the tracker died" looked like on 2026-08-11: the port simply stopped
+    # listening, with nothing in the Application log and nothing on disk. One
+    # generation is kept (.prev), because the log you want is the one written
+    # by the run that just died, and restarting is the first thing anyone does.
+    $logDir = Join-Path $RepoRoot 'temp'
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+    $outLog = Join-Path $logDir 'task-dashboard.log'
+    $errLog = Join-Path $logDir 'task-dashboard.err.log'
+    foreach ($f in @($outLog, $errLog)) {
+        if (Test-Path $f) { Move-Item -LiteralPath $f -Destination "$f.prev" -Force }
+    }
+
     Start-Process -FilePath 'node' `
         -ArgumentList @($Script, '--port', $Port) `
-        -WorkingDirectory $RepoRoot -WindowStyle Hidden | Out-Null
+        -WorkingDirectory $RepoRoot -WindowStyle Hidden `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog | Out-Null
 
     # The first run walks ~440 commits of git history to build the trend, so
     # allow for a slow start instead of declaring failure at one second.
@@ -95,8 +110,11 @@ if (Test-Listening -P $Port) {
         if (Test-Listening -P $Port) { $ok = $true; break }
         Start-Sleep -Milliseconds 250
     }
-    if (-not $ok) { throw "server did not come up on port $Port" }
-    Write-Host "task-dashboard: serving $Url"
+    if (-not $ok) {
+        $tail = if (Test-Path $errLog) { (Get-Content $errLog -Tail 10) -join "`n" } else { '' }
+        throw "server did not come up on port $Port$(if ($tail) { "`n$tail" })"
+    }
+    Write-Host "task-dashboard: serving $Url (log: $outLog)"
 }
 
 if ($NoPane) { return }
