@@ -21,6 +21,7 @@ const kernel_info = @import("kernel_info.zig");
 // Namespaces
 pub const args = @import("args.zig");
 pub const cgroup = @import("cgroup.zig");
+pub const cli_launch = @import("cli_launch.zig");
 pub const hostname = @import("hostname.zig");
 pub const i18n = @import("i18n.zig");
 pub const ipc_client = @import("ipc_client.zig");
@@ -73,6 +74,7 @@ pub const ShellEscapeWriter = shell.ShellEscapeWriter;
 pub const getKernelInfo = kernel_info.getKernelInfo;
 
 test {
+    _ = cli_launch;
     _ = file;
     _ = i18n;
     _ = ipc_client;

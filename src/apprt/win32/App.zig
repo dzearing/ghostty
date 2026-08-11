@@ -4337,11 +4337,13 @@ pub fn performIpc(
 ///   that recorded no cwd lands in the agent's directory.
 /// - `--working-directory=` on the command line is what the STARTUP window
 ///   actually honors. Its working directory comes from the resolved config,
-///   whose Windows default is `home` (`probableCliEnvironment` is hardcoded
-///   false here), and since T144 that resolved value is forwarded to the
-///   local agent on OPEN — so the process cwd alone never reaches the startup
-///   pane. T132 shipped with only the first channel and B3 held because the
-///   OPEN then carried no cwd at all; T144 closed that hole and exposed this.
+///   and since T144 that resolved value is forwarded to the local agent on
+///   OPEN — so the process cwd alone never reaches the startup pane. T132
+///   shipped with only the first channel and B3 held because the OPEN then
+///   carried no cwd at all; T144 closed that hole and exposed this. The
+///   resolved default is no longer unconditionally `home` (T506), but this
+///   spawn is detached and carries no CLI marker, so it still resolves to
+///   `home` — the argument is what makes the answer explicit either way.
 fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void {
     const windows = std.os.windows;
 
@@ -4446,6 +4448,26 @@ pub fn runComShimGuiRespawn(alloc: Allocator) bool {
             cmd.appendSlice(alloc, tail) catch break :build;
         }
         cmd.append(alloc, 0) catch break :build;
+
+        // T506: tell the child it was launched from a command line, so its
+        // `working-directory` default resolves to the directory the user was
+        // standing in rather than to home. It cannot work this out for itself:
+        // the spawn below is DETACHED, so the child has no console, and the
+        // only process that could vouch for it — this one — exits moments
+        // later. The child inherits our environment, so the variable is set on
+        // US for the duration of the spawn, exactly as `relaunch_guard.arm`
+        // does it; the child consumes and clears it (`os.cli_launch`).
+        //
+        // Best-effort: if the variable cannot be set the respawn still happens
+        // and the child just falls back to the pre-T506 default.
+        const cli_env_w = std.unicode.utf8ToUtf16LeStringLiteral(
+            internal_os.cli_launch.env_var,
+        );
+        _ = w32.SetEnvironmentVariableW(
+            cli_env_w,
+            std.unicode.utf8ToUtf16LeStringLiteral("1"),
+        );
+        defer _ = w32.SetEnvironmentVariableW(cli_env_w, null);
 
         // Same detached spawn as autoLaunchInstance above, and safe for the
         // same reasons: no handle inheritance (a GUI child holding the

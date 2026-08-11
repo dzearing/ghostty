@@ -255,12 +255,13 @@ pub fn autoLaunchDirectory(arguments: ?[]const []const u8) ?[]const u8 {
 ///
 /// Why an argv argument at all, when the spawn already sets the new process's
 /// working directory: the STARTUP window does not read the process cwd. Its
-/// working directory comes from the resolved `working-directory` config, whose
-/// default on Windows is `home` (`Config.probableCliEnvironment` is hardcoded
-/// false there), and since T144 that resolved value is forwarded to the local
-/// agent on OPEN — so it always outranks whatever directory the process
-/// happens to sit in. Saying it on the command line makes the request explicit
-/// where inheriting was accidental.
+/// working directory comes from the resolved `working-directory` config, and
+/// since T144 that resolved value is forwarded to the local agent on OPEN — so
+/// it always outranks whatever directory the process happens to sit in. Saying
+/// it on the command line makes the request explicit where inheriting was
+/// accidental. (Since T506 that default is no longer unconditionally `home` on
+/// Windows — a detached auto-launch has no console and no marker, so it still
+/// resolves to `home`, but the argument is what pins the answer either way.)
 ///
 /// Quoting: the whole token is wrapped in `"` only when the path contains
 /// whitespace. Inside a quoted region a run of trailing backslashes would

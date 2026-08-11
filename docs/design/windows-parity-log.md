@@ -15568,3 +15568,61 @@ position and the head are then skipped (**T739**). And every VT-stripping regex
 in `test\win32` is written with `` `e `` for ESC, which PowerShell 5.1 reads as
 the letter `e` - so those helpers delete every `e` from the text and leave the
 escape sequences in (**T740**).
+
+## 2026-08-11 - typing `ghoztty` in a folder now opens a window in that folder (T506)
+
+On macOS and Linux, `ghostty` typed at a prompt opens where you are standing.
+On Windows it opened in your home folder, always, no matter which project you
+had cd'd into. The cause was one line: `Config.probableCliEnvironment()`
+returned a hardcoded `false` for Windows, under an upstream comment calling it
+"not a real supported target". Every Windows launch therefore resolved the
+`working-directory` default to `home`, and the divergence was invisible in the
+code because it read as a deliberate decision rather than an unimplemented one.
+
+Implementing it properly is more interesting than it sounds, because two PE
+subsystems answer the obvious question differently. A **GUI-subsystem** binary -
+what a release `ghoztty.exe` is - never inherits its caller's console, so
+`GetConsoleWindow()` is null even when a human typed its name. A
+**console-subsystem** binary - every Debug build, and `ghoztty.com` always - is
+handed a console by Windows no matter who started it, so merely having one says
+nothing. `src/os/cli_launch.zig` answers with three signals instead:
+
+- **`GHOZTTY_CLI_LAUNCH=1`**, set by `runComShimGuiRespawn` on the child it
+  spawns. PATHEXT resolves a bare `ghoztty` to the `ghoztty.com` twin (T245),
+  whose GUI path respawns `ghoztty.exe` DETACHED - no console, and a parent
+  already exiting. That is the launch a human actually performs and the one
+  nothing can probe, so the twin tells it. The child consumes the variable and
+  clears it, so no pane's shell inherits an internal marker.
+- **A console shared with somebody else** (`GetConsoleProcessList() > 1`). A
+  console-subsystem build launched from a shell inherits that shell's console. A
+  console created FOR us - `CREATE_NEW_CONSOLE`, `CREATE_NO_WINDOW`, an Explorer
+  double-click - holds exactly one process. That distinction is what keeps every
+  GUI launch in this suite non-CLI, which `new-window-cwd.ps1` A5/A6 depend on.
+- **No console at all, but a console-owning parent**
+  (`AttachConsole(ATTACH_PARENT_PROCESS)`, released immediately). This is the
+  release-build leg, and it is not academic: MSYS/git-bash resolves `ghoztty` to
+  `ghoztty.exe`, since its transparent-extension magic covers `.exe` and not
+  `.com`.
+
+Two shared-core edits ride along, both Windows-guarded so POSIX is byte-for-byte
+unchanged. The CLI default resolves to an **explicit cwd path**, not `.inherit`:
+`.inherit` reports `value() == null`, and a null working directory on an agent
+OPEN does not mean "the app's cwd", it means the AGENT's - `C:\Windows\System32`
+for the one the HKCU Run entry starts - which is precisely the defect T144
+fixed. And the `$SHELL` lookup stays off on Windows, because `SHELL` there is an
+MSYS artifact holding `/usr/bin/bash`, which the win32 spawn cannot execute;
+without that guard, a Ghoztty launched from a git-bash prompt would have come up
+with every pane trying to run a POSIX path.
+
+New acceptance script `test\win32\cli-launch-cwd.ps1` (ALL PASS) exercises all
+four shapes on the box - the twin, the negative control, a shared console, and a
+detached spawn from a console-owning parent - plus an arm that types
+`echo T506MARK=[%GHOZTTY_CLI_LAUNCH%]` into the pane and reads it back, so the
+marker's clearing is measured rather than assumed. That arm was teeth-checked by
+making `clearMarker` a no-op and rebuilding: it went red and nothing else moved.
+`auto-launch-cwd.ps1`, `new-window-cwd.ps1` and P1-P3 stay ALL PASS; all three
+zig lanes pass.
+
+One thing the validation turned up that is not ours: `persistence-flag.ps1` is
+red with `undeclared: 4 of 169`, in `agent-attach-refused.ps1` and
+`url-scheme.ps1` - files T506 never touched. Filed as **T744**.

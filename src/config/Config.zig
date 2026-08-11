@@ -4659,10 +4659,32 @@ pub fn finalize(self: *Config) !void {
     self.@"_command-explicit" = self.command != null;
 
     // The default for the working directory depends on the system.
-    var wd: WorkingDirectory = self.@"working-directory" orelse if (probable_cli)
-        .inherit
-    else
-        .home;
+    var wd: WorkingDirectory = self.@"working-directory" orelse default: {
+        if (!probable_cli) break :default .home;
+
+        // Windows resolves the CLI default to an EXPLICIT path rather than
+        // `.inherit` (T506). `.inherit` reports `value() == null`, and a null
+        // working directory on an agent OPEN does not mean "the app's cwd" —
+        // it means "wherever the session-persistence agent happens to be
+        // sitting", which is `C:\Windows\System32` for the agent the HKCU Run
+        // entry starts. That is precisely the defect T144 fixed, and taking
+        // `.inherit` here would walk straight back into it. Resolving now, in
+        // the process that actually has the launching directory, is the only
+        // point where the answer is knowable.
+        if (comptime builtin.os.tag == .windows) {
+            if (std.process.getCwdAlloc(alloc)) |cwd| {
+                break :default .{ .path = cwd };
+            } else |err| {
+                log.warn(
+                    "could not resolve the launch directory, falling back to home: {}",
+                    .{err},
+                );
+                break :default .home;
+            }
+        }
+
+        break :default .inherit;
+    };
 
     // If we are missing either a command or home directory, we need
     // to look up defaults which is kind of expensive. We only do this
@@ -4684,6 +4706,15 @@ pub fn finalize(self: *Config) !void {
                 // will represent our SHELL at login time. We only want to
                 // read from SHELL if we're in a probable CLI environment.
                 if (!probable_cli) break :shell_env;
+
+                // Not on Windows (T506). `SHELL` there is an MSYS/git-bash
+                // artifact holding a POSIX path (`/usr/bin/bash`) that the
+                // win32 spawn cannot execute, so honoring it would break every
+                // pane of a Ghoztty launched from a git-bash prompt. The
+                // Windows default shell comes from `command-shell` and the
+                // `cmd.exe` fallback below, exactly as it did when
+                // `probableCliEnvironment` was hardcoded false here.
+                if (comptime builtin.os.tag == .windows) break :shell_env;
 
                 if (std.process.getEnvVarOwned(alloc, "SHELL")) |value| {
                     log.info("default shell source=env value={s}", .{value});
@@ -5180,10 +5211,14 @@ pub const ChangeIterator = struct {
 /// as possible because magic sucks, but each place is well documented.
 fn probableCliEnvironment() bool {
     switch (builtin.os.tag) {
-        // Windows has its own problems, just ignore it for now since
-        // its not a real supported target and GTK via WSL2 assuming
-        // single instance is probably fine.
-        .windows => return false,
+        // T506: upstream returns false here unconditionally, on the grounds
+        // that Windows "is not a real supported target". This fork ships win32
+        // as a first-class runtime, so that constant is a user-visible
+        // divergence: it pins the `working-directory` default to `home` for
+        // every Windows launch, and `ghoztty` typed in a project directory
+        // opens somewhere else. `cli_launch` answers it properly — see that
+        // module for why a console alone is not the signal here.
+        .windows => return internal_os.cli_launch.probeWindows(),
 
         // On macOS, we don't want to detect `open` calls as CLI envs.
         // Our desktop detection on macOS is very accurate due to how
