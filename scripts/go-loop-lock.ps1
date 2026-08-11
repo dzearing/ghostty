@@ -241,8 +241,57 @@ function Test-Mine($lock) {
     return $false
 }
 
+# How long this loop has been running UNBROKEN, in minutes.
+#
+# `acquired` is carried over on an own-lock re-acquire and reset on every
+# takeover, so it already means "the start of the current continuous run" -
+# /reset-context keeps it, a crash-and-revive does not. Nothing reported it,
+# which is why "is the loop up?" could be answered but "how long has it been
+# up?" could not (user, 2026-08-11).
+function Get-UptimeMinutes($lock) {
+    if (-not $lock) { return 0 }
+    $a = Parse-Iso $lock.acquired
+    if (-not $a) { return 0 }
+    return ((Get-Date) - $a).TotalMinutes
+}
+
+# "3d 04h 12m" / "2h 05m" / "7m" - the form a human reads at a glance.
+function Format-Uptime([double]$minutes) {
+    if ($minutes -lt 0) { $minutes = 0 }
+    $t = [TimeSpan]::FromMinutes($minutes)
+    if ($t.TotalDays -ge 1) { return '{0}d {1:00}h {2:00}m' -f [int]$t.TotalDays, $t.Hours, $t.Minutes }
+    if ($t.TotalHours -ge 1) { return '{0}h {1:00}m' -f [int]$t.TotalHours, $t.Minutes }
+    return '{0}m' -f [int]$t.TotalMinutes
+}
+
+# Append-only ledger of every lock transition (T139/user 2026-08-11).
+#
+# The lock file holds only the CURRENT state, so the moment a loop dies and is
+# revived, the evidence of the death is overwritten by the revival - which is
+# exactly the moment anyone wants it. One JSON object per line, so a postmortem
+# is a tail rather than a parse. Best-effort: a ledger that cannot be written
+# must never fail an acquire.
+function Write-History($lock, $event) {
+    try {
+        $dir = Split-Path -Parent $LockPath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        $row = [ordered]@{
+            at       = Now-Iso
+            event    = $event
+            pane_id  = [string]$lock.pane_id
+            pid      = [int]$lock.claude_pid
+            turn     = [int]$lock.turn
+            reason   = [string]$lock.reason
+            acquired = [string]$lock.acquired
+            uptime_m = [math]::Round((Get-UptimeMinutes $lock), 2)
+        }
+        ($row | ConvertTo-Json -Compress -Depth 3) |
+            Out-File -FilePath (Join-Path $dir 'go-loop-history.jsonl') -Encoding utf8 -Append
+    } catch { }
+}
+
 function Emit($lock, $line) {
-    if ($Json) { ($lock | ConvertTo-Json -Depth 5) } else { $line }
+    if ($Json) { ($lock | ConvertTo-Json -Depth 5) } else { "$(Now-Iso) $line" }
 }
 
 $myPid = Resolve-LoopClaudePid -Explicit $ClaudePid
@@ -309,7 +358,9 @@ switch ($Action) {
             Emit $check "BUSY owner_pane=$($check.pane_id) owner_pid=$($check.claude_pid) (lost acquire race)"
             exit 3
         }
+        Write-History $check 'acquire'
         Emit $check ("ACQUIRED pane=$($new.pane_id) pid=$($new.claude_pid) turn=$turn reason=$reason " +
+                     "uptime=$(Format-Uptime (Get-UptimeMinutes $check)) since=$($new.acquired) " +
                      "pulse=$(if ($transcript) { 'transcript' } else { 'heartbeat-only' })")
         exit 0
     }
@@ -334,7 +385,12 @@ switch ($Action) {
             $lock | Add-Member -NotePropertyName session_id -NotePropertyValue ([string]$env:CLAUDE_CODE_SESSION_ID) -Force
         }
         Write-Lock $lock
-        Emit $lock "HEARTBEAT pane=$($lock.pane_id) pid=$($lock.claude_pid) turn=$($lock.turn)"
+        Write-History $lock 'heartbeat'
+        # Every ping carries WHEN it was taken and how long the loop has been up
+        # (user, 2026-08-11): a heartbeat that says only "alive" cannot tell a
+        # loop that has run all night from one revived forty seconds ago.
+        Emit $lock ("HEARTBEAT pane=$($lock.pane_id) pid=$($lock.claude_pid) turn=$($lock.turn) " +
+                    "uptime=$(Format-Uptime (Get-UptimeMinutes $lock)) since=$($lock.acquired)")
         exit 0
     }
 
@@ -369,8 +425,10 @@ switch ($Action) {
             Emit $lock "NOTOWNER owner_pane=$($lock.pane_id) owner_pid=$($lock.claude_pid)"
             exit 4
         }
+        Write-History $lock 'release'
         Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
-        Emit $lock "RELEASED pane=$($lock.pane_id) pid=$($lock.claude_pid)"
+        Emit $lock ("RELEASED pane=$($lock.pane_id) pid=$($lock.claude_pid) " +
+                    "ran=$(Format-Uptime (Get-UptimeMinutes $lock))")
         exit 0
     }
 
@@ -403,8 +461,13 @@ switch ($Action) {
         if ($activity.At) { $activityIso = $activity.At.ToString($IsoFmt) }
         $lock | Add-Member -NotePropertyName activity_at -NotePropertyValue $activityIso -Force
         $lock | Add-Member -NotePropertyName mine -NotePropertyValue (Test-Mine $lock) -Force
+        $up = Get-UptimeMinutes $lock
+        $lock | Add-Member -NotePropertyName uptime_minutes -NotePropertyValue ([math]::Round($up, 2)) -Force
+        $lock | Add-Member -NotePropertyName uptime -NotePropertyValue (Format-Uptime $up) -Force
+        $lock | Add-Member -NotePropertyName now -NotePropertyValue (Now-Iso) -Force
         Emit $lock ("$state pane=$($lock.pane_id) pid=$($lock.claude_pid) alive=$alive(by=$aliveBy) " +
-                    "age=$([math]::Round($age, 1))m(by=$($activity.By)) turn=$($lock.turn) mine=$(Test-Mine $lock)")
+                    "age=$([math]::Round($age, 1))m(by=$($activity.By)) turn=$($lock.turn) " +
+                    "uptime=$(Format-Uptime $up) since=$($lock.acquired) mine=$(Test-Mine $lock)")
         exit 0
     }
 }

@@ -34,7 +34,10 @@ param(
     # Start the server but do not touch the window layout.
     [switch]$NoPane,
     # Stop whatever is serving this port from this repo.
-    [switch]$Stop
+    [switch]$Stop,
+    # Register (or remove) the keep-alive scheduled task described below.
+    [switch]$Install,
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,6 +64,43 @@ function Test-Listening {
 function Get-DashboardProcess {
     Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
         Where-Object { $_.CommandLine -and $_.CommandLine -like '*task-dashboard.js*' }
+}
+
+# --- keep-alive ------------------------------------------------------------
+#
+# The server is started from a Ghoztty pane, which puts it inside the app's
+# kill-on-close job object - so it dies with the app, every time. On 2026-08-11
+# Ghoztty restarted at 08:19:34 and the dashboard went with it: the port simply
+# stopped listening, and nothing anywhere was going to bring it back. That is
+# what "the tracker died" was.
+#
+# A per-user scheduled task fixes it at the root, because the Task Scheduler
+# service creates the process - outside any job this repo's tooling can be
+# caught in - and it re-runs on a timer, so a death from ANY cause (app
+# restart, crash, reboot) self-heals within the interval. `/sc MINUTE` needs no
+# elevation, which is the same reason T440's watchdog revive task uses it. The
+# launcher no-ops when the port is already listening, so the tick is free.
+$taskName = 'GhozttyTaskDashboard'
+
+function Get-KeepAliveCommand {
+    # schtasks wants the whole command as ONE /tr argument with its inner
+    # quotes backslash-escaped; anything else silently loses everything after
+    # the first space (the trap T440 documents).
+    return '\"powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden' +
+           " -File \`"$PSCommandPath\`" -Port $Port -NoPane"
+}
+
+if ($Uninstall) {
+    schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+    Write-Host "task-dashboard: keep-alive task '$taskName' removed"
+    return
+}
+
+if ($Install) {
+    schtasks /Create /TN $taskName /TR (Get-KeepAliveCommand) /SC MINUTE /MO 5 /F 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not register the keep-alive task '$taskName'" }
+    Write-Host "task-dashboard: keep-alive task '$taskName' registered (every 5m)"
+    # Fall through and start it now, so -Install also brings the server up.
 }
 
 if ($Stop) {
