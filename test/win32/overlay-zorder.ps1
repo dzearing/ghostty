@@ -446,6 +446,15 @@ $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
 
+# T179: this script is the repo's only WS_EX_TOPMOST injector, and a probe that
+# pins a window and never puts it back is what manufactured T142's phantom bug.
+# Every injection above is expected to be healed by the PRODUCT (sections C, D
+# and F assert exactly that), so the restore in Remove-TestDesktop should have
+# found nothing left to do. Anything it did have to un-pin is a window this run
+# would have leaked. Read after the cleanup - the restore happens IN it.
+$strayPins = @(Get-TestTopmostRestored)
+Assert ($strayPins.Count -eq 0) "no probe left a window topmost (harness had to un-pin: $($strayPins -join ','))"
+
 # A -NegativeControl run that never reached the inverted assertion proves
 # nothing, and would otherwise report a clean pass.
 if ($NegativeControl -and -not $script:negReached) {

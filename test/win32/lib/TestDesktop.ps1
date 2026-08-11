@@ -816,12 +816,82 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // T179: every window a probe has pinned and not yet put back, and every
+    // window the restore had to put back itself. STATIC on purpose - the
+    // ledger has to outlive the desktop object (Remove-TestDesktop disposes
+    // it) and be reachable from a PowerShell.Exiting action, which does not
+    // share the dot-sourcing script's variable scope.
+    static readonly List<IntPtr> TopmostInjected = new List<IntPtr>();
+    static readonly List<IntPtr> TopmostRestored = new List<IntPtr>();
+
     // Inject (or clear) WS_EX_TOPMOST exactly the way a stray verification
     // probe does - HWND_TOPMOST / HWND_NOTOPMOST, nothing else touched.
+    //
+    // A pin is LEDGERED here rather than left to the caller's discipline: a
+    // probe that raised a window and never put it back is what manufactured
+    // T142's phantom bug (a day spent on "background windows have banners that
+    // overlap foreground windows", which was a T131 probe's leftover
+    // HWND_TOPMOST on two overlays). RestoreTopmost is what cashes it in.
     public bool SetTopmost(IntPtr h, bool on) {
+        lock (TopmostInjected) {
+            if (on) { if (!TopmostInjected.Contains(h)) TopmostInjected.Add(h); }
+            else TopmostInjected.Remove(h);
+        }
         return (bool)Run(delegate() {
             return SetWindowPos(h, (IntPtr)(on ? -1 : -2), 0, 0, 0, 0, 0x0013); // NOSIZE|NOMOVE|NOACTIVATE
         });
+    }
+
+    // Put back every window a probe pinned that is STILL pinned, and answer
+    // with the ones that needed it - those are the leaks. Empty is the healthy
+    // answer: an injection the product healed (the T142 fix does exactly that
+    // on the next reposition or activation) is already clear by the time this
+    // runs, so it is not reported as a leak.
+    //
+    // Idempotent, and safe with no desktop bound: it walks handles, not the
+    // desktop, so it works from a finally, from Remove-TestDesktop, and from a
+    // PowerShell.Exiting action alike.
+    public static string RestoreTopmost() {
+        // GHOZTTY_TEST_TOPMOST_BREAK=1 disables the restore and nothing else,
+        // so probe-topmost-restore.ps1's arms can be shown to go red. An arm
+        // that cannot fail is not measuring anything, and this one guards a
+        // property whose absence is invisible until it costs a day (T142).
+        if (Environment.GetEnvironmentVariable("GHOZTTY_TEST_TOPMOST_BREAK") == "1") return "";
+        IntPtr[] pending;
+        lock (TopmostInjected) {
+            pending = TopmostInjected.ToArray();
+            TopmostInjected.Clear();
+        }
+        var freed = new List<string>();
+        foreach (IntPtr h in pending) {
+            if (!IsWindow(h)) continue;
+            if ((GetWindowLongW(h, -20) & 0x8) == 0) continue; // GWL_EXSTYLE, WS_EX_TOPMOST
+            SetWindowPos(h, (IntPtr)(-2), 0, 0, 0, 0, 0x0013); // HWND_NOTOPMOST
+            lock (TopmostRestored) { if (!TopmostRestored.Contains(h)) TopmostRestored.Add(h); }
+            freed.Add(((long)h).ToString());
+        }
+        return string.Join(",", freed.ToArray());
+    }
+
+    // Every window RestoreTopmost has ever had to put back this run. Survives
+    // Remove-TestDesktop, so the end-of-run assertion can read it AFTER the
+    // cleanup - the same reason the launched-pid list is kept separately.
+    public static string RestoredTopmost() {
+        lock (TopmostRestored) {
+            var s = new List<string>();
+            foreach (IntPtr h in TopmostRestored) s.Add(((long)h).ToString());
+            return string.Join(",", s.ToArray());
+        }
+    }
+
+    // Windows a probe has pinned and not yet put back. For the harness's own
+    // test; scripts assert on RestoredTopmost.
+    public static string PendingTopmost() {
+        lock (TopmostInjected) {
+            var s = new List<string>();
+            foreach (IntPtr h in TopmostInjected) s.Add(((long)h).ToString());
+            return string.Join(",", s.ToArray());
+        }
     }
 
     // Hide, or re-show with SWP_SHOWWINDOW and no z-order request. This is the
@@ -2003,6 +2073,14 @@ function Get-TestOverlaySandwich {
 
 # Inject or clear WS_EX_TOPMOST the way a stray probe does. This is how the
 # T142 defect is REPRODUCED in a test; the product never sets it.
+#
+# The pin is LEDGERED (T179), so a probe cannot leave a window topmost even if
+# the script that pinned it dies: Remove-TestDesktop restores it, and so does
+# the PowerShell.Exiting handler armed at the bottom of this file. This is the
+# only supported way to topmost a window from a test - a raw
+# SetWindowPos(h, HWND_TOPMOST, ...) is unledgered and is exactly the idiom
+# that manufactured T142's phantom bug. `probe-topmost-restore.ps1` fails the
+# suite if one reappears.
 function Set-TestWindowTopmost {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
@@ -2010,6 +2088,34 @@ function Set-TestWindowTopmost {
         $Desktop
     )
     return (Resolve-TestDesktop $Desktop).SetTopmost($Window, $On)
+}
+
+# Put back every probe-pinned window that is still pinned. Returns the hwnds it
+# had to put back - each one a leak the run would otherwise have left behind.
+# Idempotent, needs no bound desktop, and is called for you by
+# Remove-TestDesktop and on interpreter exit; call it directly only when you
+# want the answer mid-run.
+function Restore-TestWindowTopmost {
+    $raw = [GhozttyTestDesktop]::RestoreTopmost()
+    return @($raw.Split(',') | Where-Object { $_ } | ForEach-Object { [int64]$_ })
+}
+
+# Every window the restore has had to put back this run. Read it AFTER the
+# cleanup, the way the foreground-watch leak assertion is read - Remove-Test-
+# Desktop does the restoring, so a check that runs before it scores nothing:
+#
+#     $stray = @(Get-TestTopmostRestored)
+#     Assert ($stray.Count -eq 0) "no probe left a window topmost ($($stray -join ','))"
+function Get-TestTopmostRestored {
+    $raw = [GhozttyTestDesktop]::RestoredTopmost()
+    return @($raw.Split(',') | Where-Object { $_ } | ForEach-Object { [int64]$_ })
+}
+
+# Windows a probe has pinned and NOT yet put back. The harness's own oracle;
+# scripts assert on Get-TestTopmostRestored instead.
+function Get-TestTopmostPending {
+    $raw = [GhozttyTestDesktop]::PendingTopmost()
+    return @($raw.Split(',') | Where-Object { $_ } | ForEach-Object { [int64]$_ })
 }
 
 # Hide, or re-show with SWP_SHOWWINDOW and no z-order request - the probe for
@@ -2576,8 +2682,15 @@ function Test-TestDesktopLeak {
 
 # Kill everything this harness launched, unbind and drop the desktop. Safe to
 # call twice.
+#
+# Un-pins any probe-injected WS_EX_TOPMOST FIRST (T179), before the processes
+# are killed and while the handles are still real. Every GUI script already
+# calls this from its `finally`, so the restore rides a path that a mid-run
+# abort cannot skip - and a window this harness did not launch (the case that
+# burned T142) is put back rather than dying with a process we own.
 function Remove-TestDesktop {
     param($Desktop, [switch]$KeepProcesses)
+    Restore-TestWindowTopmost | Out-Null
     $td = $Desktop
     if (-not $td) { $td = $script:GhozttyTestDesktop }
     if (-not $KeepProcesses) {
@@ -2589,4 +2702,21 @@ function Remove-TestDesktop {
     $script:GhozttyTestDesktopPids = @()
     if ($td) { $td.Dispose() }
     if ($td -eq $script:GhozttyTestDesktop) { $script:GhozttyTestDesktop = $null }
+}
+
+# T179: the last net under Remove-TestDesktop, for a script that pins a window
+# and never reaches a `finally` at all. PowerShell.Exiting fires at the end of
+# a `powershell -File` run - including after an `exit` inside a try, and after
+# an unhandled terminating error - so a probe pin cannot outlive the
+# interpreter that made it.
+#
+# The action calls the STATIC method rather than the wrapper function: an event
+# action does not run in the dot-sourcing script's scope, so a function defined
+# here may not be resolvable from it, while a loaded type always is. Armed once
+# per session, and left visible to Get-EventSubscriber so the harness's own
+# test can assert the net is actually there.
+if (-not (Get-EventSubscriber -SourceIdentifier 'PowerShell.Exiting' -ErrorAction SilentlyContinue)) {
+    Register-EngineEvent -SourceIdentifier 'PowerShell.Exiting' -Action {
+        [GhozttyTestDesktop]::RestoreTopmost() | Out-Null
+    } | Out-Null
 }

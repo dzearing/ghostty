@@ -9,6 +9,47 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-10 - **T179 (T719 filed) - a test probe can no longer leave a window
+  stuck on top, even if the script that pinned it dies.** T142 cost a day
+  chasing "background windows have banners that overlap foreground windows",
+  which turned out to be a T131 verification probe leaving `HWND_TOPMOST` on two
+  overlays: a harness artifact wearing a product defect's clothes, with nothing
+  in the suite able to tell them apart. The raw `SetWindowPos` this task names in
+  `pane-banner.ps1` is already gone (that script was rewritten onto the
+  TestDesktop harness), so the work was making the restore structural rather than
+  remembered.
+  `Set-TestWindowTopmost` now LEDGERS the pin, and three paths cash it in:
+  `Remove-TestDesktop`, which every GUI script already calls from its `finally`
+  (so an abort mid-run restores - a `finally` runs on an exception AND on an
+  `exit` inside the try, both measured); a `PowerShell.Exiting` handler armed at
+  harness load, for a script with no `finally` at all; and
+  `Restore-TestWindowTopmost` on demand. The ledger is static state in the C#
+  layer on purpose - it has to outlive the desktop object `Remove-TestDesktop`
+  disposes, and be reachable from an event action, which does not share the
+  dot-sourcing script's variable scope. `overlay-zorder.ps1` (the repo's only
+  injector) gained the end-of-run arm this buys: `no probe left a window
+  topmost`, naming any window the harness had to un-pin. It reads empty on a
+  healthy run because the PRODUCT heals every stray pin, which is what sections
+  C/D/F assert - so the leak arm is about the harness, not the app.
+  New acceptance `test\win32\probe-topmost-restore.ps1`, ALL PASS (22). Its
+  subject window is charmap, not ghoztty: a plain Win32 window keeps
+  WS_EX_TOPMOST in every condition, while the product heals it, which would make
+  the app useless as an oracle for whether the HARNESS put the bit back. Section
+  D is the real end-to-end arm - a child `powershell -File` pins a window and
+  dies at `exit 9` having written no cleanup path, and the bit is clear
+  afterwards. Section E is a static scan: no test script may spell a raw
+  topmost `SetWindowPos` outside the ledgered helper, skipping doc-comments and
+  commented-out lines so the lint survives contact with the two files that
+  discuss the idiom in prose.
+  TEETH mattered more than usual here because every arm asserts an ABSENCE, and
+  an absence passes just as happily when the thing that should have set it never
+  ran. `GHOZTTY_TEST_TOPMOST_BREAK=1` disables the restore and nothing else: 7
+  arms across A, C and D go red. The static scan carries its own teeth arm
+  (synthetic offender caught on the executable line, prose and comment not).
+  Filed T719 on the way past: the T158 persistence-declaration sweep reports 4
+  undeclared launch sites (`url-scheme.ps1` x3, `agent-attach-refused.ps1` x1),
+  pre-existing and out of scope here. Floor green: all three lanes, P1-P3.
+
 - 2026-08-10 - **T682 (T708 filed) - two window shortcuts now answer from a
   focused viewer pane, and the list that decides which ones can no longer drift
   in silence.** `viewer_accel.forwards()` names the bound actions a focused
