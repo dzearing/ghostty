@@ -206,6 +206,29 @@ function Get-VerdictExitFindings {
         return $findings
     }
 
+    # T271: a script whose verdict goes through `lib\TestScore.ps1` emits no
+    # `ALL PASS` literal of its own, because the scorer owns the wording AND the
+    # exit code - 0 only for a pass, 1 for failures, 2 for a run that asserted
+    # nothing. Both directions of this rule hold by construction there, so the
+    # shared scorer satisfies it rather than reading as `no-verdict`. The one
+    # hole is `-NoExit`, which hands the code back to the caller: that shape must
+    # still contain an `exit` somewhere.
+    $scorerCalls = @($parsed.Ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        ($n.GetCommandName() -eq 'Write-TestVerdict' -or
+         $n.GetCommandName() -eq 'Write-TestAssertedNothing') }, $true))
+    if ($scorerCalls.Count -gt 0) {
+        $noExit = @($scorerCalls | Where-Object { $_.Extent.Text -match '-NoExit' })
+        if ($noExit.Count -eq 0) { return $findings }
+        $exits = @($parsed.Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true))
+        if ($exits.Count -gt 0) { return $findings }
+        [void]$findings.Add([pscustomobject]@{
+            Path = $Path; Line = $noExit[0].Extent.StartLineNumber; Kind = 'fallthrough'
+            Detail = 'Write-TestVerdict -NoExit hands back the exit code and nothing exits with it' })
+        return $findings
+    }
+
     $site = Get-VerdictSite $parsed.Ast
     if ($null -eq $site) {
         [void]$findings.Add([pscustomobject]@{

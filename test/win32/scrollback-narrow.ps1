@@ -69,6 +69,7 @@ $env:GHOZTTY_PIPE_SUFFIX = '-sbnarrow'
 $errlog = Join-Path $env:TEMP 'ghoztty-sbnarrow-stderr.log'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -184,11 +185,12 @@ try {
     # keeps the shell alive after the command by design, per flavor).
     # A flavor that is not installed on this box is a SKIP, not a failure -
     # otherwise the absence of pwsh reads as a scrollback bug.
+    # The verdict goes through the shared scorer (T271): this branch ends the
+    # run, so if the setup assertions above had ALSO been skipped it would score
+    # a run that measured nothing as a pass.
     if ($shellPath -and -not (Get-Command $shellPath -ErrorAction SilentlyContinue)) {
         Write-Host "SKIP  $Shell is not installed on this box ($shellPath)" -ForegroundColor DarkGray
-        Write-Host ''
-        Write-Host "ALL PASS ($script:pass assertions, $Shell skipped)" -ForegroundColor Green
-        exit 0
+        Write-TestVerdict -Pass $script:pass -Fail $script:fail -Skipped 1
     }
 
     if ($shellPath) {
@@ -295,6 +297,4 @@ finally {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" -ForegroundColor Green }
-else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red }
-exit $(if ($script:fail -eq 0) { 0 } else { 1 })
+Write-TestVerdict -Pass $script:pass -Fail $script:fail

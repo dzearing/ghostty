@@ -164,6 +164,13 @@ function Get-SkipAuditFindings {
                     break
                 }
             }
+            # T271: a script on the shared scorer has no ALL PASS literal - the
+            # scorer prints it - so the CALL is the verdict line, and `-Skipped`
+            # is what makes it report the count.
+            if ($line -match '\bWrite-Test(Verdict|AssertedNothing)\b') {
+                [void]$verdictLines.Add($i)
+                if ($line -match '-Skipped\b') { $verdictReports = $true }
+            }
         }
 
         # A blanket "line contains a comparison operator" filter would drop real
@@ -204,6 +211,15 @@ function Get-SkipAuditFindings {
             $t = $logical[$j].Text
             if ($t -match '^\s*#') { continue }
             if ($t -match '\$[A-Za-z_:]*skip[A-Za-z]*\s*(\+\+|\+=)') { $counted = $true }
+            # T271: the shared scorer reports the count for the script, so
+            # `-Skipped <n>` on a `Write-TestVerdict`/`Write-TestAssertedNothing`
+            # call IS this site being counted - and that call is also the verdict
+            # (it prints the last line and exits), so it ends the search the way
+            # an `ALL PASS` literal does.
+            if ($t -match '\bWrite-Test(Verdict|AssertedNothing)\b') {
+                $verdictBeforeExit = $true
+                if ($t -match '-Skipped\b') { $counted = $true }
+            }
             if ($j -ge $i -and -not $exits) {
                 if ($t -match 'ALL PASS') {
                     $verdictBeforeExit = $true

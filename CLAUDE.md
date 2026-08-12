@@ -1987,6 +1987,42 @@ a helper process with nothing to score. Acceptance:
 `test\win32\verdict-exit-audit.ps1`, whose `-TeethCheck` plants a real violator
 inside the swept directory and requires the sweep to find it.
 
+**And a run that asserted NOTHING is not a pass** (T271). The three audits above
+all assume a run happened; this is the one that asks whether it did. A
+precondition fails — a port still held by the previous run, a shell flavor not
+installed on this box, a staging build missing, no usable `HKCU\Environment\Path`
+entry — every assertion is dropped, and the last line still reads `ALL PASS
+(0 assertions, 1 skipped)` over exit 0. A run that proved the feature works and
+a run that never looked at it are then indistinguishable to the loop, to a suite
+driver, and to a human reading a wall of green.
+
+The invariant lives in one place, `test\win32\lib\TestScore.ps1`:
+`Write-TestVerdict` owns the verdict wording AND the exit code, and answers three
+different pieces of news rather than two — `ALL PASS (N assertions[, K
+SKIPPED])` at **0**, `N FAILURE(S)` at **1**, and `ASSERTED NOTHING` at **2**,
+because "the product is broken" and "the harness measured nothing" are not the
+same result and a caller should not have to parse prose to tell them apart.
+Existing consumers are unaffected: they match `ALL PASS` as a substring of the
+last line and read any nonzero code as red. `-MinPass` is the strong form (a run
+scoring 3 of its 30 assertions reports `ASSERTED TOO LITTLE` and also exits 2);
+`-NoExit` returns the verdict instead of exiting, which is how `ipc-p1`–`p3` tee
+their failure line into a transcript. `Write-TestAssertedNothing -Reason` is the
+sugar for a precondition that failed before anything could be measured.
+
+The sweep is `test\win32\lib\AssertedNothingAudit.ps1` — AST-based, for the
+reason `VerdictExitAudit` is — enforcing two kinds at zero: `zero-count` (a
+verdict hardcoding a zero count) and `early-green` (a pass verdict that ends the
+run with exit 0 anywhere but the final verdict, i.e. an abort branch scoring the
+whole run green). A third, `uncounted-final` — a final verdict that prints no
+count at all, so nothing can tell a full run from an empty one — is reported with
+its number under a ceiling that may only fall, rather than as a 39-name allowlist
+nobody would read; **T775** converts those onto the scorer and then promotes the
+kind. Exemption: the same stated-intent `# asserted-nothing-audit: <reason>`
+marker. Acceptance: `test\win32\asserted-nothing.ps1` (the scorer on the wire as
+real processes, the analyzer against fixtures both directions, the suite sweep),
+whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
+suite is clean.
+
 **A synthesized click routes the way Windows routes it** (T263).
 `Send-TestMouse` asks the target `WM_NCHITTEST` at the point first and delivers
 the `WM_NC*` family whenever the answer is not `HTCLIENT` — the same decision

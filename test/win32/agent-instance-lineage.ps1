@@ -85,6 +85,7 @@ $root = Join-Path $env:TEMP "ghoztty-t167-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 # -Release retargets the two DEFAULT paths only; an explicit -Exe/-AgentExe is
 # always obeyed (that is how a delivered install or a second staging tree gets
@@ -101,8 +102,9 @@ if ($Release) {
         Write-Host "SKIP  -Release: no staging build at $(Split-Path $Exe). Build it with:"
         Write-Host '        zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix zig-out-release'
         Write-Host ''
-        Write-Host "ALL PASS (0 checks, $script:skipped SKIPPED)"
-        exit 0
+        # T271: this used to be `ALL PASS (0 checks, 1 SKIPPED)` at exit 0 - a
+        # green verdict over a run that measured nothing at all.
+        Write-TestVerdict -Pass 0 -Fail 0 -Skipped $script:skipped -Unit 'checks'
     }
 }
 
@@ -459,10 +461,4 @@ Assert "D2 left every other agent on the box running" `
 }
 
 Write-Host ''
-$skipNote = if ($script:skipped) { ", $script:skipped SKIPPED" } else { '' }
-if ($script:failures -eq 0) {
-    Write-Host "ALL PASS ($script:passes checks$skipNote)" -ForegroundColor Green
-    exit 0
-}
-Write-Host "$script:failures FAILURE(S) ($script:passes passed$skipNote)" -ForegroundColor Red
-exit 1
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped -Unit 'checks'

@@ -38,10 +38,12 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 
 $tmp = Join-Path $env:TEMP "ghoztty-t42-userenv-$PID"
@@ -78,9 +80,9 @@ foreach ($e in ($userPath -split ';')) {
 }
 
 if ($null -eq $marker) {
-    "  SKIP no usable HKCU\Environment\Path entry on this box - nothing to assert"
-    "ALL PASS (1 SKIPPED)"
-    exit 0
+    # T271: this used to print ALL PASS and exit 0 having asserted nothing about
+    # the feature - a box without a usable PATH entry scored the whole run green.
+    Write-TestAssertedNothing -Reason 'no usable HKCU\Environment\Path entry on this box - nothing to assert' -Skipped 1
 }
 "  marker (user PATH entry): $marker"
 
@@ -234,5 +236,4 @@ Assert "no entry appears twice (case-insensitive dedupe)" (
 
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ([int]($script:failures -gt 0))
+Write-TestVerdict -Pass $script:passes -Fail $script:failures

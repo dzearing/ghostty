@@ -13,12 +13,14 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
+$script:passes = 0
 $tmp = Join-Path $env:TEMP "ghoztty-ipc-p1-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
@@ -162,12 +164,9 @@ Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 } 2>&1 | Tee-Object -FilePath $transcript
 
 ""
-if ($script:failures -eq 0) {
-    "P1 ACCEPTANCE: ALL PASS"
-    exit 0
-} else {
-    $trailer = "P1 ACCEPTANCE: $script:failures FAILURE(S) - details: $transcript"
-    Add-Content $transcript $trailer
-    $trailer
-    exit 1
-}
+# The verdict goes through the shared scorer (T271), which refuses to call a
+# run with zero passing assertions a pass; -NoExit is how the failure trailer
+# still reaches the transcript.
+$verdict = Write-TestVerdict -Label 'P1 ACCEPTANCE' -Pass $script:passes -Fail $script:failures -NoExit
+if ($verdict.Code -ne 0) { Add-Content $transcript $verdict.Line }
+exit $verdict.Code
