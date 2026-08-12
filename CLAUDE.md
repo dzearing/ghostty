@@ -2246,6 +2246,41 @@ is two panes with different tints each reporting its OWN tint (a flat fill
 cannot answer both), plus section 4 of `test-desktop-harness.ps1`, which reads
 the same pane at the same moment through both paths (94 distinct colors vs 1).
 
+**A HOVERED frame needs the same treatment, for a different reason** (T282).
+The pixels of the chrome were always capturable; the hovered *frame* was never
+painted. On a background desktop there is no real cursor, so `TrackMouseEvent`
+makes the OS post `WM_MOUSELEAVE` within a frame of every posted
+`WM_MOUSEMOVE`, and `WM_PAINT` is the lowest-priority message in a thread's
+queue — the leave is drained FIRST and what gets painted is the un-hovered
+state. An ORDERING problem, not a race: T209 measured 300 posted moves in
+bursts of 25, interleaved with captures, and never once caught a lit fill. So
+every hover fill in the win32 chrome was a `SKIP` or a per-site workaround
+through a state that happens to survive a leave (a drag, a press).
+
+`capture-hover` moves the whole probe onto the app's GUI thread, where the
+ordering is a property of who is on the stack: hit-test, SEND the move (a sent
+message is a direct call to the window procedure when sender and target share a
+thread), `RedrawWindow(RDW_UPDATENOW)` — also synchronous — then `PrintWindow`.
+The message loop is never reached in between and a posted message is only ever
+drained by the message loop, so the leave cannot interleave. Nothing is
+un-done: the leave lands on the next pump exactly as before, which is why this
+is a capture and not a "suppress the leave while a debug flag is set" switch
+whose bad day is a hover stuck lit. Same gate and same no-CLI-verb rule as
+`capture-pane`; harness side is `Get-TestHoverCapture`
+(`test\win32\lib\HoverCapture.ps1`, route H in `TestDesktop.ps1`'s CAPTURE
+LIMIT header). Acceptance: `test\win32\hover-capture.ps1`, whose load-bearing
+oracle is two controls and two captures — hovering the "+" must light the "+"
+and leave the tab's close "×" dark, and hovering the "×" must do the reverse,
+which neither an un-hovered frame nor a latched hover can answer both ways.
+
+One thing the skips were hiding, found by removing them: `T204_NEUTERED` was
+consumed as a single global `universalHover()`, so flipping it took the fill
+off EVERY icon button — including the "+", which the acceptance scripts
+describe as their positive control ("+ lit, × dark" is a product defect;
+"neither lit" is a broken control). It is `icon_button.lightsFill(glyph)` now,
+answered per glyph. Same shape as the bug T209 found in `glyphCentered()`: a
+negative control that answers a question no paint site asks is decoration.
+
 ## Windows UI: the design system is mandatory
 
 **Before changing any pixel of the win32 chrome — tab strip, banner, dialogs,

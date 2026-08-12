@@ -16,6 +16,7 @@ const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
 const ipc_capture = @import("ipc_capture.zig");
+const ipc_hover = @import("ipc_hover.zig");
 const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -94,6 +95,11 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         // release build `enabled` is false and this falls through to the
         // ordinary unknown-action answer below.
         return try ipc_capture.handle(ctx.app, ctx.alloc, request.arguments);
+    } else if (ipc_hover.enabled and std.mem.eql(u8, request.action, "capture-hover")) {
+        // T282: the same DEBUG-ONLY test seam for a HOVERED frame, which the
+        // harness cannot paint from outside at all — see ipc_hover.zig for the
+        // ordering argument. Release builds fall through to unknown-action.
+        return try ipc_hover.handle(ctx.alloc, request.arguments);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});

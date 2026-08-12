@@ -84,6 +84,20 @@
 # -AllowTerminalSurface because "T275 fixed capture" has misread this - route 0
 # does not go through PrintWindow at all.
 #
+# ROUTE H - A HOVERED FRAME (`lib\HoverCapture.ps1`'s Get-TestHoverCapture,
+# T282). Chrome, not terminal content, and a DIFFERENT limit from the one
+# above: the pixels were always capturable, but the hovered FRAME was never
+# painted. There is no real cursor here, so TrackMouseEvent makes the OS post
+# WM_MOUSELEAVE within a frame of every posted WM_MOUSEMOVE, and WM_PAINT is
+# the lowest-priority message in the queue - the leave is drained first and the
+# frame that gets painted is the un-hovered one. An ORDERING problem, so no
+# amount of retrying wins it (T209 measured 300 posted moves and never caught a
+# lit fill). Get-TestHoverCapture has the APP hit-test, send the move, repaint
+# and PrintWindow on ONE GUI-thread stack, which the message loop is never
+# reached in the middle of. Use it for ANY hover fill; a Send-TestMouse move
+# plus Get-TestWindowPixels cannot see one. The hover does not latch - the
+# leave lands on the next pump exactly as before.
+#
 # TERMINAL-CONTENT PROBES THAT STAY ON THE INPUT DESKTOP (declared, not
 # missed - an undeclared exception is indistinguishable from an oversight):
 #
@@ -1588,6 +1602,36 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // ================= a window that is NOT the app's =================
+    // A hidden STATIC owned by the HARNESS process, created on the test
+    // desktop. The fixture for "this handle is somebody else's window", which
+    // an app-side guard can only be tested against with a real one: a made-up
+    // handle answers "not a window" long before any ownership check runs, and
+    // a window on the INTERACTIVE desktop answers the same way (handles are
+    // not reachable across desktops), so neither can reach the guard at all.
+    // No message pump is needed - a caller that is refused on ownership never
+    // sends this window anything.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateWindowExW(uint exStyle, string cls, string name, uint style,
+        int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+
+    public long ForeignWindow() {
+        return (long)Run(delegate() {
+            IntPtr h = CreateWindowExW(0, "STATIC", "ghoztty-test-foreign",
+                                       0x80000000, 0, 0, 10, 10,
+                                       IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (h == IntPtr.Zero) LastError = "CreateWindowExW failed: " + Marshal.GetLastWin32Error();
+            return h.ToInt64();
+        });
+    }
+
+    // Same thread that created it: DestroyWindow refuses a window owned by
+    // another thread.
+    public bool CloseForeignWindow(long h) {
+        return (bool)Run(delegate() { return DestroyWindow(new IntPtr(h)); });
+    }
+
     // ================= capture =================
     // PrintWindow(PW_RENDERFULLCONTENT) is the ONLY capture that works on a
     // background desktop: DWM composes the input desktop only, so BitBlt off
@@ -2766,6 +2810,16 @@ function Get-TestWindowDpi {
 # land in the caller's scope exactly like the functions above.
 . (Join-Path $PSScriptRoot 'ChromeGeometry.ps1')
 
+# HOVERED-FRAME CAPTURE (`Get-TestHoverCapture`, T282), dot-sourced for the
+# same reason: a hover fill is unassertable from out here at any speed - the
+# leave is posted within a frame and WM_PAINT is the lowest-priority message,
+# so the frame that gets painted is always the un-hovered one (see the file's
+# header, and route H in the CAPTURE LIMIT section above). Every GUI script
+# that loads this file gets it, because a control that lights on hover is
+# everywhere in this chrome and the workaround for the missing frame was
+# per-site.
+. (Join-Path $PSScriptRoot 'HoverCapture.ps1')
+
 <#
 Wait for a popup menu (win32 class '#32768') owned by $ProcessId.
 
@@ -2811,6 +2865,34 @@ Pass -AllowTerminalSurface only to MEASURE the limit itself (that is what
 terminal-capture-guard.ps1 does). For a real terminal-content probe, take one
 of the four routes in the CAPTURE LIMIT header instead.
 #>
+<#
+A hidden window on the test desktop that belongs to the HARNESS process, not
+to the app under test.
+
+    $foreign = New-TestForeignWindow
+    ...
+    Remove-TestForeignWindow $foreign
+
+The fixture for an app-side "that handle is not mine" guard (T282's
+`capture-hover`). It has to be a REAL window in another process: a made-up
+handle is refused as "not a window" before any ownership check runs, and a
+window on the INTERACTIVE desktop is refused the same way, since handles are
+not reachable across desktops. Neither reaches the guard.
+
+Returns [IntPtr]::Zero if the window could not be created.
+#>
+function New-TestForeignWindow {
+    param($Desktop)
+    $td = Resolve-TestDesktop $Desktop
+    return [IntPtr]($td.ForeignWindow())
+}
+
+function Remove-TestForeignWindow {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    if ($Window -eq [IntPtr]::Zero) { return $false }
+    return (Resolve-TestDesktop $Desktop).CloseForeignWindow([int64]$Window)
+}
+
 function Get-TestWindowPixels {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,

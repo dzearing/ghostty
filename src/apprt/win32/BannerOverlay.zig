@@ -1639,7 +1639,8 @@ pub const BannerOverlay = struct {
         // used to have none, so it was the one control in the chrome that
         // gave no feedback that it was a button at all.
         const state: icon_button.State = if (self.hover_chevron) .hover else .normal;
-        if (icon_button.paintsFill(state) and icon_button.universalHover()) {
+        const glyph: icon_button.Glyph = if (self.collapsed) .chevron_down else .chevron_up;
+        if (icon_button.paintsFill(state) and icon_button.lightsFill(glyph)) {
             // Shade from the CARD's fill, not the pane background: the
             // chevron sits on the card, so that is the surface its hover has
             // to lift off.
@@ -1660,7 +1661,6 @@ pub const BannerOverlay = struct {
             }
         }
 
-        const glyph: icon_button.Glyph = if (self.collapsed) .chevron_down else .chevron_up;
         // `glyphTarget`, not `targetBox` — see the note at Window.paintIconButton
         // (T209): centering has to be something T204_NEUTERED can take away.
         icon_paint.glyph(hdc, ib, icon_button.glyphTarget(ib, box, glyph), glyph, self.secondary());
@@ -2257,14 +2257,19 @@ test "banner overlay: a size-changing updatePosition repaints in the same pass" 
 
 // T165: the link hover affordance, in PIXELS.
 //
-// The acceptance script can prove the hover STATE (from the debug log) and
-// that the resting rule is dotted (from a capture), but not the transition:
-// on the background test desktop there is no real pointer, so Windows
+// This asserts the transition with no pointer, no desktop and no timing at
+// all: the same banner painted twice into a DIB with only `hover_link`
+// different.
+//
+// It was written because the acceptance script could not reach the hovered
+// frame — on the background test desktop there is no real pointer, so Windows
 // delivers WM_MOUSELEAVE a frame after every posted WM_MOUSEMOVE and the
-// hovered frame is gone before PrintWindow can read it — the same harness
-// limit that makes the chevron's hovered FILL a SKIP. So the transition is
-// asserted here instead, by painting the same banner twice into a DIB with
-// only `hover_link` different. No pointer, no desktop, no timing.
+// hovered paint never happened. T282 removed that limit (`capture-hover` holds
+// the probe on one GUI-thread stack) and `pane-banner.ps1` now asserts the
+// solid rule on the real composited overlay. This test stays: it is the
+// cheapest form of the claim, it runs in the win32 unit lane with no GUI to
+// launch, and a DIB comparison isolates the underline from everything else
+// that could make a capture differ.
 test "banner overlay: a link's underline is dotted at rest and solid on hover" {
     const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
     registerClassOnce(hinst) catch return error.SkipZigTest;

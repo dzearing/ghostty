@@ -622,14 +622,19 @@ try {
     # `hover_chevron`, no `TrackMouseEvent`, no fill - so it gave no feedback
     # that it was a button.
     #
-    # Same split as tab-strip.ps1's 4c, and for the same measured reason: a
-    # posted WM_MOUSEMOVE cannot HOLD a hover here (TrackMouseEvent watches the
-    # real cursor, WM_MOUSELEAVE is posted, and posted messages are drained
-    # before the WM_PAINT the move dirtied), so the hovered frame is never
-    # painted at all. The TRIGGER is asserted from the debug oracle; the FILL
-    # is probed best-effort and skips when the race is lost - its co-witness is
-    # `paintIconButton`'s own pixels in caption-bar.ps1 (a pressed caption
-    # button, which does survive, on the identical fill path).
+    # Same split as tab-strip.ps1's 4c. The TRIGGER is asserted from the debug
+    # oracle - a posted WM_MOUSEMOVE cannot HOLD a hover here (TrackMouseEvent
+    # watches a real cursor that is not there, so WM_MOUSELEAVE is posted a
+    # frame later), which is also why the un-hover is read from the same log
+    # window as the hover.
+    #
+    # The FILL used to be probed best-effort and SKIPPED when the race was
+    # lost, which was always: WM_PAINT is the lowest-priority message in the
+    # queue, so the posted leave is drained before the paint the move dirtied
+    # and the hovered frame was never painted at all. T282 replaced that race
+    # with `Get-TestHoverCapture`, where the app hit-tests, sends the move,
+    # repaints and captures on ONE GUI-thread stack that the message loop is
+    # never reached in the middle of.
     & $exe +set-banner --target=bw "chev1\nchev2\nchev3" | Out-Null
     $null = Wait-Banner 'bw' 0 "chev1`nchev2`nchev3"
     Start-Sleep -Milliseconds 500
@@ -681,44 +686,46 @@ try {
             Write-Host 'SKIP T209 chevron trigger: no debug oracle in the log (release build?)'
         }
 
-        # The FILL, best effort. `fillRegion` insets the square by 2 DIP and
-        # rounds it by 4, so the fill's top edge at the square's horizontal
-        # center is lit and its top-left CORNER pixel is cut away - the same
-        # two probes tab-strip.ps1 uses, which is what distinguishes a rounded
-        # fill from a square one.
+        # The FILL. `fillRegion` insets the square by 2 DIP and rounds it by 4,
+        # so the fill's top edge at the square's horizontal center is lit and
+        # its top-left CORNER pixel is cut away - the same two probes
+        # tab-strip.ps1 uses, which is what distinguishes a rounded fill from a
+        # square one.
+        #
+        # T282 ended the race this used to run (see the section header). The
+        # hovered frame is captured by the APP, on one GUI-thread stack, so the
+        # posted WM_MOUSELEAVE cannot be drained between the move and the paint.
+        # A second probe of the SAME square from a capture hovered elsewhere on
+        # the card is what says the fill followed the hover rather than being
+        # there all along.
         $inset = Get-TestChromeDip -Dip 2.0 -Scale $bScale
         $chTop = $chCy - [int][Math]::Truncate($side / 2)
-        function Probe-Chev {
-            $s = Get-TestWindowPixels -Window $ovHwnd2
-            if ((Get-TestDistinctColors -Shot $s) -lt 8) { Close-TestWindowPixels $s; return $null }
-            $e = $s.Bitmap.GetPixel($chCx, $chTop + $inset + 1)
-            $c = $s.Bitmap.GetPixel($chL + $inset, $chTop + $inset)
-            Close-TestWindowPixels $s
+        function Probe-Chev($shot) {
+            if ($null -eq $shot) { return $null }
+            if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
+            $e = $shot.Bitmap.GetPixel($chCx, $chTop + $inset + 1)
+            $c = $shot.Bitmap.GetPixel($chL + $inset, $chTop + $inset)
             return [pscustomobject]@{ Edge = [int]$e.R; Corner = [int]$c.R }
         }
         Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
         Start-Sleep -Milliseconds 250
-        $chRest = Probe-Chev
-        $chHot = $null
-        if ($null -ne $chRest) {
-            for ($i = 0; $i -lt 12; $i++) {
-                for ($b = 0; $b -lt 25; $b++) {
-                    Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $chCx) -Y ($ovC.Top + $chCy) -Action move | Out-Null
-                }
-                $p = Probe-Chev
-                if ($null -ne $p -and $p.Edge -ge ($chRest.Edge + 6)) { $chHot = $p; break }
-                Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
-            }
-        }
-        Write-Host "INFO  chevron fill: rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge})"
-        if ($null -eq $chHot) {
-            Write-Host 'SKIP T209 chevron fill: the hovered frame was never painted (harness limit, see the section header)'
-        } else {
-            Assert ($chHot.Edge -ge ($chRest.Edge + 6)) `
-                "T204: hovering the chevron lights a fill (rest=$($chRest.Edge) hot=$($chHot.Edge))"
-            Assert ($chHot.Corner -lt ($chHot.Edge - 4)) `
-                "T204: that fill is ROUNDED - its corner is cut away (corner=$($chHot.Corner) edge=$($chHot.Edge))"
-        }
+        $restShot = Get-TestWindowPixels -Window $ovHwnd2
+        $chRest = Probe-Chev $restShot
+        Close-TestWindowPixels $restShot
+
+        $hotShot  = Get-TestHoverCapture -Hwnd $ovHwnd2 -X ($ovC.Left + $chCx) -Y ($ovC.Top + $chCy)
+        $elseShot = Get-TestHoverCapture -Hwnd $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy)
+        $chHot  = Probe-Chev $hotShot
+        $chCold = Probe-Chev $elseShot
+        Write-Host "INFO  chevron fill: rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge}) otherhover=$(if($chCold){$chCold.Edge})"
+        Assert ($null -ne $chHot -and $null -ne $chRest -and $chHot.Edge -ge ($chRest.Edge + 6)) `
+            "T204: hovering the chevron lights a fill (rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge}); $(Get-LastHoverCaptureError))"
+        Assert ($null -ne $chHot -and $chHot.Corner -lt ($chHot.Edge - 4)) `
+            "T204: that fill is ROUNDED - its corner is cut away (corner=$(if($chHot){$chHot.Corner}) edge=$(if($chHot){$chHot.Edge}))"
+        Assert ($null -ne $chCold -and $null -ne $chRest -and $chCold.Edge -lt ($chRest.Edge + 6)) `
+            "T204: ...and the fill follows the pointer - the chevron is dark while the card's left edge is hovered (edge=$(if($chCold){$chCold.Edge}))"
+        Close-TestHoverCapture $hotShot
+        Close-TestHoverCapture $elseShot
     }
 
     & $exe +set-banner --target=bw --clear | Out-Null
@@ -964,15 +971,17 @@ try {
         }
         # The underline is the BOTTOM-most link-colored row: it sits at the
         # foot of the text box, under every (capital) glyph.
+        function Measure-RuleRow($s) {
+            if ($null -eq $s) { return $null }
+            if ((Get-TestDistinctColors -Shot $s) -lt 8) { return $null }
+            $rows = Measure-LinkRows $s
+            if ($rows.Count -eq 0) { return $null }
+            $last = ($rows.Keys | Sort-Object)[-1]
+            return $rows[$last]
+        }
         function Get-RuleRow {
             $s = Get-TestWindowPixels -Window $lHwnd
-            try {
-                if ((Get-TestDistinctColors -Shot $s) -lt 8) { return $null }
-                $rows = Measure-LinkRows $s
-                if ($rows.Count -eq 0) { return $null }
-                $last = ($rows.Keys | Sort-Object)[-1]
-                return $rows[$last]
-            } finally { Close-TestWindowPixels -Shot $s }
+            try { return Measure-RuleRow $s } finally { Close-TestWindowPixels -Shot $s }
         }
 
         # Park the pointer away from the link first, so "at rest" really is.
@@ -1019,30 +1028,22 @@ try {
                 Write-Host 'SKIP T165 hover trigger: no debug oracle in the log (release build?)'
             }
 
-            # ...and the RULE going solid, best effort - the same harness limit
-            # 6f documents for the chevron fill: the hovered frame has to be
-            # captured before the un-hover lands.
-            $hot = $null
-            for ($i = 0; $i -lt 12; $i++) {
-                for ($b = 0; $b -lt 25; $b++) {
-                    Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
-                }
-                $p = Get-RuleRow
-                if ($null -ne $p -and $p.N -gt [int]($span * 0.8)) { $hot = $p; break }
-                Send-TestMouse -Window $top -Target $lHwnd -X ($ovL.Left + $ovL.Width - $lMargin - 2) -Y ($ovL.Top + $ly) -Action move | Out-Null
-            }
-            if ($null -eq $hot) {
-                # Not a hole: the dotted->solid transition is asserted in
-                # PIXELS by the zig test "banner overlay: a link's underline
-                # is dotted at rest and solid on hover", which paints the same
-                # banner twice into a DIB with only `hover_link` different and
-                # so needs no pointer at all.
-                Write-Host 'SKIP T165 solid rule: the hovered frame was never captured (harness limit, see 6f; covered by the zig pixel test)'
-            } else {
-                Write-Host "INFO  T165 hot rule: ink=$($hot.N) span=$($hot.Hi - $hot.Lo + 1)"
-                Assert ($hot.N -gt $rest.N) `
-                    "T165: hovering fills the rule in ($($rest.N) -> $($hot.N) ink px)"
-            }
+            # ...and the RULE going solid. This used to race the un-hover and
+            # SKIP when it lost, which was always - see 6f. T282's hovered-frame
+            # capture ends that: the app paints the frame with the link hovered
+            # on one GUI-thread stack, so the leave cannot be drained first.
+            # (The zig test "banner overlay: a link's underline is dotted at
+            # rest and solid on hover" still asserts the same transition against
+            # a DIB with only `hover_link` different; this is that claim on the
+            # real, composited overlay.)
+            $hotShot = Get-TestHoverCapture -Hwnd $lHwnd -X ($ovL.Left + $lx + 2) -Y ($ovL.Top + $ly)
+            $hot = Measure-RuleRow $hotShot
+            Close-TestHoverCapture $hotShot
+            Write-Host "INFO  T165 hot rule: ink=$(if($hot){$hot.N}) span=$(if($hot){$hot.Hi - $hot.Lo + 1})"
+            Assert ($null -ne $hot -and $hot.N -gt $rest.N) `
+                "T165: hovering fills the rule in ($($rest.N) -> $(if($hot){$hot.N}) ink px; $(Get-LastHoverCaptureError))"
+            Assert ($null -ne $hot -and $hot.N -gt [int]($span * 0.8)) `
+                "T165: ...to a SOLID rule, not merely a denser dotted one ($(if($hot){$hot.N}) ink px over a $span px span)"
         }
 
         # The action menu. Right-click ON the link opens it; right-click on

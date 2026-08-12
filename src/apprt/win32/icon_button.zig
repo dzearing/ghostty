@@ -878,6 +878,31 @@ pub fn universalHover() bool {
     return !T204_NEUTERED;
 }
 
+/// Does THIS button light a fill on hover? The question every paint site
+/// actually has, and the one the neuter has to answer per-glyph.
+///
+/// T282: `universalHover()` was consumed as a global switch, so flipping the
+/// neuter took the fill off EVERY icon button — including the "+", which has
+/// lit one since long before T204. That made the "+" useless as the positive
+/// control the acceptance scripts describe it as ("+ lit, × not" is a product
+/// defect; "neither lit" is a broken control), and nobody could see it because
+/// the fill assertions were skipping on the harness limit T282 removed. Same
+/// shape as the bug T209 found in `glyphCentered()`: a control that answers a
+/// question no paint site asks is decoration.
+///
+/// So the neuter restores the pre-T204 WORLD rather than a fill-less one: the
+/// "+" and the "≡"/"…" menus keep their fill, the close "×" and the banner
+/// chevron lose theirs. The caption's own minimize/maximize/restore are not
+/// part of that world (they arrived with T254) and keep theirs too — the
+/// control exists to adjudicate T204's claim, not to blank the chrome.
+pub fn lightsFill(glyph: Glyph) bool {
+    if (!T204_NEUTERED) return true;
+    return switch (glyph) {
+        .close, .chevron_up, .chevron_down => false,
+        else => true,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1453,5 +1478,23 @@ test "the shipped build centers glyphs and lights every button" {
     try testing.expect(glyphCentered());
     try testing.expect(universalHover());
     try testing.expect(!T204_NEUTERED);
+    for ([_]Glyph{ .add, .close, .menu, .chevron_up, .chevron_down, .overflow }) |g| {
+        try testing.expect(lightsFill(g));
+    }
+}
+
+test "the neuter keeps the + lit — it is the acceptance scripts' positive control" {
+    // The asymmetry IS the control (T282): with the neuter on, "+ lit, × not"
+    // is what the scripts assert, and a switch that blanked both would score a
+    // healthy build red for the wrong reason. Written against the pure
+    // function so it holds whichever way `T204_NEUTERED` is set.
+    for ([_]Glyph{ .add, .menu, .overflow, .minimize, .maximize, .restore }) |g| {
+        try testing.expect(lightsFill(g));
+    }
+    if (T204_NEUTERED) {
+        try testing.expect(!lightsFill(.close));
+        try testing.expect(!lightsFill(.chevron_up));
+        try testing.expect(!lightsFill(.chevron_down));
+    }
 }
 

@@ -181,7 +181,12 @@ fn clientSize(surface: *Surface) ClientSize {
 /// a feedback report is: the reader here is an acceptance script that asked for
 /// this exact path a moment ago, and a temp sibling would just be one more file
 /// for it to clean up.
-fn writeFile(path: []const u8, bytes: []const u8) !void {
+///
+/// Public because `ipc_hover.zig` (T282) is the same seam wearing a different
+/// verb — one debug-only capture action writing a PNG where a harness asked for
+/// one. Two copies of the write and the error shape would be two places for the
+/// answer to drift.
+pub fn writeFile(path: []const u8, bytes: []const u8) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try std.fs.createFileAbsolute(path, .{ .truncate = true })
     else
@@ -190,7 +195,8 @@ fn writeFile(path: []const u8, bytes: []const u8) !void {
     try file.writeAll(bytes);
 }
 
-fn errorResponse(
+/// Shared with `ipc_hover.zig` for the reason `writeFile` is.
+pub fn errorResponse(
     alloc: Allocator,
     comptime fmt: []const u8,
     args: anytype,

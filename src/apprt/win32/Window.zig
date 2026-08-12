@@ -2569,10 +2569,11 @@ fn heroMouseMove(self: *Window, x: i32, y: i32) void {
         // Debug-build oracle for hero-mode.ps1, the `divider hover=` idiom
         // (T233/T250): a POSTED WM_MOUSEMOVE cannot hold a hover on the
         // background test desktop, because TrackMouseEvent watches the real
-        // cursor and WM_MOUSELEAVE lands within a frame. That makes the hover
-        // paint unobservable to a pixel probe and the TRIGGER unobservable
-        // without this line. (The hot COLOR is probed mid-DRAG, which a posted
-        // button-down does hold.)
+        // cursor and WM_MOUSELEAVE lands within a frame — so the TRIGGER is
+        // unobservable without this line. (The hovered PAINT is capturable
+        // since T282, through the `capture-hover` action, which holds the
+        // whole probe on one GUI-thread stack; that is a different question
+        // from "did the state change", which is what this answers.)
         log.debug("hero divider hover={}", .{new_div});
         self.heroInvalidateDivider();
     }
@@ -5100,7 +5101,10 @@ fn paintIconButton(
     // FillRgn, not SelectClipRgn+FillRect: the close button is painted inside
     // the tab loop, which already holds the chiclet clip, and clearing that
     // clip here would un-clip everything drawn after it.
-    if (icon_button.paintsFill(state) and icon_button.universalHover()) {
+    // `lightsFill(glyph)`, not the old global `universalHover()`: the neuter
+    // has to leave the "+" lit, because that is the acceptance scripts'
+    // positive control (T282).
+    if (icon_button.paintsFill(state) and icon_button.lightsFill(glyph)) {
         const d = icon_button.fillDelta(state, true);
         const color = w32.RGB(
             icon_button.shadeChannel(base_r, d),
@@ -5952,8 +5956,9 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         // `hero hover tile=` / `divider hover=` idiom. A posted WM_MOUSEMOVE
         // cannot HOLD a hover on the background test desktop — TrackMouseEvent
         // watches the real cursor, so WM_MOUSELEAVE lands within a frame
-        // (T233) — which makes the pixel probe a race and the TRIGGER
-        // unobservable without this line.
+        // (T233) — which makes the TRIGGER unobservable without this line. The
+        // hovered FILL is no longer a race: T282's `capture-hover` paints and
+        // captures the frame on one GUI-thread stack.
         log.debug("tab hover tab={} close={} plus={} menu={}", .{
             new_hover,
             new_close,

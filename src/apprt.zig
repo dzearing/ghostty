@@ -235,6 +235,12 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/pane_capture.zig");
 
+    // Pure win32 hovered-frame capture — the `capture-hover` request shape,
+    // the client/non-client routing decision, the 16-bit `lparam` point
+    // packing and the top-down-BGRA → RGB transform (T282), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/hover_capture.zig");
+
     // Pure win32 packed-DIB header reader — where a clipboard bitmap's pixels
     // actually start (T637), same no-OS-imports deal.
     _ = @import("apprt/win32/dib_packed.zig");

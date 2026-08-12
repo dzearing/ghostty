@@ -497,8 +497,25 @@ pub extern "user32" fn IsWindowVisible(
     hWnd: HWND,
 ) callconv(.winapi) i32;
 
+pub extern "user32" fn IsWindow(
+    hWnd: ?HWND,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn UpdateWindow(
     hWnd: HWND,
+) callconv(.winapi) i32;
+
+/// Render the window's full content, including a DirectComposition/layered
+/// surface a plain `PrintWindow` would miss. The only capture that works on a
+/// BACKGROUND desktop — DWM composes the input desktop only, so a `BitBlt` off
+/// the desktop DC returns false there (see `test/win32/lib/TestDesktop.ps1`'s
+/// CAPTURE LIMIT header, and `hover_capture.zig` for the T282 use).
+pub const PW_RENDERFULLCONTENT: u32 = 0x00000002;
+
+pub extern "user32" fn PrintWindow(
+    hWnd: HWND,
+    hdcBlt: HDC,
+    nFlags: u32,
 ) callconv(.winapi) i32;
 
 pub extern "user32" fn GetMessageW(
@@ -874,6 +891,10 @@ pub extern "user32" fn SetLayeredWindowAttributes(
 pub const RDW_INVALIDATE: u32 = 0x0001;
 pub const RDW_ERASE: u32 = 0x0004;
 pub const RDW_ALLCHILDREN: u32 = 0x0080;
+/// Send `WM_PAINT` right now rather than leaving it in the queue. A SENT
+/// message, so it runs on the caller's stack — which is the whole ordering
+/// guarantee `hover_capture.zig` depends on (T282).
+pub const RDW_UPDATENOW: u32 = 0x0100;
 pub const RDW_FRAME: u32 = 0x0400;
 pub extern "user32" fn RedrawWindow(
     hWnd: ?HWND,

@@ -172,9 +172,13 @@ function Get-TestStrips {
         [Parameter(Mandatory = $true)][int[]]$Fixed,
         [Parameter(Mandatory = $true)][int]$A,
         [Parameter(Mandatory = $true)][int]$B,
-        [switch]$Horizontal
+        [switch]$Horizontal,
+        # An already-taken capture to read instead of taking a fresh one - how
+        # a HOVERED frame gets probed (T282), since a hover cannot be held
+        # across two calls out here. Not disposed: the caller owns it.
+        $Shot
     )
-    $shot = Get-TestWindowPixels -Window $Window
+    $shot = if ($Shot) { $Shot } else { Get-TestWindowPixels -Window $Window }
     try {
         if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
         $strips = New-Object System.Collections.Generic.List[object]
@@ -191,7 +195,7 @@ function Get-TestStrips {
         # would hand the caller its first PIXEL instead of its strip.
         return ,$strips.ToArray()
     } finally {
-        Close-TestWindowPixels $shot
+        if (-not $Shot) { Close-TestWindowPixels $shot }
     }
 }
 
@@ -221,7 +225,7 @@ function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb) {
 # the pane's cross-axis extent), out of one capture; `Strip` is the middle one,
 # which is the single point every probe here used before T228. `A`/`B` are the
 # two pane rects, for the tiling assertion in the T155 section.
-function Get-GapStrip([IntPtr]$top, [string]$axis) {
+function Get-GapStrip([IntPtr]$top, [string]$axis, $shot = $null) {
     $panes = Get-Panes $top
     if ($panes.Count -ne 2) { return $null }
     if ($axis -eq 'down') {
@@ -245,7 +249,7 @@ function Get-GapStrip([IntPtr]$top, [string]$axis) {
         for ($k = 0; $k -lt 3; $k++) { $empty[$k] = @() }
         return [pscustomobject]@{ Strip = @(); Strips = $empty; Gap = ($hi - $lo + 1); A = $pa; B = $pb }
     }
-    $strips = Get-TestStrips -Window $top -Fixed $at -A $lo -B $hi -Horizontal:$horiz
+    $strips = Get-TestStrips -Window $top -Fixed $at -A $lo -B $hi -Horizontal:$horiz -Shot $shot
     $mid = if ($null -eq $strips) { $null } else { $strips[1] }
     return [pscustomobject]@{
         Strip = $mid; Strips = $strips; Gap = ($hi - $lo + 1); A = $pa; B = $pb
@@ -485,14 +489,21 @@ Assert ($d.Y -lt $before - 40) "T94: drag from -4 DIP resized (line $before -> $
 # limit, not a product defect: on a real desktop the leave arrives when the
 # real pointer leaves, which is exactly the un-hover.
 #
-# So the two halves are proved separately, and together they are the whole
-# claim:
+# So the claim is proved in three ways, which since T282 include the direct
+# one:
 #
-#   * THE COLOR - by pixels, mid-DRAG. A drag holds the same `hot` state
-#     through the same paint (`paintDividers` computes ONE hot color and uses
-#     it for hover and drag alike), and `dragging_split` does not depend on
-#     the cursor, so it survives the leave. rest -> hot -> rest is read from
-#     the same probe at three moments; that IS the screenshot diff.
+#   * THE HOVERED COLOR - by pixels, in the hovered frame itself
+#     (`Get-TestHoverCapture`, T282). The app hit-tests, sends the move,
+#     repaints and captures on ONE GUI-thread stack, and a posted message is
+#     only ever drained by the message loop - which is never reached in the
+#     middle - so the leave described above cannot land between the move and
+#     the paint. This is the assertion the two below stood in for.
+#   * THE COLOR UNDER A DRAG - by pixels, mid-drag. A drag holds the same
+#     `hot` state through the same paint (`paintDividers` computes ONE hot
+#     color and uses it for hover and drag alike), and `dragging_split` does
+#     not depend on the cursor, so it survives the leave. Kept: "the band
+#     stays lit while being dragged" is its own claim (design system §5), not
+#     a workaround any more.
 #   * THE TRIGGER - by the debug-log oracle (the hero-mode.ps1 idiom): a move
 #     onto the band sets the state and a move off it clears it. Degrades to a
 #     skip on a release build, where log.debug is compiled out.
@@ -507,8 +518,8 @@ $TOL = 6
 
 # True if any pixel of the parent-visible gap matches; $null if the capture
 # held no content (same "meaningless probe" contract as Get-TestStrip).
-function Gap-Has([IntPtr]$top, [int]$v) {
-    $gap = Get-GapStrip $top 'down'
+function Gap-Has([IntPtr]$top, [int]$v, $shot = $null) {
+    $gap = Get-GapStrip $top 'down' $shot
     if ($null -eq $gap -or $null -eq $gap.Strip) { return $null }
     foreach ($px in $gap.Strip) { if (Pixel-Matches $px $v $v $v $TOL) { return $true } }
     return $false
@@ -560,6 +571,23 @@ if (Test-Path $errlog) {
 }
 if (-not $hoverLogged) {
     Write-Host 'SKIP T233 hover trigger: no debug log (release build) - the drag pixels below still cover the color'
+}
+
+# THE HOVER COLOR ITSELF, in pixels (T282). The drag below proves the same
+# `hot` color through a state that survives a leave, which is real evidence but
+# is not the gesture the user described. `Get-TestHoverCapture` has the app
+# paint and capture the frame with the band hovered, on one GUI-thread stack
+# the message loop is never reached in the middle of, so the posted
+# WM_MOUSELEAVE cannot get in between the move and the paint.
+$hoverShot = Get-TestHoverCapture -Hwnd $top -X $d.X -Y $d.Y
+$hoverIsHot = Gap-Has $top $HOT_G $hoverShot
+$hoverIsRest = Gap-Has $top $REST_G $hoverShot
+Close-TestHoverCapture $hoverShot
+if ($null -eq $hoverIsHot -or $null -eq $hoverIsRest) {
+    Write-Host "SKIP T233 (hover color): no usable hovered capture ($(Get-LastHoverCaptureError))"
+} else {
+    Assert ($hoverIsHot -eq $true) 'T233 hover: the hovered band is painted the HOVER gray'
+    Assert ($hoverIsRest -eq $false) 'T233 hover: ...and no longer the rest gray'
 }
 
 # A drag is a HELD hover (design system section 5): the mark must not drop

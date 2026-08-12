@@ -744,20 +744,20 @@ try {
     #
     #     Pre-T204 it was the odd one out: hover recolored the glyph red and
     #     lit nothing ("why doesn't the x to close a tab have a similar
-    #     hover?"). The claim splits in two because the harness cannot hold a
-    #     hover (T233): TrackMouseEvent watches the REAL cursor, there is none
-    #     on this desktop, and WM_MOUSELEAVE is a POSTED message - so it is
-    #     drained before the WM_PAINT the move dirtied, and the hovered frame
-    #     may never be painted at all.
+    #     hover?"). The claim is still made in two halves, but both are
+    #     assertions now - the FILL used to skip, because a POSTED move cannot
+    #     survive to the paint it dirties on this desktop (T233/T209) and T282
+    #     is what fixed that.
     #
     #       * THE TRIGGER - from the `tab hover ...` debug oracle: a move onto
     #         the close button's box sets close=true, a move onto the tab's
     #         title area clears it. That is the hit test agreeing with the
     #         paint geometry, which is assertion 4's other half.
-    #       * THE FILL - by pixels, best-effort, with the "+" as the harness's
-    #         POSITIVE CONTROL. The "+" has lit a fill since long before T204
-    #         and both come from the same posted move, so "+ caught, x not" is
-    #         a product defect while "neither caught" is the race and skips.
+    #       * THE FILL - by pixels, from a HOVERED capture (T282), with the "+"
+    #         as the POSITIVE CONTROL: it has lit a fill since long before
+    #         T204, so under T204_NEUTERED it must still pass while the "x"
+    #         fails. Each capture is probed at BOTH squares, so a frame where
+    #         everything is lit cannot pass either.
     # -----------------------------------------------------------------------
     Close-TestWindowPixels $shot; $shot = Get-Shot
     $selNow = @(Get-TestTabExtents -Window $top -Shot $shot -Metrics $m)
@@ -809,65 +809,63 @@ try {
         # fill's top-left CORNER pixel (cut away by the radius, so it must
         # stay the un-lit background - that is what separates a rounded fill
         # from a square one).
+        #
+        # T282 ENDED THE RACE THIS SECTION USED TO RUN. A posted move cannot
+        # survive to the paint it dirties here - the leave is posted within a
+        # frame and WM_PAINT is the lowest-priority message in the queue, so
+        # the leave is always drained first and the painted frame is the
+        # un-hovered one. It is an ORDERING problem, not a timing one: 300
+        # posted moves in bursts of 25, interleaved with captures, never once
+        # caught a lit fill (T209), and this section skipped on that.
+        # `Get-TestHoverCapture` has the APP do the whole probe on one GUI-thread
+        # stack - hit test, SEND the move, RedrawWindow(RDW_UPDATENOW),
+        # PrintWindow - which the message loop is never reached in the middle
+        # of, so the leave cannot interleave. Same PrintWindow, same pixels,
+        # same bitmap indices as the resting capture below; only the ordering
+        # differs.
         $ibInset = Get-TestChromeDip -Dip 2.0 -Scale $scale
-        function Probe-Fill($sqL, [int]$cx, [int]$y0) {
-            $edgeX = $cx
-            $edgeY = $y0 + $ibInset + 1
-            $cornX = $sqL + $ibInset
-            $cornY = $y0 + $ibInset
-            $s = Get-TestWindowPixels -Window $top
-            if ((Get-TestDistinctColors -Shot $s) -lt 8) { Close-TestWindowPixels $s; return $null }
-            $e = $s.Bitmap.GetPixel($offX + $edgeX, $stripTop + $edgeY)
-            $c = $s.Bitmap.GetPixel($offX + $cornX, $stripTop + $cornY)
-            Close-TestWindowPixels $s
+        function Probe-Fill($shot, $sqL, [int]$cx, [int]$y0) {
+            if ($null -eq $shot) { return $null }
+            if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
+            $e = $shot.Bitmap.GetPixel($offX + $cx, $stripTop + $y0 + $ibInset + 1)
+            $c = $shot.Bitmap.GetPixel($offX + $sqL + $ibInset, $stripTop + $y0 + $ibInset)
             return [pscustomobject]@{ Edge = [int]$e.R; Corner = [int]$c.R }
         }
         # Rest readings first, with the pointer parked off both buttons.
         [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
         Start-Sleep -Milliseconds 250
-        $restClose = Probe-Fill $cSqL $cCx $cSqT
-        $restPlus  = Probe-Fill $pSqL $pCx $cSqT
+        $restShot  = Get-TestWindowPixels -Window $top
+        $restClose = Probe-Fill $restShot $cSqL $cCx $cSqT
+        $restPlus  = Probe-Fill $restShot $pSqL $pCx $cSqT
+        Close-TestWindowPixels $restShot
 
-        # Then race the leave: post the move and capture immediately, over and
-        # over. A build with the fill only has to win ONCE; a build without it
-        # can never win, however many attempts it gets.
-        # A BURST of moves per attempt, not one. The leave is a single posted
-        # message; the moves are many, so the queue drains as
-        # move...leave...move...move and the LAST thing processed before the
-        # (lowest-priority) WM_PAINT is a move - which is the only ordering in
-        # which a hovered frame gets painted at all. The capture then has one
-        # frame to grab it before the next leave lands.
-        function Catch-Fill($sqL, [int]$cx, [int]$hotX, $rest) {
-            if ($null -eq $rest) { return $null }
-            $best = $null
-            for ($i = 0; $i -lt 12; $i++) {
-                for ($b = 0; $b -lt 25; $b++) {
-                    [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $hotX) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
-                }
-                $p = Probe-Fill $sqL $cx $cSqT
-                if ($null -eq $p) { continue }
-                if ($null -eq $best -or $p.Edge -gt $best.Edge) { $best = $p }
-                if ($p.Edge -ge ($rest.Edge + 8)) { return $p }
-                [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
-            }
-            return $best
-        }
-        $hotPlus  = Catch-Fill $pSqL $pCx $pCx $restPlus
-        $hotClose = Catch-Fill $cSqL $cCx $cCx $restClose
-        $plusLit  = ($null -ne $hotPlus -and $null -ne $restPlus -and $hotPlus.Edge -ge ($restPlus.Edge + 8))
+        # One capture per hovered button. Each is probed at BOTH squares: the
+        # hovered one must light and the other must not, which is what says the
+        # capture is of the hover it named rather than of a frame where
+        # everything is lit or nothing is.
+        $shotPlus  = Get-TestHoverCapture -Hwnd $top -X ($clientX + $pCx) -Y ($clientY + $m.StripTopClient + $cCy)
+        $shotClose = Get-TestHoverCapture -Hwnd $top -X ($clientX + $cCx) -Y ($clientY + $m.StripTopClient + $cCy)
+        $hotPlus   = Probe-Fill $shotPlus  $pSqL $pCx $cSqT
+        $hotClose  = Probe-Fill $shotClose $cSqL $cCx $cSqT
+        $coldPlus  = Probe-Fill $shotClose $pSqL $pCx $cSqT
         Write-Host ("INFO  hover fill: + rest=$(if($restPlus){$restPlus.Edge}) hot=$(if($hotPlus){$hotPlus.Edge}); " +
                     "x rest=$(if($restClose){$restClose.Edge}) hot=$(if($hotClose){$hotClose.Edge})")
-        if (-not $plusLit) {
-            Write-Host 'SKIP T204 hover fill: the + fill (the positive control) was never caught - the harness lost every race, so the x probe would be meaningless'
-            $script:skipped++
-        } else {
-            Assert ($null -ne $hotClose -and $hotClose.Edge -ge ($restClose.Edge + 8)) `
-                "T204: hovering the close x lights a FILL, not just a red glyph (rest=$($restClose.Edge) hot=$($hotClose.Edge))"
-            Assert ($hotClose.Corner -lt ($hotClose.Edge - 5)) `
-                "T204: that fill is ROUNDED - its corner is cut away (corner=$($hotClose.Corner) edge=$($hotClose.Edge))"
-            Assert ($hotPlus.Corner -lt ($hotPlus.Edge - 5)) `
-                "T204: the +'s fill is rounded the same way (corner=$($hotPlus.Corner) edge=$($hotPlus.Edge))"
-        }
+        # The "+" has lit a fill since long before T204, so it is the POSITIVE
+        # CONTROL: under T204_NEUTERED it must still pass while the close "x"
+        # below fails. That asymmetry is the whole claim of this section, and
+        # the SKIP this section used to take is what hid it.
+        Assert ($null -ne $hotPlus -and $null -ne $restPlus -and $hotPlus.Edge -ge ($restPlus.Edge + 8)) `
+            "T204 positive control: hovering the + lights a FILL (rest=$(if($restPlus){$restPlus.Edge}) hot=$(if($hotPlus){$hotPlus.Edge}); $(Get-LastHoverCaptureError))"
+        Assert ($null -ne $coldPlus -and $null -ne $restPlus -and $coldPlus.Edge -lt ($restPlus.Edge + 8)) `
+            "T204: ...and only the hovered one - the + is dark while the x is hovered (edge=$(if($coldPlus){$coldPlus.Edge}))"
+        Assert ($null -ne $hotClose -and $null -ne $restClose -and $hotClose.Edge -ge ($restClose.Edge + 8)) `
+            "T204: hovering the close x lights a FILL, not just a red glyph (rest=$(if($restClose){$restClose.Edge}) hot=$(if($hotClose){$hotClose.Edge}))"
+        Assert ($null -ne $hotClose -and $hotClose.Corner -lt ($hotClose.Edge - 5)) `
+            "T204: that fill is ROUNDED - its corner is cut away (corner=$(if($hotClose){$hotClose.Corner}) edge=$(if($hotClose){$hotClose.Edge}))"
+        Assert ($null -ne $hotPlus -and $hotPlus.Corner -lt ($hotPlus.Edge - 5)) `
+            "T204: the +'s fill is rounded the same way (corner=$(if($hotPlus){$hotPlus.Corner}) edge=$(if($hotPlus){$hotPlus.Edge}))"
+        Close-TestHoverCapture $shotPlus
+        Close-TestHoverCapture $shotClose
 
         # --- CLICK-THROUGH at the PAINTED center (assertion 4) ---------------
         # The regression the shared square risks is paint and hit test drifting

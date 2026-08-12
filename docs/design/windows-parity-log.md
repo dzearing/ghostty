@@ -9,6 +9,46 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T282 (T786/T787 filed) - the test harness can photograph a
+  HOVERED frame now, and the first thing it photographed was a broken negative
+  control.** Every hover fill in the win32 chrome was unassertable, and three
+  tasks had paid for it separately (T233 the split divider, T209 the tab close
+  "x" and the banner chevron). The cause is an ordering one and no faster
+  capture beats it: on the background test desktop there is no real cursor, so
+  `TrackMouseEvent` makes the OS post `WM_MOUSELEAVE` within a frame of every
+  posted `WM_MOUSEMOVE`, and `WM_PAINT` is the lowest-priority message in the
+  queue - the leave is drained FIRST and the frame that gets painted is the
+  un-hovered one. T209 measured 300 posted moves in bursts of 25 and never once
+  caught a lit fill. So the fill assertions SKIPPED, or leaned on a state that
+  happens to survive a leave (a drag, a press). The fix is the debug-only
+  `capture-hover` IPC action (`ipc_hover.zig`, pure half `hover_capture.zig`),
+  which does the whole probe inside one handler on the GUI thread - hit test,
+  SEND the move, `RedrawWindow(RDW_UPDATENOW)`, `PrintWindow` - so the message
+  loop is never reached between the move and the capture and the posted leave
+  cannot interleave. The guarantee is about who is on the stack, not about
+  speed. Option 2 from the task file ("suppress the leave behind a debug flag")
+  was rejected on its failure mode: that is product code whose bad day is a
+  hover stuck lit, while this one leaves nothing to un-do - the leave lands on
+  the next pump exactly as before, which the new script asserts. Same gate as
+  T275's `capture-pane`: Debug only, IPC only, no CLI verb (T141).
+  **The surprise:** with the skips gone, `T204_NEUTERED` failed its own promise.
+  It was consumed as one global `universalHover()`, so flipping it took the fill
+  off EVERY icon button including the "+" - and "+ lit, x dark" is exactly the
+  asymmetry the acceptance scripts call their positive control. It is
+  `icon_button.lightsFill(glyph)` now, answered per glyph; same shape as the bug
+  T209 found in `glyphCentered()`. Converted: `tab-strip.ps1` 4c (ALL PASS, 70),
+  `pane-banner.ps1` 6g plus the `SKIP T165 solid rule` next door - the link
+  underline going solid is now asserted on the real composited overlay, 39 ->
+  117 ink px (ALL PASS, 115) - and `split-divider.ps1`, which gained the direct
+  hover-COLOR assertion its mid-drag probe stood in for (ALL PASS, 65). New
+  `test\win32\hover-capture.ps1` (ALL PASS, 20; `-NegativeControl` fails as
+  required), whose load-bearing oracle is two controls and two captures: each
+  capture must light its own control and leave the other dark. Neutered run
+  measured: tab-strip 5 FAILED / 65 passed with the "+" control green. Floor
+  none/win32/agent PASS, P1-P3 ALL PASS. T786 files the three scripts still
+  proving a hover through a held state; T787 files a `T377` ink probe that went
+  red under the neutered build only.
+
 - 2026-08-12 - **T281 (T784/T785 filed) - the delivery now reads back all three
   binaries it ships, not one.** T208 gave the delivery a number both ends can
   compare and then checked exactly one file with it: `ghoztty.exe` in the primary
