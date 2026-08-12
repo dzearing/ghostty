@@ -14,7 +14,7 @@
 //! ## Demux rule (must match the client's `ClientMux` byte-for-byte, §4.3)
 //!   - **Inbound** (`pumpInput`): read the transport, parse whole frames with a
 //!     `protocol.Reader`, re-encode each frame to its wire bytes, push into the
-//!     control or data fifo by frame TYPE — `frame.type == .data` → data fifo,
+//!     control or data fifo by frame TYPE — `protocol.onDataLane` → data fifo,
 //!     everything else → control fifo. Each lane's `read` drains its own fifo.
 //!   - **Outbound** (`underlyingWrite`): writes from EITHER lane serialize onto the
 //!     single transport under one `out_mutex`, so a frame is never interleaved.
@@ -131,7 +131,7 @@ pub const Mux = struct {
             while (reader.next() catch break) |frame| {
                 wire.clearRetainingCapacity();
                 protocol.writeFrame(self.alloc, self.encoding, frame, &wire) catch continue;
-                const lane: *Fifo = if (frame.type == .data)
+                const lane: *Fifo = if (protocol.onDataLane(frame.type))
                     &self.data_fifo
                 else
                     &self.control_fifo;

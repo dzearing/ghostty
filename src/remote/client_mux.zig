@@ -17,7 +17,7 @@
 //!   - **Inbound** (`pumpInput`): a single pump reads the underlying stream, parses
 //!     whole frames with a `protocol.Reader` (honoring the negotiated
 //!     `TransferEncoding`), re-encodes each frame to its wire bytes, and pushes them
-//!     into a per-lane blocking byte fifo by frame TYPE — **`frame.type == .data`
+//!     into a per-lane blocking byte fifo by frame TYPE — **`protocol.onDataLane`
 //!     → data lane, everything else → control lane** (identical to `StdioMux`).
 //!     Each logical stream's `read` drains its own fifo, blocking until bytes or
 //!     EOF, exactly like the agent's `Fifo`.
@@ -195,7 +195,7 @@ pub const ClientMux = struct {
     /// parses whole frames with a `protocol.Reader`, re-encodes each to its wire
     /// bytes, and pushes them into the control or data fifo by frame TYPE — the
     /// SAME routing rule as the agent's `StdioMux.pumpInput`:
-    ///   `frame.type == .data` → data fifo, everything else → control fifo.
+    ///   `protocol.onDataLane(frame.type)` → data fifo, else → control fifo.
     /// On EOF/error both fifos are EOF'd so the two reader threads unblock.
     pub fn pumpInput(self: *ClientMux) void {
         var reader = protocol.Reader.init(self.alloc, self.encoding);
@@ -209,7 +209,7 @@ pub const ClientMux = struct {
             while (reader.next() catch break) |frame| {
                 wire.clearRetainingCapacity();
                 protocol.writeFrame(self.alloc, self.encoding, frame, &wire) catch continue;
-                const lane: *Fifo = if (frame.type == .data)
+                const lane: *Fifo = if (protocol.onDataLane(frame.type))
                     &self.data_fifo
                 else
                     &self.control_fifo;
@@ -463,7 +463,7 @@ const MockAgent = struct {
     fn run(self: *MockAgent) !void {
         while (try self.nextFrame()) |frame| {
             // The EXACT StdioMux demux rule, asserted by the test via the counters.
-            if (frame.type == .data) {
+            if (protocol.onDataLane(frame.type)) {
                 self.data_frames += 1;
             } else {
                 self.control_frames += 1;

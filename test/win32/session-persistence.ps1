@@ -16,7 +16,7 @@
 #      resize, survive a crash-kill relaunch EXACTLY (geometry-faithful
 #      restore -- the "big window, small content" guard), and keep tracking
 #      live resizes after re-attach.
-#   D. Flood-during-reattach gap-fill: a paced 1 Hz sequence printer runs in a
+#   D. Flood-during-reattach gap-fill, TWICE: a paced 1 Hz sequence printer runs in a
 #      pane across kill -> dead gap -> relaunch; the restored scrollback must
 #      contain EVERY sequence value (nothing lost while the app was dead or
 #      while ATTACH replay raced live output), in order, with no runaway
@@ -668,6 +668,46 @@ Assert "D6 sequence order preserved through replay+live interleave" $orderOk
 $dupBad = 0
 foreach ($g in ($vals | Group-Object)) { if ($g.Count -gt 2) { $dupBad++ } }
 Assert "D7 no runaway duplication (no value seen 3+ times; bad=$dupBad)" ($dupBad -eq 0)
+
+# --- D8-D11: the SECOND cycle, which is where a resume-point error lands -----
+# T739: the offset a re-attach records is what the NEXT one resumes from, and
+# the first re-attach is the one that can corrupt it - it is the first time the
+# agent injects bytes (its grid-snapshot repaint) that are not the session's
+# stream. Counting those recorded a resume point past the agent's head, and the
+# clamp that caught it (T532) skipped everything between the true position and
+# the head. So the arm above, run once, cannot see this at all: the offset it
+# resumes from was written by an OPEN-era launch. Everything from D1-D7 repeats
+# with a fresh sequence, and D10b is the assertion that would have gone red.
+$gtok2 = "GPF2$($PID)Q"
+& $Exe +send-keys --target=spA "for /L %i in (1,1,60) do @(echo $gtok2-%i & ping -n 2 127.0.0.1 >nul)" Enter 2>&1 | Out-Null
+$started2 = Wait-PaneToken 'spA' "$gtok2-5" 30 'd2-start'
+Assert "D8 second flood running (reached seq 5 pre-kill)" $started2
+
+$preTxt2 = Read-Pane 'spA' 400 'd2-prekill'
+$preVals2 = @([regex]::Matches($preTxt2, [regex]::Escape($gtok2) + '-(\d+)') |
+    ForEach-Object { [int]$_.Groups[1].Value } | Where-Object { $_ -ge 1 -and $_ -le 60 })
+$preKill2 = if ($preVals2.Count -gt 0) { ($preVals2 | Measure-Object -Maximum).Maximum } else { 0 }
+
+Crash-App
+Assert "D9 app killed mid-flood again (last value shown pre-kill: $preKill2)" ((App-Pids).Count -eq 0)
+Start-Sleep -Seconds 8
+
+Relaunch-App
+$n = Wait-Windows 'd2-w' 2 40
+Assert "D10 second relaunch restored both windows" ($n -eq 2)
+$done2 = Wait-PaneToken 'spA' "$gtok2-60" 120 'd2-done'
+Assert "D10a second flood completed after re-attach (seq 60 readable)" $done2
+
+$txt2 = Read-Pane 'spA' 6000 'd2-final'
+$vals2 = @([regex]::Matches($txt2, [regex]::Escape($gtok2) + '-(\d+)') |
+    ForEach-Object { [int]$_.Groups[1].Value } | Where-Object { $_ -ge 1 -and $_ -le 60 })
+$distinct2 = @($vals2 | Sort-Object -Unique)
+$missing2 = @(1..60 | Where-Object { $distinct2 -notcontains $_ })
+$gapLoss2 = @($missing2 | Where-Object { $preKill2 -le 0 -or $_ -gt $preKill2 })
+Assert "D10b nothing lost from the SECOND cycle's dead-gap or post-attach region (preKill=$preKill2, lost there: $($gapLoss2 -join ','))" (
+    $gapLoss2.Count -eq 0)
+Assert "D11 no bulk loss on the second cycle ($($distinct2.Count)/60 present, missing: $($missing2 -join ',')) " (
+    $missing2.Count -le 1)
 
 # ============================================================================
 "== E: bounded persistence-on soak -- IPC live under agent-path flood"

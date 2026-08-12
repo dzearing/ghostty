@@ -52,6 +52,7 @@
 //! | v1 | `session_busy` | pushed `META{has_descendants}` per session | close always confirms |
 //! | v1 | `open_failed` | `OPEN_FAILED` 0x06 (refused OPEN, with a reason) | silence ⇒ client times out |
 //! | v1 | `attach_failed` | `ATTACH_FAILED` 0x07 (ATTACH the agent cannot answer) | silence ⇒ client times out |
+//! | v1 | `repaint_data` | `DATA_REPAINT` 0x15 (injected repaint, advances no offset) | repaint counted as stream bytes |
 //!
 //! Two rules make that table load-bearing rather than decorative:
 //!
@@ -150,6 +151,29 @@ pub const FrameType = enum(u8) {
     detach = 0x13, // C→A  stop streaming; keep session alive
     close = 0x14, // C→A  terminate the session's container, free it
 
+    // An INJECTED repaint: bytes to feed the terminal that are NOT part of the
+    // session's byte stream. Same payload shape as `data` (`DataPayload`), and
+    // the client renders it identically — what differs is the accounting: the
+    // stream position after a repaint is its `byte_offset`, NOT
+    // `byte_offset + bytes.len`.
+    //
+    // Why it has to be said on the wire (T739): the agent injects two such
+    // frames on ATTACH — the `[N bytes of scrollback lost]` marker anchored at
+    // the client's resume point, and the `grid_snapshot` repaint anchored at the
+    // ring head S — and a repaint anchored at S is byte-for-byte
+    // indistinguishable from the first LIVE frame at S. No arithmetic over
+    // (anchor, length) can separate them, so a client that counts every byte it
+    // is fed records a resume point PAST the agent's stream head by exactly the
+    // repaint's size. The next attach is then clamped back to the head (T532)
+    // and whatever real output sat between the two is never replayed.
+    //
+    // Gated on `capability.repaint_data`, for the same reason `open_failed` and
+    // `attach_failed` are: an unknown opcode is a fatal framing error to a peer
+    // that does not know it, so the agent sends this ONLY to a client that
+    // advertised the string. Both skew directions degrade to exactly the
+    // pre-T739 behavior (the injection rides plain `DATA` and is counted).
+    data_repaint = 0x15, // A→C  {byte_offset, bytes} — repaint; advances no offset
+
     exit = 0x20, // A→C  {code, runtime_ms} (ordered after final DATA)
     meta = 0x21, // A→C  {cwd?, title?, listening_ports?, foreground_cmd?}
 
@@ -211,6 +235,25 @@ pub const FrameType = enum(u8) {
     sessions_sub = 0x7c, // C→A  {}
     sessions_unsub = 0x7d, // C→A  {}
 };
+
+/// True for the frame types that ride the DATA lane (§4.3). Everything else
+/// rides control.
+///
+/// This is the demux rule both muxes fold a single transport back into two
+/// logical lanes with — `client_mux.pumpInput` and the agent's
+/// `mux.pumpInput` — and it is ONE definition on purpose. It used to be spelled
+/// `frame.type == .data` at each site, which meant adding a data-lane opcode
+/// silently misrouted it: `data_repaint` (0x15) went to the CONTROL lane, where
+/// the control reader ignores what it does not recognize, so the agent's grid
+/// snapshot was dropped by the very client that had asked for it. Nothing
+/// crashed and nothing logged — the pane just never got its repaint. Any new
+/// data-lane opcode belongs here and nowhere else.
+pub fn onDataLane(t: FrameType) bool {
+    return switch (t) {
+        .data, .data_repaint => true,
+        else => false,
+    };
+}
 
 // -----------------------------------------------------------------------------
 // Transfer encoding (§4.2)
@@ -595,6 +638,31 @@ pub const capability = struct {
     /// client never receives the frame from an old agent. Neither garbles nor
     /// wedges.
     pub const attach_failed = "attach_failed";
+
+    /// Injected repaints are FRAMED as repaints (`DATA_REPAINT`, 0x15) instead of
+    /// riding ordinary `DATA`, so the client can feed them to the terminal
+    /// without counting them as stream bytes (T739).
+    ///
+    /// What it fixes: `Remote.appliedOffset()` is the resume point persisted for
+    /// the next re-attach, and it used to be "every byte we fed the parser". Two
+    /// of the things the agent sends on ATTACH are not stream bytes — the
+    /// scrollback-lost marker and the `grid_snapshot` repaint — so every
+    /// re-attach recorded a point PAST the agent's head by their size, the next
+    /// attach was clamped back to the head, and the real output in between was
+    /// skipped. On a quiet pane that is invisible (the repaint covers it); on a
+    /// busy one it is silently lost output.
+    ///
+    /// It cannot be a client-side inference: the repaint is anchored at the ring
+    /// head S and so is the first live frame after it, which makes them
+    /// identical on the wire. Only the sender knows.
+    ///
+    /// Gated because 0x15 is a NEW OPCODE and an unknown opcode is a fatal
+    /// framing error for the receiver. Skew degrades to exactly today's
+    /// behavior in both directions: a new agent sends plain `DATA` to an old
+    /// client (which over-counts as it always did, and the T532 clamp keeps it
+    /// safe), and a new client never sees 0x15 from an old agent. Neither
+    /// garbles nor wedges.
+    pub const repaint_data = "repaint_data";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -706,6 +774,14 @@ pub const Negotiated = struct {
     /// would treat as a fatal framing error) and the client falls back to its
     /// 10 s timeout, exactly as before.
     attach_failed: bool = false,
+
+    /// True iff BOTH peers advertised `capability.repaint_data` — the agent
+    /// frames an injected repaint as `data_repaint` (0x15) and the client knows
+    /// not to count its bytes as stream position (T739). False against any older
+    /// peer, in which case the agent sends the repaint as plain `DATA` (it must
+    /// never emit an opcode the peer would treat as a fatal framing error) and
+    /// the client over-counts by the repaint's size, exactly as before.
+    repaint_data: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -746,6 +822,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.open_failed),
         .attach_failed = hasCapability(local.capabilities, capability.attach_failed) and
             hasCapability(remote.capabilities, capability.attach_failed),
+        .repaint_data = hasCapability(local.capabilities, capability.repaint_data) and
+            hasCapability(remote.capabilities, capability.repaint_data),
     };
 }
 
@@ -2182,6 +2260,65 @@ test "negotiate: attach_failed capability is the intersection of both HELLOs" {
             .{ .transfer_encoding = .raw },
         );
         try testing.expect(!n.attach_failed);
+    }
+}
+
+test "T739: onDataLane keeps both data-lane opcodes off the control lane" {
+    // The bug this exists to prevent, measured on box: with the fold spelled
+    // `type == .data` at each mux, a `data_repaint` frame went to the CONTROL
+    // lane, where the control reader ignores what it does not recognize. The
+    // agent sent a 197-byte grid snapshot, the client had negotiated it, and it
+    // vanished — no crash, no log, just a pane that never repainted.
+    try testing.expect(onDataLane(.data));
+    try testing.expect(onDataLane(.data_repaint));
+
+    // Everything else is control, including the frames that talk ABOUT a
+    // channel's data (FLOW) and the lifecycle frames around it.
+    for ([_]FrameType{
+        .hello, .open,  .opened, .attach, .attached, .detached,
+        .flow,  .exit,  .meta,   .resize, .signal,   .detach,
+        .close, .ping,  .pong,   .rpc,    .rpc_result,
+        .open_failed,   .attach_failed,
+    }) |t| try testing.expect(!onDataLane(t));
+}
+
+test "negotiate: repaint_data capability is the intersection of both HELLOs" {
+    const both = [_][]const u8{capability.repaint_data};
+    const other = [_][]const u8{capability.grid_snapshot};
+
+    // Both advertise → the agent frames its injected repaints as 0x15.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.repaint_data);
+    }
+    // Either side missing → disabled, in BOTH directions: 0x15 is a fatal
+    // framing error to a peer that does not know it. The `other` set is
+    // `grid_snapshot` on purpose — the repaint this gate is ABOUT is the
+    // grid snapshot, and negotiating that one must still not imply this one.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+        );
+        try testing.expect(!n.repaint_data);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.repaint_data);
+    }
+    // Neither: the pre-T739 world, where the repaint rides plain DATA.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.repaint_data);
     }
 }
 

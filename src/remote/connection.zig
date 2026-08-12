@@ -560,7 +560,62 @@ pub const Pane = struct {
     /// data reader can shortcut to "route normally" without per-frame compares).
     /// Guarded by `resync_mutex`.
     resync_active: bool = false,
+
+    /// The absolute stream position of everything this connection has handed to
+    /// the pane's ring — i.e. what the consumer's applied offset becomes once it
+    /// has drained the ring empty (T739). Seeded to the offset the attach
+    /// actually resumed from (0 for a fresh OPEN or a relaunch, which start a new
+    /// stream at 0) and advanced from the DATA frames' own `byte_offset`, which
+    /// is the position of record — NOT by counting bytes, because two of the
+    /// things the agent sends are not stream bytes at all (`FrameType.data_repaint`).
+    ///
+    /// Monotonic: an injected repaint anchored below the position we have already
+    /// covered leaves it alone. Advanced only by the bytes the ring actually
+    /// ACCEPTED, so a push the ring had no room for (flow control failed to keep
+    /// up) leaves the position short — the safe direction, which replays a byte
+    /// twice rather than skipping it.
+    ///
+    /// Written by the data reader thread, read by the pane's IO thread; atomic
+    /// for exactly that reason.
+    stream_pos: std.atomic.Value(u64) = .init(0),
+
+    /// The absolute stream position handed to the ring so far. See `stream_pos`.
+    pub fn streamPos(self: *const Pane) u64 {
+        return self.stream_pos.load(.acquire);
+    }
 };
+
+/// Which kind of inbound frame the data lane delivered: the session's own byte
+/// stream (`DATA`, 0x10) or an injected repaint the agent synthesized for this
+/// attach (`DATA_REPAINT`, 0x15 — T739). Both are fed to the terminal; only the
+/// first advances the stream position.
+pub const InboundKind = enum { data, repaint };
+
+/// The stream position after routing one inbound frame, given the position we
+/// had (`current`), what the frame was anchored at, how many of its bytes the
+/// ring ACCEPTED, and whether it was an injected repaint (T739).
+///
+/// Pure so the rule that decides the next re-attach's resume point is assertable
+/// without a live agent, a ring, or a pane:
+///
+///   * a `data` frame's bytes ARE the stream, so it covers up to
+///     `byte_offset + accepted`;
+///   * a `repaint` frame's bytes are the agent's own paint anchored AT
+///     `byte_offset`, so it covers up to `byte_offset` and no further —
+///     this is the whole fix, and it cannot be inferred from the anchor
+///     because the first LIVE frame after a repaint carries the same one;
+///   * never backwards: a frame wholly below where we already are (a resync
+///     leftover, a marker anchored at the resume point) leaves the position
+///     alone rather than rewinding it into replayed history.
+pub fn streamPosAfter(
+    current: u64,
+    byte_offset: u64,
+    accepted: usize,
+    repaint: bool,
+) u64 {
+    const covered = if (repaint) byte_offset else byte_offset +| accepted;
+    return @max(current, covered);
+}
 
 /// The outcome of `attachChannel` (§3.3/§5.3/§7.3). Surfaces everything the caller
 /// needs to decide recovery tier (§7.4) or to retry a steal with `force=true`.
@@ -1010,6 +1065,12 @@ pub const Connection = struct {
         // ...and `ATTACH_FAILED` (0x07), the same courtesy on the resume path
         // (T657). Same skew story: absent ⇒ the 10 s timeout we always had.
         protocol.capability.attach_failed,
+        // We understand `DATA_REPAINT` (0x15), so a modern agent can tell us
+        // which of the bytes it sends on ATTACH are its own repaint rather than
+        // the session's stream (T739). An older agent sends them as plain DATA
+        // and we count them, exactly as before — a resume point past the head,
+        // which the T532 clamp then pulls back.
+        protocol.capability.repaint_data,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -2290,6 +2351,12 @@ pub const Connection = struct {
             // and arming it discards every byte the agent will ever send.
             .discard_below = if (resume_at > 0) resume_at - 1 else 0,
             .resync_active = resume_at > 0,
+            // T739: the position this attach resumes from is the position the
+            // consumer starts at, and it is `resume_at` — the offset the agent
+            // HONORED — for the same reason `discard_below` is: a clamped attach
+            // is talking about a different stream than the one the caller asked
+            // to resume.
+            .stream_pos = .init(resume_at),
         };
         try self.trackPane(pane);
         keep_channel = true; // the pane now owns the registered ring
@@ -2483,6 +2550,15 @@ pub const Connection = struct {
     /// promised, so nothing is parked.
     pub fn peerRepaintsOnAttach(self: *Connection) bool {
         if (self.negotiated) |n| return n.grid_snapshot else |_| return false;
+    }
+
+    /// True iff the peer negotiated `capability.repaint_data` — i.e. it FRAMES
+    /// the repaints it injects (`DATA_REPAINT`, 0x15) instead of letting them
+    /// ride ordinary DATA, so their bytes are known not to advance the stream
+    /// position (T739). False for an older agent and for a handshake that has
+    /// not landed, which is the pre-T739 wire and stays safe.
+    pub fn peerLabelsRepaints(self: *Connection) bool {
+        if (self.negotiated) |n| return n.repaint_data else |_| return false;
     }
 
     /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`
@@ -3327,13 +3403,29 @@ pub const Connection = struct {
     /// high-water), emit one `FLOW{channel, pause}` on the control lane. FLOW{resume}
     /// is emitted by the pane's CONSUMER thread once it drains back under low-water
     /// (a later increment, in `termio.Remote`) — NOT here.
-    fn routeInboundData(self: *Connection, channel: u128, byte_offset: u64, bytes: []const u8) void {
+    fn routeInboundData(
+        self: *Connection,
+        channel: u128,
+        byte_offset: u64,
+        bytes: []const u8,
+        kind: InboundKind,
+    ) void {
         var to_push = bytes;
+        // The absolute offset of the first byte we actually push. Moves up with
+        // the resync trim below so the stream position we record names the bytes
+        // that landed, not the ones we dropped.
+        var push_at = byte_offset;
 
         // Consult the per-channel resync watermark (separate lock from the table).
         self.panes_mutex.lock();
         if (self.panes.get(channel)) |pane| {
-            if (pane.resync_active) {
+            // A REPAINT is never a duplicate of anything the client already has —
+            // it is the agent's own paint of the CURRENT screen (or its sentence
+            // about a hole), synthesized for this attach. So it bypasses the
+            // resync trim entirely: there is nothing here to discard, and
+            // nothing that should disarm a watermark the real replay has not
+            // crossed yet.
+            if (pane.resync_active and kind == .data) {
                 // §7.3: discard every byte whose ABSOLUTE offset is <= W; keep offset
                 // > W. The first absolute offset we keep is `keep_from = W + 1`.
                 const keep_from = pane.discard_below + 1;
@@ -3347,6 +3439,7 @@ pub const Connection = struct {
                     // Straddles: drop the prefix below `keep_from`, push the suffix.
                     const drop: usize = @intCast(keep_from - byte_offset);
                     to_push = bytes[drop..];
+                    push_at = keep_from;
                     pane.resync_active = false; // watermark crossed
                 } else {
                     // Starts at/above `keep_from`: keep whole, disarm.
@@ -3359,6 +3452,15 @@ pub const Connection = struct {
         // Route the (possibly trimmed) bytes; `.unknown` (stale/hostile channel) is
         // dropped. On a high-water crossing, emit a single FLOW{pause}.
         const res = self.channels.pushTo(channel, to_push);
+        // How many of those bytes the pane will actually see. A `.buffered` push
+        // is held in the pre-registration buffer and flushed by `register`, so
+        // all of it counts; a `.unknown` push went nowhere.
+        const accepted: usize = switch (res) {
+            .unknown => 0,
+            .buffered => to_push.len,
+            .routed => |push| push.written,
+        };
+        self.advanceStreamPos(channel, push_at, accepted, kind);
         switch (res) {
             // `.unknown` (dropped) can no longer occur for a live-but-unregistered
             // channel: `pushTo` buffers those in the pre-registration buffer
@@ -3376,6 +3478,34 @@ pub const Connection = struct {
         }
     }
 
+    /// Publish the pane's absolute stream position after a routed frame (T739).
+    /// Separate from the resync lookup above because it must run AFTER the push,
+    /// with the count the ring accepted in hand, and the panes lock must not be
+    /// held across that push.
+    fn advanceStreamPos(
+        self: *Connection,
+        channel: u128,
+        push_at: u64,
+        accepted: usize,
+        kind: InboundKind,
+    ) void {
+        // One line per injected repaint — which is at most one per ATTACH, and
+        // the only place the size of the agent's injection is visible at all.
+        if (kind == .repaint) std.log.scoped(.remote_conn).info(
+            "repaint frame: {d} byte(s) at offset {d} (not stream position)",
+            .{ accepted, push_at },
+        );
+        self.panes_mutex.lock();
+        defer self.panes_mutex.unlock();
+        const pane = self.panes.get(channel) orelse return;
+        pane.stream_pos.store(streamPosAfter(
+            pane.stream_pos.load(.monotonic),
+            push_at,
+            accepted,
+            kind == .repaint,
+        ), .release);
+    }
+
     /// The data reader. Loops read → push → drain. For each DATA frame, decode the
     /// payload and route the raw child bytes via `routeInboundData` (resync discard
     /// §7.3 + FLOW{pause} §4.3). An unknown channel id is dropped (§15 M3 — never
@@ -3390,9 +3520,18 @@ pub const Connection = struct {
                 self.signalTransportError();
                 return;
             }) |frame| {
-                if (frame.type != .data) continue; // ignore non-DATA on this lane
+                // `data_repaint` (0x15) carries the same payload and is rendered
+                // identically; what differs is that its bytes are the agent's
+                // own paint rather than the session's stream, so they advance no
+                // offset (T739). Only an agent that negotiated `repaint_data`
+                // ever sends it.
+                const kind: InboundKind = switch (frame.type) {
+                    .data => .data,
+                    .data_repaint => .repaint,
+                    else => continue, // ignore anything else on this lane
+                };
                 const dp = protocol.DataPayload.decode(frame.payload) catch continue;
-                self.routeInboundData(frame.channel, dp.byte_offset, dp.bytes);
+                self.routeInboundData(frame.channel, dp.byte_offset, dp.bytes, kind);
             }
             const n = self.data.read(&scratch) catch {
                 self.signalTransportError();
@@ -3769,11 +3908,26 @@ const InboundAgentCtx = struct {
 
 /// Send a DATA frame on the agent's data stream.
 fn agentSendData(agent: *MockAgent, channel: u128, byte_offset: u64, bytes: []const u8) !void {
+    try agentSendDataFramed(agent, .data, channel, byte_offset, bytes);
+}
+
+/// An injected repaint (`DATA_REPAINT`, 0x15 — T739). Same payload as DATA.
+fn agentSendRepaint(agent: *MockAgent, channel: u128, byte_offset: u64, bytes: []const u8) !void {
+    try agentSendDataFramed(agent, .data_repaint, channel, byte_offset, bytes);
+}
+
+fn agentSendDataFramed(
+    agent: *MockAgent,
+    ftype: protocol.FrameType,
+    channel: u128,
+    byte_offset: u64,
+    bytes: []const u8,
+) !void {
     const payload = try agent.alloc.alloc(u8, protocol.DataPayload.encodedLen(bytes.len));
     defer agent.alloc.free(payload);
     const dp: protocol.DataPayload = .{ .byte_offset = byte_offset, .bytes = bytes };
     _ = dp.encodeInto(payload);
-    try agent.sendFrame(.{ .type = .data, .channel = channel, .seq = 0, .payload = payload });
+    try agent.sendFrame(.{ .type = ftype, .channel = channel, .seq = 0, .payload = payload });
 }
 
 /// Drain a channel's ring until `want` bytes have been collected into `out`.
@@ -3791,6 +3945,127 @@ fn drainChannel(ch: *ring.Channel, out: *std.ArrayList(u8), alloc: Allocator, wa
         spins = 0;
         try out.appendSlice(alloc, dst[0..r.read]);
     }
+}
+
+test "T739: streamPosAfter — a repaint's bytes never advance the stream position" {
+    // The measured attach burst, with the numbers from the T739 report: the
+    // client resumes at 1714 (the agent's head), and the agent injects a 169-byte
+    // grid-snapshot repaint anchored there. Counting those bytes is what recorded
+    // 1883 and made the NEXT attach get clamped back to the head.
+    try testing.expectEqual(@as(u64, 1714), streamPosAfter(1714, 1714, 169, true));
+    // The same frame as ordinary stream data — the shape an OLDER agent sends,
+    // where 1883 is the honest reading of what is on the wire and the client has
+    // no way to know better. This is the pre-T739 behavior the skew degrades to.
+    try testing.expectEqual(@as(u64, 1883), streamPosAfter(1714, 1714, 169, false));
+
+    // A gap-fill: real stream bytes, anchored where we left off.
+    try testing.expectEqual(@as(u64, 1200), streamPosAfter(1000, 1000, 200, false));
+    // ...then the repaint at the head leaves it exactly there. That equality is
+    // the whole point: the recorded offset now IS the agent's head.
+    try testing.expectEqual(@as(u64, 1200), streamPosAfter(1200, 1200, 169, true));
+    // ...and live output from the head advances it again.
+    try testing.expectEqual(@as(u64, 1250), streamPosAfter(1200, 1200, 50, false));
+
+    // The scrollback-lost marker: anchored at the resume point, which is where
+    // we already are, so it moves nothing — and the replay that follows it comes
+    // from the ring's base, ABOVE the evicted range, so the position jumps the
+    // hole instead of counting bytes across it.
+    try testing.expectEqual(@as(u64, 1000), streamPosAfter(1000, 1000, 45, true));
+    try testing.expectEqual(@as(u64, 5000), streamPosAfter(1000, 4000, 1000, false));
+
+    // Never backwards: a resync leftover wholly below where we are.
+    try testing.expectEqual(@as(u64, 5000), streamPosAfter(5000, 100, 50, false));
+    try testing.expectEqual(@as(u64, 5000), streamPosAfter(5000, 100, 50, true));
+
+    // Only the bytes the ring ACCEPTED count. A push the ring had no room for
+    // leaves the position short, which replays a byte twice rather than skipping
+    // it — the safe direction.
+    try testing.expectEqual(@as(u64, 1010), streamPosAfter(1000, 1000, 10, false));
+    try testing.expectEqual(@as(u64, 1000), streamPosAfter(1000, 1000, 0, false));
+}
+
+test "T739: an injected repaint is rendered like DATA but advances no offset" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    const ch_id: u128 = 0x7739;
+    var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 4096 });
+    defer ch.deinit(alloc);
+
+    const conn = try Connection.create(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+    );
+    defer conn.destroy(alloc);
+    try conn.registerChannel(&ch);
+
+    var ctrl_agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer ctrl_agent.deinit();
+    var ictx: InboundAgentCtx = .{ .agent = &ctrl_agent, .channel = ch_id };
+    const ath = try std.Thread.spawn(.{}, InboundAgentCtx.run, .{&ictx});
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+    ath.join();
+    ath_joined = true;
+
+    // A tracked pane is what carries the position; the ring alone cannot.
+    const sid = try alloc.dupe(u8, "s739");
+    const pane = try alloc.create(Pane);
+    pane.* = .{
+        .id = ch_id,
+        .session_id = sid,
+        .pid = 0,
+        .ring = &ch,
+        .stream_pos = .init(100),
+    };
+    try conn.trackPane(pane);
+
+    var data_agent = MockAgent.init(alloc, data_lb.agentStream(), .raw);
+    defer data_agent.deinit();
+
+    // Gap-fill, then the repaint anchored at the head it produced.
+    try agentSendData(&data_agent, ch_id, 100, "gap");
+    try agentSendRepaint(&data_agent, ch_id, 103, "REPAINT");
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(&ch, &got, alloc, "gapREPAINT".len);
+    // The repaint is rendered: its bytes reach the pane exactly like DATA's.
+    try testing.expectEqualStrings("gapREPAINT", got.items);
+
+    // ...but the position stops at the head. Counting the repaint would say 110,
+    // which is past everything the session ever produced.
+    var spins: usize = 0;
+    while (pane.streamPos() != 103 and spins < 1000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u64, 103), pane.streamPos());
+
+    // Live output from the head advances it again — the repaint cost nothing.
+    try agentSendData(&data_agent, ch_id, 103, "live");
+    spins = 0;
+    while (pane.streamPos() != 107 and spins < 1000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u64, 107), pane.streamPos());
+
+    conn.shutdown();
+    // Deregister only after shutdown (the data reader has joined) so the
+    // stack-owned ring is safe. `teardownPane` is not usable here — it frees a
+    // heap ring this test does not have.
+    conn.deregisterChannel(ch_id);
+    conn.panes_mutex.lock();
+    _ = conn.panes.remove(ch_id);
+    conn.panes_mutex.unlock();
+    alloc.free(sid);
+    alloc.destroy(pane);
 }
 
 test "inbound DATA routing: bytes land in the right channel; unknown is dropped" {

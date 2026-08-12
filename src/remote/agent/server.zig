@@ -387,6 +387,11 @@ pub const Server = struct {
             // ...and the same for an ATTACH it cannot answer at all, which is
             // the resume path a user meets after a reboot (T657).
             protocol.capability.attach_failed,
+            // This build FRAMES the repaints it injects on ATTACH (the
+            // scrollback-lost marker, the grid snapshot) as `DATA_REPAINT`, so
+            // the client stops recording a resume point past our stream head by
+            // the size of our own repaint (T739).
+            protocol.capability.repaint_data,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -631,11 +636,39 @@ pub const Server = struct {
 
     /// Enqueue a DATA frame on the data channel (the §4.2 binary payload header).
     fn sendData(self: *Server, channel: u128, byte_offset: u64, bytes: []const u8) !void {
+        try self.sendDataFramed(.data, channel, byte_offset, bytes);
+    }
+
+    /// Enqueue an INJECTED REPAINT (T739): bytes the client must render but must
+    /// NOT count as stream position, because they are ours rather than the
+    /// child's. Framed as `DATA_REPAINT` (0x15) when the peer negotiated
+    /// `repaint_data`; otherwise it rides plain `DATA`, which is exactly the
+    /// pre-T739 wire and leaves the client over-counting as it always did — an
+    /// unknown opcode would be a fatal framing error for that peer, so the
+    /// degrade is mandatory, not a nicety.
+    fn sendRepaint(self: *Server, channel: u128, byte_offset: u64, bytes: []const u8) !void {
+        const framed: protocol.FrameType = if (self.repaintDataNegotiated()) .data_repaint else .data;
+        try self.sendDataFramed(framed, channel, byte_offset, bytes);
+    }
+
+    /// True iff both peers advertised `capability.repaint_data`. A handshake that
+    /// failed (or has not landed) answers false, i.e. the safe, older wire.
+    fn repaintDataNegotiated(self: *Server) bool {
+        return if (self.negotiated) |n| n.repaint_data else |_| false;
+    }
+
+    fn sendDataFramed(
+        self: *Server,
+        ftype: protocol.FrameType,
+        channel: u128,
+        byte_offset: u64,
+        bytes: []const u8,
+    ) !void {
         const payload = try self.alloc.alloc(u8, protocol.DataPayload.encodedLen(bytes.len));
         defer self.alloc.free(payload);
         const dp: protocol.DataPayload = .{ .byte_offset = byte_offset, .bytes = bytes };
         _ = dp.encodeInto(payload);
-        try self.enqueue(.data, .data, channel, payload);
+        try self.enqueue(.data, ftype, channel, payload);
     }
 
     // --- Child output delivery ------------------------------------------------
@@ -1199,7 +1232,11 @@ pub const Server = struct {
                     "\r\n[ghoztty: {d} bytes of scrollback lost during disconnect]\r\n",
                     .{lost},
                 ) catch "";
-                if (marker.len > 0) self.sendData(s.channel, att.last_byte_offset, marker) catch {};
+                // A repaint, not stream bytes (T739): the marker is OUR sentence
+                // about the hole, anchored at the client's resume point. Counted
+                // as stream, it pushes the client's recorded offset past a
+                // position the session never produced.
+                if (marker.len > 0) self.sendRepaint(s.channel, att.last_byte_offset, marker) catch {};
                 replay_from = base;
             }
             if (!skip_replay) {
@@ -1214,15 +1251,33 @@ pub const Server = struct {
             }
         }
 
-        // Grid snapshot: a clean repaint of the visible screen AT offset S, sent as
-        // ordinary DATA (plain VT — no new opcode) at the live continuation point so
-        // the client renders it right before live output resumes. `gridSnapshotAlloc`
-        // returns null for a session that produced no output (no emulator yet), in
-        // which case the ring replay above already stands alone.
+        // Grid snapshot: a clean repaint of the visible screen AT offset S (plain
+        // VT any emulator renders) at the live continuation point, so the client
+        // paints it right before live output resumes. `gridSnapshotAlloc` returns
+        // null for a session that produced no output (no emulator yet), in which
+        // case the ring replay above already stands alone.
+        //
+        // Framed as a REPAINT (T739): its bytes are anchored at S and the stream
+        // continues at S, so a client that counted them would record a resume
+        // point S + snap.len — past our own head, by exactly the size of the
+        // repaint we just injected. That is indistinguishable from live output at
+        // S unless we say which it is, which is what `sendRepaint` does (and
+        // degrades to `sendData` for a peer that cannot be told).
         if (want_snapshot) {
-            if (s.gridSnapshotAlloc(self.alloc)) |snap| {
-                defer self.alloc.free(snap);
-                if (snap.len > 0) self.sendData(s.channel, snapshot_at, snap) catch {};
+            const snap = s.gridSnapshotAlloc(self.alloc);
+            defer if (snap) |b| self.alloc.free(b);
+            // The size of what we INJECT, which is exactly the error a client
+            // that counts it will carry (T739) — and the only place that number
+            // is visible from, since this frame looks like ordinary output on
+            // the wire. 0 means a session with no emulator yet: nothing to
+            // repaint, the ring replay above stands alone.
+            std.log.info("ATTACH ch={x}: grid snapshot {d} byte(s) at {d}", .{
+                s.channel,
+                if (snap) |b| b.len else 0,
+                snapshot_at,
+            });
+            if (snap) |b| {
+                if (b.len > 0) self.sendRepaint(s.channel, snapshot_at, b) catch {};
             }
         }
     }
@@ -3943,6 +3998,70 @@ test "ATTACH with grid_snapshot negotiated replays a visible-screen repaint (FIX
     try testing.expectEqual(s, dp.byte_offset);
     try testing.expect(std.mem.indexOf(u8, dp.bytes, "?1049h") != null);
     try testing.expect(std.mem.indexOf(u8, dp.bytes, "SNAPSHOT-ME") != null);
+}
+
+test "T739: the ATTACH repaint is framed as DATA_REPAINT, and only for a peer that asked" {
+    // Same shape as the grid_snapshot test above; what is measured here is the
+    // FRAME TYPE of the injected repaint, which is what tells the client not to
+    // count its bytes as stream position.
+    const alloc = testing.allocator;
+    for ([_]bool{ true, false }) |want_repaint_cap| {
+        var clock: TestClock = .{ .ms = 100 };
+        var fc: FakeChild = .{ .alloc = alloc };
+        defer fc.deinit();
+        var kids = [_]*FakeChild{&fc};
+        var sp: FakeSpawner = .{ .children = &kids };
+        var prng = std.Random.DefaultPrng.init(11);
+
+        var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+        defer h.deinit();
+        try h.server.start();
+        if (want_repaint_cap) {
+            try h.client.handshakeCaps(&.{
+                protocol.capability.grid_snapshot,
+                protocol.capability.repaint_data,
+            });
+        } else {
+            // A client of the pre-T739 generation: it wants the repaint but has
+            // no idea what 0x15 is, and an unknown opcode would be a fatal
+            // framing error for it.
+            try h.client.handshakeCaps(&.{protocol.capability.grid_snapshot});
+        }
+        const neg = try h.server.waitHandshake();
+        try testing.expect(neg.grid_snapshot);
+        try testing.expectEqual(want_repaint_cap, neg.repaint_data);
+
+        const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+        // Alt screen so the raw ring replay is skipped and the ONLY post-attach
+        // DATA-lane frame is the repaint itself.
+        h.server.onChildOutput(o.channel, "\x1b[?1049h");
+        h.server.onChildOutput(o.channel, "SNAPSHOT-ME");
+        _ = try h.client.nextData();
+        _ = try h.client.nextData();
+
+        var id_buf: [32]u8 = o.id;
+        try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+            .session_id = id_buf[0..],
+            .rows = 24,
+            .cols = 80,
+            .last_byte_offset = 0,
+        });
+        const af = try h.client.waitControl(.attached);
+        var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+        defer ap.deinit();
+        const s = ap.value.snapshot_at_offset;
+
+        const d = (try h.client.nextData()) orelse return error.NoSnapshot;
+        // The payload is identical either way — same anchor, same VT. Only the
+        // frame type says whether these bytes are the session's or ours.
+        const dp = try protocol.DataPayload.decode(d.payload);
+        try testing.expectEqual(s, dp.byte_offset);
+        try testing.expect(std.mem.indexOf(u8, dp.bytes, "SNAPSHOT-ME") != null);
+        try testing.expectEqual(
+            if (want_repaint_cap) protocol.FrameType.data_repaint else protocol.FrameType.data,
+            d.type,
+        );
+    }
 }
 
 test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, FIX 2)" {

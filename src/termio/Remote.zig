@@ -709,6 +709,21 @@ pub fn threadEnter(
         }
         defer outcome.deinit();
         if (outcome.pane) |p| {
+            // T739: the two numbers whose disagreement is the whole defect —
+            // what we asked to resume from, and where the agent's stream
+            // actually ends. For a pane that produced nothing since the manifest
+            // was written they must be EQUAL; a `requested` above `head` means
+            // we recorded a position the session never reached (which the clamp
+            // below then pulls back, skipping whatever sat in between). Logged
+            // unconditionally because there is no way to read either number from
+            // outside the app, and the pane looks identical whichever way it went.
+            log.info("attach: requested={d} head={d} resumed_at={d} repaints={} labeled={}", .{
+                self.attach_offset,
+                outcome.snapshot_at_offset,
+                outcome.resume_offset,
+                self.conn.peerRepaintsOnAttach(),
+                self.conn.peerLabelsRepaints(),
+            });
             attach_replay_rows = outcome.replay_rows;
             attach_replay_cols = outcome.replay_cols;
             attach_snapshot_at = outcome.snapshot_at_offset;
@@ -1668,6 +1683,77 @@ fn parkRestoredScreen(io: *termio.Termio) void {
     }
 }
 
+/// `GHOZTTY_RESUME_COUNT_BYTES=1` puts the pre-T739 accounting back: the applied
+/// offset is once again "every byte we fed the parser", repaints included.
+///
+/// A seam rather than a comment because T739's whole claim is the ABSENCE of
+/// something — no offset past the agent's head, no clamp warning — and an
+/// absence is evidence only when the same harness can be made to see it present.
+/// Nothing else changes, so a red arm names this rule and not the weather.
+/// Unset in every real launch; read once per pane on its IO thread.
+fn countBytesSeam() bool {
+    // Atomic tri-state (0 unknown / 1 on / 2 off): every pane has its own IO
+    // thread, and they all compute the same answer, but "the same answer" is
+    // still a data race if it goes through a plain global.
+    const S = struct {
+        var cached: std.atomic.Value(u8) = .init(0);
+    };
+    switch (S.cached.load(.monotonic)) {
+        1 => return true,
+        2 => return false,
+        else => {},
+    }
+    var buf: [8]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const on = if (std.process.getEnvVarOwned(fba.allocator(), "GHOZTTY_RESUME_COUNT_BYTES")) |v|
+        v.len > 0 and !std.mem.eql(u8, v, "0")
+    else |err|
+        // A value longer than the buffer is still a value: anything but "not
+        // set" means the seam is on, so an over-long "1 " cannot read as off.
+        err == error.OutOfMemory;
+    if (on) log.warn("T739 seam: GHOZTTY_RESUME_COUNT_BYTES — counting repaint bytes as stream position", .{});
+    S.cached.store(if (on) 1 else 2, .monotonic);
+    return on;
+}
+
+/// T739: take the connection's absolute stream position as OUR applied position,
+/// having just proved (an empty pop after reading it) that every byte behind it
+/// is parsed.
+///
+/// This is what keeps the persisted resume point off the end of the agent's
+/// stream. `applied_bytes` counts every byte fed to the parser, and two of the
+/// things the agent sends on ATTACH are not stream bytes at all — its
+/// scrollback-lost marker and its grid-snapshot repaint — so counting them put
+/// the recorded offset past the agent's head by exactly the repaint's size on
+/// EVERY re-attach. The next attach was then clamped back to the head (T532) and
+/// whatever real output sat between the two was never replayed. The connection
+/// derives its position from the frames' own anchors and the `data_repaint`
+/// framing, so it is right where counting cannot be.
+///
+/// A position BELOW our base is not this stream's (a relaunch resets
+/// `attach_offset` to 0 while a stale value could still be in flight), and is
+/// ignored rather than rebased onto — the offset must never walk backwards into
+/// history the pane has already shown.
+///
+/// Taken under the renderer mutex so a WP-D3 snapshot reader keeps seeing a
+/// consistent (grid, offset) pair, exactly as `processOutputTracked` does.
+fn adoptStreamPos(rd: *ThreadData, pos: u64) void {
+    if (countBytesSeam()) return;
+    const remote = &rd.io.backend.remote;
+    if (pos < remote.attach_offset) return;
+    // Rare and interesting: the only thing that makes these differ is bytes we
+    // were fed that are not the session's stream, so a line here names the
+    // repaint the agent injected and the size of the error it would have been.
+    const before = remote.appliedOffset();
+    if (before != pos) log.info(
+        "resume offset corrected: counted={d} stream={d} (delta {d})",
+        .{ before, pos, @as(i64, @intCast(before)) - @as(i64, @intCast(pos)) },
+    );
+    rd.io.renderer_state.mutex.lock();
+    defer rd.io.renderer_state.mutex.unlock();
+    remote.applied_bytes.store(pos - remote.attach_offset, .monotonic);
+}
+
 /// Drain the pane's inbound ring fully into the terminal. Called on the pane's IO
 /// thread (from `ringReady` or once eagerly in `threadEnter`). For each chunk:
 ///   1. pop from the ring (SPSC consumer side),
@@ -1703,8 +1789,18 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         // notification below, which is likewise dropped once `closing` is set.
         if (rd.io.closing.load(.acquire)) return;
 
+        // T739: the connection's authoritative stream position, read BEFORE the
+        // pop. If that pop comes up empty, everything the connection had handed
+        // to the ring at the moment of this read has already been applied — so
+        // adopting the position is exact, with no window in which we could claim
+        // bytes we have not parsed. Read after the pop instead and a push landing
+        // in between would be claimed unapplied.
+        const stream_pos = rd.pane.streamPos();
         const res = ch.pop(&buf);
-        if (res.read == 0) break;
+        if (res.read == 0) {
+            adoptStreamPos(rd, stream_pos);
+            break;
+        }
 
         // T423: the child's first bytes are in hand and nothing else can run on
         // this thread before we parse them, so this is the last — and the only
