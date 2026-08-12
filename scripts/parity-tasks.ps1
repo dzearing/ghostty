@@ -109,12 +109,24 @@ param(
 
     # Escape hatch so the acceptance script can drive a fixture directory
     # instead of the real tracker (same idea as GHOSTTY_HOST_DEFAULTS).
-    [string]$TaskDir
+    [string]$TaskDir,
+
+    # `validate` also asks scripts\guard-due.ps1 whether an acceptance harness
+    # has gone unrun since the code it covers changed (T783) - this is the
+    # pre-commit gate every turn runs, so it is where that question has teeth.
+    # The hatch is for the genuinely stuck case (a harness that cannot run on
+    # this box at all); it PRINTS that it was used, so a commit made under it
+    # can be explained rather than silently excused.
+    [switch]$NoGuardDue
 )
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+# Whether the CALLER named a task directory, remembered before the default
+# fills the parameter in. `validate` needs the distinction: a fixture run is
+# somebody testing this script, the default is the loop's pre-commit gate.
+$TaskDirGiven = [bool]$TaskDir
 if (-not $TaskDir) {
     $TaskDir = Join-Path $RepoRoot 'docs\design\windows-parity-tasks'
 }
@@ -801,6 +813,36 @@ switch ($Command) {
                 if ($bodyText -notmatch '(?m)^## Progress log\s*$') {
                     Write-Host ("NO PROGRESS LOG: {0} is in-progress with no '## Progress log' section (add one: parity-tasks.ps1 note {0} -Text ...)" -f $t.Id); $problems++
                 }
+            }
+        }
+
+        # An acceptance harness that has gone unrun since the code it covers
+        # changed (T783). Reported apart from the task-file problems above
+        # because it is a different kind of news - the tracker is fine, the
+        # HARNESS is unmeasured - but it counts the same, because this is the
+        # gate go.md runs before every commit and a warning nobody must act on
+        # is what let the go-loop guard sit 26-red for a day.
+        $dueScript = Join-Path $PSScriptRoot 'guard-due.ps1'
+        if ($TaskDirGiven) {
+            # A fixture run is somebody testing the tracker, not the loop's
+            # pre-commit gate; it has no business failing over the repo's
+            # harness stamps.
+        }
+        elseif ($NoGuardDue) {
+            Write-Host "GUARD DUE CHECK SKIPPED (-NoGuardDue): harness staleness was not checked for this commit"
+        }
+        elseif (Test-Path -LiteralPath $dueScript) {
+            # GHOZTTY_GUARD_DUE_REPO points the staleness question at a fixture
+            # tree, so test\win32\guard-due.ps1 can measure that this gate has
+            # teeth without renaming files in the real repo to make it fire.
+            # Unset in every real run.
+            $guardRepo = $RepoRoot
+            if ($env:GHOZTTY_GUARD_DUE_REPO) { $guardRepo = $env:GHOZTTY_GUARD_DUE_REPO }
+            $dueOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $dueScript check -Repo $guardRepo 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { Write-Host $line } }
+                Write-Host "  (an unrun harness is a problem here: run it, or fix what it catches, before committing)"
+                $problems++
             }
         }
 

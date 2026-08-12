@@ -2183,6 +2183,52 @@ real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
 suite is clean.
 
+**And a harness nobody RAN proves nothing either** (T783). The four audits above
+all ask what a run said; this one asks whether the run happened at all. Outside
+the P1–P3 floor an acceptance script is run when somebody remembers it, so a
+harness can go red against code that changed under it and stay red unnoticed:
+`b64c3e8aa` prefixed every `scripts\go-loop-lock.ps1` message with an ISO
+timestamp, 26 assertions in `test\win32\go-loop-guard.ps1` anchor on the answer's
+first word (`^ACQUIRED`, `^held`, `^stale-dead`), and the whole guard was red for
+a day against a lock script that was working perfectly. The loop's supervisor is
+the one thing whose failure nothing else can catch, which makes its harness the
+worst place in the tree for that gap.
+
+`scripts\guard-due.ps1` answers the question from a **committed stamp**: a
+coverage table maps a harness to the files it is ABOUT (the `go-loop` row covers
+`scripts\go-loop-*.ps1`, `scripts\loop-session.ps1` and the harness itself), a
+clean green run of that harness stamps the SHA-256 of each of them, and `check`
+compares the tree against the stamp — `GUARD CURRENT` when they match,
+`GUARD DUE` naming each file that changed, appeared or vanished when they do not.
+Four consequences it was built for:
+
+- **It is a change gate, not a schedule.** A stamp never goes stale with time,
+  and a file edited and edited back is not due. Hashing is over CRLF-folded,
+  BOM-stripped bytes, because `.ps1` carries no `text` attribute in
+  `.gitattributes` — a raw hash would report every file as changed on a
+  differently-configured clone, and a gate that cries wolf is a gate nobody
+  reads.
+- **The stamp is committed**, so the question travels with the change: a
+  `git pull` bringing in a loop-script edit made on another seat reads as DUE
+  here, which is exactly what a local mtime or a "did this turn touch it" check
+  cannot see.
+- **Only a CLEAN green run stamps.** A red run leaves the stamp alone (red must
+  stay due), and so does a run with skipped sections — a stamp written over
+  unmeasured code is the green hat the T219 audit exists to refuse.
+- **Two wirings, deliberately different in force.** `go-loop-exec.ps1 claim`
+  (go.md step 0) REPORTS and never fails, because a claim that could exit
+  nonzero over a stale stamp would wedge the loop, which is the disease and not
+  the cure; `parity-tasks.ps1 validate` (go.md step 6, before every commit)
+  FAILS, because that is where the remedy — run the harness, or fix what it
+  catches — is the work this exists to cause. `-NoGuardDue` is the stated-intent
+  hatch and prints that it was used.
+
+It never runs a harness (that would put a multi-minute GUI-launching script
+inside whatever called it) and never decides one PASSES — only that one has not
+been asked. Acceptance: `test\win32\guard-due.ps1`, whose sections D and E
+measure the two forces against each other (the same staleness must fail
+`validate` and must not fail `claim`).
+
 **And a script that can only run on the INPUT DESKTOP has to SAY so** (T272,
 widened by T276).
 T211–T218 moved the GUI suite onto a background desktop because the user's

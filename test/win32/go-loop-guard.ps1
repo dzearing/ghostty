@@ -1030,6 +1030,22 @@ if ($td) { Remove-TestDesktop }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $env:TEMP 'ghoztty-go-loop-resume.cmd') -Force -ErrorAction SilentlyContinue
 
+# --- stamp (T783) ---------------------------------------------------------
+# A green run RECORDS the content of every file it covers, so
+# scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". Stamped only on a CLEAN sweep: a run with skipped
+# sections proved less than the whole harness claims, and a stamp written over
+# unmeasured code is the green hat this suite spends so much effort refusing.
+# A red run leaves the stamp alone on purpose - red must stay due.
+if ($script:failures -eq 0) {
+    if ($script:skipped -gt 0) {
+        "  stamp NOT updated: $($script:skipped) section(s) skipped, so this run did not cover the whole harness"
+    } else {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+            update -Guard go-loop -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+    }
+}
+
 ""
 if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" ; exit 0 }
 else { "$($script:failures) FAILURE(S)" ; exit 1 }

@@ -1,0 +1,295 @@
+<#
+.SYNOPSIS
+  Report which acceptance harnesses have not been run since the code they
+  cover last changed.
+
+.DESCRIPTION
+  T783. On 2026-08-11 b64c3e8aa prefixed every scripts\go-loop-lock.ps1 message
+  with an ISO timestamp. 26 assertions in test\win32\go-loop-guard.ps1 anchor on
+  the answer's FIRST WORD (^ACQUIRED, ^held, ^stale-dead), so the whole guard
+  went red against a lock script that was working perfectly - and nobody noticed
+  for a day, because that guard is not in the P1-P3 floor and nothing tied an
+  edit of the loop's scripts to it. The loop's supervisor is the one thing whose
+  failure nothing else can catch, so its harness going quietly red is the worst
+  place in the tree for that gap.
+
+  THE MECHANISM. A green harness run STAMPS the content of every file it covers
+  (scripts\guard-due.ps1 update, called by the harness itself). This command
+  compares the files on disk against that stamp:
+
+    * every covered file hashes the same as the stamp  => the harness has been
+      run against exactly this code. CURRENT, exit 0.
+    * any covered file changed, appeared, or vanished  => nothing has run that
+      harness against the code as it now stands. DUE, exit 1, naming the files.
+
+  It is a CHANGE gate, not a schedule: a stamp does not go stale with time, and
+  a file edited and edited back is not due. The stamp is committed, so it
+  travels with the change - a `git pull` that brings in a loop-script edit made
+  on another seat reads as DUE here, which is the case a purely local mtime or
+  a "did this turn touch it" check cannot see.
+
+  WHAT IT IS NOT. It never runs the harness (that would put a multi-minute
+  GUI-launching acceptance script inside whatever called this), and it never
+  decides that a harness PASSES - only that one has not been asked. A red
+  harness run leaves the stamp alone, so red stays due.
+
+  WIRED INTO (both deliberately different in force):
+    * scripts\go-loop-exec.ps1 claim - go.md step 0, every turn. Reports, never
+      fails: a claim that can exit nonzero over a stale stamp would wedge the
+      loop, which is the disease, not the cure.
+    * scripts\parity-tasks.ps1 validate - go.md step 6, before every commit.
+      FAILS, because that is the gate with teeth, and the remedy (run the
+      harness, or fix what it caught) is the work this exists to cause.
+
+  Acceptance: test\win32\guard-due.ps1.
+
+.EXAMPLE
+  powershell -NoProfile -File scripts\guard-due.ps1
+  powershell -NoProfile -File scripts\guard-due.ps1 check -Json
+  powershell -NoProfile -File scripts\guard-due.ps1 update -Guard go-loop
+#>
+param(
+    [Parameter(Position = 0)]
+    [ValidateSet('check', 'update', 'list')]
+    [string]$Action = 'check',
+
+    # Limit to one harness by name. Omitted => every row in the table.
+    [string]$Guard,
+
+    [string]$Repo,
+    [switch]$Json
+)
+
+$ErrorActionPreference = 'Stop'
+if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
+
+# ---------------------------------------------------------------------------
+# The coverage table. One row per harness; adding a row is the whole cost of
+# closing this gap for the next harness that grows one.
+#
+# `Covers` are repo-relative globs. Keep a row to the family the harness is
+# ABOUT: a gate that demands a go-loop run every time a shared library moves is
+# noise, and noise is how a gate gets ignored. scripts\lib\NativeArgv.ps1 is
+# reached transitively from here and is deliberately NOT covered - it has its
+# own acceptance (test\win32\cli-argv-fidelity.ps1), which is the same argument
+# in the other direction.
+# ---------------------------------------------------------------------------
+$GuardTable = @(
+    [pscustomobject]@{
+        Name   = 'go-loop'
+        Script = 'test\win32\go-loop-guard.ps1'
+        Stamp  = 'test\win32\go-loop-guard.stamp.json'
+        Covers = @(
+            'scripts\go-loop-*.ps1',
+            'scripts\loop-session.ps1',
+            'test\win32\go-loop-guard.ps1'
+        )
+    }
+)
+
+function Get-RepoRelative([string]$full) {
+    $rel = $full.Substring($Repo.Length).TrimStart('\', '/')
+    return $rel.Replace('\', '/')
+}
+
+function Get-CoveredFiles($row) {
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in $row.Covers) {
+        $full = Join-Path $Repo $pattern
+        foreach ($f in @(Get-ChildItem -Path $full -File -ErrorAction SilentlyContinue)) {
+            $rel = Get-RepoRelative $f.FullName
+            if (-not $found.Contains($rel)) { $found.Add($rel) | Out-Null }
+        }
+    }
+    # Ordinal sort so the stamp's key order is the same on every box.
+    return @($found.ToArray() | Sort-Object -CaseSensitive)
+}
+
+function Get-NormalizedHash([string]$relPath) {
+    <#
+      SHA-256 of the file's bytes with CRLF folded to LF and any UTF-8 BOM
+      dropped. .ps1 carries no `text` attribute in .gitattributes, so the bytes
+      on disk depend on the checkout's line-ending settings; hashing them raw
+      would report every file as changed on a differently-configured clone, and
+      a gate that cries wolf on a fresh clone is a gate nobody reads.
+    #>
+    $bytes = [System.IO.File]::ReadAllBytes((Join-Path $Repo $relPath))
+    $out = New-Object System.Collections.Generic.List[byte]
+    $start = 0
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
+    for ($i = $start; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 0x0D -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 0x0A) { continue }
+        $out.Add($bytes[$i])
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash($out.ToArray())
+    } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+}
+
+function Get-LiveMap($row) {
+    $map = [ordered]@{}
+    foreach ($rel in (Get-CoveredFiles $row)) { $map[$rel] = Get-NormalizedHash $rel }
+    return $map
+}
+
+function Read-Stamp($row) {
+    $path = Join-Path $Repo $row.Stamp
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        return ($raw | ConvertFrom-Json)
+    } catch { return $null }
+}
+
+function Get-StampMap($stamp) {
+    $map = [ordered]@{}
+    if ($null -eq $stamp -or $null -eq $stamp.files) { return $map }
+    foreach ($p in $stamp.files.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+    return $map
+}
+
+function Get-GuardState($row) {
+    <#
+      The whole decision, as data: Kind ('current' | 'due'), Findings (one per
+      file that moved), plus what the stamp said. Pure apart from reading files,
+      so `check`, `-Json` and the acceptance script all read the same answer.
+    #>
+    $live = Get-LiveMap $row
+    $stamp = Read-Stamp $row
+    $stamped = Get-StampMap $stamp
+    # A plain array, not a generic List: PowerShell 5.1's enumerable binder
+    # throws "Argument types do not match" on @(<empty List[object]>), which is
+    # exactly the CURRENT case - the one this gate reports most often.
+    $findings = @()
+
+    if ($null -eq $stamp) {
+        return [pscustomobject]@{
+            Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+            Kind = 'due'; Reason = 'no-stamp'; Findings = @()
+            Files = @($live.Keys); StampedAt = ''; StampedCommit = ''
+        }
+    }
+
+    foreach ($rel in $live.Keys) {
+        if (-not $stamped.Contains($rel)) {
+            $findings += [pscustomobject]@{ Kind = 'new'; Path = $rel }
+        } elseif ($stamped[$rel] -ne $live[$rel]) {
+            $findings += [pscustomobject]@{ Kind = 'changed'; Path = $rel }
+        }
+    }
+    foreach ($rel in @($stamped.Keys)) {
+        if (-not $live.Contains($rel)) {
+            $findings += [pscustomobject]@{ Kind = 'removed'; Path = $rel }
+        }
+    }
+
+    $kind = if ($findings.Count -gt 0) { 'due' } else { 'current' }
+    $reason = if ($findings.Count -gt 0) { 'covered-files-changed' } else { '' }
+    return [pscustomobject]@{
+        Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+        Kind = $kind; Reason = $reason; Findings = $findings
+        Files = @($live.Keys)
+        StampedAt = [string]$stamp.generated
+        StampedCommit = [string]$stamp.commit
+    }
+}
+
+function Write-Stamp($row) {
+    <#
+      Rewrite the stamp only when the file MAP actually moved. A green harness
+      run that changed nothing must leave a clean working tree behind it -
+      otherwise every run of the harness produces a diff, and a diff nobody
+      means is a diff nobody reads.
+    #>
+    $live = Get-LiveMap $row
+    $existing = Get-StampMap (Read-Stamp $row)
+    $same = ($existing.Count -eq $live.Count)
+    if ($same) {
+        foreach ($k in $live.Keys) {
+            if (-not $existing.Contains($k) -or $existing[$k] -ne $live[$k]) { $same = $false; break }
+        }
+    }
+    if ($same) { return [pscustomobject]@{ Written = $false; Files = @($live.Keys) } }
+
+    $commit = ''
+    try { $commit = (& git -C $Repo rev-parse --short HEAD 2>$null | Out-String).Trim() } catch { $commit = '' }
+
+    $files = [ordered]@{}
+    foreach ($k in $live.Keys) { $files[$k] = $live[$k] }
+    $doc = [ordered]@{
+        guard     = $row.Name
+        script    = $row.Script.Replace('\', '/')
+        generated = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
+        commit    = $commit
+        files     = $files
+    }
+    $json = ($doc | ConvertTo-Json -Depth 5)
+    $path = Join-Path $Repo $row.Stamp
+    # UTF-8 without a BOM, LF endings: *.json is `text eol=lf` in .gitattributes.
+    [System.IO.File]::WriteAllText($path, ($json -replace "`r`n", "`n") + "`n",
+        (New-Object System.Text.UTF8Encoding($false)))
+    return [pscustomobject]@{ Written = $true; Files = @($live.Keys) }
+}
+
+$rows = @($GuardTable)
+if ($Guard) {
+    $rows = @($GuardTable | Where-Object { $_.Name -eq $Guard })
+    if ($rows.Count -eq 0) {
+        Write-Host ("ERROR unknown guard '{0}' (known: {1})" -f $Guard, (($GuardTable | ForEach-Object { $_.Name }) -join ', '))
+        exit 2
+    }
+}
+
+switch ($Action) {
+
+    'list' {
+        foreach ($row in $rows) {
+            "{0}  {1}" -f $row.Name, $row.Script
+            foreach ($rel in (Get-CoveredFiles $row)) { "    $rel" }
+        }
+        exit 0
+    }
+
+    'update' {
+        $wrote = 0
+        foreach ($row in $rows) {
+            $r = Write-Stamp $row
+            if ($r.Written) {
+                "STAMPED {0} ({1} files) -> {2}" -f $row.Name, @($r.Files).Count, $row.Stamp
+                $wrote++
+            } else {
+                "STAMP UNCHANGED {0} ({1} files)" -f $row.Name, @($r.Files).Count
+            }
+        }
+        exit 0
+    }
+
+    'check' {
+        $states = @(foreach ($row in $rows) { Get-GuardState $row })
+        if ($Json) {
+            # An array, always - a single-row table must not collapse to an object.
+            ConvertTo-Json -Depth 6 -InputObject @($states)
+            exit ([int](@($states | Where-Object { $_.Kind -eq 'due' }).Count -gt 0))
+        }
+        $due = 0
+        foreach ($s in $states) {
+            if ($s.Kind -eq 'current') {
+                $stampedAt = if ($s.StampedAt) { $s.StampedAt.Substring(0, [Math]::Min(10, $s.StampedAt.Length)) } else { '?' }
+                "GUARD CURRENT {0} ({1} files, stamped {2}{3})" -f $s.Name, @($s.Files).Count, $stampedAt,
+                    $(if ($s.StampedCommit) { " from $($s.StampedCommit)" } else { '' })
+                continue
+            }
+            $due++
+            if ($s.Reason -eq 'no-stamp') {
+                "GUARD DUE {0}: no stamp - {1} has never recorded a green run over this code" -f $s.Name, $s.Script
+            } else {
+                "GUARD DUE {0}: {1} has not been run since these changed:" -f $s.Name, $s.Script
+                foreach ($f in $s.Findings) { "    {0,-8} {1}" -f $f.Kind, $f.Path }
+            }
+            "  run: powershell -NoProfile -File {0}" -f $s.Script
+        }
+        exit ([int]($due -gt 0))
+    }
+}

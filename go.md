@@ -310,6 +310,20 @@ Concretely, in order, with no stops in between:
    bounded them — today the same overlap costs a red flake that reads as
    "test-agent is flaky again". A background lane plus a foreground script is
    the exact shape that burned the T96 turn.
+
+   **And run the harness the code you touched already has, not only the floor**
+   (T783). `scripts\guard-due.ps1 check` answers "has anybody run acceptance
+   harness X against the code as it now stands?" — from a stamp that a clean
+   green run of that harness writes and commits, so the question survives a
+   `git pull` that brings in somebody else's edit. Step 0's `claim` prints the
+   answer every turn and step 6's `validate` FAILS on it, because the go-loop
+   guard sat 26-red for a day with nobody the wiser: it is not in the P1–P3
+   floor and nothing tied a `scripts\go-loop-*.ps1` edit to
+   `test\win32\go-loop-guard.ps1`. The remedy is to RUN the named harness — red
+   stays due, since only a clean green sweep re-stamps, and a run with skipped
+   sections does not stamp at all. Adding a row to the coverage table in
+   `scripts\guard-due.ps1` is the whole cost of closing the same gap for the
+   next harness that grows one.
 4. **Make sure it's right** — validation must actually pass, on the box. A
    clean build is not evidence, and neither is a passing script you did not
    read the last line of.
@@ -367,6 +381,13 @@ Concretely, in order, with no stops in between:
    done -Commit <sha>`, evidence into that task's own file, ONE log entry in
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
    validate` before committing. Commit and push.
+
+   Since T783 `validate` is also the gate with TEETH for harness staleness: it
+   fails when `scripts\guard-due.ps1` reports an acceptance harness that has not
+   been run since the code it covers changed (step 3). Run that harness; the
+   `-NoGuardDue` hatch exists for a harness that genuinely cannot run on this
+   box and prints that it was used, so a commit made under it can be explained
+   rather than silently excused.
 
    Since T564 `set-status` **journals every transition** into the task's own
    `## Progress log` (`status: <old> -> <new>`, plus `[commit <sha>]`), so a

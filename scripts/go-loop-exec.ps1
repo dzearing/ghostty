@@ -224,6 +224,18 @@ switch ($Action) {
             "  marked this window `"$Marker $Label`""
         }
 
+        # T783: is the loop's own harness stale? Reported here because this is
+        # the one command every turn runs first, and because a loop-script edit
+        # can arrive by `git pull` from a turn that never touched it. REPORTED,
+        # never enforced: a claim that could exit nonzero over a stale stamp
+        # would wedge the loop, which is the disease and not the cure. The teeth
+        # are in `parity-tasks.ps1 validate`, at the pre-commit gate.
+        $dueScript = Join-Path $PSScriptRoot 'guard-due.ps1'
+        if (Test-Path -LiteralPath $dueScript) {
+            $dueOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $dueScript check -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
+        }
+
         $dupes = @()
         foreach ($w in $windows) {
             if ($mine -and $w.Id -eq $mine.Id) { continue }
