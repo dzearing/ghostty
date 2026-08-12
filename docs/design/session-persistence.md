@@ -385,7 +385,8 @@ processes after a reboot.
   Dead sessions render with a "process exited / restarted after reboot"
   banner (the sticky-banner feature is a natural fit) and either auto-
   `RELAUNCH` (default) or wait for Enter (config: `session-relaunch =
-  auto | prompt`).
+  restore | rerun | prompt`; the default `restore` relaunches a plain login
+  shell in the recorded cwd rather than re-running the recorded command).
 - **Sparkle:** no new hook strictly needed — the update path already sets
   `isQuitting` and preserves the manifest (§3.2). Add belt-and-braces: on
   `willInstallUpdateOnQuit`, flush the manifest and send explicit `DETACH`s

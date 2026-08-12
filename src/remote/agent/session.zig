@@ -661,6 +661,25 @@ pub const Session = struct {
         if (self.tty) |t| self.alloc.free(t);
         self.tty = copy;
     }
+
+    /// Record (or clear, with null) the session's working directory. Owns a copy;
+    /// replaces any prior value. Best-effort like `setArgv`.
+    ///
+    /// `cwd` is a RELAUNCH input: `persistMeta` writes it to `sessions.json` and
+    /// `handleRelaunch` feeds it to the synthesized relaunch OPEN, so a session
+    /// restored across an agent restart comes back where it lived. It used to be
+    /// written on exactly one path — `materialize`, loading the field back from
+    /// disk — and never on `handleOpen`, so the field was permanently null and
+    /// every reboot-floor respawn landed in whatever cwd the AGENT happened to
+    /// have (for a launchd-restarted agent, an arbitrary one). Invisible while
+    /// the relaunch re-ran a recorded command that mostly ignored its cwd;
+    /// glaring under `session-relaunch=restore`, which promises the user a shell
+    /// in the session's own directory.
+    pub fn setCwd(self: *Session, cwd: ?[]const u8) void {
+        const copy: ?[]u8 = if (cwd) |c| (self.alloc.dupe(u8, c) catch return) else null;
+        if (self.cwd) |c| self.alloc.free(c);
+        self.cwd = copy;
+    }
 };
 
 // -----------------------------------------------------------------------------

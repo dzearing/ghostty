@@ -947,6 +947,7 @@ pub const Connection = struct {
         protocol.capability.session_cpu,
         protocol.capability.sessions_push,
         protocol.capability.cpu_units,
+        protocol.capability.relaunch_notice,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -2043,6 +2044,11 @@ pub const Connection = struct {
         env: []const protocol.Open.EnvPair = &.{},
         term: ?[]const u8 = null,
         argv: ?[]const []const u8 = null,
+        /// Text for the agent to append to the ring ahead of the replay (see
+        /// `protocol.Relaunch.notice`). Only meaningful when
+        /// `supportsRelaunchNotice()`; the caller is responsible for printing it
+        /// locally instead when that is false.
+        notice: ?[]const u8 = null,
     };
 
     /// Respawn a dead-but-relaunchable session on its known `channel` (§5.4 reboot
@@ -2175,6 +2181,7 @@ pub const Connection = struct {
             .env = fidelity.env,
             .term = fidelity.term,
             .argv = fidelity.argv,
+            .notice = fidelity.notice,
         };
         const json = try protocol.encodeJson(self.alloc, req);
         defer self.alloc.free(json);
@@ -2204,6 +2211,15 @@ pub const Connection = struct {
     /// a fatal framing error.
     pub fn supportsCloseSession(self: *Connection) bool {
         if (self.negotiated) |n| return n.close_session else |_| return false;
+    }
+
+    /// True iff the negotiated peer advertised `capability.relaunch_notice` —
+    /// i.e. `RelaunchFidelity.notice` will be appended to the ring ahead of the
+    /// replay, landing between the restored scrollback and the respawned child's
+    /// output. False for an older agent (or an incomplete/failed handshake), in
+    /// which case the caller must print the notice into its own terminal instead.
+    pub fn supportsRelaunchNotice(self: *Connection) bool {
+        if (self.negotiated) |n| return n.relaunch_notice else |_| return false;
     }
 
     /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`

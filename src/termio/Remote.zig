@@ -100,10 +100,16 @@ local: bool,
 
 /// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
 /// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
-/// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
-/// divider; `.prompt` leaves the pane in its exited state for the user to decide.
+/// T12c). `.restore` respawns a plain login shell in the recorded cwd and shows
+/// a "session was lost" notice, `.rerun` respawns the recorded command in place
+/// and shows a restarted divider, and `.prompt` leaves the pane in its exited
+/// state for the user to decide.
 /// Only meaningful for the LOCAL-agent ATTACH path; irrelevant on OPEN-new.
 relaunch_policy: RelaunchPolicy,
+
+/// argv[0] for the `.restore` respawn shell (see `Config.login_shell`). Duped
+/// into `arena`.
+login_shell: ?[]const u8,
 
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
@@ -252,8 +258,14 @@ pub const Config = struct {
     pinned: bool = false,
 
     /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
-    /// `relaunch_policy` field doc. Defaults to `.auto`.
-    relaunch_policy: RelaunchPolicy = .auto,
+    /// `relaunch_policy` field doc. Defaults to `.restore`.
+    relaunch_policy: RelaunchPolicy = .restore,
+
+    /// The login shell this pane's machine would start by default, used ONLY to
+    /// name argv[0] in the `.restore` respawn argv (see `relaunchArgv`). The
+    /// agent always execs its OWN resolved shell binary, so a wrong value here
+    /// costs nothing but a misleading `$0`/`ps` label. Null ⇒ a generic label.
+    login_shell: ?[]const u8 = null,
 
     /// True when `conn` dials the LOCAL agent (same machine, UDS) — the
     /// session-persistence path. Gates surfacing the agent-reported tty from
@@ -274,7 +286,152 @@ pub const Config = struct {
 /// What a restored pane does when its ATTACH target comes back as a
 /// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
 /// `config.SessionRelaunch`; kept local so this backend need not import config.
-pub const RelaunchPolicy = enum { auto, prompt };
+pub const RelaunchPolicy = enum {
+    /// Respawn a plain login shell in the session's RECORDED cwd and print
+    /// `session_lost_notice`. The recorded command is deliberately not re-run.
+    restore,
+    /// Respawn the recorded command/shell verbatim and print `restart_divider`
+    /// (the pre-`restore` default, kept as an explicit opt-in).
+    rerun,
+    /// Leave the tombstone unrespawned; the first keystroke fires a `rerun`.
+    prompt,
+
+    /// True for the two policies that respawn the child as part of bring-up.
+    /// `.prompt` defers the respawn to `performAwaitedRelaunch`.
+    pub fn respawnsOnAttach(self: RelaunchPolicy) bool {
+        return switch (self) {
+            .restore, .rerun => true,
+            .prompt => false,
+        };
+    }
+};
+
+/// The marker printed above a relaunched session's fresh output.
+///
+/// `restart_divider` must stay BYTE-IDENTICAL to `agent/session.zig`'s
+/// `reboot_divider`, which the agent bakes into a preloaded ring snapshot: when
+/// the agent replays scrollback it owns the divider and the client suppresses
+/// its own, so there is exactly one canonical string either way. (An older agent
+/// still emits it even under `.restore`, which is why the notice reads as an
+/// addition to it rather than a replacement.)
+const restart_divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+
+/// `.restore`'s marker: the recorded command did NOT come back, this pane is a
+/// fresh login shell sitting in the dead session's recorded working directory.
+/// Deliberately worded as a statement of fact, not an error — losing the child
+/// across an agent restart is expected (POSIX: the agent's children die with it),
+/// and the scrollback above it is the dead session's real output.
+const session_lost_notice =
+    "\r\n\x1b[2m--- previous session was lost; new shell in its working directory ---\x1b[0m\r\n";
+
+/// VT state the reboot-scrollback replay may leave stuck ON in the fresh pane,
+/// reset after the replay lands and before the new shell owns the screen.
+///
+/// The replay is the dead session's RAW byte stream (`agent/ring_snapshot.zig`),
+/// so every mode the dead program enabled is re-enabled by replaying it — but the
+/// program that consumed those reports is gone. Left set, mouse tracking makes a
+/// plain shell receive SGR mouse reports as typed input (`35;1;12M` →
+/// `zsh: command not found: 30M35` on every pointer move), and a hidden cursor /
+/// disabled autowrap / stuck SGR make the pane look broken. The relaunched
+/// program re-enables whatever it needs, so resetting is safe.
+///
+/// Scoped to MODE state on purpose. `RIS` (`\x1bc`) would throw away the very
+/// scrollback the replay exists to restore. Three tempting extras are also
+/// deliberately absent because ghostty applies them UNCONDITIONALLY — i.e. they
+/// misfire on the overwhelmingly common pane that the replay left in a perfectly
+/// good state:
+///
+///   - `?1049l`/`?1047l`/`?47l` (alt screen): `switchScreenMode` restores the
+///     saved cursor (1049) or erases the display (1047) even when we are already
+///     on the primary screen, which is where a replay that restored visible
+///     scrollback necessarily left us.
+///   - `?6l` (origin): `setMode` homes the cursor whether or not the value changed.
+///   - `\x1b[r` (DECSTBM): resetting the scroll region homes the cursor too.
+///
+/// Each would move the fresh shell's first prompt on top of the restored output.
+/// A pane whose snapshot genuinely ends inside an alt-screen TUI is the residual
+/// gap; it is rarer than "every restored pane" and the cure is worse there.
+const replay_mode_reset =
+    "\x1b[?9l" ++ // X10 mouse reporting
+    "\x1b[?1000l" ++ // normal button-press mouse tracking
+    "\x1b[?1002l" ++ // button-event (drag) tracking
+    "\x1b[?1003l" ++ // any-event (hover) tracking — the reported spam
+    "\x1b[?1004l" ++ // focus in/out reporting
+    "\x1b[?1005l" ++ // UTF-8 mouse encoding
+    "\x1b[?1006l" ++ // SGR mouse encoding
+    "\x1b[?1015l" ++ // urxvt mouse encoding
+    "\x1b[?1016l" ++ // SGR-pixel mouse encoding
+    "\x1b[?2004l" ++ // bracketed paste
+    "\x1b[?1l" ++ // DECCKM: normal (not application) cursor keys
+    "\x1b>" ++ // DECKPNM: normal (not application) keypad
+    "\x1b[?7h" ++ // DECAWM: autowrap back on (its default)
+    "\x1b[?25h" ++ // DECTCEM: cursor visible again
+    "\x1b[0m"; // SGR: default text attributes
+
+/// The bytes we ask the AGENT to splice into the replay stream for this policy
+/// (`protocol.Relaunch.notice`) — the only slot that is reliably between the
+/// restored scrollback and the respawned child's first output.
+///
+/// Everything here has to be ordered by the producer, not injected locally:
+///   - the notice, because the fresh shell's first prompt repaint erases a line
+///     the client wrote after the shell took the screen (measured: the
+///     agent-baked divider survives, the client's line above the prompt is
+///     blanked);
+///   - the mode reset, because a local inject races the respawned program — for
+///     `.rerun` that means we could disable mouse tracking the re-run TUI had
+///     just enabled, which is the opposite of the bug we are fixing.
+/// Gated on `Connection.supportsRelaunchNotice`; against an older agent the
+/// client falls back to injecting both itself.
+fn relaunchStreamNotice(self: *const Remote) []const u8 {
+    return switch (self.relaunch_policy) {
+        .restore => replay_mode_reset ++ session_lost_notice,
+        // The divider is the agent's own (`reboot_divider`, already in the ring);
+        // all these policies add is the mode reset.
+        .rerun, .prompt => replay_mode_reset,
+    };
+}
+
+/// The marker this policy prints above a relaunched session's fresh output.
+fn relaunchMarker(self: *const Remote) []const u8 {
+    return switch (self.relaunch_policy) {
+        .restore => session_lost_notice,
+        .rerun, .prompt => restart_divider,
+    };
+}
+
+/// The `RELAUNCH` argv override for this policy — the whole of bug-1's fix, and
+/// entirely client-side.
+///
+/// The agent's synthesized relaunch OPEN (`agent/server.zig` `handleRelaunch`)
+/// already drops the RECORDED command whenever the viewer supplies argv
+/// (`command = if (req.argv != null) null else argv_copy`), so sending a shell
+/// argv is how a viewer says "come back as a shell, not as whatever this session
+/// was running". The recorded `cwd` is untouched by that, so the shell lands
+/// where the session started. No wire change; an agent too old to honor
+/// `Relaunch.argv` respawns from its own metadata, i.e. degrades to `.rerun`.
+///
+/// `buf` gives the synthesized argv storage on the caller's stack and must
+/// outlive the `RELAUNCH` call.
+fn relaunchArgv(self: *const Remote, buf: *[2][]const u8) ?[]const []const u8 {
+    return switch (self.relaunch_policy) {
+        // Our own argv when we have one: it is the shell-integration
+        // argv-rewrite, which is ALREADY a plain interactive-shell invocation
+        // (the apprt drops it for a `--command` pane, which is exactly the pane
+        // this policy exists for), so it is both the shell we want and the one
+        // that keeps bash/nushell integration alive.
+        .restore => self.argv orelse argv: {
+            // Mirror the `<shell> -li` the agent synthesizes for a command-less
+            // OPEN. argv[0] is a LABEL only — the agent execs its own resolved
+            // shell path (`pty_child.resolveShellPath`) either way — and a
+            // Windows agent ignores `argv` outright, landing on a plain
+            // interactive shell via the nulled command instead.
+            buf[0] = self.login_shell orelse "shell";
+            buf[1] = "-li";
+            break :argv buf;
+        },
+        .rerun, .prompt => self.argv,
+    };
+}
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -293,6 +450,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const command = if (cfg.command) |c| try aa.dupe(u8, c) else null;
     const working_directory = if (cfg.working_directory) |w| try aa.dupe(u8, w) else null;
     const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
+    const login_shell = if (cfg.login_shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
     const restore_snapshot = if (cfg.restore_snapshot) |s| try aa.dupe(u8, s) else null;
 
@@ -324,6 +482,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .pinned = cfg.pinned,
         .local = cfg.local,
         .relaunch_policy = cfg.relaunch_policy,
+        .login_shell = login_shell,
         .restore_snapshot = restore_snapshot,
         // The offset is only meaningful WITH a snapshot: attaching at offset>0
         // without painting the prior content would leave the screen blank above
@@ -426,6 +585,12 @@ pub fn threadEnter(
     // session respawned across an agent restart) rather than a live attach/open —
     // used after bring-up to print a "session restarted" divider (T12c).
     var did_relaunch = false;
+    // True when the AGENT is new enough to splice our marker + mode reset into the
+    // replay stream itself (`relaunchStreamNotice`). When it is, the client injects
+    // nothing of its own; when it isn't (older agent), the client falls back to
+    // printing them into its terminal, which is visible but can be repainted over
+    // by the respawned shell's first prompt.
+    const agent_owns_notice = self.conn.supportsRelaunchNotice();
     // Set true when the agent ALREADY replayed pre-restart scrollback + the restart
     // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
     // own snapshot-less divider so there is exactly one marker.
@@ -475,15 +640,19 @@ pub fn threadEnter(
         // No live pane. A DEAD-but-relaunchable tombstone means the AGENT itself
         // restarted (a reboot or an agent upgrade) and materialized this session
         // from its on-disk metadata (§5.4 reboot floor, T12b) — the recorded
-        // argv/cwd can bring the process back. With the `auto` policy (the
-        // default), RELAUNCH it in place on the SAME channel the dead ATTACHED
-        // arrived on and stream fresh output; `prompt` falls through to the
-        // exited overlay so the user decides.
+        // argv/cwd can bring SOMETHING back where the session lived. Both
+        // respawning policies RELAUNCH in place on the SAME channel the dead
+        // ATTACHED arrived on and stream fresh output; they differ only in the
+        // argv they ask for (`relaunchArgv`: `restore` — the default — a plain
+        // login shell, `rerun` the recorded command) and the marker they print.
+        // `prompt` falls through to the exited overlay so the user decides.
         if (outcome.status == .dead and outcome.relaunchable and
-            self.relaunch_policy == .auto)
+            self.relaunch_policy.respawnsOnAttach())
         {
             const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
             const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+            // Storage for a synthesized `.restore` argv; must outlive the call.
+            var argv_buf: [2][]const u8 = undefined;
             const r = self.conn.relaunchChannelCancellable(
                 sid,
                 outcome.channel,
@@ -494,7 +663,12 @@ pub fn threadEnter(
                 // Respawn fidelity (wp3): the agent's on-disk record has no
                 // env/TERM/argv, so send our live copies — the respawned shell
                 // keeps GHOZTTY_PANE_ID & co. and its shell integration.
-                .{ .env = self.env, .term = self.term, .argv = self.argv },
+                .{
+                    .env = self.env,
+                    .term = self.term,
+                    .argv = self.relaunchArgv(&argv_buf),
+                    .notice = if (agent_owns_notice) self.relaunchStreamNotice() else null,
+                },
                 &self.canceller,
             ) catch |err| {
                 log.warn("relaunch of dead session failed err={}", .{err});
@@ -630,14 +804,22 @@ pub fn threadEnter(
 
     // A relaunched session (T12c) streams a FRESH shell. When the agent had a ring
     // disk snapshot (T13) it already replayed pre-restart scrollback + the divider
-    // ahead of the fresh output (`relaunch_replayed`), so we print nothing — doing
-    // so would double the divider AND land it BEFORE the replayed scrollback (our
-    // inject is synchronous; the replay drains async from the channel ring). Only
-    // when there was NO snapshot (blank relaunch) do we print the divider ourselves,
-    // so the restart is visible rather than looking like a spontaneous new prompt.
-    if (did_relaunch and !relaunch_replayed) {
-        const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
-        @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
+    // ahead of the fresh output (`relaunch_replayed`), so we print nothing HERE —
+    // doing so would double the divider AND land it BEFORE the replayed scrollback
+    // (our inject is synchronous; the replay drains async from the channel ring).
+    // That case is handled after the drain below. Only when there was NO snapshot
+    // (blank relaunch) do we print the marker ourselves, so the restart is visible
+    // rather than looking like a spontaneous new prompt.
+    // (With no snapshot the agent still splices our stream notice onto the empty
+    // ring, so `.restore`'s wording is already on the way and printing it here
+    // would double it. `.rerun`/`.prompt` splice only the invisible mode reset, so
+    // their divider is still ours to print.)
+    const marker: []const u8 = if (agent_owns_notice and self.relaunch_policy == .restore)
+        ""
+    else
+        self.relaunchMarker();
+    if (did_relaunch and !relaunch_replayed and marker.len > 0) {
+        @call(.always_inline, termio.Termio.processOutput, .{ io, marker });
     } else if (self.awaiting_relaunch) {
         // Prompt policy (T12c2): the pane is a dead tombstone with no child. Show
         // an interactive affordance — `queueWrite` respawns it on the first key.
@@ -685,6 +867,28 @@ pub fn threadEnter(
     // output (produced at the live width — the authoritative RESIZE above set the
     // agent pty) then continues to land at the live width.
     if (reflow_replay) io.reflowLocalGrid(live_cols, live_rows);
+
+    // The replayed reboot-scrollback has now landed IN FULL: the agent queues
+    // every replay DATA frame ahead of `RELAUNCHED` on the same channel, and the
+    // demux thread pushes them into the ring in order before it wakes the waiter
+    // this `threadEnter` was parked on — so the drain above saw all of them.
+    //
+    // Which means this is the first point at which we can undo what the replay
+    // did to the terminal's MODE state (`replay_mode_reset`) — before the drain
+    // the replay's own `ESC[?1003h` would just turn mouse tracking back on. It is
+    // also the only correct place for `.restore`'s notice: printed earlier it
+    // would sit above the restored scrollback and scroll straight out of view.
+    //
+    // Deliberately NOT done on the ordinary alive re-attach path. There the child
+    // is still running and still OWNS these modes — a live TUI that enabled mouse
+    // tracking would stop receiving events the moment we reset it. Only a relaunch
+    // has a dead program's raw bytes replayed into a pane it no longer controls.
+    if (did_relaunch and relaunch_replayed and !agent_owns_notice) {
+        @call(.always_inline, termio.Termio.processOutput, .{ io, replay_mode_reset });
+        if (self.relaunch_policy == .restore) {
+            @call(.always_inline, termio.Termio.processOutput, .{ io, session_lost_notice });
+        }
+    }
 }
 
 pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
@@ -839,6 +1043,7 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
     const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
 
+    const agent_owns_notice = rd.conn.supportsRelaunchNotice();
     const res = rd.conn.sendRelaunchOnPane(
         rd.pane,
         rows,
@@ -846,7 +1051,12 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
         px_w,
         px_h,
         // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
-        .{ .env = self.env, .term = self.term, .argv = self.argv },
+        .{
+            .env = self.env,
+            .term = self.term,
+            .argv = self.argv,
+            .notice = if (agent_owns_notice) self.relaunchStreamNotice() else null,
+        },
         &self.canceller,
     ) catch |err| {
         log.warn("awaited relaunch failed err={}", .{err});
@@ -865,13 +1075,20 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
     // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
     self.publishProcessInfo(rd.pane);
-    const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
-    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
+    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, restart_divider });
 
     // The respawned session's DATA arrives on the ring (armed since threadEnter);
     // drain once immediately in case it landed while we were parked on the RPC (the
     // async notify is coalesced, so ringReady will also run, but this is prompt).
     drainRing(td);
+
+    // Same post-replay mode reset as `threadEnter`: consenting to a relaunch also
+    // replays the dead session's raw byte stream, which re-enables whatever modes
+    // (mouse tracking above all) the dead program had on. See `replay_mode_reset`.
+    // Only ours to inject when the agent didn't splice it into the stream itself.
+    if (res.replayed and !agent_owns_notice) {
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, replay_mode_reset });
+    }
 }
 
 pub fn childExitedAbnormally(
@@ -1098,3 +1315,209 @@ pub const ThreadData = struct {
     }
 };
 
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Build a `Remote` with ONLY the fields `relaunchMarker`/`relaunchArgv` read.
+/// Everything else stays `undefined`: those two are pure functions of the policy
+/// and the pane's own argv, and giving them a real backend would mean standing up
+/// a whole `connection.Connection`.
+fn testRemote(
+    policy: RelaunchPolicy,
+    argv: ?[]const []const u8,
+    login_shell: ?[]const u8,
+) Remote {
+    var r: Remote = undefined;
+    r.relaunch_policy = policy;
+    r.argv = argv;
+    r.login_shell = login_shell;
+    return r;
+}
+
+test "relaunch: the restart divider is byte-identical to the agent's" {
+    // `agent/session.zig` bakes `reboot_divider` into a preloaded ring snapshot
+    // and the client prints `restart_divider` when there was no snapshot, so the
+    // two are the SAME marker reached by two routes. A drift here shows up as two
+    // different "restarted" strings depending on whether scrollback was replayed
+    // — and silently breaks anything (the E2E harness included) that greps for it.
+    const agent_session = @import("../remote/agent/session.zig");
+    try testing.expectEqualStrings(agent_session.reboot_divider, restart_divider);
+}
+
+test "relaunch: restore respawns a login shell, rerun/prompt keep the pane's argv" {
+    // The `--command=` pane bug-1 is about: the apprt drops the shell-integration
+    // argv for a command pane, so `self.argv` is null and the agent would fall
+    // back to the RECORDED command. `restore` must supply a shell argv instead —
+    // that is the only thing that makes the agent's synthesized relaunch OPEN
+    // null out the recorded command.
+    var buf: [2][]const u8 = undefined;
+    {
+        var r = testRemote(.restore, null, "/bin/zsh");
+        const argv = r.relaunchArgv(&buf).?;
+        try testing.expectEqual(@as(usize, 2), argv.len);
+        try testing.expectEqualStrings("/bin/zsh", argv[0]);
+        try testing.expectEqualStrings("-li", argv[1]);
+    }
+    {
+        // No known shell (a cross-machine pane): argv[0] is only a label, the
+        // agent execs its own resolved shell, so a placeholder is fine.
+        var r = testRemote(.restore, null, null);
+        const argv = r.relaunchArgv(&buf).?;
+        try testing.expectEqualStrings("shell", argv[0]);
+        try testing.expectEqualStrings("-li", argv[1]);
+    }
+    {
+        // A plain-shell pane already carries a shell-integration argv rewrite;
+        // that IS a login-interactive shell, and keeping it preserves bash/nushell
+        // integration across the restore.
+        const integ: []const []const u8 = &.{ "/bin/bash", "--posix" };
+        var r = testRemote(.restore, integ, "/bin/bash");
+        const argv = r.relaunchArgv(&buf).?;
+        try testing.expectEqual(@as(usize, 2), argv.len);
+        try testing.expectEqualStrings("--posix", argv[1]);
+    }
+    for ([_]RelaunchPolicy{ .rerun, .prompt }) |policy| {
+        // Unchanged from before `restore` existed: send the pane's own argv (null
+        // for a command pane) so the agent respawns its recorded command.
+        var r = testRemote(policy, null, "/bin/zsh");
+        try testing.expectEqual(@as(?[]const []const u8, null), r.relaunchArgv(&buf));
+    }
+}
+
+test "relaunch: the stream notice carries the reset, and the wording only for restore" {
+    // What the agent splices in has to be self-sufficient: the client prints
+    // nothing when the agent owns it, so `.restore`'s wording AND the mode reset
+    // both have to be in this payload.
+    var r_restore = testRemote(.restore, null, null);
+    const restore_payload = r_restore.relaunchStreamNotice();
+    try testing.expect(std.mem.startsWith(u8, restore_payload, replay_mode_reset));
+    try testing.expect(std.mem.endsWith(u8, restore_payload, session_lost_notice));
+
+    // `.rerun`/`.prompt` re-run the recorded command and keep the agent's own
+    // divider, so all they need spliced is the invisible mode reset — adding the
+    // "session was lost" wording there would be a lie.
+    for ([_]RelaunchPolicy{ .rerun, .prompt }) |policy| {
+        var r = testRemote(policy, null, null);
+        try testing.expectEqualStrings(replay_mode_reset, r.relaunchStreamNotice());
+    }
+
+    // It must fit the agent's cap, or the agent truncates mid-escape-sequence.
+    try testing.expect(restore_payload.len <= protocol.Relaunch.max_notice_bytes);
+}
+
+test "relaunch: each policy's marker" {
+    var r_restore = testRemote(.restore, null, null);
+    try testing.expectEqualStrings(session_lost_notice, r_restore.relaunchMarker());
+    var r_rerun = testRemote(.rerun, null, null);
+    try testing.expectEqualStrings(restart_divider, r_rerun.relaunchMarker());
+    var r_prompt = testRemote(.prompt, null, null);
+    try testing.expectEqualStrings(restart_divider, r_prompt.relaunchMarker());
+
+    // The notice must say the session is GONE, not that it restarted — the whole
+    // point of `restore` is that the recorded command did not come back.
+    try testing.expect(std.mem.indexOf(u8, session_lost_notice, "lost") != null);
+    try testing.expect(std.mem.indexOf(u8, session_lost_notice, "restarted") == null);
+}
+
+test "relaunch: only restore/rerun respawn during attach" {
+    try testing.expect(RelaunchPolicy.restore.respawnsOnAttach());
+    try testing.expect(RelaunchPolicy.rerun.respawnsOnAttach());
+    try testing.expect(!RelaunchPolicy.prompt.respawnsOnAttach());
+}
+
+test "replay_mode_reset: turns every mouse-reporting mode off" {
+    // Bug 2: the reboot-scrollback replay is the dead TUI's RAW byte stream, so
+    // its `ESC[?1003h`/`ESC[?1006h` re-arm mouse reporting in a pane whose
+    // consumer is dead — the fresh shell then reads SGR mouse reports as typed
+    // input. Every mouse mode the emulator knows must come back off.
+    var applied = try parseModeSequence(replay_mode_reset);
+    defer applied.deinit();
+    const off_expected = [_]terminal.Mode{
+        .mouse_event_x10, // 9
+        .mouse_event_normal, // 1000
+        .mouse_event_button, // 1002
+        .mouse_event_any, // 1003
+        .focus_event, // 1004
+        .mouse_format_utf8, // 1005
+        .mouse_format_sgr, // 1006
+        .mouse_format_urxvt, // 1015
+        .mouse_format_sgr_pixels, // 1016
+        .bracketed_paste, // 2004
+        .cursor_keys, // 1
+    };
+    for (off_expected) |m| {
+        const got = applied.get(m) orelse {
+            std.debug.print("mode {} never reset\n", .{m});
+            return error.ModeMissing;
+        };
+        try testing.expect(!got);
+    }
+    // …and the two modes whose DEFAULT is on come back on.
+    try testing.expect(applied.get(.wraparound).? == true);
+    try testing.expect(applied.get(.cursor_visible).? == true);
+}
+
+test "replay_mode_reset: touches nothing but mode state" {
+    // The constraint that makes this safe: the replay exists to bring back the
+    // pre-reboot scrollback, so the reset must not erase, scroll, home the cursor,
+    // or `RIS`. Assert it structurally over the actual bytes rather than by
+    // eyeballing the literal — an added `\x1b[2J` or `\x1b[H` fails here.
+    var p: terminal.Parser = .init();
+    defer p.deinit();
+    for (replay_mode_reset) |c| {
+        for (p.next(c)) |action_| {
+            const action = action_ orelse continue;
+            switch (action) {
+                // `ESC >` (DECKPNM) is the only ESC dispatch we allow.
+                .esc_dispatch => |esc| try testing.expectEqual(@as(u8, '>'), esc.final),
+                .csi_dispatch => |csi| {
+                    // 'h'/'l' = set/reset mode, 'm' = SGR. Anything else — 'J'
+                    // (erase), 'H' (cursor position), 'r' (scroll region), 'c'
+                    // — is out of bounds for a mode reset.
+                    try testing.expect(csi.final == 'h' or csi.final == 'l' or csi.final == 'm');
+                },
+                // No printable text, no C0 control (a stray \n would scroll).
+                else => {
+                    std.debug.print("unexpected action in replay_mode_reset: {any}\n", .{action});
+                    return error.UnexpectedAction;
+                },
+            }
+        }
+    }
+
+    // Belt and braces on the three sequences whose ghostty handlers move the
+    // cursor or erase EVEN WHEN the mode is already in the requested state (see
+    // `replay_mode_reset`'s doc comment for why each is excluded).
+    for ([_][]const u8{ "?1049", "?1047", "?47", "?6l", "\x1b[r", "\x1bc" }) |forbidden| {
+        try testing.expect(std.mem.indexOf(u8, replay_mode_reset, forbidden) == null);
+    }
+}
+
+/// Parse a pure set/reset-mode sequence into the final state of each mode it
+/// touches. Test helper for the two `replay_mode_reset` tests.
+fn parseModeSequence(bytes: []const u8) !std.AutoHashMap(terminal.Mode, bool) {
+    var out = std.AutoHashMap(terminal.Mode, bool).init(testing.allocator);
+    errdefer out.deinit();
+    var p: terminal.Parser = .init();
+    defer p.deinit();
+    for (bytes) |c| {
+        for (p.next(c)) |action_| {
+            const action = action_ orelse continue;
+            const csi = switch (action) {
+                .csi_dispatch => |v| v,
+                else => continue,
+            };
+            if (csi.final != 'h' and csi.final != 'l') continue;
+            const ansi = csi.intermediates.len == 0;
+            for (csi.params) |raw| {
+                const mode = terminal.modes.modeFromInt(raw, ansi) orelse continue;
+                try out.put(mode, csi.final == 'h');
+            }
+        }
+    }
+    return out;
+}

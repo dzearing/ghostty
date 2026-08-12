@@ -49,6 +49,7 @@
 //! | v1 | `session_cpu` | pushed per-session CPU 0x79-0x7b | chooser shows no meter |
 //! | v1 | `sessions_push` | pushed session roster 0x7c-0x7d | client polls `LIST_SESSIONS` |
 //! | v1 | `cpu_units` | `cpu_pct` carries CORRECTED units everywhere | `% CPU` marked unverifiable |
+//! | v1 | `relaunch_notice` | `RELAUNCH.notice` spliced into the replay stream | viewer prints it locally (repaintable) |
 //!
 //! Two rules make that table load-bearing rather than decorative:
 //!
@@ -459,6 +460,18 @@ pub const capability = struct {
     /// combination degrades gracefully to today's behavior — no garble, no wedge.
     pub const grid_snapshot = "grid_snapshot";
 
+    /// `RELAUNCH.notice`: the agent appends the viewer's notice text to the ring
+    /// before replaying, putting it in the stream between the restored scrollback
+    /// and the respawned child's first output.
+    ///
+    /// Purely additive — no new opcode, one new optional field. This string
+    /// exists because the FALLBACK has to differ, not because the field would
+    /// break anything: an older agent silently ignores `notice`, and the client
+    /// must know that so it can print the line itself instead of showing nothing.
+    /// (The local print is the inferior path — the respawned shell's first prompt
+    /// repaint can erase it — which is exactly why the field exists.)
+    pub const relaunch_notice = "relaunch_notice";
+
     /// Every `cpu_pct` this peer reports is in CORRECTED units.
     ///
     /// Unlike every capability above, this one gates no opcode and no field. It
@@ -549,6 +562,13 @@ pub const Negotiated = struct {
     /// ring-only replay and the client just renders whatever DATA arrives.
     grid_snapshot: bool = false,
 
+    /// True iff BOTH peers advertised `capability.relaunch_notice` — i.e. the
+    /// agent will append `Relaunch.notice` to the ring ahead of the replay. False
+    /// against any older peer, in which case the client prints the notice into
+    /// its own terminal instead (visible, but liable to be repainted over by the
+    /// respawned shell's first prompt).
+    relaunch_notice: bool = false,
+
     /// True iff BOTH peers advertised `capability.session_cpu` — i.e. the pushed
     /// per-session CPU stream (0x79-0x7b) is safe to use. False against any older
     /// peer, in which case the client never sends `session_cpu_sub` (an unknown
@@ -599,6 +619,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.close_session),
         .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
             hasCapability(remote.capabilities, capability.grid_snapshot),
+        .relaunch_notice = hasCapability(local.capabilities, capability.relaunch_notice) and
+            hasCapability(remote.capabilities, capability.relaunch_notice),
         .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
             hasCapability(remote.capabilities, capability.session_cpu),
         .sessions_push = hasCapability(local.capabilities, capability.sessions_push) and
@@ -930,6 +952,29 @@ pub const Relaunch = struct {
     env: []const Open.EnvPair = &.{},
     term: ?[]const u8 = null,
     argv: ?[]const []const u8 = null,
+
+    /// Text the agent APPENDS TO THE RING before it replays, so it lands in the
+    /// byte stream between the restored scrollback and the respawned child's
+    /// first output — the same slot the reboot divider occupies. Used by the
+    /// viewer's `session-relaunch=restore` to say "the previous session was lost,
+    /// this is a fresh shell".
+    ///
+    /// It has to travel rather than being printed locally because a client-side
+    /// inject is NOT in the stream: it hits the terminal after the respawned
+    /// shell already owns the screen, and the shell's first prompt repaint erases
+    /// it (measured — the agent-baked divider on the line above survives while
+    /// the client's line is blanked). Anything that must appear ABOVE the prompt
+    /// has to be ordered by the producer.
+    ///
+    /// Gated on `capability.relaunch_notice` so the client knows whether to fall
+    /// back to printing it itself; the field is additive and optional, so an
+    /// older agent that ignores it just leaves the divider unaccompanied. Bounded
+    /// by `max_notice_bytes` on the agent side.
+    notice: ?[]const u8 = null,
+
+    /// Hard cap on `notice` the agent will append. It is UI text (one short
+    /// line), and the ring it lands in is the user's scrollback.
+    pub const max_notice_bytes: usize = 1024;
 };
 
 /// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
