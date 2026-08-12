@@ -608,8 +608,11 @@ the fix is the message.
   asserts: every delivered file matches its staging source (length + mtime;
   SHA-256 under `-DeepVerify`), every delivered `ghoztty.exe`/`ghoztty.com`
   answers `+version` with the commit being shipped, their PE subsystems are
-  GUI/console (a console `ghoztty.exe` is a Debug build), the share's loose
-  `ghoztty-agent.exe` is refreshed, and the portable ZIP is rebuilt from an
+  GUI/console (a console `ghoztty.exe` is a Debug build), every delivered
+  `ghoztty-agent.exe` — including the share's loose copy — answers `--version`
+  with the STAGED agent's build stamp (T281; the agent carries a
+  `YYYYMMDD-<hash>` stamp rather than the app's semver, so what is measured is
+  "these bytes are the staged bytes"), and the portable ZIP is rebuilt from an
   explicit manifest — root entry `Ghoztty\`, no `.pdb`, no `.bak*` — with its
   entry set diffed against the artifact it replaces. An unannounced shape change
   fails the run and the zip is NOT published; pass `-AcceptZipShape` (through
@@ -656,6 +659,22 @@ the fix is the message.
   the swap, so `UPGRADE OK` means the right bits are on disk rather than "a file
   copy returned success". Then it mirrors to the Desktop portable and the
   `\\homeassistant\share` copy, best-effort.
+
+  **The agent is held to that same standard** (T281). `agent exe swapped` used
+  to mean only that `Move-Item` + `Copy-Item` did not throw — and that branch has
+  a `WARNING:` path where neither ran (2026-07-20: the `.bak` was the still-mapped
+  image of the running agent, undeletable AND unrenameable), so a delivery could
+  leave a months-old `ghoztty-agent.exe` on disk and still say `UPGRADE OK`. It
+  now reads the installed agent's `--version` back and compares its build stamp
+  against the STAGED agent's; a mismatch is `AGENT VERIFY FAILED` and the run is
+  a failure with nothing propagated onward. What is deliberately NOT asserted is
+  the RUNNING agent's build — it is expected to be older, which is the whole
+  lazy-upgrade contract — and `-AppOnly` (the morning refresh, which ships no
+  agent at all) logs `AGENT VERIFY SKIP` rather than failing every morning. The
+  mirrored locations are read back too, as a `WARNING` naming the location: they
+  are best-effort by design, but silence was the wrong outcome. Acceptance:
+  section E of `test\win32\upgrade-staleness.ps1`, whose negative control holds
+  the `.bak` open with `FileShare.None` to reproduce the 2026-07-20 skipped swap.
 
   Why all that: skipping the build shipped the PREVIOUS delivery's binary while
   `LAUNCH OK`, `exe swapped` and `UPGRADE OK` all reported success. That happened

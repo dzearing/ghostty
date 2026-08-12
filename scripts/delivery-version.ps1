@@ -60,11 +60,53 @@ function Test-CommitsMatch {
     return ($a.Substring(0, $n) -eq $b.Substring(0, $n))
 }
 
-# One BOUNDED `+version` probe. Returns @{ Text; Why } and never throws.
+# The BUILD STAMP out of a `ghoztty-agent --version` payload. Pure.
+#
+# The agent answers a different question in a different shape: one line,
+# `ghoztty-agent 20260811-3bbf0eefb` - a `YYYYMMDD-<short hash>` stamp, or the
+# literal `dev` when git was unavailable at build time. The authority on that
+# shape is `src/remote/agent_build.zig` (`parseVersionOutput`), and this is its
+# PowerShell reader: the last whitespace-separated token of the first non-empty
+# line, anchored on the `ghoztty-agent` banner so a program that prints anything
+# else cannot vouch for itself the way A6's Build Config decoy could not.
+#
+# Returns '' for output this cannot read. `dev` comes back verbatim - it is a
+# real stamp, just not one with a commit in it.
+function Get-StampFromAgentVersionText {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if (-not $Text) { return '' }
+    foreach ($raw in ($Text -split "`n")) {
+        $line = $raw.Trim()
+        if (-not $line) { continue }
+        if ($line -notmatch '^ghoztty-agent\s+(\S.*)$') { return '' }
+        $rest = $Matches[1].Trim()
+        $tokens = @($rest -split '\s+' | Where-Object { $_ })
+        if (-not $tokens.Count) { return '' }
+        return $tokens[-1]
+    }
+    return ''
+}
+
+# The short commit inside a stamp, or '' when it carries none (`dev`, or any
+# shape we do not recognise). Never guesses: an unreadable half is '' so it
+# cannot be compared into a false match.
+function Get-CommitFromAgentStamp {
+    param([AllowEmptyString()][AllowNull()][string]$Stamp)
+    if (-not $Stamp) { return '' }
+    if ($Stamp -match '^\d{8}-([0-9a-fA-F]{7,40})$') { return $Matches[1].ToLowerInvariant() }
+    return ''
+}
+
+# One BOUNDED version probe. Returns @{ Text; Why } and never throws.
+#
+# `-VersionArg` is what the binary is asked: `+version` for ghoztty.exe, but
+# `--version` for ghoztty-agent.exe, which is a different program with its own
+# CLI and its own answer shape.
 function Invoke-GhozttyVersionText {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
-        [int]$TimeoutSec = 20
+        [int]$TimeoutSec = 20,
+        [string]$VersionArg = '+version'
     )
     if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
         return @{ Text = ''; Why = "exe not found: $Exe" }
@@ -72,13 +114,13 @@ function Invoke-GhozttyVersionText {
     $out = Join-Path $env:TEMP ("ghoztty-vsnprobe-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
     try {
         $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-            -ArgumentList "/c `"`"$Exe`" +version > `"$out`" 2>&1`""
+            -ArgumentList "/c `"`"$Exe`" $VersionArg > `"$out`" 2>&1`""
         # Cache the handle before the child can exit, or .ExitCode reads back
         # empty exactly when we most want to report it.
         $null = $p.Handle
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            return @{ Text = ''; Why = "+version hung past ${TimeoutSec}s" }
+            return @{ Text = ''; Why = "$VersionArg hung past ${TimeoutSec}s" }
         }
         $t = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw } else { '' }
         if ($t) { return @{ Text = $t; Why = '' } }
@@ -103,6 +145,48 @@ function Resolve-GhozttyExeCommit {
     $commit = Get-CommitFromVersionText $r.Text
     $why = if ($commit) { '' } elseif ($r.Why) { $r.Why } else { "no version line in the output of '$Exe +version'" }
     return @{ Commit = $commit; Why = $why }
+}
+
+# The build stamp of an agent binary ON DISK: @{ Stamp; Commit; Why } (tracker
+# T281).
+#
+# The delivery ships THREE binaries and until this existed it read exactly one
+# of them back. The agent is the one with a live failure mode already on the
+# record: the swap renames the running agent's image aside and copies the new
+# one in, and on 2026-07-20 that dance failed (`Remove-Item` silently, then
+# `Move-Item` on an existing name) - so the swap was skipped, a months-old agent
+# stayed on disk, and the run still said `UPGRADE OK`.
+#
+# `Stamp` is the whole `YYYYMMDD-<hash>`, because THAT is what a delivered agent
+# is compared against: the stamp of the agent in staging. Comparing commits
+# instead would demand that the staged agent and the staged app carry the same
+# one, which is a different (and weaker) claim - a staging prefix is built in one
+# go, but zig-out routinely holds two binaries from two builds.
+function Resolve-GhozttyAgentStamp {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [int]$TimeoutSec = 20
+    )
+    $r = Invoke-GhozttyVersionText -Exe $Exe -TimeoutSec $TimeoutSec -VersionArg '--version'
+    $stamp = Get-StampFromAgentVersionText $r.Text
+    $why = if ($stamp) { '' } elseif ($r.Why) { $r.Why } else { "no 'ghoztty-agent <stamp>' line in the output of '$Exe --version'" }
+    return @{ Stamp = $stamp; Commit = (Get-CommitFromAgentStamp $stamp); Why = $why }
+}
+
+# Do two agent stamps name the same build? Exact, case-insensitive, and empty on
+# either side is never a match - an unread stamp is an unverified delivery, which
+# is the standard this whole family exists to enforce.
+#
+# Deliberately NOT prefix-tolerant the way Test-CommitsMatch is: both stamps here
+# are produced by the same `--version` printer, so a length difference is a real
+# difference rather than two abbreviations of one commit.
+function Test-AgentStampsMatch {
+    param(
+        [AllowEmptyString()][AllowNull()][string]$A,
+        [AllowEmptyString()][AllowNull()][string]$B
+    )
+    if (-not $A -or -not $B) { return $false }
+    return ($A.Trim().ToLowerInvariant() -eq $B.Trim().ToLowerInvariant())
 }
 
 # Where zig's GLOBAL cache must live to build $Repo, given whatever the

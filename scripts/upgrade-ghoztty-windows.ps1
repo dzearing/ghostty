@@ -490,6 +490,52 @@ if (-not $installedInfo.Commit) {
     Log "POST-SWAP VERIFY FAILED: $oldExe reports '$($installedInfo.Commit)', wanted '$want'. The copy returned success and did NOT take - this run is NOT a successful delivery."
 }
 
+# ---- T281: the agent binary is held to the same standard --------------------
+#
+# `agent exe swapped` above means Move-Item + Copy-Item did not throw, and that
+# branch has a WARNING path where NEITHER ran: on 2026-07-20 the `.bak` was the
+# still-mapped image of the running agent - undeletable, and the fallback rename
+# hit 'already exists' - so the swap was skipped and a months-old agent stayed on
+# disk while the run still reported UPGRADE OK. Two of the three binaries this
+# delivery ships were trusted to a Copy-Item return, which is the exact standard
+# T208 exists to reject.
+#
+# The claim measured here is "the agent on disk is the one from staging", so it
+# is compared against the STAGED agent's stamp and not against the delivery's
+# commit: the agent's `--version` prints a build stamp, not a semver, and
+# demanding that the staged agent and the staged app carry the same commit is a
+# different (and weaker) claim than the one being made.
+#
+# What is deliberately NOT asserted: the RUNNING agent's build. It is expected to
+# be older - that is the lazy-upgrade contract, and the whole reason the swap
+# never kills it.
+$script:stagedAgentStamp = ''
+if ($AppOnly) {
+    Log 'AGENT VERIFY SKIP: -AppOnly swapped no agent, so the installed one is legitimately older'
+} elseif (-not (Test-Path $newAgent)) {
+    Log 'AGENT VERIFY SKIP: no ghoztty-agent.exe in staging, so this run claimed nothing about it'
+} else {
+    $stagedAgent = Resolve-GhozttyAgentStamp -Exe $newAgent
+    $script:stagedAgentStamp = $stagedAgent.Stamp
+    $installedAgent = Resolve-GhozttyAgentStamp -Exe $oldAgent
+    if (-not $stagedAgent.Stamp) {
+        Log ("AGENT VERIFY UNKNOWN: the STAGED agent would not report a stamp ($($stagedAgent.Why)); " +
+            'there is no number to compare the installed one against')
+    } elseif (Test-AgentStampsMatch $installedAgent.Stamp $stagedAgent.Stamp) {
+        Log "AGENT VERIFY OK: $oldAgent now reports '$($installedAgent.Stamp)'"
+    } else {
+        $got = if ($installedAgent.Stamp) { "'$($installedAgent.Stamp)'" } else { "nothing readable ($($installedAgent.Why))" }
+        # Never clobber an earlier verdict: the exe's failure is the one the
+        # delivery is named for, and both lines are in the log either way.
+        if (-not $script:deliveryFailure) {
+            $script:deliveryFailure = "AGENT VERIFY FAILED: $oldAgent reports $got but staging has '$($stagedAgent.Stamp)'"
+        }
+        Log ("AGENT VERIFY FAILED: $oldAgent reports $got, staging has '$($stagedAgent.Stamp)'. " +
+            'The agent swap did not take - the running agent keeps its sessions, but the binary the NEXT agent start ' +
+            'would pick up is the old one. This run is NOT a successful delivery.')
+    }
+}
+
 # ---- the other install locations --------------------------------------------
 #
 # The standing bar is that a fix lands everywhere the user might launch from;
@@ -548,6 +594,39 @@ if ($script:deliveryFailure) {
                 $copied += "share\(robocopy $LASTEXITCODE)"
             }
             Log "extra install '$dir': $($copied -join ', ')"
+
+            # T281: and read the location back. Until this existed the line above
+            # was the whole record - a list of file NAMES that were ATTEMPTED,
+            # which says nothing about what is on disk. On 2026-08-10 both
+            # portable locations were found holding a Debug ghoztty.exe an hour
+            # after a refresh had logged exactly such a list.
+            #
+            # A mismatch here is a WARNING naming the location, never a failure:
+            # these copies are best-effort by design (a sleeping NAS, a portable
+            # instance holding its own exe open) and the primary install has
+            # already verified. Silence is the only outcome that was wrong.
+            $mirrorExe = Join-Path $dir 'ghoztty.exe'
+            if (($copied -contains 'ghoztty.exe') -and $want) {
+                $got = Resolve-GhozttyExeCommit -Exe $mirrorExe -TimeoutSec 30
+                if (Test-CommitsMatch $got.Commit $want) {
+                    Log "extra install '$dir': VERIFIED ghoztty.exe reports '$($got.Commit)'"
+                } elseif ($got.Commit) {
+                    Log "WARNING: extra install '$dir': ghoztty.exe reports '$($got.Commit)' but the delivery is for '$want'"
+                } else {
+                    Log "WARNING: extra install '$dir': ghoztty.exe could not be asked its version ($($got.Why))"
+                }
+            }
+            $mirrorAgent = Join-Path $dir 'ghoztty-agent.exe'
+            if (($copied -contains 'ghoztty-agent.exe') -and $script:stagedAgentStamp) {
+                $gotAgent = Resolve-GhozttyAgentStamp -Exe $mirrorAgent -TimeoutSec 30
+                if (Test-AgentStampsMatch $gotAgent.Stamp $script:stagedAgentStamp) {
+                    Log "extra install '$dir': VERIFIED ghoztty-agent.exe reports '$($gotAgent.Stamp)'"
+                } elseif ($gotAgent.Stamp) {
+                    Log "WARNING: extra install '$dir': ghoztty-agent.exe reports '$($gotAgent.Stamp)' but staging has '$($script:stagedAgentStamp)'"
+                } else {
+                    Log "WARNING: extra install '$dir': ghoztty-agent.exe could not be asked its version ($($gotAgent.Why))"
+                }
+            }
         } catch {
             Log "extra install '$dir': FAILED ($($_.Exception.Message))"
         }

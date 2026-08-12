@@ -183,6 +183,22 @@ if (-not $expect) {
 }
 Say "   shipping +$expect"
 
+# T281: the agent ships in the same delivery and was the one binary nothing ever
+# read back. It carries no semver - `ghoztty-agent --version` prints a
+# `YYYYMMDD-<hash>` BUILD STAMP - so a delivered agent is measured against the
+# STAGED agent's stamp: "the bytes over there are the bytes here", which is
+# exactly the claim a copy makes and the claim a skipped copy breaks.
+$script:stagedAgentStamp = ''
+if (-not $AppOnly) {
+    $stagedAgentExe = Join-Path $stagingBin 'ghoztty-agent.exe'
+    if (Test-Path -LiteralPath $stagedAgentExe -PathType Leaf) {
+        $sa = Resolve-GhozttyAgentStamp -Exe $stagedAgentExe
+        $script:stagedAgentStamp = $sa.Stamp
+        if ($sa.Stamp) { Say "   agent $($sa.Stamp)" }
+        else { Say "  note: the staged agent would not report a stamp ($($sa.Why)); delivered agents cannot be verified this run" }
+    }
+}
+
 # ---- copy + verify one file --------------------------------------------------
 #
 # Copy-Item preserves the source's length and modification time, so those two
@@ -298,6 +314,19 @@ foreach ($dir in $Targets) {
         else { Bad "$dir\$n reports +$($got.Commit) but this delivery is +$expect"; $failedHere = $true }
     }
 
+    # The same read for the agent (T281). Present-and-wrong is a failure here for
+    # the reason it is for the exe: this location was reached, so a stale binary
+    # in it is a delivery that did not happen, not an unreachable NAS.
+    if ($script:stagedAgentStamp) {
+        $agentThere = Join-Path $dir 'ghoztty-agent.exe'
+        if (Test-Path -LiteralPath $agentThere -PathType Leaf) {
+            $ga = Resolve-GhozttyAgentStamp -Exe $agentThere
+            if (Test-AgentStampsMatch $ga.Stamp $script:stagedAgentStamp) { Ok "ghoztty-agent.exe reports $($ga.Stamp)" }
+            elseif ($ga.Stamp) { Bad "$dir\ghoztty-agent.exe reports $($ga.Stamp) but staging has $($script:stagedAgentStamp)"; $failedHere = $true }
+            else { Bad "$dir\ghoztty-agent.exe could not be asked its version ($($ga.Why))"; $failedHere = $true }
+        }
+    }
+
     if (-not $failedHere) { Say "   verified" }
 }
 
@@ -317,7 +346,17 @@ if ($LooseAgentDir -and -not $AppOnly) {
             if ($err) { Bad "$dst could not be written: $err" }
             else {
                 $why = Test-SameFile -Src $src -Dst $dst -Deep:$DeepVerify
-                if ($why) { Bad "$dst did not land: $why" } else { $script:deliveredCount++; Ok 'ghoztty-agent.exe' }
+                if ($why) { Bad "$dst did not land: $why" }
+                elseif (-not $script:stagedAgentStamp) { $script:deliveredCount++; Ok 'ghoztty-agent.exe (stamp unverifiable, see note above)' }
+                else {
+                    # T281: the semantic half. The share's loose agent is what
+                    # bootstrap.ps1 and ghoztty-agent-watcher.ps1 fetch, so a
+                    # stale one here reaches boxes this delivery never touched.
+                    $ga = Resolve-GhozttyAgentStamp -Exe $dst
+                    if (Test-AgentStampsMatch $ga.Stamp $script:stagedAgentStamp) { $script:deliveredCount++; Ok "ghoztty-agent.exe reports $($ga.Stamp)" }
+                    elseif ($ga.Stamp) { Bad "$dst reports $($ga.Stamp) but staging has $($script:stagedAgentStamp)" }
+                    else { Bad "$dst could not be asked its version ($($ga.Why))" }
+                }
             }
         }
     }

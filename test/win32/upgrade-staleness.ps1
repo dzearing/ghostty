@@ -35,6 +35,11 @@ param(
     # app. The debug build is deliberate - it is normally a different commit
     # from the release staging prefix, which is exactly the situation under test.
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    # Section E's subject (T281). Same deal: never launched as an agent, only
+    # asked `--version`. Its stamp is normally a DIFFERENT build from -Exe, which
+    # is exactly why a delivered agent is measured against the STAGED agent
+    # rather than against the app's commit.
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
     [string]$Repo = 'D:\git\ghoztty',
     [switch]$PureOnly,
     [switch]$Keep
@@ -42,15 +47,18 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
+$script:passes = 0
+$script:skipped = 0
 $root = Join-Path $env:TEMP "ghoztty-staleness-$PID"
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 function AssertEq($name, $expected, $actual) {
-    if ($expected -eq $actual) { "  PASS $name" }
+    if ($expected -eq $actual) { "  PASS $name"; $script:passes++ }
     else { "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
 }
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 . (Join-Path $Repo 'scripts\delivery-version.ps1')
 
@@ -130,10 +138,35 @@ $launcherSrc = Get-Content -LiteralPath (Join-Path $Repo 'scripts\launch-upgrade
 Assert "A19 and the launcher actually applies it before building" `
     ($launcherSrc -match '\$env:ZIG_GLOBAL_CACHE_DIR\s*=\s*\$zigCache')
 
+# --- A20 the AGENT's own version shape (T281) ---------------------------------
+# A different program with a different CLI and a different answer: one line,
+# `ghoztty-agent <YYYYMMDD>-<short hash>`. Captured on the box 2026-08-12.
+AssertEq "A20 the stamp comes out of a real agent payload" '20260811-3bbf0eefb' `
+    (Get-StampFromAgentVersionText "ghoztty-agent 20260811-3bbf0eefb`n")
+AssertEq "A21 a CRLF payload reads the same" '20260811-3bbf0eefb' `
+    (Get-StampFromAgentVersionText "ghoztty-agent 20260811-3bbf0eefb`r`n")
+AssertEq "A22 a git-less build's stamp survives verbatim" 'dev' `
+    (Get-StampFromAgentVersionText 'ghoztty-agent dev')
+AssertEq "A23 empty output yields no stamp" '' (Get-StampFromAgentVersionText '')
+# Anchored on the banner for A6's reason: a program that prints something else
+# must not be able to vouch for itself. The B-section stub prints exactly this.
+AssertEq "A24 output from some other program yields no stamp" '' `
+    (Get-StampFromAgentVersionText 'nothing useful here')
+AssertEq "A25 the commit is the half after the date" '3bbf0eefb' (Get-CommitFromAgentStamp '20260811-3bbf0eefb')
+AssertEq "A26 a dev stamp carries no commit, and never guesses one" '' (Get-CommitFromAgentStamp 'dev')
+Assert "A27 identical stamps match" (Test-AgentStampsMatch '20260811-3bbf0eefb' '20260811-3BBF0EEFB')
+Assert "A28 THE 2026-07-20 ORACLE: a months-old agent left by a skipped swap is a MISMATCH" `
+    (-not (Test-AgentStampsMatch '20260720-9968a62d9' '20260811-3bbf0eefb'))
+Assert "A29 an unread stamp is NOT a match (unverified must never read as OK)" `
+    (-not (Test-AgentStampsMatch '' '20260811-3bbf0eefb'))
+# Two `dev` stamps are equal strings and that is all this can say. It is the
+# staged-vs-installed comparison, so equality really is the claim being made.
+Assert "A30 stamps are exact, not prefix-matched the way abbreviated commits are" `
+    (-not (Test-AgentStampsMatch '20260811-3bbf0ee' '20260811-3bbf0eefb'))
+
 if ($PureOnly) {
     ""
-    if ($script:failures -eq 0) { "ALL PASS (pure only)" } else { "$($script:failures) FAILURE(S)" }
-    exit ($script:failures -gt 0)
+    Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped -Label 'pure only'
 }
 
 # ============================================================================
@@ -161,6 +194,23 @@ Set-Content -LiteralPath $mute -Encoding ascii -Value @('@echo off', 'echo nothi
 $muteInfo = Resolve-GhozttyExeCommit -Exe $mute
 AssertEq "B5 output with no version line yields no commit" '' $muteInfo.Commit
 Assert "B6 and says which failure it was" ($muteInfo.Why -match 'no version line')
+
+# --- B7 the same probe against a real AGENT binary (T281) ---------------------
+$haveAgent = Test-Path -LiteralPath $AgentExe -PathType Leaf
+if (-not $haveAgent) {
+    "  SKIP B7-B10 and E: no agent binary at $AgentExe (build one with 'zig build agent')"
+    $script:skipped++
+} else {
+    $agentInfo = Resolve-GhozttyAgentStamp -Exe $AgentExe
+    Assert "B7 the real agent reports a stamp ('$($agentInfo.Stamp)')" ($agentInfo.Stamp -match '^(dev|\d{8}-[0-9a-f]{7,40})$')
+    AssertEq "B8 and no reason-it-failed alongside it" '' $agentInfo.Why
+    $missingAgent = Resolve-GhozttyAgentStamp -Exe (Join-Path $root 'no-such-agent.exe')
+    AssertEq "B9 a missing agent yields no stamp" '' $missingAgent.Stamp
+    # The same stub, asked the agent's question: a binary that runs and answers
+    # something else must read as unverified rather than as a match.
+    $muteAgent = Resolve-GhozttyAgentStamp -Exe $mute
+    AssertEq "B10 output from a program that is not the agent yields no stamp" '' $muteAgent.Stamp
+}
 
 # ============================================================================
 "== C: launch-upgrade.ps1 refuses a stale staging prefix"
@@ -299,6 +349,10 @@ AssertEq "D11 the installed exe really is the staged one" `
     (Get-FileHash -LiteralPath (Join-Path $dStaging 'bin\ghoztty.exe')).Hash `
     (Get-FileHash -LiteralPath $installedExe).Hash
 Assert "D12 the other install locations were left alone" ($dLogText -match 'skipped by request')
+# T281: this staging prefix has no agent in it, so the run must claim nothing
+# about one - a SKIP, distinct from both a pass and a silence.
+Assert "D12b a delivery with no staged agent says so instead of vouching for one" `
+    ($dLogText -match 'AGENT VERIFY SKIP: no ghoztty-agent\.exe in staging')
 
 # --- D13 the post-swap gate itself, exercised live ---------------------------
 # -AllowStaleStaging lets the swap proceed while the delivery is declared to be
@@ -319,17 +373,104 @@ Assert "D17 nor propagate unverified bits to the other locations" `
     ($dLogText -match 'NOT PROPAGATED')
 
 # ============================================================================
-"== E: the documented procedure is the whole procedure"
+"== E: the AGENT binary is read back too (T281)"
+# ============================================================================
+# T208 gave the delivery a number both ends can compare and then checked exactly
+# ONE of the three binaries it ships. The agent is the one with a failure mode
+# already on the record: on 2026-07-20 16:10 the rename-aside dance failed
+# (`Remove-Item` silently, then `Move-Item` onto an existing name), the swap was
+# SKIPPED, a months-old agent stayed on disk - and the run reported UPGRADE OK.
+#
+# The negative control below reproduces that exactly, by holding the `.bak` open
+# with FileShare.None so it can be neither deleted nor renamed.
+if (-not $haveAgent) {
+    # Deliberately not a second SKIP site: one missing binary is one skip, and
+    # the B line above already names this section. Counting it twice would make
+    # the verdict overstate what was dropped, which is the same defect T219 is
+    # about from the other side.
+    "  (E: dropped with B7-B10 above - no agent binary)"
+} else {
+    $eRoot = Join-Path $root 'agent'
+    $eStaging = Join-Path $eRoot 'staging'
+    $eInstall = Join-Path $eRoot 'install'
+    New-Item -ItemType Directory -Force (Join-Path $eStaging 'bin') | Out-Null
+    New-Item -ItemType Directory -Force $eInstall | Out-Null
+    Copy-Item -LiteralPath $Exe (Join-Path $eStaging 'bin\ghoztty.exe') -Force
+    Copy-Item -LiteralPath $AgentExe (Join-Path $eStaging 'bin\ghoztty-agent.exe') -Force
+    $eLog = Join-Path $eRoot 'ghoztty-upgrade.log'
+    $eInstalledExe = Join-Path $eInstall 'ghoztty.exe'
+    $eInstalledAgent = Join-Path $eInstall 'ghoztty-agent.exe'
+    $stagedStamp = (Resolve-GhozttyAgentStamp -Exe (Join-Path $eStaging 'bin\ghoztty-agent.exe')).Stamp
+    Assert "E1 the staged agent reports a stamp ('$stagedStamp')" `
+        ($stagedStamp -match '^(dev|\d{8}-[0-9a-f]{7,40})$')
+
+    # --- E2 the healthy delivery: the swap happens and is PROVEN -------------
+    Set-Content -LiteralPath $eInstalledExe -Encoding ascii -Value $sentinel
+    Set-Content -LiteralPath $eInstalledAgent -Encoding ascii -Value $sentinel
+    $eOk = Invoke-InSandboxTemp -TempDir $eRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+        '-Staging', $eStaging, '-InstallDir', $eInstall, '-WorkingDirectory', $Repo,
+        '-ExpectedCommit', $exeCommit, '-NoResume', '-NoExtraInstalls', '-DelaySeconds', '0')
+    $eLogText = Get-Content -LiteralPath $eLog -Raw -ErrorAction SilentlyContinue
+    AssertEq "E2 a delivery that carries an agent succeeds" 0 $eOk.Code
+    Assert "E3 the agent swap happened" ($eLogText -match 'agent exe swapped')
+    Assert "E4 AGENT VERIFY read the installed agent back" ($eLogText -match 'AGENT VERIFY OK')
+    Assert "E5 and named the stamp now on disk" ($eLogText -match [regex]::Escape($stagedStamp))
+    AssertEq "E6 the installed agent really is the staged one" `
+        (Get-FileHash -LiteralPath (Join-Path $eStaging 'bin\ghoztty-agent.exe')).Hash `
+        (Get-FileHash -LiteralPath $eInstalledAgent).Hash
+    Assert "E7 the verdict is OK" ($eLogText -match 'UPGRADE OK')
+
+    # --- E8 NEGATIVE CONTROL: the swap is skipped, exactly as on 2026-07-20 --
+    Remove-Item -LiteralPath $eLog -Force -ErrorAction SilentlyContinue
+    $eBak = "$eInstalledAgent.bak"
+    if (-not (Test-Path -LiteralPath $eBak)) { Set-Content -LiteralPath $eBak -Encoding ascii -Value $sentinel }
+    # A stale agent on disk, the way a box that has taken earlier deliveries has.
+    Set-Content -LiteralPath $eInstalledAgent -Encoding ascii -Value $sentinel
+    $lock = [IO.File]::Open($eBak, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $eSkip = Invoke-InSandboxTemp -TempDir $eRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+            '-Staging', $eStaging, '-InstallDir', $eInstall, '-WorkingDirectory', $Repo,
+            '-ExpectedCommit', $exeCommit, '-NoResume', '-NoExtraInstalls', '-DelaySeconds', '0')
+    } finally { $lock.Close(); $lock.Dispose() }
+    $eLogText = Get-Content -LiteralPath $eLog -Raw -ErrorAction SilentlyContinue
+    Assert "E8 the swap really could not happen" ($eLogText -match 'agent exe swap failed')
+    AssertEq "E9 THE POINT: the stale agent is still the one on disk" $sentinel `
+        ((Get-Content -LiteralPath $eInstalledAgent -Raw).Trim())
+    Assert "E10 the read-back caught it" ($eLogText -match 'AGENT VERIFY FAILED')
+    AssertEq "E11 so the run is a FAILURE, not an UPGRADE OK over a skipped swap" 1 $eSkip.Code
+    Assert "E12 and it does not claim success" (-not ($eLogText -match 'UPGRADE OK'))
+    Assert "E13 nor propagate unverified bits onward" ($eLogText -match 'NOT PROPAGATED')
+    # The app half still landed - that is what makes this a distinct verdict
+    # rather than a general "the delivery broke".
+    Assert "E14 while the exe half is still reported as fine" ($eLogText -match 'POST-SWAP VERIFY OK')
+
+    # --- E15 -AppOnly: an older agent on disk is the CONTRACT, not a defect --
+    # T525's morning refresh deliberately swaps no agent. If this verified
+    # anything, the unattended daily refresh would fail every single morning.
+    Remove-Item -LiteralPath $eLog -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $eInstalledAgent -Encoding ascii -Value $sentinel
+    $eApp = Invoke-InSandboxTemp -TempDir $eRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+        '-Staging', $eStaging, '-InstallDir', $eInstall, '-WorkingDirectory', $Repo,
+        '-ExpectedCommit', $exeCommit, '-NoResume', '-NoExtraInstalls', '-DelaySeconds', '0',
+        '-AppOnly', '-DeferMarkerPath', (Join-Path $eRoot 'defer'))
+    $eLogText = Get-Content -LiteralPath $eLog -Raw -ErrorAction SilentlyContinue
+    Assert "E15 -AppOnly says it swapped no agent" ($eLogText -match 'AGENT VERIFY SKIP: -AppOnly')
+    AssertEq "E16 and the run still succeeds over a legitimately older agent" 0 $eApp.Code
+    AssertEq "E17 which is still sitting there untouched" $sentinel `
+        ((Get-Content -LiteralPath $eInstalledAgent -Raw).Trim())
+}
+
+# ============================================================================
+"== F: the documented procedure is the whole procedure"
 # ============================================================================
 # The omission in go.md is what made this defect reachable by a turn that
 # followed instructions exactly, so the doc is part of the fix.
 $goMd = Get-Content -LiteralPath (Join-Path $Repo 'go.md') -Raw
-Assert "E1 go.md says the launcher builds the staging release" ($goMd -match 'BUILDS the staging release')
-Assert "E2 go.md names the failure the gate produces" ($goMd -match 'STALE STAGING')
-Assert "E3 go.md still carries the build incantation itself" ($goMd -match '--prefix zig-out-release')
-Assert "E4 go.md points at this acceptance script" ($goMd -match 'upgrade-staleness\.ps1')
+Assert "F1 go.md says the launcher builds the staging release" ($goMd -match 'BUILDS the staging release')
+Assert "F2 go.md names the failure the gate produces" ($goMd -match 'STALE STAGING')
+Assert "F3 go.md still carries the build incantation itself" ($goMd -match '--prefix zig-out-release')
+Assert "F4 go.md points at this acceptance script" ($goMd -match 'upgrade-staleness\.ps1')
 
 ""
 if (-not $Keep) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ($script:failures -gt 0)
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped
