@@ -231,10 +231,29 @@ Concretely, in order, with no stops in between:
    glance. When you claim an untagged task, add tags to its frontmatter as
    part of making it readable.
 
-   `next` picks by **`order:`** (the queue, lowest first), then `priority:`,
-   then id — so the head of the queue is one task, not a band of forty.
-   Anything in **Current priorities** below still outranks it; that list is
-   pinned by hand and `order:` is kept in step with it.
+   `next` picks by **`priority:`** (P0 → P1 → P2 → untriaged), then `order:`
+   within that band, then id (D55; user, 2026-08-12). Priority is what the work
+   is WORTH and it decides; `order:` only sequences tasks that are worth the
+   same. Anything in **Current priorities** below still outranks both.
+
+   It used to be the other way round, and the inversion was invisible: an
+   unplaced task ranks last, so a P0 with no `order:` sorted behind every
+   positioned P2 on the board. On 2026-08-11 that left three P0s the user had
+   reported by hand sitting `todo` for a full day while twenty-four P2
+   test-harness tasks closed in front of them.
+
+   The consequence to rely on: **a task filed with a priority is queued
+   correctly the moment it is filed** — no renumbering, no hand-placement. Give
+   `order:` only when the sequence *within* a band matters (this P0 before that
+   one), and use `set-order` to inject between two neighbours.
+
+   **Re-triage is how you change what comes next.** `set-priority <id>
+   -Priority P0 -Summary "<why>"` moves a task to the head of the queue on its
+   own, and journals the transition (old → new, plus the reason) into the
+   task's `## Progress log` — since D55 a re-prioritisation *is* a queue edit,
+   so it is no longer a silent one. `-NoNote` is for a bulk normalisation pass
+   and nothing else. Acceptance: sections K and K2 of
+   `test\win32\parity-tasks-seat.ps1`.
 
    `next` answers for **this box's seat** (T344): tasks marked `seat: mac` — a
    Swift fix, a macOS regression run — are the Mac seat's and are listed as

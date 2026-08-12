@@ -370,10 +370,14 @@ switch ($Command) {
         if ($Status) { $tasks = $tasks | Where-Object { $_.Status -like "$Status*" } }
         if ($Priority) { $tasks = $tasks | Where-Object { $_.Priority -eq $Priority } }
         $tasks = @($tasks | Where-Object { Test-SeatMatch $_.Seat $wantSeat })
-        # Queue order, so `list` reads the same way `next` picks.
+        # Queue order, so `list` reads the same way `next` picks. Priority
+        # first, then order - see the long note in `next`. These two sorts must
+        # stay identical: a list that disagrees with the selector is how a
+        # human "verifies" the queue and is shown something the loop will not
+        # actually do.
         $tasks = @($tasks | Sort-Object `
-            @{ Expression = { Get-OrderRank $_.Order } }, `
             @{ Expression = { Get-PriorityRank $_.Priority } }, `
+            @{ Expression = { Get-OrderRank $_.Order } }, `
             @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
             @{ Expression = { $_.Id } })
         # Rendered at a FIXED width, not the host's. Format-Table truncates to
@@ -420,21 +424,33 @@ switch ($Command) {
             }
         }
 
-        # ORDER FIRST, then priority, then id.
+        # PRIORITY FIRST, then order, then id (D55; user, 2026-08-12: "fix the
+        # queuing and task recording to use priority for figuring out what to
+        # prioritize!! This is critical").
         #
-        # `order:` is the answer to "what next" - one number, so there is one
-        # head of the queue rather than forty things sharing a band. Priority
-        # stays as the band a human reads and filters on, and as the fallback
-        # for anything not yet placed; id remains the last tiebreaker so the
-        # ordering is total and deterministic no matter how little is filled in.
+        # `priority:` is what the work is WORTH; `order:` is only the sequence
+        # within a band. Sorting by order first inverted that, and it did it
+        # invisibly, because an unplaced task ranks MaxValue: a P0 with no
+        # `order:` sorted behind every positioned P2 on the board. On
+        # 2026-08-11 that left three P0s the user had reported by hand sitting
+        # `todo` for a full day while twenty-four P2 test-harness tasks closed
+        # in front of them, and it took hand-sorting the queue on three
+        # consecutive mornings to work around it.
         #
-        # Before any of this the selector walked the files in id order, so the
-        # loop worked whatever had been logged earliest and a crash filed
-        # yesterday queued behind two hundred older nice-to-haves (user,
-        # 2026-08-04).
+        # The consequence that makes this the right way round: a task filed
+        # with nothing but a priority is placed correctly the moment it is
+        # filed. Under the old rule it needed a hand-assigned position to be
+        # reachable at all, so the queue only worked as well as the last person
+        # who remembered to renumber it - and 70 open P1s carried no position.
+        #
+        # `order:` keeps its job inside the band: it is how triage sequences
+        # the P0s against each other, and `set-order` still injects between two
+        # of them without renumbering. What it can no longer do is outrank
+        # importance. Id remains the last tiebreaker, so the ordering is total
+        # and deterministic no matter how little is filled in.
         $ordered = $tasks | Sort-Object `
-        @{ Expression = { Get-OrderRank $_.Order } }, `
         @{ Expression = { Get-PriorityRank $_.Priority } }, `
+        @{ Expression = { Get-OrderRank $_.Order } }, `
         @{ Expression = { [int]([regex]::Match($_.Id, '\d+').Value) } }, `
         @{ Expression = { $_.Id } }
 
@@ -585,6 +601,11 @@ switch ($Command) {
         if (-not $Priority) { throw 'set-priority requires -Priority (P0|P1|P2).' }
         $path = Get-TaskPath $tid
         $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        # Read the OLD priority before overwriting it, so the journal below can
+        # name what changed rather than only what it became.
+        $oldPriority = 'untriaged'
+        $om = [regex]::Match($text, '(?m)^priority:\s*"?(P\d)"?\s*$')
+        if ($om.Success) { $oldPriority = $om.Groups[1].Value }
         $json = ConvertTo-Json $Priority -Compress
         if ($text -match '(?m)^priority:\s*.*$') {
             $new = [regex]::Replace($text, '(?m)^priority:\s*.*$', "priority: $json", 1)
@@ -604,7 +625,17 @@ switch ($Command) {
             }
         }
         [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
-        Write-Host ("{0} -> {1}" -f $tid, $Priority)
+        # Journalled for the same reason `set-status` is (T564): since D55 the
+        # priority IS the queue position, so re-prioritising a task moves what
+        # the loop does next - and a re-triage that changed the head of the
+        # queue used to leave no trace of what it displaced or why. Skipped when
+        # nothing moved, so a bulk normalisation pass does not write 200 entries
+        # saying P1 -> P1.
+        if ($oldPriority -ne $Priority -and -not $NoNote) {
+            $why = if ($SourceNote) { " ($SourceNote)" } elseif ($Summary) { " ($Summary)" } else { '' }
+            Add-ProgressNote -Path $path -NoteText "priority: $oldPriority -> $Priority$why" -SessionId $Session
+        }
+        Write-Host ("{0} -> {1} (was {2})" -f $tid, $Priority, $oldPriority)
     }
 
     'new' {

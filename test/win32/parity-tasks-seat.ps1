@@ -20,10 +20,16 @@
 #      returns a Mac-seat task.
 #   J. `next` orders by PRIORITY before id, and an untriaged task loses to a
 #      deliberate P2. `set-priority` writes the field and the reason.
-#   K. `order:` outranks priority - one number, so there is one head of the
-#      queue. A decimal injects between two neighbours without renumbering, an
-#      unordered task joins the tail, and an unparseable order reads as absent
-#      rather than as 0 (which would silently seize the head).
+#   K. PRIORITY outranks `order:` (D55, user 2026-08-12). An unplaced P0 beats
+#      every positioned lower-priority task - the 2026-08-11 incident, where
+#      three hand-reported P0s carrying no `order:` ranked MaxValue and sat
+#      behind ~200 positioned P2s for a day. `order:` still sequences INSIDE a
+#      band: a decimal injects between two same-priority neighbours without
+#      renumbering, and an unparseable order reads as absent rather than as 0.
+#   K2. Triage can re-prioritise and that alone moves the queue head, with no
+#      renumbering. `set-priority` journals the transition (naming the old
+#      priority and the reason), writes `triage-reason:`, stays silent on a
+#      no-op, and honours `-NoNote` for a bulk pass.
 #   L. `next -Claim` marks the picked task in-progress in the same breath;
 #      plain `next` stays a read-only question.
 #   M. Stale in-progress resume (2026-08-05): one agent runs the queue, so a
@@ -293,47 +299,109 @@ Assert 'new -Priority writes the field' ($n.Text -match '(?m)^priority: "P0"$')
 $n = New-AndRead @()
 Assert 'new without -Priority defaults to P1' ($n.Text -match '(?m)^priority: "P1"$')
 
-# --- K. order outranks priority ---------------------------------------------
+# --- K. PRIORITY outranks order (D55) ----------------------------------------
 ""
-"K. next orders by order before priority"
+"K. next orders by priority before order"
 Reset-Fixture
-# Inverted again: the BEST priority gets the WORST order, so an ordering that
-# still fell back to priority cannot pass this section by accident.
+# Inverted on purpose: the BEST priority gets the WORST order, and an UNPLACED
+# P0 sits against a well-placed P2. That second pair is the whole incident this
+# rule exists for - on 2026-08-11 three P0s the user reported by hand carried no
+# `order:`, so they ranked MaxValue and sat behind ~200 positioned P2s for a
+# full day. A sort that still consulted order first cannot pass this section by
+# accident.
 New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P0"' -OrderLine 'order: 50'
 New-FixtureTask -Id 'T2' -PriorityLine 'priority: "P2"' -OrderLine 'order: 2'
 New-FixtureTask -Id 'T3' -PriorityLine 'priority: "P1"' -OrderLine 'order: 1'
 New-FixtureTask -Id 'T4' -PriorityLine 'priority: "P0"'          # unordered
 
 $r = Task-Run @('next')
-Assert 'next takes order 1 over a P0 at order 50' ($r.Out -match 'NEXT: T3\b')
-Assert 'next reports the order it picked on' ($r.Out -match 'order=1\b')
-Assert 'an unordered P0 does not jump the queue' ($r.Out -notmatch 'NEXT: T4\b')
+Assert 'next takes a P0 at order 50 over a P1 at order 1' ($r.Out -match 'NEXT: T1\b')
+Assert 'next reports the priority it picked on' ($r.Out -match 'priority=P0\b')
+Assert 'the P1 at order 1 no longer heads the queue' ($r.Out -notmatch 'NEXT: T3\b')
 
 $r = Task-Run @('list')
-Assert 'list is printed in queue order' (
-    $r.Out -match '(?s)T3.*T2.*T1.*T4')
+Assert 'list is printed in queue order: both P0s, then P1, then P2' (
+    $r.Out -match '(?s)T1.*T4.*T3.*T2')
 
-# A decimal must be injectable BETWEEN two neighbours without renumbering -
-# the whole reason order is fractional.
-$r = Task-Run @('set-order', 'T4', '-Order', '1.5')
+# The regression that started this: an unplaced P0 must still outrank every
+# positioned lower-priority task. Removing the only ordered P0 leaves T4, which
+# has no `order:` at all.
+$r = Task-Run @('set-status', 'T1', '-Status', 'done')
+$r = Task-Run @('next')
+Assert 'an UNORDERED P0 beats a positioned P1 and P2' ($r.Out -match 'NEXT: T4\b')
+Assert 'and it reports as unordered rather than inventing a position' ($r.Out -match 'order=unordered')
+
+# `order:` keeps its job INSIDE the band: a decimal injects between two
+# same-priority neighbours without renumbering, which is the whole reason it is
+# fractional. It just cannot cross a priority boundary any more.
+New-FixtureTask -Id 'T6' -PriorityLine 'priority: "P2"' -OrderLine 'order: 3'
+$r = Task-Run @('set-order', 'T6', '-Order', '1.5')
 Assert 'set-order accepts a decimal' ($r.Code -eq 0)
-$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T4.md'))
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T6.md'))
 Assert 'set-order writes it invariantly (a dot, never a comma)' ($txt -match '(?m)^order: 1\.5$')
 $r = Task-Run @('list')
-Assert 'the injected task lands between its neighbours' ($r.Out -match '(?s)T3.*T4.*T2.*T1')
-$r = Task-Run @('next')
-Assert 'and next still heads the queue with order 1' ($r.Out -match 'NEXT: T3\b')
+Assert 'the injected P2 lands ahead of its same-band neighbour' ($r.Out -match '(?s)T6.*T2')
+Assert 'but still behind every higher-priority task' ($r.Out -match '(?s)T4.*T3.*T6')
 
-# A garbled order must not read as 0 and silently seize the head of the queue.
+# A garbled order must not read as 0 and seize the head of its band.
 New-FixtureTask -Id 'T5' -PriorityLine 'priority: "P2"' -OrderLine 'order: banana'
 $r = Task-Run @('next')
-Assert 'an unparseable order is treated as absent, not as 0' ($r.Out -match 'NEXT: T3\b')
+Assert 'an unparseable order is treated as absent, not as 0' ($r.Out -match 'NEXT: T4\b')
 $r = Task-Run @('validate')
 Assert 'a fixture with orders validates' ($r.Code -eq 0)
+
+# --- K2. triage can re-prioritise, and it moves the queue ---------------------
+""
+"K2. set-priority reassesses the queue and journals the change"
+Reset-Fixture
+New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P2"' -OrderLine 'order: 1'
+New-FixtureTask -Id 'T2' -PriorityLine 'priority: "P2"' -OrderLine 'order: 2'
+
+$r = Task-Run @('next')
+Assert 'the well-placed P2 heads the queue to begin with' ($r.Out -match 'NEXT: T1\b')
+
+# The flexibility the user asked for: triage decides T2 matters more, and that
+# alone must change what comes next - with no renumbering of anything.
+$r = Task-Run @('set-priority', 'T2', '-Priority', 'P0', '-Summary', 'user reported it by hand')
+Assert 'set-priority succeeds' ($r.Code -eq 0)
+Assert 'and names what it changed FROM' ($r.Out -match 'was P2')
+$r = Task-Run @('next')
+Assert 're-prioritising alone moves the head of the queue' ($r.Out -match 'NEXT: T2\b')
+Assert 'even though its order is still worse' ($r.Out -match 'order=2\b')
+
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
+Assert 'the change is journalled in the progress log' ($txt -match 'priority: P2 -> P0')
+Assert 'with the reason it was given' ($txt -match 'user reported it by hand')
+Assert 'and the triage reason is written to frontmatter' ($txt -match '(?m)^triage-reason:')
+
+# A no-op re-triage must not write an entry saying P0 -> P0; a bulk
+# normalisation pass would otherwise journal every task on the board.
+$before = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
+$r = Task-Run @('set-priority', 'T2', '-Priority', 'P0')
+$after = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
+Assert 'a no-op re-priority writes no journal entry' ($before -eq $after)
+
+# And the bulk escape hatch, same as set-status has.
+$r = Task-Run @('set-priority', 'T2', '-Priority', 'P1', '-NoNote')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
+Assert '-NoNote suppresses the journal entry' ($txt -notmatch 'priority: P0 -> P1')
+Assert 'but the field itself still changed' ($txt -match '(?m)^priority: "P1"$')
 
 # --- L. next -Claim marks the task -------------------------------------------
 ""
 "L. next -Claim marks the task in-progress"
+# Its own fixture, deliberately. L and M used to inherit whatever K happened to
+# leave behind, so re-stating K's rule broke both of them nine assertions deep -
+# in a file whose whole subject is that the queue must not depend on invisible
+# state. T3 heads this queue because it is the only P0.
+Reset-Fixture
+New-FixtureTask -Id 'T3' -PriorityLine 'priority: "P0"' -OrderLine 'order: 1'
+New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P1"' -OrderLine 'order: 50'
+New-FixtureTask -Id 'T2' -PriorityLine 'priority: "P1"' -OrderLine 'order: 2'
+New-FixtureTask -Id 'T4' -PriorityLine 'priority: "P1"'          # unordered
+New-FixtureTask -Id 'T5' -PriorityLine 'priority: "P2"' -OrderLine 'order: 3'
+$r = Task-Run @('next')
+Assert 'the only P0 heads this fixture' ($r.Out -match 'NEXT: T3\b')
 $r = Task-Run @('next')
 Assert 'next alone does NOT change status' (
     [System.IO.File]::ReadAllText((Join-Path $fixture 'T3.md')) -match '(?m)^status: "todo"$')
