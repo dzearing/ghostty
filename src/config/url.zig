@@ -101,6 +101,77 @@ const rooted_or_relative_path_branch =
     trailing_spaces_at_eol ++
     ")";
 
+// -----------------------------------------------------------------------
+// Windows paths (T757)
+//
+// The three branches around this one are POSIX-only: every one of them is
+// built from `path_chars`, which has no backslash, and none of them knows a
+// drive letter — so `D:\Users\me\clip.mp4` printed into a pane could not
+// match anything and stayed dead text on the surface a Windows user spends
+// all day looking at. T539 fixed the same complaint for pane banners; its
+// sigil set is the model here.
+//
+// The branch is live on EVERY platform rather than comptime-gated on
+// Windows. It costs macOS nothing (a `D:\…` string means nothing there), and
+// a shared core that quietly matches different text per platform is the kind
+// of divergence that rots — a Mac window attached to a Windows agent shows
+// Windows paths in its panes, and that pane should linkify them too.
+// -----------------------------------------------------------------------
+
+// `path_chars` plus the backslash. A Windows filename cannot contain one, so
+// inside a path a backslash is always a separator.
+const win_path_chars =
+    \\[\w\-.~:\/\\?#@!$&*+;=%]
+;
+
+// `D:\…` / `D:/…`, or a `\\server\share\…` UNC path. ONE letter and a colon
+// is never a URI scheme (no registered scheme is a single character), which
+// is the same call `banner_link.kindOf` makes on the banner side; the
+// lookbehind is what keeps the `s:/` inside `https://` from reading as a
+// drive. The UNC prefix is the two slashes, with a following word character
+// telling a real share apart from a `\\` that prose escaped.
+const windows_path_prefix =
+    \\(?:(?<![\w:\\\/])[A-Za-z]:[\\\/]|(?<![\w\\\/])\\\\(?=[\w~$.-]))
+;
+
+const win_dotted_path_lookahead =
+    \\(?=[\w\-.~:\/\\?#@!$&*+;=%]*\.)
+;
+
+const win_non_dotted_path_lookahead =
+    \\(?![\w\-.~:\/\\?#@!$&*+;=%]*\.)
+;
+
+// A space only continues the path when what follows is not the start of
+// ANOTHER path — otherwise `D:\a\b C:\c\d` would match as one.
+const win_dotted_path_space_segments =
+    \\(?:(?<!:) (?!\w+:\/\/)(?![A-Za-z]:[\\\/])(?!\\\\)(?!\.{0,2}[\\\/])(?!~[\\\/])[\w\-.~:\/\\?#@!$&*+;=%]*[\/\\.])*
+;
+
+const win_any_path_space_segments =
+    \\(?:(?<!:) (?!\w+:\/\/)(?![A-Za-z]:[\\\/])(?!\\\\)(?!\.{0,2}[\\\/])(?!~[\\\/])[\w\-.~:\/\\?#@!$&*+;=%]+)*
+;
+
+// Branch 4: Windows drive and UNC paths. Same dotted/undotted split as
+// branch 2 — a first segment carrying a dot is file-like and its space
+// continuation has to end on a separator or a dot, while an undotted one
+// stays broad so `C:\Program Files\app.exe` still matches whole.
+const windows_path_branch =
+    windows_path_prefix ++
+    "(?:" ++
+    win_dotted_path_lookahead ++
+    win_path_chars ++ "+" ++
+    win_dotted_path_space_segments ++
+    no_trailing_colon ++
+    trailing_spaces_at_eol ++
+    "|" ++
+    win_non_dotted_path_lookahead ++
+    win_path_chars ++ "+" ++
+    win_any_path_space_segments ++
+    no_trailing_colon ++
+    trailing_spaces_at_eol ++
+    ")";
+
 // Branch 3: Bare relative paths such as src/config/url.zig.
 const bare_relative_path_prefix =
     \\(?<!\$\d*)(?<!\w)[\w][\w\-.]*\/
@@ -118,7 +189,9 @@ pub const regex =
     "|" ++
     rooted_or_relative_path_branch ++
     "|" ++
-    bare_relative_path_branch;
+    bare_relative_path_branch ++
+    "|" ++
+    windows_path_branch;
 
 test "url regex" {
     const testing = std.testing;
@@ -480,6 +553,76 @@ test "url regex" {
             .input = "./Downloads: Operation not permitted",
             .expect = "./Downloads",
         },
+        // Windows paths (T757). The drive/UNC branch is live on every
+        // platform, so these run on the Mac seat too.
+        .{
+            .input = "D:\\Users\\David\\clip.mp4",
+            .expect = "D:\\Users\\David\\clip.mp4",
+        },
+        .{
+            .input = "wrote D:\\Users\\David\\clip.mp4 ok",
+            .expect = "D:\\Users\\David\\clip.mp4",
+        },
+        // Lowercase drive letters are drives too.
+        .{
+            .input = "d:\\lower\\case.txt",
+            .expect = "d:\\lower\\case.txt",
+        },
+        // A drive path spelled with forward slashes. Before T757 this
+        // matched only its `/tools/run.bat` tail, via the rooted branch.
+        .{
+            .input = "C:/tools/run.bat",
+            .expect = "C:/tools/run.bat",
+        },
+        .{
+            .input = "\\\\server\\share\\a.txt",
+            .expect = "\\\\server\\share\\a.txt",
+        },
+        // Spaces: `Program Files` is the reason the undotted case stays
+        // broad, exactly as `/tmp/test folder/file.txt` does above.
+        .{
+            .input = "C:\\Program Files\\app.exe",
+            .expect = "C:\\Program Files\\app.exe",
+        },
+        .{
+            .input = "\\\\server\\share\\My Docs\\a.txt",
+            .expect = "\\\\server\\share\\My Docs\\a.txt",
+        },
+        // A directory with no dot anywhere.
+        .{
+            .input = "D:\\builds\\output",
+            .expect = "D:\\builds\\output",
+        },
+        // A space must not run one path into the next.
+        .{
+            .input = "D:\\a\\b C:\\c\\d",
+            .expect = "D:\\a\\b",
+        },
+        // Compiler/grep line references ride along; a trailing colon does
+        // not, same as the POSIX branches.
+        .{
+            .input = "at D:\\a\\b.txt:12:5",
+            .expect = "D:\\a\\b.txt:12:5",
+        },
+        .{
+            .input = "C:\\Users\\David: nope",
+            .expect = "C:\\Users\\David",
+        },
+        // Punctuation around the path stays outside it.
+        .{
+            .input = "see (D:\\a\\b.txt)",
+            .expect = "D:\\a\\b.txt",
+        },
+        .{
+            .input = "foo D:\\a\\b.txt, bar",
+            .expect = "D:\\a\\b.txt",
+        },
+        // A path escaped for a string literal — how logs and JSON print
+        // one — is still the path it names.
+        .{
+            .input = "path=\"C:\\\\Users\\\\David\\\\a.txt\"",
+            .expect = "C:\\\\Users\\\\David\\\\a.txt",
+        },
     };
 
     for (cases) |case| {
@@ -512,6 +655,20 @@ test "url regex" {
         // double-slash comments are not paths
         "// foo bar",
         "//foo",
+        // Windows (T757): the sigil is the whole signal, so a bare
+        // backslash-separated relative path stays text — as it does in a
+        // pane banner.
+        "docs\\design\\foo.md",
+        // Prose with a colon in it is not a drive: a drive letter is ONE
+        // letter, and a separator has to follow the colon.
+        "Note: something",
+        "PATH: C\\Users",
+        // A doubled backslash in prose is not a UNC share, and a bare
+        // drive root has no body to link.
+        "\\\\ escaped prose",
+        "D:\\",
+        // Windows environment-variable paths have no branch yet (T801).
+        "%USERPROFILE%\\foo",
     };
     for (no_match_cases) |input| {
         var result = re.search(input, .{});

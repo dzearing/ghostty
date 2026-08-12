@@ -9,6 +9,48 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T757 (T801, T802 filed) - a Windows path printed into a pane
+  is a link now.** The shared link regex (`src/config/url.zig`, one string for
+  both frontends, wired in as `Config.default`'s only `link`) had three
+  branches and every one of them was POSIX-only: all three path branches are
+  built from a `path_chars` class with no backslash in it, and not one knows a
+  drive letter. So `D:\Users\David\clip.mp4` - which is what every build tool,
+  installer and agent on this platform prints - could not match anything, and
+  stayed dead text on the surface a Windows user looks at all day. Branch 4
+  adds the drive prefix (`D:\`, `D:/`, either case) and the UNC share
+  (`\\server\share\…`), and reuses the POSIX branch's own dotted/undotted split
+  rather than inventing a second space rule, so `C:\Program Files\app.exe`
+  matches whole while `D:\a\b C:\c\d` stays two paths and a sigil-less
+  `docs\design\foo.md` stays text (T539's rule for banners, applied to the
+  terminal). The load-bearing detail is a lookbehind, not a scheme list: one
+  letter and a colon is never a URI scheme, which is what stops the `s:/`
+  inside `https://` reading as a drive, and it protects schemes nobody has
+  added yet. 14 new match cases and 6 no-match cases, every pre-existing case
+  untouched and still green. The branch is deliberately live on EVERY platform
+  - a `D:\…` string means nothing on macOS, a Mac window attached to a Windows
+  agent shows Windows paths in its panes, and a shared core that matches
+  different text per platform is the divergence this project does not ship.
+  Two things the on-box work turned up, both filed rather than absorbed. The
+  first is a correction to the task's own premise: the acceptance criterion
+  said a click should REVEAL the file in Explorer, as a banner link does
+  (T165). It should not - that rule belongs to banners; the TERMINAL's link
+  click opens with the default application on macOS
+  (`NSWorkspace.shared.open`) exactly as win32's `ShellExecuteW("open")`
+  already does, so making Windows reveal would have been the divergence.
+  Nothing changed there. The second is **T802** (P1): the acceptance script's
+  first oracle was a double-click, and it kept reporting the plain word on a
+  build whose regex was correct. An instrumented build settled it - the core
+  DOES find the whole link on that path (`linkAtPin` with null mods, no
+  modifier needed) and something replaces the selection with a word-select
+  immediately after, so a user double-clicking a URL gets `https`. Whether a
+  real double-click on a real desktop reproduces it, or only a synthesized
+  one, is the first thing T802 has to establish. The script's oracle moved to
+  a ctrl+right-click, which selects the link the terminal found and launches
+  nothing: `test/win32/terminal-link-paths.ps1`, ALL PASS (14 assertions),
+  `-NegativeControl` red. **T801** (P2) is the leftover: `%USERPROFILE%\foo`
+  still does not linkify, because the POSIX `$VAR/` branch has no Windows
+  spelling.
+
 - 2026-08-12 - **T755 (T798 filed) - a CLI verb can no longer wait forever;
   it answers or it explains.** The measured shape was a `+list` blocked for 34
   minutes with 0.06s of CPU against an app that was alive and rendering. Two

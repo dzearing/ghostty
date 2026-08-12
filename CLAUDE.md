@@ -827,6 +827,56 @@ banner clicks; all funnel into `apprt/win32/url_scheme.zig` →
 `IpcHandlers.focusTarget` (the external path through the internal `focus` IPC
 action). Acceptance: `test/win32/url-scheme.ps1`.
 
+## Links in terminal output
+
+Text a program prints into a pane becomes clickable — ctrl-hover (⌘ on macOS)
+underlines it, ctrl-click opens it — by matching one regex against the hovered
+LINE. That regex is shared core, `src/config/url.zig`, wired in as the default
+`link` in `Config.default`, and it is the same string on both platforms.
+
+**Windows paths are part of it** (T757). Before that the regex had three
+branches and every one of them was POSIX-only: all three path branches were
+built from a `path_chars` class with **no backslash**, and none knew a drive
+letter, so `D:\Users\me\clip.mp4` printed by any tool could not match anything
+and stayed dead text — on the surface a Windows user looks at all day, and for
+most of what a path in a terminal is *for*. Branch 4 adds a drive prefix
+(`D:\…`, `D:/…`, either case) and a UNC share (`\\server\share\…`), and reuses
+the POSIX branch's own dotted/undotted split so `C:\Program Files\app.exe`
+matches whole while `D:\a\b C:\c\d` stays two paths. `foo\bar.md` with no
+sigil stays text, exactly as it does in a pane banner (T539, whose sigil set
+this follows).
+
+Two consequences worth knowing:
+
+- **The branch is live on EVERY platform**, not comptime-gated on Windows. A
+  `D:\…` string means nothing on macOS so it costs that seat nothing, a Mac
+  window attached to a Windows agent shows Windows paths in its panes, and a
+  shared core that quietly matches different text per platform is the kind of
+  divergence that rots. `test "url regex"` therefore runs the Windows cases on
+  both seats.
+- **A single letter and a colon is never a URI scheme**, which is what keeps
+  the `s:/` inside `https://` from reading as a drive — the same call
+  `banner_link.kindOf` makes on the banner side. It is a lookbehind, not a
+  scheme list, so it also protects every scheme nobody has added yet.
+
+**What a click DOES is open, not reveal** — and that is deliberate, not an
+oversight of the banner rule. A banner link only ever *reveals* a file
+(T165), because a banner is chrome; the TERMINAL's link click opens with the
+default application, on macOS (`NSWorkspace.shared.open`) as on Windows
+(`App.openUrl` → `ShellExecuteW("open")`). Making Windows reveal instead
+would be the divergence, not the parity.
+
+Acceptance: `test/win32/terminal-link-paths.ps1`, whose oracle is a
+**ctrl+right-click** — a right-press selects the link the terminal found
+(else the plain word) before showing the context menu, so the selection is
+the terminal's own answer, readable through ctrl+c, and nothing is launched.
+Column 0 is what makes it unambiguous: `:` is a word boundary and `\` `/` `.`
+are not, so the `Q` of `Q:\Users\…` selects as the whole path when the link
+is found and as the lone character `Q` when it is not. The double-click
+gesture is NOT the oracle: it reaches link detection with no modifier at all
+and finds the link, and then the selection is replaced by a plain word-select
+before anything can read it — filed as **T802**.
+
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a
