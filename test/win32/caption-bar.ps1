@@ -25,6 +25,9 @@
 #      hover/press), and the GROUP gap between the "..." and the minimize slab
 #      is plain chrome (which is what catches a cluster laid out at the wrong
 #      scale - a button would smear across it).
+#   2b. The private restatement of the caption run's four x's AGREES with
+#      lib\ChromeGeometry.ps1's published ones (T264). See CaptionGeom's header
+#      for why the restatement is kept rather than deleted.
 #   3. WM_NCHITTEST answers correctly, INCLUDING HTMAXBUTTON. That code is not
 #      decoration: the Snap Layouts flyout is triggered by the OS watching for
 #      it, so a maximize button that answers HTCLIENT silently deletes a
@@ -96,6 +99,26 @@ function HitAt($h, [int]$sx, [int]$sy) {
 # deliberately restated from the DIP constants rather than read out of the
 # binary - section 2 is what checks that derivation against real pixels.
 #
+# T264 - WHICH WAY THIS WENT, AND WHY. `lib\ChromeGeometry.ps1` publishes these
+# same four x's (`CaptionCloseLeft`/`CaptionMaxLeft`/`CaptionMinLeft`/
+# `CaptionOverflowLeft`, added in T260), so from T260 on this was the SECOND
+# derivation of one datum in one test tree - the exact shape T257 spent a task
+# deleting four times over. The choice was to read them out of the module and
+# keep one hand-written cross-check, or to keep the restatement and assert it
+# AGREES. Kept, and asserted (section 2b):
+#
+#   * The cross-check is the whole reason the copy exists. Section 2 measures
+#     PAINTED pixels against these numbers, and if the numbers came from the
+#     module then a module that drifted would move the probe points with it and
+#     keep passing - the derivation would no longer be checked by anything.
+#   * A restatement that is never compared is a latent divergence (T256: a
+#     script measuring last release's layout and reporting a healthy product as
+#     broken). Comparing it turns the duplicate into an oracle, which is the
+#     one form of duplication that pays for itself.
+#
+# So: this function stays hand-derived from the DIP constants, and section 2b
+# fails loudly the moment it and the module disagree by even a pixel.
+#
 # Re-derived per call because section 5 relaunches the window: button x's are
 # measured from the RIGHT edge, so a stale window rect aims every click at the
 # wrong place.
@@ -107,7 +130,16 @@ function CaptionGeom($h) {
     # the client's x origin inside the WINDOW rect is half the width lost.
     $borderX = [int](($win.Width - $cli.Width) / 2)
     $capW = $m.CapBtnW
-    $closeL = $cli.Width - $capW
+    # GHOZTTY_TEST_CAPTION_SKEW is the teeth-check for section 2b (T264): it
+    # shifts THIS restatement by N px so it disagrees with the module's
+    # published x's by exactly that much - the same observable state as the
+    # module's own derivation drifting a pixel, which is the failure 2b exists
+    # to catch. Deliberately small enough that nothing else moves: one px
+    # inside a 46 DIP slab still hit-tests, clicks and paints identically, so a
+    # skewed run goes red in 2b and nowhere else. Unset in every real run.
+    $skew = 0
+    if ($env:GHOZTTY_TEST_CAPTION_SKEW) { $skew = [int]$env:GHOZTTY_TEST_CAPTION_SKEW }
+    $closeL = $cli.Width - $capW + $skew
     $maxL = $closeL - $capW
     $minL = $maxL - $capW
     $overL = $minL - $m.PadMd - $m.BtnPaint
@@ -264,6 +296,30 @@ try {
     Check ($null -ne $groupC -and $groupC.R -lt 60) `
         "the '...' is one GROUP step clear of the minimize slab, not jammed against it"
     Close-TestWindowPixels $shot
+
+    # --- 2b. the restatement AGREES with ChromeGeometry (T264) ---------------
+    # `CaptionGeom` derives the caption run's four x's from the DIP constants
+    # itself; `lib\ChromeGeometry.ps1` publishes the same four. Keeping both is
+    # deliberate (see CaptionGeom's header) - what is NOT allowed is keeping
+    # both without comparing them, which is how a script ends up measuring a
+    # layout the product moved away from and calling a healthy build broken.
+    #
+    # Compared against `$geo.M` rather than the module read at line ~179: same
+    # call, same window rect, so a difference here can only be the arithmetic.
+    $gm = $geo.M
+    Check ($closeL -eq $gm.CaptionCloseLeft) `
+        "restated close x agrees with ChromeGeometry ($closeL vs $($gm.CaptionCloseLeft))"
+    Check ($maxL -eq $gm.CaptionMaxLeft) `
+        "restated maximize x agrees with ChromeGeometry ($maxL vs $($gm.CaptionMaxLeft))"
+    Check ($minL -eq $gm.CaptionMinLeft) `
+        "restated minimize x agrees with ChromeGeometry ($minL vs $($gm.CaptionMinLeft))"
+    Check ($overL -eq $gm.CaptionOverflowLeft) `
+        "restated '...' x agrees with ChromeGeometry ($overL vs $($gm.CaptionOverflowLeft))"
+    # The band height the pixel scan in section 1 was measured against is the
+    # module's too, so state that it is the same number the click points are
+    # centered on rather than leaving two 32 DIP constants to drift apart.
+    Check ($geo.M.CaptionH -eq $expectCapH) `
+        "the click points center on the same band height section 1 scanned ($($geo.M.CaptionH) vs $expectCapH)"
 
     # --- 3. WM_NCHITTEST, including the Snap Layouts code --------------------
     $bandY = $win.Top + $expectCapH - 2
