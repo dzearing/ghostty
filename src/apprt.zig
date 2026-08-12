@@ -298,6 +298,11 @@ test {
     // text (T285), same no-OS-imports deal.
     _ = @import("apprt/win32/activity_rows.zig");
 
+    // Pure win32 filter-box text search — the ONE ASCII case-fold substring
+    // test behind the machine chooser's and the Activity Monitor's filters
+    // (T288), same no-OS-imports deal.
+    _ = @import("apprt/win32/text_search.zig");
+
     // Pure win32 Activity Monitor process-control model — kill labels and
     // wording, failure text, empty state and selection pruning (T286), same
     // no-OS-imports deal.

@@ -11,6 +11,7 @@
 //! (the T240 lesson).
 
 const std = @import("std");
+const text_search = @import("text_search.zig");
 
 /// One process-table row, already marshaled out of `remote.protocol.Proc` (the
 /// strings are borrowed from the snapshot that owns them).
@@ -51,23 +52,11 @@ pub fn toggleSort(cur: Sort, key: SortKey) Sort {
     return .{ .key = key, .ascending = true };
 }
 
-/// Case-insensitive ASCII substring test.
-///
-/// `MachineChooser.zig` has a private twin of this; hoisting both into one
-/// string helper is T288, kept out of this task so a rename does not ride along
-/// with a new panel.
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    outer: while (i + needle.len <= haystack.len) : (i += 1) {
-        for (needle, 0..) |c, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) continue :outer;
-        }
-        return true;
-    }
-    return false;
-}
+/// Case-insensitive ASCII substring test — one implementation for every win32
+/// filter box, in `text_search.zig` (T288). The machine chooser's filter folds
+/// with the same function, and the ASCII limit is documented and revisited
+/// there rather than in each caller.
+pub const containsIgnoreCase = text_search.containsIgnoreCase;
 
 /// Trim the ASCII whitespace Mac trims before testing an empty query (:721).
 pub fn trim(needle: []const u8) []const u8 {
@@ -450,8 +439,6 @@ test "formatUptime: days, then hours, then minutes; empty when unknown" {
     try testing.expectEqualStrings("", formatUptime(&buf, 0));
 }
 
-test "containsIgnoreCase: needle longer than haystack is not a match" {
-    try testing.expect(!containsIgnoreCase("ab", "abc"));
-    try testing.expect(containsIgnoreCase("abc", "abc"));
-    try testing.expect(containsIgnoreCase("abc", ""));
-}
+// `containsIgnoreCase`'s own tests moved to `text_search.zig` with the
+// function (T288). What stays here is `matches`, which is this module's
+// composition of it with the pid search.

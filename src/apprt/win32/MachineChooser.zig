@@ -59,6 +59,7 @@ const system_colors = @import("system_colors.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
+const text_search = @import("text_search.zig");
 const SessionRoster = @import("SessionRoster.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
@@ -263,20 +264,11 @@ fn rect(r: chooser_layout.Rect) w32.RECT {
     return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
 
-/// Case-insensitive ASCII substring test. Pure.
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    outer: while (i + needle.len <= haystack.len) : (i += 1) {
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) continue :outer;
-        }
-        return true;
-    }
-    return false;
-}
+/// Case-insensitive ASCII substring test — one implementation for every win32
+/// filter box, in `text_search.zig` (T288). The Activity Monitor's process
+/// filter folds with the same function, and the ASCII limit is documented and
+/// revisited there rather than in each caller.
+const containsIgnoreCase = text_search.containsIgnoreCase;
 
 /// True when a device row (name or hostname) matches the filter needle. Pure.
 fn deviceMatches(dev: relay_directory.Device, needle: []const u8) bool {
@@ -3506,12 +3498,8 @@ test "rowForDeviceId: a stale row index never reads past the device list" {
     try testing.expect(rowForDeviceId(&rows, &devs, "A") == null);
 }
 
-test "containsIgnoreCase: basic matches" {
-    try testing.expect(containsIgnoreCase("Winbox", "box"));
-    try testing.expect(containsIgnoreCase("Winbox", ""));
-    try testing.expect(!containsIgnoreCase("Winbox", "mac"));
-    try testing.expect(!containsIgnoreCase("ab", "abc")); // needle longer
-}
+// `containsIgnoreCase`'s own tests moved to `text_search.zig` with the
+// function (T288), where they also run in the `none` lane.
 
 // The layout math itself is tested in `chooser_layout.zig` (it moved there
 // with T175). What stays here is the one thing that couples the two modules:
