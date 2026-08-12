@@ -36,12 +36,24 @@
 #      that is not on screen, the row keys reach the table only while the TABLE
 #      holds focus, and the table - an owner-drawn region no theme rings for us
 #      - paints design system 2.2's ring on its caret row exactly while it has
-#      the keyboard.
+#      the keyboard;
+#   M. (T293) a MULTI-ROW kill: ctrl-click and shift-click really accumulate a
+#      selection, the button re-captions to "Kill 3" as it grows, the
+#      confirmation counts the batch instead of naming a pid, a clean sweep
+#      reports killed=3 failed=0 with no banner, and a batch in which one row is
+#      already gone takes the AGGREGATED "Killed 2 of 3 (1 failed: ...)" branch.
 #
 # NOTHING THE BOX NEEDS IS EVER A TARGET. H spawns `cmd.exe /C pause` - a
 # throwaway that blocks forever with no child process - and I only ever kills
 # the pid the confirmation dialog ITSELF named, so a mis-targeted row makes the
-# script fail rather than kill a bystander.
+# script fail rather than kill a bystander. M cannot name a pid (its dialog
+# counts rows instead), so it makes the same guarantee structurally: its victims
+# are `ping -n 600 127.0.0.1` children of the panel's own spawns, and with "Show
+# all" turned back OFF the needle "ping" matches nothing else in the app's own
+# process tree - so every row on screen while it clicks is one of its own. That
+# is asserted at EVERY click and not only before the first: the first run of M
+# left "Show all" on, and the box's own ping joined the table between the check
+# and the clicks.
 #
 # ORACLE. A GDI-painted table has no text to read back, so the oracle is the
 # app's own log line, emitted by `ActivityMonitor.rebuild` on every input
@@ -98,6 +110,9 @@ $script:pass = 0
 $script:fail = 0
 # The T286 throwaway process, so the finally block can clean it up after an abort.
 $script:spawnPid = 0
+# T293's batch throwaways (each spawn plus the victim it leaves behind), same
+# reason: an abort mid-section must not leave them running.
+$script:extraPids = @()
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
@@ -143,6 +158,21 @@ function Wait-PanelState([int]$sinceCount, [int]$TimeoutMs = 6000) {
         Start-Sleep -Milliseconds 200
     }
     return Get-PanelState
+}
+
+# Wait until the panel's own state line reports exactly $Shown rows. The table is
+# LIVE and a process reaches it only on the first poll AFTER it exists, so the
+# first state line following a filter change can still predate the last spawn -
+# which is a row count that is about to be right, not a wrong one (T293).
+function Wait-PanelShown([int]$Shown, [int]$TimeoutMs = 12000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $st = $null
+    while ((Get-Date) -lt $deadline) {
+        $st = Get-PanelState
+        if ($st -and $st.Shown -eq $Shown) { return $st }
+        Start-Sleep -Milliseconds 250
+    }
+    return $st
 }
 
 function Count-PanelLines {
@@ -302,6 +332,98 @@ function Get-TestFirstRowY([IntPtr]$Panel, $Client, $Fr) {
     } finally {
         Close-TestWindowPixels -Shot $shot
     }
+}
+
+# How many stderr lines match $Pattern so far. Wait-LogMatch reads the LAST
+# match in the whole log, which cannot tell a fresh spawn's line from the one the
+# previous spawn left behind; a count can (T293).
+function Count-LogMatches([string]$Pattern) {
+    if (-not (Test-Path $errlog)) { return 0 }
+    return @(Select-String -Path $errlog -Pattern $Pattern).Count
+}
+
+# Spawn one throwaway through the panel's own "New Process..." dialog and return
+# the pid it reported, or 0. The COMMAND is the caller's, so a section can choose
+# a victim whose image name is unique in the app's process tree (T293).
+function New-PanelSpawn([IntPtr]$Panel, [string]$Command) {
+    $pat = 'activity monitor: spawn result ok=true pid=(\d+)'
+    $before = Count-LogMatches $pat
+    $btn = Get-PanelButton $Panel 'New Process*'
+    if (-not $btn) { return 0 }
+    Click-TestPosted $Panel $btn | Out-Null
+    $dlg = Wait-TestWindow -ProcessId $script:app.Pid -Class 'GhozttyNewProcess' -TimeoutMs 8000
+    if ($dlg -eq [IntPtr]::Zero) { return 0 }
+    $edits = @(@(Get-TestChildWindows -Window $dlg -Class 'Edit') | Sort-Object Top)
+    $start = @(Get-TestChildWindows -Window $dlg -Class 'Button') |
+        Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Start' } |
+        Select-Object -First 1
+    if ($edits.Count -lt 1 -or -not $start) { Send-TestWindowClose -Window $dlg | Out-Null; return 0 }
+    Send-TestControlText -Control ([IntPtr]$edits[0].Hwnd) -Text $Command | Out-Null
+    Start-Sleep -Milliseconds 300
+    Send-TestControlClick -Control ([IntPtr]$start.Hwnd) | Out-Null
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        if ((Count-LogMatches $pat) -gt $before) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if ((Count-LogMatches $pat) -le $before) { return 0 }
+    return [int](Get-LogMatch $pat).Groups[1].Value
+}
+
+# The pid of a spawned throwaway's own child - the VICTIM whose unique image name
+# is what the table filter isolates. Polled, because the child appears a moment
+# after its parent is reported.
+function Get-TestChildPid([int]$ParentPid, [string]$NameLike, [int]$TimeoutMs = 6000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $c = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentPid" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like $NameLike })
+        if ($c.Count -ge 1) { return [int]$c[0].ProcessId }
+        Start-Sleep -Milliseconds 250
+    }
+    return 0
+}
+
+# Name a pid for a failure message: "4312(gone)" or "4312(PING.EXE ppid=900)". A
+# bare number in a red assertion costs a whole extra run to identify, and a pid
+# that survived a kill is exactly the case where WHAT it is settles the cause.
+function Get-TestPidLabel([int]$ProcessId) {
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if (-not $p) { return "$ProcessId(gone)" }
+    return "$ProcessId($($p.Name) ppid=$($p.ParentProcessId))"
+}
+
+# Is the pid a LIVE process? Asked of the process table rather than through
+# Get-Process, which OPENS A HANDLE - and a handle held on an exited pid keeps it
+# a valid process object, which is the state section M creates on purpose (T293).
+function Test-PidAliveCim([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    return $null -ne (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue)
+}
+
+# The table's row PITCH in device pixels, measured from the panel's own paint: a
+# selected row is filled edge to edge, so the run of scanlines carrying NO
+# background pixel is exactly one row tall. Measured rather than restated for the
+# reason Get-TestFirstRowY is - `activity_layout.table_row_h` is the layout
+# module's number and a second copy of it here is a copy that can rot (T257).
+#
+# Call it with exactly one row selected and $RowY at the first row's top.
+function Get-TestRowPitch([IntPtr]$Panel, $Client, [int]$RowY) {
+    $x0 = $Client.Left + 40
+    $x1 = $x0 + 24
+    $w = $x1 - $x0
+    $shot = Get-TestWindowPixels -Window $Panel
+    try {
+        $top = -1
+        for ($y = $RowY; $y -lt $RowY + 240 -and $y -lt $Client.Bottom; $y++) {
+            $filled = ((Count-NonMatching $shot $x0 $y $x1 ($y + 1) $PANEL_BG) -eq $w)
+            if ($filled -and $top -lt 0) { $top = $y }
+            elseif (-not $filled -and $top -ge 0) { return $y - $top }
+        }
+    } finally {
+        Close-TestWindowPixels -Shot $shot
+    }
+    return -1
 }
 
 Kill-RepoInstances
@@ -988,6 +1110,224 @@ try {
         Close-TestWindowPixels -Shot $shotL5
     }
 
+    # --- M. The MULTI-ROW kill: what only a batch can show (T293) -------------
+    # T286 asserted every WORD of an N > 1 kill in the pure lane and every ACT of
+    # one with N == 1 on the box, which left the wiring between them unproven:
+    # that ctrl-click and shift-click really accumulate a selection, that
+    # `refreshChrome` re-captions the button as that count grows, and that a batch
+    # in which SOME rows fail takes `killFailureText`'s aggregated branch rather
+    # than its single-failure sentence.
+    #
+    # NOTHING THE BOX NEEDS IS EVER A TARGET, and here that is structural rather
+    # than careful. Each throwaway is spawned as `ping -n 600 127.0.0.1`, so the
+    # panel's own New Process leaves behind a PING.EXE whose name matches nothing
+    # else in the app's process tree: with the needle set to "ping" EVERY row the
+    # table shows is one of this section's victims, so a click that lands a row
+    # off can only hit another victim - it can never reach the app's own shell.
+    # The row count is asserted before anything is clicked, so a table holding
+    # anything else fails the section instead of being clicked on.
+    $victims = @()
+    foreach ($i in 1..3) {
+        $sp = New-PanelSpawn $panel 'ping -n 600 127.0.0.1'
+        if ($sp -gt 0) {
+            $script:extraPids += $sp
+            $vp = Get-TestChildPid $sp 'PING.EXE'
+            if ($vp -gt 0) { $victims += $vp; $script:extraPids += $vp }
+        }
+    }
+    Assert ($victims.Count -eq 3) "M three throwaway victims are running (pids: $($victims -join ' '))"
+
+    # "Show all" is still ON from E, and with it on the needle reaches EVERY
+    # process on the box - which on the first run of this section put the box's
+    # own ping in the table beside the three throwaways, one row of four that
+    # nothing here owned. Tree-only is what makes "every visible row is mine"
+    # true rather than merely likely.
+    $before = Count-PanelLines
+    if ($st.ShowAll) { Send-TestControlClick -Control ([IntPtr]$showAll.Hwnd) | Out-Null }
+    $st = Wait-PanelState $before
+    Assert (-not $st.ShowAll) 'M (setup) the table is narrowed back to the app own tree'
+
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text 'ping' | Out-Null
+    Wait-PanelState $before | Out-Null
+    $st = Wait-PanelShown 3
+    Assert ($st.Shown -eq 3) "M the needle isolates exactly the three victims (shown=$($st.Shown))"
+    $safeToClick = ($victims.Count -eq 3 -and $st.Shown -eq 3 -and -not $st.ShowAll)
+
+    $pitch = -1
+    $rowY = -1
+    if ($safeToClick) {
+        $rowInfo = Get-TestFirstRowY $panel $client $fr
+        $rowY = $rowInfo[1]
+        Assert ($rowY -ge 0) 'M the first victim row was located by its own paint'
+        if ($rowY -ge 0) {
+            $before = Count-PanelLines
+            Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($rowY + 4) -Button left -Action click | Out-Null
+            $st = Wait-PanelState $before
+            Assert ($st.Selected -eq 1) "M a plain click selects one victim (selected=$($st.Selected))"
+            $pitch = Get-TestRowPitch $panel $client $rowY
+            Assert ($pitch -ge 12 -and $pitch -le 96) "M the row pitch was measured off the selection fill ($pitch px)"
+        }
+    }
+
+    # M1. Ctrl-click ACCUMULATES, and the button counts what it would kill.
+    $batchReady = $false
+    if ($safeToClick -and $rowY -ge 0 -and $pitch -ge 12 -and $pitch -le 96) {
+        $batchReady = $true
+        foreach ($k in 1..2) {
+            $before = Count-PanelLines
+            Send-TestMouse -Window $panel -X ($client.Left + 20) `
+                -Y ($rowY + $k * $pitch + [int]($pitch / 2)) `
+                -Button left -Action click -Modifiers ctrl | Out-Null
+            $st = Wait-PanelState $before
+            $want = $k + 1
+            Assert ($st.Selected -eq $want) "M1 ctrl-click ADDS row $k to the selection (selected=$($st.Selected), want $want)"
+            if ($st.Selected -ne $want) { $batchReady = $false; break }
+            # Re-asserted at every click, not just before the first: the table is
+            # live, and a row that arrives mid-gesture is a row nothing here
+            # selected and nothing here owns. Measured, not imagined - it is what
+            # the first run of this section hit.
+            Assert ($st.Shown -eq 3) "M1 the table still holds exactly the three victims (shown=$($st.Shown))"
+            if ($st.Shown -ne 3) { $batchReady = $false; break }
+            $kb = Get-PanelButton $panel 'Kill*'
+            $cap = if ($kb) { Get-TestControlText -Control ([IntPtr]$kb.Hwnd) } else { '' }
+            Assert ($cap -eq "Kill $want") "M1 the button re-captions itself to 'Kill $want' (got '$cap')"
+        }
+    }
+
+    if ($batchReady) {
+        $killBtnM = Get-PanelButton $panel 'Kill*'
+        Assert ($null -ne $killBtnM -and (Test-TestWindowVisible -Window ([IntPtr]$killBtnM.Hwnd))) 'M1 the counted Kill button is on screen'
+        # `Options.has_kill` MAKES ROOM for the wider caption rather than letting
+        # it grow under its neighbour - the half of that claim only a real window
+        # can answer, since the pure layout tests assert rects and not controls.
+        if ($killBtnM) {
+            $kr = Get-TestWindowRect -Window ([IntPtr]$killBtnM.Hwnd)
+            $npb = Get-PanelButton $panel 'New Process*'
+            $nr = Get-TestWindowRect -Window ([IntPtr]$npb.Hwnd)
+            Assert (($kr.Right -le $nr.Left) -or ($nr.Right -le $kr.Left)) "M1 the widened Kill button does not overlap 'New Process...'"
+        }
+
+        Click-TestPosted $panel $killBtnM | Out-Null
+        $confirm = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+        Assert ($confirm -ne [IntPtr]::Zero) 'M1 the batch opens a confirmation'
+        if ($confirm -ne [IntPtr]::Zero) {
+            $ctitle = Get-TestWindowText -Window $confirm
+            Assert ($ctitle -eq 'Kill 3 processes?') "M1 the confirmation COUNTS the batch instead of naming one pid (got '$ctitle')"
+            $okBtn = @(Get-TestChildWindows -Window $confirm -Class 'Button') |
+                Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Kill 3' } |
+                Select-Object -First 1
+            Assert ($null -ne $okBtn) 'M1 the affirmative button carries the COUNTED verb'
+            if ($okBtn) { Send-TestControlClick -Control ([IntPtr]$okBtn.Hwnd) | Out-Null }
+            else { Send-TestWindowClose -Window $confirm | Out-Null }
+            Start-Sleep -Milliseconds 900
+        }
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=3 failed=0' 8000)) 'M1 the batch reported three killed, none failed'
+        $alive = $victims
+        $deadline = (Get-Date).AddSeconds(8)
+        while ((Get-Date) -lt $deadline) {
+            $alive = @($victims | Where-Object { Test-PidAliveCim $_ })
+            if ($alive.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 300
+        }
+        Assert ($alive.Count -eq 0) "M1 every process in the batch really died (still alive: $(@($alive | ForEach-Object { Get-TestPidLabel $_ }) -join ' '))"
+        Assert ($null -eq (Get-LogMatch 'activity monitor: action error: Killed')) 'M1 a clean sweep raises no failure banner'
+    }
+
+    # M2. A batch in which one row is already gone takes the AGGREGATED branch -
+    # the far side of `killFailureText`'s `total == 1` fork, which a single-row
+    # kill can never reach.
+    #
+    # The lever is T292's own guarantee: `onKill` COPIES the batch out of the
+    # snapshot before the dialog opens, so a victim that dies while the dialog is
+    # up is pruned from the SELECTION and still killed as a TARGET. Its pid is
+    # PINNED by a held process handle first - measured on the box, not assumed:
+    # with a handle open the process OBJECT outlives the process, so OpenProcess
+    # still succeeds and TerminateProcess answers ERROR_ACCESS_DENIED. That makes
+    # the failure deterministic AND makes it impossible for Windows to recycle
+    # the pid onto a bystander between the two clicks.
+    $victims2 = @()
+    if ($batchReady) {
+        foreach ($i in 1..3) {
+            $sp = New-PanelSpawn $panel 'ping -n 600 127.0.0.1'
+            if ($sp -gt 0) {
+                $script:extraPids += $sp
+                $vp = Get-TestChildPid $sp 'PING.EXE'
+                if ($vp -gt 0) { $victims2 += $vp; $script:extraPids += $vp }
+            }
+        }
+        Assert ($victims2.Count -eq 3) "M2 three fresh victims are running (pids: $($victims2 -join ' '))"
+    }
+
+    $doomed = $null
+    if ($victims2.Count -eq 3) {
+        $st = Wait-PanelShown 3
+        Assert ($st.Shown -eq 3) "M2 the table shows the three fresh victims and nothing else (shown=$($st.Shown))"
+        $rowInfo = Get-TestFirstRowY $panel $client $fr
+        $rowY = $rowInfo[1]
+        Assert ($rowY -ge 0) 'M2 the first victim row was located by its own paint'
+
+        if ($st.Shown -eq 3 -and $rowY -ge 0) {
+            $before = Count-PanelLines
+            Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($rowY + 4) -Button left -Action click | Out-Null
+            $st = Wait-PanelState $before
+            Assert ($st.Selected -eq 1) "M2 (setup) the first row is the shift anchor (selected=$($st.Selected))"
+
+            $before = Count-PanelLines
+            Send-TestMouse -Window $panel -X ($client.Left + 20) `
+                -Y ($rowY + 2 * $pitch + [int]($pitch / 2)) `
+                -Button left -Action click -Modifiers shift | Out-Null
+            $st = Wait-PanelState $before
+            Assert ($st.Selected -eq 3) "M2 shift-click EXTENDS the selection across the range (selected=$($st.Selected))"
+            Assert ($st.Shown -eq 3) "M2 the table still holds exactly the three victims (shown=$($st.Shown))"
+        }
+
+        if ($st.Selected -eq 3 -and $st.Shown -eq 3) {
+            $killBtnM = Get-PanelButton $panel 'Kill*'
+            Click-TestPosted $panel $killBtnM | Out-Null
+            $confirm = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+            Assert ($confirm -ne [IntPtr]::Zero) 'M2 the batch opens a confirmation'
+            if ($confirm -ne [IntPtr]::Zero) {
+                $doomed = Get-Process -Id $victims2[0] -ErrorAction SilentlyContinue
+                if ($doomed) {
+                    $null = $doomed.Handle   # pin the pid BEFORE it exits
+                    $doomed.Kill()
+                    $doomed.WaitForExit(5000) | Out-Null
+                }
+                Assert ($null -ne $doomed -and -not (Test-PidAliveCim $victims2[0])) "M2 (setup) one victim died behind the open dialog ($($victims2[0]))"
+
+                $okBtn = @(Get-TestChildWindows -Window $confirm -Class 'Button') |
+                    Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Kill 3' } |
+                    Select-Object -First 1
+                if ($okBtn) { Send-TestControlClick -Control ([IntPtr]$okBtn.Hwnd) | Out-Null }
+                else { Send-TestWindowClose -Window $confirm | Out-Null }
+                Start-Sleep -Milliseconds 900
+            }
+            Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=2 failed=1' 8000)) 'M2 the batch reported the two that died AND the one that could not'
+            $mAgg = Wait-LogMatch 'activity monitor: action error: Killed (\d+) of (\d+) \((\d+) failed: ([^)]*)\)' 8000
+            Assert ($null -ne $mAgg) 'M2 the failure became the AGGREGATED banner, not the single-failure sentence'
+            if ($mAgg) {
+                Assert ($mAgg.Groups[1].Value -eq '2' -and $mAgg.Groups[2].Value -eq '3' -and $mAgg.Groups[3].Value -eq '1') "M2 the banner tallies the batch (got '$($mAgg.Groups[0].Value)')"
+                Assert ($mAgg.Groups[4].Value -match 'PING') "M2 ...and NAMES what did not die (got '$($mAgg.Groups[4].Value)')"
+            }
+        }
+
+        $stillAlive = @($victims2 | Where-Object { Test-PidAliveCim $_ })
+        Assert ($stillAlive.Count -eq 0) "M2 nothing from the batch is left running (still alive: $(@($stillAlive | ForEach-Object { Get-TestPidLabel $_ }) -join ' '))"
+    }
+    # Release the pinned pid only now: the app's kill had to meet it as a
+    # terminated-but-open process, which is what the whole arm turns on.
+    if ($doomed) { $doomed.Dispose() }
+
+    # Hand the keyboard back to the filter field, where L left it - F's Escape
+    # goes to the control that has the focus, not to a coordinate.
+    $frM = Get-TestWindowRect -Window $filterEdit
+    Send-TestMouse -Window $panel -Target $filterEdit `
+        -X ([int](($frM.Left + $frM.Right) / 2)) -Y ([int](($frM.Top + $frM.Bottom) / 2)) `
+        -Button left -Action click | Out-Null
+    Start-Sleep -Milliseconds 300
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'M (teardown) the filter field holds the keyboard again'
+
     # --- F. Escape closes the panel ------------------------------------------
     Send-TestControlKey -Control $filterEdit -Key Escape | Out-Null
     Start-Sleep -Milliseconds 800
@@ -998,6 +1338,11 @@ try {
     # The throwaway from H, if I never got to kill it (an abort mid-section).
     if ($script:spawnPid -gt 0) {
         Stop-Process -Id $script:spawnPid -Force -ErrorAction SilentlyContinue
+    }
+    # And T293's batch throwaways - both halves of each spawn, since an abort can
+    # land between the parent's spawn and its victim's death.
+    foreach ($xp in @($script:extraPids)) {
+        if ($xp -gt 0) { Stop-Process -Id $xp -Force -ErrorAction SilentlyContinue }
     }
     Remove-TestDesktop
     Kill-RepoInstances
