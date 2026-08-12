@@ -105,7 +105,7 @@ a pre-existing app-teardown issue tracked as T08a, not a persistence regression.
 ## `session-persistence.py --agent-restart` — reboot-equivalent (task T12d)
 
 ```
-scripts/e2e/session-persistence.py --agent-restart [--cycles=3]
+scripts/e2e/session-persistence.py --agent-restart [--cycles=3] [--relaunch=restore|rerun]
 ```
 
 The **reboot floor** (design ACs 3 & 4). A reboot — or an agent crash — is the
@@ -122,14 +122,54 @@ variant proves it end to end:
    `sessions.json` and materializes every session as a *relaunchable tombstone*
    before it accepts connections.
 3. **Recover** — relaunch the app. It rebuilds the layout from the manifest,
-   re-attaches each leaf by session id, and (session-relaunch = `auto`) fires
-   `RELAUNCH` per pane: the agent respawns the child from recorded argv/cwd.
+   re-attaches each leaf by session id, and fires `RELAUNCH` per pane; what the
+   agent respawns is decided by `session-relaunch` (see below).
 
 Each cycle asserts the **opposite** of the survival tests: the agent PID
 **changed** (launchd brought a new one, in ≤ 5 s — measured 0–2 s), every pane's
 child PID is **new** (relaunched, not re-attached), the pane shows the
-`--- session restarted ---` banner, the marker command re-ran, and the split
-topology is still rebuilt exactly from the manifest.
+`--- session restarted ---` banner (the agent bakes it into the replayed ring
+snapshot, so it appears under either policy), the pre-restart scrollback is
+present above it, and the split topology is still rebuilt exactly from the
+manifest.
+
+**`--relaunch` — which `session-relaunch` policy to prove.** The two policies
+disagree about exactly one thing: what the fresh child *is*.
+
+- `--relaunch=restore` (the default, and the app's default — the harness passes
+  no flag, so a clean pass is itself proof of what ships). The recorded command
+  must **not** re-run: the pane shows the
+  `--- previous session was lost; … ---` notice, there is **no** second `PANE=`
+  marker after it, and an `echo` probe typed into the pane comes back with a
+  **new pid** and a **cwd equal to the one the dead session recorded** — i.e. a
+  live login shell where the session used to be. (Panes print
+  `PANE=<n> PID=<pid> CWD=<pwd>` at startup precisely so this comparison has a
+  baseline.)
+- `--relaunch=rerun` launches the app with `--session-relaunch=rerun` and keeps
+  the pre-`restore` expectations: the marker command re-ran, so a fresh `PANE=`
+  marker with a new, live pid sits after the divider.
+
+**Mouse-mode assertion (bug 2).** Each fixture pane arms what a real TUI arms —
+any-event mouse tracking, SGR encoding, bracketed paste, hidden cursor — so the
+ring snapshot carries those escapes and the replay re-arms them in a pane whose
+consumer is dead. Mode state is invisible in `+read`, so `vt-mode-probe.py` is
+typed into each restored pane to ask the emulator directly (DECRQM, `CSI ? n $ p`)
+and every mouse mode must come back `reset` with the cursor visible. The panes
+also `stty -echo`: with tracking armed and nothing reading stdin, the tty echoes
+every pointer report back as `^[[<35;12;29M` text, which fills the live test
+windows with garbage and then gets replayed into the restored pane — noise that
+is indistinguishable at a glance from the bug itself.
+
+Every probe carries a unique `--tag`. A pane is probed once per cycle, the
+previous cycle's answer is still in its scrollback, and a reboot restore replays
+that scrollback back in — an untagged reader parses the last cycle's pid and
+calls it a pass.
+
+Before killing the agent, the harness waits for its ring snapshots to reach disk
+(`wait_rings_flushed`). The flush is triggered by the viewer disconnect the
+harness just caused; SIGKILLing the agent milliseconds later races it, and the
+pane that loses comes back with no pre-restart scrollback — a flake that looks
+exactly like a broken replay.
 
 **launchd respawn throttle.** launchd rate-limits `KeepAlive` respawns to once
 per `ThrottleInterval` (default 10 s) since the job's last spawn. A real agent
@@ -165,7 +205,8 @@ same reboot floor as `--agent-restart` (children + ring RAM are lost, sessions
    tombstone → auto-`RELAUNCH` with the `--- session restarted ---` banner.
 
 Each cycle asserts the reboot-cycle checks (agent PID changed ≤ 5 s, fresh child
-PIDs, restart banner, exact topology from the manifest) **plus the defining
+PIDs, restart banner, the `--relaunch` policy's own expectations, exact topology
+from the manifest) **plus the defining
 in-place invariant: the app process is unchanged** (it did not relaunch). The
 local machine pill stays hidden throughout — recovery looks like the panes just
 restarted in place. Measured recovery ~2.5–3.7 s. Same launchd-throttle settling

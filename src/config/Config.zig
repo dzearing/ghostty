@@ -1222,19 +1222,39 @@ command: ?Command = null,
 /// a restored window does when a pane's persisted session comes back from the
 /// agent as a DEAD-but-relaunchable tombstone — i.e. the agent itself restarted
 /// (a reboot, an agent upgrade) and materialized the session's recorded
-/// metadata from disk but the child process is not running. There are two
+/// metadata from disk but the child process is not running. There are three
 /// options:
 ///
-///   * `auto` (the default) - immediately `RELAUNCH` the recorded command/shell
-///     in the same pane and print a `--- session restarted ---` divider above
-///     the fresh output.
+///   * `restore` (the default) - bring the pane back as a plain login shell in
+///     the session's recorded working directory, with a
+///     `--- previous session was lost; new shell in its working directory ---`
+///     notice above the prompt. The recorded command is NOT re-run: the pane's
+///     scrollback is restored so you can read what the dead process left behind,
+///     and you decide what to start next.
+///   * `rerun` - immediately `RELAUNCH` the recorded command/shell in the same
+///     pane and print a `--- session restarted ---` divider above the fresh
+///     output. This was the old `auto` behavior. Re-running is only right when
+///     the recorded command is idempotent and cheap; for a long-lived agent or
+///     editor it silently starts a brand-new one, which is why it is no longer
+///     the default.
 ///   * `prompt` - do NOT auto-respawn; the pane comes up in its exited state so
-///     the user decides whether to bring it back.
+///     the user decides whether to bring it back. The first keystroke re-runs
+///     the recorded command (i.e. consenting gets you `rerun`).
 ///
 /// This has no effect when the agent kept running (the ordinary app-upgrade /
 /// crash case): the session is still alive and simply re-attaches with its
 /// scrollback intact. It only matters across an agent restart.
-@"session-relaunch": SessionRelaunch = .auto,
+///
+/// `restore` needs an agent new enough to honor the viewer's respawn argv (the
+/// `RELAUNCH` respawn-fidelity fields). Against an older still-running agent it
+/// degrades to `rerun` — the agent respawns from its own recorded metadata —
+/// which is exactly the previous behavior, never a broken pane.
+///
+/// The working directory is the one the session was OPENed with, recorded by the
+/// agent; a shell that later `cd`ed elsewhere comes back where it started, and a
+/// session opened with no working directory at all comes back in the agent's own
+/// cwd. Both also require an agent new enough to record it.
+@"session-relaunch": SessionRelaunch = .restore,
 
 /// Controls when command finished notifications are sent. There are
 /// three options:
@@ -10337,7 +10357,8 @@ pub const Scrollbar = enum {
 
 /// See session-relaunch
 pub const SessionRelaunch = enum {
-    auto,
+    restore,
+    rerun,
     prompt,
 };
 

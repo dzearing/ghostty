@@ -15,6 +15,11 @@ Modes:
     changes each cycle) — exactly the on-disk swap Sparkle performs — then
     relaunch from the replaced bundle. Proves an upgrade re-attaches intact and
     leaves the agent process untouched.
+  * --relaunch=restore|rerun: which `session-relaunch` policy the reboot modes
+    (--agent-restart / --agent-only) assert. `restore` (default, and the app's
+    default so no flag is passed) = the pane comes back as a plain login shell in
+    the recorded cwd with a "session was lost" notice and NO command re-run;
+    `rerun` = the recorded command re-executes, the pre-`restore` behavior.
   * --quit=kill|graceful: how the app is terminated each cycle. `graceful` uses
     AppleScript `quit` (routes through applicationShouldTerminate → isQuitting,
     manifest preserved) instead of SIGKILL. Both must survive.
@@ -43,6 +48,16 @@ import time
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
+# Run from inside a Ghoztty pane and the CLI would inherit that pane's
+# `GHOZTTY_IPC_SOCKET` — which names the socket of the app that OWNS the pane
+# (see CLAUDE.md "Instance addressability"). For a harness launched from a
+# RELEASE pane that means every `+list`/`+new-window`/`+close` silently drives
+# the user's real terminal instead of the debug build under test. Drop it up
+# front so the debug CLI falls back to its own build-flavor derivation
+# (`ghostty-debug-<uid>.sock`); the app's SERVER side never reads this variable,
+# so unsetting it cannot affect which socket the app binds.
+os.environ.pop("GHOZTTY_IPC_SOCKET", None)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ZIGOUT_BUNDLE = os.path.join(ROOT, "zig-out", "Ghoztty-Debug.app")
 BUNDLE_ID = "com.dzearing.ghoztty.debug"
@@ -95,11 +110,46 @@ LAUNCH_ARGS = ["--confirm-close-surface=false"]
 AGENT_BIN_OVERRIDE = None
 
 # Each pane runs a unique, never-exiting marker: prints PANE=<n> PID=<shell pid>
-# once, then an incrementing tick line every second. Survival == same PID + ticks
-# continuing across the app-death gap with no second PANE= line (no restart).
+# CWD=<cwd> once, then an incrementing tick line every second. Survival == same
+# PID + ticks continuing across the app-death gap with no second PANE= line (no
+# restart). CWD is what `session-relaunch=restore` is asserted against: the
+# reboot-restored pane must be a shell sitting in THAT directory.
+#
+# The marker also puts the pane into the VT state a real TUI leaves behind —
+# any-event mouse tracking + SGR encoding, bracketed paste, hidden cursor — so
+# every reboot cycle exercises the mode-leak the replay used to cause. Those
+# bytes land in the agent's ring snapshot and get replayed verbatim into the
+# restored pane; without `termio/Remote.zig`'s `replay_mode_reset` the restored
+# shell then reads pointer motion as typed input (`command not found: 30M35`).
+# Harmless while the marker runs (its `while` loop never reads stdin).
+TUI_MODES_ON = r"\033[?1002h\033[?1003h\033[?1006h\033[?2004h\033[?25l"
+
 def marker_cmd(n):
-    return (f"echo PANE={n} PID=$$; i=0; "
+    # `stty -echo` FIRST, and it is not optional. With any-event tracking armed
+    # and nothing reading stdin, every pointer movement over a live test window
+    # gets ECHOED back by the tty and rendered as `^[[<35;12;29M` text — the
+    # windows fill with garbage while the test runs, that garbage is what the ring
+    # snapshot then replays, and it is indistinguishable at a glance from the very
+    # bug under test. A real TUI puts the tty in raw mode for the same reason.
+    return (f"stty -echo; printf '{TUI_MODES_ON}'; "
+            f"echo PANE={n} PID=$$ CWD=$PWD; i=0; "
             f"while true; do echo tick-{n}-$((i++)); sleep 1; done")
+
+# --relaunch: which `session-relaunch` policy the reboot-equivalent modes run
+# under. `restore` (the shipped default, no flag passed) brings each pane back as
+# a plain login shell in the recorded cwd; `rerun` re-executes the recorded
+# command, which is the pre-`restore` behavior and still an explicit opt-in.
+RELAUNCH_POLICY = "restore"
+
+# Every fixture pane is created with an EXPLICIT `--working-directory`, and the
+# two windows get DIFFERENT ones so "the restored shell landed in the recorded
+# cwd" can't pass by accident. This mirrors how real windows are made — a `/wt`
+# window passes `--working-directory`, and a GUI window/tab/split inherits the
+# parent surface's cwd (TerminalController's `remoteWorkingDirectory`). A bare
+# `+new-window` over IPC is the one path that records NO cwd at all, and its
+# restored shell then lands in whatever cwd the agent happens to have.
+CWD_A = ROOT
+CWD_B = os.path.join(ROOT, "scripts", "e2e")
 
 VERBOSE = False
 def log(msg):
@@ -265,6 +315,21 @@ def ring_files():
     except FileNotFoundError:
         return []
 
+def wait_rings_flushed(want, timeout=5.0):
+    """Poll until the agent has written at least `want` ring snapshots, or give up.
+    Best-effort by design (so is the flush) — the caller proceeds either way and
+    the assertions report what actually happened."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        n = len(ring_files())
+        if n >= want:
+            vlog(f"{n} ring snapshots flushed")
+            return n
+        time.sleep(0.2)
+    n = len(ring_files())
+    vlog(f"only {n}/{want} ring snapshots flushed within {timeout}s")
+    return n
+
 def clear_ring_files():
     for f in ring_files():
         try:
@@ -421,6 +486,11 @@ def parse_marker(text):
     m = _MARKER_RE.search(text)
     return (int(m.group(1)), int(m.group(2))) if m else (None, None)
 
+_CWD_RE = re.compile(r"PANE=\d+ PID=\d+ CWD=(\S+)")
+def parse_marker_cwd(text):
+    m = _CWD_RE.search(text)
+    return m.group(1) if m else None
+
 def fresh_marker(text):
     """The RELAUNCHED child's PANE= marker. With ring disk snapshots (T13) the
     agent replays the pre-restart scrollback (the OLD marker) ahead of a
@@ -444,21 +514,36 @@ def struct_of(node, name2n):
     return ("S", node["direction"], round(float(node["ratio"]), 4),
             struct_of(node["left"], name2n), struct_of(node["right"], name2n))
 
+# Pane name -> marker index, learned the first time a pane's marker is seen.
+# `session-relaunch=restore` deliberately does NOT re-run the marker command, so a
+# recovered pane can legitimately have no `PANE=` line at all (in-place recovery,
+# where there is also no replayed scrollback to carry the old one). Pane NAMES are
+# persisted in the layout manifest and survive every restore, so they are the
+# stable fallback identity.
+_NAME_TO_N = {}
+
 def snapshot():
     """Capture the full live state keyed by pane-marker index (stable across restore)."""
     windows = all_windows()
     # read every leaf, map name -> n / pid / last tick
     name2n, n2pid, n2tick, n2text = {}, {}, {}, {}
+    n2name, n2cwd = {}, {}
     for w in windows:
         for tab in w["tabs"]:
             for name in leaf_names_of(tab["splits"]):
                 text = read_pane(name)
                 n, pid = parse_marker(text)
+                if n is None:
+                    n = _NAME_TO_N.get(name)   # marker-less `restore` pane
+                else:
+                    _NAME_TO_N[name] = n
                 name2n[name] = n
                 if n is not None:
                     n2pid[n] = pid
                     n2tick[n] = last_tick(text, n)
                     n2text[n] = text
+                    n2name[n] = name
+                    n2cwd[n] = parse_marker_cwd(text)
     # per-window structure, keyed by the set of markers it contains
     win_structs = {}
     for w in windows:
@@ -473,6 +558,8 @@ def snapshot():
         "pid": n2pid,
         "tick": n2tick,
         "text": n2text,
+        "name": n2name,
+        "cwd": n2cwd,
         "win_structs": win_structs,
     }
 
@@ -530,8 +617,9 @@ def build_scenario():
     initial_leaves = all_leaf_names()
     vlog(f"initial window leaves: {initial_leaves}")
 
-    log("[build] creating window A (P0)")
-    retry_cli(["+new-window", "--target=winA", f"--command={marker_cmd(0)}"], "new-window winA")
+    log(f"[build] creating window A (P0) in {CWD_A}")
+    retry_cli(["+new-window", "--target=winA", f"--working-directory={CWD_A}",
+               f"--command={marker_cmd(0)}"], "new-window winA")
     wait_window_count(2)
 
     log("[build] closing the blank initial window")
@@ -546,17 +634,18 @@ def build_scenario():
 
     log("[build] splitting window A -> A1, A2")
     retry_cli(["+split", "--target=winA", "--direction=right", "--name=A1",
-               f"--command={marker_cmd(1)}"], "split A1")
+               f"--working-directory={CWD_A}", f"--command={marker_cmd(1)}"], "split A1")
     wait_for_pane("A1")
     retry_cli(["+split", "--target=A1", "--direction=down", "--name=A2",
-               f"--command={marker_cmd(2)}"], "split A2")
+               f"--working-directory={CWD_A}", f"--command={marker_cmd(2)}"], "split A2")
     wait_for_pane("A2")
 
-    log("[build] creating window B (P3) and splitting -> B1")
-    retry_cli(["+new-window", "--target=winB", f"--command={marker_cmd(3)}"], "new-window winB")
+    log(f"[build] creating window B (P3) in {CWD_B} and splitting -> B1")
+    retry_cli(["+new-window", "--target=winB", f"--working-directory={CWD_B}",
+               f"--command={marker_cmd(3)}"], "new-window winB")
     wait_window_count(2)
     retry_cli(["+split", "--target=winB", "--direction=right", "--name=B1",
-               f"--command={marker_cmd(4)}"], "split B1")
+               f"--working-directory={CWD_B}", f"--command={marker_cmd(4)}"], "split B1")
     wait_for_pane("B1")
 
     # Identify the two windows and their unnamed initial panes.
@@ -588,10 +677,12 @@ def build_scenario():
 
 def wait_restored(timeout=12.0, relaunched=False):
     """Poll until all EXPECTED_MARKERS are readable (re-attached & interactive).
-    When `relaunched` (the reboot path), require the marker to appear AFTER the
-    restart divider — otherwise the replayed pre-restart scrollback (T13) satisfies
-    the wait before the freshly-relaunched child has actually produced output."""
-    marker = fresh_marker if relaunched else (lambda t: parse_marker(t))
+    When `relaunched` (the reboot path), require evidence that the fresh child is
+    actually up — otherwise the replayed pre-restart scrollback (T13) satisfies the
+    wait before the relaunch has produced anything. Under `rerun` that evidence is
+    the marker re-appearing AFTER the restart divider; under `restore` the marker
+    never comes back (that is the point), so we wait on the client's own
+    post-replay notice instead, which is printed once the pane is fully up."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -599,13 +690,25 @@ def wait_restored(timeout=12.0, relaunched=False):
         except E2EError:
             time.sleep(0.2); continue
         if len(names) >= EXPECTED_LEAVES:
-            found = set()
-            for nm in names:
-                n, _ = marker(read_pane(nm, 3000))
-                if n is not None:
-                    found.add(n)
-            if EXPECTED_MARKERS.issubset(found):
-                return
+            if relaunched and RELAUNCH_POLICY == "restore":
+                # Count PANES, not markers. The marker never re-runs under
+                # `restore`, so the only marker a pane can show is the one in its
+                # REPLAYED scrollback — and a pane whose ring snapshot didn't make
+                # it to disk (T13 is best-effort) legitimately has none, which
+                # would hang this wait forever on a pane that is perfectly fine.
+                # The notice is the real signal: it is printed once the pane is up,
+                # with or without scrollback.
+                if sum(1 for nm in names if RESTORE_NOTICE in read_pane(nm, 3000)) >= EXPECTED_LEAVES:
+                    return
+            else:
+                marker = fresh_marker if relaunched else (lambda t: parse_marker(t))
+                found = set()
+                for nm in names:
+                    n, _ = marker(read_pane(nm, 3000))
+                    if n is not None:
+                        found.add(n)
+                if EXPECTED_MARKERS.issubset(found):
+                    return
         time.sleep(0.2)
     raise E2EError(f"not all panes restored within {timeout}s")
 
@@ -662,7 +765,80 @@ def assert_cycle(baseline, cur, prev, gap, agent_before, agent_after, failures, 
     check(agent_after is not None and agent_after == agent_before,
           f"agent PID changed {agent_before} -> {agent_after} (agent did not survive)")
 
+# The agent bakes this into the preloaded ring snapshot regardless of policy
+# (agent/session.zig `reboot_divider`), and the client prints the identical string
+# when there was no snapshot to replay.
 RESTART_DIVIDER = "--- session restarted ---"
+# What `session-relaunch=restore` (the default) prints after the replay instead of
+# re-running the recorded command (termio/Remote.zig `session_lost_notice`).
+RESTORE_NOTICE = "--- previous session was lost"
+
+_PROBE_RE_TMPL = r"E2EPROBE-{tag}=(\d+):(\S+)"
+
+# Monotonic per-probe tag. Every probe must be uniquely identifiable in the pane's
+# text: a pane is probed once per cycle, the previous cycle's answer is still in
+# the scrollback, and a reboot restore REPLAYS that scrollback back in — so an
+# untagged reader parses the last cycle's pid and reports a pass (observed: cycle
+# 2 asserting against cycle 1's long-dead shell).
+_probe_seq = 0
+def next_probe_tag():
+    global _probe_seq
+    _probe_seq += 1
+    return _probe_seq
+
+VT_PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vt-mode-probe.py")
+
+def probe_modes(name, modes):
+    """Ask the pane's TERMINAL which DEC private modes are set (see
+    vt-mode-probe.py). Returns {mode: "set"|"reset"|…} or {} if it never answered.
+
+    Mode state is invisible in `+read` output, so this is the only way to assert
+    the bug-2 fix from the E2E: after a reboot restore the replayed TUI bytes must
+    NOT have left mouse tracking armed in what is now a plain shell."""
+    arglist = " ".join(str(m) for m in modes)
+    tag = f"T{next_probe_tag()}"
+    if type_and_await(name, f"python3 {VT_PROBE} --tag={tag} {arglist}\n",
+                      re.compile(rf"{tag} VT-PROBE-DONE")) is None:
+        return {}
+    # Only THIS probe's lines: the tag is echoed on every one, so a previous
+    # cycle's (or a replayed) answer cannot be read as this cycle's.
+    rx = re.compile(rf"{tag} MODE (\d+) = (\S+)")
+    return {int(m.group(1)): m.group(2) for m in rx.finditer(read_pane(name))}
+
+def type_and_await(name, line, pattern, attempts=3, timeout=6.0):
+    """Type `line` into a pane and wait for `pattern` (a compiled regex) in its
+    output, RE-TYPING up to `attempts` times. Returns the match or None.
+
+    The retry is not paranoia: a pane restored under `session-relaunch=restore`
+    prints its notice as soon as the client is up, which can be a beat before the
+    freshly-spawned zsh has finished sourcing its rc files and started reading —
+    keystrokes typed into that window get chewed up by shell startup (observed:
+    `echo …` arriving as `necho …`). Retrying is simpler and more honest than
+    guessing a settle time."""
+    for _ in range(attempts):
+        rc, _, _ = run_cli(["+send-keys", f"--target={name}", line])
+        if rc != 0:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            m = pattern.search(read_pane(name))
+            if m:
+                return m
+            time.sleep(0.2)
+    return None
+
+def probe_shell(name, n):
+    """Type an `echo` into a restored pane and read the answer back: proof there
+    is a LIVE INTERACTIVE SHELL there (not a dead tombstone, not a re-run marker
+    loop) plus its pid and cwd. Returns (pid, cwd) or (None, None).
+
+    The typed line echoes back literally (`…=$$:$PWD`), so the regex requiring a
+    numeric pid only ever matches the shell's own expanded output; the per-call
+    tag keeps a previous cycle's answer from matching at all."""
+    tag = f"{n}-{next_probe_tag()}"
+    m = type_and_await(name, f"echo E2EPROBE-{tag}=$$:$PWD\n",
+                       re.compile(_PROBE_RE_TMPL.format(tag=re.escape(tag))))
+    return (int(m.group(1)), m.group(2)) if m else (None, None)
 
 def assert_reboot_cycle(baseline, cur, gap, agent_before, agent_after,
                         restart_secs, failures):
@@ -698,31 +874,71 @@ def assert_reboot_cycle(baseline, cur, gap, agent_before, agent_after,
             failures.append(f"topology mismatch for window {sorted(ns)}:\n"
                             f"      baseline={struct}\n      restored={cs}")
 
-    # Every pane RELAUNCHED: fresh child pid, banner shown, marker command re-ran,
-    # AND (T13, §5.4) the pre-restart scrollback was replayed from the agent's ring
-    # disk snapshot — so the pane reads [old scrollback][divider][fresh output].
+    # Every pane came back with a FRESH child (the agent's RAM, hence its
+    # children, was lost), the banner shown, AND (T13, §5.4) the pre-restart
+    # scrollback replayed from the agent's ring disk snapshot — so the pane reads
+    # [old scrollback][divider][fresh output]. WHAT the fresh child is depends on
+    # the policy, and that is the whole of the `restore` vs `rerun` difference.
     for n in sorted(EXPECTED_MARKERS):
         bpid = baseline["pid"].get(n)
+        name = cur["name"].get(n)
         text = cur["text"].get(n, "")
         check(RESTART_DIVIDER in text,
               f"pane {n} missing restart banner '{RESTART_DIVIDER}' after relaunch")
 
-        # With T13 the ring snapshot replays the OLD marker line ahead of the
-        # divider, so the FIRST PANE= line is the pre-restart one and the FRESH
-        # child's marker is AFTER the divider — parse the fresh pid from there.
-        idx = text.rfind(RESTART_DIVIDER)
-        pre = text[:idx] if idx >= 0 else ""
-        _, cpid = fresh_marker(text)
-        check(cpid is not None, f"pane {n} has no marker after the divider (relaunch never came back)")
-        check(cpid != bpid,
-              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
-        check(cpid is not None and pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
-
         # Pre-restart scrollback present: the OLD marker line (from before the kill)
         # appears BEFORE the divider — proof the ring snapshot was persisted on the
         # viewer disconnect and replayed on relaunch (not a blank fresh shell).
+        idx = text.rfind(RESTART_DIVIDER)
+        pre = text[:idx] if idx >= 0 else ""
         check(f"PANE={n} " in pre,
               f"pane {n} missing pre-restart scrollback before divider (ring snapshot not replayed)")
+
+        if RELAUNCH_POLICY == "rerun":
+            # Opt-in legacy behavior: the recorded command RE-RAN, so the fresh
+            # child's marker is the one after the divider.
+            _, cpid = fresh_marker(text)
+            check(cpid is not None,
+                  f"pane {n} has no marker after the divider (relaunch never came back)")
+            check(cpid != bpid,
+                  f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+            check(cpid is not None and pid_alive(cpid),
+                  f"pane {n} relaunched PID {cpid} is not alive")
+            continue
+
+        # Default (`restore`): the recorded command must NOT have re-run — the
+        # pane is a plain login shell in the session's recorded cwd, under the
+        # "session was lost" notice.
+        check(RESTORE_NOTICE in text,
+              f"pane {n} missing '{RESTORE_NOTICE} …' notice after relaunch")
+        after = text[text.rfind(RESTORE_NOTICE):] if RESTORE_NOTICE in text else ""
+        check(f"PANE={n} " not in after,
+              f"pane {n} RE-RAN its recorded command after the notice "
+              f"(session-relaunch=restore must open a shell instead)")
+
+        # It is a live interactive shell, it is a NEW process, and it is sitting
+        # where the dead session was — the headline claim of `restore`.
+        ppid, pcwd = probe_shell(name, n)
+        check(ppid is not None,
+              f"pane {n} did not answer an echo probe (no live shell after restore)")
+        check(ppid is None or ppid != bpid,
+              f"pane {n} shell pid unchanged {bpid} (expected a fresh process)")
+        check(ppid is None or pid_alive(ppid), f"pane {n} restored shell {ppid} is not alive")
+        bcwd = baseline["cwd"].get(n)
+        check(bcwd is None or pcwd == bcwd,
+              f"pane {n} restored shell cwd {pcwd!r} != recorded {bcwd!r}")
+
+        # Bug 2: the replayed bytes re-armed the dead TUI's modes (marker_cmd sets
+        # them for exactly this reason). The pane is now a plain shell, so mouse
+        # tracking left ON turns every pointer move into typed garbage.
+        got = probe_modes(cur["name"].get(n), (1002, 1003, 1006, 2004, 25))
+        check(bool(got), f"pane {n} did not answer the DECRQM mode probe")
+        for m in (1002, 1003, 1006, 2004):
+            check(got.get(m, "reset") == "reset",
+                  f"pane {n} mode ?{m} is {got.get(m)} after restore "
+                  f"(the replay re-armed it; expected reset)")
+        check(got.get(25, "set") == "set",
+              f"pane {n} cursor is still hidden after restore (mode ?25 = {got.get(25)})")
 
     check(gap < 15.0, f"reboot recovery gap {gap:.1f}s >= 15s")
 
@@ -779,6 +995,14 @@ def run_reboot_cycles(args, baseline):
             kill_pids(pids, signal.SIGKILL)
             wait_gone(pids, 5)
 
+        # 1b. Let the agent finish flushing its output rings before we kill it.
+        #     The viewer disconnect we just caused is what triggers that flush
+        #     (T13); SIGKILLing the agent a few ms later races it, and the pane
+        #     that loses comes back with no pre-restart scrollback at all — a
+        #     flake that looks exactly like a broken replay. A real reboot gives
+        #     the agent no less time than this.
+        wait_rings_flushed(EXPECTED_LEAVES)
+
         # 2. Kill the agent; launchd (KeepAlive) must bring a NEW one back, which
         #    loads sessions.json and materializes each session as a relaunchable
         #    tombstone before it accepts connections.
@@ -813,9 +1037,15 @@ def run_reboot_cycles(args, baseline):
                 log(f"    ✗ {f}")
             all_failures.extend(f"cycle {cycle}: {f}" for f in failures)
         else:
-            # Report the FRESH (post-divider) pids — cur["pid"] holds the replayed
-            # OLD marker (T13 scrollback), so derive the relaunched pids here.
-            fresh_pids = {n: fresh_marker(cur["text"].get(n, ""))[1] for n in sorted(EXPECTED_MARKERS)}
+            # Report the FRESH pids — cur["pid"] holds the replayed OLD marker
+            # (T13 scrollback), so derive the relaunched pids here. Under
+            # `restore` there is no post-divider marker to read; ask the shell.
+            if RELAUNCH_POLICY == "rerun":
+                fresh_pids = {n: fresh_marker(cur["text"].get(n, ""))[1]
+                              for n in sorted(EXPECTED_MARKERS)}
+            else:
+                fresh_pids = {n: probe_shell(cur["name"].get(n), n)[0]
+                              for n in sorted(EXPECTED_MARKERS)}
             log(f"[cycle {cycle}] PASS  recovery={gap:.1f}s  agent {agent_before}->{agent_after} "
                 f"({restart_secs:.1f}s)  fresh PIDs {fresh_pids}")
 
@@ -891,15 +1121,34 @@ def assert_inplace_cycle(baseline, cur, gap, app_before, app_after,
     for n in sorted(EXPECTED_MARKERS):
         bpid = baseline["pid"].get(n)
         text = cur["text"].get(n, "")
-        check(RESTART_DIVIDER in text,
-              f"pane {n} missing restart banner '{RESTART_DIVIDER}' after in-place recovery")
-        _, cpid = fresh_marker(text)
-        check(cpid is not None, f"pane {n} has no marker after recovery (never came back)")
-        check(cpid != bpid,
-              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
-        check(cpid is not None and pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
+        check(inplace_banner() in text,
+              f"pane {n} missing banner '{inplace_banner()}' after in-place recovery")
+        if RELAUNCH_POLICY == "rerun":
+            _, cpid = fresh_marker(text)
+            check(cpid is not None, f"pane {n} has no marker after recovery (never came back)")
+            check(cpid != bpid,
+                  f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+            check(cpid is not None and pid_alive(cpid),
+                  f"pane {n} relaunched PID {cpid} is not alive")
+            continue
+        # `restore`: a plain shell, not the recorded command. Probe it for proof.
+        ppid, pcwd = probe_shell(cur["name"].get(n), n)
+        check(ppid is not None,
+              f"pane {n} did not answer an echo probe (no live shell after in-place restore)")
+        check(ppid is None or ppid != bpid,
+              f"pane {n} shell pid unchanged {bpid} (expected a fresh process)")
+        bcwd = baseline["cwd"].get(n)
+        check(bcwd is None or pcwd == bcwd,
+              f"pane {n} restored shell cwd {pcwd!r} != recorded {bcwd!r}")
 
     check(gap < 15.0, f"in-place recovery gap {gap:.1f}s >= 15s")
+
+def inplace_banner():
+    """The marker an in-place recovery prints. Unlike the reboot cycle there is
+    usually NO ring snapshot to replay here (only the agent is killed, so it never
+    gets to flush), which means the CLIENT owns the marker — and the client prints
+    the policy's own string, not always the restart divider."""
+    return RESTORE_NOTICE if RELAUNCH_POLICY == "restore" else RESTART_DIVIDER
 
 def wait_inplace_recovered(app_before, timeout=20.0):
     """Poll until the LIVE app has rebuilt every pane in place: all markers
@@ -921,9 +1170,15 @@ def wait_inplace_recovered(app_before, timeout=20.0):
         # Require a FRESH marker after the divider (T13: the replayed pre-restart
         # scrollback carries the OLD marker + the divider ahead of the fresh
         # child's output — waiting only for the banner would return too early).
-        fresh = set(n for n in EXPECTED_MARKERS
-                    if fresh_marker(snap["text"].get(n, ""))[0] is not None
-                    and RESTART_DIVIDER in snap["text"].get(n, ""))
+        # Under `restore` the marker never comes back at all (that is the point),
+        # so the client's own post-recovery notice is the completion signal.
+        if RELAUNCH_POLICY == "restore":
+            fresh = set(n for n in EXPECTED_MARKERS
+                        if RESTORE_NOTICE in snap["text"].get(n, ""))
+        else:
+            fresh = set(n for n in EXPECTED_MARKERS
+                        if fresh_marker(snap["text"].get(n, ""))[0] is not None
+                        and RESTART_DIVIDER in snap["text"].get(n, ""))
         if EXPECTED_MARKERS.issubset(fresh):
             return
         time.sleep(0.4)
@@ -1660,7 +1915,7 @@ def run_fallback_check(args):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    global VERBOSE
+    global VERBOSE, RELAUNCH_POLICY
     ap = argparse.ArgumentParser()
     ap.add_argument("--cycles", type=int, default=3, help="terminate/relaunch cycles (default 3)")
     ap.add_argument("--upgrade", action="store_true",
@@ -1688,10 +1943,20 @@ def main():
                          "(no hang, no stray agent, no KeepAlive job)")
     ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
                     help="how to terminate the app each cycle (default kill = SIGKILL)")
+    ap.add_argument("--relaunch", choices=("restore", "rerun"), default="restore",
+                    help="session-relaunch policy for the reboot-equivalent modes "
+                         "(default restore = the shipped default: a plain shell in "
+                         "the recorded cwd; rerun = re-execute the recorded command)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     VERBOSE = args.verbose
+
+    # `restore` is the app's own default, so the flag is only passed for `rerun` —
+    # a clean pass with no flag is what proves the default is what ships.
+    RELAUNCH_POLICY = args.relaunch
+    if RELAUNCH_POLICY != "restore":
+        LAUNCH_ARGS.append(f"--session-relaunch={RELAUNCH_POLICY}")
 
     if not os.path.exists(CLI):
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")

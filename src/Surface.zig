@@ -1050,12 +1050,21 @@ pub fn init(
                     // self-lookups. Same signal as `pinned`.
                     .local = rb.local_shell_integration,
                     // Reboot-floor policy (T12c): if this ATTACH target comes
-                    // back dead-but-relaunchable (the agent restarted), `auto`
-                    // respawns it in place; `prompt` shows the exited overlay.
+                    // back dead-but-relaunchable (the agent restarted),
+                    // `restore` respawns a plain login shell in the recorded
+                    // cwd, `rerun` respawns the recorded command in place, and
+                    // `prompt` shows the exited overlay.
                     .relaunch_policy = switch (config.@"session-relaunch") {
-                        .auto => .auto,
+                        .restore => .restore,
+                        .rerun => .rerun,
                         .prompt => .prompt,
                     },
+                    // argv[0] label for a `restore` respawn's `<shell> -li`. The
+                    // same expression the shell-integration setup uses, and for
+                    // the same reason: the LOCAL agent resolves the SAME $SHELL
+                    // (same user/host). Null for a cross-machine window, where
+                    // the agent's own default shell is the only right answer.
+                    .login_shell = rb.shell orelse inherited_shell,
                     // WP-D3: the persisted screen snapshot + offset for a fast,
                     // visually-correct re-attach (null/0 ⇒ full-ring replay).
                     .restore_snapshot = rb.restore_snapshot,

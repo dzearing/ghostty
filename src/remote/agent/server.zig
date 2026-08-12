@@ -319,6 +319,10 @@ pub const Server = struct {
             // is what lets a new app distinguish us from a pre-fix agent whose
             // numbers are ~24× low on Apple Silicon.
             protocol.capability.cpu_units,
+            // `handleRelaunch` splices the viewer's `RELAUNCH.notice` into the
+            // ring ahead of the replay, so a "session was lost" line lands where
+            // the respawned shell cannot repaint over it.
+            protocol.capability.relaunch_notice,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -799,6 +803,12 @@ pub const Server = struct {
         } else if (open.shell) |sh| {
             s.setArgv(sh);
         }
+        // Record the working directory we just spawned in. This is the OTHER
+        // relaunch input (`persistMeta` → `sessions.json` → `handleRelaunch`'s
+        // synthesized OPEN) and it was never being written — see `Session.setCwd`.
+        // Null when the client sent none; the spawn then used the agent's own cwd
+        // and there is genuinely nothing session-specific to record.
+        if (open.cwd) |cwd| if (cwd.len > 0) s.setCwd(cwd);
         // Pin persistent local sessions so the idle-TTL reaper never evicts them
         // while orphaned (§7.1, T11). Set by the local-agent client for panes the
         // viewer's session-layout manifest references; false for cross-machine.
@@ -1570,6 +1580,28 @@ pub const Server = struct {
         // stable) and replay it to the reattaching viewer BEFORE the child's live
         // output — the client sees pre-restart scrollback → divider → fresh output,
         // with no offset hole (its relaunch pane keeps every byte from offset 0).
+        //
+        // The viewer's `notice` (if any) is appended to the ring FIRST, so it
+        // rides the replay in the one slot where it is safe: after the restored
+        // scrollback and the divider, before the respawned child's first byte.
+        // A viewer that prints the same line into its own terminal instead loses
+        // it — the inject lands after the fresh shell owns the screen and the
+        // shell's first prompt repaint blanks the line. `replayed` deliberately
+        // reports whether there was a real SNAPSHOT, sampled before this append,
+        // so a notice on an otherwise-empty ring doesn't make the viewer suppress
+        // its own divider.
+        const had_snapshot = rs.ring.len > 0;
+        if (req.notice) |notice| {
+            if (notice.len > 0) {
+                // Same append+advance the reboot divider does in
+                // `preloadRingSnapshot`: `out_offset` must move with the ring or
+                // the child's first output would claim these offsets too.
+                const text = notice[0..@min(notice.len, protocol.Relaunch.max_notice_bytes)];
+                rs.ring.append(rs.out_offset.value, text);
+                rs.out_offset.value +%= text.len;
+                rs.last_snapshot_offset = rs.out_offset.value;
+            }
+        }
         const replay_lo = rs.ring.base_offset;
         const replay_len = rs.ring.len;
         var replay_buf: ?[]u8 = null;
@@ -1599,12 +1631,14 @@ pub const Server = struct {
             .pid = pid,
             .found = true,
             // Tell the client we already replayed scrollback + the divider so it
-            // suppresses its own snapshot-less divider (no double marker).
-            .replayed = replay_n > 0,
+            // suppresses its own snapshot-less divider (no double marker). This
+            // means a real SNAPSHOT, sampled BEFORE any `notice` was appended —
+            // a notice on an otherwise-empty ring must not read as scrollback.
+            .replayed = had_snapshot and replay_n > 0,
             // Width the replayed bytes were drawn at (0 when unknown) so the client
             // can replay at that width then reflow — see Relaunched.replay_cols.
-            .replay_cols = if (replay_n > 0) replay_cols else 0,
-            .replay_rows = if (replay_n > 0) replay_rows else 0,
+            .replay_cols = if (had_snapshot and replay_n > 0) replay_cols else 0,
+            .replay_rows = if (had_snapshot and replay_n > 0) replay_rows else 0,
             .tty = tty_copy,
         }) catch {};
 
@@ -2307,7 +2341,15 @@ const FakeSpawner = struct {
     last_env_val_len: usize = 0,
     last_term_buf: [32]u8 = undefined,
     last_term_len: usize = 0,
+    /// Captured `Open.cwd` (empty = the spawn got none). The RELAUNCH path
+    /// synthesizes its OPEN from the session's recorded cwd, so this is how a
+    /// test sees which directory a respawn would actually land in.
+    last_cwd_buf: [256]u8 = undefined,
+    last_cwd_len: usize = 0,
 
+    fn lastCwd(self: *const FakeSpawner) []const u8 {
+        return self.last_cwd_buf[0..self.last_cwd_len];
+    }
     fn lastEnvKey(self: *const FakeSpawner) []const u8 {
         return self.last_env_key_buf[0..self.last_env_key_len];
     }
@@ -2333,6 +2375,10 @@ const FakeSpawner = struct {
         }
         self.last_term_len = @min(open.term.len, self.last_term_buf.len);
         @memcpy(self.last_term_buf[0..self.last_term_len], open.term[0..self.last_term_len]);
+        self.last_cwd_len = if (open.cwd) |c| @min(c.len, self.last_cwd_buf.len) else 0;
+        if (self.last_cwd_len > 0) {
+            @memcpy(self.last_cwd_buf[0..self.last_cwd_len], open.cwd.?[0..self.last_cwd_len]);
+        }
         const fc = self.children[self.next];
         self.next += 1;
         return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)), .tty = self.tty };
@@ -4370,4 +4416,152 @@ test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
     store.reapIdle();
     try testing.expect(store.table.getByChannel(channel) == null);
     try testing.expect(fc.wasTerminated());
+}
+
+test "OPEN records the session cwd so a RELAUNCH respawns in it" {
+    // `session-relaunch=restore` promises "a shell in the session's recorded
+    // working directory", and the recorded cwd is the only thing that can deliver
+    // it — `RELAUNCH` carries no cwd, so `handleRelaunch` reads `s.cwd`. That
+    // field was never written on `handleOpen`, so it was permanently null and
+    // every reboot-floor respawn (this policy and the old re-run alike) landed in
+    // whatever cwd the AGENT happened to have.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{
+        .cwd = "/tmp/worktree",
+        .command = "cl --resume",
+        .rows = 24,
+        .cols = 80,
+    });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expectEqualStrings("/tmp/worktree", sp.lastCwd());
+
+    // Recorded on the session, hence in `sessions.json` and hence survivable
+    // across the agent restart the reboot floor exists for.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByIdStr(op.value.session_id).?;
+    try testing.expectEqualStrings("/tmp/worktree", s.cwd.?);
+    // Fake a reboot-materialized tombstone in place: the child is gone but the
+    // relaunch metadata is what came back off disk.
+    s.alive = false;
+    s.relaunchable = true;
+    const sid = s.id_str;
+    h.server.store.mutex.unlock();
+
+    // The `restore` client sends a plain login-shell argv, which nulls the
+    // recorded command in the synthesized OPEN. The cwd must survive that.
+    const shell_argv = [_][]const u8{ "/bin/zsh", "-li" };
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = &sid,
+        .rows = 24,
+        .cols = 80,
+        .argv = &shell_argv,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expectEqualStrings("/tmp/worktree", sp.lastCwd());
+}
+
+test "RELAUNCH: the viewer's notice is spliced into the replay, not after it" {
+    // Bug-1/bug-2 UX: a client that prints its "session was lost" line locally
+    // loses it — the inject lands after the respawned shell owns the screen and
+    // the shell's first prompt repaint blanks the line (the agent-baked divider
+    // one row up survives, which is what makes the diagnosis unambiguous). So the
+    // agent has to put it in the STREAM: after the restored scrollback + divider,
+    // and before the child's first byte.
+    const ring_snapshot = @import("ring_snapshot.zig");
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xC0DE5);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
+
+    var tmp = testing.tmpDir(.{});
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    h.store.meta_path = meta;
+    h.store.rings_dir = rings;
+    // Same deinit-then-free ordering as the sibling replay test: the store only
+    // BORROWS these paths and the reader threads touch them after acking a frame.
+    defer {
+        h.deinit();
+        alloc.free(rings);
+        alloc.free(meta);
+        alloc.free(dir_path);
+        tmp.cleanup();
+    }
+
+    const rec_id = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    const scrollback = "PANE=3 PID=4242\r\ntick-3-0\r\n";
+    {
+        const recs = [_]@import("session_meta.zig").Record{.{ .id = rec_id, .argv = "cl --resume", .pinned = true, .created_ms = 50 }};
+        const body = try @import("session_meta.zig").serialize(alloc, &recs);
+        defer alloc.free(body);
+        try @import("session_meta.zig").writeAtomic(alloc, meta, body);
+        const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
+        defer alloc.free(rp);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, scrollback);
+    }
+    try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+    });
+    _ = try h.client.waitControl(.attached);
+
+    const notice = "\r\n--- previous session was lost ---\r\n";
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+        .notice = notice,
+    });
+
+    const d = try h.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    const idx_back = std.mem.indexOf(u8, dp.bytes, "PANE=3 PID=4242").?;
+    const idx_div = std.mem.indexOf(u8, dp.bytes, session.reboot_divider).?;
+    const idx_notice = std.mem.indexOf(u8, dp.bytes, notice).?;
+    try testing.expect(idx_back < idx_div);
+    try testing.expect(idx_div < idx_notice);
+    // The notice is the TAIL of the replay, so the respawned child's first output
+    // continues immediately after it rather than landing on top of it.
+    try testing.expectEqual(dp.bytes.len, idx_notice + notice.len);
+
+    const rf = try h.client.waitControl(.relaunched);
+    var rp2 = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp2.deinit();
+    // `replayed` still means "there was a real snapshot" — sampled before the
+    // notice was appended — so a notice alone can never make the viewer suppress
+    // its own divider.
+    try testing.expect(rp2.value.replayed);
 }

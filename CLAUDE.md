@@ -786,11 +786,62 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
   processes outlive the app. On next launch the app re-attaches: layout, split
   ratios, titles, working dirs, and gap-filled scrollback come back with the
   **same PIDs** (no restart) as long as the agent stayed alive.
-- `session-relaunch = auto|prompt` (default `auto`). Only matters across an
-  **agent** restart (reboot / agent upgrade), where the child is gone but its
-  metadata was materialized from disk as a relaunchable tombstone. `auto`
-  respawns the recorded command in-place with a `--- session restarted ---`
-  divider; `prompt` leaves the pane in its exited state for the user to decide.
+- `session-relaunch = restore|rerun|prompt` (default `restore`). Only matters
+  across an **agent** restart (reboot / agent upgrade), where the child is gone
+  but its metadata was materialized from disk as a relaunchable tombstone.
+  - `restore` (default): the pane comes back as a **plain login shell in the
+    session's recorded working directory**, under a
+    `--- previous session was lost; new shell in its working directory ---`
+    notice. The recorded command is **not** re-run. This is what makes a reboot
+    safe to do: a `/wt` window opened with `--command="cl …"` used to come back
+    by starting a brand-new Claude Code session, silently, in every pane.
+  - `rerun`: re-execute the recorded command in place with a
+    `--- session restarted ---` divider — the old `auto`, kept as an explicit
+    opt-in for panes whose command is cheap and idempotent.
+  - `prompt`: leave the pane in its exited state for the user to decide; the
+    consenting keystroke does a `rerun`.
+
+  The policy lives entirely client-side. `RELAUNCH` carries no argv, but the
+  agent's synthesized relaunch OPEN already drops the *recorded* command
+  whenever the viewer supplies `Relaunch.argv` — so `restore` just sends a
+  `<shell> -li` argv and the agent's own recorded `cwd` does the rest. No wire
+  change; an agent too old to honor those fields degrades to `rerun`.
+
+  **The recorded cwd is `OPEN.cwd`, recorded at spawn.** The agent used to never
+  write `Session.cwd` at all (only `materialize` set it, reading the field back
+  off disk), so it was permanently null and every reboot-floor respawn — this
+  policy and the old re-run alike — landed in whatever cwd the *agent* happened
+  to have, which for a launchd-restarted agent is arbitrary. `handleOpen` now
+  records it. Two limits remain, both benign: it is the **start** directory (the
+  agent never re-samples the shell's live cwd, so a `cd`-ed shell comes back at
+  the root it started in), and a bare `+new-window`/`+split` over IPC with no
+  `--working-directory` still records nothing — GUI windows, tabs, and splits
+  all inherit a cwd (`TerminalController.remoteWorkingDirectory`), and `/wt`
+  passes one explicitly, so real windows have it.
+
+  **Restoring scrollback also restores VT modes**, and the program that owned
+  them is dead. `termio/Remote.zig`'s `replay_mode_reset` undoes them: mouse
+  tracking above all (a dead TUI's `ESC[?1003h` makes a plain zsh read pointer
+  motion as typed input — `zsh: command not found: 30M35`), plus bracketed
+  paste, focus reporting, cursor keys/keypad, autowrap, cursor visibility, and
+  SGR. It is **mode state only** — no `RIS`, and deliberately no alt-screen /
+  origin / scroll-region reset, because ghostty applies those unconditionally
+  (cursor restore, erase, home) and they would land the fresh prompt on top of
+  the restored output. It is **not** applied on the ordinary alive re-attach:
+  there the child still runs and still owns those modes.
+
+  **The notice and the reset travel in the stream, not as a local print**
+  (`RELAUNCH.notice`, gated on the `relaunch_notice` HELLO capability). The
+  agent appends them to the ring before replaying, so they land after the
+  scrollback + divider and before the respawned child's first byte — the same
+  slot the divider occupies. A client-side inject does not survive: it reaches
+  the terminal after the fresh shell owns the screen, and the shell's first
+  prompt repaint blanks the line (measured — the agent-baked divider one row up
+  survives while the client's line goes blank, which is what pinned the cause).
+  Putting the reset there too removes a second hazard: injected locally it could
+  land *after* a `rerun` TUI armed its own mouse tracking and switch it back off.
+  Against an agent too old to advertise the capability the client falls back to
+  printing both itself — visible, just repaintable.
 
 Session lifecycle: a process DIES when the user closes its pane/tab/window (or
 `+close`s it — the CLOSE lands when the close's undo window expires), when the
