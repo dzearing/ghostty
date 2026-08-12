@@ -26,6 +26,7 @@ pub const hostname = @import("hostname.zig");
 pub const i18n = @import("i18n.zig");
 pub const ipc_client = @import("ipc_client.zig");
 pub const listening_pid = @import("listening_pid.zig");
+pub const log_stamp = @import("log_stamp.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
 pub const path_env = @import("path_env.zig");
@@ -79,6 +80,7 @@ test {
     _ = i18n;
     _ = ipc_client;
     _ = listening_pid;
+    _ = log_stamp;
     _ = path;
     _ = path_env;
     _ = process_cwd;

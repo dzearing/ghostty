@@ -10,6 +10,7 @@ const build_config = @import("build_config.zig");
 // the logging block below comptime-breaks before touching it elsewhere.
 const macos = if (builtin.target.os.tag.isDarwin()) @import("macos") else undefined;
 const cli = @import("cli.zig");
+const log_stamp = @import("os/log_stamp.zig");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
 
@@ -250,15 +251,26 @@ fn logFn(
             break :windows_file;
         defer file.close();
 
-        var msg_buf: [2048]u8 = undefined;
+        // One line, ONE write. The append is atomic per write operation, so a
+        // prefix emitted as a second write could land after another process's
+        // line and split this one in half — which is the failure T229 fixed,
+        // reintroduced. Both halves are printed into the same buffer and the
+        // whole thing goes out once. (T270)
+        var msg_buf: [2048 + log_stamp.max_len]u8 = undefined;
+        const stamp = log_stamp.format(
+            msg_buf[0..log_stamp.max_len],
+            std.time.milliTimestamp(),
+            std.os.windows.GetCurrentProcessId(),
+        );
+
         const level_txt = comptime level.asText();
         const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
-        const msg = std.fmt.bufPrint(
-            &msg_buf,
+        const body = std.fmt.bufPrint(
+            msg_buf[stamp.len..],
             level_txt ++ prefix ++ format ++ "\n",
             args,
         ) catch break :windows_file;
-        _ = file.write(msg) catch {};
+        _ = file.write(msg_buf[0 .. stamp.len + body.len]) catch {};
     }
 
     stderr: {
@@ -346,6 +358,12 @@ test {
     // win32 apprt otherwise, so pull it in explicitly to run its unit tests in
     // the `none` lane too.
     _ = @import("remote/agent_lineage.zig");
+
+    // The shared Windows log sink's per-line prefix (T270): pure timestamp/pid
+    // formatting, reached only through this file's own `logFn` — which is
+    // compiled out of Debug builds — so pull it in explicitly to run its unit
+    // tests in every lane on every platform.
+    _ = @import("os/log_stamp.zig");
 
     // Socket Reader/Writer with panic-free close-race error mappings (T81):
     // the ws transport teardown depends on these staying error-returning.
