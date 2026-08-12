@@ -189,7 +189,9 @@ fn sendOpen(
     const json_payload = try ipc_client.buildRequest(alloc, "new-remote-window", arguments);
     defer alloc.free(json_payload);
 
-    const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{}, stderr);
+    const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{
+        .action = "+new-remote-window",
+    }, stderr);
 
     const parsed = std.json.parseFromSlice(
         struct { success: bool = false, @"error": ?[]const u8 = null },

@@ -9,6 +9,46 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T755 (T798 filed) - a CLI verb can no longer wait forever;
+  it answers or it explains.** The measured shape was a `+list` blocked for 34
+  minutes with 0.06s of CPU against an app that was alive and rendering. Two
+  layers made that possible and both are now closed: `IpcServer.serveOne`
+  marshals every request to the GUI thread and waits with no timeout, so from
+  the client side a GUI thread busy with a cold start or a session restore is
+  indistinguishable from a wedged one - and a synchronous `ReadFile` on a named
+  pipe cannot be interrupted, so the client had no way out at all (no output,
+  no error, no exit code, and any script capturing that child's stdout hung
+  with it). The client's pipe is now opened `FILE_FLAG_OVERLAPPED` and every
+  read/write carries a cancellable OVERLAPPED; posix gets the same bound from
+  `SO_RCVTIMEO`/`SO_SNDTIMEO`, so the Mac CLI is bounded by the same policy
+  without a second implementation of it. Policy is pure and asserted in the
+  `none` lane (`src/os/ipc_timeout.zig`): 30s default, a "still waiting" line
+  at 5s so a slow start reads as slow rather than as a hung terminal,
+  `GHOZTTY_IPC_TIMEOUT_MS` to override (0 = forever), and a garbage value
+  falling back to the default rather than to forever - a typo must not
+  reinstate the hang. The second half of the task was P1's first section
+  failing on a cold auto-launch: that budget was 20 fixed 500ms attempts, it
+  was being reached, and it is now a 30s deadline that WATCHES the process it
+  launched, so a slow start is waited out and a dead one is answered at once.
+  One real bug found mid-flight and worth recording: `timeout_ms == 0` had
+  been doing double duty as "synchronous handle", so the documented opt-out
+  handed an overlapped handle to a synchronous `ReadFile` and wedged - neither
+  completing nor timing out. Split into `Conn.owned` and `Conn.timeout_ms`;
+  section D of the new acceptance is the arm that caught it, which is the
+  argument for having written it. Evidence: `test\win32\ipc-timeout.ps1` ALL
+  PASS (23), driven by a new `ipc-fake-server.ps1 -Wedge` that accepts, reads
+  and answers nothing - wedged by construction, so nothing depends on timing
+  luck - with a replying server as the control and the harness itself capped so
+  a regression FAILS the script instead of hanging it. `ipc-p1.ps1` x6 cold ALL
+  PASS (25 each), P2/P3 ALL PASS, all three zig lanes PASS, and the five
+  harness audits plus `cli-shim-redirect`/`ipc-instance-addressability` still
+  green. Filed **T798**: `persistence-flag.ps1` is RED at HEAD with 4
+  undeclared launch sites in `url-scheme.ps1` and `agent-attach-refused.ps1` -
+  pre-existing, noticed only because T755's two declared sites moved the count
+  from 6 to 4. Deliberately not fixed here: those are GUI launches, so the
+  answer is whether each test wants a restore, and guessing changes what they
+  measure.
+
 - 2026-08-12 - **T283 (T788/T789 filed) - the negative control that could not
   fail the assertion naming the bug it was filed for.** All eight `*_NEUTERED`
   flags in `src/apprt/win32/` were swept for the `glyphCentered()` shape T209

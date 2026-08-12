@@ -129,6 +129,7 @@ fn sendRearrange(
 
     const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{
         .max_response = 4_194_304,
+        .action = "+rearrange",
     }, stderr);
 
     const parsed = std.json.parseFromSlice(

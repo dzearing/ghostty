@@ -4576,10 +4576,11 @@ pub fn performIpc(
                 // later RELAUNCH lands a session that recorded none. A detached
                 // launcher script sits in `C:\Windows\System32`, so without this
                 // the auto-launched instance and its agent do too.
-                try autoLaunchInstance(
+                const launched = try autoLaunchInstance(
                     alloc,
                     apprt.ipc.args.autoLaunchDirectory(value.arguments),
                 );
+                defer std.os.windows.CloseHandle(launched);
                 // T118: the instance we just launched is OUR exe, so it binds
                 // the DERIVED endpoint — never the one baked into this pane by
                 // some other app. Drop the baked value for the retry, or a
@@ -4591,16 +4592,43 @@ pub fn performIpc(
 
                 // The new instance needs to create its window and bind the
                 // pipe; a cold debug start on a busy box can take a while.
-                var attempt: usize = 0;
-                while (true) : (attempt += 1) {
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                //
+                // T755: the budget is a DEADLINE (`ipc_timeout.auto_launch_ms`)
+                // rather than a fixed attempt count, and it is nearly three
+                // times what the old 20-attempts-of-500ms came to. That budget
+                // was reached in the wild — `ipc-p1.ps1`'s first section lost
+                // three assertions to one cold auto-launch and passed clean on
+                // the re-run, which is indistinguishable from a real
+                // regression to whoever runs the floor next.
+                //
+                // Waiting longer is only safe because the wait now WATCHES the
+                // process it started: an instance that dies during startup ends
+                // the wait immediately instead of burning the whole budget on a
+                // peer that is never coming. A patient wait for a live process
+                // and a fast answer about a dead one are the same policy.
+                const timeout = internal_os.ipc_timeout;
+                var waited_ms: u32 = 0;
+                while (true) {
+                    std.Thread.sleep(timeout.auto_launch_poll_ms * std.time.ns_per_ms);
+                    waited_ms += timeout.auto_launch_poll_ms;
                     return internal_os.ipc_client.sendAction(
                         alloc,
                         comptime action.wireName(),
                         value.arguments,
                     ) catch |retry_err| switch (retry_err) {
                         error.NoRunningInstance => {
-                            if (attempt < 20) continue;
+                            if (instanceExited(launched)) {
+                                log.warn(
+                                    "auto-launched instance exited before it answered after {d}ms",
+                                    .{waited_ms},
+                                );
+                                return error.NoRunningInstance;
+                            }
+                            if (waited_ms < timeout.auto_launch_ms) continue;
+                            log.warn(
+                                "auto-launched instance did not answer within {d}ms",
+                                .{timeout.auto_launch_ms},
+                            );
                             return error.NoRunningInstance;
                         },
                         else => return retry_err,
@@ -4638,7 +4666,10 @@ pub fn performIpc(
 ///   resolved default is no longer unconditionally `home` (T506), but this
 ///   spawn is detached and carries no CLI marker, so it still resolves to
 ///   `home` — the argument is what makes the answer explicit either way.
-fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void {
+/// Returns the new process's handle (T755) so the caller can tell "still
+/// starting" from "already dead" while it waits. The caller owns it and must
+/// `CloseHandle` it.
+fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!std.os.windows.HANDLE {
     const windows = std.os.windows;
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4690,8 +4721,17 @@ fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void 
         &si,
         &pi,
     ) == 0) return error.IPCFailed;
-    windows.CloseHandle(pi.hProcess);
     windows.CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
+/// Has the process behind `handle` already exited? A zero-millisecond wait is
+/// the cheapest "is it still alive" there is, and anything other than a clean
+/// signal is answered as "still alive" — a wait we cannot perform must never be
+/// the reason a healthy startup is abandoned.
+fn instanceExited(handle: std.os.windows.HANDLE) bool {
+    const windows = std.os.windows;
+    return windows.kernel32.WaitForSingleObject(handle, 0) == windows.WAIT_OBJECT_0;
 }
 
 // Not in zig std's kernel32 as of 0.15.2.

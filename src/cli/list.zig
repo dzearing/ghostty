@@ -177,6 +177,7 @@ fn sendListQuery(
 
     const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{
         .max_response = 4_194_304,
+        .action = "+list",
     }, stderr);
 
     // Verify the response has success:true

@@ -198,6 +198,7 @@ fn sendReadQuery(
 
     const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{
         .max_response = 4_194_304,
+        .action = "+read",
     }, stderr);
 
     // Check success field

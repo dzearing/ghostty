@@ -662,6 +662,59 @@ the release binary (before this, it silently drove the release app).
   forward its startup `new-window` to) that release instance's endpoint.
   Acceptance: `test/win32/ipc-instance-addressability.ps1`.
 
+### Every verb answers or explains — it never just waits
+
+**No CLI verb blocks indefinitely on the app** (T755). The bound is 30s per
+exchange, with a "still waiting" line on stderr at 5s, and `GHOZTTY_IPC_TIMEOUT_MS`
+overrides it (`0` waits forever, for a caller who genuinely wants that — a
+debugger attached to a stopped app). The timeout message names the verb, which
+half of the exchange was waiting, and the env var: *"Timed out after 30.0s
+trying to get a response from Ghoztty for '+list'."*
+
+It is a structural hazard, not a rare one. The server reads a request on a
+listener thread and marshals it to the GUI thread with no timeout of its own,
+and from the client side a GUI thread that is busy — a cold start, a session
+restore — is indistinguishable from one that is wedged. On 2026-08-11 a
+`+list` fired during `ipc-p1.ps1`'s cold auto-launch was still blocked **34
+minutes later** with 0.06s of CPU, against an app that was alive and rendering.
+There was no way out because a synchronous `ReadFile` on a named pipe cannot be
+interrupted: no output, no error, no exit code, and a caller capturing that
+child's stdout hung with it. So the client's pipe is opened
+`FILE_FLAG_OVERLAPPED` and every read carries an OVERLAPPED that can be
+cancelled; posix gets the same bound from `SO_RCVTIMEO`/`SO_SNDTIMEO`, so the
+Mac CLI is bounded by the same policy without a second implementation of it.
+
+Two things that look like details and are not:
+
+- **The bound and the handle are separate facts.** `Conn.owned` says this
+  process opened the handle (and may therefore bound it); `Conn.timeout_ms`
+  says how long. Folding them into one field made `GHOZTTY_IPC_TIMEOUT_MS=0`
+  hand an overlapped handle to a synchronous `ReadFile` — documented as
+  unpredictable, and measured here as a read that neither completed nor timed
+  out. The win32 IPC **server** wraps each accepted pipe instance in a `Conn`
+  it did not open, which is exactly what the `owned: false` default protects.
+- **A typo must not reinstate the hang.** An unparseable
+  `GHOZTTY_IPC_TIMEOUT_MS` falls back to the 30s default, never to forever;
+  only a literal `0` opts out.
+
+The auto-launch wait `+new-window` performs is a different question and has its
+own budget (`ipc_timeout.auto_launch_ms`, 30s): there the peer is a process we
+just started, and its cold start includes the loader, Defender scanning a
+freshly built binary, config parsing and a session restore. The old budget —
+20 fixed attempts of 500ms — was reached in the wild, costing `ipc-p1.ps1`'s
+first section three assertions on one cold run that passed clean on the re-run,
+which reads as a regression and is not one. Waiting nearly three times as long
+is only safe because the wait now WATCHES the process it launched: an instance
+that dies during startup ends the wait immediately rather than burning the
+budget on a peer that is never coming.
+
+Policy (numbers, env parsing, wording) is pure and asserted in the `none` lane:
+`src/os/ipc_timeout.zig`. Acceptance: `test/win32/ipc-timeout.ps1`, driven by
+`ipc-fake-server.ps1 -Wedge` — a peer that accepts, reads the request and
+answers nothing, so nothing there depends on timing luck — with a replying
+server as the control and the harness itself capped, so a regression of the
+bound fails the script instead of hanging it.
+
 ### Example: three-pane layout
 
 ```bash

@@ -112,7 +112,9 @@ fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
 
     var err_buf: [256]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writerStreaming(&err_buf);
-    const resp = ipc_client.exchange(alloc, conn, req, .{}, &stderr_writer.interface) catch |err| switch (err) {
+    const resp = ipc_client.exchange(alloc, conn, req, .{
+        .action = "+version",
+    }, &stderr_writer.interface) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try stdout.print("  - query failed\n", .{});

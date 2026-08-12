@@ -14,6 +14,8 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const build_config = @import("../build_config.zig");
 
+pub const timeout = @import("ipc_timeout.zig");
+
 const is_windows = builtin.os.tag == .windows;
 
 pub const Error = error{
@@ -37,6 +39,25 @@ extern "kernel32" fn WaitNamedPipeW(
 pub const Conn = struct {
     handle: Handle,
 
+    /// Whether this module OPENED the handle, and may therefore bound the I/O
+    /// on it (T755). On Windows that means it was created with
+    /// `FILE_FLAG_OVERLAPPED` and every read/write must carry an OVERLAPPED;
+    /// on posix it means the socket is ours to `setsockopt`.
+    ///
+    /// It is a separate fact from `timeout_ms` and must stay one. A client
+    /// that opted out of the bound (`GHOZTTY_IPC_TIMEOUT_MS=0`) still holds an
+    /// overlapped handle, and handing such a handle to a synchronous
+    /// `ReadFile` is documented as unpredictable — which is exactly what one
+    /// combined field produced: the opt-out wedged on a read that neither
+    /// completed nor timed out. The default `false` is what keeps a Conn built
+    /// around somebody else's handle — the win32 IPC SERVER wraps each
+    /// accepted pipe instance this way — on the blocking path it always had.
+    owned: bool = false,
+
+    /// Bound on a single read or write, in milliseconds; 0 means wait forever.
+    /// Only consulted when `owned`.
+    timeout_ms: u32 = 0,
+
     pub const Handle = if (is_windows) windows.HANDLE else std.posix.fd_t;
 
     pub fn close(self: Conn) void {
@@ -47,29 +68,163 @@ pub const Conn = struct {
         }
     }
 
+    /// Write every byte, bounded by this connection's timeout. A timeout here
+    /// means the peer is not draining the pipe at all.
     pub fn writeAll(self: Conn, bytes: []const u8) !void {
         var total: usize = 0;
         while (total < bytes.len) {
-            const n = if (comptime is_windows)
-                try windows.WriteFile(self.handle, bytes[total..], null)
-            else
-                try std.posix.write(self.handle, bytes[total..]);
+            const n = try self.writeSlice(bytes[total..], self.boundOrForever());
             if (n == 0) return error.EndOfStream;
             total += n;
         }
     }
 
+    /// Read exactly `buffer.len` bytes, bounded by this connection's timeout.
     pub fn readFull(self: Conn, buffer: []u8) !void {
-        var total: usize = 0;
-        while (total < buffer.len) {
-            // On Windows, std's ReadFile maps BROKEN_PIPE/EOF to 0 already.
-            const n = if (comptime is_windows)
-                try windows.ReadFile(self.handle, buffer[total..], null)
-            else
-                try std.posix.read(self.handle, buffer[total..]);
+        var done: usize = 0;
+        return self.readFullWithin(buffer, &done, self.boundOrForever());
+    }
+
+    /// `readFull` with an explicit bound and a caller-owned progress cursor.
+    ///
+    /// The cursor is what makes a two-stage wait possible: a call that gives up
+    /// leaves `done.*` at the bytes it did read, so the caller can print a
+    /// "still waiting" notice and resume the SAME read with the rest of the
+    /// budget instead of losing a partial frame. `wait_ms` of null waits
+    /// forever; expiry is `error.Timeout`.
+    pub fn readFullWithin(
+        self: Conn,
+        buffer: []u8,
+        done: *usize,
+        wait_ms: ?u32,
+    ) !void {
+        while (done.* < buffer.len) {
+            const n = self.readSlice(buffer[done.*..], wait_ms) catch |err| switch (err) {
+                error.WouldBlock => return error.Timeout,
+                else => return err,
+            };
             if (n == 0) return error.EndOfStream;
-            total += n;
+            done.* += n;
         }
+    }
+
+    /// This connection's bound as the `?u32` the slice helpers take: null when
+    /// there is none (`timeout_ms == 0`, or a handle we do not own).
+    fn boundOrForever(self: Conn) ?u32 {
+        if (!self.owned or self.timeout_ms == 0) return null;
+        return self.timeout_ms;
+    }
+
+    fn readSlice(self: Conn, buffer: []u8, wait_ms: ?u32) !usize {
+        if (comptime is_windows) {
+            // A Conn wrapping a handle we did not open (the win32 IPC server
+            // wraps each accepted pipe instance) is synchronous and cannot do
+            // overlapped I/O; it keeps the blocking path it always had.
+            if (!self.owned) return windows.ReadFile(self.handle, buffer, null);
+            return self.overlappedIo(.read, buffer, wait_ms);
+        }
+
+        if (self.owned) self.setPosixTimeout(std.posix.SO.RCVTIMEO, wait_ms);
+        return std.posix.read(self.handle, buffer);
+    }
+
+    fn writeSlice(self: Conn, bytes: []const u8, wait_ms: ?u32) !usize {
+        if (comptime is_windows) {
+            if (!self.owned) return windows.WriteFile(self.handle, bytes, null);
+            return self.overlappedIo(.write, @constCast(bytes), wait_ms) catch |err| switch (err) {
+                error.WouldBlock => error.Timeout,
+                else => err,
+            };
+        }
+
+        if (self.owned) self.setPosixTimeout(std.posix.SO.SNDTIMEO, wait_ms);
+        return std.posix.write(self.handle, bytes) catch |err| switch (err) {
+            error.WouldBlock => error.Timeout,
+            else => err,
+        };
+    }
+
+    /// Windows: one bounded read or write over an overlapped handle.
+    ///
+    /// A synchronous `ReadFile` on a named pipe cannot be interrupted, which
+    /// is the whole of T755 — a client whose peer never answered blocked for
+    /// 34 minutes. So the client's handle is opened `FILE_FLAG_OVERLAPPED`
+    /// and every operation waits on its own event with a bound. On timeout the
+    /// I/O is cancelled and then WAITED FOR: the OVERLAPPED and the buffer are
+    /// on this stack frame, and the kernel may still be writing to them until
+    /// the cancelled operation actually completes.
+    fn overlappedIo(
+        self: Conn,
+        comptime op: enum { read, write },
+        buffer: []u8,
+        wait_ms: ?u32,
+    ) !usize {
+        if (comptime !is_windows) unreachable;
+
+        const event = windows.kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_ALL_ACCESS,
+        ) orelse return error.Unexpected;
+        defer windows.CloseHandle(event);
+
+        var ov: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
+        ov.hEvent = event;
+
+        const len: windows.DWORD = @intCast(@min(buffer.len, std.math.maxInt(windows.DWORD)));
+        const started = switch (op) {
+            .read => windows.kernel32.ReadFile(self.handle, buffer.ptr, len, null, &ov),
+            .write => windows.kernel32.WriteFile(self.handle, buffer.ptr, len, null, &ov),
+        };
+
+        if (started == 0) switch (windows.GetLastError()) {
+            .IO_PENDING => {
+                const ms: windows.DWORD = if (wait_ms) |w| w else windows.INFINITE;
+                if (windows.kernel32.WaitForSingleObject(event, ms) != windows.WAIT_OBJECT_0) {
+                    // Cancel, then block until the operation is really done —
+                    // see the note above about the stack frame.
+                    _ = windows.kernel32.CancelIoEx(self.handle, &ov);
+                    _ = windows.kernel32.WaitForSingleObject(event, windows.INFINITE);
+                    return error.WouldBlock;
+                }
+            },
+            // The peer hung up. Both spellings mean "no more bytes", which the
+            // callers already read as end-of-stream.
+            .BROKEN_PIPE, .HANDLE_EOF, .PIPE_NOT_CONNECTED => return 0,
+            else => return error.Unexpected,
+        };
+
+        var transferred: windows.DWORD = 0;
+        if (windows.kernel32.GetOverlappedResult(self.handle, &ov, &transferred, 0) == 0) {
+            switch (windows.GetLastError()) {
+                .BROKEN_PIPE, .HANDLE_EOF, .PIPE_NOT_CONNECTED => return 0,
+                .OPERATION_ABORTED => return error.WouldBlock,
+                else => return error.Unexpected,
+            }
+        }
+        return transferred;
+    }
+
+    /// posix: bound the next blocking read/write with `SO_RCVTIMEO` /
+    /// `SO_SNDTIMEO`, which expire as `EAGAIN` (`error.WouldBlock`). A zero
+    /// timeval is the kernel's own spelling of "no timeout", so the
+    /// wait-forever case needs no special path. Best-effort: a socket that
+    /// refuses the option keeps the blocking behavior it had before T755
+    /// rather than failing the command outright.
+    fn setPosixTimeout(self: Conn, optname: u32, wait_ms: ?u32) void {
+        if (comptime is_windows) return;
+        const ms = wait_ms orelse 0;
+        const tv: std.posix.timeval = .{
+            .sec = @intCast(ms / 1000),
+            .usec = @intCast((ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            self.handle,
+            std.posix.SOL.SOCKET,
+            optname,
+            std.mem.asBytes(&tv),
+        ) catch {};
     }
 };
 
@@ -211,7 +366,12 @@ pub fn connectWithReset(alloc: Allocator, stderr: *std.Io.Writer) Error!Conn {
 
     if (comptime is_windows) return connectPath(alloc, path);
 
-    if (connectUnixSocket(path)) |fd| return .{ .handle = fd } else |_| {}
+    const bound = resolvedTimeoutMs(alloc);
+    if (connectUnixSocket(path)) |fd| return .{
+        .handle = fd,
+        .owned = true,
+        .timeout_ms = bound,
+    } else |_| {}
 
     // Connection failed. Drop a sentinel file to signal the main process to
     // rebind its socket, then retry with backoff.
@@ -232,7 +392,7 @@ pub fn connectWithReset(alloc: Allocator, stderr: *std.Io.Writer) Error!Conn {
         std.Thread.sleep(300 * std.time.ns_per_ms);
         if (connectUnixSocket(path)) |connected_fd| {
             std.fs.cwd().deleteFile(sentinel_path) catch {};
-            return .{ .handle = connected_fd };
+            return .{ .handle = connected_fd, .owned = true, .timeout_ms = bound };
         } else |_| {}
 
         // If the sentinel file still exists after several attempts, no
@@ -248,7 +408,17 @@ pub fn connectWithReset(alloc: Allocator, stderr: *std.Io.Writer) Error!Conn {
     return error.NoRunningInstance;
 }
 
+/// The bound every connection this module opens carries, resolved once from
+/// the environment (`GHOZTTY_IPC_TIMEOUT_MS`; see `ipc_timeout.zig`).
+fn resolvedTimeoutMs(alloc: Allocator) u32 {
+    const raw: ?[]u8 = std.process.getEnvVarOwned(alloc, timeout.env_var) catch null;
+    defer if (raw) |r| alloc.free(r);
+    return timeout.resolve(raw);
+}
+
 fn connectPath(alloc: Allocator, path: [:0]const u8) Error!Conn {
+    const bound = resolvedTimeoutMs(alloc);
+
     if (comptime is_windows) {
         const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -266,10 +436,18 @@ fn connectPath(alloc: Allocator, path: [:0]const u8) Error!Conn {
                 0,
                 null,
                 windows.OPEN_EXISTING,
-                0,
+                // T755: overlapped, so a read that the peer never answers can
+                // be cancelled instead of blocking this process forever. A
+                // synchronous ReadFile on a named pipe is uninterruptible, and
+                // that is exactly how a `+list` came to wait 34 minutes.
+                windows.FILE_FLAG_OVERLAPPED,
                 null,
             );
-            if (handle != windows.INVALID_HANDLE_VALUE) return .{ .handle = handle };
+            if (handle != windows.INVALID_HANDLE_VALUE) return .{
+                .handle = handle,
+                .owned = true,
+                .timeout_ms = bound,
+            };
             switch (windows.GetLastError()) {
                 .PIPE_BUSY => {
                     attempts += 1;
@@ -282,7 +460,7 @@ fn connectPath(alloc: Allocator, path: [:0]const u8) Error!Conn {
     }
 
     const fd = connectUnixSocket(path) catch return error.NoRunningInstance;
-    return .{ .handle = fd };
+    return .{ .handle = fd, .owned = true, .timeout_ms = bound };
 }
 
 fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
@@ -334,11 +512,23 @@ pub fn buildRequest(
 pub const ExchangeOptions = struct {
     /// Upper bound accepted for the response body length.
     max_response: u32 = 1_048_576,
+
+    /// The verb this exchange belongs to, as a user would type it. It appears
+    /// in the waiting notice and the timeout message (T755) — "Ghoztty is not
+    /// answering" is not an actionable sentence unless it says which command
+    /// was asking. The default only shows up if a caller forgets.
+    action: []const u8 = "the request",
 };
 
 /// Send one framed request over `conn` and return the framed response body,
 /// allocated from `alloc` (caller frees). Failure diagnostics are written
 /// to `stderr` before IPCFailed is returned.
+///
+/// The response read is bounded (T755): the peer marshals every request to its
+/// GUI thread, and that thread can be busy — or wedged — with no way for this
+/// side to tell. A slow peer gets a "still waiting" line at `timeout.notice_ms`
+/// and the rest of the budget; a peer that never answers gets a sentence and a
+/// nonzero exit instead of an indefinite block.
 pub fn exchange(
     alloc: Allocator,
     conn: Conn,
@@ -349,21 +539,28 @@ pub fn exchange(
     const len: u32 = @intCast(json_bytes.len);
     const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u32, len));
     conn.writeAll(&len_bytes) catch |err| {
-        stderr.print("Failed to send IPC message: {}\n", .{err}) catch {};
-        stderr.flush() catch {};
+        reportSendFailure(stderr, opts.action, conn.timeout_ms, err);
         return error.IPCFailed;
     };
     conn.writeAll(json_bytes) catch |err| {
-        stderr.print("Failed to send IPC message: {}\n", .{err}) catch {};
-        stderr.flush() catch {};
+        reportSendFailure(stderr, opts.action, conn.timeout_ms, err);
         return error.IPCFailed;
     };
 
+    // Whether the "still waiting" line has already been printed. It is per
+    // EXCHANGE, not per read: a peer slow enough to trip the notice on the
+    // length is the same peer still being slow on the body, and saying so
+    // twice about one command reads as a stutter.
+    var noticed = false;
+
     var resp_len_bytes: [4]u8 = undefined;
-    conn.readFull(&resp_len_bytes) catch {
-        stderr.print("Failed to read IPC response length\n", .{}) catch {};
-        stderr.flush() catch {};
-        return error.IPCFailed;
+    readFramed(conn, &resp_len_bytes, &noticed, opts.action, stderr) catch |err| switch (err) {
+        error.Timeout => return error.IPCFailed,
+        else => {
+            stderr.print("Failed to read IPC response length\n", .{}) catch {};
+            stderr.flush() catch {};
+            return error.IPCFailed;
+        },
     };
 
     const resp_len = std.mem.bigToNative(u32, std.mem.bytesAsValue(u32, &resp_len_bytes).*);
@@ -376,13 +573,71 @@ pub fn exchange(
     const resp_buf = try alloc.alloc(u8, resp_len);
     errdefer alloc.free(resp_buf);
 
-    conn.readFull(resp_buf) catch {
-        stderr.print("Failed to read IPC response\n", .{}) catch {};
-        stderr.flush() catch {};
-        return error.IPCFailed;
+    readFramed(conn, resp_buf, &noticed, opts.action, stderr) catch |err| switch (err) {
+        error.Timeout => return error.IPCFailed,
+        else => {
+            stderr.print("Failed to read IPC response\n", .{}) catch {};
+            stderr.flush() catch {};
+            return error.IPCFailed;
+        },
     };
 
     return resp_buf;
+}
+
+/// One bounded read of a whole frame, in the two stages `ipc_timeout`
+/// describes: wait quietly up to the notice, say we are still waiting, then
+/// wait out the rest of the budget. The progress cursor is what lets the
+/// second stage resume the first stage's partial read rather than restart it.
+fn readFramed(
+    conn: Conn,
+    buffer: []u8,
+    noticed: *bool,
+    action: []const u8,
+    stderr: *std.Io.Writer,
+) !void {
+    var done: usize = 0;
+
+    if (!noticed.*) {
+        conn.readFullWithin(
+            buffer,
+            &done,
+            timeout.firstWaitMs(conn.timeout_ms),
+        ) catch |err| switch (err) {
+            error.Timeout => {
+                noticed.* = true;
+                timeout.writeNotice(stderr, action);
+            },
+            else => return err,
+        };
+        if (done == buffer.len) return;
+    }
+
+    conn.readFullWithin(
+        buffer,
+        &done,
+        timeout.remainingWaitMs(conn.timeout_ms),
+    ) catch |err| switch (err) {
+        error.Timeout => {
+            timeout.writeTimeout(stderr, action, .response, conn.timeout_ms);
+            return error.Timeout;
+        },
+        else => return err,
+    };
+}
+
+fn reportSendFailure(
+    stderr: *std.Io.Writer,
+    action: []const u8,
+    timeout_ms: u32,
+    err: anyerror,
+) void {
+    if (err == error.Timeout) {
+        timeout.writeTimeout(stderr, action, .request, timeout_ms);
+        return;
+    }
+    stderr.print("Failed to send IPC message: {}\n", .{err}) catch {};
+    stderr.flush() catch {};
 }
 
 /// The complete client side of the simple action verbs (`+new-window`,
@@ -409,7 +664,10 @@ pub fn sendAction(
     const json_bytes = try buildRequest(alloc, action_name, arguments);
     defer alloc.free(json_bytes);
 
-    const resp_buf = try exchange(alloc, conn, json_bytes, .{}, stderr);
+    var action_buf: [64]u8 = undefined;
+    const resp_buf = try exchange(alloc, conn, json_bytes, .{
+        .action = std.fmt.bufPrint(&action_buf, "+{s}", .{action_name}) catch action_name,
+    }, stderr);
     defer alloc.free(resp_buf);
 
     const parsed = std.json.parseFromSlice(
