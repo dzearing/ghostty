@@ -59,12 +59,17 @@ $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 
 function Ghoz([string[]]$argList) {
-    # T663: the console twin when there is one. `2>&1` is what has been keeping
-    # this capture alive against the GUI-subsystem exe (it forces PowerShell to
-    # build a pipeline and wait); it stays as the fallback for an install with
-    # no twin, but the twin is what makes the exit code below mean anything.
-    $out = & (Resolve-GhozttyCliExe $GhozttyExe) @argList 2>&1 | Out-String
-    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+    # T279: the command line is built HERE, not by PowerShell. This script hands
+    # ghoztty a window LABEL (`--title=$Marker $Label`) and a duplicate-window
+    # NOTE - text a caller composed, which can carry a `"` or end in `\`, and
+    # PowerShell 5.1 puts neither on a command line intact.
+    #
+    # It also settles T663 for this script: reaching CreateProcess directly
+    # captures a GUI-subsystem exe's stdout without the `2>&1` merge that used to
+    # force it, so `+list --json` is parsed from stdout alone and a stderr line
+    # can no longer break ConvertFrom-Json. Err is kept separately for the log.
+    $r = Invoke-NativeExact -FilePath (Resolve-GhozttyCliExe $GhozttyExe) -Arguments $argList
+    return @{ Code = $r.Code; Out = $r.Out.Trim(); Err = $r.Err.Trim() }
 }
 
 function Get-Windows {
@@ -169,7 +174,7 @@ switch ($Action) {
     'mark' {
         if (-not $PaneId) { 'ERROR no pane id (not running in a Ghoztty pane)'; exit 2 }
         $r = Set-Mark $PaneId
-        if ($r.Code -ne 0) { "ERROR rename failed: $($r.Out)"; exit 2 }
+        if ($r.Code -ne 0) { "ERROR rename failed: $($r.Out) $($r.Err)".Trim(); exit 2 }
         "MARKED pane=$PaneId title=`"$Marker $Label`""
         exit 0
     }

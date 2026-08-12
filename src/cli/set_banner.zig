@@ -60,6 +60,15 @@ pub const Options = struct {
 ///
 /// All other arguments are treated as the banner text.
 ///
+/// Banner text is markdown a program composed, so it routinely carries
+/// the two characters PowerShell 5.1 cannot put on a native command line
+/// intact: an embedded `"` is copied through unescaped, and a trailing
+/// `\` is swallowed by the closing quote PowerShell adds. No escaper
+/// fixes this — a banner that opens with a quoted phrase is provably
+/// unreachable — so a PowerShell caller must build the command line
+/// itself: `Invoke-NativeExact` in `scripts/lib/NativeArgv.ps1` (T279).
+/// Shells that quote correctly (bash, zsh, cmd) need nothing special.
+///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
     var iter = try args.argsIterator(alloc);

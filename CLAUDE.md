@@ -1929,6 +1929,44 @@ are `-Wait` (Start-Process holds the handle itself) and an explicit
 zero across `test\win32\` **and** `scripts\`):
 `test\win32\harness-exitcode-audit.ps1`.
 
+**PowerShell 5.1 cannot put generated text on a native command line, so don't
+let it try** (T279). Its command-line builder is not the inverse of the CRT
+parser every C/C++/Zig program uses to split that line back into argv. Measured
+with a `GetCommandLineW` oracle, its rule is: an argument is wrapped in `"` only
+when whitespace appears at a position preceded by an **even** number of `"`
+characters, and an embedded `"` is copied through **unescaped**. Both halves
+corrupt silently, at exit 0 — the loop's own relaunch passed
+`--command=claude --dangerously-skip-permissions --continue "read go.md and go"`
+and ghoztty received `--command=claude … --continue read` plus `go.md`, `and`,
+`go` as three stray positionals, so every relaunched session came up with no
+loop prompt and nothing said so.
+
+**No escaper fixes this**, and that is a proof rather than a failed attempt.
+Escaping `"` as `\"` leaves the `"` character in place, so it still counts
+toward PowerShell's parity while the CRT no longer treats it as structural: for
+text whose first whitespace is preceded by an ODD number of quotes — `"a quoted
+phrase" then more`, an entirely ordinary title or banner — PowerShell declines to
+wrap, the CRT splits the argument at the spaces, and the structural open quote
+that would fix it adds a second `"` and flips the parity straight back.
+
+So build the command line yourself and hand it to `CreateProcess`:
+`ConvertTo-NativeArgToken` / `Invoke-NativeExact` in `scripts\lib\NativeArgv.ps1`
+(dot-sourced by `loop-session.ps1`, so the loop, the lock, the upgrade and the
+watchdog all have it). That is total, and it fixes every flag of every verb at
+once rather than one `--<field>-file=` at a time — which is why this did NOT
+grow a `--title-file` / `--banner-file` pair: the defect is in our PowerShell
+call sites, not in the product, and a CLI flag is a cross-platform obligation
+(the T141 rule) bought to work around one shell. `+send-keys --keys-file=`
+stays the transport for a PROMPT, whose bytes must skip key notation as well as
+quoting and can exceed a command line's 32767-character cap.
+`Invoke-NativeExact` also settles T663 for its callers: reaching CreateProcess
+directly captures a GUI-subsystem `ghoztty.exe`'s stdout with no `2>&1` merge,
+so a stderr line can no longer land inside a `+list --json` a script parses.
+Acceptance: `test\win32\cli-argv-fidelity.ps1`, whose section D re-sends every
+payload the old way and requires it to arrive CORRUPTED — a payload that was
+never at risk proves nothing — alongside a safe payload that must survive both
+ways.
+
 **A section the suite SKIPPED is named in the line anybody reads** (T219).
 Skipping is legitimate — pwsh is not installed, there is no network, a release
 build compiled the debug oracle out. A skip the RESULT cannot see is not: it is

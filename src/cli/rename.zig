@@ -51,7 +51,19 @@ pub const Options = struct {
 ///   * `--target=<name>`: The named window or pane whose title
 ///     to change. Required.
 ///
-///   * `--title=<new-title>`: The new display title. Required.
+///   * `--title=<new-title>`: The new display title. Required. An
+///     empty title unpins it.
+///
+/// A title composed by a program — a branch name, a commit subject, a
+/// label a caller passed in — is generated text, and PowerShell 5.1
+/// cannot put generated text on a native command line intact: it copies
+/// an embedded `"` through unescaped, and a trailing `\` is swallowed by
+/// the closing quote it adds. There is no escaper that fixes this (a
+/// title that begins with a quoted phrase is provably unreachable), so
+/// a PowerShell caller must build the command line itself — see
+/// `ConvertTo-NativeArgToken` / `Invoke-NativeExact` in
+/// `scripts/lib/NativeArgv.ps1` (T279). Shells that quote correctly
+/// (bash, zsh, cmd) need nothing special.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {

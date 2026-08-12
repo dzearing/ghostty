@@ -141,6 +141,18 @@ function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content 
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
 
+# Log an Invoke-NativeExact result the way the `& $exe ... 2>&1 | ForEach Log`
+# shape used to (T279): one line per line of output, stdout and stderr alike.
+function Log-NativeResult($tag, $r) {
+    foreach ($stream in @($r.Out, $r.Err)) {
+        if (-not $stream) { continue }
+        foreach ($line in ($stream -split "`r?`n")) {
+            if ($line.Trim()) { Log "${tag}: $($line.Trim())" }
+        }
+    }
+    if ($r.TimedOut) { Log "${tag}: TIMED OUT" }
+}
+
 Log "=== upgrade start (staging=$Staging)"
 
 # T208: the delivery's verdict is decided in two places (before the swap, and
@@ -901,9 +913,22 @@ if ($listBefore -match '"target"\s*:\s*"main"') {
 # verify the OUTCOME: a resume that ran opened a window. If none appeared, the
 # request was swallowed by an existing target and the loop would stall - retry
 # under a name nothing can already own.
+#
+# T279: this goes through Invoke-NativeExact, not `& $cliExe ...`. $ResumeCommand
+# carries a QUOTED prompt (`claude --continue "read go.md and go"`), and
+# PowerShell 5.1 copies an embedded `"` onto the command line without escaping
+# it - measured, the child used to receive
+# `--command=claude ... --continue read` plus `go.md`, `and`, `go` as three
+# stray positionals, so the relaunched session came up with no loop prompt at
+# exit 0. Building the command line ourselves is the only total fix; see
+# scripts/lib/NativeArgv.ps1 for why no escaper exists.
 $relaunchTarget = 'main'
-& $cliExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
-    ForEach-Object { Log "relaunch: $_" }
+$rl = Invoke-NativeExact -FilePath $cliExe -Arguments @(
+    '+new-window', '--target=main',
+    "--working-directory=$WorkingDirectory",
+    "--command=$ResumeCommand"
+)
+Log-NativeResult 'relaunch' $rl
 for ($i = 0; $i -lt 14; $i++) {
     Start-Sleep -Milliseconds 750
     if ((Count-Windows (Get-ListJson).Json) -gt $before) { $relaunched = $true; break }
@@ -914,8 +939,12 @@ if ($relaunched) {
     $alt = 'main-' + (Get-Date -Format 'HHmmss')
     $relaunchTarget = $alt
     Log "relaunch: no new window appeared - an existing 'main' was focused instead of created; retrying as $alt"
-    & $cliExe +new-window "--target=$alt" "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
-        ForEach-Object { Log "relaunch: $_" }
+    $rl = Invoke-NativeExact -FilePath $cliExe -Arguments @(
+        '+new-window', "--target=$alt",
+        "--working-directory=$WorkingDirectory",
+        "--command=$ResumeCommand"
+    )
+    Log-NativeResult 'relaunch' $rl
     for ($i = 0; $i -lt 14; $i++) {
         Start-Sleep -Milliseconds 750
         if ((Count-Windows (Get-ListJson).Json) -gt $before) { $relaunched = $true; break }

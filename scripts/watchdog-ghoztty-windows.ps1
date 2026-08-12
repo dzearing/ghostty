@@ -31,6 +31,10 @@ $ErrorActionPreference = 'Continue'
 $log = Join-Path $env:TEMP 'ghoztty-watchdog.log'
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content $log }
 
+# Invoke-NativeExact: the relaunch below hands a quoted resume command to
+# ghoztty, which PowerShell 5.1 cannot put on a command line intact (T279).
+. (Join-Path $PSScriptRoot 'lib\NativeArgv.ps1')
+
 # Single instance: bail if another watchdog is already running.
 $mutex = New-Object System.Threading.Mutex($false, 'Global\GhozttyFreezeWatchdog')
 if (-not $mutex.WaitOne(0)) { Log 'another watchdog instance is running; exiting'; exit 0 }
@@ -117,8 +121,23 @@ while ($true) {
             Log "relaunch env scrubbed: $($scrub -join ', ')"
 
             $exe = Join-Path $InstallDir 'ghoztty.exe'
-            & $exe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
-                ForEach-Object { Log "relaunch: $_" }
+            # T279: NOT `& $exe ... "--command=$ResumeCommand"`. The resume
+            # command carries a quoted prompt, and PowerShell 5.1 copies an
+            # embedded `"` onto the command line unescaped - the child then
+            # receives `--continue read` and three stray positionals, so the
+            # relaunched session comes up with no prompt at exit 0. Build the
+            # command line ourselves (scripts/lib/NativeArgv.ps1).
+            $rl = Invoke-NativeExact -FilePath $exe -Arguments @(
+                '+new-window', '--target=main',
+                "--working-directory=$WorkingDirectory",
+                "--command=$ResumeCommand"
+            )
+            foreach ($stream in @($rl.Out, $rl.Err)) {
+                if (-not $stream) { continue }
+                foreach ($line in ($stream -split "`r?`n")) {
+                    if ($line.Trim()) { Log "relaunch: $($line.Trim())" }
+                }
+            }
             Log "relaunched with resume: $ResumeCommand"
         }
     }

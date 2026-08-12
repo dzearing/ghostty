@@ -24,6 +24,13 @@
 # opposite calls about the same session. Anything added here loads into the
 # LOCK's process as well: keep this file free of top-level side effects.
 
+# Byte-exact native invocation (T279). Every consumer of this file hands
+# generated text - a resume command with a quoted prompt, a window label - to
+# `ghoztty.exe`, and PowerShell 5.1's own command-line builder corrupts that
+# text silently. Loaded here so there is one copy for the upgrade, the
+# watchdog and the lock alike; it defines functions only.
+. (Join-Path $PSScriptRoot 'lib\NativeArgv.ps1')
+
 # --- process identity -------------------------------------------------------
 
 # Name + start time of a pid, or $null if it is gone. The start time is what

@@ -263,11 +263,16 @@ function Get-Lock {
 }
 
 function Invoke-Ghoztty($argList) {
-    # T663: read through the console twin when the install has one - see
-    # Resolve-GhozttyCliExe. `2>&1` stays as the fallback that keeps this
-    # capture working against a pre-T245 install.
-    $out = & (Resolve-GhozttyCliExe $GhozttyExe) @argList 2>&1 | Out-String
-    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+    # T279: the command line is built HERE, not by PowerShell 5.1, whose builder
+    # copies an embedded `"` through unescaped and drops a trailing `\` into the
+    # closing quote. This path carries a generated shim PATH and a pane's
+    # `--command=`, both of which can contain either.
+    #
+    # It also settles T663 for this script: reaching CreateProcess directly
+    # captures a GUI-subsystem exe's stdout with no `2>&1` merge, so a stderr
+    # line can no longer land inside the `+list --json` this parses.
+    $r = Invoke-NativeExact -FilePath (Resolve-GhozttyCliExe $GhozttyExe) -Arguments @($argList)
+    return @{ Code = $r.Code; Out = $r.Out.Trim(); Err = $r.Err.Trim() }
 }
 
 function Test-PaneExists($paneId) {
