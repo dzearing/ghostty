@@ -17,6 +17,7 @@ const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
+const window_chord = @import("window_chord.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const viewer_accel = @import("viewer_accel.zig");
@@ -6994,6 +6995,28 @@ pub fn windowWndProc(
                     if (btn != .overflow) _ = window.handleNcLButtonDown(wparam);
                     return 0;
                 }
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
+        // The window's OWN keyboard (T746). Focus sits here whenever no child
+        // has taken it — after a control the app created is destroyed, and on
+        // the first messages of a window's life. `window_chord` is the one
+        // definition of a chord that has no binding action to be looked up
+        // from; everything else still belongs to whichever child has focus,
+        // so anything that is not a window chord falls straight through.
+        w32.WM_KEYDOWN => {
+            // First press only — bit 30 of lparam is the previous key state,
+            // set on autorepeat (the same rule Surface.handleKeyEvent uses).
+            if ((lparam & (1 << 30)) == 0) {
+                const vk: u16 = @intCast(wparam & 0xFFFF);
+                if (window_chord.classify(vk, Surface.getModifiers())) |chord| switch (chord) {
+                    .new_remote_window => {
+                        log.info("machine chooser: opening via ctrl+shift+n (window focus)", .{});
+                        window.openMachineChooser();
+                        return 0;
+                    },
+                };
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },

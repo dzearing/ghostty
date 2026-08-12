@@ -59,6 +59,7 @@ const bridge = @import("viewer_bridge.zig");
 const content = @import("viewer_content.zig");
 const viewer_watcher = @import("viewer_watcher.zig");
 const viewer_accel = @import("viewer_accel.zig");
+const window_chord = @import("window_chord.zig");
 const viewer_popup = @import("viewer_popup.zig");
 // `inputpkg`, not `input`: `navigateFromAddress` has a parameter named
 // `input` and zig refuses the shadow.
@@ -3656,6 +3657,12 @@ fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
 fn claimsChord(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) bool {
     if (viewer_accel.zoomAction(vk, mods) != null) return true;
     if (viewer_accel.paneChord(vk, mods) != null) return true;
+    // Window-scoped chords that are not binding actions (T746). Checked BEFORE
+    // the keybind table on purpose: ctrl+shift+n is still bound to the
+    // cross-platform `new_window` default in the core set, so consulting the
+    // table first is what made a focused viewer open a plain local window when
+    // the user asked for the machine chooser.
+    if (window_chord.classify(vk, mods) != null) return true;
     return self.chordAction(vk, extended, mods) != null;
 }
 
@@ -4402,6 +4409,19 @@ pub fn wndProc(
                 self.handlePaneChord(chord);
                 return 0;
             }
+            // Window chords, same order as the claim above and for the same
+            // reason (T746). Routed through `pane_view` rather than the raw
+            // `parent_window` back-pointer, which a bare test pane leaves
+            // undefined — the pattern the hero-mode arm below already uses.
+            if (window_chord.classify(vk, mods)) |chord| switch (chord) {
+                .new_remote_window => {
+                    if (self.pane_view) |pv| {
+                        log.info("machine chooser: opening via ctrl+shift+n (viewer focus)", .{});
+                        pv.parentWindow().openMachineChooser();
+                    }
+                    return 0;
+                },
+            };
             const action = self.chordAction(vk, extended, mods) orelse return 0;
             const pv = self.pane_view orelse return 0;
             const perform = self.perform_accel_action orelse return 0;

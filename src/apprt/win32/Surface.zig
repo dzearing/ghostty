@@ -31,6 +31,7 @@ const ReadonlyBadge = @import("ReadonlyBadge.zig").ReadonlyBadge;
 const KeyStateIndicator = @import("KeyStateIndicator.zig").KeyStateIndicator;
 const key_state = @import("key_state.zig");
 const translate_policy = @import("translate_policy.zig");
+const window_chord = @import("window_chord.zig");
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
@@ -3025,17 +3026,19 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     // Windows this shadows the cross-platform ctrl+shift+n → new_window
     // default (ctrl+n still opens a plain local window). First press only —
     // bit 30 of lparam is the previous key state, set on autorepeat.
-    if (action == .press and vk == 'N' and (lparam & (1 << 30)) == 0) {
-        const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
-        const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
-        const alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0;
-        const winkey = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
-            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0;
-        if (ctrl and shift and !alt and !winkey) {
-            log.info("machine chooser: opening via ctrl+shift+n", .{});
-            self.parent_window.openMachineChooser();
-            return;
-        }
+    //
+    // The chord itself is defined in `window_chord`, not here: a terminal pane
+    // is only ONE of the things that can hold this window's keyboard, and when
+    // it was spelled out inline a focused viewer pane opened a plain window
+    // and a focused top-level window did nothing at all (T746).
+    if (action == .press and (lparam & (1 << 30)) == 0) {
+        if (window_chord.classify(vk, getModifiers())) |chord| switch (chord) {
+            .new_remote_window => {
+                log.info("machine chooser: opening via ctrl+shift+n", .{});
+                self.parent_window.openMachineChooser();
+                return;
+            },
+        };
     }
 
     // Determine left/right for modifier keys using the extended key flag
@@ -4209,7 +4212,11 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
 }
 
 /// Get the current keyboard modifier state from Win32.
-fn getModifiers() input.Mods {
+/// Live modifier state, read from the thread's input queue. Public because a
+/// pane is not the only thing that answers a keystroke: `Window.wndProc` reads
+/// it for the window-scoped chords (T746), and two readers of the same fact
+/// spelled two ways is how the sides bits would quietly diverge.
+pub fn getModifiers() input.Mods {
     var mods: input.Mods = .{};
 
     // GetKeyState returns a value where the high bit indicates the key

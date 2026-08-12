@@ -380,6 +380,12 @@ test {
     // viewer pane forwards at all (T394). Same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_accel.zig");
 
+    // Pure win32 window-scoped chords that are NOT binding actions — today
+    // just ctrl+shift+n → the machine chooser, defined once so every focus
+    // target answers the same keystroke the same way (T746). Same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/window_chord.zig");
+
     // Pure win32 remote connection pill — the caption-band affordance's
     // wording, geometry and contrast floors (T367). Its only non-std imports
     // are sibling pure modules and the reconnect policy, so it builds and tests
