@@ -12,7 +12,7 @@
 # both and comparing them, so the launcher's pre-flight, the upgrade script's
 # pre-swap abort and its post-swap verification cannot drift apart.
 #
-# Two Windows-specific traps are handled here once:
+# Three traps are handled here once:
 #
 #   * ghoztty.exe is a GUI-subsystem binary, so `& $exe +version > file` from
 #     PowerShell writes ZERO bytes, silently (T245). Every probe below runs
@@ -20,12 +20,31 @@
 #     already how `Invoke-GhozttyListJson` reads `+list`.
 #   * a probe with no timeout can block forever on a half-open pipe (T187), so
 #     the child is waited on with a hard deadline and killed past it.
+#   * `+version` answers for TWO binaries, not one (T773). Below its own
+#     `Version` block it prints a `Running Instance` block describing whatever
+#     Ghoztty is RUNNING, fetched over IPC (`src/cli/version.zig`
+#     printRunningInstance, added by T52) - and that block is the only one with
+#     a line literally labelled `commit`. A reader who greps for the commit gets
+#     the running app's, which is a different binary that a delivery is not
+#     shipping. On 2026-08-11 that misread was filed as a P1 "the build bakes a
+#     stale commit stamp": a Debug build and a ReleaseFast build both "reported"
+#     the same 12-hours-old sha because both had dialed the same installed
+#     release. The bake was correct the whole time. See `Get-CommitFromVersionText`.
 
 # The short hash out of a `+version` payload. Pure: no process, no filesystem.
 #
 # Anchors on the `- version:` line rather than scanning the whole document,
 # because the Build Config section below it is free text and a future line there
 # could easily contain something `+hex`-shaped. Falls back to the banner line.
+#
+# That anchor is also what keeps the `Running Instance` block out (T773): its own
+# version line is `  - version : <v>` - one space before the colon - so the
+# literal `version:` here cannot match it, and its `  - commit  : <sha>` line is
+# never looked at. The distinction between "the binary I am shipping" and "the
+# app that happens to be running" therefore rests on a single space, which is
+# exactly the kind of thing a formatting tidy erases: arms A31-A35 of
+# `test\win32\upgrade-staleness.ps1` hold it with a payload whose two sections
+# name DIFFERENT commits.
 function Get-CommitFromVersionText {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if (-not $Text) { return '' }
@@ -112,6 +131,16 @@ function Invoke-GhozttyVersionText {
         return @{ Text = ''; Why = "exe not found: $Exe" }
     }
     $out = Join-Path $env:TEMP ("ghoztty-vsnprobe-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # Both callers want the identity of the FILE on disk, and nothing else in
+    # this module ever reads the `Running Instance` block - but `+version`
+    # produces it by dialing whatever app is running, bounded by T755's 30s
+    # default, which outlives the probe deadline below. So a busy or wedged app
+    # would turn "read this binary's stamp" into "the delivery cannot verify
+    # itself", over a question the answer does not depend on. Bound that one
+    # query hard: a timeout there costs a `- query failed` line the parsers skip
+    # past, and `+version` still exits 0 carrying its own version.
+    $prevIpcTimeout = $env:GHOZTTY_IPC_TIMEOUT_MS
+    $env:GHOZTTY_IPC_TIMEOUT_MS = '2000'
     try {
         $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
             -ArgumentList "/c `"`"$Exe`" $VersionArg > `"$out`" 2>&1`""
@@ -128,6 +157,11 @@ function Invoke-GhozttyVersionText {
     } catch {
         return @{ Text = ''; Why = "probe threw: $($_.Exception.Message)" }
     } finally {
+        if ($null -eq $prevIpcTimeout) {
+            Remove-Item Env:\GHOZTTY_IPC_TIMEOUT_MS -ErrorAction SilentlyContinue
+        } else {
+            $env:GHOZTTY_IPC_TIMEOUT_MS = $prevIpcTimeout
+        }
         Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
     }
 }

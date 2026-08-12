@@ -164,6 +164,57 @@ Assert "A29 an unread stamp is NOT a match (unverified must never read as OK)" `
 Assert "A30 stamps are exact, not prefix-matched the way abbreviated commits are" `
     (-not (Test-AgentStampsMatch '20260811-3bbf0ee' '20260811-3bbf0eefb'))
 
+# --- A31-A35: the OTHER binary in the same document (T773) --------------------
+# `+version` answers for two binaries. Under its own `Version` block it prints a
+# `Running Instance` block describing whatever Ghoztty is RUNNING, fetched over
+# IPC - and that block owns the only line literally labelled `commit`. Every
+# delivery gate here must read the block that describes the FILE it was handed.
+#
+# This is not a hypothetical: on 2026-08-11 the two blocks were read as one and
+# filed as a P1 ("a freshly built binary bakes a stale commit stamp"). A Debug
+# build and a ReleaseFast build appeared to agree on a 12-hours-old sha because
+# both had dialed the same installed release; the bake was correct throughout.
+# The fixture below is that day's shape, with the two blocks deliberately naming
+# DIFFERENT commits so a reader that confuses them cannot pass.
+$twoBinaries = @'
+Ghostty 1.4.0-users-dzearing-windows-amd64-+2699f0dd5
+
+Version
+  - version: 1.4.0-users-dzearing-windows-amd64-+2699f0dd5
+  - channel: tip
+  - update check: off (dev build)
+Build Config
+  - Zig version   : 0.15.2
+  - build mode    : .Debug
+  - app runtime   : .win32
+Running Instance
+  - version : 1.4.0-users-dzearing-windows-amd64-+2929e42c0
+  - commit  : 2929e42c0
+  - mode    : ReleaseFast
+  - runtime : win32
+  - exe     : C:\Users\David\AppData\Local\Programs\Ghoztty\ghoztty.exe
+  - pid     : 50828
+'@
+
+AssertEq "A31 THE 2026-08-11 ORACLE: the probed binary's commit wins, not the running app's" `
+    '2699f0dd5' (Get-CommitFromVersionText $twoBinaries)
+Assert "A32 and the running app's commit is never mistaken for it" `
+    ((Get-CommitFromVersionText $twoBinaries) -ne '2929e42c0')
+# The whole separation is one space (`version:` vs `version :`). Pin it from the
+# other side too, so a formatting tidy that closes that gap fails HERE rather
+# than by shipping the wrong binary under a green delivery log.
+AssertEq "A33 a Running Instance line ALONE reads as no version at all" '' `
+    (Get-CommitFromVersionText "Running Instance`r`n  - version : 1.4.0-branch-+2929e42c0`r`n  - commit  : 2929e42c0`r`n")
+# The banner fallback describes the probed binary too, so a payload whose own
+# `Version` block is missing must still never fall through to the running app.
+AssertEq "A34 the banner fallback also names the probed binary" '2699f0dd5' `
+    (Get-CommitFromVersionText "Ghostty 1.4.0-b-+2699f0dd5`r`nRunning Instance`r`n  - version : 1.4.0-b-+2929e42c0`r`n  - commit  : 2929e42c0`r`n")
+# `+version` when nothing is running: the same document minus the decoy, which
+# is the shape the pre-T773 fixture (A1) already covered - restated here so the
+# pair reads as one comparison rather than two unrelated arms.
+AssertEq "A35 no running instance changes nothing about the answer" '2699f0dd5' `
+    (Get-CommitFromVersionText "Version`r`n  - version: 1.4.0-b-+2699f0dd5`r`nRunning Instance`r`n  - none detected`r`n")
+
 if ($PureOnly) {
     ""
     Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped -Label 'pure only'
@@ -211,6 +262,44 @@ if (-not $haveAgent) {
     $muteAgent = Resolve-GhozttyAgentStamp -Exe $mute
     AssertEq "B10 output from a program that is not the agent yields no stamp" '' $muteAgent.Stamp
 }
+
+# --- B11-B13: the stamp actually tracks the tree (T773) -----------------------
+# Every gate in this file compares a baked commit against HEAD, so all of them
+# are only as good as the bake. T773 suspected the bake had frozen (it had not -
+# see A31), but nothing here could have told the difference, so these arms make
+# the invariant checkable instead of assumed.
+#
+# B11 is the mechanism: `src/build/GitVersion.zig` bakes the output of exactly
+# this `git log` line at CONFIGURE time, so if it ever stops naming HEAD - a
+# GIT_* variable in the build environment, a stale index, a caching build
+# runner - every "read the commit back" check in the delivery starts comparing
+# a number to itself and passing.
+$gitLogHead = ''
+try { $gitLogHead = (& git -C $Repo -c log.showSignature=false log --pretty=format:%h -n 1 2>$null | Out-String).Trim() } catch { $gitLogHead = '' }
+$repoHead = Get-RepoHeadCommit -Repo $Repo
+Assert "B11 the git line GitVersion.detect bakes names HEAD ('$gitLogHead' vs '$repoHead')" `
+    (Test-CommitsMatch $gitLogHead $repoHead)
+
+# B12/B13: the exe's stamp must name a real commit ON this branch. A frozen or
+# garbled stamp that named nothing (or something unreachable) would sail past
+# every prefix comparison in section A.
+$exeCommitType = ''
+try { $exeCommitType = (& git -C $Repo cat-file -t $exeCommit 2>$null | Out-String).Trim() } catch { $exeCommitType = '' }
+AssertEq "B12 the exe's baked commit is a real commit object in this repo" 'commit' $exeCommitType
+& git -C $Repo merge-base --is-ancestor $exeCommit HEAD 2>$null
+$exeIsAncestor = ($LASTEXITCODE -eq 0)
+Assert "B13 and it is reachable from HEAD, not some other branch's" `
+    ($exeIsAncestor -or (Test-CommitsMatch $exeCommit $repoHead))
+
+# What is deliberately NOT asserted here: that $Exe's stamp equals HEAD. It is
+# the obvious artifact-level freeze check and it cannot be written honestly from
+# this side. A file's mtime says when it was installed, not what the tree held
+# then, so "built from an older tree" (the defect) and "the tree moved under a
+# perfectly good binary" (a `git pull`, and both seats push to this branch) are
+# indistinguishable - and the second is routine. A run that turned it red would
+# be fabricating a failure about a healthy build, which is the T197 lesson.
+# Freshness of a SHIPPED artifact is enforced where the answer matters and the
+# tree is known clean: launch-upgrade's STALE STAGING gate, in section C below.
 
 # ============================================================================
 "== C: launch-upgrade.ps1 refuses a stale staging prefix"
