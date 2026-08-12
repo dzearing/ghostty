@@ -32,12 +32,23 @@
 #
 # WHY BUILD MODE, AND NOT "IS A PRIVATE PIPE SUFFIX SET"
 #
-# `GHOZTTY_PIPE_SUFFIX` (T441 / Isolation.ps1) moves the APP endpoint only. The
-# local agent's pipe is `is_debug`-derived and has NO env override
-# (`LocalAgent.pipeName`, src\apprt\win32\LocalAgent.zig), and so is its state
-# directory. A release build under a private suffix therefore still dials the
-# agent that owns the user's live sessions. Build mode is the one gate that
-# covers both halves, which is why the suffix is not accepted as an opt-in here.
+# `GHOZTTY_PIPE_SUFFIX` (T441 / Isolation.ps1) moves the APP endpoint and
+# nothing else. Isolating a release-lineage run takes THREE knobs, because the
+# agent half and the file half are named separately:
+#
+#   GHOZTTY_PIPE_SUFFIX     the app's IPC pipe
+#   GHOZTTY_AGENT_INSTANCE  the agent's guard mutex, heartbeat, pipe, state dir
+#                           and autostart Run value (T167; honored in RELEASE
+#                           builds too, unlike the staleness/proto test hooks)
+#   LOCALAPPDATA            every file either of them writes
+#
+# One or two of the three is the dangerous state, not a partial win: a release
+# build under a private pipe suffix alone still dials the agent that owns the
+# user's live sessions, which is what this gate exists to stop. Build mode is the
+# one thing a cold-box check can read off the exe itself, so it stays the gate;
+# a script that really does set all three says so with -Allow and proves it with
+# its own assertions (test\win32\agent-instance-lineage.ps1 -Release is the
+# pattern - it measures the user's agent and Run values before and after).
 #
 # WHAT CATCHES WHAT
 #
@@ -126,9 +137,11 @@ function Assert-GhozttyIsolatedBuild {
     success.
 
     -Allow (or GHOZTTY_TEST_ALLOW_RELEASE=1) is the opt-in for a script whose
-    SUBJECT is a release build - an upgrade or delivery test. It is deliberately
-    an explicit act: there is no env var that makes a release run safe, only one
-    that says "I know, and this script is about that build".
+    SUBJECT is a release build - an upgrade or delivery test, or a release-
+    lineage acceptance run under the three isolating knobs above. It is
+    deliberately an explicit act: there is no env var that makes a release run
+    safe, only one that says "I know, and this script is about that build".
+    Whatever it does next is the script's own responsibility to measure.
 
     A mode this file cannot read at all (an exe that does not run, or one too
     old to print the line) is refused for the same reason an unknown mode is:

@@ -36,10 +36,38 @@
 # It deliberately does NOT clear the debug lineage first - not needing to is the
 # whole claim.
 #
+# -Release (T269): run the SAME arms against the ReleaseFast staging build in
+# zig-out-release, i.e. the lineage the user's own Ghoztty is in. That is the
+# configuration the guard was actually blocking - `local`, held by the installed
+# agent that owns the user's live panes - and until this switch existed there was
+# no way to test it: a release-lineage run either lost the race (exit 183, the
+# sandbox silently non-persistent) or, with a visible stale heartbeat, would have
+# TERMINATED the user's agent and every session on it. The arms are unchanged;
+# only the three isolating knobs are, and they are what the run proves:
+#
+#   GHOZTTY_AGENT_INSTANCE  guard mutex + heartbeat + agent pipe + state dir
+#   GHOZTTY_PIPE_SUFFIX     the app's own IPC endpoint
+#   LOCALAPPDATA            every file the app and the agent write
+#
+# Release-only launch hardening, because a release build self-heals things a
+# debug build does not: GHOZTTY_URL_SCHEME=0 (it would repoint the user's real
+# `ghoztty://` handler at a temp exe) and GHOZTTY_PATH_SELFHEAL=0 (belt and
+# braces - the install-location gate already refuses a zig-out-release exe). The
+# agent autostart Run key IS written in a release build; its value name carries
+# the lineage suffix, so it can never be the user's `GhozttyAgent` entry, and the
+# BYSTANDER assertions below prove that plus "the user's agent is still running"
+# rather than assuming either.
+#
 #   powershell -NoProfile -File test\win32\agent-instance-lineage.ps1
+#   powershell -NoProfile -File test\win32\agent-instance-lineage.ps1 -Release
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    # Run against the ReleaseFast staging build (zig-out-release) instead of the
+    # debug one. Implies the release lineage, so every isolation knob above has
+    # to hold: this is the arm that would drive the user's terminal if any of
+    # them did not.
+    [switch]$Release,
     [switch]$Interactive,
     # Self-test for arm D's teeth: give D2 a lineage that is ALREADY held, i.e.
     # exactly the world before this feature existed. D2's two positive
@@ -52,10 +80,38 @@ param(
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:passes = 0
+$script:skipped = 0
 $root = Join-Path $env:TEMP "ghoztty-t167-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# -Release retargets the two DEFAULT paths only; an explicit -Exe/-AgentExe is
+# always obeyed (that is how a delivered install or a second staging tree gets
+# measured). The staging tree is not built by this script: building it here would
+# make one acceptance run take ten minutes, and the delivery scripts already own
+# that build.
+$DefaultDebugExe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe'
+$DefaultDebugAgent = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
+if ($Release) {
+    if ($Exe -eq $DefaultDebugExe) { $Exe = 'D:\git\ghoztty\zig-out-release\bin\ghoztty.exe' }
+    if ($AgentExe -eq $DefaultDebugAgent) { $AgentExe = 'D:\git\ghoztty\zig-out-release\bin\ghoztty-agent.exe' }
+    if (-not (Test-Path $Exe) -or -not (Test-Path $AgentExe)) {
+        $script:skipped++
+        Write-Host "SKIP  -Release: no staging build at $(Split-Path $Exe). Build it with:"
+        Write-Host '        zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix zig-out-release'
+        Write-Host ''
+        Write-Host "ALL PASS (0 checks, $script:skipped SKIPPED)"
+        exit 0
+    }
+}
+
+# CLI invocations go through the `.com` twin when there is one (T245): a release
+# `ghoztty.exe` is GUI-subsystem, and the whole point of the twin is that a
+# console parent gets its stdout, its pipes and its exit code back. In the debug
+# tree the `.exe` is already console-subsystem, so this is a no-op there.
+$CliExe = [System.IO.Path]::ChangeExtension($Exe, '.com')
+if (-not (Test-Path $CliExe)) { $CliExe = $Exe }
 
 function Assert($name, $cond) {
     if ($cond) { Write-Host "  PASS $name"; $script:passes++ }
@@ -114,7 +170,7 @@ function Run-Cli($argv, $out, $instance, $lad, $timeoutSec = 20) {
     # persistence: a CLI invocation - it opens no window, so there is nothing to
     # restore. (Repeated here rather than only on the function's own header: the
     # sweep looks six lines above the launch statement, and the header is seven.)
-    $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
+    $p = Start-Process -FilePath $CliExe -WindowStyle Hidden -PassThru `
         -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     $null = $p.Handle
     if ($null -eq $savedInst) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
@@ -127,19 +183,70 @@ function Run-Cli($argv, $out, $instance, $lad, $timeoutSec = 20) {
 }
 function Out-Text($f) { if (Test-Path $f) { (Get-Content $f -Raw) -replace "`0", '' } else { '' } }
 
-$null = Assert-GhozttyIsolatedBuild -Exe $Exe
+# -Allow is the release mode's opt-in, and it is honest here for the reason the
+# BuildMode doc gives: this script's SUBJECT is that build. What makes it SAFE is
+# asserted below, not assumed - the lineage suffix on every launch, and the
+# bystander checks at the end.
+$buildMode = Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$Release
+Say "build mode under test: $buildMode"
+if ($Release) {
+    # Positive control for the switch itself: a -Release run against a Debug
+    # zig-out-release would exercise the -debug lineage and prove nothing about
+    # the one the user is in.
+    Assert "setup: -Release is measuring a release-lineage build (got '$buildMode')" `
+        (-not (Test-GhozttyIsolatedBuildMode -Mode $buildMode))
+}
+
+# `local-agent` in the release lineage, `local-agent-debug` in the debug one -
+# the same `build_config.is_debug` split the pipe name and the guard key use.
+# Arms C and D derive the app's state dir from it, so a mode read wrong shows up
+# as a missing port.json rather than as a silent pass.
+$stateBase = if (Test-GhozttyIsolatedBuildMode -Mode $buildMode) { 'local-agent-debug' } else { 'local-agent' }
+
+# BYSTANDERS (T269). Everything on the box that this run must leave exactly as it
+# found it: the agents it did not start (in release mode that is the user's own,
+# holding their live panes) and the autostart Run values it did not write.
+function Get-BystanderAgentPids {
+    return , @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $script:mine -notcontains [int]$_.ProcessId } |
+        ForEach-Object { [int]$_.ProcessId })
+}
+$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+function Get-GhozttyRunValues {
+    $props = (Get-ItemProperty $RunKey -ErrorAction SilentlyContinue)
+    $map = @{}
+    if ($props) {
+        foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -like 'GhozttyAgent*') { $map[$p.Name] = [string]$p.Value }
+        }
+    }
+    return $map
+}
+$bystandersBefore = Get-BystanderAgentPids
+$runValuesBefore = Get-GhozttyRunValues
+Say "bystander agents before: $($bystandersBefore -join ' ')"
 
 New-Item -ItemType Directory -Force $root | Out-Null
 $saved = @{
-    lad  = $env:LOCALAPPDATA
-    bin  = $env:GHOSTTY_LOCAL_AGENT_BIN
-    pipe = $env:GHOZTTY_PIPE_SUFFIX
-    inst = $env:GHOZTTY_AGENT_INSTANCE
+    lad    = $env:LOCALAPPDATA
+    bin    = $env:GHOSTTY_LOCAL_AGENT_BIN
+    pipe   = $env:GHOZTTY_PIPE_SUFFIX
+    inst   = $env:GHOZTTY_AGENT_INSTANCE
+    scheme = $env:GHOZTTY_URL_SCHEME
+    selfheal = $env:GHOZTTY_PATH_SELFHEAL
 }
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # The app arms use +list/+sessions as oracles; a user instance answering the
 # shared IPC pipe would answer them about somebody else's windows.
 $env:GHOZTTY_PIPE_SUFFIX = '-t167'
+if ($Release) {
+    # A release build registers HKCU\Software\Classes\ghoztty at launch, pointed
+    # at its own exe - i.e. it would hand the user's `ghoztty://` links to a
+    # binary under zig-out-release. A debug build registers `ghoztty-debug://`
+    # and never collides, which is why no other script has needed this.
+    $env:GHOZTTY_URL_SCHEME = '0'
+    $env:GHOZTTY_PATH_SELFHEAL = '0'
+}
 
 # Lineage names. Short (the suffix is capped at 24 chars) and per-run unique, so
 # two concurrent runs of this script do not collide either.
@@ -192,11 +299,11 @@ Assert "A1 and B are both still alive alongside C" `
 # ============================================================================
 Say "== C: +sessions reads the SUFFIXED state dir"
 # ============================================================================
-# The CLI derives `<LOCALAPPDATA>\ghoztty\local-agent-debug[-<suffix>]\port.json`.
+# The CLI derives `<LOCALAPPDATA>\ghoztty\<stateBase>[-<suffix>]\port.json`.
 # Put agent D's info file exactly where that derivation points and ask the real
 # CLI to find it - then ask again with the suffix cleared, which must NOT.
 $ladD = Join-Path $root 'cli'
-$dirD = Join-Path $ladD "ghoztty\local-agent-debug-$lineD"
+$dirD = Join-Path $ladD "ghoztty\$stateBase-$lineD"
 New-Item -ItemType Directory -Force $dirD | Out-Null
 $dPort = Join-Path $dirD 'port.json'
 $d = Start-Agent 'd' $lineD $ladD "\\.\pipe\ghoztty-t167-d-$PID" $dPort
@@ -223,7 +330,7 @@ $td = New-TestDesktop -Interactive:$Interactive
 function Invoke-AppArm($tag, $instance) {
     $lad = Join-Path $root "app-$tag"
     New-Item -ItemType Directory -Force $lad | Out-Null
-    $agentDir = Join-Path $lad "ghoztty\local-agent-debug-$instance"
+    $agentDir = Join-Path $lad "ghoztty\$stateBase-$instance"
 
     $savedInst = $env:GHOZTTY_AGENT_INSTANCE
     $savedLad = $env:LOCALAPPDATA
@@ -286,7 +393,49 @@ Assert "D2 left every other agent on the box running" `
     foreach ($id in $script:mine) {
         Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
     }
+    # Arm D's agents are spawned BY THE APP, detached, so they are not in
+    # $script:mine and used to outlive the run: measured 2026-08-11 (T269), a
+    # zig-out-release agent still holding this run's temp state dir - and its own
+    # image file - after the script had exited and its $root was deleted. Matched
+    # on THIS RUN'S root, never on the image name: the user's agent runs the same
+    # image name and, in the release lineage, the same image path.
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.CommandLine -like "*$root*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
+
+    # ========================================================================
+    # BYSTANDERS (T269): what the box looked like before, still looks like now.
+    # ========================================================================
+    # In -Release mode `bystandersBefore` includes the user's OWN agent, holding
+    # their live panes: it is the incumbent whose guard used to refuse this run,
+    # and "it is still running" is half of what this script claims. A bystander
+    # that exits for its own reasons scores a false FAIL here - that is the right
+    # direction for this particular assertion.
+    $stillAlive = @(Get-Process -Id $bystandersBefore -ErrorAction SilentlyContinue |
+        ForEach-Object { [int]$_.Id })
+    $gone = @($bystandersBefore | Where-Object { $stillAlive -notcontains $_ })
+    Assert "bystander agents untouched (before: $($bystandersBefore.Count), gone: $($gone -join ' '))" `
+        ($gone.Count -eq 0)
+
+    # A RELEASE app writes the agent autostart Run value (a debug one does not,
+    # unless forced). Its name carries the lineage suffix, so it can only ever be
+    # a NEW value beside the user's - never an overwrite of theirs. Both halves
+    # are measured, then ours is removed: a Run entry pointing into %TEMP% would
+    # try to start a deleted agent at every logon.
+    $runValuesAfter = Get-GhozttyRunValues
+    $clobbered = @($runValuesBefore.Keys | Where-Object {
+        -not $runValuesAfter.ContainsKey($_) -or $runValuesAfter[$_] -ne $runValuesBefore[$_]
+    })
+    Assert "the user's autostart Run values are untouched (changed: $($clobbered -join ' '))" `
+        ($clobbered.Count -eq 0)
+    $addedRun = @($runValuesAfter.Keys | Where-Object { -not $runValuesBefore.ContainsKey($_) })
+    foreach ($name in $addedRun) {
+        Say "  this run added Run value '$name' -> removing it"
+        Assert "added Run value '$name' names a lineage of ours, not the user's" `
+            ($name -like '*t167*')
+        Remove-ItemProperty -Path $RunKey -Name $name -ErrorAction SilentlyContinue
+    }
     if ($td) {
         # Also the standing background-desktop claim: nothing this script
         # launched ever stole the user's foreground.
@@ -302,10 +451,18 @@ Assert "D2 left every other agent on the box running" `
     $env:GHOZTTY_PIPE_SUFFIX = $saved.pipe
     if ($null -eq $saved.inst) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
     else { $env:GHOZTTY_AGENT_INSTANCE = $saved.inst }
+    if ($null -eq $saved.scheme) { Remove-Item env:GHOZTTY_URL_SCHEME -ErrorAction SilentlyContinue }
+    else { $env:GHOZTTY_URL_SCHEME = $saved.scheme }
+    if ($null -eq $saved.selfheal) { Remove-Item env:GHOZTTY_PATH_SELFHEAL -ErrorAction SilentlyContinue }
+    else { $env:GHOZTTY_PATH_SELFHEAL = $saved.selfheal }
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 }
 
 Write-Host ''
-if ($script:failures -eq 0) { Write-Host "ALL PASS ($script:passes checks)" -ForegroundColor Green; exit 0 }
-Write-Host "$script:failures FAILURE(S) ($script:passes passed)" -ForegroundColor Red
+$skipNote = if ($script:skipped) { ", $script:skipped SKIPPED" } else { '' }
+if ($script:failures -eq 0) {
+    Write-Host "ALL PASS ($script:passes checks$skipNote)" -ForegroundColor Green
+    exit 0
+}
+Write-Host "$script:failures FAILURE(S) ($script:passes passed$skipNote)" -ForegroundColor Red
 exit 1
