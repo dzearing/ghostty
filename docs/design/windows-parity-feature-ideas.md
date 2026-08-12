@@ -39,3 +39,14 @@ as the digest that showed them.
 - A badge naming the pane's machine and shell flavor (WSL / pwsh / cmd / remote)
 - Copy terminal output as markdown (fenced block + the command)
 - Spill older scrollback to disk so a long-lived pane keeps hours of history
+
+## 2026-08-12
+
+- A command palette that also searches panes, directories and saved layouts
+- Undo the last layout change (reopen the pane/split/divider you just lost)
+- Zoom a pane to fill the window and back, without disturbing the split tree
+- Detach a running pane into its own window (and re-attach it later)
+- Command-boundary and error markers in the scrollbar
+- Confirm before closing a pane that is busy (and never when it is idle)
+- Paint the window before restore/chooser/daemon work finishes
+- Derive activity state from the output stream instead of polling the pane tail

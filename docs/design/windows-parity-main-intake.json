@@ -1,5 +1,5 @@
 {
   "lastEvaluated": "b388bb62c25c8a4564c88aec8e211b2d4fdc6bf0",
-  "date": "2026-08-11",
-  "note": "2026-08-11 intake: 1 non-merge commit new since bd125fc44 (b388bb62c, release notes for the v1.32.0 ghoztty:// focus-link scheme). Touches only release-notes/client/1.32.0.json - no macos/ or src/ change, so no parity owed and no task filed; the feature itself was filed yesterday as T695 and is done. parity-sweep.ps1 SWEEP CLEAN: 0 parity-relevant commits evaluated, 0 unmapped. Lag after intake: zero commits. Previous (2026-08-10): 1 commit, 1 task (T695)."
+  "date": "2026-08-12",
+  "note": "2026-08-12 intake: 0 non-merge commits new since b388bb62c - origin/main is unchanged since yesterday's intake, so nothing was evaluated and no task was filed. parity-sweep.ps1 SWEEP CLEAN: 0 commits evaluated, 0 unmapped. Lag after intake: zero commits, fourth day running. Previous (2026-08-11): 1 commit, 0 tasks (release notes only). PREVIOUS NOTE: 2026-08-11 intake: 1 non-merge commit new since bd125fc44 (b388bb62c, release notes for the v1.32.0 ghoztty:// focus-link scheme). Touches only release-notes/client/1.32.0.json - no macos/ or src/ change, so no parity owed and no task filed; the feature itself was filed yesterday as T695 and is done. parity-sweep.ps1 SWEEP CLEAN: 0 parity-relevant commits evaluated, 0 unmapped. Lag after intake: zero commits. Previous (2026-08-10): 1 commit, 1 task (T695)."
 }
