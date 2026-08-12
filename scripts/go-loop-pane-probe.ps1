@@ -1,6 +1,5 @@
 # Pane helpers for the go-loop watchdog (T241): who is sitting in this pane -
-# a Claude Code TUI, or a shell prompt? - and how to type a path into it
-# without the escape layer eating half of it.
+# a Claude Code TUI, or a shell prompt?
 #
 # The go-loop watchdog re-enters a dead loop by TYPING into the loop's pane,
 # and the right thing to type depends entirely on what is listening:
@@ -132,18 +131,12 @@ function Get-PaneOccupant {
     return 'unknown'
 }
 
-# `+send-keys` interprets backslash escapes in its text arguments (\n, \t, \r,
-# \e, \\), so a Windows path is not safe to hand it raw: %TEMP% under a user
-# called "tom" makes the shim path C:\Users\tom\... and the pane receives a TAB
-# where \t was. Caught 2026-07-31 building the T241 negative control, whose own
-# temp dir was ...\Temp\t241-negctl\ - the pane ran "C:\Users\David\AppData\
-# Local\Temp241-negctl\fake-tui.cmd" and cmd said "cannot find the path".
-# Doubling every backslash makes it arrive verbatim.
-function ConvertTo-SendKeysLiteral {
-    param([string]$Text)
-    if ($null -eq $Text) { return '' }
-    return $Text.Replace('\', '\\')
-}
+# The backslash escaper that used to live here moved to loop-session.ps1 with
+# T280, next to the transport that decides whether it is needed at all: a path
+# now travels through `+send-keys --keys-file=`, which sends bytes verbatim, and
+# escaping is only reachable through New-LoopSendKeysText's degraded branch (an
+# exe that predates T210's flag). Ask that helper for the transport; there is no
+# escaper to call by hand any more, which is the point.
 
 # The pane's shell pid, from `+list --json` (0 when the pane is not found, has
 # no terminal, or the app cannot say). $PaneId matches the leaf's stable id

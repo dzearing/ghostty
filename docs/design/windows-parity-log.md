@@ -9,6 +9,42 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T280 (T783 filed) - the loop's supervisor types a path through
+  a file now, not through an escaper.** T241 found that `+send-keys` processes
+  `\n`/`\t`/`\r`/`\e`/`\\` inside a POSITIONAL argument, so the restart shim's
+  path arrived with a TAB in it for a user called "tom"; the patch was
+  `ConvertTo-SendKeysLiteral`, doubling every backslash. T210's `--keys-file=`
+  had already retired that problem at the transport - bytes verbatim, no key
+  notation, no escape processing - which left two transports for one kind of
+  text and only one of them safe. The watchdog's `restart-in-pane` branch and
+  the guard's own fake-TUI send now both go through `New-LoopSendKeysText`, the
+  helper that already probes the installed exe for the flag. Deliverable 3 kept
+  the escaper rather than deleting it, because there IS a named case: an
+  installed ghoztty older than T210 (measured at +96fbe40c7 when the probe
+  shipped), where argv is the only transport left. So it moved into
+  `loop-session.ps1` as the private tail of that degraded branch and left
+  `go-loop-pane-probe.ps1` - which classifies pane occupants and had no business
+  owning a transport concern - entirely. That closed a latent hole on the way:
+  the degraded branch used to put text on argv UNESCAPED, so an old exe would
+  have mangled a `\n` in the resume PROMPT exactly as it mangled a path (arm
+  M23). Wire oracle: new section T of `go-loop-guard.ps1`, where a path carrying
+  `\t`, `\n` and a trailing `\` arrives at a live pane character for character
+  and the pre-fix positional send of the SAME payload must still arrive broken -
+  a payload that was never at risk proves nothing. **The surprise was the state
+  the guard was already in:** 26 assertions red before this task touched
+  anything, because `b64c3e8aa` earlier the same day prefixed every
+  `go-loop-lock.ps1` message with an ISO timestamp for the uptime report and did
+  not move the `^ACQUIRED` / `^held` / `^stale-dead` anchors that read them. The
+  lock script was working perfectly the whole time. Repaired in one place
+  (`Lock-Run` strips the stamp, keeps the line as `Raw`, and a new `A2b` asserts
+  the stamp is genuinely on the wire so the normalization cannot hide a missing
+  verb) because T280's own criteria require section N green. The gap that let a
+  supervisor's harness stay quietly red for a day - no floor runs it, no gate
+  ties a `scripts\go-loop-*.ps1` edit to it - is filed as **T783 (P1)**.
+  Validation: go-loop-guard ALL PASS 175 assertions exit 0 (T0-T3, M20-M23,
+  N0-N6 green), `floor-lane -Lane all` none/win32/agent PASS, P1/P2/P3 ALL PASS
+  (25/20/16).
+
 - 2026-08-11 - **T275 (D69, T778/T779 filed) - the acceptance suite can see the
   terminal glass again, by asking the app instead of the desktop.** Off the
   input desktop there is no composite to `GetPixel` and `PrintWindow` of a

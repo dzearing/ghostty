@@ -510,8 +510,18 @@ function Invoke-Tick {
     if ($paneAlive) {
         Log "re-entering: no claude in pane $paneId (occupant=$occupant), running the resume shim there (remaining=$remaining)"
         if ($DryRun) { return 'restart-in-pane' }
-        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", (ConvertTo-SendKeysLiteral $shim), 'Enter')
+        # T280: the shim PATH rides the same transport the prompt does - a file,
+        # whose bytes `+send-keys` writes verbatim. It used to be a positional
+        # argument with every backslash doubled by hand, which worked but left
+        # two transports for one kind of text and only one of them safe. The
+        # capability probe still decides: against an exe that predates
+        # `--keys-file` the helper degrades to the escaped positional, which is
+        # exactly what this line used to do unconditionally.
+        $keys = New-LoopSendKeysText -Exe $GhozttyExe -Text $shim -Tag 'watchdog-shim'
+        if ($keys.Degraded) { Log '  note: this ghoztty predates --keys-file; shim path sent through argv' }
+        $r = Invoke-Ghoztty (@('+send-keys', "--target=$paneId") + $keys.Args + @('Enter'))
         Log "  send-keys exit=$($r.Code) $($r.Out)"
+        if ($keys.File) { Remove-Item -LiteralPath $keys.File -ErrorAction SilentlyContinue }
         # Verify rather than assume: a shim path that landed in a TUI shows up
         # as text and re-enters nothing, which is the T241 failure exactly.
         Start-Sleep -Seconds $VerifySeconds

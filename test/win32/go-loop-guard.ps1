@@ -30,6 +30,10 @@
 #   Q. `status` asks the PANE when the recorded pid is dead (T440), so a claude
 #      relaunched in the owning pane reads as held rather than stale-dead -
 #      while `acquire` stays pid-based, on purpose.
+#   T. A path typed into a pane arrives verbatim (T280): the re-entry's shim
+#      path rides `+send-keys --keys-file=`, whose bytes are written with no
+#      escape processing, with the old positional send as the negative control -
+#      it must still arrive mangled, or the arm is measuring nothing.
 #   R. A turn longer than the staleness window is not nudged (T253): the lock's
 #      freshness follows the session TRANSCRIPT, which Claude Code advances by
 #      itself, so a working turn is visibly alive without anybody remembering to
@@ -58,8 +62,9 @@ $lockScript = Join-Path $Repo 'scripts\go-loop-lock.ps1'
 $dogScript = Join-Path $Repo 'scripts\go-loop-watchdog.ps1'
 $execScript = Join-Path $Repo 'scripts\go-loop-exec.ps1'
 
-# Get-PaneOccupant / ConvertTo-SendKeysLiteral (section M drives them directly,
-# section N needs the escaper to type a path into a pane).
+# Get-PaneOccupant (section M drives it directly) and, transitively,
+# loop-session.ps1's New-LoopSendKeysText - the transport sections M and T use to
+# put a PATH into a pane without an escape layer eating half of it.
 . (Join-Path $Repo 'scripts\go-loop-pane-probe.ps1')
 
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -68,12 +73,21 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 
-# Run the lock script and return @{ Code; Out }.
+# Run the lock script and return @{ Code; Out; Raw }.
+#
+# `Out` has the message's leading ISO timestamp removed. Every assertion here
+# asks what the lock ANSWERED - `^ACQUIRED`, `^held`, `^stale-dead` - and
+# b64c3e8aa (2026-08-11) prefixed each message with `$(Now-Iso) ` for the uptime
+# report without moving those anchors, which turned 26 of them red against a lock
+# script that was working perfectly. The timestamp is a log prefix, not part of
+# the answer, so it is stripped in ONE place rather than dulled into 26 loose
+# substring matches. `Raw` keeps the whole line, and A0 below asserts the prefix
+# is really there, so this can never quietly paper over a missing verb.
 function Lock-Run([string[]]$extra) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $lockScript,
         '-Repo', $Repo, '-LockPath', $lock) + $extra
-    $out = & powershell @argList 2>&1 | Out-String
-    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+    $out = (& powershell @argList 2>&1 | Out-String).Trim()
+    return @{ Code = $LASTEXITCODE; Raw = $out; Out = ($out -replace '^\d{4}-\d{2}-\d{2}T[\d:.+-]+\s+', '') }
 }
 
 function Dog-Run([string[]]$extra, [string]$trackerPath) {
@@ -198,6 +212,10 @@ Assert 'A1 status on a missing lock reports FREE' ($r.Code -eq 0 -and $r.Out -ma
 $owner = Start-Sleeper; $sleepers += $owner
 $r = Lock-Run @('acquire', '-PaneId', 'PANE-A', '-ClaudePid', $owner.Id)
 Assert 'A2 acquire on a free lock succeeds' ($r.Code -eq 0 -and $r.Out -match '^ACQUIRED')
+# ...and the stamp Lock-Run strips is genuinely on the wire (b64c3e8aa): without
+# this the normalization above could hide a message that lost its verb entirely.
+Assert 'A2b the message carries its ISO timestamp prefix' `
+    ($r.Raw -match '^\d{4}-\d{2}-\d{2}T[\d:.+-]+\s+ACQUIRED')
 Assert 'A3 acquire reports reason=free' ($r.Out -match 'reason=free')
 $L = Read-LockFile
 Assert 'A4 lock records the pane id' ($L.pane_id -eq 'PANE-A')
@@ -528,7 +546,9 @@ if ($ready) {
             'echo   bypass permissions on (shift+tab to cycle)',
             'ping -n 120 127.0.0.1 >nul'
         ) -join "`r`n" | Out-File -FilePath $fake -Encoding ascii
-        Ghoz @('+send-keys', "--target=$($paneN.id)", (ConvertTo-SendKeysLiteral $fake), 'Enter') | Out-Null
+        $fk = New-LoopSendKeysText -Exe $Exe -Text $fake -Tag 'guard-faketui'
+        Ghoz (@('+send-keys', "--target=$($paneN.id)") + $fk.Args + @('Enter')) | Out-Null
+        if ($fk.File) { Remove-Item -LiteralPath $fk.File -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 3
         $r = Dog-Run @('-DryRun', '-GhozttyExe', $Exe, '-ProbeGapSeconds', 3)
         Assert 'N4 a live claude in the pane is nudged, not shim''d' ($r.Out -match 'ACTION nudge')
@@ -536,6 +556,50 @@ if ($ready) {
         Assert 'N6 the shim was never typed into it' ($r.Out -notmatch 'ACTION restart-in-pane')
         Ghoz @('+send-keys', "--target=$($paneN.id)", 'C-c') | Out-Null
         Ghoz @('+close', '--target=go-loop-tui') | Out-Null
+    }
+
+    ""
+    "T. a path reaches a pane VERBATIM through --keys-file (T280)"
+    # Sections M10-M13 pin the transport helper's contract; this pins the same
+    # claim ON THE WIRE, because the helper being right about which argument to
+    # build says nothing about what the pane actually receives.
+    #
+    # One plausible Windows path carrying every escape `+send-keys` processes in
+    # a positional argument: \t (twice), \n, and a trailing backslash.
+    $payload = 'C:\Users\tom\AppData\nook\text\go.cmd\'
+
+    $paneT = New-TestWindow 'go-loop-keys'
+    Assert 'T0 a stand-in pane is open' ($null -ne $paneT)
+    if ($paneT) {
+        $tk = New-LoopSendKeysText -Exe $Exe -Text $payload -Tag 'guard-wire'
+        Ghoz (@('+send-keys', "--target=$($paneT.id)") + $tk.Args) | Out-Null
+        if ($tk.File) { Remove-Item -LiteralPath $tk.File -ErrorAction SilentlyContinue }
+        $seen = ''
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Milliseconds 500
+            $seen = (Ghoz @('+read', "--name=$($paneT.id)", '--lines=20')).Out
+            if ($seen -match [regex]::Escape($payload)) { break }
+        }
+        # Nothing is submitted: the payload is only ever typed at the prompt, so
+        # a mangled one cannot run whatever it happens to spell.
+        Assert 'T1 the path arrives at the pane character for character' `
+            ($seen -match [regex]::Escape($payload))
+        Ghoz @('+close', '--target=go-loop-keys') | Out-Null
+    }
+
+    # The pre-T280 send, as the negative control. A payload that was never at
+    # risk proves nothing, so the old transport must genuinely arrive broken -
+    # its own window, because the mangled \n submits a line and there is no
+    # reason to make T1 share a pane with that.
+    $paneU = New-TestWindow 'go-loop-keys-raw'
+    Assert 'T2 a second stand-in pane is open' ($null -ne $paneU)
+    if ($paneU) {
+        Ghoz @('+send-keys', "--target=$($paneU.id)", $payload) | Out-Null
+        Start-Sleep -Seconds 2
+        $rawSeen = (Ghoz @('+read', "--name=$($paneU.id)", '--lines=20')).Out
+        Assert 'T3 the raw positional send does NOT deliver it intact' `
+            ($rawSeen -notmatch [regex]::Escape($payload))
+        Ghoz @('+close', '--target=go-loop-keys-raw') | Out-Null
     }
 }
 
@@ -689,11 +753,32 @@ Assert 'M8 claude output above a shell prompt is a shell' `
 # '>' (the loose "ends with >" regex is the trap this anchored rule replaces).
 Assert 'M9 the composer line is not a shell prompt' `
     ((Get-PaneOccupant -Tail "  bypass permissions on`r`n| > run: dir D:\git >") -eq 'claude')
-# send-keys eats backslash escapes, so a shim path under a user called "tom"
-# would arrive with a TAB in it. Double them or the re-entry types nonsense.
-Assert 'M10 a path with \t survives send-keys escaping' `
-    ((ConvertTo-SendKeysLiteral 'C:\Users\tom\AppData\Local\Temp\go.cmd') -eq 'C:\\Users\\tom\\AppData\\Local\\Temp\\go.cmd')
-Assert 'M11 a path with no backslash is unchanged' ((ConvertTo-SendKeysLiteral 'go.cmd') -eq 'go.cmd')
+# send-keys eats backslash escapes in a POSITIONAL argument, so a shim path
+# under a user called "tom" would arrive with a TAB in it. T280 retired the
+# hand-escaping: the path rides `--keys-file=`, whose bytes are written verbatim,
+# and the escaper survives only inside the transport helper's degraded branch -
+# an exe that predates the flag, where argv is the only thing left. These arms
+# are the helper's contract; section T measures the same claim on the wire.
+$mPath = 'C:\Users\tom\AppData\nook\text\go.cmd\'
+$mKeys = New-LoopSendKeysText -Exe $Exe -Text $mPath -Tag 'guard-transport'
+Assert 'M20 a path travels as a file, not as argv' `
+    ($mKeys.Args.Count -eq 1 -and $mKeys.Args[0] -like '--keys-file=*' -and -not $mKeys.Degraded)
+Assert 'M21 and the file holds the path VERBATIM - nothing doubled, nothing lost' `
+    ($mKeys.File -and ([IO.File]::ReadAllText($mKeys.File) -ceq $mPath))
+if ($mKeys.File) { Remove-Item -LiteralPath $mKeys.File -ErrorAction SilentlyContinue }
+
+# The named case the escaper still exists for: an INSTALLED ghoztty older than
+# T210. A stand-in whose `+send-keys --help` never says "keys-file" is what the
+# watchdog met on day one (measured 2026-08-01 against +96fbe40c7), and there the
+# doubling is still what makes the path arrive intact.
+$oldExe = Join-Path $root 'old-ghoztty.cmd'
+@('@echo off', 'echo Usage: ghoztty +send-keys --target=NAME [--enter] text...') -join "`r`n" |
+    Out-File -FilePath $oldExe -Encoding ascii
+$mOld = New-LoopSendKeysText -Exe $oldExe -Text $mPath -Tag 'guard-transport-old'
+Assert 'M22 an exe without --keys-file degrades to argv, and says so' `
+    ($mOld.Degraded -and -not $mOld.File -and $mOld.Args[0] -notlike '--keys-file=*')
+Assert 'M23 and the degraded argv is escaped, so the path still survives' `
+    ($mOld.Args[0] -ceq 'C:\\Users\\tom\\AppData\\nook\\text\\go.cmd\\')
 # T440: a WORKING Claude Code scrolls every idle-composer marker off the screen.
 # Measured on the box 2026-08-04, a pane with a live session mid-task came back
 # 'unknown' - the answer that makes the watchdog type a shell command at it.

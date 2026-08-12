@@ -254,10 +254,38 @@ function Test-LoopKeysFileSupported {
     return $ok
 }
 
+# The ONE named case where a file is genuinely impossible (tracker T280), and
+# therefore the only place this escaper is allowed to be called from.
+#
+# `+send-keys` processes backslash escapes (\n, \t, \r, \e, \\) inside its
+# POSITIONAL text arguments, so a Windows path is not safe to hand it raw:
+# %TEMP% under a user called "tom" makes a shim path C:\Users\tom\... and the
+# pane receives a TAB where \t was. Caught 2026-07-31 building the T241 negative
+# control, whose own temp dir was ...\Temp\t241-negctl\ - the pane ran
+# "C:\Users\David\AppData\Local\Temp241-negctl\fake-tui.cmd" and cmd said
+# "cannot find the path". Doubling every backslash makes it arrive verbatim.
+#
+# T210's `--keys-file=` retired that problem at the transport instead: bytes go
+# verbatim, no key notation and no escape processing, so nothing needs doubling.
+# What it cannot retire is an exe that PREDATES the flag - and these scripts run
+# against whichever ghoztty is INSTALLED, the watchdog especially (a long-lived
+# HKCU Run process). That skew is the named case: argv is the only transport
+# left, and on argv the escaping is still required.
+#
+# It is deliberately NOT exported as a call-site helper. Two transports for one
+# kind of text is how a caller picks the unsafe one; callers ask
+# New-LoopSendKeysText for the transport and it decides.
+function ConvertTo-SendKeysLiteral {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ($null -eq $Text) { return '' }
+    return $Text.Replace('\', '\\')
+}
+
 # The `+send-keys` argument(s) that carry $Text to a pane: the safe transport
 # when the exe has it, the old one when it does not. Returns Args (splat into the
 # call), File (delete it afterwards; '' if none) and Degraded (true = the text is
-# on argv and its quotes are at risk - say so in the log).
+# on argv, escaped rather than verbatim, and its quotes are at risk - say so in
+# the log).
 function New-LoopSendKeysText {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
@@ -268,7 +296,7 @@ function New-LoopSendKeysText {
         $p = New-LoopPromptFile -Text $Text -Tag $Tag
         return @{ Args = @("--keys-file=$p"); File = $p; Degraded = $false }
     }
-    return @{ Args = @($Text); File = ''; Degraded = $true }
+    return @{ Args = @((ConvertTo-SendKeysLiteral $Text)); File = ''; Degraded = $true }
 }
 
 # The `+send-keys` arguments that SUBMIT a prompt already sitting in a pane's
