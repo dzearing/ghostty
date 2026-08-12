@@ -9,6 +9,38 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T281 (T784/T785 filed) - the delivery now reads back all three
+  binaries it ships, not one.** T208 gave the delivery a number both ends can
+  compare and then checked exactly one file with it: `ghoztty.exe` in the primary
+  install dir. The agent was the interesting omission, because its swap has a
+  live failure mode already on the record - 2026-07-20, the rename-aside dance
+  failed (`Remove-Item` silently, then `Move-Item` onto an existing name), the
+  swap was SKIPPED, and the run reported `UPGRADE OK` over a months-old agent.
+  `delivery-version.ps1` learned the agent's own answer shape (`ghoztty-agent
+  20260811-3bbf0eefb` - a build STAMP, not a semver), and the comparison is
+  staged-agent vs installed-agent rather than against the app's commit: the claim
+  a copy makes is "these bytes are those bytes", and demanding the two staged
+  binaries share a commit is a different claim that zig-out routinely violates
+  (found doing exactly that - filed as T784). A mismatch is now
+  `AGENT VERIFY FAILED` and the run is a failure; `-AppOnly` logs `AGENT VERIFY
+  SKIP`, because an older agent is what the morning refresh is FOR and verifying
+  it would have failed every morning. The mirrored locations are read back too -
+  the exe by commit, the agent by stamp - as a WARNING naming the location, since
+  those copies are best-effort while silence was not. `deliver-windows-build.ps1`
+  got the same two checks (fatal there, matching how it already treats a
+  present-and-wrong exe). Acceptance: `upgrade-staleness.ps1` ALL PASS (93),
+  including new section E, whose negative control holds the `.bak` open with
+  `FileShare.None` and so reproduces 2026-07-20 exactly: the swap is skipped, the
+  stale agent is still on disk, and the run exits 1 with no `UPGRADE OK` while
+  the exe half still reports fine. `deliver-windows-build.ps1` ALL PASS with the
+  agent comparison live rather than degraded. The script also moved onto
+  `Write-TestVerdict` (it was on T271's `uncounted-final` list) and its one new
+  SKIP site is counted once, so `skip-visibility`/`verdict-exit-audit`/
+  `asserted-nothing`/`harness-exitcode-audit` all stay ALL PASS. Floor
+  none/win32/agent PASS, P1-P3 ALL PASS. T785 filed for the one branch with no
+  live teeth: the deliver script cannot seed a stale binary, because its copy
+  overwrites the destination before the verify runs.
+
 - 2026-08-12 - **T280 (T783 filed) - the loop's supervisor types a path through
   a file now, not through an escaper.** T241 found that `+send-keys` processes
   `\n`/`\t`/`\r`/`\e`/`\\` inside a POSITIONAL argument, so the restart shim's
