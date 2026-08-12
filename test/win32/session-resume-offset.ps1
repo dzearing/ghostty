@@ -252,6 +252,9 @@ foreach ($arm in @('A', 'B', 'C')) {
     # launch's offset accounting is exact on any build - it is the baseline the
     # cycles below start from.
     $log0 = Join-Path $tmp "app-$arm-0.err.txt"
+    # persistence: on (default) - this launch WRITES the manifest every restore
+    # cycle below reads back; with the flag there would be no session to resume.
+    # (Its own restore is a no-op: the arm wiped the per-run LOCALAPPDATA above.)
     $app0 = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t739') -StdErr $log0
     $up0 = (Wait-TestWindow -ProcessId $app0.Pid -Class 'GhozttyWindow' -TimeoutMs 45000) -ne [IntPtr]::Zero
     Assert "$arm.0 the first launch came up" $up0

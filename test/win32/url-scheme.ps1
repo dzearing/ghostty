@@ -356,6 +356,9 @@ try {
     # cannot land on the user's screen. Two activations, one dialog: the
     # cross-process coalescing a page firing a burst of links needs.
     Remove-Item Env:\GHOZTTY_URL_SCHEME_QUIET -ErrorAction SilentlyContinue
+    # persistence: n/a - a URL activation, which is answered and exited before
+    # the single-instance bind (main_ghostty.zig, T695). It opens no terminal
+    # and never reaches the restore path, so there is nothing to declare.
     $a1 = Start-OnTestDesktop -Exe $exe -Arguments @("$debugScheme`://open/urlwin")
     $dlg = Wait-TestWindow -ProcessId $a1.Pid -Class '#32770' -TimeoutMs 15000
     Assert ($dlg -ne [IntPtr]::Zero) 'an unsupported link puts a warning on screen'
@@ -365,6 +368,7 @@ try {
             "...whose caption names the problem (got '$text')"
     }
 
+    # persistence: n/a - a URL activation, as above: no terminal, no restore.
     $a2 = Start-OnTestDesktop -Exe $exe -Arguments @("$debugScheme`://open/urlwin")
     $second = Wait-TestWindow -ProcessId $a2.Pid -Class '#32770' -TimeoutMs 8000
     Assert ($second -eq [IntPtr]::Zero) `
@@ -378,6 +382,7 @@ try {
     # finds one. Without this, "no second dialog" would also pass on a box
     # where the dialog simply takes longer than the wait -- or never appears at
     # all, which is how a coalescing test passes while coalescing is broken.
+    # persistence: n/a - a URL activation, as above: no terminal, no restore.
     $a3 = Start-OnTestDesktop -Exe $exe -Arguments @("$debugScheme`://open/urlwin")
     $third = Wait-TestWindow -ProcessId $a3.Pid -Class '#32770' -TimeoutMs 8000
     Assert ($third -ne [IntPtr]::Zero) `

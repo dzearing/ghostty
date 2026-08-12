@@ -273,6 +273,8 @@ Stop-AppOnly
 Say "== C: control - the unedited manifest restores a LIVE pane"
 # ============================================================================
 if ($goodManifest -ne '') {
+    # persistence: on (default) - this arm's whole subject is that the manifest S
+    # left behind restores a live pane, so the flag would delete the fixture.
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @() -StdErr (Join-Path $tmp 'applog-c.err.txt')
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -TimeoutMs 40000
     Assert "C the GUI came up" ($top -ne [IntPtr]::Zero)
