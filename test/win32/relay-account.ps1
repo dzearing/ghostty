@@ -182,56 +182,23 @@ function Stop-TestProcs {
 }
 
 # --- chooser control lookup --------------------------------------------------
-# All descendants of `$parent` with the given class, as {Hwnd, Text, Top,
-# Enabled}. Text comes from WM_GETTEXT (Get-TestControlText), not GetWindowTextW,
-# which is cross-process cached and reads stale for a label the app just changed
-# - and "the label changed in place" is exactly this script's claim.
+# WHICH CONTROL IS WHICH comes from lib\ChooserControls.ps1 (T294), which
+# TestDesktop.ps1 already dot-sources: `Get-ChooserAccountButton` (the LIVE one
+# of the account row's two controls - T311 gave it a bordered button for the
+# signed-out state and an owner-drawn link for the signed-in one, and hides
+# whichever this state does not use), `Get-ChooserAccountStatusText` and
+# `Get-ChooserHintText`.
 #
-# VISIBLE controls only (T311): the account row now carries two of them - a
-# bordered button for the signed-out state and an owner-drawn link for the
-# signed-in one - and hides whichever this state does not use. A hidden control
-# is not on the row, and including it would make "the topmost button" return the
-# one the user cannot see.
-function Get-ChooserControls([IntPtr]$parent, [string]$cls) {
-    return @(Get-TestChildWindows -Window $parent -Class $cls |
-        Where-Object { $_.Visible } | ForEach-Object {
-        $h = [IntPtr]$_.Hwnd
-        [pscustomobject]@{
-            Hwnd    = $h
-            Text    = (Get-TestControlText -Control $h)
-            Top     = $_.Top
-            Enabled = (Test-TestWindowEnabled -Window $h)
-        }
-    })
-}
-
-# The chooser's account button: the TOPMOST button child. The account row sits
-# above the header rule, with every other button below it (the detail pane's
-# action row, then the footer's Cancel) - so position identifies it while its
-# LABEL stays free to be what the assertions are about.
+# This script used to own private copies. Its account lookup identified the
+# button by EXCLUDING the labels it is not (`New Window`, `Open`, `Cancel`) -
+# an exclusion list that grows silently, and T177's Activity had just made it a
+# member short. The repair keyed on position instead; the lookup asks the app
+# for the control's own id now, so neither a new neighbour nor a relabel can
+# reach it - and the LABEL stays free to be what the assertions here are about.
 #
-# It used to be identified by excluding the labels it is not, which is a list
-# that grows silently: T177 added "Activity" to the detail row and the exclusion
-# would have started returning it.
-function Get-AccountButton([IntPtr]$chooser) {
-    $btns = @(Get-ChooserControls $chooser 'Button' | Sort-Object Top)
-    if ($btns.Count -eq 0) { return $null }
-    return $btns[0]
-}
-
-# The account status STATIC is the topmost one; the footer hint is the lowest.
-function Get-StaticText([IntPtr]$chooser, [bool]$topmost) {
-    $best = $null
-    $bestTop = if ($topmost) { [int]::MaxValue } else { -1 }
-    foreach ($s in Get-ChooserControls $chooser 'Static') {
-        if (($topmost -and $s.Top -lt $bestTop) -or ((-not $topmost) -and $s.Top -gt $bestTop)) {
-            $bestTop = $s.Top; $best = $s.Text
-        }
-    }
-    return $best
-}
-function Get-AccountStatusText([IntPtr]$chooser) { Get-StaticText $chooser $true }
-function Get-HintText([IntPtr]$chooser) { Get-StaticText $chooser $false }
+# Control text still comes from WM_GETTEXT, never GetWindowTextW, which is
+# cross-process cached and reads stale for a label the app just changed in
+# place - exactly this script's claim.
 
 # Is `$h` the chooser itself or one of its descendants? Replaces the driver's
 # GetParent walk: EnumChildWindows (Get-TestChildWindows) is recursive, so the
@@ -485,10 +452,10 @@ try {
     Assert "owner window is disabled while the chooser is up" (
         -not (Test-TestWindowEnabled -Window $g.Top))
 
-    $btn = Get-AccountButton $chooser
+    $btn = Get-ChooserAccountButton -Chooser $chooser
     Assert "account row has a button" ($null -ne $btn)
     Assert "signed-out label is the Google sign-in" ($null -ne $btn -and $btn.Text -eq $SignInLabel)
-    Assert "signed-out status says 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
+    Assert "signed-out status says 'Not signed in'" ((Get-ChooserAccountStatusText -Chooser $chooser) -eq 'Not signed in')
 
     if ($null -ne $btn) {
         Send-TestControlClick -Control $btn.Hwnd | Out-Null
@@ -497,7 +464,7 @@ try {
         # synchronous sign-in would fail this.
         Start-Sleep -Milliseconds 800
         Assert "chooser still up while signing in" (Test-TestWindowExists -Window $chooser)
-        $busy = Get-AccountButton $chooser
+        $busy = Get-ChooserAccountButton -Chooser $chooser
         Assert "button disabled while signing in" ($null -ne $busy -and -not $busy.Enabled)
         # Disabling the focused button would drop keyboard focus for the whole
         # dialog (WM_KEYDOWN then arrives with hwnd == NULL and Enter/Escape/Tab
@@ -516,7 +483,7 @@ try {
 
         # The row updates IN PLACE - no reopen.
         Start-Sleep -Milliseconds 600
-        $after = Get-AccountButton $chooser
+        $after = Get-ChooserAccountButton -Chooser $chooser
         # -NegativeControl inverts THIS one: "signing in through the chooser's
         # account row flips the row to signed-in, in place" is the claim T141
         # exists for, and it normally passes, so the control discriminates.
@@ -528,7 +495,7 @@ try {
             Assert "button flipped to 'Sign Out'" $flipped
         }
         Assert "button re-enabled" ($null -ne $after -and $after.Enabled)
-        Assert "status shows the signed-in email" ((Get-AccountStatusText $chooser) -eq 'e2e@example.com')
+        Assert "status shows the signed-in email" ((Get-ChooserAccountStatusText -Chooser $chooser) -eq 'e2e@example.com')
         Assert "device list refetched after sign-in" ((Get-Hits $HitsA) -match 'GET /v1/client/devices')
 
         "  -- 3: sign out on the same row"
@@ -539,10 +506,10 @@ try {
                 (Get-Hits $HitsA) -match [regex]::Escape("POST /oauth/signout HTTP/1.1|auth=$SessTok"))
             Assert "account.dat gone" (-not (Test-Path $AccountStore))
             Start-Sleep -Milliseconds 500
-            $out = Get-AccountButton $chooser
+            $out = Get-ChooserAccountButton -Chooser $chooser
             Assert "button back to the Google sign-in" ($null -ne $out -and $out.Text -eq $SignInLabel)
-            Assert "status back to 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
-            Assert "hint says signed out" ((Get-HintText $chooser) -match 'Signed out|Already signed out')
+            Assert "status back to 'Not signed in'" ((Get-ChooserAccountStatusText -Chooser $chooser) -eq 'Not signed in')
+            Assert "hint says signed out" ((Get-ChooserHintText -Chooser $chooser) -match 'Signed out|Already signed out')
         }
     }
 
@@ -570,15 +537,15 @@ try {
     $ch2 = Open-Chooser $g2
     Assert "chooser opened (dead relay)" ($ch2 -ne [IntPtr]::Zero)
     if ($ch2 -ne [IntPtr]::Zero) {
-        $b2 = Get-AccountButton $ch2
+        $b2 = Get-ChooserAccountButton -Chooser $ch2
         if ($null -ne $b2) { Send-TestControlClick -Control $b2.Hwnd | Out-Null }
         Assert "browser redirect delivered (dead relay)" (Complete-BrowserRedirect $errlog2)
         Assert "GUI reports sign_in failed" (Wait-Stderr $errlog2 'relay account: sign_in failed')
         Assert "no account.dat after failed sign-in" (-not (Test-Path $AccountStore))
         Start-Sleep -Milliseconds 500
         Assert "chooser survived the failure" (Test-TestWindowExists -Window $ch2)
-        Assert "the failure is reported in the chooser" ((Get-HintText $ch2) -match "ouldn't|failed|not completed")
-        $b2b = Get-AccountButton $ch2
+        Assert "the failure is reported in the chooser" ((Get-ChooserHintText -Chooser $ch2) -match "ouldn't|failed|not completed")
+        $b2b = Get-ChooserAccountButton -Chooser $ch2
         Assert "button re-enabled after failure" (
             $null -ne $b2b -and $b2b.Enabled -and $b2b.Text -eq $SignInLabel)
     }

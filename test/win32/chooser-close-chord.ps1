@@ -149,7 +149,7 @@ try {
 
     # Focus sits in the filter EDIT when the chooser opens - the state a real
     # user is in when they change their mind and reach for Ctrl+W.
-    $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
+    $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Assert ($filter -ne [IntPtr]::Zero) 'the chooser has its filter field'
     Assert (-not (Test-TestWindowEnabled -Window $g.Top)) 'the owner window is disabled while the chooser is up'
 

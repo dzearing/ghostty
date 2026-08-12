@@ -199,7 +199,7 @@ try {
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'ctrl+shift+n opens the chooser'
     if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser'; exit 1 }
-    $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
+    $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Assert ($filter -ne [IntPtr]::Zero) 'the chooser has its filter field'
 
     $line = Wait-LogLine $errlog2 'chooser roster: loaded (\d+) session' 8000
@@ -285,7 +285,7 @@ try {
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'the chooser reopens'
     if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser'; exit 1 }
-    $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
+    $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Wait-LogLine $errlog3 'chooser roster: loaded (\d+) session' 8000 | Out-Null
 
     # Walk to the dead row: Right enters at index 0, then Down per step.

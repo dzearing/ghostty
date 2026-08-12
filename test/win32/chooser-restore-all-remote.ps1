@@ -285,10 +285,13 @@ function Open-Chooser($g) {
     return [IntPtr]::Zero
 }
 
-# The Restore All button, found by CAPTION and including hidden windows - the
-# hidden state is a result this test needs to be able to read.
+# The Restore All button, asked for by its control ID (lib\ChooserControls.ps1,
+# T294) and including hidden windows - the hidden state is a result this test
+# needs to be able to read, and the caption this used to key on is one of the
+# things the chooser is free to change. Returned as an HWND, which is what every
+# call site here passes on to Send-TestKeys / Test-TestWindowVisible.
 function Get-RestoreAllButton($chooser) {
-    return Find-TestWindowEx -Parent $chooser -Class 'Button' -Title 'Restore All'
+    return ConvertTo-TestHwnd (Get-ChooserRestoreAllButton -Chooser $chooser)
 }
 
 function Wait-LogLine($path, $pattern, $timeoutMs) {

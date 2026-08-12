@@ -115,61 +115,20 @@ public class CmMenuRead {
 
 # --- window/control helpers (all through the test-desktop worker thread) ------
 
-# {Hwnd, Text, Left, Top, Right, Bottom, Visible} for every $cls descendant, so
-# a control can be found by LABEL or by GEOMETRY instead of creation order. Text
-# via WM_GETTEXT, which unlike GetWindowTextW is not a stale cross-process cache.
-function Get-Controls([IntPtr]$parent, [string]$cls) {
-    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
-        [pscustomobject]@{
-            Hwnd    = [IntPtr]$_.Hwnd
-            Text    = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
-            Left    = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
-            Visible = $_.Visible
-        }
-    })
-}
+# WHICH CONTROL IS WHICH in the chooser comes from lib\ChooserControls.ps1
+# (T294), which TestDesktop.ps1 already dot-sources: `Get-ChooserMenuButton`,
+# `Get-ChooserActivityButton`, `Get-ChooserActionRow`, `Get-ChooserList`,
+# `Invoke-ChooserClick`. This script used to keep private copies of all of
+# them, keyed on "the first button right of New Window" - which T177's Activity
+# button silently became. Identification is by the app's own control id now.
+#
+# `Get-TestControls` (TestDesktop.ps1) is the generic enumerator, used here for
+# the rename PROMPT and the remove CONFIRM, which are not the chooser.
 
 function Get-NthChild([IntPtr]$parent, [string]$cls, [int]$nth) {
     $all = @(Get-TestChildWindows -Window $parent -Class $cls)
     if ($all.Count -le $nth) { return [IntPtr]::Zero }
     return [IntPtr]$all[$nth].Hwnd
-}
-
-# Every button sharing the primary action's row, left to right - the detail
-# header's action RUN (T177: [New Window] [Restore All]? [Activity]? [...]).
-# Row membership is the shared baseline, which every packing keeps; the row's
-# composition is what changes with the selected machine.
-function Get-ActionRow([IntPtr]$chooser, [switch]$IncludeHidden) {
-    $buttons = @(Get-Controls $chooser 'Button')
-    $primary = $buttons | Where-Object { $_.Text -eq 'New Window' } | Select-Object -First 1
-    if (-not $primary) { return @() }
-    return @($buttons |
-        Where-Object { ($IncludeHidden -or $_.Visible) -and $_.Top -eq $primary.Top -and $_.Bottom -eq $primary.Bottom } |
-        Sort-Object Left)
-}
-
-# The management button: the SQUARE glyph button in that row. Found by shape,
-# not by label (its label is a non-ASCII ellipsis) and not by "the one after New
-# Window" (that is Activity now).
-function Get-MenuButton([IntPtr]$chooser) {
-    $sq = @(Get-ActionRow $chooser -IncludeHidden |
-        Where-Object { ($_.Right - $_.Left) -eq ($_.Bottom - $_.Top) })
-    if ($sq.Count -eq 0) { return $null }
-    return $sq[$sq.Count - 1]
-}
-
-function Get-ActivityButton([IntPtr]$chooser) {
-    @(Get-ActionRow $chooser -IncludeHidden | Where-Object { $_.Text -eq 'Activity' }) |
-        Select-Object -First 1
-}
-
-# Click the CENTRE of a control, posted at the control itself: posted messages
-# skip hit testing, so the target has to be the window the OS would have routed
-# to (T216).
-function Click-Control([IntPtr]$window, $ctl, [string]$button = 'left') {
-    $cx = [int](($ctl.Left + $ctl.Right) / 2)
-    $cy = [int](($ctl.Top + $ctl.Bottom) / 2)
-    [void](Send-TestMouse -Window $window -Target $ctl.Hwnd -X $cx -Y $cy -Button $button)
 }
 
 # The live popup's items. MN_GETHMENU is SENT: the app's GUI thread is inside
@@ -318,24 +277,24 @@ try {
     if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser to score'; exit 1 }
 
     Start-Sleep -Milliseconds 350
-    $list = Get-NthChild $chooser 'ListBox' 0
+    $list = [IntPtr](Get-ChooserList -Chooser $chooser).Hwnd
     $count = [int](Invoke-TestMessage -Window $list -Message $LB_GETCOUNT)
     Assert ($count -eq 2) "list shows Local + the fetched device (got $count)"
 
     # --- (1) the button exists, and it is HIDDEN on the Local row
     # The Local row is selected on open; Mac gives it no management actions, so
     # an ellipsis over it would open nothing.
-    $mb = Get-MenuButton $chooser
+    $mb = Get-ChooserMenuButton -Chooser $chooser
     Assert ($null -ne $mb) 'the detail header has a management button beside "New Window"'
     if ($mb) {
         Assert (-not $mb.Visible) 'management button is hidden while the Local row is selected'
     }
     # T177: Activity is gated on the same thing the menu is (mac's single
     # `if case .remote(let machine)`), so the Local row shows neither.
-    $ab = Get-ActivityButton $chooser
+    $ab = Get-ChooserActivityButton -Chooser $chooser
     Assert ($null -ne $ab) 'the detail header has an Activity button'
     if ($ab) { Assert (-not $ab.Visible) 'Activity is hidden while the Local row is selected' }
-    $localRow = @(Get-ActionRow $chooser)
+    $localRow = @(Get-ChooserActionRow -Chooser $chooser)
     Assert ($localRow.Count -eq 1 -and $localRow[0].Text -eq 'New Window') `
         "the Local row's action row is New Window alone (got: $(($localRow | ForEach-Object { $_.Text }) -join ', '))"
 
@@ -344,7 +303,7 @@ try {
     # reaches it.
     [void](Send-TestControlKey -Control $chooser -Key Down)
     Start-Sleep -Milliseconds 300
-    $mb = Get-MenuButton $chooser
+    $mb = Get-ChooserMenuButton -Chooser $chooser
     Assert ($null -ne $mb -and $mb.Visible) 'management button appears on a relay device row'
 
     # --- (1b) T177: the row's COMPOSITION and its PACKING on a remote row.
@@ -352,7 +311,7 @@ try {
     # (MachineChooserView.swift:456-491); the win32 row is packed as a run, so
     # what is asserted is the order, one shared baseline, and one gap - not
     # three fixed slots.
-    $row = @(Get-ActionRow $chooser)
+    $row = @(Get-ChooserActionRow -Chooser $chooser)
     Assert ($row.Count -eq 3) "a remote row packs three actions (got $($row.Count): $(($row | ForEach-Object { $_.Text }) -join ', '))"
     if ($row.Count -eq 3) {
         Assert ($row[0].Text -eq 'New Window') "New Window leads the run (got '$($row[0].Text)')"
@@ -375,10 +334,10 @@ try {
     # --- (1c) T177: Activity opens the Activity Monitor for THAT machine, and
     # dismisses the chooser on the way (mac's `finish(nil)` then
     # presentDialing, MachineChooserView.swift:1488-1492).
-    $ab = Get-ActivityButton $chooser
+    $ab = Get-ChooserActivityButton -Chooser $chooser
     Assert ($null -ne $ab -and $ab.Visible) 'Activity appears on a relay device row'
     if ($ab -and $ab.Visible) {
-        Click-Control $chooser $ab
+        [void](Invoke-ChooserClick -Chooser $chooser -Control $ab)
         $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
         Assert ($panel -ne [IntPtr]::Zero) 'Activity opens an Activity Monitor panel'
         if ($panel -ne [IntPtr]::Zero) {
@@ -407,14 +366,14 @@ try {
         $chooser = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000
         Assert ($chooser -ne [IntPtr]::Zero) 'the chooser re-opens after the panel took over'
         if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: chooser did not re-open'; exit 1 }
-        $list = Get-NthChild $chooser 'ListBox' 0
+        $list = [IntPtr](Get-ChooserList -Chooser $chooser).Hwnd
         Start-Sleep -Milliseconds 350
         [void](Send-TestControlKey -Control $chooser -Key Down)
         Start-Sleep -Milliseconds 300
 
-        $ab2 = Get-ActivityButton $chooser
+        $ab2 = Get-ChooserActivityButton -Chooser $chooser
         if ($ab2 -and $ab2.Visible) {
-            Click-Control $chooser $ab2
+            [void](Invoke-ChooserClick -Chooser $chooser -Control $ab2)
             Start-Sleep -Milliseconds 1200
             $panels = @(Get-TestWindows -ProcessId $app.Pid -Class 'GhozttyActivityMonitor')
             Assert ($panels.Count -eq 1) "a second Activity press focuses the same panel (got $($panels.Count) windows)"
@@ -432,17 +391,17 @@ try {
         if (-not (Test-TestWindowExists -Window $chooser)) {
             [void](Send-TestKeys -Window $top -Target $surface -Modifiers ctrl, shift -Key N)
             $chooser = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000
-            $list = Get-NthChild $chooser 'ListBox' 0
+            $list = [IntPtr](Get-ChooserList -Chooser $chooser).Hwnd
             Start-Sleep -Milliseconds 350
             [void](Send-TestControlKey -Control $chooser -Key Down)
             Start-Sleep -Milliseconds 300
         }
-        $mb = Get-MenuButton $chooser
+        $mb = Get-ChooserMenuButton -Chooser $chooser
     }
 
     # --- (2) clicking it opens the mac item list
     if ($mb -and $mb.Visible) {
-        Click-Control $chooser $mb
+        [void](Invoke-ChooserClick -Chooser $chooser -Control $mb)
         $popup = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 2500
         Assert ($popup -ne [IntPtr]::Zero) 'the management button opens a popup menu'
         if ($popup -ne [IntPtr]::Zero) {
@@ -488,7 +447,7 @@ try {
             if ($edit -ne [IntPtr]::Zero) {
                 $seed = Get-TestControlText -Control $edit
                 Assert ($seed -eq 'E2E-Box') "the field is seeded with the current name (got '$seed')"
-                $btns = @(Get-Controls $prompt 'Button')
+                $btns = @(Get-TestControls -Window $prompt -Class 'Button')
                 Assert (@($btns | Where-Object { $_.Text -eq 'Rename' }).Count -eq 1) `
                     "the prompt's affirmative button says Rename (got: $(($btns | ForEach-Object { $_.Text }) -join ', '))"
 
@@ -513,7 +472,7 @@ try {
                 # row: the machine they just renamed stays selected, so its
                 # management button (and the detail pane describing it) are
                 # still there.
-                $mbAfter = Get-MenuButton $chooser
+                $mbAfter = Get-ChooserMenuButton -Chooser $chooser
                 Assert ($null -ne $mbAfter -and $mbAfter.Visible) `
                     'the renamed machine stays selected after the re-list'
             }
@@ -521,9 +480,9 @@ try {
     }
 
     # --- (5) Remove: confirmation first, and Enter CANCELS it
-    $mb = Get-MenuButton $chooser
+    $mb = Get-ChooserMenuButton -Chooser $chooser
     if ($mb -and $mb.Visible) {
-        Click-Control $chooser $mb
+        [void](Invoke-ChooserClick -Chooser $chooser -Control $mb)
         $popup3 = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 2500
         if ($popup3 -ne [IntPtr]::Zero) {
             Send-MenuKey $chooser Down   # Host Settings...
@@ -534,7 +493,7 @@ try {
         $confirm = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 3000
         Assert ($confirm -ne [IntPtr]::Zero) 'Remove from Account... confirms before deleting'
         if ($confirm -ne [IntPtr]::Zero) {
-            $cbtns = @(Get-Controls $confirm 'Button')
+            $cbtns = @(Get-TestControls -Window $confirm -Class 'Button')
             Assert (@($cbtns | Where-Object { $_.Text -eq 'Remove' }).Count -eq 1) `
                 "the confirmation's affirmative button says Remove (got: $(($cbtns | ForEach-Object { $_.Text }) -join ', '))"
             Assert (@($cbtns | Where-Object { $_.Text -eq 'Cancel' }).Count -eq 1) 'the confirmation offers Cancel'
@@ -557,9 +516,9 @@ try {
         }
 
         # --- (6) and for real: Tab onto Remove, Enter, row goes
-        $mb = Get-MenuButton $chooser
+        $mb = Get-ChooserMenuButton -Chooser $chooser
         if ($mb -and $mb.Visible) {
-            Click-Control $chooser $mb
+            [void](Invoke-ChooserClick -Chooser $chooser -Control $mb)
             $popup4 = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 2500
             if ($popup4 -ne [IntPtr]::Zero) {
                 Send-MenuKey $chooser Down   # Host Settings...

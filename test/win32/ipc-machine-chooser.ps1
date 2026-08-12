@@ -91,42 +91,18 @@ function Get-Height([IntPtr]$h) {
     return (Get-TestWindowRect -Window $h).Height
 }
 
-# The nth (0-based) descendant of $parent with class $cls, in z-order.
-function Get-NthChild([IntPtr]$parent, [string]$cls, [int]$nth) {
-    $all = @(Get-TestChildWindows -Window $parent -Class $cls)
-    if ($all.Count -le $nth) { return [IntPtr]::Zero }
-    return [IntPtr]$all[$nth].Hwnd
-}
-
-# The $cls child sitting LOWEST in the dialog (largest top edge). The chooser
-# has two STATICs - the account status at the top and the footer hint at the
-# bottom - and this picks the hint without depending on creation order.
-function Get-LowestChild([IntPtr]$parent, [string]$cls) {
-    $best = [IntPtr]::Zero
-    $bestTop = [int]::MinValue
-    foreach ($c in Get-TestChildWindows -Window $parent -Class $cls) {
-        if ($c.Top -gt $bestTop) { $bestTop = $c.Top; $best = [IntPtr]$c.Hwnd }
-    }
-    return $best
-}
-
-# {Text, Left, Top, Right, Bottom, Visible} for every $cls child, so a test can
-# find a control by its LABEL instead of by creation order. Text via WM_GETTEXT,
-# which unlike GetWindowTextW is not a stale cross-process cache.
+# WHICH CONTROL IS WHICH comes from lib\ChooserControls.ps1 (T294), which
+# TestDesktop.ps1 already dot-sources - `Get-ChooserPrimaryButton`,
+# `Get-ChooserCancelButton`, `Get-ChooserList`, `Get-ChooserFilterField`,
+# `Get-ChooserAccountButton`, `Get-ChooserHintText` - and the generic
+# enumerator is `Get-TestControls` (lib\TestDesktop.ps1).
 #
-# `Visible` matters since T311: the account row carries TWO controls (a bordered
-# button and a link) and hides the one this state does not use, so a lookup that
-# ignores visibility can return the control the user cannot see.
-function Get-Controls([IntPtr]$parent, [string]$cls) {
-    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
-        [pscustomobject]@{
-            Hwnd    = [IntPtr]$_.Hwnd
-            Text    = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
-            Left    = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
-            Visible = $_.Visible
-        }
-    })
-}
+# This script used to find them by creation ORDER ("the first ListBox") and by
+# LABEL ("the button that says New Window"), and it kept private copies of both
+# lookups. The label one made an assertion circular: it found the primary action
+# BY the caption `New Window` and then asserted the caption was `New Window`.
+# The lookup asks the app for the control's own id now, so that assertion is a
+# real one.
 
 # Seed a DPAPI account store in the CURRENT (T93) shape, so a GUI comes up
 # SIGNED IN without running the browser flow. The account row's signed-in
@@ -400,8 +376,8 @@ try {
     $LB_GETITEMHEIGHT = 0x01A1
     $LB_GETCOUNT = 0x018B
 
-    $list = Get-NthChild $chooser 'ListBox' 0
-    $edit = Get-NthChild $chooser 'Edit' 0
+    $list = ConvertTo-TestHwnd (Get-ChooserList -Chooser $chooser)
+    $edit = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Assert ($list -ne [IntPtr]::Zero) 'chooser has a machine list'
 
     # The live DPI scale, derived from the window's own fixed 840 width. Needed
@@ -544,7 +520,7 @@ try {
     # 12 + 4 still lands on 16, so this line is unchanged and is now also the
     # check that the two did not drift apart.
     $script:hintLineH = Dip $scale 16
-    $hint1 = Get-LowestChild $chooser 'Static'
+    $hint1 = ConvertTo-TestHwnd (Get-ChooserStatic -Chooser $chooser -Edge bottom)
     if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = Get-Height $hint1 }
     Assert ($script:hintH1 -eq $script:hintLineH) "signed-in status strip is one line (line=$($script:hintLineH), got $($script:hintH1))"
     if ($list -ne [IntPtr]::Zero) {
@@ -584,11 +560,15 @@ try {
 
     # The primary action is Mac's "New Window", it lives in the detail pane, and
     # the footer holds Cancel alone.
-    $buttons = @(Get-Controls $chooser 'Button')
-    $primary = $buttons | Where-Object { $_.Text -eq 'New Window' }
-    $cancel = $buttons | Where-Object { $_.Text -eq 'Cancel' }
-    Assert ($null -ne $primary) "the primary action is labeled 'New Window' (saw: $(($buttons | ForEach-Object { $_.Text }) -join ', '))"
-    Assert ($null -ne $cancel) 'the footer has a Cancel button'
+    #
+    # Both are found by their control ID (T294), so the caption assertion below
+    # is a real one: keyed on the label, it found the button BY the caption it
+    # then asserted, and could only ever have passed.
+    $buttons = @(Get-TestControls -Window $chooser -Class 'Button')
+    $primary = Get-ChooserPrimaryButton -Chooser $chooser
+    $cancel = Get-ChooserCancelButton -Chooser $chooser
+    Assert ($null -ne $primary -and $primary.Text -eq 'New Window') "the primary action is labeled 'New Window' (saw: $(($buttons | ForEach-Object { $_.Text }) -join ', '))"
+    Assert ($null -ne $cancel -and $cancel.Text -eq 'Cancel') 'the footer has a Cancel button'
     if ($primary) {
         Assert ((($primary.Left - $orgX) -gt $masterRight)) "the primary action is in the detail pane (left=$($primary.Left - $orgX), column ends at $masterRight)"
         Assert ((($primary.Bottom - $orgY) -lt $footerY)) 'the primary action is above the footer, not in it'
@@ -618,7 +598,7 @@ try {
         # Signed OUT, the account row's control is the bordered button; the
         # signed-in state's link is hidden, so `Visible` is what tells them apart
         # (T311).
-        $acct = $buttons | Where-Object { $_.Visible -and $_.Text -match 'Sign' } | Select-Object -First 1
+        $acct = Get-ChooserAccountButton -Chooser $chooser
         if ($acct) {
             Assert ((($acct.Bottom - $acct.Top)) -eq $ctlH) "the account control is the same height as Cancel (account=$($acct.Bottom - $acct.Top), cancel=$ctlH)"
             $script:acctBtnW1 = $acct.Right - $acct.Left
@@ -684,10 +664,10 @@ try {
         Assert ($chooser2 -ne [IntPtr]::Zero) 'chooser opens with no credential'
         if ($chooser2 -ne [IntPtr]::Zero) {
             Start-Sleep -Milliseconds 400
-            $hint2 = Get-LowestChild $chooser2 'Static'
+            $hint2 = ConvertTo-TestHwnd (Get-ChooserStatic -Chooser $chooser2 -Edge bottom)
             $hintH2 = Get-Height $hint2
             $chooserH2 = Get-Height $chooser2
-            $list2 = Get-NthChild $chooser2 'ListBox' 0
+            $list2 = ConvertTo-TestHwnd (Get-ChooserList -Chooser $chooser2)
             $listH2 = if ($list2 -ne [IntPtr]::Zero) { Get-Height $list2 } else { 0 }
 
             Assert ($hintH2 -ge 2 * $script:hintLineH) "signed-out status strip wraps to 2+ lines (line=$($script:hintLineH), got $hintH2)"
@@ -750,12 +730,16 @@ try {
             $org3X = $cr3.Left
             $org3Y = $cr3.Top
 
-            # The account band is everything above the header rule; both account
-            # controls live in it and nothing else does.
+            # Both account controls, asked for by id (T294) rather than
+            # inferred from "every button above the header rule" - so where
+            # they SIT is now an assertion of its own instead of a premise of
+            # the lookup.
             $bandBot3 = $org3Y + (Dip $scale3 52)
-            $acctBtns = @(Get-Controls $chooser3 'Button' | Where-Object { $_.Top -lt $bandBot3 })
+            $acctBtns = @(Get-ChooserAccountButton -Chooser $chooser3 -IncludeHidden)
             $liveAcct = @($acctBtns | Where-Object { $_.Visible })
             Assert ($acctBtns.Count -eq 2) "the account row carries both controls (found $($acctBtns.Count))"
+            Assert (@($acctBtns | Where-Object { $_.Top -lt $bandBot3 }).Count -eq $acctBtns.Count) `
+                "both account controls sit in the band above the header rule (band ends at $bandBot3, tops: $(($acctBtns | ForEach-Object { $_.Top }) -join ', '))"
             Assert ($liveAcct.Count -eq 1) "exactly one account control is visible at a time (visible: $($liveAcct.Count))"
             if ($liveAcct.Count -eq 1) {
                 # Finding 6, the behavioural half: signed in, the control is the
@@ -773,7 +757,7 @@ try {
 
             # The email is the identity text, right-aligned above the link.
             $topStatic = $null
-            foreach ($s in Get-Controls $chooser3 'Static') {
+            foreach ($s in Get-TestControls -Window $chooser3 -Class 'Static') {
                 if ($null -eq $topStatic -or $s.Top -lt $topStatic.Top) { $topStatic = $s }
             }
             Assert ($null -ne $topStatic -and $topStatic.Text -eq $T311_EMAIL) "the account row shows the signed-in email (got '$(if ($topStatic) { $topStatic.Text })')"

@@ -215,6 +215,12 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
+    // A child window's control ID - the `hMenu` its creator passed to
+    // CreateWindowEx, i.e. the APP's own name for the control (it is what
+    // WM_COMMAND is routed on). Cross-process and free: a USER32 read of the
+    // window's own storage, needing neither the owner's message loop nor a
+    // pixel. See lib\ChooserControls.ps1 for why a test asks by id.
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
     // Class style, cross-process. Used to decide whether a target would really
     // receive WM_*BUTTONDBLCLK (see the doubleclick branch in MouseEvent).
@@ -593,6 +599,7 @@ public class GhozttyTestDesktop {
     // Modality's observable side: an owner window is DISABLED for as long as
     // its modal dialog is up, and re-enabled when the dialog closes.
     public bool Enabled(IntPtr h) { return (bool)Run(delegate() { return IsWindowEnabled(h); }); }
+    public int CtrlId(IntPtr h) { return (int)Run(delegate() { return GetDlgCtrlID(h); }); }
 
     public int[] Rect(IntPtr h) {
         return (int[])Run(delegate() {
@@ -2035,6 +2042,68 @@ function Test-TestWindowZoomed {
     return (Resolve-TestDesktop $Desktop).Zoomed($Window)
 }
 
+# A control's ID - the app's OWN name for it (GetDlgCtrlID). 0 when the creator
+# passed no id, which is how a STATIC that is only ever painted looks. Prefer
+# this over a label or a position when asking "which control is this": a label
+# is a product decision (and is often what the test asserts), and a position
+# moves the moment a neighbour is added - see lib\ChooserControls.ps1.
+function Get-TestControlId {
+    param([Parameter(Mandatory = $true)][IntPtr]$Control, $Desktop)
+    return (Resolve-TestDesktop $Desktop).CtrlId($Control)
+}
+
+<#
+Every descendant of `$Window` with class `$Class`, as
+{Hwnd, Id, Text, Left, Top, Right, Bottom, Width, Height, Visible, Enabled,
+Class} - so a control can be found by its ID, its LABEL or its GEOMETRY instead
+of by creation order.
+
+`Text` comes from WM_GETTEXT (`Get-TestControlText`), never GetWindowTextW: the
+latter reads a cross-process CACHE and goes stale for a label the app just
+changed in place, and "the label changed" is a claim several scripts make.
+
+Hidden controls are INCLUDED and `Visible` reports the state, because a dialog
+that hides rather than destroys (the chooser does, in three places) makes "is it
+hidden" a result a test needs to read. Pass -VisibleOnly for "what is on
+screen".
+
+Four scripts each kept a private copy of this (T294); it is one function now.
+#>
+# The HWND of a control object (from Get-TestControls / the Get-Chooser*
+# lookups), or IntPtr::Zero when there is no such control. The zero rather than
+# a $null is deliberate: it binds to the [IntPtr] parameters of every other
+# function here, so "the control is missing" flows through a script the same way
+# it always did instead of failing at parameter binding with a type error.
+function ConvertTo-TestHwnd {
+    param($Control)
+    if ($null -eq $Control) { return [IntPtr]::Zero }
+    return [IntPtr]$Control.Hwnd
+}
+
+function Get-TestControls {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [string]$Class = '*',
+        [switch]$VisibleOnly,
+        $Desktop
+    )
+    if ($Window -eq [IntPtr]::Zero) { return @() }
+    return @(Get-TestChildWindows -Window $Window -Class $Class -Desktop $Desktop |
+        Where-Object { -not $VisibleOnly -or $_.Visible } | ForEach-Object {
+            $h = [IntPtr]$_.Hwnd
+            [pscustomobject]@{
+                Hwnd    = $h
+                Id      = (Get-TestControlId -Control $h -Desktop $Desktop)
+                Text    = (Get-TestControlText -Control $h -Desktop $Desktop)
+                Left    = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
+                Width   = $_.Width; Height = $_.Height
+                Visible = $_.Visible
+                Enabled = (Test-TestWindowEnabled -Window $h -Desktop $Desktop)
+                Class   = $_.Class
+            }
+        })
+}
+
 # Resize the window rect (position and z-order unchanged). -Grow adds to the
 # current rect instead of setting it, which is what the size tests want when
 # they stretch a window away from its default.
@@ -2819,6 +2888,15 @@ function Get-TestWindowDpi {
 # everywhere in this chrome and the workaround for the missing frame was
 # per-site.
 . (Join-Path $PSScriptRoot 'HoverCapture.ps1')
+
+# WHICH CONTROL IS WHICH in the machine chooser (`Get-ChooserControl` and
+# friends, T294), dot-sourced for the reason ChromeGeometry.ps1 is: seven
+# scripts drive that dialog and each one kept a private copy of "find the
+# management button", so one new button in the detail pane's action row (T177's
+# Activity) silently made two of them click the wrong control. Identification is
+# by the app's own control ID, so a relabel, a move or a new neighbour cannot
+# reach it.
+. (Join-Path $PSScriptRoot 'ChooserControls.ps1')
 
 <#
 Wait for a popup menu (win32 class '#32768') owned by $ProcessId.

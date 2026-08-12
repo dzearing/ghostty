@@ -109,16 +109,11 @@ function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
 }
 
-# The account row's live control is whichever of its two buttons is VISIBLE -
-# the owner-drawn link when signed in, the bordered button when not - and the
-# row sits above every other button in the dialog, so "topmost visible BUTTON"
-# names it without depending on its label.
-function Get-AccountControl([IntPtr]$chooser) {
-    $btns = @(Get-TestChildWindows -Window $chooser -Class 'Button' |
-        Where-Object { $_.Visible } | Sort-Object Top)
-    if ($btns.Count -eq 0) { return $null }
-    return $btns[0]
-}
+# The account row's live control - whichever of its two buttons is VISIBLE (the
+# owner-drawn link when signed in, the bordered button when not) - comes from
+# lib\ChooserControls.ps1 (T294), which TestDesktop.ps1 already dot-sources.
+# This was a private "topmost visible BUTTON" copy, the fifth of its kind in
+# this suite.
 
 # Ink in a screen rect of a capture: pixels that differ from the rect's most
 # common color (its background) by more than a small tolerance. Counting ink
@@ -196,7 +191,7 @@ try {
     Start-Sleep -Milliseconds 500
 
     # --- the subject: the signed-in link -------------------------------------
-    $ctl = Get-AccountControl $chooser
+    $ctl = Get-ChooserAccountButton -Chooser $chooser
     Assert ($null -ne $ctl) 'the account row has a visible control'
     if ($null -eq $ctl) { Write-Host 'SETUP FAIL: no account control'; exit 1 }
     $link = [IntPtr]$ctl.Hwnd

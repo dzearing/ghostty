@@ -173,7 +173,7 @@ try {
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'ctrl+shift+n opens the chooser'
     if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser'; exit 1 }
-    $filter = Get-TestChildWindow -Window $chooser -Class 'Edit'
+    $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Assert ($filter -ne [IntPtr]::Zero) 'the chooser has its filter field'
     $loaded = Wait-LogLine $errlog 'chooser roster: loaded (\d+) session' 8000
     Assert ($null -ne $loaded) 'the roster loaded before anything was navigated'

@@ -136,18 +136,11 @@ public class HsMenuRead {
 
 # --- window/control helpers (all through the test-desktop worker thread) ------
 
-# {Hwnd, Text, Left, Top, Right, Bottom, Visible} for every $cls descendant, so
-# a control can be found by LABEL or by GEOMETRY instead of creation order.
-function Get-Controls([IntPtr]$parent, [string]$cls) {
-    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
-        [pscustomobject]@{
-            Hwnd    = [IntPtr]$_.Hwnd
-            Text    = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
-            Left    = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
-            Visible = $_.Visible
-        }
-    })
-}
+# The generic enumerator is `Get-TestControls` (lib\TestDesktop.ps1) and the
+# chooser's own vocabulary is `Get-ChooserMenuButton` and friends
+# (lib\ChooserControls.ps1, T294). This script used to keep a private copy of
+# both, and its copy of "find the management button" was the one T177 nearly
+# turned into a click on Activity.
 
 # A DIRECT child of $parent only. Get-TestChildWindows walks every descendant,
 # and an editable COMBOBOX owns an inner EDIT - without the parentage filter,
@@ -155,29 +148,6 @@ function Get-Controls([IntPtr]$parent, [string]$cls) {
 # direct children only, which is exactly that filter.
 function Get-DirectChild([IntPtr]$parent, [string]$cls) {
     return Find-TestWindowEx -Parent $parent -Class $cls
-}
-
-# The management button: the SQUARE glyph button in the detail pane's action
-# row. Found by shape - its label is a non-ASCII ellipsis glyph, and "the first
-# button right of New Window" stopped being it when T177 packed Activity into
-# the same row.
-function Get-MenuButton([IntPtr]$chooser) {
-    $buttons = @(Get-Controls $chooser 'Button')
-    $primary = $buttons | Where-Object { $_.Text -eq 'New Window' } | Select-Object -First 1
-    if (-not $primary) { return $null }
-    $sq = @($buttons |
-        Where-Object {
-            $_.Top -eq $primary.Top -and $_.Bottom -eq $primary.Bottom -and
-            ($_.Right - $_.Left) -eq ($_.Bottom - $_.Top)
-        } | Sort-Object Left)
-    if ($sq.Count -eq 0) { return $null }
-    return $sq[$sq.Count - 1]
-}
-
-function Click-Control([IntPtr]$window, $ctl) {
-    $cx = [int](($ctl.Left + $ctl.Right) / 2)
-    $cy = [int](($ctl.Top + $ctl.Bottom) / 2)
-    [void](Send-TestMouse -Window $window -Target $ctl.Hwnd -X $cx -Y $cy)
 }
 
 function Get-MenuItems([IntPtr]$menuWnd) {
@@ -244,9 +214,9 @@ function Get-Store {
 function Open-HostSettings([IntPtr]$chooser, [int]$gpid) {
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         Start-Sleep -Milliseconds 250
-        $mb = Get-MenuButton $chooser
+        $mb = Get-ChooserMenuButton -Chooser $chooser
         if (-not $mb -or -not $mb.Visible) { continue }
-        Click-Control $chooser $mb
+        [void](Invoke-ChooserClick -Chooser $chooser -Control $mb)
         $popup = Wait-TestPopupMenu -ProcessId $gpid -TimeoutMs 2500
         if ($popup -eq [IntPtr]::Zero) { continue }
         Send-MenuKey $chooser Down    # -> Host Settings...
@@ -355,10 +325,10 @@ try {
     Start-Sleep -Milliseconds 300
 
     # --- (1) the menu now leads with Host Settings...
-    $mb = Get-MenuButton $chooser
+    $mb = Get-ChooserMenuButton -Chooser $chooser
     Assert ($null -ne $mb -and $mb.Visible) 'management button shown on the device row'
     if ($mb -and $mb.Visible) {
-        Click-Control $chooser $mb
+        [void](Invoke-ChooserClick -Chooser $chooser -Control $mb)
         $popup = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 2500
         Assert ($popup -ne [IntPtr]::Zero) 'the management button opens a popup menu'
         if ($popup -ne [IntPtr]::Zero) {
@@ -382,11 +352,11 @@ try {
         $combo = Get-DirectChild $dlg 'ComboBox'
         Assert ($wd -ne [IntPtr]::Zero) 'there is a working-directory field'
         Assert ($combo -ne [IntPtr]::Zero) 'the shell field is an editable combo box'
-        $btns = @(Get-Controls $dlg 'Button')
+        $btns = @(Get-TestControls -Window $dlg -Class 'Button')
         Assert (@($btns | Where-Object { $_.Text -eq 'Save' }).Count -eq 1) `
             "the affirmative button says Save (got: $(($btns | ForEach-Object { $_.Text }) -join ', '))"
         Assert (@($btns | Where-Object { $_.Text -eq 'Cancel' }).Count -eq 1) 'the dialog offers Cancel'
-        $labels = @(Get-Controls $dlg 'Static' | ForEach-Object { $_.Text })
+        $labels = @(Get-TestControls -Window $dlg -Class 'Static' | ForEach-Object { $_.Text })
         Assert (($labels -join ' ') -like '*Working directory:*') 'the working-directory row is labeled'
         Assert (($labels -join ' ') -like '*Shell:*') 'the shell row is labeled'
         Assert (($labels -join ' ') -like '*remote machine*') 'the dialog says the values are remote-native'
