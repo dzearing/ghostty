@@ -40,8 +40,20 @@ const icon_button = @import("icon_button.zig");
 /// acceptance script has to be SHOWN to fail, or it is not evidence). Flip to
 /// `true`, rebuild `-Dapp-runtime=win32`, and re-run the script: it restores
 /// the pre-T202 rule where the last tab is handed whatever width is left, so
-/// the single-tab-width, tab-width-clamp and last-tab→"+" gap assertions must
-/// fail — and the accent-rule and hit-test assertions must NOT.
+/// the WIDTH assertions (single-tab width, the 50%-of-the-run cap, T235's
+/// slot arithmetic) and the "+"-follows-the-last-tab family must fail.
+///
+/// Re-measured 2026-08-12 (T283, first check since T232/T235/T242/T254/T205
+/// rebuilt the strip around it): **8 FAILED / 62 passed** — single-tab width,
+/// the 50% cap twice, two-tabs-keep-their-content-width, T235's slot edge,
+/// and the three section-4 assertions about the "+" moving with the last tab
+/// and being clickable where it lands. What survives is the accent rule, the
+/// dead-space and right-inset probes, the TAB hit tests (a click on the close
+/// "×" still closes that tab), the glyph centering and the whole shape
+/// section. The older phrasing said "the hit-test assertions must NOT" fail,
+/// which reads wider than the measurement: the "+" assertions ARE clicks, but
+/// they are clicks at a point derived from the last tab's right edge, i.e.
+/// the gap claim expressed as a hit test.
 ///
 /// Left in the source rather than behind a build option so the control is one
 /// edit away from any future reader of this module, and so the unit tests
@@ -590,6 +602,16 @@ fn slotOf(m: Metrics, scale: f32) i32 {
 /// against the 16:1 gap ratio that produced T232 (they did).
 fn painted(scale: f32, hit: Rect) Rect {
     return icon_button.targetBox(icon_button.Metrics.init(scale), hit);
+}
+
+// T283: both negative controls in this module ship CLEAR. `title_spinner`,
+// `tab_shape` and `icon_button` each pinned theirs with a test like this and
+// these two did not, so a flag left `true` by an experiment would have
+// shipped the pre-T202 strip and been caught only by an acceptance script
+// somebody remembered to run. The unit lane is the cheap standing guard.
+test "T283: the strip's negative controls are clear in the shipped build" {
+    try testing.expect(!T202_NEUTERED);
+    try testing.expect(!T249_NEUTERED);
 }
 
 test "one tab is its title's width, not stretched across the window" {

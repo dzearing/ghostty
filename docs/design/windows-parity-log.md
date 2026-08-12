@@ -9,6 +9,40 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T283 (T788/T789 filed) - the negative control that could not
+  fail the assertion naming the bug it was filed for.** All eight `*_NEUTERED`
+  flags in `src/apprt/win32/` were swept for the `glyphCentered()` shape T209
+  found: a switch that is declared, documented and unit-tested while nothing on
+  the paint path listens to it. Two more were wrong. `T123_NEUTERED` returned
+  the single-line fast path straight out of `layoutInline`, so a neutered build
+  did not wrap table cells AT ALL - which means the 360pt cap it claims to
+  restore had no observable consequence and `wide pane: a >360px value does not
+  wrap`, the assertion that states the user's report, PASSED under the control.
+  The pre-T123 world wrapped at a fixed cap; it did not stop wrapping. Worse in
+  the other direction, the early return had become shared with T377's paragraph/
+  heading/list wrapping, so flipping it also failed 5 assertions in section 6h:
+  8 FAILED / 107 passed, only 3 of them the control's own. T123's two rules are
+  now DATA (`CellWrap{break_wide, cap_lines}`) handed in per call site -
+  `forCell()` for a table cell, `shipped` for every other block - and the
+  measured split is exactly the promise its comment has always made: **6 FAILED
+  / 109 passed**, all in the T123 block, nothing in 6h. Second find:
+  `icon_button.universalHover()` had no consumer at all. T282 moved its paint
+  sites onto `lightsFill(glyph)` and left the predicate behind, kept alive by
+  the one unit test that pinned it - the same defect, created by the turn that
+  fixed its sibling. Deleted. `T202_NEUTERED` was re-measured for the first time
+  since T232/T235/T242/T254/T205 rebuilt the strip and is SOUND (8 FAILED / 62
+  passed); what was wrong there is the negative half of both claim lists, which
+  promised the hit tests would survive while three "+"-click assertions do not -
+  they are the last-tab->"+" gap claim expressed as a click. Comment corrected
+  to the measured set. Last: five of the eight flags had no shipped-value pin,
+  so a flag left `true` by an experiment would have shipped; `tab_strip_layout`
+  and `BannerOverlay` gained one, the banner's also asserting the control's two
+  worlds are different values. Floor green (none/win32/agent, P1-P3), tab-strip
+  70 and pane-banner 115 ALL PASS with every flag clear. Filed T788 (a
+  `NeuterAudit` analyzer, so the next dead control is caught the day it happens
+  rather than by hand months later) and T789 (`pane-banner.ps1` labels two
+  different sections `6g`, which is why this entry has to say "the T123 block").
+
 - 2026-08-12 - **T282 (T786/T787 filed) - the test harness can photograph a
   HOVERED frame now, and the first thing it photographed was a broken negative
   control.** Every hover fill in the win32 chrome was unassertable, and three

@@ -74,8 +74,22 @@ const ELLIPSIS = "…";
 /// Negative-control switch (kept, deliberately): true restores the
 /// pre-T123 table sizing — the fixed 360pt cap, no mid-string break, no
 /// 3-line cell cap. Flipping it and re-running `pane-banner.ps1` must fail
-/// exactly the 6 section-6g assertions and nothing else; that is how those
-/// assertions were shown to test the fix rather than the harness.
+/// exactly the 6 assertions of the T123 table block in section 6g and
+/// nothing else; that is how those assertions were shown to test the fix
+/// rather than the harness. (Measured 2026-08-12, T283: 6 FAILED / 109
+/// passed — the >360px value wrapping on a wide pane, both narrow-pane
+/// reflow assertions, the mid-string break, and both 3-line-cap
+/// assertions. Nothing in 6h moves.)
+///
+/// T283 had to reshape it to keep that promise. It used to return the
+/// single-line fast path out of `layoutInline` outright, which meant a
+/// neutered build did not wrap table cells AT ALL — so the 360pt cap it
+/// restores had no observable consequence and `a >360px value does not
+/// wrap`, the assertion that names the user's report, could not fail no
+/// matter how the flag was set. It also took T377's paragraph/heading/list
+/// wrapping down with it (5 of section 6h went red), which is a control
+/// reaching outside its own claim. Both halves are the `glyphCentered()`
+/// shape from T209: a control that cannot adjudicate its own assertion.
 const T123_NEUTERED = false;
 /// The same negative control for T377: true restores the pre-T377 world
 /// where ONLY table cells wrapped — a paragraph, a heading and a list row
@@ -987,6 +1001,34 @@ pub const BannerOverlay = struct {
         }
     };
 
+    /// Which of T123's two cell rules apply to a run. Taken as DATA rather
+    /// than read off the comptime flag inside `layoutInline`, for the reason
+    /// `icon_button.glyphTarget` is: a unit test can then assert that the two
+    /// worlds produce DIFFERENT output, and the neuter reaches TABLE CELLS
+    /// only — a paragraph, a heading and a list row keep wrapping by T377's
+    /// rules whatever T123 is set to, so a control cannot fail assertions
+    /// outside its own claim (T283).
+    const CellWrap = struct {
+        /// Break a token wider than its column mid-string.
+        break_wide: bool = true,
+        /// Cap the run at `MAX_CELL_LINES` display lines, tail-truncating
+        /// the last visible one.
+        cap_lines: bool = true,
+
+        /// The shipped rules, and what every non-table block always uses.
+        const shipped: CellWrap = .{};
+
+        /// The world the neuter restores: a cell still wraps (at the fixed
+        /// fallback cap `columnWidths` hands it), and does neither of the
+        /// two things T123 added.
+        const pre_t123: CellWrap = .{ .break_wide = false, .cap_lines = false };
+
+        /// What a TABLE cell gets.
+        fn forCell() CellWrap {
+            return if (T123_NEUTERED) pre_t123 else shipped;
+        }
+    };
+
     /// Wrap `segs` into at most `MAX_CELL_LINES` display lines within
     /// `max_w` px. Returns the single-line fast path when the run already
     /// fits, when the width is not known yet, or when the run holds an
@@ -1002,14 +1044,17 @@ pub const BannerOverlay = struct {
         max_w: i32,
         size_class: usize,
         force_bold: bool,
+        rules: CellWrap,
     ) InlineLayout {
-        if (T123_NEUTERED) return .{};
         if (max_w <= 0) return .{};
         if (hasCheckbox(segs)) return .{};
         if (self.cellNaturalWidth(hdc, segs, size_class, force_bold) <= max_w) return .{};
 
         const raw = self.tokenizeCell(arena, hdc, segs, size_class, force_bold) catch return .{};
-        const tokens = self.breakWideTokens(arena, hdc, raw, max_w, size_class) catch return .{};
+        const tokens: []const Token = if (rules.break_wide)
+            self.breakWideTokens(arena, hdc, raw, max_w, size_class) catch return .{}
+        else
+            raw;
         const tw = arena.alloc(f32, tokens.len) catch return .{};
         const ts = arena.alloc(bool, tokens.len) catch return .{};
         for (tokens, 0..) |t, ti| {
@@ -1020,7 +1065,7 @@ pub const BannerOverlay = struct {
         // Capped at MAX_CELL_LINES display lines; past that the last
         // visible line tail-truncates, so one nasty run can't blow up the
         // banner height (Mac parity).
-        const truncated = lines.len > banner_layout.MAX_CELL_LINES;
+        const truncated = rules.cap_lines and lines.len > banner_layout.MAX_CELL_LINES;
         if (truncated) lines = lines[0..banner_layout.MAX_CELL_LINES];
         return .{
             .tokens = tokens,
@@ -1159,7 +1204,7 @@ pub const BannerOverlay = struct {
         for (table.rows, 0..) |row, r| {
             for (row, 0..) |cell, col| {
                 if (col >= columns) break;
-                layouts[r * columns + col] = self.layoutInline(arena, hdc, cell, widths[col], 0, false);
+                layouts[r * columns + col] = self.layoutInline(arena, hdc, cell, widths[col], 0, false, CellWrap.forCell());
             }
         }
 
@@ -1325,7 +1370,7 @@ pub const BannerOverlay = struct {
                     },
                 }
             }
-            const lay = self.layoutInline(arena, hdc, item.content, wrapWidth(content_w), 0, false);
+            const lay = self.layoutInline(arena, hdc, item.content, wrapWidth(content_w), 0, false, CellWrap.shipped);
             y += self.drawWrapped(
                 arena,
                 hdc,
@@ -1373,14 +1418,14 @@ pub const BannerOverlay = struct {
             if (bi > 0) y += block_gap;
             const h: i32 = switch (block) {
                 .text => |segs| blk: {
-                    const lay = self.layoutInline(arena, hdc, segs, wrapWidth(content_w), 0, false);
+                    const lay = self.layoutInline(arena, hdc, segs, wrapWidth(content_w), 0, false, CellWrap.shipped);
                     break :blk self.drawWrapped(arena, hdc, lay, segs, x0, y, line_h, content_w, .leading, 0, false, draw);
                 },
                 .heading => |h| blk: {
                     const hpx = heading_px[@min(h.level - 1, 5)];
                     const hl = self.px(hpx * 4.0 / 3.0);
                     const sc = @min(h.level, 6);
-                    const lay = self.layoutInline(arena, hdc, h.content, wrapWidth(content_w), sc, false);
+                    const lay = self.layoutInline(arena, hdc, h.content, wrapWidth(content_w), sc, false, CellWrap.shipped);
                     break :blk self.drawWrapped(arena, hdc, lay, h.content, x0, y, hl, content_w, .leading, sc, false, draw);
                 },
                 .rule => blk: {
@@ -2134,6 +2179,28 @@ fn bannerWndProc(
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
+
+// T283: every negative control in this module ships CLEAR, and the T123 one
+// has something to change when it is set. Four of the eight `*_NEUTERED`
+// flags in `src/apprt/win32/` pinned their shipped value with a unit test
+// and four did not — including all three here, so a flag left `true` by an
+// experiment would have shipped a degraded banner and gone red only in an
+// acceptance script somebody remembered to run.
+//
+// The second assertion is the part that is not bookkeeping: a control whose
+// two worlds are the SAME value cannot adjudicate anything, which is the
+// `glyphCentered()`/`universalHover()` failure (T209, T282) expressed as
+// data rather than as a call-site audit.
+test "T283: the banner's negative controls are clear and non-empty" {
+    try std.testing.expect(!T123_NEUTERED);
+    try std.testing.expect(!T377_NEUTERED);
+    try std.testing.expect(!T149_NEUTERED);
+
+    const CellWrap = BannerOverlay.CellWrap;
+    try std.testing.expectEqual(CellWrap.shipped, CellWrap.forCell());
+    try std.testing.expect(!std.meta.eql(CellWrap.shipped, CellWrap.pre_t123));
+    try std.testing.expect(CellWrap.shipped.break_wide and CellWrap.shipped.cap_lines);
+}
 
 // T456: a WIDTH change makes the whole card stale, not just the strip
 // Windows uncovers. The card's rounded rim, its shadow, its chevron column

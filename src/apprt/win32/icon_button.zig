@@ -871,13 +871,6 @@ pub fn glyphTarget(m: Metrics, box: Rect, glyph: Glyph) Rect {
     };
 }
 
-/// Do the close "×" and the banner chevron light a fill like the "+" and "≡"?
-/// Always yes in the shipped build; the neuter answers `false`, restoring the
-/// pre-T204 state where those two were the odd ones out.
-pub fn universalHover() bool {
-    return !T204_NEUTERED;
-}
-
 /// Does THIS button light a fill on hover? The question every paint site
 /// actually has, and the one the neuter has to answer per-glyph.
 ///
@@ -1475,8 +1468,12 @@ test "glyphTarget is the centered target in the shipped build" {
 test "the shipped build centers glyphs and lights every button" {
     // These pin the SHIPPED behavior on every build, so flipping the neuter
     // for a negative-control run cannot be forgotten in place.
+    // `universalHover()` used to be pinned here too. T282 replaced its paint
+    // sites with `lightsFill(glyph)` and left the predicate behind, so this
+    // line was the ONLY thing still calling it — the `glyphCentered()` shape
+    // exactly (T209): a control that answers a question no paint site asks,
+    // kept alive by the test that pins it. T283 deleted it.
     try testing.expect(glyphCentered());
-    try testing.expect(universalHover());
     try testing.expect(!T204_NEUTERED);
     for ([_]Glyph{ .add, .close, .menu, .chevron_up, .chevron_down, .overflow }) |g| {
         try testing.expect(lightsFill(g));
