@@ -2023,6 +2023,31 @@ real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
 suite is clean.
 
+**And a script that still takes the user's foreground has to SAY so** (T272).
+T211–T218 moved the GUI suite onto a background desktop because the user's
+complaint was that a test run kept stealing their focus, and the buckets closed
+at 23 of 23 and 13 of 13 — with two scripts (`overlay-zorder`, `split-dim`) in
+neither, still grabbing, because nothing counted the remainder. They were
+migrated (T224/T225); what stops the property regrowing is that the *remaining*
+exceptions are declared where the reader already is. `lib\TestDesktop.ps1`'s
+header carries them as `# @input-desktop-exception: <script> -- <reason>` lines,
+and `lib\ForegroundAudit.ps1` **parses that header** rather than restating the
+list, so the prose a human reads and the set the check enforces cannot drift.
+Three kinds, all enforced at zero: `undeclared` (a grab site on no list),
+`stale-declaration` (a declared script that no longer grabs, or no longer
+exists — a list naming scripts that need no naming is how a real miss gets waved
+through), and `malformed-declaration` (including an empty list, which would turn
+every violation into a pass). A grab site is **live code only** — a token that is
+neither a PowerShell comment nor a `//` comment inside an `Add-Type`
+here-string — because two thirds of the suite MENTIONS `SendInput` in a header
+explaining that it is dead off the input desktop, and reading those as violations
+would push 22 innocent scripts onto the exception list, which is the same rot
+from the other direction. A hardcoded `New-TestDesktop -Interactive` counts too
+(the hatch is for debugging by hand, never for scoring a run); forwarding the
+switch does not. Acceptance: `test\win32\foreground-audit.ps1`, whose
+`-TeethCheck` writes a real undeclared grabber into the swept directory rather
+than a synthesized finding, since the claim under test is that the sweep notices.
+
 **A synthesized click routes the way Windows routes it** (T263).
 `Send-TestMouse` asks the target `WM_NCHITTEST` at the point first and delivers
 the `WM_NC*` family whenever the answer is not `HTCLIENT` — the same decision

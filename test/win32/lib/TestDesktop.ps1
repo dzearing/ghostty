@@ -110,6 +110,21 @@
 # old way (GrabForeground + SendInput), because nobody can watch a window on a
 # desktop they cannot see. It is for debugging by hand only - it steals focus,
 # so it is never how an acceptance run is scored.
+#
+# INTERACTIVE BY DESIGN - the scripts that still take the user's foreground
+# (T272). T217 closed at 23 of 23 and T218 at 13 of 13, and the fleet-wide claim
+# became "the acceptance scripts no longer steal the user's foreground" - while
+# two scripts sat in neither bucket, still grabbing, because nothing counted the
+# remainder. Those two were migrated (T224, T225); what stops the property
+# regrowing is that the remaining exceptions are DECLARED here rather than
+# remembered. An undeclared grab site is indistinguishable from an oversight,
+# which is how the first two went quiet. `lib\ForegroundAudit.ps1` PARSES the
+# marker lines below and fails on any script that grabs and is not among them,
+# so the prose a human reads and the set the check enforces cannot drift apart.
+#
+# @input-desktop-exception: context-menu-real-input.ps1 -- (T240) the subject IS a real right-click: a script that synthesizes the trigger cannot validate the trigger.
+# @input-desktop-exception: profile-latency.ps1 -- (T53b) injection timing is the measurement, so a posted message would time the wrong path.
+# @input-desktop-exception: test-desktop-spike.ps1 -- (T207) the spike that measured what does and does not work off the input desktop; it has to reach both.
 
 # T118: never inherit an IPC endpoint. A script started from one of the user's
 # own panes inherits $GHOZTTY_IPC_SOCKET naming the USER'S app, and the CLI
