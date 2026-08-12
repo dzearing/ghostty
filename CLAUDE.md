@@ -2023,7 +2023,8 @@ real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
 suite is clean.
 
-**And a script that still takes the user's foreground has to SAY so** (T272).
+**And a script that can only run on the INPUT DESKTOP has to SAY so** (T272,
+widened by T276).
 T211–T218 moved the GUI suite onto a background desktop because the user's
 complaint was that a test run kept stealing their focus, and the buckets closed
 at 23 of 23 and 13 of 13 — with two scripts (`overlay-zorder`, `split-dim`) in
@@ -2044,9 +2045,34 @@ explaining that it is dead off the input desktop, and reading those as violation
 would push 22 innocent scripts onto the exception list, which is the same rot
 from the other direction. A hardcoded `New-TestDesktop -Interactive` counts too
 (the hatch is for debugging by hand, never for scoring a run); forwarding the
-switch does not. Acceptance: `test\win32\foreground-audit.ps1`, whose
-`-TeethCheck` writes a real undeclared grabber into the swept directory rather
-than a synthesized finding, since the claim under test is that the sweep notices.
+switch does not.
+
+**Stealing focus is one cause of being un-runnable in the loop, not the
+definition of it** (T276), so a second family counts toward the same one list: a
+read of the **composited screen** — `CopyFromScreen`, or `GetDC`/`GetWindowDC`/
+`Graphics.FromHwnd` on a NULL or desktop hwnd — which DWM produces for the input
+desktop only. T272's rule was written as "takes the foreground" and its sweep
+therefore could not see `color-contrast.ps1`, which called neither watched API
+and was input-desktop-only all the same; `split-dim.ps1` used the identical
+mechanism and made the list only because it ALSO grabbed focus, which is luck,
+not coverage. (Both are moot as findings today — T225 and T275 migrated them —
+which is exactly why the check has to hold the property instead of the memory of
+it.) The NULL is load-bearing: `GetDC($hwnd)` is a window DC, works fine off the
+desktop, and is not a finding, so a P/Invoke *declaration* never trips the rule.
+This family needs its own detection pass rather than a longer pattern, because a
+screen-DC call site spans several PowerShell tokens (`[Drv]`, `::`, `GetDC`, `(`,
+`[IntPtr]`, `::`, `Zero`, `)`) while every watched user32 name is a lone
+identifier — it scans the whole source with comment spans blanked
+*length-preservingly*, so offsets still name their line. Second reason to flag
+one, beyond the desktop it needs: **where a probe reads is not what it reads.**
+`split-dim`'s probe was carried as a terminal-content probe by three task files
+because it sampled a point over the terminal; what it sampled was a layered
+window in front of it. A window capture names its target, a screen DC names a
+point.
+
+Acceptance: `test\win32\foreground-audit.ps1`, whose `-TeethCheck` writes real
+undeclared violators into the swept directory — one per family — rather than
+synthesized findings, since the claim under test is that the sweep notices.
 
 **A synthesized click routes the way Windows routes it** (T263).
 `Send-TestMouse` asks the target `WM_NCHITTEST` at the point first and delivers

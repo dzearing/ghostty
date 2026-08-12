@@ -1,28 +1,37 @@
 <#
 .SYNOPSIS
-    T272 acceptance - an acceptance script that takes the user's foreground must
-    be declared interactive-by-design, and the declaration must be true.
+    T272 + T276 acceptance - an acceptance script that can only run on the INPUT
+    DESKTOP must be declared interactive-by-design, and the declaration must be
+    true.
 
 .DESCRIPTION
-    Three sections:
+    Four sections:
 
       A. The declaration parser (`lib\ForegroundAudit.ps1`) against fixtures:
          a well-formed marker is read, a malformed one is named rather than
          silently dropped, and prose around the markers is ignored.
 
-      B. The grab-site detector, both directions. The interesting half is what
-         is NOT a finding: two thirds of this suite MENTIONS `SendInput` in a
-         header explaining that it is dead on a background desktop, and reading
-         those as violations would push 22 innocent scripts onto the exception
-         list - the same rot from the other direction.
+      B. The detector, both directions. The interesting half is what is NOT a
+         finding: two thirds of this suite MENTIONS `SendInput` in a header
+         explaining that it is dead on a background desktop, and reading those
+         as violations would push 22 innocent scripts onto the exception list -
+         the same rot from the other direction.
 
-      C. The sweep over `test\win32\*.ps1`: every grab site is declared, and
-         every declaration still names a script that grabs.
+      D. The screen-DC family (T276) - the sites that need the input desktop
+         while grabbing nothing. T272's rule was "takes the foreground", so its
+         sweep could not see `color-contrast.ps1`, which read the composited
+         screen with `GetDC(NULL)` + `GetPixel`. The load-bearing negative here
+         is `GetDC($hwnd)`: a WINDOW DC is fine off the desktop, so a P/Invoke
+         declaration must never trip the rule - only a call site naming the
+         screen does.
 
-    `-TeethCheck` proves the section-C assertion can fail: it writes a real
-    violator into the swept directory (a script with a live `SendInput`, on no
-    list) and requires the sweep to find it. Run it after any change to the
-    analyzer.
+      C. The sweep over `test\win32\*.ps1`: every site is declared, and every
+         declaration still names a script that needs the input desktop.
+
+    `-TeethCheck` proves the section-C assertion can fail: it writes two real
+    violators into the swept directory - one with a live `SendInput`, one with a
+    live screen-DC read, both on no list - and requires the sweep to find each.
+    Run it after any change to the analyzer.
 
 .NOTES
     # persistence: launches no GUI - this scores scripts, it does not run them.
@@ -184,6 +193,90 @@ Set-Content -LiteralPath $marked -Encoding ascii -Value @(
 $f = @(Get-ForegroundAuditFindings -Files @($marked) -Declared $decl)
 AssertEq 'B16 a marked file is not swept as an undeclared grabber' 0 @($f | Where-Object { $_.Kind -eq 'undeclared' }).Count
 
+# ===========================================================================
+Write-Host ''
+Write-Host '== D: the screen-DC family - input-desktop-only without grabbing'
+# ===========================================================================
+
+function ScreenDcCount([string[]]$Text) {
+    return @(Get-ForegroundAuditSites -Text $Text | Where-Object { $_.Family -eq 'screen-dc' }).Count
+}
+
+Assert 'D1 a PowerShell screen-DC read is a site' ((ScreenDcCount @(
+    '$hdc = [Drv]::GetDC([IntPtr]::Zero)'
+)) -ge 1)
+
+Assert 'D2 so is the C# spelling inside an Add-Type here-string' ((ScreenDcCount @(
+    'Add-Type @'''
+    'public class Drv {'
+    '  public static int Peek() { IntPtr h = GetDC(IntPtr.Zero); return 0; }'
+    '}'
+    ''''
+)) -ge 1)
+
+Assert 'D3 and Graphics.CopyFromScreen' ((ScreenDcCount @(
+    '$g.CopyFromScreen($x, $y, 0, 0, $size)'
+)) -ge 1)
+
+Assert 'D4 and a bare zero handle' ((ScreenDcCount @('$hdc = [Drv]::GetDC(0)')) -ge 1)
+
+Assert 'D5 and the desktop window spelled out' ((ScreenDcCount @(
+    '$hdc = [Drv]::GetWindowDC([Drv]::GetDesktopWindow())'
+)) -ge 1)
+
+# The load-bearing negatives. A WINDOW DC works off the input desktop, so
+# neither a real window read nor the P/Invoke declaration behind it is a finding
+# - otherwise every script that captures a window would land on the list.
+AssertEq 'D6 a window DC is NOT a screen-DC site' 0 (ScreenDcCount @(
+    '$hdc = [Drv]::GetDC($hwnd)'
+    '$dc  = [Drv]::GetWindowDC($top)'
+))
+AssertEq 'D7 nor is the P/Invoke declaration it is called through' 0 (ScreenDcCount @(
+    'Add-Type @'''
+    'public class Drv {'
+    '  [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);'
+    '  [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);'
+    '}'
+    ''''
+))
+AssertEq 'D8 nor a comment saying CopyFromScreen is dead here' 0 (ScreenDcCount @(
+    '# CopyFromScreen is dead off the input desktop; PrintWindow replaces it.'
+    '# GetDC(IntPtr.Zero) likewise - DWM composes only the input desktop.'
+))
+AssertEq 'D9 nor a C# comment inside a here-string' 0 (ScreenDcCount @(
+    'Add-Type @'''
+    'public class Drv {'
+    '  // GetDC(IntPtr.Zero) would be dead here.'
+    '  public static void Post() { }'
+    '}'
+    ''''
+))
+
+# End to end through the analyzer: the same declaration list covers both
+# families, because it is one exemption - "this script needs the input desktop".
+Set-Content -LiteralPath (Join-Path $tmp 'probe.ps1') -Encoding ascii `
+    -Value '$hdc = [Drv]::GetDC([IntPtr]::Zero); $c = [Drv]::GetPixel($hdc, 4, 4)'
+$probe = @((Join-Path $tmp 'probe.ps1'))
+
+$declProbe = @([pscustomobject]@{
+    Script = 'probe.ps1'; Reason = 'its oracle is GL pixels'; Line = 11; Malformed = $false })
+
+$f = @(Get-ForegroundAuditFindings -Files $probe -Declared $decl)
+AssertEq 'D10 an undeclared screen-DC prober is a finding' 1 @($f | Where-Object { $_.Kind -eq 'undeclared' }).Count
+Assert 'D11 and the detail names the composited screen, not a foreground grab' (
+    @($f | Where-Object { $_.Kind -eq 'undeclared' })[0].Detail -match 'composited screen')
+
+$f = @(Get-ForegroundAuditFindings -Files $probe -Declared $declProbe)
+AssertEq 'D12 declaring it clears the finding' 0 $f.Count
+
+# And a declaration for a script that has since migrated off the screen DC goes
+# stale, exactly as a foreground one does - the list must not outlive the need.
+Set-Content -LiteralPath (Join-Path $tmp 'probe.ps1') -Encoding ascii `
+    -Value '$shot = Get-TestPaneCapture -Target $t; $c = $shot.Bitmap.GetPixel(4, 4)'
+$f = @(Get-ForegroundAuditFindings -Files $probe -Declared $declProbe)
+Assert 'D13 a migrated screen probe makes its declaration stale' (
+    @($f | Where-Object { $_.Kind -eq 'stale-declaration' }).Count -eq 1)
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
 # ===========================================================================
@@ -191,23 +284,32 @@ Write-Host ''
 Write-Host '== C: the sweep over the acceptance suite'
 # ===========================================================================
 
-$planted = $null
+$planted = @()
 if ($TeethCheck) {
-    # A real file in the real swept directory, not a synthesized finding: the
+    # Real files in the real swept directory, not synthesized findings: the
     # claim under test is that the SWEEP notices, which a hand-made object would
-    # not exercise.
-    $planted = Join-Path $Suite 'zz-foreground-audit-teeth.ps1'
-    Set-Content -LiteralPath $planted -Encoding ascii -Value @(
-        '# planted by foreground-audit.ps1 -TeethCheck; deleted at the end of the run.'
-        '$null = [Drv]::SendInput(1, $inputs, 40)'
-    )
-    Write-Host '  TEETH CHECK: a real undeclared grabber is in the swept directory'
+    # not exercise. One per family - a screen-DC violator is invisible to the
+    # pre-T276 detector, so it is the arm that proves the widening landed.
+    $planted = @(
+        @{ Name = 'zz-foreground-audit-teeth.ps1'
+           Body = '$null = [Drv]::SendInput(1, $inputs, 40)' }
+        @{ Name = 'zz-foreground-audit-teeth-screendc.ps1'
+           Body = '$hdc = [Drv]::GetDC([IntPtr]::Zero)' }
+    ) | ForEach-Object {
+        $p = Join-Path $Suite $_.Name
+        Set-Content -LiteralPath $p -Encoding ascii -Value @(
+            '# planted by foreground-audit.ps1 -TeethCheck; deleted at the end of the run.'
+            $_.Body
+        )
+        $p
+    }
+    Write-Host '  TEETH CHECK: two real undeclared violators are in the swept directory'
 }
 
 try {
     $sweep = @(Get-ForegroundAuditSweep $Suite)
 } finally {
-    if ($planted) { Remove-Item -LiteralPath $planted -Force -ErrorAction SilentlyContinue }
+    foreach ($p in $planted) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
 }
 
 $hardKinds = Get-ForegroundAuditHardKinds
@@ -215,9 +317,11 @@ $hard = @($sweep | Where-Object { $hardKinds -contains $_.Kind })
 
 if ($TeethCheck) {
     Assert 'C1 goes red when an undeclared foreground grab is added' (
-        @($hard | Where-Object { $_.Path -match 'zz-foreground-audit-teeth' }).Count -eq 1)
+        @($hard | Where-Object { $_.Path -match 'zz-foreground-audit-teeth\.ps1' }).Count -eq 1)
+    Assert 'C1b and when an undeclared screen-DC probe is added' (
+        @($hard | Where-Object { $_.Path -match 'zz-foreground-audit-teeth-screendc' }).Count -eq 1)
 } else {
-    Assert 'C1 every foreground grab in the suite is declared, and every declaration is live' ($hard.Count -eq 0)
+    Assert 'C1 every input-desktop site in the suite is declared, and every declaration is live' ($hard.Count -eq 0)
     foreach ($h in $hard) {
         Write-Host "       $(Split-Path $h.Path -Leaf):$($h.Line) $($h.Kind) - $($h.Detail)"
     }
@@ -237,8 +341,23 @@ foreach ($n in $declaredNames) {
     $p = Join-Path $Suite $n
     if ((Test-Path -LiteralPath $p) -and (@(Get-ForegroundAuditSites -Path $p).Count -gt 0)) { $stillGrabbing++ }
 }
-AssertEq 'C3 every declared exception is still a real grabber' $declaredNames.Count $stillGrabbing
+AssertEq 'C3 every declared exception still needs the input desktop' $declaredNames.Count $stillGrabbing
 Write-Host "  ($($declaredNames.Count) script(s) declared interactive-by-design: $($declaredNames -join ', '))"
 
+# The widened family must be LIVE in the sweep, not merely implemented: if no
+# script in the suite still reads a screen DC, C1's green says nothing about it.
+# test-desktop-spike is that script by design (it MEASURES what is dead off the
+# input desktop, so it has to reach both), and it is declared.
+$screenDc = @()
+foreach ($n in $declaredNames) {
+    $p = Join-Path $Suite $n
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    if (@(Get-ForegroundAuditSites -Path $p | Where-Object { $_.Family -eq 'screen-dc' }).Count -gt 0) {
+        $screenDc += $n
+    }
+}
+Assert 'C4 the screen-DC family is exercised by a real declared script' ($screenDc.Count -ge 1)
+Write-Host "  (screen-DC readers, all declared: $($screenDc -join ', '))"
+
 Write-Host ''
-Write-TestVerdict -Label 'T272 ACCEPTANCE' -Pass $script:pass -Fail $script:fail -MinPass 18
+Write-TestVerdict -Label 'T272/T276 ACCEPTANCE' -Pass $script:pass -Fail $script:fail -MinPass 30

@@ -87,13 +87,15 @@
 # TERMINAL-CONTENT PROBES THAT STAY ON THE INPUT DESKTOP (declared, not
 # missed - an undeclared exception is indistinguishable from an oversight):
 #
-#   color-contrast.ps1   (T150) The whole script reads back colors the
-#                        RENDERER chose - derived foreground, regenerated
-#                        palette, draw-time contrast floor. None of it exists
-#                        anywhere but in GL pixels. Screen-DC GetPixel.
 #   profile-latency.ps1  (T53b) One assertion: the scroll-viewport pixel hash.
 #                        The script is interactive anyway (SendInput timing IS
 #                        the measurement) - see T272.
+#
+# `color-contrast.ps1` was the third entry here and is not one any more: route 0
+# took it off the input desktop entirely (T275), which is what route 0 was for.
+# Its old shape is the reason the audit's rule is written the way it is - it
+# called neither SendInput nor SetForegroundWindow, and was input-desktop-only
+# all the same because it read the composited screen (see T276).
 #
 # The guard that keeps this from regrowing is in Get-TestWindowPixels: it
 # REFUSES a GhozttyTerminal capture unless -AllowTerminalSurface is passed,
@@ -126,8 +128,15 @@
 # desktop they cannot see. It is for debugging by hand only - it steals focus,
 # so it is never how an acceptance run is scored.
 #
-# INTERACTIVE BY DESIGN - the scripts that still take the user's foreground
-# (T272). T217 closed at 23 of 23 and T218 at 13 of 13, and the fleet-wide claim
+# INTERACTIVE BY DESIGN - the scripts that can only run on the INPUT DESKTOP
+# (T272, widened by T276). Two ways to end up here, one list: taking the
+# foreground / injecting input, and reading the COMPOSITED SCREEN (a screen DC,
+# CopyFromScreen), which DWM produces for the input desktop only. The second is
+# not a footnote - `color-contrast.ps1` was input-desktop-only for years while
+# grabbing no input at all, and the sweep that was written to find "scripts that
+# steal focus" could not see it.
+#
+# T217 closed at 23 of 23 and T218 at 13 of 13, and the fleet-wide claim
 # became "the acceptance scripts no longer steal the user's foreground" - while
 # two scripts sat in neither bucket, still grabbing, because nothing counted the
 # remainder. Those two were migrated (T224, T225); what stops the property
