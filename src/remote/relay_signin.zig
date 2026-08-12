@@ -91,6 +91,16 @@ pub fn resolveClientId(alloc: Allocator, explicit: ?[]const u8) ?[]const u8 {
     return nonEmpty(build_config.google_client_id);
 }
 
+/// Whether a sign-in can be STARTED at all: true when a client id resolves
+/// (`GHOSTTY_GOOGLE_CLIENT_ID`, then the `-Dgoogle-client-id` bake). Mac's
+/// `RelayAccount.isConfigured` (RelayAccount.swift:103), and the GUI asks it
+/// for the same reason: a build carrying no client id can only ever answer
+/// `Error.NoClientId`, so the chooser must say so instead of offering a button
+/// whose every press fails (T747). Cheap — one env read, no network.
+pub fn isConfigured(alloc: Allocator) bool {
+    return resolveClientId(alloc, null) != null;
+}
+
 /// Run a full sign-in, blocking until the browser redirect lands (or
 /// `timeout_ms` elapses), and persist the account store on success. Returns the
 /// signed-in email, allocated on `alloc`.

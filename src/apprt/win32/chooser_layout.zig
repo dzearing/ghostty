@@ -346,17 +346,22 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
 // ---------------------------------------------------------------------
 
 /// What the account row is showing. Mac branches its `accountRow` on exactly
-/// these three (MachineChooserView.swift:903-932) and draws a different thing in
-/// each; the "unconfigured" fourth is a build without a relay base, which win32
-/// reports through the status strip instead.
-pub const AccountState = enum { signed_in, signed_out, busy };
+/// these four (MachineChooserView.swift:1120-1155) and draws a different thing
+/// in each — including `unconfigured`, a build carrying no Google OAuth client
+/// id, where Mac shows a sentence and NO button at all.
+pub const AccountState = enum { signed_in, signed_out, busy, unconfigured };
 
 /// Pure state derivation, so the chooser and the tests agree on what "busy
 /// while signed in" is (busy wins — the row is describing an operation, not an
 /// account).
-pub fn accountState(signed_in: bool, busy: bool) AccountState {
+///
+/// `configured` only decides the SIGNED-OUT case (T747): an account signed in
+/// under an env-supplied client id must still be offered "Sign Out", and a
+/// sign-in already in flight is describing itself.
+pub fn accountState(signed_in: bool, busy: bool, configured: bool) AccountState {
     if (busy) return .busy;
-    return if (signed_in) .signed_in else .signed_out;
+    if (signed_in) return .signed_in;
+    return if (configured) .signed_out else .unconfigured;
 }
 
 /// Measured caption widths in physical pixels, WITHOUT padding — the caller
@@ -458,6 +463,21 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
                 .bottom = status_top + a.link_h,
             };
             return .{ .text = status, .button = button };
+        },
+        .unconfigured => {
+            // No control at all: this build cannot sign in, so there is nothing
+            // for a button to do — and chrome that controls nothing does not
+            // appear (design system §"Vertical space belongs to the terminal",
+            // and Mac's own answer at MachineChooserView.swift:1150-1155). The
+            // sentence gets the whole band, still right-aligned, so the row
+            // reads as the same block with its control removed.
+            const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
+            return .{ .text = .{
+                .left = band.left,
+                .top = status_top,
+                .right = band.right,
+                .bottom = status_top + a.link_h,
+            } };
         },
     }
 }
@@ -907,10 +927,45 @@ test "accountRow: the two states are different compositions, not one slot (T311)
     try testing.expect(busy.button != null);
     try testing.expect(busy.avatar == null);
 
-    try testing.expectEqual(AccountState.busy, accountState(true, true));
-    try testing.expectEqual(AccountState.busy, accountState(false, true));
-    try testing.expectEqual(AccountState.signed_in, accountState(true, false));
-    try testing.expectEqual(AccountState.signed_out, accountState(false, false));
+    try testing.expectEqual(AccountState.busy, accountState(true, true, true));
+    try testing.expectEqual(AccountState.busy, accountState(false, true, true));
+    try testing.expectEqual(AccountState.signed_in, accountState(true, false, true));
+    try testing.expectEqual(AccountState.signed_out, accountState(false, false, true));
+}
+
+test "accountRow: an unconfigured build offers no button at all (T747)" {
+    // The defect this state exists for: a build with no `-Dgoogle-client-id`
+    // rendered the full signed-out composition, so every press of a perfectly
+    // healthy-looking button failed with NoClientId and the user read the
+    // feature as broken.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const l = layout(scale, 1);
+        const row = accountRow(l, .unconfigured, .{});
+        try testing.expect(row.button == null);
+        try testing.expect(row.avatar == null);
+        try testing.expect(row.link == null);
+
+        // The sentence takes the space the control gave up — the whole band,
+        // no wider, and on the band's center line like every other state's.
+        const band = l.account.band;
+        try testing.expectEqual(band.left, row.text.left);
+        try testing.expectEqual(band.right, row.text.right);
+        try testing.expect(row.text.top >= band.top);
+        try testing.expect(row.text.bottom <= band.bottom);
+        try testing.expectEqual(l.account.link_h, row.text.height());
+
+        // And it is strictly more room than the signed-out sentence gets, which
+        // is the point: the message that replaces a control has to fit.
+        const out = accountRow(l, .signed_out, .{ .button = 120 });
+        try testing.expect(row.text.width() > out.text.width());
+    }
+
+    // Only the signed-OUT case turns into it. A stored account (an env-supplied
+    // client id, or a build that had one) must still be offered Sign Out, and a
+    // sign-in in flight is describing itself.
+    try testing.expectEqual(AccountState.unconfigured, accountState(false, false, false));
+    try testing.expectEqual(AccountState.signed_in, accountState(true, false, false));
+    try testing.expectEqual(AccountState.busy, accountState(false, true, false));
 }
 
 test "accountRow: the bordered control is sized to ITS caption (T311, finding 6)" {

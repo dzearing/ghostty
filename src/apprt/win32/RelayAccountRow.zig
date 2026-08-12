@@ -179,11 +179,28 @@ pub fn buttonLabel(signed_in: bool, busy: bool) []const u8 {
     return if (signed_in) "Sign Out" else "Sign in with Google…";
 }
 
-/// The account status line shown next to the button.
-pub fn statusText(email: ?[]const u8, busy: bool) []const u8 {
+/// The account row's sentence when this build carries no Google OAuth client id
+/// (T747). It replaces the button rather than sitting beside one: there is
+/// nothing to press, and a build with no client id can only answer
+/// `Error.NoClientId` to every attempt.
+pub const unconfigured_status = "Google sign-in isn't set up in this build";
+
+/// The footer-hint version of the same news, which is where the remedy goes —
+/// the row's one line has no room for it, and the strip already wraps. Mac says
+/// the same thing in its (larger) row: MachineChooserView.swift:1151.
+pub const unconfigured_hint =
+    "Google sign-in isn't set up in this build — it needs a Google OAuth client id " ++
+    "(-Dgoogle-client-id, or GHOSTTY_GOOGLE_CLIENT_ID in the environment). " ++
+    "See docs/design/relay-oidc-setup.md.";
+
+/// The account status line shown next to the button. `configured` is false when
+/// no client id resolves; the signed-OUT line then says so instead of naming a
+/// button that is no longer drawn (T747).
+pub fn statusText(email: ?[]const u8, busy: bool, configured: bool) []const u8 {
     if (busy) return "Finish signing in in your browser…";
-    const e = email orelse return "Not signed in";
-    return if (e.len == 0) "Not signed in" else e;
+    const signed_out = if (configured) "Not signed in" else unconfigured_status;
+    const e = email orelse return signed_out;
+    return if (e.len == 0) signed_out else e;
 }
 
 /// The monogram letter for the avatar circle (T311): the email's first LETTER,
@@ -228,8 +245,26 @@ test "buttonLabel: signed-in offers sign out, busy overrides both" {
 }
 
 test "statusText: email when signed in, never a blank line" {
-    try testing.expectEqualStrings("me@example.com", statusText("me@example.com", false));
-    try testing.expectEqualStrings("Not signed in", statusText(null, false));
-    try testing.expectEqualStrings("Not signed in", statusText("", false));
-    try testing.expect(statusText("me@example.com", true).len > 0);
+    try testing.expectEqualStrings("me@example.com", statusText("me@example.com", false, true));
+    try testing.expectEqualStrings("Not signed in", statusText(null, false, true));
+    try testing.expectEqualStrings("Not signed in", statusText("", false, true));
+    try testing.expect(statusText("me@example.com", true, true).len > 0);
+}
+
+test "statusText: an unconfigured build says so instead of 'Not signed in' (T747)" {
+    // "Not signed in" next to a button is an invitation; with no client id
+    // there is nothing to accept, so the line has to name the real state.
+    try testing.expectEqualStrings(unconfigured_status, statusText(null, false, false));
+    try testing.expectEqualStrings(unconfigured_status, statusText("", false, false));
+
+    // A stored account still shows its email — Sign Out needs no client id.
+    try testing.expectEqualStrings("me@example.com", statusText("me@example.com", false, false));
+    // And a sign-in in flight still describes itself.
+    try testing.expectEqualStrings(statusText(null, true, true), statusText(null, true, false));
+
+    // The hint carries the remedy the one-line row has no room for, and names
+    // both ways to supply an id plus the doc.
+    try testing.expect(std.mem.indexOf(u8, unconfigured_hint, "relay-oidc-setup.md") != null);
+    try testing.expect(std.mem.indexOf(u8, unconfigured_hint, "GHOSTTY_GOOGLE_CLIENT_ID") != null);
+    try testing.expect(unconfigured_hint.len > unconfigured_status.len);
 }

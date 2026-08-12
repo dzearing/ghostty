@@ -146,7 +146,17 @@ $td = New-TestDesktop -Interactive:$Interactive
 try {
     # persistence: explicitly off - this script restores nothing and must not
     # inherit whatever panes the previous run left in the manifest.
+    #
+    # The client id is pinned so the account row lands in its signed-OUT state
+    # (a bordered button, with the link hidden), which is the pair section 7
+    # below is about. With none resolvable the row is `unconfigured` and draws
+    # neither control (T747) - a legitimate state, measured by section 8 of
+    # relay-account.ps1, but not this script's subject, and which one a build
+    # lands in depends on the box rather than on the code. Nothing here signs
+    # in, so the value is never used.
+    $env:GHOSTTY_GOOGLE_CLIENT_ID = 'cid-chooser-controls'
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    Remove-Item env:GHOSTTY_GOOGLE_CLIENT_ID -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) {
         Write-Host 'SETUP FAIL: GUI died at launch'

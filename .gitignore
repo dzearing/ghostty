@@ -44,6 +44,9 @@ macos/macos/
 
 # Local Google OAuth client id for dev builds (never commit; injected via
 # -Dgoogle-client-id in CI). The id is public but managed as build config.
+# The repo-root path is the one to use - the id is baked into the Windows
+# binary too, so it is not a macOS-only setting (T747).
+google-client-id.txt
 macos/google-client-id.txt
 
 # Backfill drafts (raw GitHub bodies to curate from; not shipped)

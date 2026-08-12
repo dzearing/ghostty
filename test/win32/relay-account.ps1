@@ -24,6 +24,11 @@
 #      relay (Bearer = old token) and the rotated token is persisted.
 #   7. account tier E2E: with a fresh session, +new-remote-window WITHOUT
 #      --token dials a live relay+agent (needs go + ghoztty-agent).
+#   8. a build with NO Google client id - which is what SHIPS - offers no
+#      sign-in button at all, says so in the row, and puts the remedy in the
+#      hint (T747). Sections 2-4 all set GHOSTTY_GOOGLE_CLIENT_ID, which is how
+#      a dead button shipped past a green suite; this one deliberately does
+#      not, and ends with the configured relaunch as its control.
 #
 # Sections 5-7 SEED the account store directly (a DPAPI blob in the current
 # shape) instead of re-driving the GUI: what they exercise is the reader/renew
@@ -308,11 +313,19 @@ function Wait-FakeRelay($port, $nonce) {
 # store, with the browser open suppressed so the harness plays the browser
 # itself. Session persistence off so a restore cannot hand this run a previous
 # run's window (the T131 lesson). Returns { App, Pid, Top, Surface }.
-function Launch-Gui($relayBase, $errlog) {
+function Launch-Gui($relayBase, $errlog, [switch]$NoClientId) {
     Remove-Item $errlog -ErrorAction SilentlyContinue
     $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
     $env:GHOSTTY_RELAY_BASE = $relayBase
-    $env:GHOSTTY_GOOGLE_CLIENT_ID = 'cid-e2e'
+    # -NoClientId is section 8's whole subject: the SHIPPED build carries no
+    # -Dgoogle-client-id, so this is the state every real user meets. Every
+    # other launch here sets one, which is exactly why the unconfigured path
+    # went unmeasured until T747.
+    if ($NoClientId) {
+        Remove-Item env:GHOSTTY_GOOGLE_CLIENT_ID -ErrorAction SilentlyContinue
+    } else {
+        $env:GHOSTTY_GOOGLE_CLIENT_ID = 'cid-e2e'
+    }
     $env:GHOSTTY_OAUTH_AUTH_ENDPOINT = "$FakeABase/authorize"
     $env:GHOZTTY_ENROLL_NO_OPEN = '1'
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
@@ -666,8 +679,103 @@ try {
         }
     }
 
-    "== cleanup"
+    "== cleanup of the sections 5-7 GUI"
     Run-Cli '+close --target=acctbase' 'acctclosebase.out' | Out-Null
+    # Ghoztty is single-instance per pipe: a second launch FORWARDS to the
+    # running app and exits, so section 8 gets no GUI of its own until this one
+    # is gone. Every other section here already stops its GUI before the next
+    # launch; sections 5-7 kept theirs alive for the CLI to drive.
+    if ($g3 -and $g3.App.Process -and -not $g3.App.Process.HasExited) {
+        Stop-Process -Id $g3.Pid -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+
+    "== 8: a build with NO client id offers no sign-in button at all (T747)"
+    # The defect: the shipped build carries no -Dgoogle-client-id, so every
+    # press of a perfectly healthy-looking "Sign in with Google..." button
+    # failed instantly with NoClientId - no browser, no visible reason - and the
+    # user read the whole relay path as broken. Mac has never had this hole
+    # (MachineChooserView.swift:1148-1155 branches on RelayAccount.isConfigured
+    # and draws a sentence instead of a button); win32 drew the button
+    # unconditionally.
+    #
+    # The other seven sections all set GHOSTTY_GOOGLE_CLIENT_ID, which is how
+    # this shipped untested. This one deliberately does not - and the configured
+    # relaunch at the end is its control: same build, same chooser, one env var
+    # apart.
+    $bakedIdFile = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'macos\google-client-id.txt'
+    if (Test-Path $bakedIdFile) {
+        "  SKIP unconfigured-build case: $bakedIdFile exists, so this build has an id baked in"
+        $script:skipped++
+    } else {
+        $errlog8 = "$tmp\gui-noid.stderr.log"
+        Remove-Item $AccountStore -ErrorAction SilentlyContinue
+        $g8 = Launch-Gui $FakeABase $errlog8 -NoClientId
+        if (-not $g8) {
+            Write-Host 'SETUP FAIL: GUI did not come up for the unconfigured section'; $script:failures++
+        } else {
+            $ch8 = Open-Chooser $g8
+            Assert "chooser opened (no client id)" ($ch8 -ne [IntPtr]::Zero)
+            if ($ch8 -ne [IntPtr]::Zero) {
+                $both = @(Get-ChooserAccountButton -Chooser $ch8 -IncludeHidden)
+                Assert "both account controls exist (the row is built, not missing)" ($both.Count -eq 2)
+                $shown = @($both | Where-Object { $_.Visible })
+                Assert "no account control is visible - there is nothing to press" ($shown.Count -eq 0)
+
+                $st8 = Get-ChooserAccountStatusText -Chooser $ch8
+                Assert "the row says sign-in is not set up, not 'Not signed in'" (
+                    $st8 -eq "Google sign-in isn't set up in this build")
+
+                $hint8 = Get-ChooserHintText -Chooser $ch8
+                Assert "the hint names the env var that would fix it" ($hint8 -match 'GHOSTTY_GOOGLE_CLIENT_ID')
+                Assert "the hint names the setup doc" ($hint8 -match 'relay-oidc-setup\.md')
+                Assert "the hint does NOT point at a button that is not drawn" (
+                    -not ($hint8 -match 'use Sign in with Google above'))
+
+                # A hidden BUTTON still answers BM_CLICK, so this reaches the
+                # app's own guard rather than the widget's visibility: a flow
+                # that can only fail must not be started at all.
+                Send-TestControlClick -Control $both[0].Hwnd | Out-Null
+                Start-Sleep -Milliseconds 1200
+                $err8 = if (Test-Path $errlog8) { Get-Content $errlog8 -Raw } else { '' }
+                Assert "clicking the hidden button starts no browser flow" (
+                    -not ($err8 -match 'open this URL to sign in'))
+                Assert "and reports no sign-in failure either" (
+                    -not ($err8 -match 'relay account: sign_in failed'))
+                Assert "no account written" (-not (Test-Path $AccountStore))
+                Assert "chooser survived the click" (Test-TestWindowExists -Window $ch8)
+            }
+            Assert "app survived the unconfigured chooser" (-not ($g8.App.Process -and $g8.App.Process.HasExited))
+            if ($g8.App.Process -and -not $g8.App.Process.HasExited) {
+                Stop-Process -Id $g8.Pid -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Milliseconds 800
+        }
+
+        # CONTROL: the identical launch WITH a client id must show the button.
+        # Without this, "no button" would also pass against a chooser whose
+        # account row failed to build at all.
+        $errlog8b = "$tmp\gui-id.stderr.log"
+        $g8b = Launch-Gui $FakeABase $errlog8b
+        if (-not $g8b) {
+            Write-Host 'SETUP FAIL: GUI did not come up for the configured control'; $script:failures++
+        } else {
+            $ch8b = Open-Chooser $g8b
+            Assert "chooser opened (control: client id present)" ($ch8b -ne [IntPtr]::Zero)
+            if ($ch8b -ne [IntPtr]::Zero) {
+                $b8b = Get-ChooserAccountButton -Chooser $ch8b
+                Assert "CONTROL: with a client id the sign-in button IS visible" (
+                    $null -ne $b8b -and $b8b.Text -eq $SignInLabel)
+                Assert "CONTROL: and the row is back to 'Not signed in'" (
+                    (Get-ChooserAccountStatusText -Chooser $ch8b) -eq 'Not signed in')
+            }
+            if ($g8b.App.Process -and -not $g8b.App.Process.HasExited) {
+                Stop-Process -Id $g8b.Pid -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Milliseconds 800
+        }
+    }
+
 } catch {
     # $ErrorActionPreference is Continue, so a NON-terminating error prints and
     # the run carries on - but a terminating one (a marshalling failure, a

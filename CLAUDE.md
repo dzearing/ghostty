@@ -563,9 +563,28 @@ before deleting the local store.
 
 The Google OAuth client id is baked into the build via `-Dgoogle-client-id`
 (public — it appears in the browser URL), overridable with
-`GHOSTTY_GOOGLE_CLIENT_ID`; the relay comes from `GHOSTTY_RELAY_BASE`, else the
-built-in default. Shared implementation: `src/remote/relay_signin.zig`; win32
-UI in `src/apprt/win32/RelayAccountRow.zig`.
+`GHOSTTY_GOOGLE_CLIENT_ID`; a dev build with neither reads a git-ignored
+`google-client-id.txt` at the repo root (or the older `macos/` path). The relay
+comes from `GHOSTTY_RELAY_BASE`, else the built-in default. Shared
+implementation: `src/remote/relay_signin.zig`; win32 UI in
+`src/apprt/win32/RelayAccountRow.zig`.
+
+**A build with no client id says so instead of offering the button** (T747). No
+id resolves ⇒ `signIn` can only ever answer `NoClientId`, so the account row
+draws no control at all — the sentence *"Google sign-in isn't set up in this
+build"* takes the whole band, and the chooser's footer hint carries the remedy
+(the two ways to supply an id, plus `docs/design/relay-oidc-setup.md`). Mac has
+always branched this way (`RelayAccount.isConfigured` →
+`MachineChooserView.accountRow`); win32 drew the enabled button unconditionally,
+so on the shipped build — which bakes no id — every press failed instantly with
+no browser and no visible reason, and the whole relay path read as broken. The
+state is `chooser_layout.AccountState.unconfigured`, and it only ever replaces
+the SIGNED-OUT case: a stored account is still offered Sign Out (which needs no
+client id) and an in-flight sign-in still describes itself. What hid this for so
+long is that the test always supplied one: every GUI section of
+`test/win32/relay-account.ps1` sets `GHOSTTY_GOOGLE_CLIENT_ID`, so the state
+every real user meets was never once exercised. Its section 8 now launches
+without one, and ends with the configured relaunch as its control.
 
 Once signed in, `+new-remote-window --relay/--device` with **no** `--token`
 uses the account's session token (token-resolution order: explicit `--token`

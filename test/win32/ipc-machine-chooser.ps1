@@ -262,7 +262,16 @@ function Launch-Gui($errlog) {
     # that came from the terminal background rather than from any pill. A
     # neutral grey gives b-r = 0 at rest, which is what makes the tint probes
     # mean what they say (the same reason the script pins the accent below).
+    #
+    # The client id is pinned for the same class of reason (T747): with none
+    # resolvable the account row is in its `unconfigured` state and draws NO
+    # sign-in button at all, so this script's signed-out measurements would be
+    # measuring a state it is not about - and which one a build lands in depends
+    # on whether the box has a google-client-id.txt, which is not a property of
+    # the code under test. The value is never used: nothing here signs in.
+    $env:GHOSTTY_GOOGLE_CLIENT_ID = 'cid-chooser-layout'
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false', '--background=#1e1e1e') -StdErr $errlog
+    Remove-Item env:GHOSTTY_GOOGLE_CLIENT_ID -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { return $null }
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
@@ -598,7 +607,13 @@ try {
         # Signed OUT, the account row's control is the bordered button; the
         # signed-in state's link is hidden, so `Visible` is what tells them apart
         # (T311).
+        # Asserted, not just guarded: a null here used to skip the two
+        # measurements below in silence, and the row losing its button is
+        # exactly what happens in the `unconfigured` state (T747) - a state this
+        # script pins itself out of, and would want to hear about if it landed
+        # in one anyway.
         $acct = Get-ChooserAccountButton -Chooser $chooser
+        Assert ($null -ne $acct) 'the signed-out account row has a visible control to measure'
         if ($acct) {
             Assert ((($acct.Bottom - $acct.Top)) -eq $ctlH) "the account control is the same height as Cancel (account=$($acct.Bottom - $acct.Top), cancel=$ctlH)"
             $script:acctBtnW1 = $acct.Right - $acct.Left

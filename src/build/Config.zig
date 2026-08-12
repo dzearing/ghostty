@@ -569,14 +569,24 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 /// readDevGoogleClientID reads a git-ignored local file with the Google OAuth
 /// client id for dev builds, so `-Dgoogle-client-id` need not be passed by
 /// hand. Returns "" when the file is absent (a build with no client id —
-/// sign-in is simply unavailable until one is provided).
+/// sign-in is then unavailable, and both frontends say so in the machine
+/// chooser rather than offering a button that can only fail; see T747).
+///
+/// The repo-root `google-client-id.txt` is the spelling to use: the id is baked
+/// into the Windows binary as well (`build_config.google_client_id`), and a
+/// Windows seat should not have to put its build configuration under `macos/`.
+/// That older path is still read, so a Mac checkout that already has one keeps
+/// working.
 fn readDevGoogleClientID(b: *std.Build) []const u8 {
-    const data = b.build_root.handle.readFileAlloc(
-        b.allocator,
+    for ([_][]const u8{
+        "google-client-id.txt",
         "macos/google-client-id.txt",
-        4096,
-    ) catch return "";
-    return std.mem.trim(u8, data, &std.ascii.whitespace);
+    }) |path| {
+        const data = b.build_root.handle.readFileAlloc(b.allocator, path, 4096) catch continue;
+        const id = std.mem.trim(u8, data, &std.ascii.whitespace);
+        if (id.len > 0) return id;
+    }
+    return "";
 }
 
 /// Configure the build options with our values.

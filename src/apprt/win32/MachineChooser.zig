@@ -231,6 +231,12 @@ token: ?[]const u8 = null,
 /// account store on open and after every sign-in/sign-out (T141).
 email: ?[]const u8 = null,
 
+/// Whether a sign-in can be started at all — false when this build carries no
+/// Google OAuth client id and none is in the environment (T747). Resolved once
+/// on open: it is a build/environment fact, not something the dialog can
+/// change, and the account row hides its button entirely when it is false.
+sign_in_configured: bool = true,
+
 /// The fetched device list. Owned by `parsed` (its own JSON arena); empty when
 /// there is no credential or the fetch failed. Freed in `close`.
 parsed: ?relay_directory.Parsed = null,
@@ -353,6 +359,7 @@ pub fn open(window: *Window) void {
     self.relay_base = relay_directory.resolveBase(arena) catch relay_directory.default_base;
     self.token = IpcHandlers.resolveToken(arena);
     self.email = relay_signin.signedInEmail(arena);
+    self.sign_in_configured = relay_signin.isConfigured(arena);
     const hint_text = self.fetchDevices(alloc);
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
@@ -819,8 +826,13 @@ pub fn open(window: *Window) void {
 /// hint text describing the outcome (empty when devices were listed).
 /// `list_alloc` backs the returned `Parsed` (freed in `close`).
 fn fetchDevices(self: *MachineChooser, list_alloc: Allocator) []const u8 {
-    const tok = self.token orelse
-        return "Not signed in — use Sign in with Google above to list your machines.";
+    // Pointing at a button that is not drawn — and could not work if it were —
+    // is worse than saying nothing, so the unconfigured build gets the remedy
+    // instead of the invitation (T747).
+    const tok = self.token orelse return if (self.sign_in_configured)
+        "Not signed in — use Sign in with Google above to list your machines."
+    else
+        RelayAccountRow.unconfigured_hint;
 
     const parsed = relay_directory.listDevices(list_alloc, self.relay_base, tok) catch |err| {
         log.warn("machine chooser: device list failed err={}", .{err});
@@ -879,10 +891,13 @@ fn rowText(self: *const MachineChooser, row: Row) chooser_rows.RowText {
 /// and for the acceptance script.
 fn refreshAccountRow(self: *MachineChooser) void {
     const busy = RelayAccountRow.isRunning();
-    const state = chooser_layout.accountState(self.email != null, busy);
+    const state = self.accountState();
     const signed_in = state == .signed_in;
+    // Nothing to press in either of these: the link is the signed-in control,
+    // and an unconfigured build has no control at all (T747).
+    const hide_button = signed_in or state == .unconfigured;
 
-    setText(self.account_status, RelayAccountRow.statusText(self.email, busy));
+    setText(self.account_status, RelayAccountRow.statusText(self.email, busy, self.sign_in_configured));
     setText(self.account_link, RelayAccountRow.buttonLabel(true, false));
     setText(self.account_btn, RelayAccountRow.buttonLabel(false, busy));
 
@@ -902,11 +917,14 @@ fn refreshAccountRow(self: *MachineChooser) void {
     const focus = w32.GetFocus();
     const on_account = focus == @as(?w32.HWND, self.account_btn) or
         focus == @as(?w32.HWND, self.account_link);
-    if (on_account and (busy or focus != @as(?w32.HWND, self.accountControl()))) {
+    // The control that will still be pressable after this pass — null in the
+    // unconfigured state, where BOTH are hidden and focus has nowhere to stay.
+    const live: ?w32.HWND = if (state == .unconfigured) null else self.accountControl();
+    if (on_account and (busy or focus != live)) {
         _ = w32.SetFocus(self.filter);
     }
 
-    _ = w32.ShowWindow(self.account_btn, if (signed_in) w32.SW_HIDE else w32.SW_SHOW);
+    _ = w32.ShowWindow(self.account_btn, if (hide_button) w32.SW_HIDE else w32.SW_SHOW);
     _ = w32.ShowWindow(self.account_link, if (signed_in) w32.SW_SHOW else w32.SW_HIDE);
     // A hidden window gets no `WM_MOUSELEAVE`, so signing out under the pointer
     // would leave the flag set and the link would come back already underlined
@@ -917,10 +935,21 @@ fn refreshAccountRow(self: *MachineChooser) void {
     self.applyAccountRow(layout(self.window.scale, self.hint_lines));
 }
 
+/// What the account row is showing right now. One derivation, so the labels,
+/// the placement and the measurement cannot disagree about the state.
+fn accountState(self: *const MachineChooser) chooser_layout.AccountState {
+    return chooser_layout.accountState(
+        self.email != null,
+        RelayAccountRow.isRunning(),
+        self.sign_in_configured,
+    );
+}
+
 /// The account row's VISIBLE control — the link when signed in, the bordered
 /// button otherwise. One name for "the thing the user can press", so the focus
 /// cycle, the Enter handler and the click routing cannot disagree about which
-/// of the two is live.
+/// of the two is live. In the `unconfigured` state neither is shown; the Tab
+/// walk steps over the hidden button, so this still answers safely.
 fn accountControl(self: *const MachineChooser) w32.HWND {
     return if (self.email != null and !RelayAccountRow.isRunning())
         self.account_link
@@ -932,7 +961,7 @@ fn accountControl(self: *const MachineChooser) w32.HWND {
 /// (the monogram is painted, not a control, so moving the stack has to
 /// invalidate it).
 fn applyAccountRow(self: *MachineChooser, l: Layout) void {
-    const state = chooser_layout.accountState(self.email != null, RelayAccountRow.isRunning());
+    const state = self.accountState();
     const row = chooser_layout.accountRow(l, state, self.measureAccount(state));
 
     _ = w32.MoveWindow(
@@ -957,12 +986,18 @@ fn applyAccountRow(self: *MachineChooser, l: Layout) void {
 fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountState) chooser_layout.AccountText {
     return switch (state) {
         .signed_in => .{
-            .email = self.measureWith(self.subtitle_font, RelayAccountRow.statusText(self.email, false)),
+            .email = self.measureWith(
+                self.subtitle_font,
+                RelayAccountRow.statusText(self.email, false, self.sign_in_configured),
+            ),
             .link = self.measureWith(self.font, RelayAccountRow.buttonLabel(true, false)),
         },
         .signed_out, .busy => .{
             .button = self.measureWith(self.font, RelayAccountRow.buttonLabel(false, state == .busy)),
         },
+        // Nothing to size: the sentence takes the whole band and there is no
+        // control beside it (T747).
+        .unconfigured => .{},
     };
 }
 
@@ -970,6 +1005,14 @@ fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountStat
 /// run off-thread (`RelayAccountRow`); the row goes to its pending state
 /// immediately so the click is visibly acknowledged.
 fn onAccountClicked(self: *MachineChooser) void {
+    // Unreachable through the UI — the button is not drawn in the unconfigured
+    // state — but the click can still arrive as a synthesized BM_CLICK, and
+    // starting a flow that can only fail is the defect this state exists to
+    // remove (T747).
+    if (self.email == null and !self.sign_in_configured) {
+        self.setHint(RelayAccountRow.unconfigured_hint);
+        return;
+    }
     const started = if (self.email != null)
         RelayAccountRow.signOutAsync(self.window.app)
     else
