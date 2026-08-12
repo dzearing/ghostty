@@ -51,13 +51,18 @@
 # a DIB (Surface.heroSnap*) and the GUI thread blits it with GDI. So a changing
 # carousel is direct evidence that the hidden panes are really rendering.
 #
-# What that leaves DROPPED (and it is recorded, not weakened): the two
+# WHAT T214 DROPPED HERE, AND WHAT BROUGHT IT BACK. The two
 # `Get-PaneColorCount` probes that PrintWindow'd a GhozttyTerminal child and
-# required >= 8 distinct colors ("hero pane renders content"). That probe reads
-# the flat fill and would score green against a pane that renders nothing -
-# exactly the trap the harness header warns about. Capturing the terminal
-# surface remains open as T214. The claim is not lost, only relocated: phase
-# 1's carousel signature is renderer output on the GDI side of the boundary.
+# required >= 8 distinct colors ("hero pane renders content") were dropped
+# rather than weakened: that probe reads the flat fill and would score green
+# against a pane that renders nothing, exactly the trap the harness header
+# warns about. T275 built the fifth route T214 named - the app handing out its
+# OWN renderer's pixels through the debug-only `capture-pane` IPC action, which
+# is the same readback these very thumbnails come from - so both probes are
+# back in phase 1, asserted on the pane's real glass and on the HIDDEN pane
+# specifically. The carousel signature stays: it is the same claim measured on
+# the GDI side of the boundary, and two independent oracles for hero mode's
+# central promise is not one too many.
 #
 # A positive control (ctrl+k, T55) runs first so an injection failure is
 # distinguishable from a hero regression. Only touches ghoztty processes
@@ -84,6 +89,7 @@ $errlog = Join-Path $env:TEMP 'ghoztty-hero-mode-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -411,6 +417,20 @@ for ($t = 0; $t -lt 5 -and -not $sigChanged; $t++) {
 }
 Assert $sigChanged 'carousel thumbnails visibly update while a busy TUI runs in a hidden pane'
 Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-snap.png')
+
+# The two `Get-PaneColorCount` probes T214 dropped, RESTORED (T275) - now
+# against the pane's own pixels rather than a PrintWindow flat fill. The claim
+# is the one hero mode is built on: a pane keeps rendering while it is HIDDEN,
+# which is why its carousel thumbnail is worth looking at.
+$heroShot = Get-TestPaneCapture -Target $win
+Assert ($null -ne $heroShot -and (Get-TestPaneColorCount -Shot $heroShot) -ge 8) `
+    "hero pane renders content ($(if ($heroShot) { "$(Get-TestPaneColorCount -Shot $heroShot) distinct colors" } else { Get-LastPaneCaptureError }))"
+if ($heroShot) { Close-TestPaneCapture $heroShot }
+
+$hiddenShot = Get-TestPaneCapture -Target 'herob'
+Assert ($null -ne $hiddenShot -and (Get-TestPaneColorCount -Shot $hiddenShot) -ge 8) `
+    "HIDDEN pane renders content ($(if ($hiddenShot) { "$(Get-TestPaneColorCount -Shot $hiddenShot) distinct colors" } else { Get-LastPaneCaptureError }))"
+if ($hiddenShot) { Close-TestPaneCapture $hiddenShot }
 
 # Toggle off and add the third pane for the geometry/nav/click phase.
 $r = Send-HeroChord $top ([IntPtr]$big1.Hwnd) @('ctrl', 'shift') 'Space'

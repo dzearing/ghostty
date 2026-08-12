@@ -229,6 +229,12 @@ test {
     // a feedback report (T637), same no-OS-imports deal.
     _ = @import("apprt/win32/png_encode.zig");
 
+    // Pure win32 pane-content capture — the `capture-pane` request shape, the
+    // size a capture is taken at, and the bottom-up-BGRA → top-down-RGB
+    // transform between the renderer's readback and the PNG encoder (T275),
+    // same no-OS-imports deal.
+    _ = @import("apprt/win32/pane_capture.zig");
+
     // Pure win32 packed-DIB header reader — where a clipboard bitmap's pixels
     // actually start (T637), same no-OS-imports deal.
     _ = @import("apprt/win32/dib_packed.zig");

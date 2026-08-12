@@ -44,9 +44,21 @@
 # native chrome migrate; probes of rendered terminal content cannot, and must
 # not be "migrated" into an assertion that passes against a blank fill.
 #
-# THE ROUTE for a terminal-content probe (T214, decided 2026-08-01). In order,
-# and the first one that applies wins:
+# THE ROUTE for a terminal-content probe (T214, decided 2026-08-01; route 0
+# added by T275, 2026-08-11). In order, and the first one that applies wins:
 #
+#   0. ASK THE APP FOR ITS OWN PIXELS - `lib\PaneCapture.ps1`'s
+#      Get-TestPaneCapture, over the debug-only `capture-pane` IPC action. The
+#      pane's renderer thread reads back its OFFSCREEN target (the same
+#      readback hero mode's thumbnails use) and the app writes a PNG, so no
+#      desktop, no composite and no window visibility is involved - a HIDDEN
+#      pane captures exactly as a focused one does (asserted in
+#      pane-capture.ps1 section 5). This is the route for anything whose claim
+#      really is "what the glass is showing": the tint that reached the GL
+#      clear color, a pane that is rendering content at all.
+#      Its own trap, and why it is route 0 rather than the only route: it
+#      captures ONE PANE, not a composite, so it can say nothing about z-order,
+#      chrome over glass, or a divider between two panes. For those, keep going.
 #   1. ASK WHICH THREAD PAINTED THE PIXELS, not which technology produced
 #      them. GL content that the app itself moves onto the GDI side is
 #      capturable: the hero carousel's thumbnails are renderer output, but the
@@ -57,17 +69,20 @@
 #   2. FIND ANOTHER NATIVE PAINTER OF THE SAME VALUE. window-color's pane
 #      centre tint probe became the banner band, a different consumer of the
 #      same effective background (Surface.refreshBannerColors). Label what the
-#      substitute does NOT cover - there, the glass itself.
+#      substitute does NOT cover - there, the glass itself. (That one now has
+#      BOTH: the band assertion stayed and route 0 added the glass beside it.)
 #   3. DROP THE ASSERTION, in place, with the measured reason in the script
 #      header. Never weaken it into something a flat fill can pass. hero-mode's
-#      two Get-PaneColorCount probes went this way.
+#      two Get-PaneColorCount probes went this way, and came back through route
+#      0 - which is what T214 said would flip the trade.
 #   4. INTERACTIVE BY DESIGN - keep it on the input desktop and declare it
 #      below. Only for a script whose whole oracle is terminal content.
 #
-# Route 0 - an app-side GL readback exposed over IPC - is NOT built, and the
-# reason is that the app already has half of it: heroSnap proves the renderer
-# can hand a DIB to the GUI thread. If routes 1-4 ever stop being enough,
-# generalise heroSnap rather than inventing a second capture path (T275).
+# THE FLAT-FILL LIMIT ITSELF HAS NOT MOVED. Route 0 is a way AROUND it, not a
+# repeal of it: PrintWindow on a GhozttyTerminal child still returns one color,
+# and Get-TestWindowPixels still refuses that capture. A probe that reaches for
+# -AllowTerminalSurface because "T275 fixed capture" has misread this - route 0
+# does not go through PrintWindow at all.
 #
 # TERMINAL-CONTENT PROBES THAT STAY ON THE INPUT DESKTOP (declared, not
 # missed - an undeclared exception is indistinguishable from an oversight):

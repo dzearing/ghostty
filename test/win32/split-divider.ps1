@@ -726,9 +726,11 @@ Stop-Process -Id $app251.Pid -Force -ErrorAction SilentlyContinue
 #     instead of assumed - `split_geometry`'s `axis()` tests assert the same
 #     tiling in pure arithmetic, and this asserts the layout code that uses it.
 #
-# The pixel-perfect version still wants a composited capture; that lives with
-# T275 (an app-side snapshot over IPC), NOT with T214, which considered route 0
-# and deliberately did not build it.
+# The pixel-perfect version still wants a COMPOSITED capture, and T275 does not
+# supply one: route 0 (`capture-pane`) has one pane's renderer read back its own
+# offscreen target, so it answers "what is this pane showing" exactly and can
+# say nothing about the strip of PARENT between two panes. That remains open as
+# T778.
 #
 # Green is used so no earlier run's red/blue can be mistaken for a band.
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
+const ipc_capture = @import("ipc_capture.zig");
 const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -87,6 +88,12 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleReload(ctx, request);
     } else if (std.mem.eql(u8, request.action, "focus")) {
         return try handleFocus(ctx, request);
+    } else if (ipc_capture.enabled and std.mem.eql(u8, request.action, "capture-pane")) {
+        // T275: a DEBUG-ONLY test seam, not a CLI verb — see ipc_capture.zig
+        // for why it is gated and why there is no `+capture-pane`. In a
+        // release build `enabled` is false and this falls through to the
+        // ordinary unknown-action answer below.
+        return try ipc_capture.handle(ctx.app, ctx.alloc, request.arguments);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});

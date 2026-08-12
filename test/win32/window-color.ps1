@@ -22,18 +22,21 @@
 # (test/win32/lib/TestDesktop.ps1), so the run never takes the user's
 # foreground - asserted here, not assumed.
 #
-# THE ONE PROBE THAT COULD NOT MIGRATE AS-IS (flagged in T218 batch 2, and it
-# held): section 1 read the composited SCREEN pixel at the pane centre to prove
-# the tint reached the glass. The glass is the OpenGL terminal surface, which
-# is exactly the half of the harness's CAPTURE LIMIT that PrintWindow returns
-# as a flat fill - and there is no composite off the input desktop to GetPixel
-# either. Both halves of that probe are gone, so it is DROPPED, not weakened
-# into an assertion that scores a blank fill. What replaced it asserts a
-# strictly different claim and is labeled as such: the banner overlay is a
-# GDI-painted layered popup whose band is the pane's effective background
-# (pane-banner.ps1 pins the same corner pixel), so it proves the tint reaches
-# native painted output - NOT that the GL clear color changed. Capturing the
-# terminal surface itself remains open as T214; the glass is unasserted here.
+# THE ONE PROBE THAT COULD NOT MIGRATE AS-IS, AND HOW IT CAME BACK (T218 batch
+# 2 flagged it; T214 dropped it; T275 restored it). Section 1 used to read the
+# composited SCREEN pixel at the pane centre to prove the tint reached the
+# glass. The glass is the OpenGL terminal surface, which is exactly the half of
+# the harness's CAPTURE LIMIT that PrintWindow returns as a flat fill - and off
+# the input desktop there is no composite to GetPixel either. So it was DROPPED
+# rather than weakened into an assertion that scores a blank fill.
+#
+# Section 1 now asserts it TWICE, on two different sides of the boundary. The
+# banner band is the GDI half: a layered popup whose band the product fills
+# with the pane's effective background (pane-banner.ps1 pins the same corner
+# pixel), so it proves the tint reaches native painted output. The pane capture
+# is the glass itself - the debug-only `capture-pane` IPC action has the pane's
+# OWN renderer read back its content (`lib\PaneCapture.ps1`), which needs no
+# desktop and no composite, so the GL clear color is finally assertable here.
 #
 # -NegativeControl expects the picker to apply #334455 (a color it never
 # picks) instead of the configured background, which MUST fail: that value is
@@ -54,6 +57,7 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = '-colortest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -206,6 +210,19 @@ $band = Measure-BannerBand $appPid $cwTop 'cw'
 Assert ($band.Colors -ge 2) "banner capture holds real content ($($band.Colors) distinct colors)"
 Assert ($band.Px -eq '51,68,85') `
     "new-window --color: the tint is the pane background the banner band paints (got $($band.Px))"
+
+# ...and now THE GLASS ITSELF (T275). This is the probe T214 dropped, restored
+# against pixels the pane's own renderer produced rather than a PrintWindow
+# flat fill. The dominant color of a terminal capture is its background by
+# definition, so it is the GL clear color the tint had to reach - a strictly
+# stronger claim than the banner band above, which is GDI.
+$glass = Get-TestPaneCapture -Target 'cw'
+$glassDom = if ($glass) { Get-TestPaneDominantColor -Shot $glass } else { $null }
+Assert ($null -ne $glass -and (Get-TestPaneColorCount -Shot $glass) -ge 4) `
+    "glass capture holds real content ($(if ($glass) { "$(Get-TestPaneColorCount -Shot $glass) distinct colors" } else { Get-LastPaneCaptureError }))"
+Assert (Test-PaneColorNear -Color $glassDom -R 51 -G 68 -B 85) `
+    "new-window --color: the tint reached the GL clear color (dominant $glassDom)"
+if ($glass) { Close-TestPaneCapture $glass }
 
 # --- 2. plain +split inherits the shifted parent tint (exact oracle) -----
 & $exe +split --target=cw --name=cp1 | Out-Null

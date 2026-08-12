@@ -30,6 +30,11 @@
 #               forced capture is a flat fill, and the fill does not move when
 #               the pane renders. The last two are the negative control for
 #               the first: without them the refusal is a superstition.
+#               T275 (2026-08-11) added a fourth, and it is a PAIR with those:
+#               route 0 (`capture-pane`, the app reading back its own
+#               renderer) captures the SAME pane at the SAME moment and sees
+#               the text. The limit is unrepealed; what changed is that there
+#               is now somewhere to send a probe that hits it.
 #
 # The capture assertion carries its own negative control: the SAME probe runs
 # against a light-chrome window and a dark-chrome one and must separate them.
@@ -56,9 +61,12 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = '-harnesstest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $script:pass = 0
 $script:fail = 0
+$script:skipped = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
@@ -112,8 +120,14 @@ try {
     # `--background=ffffff` is the input the caption band actually derives from
     # (Window.paintCaption: bg + 20 per channel). Deliberately NOT
     # `--window-theme=light`, which no longer reaches it - see the header.
+    # `--foreground=101010` is load-bearing for the route-0 assertion below and
+    # for nothing else: the default foreground is white, so a `--background=
+    # ffffff` window renders white on white and its glass really IS one color.
+    # Route 0 said so, which is the correct answer and a useless control - the
+    # comparison it has to make is against a pane with visible text in it.
     $app = Start-OnTestDesktop -Exe $exe -Arguments @(
-        '--session-persistence=false', '--background=ffffff', '--window-show-tab-bar=always')
+        '--session-persistence=false', '--background=ffffff', '--foreground=101010',
+        '--window-show-tab-bar=always')
     $launched += $app.Pid
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
@@ -190,6 +204,26 @@ try {
     Write-Host "capture: terminal surface after more output distinct=$surfColors2 meanLum=$surfLum2"
     Assert (($surfColors2 -le 2) -and ([math]::Abs($surfLum2 - $surfLum) -le 1)) `
         "the flat fill does not move when the terminal renders (distinct=$surfColors2 meanLum=$surfLum2 vs $surfLum)"
+
+    #       4. ROUTE 0 SEES WHAT PRINTWINDOW CANNOT (T275). Same pane, same
+    #          moment: `capture-pane` has the pane's own renderer read back its
+    #          offscreen target, and that capture is full of the text the flat
+    #          fill above could not see. This is the pair that keeps both facts
+    #          true at once - the PrintWindow limit is real and unrepealed, and
+    #          there is now a way around it that does not go through PrintWindow
+    #          at all. Without it, a future reader has only the refusal and no
+    #          idea what to do instead.
+    if ($paneName) {
+        $route0 = Get-TestPaneCapture -Target $paneName
+        $route0Colors = if ($route0) { Get-TestPaneColorCount -Shot $route0 } else { 0 }
+        if ($route0) { Close-TestPaneCapture $route0 }
+        Write-Host "capture: route 0 (capture-pane) distinct=$route0Colors"
+        Assert ($route0Colors -ge 8) `
+            "route 0 reads the SAME pane as real content ($route0Colors distinct colors, vs $surfColors2 through PrintWindow)"
+    } else {
+        Write-Host 'SKIP  route 0 comparison: the pane has no registered name to capture'
+        $script:skipped++
+    }
 
     # --- a modifier CHORD: ctrl+shift+t must add a tab.
     Assert ((Get-TabCount) -eq 1) 'setup: one tab before the chord'
@@ -273,5 +307,7 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
-else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red; exit 1 }
+# One scorer owns the wording AND the exit code (T271), so a run that skipped a
+# section says so in the line anybody reads (T219) and a run that asserted
+# nothing cannot report a pass.
+Write-TestVerdict -Pass $script:pass -Fail $script:fail -Skipped $script:skipped

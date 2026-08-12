@@ -2153,6 +2153,35 @@ nothing else move, which is how each arm was teeth-checked. A viewer pane has
 no shell; its equivalent claim is that the PAGE still responds — see the
 page-server oracle in `test\win32\viewer-restore.ps1`.
 
+**A probe of the terminal GLASS asks the app, not the desktop** (T275). The
+acceptance suite runs on a background desktop, where there is no composite to
+`GetPixel` and `PrintWindow` of a `GhozttyTerminal` child returns a **flat
+fill** — a perfectly valid bitmap, which is why T214 DROPPED three assertions
+about rendered content rather than weaken them into something a blank fill
+passes. The way around it is the debug-only **`capture-pane`** IPC action: the
+pane's own renderer thread reads back its **offscreen** target (the readback
+hero mode's carousel thumbnails already use — `Surface.heroSnap*` →
+`OpenGL.captureThumb`), and the app writes a PNG. No desktop, no composite, no
+window visibility: a pane hidden with `SW_HIDE` captures exactly as a focused
+one does. Harness side: `Get-TestPaneCapture` in `test\win32\lib\PaneCapture.ps1`
+(route 0 in TestDesktop.ps1's CAPTURE LIMIT header); the three dropped
+assertions are back in `hero-mode.ps1` and `window-color.ps1`, and
+`color-contrast.ps1` — the accessibility oracle — moved off the input desktop
+onto it.
+
+**There is deliberately no `ghoztty +capture-pane`.** `src/cli/ghostty.zig`'s
+`Action` enum is shared by every apprt, so a verb there is a cross-platform CLI
+surface and a Mac obligation — the T141 rule. This is instrumentation with one
+consumer, so it is gated on `build_config.is_debug` and the harness frames the
+request itself; a shipped ReleaseFast build answers `unknown action`, which
+costs the suite nothing because T350 already requires every acceptance script to
+run against a Debug build. It captures ONE PANE and therefore says nothing about
+z-order or the strip of parent between two panes — a composited capture is
+**T778**. Acceptance: `test\win32\pane-capture.ps1`, whose load-bearing oracle
+is two panes with different tints each reporting its OWN tint (a flat fill
+cannot answer both), plus section 4 of `test-desktop-harness.ps1`, which reads
+the same pane at the same moment through both paths (94 distinct colors vs 1).
+
 ## Windows UI: the design system is mandatory
 
 **Before changing any pixel of the win32 chrome — tab strip, banner, dialogs,

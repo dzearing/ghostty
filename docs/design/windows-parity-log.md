@@ -9,6 +9,40 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-11 - **T275 (D69, T778/T779 filed) - the acceptance suite can see the
+  terminal glass again, by asking the app instead of the desktop.** Off the
+  input desktop there is no composite to `GetPixel` and `PrintWindow` of a
+  `GhozttyTerminal` child returns a FLAT FILL, so T214 dropped three assertions
+  about rendered content rather than weaken them into something a blank fill
+  passes, and left `color-contrast.ps1` - the accessibility oracle - stranded on
+  the input desktop. This is the fifth route T214 named and deliberately did not
+  build: a debug-only `capture-pane` IPC action drives the readback hero mode's
+  carousel thumbnails already use (`Surface.heroSnap*` -> `OpenGL.captureThumb`,
+  which reads the OFFSCREEN target), and the app writes a PNG. No second GL
+  path, and window visibility is not involved - a pane hidden with `SW_HIDE`
+  captures exactly as a focused one does, asserted rather than assumed. There is
+  deliberately NO `+capture-pane` CLI verb: the `Action` enum is shared by every
+  apprt, so a verb there is a Mac obligation for a mechanism with one consumer
+  (D69 records the call; the gate is `build_config.is_debug`, which every
+  acceptance script already satisfies under T350). The load-bearing oracle is
+  two panes with different tints each reporting its OWN tint - a flat fill
+  cannot answer both - and `-NegativeControl` asserts the wrong one and goes
+  red. All three dropped assertions are back (`hero-mode` 131/127 distinct
+  colors on the hero AND the hidden pane, `window-color` on the GL clear color
+  beside the banner band it was substituted with) and `color-contrast` moved to
+  the background desktop, its screen-DC P/Invoke deleted, reporting ratios that
+  are analytically exact (4.69:1 IS black on #777777; 3.03 sits on the
+  renderer's nominal 3.0 floor). `test-desktop-harness.ps1` keeps all three
+  flat-fill assertions and adds a fourth beside them: the SAME pane at the SAME
+  moment reads 94 distinct colors through route 0 and 1 through PrintWindow, so
+  the limit stays measured and the way around it is measured too. One surprise
+  worth keeping: the first version of that comparison scored 1 color and was
+  RIGHT - the fixture launches `--background=ffffff` with the default white
+  foreground, so the pane really was white on white. Route 0 does not flatter
+  its caller. Next: T778 (a composited capture - route 0 is one pane, so the
+  split-divider band between two panes still has no pixel oracle), T779
+  (`persistence-flag.ps1` red on four pre-existing launches).
+
 - 2026-08-11 - **T255 (T766 filed) - the window that "ignored WM_CLOSE on the
   test desktop" was showing a dialog nobody could see.** The report had a
   long-lived Ghoztty window dropping WM_CLOSE and every WM_SYSCOMMAND while

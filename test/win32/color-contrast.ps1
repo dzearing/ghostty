@@ -28,8 +28,22 @@
 # (4.76:1). Rec.601 lightness calls that background "dark" and picks white,
 # which measures 4.42:1 -- under the floor, and the exact hole T150 closes.
 #
+# MIGRATED TO THE BACKGROUND TEST DESKTOP (T275). This script used to be one of
+# the two declared interactive-by-design exceptions: every number it reports is
+# a color the RENDERER chose - derived foreground, regenerated palette,
+# draw-time contrast floor - and none of that exists anywhere but in GL pixels,
+# which off the input desktop had neither a composite to GetPixel nor a
+# PrintWindow that returns anything but a flat fill. It now reads those pixels
+# through route 0 (`lib\PaneCapture.ps1` -> the debug-only `capture-pane` IPC
+# action), where the pane's own renderer hands back its offscreen target. The
+# oracle - WCAG ratios against the known background, same floors, same patch
+# scan for antialiased text - did not change; only where the pixels come from.
+# What that buys is that an ACCESSIBILITY oracle can run in the loop instead of
+# waiting for someone to be sitting at the box, which is exactly the rot T214
+# named as the thing that would justify building this.
+#
 # Only touches ghoztty processes running from this repo's zig-out.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -44,51 +58,9 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Runtime.InteropServices;
-public class ContrastDrv {
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
-    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
-    [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-
-    // The single visible GhozttyTerminal child of a window, as
-    // "left,top,right,bottom" (these panes are never split here).
-    public static string Pane(IntPtr top) {
-        string found = null;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) {
-                RECT r; GetWindowRect(h, out r);
-                found = r.left + "," + r.top + "," + r.right + "," + r.bottom;
-                return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Composited screen pixel as "r,g,b".
-    public static string ScreenPixel(int x, int y) {
-        IntPtr dc = GetDC(IntPtr.Zero);
-        uint c = GetPixel(dc, x, y); // COLORREF 0x00BBGGRR
-        ReleaseDC(IntPtr.Zero, dc);
-        return (c & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + ((c >> 16) & 0xFF);
-    }
-}
-'@
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 # Kill the repo's app AND its agent. The agent is not optional here: it
 # outlives the app by design, so a session named `ccl` from an earlier run
@@ -135,7 +107,8 @@ function Get-Win($target) {
     return $null
 }
 
-# Open a window running the fixture. Returns its HWND, or $null.
+# Open a window running the fixture and wait until its pane is CAPTURABLE.
+# Returns the target name (which is what the probe addresses now), or $null.
 function New-PaintedWindow([string]$target, [string]$hex, [string]$step) {
     Remove-Item $step -ErrorAction SilentlyContinue
     & $exe +new-window --target=$target --color=$hex `
@@ -143,10 +116,9 @@ function New-PaintedWindow([string]$target, [string]$hex, [string]$step) {
 
     for ($t = 0; $t -lt 60; $t++) {
         Start-Sleep -Milliseconds 500
-        $w = Get-Win $target
-        if (-not $w) { continue }
-        $hwnd = [IntPtr][int64]$w.id
-        if ([ContrastDrv]::Pane($hwnd)) { return $hwnd }
+        if (-not (Get-Win $target)) { continue }
+        $shot = Get-TestPaneCapture -Target $target
+        if ($shot) { Close-TestPaneCapture $shot; return $target }
     }
     return $null
 }
@@ -160,7 +132,7 @@ function New-PaintedWindow([string]$target, [string]$hex, [string]$step) {
 # where a single coordinate can land between strokes and report the
 # background as the answer. On the solid block steps every sample is the
 # same color, so the patch scan is a no-op.
-function Read-Step([IntPtr]$hwnd, [string]$name, [string]$step, [string]$hex) {
+function Read-Step([string]$target, [string]$name, [string]$step, [string]$hex) {
     $ready = $false
     for ($t = 0; $t -lt 120; $t++) {
         if ((Test-Path $step) -and (Get-Content $step -Raw).Trim() -eq $name) { $ready = $true; break }
@@ -171,19 +143,25 @@ function Read-Step([IntPtr]$hwnd, [string]$name, [string]$step, [string]$hex) {
     # The fixture reports after writing, but the PIXELS land a frame later.
     Start-Sleep -Milliseconds 700
 
-    $c = [ContrastDrv]::Pane($hwnd) -split ','
-    $left = [int]$c[0]; $top = [int]$c[1]; $right = [int]$c[2]; $bottom = [int]$c[3]
-    $x0 = [int](($left + $right) / 2)
-    $y0 = [int](($top + $bottom) / 2)
-
-    $best = $null; $bestRatio = -1
-    for ($dy = 0; $dy -lt 24; $dy++) {
-        for ($dx = 0; $dx -lt 24; $dx++) {
-            $px = [ContrastDrv]::ScreenPixel(($x0 + $dx), ($y0 + $dy))
-            $r = Wcag-Ratio $px $hex
-            if ($r -gt $bestRatio) { $bestRatio = $r; $best = $px }
+    $shot = Get-TestPaneCapture -Target $target
+    if (-not $shot) { return $null }
+    try {
+        # The capture IS the pane's client area, so the pane centre is the
+        # bitmap centre - no screen coordinates anywhere in this probe now.
+        $x0 = [int]($shot.Bitmap.Width / 2)
+        $y0 = [int]($shot.Bitmap.Height / 2)
+        $best = $null; $bestRatio = -1
+        for ($dy = 0; $dy -lt 24; $dy++) {
+            for ($dx = 0; $dx -lt 24; $dx++) {
+                $x = $x0 + $dx; $y = $y0 + $dy
+                if ($x -ge $shot.Bitmap.Width -or $y -ge $shot.Bitmap.Height) { continue }
+                $c = $shot.Bitmap.GetPixel($x, $y)
+                $px = "$($c.R),$($c.G),$($c.B)"
+                $r = Wcag-Ratio $px $hex
+                if ($r -gt $bestRatio) { $bestRatio = $r; $best = $px }
+            }
         }
-    }
+    } finally { Close-TestPaneCapture $shot }
 
     Remove-Item $step -ErrorAction SilentlyContinue
     return $best
@@ -203,13 +181,20 @@ Assert-GhozttyPrivateEndpoint -Exe $exe
 $step1 = Join-Path $env:TEMP "ghoztty-t150-$PID-step1.txt"
 $step2 = Join-Path $env:TEMP "ghoztty-t150-$PID-step2.txt"
 
-# Persistence off for the same reason the agent gets killed above: this
-# test is about what the renderer draws right now, and a restored pane
-# brings back a previous run's screen.
-$proc = Start-Process $exe -ArgumentList '--background=#101014', '--session-persistence=off' -PassThru
+# persistence: --session-persistence=off, for the same reason the agent gets
+# killed above: this test is about what the renderer draws right now, and a
+# restored pane brings back a previous run's screen.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$app = Start-OnTestDesktop -Exe $exe -Arguments @('--background=#101014', '--session-persistence=off')
+$proc = $app.Process
 Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+if ($proc -and $proc.HasExited) {
+    Write-TestAssertedNothing -Reason 'GUI died at launch' -Label 'color-contrast'
+}
 Assert-GhozttyIsolated -Exe $exe
+Assert (-not (Test-TestDesktopLeak -ProcessId ([int]$app.Pid))) `
+    'GUI is NOT enumerable on the interactive desktop'
 
 # --- 1. light background: every content class stays readable --------------
 $LIGHT = '#f0f0f0'
@@ -268,13 +253,18 @@ if ($h2) {
 }
 
 # --- 3. app survived ------------------------------------------------------
-Assert (-not $proc.HasExited) 'GUI process alive after all scenarios'
+Assert (-not ($proc -and $proc.HasExited)) 'GUI process alive after all scenarios'
 $json = (& $exe +list --json 2>$null | Out-String).Trim()
 Assert ($json -match '"success":true') '+list still responds'
 
+# --- 4. the run never took the user's foreground ---------------------------
+$fgSeen = @(Stop-TestForegroundWatch)
+$leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
+Assert ($leaked.Count -eq 0) "the user's foreground was never taken ($($leaked -join ', '))"
+
 Kill-RepoInstances
+if ($td) { Remove-TestDesktop $td }
 Remove-Item $step1, $step2 -ErrorAction SilentlyContinue
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }
-else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)"; exit 1 }
+Write-TestVerdict -Pass $script:pass -Fail $script:fail

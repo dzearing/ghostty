@@ -1378,6 +1378,64 @@ pub fn heroSnapCommit(self: *Surface, ok: bool) void {
     }
 }
 
+/// GUI thread: capture this pane's rendered content at (w, h) into `out`
+/// (bottom-up BGRA, `w*h*4` bytes) and return once the renderer has delivered
+/// it. Debug-only test seam behind the `capture-pane` IPC action (T275); see
+/// `pane_capture.zig` for why it exists and what the pixels become.
+///
+/// It drives the SAME request slot hero mode does, deliberately: there is one
+/// GL readback path in this app (`renderer/OpenGL.zig` `captureThumb`) and a
+/// second one would be a second set of lifetime rules over the same texture.
+/// The consequence is that a capture taken while hero mode is running steals
+/// that pane's next thumbnail — the carousel simply re-requests on its next
+/// 150ms tick, and nothing here runs during a hero session anyway.
+///
+/// Blocks the GUI thread for up to `timeout_ms`. That is acceptable ONLY
+/// because the work happens on the pane's own renderer thread, which needs
+/// nothing from the message loop to finish it — the same reason hero mode can
+/// keep requesting captures from panes whose window is hidden.
+pub fn captureContent(
+    self: *Surface,
+    w: u32,
+    h: u32,
+    out: []u8,
+    timeout_ms: u64,
+) error{ NotReady, WrongSize, Timeout }!void {
+    if (w == 0 or h == 0) return error.WrongSize;
+    if (out.len != @as(usize, w) * @as(usize, h) * 4) return error.WrongSize;
+    if (!self.core_surface_ready) return error.NotReady;
+
+    // The sequence BEFORE the request: a capture is delivered when the seq
+    // moves, and comparing against a remembered value rather than against a
+    // flag is what makes a stale hero snapshot sitting in the buffer
+    // unmistakable for this request's answer.
+    const before = seq: {
+        self.snap_mutex.lock();
+        defer self.snap_mutex.unlock();
+        break :seq self.snap_seq;
+    };
+
+    self.heroSnapRequest(w, h);
+
+    var waited: u64 = 0;
+    const step_ms: u64 = 5;
+    while (waited < timeout_ms) : (waited += step_ms) {
+        {
+            self.snap_mutex.lock();
+            defer self.snap_mutex.unlock();
+            if (self.snap_seq != before and
+                self.snap_req_w == w and self.snap_req_h == h and
+                self.snap_buffer.len == out.len)
+            {
+                @memcpy(out, self.snap_buffer);
+                return;
+            }
+        }
+        std.Thread.sleep(step_ms * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
 /// GUI thread (WM_APP_HERO_SNAP): sync the DIB cache from the snapshot
 /// buffer. Returns true if the DIB changed (tile needs a repaint).
 pub fn heroSnapPublish(self: *Surface) bool {
