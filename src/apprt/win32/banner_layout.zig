@@ -428,6 +428,47 @@ test "columnWidths: a banner never blocks the pane from shrinking" {
     for (out) |w| try std.testing.expectEqual(@as(f32, 1), w);
 }
 
+test "columnWidths: unused width is granted to the wide column, at every scale (T745)" {
+    // The reported symptom was a two-column banner table — a bold label and a
+    // long value — that stopped near the HALFWAY mark of a ~1900px pane with
+    // the rest of the row empty. The property that rules that out is exact and
+    // has nothing to do with the DPI: whatever the narrow label does not need
+    // belongs to the wide column, so the pair spans the whole content width
+    // and nothing is stranded.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const gap = 18.0 * scale;
+        const label = 80.0 * scale; // "Prompt"
+        const value = 4000.0 * scale; // a long line: far past the pane
+        const available = 1900.0 * scale;
+        var out: [2]f32 = undefined;
+        columnWidths(&.{ label, value }, &out, available, gap);
+        try std.testing.expectApproxEqAbs(label, out[0], 0.01);
+        try std.testing.expectApproxEqAbs(available - gap - label, out[1], 0.01);
+        // Restated as the thing a reader of the banner sees: the row uses the
+        // whole width, and the value column is nowhere near half of it.
+        try std.testing.expectApproxEqAbs(available, out[0] + out[1] + gap, 0.01);
+        try std.testing.expect(out[1] > available * 0.9);
+    }
+}
+
+test "columnWidths: several wide columns split the slack and still spend it all (T745)" {
+    // Same property with the slack shared: two labels hand their unused width
+    // to the two wide columns, which take equal shares of what is left. The
+    // sum is still the full content width at every scale.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const gap = 12.0 * scale;
+        const naturals = [_]f32{ 60.0 * scale, 90.0 * scale, 3000.0 * scale, 2500.0 * scale };
+        const available = 1600.0 * scale;
+        var out: [4]f32 = undefined;
+        columnWidths(&naturals, &out, available, gap);
+        try std.testing.expectApproxEqAbs(naturals[0], out[0], 0.01);
+        try std.testing.expectApproxEqAbs(naturals[1], out[1], 0.01);
+        try std.testing.expectApproxEqAbs(out[2], out[3], 0.01);
+        const gaps = gap * 3.0;
+        try std.testing.expectApproxEqAbs(available, out[0] + out[1] + out[2] + out[3] + gaps, 0.01);
+    }
+}
+
 test "columnWidths: width unknown — the old fixed cap" {
     var out: [2]f32 = undefined;
     columnWidths(&.{ 80, 900 }, &out, 0, 18);

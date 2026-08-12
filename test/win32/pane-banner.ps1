@@ -794,6 +794,91 @@ try {
     Assert ($cap8 -le ($wideShortH + 2 * $oneRow)) "capped cell stays within header + 3 lines ($cap8 px, 1-row $wideShortH px, row ~$oneRow px)"
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'reflow section: GUI alive'
 
+    # --- 6g2. T745: the value column really USES the width it was given -------
+    # Every oracle in 6g is a band HEIGHT, and a regression that granted the
+    # value column only half the pane would still satisfy all of them - the long
+    # value would simply wrap one line later, which "the table reflowed taller"
+    # cannot tell from a correct layout. What was REPORTED (2026-08-11, with a
+    # screenshot) is horizontal: a two-column banner table whose long cell
+    # stopped near the halfway mark of a ~1900px pane with the rest of the row
+    # empty. So this measures the text's own right edge against the content
+    # column's, which is the only assertion here that a 50% cap would fail.
+    #
+    # The banner is the exact shape the report came from: an EMPTY header row
+    # (which is how a label/value banner keeps its label column narrow), so no
+    # header text and no divider are drawn - every ink pixel inside the card is
+    # cell text, and nothing spans the width for free.
+    Set-TestWindowPos -Window $top -X 100 -Y 100 -Width 1400 -Height 700 | Out-Null
+    Start-Sleep -Milliseconds 900
+
+    # Rightmost ink column inside [x0, x1), measured against the card wash (the
+    # most common color in the capture - text is always the minority).
+    function Measure-InkRight($shot, [int]$x0, [int]$x1) {
+        $counts = @{}
+        for ($y = 0; $y -lt $shot.Height; $y += 2) {
+            for ($x = $x0; $x -lt $x1; $x += 2) {
+                $c = $shot.Bitmap.GetPixel($x, $y)
+                $k = "$($c.R),$($c.G),$($c.B)"
+                $counts[$k] = 1 + $counts[$k]
+            }
+        }
+        $bg = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key.Split(',')
+        $br = [int]$bg[0]; $bgn = [int]$bg[1]; $bb = [int]$bg[2]
+        # Scan each row from the RIGHT and stop at the first ink: only a pixel
+        # further right than the best so far can move the answer.
+        $max = -1
+        for ($y = 0; $y -lt $shot.Height; $y++) {
+            $lo = [math]::Max($x0, $max + 1)
+            for ($x = $x1 - 1; $x -ge $lo; $x--) {
+                $c = $shot.Bitmap.GetPixel($x, $y)
+                # 200, not a hair over the wash: the card also carries soft
+                # full-width paint (the collapse fade, the elevation shadow)
+                # that a low threshold reads as ink at every x, which would
+                # make this probe unfailable. Body text is ~500 away from the
+                # wash summed over RGB; those gradients are tens.
+                if (([math]::Abs($c.R - $br) + [math]::Abs($c.G - $bgn) + [math]::Abs($c.B - $bb)) -gt 200) {
+                    $max = $x; break
+                }
+            }
+        }
+        return $max
+    }
+
+    # 4x the sentence is ~2x the content width at 1400px, so the value overflows
+    # and its FIRST wrapped line has to fill the row. Short words on purpose:
+    # a greedy wrap then leaves only one word of slack at the line end.
+    $t745Val = ($sentence * 4).Trim()
+    & $exe +set-banner --target=bw "|  |  |\n|---|---|\n| **Prompt** | $t745Val |\n| **Status** | ok |" | Out-Null
+    $null = Wait-Banner 'bw' 0 "|  |  |`n|---|---|`n| **Prompt** | $t745Val |`n| **Status** | ok |"
+    Start-Sleep -Milliseconds 800
+    $ov745 = Get-Overlay $appPid $top
+    Assert ($null -ne $ov745) 'T745: overlay up for the width probe'
+    if ($ov745) {
+        $s745 = (Get-TestWindowDpi -Window ([IntPtr]$ov745.Hwnd)) / 96.0
+        $mg745 = Get-TestChromeDip -Dip 12.0 -Scale $s745   # card margin
+        $pd745 = Get-TestChromeDip -Dip 12.0 -Scale $s745   # card padding
+        $sd745 = Get-TestChromeDip -Dip 28.0 -Scale $s745   # chevron button side
+        $gp745 = Get-TestChromeDip -Dip 4.0 -Scale $s745    # content/chevron gap
+        # banner_layout.contentWidth, restated: content runs from margin+padding
+        # to the chevron column's left edge, less the design-system gap.
+        $cLeft = $mg745 + $pd745
+        $cRight = $ov745.Width - $mg745 - $sd745 - $gp745
+        $shot745 = Get-TestWindowPixels -Window ([IntPtr]$ov745.Hwnd)
+        $colors745 = Get-TestDistinctColors -Shot $shot745 -Inset 2
+        Assert ($colors745 -ge 8) "T745: the card really painted ($colors745 distinct colors)"
+        $inkR = Measure-InkRight $shot745 $cLeft $cRight
+        Close-TestWindowPixels $shot745
+        $span = $cRight - $cLeft
+        $used = if ($span -gt 0) { [math]::Round(100.0 * ($inkR - $cLeft) / $span, 1) } else { 0 }
+        # 85%: the only slack a greedy wrap can leave at the end of a full line
+        # is the word that did not fit, and these are short words. A column
+        # capped at half the pane - the reported symptom, and what the pre-T123
+        # 360px cap does at this width - lands near 50 and fails.
+        Assert ($colors745 -ge 8 -and $used -ge 85.0) `
+            "T745: the value column uses the pane width ($used% of the $span px content column; ink ends at x=$inkR)"
+    }
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T745 width probe: GUI alive'
+
     # --- 6h. T377: EVERY block wraps, caps at 3 lines, clears the chevron -----
     # Table cells were the only thing that wrapped: `wrapTokens` had exactly one
     # call site. A paragraph, a heading and a list row were each drawn with one
