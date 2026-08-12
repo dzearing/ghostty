@@ -288,8 +288,14 @@ try {
     }
 
     # A click on the strip, posted where a real one would land.
-    function Strip-Click([int]$cx) {
-        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + $m.StripTopClient + [int]($barH / 2)) -Button left -Action click)
+    #
+    # -Client forces the CLIENT message even where the window hit-tests the
+    # point as caption (T263). Section 6 needs that: it aims at the window's
+    # last pixel column to prove the STRIP does not claim it, and in a merged
+    # row that column belongs to the caption's close button - so a routed click
+    # there would close the window instead of answering the question asked.
+    function Strip-Click([int]$cx, [switch]$Client) {
+        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + $m.StripTopClient + [int]($barH / 2)) -Button left -Action click -Client:$Client)
         Start-Sleep -Milliseconds 300
     }
 
@@ -940,15 +946,30 @@ try {
     #    is a stronger statement than the old one, because it fails both if the
     #    inset is wrong and if the retired "=" came back.
     # -----------------------------------------------------------------------
+    #    Two oracles, because since T263 a click at that column is not even
+    #    the strip's to decline: the merged row hands its right end to the
+    #    caption, so the window itself routes it away as a non-client hit
+    #    (asserted first, from the app's own WM_NCHITTEST). The click is then
+    #    delivered in the CLIENT form on purpose - the message the strip's own
+    #    handler reads - so "the hit box stops short of the border" is still
+    #    measured against the strip rather than assumed from the routing.
+    $edgeRoute = Get-TestMouseRoute -Window $top `
+        -X ($clientX + $clientW - 1) -Y ($clientY + $m.StripTopClient + [int]($barH / 2))
+    Assert $edgeRoute.NonClient `
+        "right inset: the window's last column belongs to the caption, not the strip (hit $($edgeRoute.Code))"
     $tabsBeforeEdge = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count
-    Strip-Click ($clientW - 1)
+    Strip-Click ($clientW - 1) -Client
     Start-Sleep -Milliseconds 300
     Assert ((Get-TestWindow -ProcessId $app.Pid -Class '#32768') -eq [IntPtr]::Zero) `
         'right inset: the strip does not run flush to the window border (a click at the edge opens nothing)'
     Assert (@(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count -eq $tabsBeforeEdge) `
         'right inset: ...and not a tab either - the hit box stops short of the border'
 
-    Strip-Click ($clientW - $padR - [int]($btnPaint / 2))
+    # -Client for the same reason as the edge probe above: the claim is about
+    # what the STRIP does with that slot, and the merged row's right end is the
+    # caption's button cluster - a routed click there would close the window
+    # (it lands on HTCLOSE) rather than answer the question.
+    Strip-Click ($clientW - $padR - [int]($btnPaint / 2)) -Client
     Start-Sleep -Milliseconds 500
     $menu = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 1200
     Assert ($menu -eq [IntPtr]::Zero) `

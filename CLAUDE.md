@@ -1987,6 +1987,27 @@ a helper process with nothing to score. Acceptance:
 `test\win32\verdict-exit-audit.ps1`, whose `-TeethCheck` plants a real violator
 inside the swept directory and requires the sweep to find it.
 
+**A synthesized click routes the way Windows routes it** (T263).
+`Send-TestMouse` asks the target `WM_NCHITTEST` at the point first and delivers
+the `WM_NC*` family whenever the answer is not `HTCLIENT` — the same decision
+`DefWindowProc`'s input path makes. Since T254 the caption band is client
+PIXELS that the window claims back through its hit test, so the harness's
+client-only `WM_LBUTTONDOWN` reached no handler there at all: T260 lost 17
+assertions to it against a caption that was painting and hit-testing correctly,
+and every script that met it grew a private `WM_NCHITTEST` + posted
+`WM_NCLBUTTONDOWN` pair to work around it. Three answers are deliberately NOT
+converted — `HTNOWHERE`, `HTTRANSPARENT` (the surface child returns it over the
+split-divider grab band) and `HTERROR` — because all three mean "not me", which
+is the z-order question this harness deliberately does not ask: it posts to the
+hwnd you NAME. Two consequences worth knowing: a click at the window's last
+column in the merged row is the CLOSE button and really closes the window, so a
+probe whose subject is what the STRIP does with that column passes the
+`-Client` escape hatch; and `Get-TestMouseRoute` reports the decision, so a
+script can assert "this point is the minimize button" before clicking and read
+a moved button as a moved button. `GHOZTTY_TEST_MOUSE_CLIENT=1` reproduces the
+pre-T263 harness from the same tree, which is how a red script is told apart
+from a routing regression. Acceptance: `test/win32/mouse-nc-routing.ps1`.
+
 **A test sandbox can have an agent of its own** (T167). The local agent's
 single-instance guard is per-user and per-LINEAGE, and the lineage is a
 compile-time fact (`local-debug` for every debug build), so a debug agent

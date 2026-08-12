@@ -394,22 +394,22 @@ function Menu-Host([IntPtr]$top) {
     return [pscustomobject]@{ Kind = 'caption'; X = $m.CaptionOverflowX; Y = [int]($m.CaptionH / 2); M = $m }
 }
 
-# lparam for a mouse/hit-test message: screen point packed lo=x, hi=y.
-function PackPoint([int]$x, [int]$y) {
-    return [IntPtr](([int64]($y -band 0xFFFF) -shl 16) -bor [int64]($x -band 0xFFFF))
-}
-
 # Click this window's menu host, wherever it is, and return the hit-test code
-# the app answered for that point (0 for the strip, which is not hit-tested by
-# WM_NCHITTEST at all).
+# the app answered for that point (HTCLIENT for the strip, which is client area
+# like any other control).
 #
-# The two hosts take DIFFERENT message paths and that is not an implementation
-# detail this can paper over: the caption band is client area the window claims
-# back through WM_NCHITTEST, so Windows delivers WM_NCLBUTTONDOWN there, and a
-# posted client WM_LBUTTONDOWN - which is what Send-TestMouse is - reaches
-# nothing (measured: every menu-open assertion failed while F10 still passed).
-# The CODE is asked of the app rather than assumed, so a "..." that stopped
-# answering HTSYSMENU makes this stop finding it instead of clicking blind.
+# The two hosts take DIFFERENT message paths, and since T263 that is the
+# HARNESS's business rather than this script's: the caption band is client
+# pixels the window claims back through WM_NCHITTEST, so Windows delivers
+# WM_NCLBUTTONDOWN there, and Send-TestMouse now asks the same question and
+# delivers the same pair. This used to hand-roll that (a WM_NCHITTEST probe
+# plus a posted WM_NCLBUTTONDOWN) because a plain posted client click reached
+# nothing at all - measured in T260, where every menu-open assertion failed
+# while F10 still passed.
+#
+# DOWN only, no release: the "..." opens a TrackPopupMenu that blocks the GUI
+# thread inside the down handler, so a matching up would be retrieved by the
+# menu's own modal loop rather than by the button. Close-Menu ends it.
 function Click-MenuHost([IntPtr]$top) {
     $h = Menu-Host $top
     $cr = Get-TestWindowRect -Window $top -Client
@@ -417,10 +417,13 @@ function Click-MenuHost([IntPtr]$top) {
     $sy = $cr.Top + $h.Y
     if ($h.Kind -eq 'strip') {
         [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action click)
-        return 0
+        return 1
     }
-    $code = [int](Invoke-TestMessage -Window $top -Message 0x0084 -LParam (PackPoint $sx $sy))  # WM_NCHITTEST
-    [void](Send-TestRawMessage -Window $top -Message 0x00A1 -WParam ([IntPtr]$code) -LParam (PackPoint $sx $sy))
+    # The code is READ from the app, not assumed, so a "..." that stopped
+    # answering HTSYSMENU reads as a moved button rather than as a menu that
+    # did not open.
+    $code = (Get-TestMouseRoute -Window $top -X $sx -Y $sy).Code
+    [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action down)
     return $code
 }
 

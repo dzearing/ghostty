@@ -257,6 +257,14 @@ public class GhozttyTestDesktop {
     const uint WM_MOUSEWHEEL = 0x020A;
     const uint MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002, MK_SHIFT = 0x0004;
     const uint MK_CONTROL = 0x0008, MK_MBUTTON = 0x0010;
+    // The non-client twins (T263). Windows picks between these and the client
+    // messages above by WM_NCHITTEST, and so does MouseEvent.
+    const uint WM_NCHITTEST = 0x0084;
+    const uint WM_NCMOUSEMOVE = 0x00A0;
+    const uint WM_NCLBUTTONDOWN = 0x00A1, WM_NCLBUTTONUP = 0x00A2, WM_NCLBUTTONDBLCLK = 0x00A3;
+    const uint WM_NCRBUTTONDOWN = 0x00A4, WM_NCRBUTTONUP = 0x00A5, WM_NCRBUTTONDBLCLK = 0x00A6;
+    const uint WM_NCMBUTTONDOWN = 0x00A7, WM_NCMBUTTONUP = 0x00A8, WM_NCMBUTTONDBLCLK = 0x00A9;
+    const int HTERROR = -2, HTTRANSPARENT = -1, HTNOWHERE = 0, HTCLIENT = 1;
     const uint PW_RENDERFULLCONTENT = 2;
 
     // ================= worker thread =================
@@ -1314,12 +1322,66 @@ public class GhozttyTestDesktop {
     // its handler has nothing to read. Assert the decision underneath such a
     // handler (WM_NCHITTEST for the divider band), never the cursor.
     //
-    // What is NOT reproduced: hit-testing. A posted message goes to the hwnd
-    // you name, whatever is on top of it. That is a feature for tests (no
-    // z-order flake) and a trap if you post to the parent expecting a child
-    // to get it.
+    // What is NOT reproduced: Z-ORDER hit-testing. A posted message goes to
+    // the hwnd you name, whatever is on top of it. That is a feature for tests
+    // (no z-order flake) and a trap if you post to the parent expecting a
+    // child to get it.
+    //
+    // What IS reproduced, since T263: the window's OWN hit test, i.e. which
+    // message family the named target would really receive at that point. See
+    // IsNonClientCode below.
     static IntPtr PackPoint(int x, int y) {
         return (IntPtr)((int)(((uint)y << 16) | ((uint)x & 0xFFFF)));
+    }
+
+    // ---- client vs non-client routing (T263) ----------------------------
+    // Windows decides which FAMILY of mouse message a point produces by asking
+    // the window WM_NCHITTEST first: HTCLIENT gets WM_LBUTTONDOWN & co., and
+    // any other code gets the WM_NC* twin, with the hit code in wparam and the
+    // SCREEN point in lparam. Since T254 the caption band is client PIXELS
+    // that the window claims back through its hit test, so a posted client
+    // message there reaches no handler at all and the click silently does
+    // nothing (measured in T260: every menu-open assertion failed while F10
+    // still passed). Doing the routing here means a script stops having to
+    // know which band it is aiming at.
+    //
+    // The three "not me" answers are deliberately NOT converted:
+    //
+    //   HTNOWHERE      the point is outside the window we were told to post to
+    //   HTTRANSPARENT  the window declines the hit so it falls to the one
+    //                  below (the surface child does exactly this over the
+    //                  split-divider grab band, App.surfaceWndProc)
+    //   HTERROR        the window could not answer
+    //
+    // All three are the z-order question this harness deliberately does not
+    // ask - "post to the hwnd you name, whatever is on top of it" - so they
+    // keep today's client delivery to the named target rather than being
+    // turned into an NC message with a nonsense hit code in wparam.
+    static bool IsNonClientCode(int code) {
+        return code != HTCLIENT && code != HTNOWHERE
+            && code != HTTRANSPARENT && code != HTERROR;
+    }
+
+    // Ask the window itself. A window that does not answer within the timeout
+    // (wedged, or dying) is reported HTCLIENT, i.e. today's behavior: a
+    // routing question must never be the thing that hangs a mouse click. The
+    // timeout is deliberately much shorter than Send()'s 10s - this call is on
+    // the path of EVERY click, including the storm-shaped scripts.
+    int HitTestCode(IntPtr h, int sx, int sy) {
+        IntPtr res;
+        // SMTO_ABORTIFHUNG
+        if (SendMessageTimeoutW(h, WM_NCHITTEST, IntPtr.Zero, PackPoint(sx, sy),
+                                0x0002, 1500, out res) == IntPtr.Zero) return HTCLIENT;
+        return res.ToInt32();
+    }
+
+    // The routing decision, exposed so a script can assert it directly
+    // (Get-TestMouseRoute) rather than inferring it from an effect.
+    public int MouseRoute(IntPtr top, IntPtr target, int sx, int sy) {
+        return (int)Run(delegate() {
+            IntPtr dst = (target == IntPtr.Zero) ? top : target;
+            return HitTestCode(dst, sx, sy);
+        });
     }
 
     static uint MouseMk(ushort[] mods, uint buttons) {
@@ -1337,9 +1399,12 @@ public class GhozttyTestDesktop {
     // action: 0 move, 1 down, 2 up, 3 click, 4 double-click, 5 wheel.
     // x/y are SCREEN coordinates - the same math the pre-migration scripts
     // already do with GetWindowRect - and are converted per target hwnd.
+    //
+    // clientOnly forces the client messages even where the window hit-tests
+    // the point as non-client (the -Client escape hatch).
     public bool MouseEvent(IntPtr top, IntPtr target, int sx, int sy,
                            int button, int action, int holdMs,
-                           ushort[] mods, int wheelDelta) {
+                           ushort[] mods, int wheelDelta, bool clientOnly) {
         return (bool)Run(delegate() {
             uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
             uint cur = GetCurrentThreadId();
@@ -1360,7 +1425,35 @@ public class GhozttyTestDesktop {
                 if (button == 1) { down = WM_RBUTTONDOWN; up = WM_RBUTTONUP; dbl = WM_RBUTTONDOWN; held = MK_RBUTTON; }
                 else if (button == 2) { down = WM_MBUTTONDOWN; up = WM_MBUTTONUP; dbl = WM_MBUTTONDOWN; held = MK_MBUTTON; }
 
-                PostMessageW(dst, WM_MOUSEMOVE, (IntPtr)MouseMk(mods, 0), lp);
+                // T263: route the way Windows does. On the NC path the hit
+                // code takes wparam's place, lparam is the SCREEN point, and
+                // the second click of a double is ALWAYS the DBLCLK form -
+                // CS_DBLCLKS governs client double-clicks only, which is why
+                // a caption double-click maximizes any window.
+                int hit = HTCLIENT;
+                bool nc = false;
+                if (!clientOnly && action != 5) {
+                    hit = HitTestCode(dst, sx, sy);
+                    nc = IsNonClientCode(hit);
+                }
+                uint move = WM_MOUSEMOVE;
+                IntPtr moveWp = (IntPtr)MouseMk(mods, 0);
+                if (nc) {
+                    lp = PackPoint(sx, sy);
+                    move = WM_NCMOUSEMOVE;
+                    moveWp = (IntPtr)hit;
+                    down = WM_NCLBUTTONDOWN; up = WM_NCLBUTTONUP; dbl = WM_NCLBUTTONDBLCLK;
+                    if (button == 1) { down = WM_NCRBUTTONDOWN; up = WM_NCRBUTTONUP; dbl = WM_NCRBUTTONDBLCLK; }
+                    else if (button == 2) { down = WM_NCMBUTTONDOWN; up = WM_NCMBUTTONUP; dbl = WM_NCMBUTTONDBLCLK; }
+                }
+                // The NC messages carry the hit code where the client ones
+                // carry MK_* flags, so a button/modifier bit has nowhere to
+                // ride: on that path the app reads modifiers with GetKeyState,
+                // which is what the faked keyboard state above is for.
+                IntPtr downWp = nc ? (IntPtr)hit : (IntPtr)MouseMk(mods, held);
+                IntPtr upWp = nc ? (IntPtr)hit : (IntPtr)MouseMk(mods, 0);
+
+                PostMessageW(dst, move, moveWp, lp);
                 Thread.Sleep(20);
 
                 if (action == 0) {
@@ -1371,11 +1464,11 @@ public class GhozttyTestDesktop {
                     PostMessageW(dst, WM_MOUSEWHEEL, (IntPtr)(int)wp, PackPoint(sx, sy));
                 } else {
                     if (action == 1 || action == 3 || action == 4) {
-                        PostMessageW(dst, down, (IntPtr)MouseMk(mods, held), lp);
+                        PostMessageW(dst, down, downWp, lp);
                     }
                     if (action == 3 || action == 4) {
                         Thread.Sleep(holdMs);
-                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                        PostMessageW(dst, up, upWp, lp);
                     }
                     if (action == 4) {
                         // What the OS would really deliver depends on the
@@ -1388,13 +1481,13 @@ public class GhozttyTestDesktop {
                         // gesture as a single click. Posting the wrong one
                         // costs a word-select that never happens.
                         Thread.Sleep(30);
-                        uint second = WantsDblClk(dst) ? dbl : down;
-                        PostMessageW(dst, second, (IntPtr)MouseMk(mods, held), lp);
+                        uint second = (nc || WantsDblClk(dst)) ? dbl : down;
+                        PostMessageW(dst, second, downWp, lp);
                         Thread.Sleep(holdMs);
-                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                        PostMessageW(dst, up, upWp, lp);
                     }
                     if (action == 2) {
-                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                        PostMessageW(dst, up, upWp, lp);
                     }
                 }
 
@@ -2465,7 +2558,24 @@ a CS_DBLCLKS window (GhozttyWindow - the split divider's equalize gesture)
 gets down/up/DBLCLK/up, and a window without that style (GhozttyTerminal, the
 terminal surface, which counts its own clicks) gets down/up/down/up. Posting
 the CS_DBLCLKS form at a surface loses the second click entirely, so the
-word-select it was meant to trigger never happens (measured in T218).
+word-select it was meant to trigger never happens (measured in T218). On the
+non-client path the DBLCLK form is always sent, because CS_DBLCLKS governs
+client double-clicks only.
+
+CLIENT OR NON-CLIENT IS DECIDED THE WAY WINDOWS DECIDES IT (T263): the target
+is asked WM_NCHITTEST at the point first, and an answer other than HTCLIENT
+delivers the WM_NC* twin (WM_NCLBUTTONDOWN & co.) with the hit code in wparam
+and the SCREEN point in lparam. That is what makes a caption-band click - the
+"..." menu button, minimize, close, since T254 all client PIXELS the window
+claims back through its hit test - actually reach a handler. Use -Client to
+force the client message anyway, for a test whose subject IS that path.
+
+Two consequences worth knowing:
+
+  * HTNOWHERE / HTTRANSPARENT / HTERROR keep the client delivery, because all
+    three mean "not me" and this harness posts to the hwnd you NAME.
+  * A down on HTCAPTION hands DefWindowProc a window-drag, exactly as a real
+    press on the title area does. Aim at a button, or expect a move loop.
 #>
 function Send-TestMouse {
     param(
@@ -2478,6 +2588,7 @@ function Send-TestMouse {
         [string[]]$Modifiers = @(),
         [int]$HoldMs = 40,
         [int]$Delta = 0,
+        [switch]$Client,
         $Desktop
     )
     $td = Resolve-TestDesktop $Desktop
@@ -2486,7 +2597,46 @@ function Send-TestMouse {
         'move' { 0 } 'down' { 1 } 'up' { 2 } 'click' { 3 } 'doubleclick' { 4 } 'wheel' { 5 }
     }
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
-    return $td.MouseEvent($Window, $Target, $X, $Y, $b, $a, $HoldMs, [uint16[]]$mods, $Delta)
+    # GHOZTTY_TEST_MOUSE_CLIENT=1 forces every click through the client path,
+    # i.e. reproduces the pre-T263 harness from this same tree. That is the
+    # one-command answer to "did the routing break this script?" for a script
+    # that is not about routing at all - and it is how T263 established that
+    # tab-strip.ps1's failures were already there.
+    $clientOnly = $Client -or ($env:GHOZTTY_TEST_MOUSE_CLIENT -eq '1')
+    return $td.MouseEvent($Window, $Target, $X, $Y, $b, $a, $HoldMs, [uint16[]]$mods, $Delta, [bool]$clientOnly)
+}
+
+<#
+The routing Send-TestMouse will use at a SCREEN point - the target's own answer
+to WM_NCHITTEST, plus whether that makes the click non-client (T263).
+
+    $r = Get-TestMouseRoute -Window $top -X $sx -Y $sy
+    $r.Code        # 8 (HTMINBUTTON)
+    $r.NonClient   # $true
+
+This is the DECISION, not a guess at it: Send-TestMouse asks the same question
+of the same window. Assert it when a script wants to say "this point is the
+minimize button" before clicking, so a button that moved reads as a moved
+button rather than as an action that did not happen.
+
+A window that does not answer within 1.5s is reported HTCLIENT, which is the
+delivery a wedged app gets anyway.
+#>
+function Get-TestMouseRoute {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [IntPtr]$Target = [IntPtr]::Zero,
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        $Desktop
+    )
+    $code = [int](Resolve-TestDesktop $Desktop).MouseRoute($Window, $Target, $X, $Y)
+    # Mirrors Native.IsNonClientCode: HTNOWHERE(0) / HTTRANSPARENT(-1) /
+    # HTERROR(-2) all mean "not me", so they keep the client delivery.
+    [pscustomobject]@{
+        Code      = $code
+        NonClient = ($code -ne 1 -and $code -ne 0 -and $code -ne -1 -and $code -ne -2)
+    }
 }
 
 <#

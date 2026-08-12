@@ -42,12 +42,15 @@
 #      the window looks perfectly fine, and the controls are simply
 #      unreachable.
 #
-# LIMIT, stated rather than glossed: sections 3-5 post the messages the OS
-# would post. They prove our handlers are right; they do not prove Windows
-# routes a real pointer to them (T240's lesson - a script that synthesizes the
-# trigger cannot validate the trigger). The part that cannot be faked is
-# section 1-2: those are PAINTED pixels from a live window, and the caption
-# band does not exist at all unless WM_NCCALCSIZE actually worked.
+# LIMIT, stated rather than glossed: sections 4-5 click at a POINT and let the
+# harness route it - since T263 Send-TestMouse asks the window the same
+# WM_NCHITTEST Windows asks and posts the message family that answer names, so
+# the hit code is no longer hand-picked here and a button that MOVED now fails
+# these sections. What is still synthesized is the delivery itself: these are
+# posted messages, not a real pointer (T240's lesson - a script that
+# synthesizes the trigger cannot validate the trigger). The part that cannot be
+# faked at all is sections 1-2: those are PAINTED pixels from a live window,
+# and the caption band does not exist unless WM_NCCALCSIZE actually worked.
 #
 # NEGATIVE CONTROL: -NegativeControl inverts section 1's band-height assertion
 # (asserts the band is ABSENT, i.e. the window's top row is already terminal
@@ -86,11 +89,58 @@ function HitAt($h, [int]$sx, [int]$sy) {
     return [int](Invoke-TestMessage -Window $h -Message $WM_NCHITTEST -LParam (PackPoint $sx $sy))
 }
 
-# The DOWN/UP pair Windows posts after its own hit test resolves to a button.
-function ClickCaption($h, [int]$downCode, [int]$upCode) {
-    Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONDOWN -WParam ([IntPtr]$downCode) -LParam (PackPoint 0 0) | Out-Null
+# Where the caption's controls are, in this window, right now: the system trio
+# is three NATIVE 46 DIP slabs flush to the client's right edge with zero gaps
+# (T496), and T234's "..." is the app's 28 DIP square one GROUP step (pad_md)
+# left of the minimize slab. Same arithmetic as caption_layout.layout,
+# deliberately restated from the DIP constants rather than read out of the
+# binary - section 2 is what checks that derivation against real pixels.
+#
+# Re-derived per call because section 5 relaunches the window: button x's are
+# measured from the RIGHT edge, so a stale window rect aims every click at the
+# wrong place.
+function CaptionGeom($h) {
+    $m = Get-TestChromeMetrics -Window $h -StripVisible $false
+    $win = Get-TestWindowRect -Window $h
+    $cli = Get-TestWindowRect -Window $h -Client
+    # The left/right frame survives NCCALCSIZE; only the top was reclaimed. So
+    # the client's x origin inside the WINDOW rect is half the width lost.
+    $borderX = [int](($win.Width - $cli.Width) / 2)
+    $capW = $m.CapBtnW
+    $closeL = $cli.Width - $capW
+    $maxL = $closeL - $capW
+    $minL = $maxL - $capW
+    $overL = $minL - $m.PadMd - $m.BtnPaint
+    # Off the CLIENT origin, not the window's: maximized, the frame hangs above
+    # the monitor (rect top is -sysFrameY) while the band still starts at the
+    # client's first row - so a window-relative y aims the restore click at the
+    # sky. Restored, the two are the same point (section 1 asserts exactly
+    # that), so this costs nothing there.
+    $cy = $cli.Top + [int]($m.CaptionH / 2)
+    $x = { param($left, $w) $cli.Left + $left + [int]($w / 2) }
+    [pscustomobject]@{
+        M = $m; Win = $win; Cli = $cli; BorderX = $borderX
+        CapW = $capW; Btn = $m.BtnPaint; PadMd = $m.PadMd
+        OverL = $overL; MinL = $minL; MaxL = $maxL; CloseL = $closeL; Cy = $cy
+        PtOver  = @((& $x $overL $m.BtnPaint), $cy)
+        PtMin   = @((& $x $minL $capW), $cy)
+        PtMax   = @((& $x $maxL $capW), $cy)
+        PtClose = @((& $x $closeL $capW), $cy)
+        # The drag band: left of the title, well clear of every button.
+        PtDrag  = @(($win.Left + $borderX + 40), $cy)
+    }
+}
+
+# A real click, at a POINT. Send-TestMouse asks the window the same
+# WM_NCHITTEST Windows asks and delivers the WM_NC* pair the caption band
+# actually receives (T263), so this is no longer a synthesized message pair
+# with a hand-picked hit code - the app decides what is under each point.
+# Two points, because press-then-release-elsewhere is a gesture this script
+# asserts: down at $downPt, up at $upPt.
+function ClickCaption($h, [int[]]$downPt, [int[]]$upPt) {
+    [void](Send-TestMouse -Window $h -Target $h -X $downPt[0] -Y $downPt[1] -Action down)
     Start-Sleep -Milliseconds 120
-    Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONUP -WParam ([IntPtr]$upCode) -LParam (PackPoint 0 0) | Out-Null
+    [void](Send-TestMouse -Window $h -Target $h -X $upPt[0] -Y $upPt[1] -Action up)
     Start-Sleep -Milliseconds 400
 }
 
@@ -171,18 +221,16 @@ try {
         "the window's TOP row is client chrome, not a DWM caption (rgb $($capTop.R),$($capTop.G),$($capTop.B))"
 
     # --- 2. the buttons paint where the layout module says -------------------
-    # The system trio is three NATIVE 46 DIP slabs flush to the window's right
-    # edge with zero gaps (T496); T234's "..." is the app's 28 DIP square one
-    # GROUP step (pad_md) left of the minimize slab. Same arithmetic as
-    # caption_layout.layout, deliberately restated here from the DIP constants
-    # rather than read out of the binary.
-    $capW = $m.CapBtnW
-    $padMd = $m.PadMd
-    $closeL = $cli.Width - $capW
-    $maxL = $closeL - $capW
-    $minL = $maxL - $capW
-    $overL = $minL - $padMd - $btn
-    $cy = $win.Top + [int]($expectCapH / 2)
+    # Layout from CaptionGeom (see the arithmetic there); what this section
+    # adds is the check that the derivation matches PAINTED pixels.
+    $geo = CaptionGeom $h
+    $capW = $geo.CapW
+    $padMd = $geo.PadMd
+    $closeL = $geo.CloseL
+    $maxL = $geo.MaxL
+    $minL = $geo.MinL
+    $overL = $geo.OverL
+    $cy = $geo.Cy
     $names = @('overflow', 'minimize', 'maximize', 'close')
     $lefts = @($overL, $minL, $maxL, $closeL)
     $widths = @($btn, $capW, $capW, $capW)
@@ -242,8 +290,9 @@ try {
     # icon-button treatment shades the chrome by 25 for `pressed`, so a
     # 20,20,20 band becomes 45,45,45 under the button and stays 20,20,20 in
     # the gap beside it. Nothing else in the window paints that value there,
-    # and it cannot appear unless WM_NCLBUTTONDOWN was routed to
-    # `handleNcLButtonDown` and matched a button rect.
+    # and it cannot appear unless the press was routed as WM_NCLBUTTONDOWN,
+    # reached `handleNcLButtonDown` and matched a button rect - which is the
+    # whole chain a plain client click at the same point misses (T263).
     # Sampled inside the slab but OFF the glyph: the slab's fill covers the
     # band's full height (T496), so its top rows light with the press while
     # the centered 10 DIP mark stays well below them. Probing the glyph row
@@ -258,7 +307,7 @@ try {
         return $c
     }
     $restC = FillShade $h $win $borderX $minL $capW $padSm
-    Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONDOWN -WParam ([IntPtr]$HTMINBUTTON) -LParam (PackPoint 0 0) | Out-Null
+    [void](Send-TestMouse -Window $h -Target $h -X $geo.PtMin[0] -Y $geo.PtMin[1] -Action down)
     Start-Sleep -Milliseconds 400
     $pressC = FillShade $h $win $borderX $minL $capW $padSm
     Check ($null -ne $pressC -and $pressC.R -ge ($restC.R + 15)) `
@@ -268,7 +317,7 @@ try {
     # what keeps this assertion readable. (Releasing on the button itself
     # would post SC_MINIMIZE and the next capture would be of a -32000 icon
     # stub, i.e. no pixels at all.)
-    Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONUP -WParam ([IntPtr]$HTCAPTION) -LParam (PackPoint 0 0) | Out-Null
+    [void](Send-TestMouse -Window $h -Target $h -X $geo.PtDrag[0] -Y $geo.PtDrag[1] -Action up)
     Start-Sleep -Milliseconds 500
     $afterC = FillShade $h $win $borderX $minL $capW $padSm
     Check ($null -ne $afterC -and $afterC.R -le ($restC.R + 6)) `
@@ -327,8 +376,13 @@ try {
     Start-Sleep -Milliseconds 2500
     Set-TestWindowSize -Window $h -Width 1100 -Height 700 | Out-Null
     Start-Sleep -Milliseconds 1000
+    # New window, new rect: re-derive the button points before aiming at them.
+    $geo = CaptionGeom $h
 
-    ClickCaption $h $HTMINBUTTON $HTMINBUTTON
+    # Every click below is an ordinary Send-TestMouse at a POINT. That the
+    # minimize point is the minimize BUTTON was established by section 3's hit
+    # tests, so a failure here is about the action, not about the aim.
+    ClickCaption $h $geo.PtMin $geo.PtMin
     # WS_MINIMIZE, not the rect: the -32000,-32000 caption stub is
     # Explorer's arrangement, and this desktop has no Explorer - an iconic
     # window here parks at a real on-screen rect (measured: 0,2066 199x34),
@@ -338,7 +392,7 @@ try {
     Send-TestSysCommand -Window $h -Command 'restore' | Out-Null
     Start-Sleep -Milliseconds 700
 
-    ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
+    ClickCaption $h $geo.PtMax $geo.PtMax
     $zoomed = Test-TestWindowZoomed -Window $h
     Check $zoomed "maximize click maximized the window"
 
@@ -374,14 +428,18 @@ try {
         Bad "maximized: caption-on-screen check could not run"
     }
 
-    ClickCaption $h $HTMAXBUTTON $HTMAXBUTTON
+    # Maximized, the window rect moved (and its frame now hangs off the
+    # monitor), so the buttons are somewhere else: re-derive before aiming.
+    $geo = CaptionGeom $h
+    ClickCaption $h $geo.PtMax $geo.PtMax
     Check (-not (Test-TestWindowZoomed -Window $h)) "a second maximize click restored the window"
 
-    ClickCaption $h $HTCLOSE $HTMINBUTTON
+    $geo = CaptionGeom $h
+    ClickCaption $h $geo.PtClose $geo.PtMin
     Check (Test-TestWindowExists -Window $h) `
         "a close PRESS released over minimize does not close the window"
 
-    ClickCaption $h $HTCLOSE $HTCLOSE
+    ClickCaption $h $geo.PtClose $geo.PtClose
     Start-Sleep -Milliseconds 900
     # Same interrogation as the control: if the close did not take, say WHAT
     # held it rather than leaving a bare "closed the window" failure to guess at.
