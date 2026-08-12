@@ -1830,6 +1830,21 @@ pub extern "user32" fn GetWindowPlacement(
     lpwndpl: *WINDOWPLACEMENT,
 ) callconv(.winapi) i32;
 
+/// The only call that sets a window's normal rect and its show state TOGETHER
+/// (T748). `SetWindowPos` moves a maximized window without clearing
+/// `WS_MAXIMIZE`, which leaves a window Windows still calls maximized sitting at
+/// a normal window's size — see `applyRestoreFrame`.
+pub extern "user32" fn SetWindowPlacement(
+    hWnd: HWND,
+    lpwndpl: *const WINDOWPLACEMENT,
+) callconv(.winapi) i32;
+
+/// `WINDOWPLACEMENT.showCmd` spellings. `SW_SHOWMAXIMIZED` is the same value as
+/// `SW_MAXIMIZE`; both are here because the placement struct documents itself in
+/// the `SW_SHOW*` vocabulary.
+pub const SW_SHOWNORMAL: u32 = 1;
+pub const SW_SHOWMAXIMIZED: u32 = 3;
+
 pub extern "user32" fn BeginPaint(hwnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) i32;
 

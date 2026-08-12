@@ -47,6 +47,7 @@ const tray_notify = @import("tray_notify.zig");
 const session_layout = @import("session_layout.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
+const window_placement = @import("window_placement.zig");
 const agent_recovery = @import("agent_recovery.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
@@ -1460,6 +1461,12 @@ const FrameCapture = struct {
 /// rect, which a later restore would faithfully rebuild as an offscreen sliver
 /// (T106). Null frame ⇒ the query failed / no hwnd; restore falls back to
 /// config.
+///
+/// The manifest's frames are SCREEN coordinates throughout (that is what
+/// `restore_frame`'s monitor arithmetic and `SetWindowPos` both mean), so the
+/// `rcNormalPosition` arm converts out of the placement struct's own workspace
+/// coordinates on the way past — see `window_placement.zig`. A no-op on a
+/// bottom-taskbar desktop; a taskbar's thickness of drift on any other.
 fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
     const hwnd = hwnd_opt orelse return .{};
     const maximized = w32.IsZoomed(hwnd) != 0;
@@ -1469,13 +1476,32 @@ fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
         wp.length = @sizeOf(w32.WINDOWPLACEMENT);
         if (w32.GetWindowPlacement(hwnd, &wp) == 0) return .{ .maximized = maximized };
         r = wp.rcNormalPosition;
-    } else {
-        if (w32.GetWindowRect(hwnd, &r) == 0) return .{};
+        const screen = window_placement.toScreen(.{
+            .x = r.left,
+            .y = r.top,
+            .w = r.right - r.left,
+            .h = r.bottom - r.top,
+        }, workspaceOrigin());
+        return .{
+            .frame = .{ .x = screen.x, .y = screen.y, .w = screen.w, .h = screen.h },
+            .maximized = maximized,
+        };
     }
+    if (w32.GetWindowRect(hwnd, &r) == 0) return .{};
     return .{
         .frame = .{ .x = r.left, .y = r.top, .w = r.right - r.left, .h = r.bottom - r.top },
         .maximized = maximized,
     };
+}
+
+/// The primary monitor's work-area origin — the offset between screen and
+/// `WINDOWPLACEMENT` workspace coordinates. An unreadable work area answers
+/// `(0, 0)`, which makes both conversions the identity: replaying the recorded
+/// numbers unchanged beats shifting them by a guess.
+fn workspaceOrigin() window_placement.Origin {
+    var work: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    if (w32.SystemParametersInfoW(w32.SPI_GETWORKAREA, 0, @ptrCast(&work), 0) == 0) return .{};
+    return .{ .x = work.left, .y = work.top };
 }
 
 /// Capture one leaf's restore metadata: the agent session id to re-ATTACH to
@@ -3737,10 +3763,27 @@ fn liveNodeShapes(
     return out;
 }
 
-/// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact
-/// screen rect the capture recorded. Maximized: set the (restored-down) rect,
-/// then maximize over it — matching T85's remembered-maximized behavior. Null
-/// frame ⇒ leave the created position (config/cascade) as-is.
+/// Apply the restored outer placement: the recorded normal rect AND the
+/// recorded maximized state, which are one fact and are therefore applied with
+/// one call. Null frame with no maximized flag ⇒ the capture knew nothing;
+/// leave the created position (config/cascade) as-is.
+///
+/// **The two halves cannot be applied separately** (T748). By the time this
+/// runs the window has already been SHOWN — and shown maximized whenever the
+/// T85 placement memory said the user's last window was, which for a user who
+/// works maximized is every window on every launch. `SetWindowPos` then moves
+/// and resizes that window WITHOUT clearing `WS_MAXIMIZE`: Windows still calls
+/// it maximized (so the caption drops its resize border and the chrome lays
+/// itself out for a maximized window) while it sits at a normal window's size
+/// and position. That is the "maximized but no border, renders oddly" window
+/// the report describes, and the following `ShowWindow(SW_MAXIMIZE)` could not
+/// undo it — asking for a state the window is already in does nothing. The
+/// mirror image is just as broken: a manifest window that was NOT maximized,
+/// restored while the memory says maximized, was resized to its small rect with
+/// the maximize style still set.
+///
+/// `SetWindowPlacement` is the one call that sets `rcNormalPosition` and the
+/// show state together, so no intermediate state exists to be caught in.
 fn applyRestoreFrame(
     window: *Window,
     frame: ?session_layout.Frame,
@@ -3751,31 +3794,90 @@ fn applyRestoreFrame(
     reanchor: bool,
 ) void {
     const hwnd = window.hwnd orelse return;
-    if (frame) |f| {
-        const placed: session_layout.Frame = if (reanchor) blk: {
-            const r = reanchorFrame(.{ .x = f.x, .y = f.y, .w = f.w, .h = f.h });
-            if (r.x != f.x or r.y != f.y or r.w != f.w or r.h != f.h) {
-                log.info(
-                    "session-restore: frame {d},{d} {d}x{d} is off every monitor here, re-anchored to {d},{d} {d}x{d}",
-                    .{ f.x, f.y, f.w, f.h, r.x, r.y, r.w, r.h },
-                );
-            }
-            break :blk .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
-        } else f;
-        _ = w32.SetWindowPos(
+    // Nothing recorded at all (the capture's query failed): today's behavior is
+    // to leave the window exactly as it was created, and a placement call here
+    // would instead impose a state nobody measured.
+    if (frame == null and !maximized) return;
+
+    const placed: ?session_layout.Frame = if (frame) |f| blk: {
+        if (!reanchor) break :blk f;
+        const r = reanchorFrame(.{ .x = f.x, .y = f.y, .w = f.w, .h = f.h });
+        if (r.x != f.x or r.y != f.y or r.w != f.w or r.h != f.h) {
+            log.info(
+                "session-restore: frame {d},{d} {d}x{d} is off every monitor here, re-anchored to {d},{d} {d}x{d}",
+                .{ f.x, f.y, f.w, f.h, r.x, r.y, r.w, r.h },
+            );
+        }
+        break :blk .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    } else null;
+
+    log.debug("session-restore: placing window maximized={} frame={any}", .{ maximized, placed });
+
+    // The manifest is authoritative for THIS window: the placement memory only
+    // ever supplied a default for a window nobody had a record of. Set before
+    // the early return below, so a window still waiting for its first
+    // ShowWindow maximizes (or does not) per the manifest.
+    window.start_maximized = maximized;
+
+    // Not shown yet — the created rect IS the normal rect and `start_maximized`
+    // above drives the first ShowWindow. A plain move is enough here, and is
+    // what must happen: a placement call would make the window visible before
+    // its first pane is ready.
+    if (w32.IsWindowVisible(hwnd) == 0) {
+        if (placed) |f| _ = w32.SetWindowPos(
             hwnd,
             null,
-            placed.x,
-            placed.y,
-            placed.w,
-            placed.h,
+            f.x,
+            f.y,
+            f.w,
+            f.h,
             w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
         );
+        return;
     }
-    if (maximized) {
-        window.start_maximized = true;
-        _ = w32.ShowWindow(hwnd, w32.SW_MAXIMIZE);
+
+    var wp: w32.WINDOWPLACEMENT = undefined;
+    wp.length = @sizeOf(w32.WINDOWPLACEMENT);
+    if (w32.GetWindowPlacement(hwnd, &wp) == 0) {
+        // No placement to amend. Fall back to the two-step, ORDERED so it can
+        // never leave the hybrid state above: un-maximize first, move second.
+        if (w32.IsZoomed(hwnd) != 0) {
+            // Already exactly where the manifest wants it; the geometry of a
+            // maximized window belongs to Windows.
+            if (maximized) return;
+            _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+        }
+        if (placed) |f| _ = w32.SetWindowPos(
+            hwnd,
+            null,
+            f.x,
+            f.y,
+            f.w,
+            f.h,
+            w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+        );
+        if (maximized) _ = w32.ShowWindow(hwnd, w32.SW_MAXIMIZE);
+        return;
     }
+
+    wp.flags = 0;
+    wp.showCmd = switch (window_placement.show(maximized)) {
+        .maximized => w32.SW_SHOWMAXIMIZED,
+        .show_noactivate => @intCast(w32.SW_SHOWNOACTIVATE),
+    };
+    if (placed) |f| {
+        const ws = window_placement.toWorkspace(
+            .{ .x = f.x, .y = f.y, .w = f.w, .h = f.h },
+            workspaceOrigin(),
+        );
+        wp.rcNormalPosition = .{
+            .left = ws.x,
+            .top = ws.y,
+            .right = ws.x +| ws.w,
+            .bottom = ws.y +| ws.h,
+        };
+    }
+    _ = w32.SetWindowPlacement(hwnd, &wp);
 }
 
 /// The win32 half of `restore_frame.reanchor`: ask the OS the two questions the

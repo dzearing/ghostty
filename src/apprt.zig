@@ -358,6 +358,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/restore_frame.zig");
 
+    // Pure win32 window-placement rules: the workspace/screen coordinate
+    // boundary a `WINDOWPLACEMENT` sits on, and which show command a restore
+    // asks for (T748). Imports only `restore_frame.zig` for its `Rect`.
+    _ = @import("apprt/win32/window_placement.zig");
+
     // Pure win32 local-agent crash-recovery policy: when a dropped shared link
     // is a real drop, and whose session a tree swap may never end (T145). Its
     // only non-std import is the shared-core `remote/connection.zig` link-state
