@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const chooser_cpu = @import("chooser_cpu.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -121,6 +122,13 @@ killed_count: usize = 0,
 /// the `persisted_title` rung of the label ladder. Null when there is no
 /// manifest (persistence off, or a first run).
 manifest: ?session_layout.Parsed = null,
+
+/// Whether the CPU meter's column is reserved in every row (T462). A statement
+/// about the MACHINE — its agent advertised `session_cpu` and a subscription is
+/// live on it — set by the chooser from its probe, and read by every geometry
+/// call here so the paint and the hit tests cannot disagree about where a row's
+/// title starts.
+cpu_column: bool = false,
 
 pub fn init(alloc: Allocator) SessionRoster {
     return .{ .alloc = alloc };
@@ -571,6 +579,12 @@ pub const max_rows = 128;
 
 pub const VisibleRow = struct {
     session: chooser_sessions.Session,
+    /// This session's newest per-core CPU reading (T462), or null when the last
+    /// pushed frame did not name it. Filled by the chooser from its
+    /// `SessionCpuProbe` after `visible()` returns — the roster owns what a row
+    /// SAYS, and the stream is a different subscription with a different
+    /// lifetime.
+    cpu: ?f32 = null,
     /// The live pane title bound to this session, when one of our panes has it
     /// open. Borrows the surface's own title.
     live_title: ?[]const u8 = null,
@@ -783,7 +797,7 @@ pub fn paint(self: *const SessionRoster, ctx: PaintCtx, rows: []const VisibleRow
     var y = ctx.region.top - self.scroll;
     for (rows, 0..) |row, i| {
         const subs = chooser_sessions.sublineCount(row.session);
-        const l = chooser_sessions.rowLayout(m, ctx.region.left, y, ctx.region.width(), subs);
+        const l = chooser_sessions.rowLayout(m, ctx.region.left, y, ctx.region.width(), subs, self.cpu_column);
         y = l.card.bottom + m.row_gap;
         // Fully above or below the region: nothing to draw.
         if (l.card.bottom <= ctx.region.top or l.card.top >= ctx.region.bottom) continue;
@@ -829,6 +843,13 @@ fn paintRow(
     drawDot(hdc, l.dot, dot_ink, row.session.alive);
 
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+
+    // The CPU meter, in the column the row already reserved for it (T462). Only
+    // a row with a READING draws one: a dead session has no process tree to roll
+    // up, and drawing 0% for it would be indistinguishable from an idle live one.
+    if (l.cpu.width() > 0) {
+        if (row.cpu) |pct| drawCpuMeter(hdc, ctx, l.cpu, pct, card_bg);
+    }
 
     // The label, then the badge run packed after its MEASURED width (a width
     // that comes from text metrics is measured, never re-derived).
@@ -895,6 +916,47 @@ fn paintRow(
 
     // Kill: the app's one icon button, lit on hover like every other.
     drawKill(hdc, ctx, m, l.kill, hovered, card_bg);
+}
+
+/// One session's CPU meter: a track, its filled prefix, and the number after it
+/// (T462). Every number here comes from `chooser_cpu`, which is asserted at
+/// 1.0/1.25/1.5/2.0 in the none lane — this function only turns rects into GDI
+/// calls.
+fn drawCpuMeter(
+    hdc: w32.HDC,
+    ctx: PaintCtx,
+    col: chooser_layout.Rect,
+    cpu_pct: f32,
+    card_bg: chooser_sessions.Rgb,
+) void {
+    const m = chooser_cpu.metrics(ctx.scale);
+    const l = chooser_cpu.meterLayout(m, .{
+        .left = col.left,
+        .top = col.top,
+        .right = col.right,
+        .bottom = col.bottom,
+    }, cpu_pct);
+    const ink = chooser_cpu.meterInk(card_bg, cpu_pct);
+
+    fillRound(hdc, cpuRect(l.track), m.bar_radius, chooser_cpu.trackFill(card_bg));
+    // A zero-width fill is not painted: `RoundRect` on an empty rect still
+    // stamps a pixel, which would make 0% and 1% look the same.
+    if (l.fill.width() > 0) fillRound(hdc, cpuRect(l.fill), m.bar_radius, ink);
+
+    const old = if (ctx.caption_font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, rgb(ink));
+    var buf: [16]u8 = undefined;
+    var r = rect(cpuRect(l.value));
+    // Left-aligned and single-line, and NOT ellipsized: the slot is sized for
+    // three digits, and a four-digit reading (ten fully busy cores in one
+    // session) runs into its own slack rather than being cut to "16…".
+    drawWith(hdc, chooser_cpu.formatPct(&buf, cpu_pct), &r, w32.DT_LEFT | w32.DT_SINGLELINE |
+        w32.DT_VCENTER | w32.DT_NOPREFIX | w32.DT_NOCLIP);
+    if (old) |o| _ = w32.SelectObject(hdc, o);
+}
+
+fn cpuRect(r: chooser_cpu.Rect) chooser_layout.Rect {
+    return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
 
 fn drawKill(
@@ -1062,7 +1124,7 @@ pub fn killAt(
     var cy = region.top - self.scroll;
     for (rows, 0..) |row, i| {
         const subs = chooser_sessions.sublineCount(row.session);
-        const l = chooser_sessions.rowLayout(m, region.left, cy, region.width(), subs);
+        const l = chooser_sessions.rowLayout(m, region.left, cy, region.width(), subs, self.cpu_column);
         cy = l.card.bottom + m.row_gap;
         if (l.kill_hit.left <= x and x < l.kill_hit.right and
             l.kill_hit.top <= y and y < l.kill_hit.bottom) return i;
@@ -1088,7 +1150,7 @@ pub fn rowAt(
     var cy = region.top - self.scroll;
     for (rows, 0..) |row, i| {
         const subs = chooser_sessions.sublineCount(row.session);
-        const l = chooser_sessions.rowLayout(m, region.left, cy, region.width(), subs);
+        const l = chooser_sessions.rowLayout(m, region.left, cy, region.width(), subs, self.cpu_column);
         cy = l.card.bottom + m.row_gap;
         if (l.card.left <= x and x < l.card.right and
             l.card.top <= y and y < l.card.bottom) return i;

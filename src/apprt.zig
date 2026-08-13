@@ -281,6 +281,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_sessions.zig");
 
+    // Pure win32 machine-chooser per-session CPU meter — the column's
+    // geometry, the bar's fill and tone, the number's spelling, and the bounded
+    // store one pushed frame lands in (T462), same no-OS-imports deal.
+    _ = @import("apprt/win32/chooser_cpu.zig");
+
     // Pure win32 machine connection-pool bookkeeping — endpoint keying, the
     // lease refcount and the re-dial policy behind one warm connection per
     // remote machine (T461), same no-OS-imports deal.

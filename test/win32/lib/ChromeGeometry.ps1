@@ -660,6 +660,14 @@ function Get-TestChooserRosterGeometry {
     $killX = $right - $padX - [int]([math]::Floor($killW / 2))
     $killY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
 
+    # The per-session CPU meter's column (T462), when the machine's agent can
+    # serve the pushed stream: the 24 DIP bar sits after the card padding, the
+    # 12 DIP liveness-dot column and the 8 DIP text gap, centred on the title's
+    # line box. A BAND rather than a point, because which row is the busy one
+    # depends on session creation order - a scan across the band answers "is any
+    # meter drawn" without pinning a row.
+    $meterLeft = $left + $padX + (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 8 $s)
+
     return [pscustomobject]@{
         Left  = $left; Top = $top; Right = $right; Bottom = $bottom
         KillX = $killX; KillY = $killY
@@ -667,5 +675,7 @@ function Get-TestChooserRosterGeometry {
         # scale-step in from the card's left edge, on the title's line.
         CardX = $left + (Get-TestChromeDip 4 $s)
         CardY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
+        MeterLeft = $meterLeft
+        MeterRight = $meterLeft + (Get-TestChromeDip 24 $s)
     }
 }

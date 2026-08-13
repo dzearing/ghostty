@@ -1724,6 +1724,37 @@ roster, resume one session or rebuild the whole topology locally. Cross-machine
 Resume shipped on macOS 2026-07-16; on Windows, browse/Resume-one landed with
 T318–T320 and cross-machine Restore All with T336 (2026-08-02).
 
+**Every session row carries a live CPU meter**, on both platforms — a bar that
+saturates at ONE core plus the number, per-core over the session's whole process
+tree (top(1)'s convention, so four busy threads read ~400%). It is what tells the
+build chewing a core from the five shells sitting at a prompt. Three rules,
+Mac's, and each is load-bearing:
+
+- **The agent decides the cadence.** The client asks (2s) and the agent floors,
+  stretches under its own load and caps (`Server.throttledIntervalMs`, 0.5–10s),
+  reporting what it actually used in EVERY frame. The UI reads that number rather
+  than assuming its own, which is what keeps a throttled stream distinguishable
+  from a stalled one. A fixed client-side poll would hit a box hardest exactly
+  when it can least afford it.
+- **0% is shown, not hidden.** Hiding idle rows makes "idle" and "the meter is
+  broken" look identical, and it removes the baseline that makes a busy row
+  obvious — 400% only reads as alarming next to neighbours at 0. A missing meter
+  means exactly one thing: no reading for that session.
+- **The column is reserved for the MACHINE, never per row**, so every title
+  starts at the same x and the meters stack into a scannable strip. An agent that
+  never advertised `capability.session_cpu` reserves nothing and draws nothing —
+  the gate is not politeness, since an unknown opcode is a FATAL framing error to
+  an older agent, so subscribing blind would kill a working connection.
+
+Windows subscribes on the same warm connection everything else about that machine
+rides (below): the local agent's, or the pool's for a remote one, torn down when
+the selection moves and before the lease is released (T462 —
+`SessionCpuProbe.zig`, with the column geometry, the fill, the tone and the
+number pure in `chooser_cpu.zig`, asserted at 1.0/1.25/1.5/2.0). Acceptance:
+`test/win32/chooser-session-cpu.ps1`, whose control makes the same agent advertise
+like an older one (`GHOSTTY_AGENT_SUPPRESS_CAPS=session_cpu`) and requires the
+meter to vanish rather than freeze, wedge, or invent a number.
+
 **Selecting a machine dials it ONCE, and everything about that machine rides the
 same connection** (T461 — the win32 half of Mac's
 `MachineConnectionPool.swift`). Every roster refetch of a remote row used to dial

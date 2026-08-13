@@ -61,6 +61,7 @@ const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const text_search = @import("text_search.zig");
 const SessionRoster = @import("SessionRoster.zig");
+const SessionCpuProbe = @import("SessionCpuProbe.zig");
 const machine_pool = @import("machine_pool.zig");
 const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
@@ -263,6 +264,13 @@ roster: SessionRoster,
 /// machine the user clicked through. Released in `destroyState`, so a connection
 /// can never outlive the dialog that wanted it.
 pool_lease: ?*MachineConnectionPool.Lease = null,
+
+/// The selected machine's pushed per-session CPU stream (T462). Follows the
+/// SELECTION, exactly as the roster and the lease do — one subscription at a
+/// time, and none at all once the dialog is gone. Torn down in `releaseOwned`
+/// BEFORE the lease, because the pool may free the connection the moment the
+/// last lease goes.
+cpu: SessionCpuProbe = .{},
 
 /// A cross-machine Restore All is dialing on a worker thread (T339). It gates
 /// a second press: the first one's dials are still in flight, and pressing
@@ -1486,6 +1494,11 @@ fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void 
     const p = self.pal();
     var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const visible = self.roster.visible(self.window.app, &rows);
+    // The newest pushed reading per row (T462). Filled here rather than inside
+    // `visible` because the stream is a different subscription with a different
+    // lifetime from the roster — and only the PAINT needs it, so the hit tests
+    // pay nothing for it.
+    for (rows[0..visible.len]) |*r| r.cpu = self.cpu.get(r.session.id);
     self.roster.paint(.{
         .hdc = hdc,
         .region = l.sessions,
@@ -1542,7 +1555,63 @@ fn syncRoster(self: *MachineChooser) void {
     // The lease FIRST: `show` fetches, and a fetch against a remote machine
     // borrows the pooled connection this lease is what dials.
     self.syncPoolLease(target, remote);
-    if (self.roster.show(self.window.app, self.id, target, remote)) self.refreshSessions();
+    // Then the meter, on whatever connection this machine already has: the
+    // LOCAL agent's warm one, or — for a remote machine — nothing yet, because
+    // the pool's dial answers through `onPoolChange` and that is where the
+    // subscription lands.
+    const cpu_moved = switch (target) {
+        .local => self.cpu.retarget(
+            self.window.app.msg_hwnd,
+            self.id,
+            self.window.app.local_agent.sharedConnectionIfWarm(),
+        ),
+        .none => self.cpu.retarget(self.window.app.msg_hwnd, self.id, null),
+        // A machine the pool has warm already (a re-selection) never produces a
+        // second dial and therefore never notifies, so ask the pool directly
+        // rather than waiting for an edge that has already gone past.
+        .remote => self.syncRemoteCpu(),
+    };
+    var changed = self.roster.show(self.window.app, self.id, target, remote);
+    if (self.syncCpuColumn() or cpu_moved) changed = true;
+    if (changed) self.refreshSessions();
+}
+
+/// Subscribe the meter to a REMOTE machine's pooled connection when there is
+/// one. Borrowing for the length of this call is what makes it safe: the entry's
+/// refcount holds the transport up while we install the handler, and the
+/// chooser's own lease is what keeps it up afterwards.
+fn syncRemoteCpu(self: *MachineChooser) bool {
+    const ep = self.roster.endpoint() orelse
+        return self.cpu.retarget(self.window.app.msg_hwnd, self.id, null);
+    const entry = self.window.app.machine_pool.borrow(ep) orelse
+        return self.cpu.retarget(self.window.app.msg_hwnd, self.id, null);
+    defer entry.release();
+    return self.cpu.retarget(self.window.app.msg_hwnd, self.id, entry.conn());
+}
+
+/// Keep the roster's reserved CPU column in step with whether the meter can be
+/// served at all. ONE place decides it, because the paint and the hit tests both
+/// read it and a disagreement moves every row's title out from under the clicks.
+/// Returns true when it moved.
+fn syncCpuColumn(self: *MachineChooser) bool {
+    const want = self.cpu.supported();
+    if (self.roster.cpu_column == want) return false;
+    self.roster.cpu_column = want;
+    return true;
+}
+
+/// GUI thread: a pushed CPU frame landed for `chooser_id` (T462). Routed by id
+/// like the roster's own reply — a chooser that closed in the meantime simply
+/// finds no match, which is why the frame is announced on the app's
+/// message-only window and not at a dialog HWND.
+pub fn onSessionCpu(app: *App, chooser_id: u64) void {
+    for (app.windows.items) |win| {
+        const chooser = win.machine_chooser orelse continue;
+        if (chooser.id != chooser_id) continue;
+        _ = chooser.syncCpuColumn();
+        chooser.refreshSessions();
+        return;
+    }
 }
 
 /// Hold a lease on exactly the machine the roster is pointed at (T461) — one
@@ -1570,6 +1639,12 @@ fn syncPoolLease(
         if (want) |k| {
             if (std.mem.eql(u8, lease.key(), k)) return;
         }
+        // The CPU subscription rides this machine's connection, and releasing
+        // the last lease FREES that connection right here — so the handler comes
+        // off while the socket is still alive (T462). The same ordering
+        // `releaseOwned` uses, for the same reason; doing it after the release
+        // would unsubscribe through a freed transport.
+        self.cpu.stop();
         self.window.app.machine_pool.release(lease);
         self.pool_lease = null;
     }
@@ -1597,9 +1672,18 @@ fn onPoolChange(
     failure: MachineConnectionPool.Failure,
 ) void {
     const self: *MachineChooser = @ptrCast(@alignCast(ctx));
-    if (self.roster.onPoolChange(self.window.app, self.id, conn, failure)) {
-        self.refreshSessions();
+    var changed = self.roster.onPoolChange(self.window.app, self.id, conn, failure);
+    // The meter rides the same connection. A live one is where the subscription
+    // goes; a null one means the pool is about to FREE it, so the handler is
+    // forgotten rather than unsubscribed — writing down a socket its owner has
+    // already given up on is the one thing this ordering exists to avoid.
+    if (conn) |c| {
+        if (self.cpu.retarget(self.window.app.msg_hwnd, self.id, c)) changed = true;
+    } else {
+        self.cpu.forget();
     }
+    if (self.syncCpuColumn()) changed = true;
+    if (changed) self.refreshSessions();
 }
 
 /// Repaint the detail pane after the roster changed. The subtitle's count lives
@@ -3295,6 +3379,10 @@ fn destroyState(self: *MachineChooser) void {
 /// riding the pooled connection is fine too — its borrow holds the transport
 /// alive on its own, which is what refcounting the entry buys.
 fn releaseOwned(self: *MachineChooser) void {
+    // The CPU subscription FIRST: the pool may free the machine's connection the
+    // moment the last lease goes, and a handler still registered on it would
+    // then fire into freed memory (T462).
+    self.cpu.stop();
     if (self.pool_lease) |lease| {
         self.window.app.machine_pool.release(lease);
         self.pool_lease = null;

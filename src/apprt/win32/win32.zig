@@ -1876,6 +1876,11 @@ pub const DT_END_ELLIPSIS: u32 = 0x8000;
 /// Path column's `.truncationMode(.head)` on the Mac.
 pub const DT_PATH_ELLIPSIS: u32 = 0x4000;
 pub const DT_NOPREFIX: u32 = 0x800;
+/// Draw past the rect instead of clipping to it. The chooser's CPU meter uses
+/// it so a four-digit reading (ten fully busy cores in one session) runs into
+/// the slack beside its fixed slot rather than being cut mid-glyph — the slot is
+/// sized for the readings that happen, not for the theoretical maximum (T462).
+pub const DT_NOCLIP: u32 = 0x100;
 
 // STATIC control styles.
 pub const SS_NOPREFIX: u32 = 0x80;

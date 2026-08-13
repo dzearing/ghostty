@@ -21,6 +21,7 @@ const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const SessionRoster = @import("SessionRoster.zig");
+const SessionCpuProbe = @import("SessionCpuProbe.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
@@ -7228,6 +7229,15 @@ fn msgWndProc(
             const res: *SessionRoster.Result = @ptrFromInt(wparam);
             MachineChooser.onSessions(app, res);
         }
+        return 0;
+    }
+
+    if (msg == SessionCpuProbe.WM_APP_CHOOSER_SESSION_CPU) {
+        // wparam = the chooser id a pushed per-session CPU frame belongs to
+        // (T462). An integer payload with nothing to free, and routed by id for
+        // the same reason the roster's reply is: a chooser that closed first
+        // must not be written through, and a dialog HWND can be recycled.
+        MachineChooser.onSessionCpu(app, @intCast(wparam));
         return 0;
     }
 

@@ -9,6 +9,44 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T462 - the chooser's session rows have a live CPU meter.** The
+  agent has measured each session's whole process tree and PUSHED the numbers
+  since `session_cpu` (0x79-0x7b) landed, and the Mac chooser has drawn them all
+  along; win32 was the only side that never subscribed, so its rows carried a
+  blank where the answer to "which of these is doing anything" lives. It rides
+  T461's warm connection - the local agent's, or the pool's for a remote machine
+  - and moves with the selection, torn down BEFORE the lease is released because
+  the pool may free the connection the moment the last lease goes. Three things
+  are Mac's and were ported rather than re-decided: the bar saturates at ONE core
+  (a bar scaled to ncpu leaves the common one-busy-core case a sliver, which is
+  the case the meter exists to make obvious) and the number carries the rest; 0%
+  is DRAWN, since hiding idle rows makes "idle" and "broken" identical and
+  removes the baseline that makes 400% read as alarming; and the column is
+  reserved for the MACHINE, never per row, so titles line up and the meters stack
+  into a strip. The cadence is the agent's and is read out of every frame rather
+  than assumed - it floors, stretches under its own load and caps - which is what
+  keeps a throttled stream distinguishable from a stalled one. New pure
+  `chooser_cpu.zig` (column geometry, fill, tone, spelling, and the bounded store
+  a pushed frame lands in) asserted at 1.0/1.25/1.5/2.0 with the contrast floors;
+  `SessionCpuProbe.zig` owns the subscription, copies the borrowed rows on the
+  reader thread and posts to the app's message-only window routed BY CHOOSER ID,
+  the same discipline the roster's reply follows. The acceptance script's control
+  is the interesting half: `GHOSTTY_AGENT_SUPPRESS_CAPS=session_cpu` makes this
+  same agent advertise like one too old to serve the stream, and the meter must
+  vanish - no column, no bar, zero frames, chooser still answering - because an
+  unknown opcode is a FATAL framing error to an older agent, so the capability
+  gate is what keeps a working connection alive rather than politeness. Two
+  surprises worth keeping: the first frame of any stream is a baseline with no
+  delta behind it so every reading in it is 0 (which is why the script waits for
+  three, not one), and a pixel COUNT could not tell a meter from the session
+  TITLE - ClearType fringes the glyph edges warm, and the title starts exactly
+  where the column would be when there is none, so the oracle is the longest
+  unbroken RUN of tinted pixels (30px with the meter, 1px without). T812-T814 filed: the meter has
+  no tooltip (Mac's is where the units and the throttle notice live), it freezes
+  silently if the LOCAL agent's shared connection is replaced under an open
+  chooser, and `unsubscribe*` returning does not actually prove no handler is in
+  flight - a claim three call sites already lean on.
+
 - 2026-08-12 - **T757 (T801, T802 filed) - a Windows path printed into a pane
   is a link now.** The shared link regex (`src/config/url.zig`, one string for
   both frontends, wired in as `Config.default`'s only `link`) had three

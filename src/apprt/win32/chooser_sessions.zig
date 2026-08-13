@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const chooser_cpu = @import("chooser_cpu.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -443,6 +444,11 @@ pub const Metrics = struct {
     /// hollow ring and a live row's filled dot share one grid.
     dot_col_w: i32,
     dot_d: i32,
+    /// The per-session CPU meter's column and the gap to the text after it
+    /// (T462). Reserved only when the machine's agent can serve the stream, so
+    /// an older agent leaves no dead gutter — see `rowLayout`'s `show_cpu`.
+    cpu_col_w: i32,
+    cpu_gap: i32,
     /// Column -> text.
     text_gap: i32,
     title_h: i32,
@@ -482,6 +488,8 @@ pub fn metrics(scale: f32) Metrics {
         .radius = px(8, scale),
         .dot_col_w = px(12, scale),
         .dot_d = px(8, scale),
+        .cpu_col_w = chooser_cpu.columnWidth(scale),
+        .cpu_gap = chooser_cpu.metrics(scale).col_gap,
         .text_gap = px(8, scale),
         .title_h = body.height + px(4, scale),
         .subline_h = caption.height + px(4, scale),
@@ -525,6 +533,12 @@ pub fn rowHeight(m: Metrics, sublines: i32) i32 {
 pub const RowLayout = struct {
     card: Rect,
     dot: Rect,
+    /// The CPU meter's reserved column, on the title's line box (T462). Empty
+    /// (zero-width) when the machine's agent cannot serve the stream — a caller
+    /// draws a meter into it only when it has a reading, but the SPACE is a
+    /// property of the machine, so every row of a supported machine reserves it
+    /// and their titles all start at the same x.
+    cpu: Rect,
     title: Rect,
     cwd: Rect,
     argv: Rect,
@@ -535,7 +549,11 @@ pub const RowLayout = struct {
     kill_hit: Rect,
 };
 
-pub fn rowLayout(m: Metrics, x: i32, y: i32, w: i32, sublines: i32) RowLayout {
+/// `show_cpu` reserves the meter column between the dot and the text (T462).
+/// It is a statement about the MACHINE — its agent advertised the `session_cpu`
+/// capability — never about the row, so it is the same for every card in one
+/// roster and the meters stack into a scannable strip.
+pub fn rowLayout(m: Metrics, x: i32, y: i32, w: i32, sublines: i32, show_cpu: bool) RowLayout {
     const h = rowHeight(m, sublines);
     const card: Rect = .{ .left = x, .top = y, .right = x + w, .bottom = y + h };
 
@@ -560,7 +578,16 @@ pub fn rowLayout(m: Metrics, x: i32, y: i32, w: i32, sublines: i32) RowLayout {
         .bottom = kill.bottom + grow,
     };
 
-    const text_left = card.left + m.pad_x + m.dot_col_w + m.text_gap;
+    const cpu_left = card.left + m.pad_x + m.dot_col_w + m.text_gap;
+    const cpu_top = card.top + m.pad_y;
+    const cpu: Rect = if (show_cpu) .{
+        .left = cpu_left,
+        .top = cpu_top,
+        .right = cpu_left + m.cpu_col_w,
+        .bottom = cpu_top + m.title_h,
+    } else .{ .left = cpu_left, .top = cpu_top, .right = cpu_left, .bottom = cpu_top + m.title_h };
+
+    const text_left = if (show_cpu) cpu.right + m.cpu_gap else cpu_left;
     const text_right = kill.left - m.kill_gap;
     const title: Rect = .{
         .left = text_left,
@@ -603,6 +630,7 @@ pub fn rowLayout(m: Metrics, x: i32, y: i32, w: i32, sublines: i32) RowLayout {
             .right = dot_left + m.dot_d,
             .bottom = dot_top + m.dot_d,
         },
+        .cpu = cpu,
         .title = title,
         .cwd = cwd,
         .argv = argv,
@@ -805,7 +833,7 @@ test "row geometry nests inside the card at every scale" {
         const m = metrics(scale);
         const w = px(560, scale);
         for ([_]i32{ 0, 1, 2 }) |subs| {
-            const r = rowLayout(m, 100, 40, w, subs);
+            const r = rowLayout(m, 100, 40, w, subs, false);
             try testing.expectEqual(rowHeight(m, subs), r.card.height());
 
             // Nothing escapes the card.
@@ -833,12 +861,12 @@ test "row geometry nests inside the card at every scale" {
 
 test "row geometry: sublines stack in order and only when present" {
     const m = metrics(1.25);
-    const one = rowLayout(m, 0, 0, 400, 1);
+    const one = rowLayout(m, 0, 0, 400, 1, false);
     try testing.expect(one.cwd.height() > 0);
     try testing.expectEqual(@as(i32, 0), one.argv.height());
     try testing.expectEqual(one.title.bottom + m.line_gap, one.cwd.top);
 
-    const two = rowLayout(m, 0, 0, 400, 2);
+    const two = rowLayout(m, 0, 0, 400, 2, false);
     try testing.expectEqual(two.cwd.bottom + m.line_gap, two.argv.top);
     try testing.expect(two.card.height() > one.card.height());
 }
@@ -848,7 +876,7 @@ test "every spacing number is on the 4 DIP scale" {
     // looks fine at 1.0, which is exactly why this is asserted and not intended.
     const allowed = [_]f32{ 2, 4, 8, 12, 16, 24 };
     const m = metrics(1.0);
-    const values = [_]i32{ m.pad_x, m.pad_y, m.row_gap, m.radius, m.dot_col_w, m.dot_d, m.text_gap, m.line_gap, m.badge_gap, m.badge_pad_x, m.kill_gap };
+    const values = [_]i32{ m.pad_x, m.pad_y, m.row_gap, m.radius, m.dot_col_w, m.dot_d, m.cpu_gap, m.text_gap, m.line_gap, m.badge_gap, m.badge_pad_x, m.kill_gap };
     for (values) |v| {
         var ok = false;
         for (allowed) |a| {
@@ -858,9 +886,47 @@ test "every spacing number is on the 4 DIP scale" {
     }
 }
 
+test "the CPU column is reserved for the machine, not for the row (T462)" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = metrics(scale);
+        const w = px(560, scale);
+        const off = rowLayout(m, 100, 40, w, 1, false);
+        const on = rowLayout(m, 100, 40, w, 1, true);
+
+        // Without the column nothing is reserved and the text starts where it
+        // always did — an agent that cannot serve the stream leaves no gutter.
+        try testing.expectEqual(@as(i32, 0), off.cpu.width());
+        try testing.expectEqual(off.cpu.right, off.title.left);
+
+        // With it, the column sits between the dot and the text, clearing both
+        // by a real gap measured against PAINTED edges (§1.2).
+        try testing.expectEqual(m.cpu_col_w, on.cpu.width());
+        try testing.expect(on.cpu.left - off.dot.right >= m.text_gap);
+        try testing.expectEqual(m.cpu_gap, on.title.left - on.cpu.right);
+        try testing.expectEqual(off.title.left + m.cpu_col_w + m.cpu_gap, on.title.left);
+
+        // It rides the TITLE's line box, so a three-line card's meter stays
+        // beside the name instead of floating in the middle.
+        try testing.expectEqual(on.title.top, on.cpu.top);
+        try testing.expectEqual(on.title.bottom, on.cpu.bottom);
+
+        // Reserving it never changes the card's height, nor where the sublines
+        // and the Kill button sit — only where the text column starts.
+        try testing.expectEqual(off.card.height(), on.card.height());
+        try testing.expectEqual(off.kill.left, on.kill.left);
+        try testing.expect(on.cpu.right <= on.card.right);
+
+        // Every card of the same roster reserves the same width, whatever it
+        // holds: a column that collapses on some rows is not a column.
+        const three_line = rowLayout(m, 100, 40, w, 2, true);
+        try testing.expectEqual(on.cpu.width(), three_line.cpu.width());
+        try testing.expectEqual(on.title.left, three_line.title.left);
+    }
+}
+
 test "the badge capsule is centered on the title line and pads both sides" {
     const m = metrics(1.5);
-    const r = rowLayout(m, 0, 0, 600, 1);
+    const r = rowLayout(m, 0, 0, 600, 1, false);
     const box = badgeBox(m, r.title.left + 100, r.title, 40);
     try testing.expectEqual(@as(i32, 40) + m.badge_pad_x * 2, box.width());
     try testing.expectEqual(m.badge_h, box.height());
