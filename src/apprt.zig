@@ -177,6 +177,11 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_content.zig");
 
+    // Pure win32 git-diff viewer logic — the `git-status:`/`git-diff:` spec,
+    // the git invocations it shapes, the `-z` output parsing and the
+    // `window.__viewer` diff calls (T463), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_diff.zig");
+
     // Pure win32 viewer address-bar logic — Windows-shaped file-path
     // classification, omnibox completion, display text (T159), same
     // no-OS-imports deal.

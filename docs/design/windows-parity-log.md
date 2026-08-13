@@ -9,6 +9,47 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-12 - **T463 - `--view=git-status:` / `--view=git-diff:<revspec>` render
+  a diff on Windows.** The CLI has accepted both schemes since the merge, and the
+  page that draws a diff (`src/viewer/diff.js`, 925 lines) has been in the bundle
+  just as long; what was missing was every inch between them, so the command
+  opened a pane that tried to read a FILE called `git-diff:main...HEAD` and
+  showed an error card. Three pieces, split the way every win32 port of a Swift
+  feature is: pure `viewer_diff.zig` (the spec and its canonical location, the
+  table of git invocations, the `-z` output iterators, and the two
+  `window.__viewer` calls), `ViewerDiffProbe.zig` (one worker slot per pane doing
+  repo root, default base, file list and one file's patch off the message loop
+  the terminal next door draws on), and `Mode.diff` as a third thing the bundled
+  template renders. Four things worth keeping. **`cli/view_arg.isDiffView` is
+  imported, not repeated** - the CLI's "do not path-resolve this" test and the
+  viewer's "this is a diff" test are now one function, so `git-diff-notes.md`
+  cannot be a file to one and a revspec to the other. **A non-zero git exit is
+  not an empty diff**: `git diff nosuchref..HEAD` prints nothing and fails, and
+  the whole point of the task's title is that reading that as "no changes" is a
+  swallowed error - so `git_run.captureAlloc` reports the exit status, and a bad
+  revspec paints "git could not produce this diff" naming the spec. That new
+  capture exists for a second reason that is a deadlock rather than a size limit:
+  the fixed-buffer `capture` stops on a full buffer, which leaves git blocked
+  writing into a pipe nobody drains and the `wait` after it never returns - not
+  theoretical when a whole-repository `--name-status` is megabytes. **The
+  working-tree poll redraws only when the list MOVED**, which is what keeps a
+  `git-status:` pane from resetting its own scroll every two seconds, and the
+  acceptance script asserts the quiet half as well as the live half. And the
+  oracle: `+list --json` cannot see inside a WebView2 and the suite runs on a
+  desktop where nothing can screenshot one, so `viewer-diff.ps1` (38 assertions)
+  reads the app's own log - and the win32 lane's live host-floor test then reads
+  the rendered DOM back (`"1|true|true|Working tree … · 2 files +3 −0"`), which is
+  the part that proves the log line was true. Surprises: a `Probe.complete` that
+  REPLACES the file list leaked the old list's backing array on every poll (found
+  by the lane's own gpa, not by reading); and a PowerShell helper named `Git`
+  calling `& git` calls itself, silently, leaving `$LASTEXITCODE` empty so it
+  reads exactly like a box with no git installed. Filed from this work: **T817**
+  (no next/previous-change or unified⇄side-by-side controls yet - the page half of
+  both already ships), **T818** (the git calls have no deadline; Mac's has a 15s
+  watchdog), and **T464**/**T595** are now unblocked rather than pre-emptive -
+  until the file tree lands a win32 diff pane opens its FIRST file and stays
+  there.
+
 - 2026-08-12 - **T462 - the chooser's session rows have a live CPU meter.** The
   agent has measured each session's whole process tree and PUSHED the numbers
   since `session_cpu` (0x79-0x7b) landed, and the Mac chooser has drawn them all

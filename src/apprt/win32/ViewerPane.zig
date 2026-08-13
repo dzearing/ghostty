@@ -1,5 +1,5 @@
 //! A viewer pane: a split-tree leaf that renders CONTENT (a markdown/text
-//! file or a website) instead of a terminal. CLAUDE.md's "Viewer Panes"
+//! file or a website) instead of a terminal. docs/claude/viewers.md's "Viewer Panes"
 //! section is the cross-platform contract; this is the win32 half.
 //!
 //! **The host floor (T373).** The pane owns a `GhozttyViewer` child window and,
@@ -79,6 +79,8 @@ const ViewerFeedbackSend = @import("ViewerFeedbackSend.zig");
 const viewer_worktree = @import("viewer_worktree.zig");
 const git_run = @import("git_run.zig");
 const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
+const ViewerDiffProbe = @import("ViewerDiffProbe.zig");
+const viewer_diff = @import("viewer_diff.zig");
 const build_config = @import("../../build_config.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
@@ -126,6 +128,11 @@ pub const WM_APP_VIEWER_FOCUS_ADDRESS: u32 = w32.WM_APP + 22;
 /// bar can be re-laid and repainted.
 pub const WM_APP_VIEWER_WORKTREE: u32 = w32.WM_APP + 23;
 
+/// The diff worker's "git has answered" post (T463). A listing is several
+/// process spawns and a patch is one more, so only the RESULT lands here, on
+/// the GUI thread, where it can be pushed into the page.
+pub const WM_APP_VIEWER_DIFF: u32 = w32.WM_APP + 26;
+
 /// The feedback sender's "the report is filed (or is not)" post (T636). Its
 /// worker runs `git rev-parse` twice, reads the quoted file and writes the
 /// report folder — all blocking work with no business on the message loop the
@@ -157,6 +164,20 @@ const reload_timer_id: usize = 1;
 /// rectangle needs — the same reason Mac watches with an app-local event
 /// monitor rather than a tracking area.
 const nav_timer_id: usize = 2;
+
+/// The working-tree poll's timer id, in the host window's own timer space
+/// (T463).
+const diff_timer_id: usize = 4;
+
+/// How often a `git-status:` pane re-checks the working tree, matching Mac's
+/// `diffRefreshInterval`.
+///
+/// A poll rather than a file watcher, because the thing being watched is a
+/// whole REPOSITORY: a watcher would have to cover every tracked file, the
+/// index and HEAD, and would still miss a `git add` performed in another
+/// checkout of the same repo. The page is only redrawn when the file list
+/// actually moved, so an idle pane costs one `git diff` and no repaint.
+const diff_poll_ms: u32 = 2000;
 
 /// How long the pane waits for the writes to stop before re-reading, matching
 /// Mac's 0.1s (`ViewerView.scheduleReload`). An editor's save is several
@@ -433,6 +454,30 @@ nav: ?*ViewerNavBar = null,
 /// allocator to hand it — which is every pane before `start`, and every unit
 /// test that drives a bare pane.
 worktree: ?ViewerWorktreeProbe = null,
+
+/// Everything a `git-status:` / `git-diff:<revspec>` pane asks git for, and the
+/// worker that asks off the UI thread (T463). Null on the same terms as
+/// `worktree` — a pane with no allocator and no host window runs no git.
+diff_probe: ?ViewerDiffProbe = null,
+
+/// Which file of the current diff the page is showing, as an index into the
+/// probe's list. Null before the first patch has been asked for.
+///
+/// Kept as a PATH as well, because a refresh rebuilds the list and the index
+/// alone would then name whatever moved into that slot — a file that was
+/// staged out from under the reader.
+diff_file: ?[]u8 = null,
+
+/// Whether the page has been given a listing since it last loaded. A poll only
+/// redraws when the file list MOVED, so without this a freshly-loaded page
+/// whose diff has not changed would be handed nothing and stay blank — Mac's
+/// `force` flag, for the same case.
+diff_pushed: bool = false,
+
+/// The layout the diff page renders in — `unified` or `split`. In-session for
+/// now; the controls that change it live in the nav bar, which the win32 diff
+/// pane does not have yet (filed separately).
+diff_style: []const u8 = "unified",
 
 /// The feedback composer (T634). Created hidden alongside the nav bar, in
 /// `ensureNav`, because that is the one place with both halves it needs (a
@@ -717,6 +762,14 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         sender.deinit();
         self.feedback_send = null;
     }
+    // Same ordering, same reason (T463): `deinit` JOINS whatever git worker is
+    // out, and its completion post dies with the window it was addressed to.
+    if (self.diff_probe) |*probe| {
+        probe.deinit();
+        self.diff_probe = null;
+    }
+    if (self.diff_file) |f| alloc.free(f);
+    self.diff_file = null;
     // Destroy the dim overlay before the host window (its owner) is gone —
     // the same ordering Surface.deinit keeps for its own (T380).
     if (self.dim_overlay) |d| {
@@ -878,6 +931,14 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
     if (self.feedback_send == null) {
         self.feedback_send = ViewerFeedbackSend.init(alloc);
         self.feedback_send.?.attach(hwnd, WM_APP_VIEWER_FEEDBACK_SENT);
+    }
+    // ...and so does the diff loader (T463). Its first listing is asked for by
+    // the page-ready call rather than here, because a listing pushed before the
+    // template exists has nowhere to land.
+    if (self.diff_probe == null) {
+        self.diff_probe = ViewerDiffProbe.init(alloc);
+        self.diff_probe.?.attach(hwnd, WM_APP_VIEWER_DIFF);
+        self.syncDiffPoll();
     }
     // The composer (T634) needs the same two halves, and it is built HERE
     // rather than on first open for one concrete reason: it edits itself from
@@ -1314,7 +1375,18 @@ const location_cap = 4096;
 /// already follow. That is not an edge case here, it is the NORMAL path: a
 /// pane is constructed and told where to go long before a browser process
 /// finishes starting.
-pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.Error!void {
+pub fn navigate(self: *ViewerPane, alloc: Allocator, requested: []const u8) Allocator.Error!void {
+    // A diff location is CANONICALIZED on the way in (T463): `git-status` and
+    // `git-status:` are one location, and `git-diff: main...HEAD ` is the same
+    // diff as `git-diff:main...HEAD`. One spelling is what the address bar
+    // shows, what `+list --json` reports and what the manifest restores — and
+    // the pane compares locations to decide what to re-run.
+    var canon_buf: [location_cap]u8 = undefined;
+    const url: []const u8 = if (viewer_diff.parse(requested)) |spec|
+        (spec.canonicalLocation(&canon_buf) orelse requested)
+    else
+        requested;
+
     const dup = try alloc.dupeZ(u8, url);
     if (self.location) |l| alloc.free(l);
     self.location = dup;
@@ -1391,6 +1463,10 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, url: []const u8) Allocator.
     self.refreshWorktree();
     self.applyNavigation();
     self.syncWatcher(alloc);
+    // A diff's content is a repository, not a file, so its "watcher" is a poll
+    // and its first load happens when the template says it is ready (T463).
+    self.diff_pushed = false;
+    self.syncDiffPoll();
 }
 
 /// Re-derive the read grant and the page URL a rendered `.html` file loads
@@ -1490,6 +1566,196 @@ fn syncWatcher(self: *ViewerPane, alloc: Allocator) void {
     _ = w32.KillTimer(hwnd, reload_timer_id);
     const path = self.file_path orelse return;
     self.watcher.start(alloc, hwnd, WM_APP_VIEWER_RELOAD, path);
+}
+
+// -------------------------------------------------------------------------
+// Git diff panes (T463; Mac's `refreshDiff` / `pushDiffListing` /
+// `pushDiffFile`)
+// -------------------------------------------------------------------------
+
+/// The spec this pane is showing, or null when it is not showing a diff.
+/// Borrows from `location`.
+fn diffSpec(self: *const ViewerPane) ?viewer_diff.Spec {
+    if (self.mode != .diff) return null;
+    return viewer_diff.parse(self.location orelse return null);
+}
+
+/// Start (or restart) the working-tree poll, and stop it everywhere else.
+///
+/// Only `git-status:` polls: a commit or a range is a fixed pair of trees and
+/// re-running it would spend a process every two seconds to redraw the same
+/// bytes. Driven from the same places `syncWatcher` is, because it is the same
+/// question for a pane whose content is a repository rather than a file.
+fn syncDiffPoll(self: *ViewerPane) void {
+    const hwnd = self.hwnd orelse return;
+    _ = w32.KillTimer(hwnd, diff_timer_id);
+    const spec = self.diffSpec() orelse return;
+    if (!spec.tracksWorkingTree()) return;
+    _ = w32.SetTimer(hwnd, diff_timer_id, diff_poll_ms, null);
+}
+
+/// Ask git for this pane's file list. Everything below lands later, on
+/// `WM_APP_VIEWER_DIFF`.
+fn refreshDiff(self: *ViewerPane) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    if (self.mode != .diff) return;
+    probe.requestListing(self.location orelse return, self.origin_directory);
+}
+
+/// A listing arrived: push the header, then open a file so the pane is not a
+/// summary over an empty page.
+fn applyDiffListing(self: *ViewerPane, alloc: Allocator) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    const spec = self.diffSpec() orelse return;
+    const resolved = probe.resolvedSpec(self.location orelse "") orelse spec;
+
+    var files: usize = 0;
+    var additions: u64 = 0;
+    var deletions: u64 = 0;
+    for (probe.files.items) |f| {
+        files += 1;
+        additions += f.additions;
+        deletions += f.deletions;
+    }
+
+    var subtitle_buf: [512]u8 = undefined;
+    var message_buf: [512]u8 = undefined;
+    var detail_buf: [1024]u8 = undefined;
+    var listing: viewer_diff.Listing = .{
+        .title = resolved.title(),
+        .subtitle = viewer_diff.subtitle(&subtitle_buf, resolved, probe.repo),
+        .file_count = files,
+        .additions = additions,
+        .deletions = deletions,
+        .style = self.diff_style,
+    };
+    if (probe.failure) |*f| {
+        const view = f.view();
+        listing.message = view.title();
+        listing.detail = view.detail(&detail_buf);
+    } else if (files == 0) {
+        listing.message = viewer_diff.emptyMessage(&message_buf, resolved);
+    }
+
+    // The acceptance oracle. `+list` cannot see inside a WebView2 and the suite
+    // runs on a background desktop, so the GUI's own stderr is where "this pane
+    // really rendered this diff" has to be readable (the T633 rule, same shape).
+    log.info("viewer diff pane={s} spec={s} repo={s} files={d} +{d} -{d} status={s}", .{
+        self.paneId(),
+        self.location orelse "",
+        probe.repo orelse "<none>",
+        files,
+        additions,
+        deletions,
+        listing.message orelse "ok",
+    });
+
+    const js = viewer_diff.setDiffListingCall(alloc, listing) catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+
+    // Nothing to open, and nothing to keep: a pane whose diff emptied out must
+    // not keep claiming to be showing a file that left it.
+    if (files == 0) {
+        if (self.diff_file) |f| alloc.free(f);
+        self.diff_file = null;
+        return;
+    }
+    self.openDiffFile(alloc, self.reselectDiffFile(), null);
+}
+
+/// Which file the page should be showing after a refresh: the same one when it
+/// is still in the diff (a poll must not yank the reader somewhere else), else
+/// the first — the pane has no file tree yet, so the first file is what makes a
+/// freshly-opened diff show a diff rather than "select a file".
+fn reselectDiffFile(self: *const ViewerPane) usize {
+    const probe = if (self.diff_probe) |*p| p else return 0;
+    const want = self.diff_file orelse return 0;
+    for (probe.files.items, 0..) |f, i| {
+        if (std.mem.eql(u8, f.path, want)) return i;
+    }
+    return 0;
+}
+
+/// Ask git for one file's patch, remembering which file that is.
+fn openDiffFile(self: *ViewerPane, alloc: Allocator, index: usize, scroll_to: ?[]const u8) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    if (index >= probe.files.items.len) return;
+    const entry = probe.files.items[index];
+
+    if (self.diff_file) |f| alloc.free(f);
+    self.diff_file = alloc.dupe(u8, entry.path) catch null;
+
+    // A binary file never gets a patch; say so immediately rather than spawning
+    // a git process that will produce nothing useful (Mac's `loadDiffPatch`).
+    if (entry.binary) {
+        self.pushDiffFile(alloc, entry, null, scroll_to);
+        return;
+    }
+    probe.requestPatch(self.location orelse return, index, scroll_to);
+}
+
+/// A patch arrived (or was skipped): put it on screen.
+fn applyDiffPatch(self: *ViewerPane, alloc: Allocator) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    const path = probe.patch_path orelse return;
+    for (probe.files.items) |entry| {
+        if (!std.mem.eql(u8, entry.path, path)) continue;
+        self.pushDiffFile(alloc, entry, probe.patch, null);
+        return;
+    }
+}
+
+fn pushDiffFile(
+    self: *ViewerPane,
+    alloc: Allocator,
+    entry: ViewerDiffProbe.Entry,
+    patch: ?[]const u8,
+    scroll_to: ?[]const u8,
+) void {
+    log.info("viewer diff pane={s} file={s} status={s} patch={d}", .{
+        self.paneId(),
+        entry.path,
+        entry.status.letter(),
+        (patch orelse "").len,
+    });
+    const js = viewer_diff.setDiffFileCall(alloc, .{
+        .path = entry.path,
+        .old_path = entry.old_path,
+        .status = entry.status,
+        .origin = entry.origin,
+        .additions = entry.additions,
+        .deletions = entry.deletions,
+        .binary = entry.binary,
+        .language = content.highlightLanguage(content.extension(entry.path)) orelse "",
+        .patch = patch orelse "",
+        .scroll_to = scroll_to,
+    }) catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+}
+
+/// The diff worker landed. The ONLY place its answer is read, and it runs on
+/// the GUI thread — which is what lets the page be driven straight from it.
+fn completeDiff(self: *ViewerPane, alloc: Allocator) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    // A snapshot of what was on screen BEFORE this answer, so a poll that found
+    // nothing new redraws nothing: re-pushing an identical listing would reset
+    // the page's scroll every two seconds.
+    const before = probe.snapshot(alloc);
+    defer ViewerDiffProbe.freeSnapshot(alloc, before);
+
+    switch (probe.complete()) {
+        .none => return,
+        .listing => {
+            if (probe.listingDiffers(before) or !self.diff_pushed) {
+                self.diff_pushed = true;
+                self.applyDiffListing(alloc);
+            }
+        },
+        .patch => self.applyDiffPatch(alloc),
+    }
+    probe.drainDeferred(self.location orelse "", self.origin_directory);
 }
 
 /// Everything a freshly-created viewer pane is opened WITH. One struct rather
@@ -2756,6 +3022,16 @@ fn refetchFromOrigin(self: *ViewerPane) void {
 fn renderFileContent(self: *ViewerPane) void {
     const p = self.pending orelse return;
     const alloc = p.alloc;
+    // A diff has no file to read: its content comes from git, asynchronously,
+    // and arrives on `WM_APP_VIEWER_DIFF` (T463). The page is ready NOW, which
+    // is what this call means, so this is where the first listing is asked for
+    // — and why `diff_pushed` is cleared by every navigation: a freshly-loaded
+    // page must be handed the listing even when git's answer has not moved.
+    if (self.mode == .diff) {
+        self.diff_pushed = false;
+        self.refreshDiff();
+        return;
+    }
     const path = self.file_path orelse {
         self.injectError(alloc, content.error_unreadable, self.location orelse "");
         return;
@@ -2792,8 +3068,9 @@ fn renderFileContent(self: *ViewerPane) void {
             content.highlightLanguage(content.extension(path)),
         ),
         // Neither has content to inject: a website is its own page, and so is a
-        // rendered `.html` file (T601) — the web view loaded it directly.
-        .web, .html => return,
+        // rendered `.html` file (T601) — the web view loaded it directly. A
+        // diff answered above, before there was a file path to fail on.
+        .web, .html, .diff => return,
     } catch return;
     defer alloc.free(js);
     self.executeScript(alloc, js);
@@ -4457,6 +4734,12 @@ pub fn wndProc(
             return 0;
         },
 
+        // The diff worker has an answer (T463), on the same terms.
+        WM_APP_VIEWER_DIFF => {
+            if (self.pending) |p| self.completeDiff(p.alloc);
+            return 0;
+        },
+
         // The page called `window.close()` (T163) — Mac's `webViewDidClose`.
         // Closes this pane and nothing else: for the single-pane popup window
         // that IS the window, matching browser semantics, and if the user has
@@ -4487,6 +4770,15 @@ pub fn wndProc(
                 // gives the pane its band back.
                 _ = w32.KillTimer(hwnd, feedback_close_timer_id);
                 self.setFeedbackOpen(false);
+                return 0;
+            }
+            if (wparam == diff_timer_id) {
+                // The working-tree poll (T463). Repeating, not one-shot: it is
+                // a question about a repository that never stops being asked
+                // while the pane is open. Re-entrancy is the probe's problem
+                // and it has an answer — one worker, deferred re-issue — so a
+                // slow `git diff` cannot stack spawns behind itself.
+                self.refreshDiff();
                 return 0;
             }
             if (wparam != reload_timer_id) {
@@ -5491,7 +5783,7 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expect(pane.can_go_back);
 
     // `GoBack` (40): the browser walks onto the template again, and the pane
-    // must go back to RENDERING THE FILE — CLAUDE.md's "going Back from a
+    // must go back to RENDERING THE FILE — docs/claude/viewers.md's "going Back from a
     // website re-renders the file". SourceChanged flips the mode, the
     // NavigationCompleted that follows re-injects the content, and the
     // headings coming back is the whole chain having run.
@@ -6107,6 +6399,142 @@ test "host floor: a real controller on a real window, on this box" {
         // a user selects the block and hits Delete.)
         pane.feedbackSetText(alloc, "just my own words\n");
         try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
+    }
+
+    // ------------------------------------------------------------------
+    // T463: a git diff, rendered by the same page
+    // ------------------------------------------------------------------
+    //
+    // The whole chain with nothing stubbed: a real repository, the real
+    // worker running real `git` off the message loop, the real payloads, and
+    // the real `diff.js` building rows in the real document — asserted by
+    // reading the DOM back, which is the only oracle that can tell "the page
+    // rendered a diff" from "the pane logged that it pushed one". The
+    // acceptance script outside can only read the log line; this is the half
+    // that proves the log line was true.
+    //
+    // Its own repository rather than the one above: the counts have to be
+    // KNOWN, and by this point that tmp dir has a feedback report in it.
+    {
+        var diff_tmp = testing.tmpDir(.{});
+        defer diff_tmp.cleanup();
+        try diff_tmp.dir.writeFile(.{ .sub_path = "tracked.txt", .data = "one\ntwo\n" });
+        const diff_dir = try diff_tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(diff_dir);
+
+        if (!gitInitTestRepo(alloc, diff_dir)) {
+            log.warn("T463: no throwaway repo on this box; the diff arm is skipped", .{});
+        } else {
+            // One tracked file modified, one file never added: two entries in
+            // two different sections, which is also the assertion that the
+            // untracked leg synthesizes a patch git will not produce.
+            try diff_tmp.dir.writeFile(.{ .sub_path = "tracked.txt", .data = "one\ntwo\nthree\n" });
+            try diff_tmp.dir.writeFile(.{ .sub_path = "loose.txt", .data = "new\nfile\n" });
+
+            // `git-status` without its colon: the canonical form is what the
+            // pane must store, since that is what `+list` reports and what the
+            // manifest restores.
+            try pane.navigate(alloc, "git-status");
+            pane.applyOpenMetadata(alloc, .{
+                .location = "git-status:",
+                .origin_directory = diff_dir,
+            });
+            try testing.expectEqual(content.Mode.diff, pane.mode);
+            try testing.expectEqualStrings("git-status:", pane.location.?);
+            try testing.expectEqualStrings("Working tree", pane.title.?);
+            // The origin directory is applied AFTER the navigate that will use
+            // it, exactly as the real open path orders the two — which is safe
+            // because the listing is not asked for until the template has
+            // finished loading, several message-loop turns later.
+            //
+            // The listing and then the patch: two worker round trips, each
+            // landing as a posted message this pump has to deliver.
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    const probe = if (p.diff_probe) |*d| d else return false;
+                    return p.page_loaded and p.diff_pushed and
+                        probe.files.items.len == 2 and
+                        probe.patch_path != null and !probe.busy();
+                }
+            }.ready, &pane);
+
+            const probe = &pane.diff_probe.?;
+            try testing.expectEqualStrings(diff_dir, probe.repo.?);
+            // Sections, and which side each file came from.
+            var saw_unstaged = false;
+            var saw_untracked = false;
+            for (probe.files.items) |f| {
+                if (f.origin == .unstaged and std.mem.eql(u8, f.path, "tracked.txt")) {
+                    saw_unstaged = true;
+                    try testing.expectEqual(@as(u32, 1), f.additions);
+                }
+                if (f.origin == .untracked and std.mem.eql(u8, f.path, "loose.txt")) {
+                    saw_untracked = true;
+                    // Counted by READING the file — git will not diff it.
+                    try testing.expectEqual(@as(u32, 2), f.additions);
+                }
+            }
+            try testing.expect(saw_unstaged);
+            try testing.expect(saw_untracked);
+
+            // ...and the page drew it. `.d-file` is the file card, `.d-line`
+            // its rows, `.d-add` an added line: a payload that never arrived,
+            // or arrived as a JS syntax error, leaves all three at zero.
+            const Probe = struct {
+                done: bool = false,
+                ok: bool = false,
+                text: [256]u8 = undefined,
+                len: usize = 0,
+
+                fn onDone(p: *@This(), result: com.HRESULT, value: ?[*:0]const u16) com.HRESULT {
+                    p.done = true;
+                    p.ok = !com.failed(result);
+                    if (value) |v| {
+                        const span = std.mem.span(v);
+                        const n = std.unicode.utf16LeToUtf8(&p.text, span) catch 0;
+                        p.len = @min(n, p.text.len);
+                    }
+                    return com.S_OK;
+                }
+            };
+            const ProbeHandler = com.Callback(iface.IID_ExecuteScriptCompletedHandler, Probe.onDone);
+            const js =
+                \\(function () {
+                \\  var root = document.querySelector(".viewer-diff-root");
+                \\  if (!root) return "no-root";
+                \\  return [
+                \\    root.querySelectorAll(".d-file").length,
+                \\    root.querySelectorAll(".d-line, .d-pair").length > 0,
+                \\    root.querySelectorAll(".d-add").length > 0,
+                \\    (root.querySelector(".d-summary") || {}).textContent || ""
+                \\  ].join("|");
+                \\})()
+            ;
+            const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, js);
+            defer alloc.free(wide);
+            var dom: Probe = .{};
+            const handler = try ProbeHandler.create(alloc, &dom);
+            defer handler.release();
+            try testing.expect(web.executeScript(wide.ptr, @ptrCast(handler)));
+            var dom_timer = try std.time.Timer.start();
+            while (dom_timer.read() < 15 * std.time.ns_per_s and !dom.done) {
+                while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                    _ = w32.TranslateMessage(&msg);
+                    _ = w32.DispatchMessageW(&msg);
+                }
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            try testing.expect(dom.done);
+            try testing.expect(dom.ok);
+            // Loud on success too: "78 tests passed" cannot say whether this
+            // one talked to a browser (the T372/T162 convention).
+            log.warn("T463 diff DOM: {s}", .{dom.text[0..dom.len]});
+            const got = dom.text[0..dom.len];
+            try testing.expect(std.mem.startsWith(u8, got, "\"1|true|true|"));
+            // The header names the whole diff, not just the open file.
+            try testing.expect(std.mem.indexOf(u8, got, "Working tree") != null);
+            try testing.expect(std.mem.indexOf(u8, got, "2 files") != null);
+        }
     }
 }
 

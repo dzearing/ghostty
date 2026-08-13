@@ -35,6 +35,19 @@ const url_scheme = @import("../ipc/url_scheme.zig");
 
 const ipc_args = @import("../ipc/args.zig");
 
+/// The CLI's own diff-scheme classification (T463). Imported rather than
+/// repeated for the same reason `ipc_args.viewMode` is: the CLI decides on this
+/// test whether to path-resolve a `--view=` value, and a renderer that
+/// disagreed about which values are diffs would render a resolved path as a
+/// revspec or a revspec as a file.
+const view_arg = @import("../../cli/view_arg.zig");
+
+/// The diff spec, for the two things a location alone has to answer here: which
+/// mode it is, and what to call the pane. The import is mutual — `viewer_diff`
+/// builds its page calls with `appendJsString` from this file — which Zig
+/// resolves per-declaration, and neither direction is reached at comptime.
+const viewer_diff = @import("viewer_diff.zig");
+
 /// The synthetic origin file-mode panes load from. Everything under it is
 /// served by the pane's `WebResourceRequested` handler; nothing ever leaves
 /// the machine, and the host does not resolve in DNS.
@@ -93,13 +106,23 @@ pub const Mode = enum {
     /// CSS, scripts, images and fonts run exactly as they would if it were
     /// hosted. Mac's fourth `Mode` case, same extensions.
     html,
+    /// A git diff, rendered through the same bundled template (T463; Mac's
+    /// `.diff(ViewerDiffSpec)`). The location is a `git-status:` /
+    /// `git-diff:<revspec>` scheme rather than a path, and the content arrives
+    /// through `window.__viewer.setDiffListing` / `setDiffFile` once git has
+    /// answered — see `viewer_diff.zig`.
+    diff,
 
     /// Whether this mode has a FILE on disk behind it. True for a rendered
     /// HTML page as much as for a markdown document — the pane is titled by
     /// its basename, watches it for saves, and reports itself as a file to
     /// `+list`.
+    ///
+    /// False for a diff: what is behind that is a REPOSITORY, not a file.
+    /// There is nothing to path-resolve, nothing to watch for saves (a status
+    /// pane polls git instead), and no basename to title the pane with.
     pub fn isFile(self: Mode) bool {
-        return self != .web;
+        return self != .web and self != .diff;
     }
 
     /// Whether this mode loads the BUNDLED TEMPLATE and injects the file's
@@ -111,8 +134,12 @@ pub const Mode = enum {
     /// reload, the relative-link routing that only exists because the template
     /// cannot navigate — is false for it, while everything the FILE implies is
     /// still true.
+    ///
+    /// A diff is the mirror image (T463): no file, but the template all the
+    /// same — it is a third thing that one page can render, which is why the
+    /// pane navigates to the template and pushes content into it afterwards.
     pub fn usesTemplate(self: Mode) bool {
-        return self == .markdown or self == .code;
+        return self == .markdown or self == .code or self == .diff;
     }
 
     /// Whether the pane navigates like a browser here (Mac's `isLivePage`):
@@ -128,6 +155,11 @@ pub const Mode = enum {
 /// must agree on what counts as a URL, and three copies of that test is three
 /// chances to disagree (the T257 lesson).
 pub fn modeFor(location: []const u8) Mode {
+    // The diff schemes come FIRST (T463), exactly as they do in Mac's
+    // `ViewerView.classify`: `git-diff:main...HEAD` has neither a `://` nor a
+    // useful extension, so every test below it would read it as a code file and
+    // try to open a file by that name.
+    if (view_arg.isDiffView(std.mem.trim(u8, location, " \t\r\n"))) return .diff;
     if (ipc_args.viewMode(location) == .web) return .web;
     const ext = extension(location);
     for ([_][]const u8{ "md", "markdown", "mdown", "mkd", "mdwn" }) |m| {
@@ -265,6 +297,13 @@ pub fn urlHost(location: []const u8) ?[]const u8 {
 /// have — a nameless pane is the defect this replaces — with the empty string
 /// the one degenerate input, which nothing constructs a pane from.
 pub fn initialTitle(mode: Mode, location: []const u8, file_path: ?[]const u8) []const u8 {
+    // A diff is named by WHAT IT SHOWS, not by its scheme (T463; Mac's
+    // `mode.title`): "Working tree" and "main...HEAD" are what a tab can be
+    // read at a glance, where `git-status:` is the address that produced it.
+    if (mode == .diff) {
+        const spec = viewer_diff.parse(location) orelse return location;
+        return spec.title();
+    }
     if (!mode.isFile()) return urlHost(location) orelse location;
     // The decoded path when the pane has one (a `file://` location's basename
     // would otherwise still be percent-encoded), else the location as typed.
@@ -848,7 +887,10 @@ pub const FileLinkAction = enum { viewer_split, default_app };
 
 pub fn fileLinkAction(path: []const u8) FileLinkAction {
     return switch (modeFor(path)) {
-        .markdown, .html => .viewer_split,
+        // A diff is a Ghoztty view like the other two, and it reaches here only
+        // from a document that LINKED to `git-diff:…` — which is a link to a
+        // pane, not to a file the shell could open at all.
+        .markdown, .html, .diff => .viewer_split,
         .code, .web => .default_app,
     };
 }
@@ -920,6 +962,25 @@ test "the three mode predicates split file, template and live page" {
 
     for ([_]Mode{ .web, .html }) |m| try testing.expect(m.isLivePage());
     for ([_]Mode{ .markdown, .code }) |m| try testing.expect(!m.isLivePage());
+
+    // A diff (T463) is the mirror of `.html`: it uses the template and has no
+    // file behind it, which is the combination nothing else has.
+    try testing.expect(Mode.diff.usesTemplate());
+    try testing.expect(!Mode.diff.isFile());
+    try testing.expect(!Mode.diff.isLivePage());
+}
+
+test "the diff schemes classify ahead of every path test" {
+    // `git-diff:main...HEAD` ends in something that looks like an extension and
+    // contains no `://`, so it reaches every other test disguised as a file.
+    try testing.expectEqual(Mode.diff, modeFor("git-status:"));
+    try testing.expectEqual(Mode.diff, modeFor("git-status"));
+    try testing.expectEqual(Mode.diff, modeFor("git-diff:"));
+    try testing.expectEqual(Mode.diff, modeFor("git-diff:main...HEAD"));
+    try testing.expectEqual(Mode.diff, modeFor("git-diff:a1b2c3d"));
+    // The near-miss: a FILE whose name starts with the same letters.
+    try testing.expectEqual(Mode.markdown, modeFor("git-diff-notes.md"));
+    try testing.expectEqual(Mode.code, modeFor("git-status-report.txt"));
 }
 
 test "reloadPlan: the branch is the verb's whole contract" {
