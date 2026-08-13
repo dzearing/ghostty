@@ -84,6 +84,23 @@ $GuardTable = @(
             'scripts\loop-session.ps1',
             'test\win32\go-loop-guard.ps1'
         )
+    },
+    # Crash evidence is the other thing whose failure nothing else catches: a
+    # capture path that has quietly stopped working looks exactly like a lane
+    # that did not crash, and is only ever exercised on a day already going
+    # badly. scripts\floor-lane.ps1 is deliberately NOT covered - it is edited
+    # for reasons that have nothing to do with crash capture (stall detection,
+    # lane table), and a gate that fires on those is the noise T783 warns about.
+    [pscustomobject]@{
+        Name   = 'crash-first-chance'
+        Script = 'test\win32\crash-first-chance.ps1'
+        Stamp  = 'test\win32\crash-first-chance.stamp.json'
+        Covers = @(
+            'scripts\lib\CrashDump.ps1',
+            'scripts\lib\CrashCatch.ps1',
+            'scripts\crash-catch.ps1',
+            'test\win32\crash-first-chance.ps1'
+        )
     }
 )
 
@@ -159,6 +176,25 @@ function Get-GuardState($row) {
     $live = Get-LiveMap $row
     $stamp = Read-Stamp $row
     $stamped = Get-StampMap $stamp
+
+    # A row whose coverage matches NO file in this tree is not applicable here:
+    # there is nothing that could have changed, so it cannot be due. That is the
+    # normal case whenever the gate is pointed at a foreign tree -- which is
+    # exactly what this gate's own acceptance script does, with a fixture repo
+    # shaped like ONE row. Without this, adding a second row to the table made
+    # eight of its arms fail over an exit code that had nothing to do with them,
+    # and every future row would do it again.
+    #
+    # It is reported, never silent: a row whose globs are a typo says so as
+    # `GUARD N/A`, which is a different sentence from `GUARD CURRENT` and cannot
+    # be mistaken for one.
+    if ($live.Count -eq 0 -and $null -eq $stamp) {
+        return [pscustomobject]@{
+            Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+            Kind = 'n/a'; Reason = 'no-covered-files'; Findings = @()
+            Files = @(); StampedAt = ''; StampedCommit = ''
+        }
+    }
     # A plain array, not a generic List: PowerShell 5.1's enumerable binder
     # throws "Argument types do not match" on @(<empty List[object]>), which is
     # exactly the CURRENT case - the one this gate reports most often.
@@ -275,6 +311,10 @@ switch ($Action) {
         }
         $due = 0
         foreach ($s in $states) {
+            if ($s.Kind -eq 'n/a') {
+                "GUARD N/A {0}: nothing in this tree matches its coverage" -f $s.Name
+                continue
+            }
             if ($s.Kind -eq 'current') {
                 $stampedAt = if ($s.StampedAt) { $s.StampedAt.Substring(0, [Math]::Min(10, $s.StampedAt.Length)) } else { '?' }
                 "GUARD CURRENT {0} ({1} files, stamped {2}{3})" -f $s.Name, @($s.Files).Count, $stampedAt,

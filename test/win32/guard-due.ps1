@@ -174,13 +174,27 @@ try {
     $r = Invoke-Due check
     Check 'C6 an uncovered file changing does not make the row due' ($r.Exit -eq 0) $r.Text
 
-    $r = Invoke-Due check -Json
+    # Scoped to the row this fixture is shaped like: the table has other rows,
+    # whose files do not exist here, and "one row must still be an array" is the
+    # claim -- which -Guard states exactly rather than by accident of the table
+    # having a single entry.
+    $r = Invoke-Due check -Json -Guard 'go-loop'
     $j = $null
     try { $j = ($r.Text | ConvertFrom-Json) } catch { }
     Check 'C7 -Json emits an ARRAY even for one row' `
         ($null -ne $j -and $j -is [array] -and $j.Count -eq 1) $r.Text
     Check 'C8 -Json reports the machine token' `
         ($null -ne $j -and $j[0].Kind -eq 'current' -and $j[0].Name -eq 'go-loop') $r.Text
+
+    # A row that covers nothing in THIS tree is not applicable, not due. Every
+    # other row in the real table is in that state against this fixture, and
+    # before it existed each new row failed eight arms here over an exit code
+    # that had nothing to do with them.
+    $r = Invoke-Due check
+    Check 'C10 a row covering nothing here is N/A, not DUE' `
+        ($r.Exit -eq 0 -and $r.Text -match 'GUARD N/A') "exit=$($r.Exit): $($r.Text)"
+    Check 'C11 and N/A is not silent (a typo''d row still says so)' `
+        ($r.Text -notmatch 'GUARD CURRENT crash-first-chance') $r.Text
 
     $r = Invoke-Due check -Guard 'no-such-harness'
     Check 'C9 an unknown guard name is an error, not a pass' `

@@ -2017,6 +2017,49 @@ Library: `scripts/lib/CrashCatch.ps1`, which documents the three cdb traps
 break, cdb echoes its own command back). Acceptance:
 `test\win32\crash-stacks.ps1`.
 
+**But a re-run only ever describes a crash that agrees to happen twice** (T460).
+The crash that tooling was built for lands on about half of runs, so the
+occurrence that actually failed the lane is precisely the one it cannot see, and
+an intermittent crash gets diagnosed by trying to provoke it again. Nothing
+needed inventing: Windows was already keeping the evidence. WER's **LocalDumps**
+is enabled machine-wide here, so a binary that dies leaves a minidump in
+`%LOCALAPPDATA%\CrashDumps` **at the moment it dies** — unattended, on the FIRST
+crash, at zero cost to a run that does not crash — and nothing read it. A red
+lane now reads that dump first (`cdb -z`, about a second) and reaches the
+~10-minute re-run only when there is none. By hand:
+`crash-catch.ps1 -Last -Lane <lane>`, `-FromDump <path>` for a named dump, and
+`-Status` for whether the box is armed at all.
+
+Four things that look like details and are not:
+
+- **A mini dump answers a stack question.** LocalDumps' default type carries
+  every thread's stack, which is what the re-run was bought for; full memory
+  needs a per-exe `DumpType=2` under **HKLM** and therefore elevation, so it is
+  an upgrade and not a precondition. **HKCU is ignored outright** — measured: a
+  `DumpFolder` set there was skipped and the dump still landed in the HKLM
+  default folder.
+- **The recorded exception is zig's handler aborting, not the fault.** The
+  handler runs first and aborts, so the dump's exception is `0x80000003`; the
+  frames that faulted are still on that same thread's stack *under*
+  `handleSegfaultWindows`, with every other thread beside them. The block says
+  so, rather than leaving a reader chasing a breakpoint that never existed.
+- **Whether a dump is a crash is asked of the FILE, not of the debugger.** cdb
+  reports `80000003 (Break instruction exception)` off the current context for a
+  dump holding no exception at all — indistinguishable, in its output, from a
+  real abort — so a T48 freeze-watchdog dump of a *healthy* process would read as
+  a crash and manufacture a stack for a bug that never happened.
+  `Test-MinidumpHasException` reads the stream directory for an ExceptionStream
+  instead.
+- **A dump older than the run that is asking is never returned.** A wrong stack
+  costs more than no stack: it sends the next investigation somewhere the bug has
+  never been.
+
+Library: `scripts/lib/CrashDump.ps1`. Acceptance:
+`test\win32\crash-first-chance.ps1`, whose lane arm drives the crasher through
+`floor-lane.ps1 -Command` and requires both directions — the dump path when a
+dump exists, and, under `GHOZTTY_CRASH_NO_WER=1` (a box with no capture,
+reproduced from this same tree), the re-run fallback.
+
 **A harness must never fabricate a failure, and one shape of that is now
 checked** (T197). `Start-Process -PassThru` hands back a process object whose
 `ExitCode` reads back **empty** unless something touched `$p.Handle` while the

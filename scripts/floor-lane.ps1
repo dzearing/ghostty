@@ -80,6 +80,12 @@ param(
     # when you are hunting a specific intermittent crash and want the odds.
     [int]$CatchAttempts = 1,
     [int]$CatchTimeoutSeconds = 600,
+    # Run this command as if it were a lane, instead of a zig lane. The whole
+    # watchdog (CPU/stall/timeout) and the whole crash path apply to it, which
+    # is what makes the crash wiring testable end to end without staging a real
+    # red lane: point it at a binary that dies and watch which evidence path the
+    # script takes.
+    [string]$Command,
     [switch]$SelfTest
 )
 
@@ -92,6 +98,10 @@ $ErrorActionPreference = 'Stop'
 # (T450). Zig's own handler dies in a recursive panic, so without this a crash
 # leaves no stack at all -- see scripts/lib/CrashCatch.ps1.
 . "$PSScriptRoot\lib\CrashCatch.ps1"
+# Reads the dump Windows already wrote at the moment of the crash (T460), which
+# is the same evidence without the re-run -- and is the ONLY thing that works
+# for a crash that does not reproduce.
+. "$PSScriptRoot\lib\CrashDump.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -417,6 +427,32 @@ function Invoke-LaneCrashCatch {
         Write-Host "  $name crashed but no built copy was found under $Repo\.zig-cache\o"
         return
     }
+    # FIRST, the crash that actually happened. Windows wrote a dump of it at
+    # the moment it died (WER LocalDumps), so the stack is already on disk --
+    # every thread, source lines, seconds to read, and no reproduction needed.
+    # The re-run below can only ever describe a DIFFERENT crash, and only when
+    # the bug obliges by happening twice (T460).
+    # The Application Error event has already been logged by the time we get
+    # here, so WER has finished writing; 10s is slack, not a poll budget.
+    $dump = Find-WerCrashDump -ExeNames @($name) -Since $Since -WaitSeconds 10
+    if ($dump) {
+        Write-Host "-- reading the dump Windows wrote when $name died (no re-run) --"
+        try {
+            $sym = Split-Path -Parent $exe
+            $r = Invoke-CrashDumpAnalysis -DumpPath $dump.FullName -SymbolPath $sym `
+                -Repo $Repo -LaneLog $LaneLog
+            if (Write-CrashDumpStack -Result $r) { return }
+            Write-Host '  that dump carried no exception, so the re-run below is the fallback'
+        }
+        catch {
+            Write-Host "  reading the dump failed: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host "-- no dump was written when $name died --"
+        $null = Write-WerArmedStatus -ExeNames @($name)
+    }
+
     Write-Host "-- capturing a stack for $name under cdb (up to $CatchAttempts attempt(s); -NoCatch to skip) --"
     try {
         $r = Invoke-CrashCatch -Exe $exe -Attempts $CatchAttempts `
@@ -458,6 +494,18 @@ if ($SelfTest) {
     if ($failures -eq 0) { Write-Host 'ALL PASS'; exit 0 }
     Write-Host "$failures FAILURE(S)"
     exit 1
+}
+
+if ($Command) {
+    $r = Invoke-Lane -Name 'command' -Iteration 1 -RawCommand $Command
+    Write-Host ""
+    Write-Host "FLOOR SUMMARY: command=$r"
+    switch ($r) {
+        'PASS' { exit $EXIT_PASS }
+        'STALL' { exit $EXIT_STALL }
+        'TIMEOUT' { exit $EXIT_TIMEOUT }
+    }
+    exit $EXIT_FAIL
 }
 
 $lanes = if ($Lane -eq 'all') { @('none', 'win32', 'agent') } else { @($Lane) }

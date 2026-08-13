@@ -262,6 +262,12 @@ function Read-CrashCatchLog {
     if (-not $res.ExceptionCode -and $text -match 'code ([0-9a-fA-F]{8}) \(') { $res.ExceptionCode = '0x' + $Matches[1].ToLower() }
     if ($text -match 'ExceptionAddress:\s*\S+\s*\(([^)]+)\)') { $res.FaultSite = $Matches[1] }
     if ($text -match '\(([^)]*Access violation[^)]*)\)') { $res.ExceptionName = $Matches[1] }
+    # `.exr -1` names the code in parentheses beside it ("80000003 (Break
+    # instruction exception)"). Reading that is what keeps a post-mortem block
+    # from printing a bare hex number with no words next to it.
+    if (-not $res.ExceptionName -and $text -match 'ExceptionCode:\s*[0-9a-fA-F]{8}\s*\(([^)]+)\)') {
+        $res.ExceptionName = $Matches[1].Trim()
+    }
     if (-not $res.ExceptionName -and $text -match '- code [0-9a-fA-F]+ \(') {
         if ($text -match '\): ([A-Za-z ]+) - code') { $res.ExceptionName = $Matches[1].Trim() }
     }
