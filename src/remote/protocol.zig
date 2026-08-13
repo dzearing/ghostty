@@ -31,7 +31,7 @@
 //! ## Compatibility history (the agent contract's version log)
 //!
 //! The `ghoztty-agent` outlives the app, so a running agent is frequently a
-//! DIFFERENT build than the app talking to it (see CLAUDE.md, "Agent contract &
+//! DIFFERENT build than the app talking to it (see docs/claude/sessions.md, "Agent contract &
 //! upgrade compatibility"). Every wire evolution is therefore recorded here, so
 //! the compatibility matrix is checkable in review rather than inferred from
 //! `git log`. `proto_version` is bumped only for a BREAKING change; everything
@@ -65,8 +65,15 @@
 //!      were being read as nanoseconds, ~24× low on Apple Silicon), and a value
 //!      that silently changes meaning is exactly what the contract forbids
 //!      shipping ungated.
+//!
+//! Not everything additive needs a capability. An optional HELLO FIELD that
+//! gates no opcode and changes no existing value's meaning is safe on its own,
+//! because an older peer simply omits it and `ignore_unknown_fields` swallows it
+//! in the other direction: `hostname`, `build_version` and `pty_flavor` (T471)
+//! are all of that kind. Each states its "absent ⇒" on the field itself.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -665,6 +672,48 @@ pub const capability = struct {
     pub const repaint_data = "repaint_data";
 };
 
+/// The kind of pseudo-terminal a peer spawns its children on. Wire-visible
+/// (`Hello.pty_flavor`) because it is the ONE thing about the far machine the
+/// near side cannot infer: a pane's terminal behaviour depends on the child's
+/// pty, and on a cross-OS remote pane that is not the local OS's (T471).
+///
+/// What it decides today: `termio/history_guard.zig`. A ConPTY child repaints
+/// its whole viewport after every resize, so rows a resize drags out of
+/// scrollback are erased — the guard that stops that must be armed for a ConPTY
+/// child and left off for a POSIX one, whichever machine the WINDOW is on.
+///
+/// Deliberately a plain enum with a string encoding and no capability gate: it
+/// is an additive optional FIELD (an older peer omits it and the reader falls
+/// back to the local OS's flavour, which is exactly the pre-T471 behaviour), and
+/// it gates no opcode, so there is nothing an older peer could choke on.
+pub const PtyFlavor = enum {
+    /// Windows ConPTY: conhost owns the viewport and repaints all of it after a
+    /// resize, opening with `ESC[H ESC[2J`.
+    conpty,
+    /// A POSIX pty: the child gets `SIGWINCH` and repaints nothing on its own.
+    posix,
+
+    /// The flavour of pty THIS build spawns children on. The single derivation
+    /// of that fact: an agent advertises it, a client advertises it, and
+    /// `termio/history_guard.zig` falls back to it for a peer that reports
+    /// none. (`builtin` is compiler-provided, so naming it here keeps this
+    /// module standalone-testable.)
+    pub const local: PtyFlavor = if (builtin.os.tag == .windows) .conpty else .posix;
+
+    /// The wire spelling. Stable — this string is the protocol.
+    pub fn toString(self: PtyFlavor) []const u8 {
+        return @tagName(self);
+    }
+
+    /// Parse a wire spelling, or null for anything this build does not know.
+    /// Unknown is NOT an error: a future peer may name a third flavour, and the
+    /// contract is that we degrade to our own default rather than drop a
+    /// connection over a field that only tunes a guard.
+    pub fn fromString(s: []const u8) ?PtyFlavor {
+        return std.meta.stringToEnum(PtyFlavor, s);
+    }
+};
+
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
 /// (unknown fields ignored). Sent first in each direction; the connection layer
 /// negotiates the intersection before any other frame (§4.2).
@@ -691,6 +740,25 @@ pub const Hello = struct {
     /// to claim the opposite — "never treated as stale" — which contradicted
     /// the code it describes; T201.)
     build_version: ?[]const u8 = null,
+
+    /// The pty flavour this peer spawns children on (`PtyFlavor.toString`), or
+    /// null from a peer too old to say. Set by the AGENT, whose children are the
+    /// ones whose repaint behaviour matters; the client sets it too, so the
+    /// field means the same thing in both directions and a future agent could
+    /// read it.
+    ///
+    /// Additive/optional: absent ⇒ null, and the reader falls back to the LOCAL
+    /// machine's flavour — the pre-T471 derivation, so an old agent behaves
+    /// exactly as it did. A string rather than an enum so an unknown future
+    /// spelling parses (to null) instead of failing the whole HELLO.
+    pty_flavor: ?[]const u8 = null,
+
+    /// The peer's pty flavour as a value, or null when it did not say (or named
+    /// one this build does not know). Callers own the fallback — see
+    /// `termio/history_guard.zig`, which reads null as "assume this machine's".
+    pub fn ptyFlavor(self: Hello) ?PtyFlavor {
+        return PtyFlavor.fromString(self.pty_flavor orelse return null);
+    }
 
     /// Serialize to a JSON byte slice owned by `alloc`. Null optionals are
     /// elided rather than emitted as `"field":null`, matching every other
@@ -2533,6 +2601,57 @@ test "HELLO build_version: additive + back-compat" {
     const bj = try bare.encode(alloc);
     defer alloc.free(bj);
     try testing.expect(std.mem.indexOf(u8, bj, "build_version") == null);
+}
+
+test "HELLO pty_flavor: additive + back-compat + unknown spelling (T471)" {
+    const alloc = testing.allocator;
+
+    // A newer agent says what its children run on; it round-trips as a value.
+    const newer: Hello = .{
+        .transfer_encoding = .raw,
+        .pty_flavor = PtyFlavor.conpty.toString(),
+    };
+    const nj = try newer.encode(alloc);
+    defer alloc.free(nj);
+    try testing.expect(std.mem.indexOf(u8, nj, "\"pty_flavor\":\"conpty\"") != null);
+    var np = try Hello.parse(alloc, nj);
+    defer np.deinit();
+    try testing.expectEqual(PtyFlavor.conpty, np.value.ptyFlavor().?);
+
+    // An OLDER peer omits it → null, never a parse error. The reader's fallback
+    // (the local machine's flavour) is `history_guard`'s business; all this
+    // layer promises is that the absence decodes cleanly.
+    const legacy =
+        \\{"proto_version":1,"transfer_encoding":"raw","capabilities":["rpc"]}
+    ;
+    var lp = try Hello.parse(alloc, legacy);
+    defer lp.deinit();
+    try testing.expect(lp.value.pty_flavor == null);
+    try testing.expect(lp.value.ptyFlavor() == null);
+
+    // A FUTURE peer naming a flavour this build never heard of parses to null
+    // rather than failing the HELLO — the reason the field is a string on the
+    // wire and not an enum.
+    const future =
+        \\{"proto_version":1,"transfer_encoding":"raw","pty_flavor":"tty37"}
+    ;
+    var fp = try Hello.parse(alloc, future);
+    defer fp.deinit();
+    try testing.expectEqualStrings("tty37", fp.value.pty_flavor.?);
+    try testing.expect(fp.value.ptyFlavor() == null);
+
+    // Null ⇒ elided, so a peer that never sends it stays byte-identical to one
+    // built before the field existed.
+    const bare: Hello = .{ .transfer_encoding = .raw };
+    const bj = try bare.encode(alloc);
+    defer alloc.free(bj);
+    try testing.expect(std.mem.indexOf(u8, bj, "pty_flavor") == null);
+
+    // And the wire spellings themselves, pinned: they ARE the protocol.
+    try testing.expectEqualStrings("conpty", PtyFlavor.conpty.toString());
+    try testing.expectEqualStrings("posix", PtyFlavor.posix.toString());
+    try testing.expectEqual(PtyFlavor.posix, PtyFlavor.fromString("posix").?);
+    try testing.expect(PtyFlavor.fromString("") == null);
 }
 
 test "OPEN/ATTACHED JSON payloads round-trip with null elision" {

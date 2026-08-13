@@ -150,6 +150,18 @@ awaiting_relaunch: bool = false,
 /// surface free joins the IO thread), read on the IO thread in `threadExit`.
 close_on_exit: std.atomic.Value(bool) = .init(false),
 
+/// The pty flavour our CHILD runs on, as the agent reported it in its HELLO
+/// (T471), or null while unknown — before bring-up resolves the pane, or against
+/// an agent too old to say. Drives `termio/history_guard.zig`: the scrollback
+/// guard belongs to a ConPTY child, and on a CROSS-OS remote pane that is not
+/// the same question as "is this a Windows app".
+///
+/// Written once by `threadEnter` after the pane is live (so the handshake has
+/// certainly resolved — `waitHandshake`'s event orders the control reader's
+/// write before this read) and read by `Termio.resize`. Both are the IO thread,
+/// so it needs no synchronization of its own.
+child_pty_flavor: ?protocol.PtyFlavor = null,
+
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
@@ -577,6 +589,13 @@ pub fn bringUpNotice(self: *const Remote) ?[]const u8 {
     return self.bring_up_notice_buf[0..self.bring_up_notice_len];
 }
 
+/// The pty flavour of the child on the far end, or null while unknown (see the
+/// field). Read by `Termio` through `backend.childPtyFlavor` to decide whether
+/// this pane's resizes need the scrollback guard (T471).
+pub fn childPtyFlavor(self: *const Remote) ?protocol.PtyFlavor {
+    return self.child_pty_flavor;
+}
+
 /// Initialize the terminal state for this backend (mirrors `Exec.initTerminal`):
 /// set the initial pwd if we have a working-directory hint and seed the grid /
 /// screen size from the terminal. The pwd is otherwise resolved lazily from the
@@ -948,6 +967,16 @@ pub fn threadEnter(
     // On any failure after this point we DETACH the pane (keep-alive teardown,
     // §3.3) so the remote session survives for a later re-attach.
     errdefer self.conn.detachChannel(pane);
+
+    // What kind of pty is on the far end (T471). The agent reports it in its
+    // HELLO and this pane's terminal needs it to decide whether a resize must
+    // guard the scrollback against the child's repaint. Null from an agent older
+    // than T471, which `history_guard.enabledFor` reads as "assume this
+    // machine's" — the pre-T471 answer, right for every same-OS pane.
+    self.child_pty_flavor = self.conn.peerPtyFlavor();
+    log.debug("child pty flavour: {?s}", .{
+        if (self.child_pty_flavor) |f| f.toString() else null,
+    });
 
     // Re-assert the winsize now that the pane is live. ATTACH carries only
     // rows/cols (the agent zeroes the pixel geometry), and a forced-reclaim

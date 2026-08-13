@@ -46,30 +46,52 @@
 //! the first active row held in place, nothing above it can be dragged in,
 //! notice included.
 //!
-//! ## Why it is Windows-only
+//! ## Why it is the CHILD's pty that decides, not the host OS
 //!
 //! Fact (2) is ConPTY's. A POSIX child does not repaint on `SIGWINCH`, so the
 //! rows ghostty pulls down stay on screen and stay readable — that is the whole
-//! point of the behaviour, and macOS keeps it. Turning it off everywhere would
-//! be a user-visible regression on the platform where it works, for a bug that
-//! cannot happen there.
+//! point of the behaviour, and macOS keeps it. Turning it on everywhere would
+//! be a user-visible regression on the platform where the pull-down works, for a
+//! bug that cannot happen there.
 //!
-//! Known gap, deliberately not closed here: a **cross-OS remote pane** is judged
-//! by the LOCAL os, not the child's. A macOS app attached to a Windows agent's
-//! ConPTY still loses history, and a Windows app attached to a POSIX agent gets
-//! the guard it does not need (harmless — blank rows instead of pulled-down
-//! ones). Fixing it properly means the child's pty flavour riding the agent
-//! HELLO handshake, which is a protocol change; filed as its own task.
+//! The question is therefore about the CHILD, and for a local pane the child is
+//! always this machine's — which is why T431 shipped `builtin.os.tag ==
+//! .windows` and why that was right for every pane that existed then. A **remote
+//! pane** breaks the equivalence: the shell lives on the agent's machine, so a
+//! macOS window can own a ConPTY child (guard needed, and its absence was real
+//! data loss) and a Windows window can own a POSIX one (guard pointless — the
+//! user sees new blank rows where previously-scrolled output should have slid
+//! into view).
+//!
+//! So the flavour rides the agent HELLO (`protocol.PtyFlavor`, T471) and the
+//! decision is per pane, made by `enabledFor` on what the backend's child
+//! actually runs on. A peer too old to say answers null, which falls back to
+//! `local_flavor` — bit-for-bit the pre-T471 behaviour, so an old agent is not a
+//! regression, just an unimproved case.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const terminal = @import("../terminal/main.zig");
+const protocol = @import("../remote/protocol.zig");
 
 const log = std.log.scoped(.history_guard);
 
-/// Whether the child owning this process's panes repaints its whole viewport
-/// after a resize. See "Why it is Windows-only" above.
-pub const enabled: bool = builtin.os.tag == .windows;
+/// The pty flavour of children THIS machine spawns. The answer for every local
+/// (exec) pane, and the fallback for a remote peer that did not report one.
+/// Derived once, on the wire type, so the agent's HELLO and this guard cannot
+/// disagree about what this build runs.
+pub const local_flavor: protocol.PtyFlavor = .local;
+
+/// Whether a pane whose child runs on `flavor` needs the guard, i.e. whether
+/// that child repaints its whole viewport after a resize.
+///
+/// Null means "not reported": an agent older than T471, or a handshake that has
+/// not resolved yet. Both fall back to `local_flavor`, which is the answer that
+/// was hard-coded before this was negotiable — reduced function, never a wrong
+/// guess about a pane we know nothing about.
+pub fn enabledFor(flavor: ?protocol.PtyFlavor) bool {
+    return (flavor orelse local_flavor) == .conpty;
+}
 
 /// Pin the first row of the active area, so `hold` can tell how far a resize
 /// dragged it down. Returns null when there is nothing to guard or the pin
@@ -121,6 +143,23 @@ pub fn hold(t: *terminal.Terminal, pin: *terminal.Pin) void {
     t.setCursorPos(
         @as(usize, if (old_y > imported) old_y - imported else 0) + 1,
         @as(usize, old_x) + 1,
+    );
+}
+
+test "enabledFor: the CHILD's pty decides, not the host os (T471)" {
+    const testing = std.testing;
+
+    // A ConPTY child repaints; a POSIX child does not. Neither answer depends on
+    // which OS this test is running on — that is the whole point.
+    try testing.expect(enabledFor(.conpty));
+    try testing.expect(!enabledFor(.posix));
+
+    // Not reported (an agent older than T471, or a handshake still in flight)
+    // falls back to this machine's flavour: exactly the pre-T471 derivation.
+    try testing.expectEqual(builtin.os.tag == .windows, enabledFor(null));
+    try testing.expectEqual(
+        @as(protocol.PtyFlavor, if (builtin.os.tag == .windows) .conpty else .posix),
+        local_flavor,
     );
 }
 

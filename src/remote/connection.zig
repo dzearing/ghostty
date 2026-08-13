@@ -867,6 +867,13 @@ pub const Connection = struct {
     /// a silent downgrade (T125).
     peer_proto_version: ?u16 = null,
 
+    /// The pty flavour the peer said its children run on (T471), or null when it
+    /// did not say / named one this build does not know. Same write/read
+    /// ordering as `peer_hostname`. A remote pane's terminal reads it to decide
+    /// whether its resizes need the ConPTY scrollback guard, which on a cross-OS
+    /// pane is not the same question as "am I running on Windows".
+    peer_pty_flavor: ?protocol.PtyFlavor = null,
+
     /// Per-connection frame sequence (§4.2). Assigned by the writer thread at send
     /// time so seq order matches wire order, single-writer (no atomics needed).
     frame_seq: protocol.FrameSeq = .{},
@@ -1096,6 +1103,13 @@ pub const Connection = struct {
         // (tcp/ssh/relay/mux) negotiates `close_session` with a modern agent.
         var hello = local_hello;
         if (hello.capabilities.len == 0) hello.capabilities = &client_capabilities;
+        // Say what kind of pty WE spawn children on (T471). The agent has no use
+        // for it today — the flow that matters is the other direction, an agent
+        // telling us about the child it owns — but the field means one thing in
+        // both directions, and a future agent that wants it should not need a
+        // second wire change to get it. Statically-known string; costs a few
+        // bytes in a frame sent once per connection.
+        if (hello.pty_flavor == null) hello.pty_flavor = protocol.PtyFlavor.local.toString();
         self.* = .{
             .alloc = alloc,
             .control = control,
@@ -3353,6 +3367,11 @@ pub const Connection = struct {
         // a bare `error.Incompatible`, and the only way to tell "the agent is
         // behind us" from "we are behind the agent" afterwards is this number.
         self.peer_proto_version = parsed.value.proto_version;
+        // And what its children run on (T471) — a value, not a slice, so there
+        // is nothing to dupe out of the parse arena. Null from an agent older
+        // than the field, or from a future spelling we don't know; the reader
+        // (`history_guard.enabledFor`) falls back to this machine's flavour.
+        self.peer_pty_flavor = parsed.value.ptyFlavor();
         return protocol.negotiate(self.local_hello, parsed.value);
     }
 
@@ -3374,6 +3393,13 @@ pub const Connection = struct {
     /// has returned successfully.
     pub fn peerBuildVersion(self: *const Connection) ?[:0]const u8 {
         return self.peer_build_version;
+    }
+
+    /// The pty flavour the peer spawns its children on (T471), or null from an
+    /// agent too old to report one. Only valid after `waitHandshake` has
+    /// returned successfully — a remote pane reads it once its pane is live.
+    pub fn peerPtyFlavor(self: *const Connection) ?protocol.PtyFlavor {
+        return self.peer_pty_flavor;
     }
 
     /// Store the handshake outcome and wake `waitHandshake`. First writer wins so
@@ -3771,6 +3797,9 @@ const MockAgent = struct {
     reader: protocol.Reader,
     scratch: [read_buf_size]u8 = undefined,
     alloc: Allocator,
+    /// The `pty_flavor` the CLIENT reported in its own HELLO, captured by the
+    /// handshake (T471). Null until a handshake has run.
+    saw_pty_flavor: ?protocol.PtyFlavor = null,
 
     fn init(alloc: Allocator, stream: Stream, encoding: protocol.TransferEncoding) MockAgent {
         return .{
@@ -3822,13 +3851,30 @@ const MockAgent = struct {
     /// advertised them, so a test that drives one must hand the mock its
     /// capability set — an empty set models an older agent.
     fn handshakeCaps(self: *MockAgent, caps: []const []const u8) !protocol.TransferEncoding {
+        return self.handshakeFull(caps, null);
+    }
+
+    /// `handshakeCaps`, but the agent HELLO also reports `pty_flavor` — the wire
+    /// spelling verbatim, so a test can model an agent on the OTHER os, an agent
+    /// too old to say (null), or one naming a flavour this build never heard of
+    /// (T471). Records the client's own reported flavour in `saw_pty_flavor`.
+    fn handshakeFull(
+        self: *MockAgent,
+        caps: []const []const u8,
+        pty_flavor: ?[]const u8,
+    ) !protocol.TransferEncoding {
         const frame = (try self.nextFrame()) orelse return error.NoHello;
         try testing.expectEqual(protocol.FrameType.hello, frame.type);
         var parsed = try protocol.Hello.parse(self.alloc, frame.payload);
         defer parsed.deinit();
         const enc = parsed.value.transfer_encoding;
+        self.saw_pty_flavor = parsed.value.ptyFlavor();
 
-        const reply: protocol.Hello = .{ .transfer_encoding = enc, .capabilities = caps };
+        const reply: protocol.Hello = .{
+            .transfer_encoding = enc,
+            .capabilities = caps,
+            .pty_flavor = pty_flavor,
+        };
         const json = try reply.encode(self.alloc);
         defer self.alloc.free(json);
         try self.sendFrame(.{
@@ -3885,6 +3931,70 @@ test "handshake: client negotiates encoding/version, agent sees client HELLO" {
         try testing.expectEqual(protocol.proto_version, neg.proto_version);
         try testing.expect(actx.err == null);
         try testing.expectEqual(enc, actx.saw_encoding);
+
+        conn.shutdown();
+    }
+}
+
+const FlavorAgentCtx = struct {
+    agent: *MockAgent,
+    /// The wire spelling this mock agent reports, or null for an agent too old
+    /// to report one.
+    flavor: ?[]const u8,
+    err: ?anyerror = null,
+    fn run(self: *FlavorAgentCtx) void {
+        _ = self.agent.handshakeFull(&.{}, self.flavor) catch |e| {
+            self.err = e;
+        };
+    }
+};
+
+test "handshake: the agent's pty flavour crosses the wire in both directions (T471)" {
+    const alloc = testing.allocator;
+
+    // What the agent says → what a pane on this connection believes its child
+    // runs on. The last two are the skew cases: an agent from before the field
+    // existed, and one naming a flavour this build has never heard of. Both must
+    // land on null, which the guard reads as "assume this machine's" — i.e. the
+    // pre-T471 behaviour, never a wrong positive answer.
+    const cases = [_]struct { said: ?[]const u8, want: ?protocol.PtyFlavor }{
+        .{ .said = "posix", .want = .posix },
+        .{ .said = "conpty", .want = .conpty },
+        .{ .said = null, .want = null },
+        .{ .said = "tty37", .want = null },
+    };
+
+    for (cases) |c| {
+        var ctrl_lb = Loopback.init(alloc);
+        defer ctrl_lb.deinit();
+        var data_lb = Loopback.init(alloc);
+        defer data_lb.deinit();
+
+        const conn = try Connection.create(
+            alloc,
+            ctrl_lb.clientStream(),
+            data_lb.clientStream(),
+            .{ .transfer_encoding = .raw },
+        );
+        defer conn.destroy(alloc);
+
+        var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+        defer agent.deinit();
+        var actx: FlavorAgentCtx = .{ .agent = &agent, .flavor = c.said };
+        const ath = try std.Thread.spawn(.{}, FlavorAgentCtx.run, .{&actx});
+
+        try conn.start();
+        _ = try conn.waitHandshake();
+        ath.join();
+        try testing.expect(actx.err == null);
+
+        // The peer's answer, which is what a cross-OS pane hangs its scrollback
+        // guard on.
+        try testing.expectEqual(c.want, conn.peerPtyFlavor());
+
+        // And the other direction: we report OUR flavour unasked, so an agent
+        // that ever wants it does not need a second wire change to get it.
+        try testing.expectEqual(protocol.PtyFlavor.local, agent.saw_pty_flavor.?);
 
         conn.shutdown();
     }

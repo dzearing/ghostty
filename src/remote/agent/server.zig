@@ -403,6 +403,13 @@ pub const Server = struct {
         /// so the app can detect it is running an older build than it bundles and
         /// lazily refresh it. Must outlive `start()` (encoded there). Optional.
         build_version: ?[]const u8 = null,
+        /// The pty flavour this agent's children run on, advertised in the HELLO
+        /// so a client can pick a per-pane terminal policy from the CHILD rather
+        /// than from its own OS (T471 — the scrollback guard). Defaults to what
+        /// this build actually spawns; overridden only by the `pty_flavor` test
+        /// seam, which is how an on-box script reaches the cross-OS case with one
+        /// machine.
+        pty_flavor: protocol.PtyFlavor = .local,
         /// The `proto_version` to advertise, overriding this build's pinned one.
         /// A TEST SEAM (T125) and nothing else: an incompatible protocol skew is
         /// otherwise unreproducible from one tree, because both ends are built
@@ -437,6 +444,7 @@ pub const Server = struct {
                 .capabilities = opts.capabilities,
                 .hostname = opts.hostname,
                 .build_version = opts.build_version,
+                .pty_flavor = opts.pty_flavor.toString(),
             },
             .clock = opts.clock orelse Clock.real(),
             .spawner = spawner,

@@ -5,6 +5,8 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const protocol = @import("../remote/protocol.zig");
+const history_guard = @import("history_guard.zig");
 
 // The preallocation size for the write request pool. This should be big
 // enough to satisfy most write requests. It must be a power of 2.
@@ -64,6 +66,20 @@ pub const Backend = union(Kind) {
         return switch (self.*) {
             .exec => null,
             .remote => |*remote| remote.bringUpNotice(),
+        };
+    }
+
+    /// The kind of pty this backend's CHILD runs on, or null when it is not
+    /// knowable yet (a remote peer too old to report one, or a handshake that
+    /// has not resolved). Drives `termio/history_guard.zig` — see `enabledFor`
+    /// for what null means there.
+    ///
+    /// An exec pane's child is always this machine's, which is why the guard
+    /// could be a compile-time constant until remote panes existed (T471).
+    pub fn childPtyFlavor(self: *const Backend) ?protocol.PtyFlavor {
+        return switch (self.*) {
+            .exec => history_guard.local_flavor,
+            .remote => |*remote| remote.childPtyFlavor(),
         };
     }
 

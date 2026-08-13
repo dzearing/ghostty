@@ -663,11 +663,15 @@ pub fn settleNotice(self: *Termio) void {
     self.notice_guard = session_notice.trackFold(&self.terminal);
 }
 
-/// Pin the active-area boundary before a resize, on the platforms whose child
-/// repaints the viewport afterwards. See `history_guard`. Null everywhere else,
-/// which makes both call sites a compile-time no-op off Windows.
+/// Pin the active-area boundary before a resize, for a pane whose CHILD repaints
+/// the viewport afterwards. See `history_guard`. Null for every other pane, so
+/// both call sites cost one comparison and nothing else.
+///
+/// The flavour comes from the backend rather than `builtin.os.tag` because a
+/// remote pane's child runs on the agent's machine, which need not be this one
+/// (T471). Read on the IO thread, which is also the only thread that resizes.
 fn armHistoryGuardLocked(self: *Termio) ?*terminalpkg.Pin {
-    if (comptime !history_guard.enabled) return null;
+    if (!history_guard.enabledFor(self.backend.childPtyFlavor())) return null;
     return history_guard.arm(&self.terminal);
 }
 

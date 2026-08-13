@@ -1903,6 +1903,31 @@ fn protoVersionOverride(alloc: Allocator) ?u16 {
     return n;
 }
 
+/// The pty flavour to advertise in the HELLO: what this build actually spawns,
+/// unless `GHOZTTY_AGENT_PTY_FLAVOR` says otherwise.
+///
+/// The override is a TEST SEAM (T471) and nothing else. The behaviour it exists
+/// to reach — a client whose CHILD runs on the other kind of pty — otherwise
+/// needs two machines running two operating systems, so on one box there is no
+/// way to prove the client took the flavour off the wire rather than off
+/// `builtin.os.tag`. Debug/ReleaseSafe only, so a shipped agent can never
+/// misreport what it runs; same gate and same shape as
+/// `protoVersionOverride`.
+fn ptyFlavorOverride(alloc: Allocator) protocol.PtyFlavor {
+    if (comptime builtin.mode != .Debug and builtin.mode != .ReleaseSafe) return .local;
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_PTY_FLAVOR") catch return .local;
+    defer alloc.free(v);
+    const f = protocol.PtyFlavor.fromString(std.mem.trim(u8, v, " \t\r\n")) orelse {
+        std.log.warn("ignoring unknown GHOZTTY_AGENT_PTY_FLAVOR={s}", .{v});
+        return .local;
+    };
+    std.log.warn("advertising pty_flavor {s} instead of {s} (debug test hook)", .{
+        f.toString(),
+        protocol.PtyFlavor.local.toString(),
+    });
+    return f;
+}
+
 /// Stand up a `Mux` + `Server` over one transport `server.Stream`, sharing the
 /// daemon `store` + `spawner`, run until the transport EOFs, then tear the
 /// connection down. Shared by both stdio and TCP modes.
@@ -1933,6 +1958,7 @@ fn serveOne(
             .ring_bytes = configured_ring_bytes,
             .build_version = agent_version,
             .proto_version = protoVersionOverride(alloc),
+            .pty_flavor = ptyFlavorOverride(alloc),
         },
     );
     defer srv.destroy(alloc);
