@@ -57,6 +57,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
+// Test-only (T467): the class-level resize/redraw probe. Imported at file
+// scope so its own positive and negative controls are queued into the win32
+// test lane along with the class test below.
+const class_redraw = @import("class_redraw.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
@@ -194,7 +198,14 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
     if (class_registered) return;
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // CS_HREDRAW | CS_VREDRAW (T467): `paint` fills the client and then
+        // lays the pill, the carousel and the send row out from
+        // `Layout.init(layoutInput(width, scale))`, so the bar's content is a
+        // function of its own bounds. The pane resizes it with
+        // `MoveWindow(.., TRUE)` on every bounds sync - that paints whatever is
+        // invalid, and without this style the only invalid part is the strip
+        // the widen uncovered.
+        .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -1898,4 +1909,14 @@ fn wndProc(
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+// T467: `paint` fills the client and then places the pill, the image carousel
+// and the send row from a layout built on the bar's own width, so a resize
+// makes all of it stale — not just the strip Windows uncovers.
+test "viewer feedback class: a resize invalidates the whole bar" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClass(hinst);
+    if (!class_registered) return error.SkipZigTest;
+    try class_redraw.expectResizeInvalidatesWholeClient(CLASS_NAME);
 }

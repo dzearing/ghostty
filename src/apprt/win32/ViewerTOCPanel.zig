@@ -32,6 +32,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
+// Test-only (T467): the class-level resize/redraw probe. Imported at file
+// scope so its own positive and negative controls are queued into the win32
+// test lane along with the class test below.
+const class_redraw = @import("class_redraw.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const system_colors = @import("system_colors.zig");
@@ -124,7 +128,16 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
     if (class_registered) return;
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // CS_HREDRAW | CS_VREDRAW (T467): the card is a rounded band drawn
+        // against the window's own bounds - the rim and its shadow sit on the
+        // edges, and in gutter mode the card is inset inside a strip whose
+        // width `place()` re-derives from the pane. `place()` happens to redraw
+        // today because `SetWindowRgn(.., TRUE)` runs right after its
+        // `MoveWindow`, but that is a side effect of the rounded-corner clip,
+        // not a repaint contract: the gutter branch that passes a null region
+        // would lose it. The class style is the property being relied on, so
+        // it is the class that states it.
+        .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -995,4 +1008,16 @@ fn wndProc(
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+// T467: the panel is a rounded card drawn against its own bounds — the rim and
+// its shadow sit on the edges — and `place()` re-derives its width from the
+// pane on every bounds sync. It survives today only because
+// `SetWindowRgn(.., TRUE)` happens to follow the `MoveWindow`; this asserts the
+// property directly, on the class, where it does not depend on that.
+test "viewer TOC class: a resize invalidates the whole card" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClass(hinst);
+    if (!class_registered) return error.SkipZigTest;
+    try class_redraw.expectResizeInvalidatesWholeClient(CLASS_NAME);
 }

@@ -130,6 +130,10 @@ const Allocator = std.mem.Allocator;
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+// Test-only (T467): the class-level resize/redraw probe. Imported at file
+// scope so its own positive and negative controls are queued into the win32
+// test lane along with the class test below.
+const class_redraw = @import("class_redraw.zig");
 const layout_mod = @import("activity_layout.zig");
 const rows_mod = @import("activity_rows.zig");
 const cards_mod = @import("activity_cards.zig");
@@ -2478,13 +2482,30 @@ fn registerClass(app: *App) ?void {
     // Warm the palette memo so the first paint does not resolve on the critical
     // path; the brushes are created on demand, keyed on their color.
     _ = palFor(app);
+    return registerClassWith(app.hinstance);
+}
+
+/// The registration itself, taking only what the class needs. Split out so the
+/// class-level redraw test (T467) can register it without standing up an `App`
+/// — the palette warm-up above is the only part that needs one.
+fn registerClassWith(hinstance: ?w32.HINSTANCE) ?void {
+    if (class_registered) return;
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // CS_HREDRAW | CS_VREDRAW (T467): every pixel this window paints is
+        // derived from the CURRENT client size - `layout()` feeds
+        // `GetClientRect` straight into `layout_mod.layout`, and the gauges,
+        // the control bar, the table columns and the dividers are all measured
+        // against `l.client_w`/`l.client_h`. This is a user-resizable
+        // `WS_OVERLAPPEDWINDOW` panel, and `WM_SIZE` only re-places the child
+        // controls, so without this a drag repaints the newly exposed strip
+        // and leaves the table drawn at the width it used to have. Paired with
+        // the `WM_ERASEBKGND => 1` below, the stale pixels are not even erased.
+        .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
-        .hInstance = app.hinstance,
+        .hInstance = hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
         // Null: a class background brush is captured at registration, which
@@ -4804,4 +4825,15 @@ test "nextVisibleFocus: nothing visible leaves focus where it is" {
     const v: [focus_count]bool = @splat(false);
     try testing.expectEqual(Focusable.filter, nextVisibleFocus(.filter, false, v));
     try testing.expectEqual(Focusable.table, nextVisibleFocus(.table, true, v));
+}
+
+// T467: this is the one panel on Windows the USER resizes by dragging its
+// frame, and every pixel of it — the gauges, the control bar, the table's
+// columns, the dividers — is measured against the client rect that `layout()`
+// reads back. `WM_SIZE` only re-places the child controls, so the owner-painted
+// table's repaint is entirely the class's job.
+test "activity monitor class: a resize invalidates the whole panel" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassWith(hinst) orelse return error.SkipZigTest;
+    try class_redraw.expectResizeInvalidatesWholeClient(CLASS_NAME);
 }

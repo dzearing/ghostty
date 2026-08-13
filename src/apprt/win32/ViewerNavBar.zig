@@ -25,6 +25,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
+// Test-only (T467): the class-level resize/redraw probe. Imported at file
+// scope so its own positive and negative controls are queued into the win32
+// test lane along with the class test below.
+const class_redraw = @import("class_redraw.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
@@ -116,7 +120,14 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
     if (class_registered) return;
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
-        .style = 0,
+        // CS_HREDRAW | CS_VREDRAW (T467): the bar's whole layout is
+        // `Layout.init(scale, width, shown)` - the buttons are anchored to the
+        // right edge and the address field stretches between them - so a width
+        // change makes every pixel stale, not just the strip the resize
+        // uncovers. `place()` resizes with `MoveWindow(.., TRUE)`, which paints
+        // the update region but does not widen it; the class style is what
+        // makes that region the whole client.
+        .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -796,4 +807,16 @@ fn activate(self: *ViewerNavBar, b: layout_mod.Button) void {
         .home => self.pane.goHome(),
         .feedback => self.pane.toggleFeedback(),
     }
+}
+
+// T467: the bar's buttons are anchored to its right edge and the address field
+// spans what is left, so a pane width change re-lays out every one of them.
+// `place()` resizes with `MoveWindow(.., TRUE)`, which paints the update
+// region — the class is what decides that the region is the whole bar and not
+// the sliver the widen uncovered.
+test "viewer nav class: a resize invalidates the whole bar" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClass(hinst);
+    if (!class_registered) return error.SkipZigTest;
+    try class_redraw.expectResizeInvalidatesWholeClient(CLASS_NAME);
 }

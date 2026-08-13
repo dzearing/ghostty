@@ -590,6 +590,64 @@ hunting a capture bug that is not there.
 
 ---
 
+## 5c. A class whose paint is derived from its own bounds carries `CS_HREDRAW | CS_VREDRAW` (T456, T467)
+
+When a window is RESIZED, Windows invalidates only the strip the resize
+uncovered — unless the window's CLASS says otherwise. `CS_HREDRAW | CS_VREDRAW`
+is what widens that to the whole client area, and it is set once, at
+`RegisterClassExW`, for the life of the process.
+
+**The test is: is a partial repaint of this window distinguishable from a full
+one?** A flat fill (`DimOverlay`) says no — repainting the new strip leaves
+exactly the picture a full repaint would. Anything laid out against its own
+bounds says yes: a card whose rounded rim and shadow sit on the edges, a bar
+whose buttons are anchored right, a table whose columns are a fraction of the
+client width, text word-wrapped to a content width. Those windows keep the
+geometry they were last painted at while their frame moves — invisible in a
+screenshot, obvious in a divider drag (T456, the pane banner: measured at
+`GetUpdateRect` = 0 after a 40px widen).
+
+`MoveWindow(.., TRUE)` does **not** substitute for it. It paints whatever is
+invalid; it does not make more of the window invalid. Neither does a hand
+`InvalidateRect` at one call site, which is a promise every future caller has to
+remember to keep.
+
+The audit of every registered class, so this is not re-derived a third time:
+
+| Class | Style | Needs it? | Why |
+|---|---|---|---|
+| `BannerOverlay` | `CS_HREDRAW\|CS_VREDRAW` | **yes** (T456) | Card laid out against the band: rim, shadow, chevron column, wrapped text |
+| `ActivityMonitor` | `CS_HREDRAW\|CS_VREDRAW` | **yes** (T467) | User-resizable panel; every element measured from `client_w`/`client_h` |
+| `GhozttyViewerNav` | `CS_HREDRAW\|CS_VREDRAW` | **yes** (T467) | Right-anchored buttons, address field spans the rest |
+| `GhozttyViewerFeedback` | `CS_HREDRAW\|CS_VREDRAW` | **yes** (T467) | Pill, image carousel and send row placed from the bar's width |
+| `GhozttyViewerTOC` | `CS_HREDRAW\|CS_VREDRAW` | **yes** (T467) | Rounded card against its own bounds (the `SetWindowRgn` redraw is a side effect, not a contract) |
+| `ViewerPane` | `CS_HREDRAW\|CS_VREDRAW` | yes | Centered card |
+| `DimOverlay` | `0` | no | Flat fill — a partial repaint is indistinguishable |
+| `Scrollbar`, `KeyStateIndicator`, `ReadonlyBadge` | `0` | no | **Push-model**: painted by `UpdateLayeredWindow`, never `WM_PAINT`. The style would be inert; what matters is that every resize path calls their `repaint()`, and each does |
+| Top-level `Window` | `CS_DBLCLKS` | no | `handleResize` invalidates the caption band and the tab strip by hand and deliberately, so a resize does not repaint the child-covered pane area |
+| Terminal surface | `CS_OWNDC` | no | The OpenGL renderer redraws the whole client every frame; `WM_PAINT` only wakes it |
+| Message-only window, agent tray window | `0` | no | Never painted |
+| `RegionSelector` | `0` | no | Created at virtual-screen size and never resized; manages its own invalidation |
+| `BannerDialog`, `ConfirmDialog`, `RenameDialog`, `NewProcessDialog`, `HostSettingsDialog`, `MachineChooser` | `0` / `CS_DBLCLKS` | no | Fixed-size `WS_POPUP\|WS_CAPTION` dialogs: no `WS_THICKFRAME`, no `WM_SIZE`, no self-resize. Only their child controls move |
+
+One latent case is deliberately left alone and named here so it is not
+rediscovered as a mystery: the **command palette and search popups ride the
+terminal's own class** (`TERMINAL_CLASS_NAME`), so they cannot be given the
+style without giving it to every terminal surface, where it would force a
+full-client erase on every drag frame. They are sized `<constant> * scale`, so
+they only ever resize on a DPI change while open. Filed as its own task.
+
+**How this is asserted:** `src/apprt/win32/class_redraw.zig` creates a real
+window of the class (on-screen, layered at alpha 0 — parked off-monitor it has
+an empty visible region and Windows invalidates nothing, which passes the
+assertion for the wrong reason), resizes it along ONE axis at a time, and reads
+`GetUpdateRect` back. Width and height are measured separately so a class
+carrying one style bit cannot pass. The module registers its own positive and
+negative control classes, identical but for the style, so every run re-proves
+that the probe can tell them apart.
+
+---
+
 ## 6. Vertical space is expensive
 
 A terminal's vertical space belongs to the terminal. Chrome that is always
