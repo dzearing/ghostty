@@ -409,19 +409,38 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// Main frame only: the toolbar positions itself in viewport coordinates,
     /// which a subframe's own coordinate space would not match.
     static func selectionUserScript() -> WKUserScript? {
+        userScript(named: "selection", degradesTo: "quoting", forMainFrameOnly: true)
+    }
+
+    /// The bundled link-context-menu user script, or nil if the resource is
+    /// missing (a broken bundle degrades to WebKit's own menu, never a crash).
+    ///
+    /// ALL frames, unlike the selection toolbar: this script reports a click
+    /// and the menu is drawn natively at the pointer, so a subframe's own
+    /// coordinate space is irrelevant and a link inside an iframe gets the
+    /// same menu as one outside it.
+    static func linkMenuUserScript() -> WKUserScript? {
+        userScript(named: "links", degradesTo: "the link menu", forMainFrameOnly: false)
+    }
+
+    private static func userScript(
+        named name: String,
+        degradesTo feature: String,
+        forMainFrameOnly: Bool
+    ) -> WKUserScript? {
         guard let url = Bundle.main.url(
-            forResource: "selection",
+            forResource: name,
             withExtension: "js",
             subdirectory: "ghostty/viewer"),
             let source = try? String(contentsOf: url, encoding: .utf8)
         else {
-            logger.warning("selection.js missing from bundle; quoting disabled")
+            logger.warning("\(name).js missing from bundle; \(feature) disabled")
             return nil
         }
         return WKUserScript(
             source: source,
             injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true)
+            forMainFrameOnly: forMainFrameOnly)
     }
 
     /// Classify a location as a diff, a website, or a file to render.
@@ -523,6 +542,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // arbitrary web content, which is where quoting a dev server's UI
             // matters most.
             if let script = Self.selectionUserScript() {
+                config.userContentController.addUserScript(script)
+            }
+
+            // Link context menu, injected into every page for the same reason.
+            // It only decides whether a right-click landed on a link Ghoztty
+            // has actions for and suppresses WebKit's menu when it did; the
+            // menu itself is native (see `presentLinkMenu`). A right-click on
+            // anything else — page background, an image, selected text, a
+            // `mailto:` — still gets WebKit's own menu, unchanged.
+            if let script = Self.linkMenuUserScript() {
                 config.userContentController.addUserScript(script)
             }
 
@@ -1741,6 +1770,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
             activeHeadingID = payload["id"] as? String
         case "quote":
             handleQuoteMessage(payload)
+        case "linkMenu":
+            presentLinkMenu(payload)
         case "diffNavOverflow":
             // The open file has no further hunk in that direction; the next
             // change is in the next FILE.
@@ -1748,6 +1779,26 @@ final class ViewerView: NSView, Codable, ObservableObject {
         default:
             break
         }
+    }
+
+    /// The page reported a right-click on a link (see `links.js`, which has
+    /// already suppressed WebKit's own menu for it). Shows the SAME menu a
+    /// banner link shows — one menu, one modifier scheme, one place the
+    /// ordering contract lives, with the first item the left-click default.
+    ///
+    /// Positioned from the POINTER rather than from the click's page
+    /// coordinates: those are CSS pixels inside a view that may be page-zoomed
+    /// and pinch-magnified, while the pointer has not moved in the time it took
+    /// the message to cross the bridge.
+    private func presentLinkMenu(_ payload: [String: Any]) {
+        guard let href = payload["href"] as? String,
+              let url = URL(string: href),
+              let target = resolvedLinkURL(for: url),
+              let window
+        else { return }
+        let point = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        BannerLinkOpener(anchor: self).menu(for: target)
+            .popUp(positioning: nil, at: point, in: self)
     }
 
     /// The page's selection toolbar sent a passage to quote. Opens the
@@ -3072,7 +3123,28 @@ extension ViewerView: WKNavigationDelegate {
         // file, which is a page in every way that matters. Its links behave
         // exactly as they would if the folder were served over http, which is
         // how these mocks and prototypes had to be viewed before.
+        //
+        // The ONE exception is a link the user clicked that leads out of the
+        // page's own origin (see `isExternalLivePageLink`): Ghoztty's WKWebView
+        // keeps its own cookie store, so a hop to another site renders
+        // logged-out here, and the browser is where that session lives. It
+        // leaves through the SAME scheme a banner link does — plain click to
+        // the system, Cmd to a side pane, Cmd-Shift to a surface of its own —
+        // so there is one modifier scheme across every link surface.
+        //
+        // Narrowly gated on a main-frame `.linkActivated`: a page's own
+        // redirects, form posts, script navigations, iframe loads, and
+        // subresource fetches are the page's business, not the user's click.
         if isLivePage {
+            if navigationAction.navigationType == .linkActivated,
+               navigationAction.targetFrame?.isMainFrame == true,
+               Self.isExternalLivePageLink(from: webView.url, to: url) {
+                decisionHandler(.cancel)
+                BannerLinkOpener(anchor: self).perform(
+                    BannerLinkOpener.action(for: url, modifiers: navigationAction.modifierFlags),
+                    on: url)
+                return
+            }
             decisionHandler(.allow)
             return
         }
@@ -3098,19 +3170,11 @@ extension ViewerView: WKNavigationDelegate {
             return
         }
 
-        // Relative links render as ghoztty-viewer:// URLs; map them back to
-        // a real file next to the viewed file. file:// links come through
-        // as-is (markdown-it linkify or explicit file URLs).
-        let fileURL: URL?
-        if url.scheme == ViewerSchemeHandler.scheme {
-            let relative = String(url.path.dropFirst())
-            fileURL = schemeHandler?.resolveForNavigation(relative)
-        } else if url.isFileURL {
-            fileURL = url
-        } else {
-            fileURL = nil
-        }
-        guard let fileURL else { return }
+        // Relative links render as ghoztty-viewer:// URLs; `resolvedLinkURL`
+        // maps them back to a real file next to the viewed file, and passes
+        // file:// links (markdown-it linkify or explicit file URLs) straight
+        // through. Anything else is a scheme this pane has nothing to do with.
+        guard let fileURL = resolvedLinkURL(for: url), fileURL.isFileURL else { return }
 
         switch Self.mode(for: fileURL.path) {
         case .markdown, .html:
@@ -3118,6 +3182,87 @@ extension ViewerView: WKNavigationDelegate {
         default:
             NSWorkspace.shared.open(fileURL)
         }
+    }
+
+    /// Whether a link clicked in a LIVE-PAGE viewer (a website, or a local HTML
+    /// file, both of which own their own navigation) leads OUT of the page's
+    /// own origin, and so belongs somewhere other than this pane.
+    ///
+    /// "Origin" here is deliberately NOT the web platform's origin. That one
+    /// decides what a script may read; this one decides where a PERSON wants a
+    /// page to open, and the two want different rules:
+    ///
+    /// - **http(s) → http(s):** the same **host**, and the same **port as
+    ///   written**. The scheme is excluded on purpose, so an `http` → `https`
+    ///   upgrade on the same host — the most common same-site hop there is —
+    ///   keeps navigating in the pane. The port is included on purpose:
+    ///   `localhost:3000` → `localhost:5173` is a hop between two different dev
+    ///   servers. A subdomain is a different host and therefore external, which
+    ///   is what "a link out to another site" means to a person.
+    /// - **file:// → file://:** inside the page's own directory, recursively —
+    ///   exactly the read grant `loadFileURL(_:allowingReadAccessTo:)` gave the
+    ///   pane, so a scaffolded mock clicks through its own pages while a link
+    ///   reaching UP out of the folder (which this pane could never load) stops
+    ///   being a dead click. Existence is not checked: a link to a missing
+    ///   sibling is the page's own broken link and should get the page's own
+    ///   error, not Finder.
+    /// - **Across those two families** — a local mock linking to github.com, a
+    ///   dev server linking to a `file://` path — there is no shared origin at
+    ///   all, so the link is external.
+    /// - **Every other scheme** (`javascript:`, `data:`, `blob:`, `about:`,
+    ///   `mailto:`, some app's custom scheme) is left exactly as it is today and
+    ///   followed in the pane. `javascript:` links are ordinary page machinery,
+    ///   and handing an arbitrary scheme to `NSWorkspace` would resolve it to
+    ///   whatever handler happens to be registered — the same reason
+    ///   `popupDestination(for:modifiers:)` guards its scheme.
+    static func isExternalLivePageLink(from page: URL?, to link: URL) -> Bool {
+        guard let page else { return false }
+        if let pageSite = Self.site(of: page) {
+            // A web page. Another site is external; a `file://` link is too
+            // (WebKit refuses that navigation outright, so following it in the
+            // pane is a dead click).
+            guard let linkSite = Self.site(of: link) else { return link.isFileURL }
+            return pageSite != linkSite
+        }
+        guard page.isFileURL else { return false }
+        if Self.site(of: link) != nil { return true }
+        guard link.isFileURL else { return false }
+        return !Self.path(link, isUnder: page.deletingLastPathComponent())
+    }
+
+    /// A live page's site: its host plus the port as written, or nil when it is
+    /// not an http(s) location at all. A default port is dropped so
+    /// `http://x.com:80` and `https://x.com` are the same site.
+    private static func site(of url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(), !host.isEmpty
+        else { return nil }
+        guard let port = url.port,
+              port != (scheme == "http" ? 80 : 443)
+        else { return host }
+        return "\(host):\(port)"
+    }
+
+    /// Whether `url` names a path inside `directory`. Purely by path: this
+    /// decides where a link opens, not whether a file can be served, so a link
+    /// to a not-yet-existing sibling still counts as inside the page's folder.
+    private static func path(_ url: URL, isUnder directory: URL) -> Bool {
+        let target = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let root = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        return target == root || target.hasPrefix(root + "/")
+    }
+
+    /// The real destination a clicked link names. A relative link inside the
+    /// render template arrives as a `ghoztty-viewer://` URL — an implementation
+    /// detail of how the page is served — so it maps back to the file it names;
+    /// every other link already IS its destination.
+    ///
+    /// Nil only when a template link names a file that is not there, which is
+    /// also exactly what a left-click on it does: nothing.
+    func resolvedLinkURL(for url: URL) -> URL? {
+        guard url.scheme == ViewerSchemeHandler.scheme else { return url }
+        return schemeHandler?.resolveForNavigation(String(url.path.dropFirst()))
     }
 
     /// Open another viewer as a split next to this pane.
@@ -3262,6 +3407,20 @@ extension ViewerView: WKUIDelegate {
         else { return }
         controller.closeSurface(node, withConfirmation: false)
     }
+}
+
+// MARK: - Link anchor
+
+/// A viewer pane is a link surface too: the links on its page use the same
+/// actions, modifier scheme, and right-click menu a banner's do.
+extension ViewerView: LinkAnchor {
+    var anchorWindow: NSWindow? { window }
+
+    func anchorPane(in tree: SplitTree<PaneView>) -> PaneView? {
+        tree.first(where: { $0.viewerView === self })
+    }
+
+    var anchorDirectory: String? { originDirectory }
 }
 
 // MARK: - TOC script bridge

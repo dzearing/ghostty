@@ -107,7 +107,7 @@ final class BannerTextView: NSView {
 
     /// Actions (open in new window / side pane / browser, copy) for the links
     /// in this view, anchored to `linkSurface`.
-    private var linkOpener: BannerLinkOpener { BannerLinkOpener(surface: linkSurface) }
+    private var linkOpener: BannerLinkOpener { BannerLinkOpener(anchor: linkSurface) }
 
     private var trackingArea: NSTrackingArea?
 
