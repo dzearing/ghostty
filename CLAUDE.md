@@ -185,6 +185,15 @@ Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic
 
 A URL goes to the real browser by default because Ghoztty's `WKWebView` keeps its own cookie store with no relationship to Safari/Chrome — anything behind a login renders logged-out in a viewer pane, and OAuth sign-in never completes. A file path is only *revealed*, never opened, so a click can't launch whatever app claims the extension. The right-click menu offers all of them (its first item is by contract the left-click default) plus Copy Link / Copy Path.
 
+**This table is not banner-only.** It is `BannerLinkOpener`, and **viewer panes use the
+same one** — for the links a viewer hands out (see Viewer Panes → Links) and for the
+right-click menu on any link in a viewer page. One modifier scheme, one menu, one place
+the ordering contract lives; a second copy is the drift the type exists to prevent. The
+opener reaches its surface through a `LinkAnchor` (the terminal `SurfaceView` for a
+banner, the `ViewerView` for a viewer pane), which is what supplies the window's
+controller, the pane a side split anchors beside, and the origin directory a viewer
+opened from the link inherits.
+
 **Lists.** Consecutive lines that begin with a list marker render as a list block with table-like row spacing and a **shared marker gutter**, so every item's content left-aligns regardless of marker kind (bullets, numbers, and checkboxes in one run all line up). Supported markers:
 
 - `- ` or `* ` → an unordered **bullet** (`•`).
@@ -404,8 +413,10 @@ Consequences, all deliberate:
   app that reads as broken in the one case where the link could never have
   worked.
 - **Viewer panes** intercept `ghoztty://` at the top of `decidePolicyFor`,
-  ahead of the live-page passthrough (WebKit cannot load the scheme, so an
-  allowed navigation is a dead click). A `target="_blank"` focus link resolves
+  ahead of the live-page passthrough AND of the cross-origin external-link
+  check (WebKit cannot load the scheme, so an allowed navigation is a dead
+  click, and a focus link is not "content on another site" to hand to a
+  browser). A `target="_blank"` focus link resolves
   to `PopupDestination.ghozttyCommand` instead of falling through to
   "non-web scheme ⇒ open a Ghoztty window", which is how it used to create a
   viewer window pointed at the command string.
@@ -416,13 +427,16 @@ Consequences, all deliberate:
 - **Banner links** ignore the Cmd / Cmd-Shift modifier scheme
   (`BannerLinkOpener.Action.runGhozttyCommand`): the link names a window, not
   content, so there is nothing to open in a side pane or a new window. The
-  right-click menu is **Focus in Ghoztty** + **Copy Link**.
+  right-click menu is **Focus in Ghoztty** + **Copy Link**. A focus link
+  right-clicked in a **viewer page** gets that same two-item menu, since the
+  viewer builds its menu from the same `BannerLinkOpener`.
 
 Entry points: `application(_:open:)` (`AppDelegate.swift`) for LaunchServices,
-`ViewerView` for viewer link clicks and popups, `BannerLinkOpener` for banner
-clicks. All of them funnel into `GhozttyURLScheme.handle` →
-`IPCServer.focusTarget`. Tests: `GhozttyURLSchemeTests`, plus the
-`ghoztty`-scheme cases in `BannerLinkOpenerTests` and `ViewerPopupTests`.
+`ViewerView` for viewer link clicks, popups, and the viewer link menu,
+`BannerLinkOpener` for banner clicks. All of them funnel into
+`GhozttyURLScheme.handle` → `IPCServer.focusTarget`. Tests:
+`GhozttyURLSchemeTests`, plus the `ghoztty`-scheme cases in
+`BannerLinkOpenerTests` and `ViewerPopupTests`.
 
 ## Viewer Panes
 
@@ -491,16 +505,64 @@ ghoztty +close --target=doc
   that grant narrow — put shared assets under the page's directory, or serve
   the project over http. Rendering is unconditional: there is no source-view
   toggle. Because the page is the document, an HTML pane is navigable like a
-  website — its links follow **in the pane**, exactly as they would if the
-  folder were hosted — and Back/Forward cross into and out of it. A file
+  website — its links follow **in the pane** for anything inside that same
+  grant, exactly as they would if the folder were hosted (Links, below, is the
+  one exception) — and Back/Forward cross into and out of it. A file
   that cannot be opened shows the usual in-page error card.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
-- **Links** in markdown/code viewers: http(s) opens the default browser; a
-  relative `.md` or `.html` link opens another viewer split (both are things a
-  viewer renders); other local files open in their default app. An HTML pane
-  is the exception — being a page, it follows every link in place.
+- **Links.** Every viewer kind now hands a link that leads *out* of what the
+  pane is showing to the same place a banner link goes (see Banners → Link
+  clicks: plain click to the system, Cmd to a side pane, Cmd-Shift to a surface
+  of its own), and **right-clicking any link gives the same menu** —
+  `BannerLinkOpener`, adopted whole, not a viewer copy of it.
+  - In **markdown/code** viewers (unchanged): http(s) opens the default browser;
+    a relative `.md` or `.html` link opens another viewer split (both are things
+    a viewer renders); other local files open in their default app.
+  - In **live-page** viewers (a website, a local HTML file) a link is followed
+    in the pane unless it is **cross-origin**, in which case a plain click
+    leaves for the browser. This is what makes an authenticated site work: the
+    `WKWebView`'s cookie store is Ghoztty's own, so a hop out to `github.com`
+    renders logged-out here.
+  - **"Origin" here is deliberately not the web platform's.** That one decides
+    what a *script* may read; this one decides where a *person* wants a page to
+    open (`ViewerView.isExternalLivePageLink`):
+    **http(s)** is same-origin on the same **host** + the same **port as
+    written** — the scheme is excluded so an `http`→`https` upgrade stays in the
+    pane, and the port is included because `localhost:3000` → `localhost:5173`
+    is a different dev server. A subdomain is a different host, so external.
+    **`file://`** is same-origin inside the page's own directory, recursively —
+    exactly the read grant the HTML bullet describes, so a mock clicks through
+    its own pages and a link reaching UP out of the folder (which this pane
+    could never load) stops being a dead click. Existence is not checked: a
+    broken sibling link is the page's own 404, not Finder's problem.
+    **Across the two** (a local mock linking to a website, a dev server linking
+    to a `file://` path) there is no shared origin, so: external.
+    **Every other scheme** — `javascript:`, `data:`, `blob:`, `about:`,
+    `mailto:` — is untouched and followed in the pane. `javascript:` is ordinary
+    page machinery, and handing an arbitrary scheme to `NSWorkspace` would
+    resolve it to whatever handler is registered.
+  - Only a **user's click on a main-frame link** (`.linkActivated`) is ever
+    routed. A page's own redirects, form posts, script navigations, iframe
+    loads, and subresource fetches are the page's business and pass through.
+  - **The right-click menu** is Ghoztty's, on every page including ones we do
+    not control. `src/viewer/links.js` is a `WKUserScript` — for the same reason
+    `selection.js` is one: `viewer.js` is a `<script src>` in `viewer.html` and
+    only ever runs on the bundled template, which would have left a website's
+    links with WebKit's menu and the template's with ours. The script does
+    nothing but decide whether the click landed on a link Ghoztty has actions
+    for, `preventDefault()` if so, and report the href; the menu itself is
+    native and pops up at the **pointer** (the click's page coordinates are CSS
+    pixels inside a view that may be zoomed and pinch-magnified). It runs in
+    **all frames**, unlike `selection.js`, precisely because it needs no page
+    coordinates. It **declines** — leaving WebKit's own menu exactly as it is
+    today — for a same-document `#fragment`, for a click inside the user's
+    current selection (Copy / Look Up must survive), for `mailto:`/`javascript:`
+    and other schemes with no Ghoztty action, and whenever the native bridge is
+    missing. A relative template link (`ghoztty-viewer://…`) is resolved back to
+    the file it names, so the menu offers file actions; a template link to a
+    missing file gets no menu, matching a left-click on it doing nothing.
 - **Links that open a new surface** in a website viewer — `target="_blank"` or
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane
@@ -511,6 +573,12 @@ ghoztty +close --target=doc
   tradeoff: a popup that lands in the browser can't `window.close()` itself
   back to the Ghoztty page that opened it, so an OAuth flow finishes in the
   browser. That flow wasn't authenticating in Ghoztty anyway.
+  **Cmd here means a new window, not a side pane** — deliberately out of step
+  with the Link clicks table above, and left that way. `window.open()` is a
+  request for a *window*; the code honors the `width=`/`height=` the opener
+  asked for, and a sign-in popup crammed into a split is not what the page or
+  the user meant. Cmd on an ordinary link (which asks for no such thing) still
+  means a side pane.
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position — an HTML pane re-fetches the page from
   disk, and WebKit restores the scroll offset across it, so a save does not

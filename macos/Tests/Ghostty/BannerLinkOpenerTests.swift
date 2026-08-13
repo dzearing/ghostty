@@ -9,7 +9,7 @@ import Testing
 /// the pasteboard, and what a viewer pane is handed to display the link.
 @MainActor
 struct BannerLinkOpenerTests {
-    private let opener = BannerLinkOpener(surface: nil)
+    private let opener = BannerLinkOpener(anchor: nil)
     private let web = URL(string: "https://example.com")!
     private let file = URL(fileURLWithPath: "/tmp/a.md")
     private let ghoztty = URL(string: "ghoztty://focus/dev")!
