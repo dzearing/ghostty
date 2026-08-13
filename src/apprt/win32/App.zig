@@ -37,6 +37,7 @@ const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const LocalAgent = @import("LocalAgent.zig");
+const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const protocol = @import("../../remote/protocol.zig");
 const tab_color = @import("tab_color.zig");
@@ -294,6 +295,14 @@ ipc_registry: IpcRegistry = .{},
 /// see `LocalAgent.sharedConnection`.
 local_agent: LocalAgent = undefined,
 
+/// One warm connection per REMOTE machine (T461), shared by every feature that
+/// talks to that machine's agent — today the chooser's session roster and its
+/// Kill. The remote-side counterpart to `local_agent`'s shared connection, and
+/// app-scoped for the same reason: a connection keyed by the endpoint outlives
+/// the transient UI that asked for it only as long as somebody holds a lease, but
+/// the TABLE of them must not belong to any one dialog.
+machine_pool: MachineConnectionPool = undefined,
+
 /// Deadline (ms, `milliTimestamp` scale) by which the shared local-agent link
 /// must come back before its drop counts as real (T145). Non-null ⇒ a settle
 /// watch is running and `AGENT_WATCH_TIMER_ID` is armed. Overlapping down edges
@@ -414,6 +423,7 @@ pub fn init(
         .hinstance = hinstance,
         .bg_brush = bg_brush,
         .local_agent = LocalAgent.init(alloc),
+        .machine_pool = MachineConnectionPool.init(alloc),
     };
 
     // Register the window container class (GDI painting, no CS_OWNDC).
@@ -1181,6 +1191,11 @@ pub fn terminate(self: *App) void {
     // CLOSE — the agent keeps its pinned sessions + snapshots rings so they
     // re-attach on the next launch (T89d; the close-vs-quit split is T89e).
     self.local_agent.deinit();
+
+    // Same ordering rule for the remote machines' warm connections (T461): every
+    // chooser is gone with its window above, so every lease is released and this
+    // is only mopping up an entry a borrow still held.
+    self.machine_pool.deinit();
 
     // Free the IPC target registry (keys are owned).
     self.ipc_registry.deinit(alloc);
@@ -7213,6 +7228,27 @@ fn msgWndProc(
             const res: *SessionRoster.Result = @ptrFromInt(wparam);
             MachineChooser.onSessions(app, res);
         }
+        return 0;
+    }
+
+    if (msg == MachineConnectionPool.WM_APP_MACHINE_POOL_DIALED) {
+        // wparam = heap *DialResult owned by the handler. Here rather than on a
+        // chooser's window for the same reason as the roster above, and with a
+        // sharper consequence: a discarded dial leaks the CONNECTION it opened,
+        // which nothing else would ever free (T461).
+        if (wparam != 0) {
+            const res: *MachineConnectionPool.DialResult = @ptrFromInt(wparam);
+            app.machine_pool.onDialed(res);
+        }
+        return 0;
+    }
+
+    if (msg == MachineConnectionPool.WM_APP_MACHINE_POOL_NOTIFY) {
+        // Two integer payloads, no allocation: a warm-connection replay for a
+        // late lease (wparam 0), or a pooled connection's link state moving
+        // (wparam = its entry id). Posted from the connection's reader thread,
+        // which may not touch GUI state.
+        app.machine_pool.onNotify(wparam, lparam);
         return 0;
     }
 

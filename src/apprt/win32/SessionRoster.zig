@@ -33,9 +33,10 @@ const chooser_sessions = @import("chooser_sessions.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const icon_button = @import("icon_button.zig");
 const LocalAgent = @import("LocalAgent.zig");
+const machine_pool = @import("machine_pool.zig");
+const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const session_layout = @import("session_layout.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
-const relay_dial = @import("../../remote/relay_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const w32 = @import("win32.zig");
 
@@ -63,11 +64,17 @@ const max_killed = 16;
 // State (GUI thread only)
 // ---------------------------------------------------------------------
 
-/// Everything the worker needs to reach a REMOTE machine's agent. There is no
-/// new RPC on this path — `Connection.requestSessions` is transport-agnostic
+/// Everything needed to reach a REMOTE machine's agent. There is no new RPC on
+/// this path — `Connection.requestSessions` is transport-agnostic
 /// (`connection.zig:1598`), which is Mac's own claim about it
 /// (`SessionBrowserProbe.swift:93-96`) — so the whole remote half of this file
-/// is the dial and who owns it.
+/// is the connection and who owns it.
+///
+/// Since T461 that owner is `App.machine_pool`: this roster BORROWS the
+/// machine's one warm connection for the length of an RPC instead of dialing its
+/// own and freeing it per fetch. The credentials are still carried here because
+/// the pool needs them to dial (a token can rotate; it is not part of the
+/// endpoint's identity).
 pub const Remote = struct {
     /// The relay HTTPS base (an `http://` base is a loopback test relay).
     base: []const u8,
@@ -144,46 +151,23 @@ const Request = struct {
     hwnd: w32.HWND,
     chooser_id: u64,
     serial: u64,
-    /// The app's warm shared agent connection, borrowed. Never freed here — it
-    /// is owned by `LocalAgent` for the app's lifetime (and a retired one is
-    /// kept alive precisely so a borrow like this can never dangle).
+    /// The agent connection this RPC rides, borrowed. Never freed here: for the
+    /// LOCAL target it is owned by `LocalAgent` for the app's lifetime (and a
+    /// retired one is kept alive precisely so a borrow like this can never
+    /// dangle), and for a REMOTE target it belongs to `entry` below.
     warm: ?*remote_connection.Connection,
     /// A session to END before listing, for the Kill path. Owned.
     kill_id: ?[]u8,
-    /// A relay target, DEEP-COPIED off the GUI thread's borrowed strings: the
-    /// chooser that owns them can close while this dial is still blocking.
-    remote: ?OwnedRemote = null,
+    /// The pooled connection's refcount ticket for a REMOTE target (T461). Held
+    /// for the whole blocking call and given back on the way out, which is what
+    /// makes it safe for the last lease to drop mid-RPC: the pool's own
+    /// reference can go while this one keeps the transport alive.
+    entry: ?*MachineConnectionPool.Entry = null,
 
     fn destroy(self: *Request) void {
         if (self.kill_id) |k| self.alloc.free(k);
-        if (self.remote) |r| r.deinit(self.alloc);
+        if (self.entry) |e| e.release();
         self.alloc.destroy(self);
-    }
-};
-
-const OwnedRemote = struct {
-    base: []u8,
-    device: []u8,
-    token: []u8,
-
-    fn dupe(alloc: Allocator, src: Remote) ?OwnedRemote {
-        const base = alloc.dupe(u8, src.base) catch return null;
-        const device = alloc.dupe(u8, src.device) catch {
-            alloc.free(base);
-            return null;
-        };
-        const token = alloc.dupe(u8, src.token) catch {
-            alloc.free(base);
-            alloc.free(device);
-            return null;
-        };
-        return .{ .base = base, .device = device, .token = token };
-    }
-
-    fn deinit(self: OwnedRemote, alloc: Allocator) void {
-        alloc.free(self.base);
-        alloc.free(self.device);
-        alloc.free(self.token);
     }
 };
 
@@ -196,9 +180,6 @@ pub const Result = struct {
     /// Whether a requested Kill was confirmed by the agent. Null when this
     /// fetch did not carry one.
     killed_ok: ?bool = null,
-    /// The relay rejected our bearer. A different sentence from "couldn't
-    /// reach it", because it is the one the user can act on.
-    unauthorized: bool = false,
 
     pub fn destroy(self: *Result) void {
         if (self.roster) |*r| r.deinit();
@@ -268,14 +249,19 @@ fn clear(self: *SessionRoster) void {
 /// is matched on it, never on a pointer, so a chooser that closed in the
 /// meantime cannot be written through.
 ///
-/// Resolving the WARM connection happens HERE, on the GUI thread, because that
-/// is where `LocalAgent`'s state lives. The blocking part is all the worker
-/// does; when there is no warm connection the worker dials the EXISTING agent
-/// itself and frees that probe afterwards — browsing must never SPAWN an agent.
-/// A `.remote` target skips all of that and dials the relay instead, freeing
-/// that connection when it is done: per-machine browse connections are
-/// short-lived (`SessionBrowserProbe.swift:145-149`), unlike the local agent's
-/// warm one, which `LocalAgent` owns and this never frees.
+/// Resolving the connection happens HERE, on the GUI thread, because that is
+/// where the state that owns it lives. The blocking part is all the worker does.
+///
+/// For the LOCAL target: the app's warm `LocalAgent` connection, or — when there
+/// is none — a probe dial of the agent that is ALREADY running, freed afterwards.
+/// Browsing must never SPAWN an agent.
+///
+/// For a REMOTE target: a BORROW of the machine's pooled warm connection (T461).
+/// A machine with no warm connection is not dialed from here at all — the pool
+/// owns dialing, and the lease's notification is what refetches once it lands.
+/// That is the whole point of the pool: before it, every fetch dialed the relay
+/// and freed it again, so N refetches cost N WebSocket upgrades and N relay
+/// authentications, and nothing could subscribe to anything.
 pub fn fetch(
     self: *SessionRoster,
     app: *App,
@@ -310,16 +296,29 @@ pub fn fetch(
         // No credential at all is the signed-out case, and it gets the SAME
         // actionable sentence a rejected one does — "couldn't reach it" would
         // send the user looking at the network.
-        const r = self.remote orelse {
+        const ep = self.endpoint() orelse {
             req.destroy();
             self.state = .unauthorized;
             return;
         };
-        req.remote = OwnedRemote.dupe(self.alloc, r) orelse {
+        if (app.machine_pool.borrow(ep)) |entry| {
+            req.entry = entry;
+            req.warm = entry.conn();
+        } else {
+            // Not warm. The pool is already dialing (the chooser's lease started
+            // one) unless the last attempt failed, in which case this asks for a
+            // retry — bounded by the pool's own cooldown, so a refetch storm
+            // cannot become a dial storm. Either way the answer arrives as a
+            // lease notification, so leave the region as it is rather than
+            // reporting a failure this fetch did not observe.
+            app.machine_pool.ensureConnected(msg_hwnd, ep);
+            if (kill_id != null) log.warn(
+                "chooser roster: kill dropped — no warm connection to {s}",
+                .{self.targetDevice()},
+            );
             req.destroy();
-            self.state = .failed;
             return;
-        };
+        }
     }
     if (kill_id) |k| {
         req.kill_id = self.alloc.dupe(u8, k) catch {
@@ -344,29 +343,15 @@ fn worker(req: *Request) void {
     const alloc = req.alloc;
 
     var probe: ?tcp_dial.Dialed = null;
-    var relay: ?relay_dial.Dialed = null;
-    var unauthorized = false;
-    const conn: ?*remote_connection.Connection = if (req.remote) |r| blk: {
-        // A REMOTE machine: dial the relay, read, free. Short-lived by design
-        // — a browse must not leave a connection open to every machine the user
-        // clicked through.
-        relay = relay_dial.dial(alloc, r.base, r.device, r.token, .raw) catch |err| {
-            log.warn("chooser roster: relay dial failed device={s} err={}", .{ r.device, err });
-            unauthorized = err == error.WebSocketUnauthorized;
-            break :blk null;
-        };
-        log.info("chooser roster: relay dialled device={s}", .{r.device});
-        break :blk relay.?.conn;
-    } else req.warm orelse blk: {
+    const conn: ?*remote_connection.Connection = req.warm orelse blk: {
         // No warm connection: dial the agent that is ALREADY running. Never
-        // spawn one — browsing a roster must not start a daemon.
+        // spawn one — browsing a roster must not start a daemon. Only the LOCAL
+        // target ever gets here; a remote fetch without a pooled connection is
+        // refused before the thread is spawned.
         probe = LocalAgent.dialProbe(alloc);
         break :blk if (probe) |p| p.conn else null;
     };
     defer if (probe) |*p| p.deinit();
-    // The relay connection is ours alone, so it is freed here. The local
-    // agent's warm one is `LocalAgent`'s and is never touched.
-    defer if (relay) |*r| r.deinit();
 
     var killed_ok: ?bool = null;
     var roster: ?remote_connection.OwnedSessions = null;
@@ -389,8 +374,10 @@ fn worker(req: *Request) void {
     // — both RPCs came back `error.ConnectionClosed`/`error.Timeout` — but the
     // defect was never in this worker: the agent's per-connection push pumps
     // could outlive their connection and write freed memory (fixed alongside
-    // T420), and each roster dial/deinit cycle armed exactly that window. Do
-    // NOT add a retry-on-fresh-dial here: one was tried and WEDGED the worker
+    // T420), and each roster dial/deinit cycle armed exactly that window. T461
+    // removed the cycle itself: a remote fetch now borrows one pooled
+    // connection, so there is no per-fetch dial left to arm anything. Do NOT add
+    // a retry-on-fresh-dial here: one was tried and WEDGED the worker
     // (`relay_dial.dial`'s upgrade read has no deadline), which is worse than
     // a stale count. `chooser-sessions-remote.ps1` asserts the refetch lands.
 
@@ -404,7 +391,6 @@ fn worker(req: *Request) void {
         .serial = req.serial,
         .roster = roster,
         .killed_ok = killed_ok,
-        .unauthorized = unauthorized,
     };
     if (w32.PostMessageW(req.hwnd, WM_APP_CHOOSER_SESSIONS, @intFromPtr(res), 0) == 0) {
         // The app is going away; nothing will ever collect this.
@@ -441,8 +427,11 @@ pub fn adopt(self: *SessionRoster, res: *Result) bool {
         }
     } else {
         // A failed fetch does not erase a roster we already have: showing the
-        // last known list beats blanking the region on one hiccup.
-        if (self.owned == null) self.state = if (res.unauthorized) .unauthorized else .failed;
+        // last known list beats blanking the region on one hiccup. Nor does it
+        // overwrite `unauthorized`, which since T461 is the POOL's verdict about
+        // the machine's credentials — a more specific and more actionable
+        // sentence than anything this RPC's failure can say.
+        if (self.owned == null and self.state != .unauthorized) self.state = .failed;
         log.info("chooser roster: fetch failed target={s} device={s} state={s}", .{
             @tagName(self.target),
             self.targetDevice(),
@@ -461,6 +450,65 @@ pub fn adopt(self: *SessionRoster, res: *Result) bool {
     // new content the moment it knows the region (`clampScrollTo`) — the same
     // clamp-at-the-point-of-use rule `cursorIndex` follows, and for the same
     // reason: this function has no geometry to clamp against.
+    return true;
+}
+
+/// This roster's pool endpoint, or null when there is nothing poolable to name:
+/// the local agent (`LocalAgent` owns that connection), no selection, or a remote
+/// machine with no credential — which is the signed-out case and gets the
+/// `unauthorized` sentence rather than a dial.
+pub fn endpoint(self: *const SessionRoster) ?machine_pool.Endpoint {
+    if (self.target != .remote) return null;
+    const r = self.remote orelse return null;
+    return .{ .relay = .{ .base = r.base, .device = r.device } };
+}
+
+/// GUI thread: the pool says this machine's warm connection became usable, or
+/// stopped being (T461). Returns true when the region changed and the caller
+/// should repaint.
+///
+/// A connection arriving is not itself a roster — it is the thing a roster can
+/// now be fetched over — so this kicks a fetch rather than painting anything, and
+/// only when one is not already in flight (an `acquire` on an already-warm
+/// machine replays through here in the same breath the selection's own fetch
+/// borrowed it).
+pub fn onPoolChange(
+    self: *SessionRoster,
+    app: *App,
+    chooser_id: u64,
+    conn: ?*remote_connection.Connection,
+    failure: MachineConnectionPool.Failure,
+) bool {
+    if (self.target != .remote) return false;
+    if (conn != null) {
+        if (self.inflight) return false;
+        const before = self.state;
+        self.fetch(app, chooser_id, null);
+        // The roster itself lands later, through `adopt`; the only thing worth
+        // repainting for here is a fetch that failed before it started.
+        return self.state != before;
+    }
+    // No connection: report WHY, and only over a region that has nothing better
+    // to show — a roster already on screen is more useful than an error card
+    // about the socket it was fetched over.
+    if (self.owned != null) return false;
+    const next: chooser_sessions.State = switch (failure) {
+        .unauthorized => .unauthorized,
+        .none, .offline => .failed,
+    };
+    if (self.state == next) return false;
+    self.state = next;
+    self.inflight = false;
+    // Deliberately the SAME sentence `adopt` prints for a failed fetch. Which
+    // layer learned that a machine is unreachable is our business; "the roster
+    // could not load from this machine, and here is the state it resolved to" is
+    // one fact with one vocabulary, and the acceptance suite reads it as the
+    // roster's answer (`chooser-sessions-remote.ps1` F and G).
+    log.info("chooser roster: fetch failed target={s} device={s} state={s}", .{
+        @tagName(self.target),
+        self.targetDevice(),
+        @tagName(next),
+    });
     return true;
 }
 

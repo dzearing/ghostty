@@ -281,6 +281,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_sessions.zig");
 
+    // Pure win32 machine connection-pool bookkeeping — endpoint keying, the
+    // lease refcount and the re-dial policy behind one warm connection per
+    // remote machine (T461), same no-OS-imports deal.
+    _ = @import("apprt/win32/machine_pool.zig");
+
     // Pure win32 Activity Monitor panel layout (T284), same no-OS-imports
     // deal.
     _ = @import("apprt/win32/activity_layout.zig");

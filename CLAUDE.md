@@ -1724,6 +1724,58 @@ roster, resume one session or rebuild the whole topology locally. Cross-machine
 Resume shipped on macOS 2026-07-16; on Windows, browse/Resume-one landed with
 T318–T320 and cross-machine Restore All with T336 (2026-08-02).
 
+**Selecting a machine dials it ONCE, and everything about that machine rides the
+same connection** (T461 — the win32 half of Mac's
+`MachineConnectionPool.swift`). Every roster refetch of a remote row used to dial
+the relay, run `LIST_SESSIONS` and free the connection again — so a WebSocket
+upgrade and a relay authentication per fetch, and nowhere to hang anything that
+has to keep LISTENING (a per-session CPU meter needs a connection that outlives
+one RPC, which a dial-read-free probe cannot host by construction). The local
+agent has had a warm connection since session persistence shipped; this is the
+remote half of it, `App.machine_pool`.
+
+- **Keyed by ENDPOINT** (`relay:<base>|<device>` or `tcp:<host>:<port>`), never by
+  chooser row: two rows that name the same device describe one agent and share
+  one socket. The token is not part of the key — a rotated relay session token is
+  the same machine — but it IS refreshed on every acquire, so a re-dial never
+  uses a stale bearer.
+- **Refcounted by leases, never by guesswork.** Dialed on the first borrow, freed
+  on the last release. A lease follows the chooser's SELECTION, so a browse does
+  not leave a socket open to every machine the user clicked through — arrowing
+  away drops it and arrowing back dials again — and closing the chooser can never
+  leave a connection behind, because the lease also holds the chooser as its
+  callback context (a lease that outlived its dialog is a call into freed memory
+  the next time anything about that machine changes: measured, and it killed the
+  app).
+- **A blocking RPC outlives the pool's own reference.** `LIST_SESSIONS` and
+  `CLOSE_SESSION` run on worker threads where the last lease can drop mid-call, so
+  `borrow` hands out an atomically refcounted entry and whoever drops the last
+  reference frees the transport. That is Mac's ARC retain in win32 dress, and it
+  is what makes the win32 invalidation path safe with no synchronous delivery:
+  a link-state callback arrives on the connection's own reader thread and can only
+  POST to the GUI thread, and a borrow the notification has not reached yet is
+  holding the transport up by construction.
+- **A dial that lands after its machine moved on belongs to nobody.** Released,
+  invalidated or re-dialed while a dial blocks ⇒ the result is freed instead of
+  installed, decided by a pool-wide monotonic generation (never per-slot, so a
+  slot reused for the same endpoint cannot match a stale dial by accident).
+- **Only a DEAD link invalidates.** The transport FSM enters `reconnecting` after
+  a few missed heartbeats and snaps back on the next authentic packet, so a down
+  edge is not a death — the same reasoning as `agent_recovery.settle_ms`, minus
+  its settle window, because nothing here rebuilds windows: it just re-dials
+  (bounded by a 5s cooldown, so a refetch storm cannot become a dial storm).
+- The **local** agent is deliberately not pooled here: `LocalAgent` already owns
+  exactly this for the app's lifetime, and pooling it too would mean two
+  connections to one agent.
+
+Rules — the key, the lease refcount, the cooldown, the generation check — are
+pure in `src/apprt/win32/machine_pool.zig` and asserted in the `none` lane;
+the resources are `MachineConnectionPool.zig`. Acceptance:
+`test/win32/chooser-conn-pool.ps1`, whose oracle is the fake relay's own request
+log (five refetches, zero further connects) paired with the app's load count —
+"one dial" is only good news if the fetches really happened — and whose control is
+a second chooser that must dial again.
+
 **Restore All across LINEAGES** (a Mac machine restored on Windows) works as of
 T337, and it works by translation rather than by agreement. The layout blob the
 agent stores is opaque to it, so its schema is a contract between two viewers —

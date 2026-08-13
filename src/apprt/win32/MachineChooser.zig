@@ -61,7 +61,10 @@ const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const text_search = @import("text_search.zig");
 const SessionRoster = @import("SessionRoster.zig");
+const machine_pool = @import("machine_pool.zig");
+const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
+const remote_connection = @import("../../remote/connection.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
 const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
@@ -252,6 +255,14 @@ id: u64,
 /// The selected machine's live sessions (T318). Only the Local row has one
 /// today; a remote machine's roster comes over its own transport in T319.
 roster: SessionRoster,
+
+/// This chooser's borrow on the SELECTED remote machine's warm connection
+/// (T461), or null when the selection is Local, empty, or signed out. It follows
+/// the selection: moving to another machine releases this one and takes a new
+/// one, which is what keeps a browse from leaving a connection open to every
+/// machine the user clicked through. Released in `destroyState`, so a connection
+/// can never outlive the dialog that wanted it.
+pool_lease: ?*MachineConnectionPool.Lease = null,
 
 /// A cross-machine Restore All is dialing on a worker thread (T339). It gates
 /// a second press: the first one's dials are still in flight, and pressing
@@ -1528,7 +1539,67 @@ fn syncRoster(self: *MachineChooser) void {
             };
         },
     };
+    // The lease FIRST: `show` fetches, and a fetch against a remote machine
+    // borrows the pooled connection this lease is what dials.
+    self.syncPoolLease(target, remote);
     if (self.roster.show(self.window.app, self.id, target, remote)) self.refreshSessions();
+}
+
+/// Hold a lease on exactly the machine the roster is pointed at (T461) — one
+/// per chooser, moved rather than accumulated.
+///
+/// Keyed by ENDPOINT, so re-selecting the same machine (or selecting a second
+/// row that names it) keeps the existing lease and its warm connection instead of
+/// releasing and re-dialing. The release comes FIRST when the endpoint really
+/// changed: the machine we are leaving should let go of its socket before the one
+/// we are arriving at takes a slot.
+fn syncPoolLease(
+    self: *MachineChooser,
+    target: chooser_sessions.Target,
+    remote: ?SessionRoster.Remote,
+) void {
+    var kbuf: [machine_pool.max_key]u8 = undefined;
+    const want: ?[]const u8 = if (target == .remote) blk: {
+        const r = remote orelse break :blk null;
+        break :blk machine_pool.key(&kbuf, .{
+            .relay = .{ .base = r.base, .device = r.device },
+        });
+    } else null;
+
+    if (self.pool_lease) |lease| {
+        if (want) |k| {
+            if (std.mem.eql(u8, lease.key(), k)) return;
+        }
+        self.window.app.machine_pool.release(lease);
+        self.pool_lease = null;
+    }
+
+    const k = want orelse return;
+    _ = k;
+    const r = remote.?;
+    const hwnd = self.window.app.msg_hwnd orelse return;
+    self.pool_lease = self.window.app.machine_pool.acquire(
+        hwnd,
+        .{ .relay = .{ .base = r.base, .device = r.device } },
+        r.token,
+        self,
+        onPoolChange,
+    );
+}
+
+/// The pool's state feed for the machine this chooser is browsing (T461). Static
+/// so it can be a plain function pointer; `ctx` is the chooser, which is safe
+/// because a lease is released synchronously in `destroyState` and the pool never
+/// calls back into a released one.
+fn onPoolChange(
+    ctx: *anyopaque,
+    conn: ?*remote_connection.Connection,
+    failure: MachineConnectionPool.Failure,
+) void {
+    const self: *MachineChooser = @ptrCast(@alignCast(ctx));
+    if (self.roster.onPoolChange(self.window.app, self.id, conn, failure)) {
+        self.refreshSessions();
+    }
 }
 
 /// Repaint the detail pane after the roster changed. The subtitle's count lives
@@ -3205,12 +3276,30 @@ pub fn cancel(self: *MachineChooser) void {
 /// Free state that was allocated before the HWND existed (early-return paths
 /// in `open`). Does NOT touch `machine_chooser` or the owner (never set yet).
 fn destroyState(self: *MachineChooser) void {
-    // An in-flight roster fetch outlives this — it holds no pointer here, only
-    // the id, so its reply finds no chooser and frees itself.
-    self.roster.deinit();
+    self.releaseOwned();
     if (self.parsed) |*p| p.deinit();
     self.arena.deinit();
     self.window.app.core_app.alloc.destroy(self);
+}
+
+/// Everything this chooser holds that lives OUTSIDE its own allocation. Called
+/// from both teardown paths — `destroyState` (the early returns in `open`) and
+/// `close` (every real dismissal) — because the two used to diverge and that is
+/// exactly how the pool lease outlived its chooser: the lease holds `self` as its
+/// callback context, so a lease left behind is a call into freed memory the next
+/// time anything about that machine changes (measured: the SECOND chooser's dial
+/// notified the first chooser's ghost and the app died).
+///
+/// An in-flight roster fetch is not in here: it holds no pointer to us, only the
+/// chooser id, so its reply finds no chooser and frees itself. An RPC still
+/// riding the pooled connection is fine too — its borrow holds the transport
+/// alive on its own, which is what refcounting the entry buys.
+fn releaseOwned(self: *MachineChooser) void {
+    if (self.pool_lease) |lease| {
+        self.window.app.machine_pool.release(lease);
+        self.pool_lease = null;
+    }
+    self.roster.deinit();
 }
 
 /// Tear down: re-enable the owner, destroy the dialog, free. The owner MUST be
@@ -3262,6 +3351,7 @@ fn close(self: *MachineChooser, refocus_owner: bool) void {
         }
     }
 
+    self.releaseOwned();
     if (self.parsed) |*p| p.deinit();
     self.arena.deinit();
     window.app.core_app.alloc.destroy(self);
