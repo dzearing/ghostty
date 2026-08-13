@@ -432,6 +432,7 @@ The layout is a tree with two node types:
 
 **Behavior:**
 - All pane names in the layout must exist in the target window's registry.
+- A layout may name **viewer panes** (`--view=`) alongside terminals; a viewer keeps its rendered page and scroll position.
 - Panes **not** mentioned in the layout are removed from the tree.
 - Focus is preserved if the focused pane is in the new layout; otherwise moves to the first leaf.
 - Supports undo (Cmd+Z restores the previous layout).

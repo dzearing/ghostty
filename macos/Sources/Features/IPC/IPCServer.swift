@@ -55,6 +55,18 @@ class IPCServer {
             case .viewerPane(_, let ref): return ref.value != nil
             }
         }
+
+        /// Whether this entry names `pane`: a terminal by the surface it
+        /// wraps, a viewer by identity. A collected weak ref names nothing —
+        /// without that guard a viewer pane (`surfaceView` nil) matches every
+        /// dead terminal entry.
+        func names(_ pane: PaneView) -> Bool {
+            switch self {
+            case .window: return false
+            case .pane(_, let ref): return ref.value != nil && ref.value === pane.surfaceView
+            case .viewerPane(_, let ref): return ref.value === pane
+            }
+        }
     }
 
     private class WeakRef<T: AnyObject> {
@@ -1538,14 +1550,6 @@ class IPCServer {
 
     // MARK: - Rearrange
 
-    private final class LayoutNode: Decodable {
-        let pane: String?
-        let direction: String?
-        let ratio: Double?
-        let left: LayoutNode?
-        let right: LayoutNode?
-    }
-
     private func handleRearrange(_ request: IPCRequest) -> IPCResponse {
         let parsed: ParsedArguments
         if let arguments = request.arguments {
@@ -1556,37 +1560,6 @@ class IPCServer {
 
         guard let layoutJSON = parsed.layout else {
             return IPCResponse(success: false, error: "--layout is required for +rearrange")
-        }
-
-        guard let layoutData = layoutJSON.data(using: .utf8) else {
-            return IPCResponse(success: false, error: "invalid UTF-8 in layout JSON")
-        }
-
-        let layout: LayoutNode
-        do {
-            layout = try JSONDecoder().decode(LayoutNode.self, from: layoutData)
-        } catch {
-            return IPCResponse(success: false, error: "invalid layout JSON: \(error.localizedDescription)")
-        }
-
-        // Collect all pane names referenced in the layout
-        var layoutPaneNames: [String] = []
-        if let err = collectPaneNames(layout, into: &layoutPaneNames) {
-            return err
-        }
-
-        // Check for duplicates
-        let nameSet = Set(layoutPaneNames)
-        if nameSet.count != layoutPaneNames.count {
-            let dupes = layoutPaneNames.filter { name in
-                layoutPaneNames.filter { $0 == name }.count > 1
-            }
-            return IPCResponse(success: false, error: "duplicate pane name in layout: '\(Set(dupes).first ?? "")'")
-        }
-
-        // Must have at least one pane
-        if layoutPaneNames.isEmpty {
-            return IPCResponse(success: false, error: "layout must contain at least one pane")
         }
 
         var result: IPCResponse = .ok
@@ -1621,152 +1594,77 @@ class IPCServer {
 
                 guard let controller else { return }
 
-                // Resolve all pane names to panes in this controller's tree.
-                // We reuse the EXISTING PaneView wrappers so leaf identity (and
-                // therefore SwiftUI structural identity) is preserved across the
-                // rearrange.
-                var panesByName: [String: PaneView] = [:]
-                for name in layoutPaneNames {
-                    guard let entry = self.resolveTarget(name) else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' not found in registry")
-                        return
-                    }
-                    guard let surface = entry.surfaceView else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
-                        return
-                    }
-                    guard let pane = controller.surfaceTree.pane(for: surface) else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' is not in the target window")
-                        return
-                    }
-                    panesByName[name] = pane
-                }
-
-                // Build the new split tree from the layout
+                // Build the new tree out of the panes this window already has.
+                // The EXISTING PaneView wrappers are reused, so leaf identity
+                // (and therefore SwiftUI structural identity) is preserved
+                // across the rearrange.
                 let newRoot: SplitTree<PaneView>.Node
-                do {
-                    newRoot = try self.buildSplitNode(from: layout, panes: panesByName)
-                } catch {
-                    result = IPCResponse(success: false, error: "failed to build layout: \(error)")
+                switch RearrangeLayout.build(
+                    layoutJSON: layoutJSON,
+                    in: controller.surfaceTree,
+                    resolve: { name in
+                        guard let entry = self.resolveTarget(name) else { return nil }
+                        return .init(
+                            surface: entry.surfaceView,
+                            viewerPane: entry.viewerPaneView,
+                            isAlive: entry.isAlive)
+                    }
+                ) {
+                case .success(let root):
+                    newRoot = root
+                case .failure(let failure):
+                    result = IPCResponse(success: false, error: failure.message)
                     return
                 }
 
                 // Collect all current panes in the tree
                 let currentPanes = Set(controller.surfaceTree.map { $0 })
-                let keptPanes = Set(panesByName.values)
+                let keptPanes = Set(newRoot.leaves())
                 let removedPanes = currentPanes.subtracting(keptPanes)
 
-                // Remember the currently focused surface
+                // Focus stays where it was if the layout kept that pane, and
+                // otherwise lands on the layout's first one. A focused VIEWER
+                // is not `focusedSurface` (it has no surface); it is whichever
+                // pane's content holds first responder.
                 let focusedSurface = controller.focusedSurface
-                let newFocus: Ghostty.SurfaceView? = if let focusedSurface,
-                    keptPanes.contains(where: { $0.surfaceView === focusedSurface }) {
-                    focusedSurface
+                let focusedPane = controller.surfaceTree.first { pane in
+                    if let focusedSurface { return pane.surfaceView === focusedSurface }
+                    return pane.contentIsFirstResponder
+                }
+                let newFocus: PaneView = if let focusedPane, keptPanes.contains(focusedPane) {
+                    focusedPane
                 } else {
-                    newRoot.leftmostLeaf().surfaceView
+                    newRoot.leftmostLeaf()
                 }
 
                 // Replace the tree
                 let newTree = SplitTree<PaneView>(root: newRoot, zoomed: nil)
                 controller.replaceSurfaceTree(
                     newTree,
-                    moveFocusTo: newFocus,
+                    moveFocusTo: newFocus.surfaceView,
                     moveFocusFrom: focusedSurface,
                     undoAction: "Rearrange Layout"
                 )
 
+                // A viewer has no surface for `replaceSurfaceTree` to focus,
+                // so it is focused the way the close path does it.
+                if newFocus.surfaceView == nil {
+                    DispatchQueue.main.async { Ghostty.moveFocus(to: newFocus) }
+                }
+
                 // Remove registry entries for panes no longer in the tree
                 for pane in removedPanes {
-                    for (name, entry) in self.targetRegistry {
-                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === pane.surfaceView {
-                            self.targetRegistry.removeValue(forKey: name)
-                            break
-                        }
+                    for (name, entry) in self.targetRegistry where entry.names(pane) {
+                        self.targetRegistry.removeValue(forKey: name)
                     }
                 }
 
-                Self.logger.info("IPC: rearranged layout with \(layoutPaneNames.count) panes")
+                Self.logger.info("IPC: rearranged layout with \(keptPanes.count) panes")
             }
         }
 
         semaphore.wait()
         return result
-    }
-
-    private func collectPaneNames(_ node: LayoutNode, into names: inout [String]) -> IPCResponse? {
-        if let pane = node.pane {
-            names.append(pane)
-            return nil
-        }
-
-        guard node.direction != nil else {
-            return IPCResponse(success: false, error: "layout node must have either 'pane' or 'direction'")
-        }
-        guard let left = node.left else {
-            return IPCResponse(success: false, error: "split node must have 'left' child")
-        }
-        guard let right = node.right else {
-            return IPCResponse(success: false, error: "split node must have 'right' child")
-        }
-
-        if let err = collectPaneNames(left, into: &names) { return err }
-        if let err = collectPaneNames(right, into: &names) { return err }
-        return nil
-    }
-
-    @MainActor
-    private func buildSplitNode(
-        from layout: LayoutNode,
-        panes: [String: PaneView]
-    ) throws -> SplitTree<PaneView>.Node {
-        if let paneName = layout.pane {
-            guard let pane = panes[paneName] else {
-                throw RearrangeError.paneNotFound(paneName)
-            }
-            return .leaf(view: pane)
-        }
-
-        guard let dirStr = layout.direction else {
-            throw RearrangeError.invalidNode
-        }
-
-        let direction: SplitTree<PaneView>.Direction = switch dirStr.lowercased() {
-        case "horizontal": .horizontal
-        case "vertical": .vertical
-        default: throw RearrangeError.invalidDirection(dirStr)
-        }
-
-        guard let leftLayout = layout.left, let rightLayout = layout.right else {
-            throw RearrangeError.missingSplitChildren
-        }
-
-        let ratioPercent = layout.ratio ?? 50
-        let clampedRatio = min(0.9, max(0.1, ratioPercent / 100.0))
-
-        let leftNode = try buildSplitNode(from: leftLayout, panes: panes)
-        let rightNode = try buildSplitNode(from: rightLayout, panes: panes)
-
-        return .split(.init(
-            direction: direction,
-            ratio: clampedRatio,
-            left: leftNode,
-            right: rightNode
-        ))
-    }
-
-    private enum RearrangeError: Error, CustomStringConvertible {
-        case paneNotFound(String)
-        case invalidNode
-        case invalidDirection(String)
-        case missingSplitChildren
-
-        var description: String {
-            switch self {
-            case .paneNotFound(let name): return "pane '\(name)' not found"
-            case .invalidNode: return "node must have 'pane' or 'direction'"
-            case .invalidDirection(let dir): return "invalid direction '\(dir)' (expected 'horizontal' or 'vertical')"
-            case .missingSplitChildren: return "split node must have 'left' and 'right' children"
-            }
-        }
     }
 
     private func handleList() -> IPCResponse {

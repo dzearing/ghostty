@@ -44,7 +44,8 @@ pub const Options = struct {
 /// Accepts a declarative JSON layout description and rebuilds the split
 /// tree to match, preserving terminal state (running processes, scrollback,
 /// focus). Panes are referenced by name and must already exist in the
-/// target window.
+/// target window. A layout may name VIEWER panes (`--view=`) alongside
+/// terminals; a viewer keeps its rendered page and scroll position.
 ///
 /// Flags:
 ///
