@@ -50,3 +50,14 @@ as the digest that showed them.
 - Confirm before closing a pane that is busy (and never when it is idle)
 - Paint the window before restore/chooser/daemon work finishes
 - Derive activity state from the output stream instead of polling the pane tail
+
+## 2026-08-13
+
+- Anchor a line while output streams underneath it
+- Follow the Windows light/dark setting, instantly
+- Collapse repeated output lines into one row with a count
+- Quick-look the file path or URL under the cursor
+- A per-pane timestamp gutter you can toggle
+- Drop a pane onto an edge to split
+- Remote panes that reconnect visibly after sleep
+- Never a blank window over RDP (renderer fallback)
