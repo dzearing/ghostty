@@ -259,9 +259,16 @@ function Get-UptimeMinutes($lock) {
 function Format-Uptime([double]$minutes) {
     if ($minutes -lt 0) { $minutes = 0 }
     $t = [TimeSpan]::FromMinutes($minutes)
-    if ($t.TotalDays -ge 1) { return '{0}d {1:00}h {2:00}m' -f [int]$t.TotalDays, $t.Hours, $t.Minutes }
-    if ($t.TotalHours -ge 1) { return '{0}h {1:00}m' -f [int]$t.TotalHours, $t.Minutes }
-    return '{0}m' -f [int]$t.TotalMinutes
+    # `$t.Days` / `[math]::Floor`, never `[int]$t.TotalDays`: PowerShell's [int]
+    # cast ROUNDS, so a loop up for 1d 12h 14m computed TotalDays = 1.51 and
+    # printed "2d 12h 14m" - a whole day added to the one number this function
+    # exists to report, and it crossed over mid-run so the uptime appeared to
+    # jump a day in a two-hour window (measured 2026-08-12 20:36). The
+    # components are already truncated remainders; only the leading unit was
+    # ever at risk.
+    if ($t.TotalDays -ge 1) { return '{0}d {1:00}h {2:00}m' -f $t.Days, $t.Hours, $t.Minutes }
+    if ($t.TotalHours -ge 1) { return '{0}h {1:00}m' -f [math]::Floor($t.TotalHours), $t.Minutes }
+    return '{0}m' -f [math]::Floor($t.TotalMinutes)
 }
 
 # Append-only ledger of every lock transition (T139/user 2026-08-11).
