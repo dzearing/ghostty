@@ -4040,19 +4040,79 @@ fn agentSendDataFramed(
     try agent.sendFrame(.{ .type = ftype, .channel = channel, .seq = 0, .payload = payload });
 }
 
+/// How long a test wait may take before it is called a timeout. Generous on
+/// purpose: it is an upper bound on a hang, not a performance assertion.
+const test_wait_ms: u64 = 10_000;
+
+/// A wall-clock budget for a test that waits on another thread.
+///
+/// Spin counts do not measure time, they measure scheduler contention (T472).
+/// On a box running three test lanes and a WebView2 host, the 100_000 yields
+/// this replaced could burn through in far less time than the writer thread
+/// needed, so a green tree produced `error.Timeout` at random — and a flaky
+/// red run costs more than a real one, because it trains whoever is watching
+/// to shrug at red. A deadline cannot be starved that way, and it says what it
+/// means: "nothing arrived in ten seconds."
+const TestDeadline = struct {
+    timer: std.time.Timer,
+    budget_ns: u64,
+
+    fn start() !TestDeadline {
+        return startWith(test_wait_ms);
+    }
+
+    fn startWith(budget_ms: u64) !TestDeadline {
+        return .{
+            .timer = try std.time.Timer.start(),
+            .budget_ns = budget_ms * std.time.ns_per_ms,
+        };
+    }
+
+    fn expired(self: *TestDeadline) bool {
+        return self.timer.read() > self.budget_ns;
+    }
+
+    /// Yield to the thread we are waiting on, or report the budget is spent.
+    fn yield(self: *TestDeadline) error{Timeout}!void {
+        if (self.expired()) return error.Timeout;
+        std.Thread.yield() catch {};
+    }
+};
+
+test "T472: a test wait is bounded by the wall clock, not by a spin count" {
+    // A spent budget is a timeout, and says so through the error rather than
+    // by falling off the end of a loop.
+    var spent = try TestDeadline.startWith(0);
+    std.Thread.sleep(2 * std.time.ns_per_ms);
+    try testing.expect(spent.expired());
+    try testing.expectError(error.Timeout, spent.yield());
+
+    // ...and no number of yields can spend a budget that has not elapsed. This
+    // is the property the old oracle lacked: 100_000 contended yields on a
+    // loaded box were a "timeout" while nothing was actually late.
+    var generous = try TestDeadline.startWith(10 * std.time.ms_per_s * 60);
+    for (0..200_000) |_| try generous.yield();
+    try testing.expect(!generous.expired());
+}
+
 /// Drain a channel's ring until `want` bytes have been collected into `out`.
 fn drainChannel(ch: *ring.Channel, out: *std.ArrayList(u8), alloc: Allocator, want: usize) !void {
     var dst: [256]u8 = undefined;
-    var spins: usize = 0;
+    var deadline = try TestDeadline.start();
     while (out.items.len < want) {
         const r = ch.pop(&dst);
         if (r.read == 0) {
-            spins += 1;
-            if (spins > 100_000) return error.Timeout;
-            std.Thread.yield() catch {};
+            deadline.yield() catch {
+                // Say what was actually collected: a bare `error.Timeout` out
+                // of a drain names neither the channel nor how far it got.
+                std.debug.print(
+                    "\ndrainChannel: {d}ms budget spent with {d} of {d} byte(s): \"{s}\"\n",
+                    .{ test_wait_ms, out.items.len, want, out.items },
+                );
+                return error.Timeout;
+            };
             continue;
         }
-        spins = 0;
         try out.appendSlice(alloc, dst[0..r.read]);
     }
 }
@@ -4156,14 +4216,16 @@ test "T739: an injected repaint is rendered like DATA but advances no offset" {
 
     // ...but the position stops at the head. Counting the repaint would say 110,
     // which is past everything the session ever produced.
-    var spins: usize = 0;
-    while (pane.streamPos() != 103 and spins < 1000) : (spins += 1) std.Thread.yield() catch {};
+    // On the budget rather than a spin count (T472): a `break` on the deadline
+    // hands the failure to `expectEqual`, which prints both positions.
+    var deadline = try TestDeadline.start();
+    while (pane.streamPos() != 103) deadline.yield() catch break;
     try testing.expectEqual(@as(u64, 103), pane.streamPos());
 
     // Live output from the head advances it again — the repaint cost nothing.
     try agentSendData(&data_agent, ch_id, 103, "live");
-    spins = 0;
-    while (pane.streamPos() != 107 and spins < 1000) : (spins += 1) std.Thread.yield() catch {};
+    deadline = try TestDeadline.start();
+    while (pane.streamPos() != 107) deadline.yield() catch break;
     try testing.expectEqual(@as(u64, 107), pane.streamPos());
 
     conn.shutdown();
@@ -4736,15 +4798,12 @@ const HealthAgentCtx = struct {
     }
 };
 
-/// Spin until `cond()` is true or we exceed a generous spin budget (deterministic;
-/// no fixed sleeps — the agent thread makes progress on its own).
+/// Wait until `cond()` is true or the wall-clock budget is spent (no fixed
+/// sleeps — the agent thread makes progress on its own). The budget is a
+/// deadline rather than a spin count for the reason in `TestDeadline` (T472).
 fn spinUntil(comptime ctx_t: type, ctx: *ctx_t, cond: *const fn (*ctx_t) bool) !void {
-    var spins: usize = 0;
-    while (!cond(ctx)) {
-        spins += 1;
-        if (spins > 5_000_000) return error.Timeout;
-        std.Thread.yield() catch {};
-    }
+    var deadline = try TestDeadline.start();
+    while (!cond(ctx)) try deadline.yield();
 }
 
 const StateRec = struct {
@@ -5685,11 +5744,10 @@ test "unsubscribeMetrics: clears the handler slot (no callback after)" {
     h.conn.unsubscribeMetrics();
     try testing.expect(h.conn.metrics_handler == null);
 
-    // The agent recorded the unsub.
-    var spins: usize = 0;
-    while (!a.saw_metrics_unsub.load(.monotonic) and spins < 1000) : (spins += 1) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
+    // The agent recorded the unsub. On the wall-clock budget (T472), so a
+    // loaded box cannot turn a slow round trip into a failure.
+    var deadline = try TestDeadline.start();
+    while (!a.saw_metrics_unsub.load(.monotonic)) deadline.yield() catch break;
     try testing.expect(a.saw_metrics_unsub.load(.monotonic));
 
     // A second unsubscribe is a harmless no-op (slot already null).
