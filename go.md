@@ -349,15 +349,44 @@ Concretely, in order, with no stops in between:
    is folded into the linked task automatically — so the reply lands where
    whoever picks that task up will see it.
 
-   **What belongs here:** a fork you resolved by assumption and could not
-   verify (which of two designs, how far to widen a fix, whether a surprise
-   is in scope). **What does not:** anything you can settle by reading the
-   code or running something — investigate instead; a decision is not a way
-   to outsource work. Anything the tracker already answers. And never file
-   one and then wait: keep going, exactly as before.
+   **What belongs here changed on 2026-08-14** (user directive, recorded in
+   D46's resolution): the user can adjudicate EXPERIENCE, not implementation
+   — "the how is very foreign to me". Before filing, apply the **experience
+   test**: *could the user tell the options apart by using the app?*
 
-   Write it for someone who has not seen the code. `-Why` states what forced
-   the choice. Each option carries **Pros:** and **Cons:** lists (`|` between
+   - **No — the options differ only in mechanism** (which API or control,
+     which module, which wire shape, where a value is computed, how a test or
+     script is structured, build/delivery/tracker process): this is YOUR
+     call, not a decision to file. Make it — weigh robustness, performance,
+     user experience, scale over time, stability, and parity as always —
+     and record the choice and its why in the task file and the log.
+     "Consider the feature's goal and presentation, make it work and look
+     just like the Mac experience, pick the best tech and approach to bring
+     parity" is standing policy, not a question to ask.
+   - **Yes — the options produce experiences the user could tell apart**, and
+     the Mac-to-Windows translation is genuinely ambiguous (no native
+     counterpart, a Windows convention that pulls against Mac's look, a
+     behavior that cannot be carried across exactly): file it, framed as the
+     experience gap. These are the ONLY decisions that should reach the
+     user's Activity feed.
+
+   **What does not belong** (unchanged): anything you can settle by reading
+   the code or running something — investigate instead; a decision is not a
+   way to outsource work. Anything the tracker already answers. And never
+   file one and then wait: keep going, exactly as before.
+
+   Write it for someone who will never read the code and does not know
+   win32. The TITLE names what the user would see or feel, never the
+   mechanism ("When the banner collapses, should its text fade out like
+   Mac's?", not "Should the collapse AlphaBlend an offscreen DIB?"). `-Why`
+   states the experience gap in plain terms: what Mac shows, what Windows
+   would show under each option, and why the translation is not obvious.
+   Each option's LABEL says what the user gets; its Pros/Cons lead with
+   user-visible consequences, with implementation detail after or not at
+   all. If the question cannot be phrased without API or module names, that
+   is the tell it fails the experience test — answer it yourself.
+
+   Each option carries **Pros:** and **Cons:** lists (`|` between
    items) — a list without both is not a choice, it is a quiz — and where a
    con can be reduced, a **Mitigation:** naming the extra work that reduces
    it ("adds complexity" → a thorough design pass to make sure the shape is
