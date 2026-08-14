@@ -101,6 +101,31 @@ $GuardTable = @(
             'scripts\crash-catch.ps1',
             'test\win32\crash-first-chance.ps1'
         )
+    },
+    # The T443 instruments have the same failure profile as the crash captures,
+    # in its purest form: T832 exists because both of them measured a condition
+    # the defect has never occurred in, and reported "all clear" for months
+    # while it was still there. A broken soak or a breakpoint that never arms
+    # is indistinguishable from good news, so the harness has to be run against
+    # the code as it stands rather than remembered.
+    [pscustomobject]@{
+        Name   = 'test-binary-soak'
+        Script = 'test\win32\test-binary-soak.ps1'
+        Stamp  = 'test\win32\test-binary-soak.stamp.json'
+        Covers = @(
+            'scripts\test-binary-soak.ps1',
+            'test\win32\test-binary-soak.ps1'
+        )
+    },
+    [pscustomobject]@{
+        Name   = 'crash-databreak'
+        Script = 'test\win32\crash-databreak.ps1'
+        Stamp  = 'test\win32\crash-databreak.stamp.json'
+        Covers = @(
+            'scripts\crash-databreak.ps1',
+            'scripts\lib\DataBreak.ps1',
+            'test\win32\crash-databreak.ps1'
+        )
     }
 )
 

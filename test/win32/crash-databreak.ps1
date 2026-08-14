@@ -138,13 +138,38 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     '}'
 ) | Set-Content -Path (Join-Path $work 'crashctl.zig') -Encoding ASCII
 
+# The same staged wild write, but slowly: the T832 mode ATTACHES to a process
+# somebody else started, so the fixture has to still be alive when cdb arrives.
+# It idles for a beat, then stomps once a tick for long enough that an attach
+# lands well before the write.
+@(
+    'const std = @import("std");',
+    'noinline fn stomp(p: *u64) void {',
+    '    p.* = 0x4141414141414141;',
+    '}',
+    'noinline fn victim(a: u64, b: u64, c: u64) u64 {',
+    '    stomp(@constCast(&a));',
+    '    return a +% b +% c;',
+    '}',
+    'pub fn main() !void {',
+    '    std.Thread.sleep(4 * std.time.ns_per_s);',
+    '    var i: u64 = 0;',
+    '    var r: u64 = 0;',
+    '    while (i < 60) : (i += 1) {',
+    '        r +%= victim(0x1234, 2, 3);',
+    '        std.Thread.sleep(100 * std.time.ns_per_ms);',
+    '    }',
+    '    std.debug.print("r={x}\n", .{r});',
+    '}'
+) | Set-Content -Path (Join-Path $work 'slowstomp.zig') -Encoding ASCII
+
 Push-Location $work
-foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig')) {
+foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig')) {
     $b = & zig build-exe $src 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Host ("build failed for {0}: {1}" -f $src, ($b -join ' ')) }
 }
 Pop-Location
-foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe')) {
+foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe')) {
     Check "fixture $exe built" (Test-Path (Join-Path $work $exe))
 }
 if (-not (Test-Path (Join-Path $work 'stompctl.exe'))) {
@@ -244,7 +269,58 @@ Check 'the crash is still captured (T450 path)' ($text -match '0xc0000005') "tai
 Check 'the crash names the faulting site' ($text -match 'crashctl!boom')
 Check 'the armed cycles before the crash are reported' ($text -match '1 arm cycle\(s\)')
 
-# ---------------------------------------------- 8. bad input fails, not hangs
+# ------------- 8. the T832 mode: arm a process somebody else launches
+#
+# The T443 corruption only ever happens under `zig build`, which starts the
+# test binary itself -- so the tool has to be able to arm a process it did not
+# launch. It ATTACHES (`cdb -p`), which keeps the whole single-process recipe
+# intact; following children (`cdb -o`) was tried first and cannot work here,
+# for the two reasons the driver's -UnderBuildRunner help records. Proven
+# against the same staged wild write in a process this script started
+# independently of the debugger.
+
+$slowSlot = $null
+$ssp = Invoke-DataBreakProbe -Exe (Join-Path $work 'slowstomp.exe') -Symbol victim
+if ($ssp.Ok) {
+    # Same shape as stompctl's `victim`, so the same spill is the aliased copy.
+    $lastSpill = @($ssp.Spills | Where-Object { $_.Origin -eq 'rdx' } | Select-Object -Last 1)
+    if ($lastSpill.Count -eq 1) { $slowSlot = $lastSpill[0].Offset }
+}
+Check 'the slow-stomp fixture probe finds the copy slot' ($null -ne $slowSlot) "ok=$($ssp.Ok) err=$($ssp.Error)"
+
+if ($null -ne $slowSlot) {
+    $attachOut = Join-Path $work 'dumps-attach'
+    $victimExe = Join-Path $work 'slowstomp.exe'
+    $vp = Start-Process -FilePath $victimExe -PassThru -WindowStyle Hidden
+    $null = $vp.Handle
+    $r = Invoke-DataBreak -Exe $victimExe -Symbol victim -SlotOffsets $slowSlot -OutDir $attachOut `
+        -AttachPid $vp.Id -TimeoutSeconds 180 -Writer { param($s) }
+    try { if (-not $vp.HasExited) { Stop-Process -Id $vp.Id -Force -ErrorAction SilentlyContinue } } catch {}
+
+    Check 'attaching to a running process arms it' ($r.ArmCount -gt 0) `
+    ("armed=$($r.ArmCount) err=$($r.Error) exit=$($r.ExitCode)")
+    Check 'the attached run catches the wild write' $r.Hit "armed=$($r.ArmCount) hit=$($r.Hit)"
+    Check 'the attached run names the writer' `
+    (($r.WriterSite -match 'slowstomp!stomp') -or (($r.WriterBlock -join ' ') -match 'slowstomp!stomp')) `
+    "writer=$($r.WriterSite)"
+    Check 'the attached run walks the victim frame' (($r.StackBlock -join ' ') -match 'slowstomp!victim')
+    Check 'the attached run dumps' ($r.DumpPath -and (Test-Path -LiteralPath $r.DumpPath))
+}
+else {
+    Check 'attaching to a running process arms it' $false 'no copy slot from the slow-stomp probe'
+}
+
+# The driver defaults a lane to the build runner, and says which condition a
+# standalone run measures -- the whole point of T832.
+$out = & powershell -NoProfile -File $driver -Lane none -Exe (Join-Path $work 'loopctl.exe') `
+    -Symbol victim -Standalone -OutDir (Join-Path $work 'dumps-warn') 2>&1
+$text = ($out | Out-String)
+Check 'a standalone lane run warns it is not the T443 condition' `
+($text -match 'mode = STANDALONE' -and $text -match 'NEVER been observed in this condition' -and $text -match 'T832') `
+    ($text -replace '\s+', ' ')
+Check 'the standalone caveat is repeated in the verdict' ($text -match 'mode=standalone')
+
+# ---------------------------------------------- 9. bad input fails, not hangs
 
 $out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'no-such.exe') 2>&1
 Check 'a missing exe exits 2' ($LASTEXITCODE -eq 2) "got $LASTEXITCODE"
@@ -252,6 +328,10 @@ $out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'loopctl.exe'
 Check 'an unknown symbol exits 2' ($LASTEXITCODE -eq 2) "got $LASTEXITCODE"
 $out = & powershell -NoProfile -File $driver 2>&1
 Check 'no target exits 2 with guidance' ($LASTEXITCODE -eq 2 -and ($out | Out-String) -match '-Lane') "got $LASTEXITCODE"
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'loopctl.exe') -UnderBuildRunner 2>&1
+Check '-UnderBuildRunner without a lane exits 2' ($LASTEXITCODE -eq 2) "got $LASTEXITCODE"
+$out = & powershell -NoProfile -File $driver -Lane none -UnderBuildRunner -Standalone 2>&1
+Check 'the two modes cannot both be asked for' ($LASTEXITCODE -eq 2) "got $LASTEXITCODE"
 
 # --------------------------------------------------------------------- cleanup
 

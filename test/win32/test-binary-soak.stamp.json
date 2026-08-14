@@ -1,0 +1,10 @@
+{
+    "guard":  "test-binary-soak",
+    "script":  "test/win32/test-binary-soak.ps1",
+    "generated":  "2026-08-14T12:33:06-07:00",
+    "commit":  "230e4c0b8",
+    "files":  {
+                  "scripts/test-binary-soak.ps1":  "ffc2bb03bdac1adca882e5f4d35dd9389059478732c7e645d2dc2eab3bfa0825",
+                  "test/win32/test-binary-soak.ps1":  "975f09a4fa81fb7ab2fecc0251c55d37ac94dfd2f64fe0c74a82bf0787ab8337"
+              }
+}

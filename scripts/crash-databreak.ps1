@@ -26,6 +26,43 @@
     Run the newest test binary a zig lane built, instead of naming an exe.
     `agent` covers both agent test binaries and tries them in turn.
 
+.PARAMETER UnderBuildRunner
+    Arm against the lane as `zig build` runs it, instead of launching the test
+    binary directly. THIS IS THE DEFAULT FOR -Lane, and T832 is why: every
+    T443 crash ever observed came from `zig build`, and ~200 direct runs of the
+    same binaries -- including the exact one that had just dumped three times
+    -- produced zero. `zig build` passes `--listen=-`, so the test runner takes
+    `mainServer()` and drives one test per pipe message; a directly-launched
+    binary takes `mainTerminal()` and runs them back to back. An instrument
+    armed against the second condition can sit there forever and catch nothing.
+
+    Mechanically: the lane is started detached, the script waits for the build
+    runner to launch one of the lane's test binaries, and cdb ATTACHES to it
+    (`-p`). Everything after that is the single-process recipe unchanged. The
+    image path is read off the RUNNING process, so a lane that rebuilds -- or
+    a `-Filter`, which builds a different binary -- is armed correctly rather
+    than against a stale offset.
+
+    Following children (`cdb -o`) was tried first and does not work here, for
+    two measured reasons: `g` returns once per child attach, so a script ending
+    in `g; q` quits at the first child, and `bu <module>+<rva>` is rejected
+    ("Bp expression contains symbols not qualified with module name") because
+    cdb reads a bare module name as a symbol.
+
+.PARAMETER AttachTimeoutSeconds
+    How long to wait for the build runner to reach the test step. Default 1200
+    -- a cold lane compiles first.
+
+.PARAMETER Standalone
+    Launch the test binary directly (the pre-T832 behaviour). Kept for
+    rehearsing the tool against a staged wild write, which is what it was
+    proven with; it prints a warning naming the condition it measures.
+
+.PARAMETER Filter
+    `-Dtest-filter=<x>` for the build-runner lane. For smoke-testing the
+    plumbing cheaply; a filtered lane is not a condition T443 reproduces in
+    (T443 measured 20 consecutive clean runs of `-Dtest-filter=terminal.`).
+
 .PARAMETER Symbol
     The function whose spilled parameters get armed. Default: verifyIntegrity
     (the T443 victim frame).
@@ -54,12 +91,18 @@
 param(
     [ValidateSet('none', 'win32', 'agent')][string]$Lane,
     [string]$Exe,
+    [switch]$UnderBuildRunner,
+    [switch]$Standalone,
+    [string]$Filter = '',
     [string]$Symbol = 'verifyIntegrity',
     [string]$SignatureFilter = '',
     [long[]]$SlotOffsets = @(),
     [int]$MaxSlots = 4,
     [string[]]$Arguments = @(),
     [int]$TimeoutSeconds = 1200,
+    # How long to wait for the build runner to reach the test step. Generous:
+    # a cold lane compiles first, and a timeout here reads as "no crash".
+    [int]$AttachTimeoutSeconds = 1200,
     [string]$OutDir,
     [string]$Cdb,
     [string]$Repo = 'D:\git\ghoztty',
@@ -98,6 +141,44 @@ else {
     exit 2
 }
 
+# ------------------------------------------------------------------ the mode
+
+if ($UnderBuildRunner -and $Standalone) {
+    Write-Host 'databreak: -UnderBuildRunner and -Standalone are mutually exclusive.'
+    exit 2
+}
+if ($UnderBuildRunner -and -not $Lane) {
+    Write-Host 'databreak: -UnderBuildRunner needs -Lane (there is no build step for a bare -Exe).'
+    exit 2
+}
+# Default to the condition the defect actually occurs in (T832). -Exe has no
+# lane to build, so it can only ever be standalone.
+$underBuild = if ($Standalone) { $false } elseif ($UnderBuildRunner) { $true } else { [bool]$Lane }
+
+$laneProc = $null
+$laneLog = ''
+if ($underBuild) {
+    if (-not (Get-Command zig -ErrorAction SilentlyContinue)) {
+        Write-Host 'databreak: zig.exe is not on PATH, so the build runner cannot be armed against.'
+        exit 2
+    }
+    $laneArgs = switch ($Lane) {
+        'none' { 'test -Dapp-runtime=none' }
+        'win32' { 'test -Dapp-runtime=win32' }
+        'agent' { 'test-agent' }
+    }
+    if ($Filter) { $laneArgs += (' -Dtest-filter="' + $Filter + '"') }
+    Write-Host "databreak: mode = build-runner (zig build $laneArgs), attaching to the test binary it starts"
+}
+elseif ($Lane -or (@($targets | Where-Object { (Split-Path -Leaf $_) -match '^(ghostty-test|ghoztty-agent(-core)?-test)\.exe$' }).Count -gt 0)) {
+    # Only for OUR test binaries: a fixture exe has no build runner to be the
+    # wrong side of, and a warning that cries wolf stops being read.
+    Write-Host 'databreak: mode = STANDALONE -- the binary is launched directly (mainTerminal).'
+    Write-Host '           T443 has NEVER been observed in this condition (~200 runs, 0 crashes,'
+    Write-Host '           against 5 aborts in 26 build-runner lane runs on 2026-08-14). A clean'
+    Write-Host '           result here is not evidence about T443. See T832; use -UnderBuildRunner.'
+}
+
 # ------------------------------------------------------------------- run it
 
 function Format-SlotList {
@@ -105,24 +186,119 @@ function Format-SlotList {
     return (@($Offsets | ForEach-Object { Format-RbpExpression -Offset $_ }) -join ', ')
 }
 
+function Stop-LaneTree {
+    <#
+    .SYNOPSIS
+        Tear down the detached `zig build` wrapper and everything under it.
+    .DESCRIPTION
+        cdb kills the test binary it attached to when it quits, which makes the
+        lane fail and unwind on its own -- but a wedged compile or a second
+        test binary would otherwise be left running against the next arm.
+        taskkill /T because Stop-Process orphans the tree below cmd.exe.
+    #>
+    param($Proc)
+    if (-not $Proc) { return }
+    if ($Proc.HasExited) { return }
+    & taskkill.exe /PID $Proc.Id /T /F *> $null
+}
+
+function Start-Lane {
+    <#
+    .SYNOPSIS
+        Run the lane detached, the way floor-lane.ps1 does, and return the
+        cmd.exe wrapper so it can be torn down afterwards.
+    #>
+    # NOT $Args: that is a PowerShell automatic variable, and a parameter of
+    # that name silently never binds -- the lane then runs a bare `zig build`.
+    param([string]$LaneArgLine, [string]$LogPath)
+    $cache = $env:ZIG_GLOBAL_CACHE_DIR
+    if (-not $cache) {
+        # CLAUDE.md / T243: the global cache must sit on the repo's own drive,
+        # or the build runner asserts instead of saying so. A detached cmd.exe
+        # does not inherit a $env: set in an earlier shell, so it is set here.
+        $cache = Join-Path (Split-Path -Qualifier $Repo) '\zig-global-cache'
+    }
+    # Through a .cmd FILE, not an argument: the lane line carries embedded
+    # quotes (`-Dtest-filter="x"`), and Start-Process re-quotes an argument
+    # list on its way to the child, which mangles them into a cmd that exits
+    # before it runs anything -- an empty log and "the lane never started a
+    # test binary". A file has no quoting layer to get wrong.
+    $bat = [IO.Path]::ChangeExtension($LogPath, '.cmd')
+    @(
+        '@echo off',
+        "set `"ZIG_GLOBAL_CACHE_DIR=$cache`"",
+        "cd /d `"$Repo`"",
+        "zig build $LaneArgLine"
+    ) | Set-Content -LiteralPath $bat -Encoding ASCII
+    $p = Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "`"$bat`"") -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $LogPath -RedirectStandardError ([IO.Path]::ChangeExtension($LogPath, '.err.log'))
+    $null = $p.Handle
+    return $p
+}
+
+function Wait-ForLaneTestProcess {
+    <#
+    .SYNOPSIS
+        Wait for the build runner to start one of the lane's test binaries.
+    .DESCRIPTION
+        Matched on process NAME, and the image path is then read back off the
+        RUNNING process. That is deliberate: the lane may rebuild, and a path
+        picked out of .zig-cache beforehand would then name a binary nobody is
+        running -- which is how an armed run measures nothing and still reports
+        clean.
+    #>
+    param([string[]]$Names, [int]$TimeoutSeconds, $LaneProc)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($n in $Names) {
+            $c = @(Get-Process -Name $n -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path } | Sort-Object StartTime | Select-Object -First 1)
+            if ($c.Count -eq 1) { return $c[0] }
+        }
+        if ($LaneProc -and $LaneProc.HasExited) { return $null }
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
+}
+
 $hit = $null
 $crashed = $null
 $last = $null
+
+if ($underBuild) {
+    $laneLog = Join-Path $env:TEMP ("databreak-lane-$Lane-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+    Write-Host "databreak: lane log: $laneLog"
+    $laneProc = Start-Lane -LaneArgLine $laneArgs -LogPath $laneLog
+    $names = @($targets | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) } | Select-Object -Unique)
+    Write-Host ("databreak: waiting up to ${AttachTimeoutSeconds}s for one of: " + ($names -join ', '))
+    $victimProc = Wait-ForLaneTestProcess -Names $names -TimeoutSeconds $AttachTimeoutSeconds -LaneProc $laneProc
+    if (-not $victimProc) {
+        Write-Host 'databreak: the lane never started a test binary (compile failure, or it finished first).'
+        Write-Host "           read $laneLog"
+        Stop-LaneTree -Proc $laneProc
+        exit 2
+    }
+    $targets = @($victimProc.Path)
+    Write-Host ("databreak: attaching to {0} pid {1}" -f (Split-Path -Leaf $victimProc.Path), $victimProc.Id)
+}
+
 foreach ($t in $targets) {
     if (-not (Test-Path -LiteralPath $t)) {
         Write-Host "databreak: no such exe: $t"
         exit 2
     }
+    $attachPid = if ($underBuild) { $victimProc.Id } else { 0 }
     $r = Invoke-DataBreak -Exe $t -Symbol $Symbol -SignatureFilter $SignatureFilter `
         -SlotOffsets $SlotOffsets -MaxSlots $MaxSlots `
         -Arguments $Arguments -OutDir $OutDir -TimeoutSeconds $TimeoutSeconds -Cdb $Cdb -Repo $Repo `
-        -KeepLog:$KeepLog
+        -AttachPid $attachPid -KeepLog:$KeepLog
     if ($r.Error) {
         Write-Host "databreak: $($r.Error)"
         if ($r.Probe -and $r.Probe.RawDisasm.Count -gt 0) {
             Write-Host 'databreak: probe disassembly follows --'
             foreach ($l in $r.Probe.RawDisasm) { Write-Host ('  | ' + $l) }
         }
+        Stop-LaneTree -Proc $laneProc
         exit 2
     }
     if ($ShowProbe) {
@@ -140,6 +316,11 @@ foreach ($t in $targets) {
     if ($r.Hit) { $hit = $r; break }
     if ($r.Crashed) { $crashed = $r; break }
 }
+
+# cdb has exited, so whatever it was attached to is gone; unwind the rest of
+# the lane rather than leaving a compile or a second test binary running.
+Stop-LaneTree -Proc $laneProc
+if ($underBuild -and $laneLog) { Write-Host "databreak: lane transcript: $laneLog" }
 
 if ($hit) {
     Write-Host '-- data breakpoint hit --'
@@ -184,7 +365,15 @@ if ($crashed) {
 
 if ($last.ArmCount -eq 0) {
     Write-Host ("databreak: WARNING -- the entry breakpoint never fired; '{0}' was never called (wrong symbol, or a filtered run that does not reach it)" -f $Symbol)
+    if ($underBuild) {
+        Write-Host '           under the build runner this also means the deferred breakpoint never resolved --'
+        Write-Host '           check that the lane actually rebuilt/ran the probed binary rather than a cached one.'
+    }
 }
-Write-Host ("databreak: no wild write observed -- {0} arm cycle(s), {1} disarm(s), program ran {2}s (cdb exit {3})" -f `
-        $last.ArmCount, $last.DisarmCount, $last.Seconds, $last.ExitCode)
+$modeName = if ($underBuild) { 'build-runner' } else { 'standalone' }
+Write-Host ("databreak: no wild write observed (mode={4}) -- {0} arm cycle(s), {1} disarm(s), program ran {2}s (cdb exit {3})" -f `
+        $last.ArmCount, $last.DisarmCount, $last.Seconds, $last.ExitCode, $modeName)
+if (-not $underBuild -and $Lane) {
+    Write-Host '           reminder: standalone is not a condition T443 has ever reproduced in (T832).'
+}
 exit 0

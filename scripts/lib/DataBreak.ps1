@@ -442,6 +442,23 @@ function Invoke-DataBreak {
         Override the armed slots with explicit rbp-relative offsets (signed).
         The probe still supplies the arm point and the return slot. This is
         how the acceptance test aims at a slot the fixture actually writes.
+    .PARAMETER AttachPid
+        ATTACH to this already-running process instead of launching the probed
+        exe. The probe still reads the exe named by -Exe -- that is where the
+        prologue and the module RVA come from -- so the caller must make sure
+        the pid is running that same image.
+
+        This is what makes it possible to arm against a test binary that only
+        the `zig build` runner knows how to start (T832): the T443 corruption
+        has never once been observed in a directly-launched process. Attaching
+        was chosen over `cdb -o` (follow children) after both of that route's
+        failure modes were measured: `g` returns once per child attach, so a
+        script ending in `g; q` quits at the first one, and a `bu
+        <module>+<rva>` breakpoint is rejected outright ("Bp expression
+        contains symbols not qualified with module name") because a bare
+        module name is read as a symbol. Attaching keeps the whole single
+        process arm/disarm recipe -- and the module is already loaded, so the
+        breakpoint is the same plain `bp0` the launch path uses.
     .OUTPUTS
         Probe, Hit, Crashed, ArmCount, DisarmCount, WriterSite, WriterBlock,
         StackBlock, VictimRbp, HitValue, ArmedOffsets, LastTest, DumpPath,
@@ -454,6 +471,7 @@ function Invoke-DataBreak {
         [long[]]$SlotOffsets = @(),
         [int]$MaxSlots = 4,
         [string[]]$Arguments = @(),
+        [int]$AttachPid = 0,
         [string]$OutDir,
         [int]$TimeoutSeconds = 1200,
         [int]$Keep = 3,
@@ -556,6 +574,10 @@ function Invoke-DataBreak {
     # without -- touching an armed slot. Module+rva rather than a symbol
     # expression: it survives ASLR between sessions and cannot be ambiguous
     # (Zig gives overloads the same bare name).
+    # `bu` rather than `bp` when the target process does not exist yet: the
+    # module is loaded later, by a child, so the address cannot be resolved at
+    # the loader break. cdb re-evaluates a `bu` on every module load, in every
+    # process it is following, which is exactly the semantics -ChildDebug needs.
     $entry = ('bp0 {0}+0x{1:x} "$$<{2}"' -f $probe.ModuleName, $probe.ArmRva, $armFwd)
     New-CdbScript -DumpPath $dump -PrologCommands @($entry) |
         Set-Content -LiteralPath $scriptFile -Encoding ASCII
@@ -563,12 +585,19 @@ function Invoke-DataBreak {
     $prevSym = $env:_NT_SYMBOL_PATH
     $env:_NT_SYMBOL_PATH = (Split-Path -Parent $probe.ExePath)
 
-    $argList = @('-lines', '-cf', ('"' + $scriptFile + '"'), ('"' + $probe.ExePath + '"'))
-    foreach ($x in $Arguments) { $argList += ('"' + $x + '"') }
+    $argList = @('-lines', '-cf', ('"' + $scriptFile + '"'))
+    if ($AttachPid -gt 0) {
+        $argList += @('-p', "$AttachPid")
+    }
+    else {
+        $argList += ('"' + $probe.ExePath + '"')
+        foreach ($x in $Arguments) { $argList += ('"' + $x + '"') }
+    }
 
     & $Writer ("databreak: arming {0} slot(s) on {1}!{2} -- {3}" -f `
             $offsets.Count, $probe.ModuleName, $probe.Symbol, `
         (@($offsets | ForEach-Object { Format-RbpExpression -Offset $_ }) -join ', '))
+    if ($AttachPid -gt 0) { & $Writer ("databreak: attaching to pid {0}" -f $AttachPid) }
     $t0 = Get-Date
     $p = Start-Process -FilePath $cdbPath -ArgumentList ($argList -join ' ') `
         -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
