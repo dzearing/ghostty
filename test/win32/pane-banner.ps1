@@ -31,7 +31,9 @@
 #   - A checked task-list box paints real green pixels (native box), not
 #     a plaintext glyph.
 #   - A multi-line banner collapses to a first-line sliver on click and
-#     expands back on a second click.
+#     expands back on a second click — and every animated frame of BOTH
+#     directions is really painted, so an expand never leaves a stale
+#     half-open card sitting in the band (T833).
 #   - T165 (link affordance): a link's underline is DOTTED at rest and goes
 #     SOLID under the pointer (measured as ink-over-span on the rule's own
 #     row, so it needs no pixel constant); a right-click on a link opens the
@@ -530,16 +532,18 @@ try {
         # every painted frame after it, in order.
         function Get-AnimFrames {
             $from = $null; $to = $null; $toggles = 0
-            $frames = @()
+            $frames = @(); $paints = @()
             foreach ($l in @(Get-Content $errlog -ErrorAction SilentlyContinue)) {
                 if ($l -match 'banner collapse from=(-?\d+) to=(-?\d+)') {
                     $toggles++
                     $from = [int]$Matches[1]; $to = [int]$Matches[2]
                 } elseif ($l -match 'banner collapse h=(-?\d+)') {
                     $frames += [int]$Matches[1]
+                } elseif ($l -match 'banner paint h=(-?\d+)') {
+                    $paints += [int]$Matches[1]
                 }
             }
-            return [pscustomobject]@{ From = $from; To = $to; Toggles = $toggles; Frames = $frames }
+            return [pscustomobject]@{ From = $from; To = $to; Toggles = $toggles; Frames = $frames; Paints = $paints }
         }
 
         $animMid = $ovA.Left + [int]($ovA.Width / 2)
@@ -592,6 +596,21 @@ try {
                 "T149 ($dir): the frames only ever move toward the target - no bounce, no overshoot"
             Assert ($a.Frames[-1] -eq $a.To) `
                 "T149 ($dir): the last frame lands EXACTLY on the settled height ($($a.Frames[-1]) = $($a.To))"
+
+            # T833: and every one of those frames REACHED THE SCREEN. The
+            # frames above are what the heartbeat wanted; `banner paint h=` is
+            # what a WM_PAINT actually drew. They agreed in the collapse
+            # direction for free - the popup shrinks per frame, and a window
+            # resize invalidates - and never in the expand direction, where the
+            # band is reserved at its settled height in one step and the window
+            # then never changes size again. The user's report is exactly that
+            # gap: "collapse, then expand, and the card stays stale".
+            Write-Host "INFO  T833 $dir : paints=$($a.Paints -join ',')"
+            $painted = @($a.Paints | Where-Object { $_ -gt $lo -and $_ -lt $hi } | Sort-Object -Unique)
+            Assert ($painted.Count -ge 3) `
+                "T833 ($dir): the intermediate frames are PAINTED, not just ticked ($($painted.Count) distinct heights on screen)"
+            Assert ($a.Paints.Count -gt 0 -and $a.Paints[-1] -eq $a.To) `
+                "T833 ($dir): the card ends up painted at its settled height ($($a.Paints[-1]) = $($a.To)) - no stale card left over"
 
             # ...and once it settles the popup is glued back over the pane at
             # the band the layout reserved, which is what Get-Overlay matches

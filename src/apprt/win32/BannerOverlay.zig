@@ -121,6 +121,15 @@ const COLLAPSE_TIMER_ID: usize = 1;
 /// the toggle and settled-geometry ones, which are 6f's claim restated, and
 /// no assertion outside 6f2 moves.)
 const T149_NEUTERED = false;
+
+/// Negative control for `pane-banner.ps1`'s T833 assertions. Flipping it
+/// restores the pre-T833 behavior — the animation heartbeat ticks and logs,
+/// but only `updatePosition`'s resize path ever dirties the client — so an
+/// EXPAND, whose window height never changes, freezes on whichever frame the
+/// toggle's own invalidate happened to catch. Re-running the script must fail
+/// exactly the 6f2 "reaches the screen" assertions in the expand direction and
+/// nothing else.
+const T833_NEUTERED = false;
 /// Chevron toggle glyph half-width / height.
 const CHEV_W: f32 = 5.0;
 const CHEV_H: f32 = 3.5;
@@ -182,6 +191,13 @@ pub const BannerOverlay = struct {
     /// Expanded content height in px (excludes padding), lazily computed;
     /// -1 means stale (recompute on next use).
     content_h: i32 = -1,
+
+    /// The card height the LAST paint actually put on the screen (T833), or
+    /// -1 before the first one. `paintedCardHeight()` is what the next paint
+    /// would draw; this is what the pixels currently show, which is the only
+    /// thing that can answer "is the card stale?" — during an expand the
+    /// window keeps the settled band the whole way, so its size cannot.
+    painted_h: i32 = -1,
 
     /// Height the window layout reserved for this strip ABOVE the owner
     /// pane (T101). The layout shrinks/offsets the owner HWND by this and
@@ -1470,6 +1486,17 @@ pub const BannerOverlay = struct {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
 
+        // Debug-build oracle for pane-banner.ps1's T833 assertions, and the
+        // record of what the pixels now show. `banner collapse h=` says which
+        // frame the animation WANTED; this says which frame was drawn, and
+        // the two only agreed in the collapse direction before T833.
+        self.painted_h = self.paintedCardHeight();
+        log.debug("banner paint h={} cw={} pw={}", .{
+            self.painted_h,
+            client.right,
+            self.pane_w,
+        });
+
         // The band the CARD occupies. The whole client when settled; while
         // the card animates OPEN it is shorter than the window, which is
         // already sized to the taller settled band (T149).
@@ -1795,10 +1822,27 @@ pub const BannerOverlay = struct {
         // the settled height rather than a frame short of it.
         log.debug("banner collapse h={}", .{self.paintedCardHeight()});
         if (done) self.stopCollapseAnim();
+        // Dirty the client for THIS frame's card height (T833). The window
+        // resize `updatePosition` relies on to repaint only happens in the
+        // collapse direction: expanding, the layout reserved the settled
+        // (taller) band in one step at the toggle, so every frame is drawn
+        // inside a window whose size never changes — no CS_VREDRAW
+        // invalidate, no repaint, and the card froze on whichever frame the
+        // toggle's own invalidate happened to catch. The user saw an expand
+        // that left a stale, half-open card behind.
+        //
+        // Keyed on the height that was actually PAINTED, not on the one the
+        // last tick wanted, so a frame that rounds to the same height still
+        // has nothing to draw — the property the resize path had for free.
+        const dirty = !T833_NEUTERED and self.paintedCardHeight() != self.painted_h;
+        if (dirty) _ = w32.InvalidateRect(self.hwnd, null, 1);
         // `updatePosition` invalidates and repaints synchronously whenever
-        // the height actually changed, which is every frame of a resize; a
-        // frame that rounds to the same height has nothing new to draw.
+        // the height actually changed, which is every frame of a COLLAPSE.
         self.updatePosition(self.scale);
+        // ...and an expand frame is still dirty here, so finish it in the
+        // same tick rather than leaving the card a pumped WM_PAINT behind
+        // the geometry it is glued to (T456's reasoning, one direction over).
+        if (dirty) _ = w32.UpdateWindow(self.hwnd);
     }
 
     fn linkAt(self: *const BannerOverlay, x: i32, y: i32) ?[]const u8 {
@@ -2320,6 +2364,102 @@ test "banner overlay: a size-changing updatePosition repaints in the same pass" 
 
         try std.testing.expectEqual(@as(i32, 0), w32.GetUpdateRect(overlay.hwnd, null, 0));
     }
+}
+
+// T833: the OTHER direction of the same seam, and the one nothing covered.
+//
+// `updatePosition` repaints when the popup's SIZE changes, which is every frame
+// of a COLLAPSE — the card shrinks and the window shrinks with it. An EXPAND
+// gets no such thing: the toggle relayouts the grid ONCE, to the settled
+// (taller) band, so the window is already at its final size before the first
+// animated frame and never changes again. Nothing else dirtied the client, so
+// the card stayed on whichever frame the toggle's own invalidate happened to
+// catch and the user was left looking at a stale, half-open card in a
+// full-height band.
+//
+// The assertion is the painted height MOVING while the window height does not:
+// `painted_h` is written by `paint`, so it only advances if a WM_PAINT really
+// ran. `GetUpdateRect` == 0 after every tick is the T456 half restated — the
+// frame is drawn IN the tick, not a pumped paint later.
+test "banner overlay: an expanding card repaints while the window keeps its size" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        200,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    overlay.setText("**Build status**\nsecond line\nthird line\nfourth line");
+
+    // Settle COLLAPSED, the state a first click leaves behind: the layout has
+    // already given the band back to the grid and the card is painted short.
+    overlay.collapsed = true;
+    overlay.updatePosition(1.0); // teaches it the pane width
+    overlay.inset = overlay.stripHeight();
+    overlay.updatePosition(1.0);
+    _ = w32.InvalidateRect(overlay.hwnd, null, 1);
+    _ = w32.UpdateWindow(overlay.hwnd);
+    const collapsed_h = overlay.painted_h;
+    try std.testing.expect(collapsed_h > 0);
+
+    // The second click: the flip, plus the ONE relayout the toggle issues.
+    overlay.collapsed = false;
+    overlay.inset = overlay.stripHeight();
+    const target = overlay.cardHeight();
+    try std.testing.expect(target > collapsed_h);
+    overlay.updatePosition(1.0);
+    _ = w32.InvalidateRect(overlay.hwnd, null, 1);
+    _ = w32.UpdateWindow(overlay.hwnd);
+
+    var before: w32.RECT = undefined;
+    try std.testing.expect(w32.GetWindowRect(overlay.hwnd, &before) != 0);
+
+    // Drive the animation by hand rather than through `startCollapseAnim`: no
+    // timer to pump, and no dependency on the system's client-area animation
+    // setting, which would legitimately turn the whole thing off.
+    overlay.collapse_anim = .{
+        .from_h = collapsed_h,
+        .start = std.time.Instant.now() catch return error.SkipZigTest,
+    };
+
+    var saw_intermediate = false;
+    var guard: usize = 0;
+    while (overlay.collapse_anim != null and guard < 200) : (guard += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        overlay.onCollapseTick();
+        if (overlay.painted_h > collapsed_h and overlay.painted_h < target) {
+            saw_intermediate = true;
+        }
+        try std.testing.expectEqual(@as(i32, 0), w32.GetUpdateRect(overlay.hwnd, null, 0));
+    }
+
+    var after: w32.RECT = undefined;
+    try std.testing.expect(w32.GetWindowRect(overlay.hwnd, &after) != 0);
+    // The premise: the window really did hold still for the whole animation.
+    try std.testing.expectEqual(before.bottom - before.top, after.bottom - after.top);
+    try std.testing.expect(saw_intermediate);
+    // And it ends up showing the card it settled at, not a frame short of it.
+    try std.testing.expectEqual(target, overlay.painted_h);
 }
 
 // T165: the link hover affordance, in PIXELS.
