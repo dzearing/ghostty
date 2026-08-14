@@ -376,5 +376,31 @@
 </description>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.32.0/Ghoztty-1.32.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="rEURiI5dVR2iBh3rl6r/oVNN8yQCHwEX/nvivTsEFyLlLQ6FSoVHFyzAnPNREjI+Y6DbnDBCTy8xJmJWMbeLCw==" length="25790855" />
         </item>
+        <item>
+            <title>Version 1.33.0</title>
+            <sparkle:version>1.33.0</sparkle:version>
+            <sparkle:shortVersionString>1.33.0</sparkle:shortVersionString>
+            <pubDate>Fri, 14 Aug 2026 06:30:46 +0000</pubDate>
+            <description>{
+  "version": "1.33.0",
+  "sections": [
+    {
+      "title": "Viewer panes",
+      "items": [
+        { "title": "Links that lead off-site now open in your real browser", "text": "Clicking a link out to another site from a live page (a dev server, a local HTML mock) used to follow it inside the pane, where Ghoztty's own cookie jar meant anything behind a login rendered logged-out. Cross-origin links now hand off to your default browser, so signing in works. Clicking around inside the same dev server or through a mock's own pages is untouched — that's what live pages are for." },
+        { "title": "Every link gets Ghoztty's right-click menu", "text": "On any page, including sites we don't control, right-clicking a link offers the same actions a banner link does: open in a side pane, open in a new window, copy the link or path. The Cmd / Cmd-Shift modifiers work there too. Your text selection is respected — right-clicking inside a selection still gives you Copy and Look Up." }
+      ]
+    },
+    {
+      "title": "Command line",
+      "items": [
+        { "title": "`+rearrange` can place viewer panes", "text": "A layout that named a viewer pane failed with \"pane is no longer alive,\" about a pane `+list` had just reported, which left any window holding a preview pane permanently un-rearrangeable. Viewer panes now rearrange like any other, keep their content and scroll position, and focus lands where the layout asked." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.33.0/Ghoztty-1.33.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="7ik5ylGpI+yjuaSen7wNZeQzKIBqZDL4v9Si0ly56BbXtfNpOXWWR8SeMO26c0xsEdYRDL9GWL4CQNiyC9rpBw==" length="25795967" />
+        </item>
     </channel>
 </rss>
