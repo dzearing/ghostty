@@ -532,6 +532,7 @@ pub inline fn pauseIntegrityChecks(self: *PageList, pause: bool) void {
 }
 
 const IntegrityError = error{
+    PageMemoryPtrCorrupted,
     PageSerialInvalid,
     TotalRowsMismatch,
     TrackedPinInvalid,
@@ -553,6 +554,33 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
     {
         var node_ = self.pages.first;
         while (node_) |node| {
+            // T443: check EVERY live page's base pointer here, not just the
+            // one page an operation happens to be touching. The corruption
+            // this hunts damages a page that nothing is looking at, and the
+            // per-page check in `Page.verifyIntegrity` only reports it the
+            // next time that particular page is verified -- which is how the
+            // abort keeps landing in an arbitrary later test instead of near
+            // whatever wrote. This walk is already being paid for, so the
+            // check is free, and it fires at the very next PageList
+            // assertion after the write: the test that panics is then the
+            // test that CORRUPTED, not merely the one that tripped over it.
+            if (!Page.memoryPtrPlausible(
+                @intFromPtr(node.data.memory.ptr),
+                node.data.memory.len,
+            )) {
+                log.warn(
+                    "PageList integrity violation: page memory pointer corrupted " ++
+                        "serial={} page=0x{x} memory.ptr=0x{x} memory.len=0x{x}",
+                    .{
+                        node.serial,
+                        @intFromPtr(&node.data),
+                        @intFromPtr(node.data.memory.ptr),
+                        node.data.memory.len,
+                    },
+                );
+                return IntegrityError.PageMemoryPtrCorrupted;
+            }
+
             actual_total += node.data.size.rows;
             node_ = node.next;
 
@@ -5539,6 +5567,41 @@ pub const Cell = struct {
         } };
     }
 };
+
+test "PageList verifyIntegrity catches a corrupted page base anywhere in the list" {
+    if (comptime !build_options.slow_runtime_safety) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, null);
+    defer s.deinit();
+
+    // Grow past the first page so the damaged page is NOT the one a caller
+    // would be operating on -- that is the whole point of sweeping the list.
+    var guard: usize = 0;
+    while (s.pages.first.?.next == null) : (guard += 1) {
+        try testing.expect(guard < 100_000);
+        _ = try s.grow();
+    }
+
+    const node = s.pages.first.?;
+    const saved = node.data.memory.ptr;
+    defer node.data.memory.ptr = saved;
+
+    // The exact T443 signature: the low 32 bits stay arithmetically exact and
+    // the high 32 bits are replaced by a page-offset-shaped value, which keeps
+    // the pointer non-null AND page-aligned. The high half is from the
+    // 2026-08-14 dump.
+    node.data.memory.ptr = @ptrFromInt(
+        (@intFromPtr(saved) & 0xffff_ffff) | (@as(usize, 0x11a60) << 32),
+    );
+
+    try testing.expectError(
+        IntegrityError.PageMemoryPtrCorrupted,
+        s.verifyIntegrity(),
+    );
+}
 
 test "PageList" {
     const testing = std.testing;
