@@ -1,0 +1,13 @@
+{
+  "version": "1.33.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        { "title": "A reboot brings back a shell, not a re-run", "text": "Restored panes used to silently re-execute whatever command they were opened with, so a reboot quietly started a brand-new agent session in every pane. A pane now comes back as a plain login shell in the directory it was working in, under a notice telling you the previous session was lost. Set `session-relaunch = rerun` to get the old re-execute behavior back for panes whose command is cheap and idempotent." },
+        { "title": "The mouse no longer types into your shell", "text": "Replaying a dead TUI's scrollback left its mouse tracking armed, so moving the pointer typed things like `35;1;12M` at the prompt. The restore now resets those terminal modes along with bracketed paste, focus reporting, and cursor keys." },
+        { "title": "Restored panes land in the right directory", "text": "Sessions were coming back in whatever directory the background agent happened to be in rather than the one the pane started in. The working directory is now recorded when the session opens." }
+      ]
+    }
+  ]
+}
