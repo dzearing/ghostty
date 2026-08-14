@@ -1292,17 +1292,60 @@ pub const Page = struct {
     /// is why the crash has been misread for several sessions. Checking it
     /// here — where the page is still in hand — turns a wild fault into a
     /// message that names the page, the expected range and the bad pointer.
+    /// The half of a bad map pointer that survived, if any. See
+    /// `assertMapPtrInPage`; this is the part the 2026-08-14 dump made
+    /// answerable and it is separated out so it can be unit tested without
+    /// having to reach a panic.
+    pub const MapPtrDamage = enum {
+        /// `base + offset` reproduces the pointer exactly, so the pointer is
+        /// what the arithmetic asked for and it is the PAGE that is wrong.
+        exact,
+        /// Only the low 32 bits match. The high half was inherited rather
+        /// than computed — a `u32` offset added to a base can move the high
+        /// half by at most one, so this cannot come from the addition.
+        low_half_only,
+        /// Neither half matches: an unrelated value.
+        neither,
+    };
+
+    pub fn mapPtrDamage(base: usize, map_offset: size.OffsetInt, ptr: usize) MapPtrDamage {
+        const expect = base +% map_offset;
+        if (ptr == expect) return .exact;
+        if (ptr & 0xffff_ffff == expect & 0xffff_ffff) return .low_half_only;
+        return .neither;
+    }
+
+    /// Panic, naming the damage, if a map's metadata pointer has left this
+    /// page's memory.
+    ///
+    /// `map_offset` is the offset the pointer was reified from, so the
+    /// message can say WHICH half of `base + offset` went wrong. On
+    /// 2026-08-14 that turned out to be the discriminator the whole hunt
+    /// needed: the low half was `base + offset` to the byte and only the
+    /// high half was foreign, which rules the arithmetic and the store out
+    /// and puts the damage on the base pointer as loaded at the call site.
     inline fn assertMapPtrInPage(
         self: *const Page,
         comptime name: []const u8,
+        map_offset: size.OffsetInt,
         metadata: anytype,
     ) void {
         const ptr: usize = if (metadata) |m| @intFromPtr(m) else 0;
         if (self.ptrInPage(ptr)) return;
+        const base = @intFromPtr(self.memory.ptr);
         log.err(
             "page " ++ name ++ " metadata pointer outside page memory " ++
-                "ptr=0x{x} page_base=0x{x} page_len=0x{x}",
-            .{ ptr, @intFromPtr(self.memory.ptr), self.memory.len },
+                "ptr=0x{x} expect=0x{x} damage={s} " ++
+                "page_base=0x{x} page_len=0x{x} map_offset=0x{x} self=0x{x}",
+            .{
+                ptr,
+                base +% map_offset,
+                @tagName(mapPtrDamage(base, map_offset, ptr)),
+                base,
+                self.memory.len,
+                map_offset,
+                @intFromPtr(self),
+            },
         );
         @panic("page map metadata pointer corrupted");
     }
@@ -1312,7 +1355,11 @@ pub const Page = struct {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.hyperlink_map.map(self.memory);
         if (build_options.slow_runtime_safety) {
-            self.assertMapPtrInPage("hyperlink_map", map.metadata);
+            self.assertMapPtrInPage(
+                "hyperlink_map",
+                self.hyperlink_map.metadata.offset,
+                map.metadata,
+            );
         }
         return map.get(cell_offset);
     }
@@ -1629,7 +1676,11 @@ pub const Page = struct {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.grapheme_map.map(self.memory);
         if (build_options.slow_runtime_safety) {
-            self.assertMapPtrInPage("grapheme_map", map.metadata);
+            self.assertMapPtrInPage(
+                "grapheme_map",
+                self.grapheme_map.metadata.offset,
+                map.metadata,
+            );
         }
         const slice = map.get(cell_offset) orelse return null;
         return slice.slice(self.memory);
@@ -2312,6 +2363,45 @@ test "Page ptrInPage bounds" {
     const half_clobbered = (in_page & 0xffff_ffff) | (0x0003_d3d0 << 32);
     try testing.expect(page.ptrInPage(in_page));
     try testing.expect(!page.ptrInPage(half_clobbered));
+}
+
+test "Page mapPtrDamage classifies the 2026-08-14 dump" {
+    // Verbatim from `.dumps\ghoztty-agent-core-test-20260814-102220-0.dmp`,
+    // the first occurrence where T443's diagnostic fired and printed numbers:
+    //
+    //   page hyperlink_map metadata pointer outside page memory
+    //   ptr=0x11a60cb29de28 page_base=0x1c9cb22f000 page_len=0x6f000
+    //
+    // The low half is `base + 0x6ee28` to the byte and only the high half is
+    // foreign, which is what `low_half_only` names. A u32 offset added to a
+    // base can carry the high half by at most one, so this classification is
+    // what says the addition did not produce the pointer.
+    const base: usize = 0x0000_01c9_cb22_f000;
+    const map_offset: size.OffsetInt = 0x6_ee28;
+    const observed: usize = 0x0001_1a60_cb29_de28;
+
+    try testing.expectEqual(Page.MapPtrDamage.low_half_only, Page.mapPtrDamage(
+        base,
+        map_offset,
+        observed,
+    ));
+    try testing.expectEqual(Page.MapPtrDamage.exact, Page.mapPtrDamage(
+        base,
+        map_offset,
+        base + map_offset,
+    ));
+    try testing.expectEqual(Page.MapPtrDamage.neither, Page.mapPtrDamage(
+        base,
+        map_offset,
+        0xdead_beef,
+    ));
+    // A null metadata pointer reads as 0 and must not be mistaken for a
+    // near-miss just because a zero page base would make it exact.
+    try testing.expectEqual(Page.MapPtrDamage.neither, Page.mapPtrDamage(
+        base,
+        map_offset,
+        0,
+    ));
 }
 
 test "Page capacity adjust cols down" {
