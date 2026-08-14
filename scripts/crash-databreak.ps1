@@ -72,6 +72,76 @@
     slots (at most 4 -- x64 has four debug registers). The probe still
     supplies the arm point and the return slot.
 
+.PARAMETER WatchPages
+    Watch a HEAP field for the rest of the run instead of stack slots per call
+    (T474/T838). The default shape arms and disarms around every call of
+    -Symbol: against the real target that is 335,878 round trips at ~2 ms, and
+    the lane times out mid-run having measured nothing.
+
+    T443's damaged 4 bytes are `Page.memory.ptr` -- a heap address that is
+    stable for the life of the page -- so this mode reads the object pointer
+    out of -Symbol's first spill slot, arms `ba w8` on `<self>+-FieldOffset`,
+    and never disarms. After -WatchCount distinct objects are armed it DISABLES
+    the entry breakpoint, so the whole instrument costs -WatchCount round trips
+    and the lane then runs at full speed.
+
+    Reports are gated on the T443 signature (the post-write qword at or above
+    0x800000000000, which no user-mode pointer can reach), so an ordinary write
+    -- a pooled page re-initialised at the same address, a deinit zeroing it --
+    continues silently instead of stopping the run. -GuardOffset adds the second
+    half of that gate: see its help, and do not turn it off casually -- the very
+    first armed run of the real thing reported recycled memory without it.
+
+    Blind spots, stated because a partial watch that reads as total coverage is
+    the failure mode: x64 has four debug registers, so four addresses are
+    watched out of the thousands a lane touches. It is an ADDRESS that is
+    watched, not a page, so every later page landing on the same pool slot is
+    covered too. A clean run means "nothing implausible was written to these
+    four addresses", never "no corruption happened".
+
+.PARAMETER WatchCount
+    How many distinct objects to arm in -WatchPages mode (1-4, default 4).
+
+.PARAMETER FieldOffset
+    Byte offset of the watched pointer inside the object. 0 (the default) is
+    `Page.memory.ptr`, which is Page's first field.
+
+.PARAMETER FieldAlign
+    Expected alignment of the watched pointer, used as an arm-time gate so a
+    slot that does not hold a *Page is rejected instead of armed. Default 4096
+    (a page-aligned backing buffer); 1 disables it.
+
+.PARAMETER GuardOffset
+    Bytes past the watched pointer holding a value that must be UNCHANGED
+    between the arm and the report -- `memory.len` for a Page, at the default 8.
+    Nothing disarms in this mode, so a freed page whose address is recycled
+    stays watched: the first armed run of the agent lane duly reported
+    `hyperlink.dupe` memcpy-ing "https://example.com" into a later page's
+    string_alloc over those bytes, because ASCII reads as an implausible
+    pointer. T443's damage leaves the length intact; recycling does not. 0
+    disables the guard and restores that false positive.
+
+.PARAMETER HotLimit
+    Ordinary (waved-through) writes a watched address may take before its
+    breakpoint is dropped. Nothing disarms in this mode, so an address whose
+    page died can be recycled into memory something writes constantly -- and at
+    ~2 ms per break that is not a slow run, it is a run that never finishes: the
+    first real armed lane burned thirteen minutes and a 335 MB transcript on
+    exactly one such address. The drop is counted and reported, so a reader sees
+    "3 of 4 watched to the end" rather than a lane that quietly starved.
+
+.PARAMETER SelfSlotOffset
+    Explicit rbp-relative offsets of the spill slots that might hold the object
+    pointer. Default: every canonical spill slot the probe found, tried in
+    order; the first that passes the arm gates wins. Guessing a single one does
+    not work -- the fixture's `check(self, a, b)` spills in parameter order and
+    the real `Page.verifyIntegrity` does not.
+
+.PARAMETER AttachName
+    Substring of the test binary to attach to when a lane builds more than one.
+    `-Lane agent` starts `ghoztty-agent-test.exe` first and never calls
+    Page.verifyIntegrity there; `-AttachName core` waits for the one that does.
+
 .PARAMETER ShowProbe
     Print the parsed prologue (spills, armed slots, arm point, return slot)
     before running.
@@ -80,12 +150,18 @@
     A `-- data breakpoint --` report.
     Exit 0 = ran clean (armed, no wild write observed), 1 = a wild write was
     caught, 2 = could not run (no cdb, no exe, probe failed), 3 = the program
-    crashed without touching an armed slot (crash captured a la crash-catch).
+    crashed without touching an armed slot (crash captured a la crash-catch),
+    4 = -WatchPages only: the session was ended by a break nobody routed, so
+    the program was killed mid-run and the watch covered only part of it.
 
 .EXAMPLE
     powershell -NoProfile -File scripts\crash-databreak.ps1 -Lane agent
 .EXAMPLE
     powershell -NoProfile -File scripts\crash-databreak.ps1 -Exe fixture.exe -Symbol victim -SlotOffsets -8
+.EXAMPLE
+    # T443's own hunt: watch four pages' memory.ptr for a whole agent lane.
+    powershell -NoProfile -File scripts\crash-databreak.ps1 -Lane agent `
+        -Symbol verifyIntegrity -SignatureFilter page.Page -WatchPages -TimeoutSeconds 2400
 #>
 [CmdletBinding()]
 param(
@@ -98,6 +174,16 @@ param(
     [string]$SignatureFilter = '',
     [long[]]$SlotOffsets = @(),
     [int]$MaxSlots = 4,
+    [switch]$WatchPages,
+    [ValidateRange(1, 4)][int]$WatchCount = 4,
+    [int]$WatchSize = 8,
+    [long]$FieldOffset = 0,
+    [long]$FieldAlign = 4096,
+    [long]$GuardOffset = 8,
+    [int]$HotLimit = 1000,
+    [long[]]$SelfSlotOffset = @(),
+    [int]$MaxArmAttempts = 2000,
+    [string]$AttachName = '',
     [string[]]$Arguments = @(),
     [int]$TimeoutSeconds = 1200,
     # How long to wait for the build runner to reach the test step. Generous:
@@ -154,6 +240,11 @@ if ($UnderBuildRunner -and -not $Lane) {
 # Default to the condition the defect actually occurs in (T832). -Exe has no
 # lane to build, so it can only ever be standalone.
 $underBuild = if ($Standalone) { $false } elseif ($UnderBuildRunner) { $true } else { [bool]$Lane }
+
+if ($WatchPages) {
+    Write-Host ("databreak: arming = PAGE-WATCH -- up to {0} heap address(es) at <self>+0x{1:x}, armed once and never disarmed." -f $WatchCount, $FieldOffset)
+    Write-Host '           Blind to every other page: x64 has four debug registers. A clean run is not "no corruption".'
+}
 
 $laneProc = $null
 $laneLog = ''
@@ -270,6 +361,18 @@ if ($underBuild) {
     Write-Host "databreak: lane log: $laneLog"
     $laneProc = Start-Lane -LaneArgLine $laneArgs -LogPath $laneLog
     $names = @($targets | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) } | Select-Object -Unique)
+    if ($AttachName) {
+        # A lane can build more than one test binary and only one of them
+        # exercises the target: `-Lane agent` starts ghoztty-agent-test.exe
+        # first, and Page.verifyIntegrity is never called there -- an armed run
+        # against it burns three minutes and measures nothing.
+        $names = @($names | Where-Object { $_ -like ('*' + $AttachName + '*') })
+        if ($names.Count -eq 0) {
+            Write-Host "databreak: -AttachName '$AttachName' matches none of the lane's test binaries."
+            Stop-LaneTree -Proc $laneProc
+            exit 2
+        }
+    }
     Write-Host ("databreak: waiting up to ${AttachTimeoutSeconds}s for one of: " + ($names -join ', '))
     $victimProc = Wait-ForLaneTestProcess -Names $names -TimeoutSeconds $AttachTimeoutSeconds -LaneProc $laneProc
     if (-not $victimProc) {
@@ -288,10 +391,20 @@ foreach ($t in $targets) {
         exit 2
     }
     $attachPid = if ($underBuild) { $victimProc.Id } else { 0 }
-    $r = Invoke-DataBreak -Exe $t -Symbol $Symbol -SignatureFilter $SignatureFilter `
-        -SlotOffsets $SlotOffsets -MaxSlots $MaxSlots `
-        -Arguments $Arguments -OutDir $OutDir -TimeoutSeconds $TimeoutSeconds -Cdb $Cdb -Repo $Repo `
-        -AttachPid $attachPid -KeepLog:$KeepLog
+    if ($WatchPages) {
+        $r = Invoke-DataBreakPageWatch -Exe $t -Symbol $Symbol -SignatureFilter $SignatureFilter `
+            -SelfSlotOffset $SelfSlotOffset -FieldOffset $FieldOffset -FieldAlign $FieldAlign `
+            -GuardOffset $GuardOffset -HotLimit $HotLimit `
+            -WatchCount $WatchCount -WatchSize $WatchSize -MaxArmAttempts $MaxArmAttempts `
+            -Arguments $Arguments -OutDir $OutDir -TimeoutSeconds $TimeoutSeconds -Cdb $Cdb -Repo $Repo `
+            -AttachPid $attachPid -KeepLog:$KeepLog
+    }
+    else {
+        $r = Invoke-DataBreak -Exe $t -Symbol $Symbol -SignatureFilter $SignatureFilter `
+            -SlotOffsets $SlotOffsets -MaxSlots $MaxSlots `
+            -Arguments $Arguments -OutDir $OutDir -TimeoutSeconds $TimeoutSeconds -Cdb $Cdb -Repo $Repo `
+            -AttachPid $attachPid -KeepLog:$KeepLog
+    }
     if ($r.Error) {
         Write-Host "databreak: $($r.Error)"
         if ($r.Probe -and $r.Probe.RawDisasm.Count -gt 0) {
@@ -317,7 +430,12 @@ foreach ($t in $targets) {
         foreach ($s in $p.Spills) {
             Write-Host ("  spill {0} <- {1} (origin {2})" -f (Format-RbpExpression -Offset $s.Offset), $s.Reg, $s.Origin)
         }
-        Write-Host ("  armed: {0}" -f (Format-SlotList -Offsets $r.ArmedOffsets))
+        if ($WatchPages) {
+            Write-Host ("  object pointer read from: {0}" -f (Format-SlotList -Offsets $r.SelfSlotCandidates))
+        }
+        else {
+            Write-Host ("  armed: {0}" -f (Format-SlotList -Offsets $r.ArmedOffsets))
+        }
         Write-Host ("  arm point: {0}!{1}+0x{2:x} (= {0}+0x{3:x}); return slot: {4}" -f `
                 $p.ModuleName, $p.Symbol, $p.ArmOffset, $p.ArmRva, (Format-RbpExpression -Offset $p.RetSlotOffset))
     }
@@ -333,8 +451,17 @@ if ($underBuild -and $laneLog) { Write-Host "databreak: lane transcript: $laneLo
 
 if ($hit) {
     Write-Host '-- data breakpoint hit --'
-    Write-Host ("  a write to an armed slot of {0}!{1} was caught in the act" -f $hit.Probe.ModuleName, $hit.Probe.Symbol)
-    Write-Host ("  armed: {0}; victim frame rbp = {1}" -f (Format-SlotList -Offsets $hit.ArmedOffsets), $hit.VictimRbp)
+    if ($WatchPages) {
+        Write-Host ("  an implausible pointer was written to a watched heap field of {0}!{1}" -f $hit.Probe.ModuleName, $hit.Probe.Symbol)
+        Write-Host ("  watched address = {0}" -f $hit.VictimRbp)
+        Write-Host ("  {0} address(es) armed{1}, {2} dropped as hot" -f $hit.ArmCount, `
+            $(if ($hit.ArmedFull) { ', entry breakpoint disabled' } else { ' -- entry breakpoint still live' }), `
+                $hit.HotDropped)
+    }
+    else {
+        Write-Host ("  a write to an armed slot of {0}!{1} was caught in the act" -f $hit.Probe.ModuleName, $hit.Probe.Symbol)
+        Write-Host ("  armed: {0}; victim frame rbp = {1}" -f (Format-SlotList -Offsets $hit.ArmedOffsets), $hit.VictimRbp)
+    }
     if ($hit.WriterSite) { Write-Host ("  writer (one instruction past the write): " + $hit.WriterSite) }
     if ($hit.LastTest) { Write-Host ("  running at the time: " + $hit.LastTest) }
     Write-Host '  writing instruction (last line of the backward disassembly):'
@@ -373,15 +500,54 @@ if ($crashed) {
 }
 
 if ($last.ArmCount -eq 0) {
-    Write-Host ("databreak: WARNING -- the entry breakpoint never fired; '{0}' was never called (wrong symbol, or a filtered run that does not reach it)" -f $Symbol)
+    if ($WatchPages) {
+        if (-not $last.Tried) {
+            Write-Host ("databreak: WARNING -- nothing was armed because '{0}' was NEVER CALLED in this process." -f $Symbol)
+            Write-Host '           The entry breakpoint resolved and simply never fired, so this run measured nothing at all.'
+            Write-Host '           Aim at the binary that exercises the target (-AttachName), or check the -SignatureFilter.'
+        }
+        else {
+            Write-Host ("databreak: WARNING -- '{0}' ran, but no candidate slot held an object the gates accept." -f $Symbol)
+            Write-Host ("           tried: {0}; each must hold a plausible aligned pointer whose field at +0x{1:x}" -f `
+                (Format-SlotList -Offsets $last.SelfSlotCandidates), $FieldOffset)
+            Write-Host ('           is itself a plausible pointer aligned to 0x{0:x}. Pass -SelfSlotOffset to aim it.' -f $FieldAlign)
+        }
+    }
+    else {
+        Write-Host ("databreak: WARNING -- the entry breakpoint never fired; '{0}' was never called (wrong symbol, or a filtered run that does not reach it)" -f $Symbol)
+    }
     if ($underBuild) {
         Write-Host '           under the build runner this also means the deferred breakpoint never resolved --'
         Write-Host '           check that the lane actually rebuilt/ran the probed binary rather than a cached one.'
     }
 }
 $modeName = if ($underBuild) { 'build-runner' } else { 'standalone' }
-Write-Host ("databreak: no wild write observed (mode={4}) -- {0} arm cycle(s), {1} disarm(s), program ran {2}s (cdb exit {3})" -f `
-        $last.ArmCount, $last.DisarmCount, $last.Seconds, $last.ExitCode, $modeName)
+if ($WatchPages -and $last.EndedEarly) {
+    Write-Host 'databreak: STOPPED EARLY -- a break nobody routed ended the session and killed the program'
+    Write-Host ("           mid-run, so only the first {0}s of it was watched. This is NOT a clean result." -f $last.Seconds)
+    Write-Host ('           last first-chance report: ' + $last.StrayBreak)
+    if ($last.LogPath) { Write-Host ('           transcript: ' + $last.LogPath) }
+    exit 4
+}
+if ($WatchPages) {
+    Write-Host ("databreak: no implausible write observed (mode={0}, page-watch) -- {1} address(es) armed{2}, program ran {3}s (cdb exit {4})" -f `
+            $modeName, $last.ArmCount, $(if ($last.ArmedFull) { ', entry breakpoint disabled' } else { '' }), $last.Seconds, $last.ExitCode)
+    if ($last.ArmCount -gt 0) {
+        Write-Host ("           COVERAGE: {0} heap address(es) armed out of every page the run touched; {1} dropped after" -f `
+                $last.ArmCount, $last.HotDropped)
+        Write-Host ('           going hot, so {0} watched to the end. A clean result rules out a corrupting write to' -f `
+            ($last.ArmCount - $last.HotDropped))
+        Write-Host '           THOSE addresses only; it is not evidence that no page was damaged.'
+    }
+    if ($last.ArmCount -gt 0 -and -not $last.ArmedFull) {
+        Write-Host ("           NOTE: fewer than -WatchCount {0} armed, so the entry breakpoint stayed live for the whole run" -f $WatchCount)
+        Write-Host '           and the per-call cost this mode exists to remove was still being paid.'
+    }
+}
+else {
+    Write-Host ("databreak: no wild write observed (mode={4}) -- {0} arm cycle(s), {1} disarm(s), program ran {2}s (cdb exit {3})" -f `
+            $last.ArmCount, $last.DisarmCount, $last.Seconds, $last.ExitCode, $modeName)
+}
 if (-not $underBuild -and $Lane) {
     Write-Host '           reminder: standalone is not a condition T443 has ever reproduced in (T832).'
 }

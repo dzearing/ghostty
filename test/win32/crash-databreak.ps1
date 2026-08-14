@@ -193,13 +193,66 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     '}'
 ) | Set-Content -Path (Join-Path $work 'slowstomp.zig') -Encoding ASCII
 
+# The T474/T838 shape: the watched bytes are a HEAP field, not a stack slot.
+# Six objects whose first field is a page-aligned pointer -- the same layout as
+# Page.memory.ptr -- are checked thousands of times, so the instrument must arm
+# on the first four DISTINCT ones and then stop breaking at all. Three writes
+# then land on watched addresses, and only one may be reported:
+#   - a legitimate re-assignment of objs[0].ptr (a pooled page re-initialised at
+#     the same slot), waved through because the value stays plausible;
+#   - the same T443-shaped scribble on objs[2], but with its `len` changed
+#     first -- that is RECYCLED memory, and the shape guard must reject it. This
+#     case is not hypothetical: without the guard the first armed run of the
+#     real agent lane reported hyperlink.dupe memcpy-ing a URI into a later
+#     page's string_alloc over a freed page's address;
+#   - the 4-byte scribble over objs[1].ptr's HIGH half with `len` intact, which
+#     is the exact T443 damage and is the one that must be caught.
+@(
+    'const std = @import("std");',
+    'const Obj = struct { ptr: [*]u8, len: usize, tag: u64 };',
+    'var bufs: [6][4096]u8 align(4096) = undefined;',
+    'var objs: [6]Obj = undefined;',
+    'noinline fn check(self: *Obj, a: u64, b: u64) u64 {',
+    '    return @intFromPtr(self.ptr) +% self.len +% a +% b;',
+    '}',
+    'noinline fn unused(self: *Obj, a: u64, b: u64) u64 {',
+    '    return @intFromPtr(self.ptr) +% a +% b;',
+    '}',
+    'noinline fn stomp(p: *u32) void {',
+    '    p.* = 0x11a60;',
+    '}',
+    'pub fn main() !void {',
+    '    var sum: u64 = 0;',
+    '    for (&objs, 0..) |*o, i| {',
+    '        o.* = .{ .ptr = &bufs[i], .len = bufs[i].len, .tag = i };',
+    '    }',
+    '    var round: usize = 0;',
+    '    while (round < 500) : (round += 1) {',
+    '        for (&objs) |*o| sum +%= check(o, 2, 3);',
+    '    }',
+    '    if (objs[0].tag == 12345) sum +%= unused(&objs[0], 1, 2);',
+    '    objs[0].ptr = &bufs[0];',
+    '    sum +%= check(&objs[0], 2, 3);',
+    '    var k: usize = 0;',
+    '    while (k < 1100) : (k += 1) objs[3].ptr = &bufs[3];',
+    '    objs[2].len = 999;',
+    '    const hi2: *u32 = @ptrFromInt(@intFromPtr(&objs[2]) + 4);',
+    '    stomp(hi2);',
+    '    sum +%= check(&objs[2], 2, 3);',
+    '    const hi: *u32 = @ptrFromInt(@intFromPtr(&objs[1]) + 4);',
+    '    stomp(hi);',
+    '    sum +%= check(&objs[1], 2, 3);',
+    '    std.debug.print("sum={x}\n", .{sum});',
+    '}'
+) | Set-Content -Path (Join-Path $work 'pagewatch.zig') -Encoding ASCII
+
 Push-Location $work
-foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig', 'bigframe.zig')) {
+foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig', 'bigframe.zig', 'pagewatch.zig')) {
     $b = & zig build-exe $src 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Host ("build failed for {0}: {1}" -f $src, ($b -join ' ')) }
 }
 Pop-Location
-foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe', 'bigframe.exe')) {
+foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe', 'bigframe.exe', 'pagewatch.exe')) {
     Check "fixture $exe built" (Test-Path (Join-Path $work $exe))
 }
 if (-not (Test-Path (Join-Path $work 'stompctl.exe'))) {
@@ -393,6 +446,93 @@ Check 'a standalone lane run warns it is not the T443 condition' `
 ($text -match 'mode = STANDALONE' -and $text -match 'NEVER been observed in this condition' -and $text -match 'T832') `
     ($text -replace '\s+', ' ')
 Check 'the standalone caveat is repeated in the verdict' ($text -match 'mode=standalone')
+
+# ---------------- 8b. -WatchPages: a heap field, armed once, never disarmed
+#
+# T474/T838. The per-call shape arms and disarms around every call of the
+# target: against the real Page.verifyIntegrity that is 335,878 round trips at
+# ~2 ms, and the lane timed out mid-run having measured nothing. The damaged
+# bytes are a heap field, so this mode arms on the object instead and then gets
+# out of the way. What has to be true, and is checked here rather than asserted:
+# the arm count is the number of WATCHED OBJECTS (not the number of calls), the
+# entry breakpoint really is disabled afterwards, an ordinary write to a watched
+# address does not stop the run, and the T443-shaped scribble does.
+
+$pwOut = Join-Path $work 'dumps-pagewatch'
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'pagewatch.exe') -Symbol check `
+    -WatchPages -WatchCount 4 -ShowProbe -OutDir $pwOut 2>&1
+$code = $LASTEXITCODE
+$text = ($out | Out-String)
+
+Check 'a page-watch hit exits 1' ($code -eq 1) "got $code, tail: $($text -replace '\s+', ' ')"
+Check 'the mode announces what it is blind to' `
+($text -match 'PAGE-WATCH' -and $text -match 'four debug registers') ($text -replace '\s+', ' ')
+Check 'the object pointer slot is named in the probe' `
+($text -match 'object pointer read from: @rbp') ($text -replace '\s+', ' ')
+# 3000+ calls of `check`, four arm cycles: the whole point of the redesign.
+Check 'it arms per object, not per call' ($text -match '4 address\(es\) armed') `
+    ($(($out | Select-String -Pattern 'address\(es\) armed|data breakpoint hit' | Select-Object -First 1) -replace '\s+', ' '))
+# And then gets out of the way: without this the per-call cost the redesign
+# exists to remove would still be paid for the rest of the run.
+Check 'the entry breakpoint is disabled once full' ($text -match 'entry breakpoint disabled') `
+    ($(($out | Select-String -Pattern 'address\(es\) armed' | Select-Object -First 1) -replace '\s+', ' '))
+# An address that outlives its page can be recycled into memory something writes
+# constantly. objs[3] is written 1100 times with a perfectly plausible pointer;
+# at ~2 ms a break that is a run that never finishes, so the breakpoint must be
+# dropped and the drop must be visible in the verdict.
+Check 'an address that goes hot is dropped and counted' ($text -match '1 dropped as hot') `
+    ($(($out | Select-String -Pattern 'address\(es\) armed' | Select-Object -First 1) -replace '\s+', ' '))
+Check 'the T443-shaped scribble is caught' ($text -match 'implausible pointer was written') `
+    ($text -replace '\s+', ' ')
+Check 'the writer is named' ($text -match 'pagewatch!stomp') ($text -replace '\s+', ' ')
+Check 'the writing instruction is shown' ($text -match 'mov\s+dword ptr \[\w+\],')
+Check 'the watched address is reported' ($text -match 'watched address = [0-9a-f]+')
+# The reported object is the one whose length is still 4096 -- objs[1]. If the
+# shape guard were not doing its job the run would have stopped one write
+# earlier, on objs[2], whose length had been changed to 999 (0x3e7) first.
+Check 'recycled memory is rejected, the intact page is reported' `
+($text -match '00000000.00001000' -and $text -notmatch '00000000.000003e7') `
+    ($(($out | Select-String -Pattern '^\s+\|\s+[0-9a-f]{8}.[0-9a-f]{8}\s+[0-9a-f]' | Select-Object -First 1) -replace '\s+', ' '))
+Check 'the victim frame is in the stack' ($text -match 'pagewatch!main')
+$pwDumps = @(Get-ChildItem $pwOut -Filter '*.dmp' -ErrorAction SilentlyContinue)
+Check 'a full dump is on disk' ($pwDumps.Count -ge 1 -and $pwDumps[0].Length -gt 100KB) `
+($(if ($pwDumps.Count -ge 1) { "$($pwDumps[0].Length) bytes" } else { 'none' }))
+Check 'the cdb helper files are cleaned up' `
+((@(Get-ChildItem $pwOut -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(cdb|txt)$' })).Count -eq 0)
+
+# The gate, proven from the other side: aim the same run at a field offset whose
+# contents are NOT a plausible aligned pointer (`tag`, at +16, which holds a
+# small index) and nothing arms. That is what stops a wrong -SelfSlotOffset from
+# silently watching junk bytes and reporting a clean run.
+$gateOut = Join-Path $work 'dumps-pagewatch-gate'
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'pagewatch.exe') -Symbol check `
+    -WatchPages -FieldOffset 16 -OutDir $gateOut 2>&1
+$code = $LASTEXITCODE
+$text = ($out | Out-String)
+Check 'a field that is not a pointer arms nothing' `
+($code -eq 0 -and $text -match 'no candidate slot held an object the gates accept') `
+    "got $code, tail: $($text -replace '\s+', ' ')"
+# "the gates rejected everything" and "the function was never called" are
+# different bugs with the same symptom, and a verdict that hedged between them
+# sent one armed lane run against a binary that never calls the target.
+Check 'the refusal says the target DID run' `
+($text -match "'check' ran, but" -and $text -notmatch 'NEVER CALLED') ($text -replace '\s+', ' ')
+Check 'the refusal lists every slot it tried' `
+($text -match 'tried: @rbp-0x10, @rbp-0x8, @rbp') ($text -replace '\s+', ' ')
+Check 'the refusal says how to aim it' ($text -match '-SelfSlotOffset') ($text -replace '\s+', ' ')
+
+# The other half of that distinction: a target that is compiled in but never
+# called. This is not hypothetical -- the first armed run of the real thing
+# attached to ghoztty-agent-test.exe, where Page.verifyIntegrity is never
+# called, and spent three minutes reporting a clean lane.
+$neverOut = Join-Path $work 'dumps-pagewatch-never'
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'pagewatch.exe') -Symbol unused `
+    -WatchPages -OutDir $neverOut 2>&1
+$code = $LASTEXITCODE
+$text = ($out | Out-String)
+Check 'a target that is never called says so' `
+($code -eq 0 -and $text -match 'NEVER CALLED' -and $text -match 'measured nothing at all') `
+    "got $code, tail: $($text -replace '\s+', ' ')"
 
 # ---------------------------------------------- 9. bad input fails, not hangs
 

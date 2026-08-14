@@ -490,6 +490,400 @@ function Read-DataBreakLog {
     return $res
 }
 
+function Invoke-DataBreakPageWatch {
+    <#
+    .SYNOPSIS
+        Arm hardware write breakpoints on a HEAP field -- `&page.memory.ptr` --
+        for the rest of the run, instead of on a stack slot per call (T474/T838).
+
+    .DESCRIPTION
+        Invoke-DataBreak arms the target function's spilled parameters and
+        disarms them when it returns, so the cost is one break-into-debugger
+        round trip per call. Against the real target that is 335,878 cycles at
+        ~2 ms: the lane never finished and the run measured nothing.
+
+        T443 turn 3 established that the damaged 4 bytes are not on the stack at
+        all -- they are `Page.memory.ptr` on the heap (`memory` is field 0, so
+        `&page.memory.ptr` IS the page's own address). A heap address is stable
+        for the life of the page, which is what makes a cheaper shape possible:
+
+        1. Break at the same probed arm point in $Symbol and read the object
+           pointer out of its first spill slot.
+        2. Gate it: non-null, and the field it names must itself be a plausible
+           aligned pointer. That is what proves the slot really holds a *Page
+           rather than something the caller left there.
+        3. Arm `ba w8` on `<self>+<FieldOffset>` and LEAVE IT ARMED. Nothing
+           disarms.
+        4. Once $WatchCount distinct objects are armed, DISABLE the entry
+           breakpoint. From then on the program runs at full speed: the total
+           cost of the instrument is $WatchCount round trips, not one per call.
+
+        Each armed breakpoint's command file gates the report on the T443
+        signature -- the post-write qword above $Implausible, which no
+        user-mode pointer can reach. Ordinary writes to the slot (a pooled Page
+        being re-initialised at the same address, a deinit zeroing it) continue
+        silently, so the armed window can outlive the page that opened it.
+
+        THE SHAPE GUARD ($GuardOffset) is the second half of that gate, and it
+        is not optional decoration -- the first armed run of the real thing
+        reported a hit that turned out to be recycled memory. The page had been
+        freed, its pool region handed back to the GPA, and a later page's
+        backing buffer allocated over it; `hyperlink.dupe`'s `@memcpy` of the
+        URI "https://example.com" into `dst_page.string_alloc` then wrote ASCII
+        over the watched bytes, and ASCII reads as an implausible pointer.
+        So the report also requires the qword $GuardOffset bytes past the
+        watched pointer -- `memory.len` for a Page -- to be UNCHANGED since the
+        arm. T443's damage leaves it alone (every dump printed `page_len=0x6f000`
+        intact), while recycled memory does not survive it. $GuardOffset 0
+        disables the guard and takes the false positives with it.
+
+        WHAT THIS IS BLIND TO, said plainly because a partial watch that reads
+        as total coverage is the failure mode here: x64 has FOUR debug
+        registers, so at most four addresses are watched out of the thousands a
+        lane touches. What is watched is an ADDRESS, not a page -- every later
+        page that lands on the same pool slot is covered too, which is the only
+        reason the odds are better than 4-out-of-N. A run that ends clean says
+        "no implausible write reached these four addresses", never "no
+        corruption happened".
+
+    .PARAMETER SelfSlotOffset
+        Explicit rbp-relative offsets of the slots that might hold the object
+        pointer. Default: EVERY canonical spill slot the probe found, tried in
+        order, first one that passes the gates wins.
+
+        Guessing a single slot does not work and this is measured: the fixture's
+        `check(self, a, b)` spills rdx/r8/r9 in parameter order, while the real
+        `Page.verifyIntegrity(self, alloc)` in ghoztty-agent-test.exe spills
+        r8/rdx/rcx -- so "the first spill is the first parameter" is false on the
+        one target that matters. The gates are what make trying all of them safe:
+        a candidate is only armed if it holds a plausible aligned pointer whose
+        own field at +$FieldOffset is a plausible pointer aligned to $FieldAlign,
+        which is a description only a real *Page satisfies.
+
+    .PARAMETER FieldOffset
+        Byte offset of the watched pointer inside the object. 0 for
+        `Page.memory.ptr`, which is field 0.
+
+    .PARAMETER FieldAlign
+        The watched pointer's expected alignment, used as an arm-time gate.
+        4096 for a page-aligned backing buffer; 1 disables the gate.
+
+    .PARAMETER MaxArmAttempts
+        Give up arming after this many calls of $Symbol and disable the entry
+        breakpoint anyway, so a wrong slot costs seconds rather than the run.
+
+    .OUTPUTS
+        The same shape Invoke-DataBreak returns, plus SelfSlotOffset and
+        ArmedFull. DisarmCount is always 0 by design.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string]$Symbol,
+        [string]$SignatureFilter = '',
+        [long[]]$SelfSlotOffset = @(),
+        [long]$FieldOffset = 0,
+        [long]$FieldAlign = 4096,
+        [long]$GuardOffset = 8,
+        [int]$HotLimit = 1000,
+        [int]$WatchCount = 4,
+        [int]$WatchSize = 8,
+        [string]$Implausible = '0x800000000000',
+        [int]$MaxArmAttempts = 2000,
+        [string[]]$Arguments = @(),
+        [int]$AttachPid = 0,
+        [string]$OutDir,
+        [int]$TimeoutSeconds = 1800,
+        [int]$Keep = 3,
+        [string]$Cdb,
+        [string]$Repo = 'D:\git\ghoztty',
+        [switch]$KeepLog,
+        [scriptblock]$Writer = { param($s) Write-Host $s }
+    )
+
+    $probe = Invoke-DataBreakProbe -Exe $Exe -Symbol $Symbol -SignatureFilter $SignatureFilter -Cdb $Cdb
+    $result = [pscustomobject]@{
+        Probe          = $probe
+        Hit            = $false
+        Crashed        = $false
+        ArmCount       = 0
+        DisarmCount    = 0
+        ArmedFull      = $false
+        Tried          = $false
+        HotDropped     = 0
+        EndedEarly     = $false
+        StrayBreak     = ''
+        SelfSlotOffset = [long]0
+        SelfSlotCandidates = @()
+        WriterSite     = ''
+        WriterBlock    = @()
+        StackBlock     = @()
+        VictimRbp      = ''
+        HitValue       = ''
+        ArmedOffsets   = @()
+        LastTest       = ''
+        DumpPath       = ''
+        LogPath        = ''
+        ErrLogPath     = ''
+        ExitCode       = $null
+        Seconds        = 0
+        Error          = ''
+        CrashResult    = $null
+    }
+    if (-not $probe.Ok) { $result.Error = $probe.Error; return $result }
+
+    if ($WatchCount -lt 1) { $WatchCount = 1 }
+    if ($WatchCount -gt 4) { $WatchCount = 4 }
+
+    $candidates = @()
+    if ($SelfSlotOffset.Count -gt 0) { $candidates = @($SelfSlotOffset) }
+    elseif ($probe.ArmedSlots.Count -gt 0) { $candidates = @($probe.ArmedSlots | ForEach-Object { $_.Offset }) }
+    if ($candidates.Count -eq 0) {
+        $result.Error = "no spill slot to read the object pointer from in '$Symbol'"
+        return $result
+    }
+    $result.SelfSlotOffset = $candidates[0]
+    $result.SelfSlotCandidates = @($candidates)
+    $result.ArmedOffsets = @($candidates)
+
+    $cdbPath = Get-CdbPath -Override $Cdb
+    if (-not $OutDir) { $OutDir = Join-Path $Repo '.dumps' }
+    if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+    $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
+
+    $base = [IO.Path]::GetFileNameWithoutExtension($probe.ExePath)
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $tag = "$base-pagewatch-$stamp-1"
+    $dump = Join-Path $OutDir "$tag.dmp"
+    $log = Join-Path $OutDir "$tag.log"
+    $errLog = Join-Path $OutDir "$tag.err.log"
+    $scriptFile = Join-Path $OutDir "$tag.cdb"
+    $dumpFwd = $dump -replace '\\', '/'
+
+    # Every generated file is one $$< include, so every cdb command below sits
+    # at exactly ONE level of quoting -- the rule the header records.
+    $helpers = @()
+    $armFiles = @()
+    $hitFiles = @()
+    $reportFiles = @()
+    for ($n = 1; $n -le $WatchCount; $n++) {
+        $armFiles += (Join-Path $OutDir ("$tag.arm$n.txt"))
+        $hitFiles += (Join-Path $OutDir ("$tag.hit$n.txt"))
+        $reportFiles += (Join-Path $OutDir ("$tag.report$n.txt"))
+    }
+
+    $fieldSuffix = $(if ($FieldOffset -ne 0) { '+0x{0:x}' -f $FieldOffset } else { '' })
+    $alignMask = [long]0
+    if ($FieldAlign -gt 1) { $alignMask = $FieldAlign - 1 }
+
+    for ($n = 1; $n -le $WatchCount; $n++) {
+        $slot = '@$t{0}{1}' -f $n, $fieldSuffix
+        $hitFwd = $hitFiles[$n - 1] -replace '\\', '/'
+
+        # The report lives in its OWN include, not inline in the `.if`. cdb
+        # echoes every command it runs, so an inline report is echoed on every
+        # ordinary write to the address too -- and one storming address wrote
+        # a 335 MB transcript in thirteen minutes before this was split out.
+        # Its lines all run unconditionally and the last is `q`, so the
+        # "an early `g` leaves the rest queued for the next stop" hazard that
+        # forces the arm files onto one line does not apply here.
+        @(
+            '.echo GHOZTTY-DATABREAK-HIT',
+            ('r $t9 = ' + $slot),
+            '.echo GHOZTTY-VICTIM-RBP',
+            'r $t9',
+            'r',
+            '.echo GHOZTTY-WRITER',
+            ('dq ' + $slot + ' L2'),
+            'ub @rip L3',
+            'u @rip L2',
+            '.echo GHOZTTY-STACK',
+            '.lines -e',
+            'kv 40',
+            '.echo GHOZTTY-ALL-THREADS-HIT',
+            '~*kv 40',
+            ".dump /ma $dumpFwd",
+            '.echo GHOZTTY-DATABREAK-END',
+            'q'
+        ) | Set-Content -LiteralPath $reportFiles[$n - 1] -Encoding ASCII
+
+        $hitGate = 'poi(' + $slot + ') >= ' + $Implausible
+        if ($GuardOffset -gt 0) {
+            $hitGate = '(' + $hitGate + ') & (poi(' + $slot + '+0x{0:x}) == @$t1{1})' -f $GuardOffset, $n
+        }
+        # A watched address that outlives its page can be recycled into memory
+        # something writes constantly, and then every write breaks into the
+        # debugger at ~2 ms. Left alone that is not a slow run, it is a run that
+        # never ends: the first real armed lane spent thirteen minutes and
+        # 335 MB of transcript on one such address. After -HotLimit ordinary
+        # writes the breakpoint is dropped and SAID so -- three watched
+        # addresses that ran to the end is a result; four that silently starved
+        # the lane is not.
+        @(
+            ('.if (' + $hitGate + ') { $$<' + ($reportFiles[$n - 1] -replace '\\', '/') + ' }'),
+            ('r $t{0} = @$t{0} + 1' -f (14 + $n)),
+            ('.if (@$t{0} > 0x{1:x}) {{ bd{2}; .echo GHOZTTY-WATCH-HOT }}' -f (14 + $n), $HotLimit, $n),
+            'g'
+        ) | Set-Content -LiteralPath $hitFiles[$n - 1] -Encoding ASCII
+
+        # Find the object pointer: walk the candidate slots and keep the first
+        # that survives the gates. MASM's `&` does not short-circuit, so the
+        # value gate (is this even a pointer?) and the field gate (does it point
+        # at something shaped like a *Page?) are two separate lines -- the
+        # second only ever dereferences an address the first already vetted.
+        $find = @('r $t0 = 0')
+        foreach ($c in $candidates) {
+            $cExpr = 'poi(' + (Format-RbpExpression -Offset $c) + ')'
+            $valGate = @(
+                ('(' + $cExpr + ' > 0x10000)'),
+                ('(' + $cExpr + ' < ' + $Implausible + ')'),
+                ('((' + $cExpr + ' & 7) == 0)')
+            ) -join ' & '
+            $find += ('.if ((@$t0 == 0) & ' + $valGate + ') { r $t0 = ' + $cExpr + ' }')
+            $fieldExpr = 'poi(@$t0' + $fieldSuffix + ')'
+            $reject = @(
+                ('(' + $fieldExpr + ' == 0)'),
+                ('(' + $fieldExpr + ' >= ' + $Implausible + ')')
+            )
+            if ($alignMask -gt 0) { $reject += ('((' + $fieldExpr + ' & 0x{0:x}) != 0)' -f $alignMask) }
+            $find += ('.if ((@$t0 != 0) & (' + ($reject -join ' | ') + ')) { r $t0 = 0 }')
+        }
+
+        $gates = @('(@$t0 != 0)')
+        for ($k = 1; $k -lt $n; $k++) { $gates += ('(@$t0 != @$t{0})' -f $k) }
+
+        $advance = $(if ($n -lt $WatchCount) {
+                'bp0 {0}+0x{1:x} "$$<{2}"' -f $probe.ModuleName, $probe.ArmRva, ($armFiles[$n] -replace '\\', '/')
+            }
+            else { 'bd0; .echo GHOZTTY-ARMED-FULL' })
+        $armParts = @(('r $t{0} = @$t0' -f $n))
+        if ($GuardOffset -gt 0) {
+            # The shape guard's baseline, captured while the object is known
+            # good. Compared at hit time; a mismatch means these bytes are no
+            # longer the object that was armed.
+            $armParts += ('r $t1{0} = poi({1}+0x{2:x})' -f $n, $slot, $GuardOffset)
+        }
+        $armParts += ('ba{0} w{1} {2} "$$<{3}"' -f $n, $WatchSize, $slot, $hitFwd)
+        $armParts += '.echo GHOZTTY-ARM'
+        $armParts += $advance
+        $armBody = $armParts -join '; '
+
+        @(
+            $find,
+            'r $t7 = @$t7 + 1',
+            # Once, on the first call: the difference between "the gates
+            # rejected everything" and "the function was never called" is the
+            # whole diagnosis when a run arms nothing, and without this marker
+            # the verdict has to hedge between them.
+            '.if (@$t7 == 1) { .echo GHOZTTY-ARM-TRY }',
+            ('.if (' + ($gates -join ' & ') + ') { ' + $armBody + ' }'),
+            ('.if (@$t7 > 0x{0:x}) {{ bd0; .echo GHOZTTY-ARM-GIVEUP }}' -f $MaxArmAttempts),
+            'g'
+        ) | Set-Content -LiteralPath $armFiles[$n - 1] -Encoding ASCII
+    }
+    $helpers = @($armFiles) + @($hitFiles) + @($reportFiles) + @($scriptFile)
+
+    $entry = ('bp0 {0}+0x{1:x} "$$<{2}"' -f $probe.ModuleName, $probe.ArmRva, ($armFiles[0] -replace '\\', '/'))
+    # A hardware data breakpoint arrives as a single-step exception. cdb matches
+    # it to the registered `ba` first, so a real hit still runs its command file
+    # -- but one that matches NOTHING (a thread created after the arm, which
+    # does not inherit the debug registers) falls through to the sse filter,
+    # breaks, returns from `g`, and drops straight into the script's closing
+    # `q`. That happened 110s into the first guarded lane run: cdb quit, the
+    # test binary died at exit 84 mid-`remote.connection`, and the verdict still
+    # said "no implausible write observed". Ignoring the filter keeps the run
+    # going; the cost is that a stray single step is no longer visible, which
+    # is why EndedEarly below is checked anyway.
+    New-CdbScript -DumpPath $dump -PrologCommands @($entry, 'sxi sse') |
+        Set-Content -LiteralPath $scriptFile -Encoding ASCII
+
+    $prevSym = $env:_NT_SYMBOL_PATH
+    $env:_NT_SYMBOL_PATH = (Split-Path -Parent $probe.ExePath)
+
+    $argList = @('-lines', '-cf', ('"' + $scriptFile + '"'))
+    if ($AttachPid -gt 0) { $argList += @('-p', "$AttachPid") }
+    else {
+        $argList += ('"' + $probe.ExePath + '"')
+        foreach ($x in $Arguments) { $argList += ('"' + $x + '"') }
+    }
+
+    & $Writer ("databreak: page-watch -- up to {0} address(es) at <self>{1}; candidate slots for <self>: {2} (in {3}!{4})" -f `
+            $WatchCount, $(if ($FieldOffset -ne 0) { '+0x{0:x}' -f $FieldOffset } else { '+0' }), `
+        (@($candidates | ForEach-Object { Format-RbpExpression -Offset $_ }) -join ', '), $probe.ModuleName, $probe.Symbol)
+    if ($AttachPid -gt 0) { & $Writer ("databreak: attaching to pid {0}" -f $AttachPid) }
+    $t0 = Get-Date
+    $p = Start-Process -FilePath $cdbPath -ArgumentList ($argList -join ' ') `
+        -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
+    $null = $p.Handle
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        & $Writer "databreak: TIMEOUT after ${TimeoutSeconds}s -- killing"
+        try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+        $p.WaitForExit(10000) | Out-Null
+    }
+    $result.Seconds = [int]((Get-Date) - $t0).TotalSeconds
+    $env:_NT_SYMBOL_PATH = $prevSym
+    $result.ExitCode = $p.ExitCode
+    $result.LogPath = $log
+    $result.ErrLogPath = $errLog
+
+    $parsed = Read-DataBreakLog -LogPath $log
+    $result.ArmCount = $parsed.ArmCount
+    $result.DisarmCount = $parsed.DisarmCount
+    $result.Hit = $parsed.Hit
+    $result.WriterSite = $parsed.WriterSite
+    $result.WriterBlock = $parsed.WriterBlock
+    $result.StackBlock = $parsed.StackBlock
+    $result.VictimRbp = $parsed.VictimRbp
+    $result.HitValue = $parsed.HitValue
+    $result.LastTest = Get-LastProgressLine -Path $errLog
+    $result.ArmedFull = (@(Select-String -LiteralPath $log -Pattern '^\s*(?:\d+:\d+>\s*)?GHOZTTY-ARMED-FULL\s*$' -ErrorAction SilentlyContinue).Count -gt 0)
+    $result.Tried = (@(Select-String -LiteralPath $log -Pattern '^\s*(?:\d+:\d+>\s*)?GHOZTTY-ARM-TRY\s*$' -ErrorAction SilentlyContinue).Count -gt 0)
+    $result.HotDropped = @(Select-String -LiteralPath $log -Pattern '^\s*(?:\d+:\d+>\s*)?GHOZTTY-WATCH-HOT\s*$' -ErrorAction SilentlyContinue).Count
+    # A break nobody routed ends the session at cdb's closing `q`, killing the
+    # debuggee mid-lane -- and the verdict would otherwise read as a clean full
+    # run. Any first-chance report that is not one of ours is that condition.
+    if (-not $result.Hit -and -not $result.Crashed) {
+        # Anchored past the LOADER break, which is a first-chance
+        # `Break instruction exception` cdb reports on every run before it even
+        # reads the command file. Counting that one would make every clean run
+        # look like it stopped early -- the mirror image of the bug this check
+        # exists for, and it fails the same way: by lying about coverage.
+        # The anchor is cdb's FIRST prompt line: the loader break is reported
+        # before cdb has a prompt to echo the command file at, so anything past
+        # that point is a stop the script did not ask for. (`-cf` prints no
+        # "Reading initial command" banner, which is what the first attempt at
+        # this anchored on and why every clean run then read as stopped early.)
+        $anchor = 0
+        $start = @(Select-String -LiteralPath $log -Pattern '^\s*\d+:\d+>' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($start.Count -gt 0) { $anchor = $start[0].LineNumber }
+        $stray = @(Select-String -LiteralPath $log -Pattern '^\([0-9a-f]+\.[0-9a-f]+\):.*\(first chance\)' -ErrorAction SilentlyContinue |
+                Where-Object { $_.LineNumber -gt $anchor })
+        if ($stray.Count -gt 0) {
+            $result.EndedEarly = $true
+            $result.StrayBreak = $stray[$stray.Count - 1].Line.Trim()
+        }
+    }
+
+    $crashMarker = @(Select-String -LiteralPath $log -Pattern '^\s*(?:\d+:\d+>\s*)?GHOZTTY-CRASH-BEGIN\s*$' -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($crashMarker.Count -gt 0) {
+        $crash = Read-CrashCatchLog -LogPath $log
+        if ($crash.Crashed) {
+            $result.Crashed = $true
+            $result.CrashResult = $crash
+        }
+    }
+    if (Test-Path -LiteralPath $dump) { $result.DumpPath = $dump }
+
+    Remove-Item -LiteralPath $helpers -Force -ErrorAction SilentlyContinue
+    if ($result.Hit -or $result.Crashed) {
+        Remove-OldCrashCapture -OutDir $OutDir -Keep $Keep
+    } elseif (-not $KeepLog -and -not $result.EndedEarly) {
+        Remove-Item -LiteralPath $log, $errLog -Force -ErrorAction SilentlyContinue
+        $result.LogPath = ''
+        $result.ErrLogPath = ''
+    }
+    return $result
+}
+
 function Invoke-DataBreak {
     <#
     .SYNOPSIS
