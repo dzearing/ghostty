@@ -61,3 +61,13 @@ as the digest that showed them.
 - Drop a pane onto an edge to split
 - Remote panes that reconnect visibly after sleep
 - Never a blank window over RDP (renderer fallback)
+
+## 2026-08-14
+
+- Build progress on the taskbar button
+- An elevated (administrator) pane looks elevated
+- Recent projects and saved layouts on the taskbar jump list
+- Open this pane's folder in Explorer or your editor
+- Copy the selection as an image
+- Predictive echo on remote panes
+- Snap groups that survive a restart
