@@ -13,9 +13,13 @@
     The recipe, end to end:
 
     1. PROBE. Run cdb just long enough to disassemble the target function and
-       parse its Debug prologue: `push rbp` / `sub rsp,X` / `lea rbp,[rsp+Y]`
-       followed by a leading run of `mov [rbp+/-off],reg` spills (possibly via
-       a scratch register: `mov rax,rdx; mov [rbp-10h],rax` spills rdx). From
+       parse its Debug prologue: `push rbp` / an optional run of further
+       `push <reg>` saves / the frame allocation / `lea rbp,[rsp+Y]` followed
+       by a leading run of `mov [rbp+/-off],reg` spills (possibly via
+       a scratch register: `mov rax,rdx; mov [rbp-10h],rax` spills rdx). The
+       frame allocation has two shapes and both are read (T834): `sub rsp,X`
+       for a frame under 4 KB, and `mov eax,X; call __chkstk; sub rsp,rax` --
+       the stack-probe form the compiler switches to at 4 KB and above. From
        that: the canonical spill slot per incoming register (the FIRST spill
        per origin register -- the slots the T454 dump showed corrupted), the
        arm point (first instruction after the spill run, so the prologue's own
@@ -47,10 +51,10 @@
     Known limits, by design:
     - x64 has FOUR debug registers; at most 4 slots are armed (default: all
       distinct origin registers found, capped at 4).
-    - Only the standard Zig Debug frame (`push rbp / sub rsp,X /
-      lea rbp,[rsp+Y]`) is understood. A tiny leaf function can get a
-      frameless `push rax` prologue instead; the probe refuses it loudly
-      rather than arming the wrong bytes.
+    - Only an rbp-based Zig Debug frame is understood, in its two allocation
+      shapes (plain `sub rsp,X`, or the `__chkstk` probe form at 4 KB and
+      above). A tiny leaf function can get a frameless `push rax` prologue
+      instead; the probe refuses it loudly rather than arming the wrong bytes.
     - Threads created AFTER a ba is set do not inherit debug registers. The
       T450 capture showed only parked thread-pool workers, so this is
       acceptable; a hit from an unstarted thread would need a different tool.
@@ -147,16 +151,19 @@ function Invoke-DataBreakProbe {
         PageList.verifyIntegrity -- Zig gives both the same bare name).
     .OUTPUTS
         Ok, Error, ExePath, ModuleName, Symbol, Candidates, ModuleBase,
-        EntryAddress, EntryRva, FrameSub, FrameLea, RetSlotOffset, Spills
-        (Offset/Reg/Origin per spill, in order), ArmedSlots (first spill per
-        origin register), ArmOffset, ArmRva, RawDisasm.
+        EntryAddress, EntryRva, FrameSub, FrameLea, FrameShape ('sub' or
+        'chkstk'), ExtraPushes, RetSlotOffset, Spills (Offset/Reg/Origin per
+        spill, in order), ArmedSlots (first spill per origin register),
+        ArmOffset, ArmRva, RawDisasm.
     #>
     param(
         [Parameter(Mandatory)][string]$Exe,
         [Parameter(Mandatory)][string]$Symbol,
         [string]$SignatureFilter = '',
         [string]$Cdb,
-        [int]$DisasmLength = 32,
+        # 40, not 32: a __chkstk prologue (T834) spends four more instructions
+        # before the spill run starts, and the run has to end inside this window.
+        [int]$DisasmLength = 40,
         [int]$TimeoutSeconds = 120
     )
 
@@ -172,6 +179,8 @@ function Invoke-DataBreakProbe {
         EntryRva      = [long]0
         FrameSub      = [long]0
         FrameLea      = [long]0
+        FrameShape    = ''
+        ExtraPushes   = [int]0
         RetSlotOffset = [long]0
         Spills        = @()
         ArmedSlots    = @()
@@ -261,28 +270,77 @@ function Invoke-DataBreakProbe {
         return $res
     }
 
-    # The Zig Debug frame: push rbp / sub rsp,X / lea rbp,[rsp+Y]. Anything
-    # else is a shape this recipe has not seen -- fail loudly with the disasm
-    # attached rather than arming the wrong bytes.
+    # The Zig Debug frame: push rbp / [more push <reg>] / the frame
+    # allocation / lea rbp,[rsp+Y]. Anything else is a shape this recipe has
+    # not seen -- fail loudly with the disasm attached rather than arming the
+    # wrong bytes.
     if ($insns[0].Mnemonic -ne 'push' -or $insns[0].Operands -ne 'rbp') {
         $res.Error = "prologue does not start with 'push rbp': $($insns[0].Mnemonic) $($insns[0].Operands)"
         return $res
     }
-    if ($insns[1].Mnemonic -ne 'sub' -or $insns[1].Operands -notmatch '^rsp,([0-9a-f]+)h?$') {
-        $res.Error = "expected 'sub rsp,X' second: $($insns[1].Mnemonic) $($insns[1].Operands)"
+
+    # Callee-saved registers pushed after rbp. Each one moves the return-address
+    # slot another 8 bytes away from rbp, and nothing else about the recipe
+    # changes. A frame that needs a __chkstk probe saves two of them here
+    # (push rsi / push rdi) in the shape T834 found.
+    $i = 1
+    while ($i -lt $insns.Count -and $insns[$i].Mnemonic -eq 'push' -and $insns[$i].Operands -match '^r[a-z0-9]+$') {
+        $res.ExtraPushes++
+        $i++
+    }
+    if ($i -ge $insns.Count - 1) {
+        $res.Error = "prologue is nothing but pushes in the first $($insns.Count) instruction(s) of '$target'"
         return $res
     }
-    $res.FrameSub = [Convert]::ToInt64($Matches[1], 16)
-    if ($insns[2].Mnemonic -ne 'lea' -or $insns[2].Operands -notmatch '^rbp,\[rsp(?:\+([0-9a-f]+)h?)?\]$') {
-        $res.Error = "expected 'lea rbp,[rsp+Y]' third: $($insns[2].Mnemonic) $($insns[2].Operands)"
+
+    # The frame allocation, in either shape:
+    #   sub rsp,X                                 -- frames under 4 KB
+    #   mov eax,X / call __chkstk / sub rsp,rax   -- 4 KB and above (T834)
+    # Both allocate X bytes; only the instruction count differs.
+    if ($insns[$i].Mnemonic -eq 'sub' -and $insns[$i].Operands -match '^rsp,([0-9a-f]+)h?$') {
+        $res.FrameSub = [Convert]::ToInt64($Matches[1], 16)
+        $res.FrameShape = 'sub'
+        $i++
+    }
+    elseif ($insns[$i].Mnemonic -eq 'mov' -and $insns[$i].Operands -match '^eax,([0-9a-f]+)h?$') {
+        $size = [Convert]::ToInt64($Matches[1], 16)
+        if ($i + 2 -ge $insns.Count) {
+            $res.Error = "a __chkstk prologue was cut short by -DisasmLength in '$target'"
+            return $res
+        }
+        if ($insns[$i + 1].Mnemonic -ne 'call' -or $insns[$i + 1].Operands -notmatch '__chkstk') {
+            $res.Error = ("expected 'call __chkstk' after 'mov eax,{0:x}h': {1} {2}" -f `
+                    $size, $insns[$i + 1].Mnemonic, $insns[$i + 1].Operands)
+            return $res
+        }
+        if ($insns[$i + 2].Mnemonic -ne 'sub' -or $insns[$i + 2].Operands -ne 'rsp,rax') {
+            $res.Error = "expected 'sub rsp,rax' after the __chkstk call: $($insns[$i + 2].Mnemonic) $($insns[$i + 2].Operands)"
+            return $res
+        }
+        $res.FrameSub = $size
+        $res.FrameShape = 'chkstk'
+        $i += 3
+    }
+    else {
+        $res.Error = "expected a frame allocation ('sub rsp,X' or 'mov eax,X; call __chkstk; sub rsp,rax'): $($insns[$i].Mnemonic) $($insns[$i].Operands)"
+        return $res
+    }
+
+    if ($i -ge $insns.Count) {
+        $res.Error = "the prologue was cut short by -DisasmLength in '$target'"
+        return $res
+    }
+    if ($insns[$i].Mnemonic -ne 'lea' -or $insns[$i].Operands -notmatch '^rbp,\[rsp(?:\+([0-9a-f]+)h?)?\]$') {
+        $res.Error = "expected 'lea rbp,[rsp+Y]' after the frame allocation: $($insns[$i].Mnemonic) $($insns[$i].Operands)"
         return $res
     }
     if ($Matches[1]) { $res.FrameLea = [Convert]::ToInt64($Matches[1], 16) } else { $res.FrameLea = 0 }
+    $i++
 
     $res.EntryAddress = $insns[0].Address
     # entry rsp (the return address slot) relative to the frame pointer:
-    # rbp = entry_rsp - 8 - X + Y  =>  ret slot = rbp + 8 + X - Y.
-    $res.RetSlotOffset = 8 + $res.FrameSub - $res.FrameLea
+    # rbp = entry_rsp - 8 - 8*pushes - X + Y  =>  ret slot = rbp + 8 + 8*pushes + X - Y.
+    $res.RetSlotOffset = 8 + (8 * $res.ExtraPushes) + $res.FrameSub - $res.FrameLea
 
     # Walk the leading spill run. Two shapes participate:
     #   mov qword ptr [rbp(+/-off)],REG   -- a spill
@@ -292,7 +350,7 @@ function Invoke-DataBreakProbe {
     $origin = @{}
     $spills = @()
     $armAddr = [uint64]0
-    for ($i = 3; $i -lt $insns.Count; $i++) {
+    for (; $i -lt $insns.Count; $i++) {
         $insn = $insns[$i]
         if ($insn.Mnemonic -eq 'mov' -and $insn.Operands -match '^qword ptr \[rbp(?:([+-])([0-9a-f]+)h?)?\],(r[a-z0-9]+)$') {
             $off = [long]0

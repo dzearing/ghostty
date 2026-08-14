@@ -303,8 +303,17 @@ foreach ($t in $targets) {
     }
     if ($ShowProbe) {
         $p = $r.Probe
-        Write-Host ("databreak: probe {0}!{1} entry=0x{2:x} frame: sub rsp,0x{3:x} lea rbp,[rsp+0x{4:x}]" -f `
-                $p.ModuleName, $p.Symbol, $p.EntryAddress, $p.FrameSub, $p.FrameLea)
+        # Say which allocation shape was read, and how many callee-saved
+        # registers sit under the frame: a transcript that always printed
+        # "sub rsp,X" would misdescribe a __chkstk frame (T834), and the push
+        # count is what the return slot is computed from.
+        $frameDesc = $(if ($p.FrameShape -eq 'chkstk') {
+                'mov eax,0x{0:x}/__chkstk' -f $p.FrameSub
+            }
+            else { 'sub rsp,0x{0:x}' -f $p.FrameSub })
+        if ($p.ExtraPushes -gt 0) { $frameDesc = ('{0} push(es) + ' -f $p.ExtraPushes) + $frameDesc }
+        Write-Host ("databreak: probe {0}!{1} entry=0x{2:x} frame: {3} lea rbp,[rsp+0x{4:x}]" -f `
+                $p.ModuleName, $p.Symbol, $p.EntryAddress, $frameDesc, $p.FrameLea)
         foreach ($s in $p.Spills) {
             Write-Host ("  spill {0} <- {1} (origin {2})" -f (Format-RbpExpression -Offset $s.Offset), $s.Reg, $s.Origin)
         }

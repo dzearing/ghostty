@@ -10,9 +10,10 @@
     script proves the whole recipe against fixtures where the "wild write" is
     staged deliberately:
 
-    - the PROBE parses a real Zig Debug prologue (including spills routed
-      through a scratch register, and same-named overloads picked apart by
-      signature),
+    - the PROBE parses a real Zig Debug prologue in both of its allocation
+      shapes -- plain `sub rsp,X`, and the `__chkstk` probe form a frame over
+      4 KB gets (T834) -- including spills routed through a scratch register,
+      and same-named overloads picked apart by signature,
     - the ARM/DISARM cycle runs per call without false positives (200 calls,
       0 hits on a clean function),
     - a write into an armed slot is CAUGHT with the writing instruction and
@@ -98,6 +99,35 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     '}'
 ) | Set-Content -Path (Join-Path $work 'loopctl.zig') -Encoding ASCII
 
+# A frame over 4 KB, which the compiler allocates with a __chkstk stack probe
+# instead of a plain `sub rsp,X`, and which saves two more registers before it
+# (T834). That is the shape Page.verifyIntegrity grew into once T443's own
+# diagnostics widened it, and the probe refused it until this fixture existed.
+# The inline-asm clobber is what forces the `push rsi` / `push rdi` pair
+# deterministically -- a big frame alone does not produce them, and those
+# pushes are exactly what moves the return-address slot.
+@(
+    'const std = @import("std");',
+    'noinline fn victim(a: u64, b: u64, c: u64) u64 {',
+    '    var buf: [700]u64 = undefined;',
+    '    var i: usize = 0;',
+    '    while (i < buf.len) : (i += 1) buf[i] = a +% i;',
+    '    asm volatile ("nop"',
+    '        :',
+    '        :',
+    '        : .{ .rsi = true, .rdi = true });',
+    '    return buf[buf.len - 1] +% b *% 3 +% c;',
+    '}',
+    'pub fn main() !void {',
+    '    var sum: u64 = 0;',
+    '    var i: u64 = 0;',
+    '    while (i < 40) : (i += 1) {',
+    '        sum +%= victim(i, 2, 3);',
+    '    }',
+    '    std.debug.print("sum={x}\n", .{sum});',
+    '}'
+) | Set-Content -Path (Join-Path $work 'bigframe.zig') -Encoding ASCII
+
 # Two container-scoped functions with the same bare name: Zig emits both as
 # `pick`, exactly like Page.verifyIntegrity vs PageList.verifyIntegrity in
 # the real test binary. The probe must refuse the bare name and accept a
@@ -164,12 +194,12 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
 ) | Set-Content -Path (Join-Path $work 'slowstomp.zig') -Encoding ASCII
 
 Push-Location $work
-foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig')) {
+foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig', 'bigframe.zig')) {
     $b = & zig build-exe $src 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Host ("build failed for {0}: {1}" -f $src, ($b -join ' ')) }
 }
 Pop-Location
-foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe')) {
+foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe', 'bigframe.exe')) {
     Check "fixture $exe built" (Test-Path (Join-Path $work $exe))
 }
 if (-not (Test-Path (Join-Path $work 'stompctl.exe'))) {
@@ -194,6 +224,50 @@ if ($probe.Ok) {
     ($probe.RetSlotOffset -eq (8 + $probe.FrameSub - $probe.FrameLea)) "got $($probe.RetSlotOffset)"
     Check 'the module base was resolved' ($probe.ModuleBase -gt 0)
     Check 'the arm rva is module-relative' ($probe.ArmRva -eq ($probe.EntryRva + $probe.ArmOffset))
+    Check 'a small frame is reported as the plain sub shape' `
+    ($probe.FrameShape -eq 'sub' -and $probe.ExtraPushes -eq 0) `
+    "shape=$($probe.FrameShape) pushes=$($probe.ExtraPushes)"
+}
+
+# ------------------------------------- 3b. the >4 KB frame shape (T834)
+#
+# Past 4 KB the compiler allocates the frame with a __chkstk stack probe and
+# saves two more registers first. The probe read only the small-frame shape
+# and REFUSED this one, which is what stalled T443's hunt: its own diagnostics
+# had grown Page.verifyIntegrity's frame to 0x1020 bytes. The frame facts must
+# come out the same, and the extra pushes must move the return-address slot --
+# that slot is where the one-shot disarm breakpoint goes, so getting it wrong
+# would leave every armed slot live after the function returned.
+
+$big = Invoke-DataBreakProbe -Exe (Join-Path $work 'bigframe.exe') -Symbol victim
+Check 'probe succeeds on a >4 KB frame' $big.Ok $big.Error
+if ($big.Ok) {
+    Check 'the __chkstk allocation shape is recognised' ($big.FrameShape -eq 'chkstk') "got $($big.FrameShape)"
+    Check 'the frame size comes from the __chkstk argument' ($big.FrameSub -gt 4096) `
+    ("got 0x{0:x}" -f $big.FrameSub)
+    Check 'the callee-saved pushes before it are counted' ($big.ExtraPushes -eq 2) "got $($big.ExtraPushes)"
+    Check 'the pushes move the return slot' `
+    ($big.RetSlotOffset -eq (8 + (8 * $big.ExtraPushes) + $big.FrameSub - $big.FrameLea)) `
+    ("got 0x{0:x}" -f $big.RetSlotOffset)
+    Check 'spills are still found past the bigger prologue' ($big.Spills.Count -ge 3) "got $($big.Spills.Count)"
+    Check 'the arm point is past the whole prologue' `
+    ($big.ArmOffset -gt 0 -and $big.ArmRva -eq ($big.EntryRva + $big.ArmOffset)) "got $($big.ArmOffset)"
+
+    # The frame math, proven rather than asserted: an arm count that matches
+    # the disarm count means the one-shot breakpoint on the return-address
+    # slot fired every single time.
+    $bigOut = Join-Path $work 'dumps-bigframe'
+    $out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'bigframe.exe') -Symbol victim -ShowProbe -OutDir $bigOut 2>&1
+    $code = $LASTEXITCODE
+    $text = ($out | Out-String)
+    Check 'a __chkstk frame arms and runs clean' ($code -eq 0) "got $code, tail: $($text -replace '\s+', ' ')"
+    Check 'every call armed (40 cycles)' ($text -match '40 arm cycle\(s\)') "tail: $($text -replace '\s+', ' ')"
+    Check 'every call disarmed on return' ($text -match '40 disarm\(s\)')
+    # A transcript that said "sub rsp,X" for a frame with no such instruction
+    # would send the next reader looking for the wrong bytes.
+    Check 'the transcript names the allocation shape it read' `
+    ($text -match 'frame: 2 push\(es\) \+ mov eax,0x[0-9a-f]+/__chkstk') `
+    ($(($out | Select-String -Pattern 'frame:' | Select-Object -First 1) -replace '\s+', ' '))
 }
 
 # --------------------------------------- 4. same-named overloads (the real
