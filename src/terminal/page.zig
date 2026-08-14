@@ -377,6 +377,11 @@ pub const Page = struct {
         if (std.valgrind.runningOnValgrind() > 0) return;
 
         if (build_options.slow_runtime_safety) {
+            // Before anything reads through this page: T443's corruption
+            // lands on `memory.ptr` itself, and a page whose base is wrong
+            // makes every offset below reify garbage.
+            self.assertMemoryPtrPlausible();
+
             if (self.pause_integrity_checks > 0) return;
         }
 
@@ -1313,6 +1318,48 @@ pub const Page = struct {
         if (ptr == expect) return .exact;
         if (ptr & 0xffff_ffff == expect & 0xffff_ffff) return .low_half_only;
         return .neither;
+    }
+
+    /// One past the highest address a user-mode pointer can hold on the
+    /// 64-bit targets we build for. x86_64 canonical user addresses stop at
+    /// 0x0000_7FFF_FFFF_FFFF and aarch64 user addresses are lower still, so
+    /// anything at or above this is not a pointer at all.
+    const user_address_ceiling: usize = 0x0000_8000_0000_0000;
+
+    /// Whether `memory.ptr` still looks like the page-aligned user-mode
+    /// allocation every page is given.
+    ///
+    /// T443: the corruption this exists to catch replaces the HIGH 32 bits
+    /// of `Page.memory.ptr` with a page offset and leaves the low 32 bits
+    /// arithmetically exact. That keeps the pointer non-null AND page
+    /// aligned, so every null and alignment check waves it through — but it
+    /// pushes the address far above anything user mode can address, which is
+    /// what this looks at. Disassembling `verifyIntegrity` in the crashing
+    /// agent binary on 2026-08-14 showed the bad base is loaded straight out
+    /// of the `Page` struct (`memory` is at offset 0, so the load is
+    /// `mov r9,[self]`), not out of a stack copy of the slice — so the
+    /// damaged value is the field itself and checking the field catches it.
+    pub fn memoryPtrPlausible(ptr: usize, len: usize) bool {
+        if (ptr == 0 or len == 0) return false;
+        if (ptr % std.heap.page_size_min != 0) return false;
+        if (ptr >= user_address_ceiling) return false;
+        return len <= user_address_ceiling - ptr;
+    }
+
+    /// Panic, naming the page, if `memory.ptr` is not a plausible
+    /// allocation. Called at the top of every integrity check so a damaged
+    /// page is reported against the page that owns the damage, at the next
+    /// check, rather than ten frames deep inside whichever map happened to
+    /// reify a pointer from it. See `memoryPtrPlausible`.
+    inline fn assertMemoryPtrPlausible(self: *const Page) void {
+        const ptr = @intFromPtr(self.memory.ptr);
+        if (memoryPtrPlausible(ptr, self.memory.len)) return;
+        log.err(
+            "page memory pointer is not a valid allocation " ++
+                "self=0x{x} memory.ptr=0x{x} memory.len=0x{x}",
+            .{ @intFromPtr(self), ptr, self.memory.len },
+        );
+        @panic("page memory pointer corrupted");
     }
 
     /// Panic, naming the damage, if a map's metadata pointer has left this
@@ -2363,6 +2410,38 @@ test "Page ptrInPage bounds" {
     const half_clobbered = (in_page & 0xffff_ffff) | (0x0003_d3d0 << 32);
     try testing.expect(page.ptrInPage(in_page));
     try testing.expect(!page.ptrInPage(half_clobbered));
+}
+
+test "Page memoryPtrPlausible rejects a half-clobbered base" {
+    // A real page passes, and so does the shape of one: 64 KiB-aligned bases
+    // are used below so the literals stay page-aligned on every target we
+    // build for (page_size_min is 4 KiB on Windows/Linux, 16 KiB on aarch64
+    // macOS).
+    var page = try Page.init(std_capacity);
+    defer page.deinit();
+    try testing.expect(Page.memoryPtrPlausible(
+        @intFromPtr(page.memory.ptr),
+        page.memory.len,
+    ));
+
+    const good: usize = 0x0000_01c9_cb22_0000;
+    const len: usize = 0x6f000;
+    try testing.expect(Page.memoryPtrPlausible(good, len));
+
+    // The uninteresting rejections.
+    try testing.expect(!Page.memoryPtrPlausible(0, len));
+    try testing.expect(!Page.memoryPtrPlausible(good, 0));
+    try testing.expect(!Page.memoryPtrPlausible(good + 1, len));
+
+    // The T443 shape, from both dumps that recorded it: the high 32 bits are
+    // replaced by a page offset and the low 32 bits are left exact. Both stay
+    // non-null and page-aligned, which is why null and alignment checks have
+    // never caught this, and both land above the user address ceiling.
+    const clobbered_20260814: usize = 0x0001_1a60_cb22_0000;
+    const clobbered_20260804: usize = 0x0003_d3d0_cca6_0000;
+    try testing.expectEqual(good & 0xffff_ffff, clobbered_20260814 & 0xffff_ffff);
+    try testing.expect(!Page.memoryPtrPlausible(clobbered_20260814, len));
+    try testing.expect(!Page.memoryPtrPlausible(clobbered_20260804, 0x72000));
 }
 
 test "Page mapPtrDamage classifies the 2026-08-14 dump" {

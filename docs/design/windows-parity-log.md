@@ -9,6 +9,37 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-14 - **T443 (turn 3) - the corrupted value is the FIELD, not a copy of
+  it, and there is now a detector that does not need a debugger.** Turn 2 ended
+  pointing the next armed run at "a 4-byte write onto the high half of a
+  `Page.memory.ptr` copy - stack spill **or** the `Page` struct itself". That
+  ambiguity is resolved, statically, with no repro: disassembling
+  `verifyIntegrity` in the agent lane's own binary shows the slot holding `self`
+  is written exactly once, `memory` is `Page`'s first field (`[self]` and
+  `[self+8]` are ptr and len, `[self+0x160]` is `hyperlink_map`), and the load
+  that produced the half-clobbered base is `mov r9,[self]` - reading the heap
+  field directly. There is no stack temporary in that path to blame. Turn 2 read
+  the equivalent instruction pair as "a pointer to the page's memory slice" and
+  inferred one; it was `self`.
+  Two consequences. **The armed hunt gets affordable**: a heap field is stable
+  for the life of the page, so `crash-databreak.ps1` can arm once per PAGE
+  instead of once per integrity check - the 335,878 arm/disarm cycles at ~2 ms
+  that timed out mid-lane on turn 2 were paying for the wrong target. Filed as
+  **T838**, and T443 now deps on it. **And the crash gets caught earlier**:
+  `Page.memoryPtrPlausible` + `assertMemoryPtrPlausible` run at the top of
+  `verifyIntegrity` under `slow_runtime_safety`. This damage keeps the pointer
+  non-null AND page-aligned - which is exactly why every null and alignment
+  check in the codebase has waved it through for two weeks - but it pushes the
+  address above `0x0000_8000_0000_0000`, which no user-mode pointer can reach.
+  Checking the field means a damaged page is reported against the page that owns
+  the damage, at the next check on it, instead of ten frames deep in whichever
+  map happened to reify a pointer from it. Unit test uses the verbatim high
+  halves from both recorded dumps (`0x11a60`, `0x3d3d0`).
+  Not fixed, and the file says so: the corrupter is still unidentified and T443
+  is back to `todo` behind T838. Floor: `floor-lane -Lane all` ALL LANES PASS
+  (none 277s / win32 344s / agent 330s), P1/P2/P3 ALL PASS (25/20/16
+  assertions), `guard-due check` all CURRENT.
+
 - 2026-08-12 - **T463 - `--view=git-status:` / `--view=git-diff:<revspec>` render
   a diff on Windows.** The CLI has accepted both schemes since the merge, and the
   page that draws a diff (`src/viewer/diff.js`, 925 lines) has been in the bundle
