@@ -1021,9 +1021,36 @@ pub fn init(
                 // cross-machine agent (possibly a different OS) is the spawn
                 // failure that never replies OPENED and wedges the IO thread —
                 // the same reason the default shell must never be forwarded.
+                // T514: an explicit command that is nothing but a BARE shell
+                // (`command = pwsh` in the config, `ghoztty -e pwsh`) is a
+                // shell CHOICE, not a command. Forwarded as OPEN.command it
+                // ran NESTED under the agent's default shell (`cmd /c pwsh`)
+                // with the integration argv rewrite dropped — while the same
+                // config on the exec path integrates it directly (T27). So
+                // forward it as OPEN.shell instead, which both unwraps the
+                // nesting and re-enables integration. LOCAL agent only (the
+                // same reason the command gate below is), never overriding an
+                // explicit apprt shell, and never rewriting an apprt-built
+                // command (`wait-after-command`: the IPC `--command` path has
+                // its own keep-alive contract, T468, and `--shell` for this).
+                const command_shell: ?[]const u8 = shell: {
+                    if (!rb.local_shell_integration) break :shell null;
+                    if (rb.shell != null) break :shell null;
+                    if (config.@"wait-after-command") break :shell null;
+                    if (!command_explicit) break :shell null;
+                    const c = command orelse break :shell null;
+                    break :shell shell_integration.bareShellCommand(alloc, c) catch |err| {
+                        log.warn("bare-shell command detection failed err={}", .{err});
+                        break :shell null;
+                    };
+                };
+                // Outlives Remote.init (which dupes it) exactly like integ_argv.
+                defer if (command_shell) |s| alloc.free(s);
+
                 if (command) |c| {
-                    if (config.@"wait-after-command" or
-                        (rb.local_shell_integration and command_explicit))
+                    if (command_shell == null and
+                        (config.@"wait-after-command" or
+                            (rb.local_shell_integration and command_explicit)))
                     {
                         remote_command = try c.string(alloc);
                     }
@@ -1064,7 +1091,8 @@ pub fn init(
                     alloc.free(argv);
                 };
                 if (rb.local_shell_integration) {
-                    const shell_for_integration = rb.shell orelse inherited_shell;
+                    const shell_for_integration =
+                        command_shell orelse rb.shell orelse inherited_shell;
                     integ_argv = appendLocalShellIntegrationEnv(
                         alloc,
                         &integ_env,
@@ -1132,7 +1160,10 @@ pub fn init(
                         working_directory,
                         rb.local_shell_integration,
                     ),
-                    .shell = rb.shell,
+                    // A bare-shell command IS the shell (T514); an explicit
+                    // apprt shell can't coexist with it (command_shell is
+                    // null whenever rb.shell is set).
+                    .shell = command_shell orelse rb.shell,
                     .term = config.term,
                     .env = remote_env.items,
                     .argv = forwarded_argv,

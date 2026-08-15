@@ -31,6 +31,11 @@
 #      the AlreadyRunning arm used to forward a bare `new-window` with a null
 #      payload, so the running instance opened an empty window and the command
 #      vanished with exit 0 and no log line.
+#   F  a command that is nothing but a BARE SHELL (`--command=powershell`, the
+#      launch spelling of `command = powershell` in the config) runs that shell
+#      UN-NESTED with shell integration (T514). Pre-fix the agent ran
+#      `cmd /c powershell`: the user's shell nested under a hidden cmd.exe, the
+#      integration argv rewrite dropped, and +list frozen on the wrapper's cwd.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Hermetic: a per-run
 # $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN (so no real session-layout is
@@ -391,6 +396,59 @@ if ($cmdPaneE -ne '') {
 
 Stop-TestProcs
 
+# ============================================================================
+"== F: a bare-shell --command runs UN-NESTED with shell integration (T514)"
+# ============================================================================
+# `--command=powershell` is the launch spelling of `command = powershell` in
+# the config file - same config key, same `_command-explicit` signal, same
+# Surface.init path. A bare recognized shell is a shell CHOICE: it must travel
+# as OPEN.shell (un-nested, integrated), not OPEN.command (`cmd /c powershell`).
+$tmpF = Join-Path $root 'f'
+$wdF = Join-Path $root 'wd514'
+New-Item -ItemType Directory -Force $wdF | Out-Null
+
+Launch $tmpF @('--command=powershell')
+$paneF = First-Pane $tmpF 'f' 60
+Assert "F1 the launch opened a window with a pane" ($paneF -ne '')
+
+# The leaf's pid is the agent-reported shell process - the process the agent
+# actually spawned. Pre-fix that was the cmd.exe wrapper; the user's shell ran
+# nested one level below it. Poll: the pid arrives with the agent's OPENED.
+$leafF = $null
+$deadlineF = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadlineF) {
+    $leaves = @(Leaves-Of-Windows (Snapshot-Windows $tmpF 'f-pid'))
+    $leafF = @($leaves | Where-Object { [string]$_.name -eq $paneF })[0]
+    if ($null -ne $leafF -and [int]$leafF.pid -gt 0) { break }
+    Start-Sleep -Milliseconds 700
+}
+$shellProcF = $null
+if ($null -ne $leafF -and [int]$leafF.pid -gt 0) {
+    $shellProcF = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$leafF.pid)"
+}
+AssertEq "F2 the pane's shell IS powershell (pre-fix: a nested cmd.exe wrapper)" `
+    'powershell.exe' ([string]$shellProcF.Name)
+Assert "F3 the shell's command line carries the integration rewrite (ghostty.ps1)" `
+    ([string]$shellProcF.CommandLine -match '(?i)ghostty\.ps1')
+
+# Integration-visible behavior: a cd inside the pane shows up in +list. The
+# quoted token keeps `cd <path>` one argument through the cmd.exe wrapper.
+Run-Cli "+send-keys --target=$paneF `"cd $wdF`" Enter" "$tmpF\sk.txt" 15 | Out-Null
+$gotWdF = ''
+$deadlineF = (Get-Date).AddSeconds(40)
+while ((Get-Date) -lt $deadlineF) {
+    $leaves = @(Leaves-Of-Windows (Snapshot-Windows $tmpF 'f-wd'))
+    $l = @($leaves | Where-Object { [string]$_.name -eq $paneF })[0]
+    if ($null -ne $l -and ([string]$l.working_directory).ToLower() -eq $wdF.ToLower()) {
+        $gotWdF = [string]$l.working_directory
+        break
+    }
+    Start-Sleep -Milliseconds 800
+}
+Assert "F4 +list follows an in-pane cd (pre-fix: frozen on the wrapper's cwd)" ($gotWdF -ne '')
+
+Stop-TestProcs
+
 # ---- teardown --------------------------------------------------------------
 Stop-TestProcs
 $env:LOCALAPPDATA = $savedLocalAppData
@@ -400,6 +458,14 @@ if ($null -eq $savedAgentBin) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
 }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+# A green run stamps the covered files (T783) so guard-due can answer "has
+# this harness been run as it now stands?". Red leaves the stamp alone.
+if ($script:failures -eq 0) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard gui-launch-command -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }

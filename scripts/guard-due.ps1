@@ -243,6 +243,21 @@ $GuardTable = @(
             'test\win32\agent-shell-integration.ps1'
         )
     },
+    # The GUI launch-command path (T104, T487, T514): -e / --command= / a
+    # config `command`, incl. the bare-shell-as-shell-choice forwarding. The
+    # row stays on the harness itself: the code under test lives in core
+    # src\Surface.zig, which moves for a hundred reasons this 4-minute GUI
+    # harness cannot see, so covering it there would wedge every core edit.
+    # An edit to the harness (or its assertions) must re-prove itself, which
+    # before this row nothing required.
+    [pscustomobject]@{
+        Name   = 'gui-launch-command'
+        Script = 'test\win32\gui-launch-command.ps1'
+        Stamp  = 'test\win32\gui-launch-command.stamp.json'
+        Covers = @(
+            'test\win32\gui-launch-command.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.

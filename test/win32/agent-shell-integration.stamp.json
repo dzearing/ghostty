@@ -1,10 +1,10 @@
 {
     "guard":  "agent-shell-integration",
     "script":  "test/win32/agent-shell-integration.ps1",
-    "generated":  "2026-08-15T14:12:42-07:00",
-    "commit":  "e35ed5467",
+    "generated":  "2026-08-15T14:47:56-07:00",
+    "commit":  "08dda0030",
     "files":  {
-                  "src/termio/shell_integration.zig":  "64522dafd39380f36662573dc87cb99a7325c617f7b45e45ee9dbba1827cfe72",
+                  "src/termio/shell_integration.zig":  "bf843866127ccc1de33247f91a1de9d1b40813d4fcd4ebc8dff31e135c45e37e",
                   "test/win32/agent-shell-integration.ps1":  "ff48d7677a1fe377443dbab51b564881253bf2a704e694a1755003282d5dbc80"
               }
 }

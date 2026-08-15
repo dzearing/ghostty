@@ -232,6 +232,72 @@ test detectShell {
     }
 }
 
+/// Answer whether `command` is nothing but a BARE shell — a single argv0
+/// with no arguments that `detectShell` recognizes. Returns the argv0 duped
+/// into `alloc` (caller frees), or null when the command carries arguments
+/// or names anything else.
+///
+/// Why it exists (T514): a config `command = pwsh` is a shell CHOICE, but on
+/// an agent-backed pane it used to travel as `OPEN.command`, so the agent ran
+/// `cmd /c pwsh` — the user's shell nested under the default shell, with the
+/// integration argv rewrite dropped (an explicit command suppresses it by
+/// design). The caller forwards a bare shell as `OPEN.shell` instead, which
+/// unwraps the nesting and re-enables integration. A command WITH arguments
+/// keeps command semantics untouched: only the pure "this is my shell"
+/// spelling is reinterpreted.
+pub fn bareShellCommand(alloc: Allocator, command: config.Command) !?[]const u8 {
+    if (try detectShell(alloc, command) == null) return null;
+
+    var arg_iter = try command.argIterator(alloc);
+    defer arg_iter.deinit();
+    const arg0 = arg_iter.next() orelse return null;
+    if (arg_iter.next() != null) return null;
+    return try alloc.dupe(u8, arg0);
+}
+
+test bareShellCommand {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A bare recognized shell comes back as its argv0.
+    {
+        const got = (try bareShellCommand(alloc, .{ .shell = "pwsh" })).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("pwsh", got);
+    }
+    {
+        const got = (try bareShellCommand(alloc, .{ .shell = "bash.exe" })).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("bash.exe", got);
+    }
+    {
+        const got = (try bareShellCommand(alloc, .{ .direct = &.{"nu"} })).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("nu", got);
+    }
+
+    // Arguments mean a real command line, never a shell choice.
+    try testing.expect(try bareShellCommand(alloc, .{ .shell = "pwsh -NoProfile" }) == null);
+    try testing.expect(try bareShellCommand(
+        alloc,
+        .{ .direct = &.{ "bash", "-c", "ls" } },
+    ) == null);
+
+    // Unrecognized programs (cmd.exe cannot integrate; scripts are commands).
+    try testing.expect(try bareShellCommand(alloc, .{ .shell = "cmd.exe" }) == null);
+    try testing.expect(try bareShellCommand(alloc, .{ .shell = "python" }) == null);
+
+    if (comptime builtin.target.os.tag == .windows) {
+        // A quoted full path is still bare: one argv0, recognized.
+        const got = (try bareShellCommand(
+            alloc,
+            .{ .shell = "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\"" },
+        )).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", got);
+    }
+}
+
 /// Set up the shell integration features environment variable.
 pub fn setupFeatures(
     env: *EnvMap,
