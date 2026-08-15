@@ -150,7 +150,20 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     const arg0 = arg_iter.next() orelse return null;
     const exe = std.fs.path.basename(arg0);
 
-    if (std.mem.eql(u8, "bash", exe)) {
+    // On Windows a shell is routinely named with the extension or by full
+    // path ("bash.exe", "C:\...\bash.exe"), and Windows filenames are
+    // case-insensitive, so strip a trailing ".exe" and lowercase before
+    // every name check. A name longer than the buffer cannot match any
+    // shell we know.
+    var buf: [16]u8 = undefined;
+    const stripped = if (std.ascii.endsWithIgnoreCase(exe, ".exe"))
+        exe[0 .. exe.len - 4]
+    else
+        exe;
+    if (stripped.len > buf.len) return null;
+    const name = std.ascii.lowerString(buf[0..stripped.len], stripped);
+
+    if (std.mem.eql(u8, "bash", name)) {
         // Apple distributes their own patched version of Bash 3.2
         // on macOS that disables the ENV-based POSIX startup path.
         // This means we're unable to perform our automatic shell
@@ -167,26 +180,14 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
         return .bash;
     }
 
-    if (std.mem.eql(u8, "elvish", exe)) return .elvish;
-    if (std.mem.eql(u8, "fish", exe)) return .fish;
-    if (std.mem.eql(u8, "nu", exe)) return .nushell;
-    if (std.mem.eql(u8, "zsh", exe)) return .zsh;
+    if (std.mem.eql(u8, "elvish", name)) return .elvish;
+    if (std.mem.eql(u8, "fish", name)) return .fish;
+    if (std.mem.eql(u8, "nu", name)) return .nushell;
+    if (std.mem.eql(u8, "zsh", name)) return .zsh;
 
-    // Windows: pwsh.exe / powershell.exe (with or without the extension;
-    // the basename is what we see). cmd.exe has no prompt hook and cannot
-    // be integrated.
-    {
-        var buf: [16]u8 = undefined;
-        const base = if (std.ascii.endsWithIgnoreCase(exe, ".exe"))
-            exe[0 .. exe.len - 4]
-        else
-            exe;
-        if (base.len <= buf.len) {
-            const lower = std.ascii.lowerString(buf[0..base.len], base);
-            if (std.mem.eql(u8, "pwsh", lower)) return .powershell;
-            if (std.mem.eql(u8, "powershell", lower)) return .powershell;
-        }
-    }
+    // cmd.exe has no prompt hook and cannot be integrated.
+    if (std.mem.eql(u8, "pwsh", name)) return .powershell;
+    if (std.mem.eql(u8, "powershell", name)) return .powershell;
 
     return null;
 }
@@ -208,6 +209,27 @@ test detectShell {
 
     try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "bash -c 'command'" }));
     try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "\"/a b/bash\"" }));
+
+    // Windows spellings: extension, mixed case, full path (T513).
+    try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "bash.exe" }));
+    try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "Bash.EXE" }));
+    try testing.expectEqual(.nushell, try detectShell(alloc, .{ .shell = "nu.exe" }));
+    try testing.expectEqual(.zsh, try detectShell(alloc, .{ .shell = "zsh.exe" }));
+    try testing.expectEqual(.fish, try detectShell(alloc, .{ .shell = "fish.exe" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "pwsh.exe" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "PowerShell.exe" }));
+    try testing.expect(try detectShell(alloc, .{ .shell = "cmd.exe" }) == null);
+    if (comptime builtin.target.os.tag == .windows) {
+        // Backslash paths only split on Windows' basename rules.
+        try testing.expectEqual(.bash, try detectShell(
+            alloc,
+            .{ .shell = "\"C:\\Program Files\\Git\\bin\\bash.exe\" -l" },
+        ));
+        try testing.expectEqual(.nushell, try detectShell(
+            alloc,
+            .{ .direct = &.{"C:\\Users\\x\\AppData\\Local\\Programs\\nu\\bin\\nu.exe"} },
+        ));
+    }
 }
 
 /// Set up the shell integration features environment variable.

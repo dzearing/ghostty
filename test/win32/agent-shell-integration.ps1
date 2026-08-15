@@ -23,6 +23,10 @@
 #   B  default pane (no --shell): spawns plain cmd.exe with NO integration
 #      argv — the client must not forward a bogus rewrite for a shell that
 #      cannot be integrated.
+#   C  (T513) `--shell=<full path to git-bash's bash.exe>`: detection must
+#      survive the Windows spelling (full path + .exe), proven by the child
+#      command line carrying bash's `--posix` integration rewrite. Uses the
+#      8.3 short path so the space in "Program Files" needs no quoting.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Hermetic: per-run
 # LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN + private IPC suffix (Isolation.ps1),
@@ -34,6 +38,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
+$script:skips = 0
 $root = Join-Path $env:TEMP "ghoztty-t151-shellint-$PID"
 
 function Assert($name, $cond) {
@@ -203,6 +208,40 @@ Assert "B3 the default pane's child is cmd.exe (COMSPEC default)" `
 Assert "B4 no integration argv leaked into the default pane" `
     ($null -ne $procB -and $procB.CommandLine -notmatch 'ghostty\.ps1' -and $procB.CommandLine -notmatch '-NoExit')
 
+# ============================================================================
+"== C: --shell=<full git-bash path> gets the --posix rewrite (T513)"
+# ============================================================================
+$bashPath = 'C:\Program Files\Git\bin\bash.exe'
+$bashRes = 'D:\git\ghoztty\zig-out\share\ghostty\shell-integration\bash\ghostty.bash'
+if (-not (Test-Path $bashPath)) {
+    "  SKIP C: git-bash not found at $bashPath"
+    $script:skips++
+} else {
+    Assert "C0 ghostty.bash is in the build's resources" (Test-Path $bashRes)
+    # 8.3 short path: same file, no space, so no quoting layer can mangle it.
+    $shortBash = (New-Object -ComObject Scripting.FileSystemObject).GetFile($bashPath).ShortPath
+    if ($shortBash -match ' ') {
+        "  SKIP C: volume has no space-free short path for $bashPath"
+        $script:skips++
+    } else {
+        $codeC = Run-Cli "+new-window --target=t513bash --shell=$shortBash" "$root\new-c.txt" 60
+        Assert "C1 +new-window --shell=<full bash.exe path> succeeded (exit 0)" ($codeC -eq 0)
+
+        $paneC = Wait-Pane 'c' 't513bash' 40
+        Assert "C2 the bash pane is up with a live pid" ($null -ne $paneC -and [int]$paneC.pid -gt 0)
+
+        $procC = $null
+        if ($null -ne $paneC -and [int]$paneC.pid -gt 0) {
+            $procC = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$paneC.pid)"
+        }
+        Assert "C3 the pane's child is bash.exe" ($null -ne $procC -and $procC.Name -ieq 'bash.exe')
+        Assert "C4 its command line carries the --posix integration rewrite" `
+            ($null -ne $procC -and $procC.CommandLine -match '--posix')
+
+        Run-Cli '+close --target=t513bash' "$root\close-c.txt" 15 | Out-Null
+    }
+}
+
 # ---- teardown --------------------------------------------------------------
 Run-Cli '+close --target=t151ps' "$root\close-a.txt" 15 | Out-Null
 Run-Cli '+close --target=t151def' "$root\close-b.txt" 15 | Out-Null
@@ -214,6 +253,15 @@ if ($null -eq $savedAgentBin) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
 }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+# A green run with no skipped sections stamps the covered files (T783) so
+# guard-due can answer "has this harness been run against shell_integration.zig
+# as it now stands?". Red or skipped leaves the stamp alone: both stay due.
+if ($script:failures -eq 0 -and $script:skips -eq 0) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard agent-shell-integration -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }

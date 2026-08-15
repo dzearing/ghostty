@@ -227,6 +227,22 @@ $GuardTable = @(
             'test\win32\window-name-env.ps1'
         )
     },
+    # Shell-integration detection + the agent argv delivery (T151, T513):
+    # detectShell's Windows spellings (.exe suffix, full paths, mixed case)
+    # are proven end-to-end only by this harness — the none-lane unit tests
+    # pin the table, but nothing else in the floor opens an agent-backed pane
+    # and reads the child's command line back. The row stays on
+    # shell_integration.zig (the subject) rather than all of src\termio:
+    # Exec.zig moves for reasons that have nothing to do with detection.
+    [pscustomobject]@{
+        Name   = 'agent-shell-integration'
+        Script = 'test\win32\agent-shell-integration.ps1'
+        Stamp  = 'test\win32\agent-shell-integration.stamp.json'
+        Covers = @(
+            'src\termio\shell_integration.zig',
+            'test\win32\agent-shell-integration.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.
