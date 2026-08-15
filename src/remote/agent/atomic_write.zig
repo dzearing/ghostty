@@ -28,6 +28,23 @@
 //! writer finished and synced; when writers overlap, last rename wins with a
 //! COMPLETE file.
 //!
+//! ## Why the rename retries, and why the budget is seconds (T508)
+//!
+//! Unique staging names make every rename publish a complete file, but on
+//! Windows the rename ITSELF can transiently fail: the publish is
+//! `FileRenameInformation` + `ReplaceIfExists`, and replacing a target some
+//! other process holds open without `FILE_SHARE_DELETE` surfaces
+//! `STATUS_ACCESS_DENIED` (⇒ `error.AccessDenied`). The holder in practice is
+//! the on-access scanner examining the file the PREVIOUS writer just
+//! published. Measured on this box (probe with unbounded retries, 4 threads x
+//! 200 rounds x 10 processes under CPU load): outages hit all four threads at
+//! once, last 440–786ms, and always clear — scan holds are sub-millisecond on
+//! an idle box, which is why only loaded soaks ever saw this. The staging
+//! file is complete and synced before the rename, so retrying is safe by
+//! construction; the budget must out-wait a whole stretched scan hold, so it
+//! is seconds, not milliseconds (a 95ms budget still failed 37 of 120 runs).
+//! A genuine permission problem still fails, ~5s later.
+//!
 //! ## Crash debris
 //!
 //! A process that dies between create and rename leaves `<path>.<hex>.tmp`
@@ -73,13 +90,67 @@ pub fn writeChunks(alloc: Allocator, path: []const u8, chunks: []const []const u
         try file.sync();
     }
     errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    try renameWithRetry(std.fs.cwd(), ThreadSleeper{}, tmp_path, path);
 
     // Heal legacy `<path>.tmp` debris left by a pre-unique-name build that
     // died between create and rename (that name is never written again).
     const legacy = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(legacy);
     std.fs.cwd().deleteFile(legacy) catch {};
+}
+
+/// Total retry budget for the publish rename before its error is real (T508).
+/// Sized from measurement, not taste: with retries unbounded, the observed
+/// AccessDenied outages on this box under a deliberately brutal load harness
+/// (16 CPU spinners + 40 writer threads) lasted 440–786ms and always cleared —
+/// the signature of an on-access scanner holding the just-published target,
+/// stretched by CPU starvation. 5s is ~6x the worst observed hold; the first
+/// sizing (95ms) was inside the window and still failed 37 of 120 runs.
+const rename_retry_budget_ns: u64 = 5 * std.time.ns_per_s;
+
+/// Backoff before retry `attempt` (1-based): 1ms, 2ms, 4ms … capped at 50ms.
+fn renameBackoffNs(attempt: usize) u64 {
+    const shift: u6 = @intCast(@min(attempt - 1, 6));
+    return @min(@as(u64, std.time.ns_per_ms) << shift, 50 * std.time.ns_per_ms);
+}
+
+/// The error shapes a scanner's transient hold on the target (or a concurrent
+/// replace of the same target) produces on Windows. Anything else —
+/// FileNotFound, NoSpaceLeft, a bad path — is real and never retried.
+fn isTransientRenameError(err: anyerror) bool {
+    return switch (err) {
+        error.AccessDenied, error.PathAlreadyExists => true,
+        else => false,
+    };
+}
+
+/// Sleeper used by production `writeChunks`; tests inject a recorder instead
+/// so the budget-exhaustion path runs without real sleeping.
+const ThreadSleeper = struct {
+    fn sleep(_: @This(), ns: u64) void {
+        std.Thread.sleep(ns);
+    }
+};
+
+/// Rename with a time-budgeted retry on the transient contention errors
+/// (T508). `dir` is anything with a `rename(old, new)` method — `std.fs.Dir`
+/// in production, a failure-injecting mock in tests — and `sleeper` anything
+/// with a `sleep(ns)` method. The budget counts REQUESTED sleep, so actual
+/// wall time is at least the budget under load, which is the direction that
+/// helps.
+fn renameWithRetry(dir: anytype, sleeper: anytype, tmp_path: []const u8, path: []const u8) !void {
+    var slept: u64 = 0;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        return dir.rename(tmp_path, path) catch |err| {
+            if (!isTransientRenameError(err)) return err;
+            if (slept >= rename_retry_budget_ns) return err;
+            const ns = renameBackoffNs(attempt);
+            sleeper.sleep(ns);
+            slept += ns;
+            continue;
+        };
+    }
 }
 
 /// Best-effort: delete EVERY staging sibling of `path` — the legacy fixed
@@ -181,13 +252,19 @@ test "writeChunks: concurrent writers to ONE path never error or tear (T183)" {
     // two writers' bytes is detectable, and truncation is detectable by size.
     const body_len = 4096;
 
+    // On failure the error is RECORDED, not just a bool — T508 spent a soak
+    // cycle blind because this test's catch discarded the error value.
+    const Failure = struct {
+        var err_name = std.atomic.Value(?[*:0]const u8).init(null);
+    };
     const W = struct {
         fn run(a: Allocator, p: []const u8, fill: u8, failed: *std.atomic.Value(bool)) void {
             var body: [body_len]u8 = undefined;
             @memset(&body, fill);
             var i: usize = 0;
             while (i < rounds) : (i += 1) {
-                writeChunks(a, p, &.{&body}, .{}) catch {
+                writeChunks(a, p, &.{&body}, .{}) catch |err| {
+                    Failure.err_name.store(@errorName(err).ptr, .seq_cst);
                     failed.store(true, .seq_cst);
                     return;
                 };
@@ -201,13 +278,84 @@ test "writeChunks: concurrent writers to ONE path never error or tear (T183)" {
         t.* = try std.Thread.spawn(.{}, W.run, .{ alloc, path, 'A' + @as(u8, @intCast(i)), &failed });
     }
     for (&threads) |*t| t.join();
-    try testing.expect(!failed.load(.seq_cst));
+    if (failed.load(.seq_cst)) {
+        std.debug.print("concurrent writeChunks failed: error.{s}\n", .{Failure.err_name.load(.seq_cst).?});
+        return error.ConcurrentWriterErrored;
+    }
 
     // The survivor is exactly ONE complete body.
     const got = try std.fs.cwd().readFileAlloc(alloc, path, body_len * 2);
     defer alloc.free(got);
     try testing.expectEqual(@as(usize, body_len), got.len);
     for (got) |b| try testing.expectEqual(got[0], b);
+}
+
+/// Failure-injecting stand-in for `std.fs.Dir` in the retry tests: fails the
+/// first `fail_count` renames with `err`, then succeeds.
+const MockRenameDir = struct {
+    fail_count: usize,
+    err: anyerror = error.AccessDenied,
+    calls: usize = 0,
+
+    fn rename(self: *MockRenameDir, old: []const u8, new: []const u8) !void {
+        _ = old;
+        _ = new;
+        self.calls += 1;
+        if (self.calls <= self.fail_count) return self.err;
+    }
+};
+
+/// Records requested sleeps instead of performing them, so the retry tests —
+/// including exhausting the whole 5s budget — run in microseconds.
+const RecordingSleeper = struct {
+    total_ns: u64 = 0,
+    fn sleep(self: *RecordingSleeper, ns: u64) void {
+        self.total_ns += ns;
+    }
+};
+
+test "renameWithRetry: transient AccessDenied is retried away (T508)" {
+    var mock: MockRenameDir = .{ .fail_count = 3 };
+    var sleeper: RecordingSleeper = .{};
+    try renameWithRetry(&mock, &sleeper, "a.tmp", "a");
+    try testing.expectEqual(@as(usize, 4), mock.calls);
+    // Exponential opening: 1ms + 2ms + 4ms requested.
+    try testing.expectEqual(@as(u64, 7 * std.time.ns_per_ms), sleeper.total_ns);
+}
+
+test "renameWithRetry: persistent transient error surfaces after the time budget" {
+    var mock: MockRenameDir = .{ .fail_count = std.math.maxInt(usize) };
+    var sleeper: RecordingSleeper = .{};
+    try testing.expectError(error.AccessDenied, renameWithRetry(&mock, &sleeper, "a.tmp", "a"));
+    // The whole budget was spent waiting before giving up — this is what
+    // out-waits a stretched scan hold (measured up to ~786ms; see module doc).
+    try testing.expect(sleeper.total_ns >= rename_retry_budget_ns);
+    // …and not overspent by more than one capped backoff.
+    try testing.expect(sleeper.total_ns < rename_retry_budget_ns + 50 * std.time.ns_per_ms);
+    try testing.expect(mock.calls > 2);
+}
+
+test "renameWithRetry: a real error is never retried" {
+    var mock: MockRenameDir = .{ .fail_count = std.math.maxInt(usize), .err = error.FileNotFound };
+    var sleeper: RecordingSleeper = .{};
+    try testing.expectError(error.FileNotFound, renameWithRetry(&mock, &sleeper, "a.tmp", "a"));
+    try testing.expectEqual(@as(usize, 1), mock.calls);
+    try testing.expectEqual(@as(u64, 0), sleeper.total_ns);
+}
+
+test "renameWithRetry: PathAlreadyExists counts as transient" {
+    var mock: MockRenameDir = .{ .fail_count = 1, .err = error.PathAlreadyExists };
+    var sleeper: RecordingSleeper = .{};
+    try renameWithRetry(&mock, &sleeper, "a.tmp", "a");
+    try testing.expectEqual(@as(usize, 2), mock.calls);
+}
+
+test "renameBackoffNs: exponential then capped at 50ms" {
+    try testing.expectEqual(@as(u64, 1 * std.time.ns_per_ms), renameBackoffNs(1));
+    try testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), renameBackoffNs(2));
+    try testing.expectEqual(@as(u64, 32 * std.time.ns_per_ms), renameBackoffNs(6));
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), renameBackoffNs(7));
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), renameBackoffNs(100));
 }
 
 test "writeChunks: secret publishes mode 0600 on POSIX" {
