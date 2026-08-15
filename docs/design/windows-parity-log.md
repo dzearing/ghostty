@@ -9,6 +9,25 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T484 - the repeated-crash scrollback loss is closed as a
+  duplicate of T666, with the fix verified green on today's HEAD.** The defect
+  (a second restore comes back holding one screen, all older history gone —
+  session-persistence B2.7/B3.7 red since 2026-08-04) was independently
+  re-found, root-caused and fixed under T666 on 2026-08-11 (`3bbf0eefb`: park
+  the painted WP-D3 snapshot into scrollback before the agent's screen-only
+  repaint homes over it, and replay the gap at capture geometry), but T666
+  never cited T484, so this task sat open four days after its own fix landed.
+  This turn confirmed suspect 2 was the right mechanism (the app's 600-row
+  snapshot WAS painted, then erased — not eviction, not ring truncation), then
+  verified: **three consecutive full `session-persistence.ps1` runs at HEAD,
+  ALL PASS, B1.7/B2.7/B3.7 explicitly green each time**, with a negative
+  control — the B*.7 assertions are byte-identical to the ones that failed 3x
+  deterministically on 2026-08-09 (`git diff 328da04b0..HEAD` on the harness
+  shows only T739's additions), so the green is the fix, not a weakened probe.
+  No code changed this turn; tracker-only close-out. Process note: a dupe
+  filed from a different symptom description ("re-attach loses older cycles"
+  vs "second re-attach replays only the last screen") is invisible to a title
+  scan — the harness assertion id (B*.7) was the common key both tasks named.
 - 2026-08-15 - **T483 - the reset-context B7 flake is closed as died-with-the-
   old-delivery-path, and section B can now attribute any recurrence.** The
   1-in-3 "continuation never arrived" failure was observed 2026-08-05; the
