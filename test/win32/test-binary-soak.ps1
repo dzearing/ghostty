@@ -62,8 +62,8 @@ $out = Join-Path $work 'out'
 function Invoke-Soak {
     param([hashtable]$P = @{})
     $P = $P.Clone()
-    $P['OutDir'] = $out
-    $P['Repo'] = $Repo
+    if (-not $P.ContainsKey('OutDir')) { $P['OutDir'] = $out }
+    if (-not $P.ContainsKey('Repo')) { $P['Repo'] = $Repo }
     # -Width, or Out-String wraps at the host width (80 in a hidden console)
     # and an assertion about the one-line summary fails on a line break rather
     # than on the thing it is asserting.
@@ -320,6 +320,55 @@ Copy-Item -LiteralPath $psExe -Destination $plain -Force
 $r = Invoke-Soak @{ Exe = $plain; Arguments = @('-NoProfile', '-Command', 'exit 0'); Runs = 1; Label = 'plain' }
 Check 'a fixture exe gets no T443 warning' (-not ($r.Text -match 'NEVER been observed')) `
     ($r.Text -replace '\s+', ' ')
+
+# ------------------ 5. a two-binary lane keeps BOTH binaries' logs (T509)
+#
+# `-Lane agent -Mode standalone` soaks two binaries in turn, and the per-run
+# log name used to carry only {label}-{stamp}-{NN} with NN restarting per
+# binary -- so the second binary's run NN overwrote the first's, and during
+# T238 the failing binary's evidence was exactly what got lost. The lane is
+# fixtured with a fake repo whose .zig-cache holds two powershell copies named
+# like the agent test binaries; the FIRST fails (echoing its own path), the
+# second passes.
+
+$fakeRepo = Join-Path $work 'repo509'
+$oDir = Join-Path $fakeRepo '.zig-cache\o\cafef00d'
+New-Item -ItemType Directory -Force -Path $oDir | Out-Null
+Copy-Item -LiteralPath $psExe -Destination (Join-Path $oDir 'ghoztty-agent-test.exe') -Force
+Copy-Item -LiteralPath $psExe -Destination (Join-Path $oDir 'ghoztty-agent-core-test.exe') -Force
+# Single-quoted so $PID reaches the fixture unexpanded; the exe name is the
+# only thing that tells the two binaries apart, since both get the same args.
+$body509 = 'Write-Output ((Get-Process -Id $PID).Path); if ((Get-Process -Id $PID).Path -like ''*-core-*'') { exit 0 } else { exit 1 }'
+$out509 = Join-Path $work 'out509'
+$r = Invoke-Soak @{
+    Lane = 'agent'; Mode = 'standalone'; Runs = 2; Label = 'twobin'
+    Arguments = @('-NoProfile', '-Command', $body509)
+    Repo = $fakeRepo; OutDir = $out509
+}
+$logs = @(Get-ChildItem -LiteralPath $out509 -Filter 'twobin-*.log' -ErrorAction SilentlyContinue)
+Check 'a two-binary standalone soak keeps a distinct log per run per binary (4 files)' `
+($logs.Count -eq 4) "found $($logs.Count): $(($logs | ForEach-Object Name) -join ', ')"
+Check 'each log name carries the exe basename' `
+((@($logs | Where-Object { $_.Name -match '^twobin-\d{8}-\d{6}-ghoztty-agent-test-\d\d\.log$' }).Count -eq 2) -and
+    (@($logs | Where-Object { $_.Name -match '^twobin-\d{8}-\d{6}-ghoztty-agent-core-test-\d\d\.log$' }).Count -eq 2)) `
+    (($logs | ForEach-Object Name) -join ', ')
+$firstLog = @($logs | Where-Object { $_.Name -match '-ghoztty-agent-test-01\.log$' })
+$firstText = if ($firstLog.Count -eq 1) { (Get-Content -LiteralPath $firstLog[0].FullName -ErrorAction SilentlyContinue) -join "`n" } else { '' }
+Check 'the FIRST binary''s failing run is still readable after the second binary finished' `
+($firstText -match 'ghoztty-agent-test\.exe' -and -not ($firstText -match '-core-')) `
+    "log content: $firstText"
+Check 'the totals line covers both binaries' `
+($r.Text -match 'SOAK twobin: mode=standalone runs=4 concurrency=1 pass=2 fail=2 crash=0') `
+    ($r.Text -replace '\s+', ' ')
+Check 'the summary attributes fails per binary' `
+(($r.Text -match 'ghoztty-agent-test\.exe: runs=2 pass=0 fail=2 crash=0') -and
+    ($r.Text -match 'ghoztty-agent-core-test\.exe: runs=2 pass=2 fail=0 crash=0')) `
+    ($r.Text -replace '\s+', ' ')
+# Negative control: with one binary there is nothing to attribute, and an
+# always-on breakdown would just repeat the totals line.
+$r = Invoke-Soak @{ Exe = $plain; Arguments = @('-NoProfile', '-Command', 'exit 0'); Runs = 1; Label = 'onebin' }
+Check 'a single-binary soak carries no per-exe breakdown line' `
+(-not ($r.Text -match '\.exe: runs=')) ($r.Text -replace '\s+', ' ')
 
 # --------------------------------------------------------------------- cleanup
 

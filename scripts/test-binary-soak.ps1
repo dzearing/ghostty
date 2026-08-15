@@ -139,6 +139,10 @@
     command-shaped load, `load-iters=N` -- because a run count that does not
     name its condition is what T832 had to throw away, and a load nobody
     measured is a condition nobody can check.
+    When more than one binary was soaked (-Lane agent standalone), a per-binary
+    line follows the summary attributing pass/fail/crash to each exe, and each
+    per-run log name carries the exe basename so the two binaries' logs cannot
+    overwrite each other (T509).
     Exit 0 = no crashes, 1 = at least one crash, 2 = could not run.
 
 .EXAMPLE
@@ -329,7 +333,13 @@ foreach ($t in $targets) {
         $pending = @()
         for ($k = 1; $k -le $batch; $k++) {
             $idx = $started + $k
-            $log = Join-Path $OutDir ("{0}-{1}-{2:d2}.log" -f $tag, $stamp, $idx)
+            # The exe basename is part of the log name because $idx restarts at
+            # 1 for each target: a lane that soaks two binaries in turn (agent)
+            # otherwise has run 07 of binary 2 OVERWRITE run 07 of binary 1,
+            # and the first binary's failure evidence is gone by the time
+            # anyone reads it -- that loss cost T238 a whole re-soak (T509).
+            $exeBase = [IO.Path]::GetFileNameWithoutExtension($exeName)
+            $log = Join-Path $OutDir ("{0}-{1}-{2}-{3:d2}.log" -f $tag, $stamp, $exeBase, $idx)
             # ONE string, not an array: Start-Process does not quote the
             # elements of -ArgumentList, so an array is re-tokenised on spaces
             # (the T200 trap). The doubled outer quote is cmd's own /c rule --
@@ -599,15 +609,36 @@ function Stop-SoakLoadWorkers {
 }
 
 function Stop-SoakProcessTree {
-    param([int]$Id, [int]$Depth = 0)
-    if ($Depth -gt 6) { return }
-    $kids = @()
-    try {
-        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$Id" -ErrorAction SilentlyContinue)
-    }
-    catch {}
-    foreach ($k in $kids) { Stop-SoakProcessTree -Id ([int]$k.ProcessId) -Depth ($Depth + 1) }
+    param([int]$Id)
+    # The ROOT dies first, then the descendants -- NOT depth-first. Killing
+    # children before their parent leaves the worker's loop alive while its
+    # command dies under it, and each per-level CIM query is slow enough that
+    # the worker then records a phantom `exit=-1` iteration AND spawns a new
+    # command inside the teardown window, corrupting the started/completed
+    # counts the summary reports (T858). With the root dead nothing can
+    # respawn; a dead parent's children keep their stale ParentProcessId on
+    # Windows, so passes over a fresh snapshot keep finding the family until
+    # no member is left alive.
     try { Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue } catch {}
+    $family = @($Id)
+    foreach ($pass in 1..4) {
+        $snap = @()
+        try { $snap = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) } catch {}
+        # Transitive closure: anything whose parent chain reaches the family.
+        $grew = $true
+        while ($grew) {
+            $grew = $false
+            foreach ($p in $snap) {
+                if (($family -contains [int]$p.ParentProcessId) -and -not ($family -contains [int]$p.ProcessId)) {
+                    $family += [int]$p.ProcessId
+                    $grew = $true
+                }
+            }
+        }
+        [array]$alive = @($family | Where-Object { $_ -ne $Id -and (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+        if ($alive.Count -eq 0) { break }
+        foreach ($procId in $alive) { try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {} }
+    }
 }
 
 function Get-SoakLoadAlive {
@@ -877,6 +908,22 @@ if ($mode -eq 'build-runner') {
     if ($LoadKind -ne 'cpu' -and $LoadWorkers -gt 0) { $summary += " load-iters=$loadIters started=$loadStarted" }
 }
 Write-Host $summary
+
+# When more than one binary was soaked, say which binary each verdict belonged
+# to: `runs=40 fail=3` over two binaries is unanswerable later without this
+# line, and the per-run logs alone answered it only until they were lost (T509).
+$exeGroups = @($rows | Group-Object Exe)
+if ($exeGroups.Count -gt 1) {
+    foreach ($g in $exeGroups) {
+        $c = @{ PASS = 0; FAIL = 0; CRASH = 0; HANG = 0 }
+        foreach ($row in $g.Group) { $c[$row.Verdict]++ }
+        $perExe = "  {0}: runs={1} pass={2} fail={3} crash={4}" -f `
+            $g.Name, $g.Count, $c.PASS, $c.FAIL, $c.CRASH
+        if ($c.HANG -gt 0) { $perExe += " hang=$($c.HANG)" }
+        Write-Host $perExe
+    }
+}
+
 if ($mode -eq 'standalone' -and $warnStandalone) {
     Write-Host '  NOTE: standalone -- see the warning above; this says nothing about T443 (T832).'
 }
