@@ -1944,22 +1944,27 @@ test "restoreWindowHasAttachableLeaf keeps viewer-bearing windows with no agent 
         .{ .leaf = .{ .session_id = "gone-1" } },
     };
 
-    const mk = struct {
-        fn win(nodes: []const session_layout.Node) session_layout.Window {
-            const tabs = &[_]session_layout.Tab{.{ .nodes = nodes, .active = true }};
-            return .{ .id = "w1", .tabs = tabs };
-        }
-    };
+    // The tab arrays must live in THIS frame. A helper that built one from a
+    // runtime `nodes` slice and returned `.{ .tabs = &local }` handed back a
+    // pointer into its own frame; Debug left that memory intact and ReleaseSafe
+    // reused it, which is how this test segfaulted 10 runs out of 10 (T477).
+    const viewer_tabs = [_]session_layout.Tab{.{ .nodes = &viewer_only, .active = true }};
+    const mixed_tabs = [_]session_layout.Tab{.{ .nodes = &mixed, .active = true }};
+    const terminal_tabs = [_]session_layout.Tab{.{ .nodes = &terminal_only, .active = true }};
+
+    const viewer_win: session_layout.Window = .{ .id = "w1", .tabs = &viewer_tabs };
+    const mixed_win: session_layout.Window = .{ .id = "w1", .tabs = &mixed_tabs };
+    const terminal_win: session_layout.Window = .{ .id = "w1", .tabs = &terminal_tabs };
 
     // The bug: both of these were dropped before restore ever reached them,
     // because the connection resolve above bailed first.
-    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&viewer_only), &empty));
-    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&mixed), &empty));
+    try std.testing.expect(restoreWindowHasAttachableLeaf(viewer_win, &empty));
+    try std.testing.expect(restoreWindowHasAttachableLeaf(mixed_win, &empty));
     // Still dropped, and must be: every leaf in it is a session that is gone.
-    try std.testing.expect(!restoreWindowHasAttachableLeaf(mk.win(&terminal_only), &empty));
+    try std.testing.expect(!restoreWindowHasAttachableLeaf(terminal_win, &empty));
     // An UNKNOWN roster (probe failed) is the other tri-state arm and still
     // attempts everything — the agentless set must not be spelled `null`.
-    try std.testing.expect(restoreWindowHasAttachableLeaf(mk.win(&terminal_only), null));
+    try std.testing.expect(restoreWindowHasAttachableLeaf(terminal_win, null));
 }
 
 test "collectAttachedLeaves counts only leaves that attach a session" {

@@ -47,7 +47,17 @@ pub const Contents = struct {
     ///
     /// Prefer accessing with `Contents.bgCell(row, col).*` instead
     /// of directly indexing in order to avoid integer size bugs.
-    bg_cells: []shaderpkg.CellBg = undefined,
+    ///
+    /// Defaults to an empty slice rather than `undefined` so that the two
+    /// functions that free it before it is ever assigned — `deinit` on a
+    /// Contents that was never resized, and the first `resize`, which frees
+    /// the previous buffer — are freeing a real (empty) slice instead of
+    /// invoking undefined behavior. A `free` of an `undefined` slice is UB
+    /// the optimizer is entitled to compile to a trap, and at ReleaseSafe
+    /// LLVM does exactly that: it turns the tail of any such caller into
+    /// `unreachable` (see `test "Contents with zero-sized screen"`, which
+    /// died on an `int 3` immediately after `setCursor` returned).
+    bg_cells: []shaderpkg.CellBg = &.{},
 
     /// The ArrayListCollection which holds all of the foreground cells. When
     /// sized with Contents.resize the individual ArrayLists are given enough
