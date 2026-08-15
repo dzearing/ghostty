@@ -54,10 +54,44 @@ pub const SendError = error{
     Closed,
     BrokenPipe,
     ConnectionResetByPeer,
+    ConnectionTimedOut,
     SystemResources,
     AccessDenied,
     Unexpected,
 };
+
+/// Arm (`ms` > 0) or clear (`ms` == 0) BOTH the receive and send timeouts on a
+/// blocking socket (SO_RCVTIMEO/SO_SNDTIMEO). While armed, a `recvOnce`/
+/// `sendOnce` that sits longer than `ms` with no progress fails with
+/// `error.ConnectionTimedOut` instead of blocking forever.
+///
+/// This is a HANDSHAKE-PHASE tool (T510): the ws dial arms it for the
+/// TLS + WebSocket-upgrade reads — where a peer that TCP-accepts and then goes
+/// silent used to wedge the calling thread permanently — and clears it before
+/// the socket is handed to the connection, whose reader parks in `recv` for
+/// minutes by DESIGN (the keepalive owns liveness there). A timeout left armed
+/// past the handshake would make every idle read a `ConnectionTimedOut`, which
+/// the stream layers map to EOF — a silent disconnect — so arming and clearing
+/// always travel together.
+pub fn setIoTimeout(fd: posix.socket_t, ms: u32) posix.SetSockOptError!void {
+    if (builtin.os.tag == .windows) {
+        // Winsock takes a DWORD of milliseconds; 0 restores "no timeout".
+        const w = std.os.windows;
+        const val: w.DWORD = ms;
+        const bytes = std.mem.asBytes(&val);
+        try posix.setsockopt(fd, w.ws2_32.SOL.SOCKET, w.ws2_32.SO.RCVTIMEO, bytes);
+        try posix.setsockopt(fd, w.ws2_32.SOL.SOCKET, w.ws2_32.SO.SNDTIMEO, bytes);
+    } else {
+        // POSIX takes a timeval; all-zero restores "no timeout".
+        const tv: posix.timeval = .{
+            .sec = @intCast(ms / std.time.ms_per_s),
+            .usec = @intCast((ms % std.time.ms_per_s) * std.time.us_per_ms),
+        };
+        const bytes = std.mem.asBytes(&tv);
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, bytes);
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, bytes);
+    }
+}
 
 /// Best-effort `SO_NOSIGPIPE` on Darwin/BSD (no-op elsewhere). MUST go through
 /// libc directly, NOT `posix.setsockopt`: the std wrapper treats `EINVAL` as
@@ -112,6 +146,10 @@ pub fn recvOnce(fd: posix.socket_t, buf: []u8) RecvError!usize {
             .CONNRESET, .CONNREFUSED => return error.ConnectionResetByPeer,
             .NOTCONN => return error.SocketNotConnected,
             .TIMEDOUT => return error.ConnectionTimedOut,
+            // An armed SO_RCVTIMEO expiring surfaces as EAGAIN/EWOULDBLOCK on
+            // POSIX (our sockets are otherwise blocking, so nothing else
+            // produces it) — same meaning as Windows' WSAETIMEDOUT above.
+            .AGAIN => return error.ConnectionTimedOut,
             .NOMEM => return error.SystemResources,
             .FAULT => unreachable,
             else => |e| return posix.unexpectedErrno(e),
@@ -135,6 +173,9 @@ pub fn sendOnce(fd: posix.socket_t, bytes: []const u8) SendError!usize {
                 // A send on a not-/no-longer-connected socket is a dead lane.
                 .WSAEBADF, .WSAENOTSOCK, .WSAESHUTDOWN, .WSAENOTCONN => return error.Closed,
                 .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET => return error.ConnectionResetByPeer,
+                // An armed SO_SNDTIMEO expiring (handshake-phase only, see
+                // `setIoTimeout`).
+                .WSAETIMEDOUT => return error.ConnectionTimedOut,
                 .WSAENOBUFS => return error.SystemResources,
                 else => |e| return w.unexpectedWSAError(e),
             }
@@ -147,6 +188,9 @@ pub fn sendOnce(fd: posix.socket_t, bytes: []const u8) SendError!usize {
             .BADF, .NOTSOCK => return error.Closed,
             .PIPE => return error.BrokenPipe,
             .CONNRESET => return error.ConnectionResetByPeer,
+            // An armed SO_SNDTIMEO expiring (handshake-phase only, see
+            // `setIoTimeout`).
+            .AGAIN => return error.ConnectionTimedOut,
             .NOBUFS, .NOMEM => return error.SystemResources,
             .ACCES => return error.AccessDenied,
             .FAULT => unreachable,
@@ -358,6 +402,28 @@ test "Writer: flush after shutdown(.both) is an error, not a panic (T81)" {
     // Subsequent writes big enough to force a drain also fail, not panic.
     var big: [128]u8 = @splat('x');
     try testing.expectError(error.WriteFailed, w.interface.writeAll(&big));
+}
+
+test "setIoTimeout: an armed recv timeout fires as ConnectionTimedOut; cleared, data still flows" {
+    const pair = try loopbackPair();
+    defer closeSock(pair.a);
+    defer closeSock(pair.b);
+
+    // Armed: a recv with nothing inbound must FAIL within the deadline instead
+    // of blocking this test forever (the T510 wedge shape, in miniature).
+    try setIoTimeout(pair.b, 200);
+    var timer = try std.time.Timer.start();
+    var got: [16]u8 = undefined;
+    try testing.expectError(error.ConnectionTimedOut, recvOnce(pair.b, &got));
+    // Generous upper bound: the point is "bounded", not "precisely 200ms".
+    try testing.expect(timer.read() < 10 * std.time.ns_per_s);
+
+    // Cleared: the socket is an ordinary blocking socket again and real data
+    // round-trips (proves clearing didn't wedge or half-close anything).
+    try setIoTimeout(pair.b, 0);
+    try writeAllStream(.{ .handle = pair.a }, "after");
+    const n = try recvOnce(pair.b, &got);
+    try testing.expectEqualStrings("after", got[0..n]);
 }
 
 test "Reader: peer close surfaces as EndOfStream through the interface" {

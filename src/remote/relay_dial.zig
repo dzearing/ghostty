@@ -49,6 +49,16 @@ pub const Dialed = struct {
 
     /// Tear everything down in the strict order (see the module doc). Idempotent
     /// on the connection (its `shutdown` is). Safe to call once.
+    ///
+    /// BOUNDED, including on a half-dead connection (T510): the only waits here
+    /// are thread joins, and every joined thread's exit is forced rather than
+    /// hoped for — `conn.shutdown()` closes both lane streams, which closes the
+    /// transport WebSocket, whose `close` does `shutdown(.both)` on the raw
+    /// socket; that errors out any recv/send those threads are blocked in
+    /// (through `socket_rw`'s mapped errors, never a hang or a panic — the T81
+    /// suite proves both directions), so reader/writer/heartbeat/pump all
+    /// observe a dead stream and return. Nothing in this path performs a
+    /// network wait of its own.
     pub fn deinit(self: *Dialed) void {
         self.conn.shutdown();
         self.mux.joinPump();
@@ -89,6 +99,31 @@ pub fn dial(
     token: []const u8,
     encoding: protocol.TransferEncoding,
 ) !Dialed {
+    return dialUpgradeTimeout(
+        alloc,
+        relay_base,
+        device_id,
+        token,
+        encoding,
+        ws_client.default_upgrade_timeout_ms,
+    );
+}
+
+/// `dial` with an explicit deadline (ms) for the TCP-connect→TLS→WebSocket-
+/// upgrade phase (T510). Tests use a short deadline; production callers go
+/// through `dial`. Every phase of the dial is now bounded: the upgrade by this
+/// deadline, and the HELLO by `tcp_dial.default_handshake_timeout_ns` below —
+/// so a silent endpoint (a firewalled port that accepts, a hung relay) fails
+/// the dial instead of wedging the calling thread forever, which is what once
+/// permanently stuck the chooser roster's serialized worker (T328).
+pub fn dialUpgradeTimeout(
+    alloc: Allocator,
+    relay_base: []const u8,
+    device_id: []const u8,
+    token: []const u8,
+    encoding: protocol.TransferEncoding,
+    upgrade_timeout_ms: u32,
+) !Dialed {
     // 1. Build the ws(s) URL: convert the base scheme and append the
     //    client-connect path with the device query. Both strings are scratch and
     //    freed before we return. `http`/`ws` bases stay PLAINTEXT (loopback test
@@ -119,9 +154,9 @@ pub fn dial(
     defer alloc.free(authz);
     const headers = [_]ws_client.Header{.{ .name = "Authorization", .value = authz }};
 
-    // 3. Dial + TLS + WebSocket upgrade. From here, on any error we must free the
-    //    WebSocket.
-    const ws = try ws_client.WsClient.connectUrl(alloc, url, &headers);
+    // 3. Dial + TLS + WebSocket upgrade, bounded by the upgrade deadline
+    //    (T510). From here, on any error we must free the WebSocket.
+    const ws = try ws_client.WsClient.connectUrlTimeout(alloc, url, &headers, upgrade_timeout_ms);
     errdefer ws.deinit();
 
     // 4. Fold the two logical lanes onto the WebSocket's connection-side stream.
@@ -209,6 +244,45 @@ test "dial: unknown-scheme relay base is rejected" {
         "tok",
         .raw,
     ));
+}
+
+test "dial: an endpoint that accepts TCP and never answers the upgrade fails within the deadline, no leak (T510)" {
+    const alloc = testing.allocator;
+
+    // Accept the TCP connect, then say nothing — the untested shape that once
+    // wedged the chooser roster's worker thread permanently (T328): a
+    // firewalled port that accepts, a hung relay. The dial must come back with
+    // an error inside its deadline, with every partial resource freed (the
+    // testing allocator asserts no leak).
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.listen_address.getPort();
+
+    const Silent = struct {
+        listener: *std.net.Server,
+        conn: ?std.net.Server.Connection = null,
+        fn run(self: *@This()) void {
+            self.conn = self.listener.accept() catch null;
+        }
+    };
+    var silent = Silent{ .listener = &listener };
+    const t = try std.Thread.spawn(.{}, Silent.run, .{&silent});
+    defer if (silent.conn) |c| c.stream.close();
+    defer t.join();
+
+    var ubuf: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ubuf, "http://127.0.0.1:{d}", .{port});
+
+    var timer = try std.time.Timer.start();
+    if (dialUpgradeTimeout(alloc, base, "device-t510", "tok", .raw, 500)) |d| {
+        var dialed = d;
+        dialed.deinit();
+        return error.UnexpectedSuccess;
+    } else |_| {
+        // Any error is fine; the assertion is bounded return, not which error.
+        try testing.expect(timer.read() < 10 * std.time.ns_per_s);
+    }
 }
 
 test "dial: plaintext loopback base is accepted (fails at connect, no leak)" {

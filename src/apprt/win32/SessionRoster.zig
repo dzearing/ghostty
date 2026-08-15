@@ -384,10 +384,12 @@ fn worker(req: *Request) void {
     // could outlive their connection and write freed memory (fixed alongside
     // T420), and each roster dial/deinit cycle armed exactly that window. T461
     // removed the cycle itself: a remote fetch now borrows one pooled
-    // connection, so there is no per-fetch dial left to arm anything. Do NOT add
-    // a retry-on-fresh-dial here: one was tried and WEDGED the worker
-    // (`relay_dial.dial`'s upgrade read has no deadline), which is worse than
-    // a stale count. `chooser-sessions-remote.ps1` asserts the refetch lands.
+    // connection, so there is no per-fetch dial left to arm anything. A
+    // retry-on-fresh-dial was tried here once and WEDGED the worker —
+    // `relay_dial.dial`'s upgrade read had no deadline at the time; T510 has
+    // since bounded every phase of the dial (upgrade + HELLO), so a redial can
+    // no longer park this thread, but the pooled design stands on its own
+    // merits. `chooser-sessions-remote.ps1` asserts the refetch lands.
 
     const res = alloc.create(Result) catch {
         if (roster) |*r| r.deinit();

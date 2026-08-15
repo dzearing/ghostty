@@ -85,6 +85,16 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// Default deadline for the post-connect handshake phase (TLS + WebSocket
+/// upgrade), T510. An endpoint that completes the TCP connect and then goes
+/// silent — a firewalled port that accepts, a hung relay — used to block the
+/// dialling thread FOREVER inside the TLS/upgrade read; the fast failures (502,
+/// 401, refused connect) all resolved quickly, which is why the wedge shape went
+/// unexercised. Generous (a slow relay hop is seconds, not the 15 it gets), and
+/// cleared the moment the upgrade completes: established-connection reads are
+/// unbounded by design, with the keepalive owning liveness.
+pub const default_upgrade_timeout_ms: u32 = 15_000;
+
 /// Dial parameters. Nothing here is retained past `connect` (strings are only
 /// borrowed for the duration of the handshake).
 pub const Options = struct {
@@ -102,6 +112,11 @@ pub const Options = struct {
     /// connection — use ONLY for loopback test servers (mirrors
     /// `http_client.zig`'s `http://` support); real relays are always `wss://`.
     tls: bool = true,
+    /// Deadline (ms) for the TLS handshake + WebSocket upgrade after the TCP
+    /// connect (T510); 0 disables the deadline (NOT recommended outside tests —
+    /// a silent endpoint then wedges the dialling thread forever, which is the
+    /// exact defect this bounds). Cleared once the upgrade completes.
+    upgrade_timeout_ms: u32 = default_upgrade_timeout_ms,
 };
 
 pub const ConnectError = error{
@@ -197,6 +212,14 @@ pub const WsClient = struct {
         // Windows has no SIGPIPE).
         socket_rw.disableSigpipe(socket.handle);
 
+        // Bound the whole handshake phase (TLS + WebSocket upgrade), T510: an
+        // endpoint that accepted the connect and then says nothing must fail
+        // the dial, not park this thread forever. Cleared after `handshake`
+        // succeeds — an armed timeout on the ESTABLISHED connection would turn
+        // every idle read into a silent EOF (see `socket_rw.setIoTimeout`).
+        if (options.upgrade_timeout_ms != 0)
+            try socket_rw.setIoTimeout(socket.handle, options.upgrade_timeout_ms);
+
         // --- System CA roots (TLS only; stays empty for plaintext) ------------
         var ca_bundle: Certificate.Bundle = .{};
         if (options.tls) try ca_bundle.rescan(alloc);
@@ -249,6 +272,14 @@ pub const WsClient = struct {
 
         // --- WebSocket upgrade over the (possibly encrypted) channel ---------
         try self.handshake(options);
+
+        // Handshake done: restore unbounded blocking I/O before anyone reads
+        // frames. The connection's reader parks in `recv` for minutes by
+        // design (the keepalive owns liveness from here); a leftover timeout
+        // would sever every idle connection at the deadline.
+        if (options.upgrade_timeout_ms != 0)
+            try socket_rw.setIoTimeout(socket.handle, 0);
+
         // The 101 response counts as first inbound traffic: staleness windows
         // start "now", not at epoch.
         self.noteRx();
@@ -258,7 +289,19 @@ pub const WsClient = struct {
     /// Parse a `wss://host[:port]/path` (or `https://...`) URL and connect.
     /// `ws://`/`http://` yield a PLAINTEXT connection — loopback test servers
     /// only (same rule as `http_client.zig`); real relays are always TLS.
+    /// The handshake phase is bounded by `default_upgrade_timeout_ms` (T510).
     pub fn connectUrl(alloc: Allocator, url: []const u8, headers: []const Header) !*WsClient {
+        return connectUrlTimeout(alloc, url, headers, default_upgrade_timeout_ms);
+    }
+
+    /// `connectUrl` with an explicit handshake-phase deadline (ms; 0 disables).
+    /// Tests use a short deadline; production callers go through `connectUrl`.
+    pub fn connectUrlTimeout(
+        alloc: Allocator,
+        url: []const u8,
+        headers: []const Header,
+        upgrade_timeout_ms: u32,
+    ) !*WsClient {
         var rest = url;
         var use_tls = true;
         var port: u16 = 443;
@@ -290,7 +333,14 @@ pub const WsClient = struct {
             port = try std.fmt.parseInt(u16, authority[colon + 1 ..], 10);
         }
 
-        return connect(alloc, .{ .host = host, .port = port, .path = path, .headers = headers, .tls = use_tls });
+        return connect(alloc, .{
+            .host = host,
+            .port = port,
+            .path = path,
+            .headers = headers,
+            .tls = use_tls,
+            .upgrade_timeout_ms = upgrade_timeout_ms,
+        });
     }
 
     /// Tear down: close the socket (shutdown-first, no close frame — see
@@ -854,6 +904,50 @@ test "splitHeader: name/value split" {
     try testing.expectEqualStrings("Sec-WebSocket-Accept", hv.name);
     try testing.expectEqualStrings(" abc123", hv.value);
     try testing.expect(WsClient.splitHeader("no-colon-here") == null);
+}
+
+test "connect: an endpoint that accepts TCP and never answers the upgrade fails within the deadline (T510)" {
+    const alloc = testing.allocator;
+
+    // A listener that accepts the connection and then says NOTHING — the
+    // firewalled-port / hung-relay shape whose fast cousins (502, 401, refused
+    // connect) all resolve quickly and so were the only shapes ever exercised.
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.listen_address.getPort();
+
+    const Silent = struct {
+        listener: *std.net.Server,
+        conn: ?std.net.Server.Connection = null,
+        fn run(self: *@This()) void {
+            self.conn = self.listener.accept() catch null;
+        }
+    };
+    var silent = Silent{ .listener = &listener };
+    const t = try std.Thread.spawn(.{}, Silent.run, .{&silent});
+    defer if (silent.conn) |c| c.stream.close();
+    defer t.join();
+
+    // Plaintext so the wedge point is the upgrade-response read itself (the
+    // TLS-handshake read sits on the same armed socket, so it is bounded by
+    // the same deadline).
+    var timer = try std.time.Timer.start();
+    const result = WsClient.connect(alloc, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/v1/client/connect?device=t510",
+        .tls = false,
+        .upgrade_timeout_ms = 500,
+    });
+    if (result) |ws| {
+        ws.deinit();
+        return error.UnexpectedSuccess;
+    } else |_| {
+        // Any error is fine; the assertion is that we GOT one, bounded. The
+        // bound is generous — the point is "returns", not "returns in 500ms".
+        try testing.expect(timer.read() < 10 * std.time.ns_per_s);
+    }
 }
 
 // --- Live relay round-trip (gated on env vars) -------------------------------
