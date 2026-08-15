@@ -64,7 +64,10 @@ function Invoke-Soak {
     $P = $P.Clone()
     $P['OutDir'] = $out
     $P['Repo'] = $Repo
-    $text = (& $soak @P *>&1 | Out-String)
+    # -Width, or Out-String wraps at the host width (80 in a hidden console)
+    # and an assertion about the one-line summary fails on a line break rather
+    # than on the thing it is asserting.
+    $text = (& $soak @P *>&1 | Out-String -Width 4096)
     return [pscustomobject]@{ Text = $text; Code = $LASTEXITCODE }
 }
 
@@ -129,6 +132,39 @@ Check 'the victim test is named from the lane log' `
 ($r.Text -match 'victim: 1234/3913 terminal\.PageList') ($r.Text -replace '\s+', ' ')
 Check 'the lane log is named so the evidence is findable' ($r.Text -match 'lane log: .+floor-lane-command-')
 
+# --------------------------------------------- 3b. -LoadWorkers (T443 turn 6)
+
+# The cell with all of T443's sightings in it and no measurement is
+# `build-runner x loaded`: load was only ever soaked in standalone mode, which
+# cannot reproduce the defect, and the build runner was only ever soaked on a
+# quiet box. What is asserted here is that the knob really loads the box, that
+# it cleans up after itself, and that the summary names the condition -- not
+# that a crash appears, which is what the soak itself is for.
+# Counted by command line, not by process name: this box runs several
+# powershell sessions of its own, and a count of those is noise.
+function Get-LoadWorkerCount {
+    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*1000003*' }).Count
+}
+
+$r = Invoke-Soak @{ LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'brload'; LoadWorkers = 3 }
+$leftOver = Get-LoadWorkerCount
+Check '-LoadWorkers reports the workers it started' `
+($r.Text -match '-LoadWorkers 3: 3 worker\(s\) holding the box busy') ($r.Text -replace '\s+', ' ')
+Check 'the load level lands in the summary line, so a pasted number names its condition' `
+($r.Text -match 'SOAK brload:.*load=3') ($r.Text -replace '\s+', ' ')
+Check 'the workers are all still alive at the end (a soak that quiesced silently is not a loaded soak)' `
+($r.Text -match 'load: 3 worker\(s\) requested, 3 still running at the end') ($r.Text -replace '\s+', ' ')
+Check 'a loaded soak still classifies its rounds' `
+($r.Text -match 'pass=1 fail=0 crash=0') ($r.Text -replace '\s+', ' ')
+Check 'the workers are killed when the soak ends' ($leftOver -eq 0) "$leftOver left running"
+
+# The condition is named even when there is none, or a green number read later
+# is ambiguous between "quiesced" and "nobody recorded it".
+$r = Invoke-Soak @{ LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'brnoload' }
+Check 'an unloaded build-runner soak still says load=0' ($r.Text -match 'SOAK brnoload:.*load=0') `
+    ($r.Text -replace '\s+', ' ')
+
 # ------------------------------- 4. standalone still works, and admits what it is
 
 # A lane-shaped NAME is what turns the warning on: a fixture exe has no build
@@ -148,6 +184,12 @@ Check 'standalone warns that it is not the T443 condition' `
     ($r.Text -replace '\s+', ' ')
 Check 'the warning cites the task that measured it' ($r.Text -match 'T832')
 Check 'the summary repeats the caveat' ($r.Text -match 'says nothing about T443')
+
+$r = Invoke-Soak @{ Exe = $fake; Arguments = @('-NoProfile', '-Command', 'exit 0'); Runs = 1; Label = 'saload'; LoadWorkers = 4 }
+Check 'standalone says it is ignoring -LoadWorkers rather than loading a condition that cannot fire' `
+($r.Text -match 'LoadWorkers is build-runner only') ($r.Text -replace '\s+', ' ')
+Check 'standalone carries no load= claim in its summary' (-not ($r.Text -match 'SOAK saload:.*load=')) `
+    ($r.Text -replace '\s+', ' ')
 
 $r = Invoke-Soak @{ Exe = $fake; Arguments = @('-NoProfile', '-Command', 'exit 5'); Runs = 1; Label = 'sacrash' }
 Check 'standalone still classifies a fatal NTSTATUS as CRASH' `
@@ -170,5 +212,16 @@ Check 'a fixture exe gets no T443 warning' (-not ($r.Text -match 'NEVER been obs
 # --------------------------------------------------------------------- cleanup
 
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- stamp (T783) ---------------------------------------------------------
+# This harness has a guard row in scripts\guard-due.ps1 but never stamped, so
+# the only way its DUE was ever cleared was somebody running `guard-due update`
+# by hand -- an assertion that the harness had been run, in the one place that
+# is supposed to MEASURE it. Only a clean green run stamps; a red run must stay
+# due.
+if ($script:failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard test-binary-soak -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 Write-TestVerdict -Pass $passes -Fail $failures

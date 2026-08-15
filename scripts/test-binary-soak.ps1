@@ -65,9 +65,31 @@
     oversubscribed to appear cannot be soaked for one process at a time, which
     is how 47 runs of a "50% flaky" crash came back green and told us nothing.
 
+.PARAMETER LoadWorkers
+    Build-runner mode only. Hold N CPU/allocation-churning worker processes on
+    the box for the whole soak, so the lane runs on a BUSY machine.
+
+    This is the other half of the -Concurrency experiment, and it exists
+    because T443's two variables were never crossed. Load was tested only in
+    standalone mode (32 copies of the crash-day binary at once, 0 crashes) --
+    the condition the defect has never once occurred in. The build runner was
+    tested only on a quiesced box (15 sequential agent-lane runs on 2026-08-14,
+    0 crashes). Yet every abort that task has ever recorded arrived while
+    something ELSE was compiling or testing on the box: 5 in 26 runs the same
+    morning, then nothing once it went quiet. `build-runner x loaded` is the
+    cell with all the sightings in it and no measurement.
+
+    The workers are ordinary processes burning CPU and churning 4 MB
+    allocations -- they cannot touch the lane's memory, so what they vary is
+    scheduling and memory-manager timing, which is what a latent race needs.
+    They self-expire on a deadline as well as being killed at the end, so an
+    interrupted soak cannot leave the box loaded.
+
 .OUTPUTS
     A per-run table and a final one-line summary:
         SOAK <label>: mode=M runs=N pass=P fail=F crash=C  crash-rate=C/N (xx%)
+    In build-runner mode the summary also carries `load=N`, because a run
+    count that does not name its condition is what T832 had to throw away.
     Exit 0 = no crashes, 1 = at least one crash, 2 = could not run.
 
 .EXAMPLE
@@ -90,6 +112,7 @@ param(
     [string[]]$Arguments = @(),
     [int]$Runs = 10,
     [ValidateRange(1, 64)][int]$Concurrency = 1,
+    [ValidateRange(0, 64)][int]$LoadWorkers = 0,
     [string]$Label = '',
     [int]$TimeoutSeconds = 900,
     [string]$OutDir = "$env:TEMP\ghoztty-soak",
@@ -120,6 +143,14 @@ $mode = $Mode
 if ($mode -eq 'auto') { $mode = if ($Exe) { 'standalone' } else { 'build-runner' } }
 # floor-lane names a -Command run 'command', not after a lane.
 $laneName = if ($LaneCommand) { 'command' } else { $Lane }
+
+# Load is a build-runner instrument. Standalone already has -Concurrency for
+# oversubscription, and it is the condition T443 has never occurred in, so
+# loading it harder measures nothing new.
+if ($LoadWorkers -gt 0 -and $mode -eq 'standalone') {
+    Write-Host 'soak: -LoadWorkers is build-runner only (standalone has -Concurrency); ignoring it.'
+    $LoadWorkers = 0
+}
 
 $targets = @()
 if ($mode -eq 'standalone') {
@@ -332,6 +363,48 @@ foreach ($t in $targets) {
 # second copy of both. Sequential by construction -- T401: an overlapped lane
 # starves and wedges, and a wedge is not a data point.
 
+# A background load worker: CPU burn plus 4 MB allocation churn. It cannot
+# reach the lane's memory -- what it varies is scheduling and memory-manager
+# timing, which is the whole point (see -LoadWorkers). The deadline is a
+# safety net so a soak that is killed rather than finished cannot leave the
+# box loaded for the next person.
+function Start-SoakLoadWorkers {
+    param([int]$Count, [int]$Seconds, [string]$PsExe)
+    $body = '$d=(Get-Date).AddSeconds(' + $Seconds + ');$x=1;' +
+    'while((Get-Date) -lt $d){for($i=0;$i -lt 300000;$i++){$x=($x*31+7)%1000003};' +
+    '$b=New-Object byte[] 4194304;$b[0]=1;$b[4194303]=2;$b=$null}'
+    $procs = @()
+    for ($w = 0; $w -lt $Count; $w++) {
+        try {
+            $p = Start-Process -FilePath $PsExe `
+                -ArgumentList ('-NoProfile -Command "' + $body + '"') `
+                -PassThru -WindowStyle Hidden
+            # PS 5.1: cache .Handle before the child can exit, or ExitCode and
+            # HasExited come back empty later (the T473 trap).
+            $null = $p.Handle
+            $procs += $p
+        }
+        catch {}
+    }
+    return , $procs
+}
+
+function Stop-SoakLoadWorkers {
+    param($Procs)
+    foreach ($p in @($Procs)) {
+        try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+    }
+}
+
+function Get-SoakLoadAlive {
+    param($Procs)
+    $n = 0
+    foreach ($p in @($Procs)) {
+        try { if (-not $p.HasExited) { $n++ } } catch {}
+    }
+    return $n
+}
+
 if ($mode -eq 'build-runner') {
     $laneScript = Join-Path $PSScriptRoot 'floor-lane.ps1'
     if (-not (Test-Path -LiteralPath $laneScript)) {
@@ -351,7 +424,28 @@ if ($mode -eq 'build-runner') {
         Write-Host "      -Concurrency $Concurrency ignored here: lane runs are never overlapped (T401)"
     }
 
+    # Held for the whole soak rather than per round, because the condition
+    # being reproduced is "the box was busy", which in the sightings included
+    # the build as well as the test run.
+    $loadProcs = @()
+    $loadDeadline = [math]::Min(14400, ($Runs * $roundTimeout) + 600)
+    if ($LoadWorkers -gt 0) {
+        $loadProcs = Start-SoakLoadWorkers -Count $LoadWorkers -Seconds $loadDeadline -PsExe $psExe
+        Write-Host ("      -LoadWorkers ${LoadWorkers}: " +
+            "$(Get-SoakLoadAlive $loadProcs) worker(s) holding the box busy")
+    }
+
     for ($i = 1; $i -le $Runs; $i++) {
+        # A worker that died (or hit its own deadline) would quietly turn a
+        # loaded soak into a quiesced one halfway through, and the summary
+        # would still claim the load. Top up instead.
+        if ($LoadWorkers -gt 0) {
+            $short = $LoadWorkers - (Get-SoakLoadAlive $loadProcs)
+            if ($short -gt 0) {
+                $loadProcs += Start-SoakLoadWorkers -Count $short -Seconds $loadDeadline -PsExe $psExe
+            }
+        }
+
         $log = Join-Path $OutDir ("{0}-{1}-{2:d2}.log" -f $tag, $stamp, $i)
         $laneArgs = '-NoProfile -File "' + $laneScript + '" -Repeat 1'
         if ($LaneCommand) { $laneArgs += ' -Command "' + $LaneCommand + '"' }
@@ -452,6 +546,13 @@ if ($mode -eq 'build-runner') {
         if ($victim) { Write-Host "            victim: $victim" }
         if ($laneLog) { Write-Host "            lane log: $laneLog" }
     }
+
+    if ($LoadWorkers -gt 0) {
+        $loadAliveEnd = Get-SoakLoadAlive $loadProcs
+        Stop-SoakLoadWorkers $loadProcs
+        Write-Host ''
+        Write-Host "  load: $LoadWorkers worker(s) requested, $loadAliveEnd still running at the end"
+    }
 }
 
 $n = $rows.Count
@@ -461,6 +562,9 @@ $conc = if ($mode -eq 'build-runner') { 1 } else { $Concurrency }
 $summary = "SOAK {0}: mode={7} runs={1} concurrency={6} pass={2} fail={3} crash={4}  crash-rate={4}/{1} ({5}%)" -f `
     $tag, $n, $totals.pass, $totals.fail, $totals.crash, $rate, $conc, $mode
 if ($totals.hang -gt 0) { $summary += "  hang=$($totals.hang)" }
+# The condition, in the line that gets pasted into a task file. A soak number
+# that does not name its condition is the mistake T832 had to unwind.
+if ($mode -eq 'build-runner') { $summary += "  load=$LoadWorkers" }
 Write-Host $summary
 if ($mode -eq 'standalone' -and $warnStandalone) {
     Write-Host '  NOTE: standalone -- see the warning above; this says nothing about T443 (T832).'
