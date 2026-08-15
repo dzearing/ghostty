@@ -1,0 +1,15 @@
+{
+    "guard":  "pane-banner",
+    "script":  "test/win32/pane-banner.ps1",
+    "generated":  "2026-08-14T20:17:53-07:00",
+    "commit":  "624d99598",
+    "files":  {
+                  "src/apprt/win32/banner_card.zig":  "87659068b86b4875b1890d1ce2d4ff1a671bb3ddc817d05d8983a13d5a9a95c8",
+                  "src/apprt/win32/banner_layout.zig":  "4d495e2873a219a53a1122b7e0d8ab074502348adedd08d8801dae2827a917ce",
+                  "src/apprt/win32/banner_link.zig":  "f1c3f4364320cdb8942d892f3f204b7714644da3e91e749fcac0ce6499d72cd2",
+                  "src/apprt/win32/banner_markdown.zig":  "399bf6befc69a6a78be4f76e12ae92b42f7ea49396a42b61cfb23ef4e8e22e86",
+                  "src/apprt/win32/BannerDialog.zig":  "622680c11260c4d1ace70de11ab6014acd1f35ccda14e11a88cf738f0773bac6",
+                  "src/apprt/win32/BannerOverlay.zig":  "95ee13980cb359bb3a9ffb97888820813b4a230c89a4fe1c0a811ee3698e491e",
+                  "test/win32/pane-banner.ps1":  "908abe0e777820c61c0e8588cdacfb9fd53ece2a3efc88fc6bd2be792d7aaa29"
+              }
+}

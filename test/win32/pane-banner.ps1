@@ -83,6 +83,7 @@ $env:GHOZTTY_PIPE_SUFFIX = '-bntest'
 
 $script:pass = 0
 $script:fail = 0
+$script:skipped = 0
 $script:negReached = $false
 
 # Write-Host, not the pipeline: a helper that asserts must never also return a
@@ -90,6 +91,15 @@ $script:negReached = $false
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
+}
+
+# A section that could not run. Counted, not just printed: the guard stamp
+# below is only written by a run that covered the WHOLE harness, and a skip
+# that is invisible to the counter is exactly how a stamp gets written over
+# code nothing measured.
+function Note-Skip([string]$label) {
+    $script:skipped++
+    Write-Host "SKIP  $label"
 }
 
 function Stop-RepoInstances {
@@ -164,7 +174,7 @@ function Get-Overlay([int]$procId, [IntPtr]$top, [int]$i = 0) {
 # Capture the overlay and hand back the shot plus its own distinct-color count,
 # so every probe below can score the guard as its own assertion.
 function Get-OverlayShot($overlay) {
-    $shot = Get-TestWindowPixels -Window ([IntPtr]$overlay.Hwnd)
+    $shot = Get-TestWindowPixels -Window ([IntPtr]$overlay.Hwnd) -Sync
     return @{ Shot = $shot; Colors = (Get-TestDistinctColors -Shot $shot -Inset 2) }
 }
 
@@ -526,7 +536,7 @@ try {
     Start-Sleep -Milliseconds 500
     $ovA = Get-Overlay $appPid $top
     if (-not $ovA -or -not (Test-Path $errlog)) {
-        Write-Host 'SKIP T149 collapse animation: no overlay or no debug oracle (release build?)'
+        Note-Skip 'T149 collapse animation: no overlay or no debug oracle (release build?)'
     } else {
         # Read the log window a toggle produced: the single from=/to= line and
         # every painted frame after it, in order.
@@ -566,7 +576,7 @@ try {
             # a build that stopped animating fails the frame assertions below
             # instead of skipping past them.
             if ($a.Toggles -eq 0) {
-                Write-Host "SKIP T149 ($dir): no `"banner collapse`" oracle in the log (release build?)"
+                Note-Skip "T149 ($dir): no `"banner collapse`" oracle in the log (release build?)"
                 break
             }
             Write-Host "INFO  T149 $dir : from=$($a.From) to=$($a.To) toggles=$($a.Toggles) frames=$($a.Frames -join ',')"
@@ -702,7 +712,7 @@ try {
             }
         }
         if (-not $chevLogged) {
-            Write-Host 'SKIP T209 chevron trigger: no debug oracle in the log (release build?)'
+            Note-Skip 'T209 chevron trigger: no debug oracle in the log (release build?)'
         }
 
         # The FILL. `fillRegion` insets the square by 2 DIP and rounds it by 4,
@@ -728,7 +738,7 @@ try {
         }
         Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
         Start-Sleep -Milliseconds 250
-        $restShot = Get-TestWindowPixels -Window $ovHwnd2
+        $restShot = Get-TestWindowPixels -Window $ovHwnd2 -Sync
         $chRest = Probe-Chev $restShot
         Close-TestWindowPixels $restShot
 
@@ -867,12 +877,37 @@ try {
     # and its FIRST wrapped line has to fill the row. Short words on purpose:
     # a greedy wrap then leaves only one word of slack at the line end.
     $t745Val = ($sentence * 4).Trim()
-    & $exe +set-banner --target=bw "|  |  |\n|---|---|\n| **Prompt** | $t745Val |\n| **Status** | ok |" | Out-Null
-    $null = Wait-Banner 'bw' 0 "|  |  |`n|---|---|`n| **Prompt** | $t745Val |`n| **Status** | ok |"
-    Start-Sleep -Milliseconds 800
-    $ov745 = Get-Overlay $appPid $top
-    Assert ($null -ne $ov745) 'T745: overlay up for the width probe'
-    if ($ov745) {
+    $t745Tbl = "|  |  |\n|---|---|\n| **Prompt** | $t745Val |\n| **Status** | ok |"
+    $t745Exp = "|  |  |`n|---|---|`n| **Prompt** | $t745Val |`n| **Status** | ok |"
+
+    # MANY renders, not one (T835). A single measurement here passed on a build
+    # whose captures put this same row's ink anywhere between 27% and 97% - the
+    # DWM capture path returns torn frames, so one sample proves nothing about
+    # the next one. The loop re-renders from a DIFFERENT banner each round, so
+    # each round is a real relayout rather than a re-read of one surface, and
+    # EVERY round has to be full width.
+    $t745Rounds = 8
+    $t745Used = @()
+    $t745Colors = @()
+    $t745Ov = $null
+    foreach ($round in 1..$t745Rounds) {
+        & $exe +set-banner --target=bw "filler one\nfiller two" | Out-Null
+        $null = Wait-Banner 'bw' 0 "filler one`nfiller two"
+        Start-Sleep -Milliseconds 400
+        & $exe +set-banner --target=bw $t745Tbl | Out-Null
+        $null = Wait-Banner 'bw' 0 $t745Exp
+        Start-Sleep -Milliseconds 600
+        # The overlay is re-positioned around each banner change, so a round can
+        # land in the gap where it does not yet sit against the pane. Wait for it
+        # rather than skipping the round: a skipped round is a round that was
+        # never measured, and this assertion's whole point is that all 8 were.
+        $ov745 = $null
+        for ($w745 = 0; $w745 -lt 20 -and -not $ov745; $w745++) {
+            $ov745 = Get-Overlay $appPid $top
+            if (-not $ov745) { Start-Sleep -Milliseconds 150 }
+        }
+        if (-not $ov745) { continue }
+        $t745Ov = $ov745
         $s745 = (Get-TestWindowDpi -Window ([IntPtr]$ov745.Hwnd)) / 96.0
         $mg745 = Get-TestChromeDip -Dip 12.0 -Scale $s745   # card margin
         $pd745 = Get-TestChromeDip -Dip 12.0 -Scale $s745   # card padding
@@ -882,20 +917,27 @@ try {
         # to the chevron column's left edge, less the design-system gap.
         $cLeft = $mg745 + $pd745
         $cRight = $ov745.Width - $mg745 - $sd745 - $gp745
-        $shot745 = Get-TestWindowPixels -Window ([IntPtr]$ov745.Hwnd)
-        $colors745 = Get-TestDistinctColors -Shot $shot745 -Inset 2
-        Assert ($colors745 -ge 8) "T745: the card really painted ($colors745 distinct colors)"
+        # -Sync: through the overlay's own WM_PRINTCLIENT, so the bitmap is the
+        # frame the app painted. Without it this measurement is a coin flip.
+        $shot745 = Get-TestWindowPixels -Window ([IntPtr]$ov745.Hwnd) -Sync
+        $t745Colors += (Get-TestDistinctColors -Shot $shot745 -Inset 2)
         $inkR = Measure-InkRight $shot745 $cLeft $cRight
         Close-TestWindowPixels $shot745
         $span = $cRight - $cLeft
-        $used = if ($span -gt 0) { [math]::Round(100.0 * ($inkR - $cLeft) / $span, 1) } else { 0 }
-        # 85%: the only slack a greedy wrap can leave at the end of a full line
-        # is the word that did not fit, and these are short words. A column
-        # capped at half the pane - the reported symptom, and what the pre-T123
-        # 360px cap does at this width - lands near 50 and fails.
-        Assert ($colors745 -ge 8 -and $used -ge 85.0) `
-            "T745: the value column uses the pane width ($used% of the $span px content column; ink ends at x=$inkR)"
+        $t745Used += if ($span -gt 0) { [math]::Round(100.0 * ($inkR - $cLeft) / $span, 1) } else { 0 }
     }
+    Assert ($null -ne $t745Ov) 'T745: overlay up for the width probe'
+    Assert ($t745Used.Count -eq $t745Rounds) "T745: all $t745Rounds renders measured ($($t745Used.Count))"
+    $minColors = ($t745Colors | Measure-Object -Minimum).Minimum
+    Assert ($t745Used.Count -eq $t745Rounds -and $minColors -ge 8) `
+        "T745: the card really painted on every render (min $minColors distinct colors)"
+    # 85%: the only slack a greedy wrap can leave at the end of a full line
+    # is the word that did not fit, and these are short words. A column
+    # capped at half the pane - the reported symptom, and what the pre-T123
+    # 360px cap does at this width - lands near 50 and fails.
+    $worst = ($t745Used | Measure-Object -Minimum).Minimum
+    Assert ($t745Used.Count -eq $t745Rounds -and $worst -ge 85.0) `
+        "T745/T835: the value column uses the pane width on EVERY render (worst $worst% of ${t745Rounds}: $($t745Used -join ', '))"
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'T745 width probe: GUI alive'
 
     # --- 6h. T377: EVERY block wraps, caps at 3 lines, clears the chevron -----
@@ -971,7 +1013,7 @@ try {
         $refX = $wMargin + [int][Math]::Truncate($wPad / 2)
         Write-Host "INFO  T377 probe: chevronL=$chL gap=$wGap row=$rowTop..$($rowTop + $wLine) ref=$refX (overlay $($ovW.Width)x$($ovW.Height))"
 
-        $shotW = Get-TestWindowPixels -Window $wHwnd
+        $shotW = Get-TestWindowPixels -Window $wHwnd -Sync
         try {
             if ((Get-TestDistinctColors -Shot $shotW) -lt 8) {
                 $script:fail += 2
@@ -1084,7 +1126,7 @@ try {
             return $rows[$last]
         }
         function Get-RuleRow {
-            $s = Get-TestWindowPixels -Window $lHwnd
+            $s = Get-TestWindowPixels -Window $lHwnd -Sync
             try { return Measure-RuleRow $s } finally { Close-TestWindowPixels -Shot $s }
         }
 
@@ -1129,7 +1171,7 @@ try {
                 }
             }
             if (-not $linkLogged) {
-                Write-Host 'SKIP T165 hover trigger: no debug oracle in the log (release build?)'
+                Note-Skip 'T165 hover trigger: no debug oracle in the log (release build?)'
             }
 
             # ...and the RULE going solid. This used to race the un-hover and
@@ -1463,6 +1505,24 @@ if ($NegativeControl -and -not $script:negReached) {
     Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
 }
 
+# --- stamp (T783, row added by T835) --------------------------------------
+# A green run RECORDS the content of every banner source it covers, so
+# scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". The banner's regressions are HORIZONTAL - a value
+# column that stops halfway is invisible to every band-height oracle in this
+# file - so these pixel probes are the only thing that can see them, and
+# nothing else tied a BannerOverlay edit to running them.
+# Stamped only on a CLEAN sweep: a run with skipped sections proved less than
+# the whole harness claims. A red run leaves the stamp alone on purpose.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    if ($script:skipped -gt 0) {
+        Write-Host "  stamp NOT updated: $script:skipped section(s) skipped, so this run did not cover the whole harness"
+    } else {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+            update -Guard pane-banner -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+    }
+}
+
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" }
 else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)"; exit 1 }

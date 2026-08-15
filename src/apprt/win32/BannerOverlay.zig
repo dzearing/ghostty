@@ -2117,6 +2117,21 @@ fn bannerWndProc(
             return 0;
         },
 
+        // The same card, rendered into somebody else's DC on demand — which
+        // is how a test captures this window EXACTLY (T835). Without it, a
+        // capture has to go through `PrintWindow(PW_RENDERFULLCONTENT)`,
+        // whose DWM copy of a layered window returns before the copy has
+        // finished: the banner's own paint was byte-identical across ten
+        // renders while three back-to-back captures of that unchanged window
+        // read the table's value text as ending at 1062, 1283 and 1179 px.
+        // The stunted column was in the CAPTURE, and every pixel assertion
+        // against this overlay inherited the flake.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            self.paint(@ptrFromInt(wparam));
+            return 0;
+        },
+
         // T204: the chevron is an icon button, so it hot-tracks like one.
         // The overlay had no WM_MOUSEMOVE handling at all before this — which
         // is the mechanical reason the chevron could not have a hover, not a
@@ -2477,6 +2492,106 @@ test "banner overlay: an expanding card repaints while the window keeps its size
 // cheapest form of the claim, it runs in the win32 unit lane with no GUI to
 // launch, and a DIB comparison isolates the underline from everything else
 // that could make a capture differ.
+// T835: the overlay draws its card into a DC handed to it by WM_PRINTCLIENT,
+// and draws the SAME card it would paint itself.
+//
+// This is the shipped half of the fix for a flake that cost a P0 investigation
+// aimed at the wrong code. `Get-TestWindowPixels -Sync` — the capture every
+// pixel assertion in pane-banner.ps1 now uses — is `PrintWindow` with no flags,
+// which is this message and nothing else. The alternative it replaces asks DWM
+// for an asynchronous copy of the layered window's composited surface, and that
+// copy tears: three back-to-back captures of one unchanged overlay put the end
+// of the same table row at 1062, 1283 and 1179 px while the app's own paint was
+// identical every time. So a handler going missing here does not fail loudly in
+// the app — it quietly makes a whole acceptance script measure noise again.
+//
+// Asserted against `paint` itself rather than against any particular pixel: the
+// claim is "the message routes to the real paint", which is exactly what a
+// byte-for-byte match with a direct paint into the same DIB proves.
+test "banner overlay: WM_PRINTCLIENT draws the card into the caller's DC" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        120,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    // A two-column table with a long value: the exact shape whose right-hand
+    // edge the torn capture kept moving.
+    overlay.setText("|  |  |\n|---|---|\n| **Prompt** | the quick brown fox jumps over the lazy dog and keeps on running |");
+    overlay.inset = 80;
+    overlay.updatePosition(1.0);
+
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(overlay.hwnd, &client) == 0) return error.SkipZigTest;
+    const w = @max(client.right - client.left, 1);
+    const h = @max(client.bottom - client.top, 1);
+    const count: usize = @intCast(w * h);
+
+    var bmi = std.mem.zeroes(w32.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -@as(i32, h);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+
+    const wnd_dc = w32.GetDC(overlay.hwnd) orelse return error.SkipZigTest;
+    defer _ = w32.ReleaseDC(overlay.hwnd, wnd_dc);
+
+    // Two DIBs, so the direct paint and the printed one can be compared
+    // without either overwriting the other.
+    const dc_a = w32.CreateCompatibleDC(wnd_dc) orelse return error.SkipZigTest;
+    defer _ = w32.DeleteDC(dc_a);
+    var bits_a: ?*anyopaque = null;
+    const bmp_a = w32.CreateDIBSection(dc_a, &bmi, w32.DIB_RGB_COLORS, &bits_a, null, 0) orelse
+        return error.SkipZigTest;
+    defer _ = w32.DeleteObject(bmp_a);
+    _ = w32.SelectObject(dc_a, bmp_a);
+
+    const dc_b = w32.CreateCompatibleDC(wnd_dc) orelse return error.SkipZigTest;
+    defer _ = w32.DeleteDC(dc_b);
+    var bits_b: ?*anyopaque = null;
+    const bmp_b = w32.CreateDIBSection(dc_b, &bmi, w32.DIB_RGB_COLORS, &bits_b, null, 0) orelse
+        return error.SkipZigTest;
+    defer _ = w32.DeleteObject(bmp_b);
+    _ = w32.SelectObject(dc_b, bmp_b);
+
+    const px_a = @as([*]u32, @ptrCast(@alignCast(bits_a orelse return error.SkipZigTest)))[0..count];
+    const px_b = @as([*]u32, @ptrCast(@alignCast(bits_b orelse return error.SkipZigTest)))[0..count];
+
+    overlay.paint(dc_a);
+    _ = w32.SendMessageW(overlay.hwnd, w32.WM_PRINTCLIENT, @intFromPtr(dc_b), 0);
+
+    // It drew SOMETHING: an unhandled WM_PRINTCLIENT leaves the DIB at its
+    // zero-initialized state, which would match nothing but itself.
+    var painted: usize = 0;
+    for (px_a) |p| {
+        if (p & 0x00FFFFFF != 0) painted += 1;
+    }
+    try std.testing.expect(painted > count / 4);
+    try std.testing.expectEqualSlices(u32, px_a, px_b);
+}
+
 test "banner overlay: a link's underline is dotted at rest and solid on hover" {
     const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
     registerClassOnce(hinst) catch return error.SkipZigTest;

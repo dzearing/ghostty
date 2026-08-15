@@ -33,6 +33,22 @@
 #                        PrintWindow(PW_RENDERFULLCONTENT) - see the limit
 #                        below, which is narrower than the spike concluded.
 #
+# CAPTURE TEAR (measured 2026-08-14, T835): PW_RENDERFULLCONTENT asks DWM for a
+# copy of a layered window's composited surface, and that copy is ASYNCHRONOUS -
+# it can hand back a half-finished frame. Three back-to-back captures of ONE
+# banner overlay, unchanged and long since painted, put the right edge of the
+# same table row at 1062, 1283 and 1179 px while the app logged an identical
+# paint every time. So a pixel measurement over the default capture is a coin
+# flip, and it fails in the direction that looks like a rendering bug in the
+# app: pane-banner.ps1 went red about one run in three and T835 was filed
+# against the banner's column math, which was never wrong.
+# Use `Get-TestWindowPixels -Sync` for pixel ASSERTIONS on chrome. It goes
+# through the window's own WM_PRINTCLIENT instead of DWM, so the window draws
+# the frame synchronously into our DC and the bitmap is exactly what it painted
+# (60/60 identical after the switch). It needs a WM_PRINTCLIENT handler in the
+# window - add one, it is three lines beside the WM_PAINT case - and it throws
+# rather than returning the blank frame a window without one prints.
+#
 # CAPTURE LIMIT (measured here 2026-07-30, and it REVISES T207's answer):
 # PrintWindow on a background desktop returns the window's GDI-painted CHROME
 # only - titlebar, tab strip, menus, dialog controls, banners. The OpenGL
@@ -282,6 +298,9 @@ public class GhozttyTestDesktop {
     [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr o);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr hdc, int x, int y);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+    [DllImport("user32.dll")] static extern int FillRect(IntPtr hdc, ref RECT r, IntPtr brush);
 
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
@@ -1645,7 +1664,34 @@ public class GhozttyTestDesktop {
     // the desktop DC (== Graphics.CopyFromScreen) returns false there.
     // Returns { hbitmap, width, height, left, top }; hbitmap is handed to
     // Image.FromHbitmap on the caller's side and freed by ReleaseCapture.
-    public long[] CaptureWindow(IntPtr h) {
+    public long[] CaptureWindow(IntPtr h) { return CaptureWindowMode(h, false); }
+
+    // The SYNCHRONOUS capture (T835). `PrintWindow` with no flags takes the
+    // WM_PRINT -> WM_PRINTCLIENT path, so the window itself draws the frame
+    // into our DC before the call returns and the bitmap is exactly what its
+    // paint produced. PW_RENDERFULLCONTENT instead asks DWM for a copy of the
+    // composited surface, and that copy is ASYNCHRONOUS: three back-to-back
+    // captures of one unchanged banner overlay read its table's value text as
+    // ending at 1062, 1283 and 1179 px while the app's own paint logged the
+    // identical line end (1290) every time. Any pixel assertion over such a
+    // capture is a coin flip - which is what made pane-banner.ps1 fail about
+    // one run in three and read as a rendering bug in the app.
+    //
+    // The cost of "synchronous" is that this is a cross-process SendMessage on
+    // the one worker thread the whole harness marshals through, so an app whose
+    // GUI thread is wedged hangs the capture instead of failing it. That is the
+    // trade this file usually refuses (see the SendMessageTimeout note above),
+    // and it is taken here because a wedged GUI is already a failed run, while
+    // a torn capture is a green one that proves nothing.
+    //
+    // It is OPT-IN because it only works on a window whose WndProc answers
+    // WM_PRINTCLIENT. When one does not, the client area comes back untouched:
+    // the bitmap is pre-filled with a sentinel and a capture that is still
+    // entirely sentinel FAILS rather than handing back a blank frame to assert
+    // against. Add the handler to that window instead of falling back quietly.
+    public long[] CaptureWindowSync(IntPtr h) { return CaptureWindowMode(h, true); }
+
+    long[] CaptureWindowMode(IntPtr h, bool sync) {
         return (long[])Run(delegate() {
             RECT r;
             if (!GetWindowRect(h, out r)) { LastError = "GetWindowRect failed"; return new long[] { 0, 0, 0, 0, 0 }; }
@@ -1655,13 +1701,43 @@ public class GhozttyTestDesktop {
             IntPtr hdcMem = CreateCompatibleDC(hdcWin);
             IntPtr hbmp = CreateCompatibleBitmap(hdcWin, w, ht);
             IntPtr old = SelectObject(hdcMem, hbmp);
-            bool ok = PrintWindow(h, hdcMem, PW_RENDERFULLCONTENT);
+            if (sync) {
+                RECT all = new RECT(); all.left = 0; all.top = 0; all.right = w; all.bottom = ht;
+                IntPtr brush = CreateSolidBrush(SENTINEL);
+                FillRect(hdcMem, ref all, brush);
+                DeleteObject(brush);
+            }
+            bool ok = PrintWindow(h, hdcMem, sync ? 0u : PW_RENDERFULLCONTENT);
+            bool blank = false;
+            if (ok && sync) blank = AllSentinel(hdcMem, w, ht);
             SelectObject(hdcMem, old);
             DeleteDC(hdcMem);
             ReleaseDC(h, hdcWin);
             if (!ok) { DeleteObject(hbmp); LastError = "PrintWindow failed"; return new long[] { 0, 0, 0, 0, 0 }; }
+            if (blank) {
+                DeleteObject(hbmp);
+                LastError = "WM_PRINTCLIENT drew nothing: this window cannot be captured synchronously";
+                return new long[] { 0, 0, 0, 0, 0 };
+            }
             return new long[] { hbmp.ToInt64(), w, ht, r.left, r.top };
         });
+    }
+
+    // A colour nothing in the chrome paints, so "still sentinel" means "not
+    // drawn" rather than "drawn this colour".
+    const uint SENTINEL = 0x00FF00FF;
+
+    static bool AllSentinel(IntPtr hdc, int w, int ht) {
+        for (int gy = 0; gy < 8; gy++) {
+            for (int gx = 0; gx < 8; gx++) {
+                int x = (int)((gx + 0.5) * w / 8.0);
+                int y = (int)((gy + 0.5) * ht / 8.0);
+                if (x >= w) x = w - 1;
+                if (y >= ht) y = ht - 1;
+                if (GetPixel(hdc, x, y) != SENTINEL) return false;
+            }
+        }
+        return true;
     }
 
     public void ReleaseCapture(long hbmp) {
@@ -2942,6 +3018,15 @@ up front, before anyone can measure anything.
 Pass -AllowTerminalSurface only to MEASURE the limit itself (that is what
 terminal-capture-guard.ps1 does). For a real terminal-content probe, take one
 of the four routes in the CAPTURE LIMIT header instead.
+
+-Sync captures through WM_PRINTCLIENT instead of DWM (T835). USE IT FOR EVERY
+PIXEL ASSERTION on chrome that answers that message: the default DWM copy is
+asynchronous and returns torn frames, so a measurement over it is a coin flip.
+Three back-to-back default captures of one unchanged banner overlay put the end
+of the same table row at 1062, 1283 and 1179 px while the app logged an
+identical paint each time - a rendering bug that was never in the app. -Sync
+throws on a window with no WM_PRINTCLIENT handler rather than returning the
+blank frame such a window prints, so the answer there is to add the handler.
 #>
 <#
 A hidden window on the test desktop that belongs to the HARNESS process, not
@@ -2975,7 +3060,8 @@ function Get-TestWindowPixels {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
         $Desktop,
-        [switch]$AllowTerminalSurface
+        [switch]$AllowTerminalSurface,
+        [switch]$Sync
     )
     $td = Resolve-TestDesktop $Desktop
     if (-not $AllowTerminalSurface) {
@@ -2990,7 +3076,7 @@ function Get-TestWindowPixels {
                    "-AllowTerminalSurface is for measuring the limit itself.")
         }
     }
-    $r = $td.CaptureWindow($Window)
+    $r = if ($Sync) { $td.CaptureWindowSync($Window) } else { $td.CaptureWindow($Window) }
     if ($r[0] -eq 0) { throw "Get-TestWindowPixels failed: $($td.LastError)" }
     $hbmp = [IntPtr]$r[0]
     try {

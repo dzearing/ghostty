@@ -155,6 +155,11 @@ pub const WM_GETOBJECT: u32 = 0x003D;
 pub const OBJID_CLIENT: isize = -4;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_PAINT: u32 = 0x000F;
+/// "Draw yourself into THIS dc, right now." `PrintWindow` sends it, and a
+/// window that answers it can be captured exactly and synchronously — the
+/// DWM `PW_RENDERFULLCONTENT` path is asynchronous and hands back torn
+/// frames instead (T835).
+pub const WM_PRINTCLIENT: u32 = 0x0318;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;

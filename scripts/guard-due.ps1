@@ -126,6 +126,26 @@ $GuardTable = @(
             'scripts\lib\DataBreak.ps1',
             'test\win32\crash-databreak.ps1'
         )
+    },
+    # The banner is the one piece of chrome the user reads all day, and its
+    # regressions are HORIZONTAL - a column that stops halfway is invisible to
+    # every height oracle in the suite, so only pane-banner.ps1's pixel probes
+    # can see it. The row was held back while that script was one-run-in-three
+    # red; T835 found the flake was in the CAPTURE, not the banner, and with a
+    # synchronous capture the script is deterministic enough to gate on.
+    [pscustomobject]@{
+        Name   = 'pane-banner'
+        Script = 'test\win32\pane-banner.ps1'
+        Stamp  = 'test\win32\pane-banner.stamp.json'
+        Covers = @(
+            'src\apprt\win32\BannerOverlay.zig',
+            'src\apprt\win32\banner_layout.zig',
+            'src\apprt\win32\banner_card.zig',
+            'src\apprt\win32\banner_markdown.zig',
+            'src\apprt\win32\banner_link.zig',
+            'src\apprt\win32\BannerDialog.zig',
+            'test\win32\pane-banner.ps1'
+        )
     }
 )
 
