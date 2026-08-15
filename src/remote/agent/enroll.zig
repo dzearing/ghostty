@@ -35,6 +35,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http_client = @import("../http_client.zig");
+const atomic_write = @import("atomic_write.zig");
 
 /// How much the poll interval grows on a `slow_down` answer (RFC 8628 §3.5).
 pub const slow_down_bump_s: u32 = 5;
@@ -308,38 +309,23 @@ pub fn relayEnvPath(alloc: Allocator) ![]u8 {
 /// Write relay.env at `path` (creating parent directories; mode 0600 on
 /// POSIX — it holds a bearer credential).
 ///
-/// The write is ATOMIC: content lands in a `.tmp` sibling first, then a
-/// rename publishes it over the target (plain rename(2) on POSIX; on Windows
-/// zig's `Dir.rename` issues FILE_RENAME_INFORMATION with ReplaceIfExists —
-/// MoveFileEx-replace semantics — so an existing relay.env is replaced, not
-/// an error). A live `--relay` daemon polls this file for a re-enroll (see
-/// `relay_creds.zig`) and must never observe a half-written credential.
+/// The write is ATOMIC: content lands in a staging sibling first (unique name
+/// per call — `atomic_write`, T183/T500), then a rename publishes it over the
+/// target (plain rename(2) on POSIX; on Windows zig's `Dir.rename` issues
+/// FILE_RENAME_INFORMATION with ReplaceIfExists — MoveFileEx-replace
+/// semantics — so an existing relay.env is replaced, not an error). A live
+/// `--relay` daemon polls this file for a re-enroll (see `relay_creds.zig`)
+/// and must never observe a half-written credential.
 pub fn saveRelayEnv(alloc: Allocator, path: []const u8, relay_base: []const u8, device_token: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
     const content = try formatRelayEnv(alloc, relay_base, device_token);
     defer alloc.free(content);
 
-    // Fixed `.tmp` suffix (same directory, so the rename never crosses a
-    // filesystem). Concurrent enrolls racing on it just end last-writer-wins,
-    // exactly like they would on the target itself.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
+    // `.secret` stages the file 0600 on POSIX (it holds a bearer credential).
+    try atomic_write.writeChunks(alloc, path, &.{content}, .{ .secret = true });
 
-    var flags: std.fs.File.CreateFlags = .{ .truncate = true };
-    if (builtin.os.tag != .windows) flags.mode = 0o600;
-    {
-        // Declared before the create/close pair so on error (LIFO) the file
-        // closes BEFORE the delete — Windows can't delete an open file.
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        const file = try std.fs.cwd().createFile(tmp_path, flags);
-        defer file.close();
-        try file.writeAll(content);
-        // Durable before the rename publishes it: a crash must not leave a
-        // valid-looking relay.env with garbage (or empty) content.
-        try file.sync();
-    }
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    // A crashed earlier save's staging debris IS the credential — sweep it.
+    // Safe here because relay.env has a single writer (the enroll flow).
+    atomic_write.cleanStaging(path);
 
     // On Windows the create-flags `mode` is ignored, so the file inherits its
     // parent's ACL (`%LOCALAPPDATA%` — user-scoped, but SYSTEM/Administrators
@@ -390,16 +376,15 @@ pub fn loadDeviceToken(alloc: Allocator) ?[]u8 {
     return null;
 }
 
-/// Delete the agent's relay.env (and any leftover `.tmp` sibling). Best-effort:
-/// a missing file is success. Used by "Sign out" to drop the local credential
-/// so a restart won't silently reconnect.
+/// Delete the agent's relay.env (and any leftover staging sibling — legacy
+/// `.tmp` or a crashed writer's unique-name debris). Best-effort: a missing
+/// file is success. Used by "Sign out" to drop the local credential so a
+/// restart won't silently reconnect.
 pub fn clearLocalCredential(alloc: Allocator) void {
     const path = relayEnvPath(alloc) catch return;
     defer alloc.free(path);
     std.fs.cwd().deleteFile(path) catch {};
-    const tmp = std.fmt.allocPrint(alloc, "{s}.tmp", .{path}) catch return;
-    defer alloc.free(tmp);
-    std.fs.cwd().deleteFile(tmp) catch {};
+    atomic_write.cleanStaging(path);
 }
 
 /// The account a device token is bound to, as reported by `/v1/agent/whoami`.
@@ -936,16 +921,31 @@ test "relay.env: save → load round-trip on disk" {
     try testing.expectEqualStrings("tok-1", env.device_token.?);
 
     // Overwrite rotates the credential in place — the atomic tmp+rename path
-    // must replace an EXISTING target (the re-enroll case).
+    // must replace an EXISTING target (the re-enroll case). Pre-seed a crashed
+    // pre-save's fixed-name staging debris: that debris is a credential, and
+    // save must sweep it.
+    const parent = std.fs.path.dirname(path).?;
+    {
+        const legacy = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+        defer alloc.free(legacy);
+        try std.fs.cwd().writeFile(.{ .sub_path = legacy, .data = "debris" });
+    }
     try saveRelayEnv(alloc, path, "https://relay.test", "tok-2");
     var env2 = try loadRelayEnv(alloc, path);
     defer env2.deinit(alloc);
     try testing.expectEqualStrings("tok-2", env2.device_token.?);
 
-    // The staging file is consumed by the rename, never left behind.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
+    // No staging leftover of ANY name — the directory holds exactly the
+    // published file (T500, the T183 tests' stronger form).
+    var dir = try std.fs.cwd().openDir(parent, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next()) |entry| {
+        count += 1;
+        try testing.expectEqualStrings("relay.env", entry.name);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
 }
 
 test "relay.env: missing file loads as empty" {

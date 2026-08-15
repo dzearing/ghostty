@@ -41,6 +41,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const relay_session = @import("relay_session.zig");
 const win_acl = @import("win_acl.zig");
+const atomic_write = @import("agent/atomic_write.zig");
 
 const log = std.log.scoped(.relay_account);
 
@@ -142,22 +143,12 @@ pub fn save(alloc: Allocator, path: []const u8, account: Account) !void {
     const blob = try protect(alloc, json);
     defer alloc.free(blob);
 
-    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
-
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-
-    var flags: std.fs.File.CreateFlags = .{ .truncate = true };
-    if (builtin.os.tag != .windows) flags.mode = 0o600;
-    {
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        const file = try std.fs.cwd().createFile(tmp_path, flags);
-        defer file.close();
-        try file.writeAll(blob);
-        try file.sync();
-    }
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    // Staging sibling + rename via the shared recipe (`atomic_write`,
+    // T183/T500); `.secret` stages the file 0600 on POSIX. A crashed earlier
+    // save's staging debris is a (DPAPI-wrapped) credential — sweep it; safe
+    // because account.dat has a single writer (the sign-in flow).
+    try atomic_write.writeChunks(alloc, path, &.{blob}, .{ .secret = true });
+    atomic_write.cleanStaging(path);
 
     // Owner-only, non-inherited DACL now that it holds a credential (no-op off
     // Windows; POSIX already got 0600). Best-effort.
@@ -204,9 +195,11 @@ pub fn load(alloc: Allocator, path: []const u8) !Account {
     return acct;
 }
 
-/// Delete account.dat (sign out). A missing file is success.
+/// Delete account.dat (sign out), and any staging sibling a crashed save left
+/// behind — that debris is a credential too. A missing file is success.
 pub fn delete(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
+    atomic_write.cleanStaging(path);
 }
 
 /// Whether a signed-in account exists (cheap: file presence, no decrypt).
@@ -379,6 +372,25 @@ test "account store: save then load round-trips (with and without picture)" {
         try testing.expect(got.picture == null);
         try testing.expectEqualStrings("sess-456", got.session_token);
     }
+
+    // A crashed pre-save's staging debris is a credential: save sweeps it, and
+    // no staging leftover of ANY name survives — the directory holds exactly
+    // the published file (T500).
+    try tmp.dir.writeFile(.{ .sub_path = "account.dat.tmp", .data = "debris" });
+    try save(alloc, path, .{ .session_token = "s", .expiry = 0, .email = "e", .relay_base = "b" });
+    {
+        const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(dir_path);
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        var count: usize = 0;
+        while (try it.next()) |entry| {
+            count += 1;
+            try testing.expectEqualStrings("account.dat", entry.name);
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
 }
 
 test "account store: load on a missing file is SignedOut" {
@@ -440,8 +452,15 @@ test "account store: delete removes the file (idempotent)" {
         .relay_base = "b",
     });
     try testing.expect(isSignedIn(alloc, path));
+    // Sign-out must also drop a crashed save's staging debris — it holds the
+    // credential too (unique-name form, T500).
+    try tmp.dir.writeFile(.{ .sub_path = "account.dat.00112233aabbccdd.tmp", .data = "debris" });
     delete(path);
     try testing.expect(!isSignedIn(alloc, path));
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile("account.dat.00112233aabbccdd.tmp"),
+    );
     delete(path); // idempotent: no error on a second delete
 }
 

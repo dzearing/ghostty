@@ -101,7 +101,7 @@ pub fn writeAtomic(
     std.mem.writeInt(u16, header[magic.len + 8 ..][0..2], cols, .little);
     std.mem.writeInt(u16, header[magic.len + 10 ..][0..2], rows, .little);
     std.mem.writeInt(u64, header[magic.len + 12 ..][0..8], @intCast(bytes.len), .little);
-    try atomic_write.writeChunks(alloc, path, &.{ &header, bytes });
+    try atomic_write.writeChunks(alloc, path, &.{ &header, bytes }, .{});
 }
 
 /// Load + parse the snapshot at `path`. Returns null when the file is ABSENT (a

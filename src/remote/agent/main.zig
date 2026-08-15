@@ -125,6 +125,7 @@ const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
 const tray_account = @import("tray_account.zig");
 const enroll = @import("enroll.zig");
+const atomic_write = @import("atomic_write.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
@@ -1598,31 +1599,15 @@ fn writePipeFile(alloc: Allocator, path: []const u8, pipe: []const u8) !void {
     return writeInfoFile(alloc, path, 0, null, pipe);
 }
 
-/// Atomically write the agent info file to `path` via the same-directory
-/// tmp+rename pattern (see `enroll.saveRelayEnv`), creating parent directories
-/// as needed. `pid` lets the reader liveness-check the writer; `startedAt`
+/// Atomically write the agent info file to `path` (staging sibling + rename,
+/// via `atomic_write` — see T183/T500), creating parent directories as
+/// needed. `pid` lets the reader liveness-check the writer; `startedAt`
 /// (unix ms) lets it spot a stale file from a previous boot; `socket` (when
 /// set) carries the UDS path to dial.
 fn writeInfoFile(alloc: Allocator, path: []const u8, port: u16, socket: ?[]const u8, pipe: ?[]const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
     const content = try formatInfoFile(alloc, port, currentPid(), std.time.milliTimestamp(), socket, pipe);
     defer alloc.free(content);
-
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    {
-        // Declared before the create/close pair so on error (LIFO) the file
-        // closes BEFORE the delete — Windows can't delete an open file.
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(content);
-        // Durable before the rename publishes it: a reader must never parse a
-        // partially-flushed record.
-        try file.sync();
-    }
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-    try std.fs.cwd().rename(tmp_path, path);
+    try atomic_write.writeChunks(alloc, path, &.{content}, .{});
 }
 
 /// The TCP info-file JSON body (pure — separated from the I/O for tests).
@@ -2569,13 +2554,20 @@ test "port file: bind port 0 → write file → read back live port → dial it"
     const conn = try std.net.tcpConnectToAddress(dial_addr);
     conn.close();
 
-    // The staging file is consumed by the rename, never left behind.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-    defer alloc.free(tmp_path);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
-
     // Rewrite (agent restart reusing the same path) must replace the file.
     try writePortFile(alloc, path, bound_port);
+
+    // No staging leftover of ANY name — the directory holds exactly the
+    // published file (T500, the T183 tests' stronger form).
+    var pdir = try std.fs.cwd().openDir(std.fs.path.dirname(path).?, .{ .iterate = true });
+    defer pdir.close();
+    var it = pdir.iterate();
+    var count: usize = 0;
+    while (try it.next()) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("port.json", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 // --- T09: --listen-unix transport + same-uid peercred gate -------------------
@@ -2732,10 +2724,17 @@ test "socket info file: bind unix socket → write file → read back pid+socket
     // The advertised socket actually dials (proves the published path is live).
     try std.testing.expect(probeUnixAlive(sock));
 
-    // The staging file is consumed by the rename, never left behind.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{info});
-    defer alloc.free(tmp_path);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
+    // No staging leftover of ANY name. The info file lives in the shared /tmp,
+    // so instead of exact directory contents: nothing but the file itself may
+    // start with its (pid-unique) basename (T500).
+    const base = std.fs.path.basename(info);
+    var tdir = try std.fs.cwd().openDir("/tmp", .{ .iterate = true });
+    defer tdir.close();
+    var it = tdir.iterate();
+    while (try it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, base)) continue;
+        try std.testing.expectEqualStrings(base, entry.name);
+    }
 }
 
 test "wssBase: https/wss normalize to wss; http/ws stay plaintext; others refused" {

@@ -115,7 +115,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Parsed {
 /// Mirrors `session_meta.writeAtomic`: concurrent writers to the same path are
 /// safe — see `atomic_write` (T183).
 pub fn writeAtomic(alloc: Allocator, path: []const u8, bytes: []const u8) !void {
-    try atomic_write.writeChunks(alloc, path, &.{bytes});
+    try atomic_write.writeChunks(alloc, path, &.{bytes}, .{});
 }
 
 /// Load + parse the file at `path`. Returns null when ABSENT (normal — a first
