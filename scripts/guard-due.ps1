@@ -102,6 +102,20 @@ $GuardTable = @(
             'test\win32\crash-first-chance.ps1'
         )
     },
+    # The cache self-heal (T494) fires only on a torn cache, i.e. on a day
+    # already going badly, so a quietly broken detector looks exactly like "no
+    # corruption happened". scripts\floor-lane.ps1 itself stays uncovered for
+    # the same reason as in the crash rows: its heal wiring is proven by this
+    # harness's parse/wiring arms without gating every stall-detector edit.
+    [pscustomobject]@{
+        Name   = 'cache-heal'
+        Script = 'test\win32\floor-lane-cache-heal.ps1'
+        Stamp  = 'test\win32\floor-lane-cache-heal.stamp.json'
+        Covers = @(
+            'scripts\lib\CacheHeal.ps1',
+            'test\win32\floor-lane-cache-heal.ps1'
+        )
+    },
     # The T443 instruments have the same failure profile as the crash captures,
     # in its purest form: T832 exists because both of them measured a condition
     # the defect has never occurred in, and reported "all clear" for months

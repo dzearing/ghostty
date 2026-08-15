@@ -31,6 +31,11 @@
       * It sweeps leaked `msedgewebview2.exe` hosts, which are invisible to a
         sweep that filters on zig-out/zig-cache paths (that exe lives under
         Program Files). Match on `--webview-exe-name=` instead.
+      * It self-heals a torn zig-cache entry (T494): a FAIL whose compile
+        errors point into `.zig-cache\` or the global cache is a half-written
+        cache file, not red code -- the entry is deleted (loudly, as
+        `CACHE HEAL` lines) and the lane re-run ONCE; the re-run's verdict is
+        final. See scripts\lib\CacheHeal.ps1.
 
 .PARAMETER Lane
     none | win32 | agent | lib | all. Default `all` runs the four zig lanes in
@@ -113,6 +118,10 @@ $ErrorActionPreference = 'Stop'
 # is the same evidence without the re-run -- and is the ONLY thing that works
 # for a crash that does not reproduce.
 . "$PSScriptRoot\lib\CrashDump.ps1"
+# Recognizes a torn zig-cache entry (a zero-filled generated file failing the
+# compile as if the code were red) and deletes exactly that entry, so a lane
+# can heal itself and retry once instead of reporting a phantom FAIL (T494).
+. "$PSScriptRoot\lib\CacheHeal.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -304,6 +313,9 @@ function Invoke-Lane {
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $log = Join-Path $env:TEMP "floor-lane-$Name-$stamp.log"
+    # The caller's cache-heal check (T494) needs the log of the run that just
+    # failed; the return value stays a bare verdict string on purpose.
+    $script:LastLaneLog = $log
 
     if ($RawCommand) {
         # Self-test: the same watchdog loop over a synthetic command, so the
@@ -529,8 +541,26 @@ $worst = $EXIT_PASS
 $summary = @()
 
 foreach ($l in $lanes) {
+    # At most ONE cache heal per lane per invocation (T494): a FAIL whose
+    # compile errors point INTO a zig cache is a torn cache entry, not red
+    # code, so delete that entry and re-run once. The re-run's verdict is
+    # final -- a genuine failure simply fails again and is reported as such.
+    $healedThisLane = $false
     for ($i = 1; $i -le $Repeat; $i++) {
         $r = Invoke-Lane -Name $l -Iteration $i
+        if ($r -eq 'FAIL' -and -not $healedThisLane -and $script:LastLaneLog) {
+            $torn = @(Get-TornCacheEntry -LogPath $script:LastLaneLog -RepoPath $Repo -GlobalCacheDir $cacheDir)
+            if ($torn.Count -gt 0) {
+                $healedThisLane = $true
+                $warn = @(Get-CacheCorruptionWarning -LogPath $script:LastLaneLog)
+                if ($warn.Count -gt 0) {
+                    Write-Host "CACHE HEAL corroboration: $($warn.Count) invalid-timestamp warning(s) in the same log"
+                }
+                $removed = Invoke-CacheHeal -Entries $torn
+                Write-Host "LANE $l healed $removed torn cache entr(y/ies); re-running once (a second FAIL is final)"
+                $r = Invoke-Lane -Name $l -Iteration $i
+            }
+        }
         $summary += "$l#${i}=$r"
         switch ($r) {
             'FAIL' { if ($worst -lt $EXIT_FAIL) { $worst = $EXIT_FAIL } }
