@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T508 - the "concurrent savers never error" promise now
+  holds under load: the atomic-write rename out-waits Defender's scan
+  hold.** The soak flake was root-caused with instrumentation, not guessed:
+  a per-site-tagged repro pinned it to the publish rename returning
+  AccessDenied, and an unbounded-retry probe measured the true shape - all
+  four writer threads blocked at once for 440-786ms, the signature of the
+  on-access scanner holding the just-published target (sub-ms on an idle
+  box, stretched ~1000x by CPU starvation, which is why only loaded soaks
+  ever saw it). The surprise worth keeping: a first fix with a 95ms retry
+  budget - generous against the imagined microsecond rename-vs-rename
+  collision - still failed 37/120, because the real outage is three orders
+  of magnitude longer than the imagined one. The landed retry is
+  time-budgeted at 5s (~6x worst measured), deterministic-tested via
+  injected rename/sleeper mocks, and the T183 stress test now records the
+  actual error instead of a bool. Verified: 120/120 on the load harness
+  that failed 6/10 unfixed, 10-run concurrency-5 soak clean, floor + P1-P3
+  green. Commit 8fb71bdd4.
 - 2026-08-15 - **T500 - the last three fixed-name atomic writes are gone,
   and a crashed save can no longer strand a credential.** The agent info
   file (`main.zig writeInfoFile`), `enroll.saveRelayEnv` and
