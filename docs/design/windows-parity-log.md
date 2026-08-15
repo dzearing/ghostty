@@ -9,7 +9,29 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
-- 2026-08-15 - **T489 - a mistyped CLI flag now names itself and fails
+- 2026-08-15 - **T498 - a busy box can no longer turn the non-agent test
+  lanes red (or wedge them) over nothing.** The T346/T258 discipline, applied
+  outside the agent lane: the wall-clock wait helpers moved to a shared
+  `src/remote/test_util.zig` (60s liveness bound; `waitUntil`, new
+  `waitEvent`, new `drainRing`; `agent/test_util.zig` re-exports).
+  tcp_dial's three echo drains and client_mux's one dropped their spendable
+  5s deadlines + hot yield-polls for `drainRing`; connection.zig's ByteFifo
+  and client_mux's TestFifo got the T258 read deadline on the direction the
+  TEST reads (with unit tests), 17 test-body `ResetEvent.wait()`s became
+  bounded `waitEvent`s, and `test_wait_ms` went 10s -> 60s (10s proved
+  spendable, T183); inbound_ring's SPSC and firehose/HOL stress loops are now
+  stall-bounded (timer resets on progress) so a real hang fails red instead
+  of wedging, and the SPSC corruption check no longer errors out before the
+  join (freed the ring under a live producer). wp4_e2e: the one unbounded
+  reconnecting poll bounded; its remaining sleeps classified in-file. The
+  500ms "let the DETACH land" sleep is the OPPOSITE defect - a false PASS
+  race - filed as T854 (seat: mac; the harness is POSIX-only).
+  `renderer/State.zig` verified as product code with a wall-clock budget and
+  left alone. Validation: floor -Lane all PASS; none and win32 lanes green
+  x3 each including a run under the T346 32-busy-loop all-core load (lanes
+  measurably slower, still green). Surprise for the next loaded run: the
+  `\Processor(_Total)` counter shows only ~55% under this generator (core
+  parking) - judge load by lane slowdown, not the counter.
   instead of being silently ignored or dying with an empty stderr.** Two
   defect classes, one engine: verbs with a `_diagnostics` list nobody read
   (`+list`, `+sessions`) dropped the flag and exited 0; strict-Options verbs
