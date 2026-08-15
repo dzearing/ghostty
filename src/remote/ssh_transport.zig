@@ -60,8 +60,28 @@ const log = std.log.scoped(.remote_ssh);
 
 /// pipe(2) with CLOEXEC set on both ends (POSIX). Mirrors `os/pipe.zig` but is
 /// inlined here to keep this module sibling-only for standalone testability.
+///
+/// T475: `posix.pipe2` is `void` on Windows, so its call must not be ANALYZED
+/// there — the comptime early return is what keeps it out of the build, the
+/// same shape this file already uses at `controlPath` and in its tests. The
+/// Windows answer is honestly "unsupported": nothing on this platform spawns
+/// the `ssh` subprocess pair (the Windows seat reaches remote machines through
+/// `ghoztty-agent`), and a `CreatePipe` stub no caller can reach would only
+/// look like support that isn't there.
 fn pipe() ![2]posix.fd_t {
+    if (comptime builtin.os.tag == .windows) return error.Unsupported;
     return posix.pipe2(.{ .CLOEXEC = true });
+}
+
+/// Is `fd` a real descriptor we should close? POSIX spells "none" as a
+/// negative fd; a Windows `fd_t` is a HANDLE (a pointer), where the same
+/// sentinel is `INVALID_HANDLE_VALUE` and `fd >= 0` is not even a legal
+/// comparison (T475).
+fn fdOpen(fd: posix.fd_t) bool {
+    if (comptime builtin.os.tag == .windows) {
+        return fd != std.os.windows.INVALID_HANDLE_VALUE;
+    }
+    return fd >= 0;
 }
 
 /// Which logical channel an `ssh` subprocess carries (§4.3). The agent is told
@@ -186,8 +206,8 @@ pub const ChildStream = struct {
         const self: *ChildStream = @ptrCast(@alignCast(ctx));
         if (self.closed.swap(true, .acq_rel)) return;
         // Close write first (signals EOF to the child's stdin), then read.
-        if (self.write_fd >= 0) posix.close(self.write_fd);
-        if (self.read_fd >= 0 and self.read_fd != self.write_fd) posix.close(self.read_fd);
+        if (fdOpen(self.write_fd)) posix.close(self.write_fd);
+        if (fdOpen(self.read_fd) and self.read_fd != self.write_fd) posix.close(self.read_fd);
     }
 };
 
@@ -467,7 +487,14 @@ pub fn spawnChannel(
     posix.close(stdin_pipe[0]);
     posix.close(stdout_pipe[1]);
 
-    log.debug("spawned ssh {s} channel pid={?d}", .{ channel.argValue(), cmd.pid });
+    // A child id is an int on POSIX and a HANDLE on Windows, and `{d}` does
+    // not format a pointer (T475) — widen to a number so the line reads the
+    // same on both platforms.
+    const pid_num: ?usize = if (cmd.pid) |p|
+        (if (comptime builtin.os.tag == .windows) @intFromPtr(p) else @intCast(p))
+    else
+        null;
+    log.debug("spawned ssh {s} channel pid={?d}", .{ channel.argValue(), pid_num });
     return .{ .command = cmd, .stream_impl = stream_impl };
 }
 
@@ -691,13 +718,23 @@ fn teardownChild(comptime CommandT: type, alloc: Allocator, child: ChildChannel(
 /// wait for it so we don't leak a zombie.
 fn reapChild(comptime CommandT: type, child: *ChildChannel(CommandT)) void {
     if (child.command.pid) |pid| {
-        // The ssh client exits when its stdin closes and the master persists
-        // only for `ControlPersist`; a SIGTERM is a belt-and-suspenders nudge.
-        // Guard pid > 0: `kill(0, ...)` would signal our whole process group and
-        // `kill(-1, ...)` every process — only a real child pid is ever killed.
-        if (pid > 0) posix.kill(pid, posix.SIG.TERM) catch {};
+        termChild(pid);
         _ = child.command.wait(true) catch {};
     }
+}
+
+/// SIGTERM a live child pid. POSIX-only, and factored out of `reapChild` so
+/// the comptime guard can swallow the whole call: Windows has no `SIG.TERM`
+/// and its pid is a HANDLE, so `pid > 0` does not even compile there (T475).
+/// Taking `pid` as a parameter — rather than guarding in place — is what keeps
+/// the capture in `reapChild` used on both platforms.
+fn termChild(pid: anytype) void {
+    if (comptime builtin.os.tag == .windows) return;
+    // The ssh client exits when its stdin closes and the master persists
+    // only for `ControlPersist`; a SIGTERM is a belt-and-suspenders nudge.
+    // Guard pid > 0: `kill(0, ...)` would signal our whole process group and
+    // `kill(-1, ...)` every process — only a real child pid is ever killed.
+    if (pid > 0) posix.kill(pid, posix.SIG.TERM) catch {};
 }
 
 // =============================================================================

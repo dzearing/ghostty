@@ -33,8 +33,19 @@
         Program Files). Match on `--webview-exe-name=` instead.
 
 .PARAMETER Lane
-    none | win32 | agent | all. Default `all` runs the three zig lanes in
+    none | win32 | agent | lib | all. Default `all` runs the four zig lanes in
     sequence.
+
+    `lib` is the odd one out: it BUILDS rather than tests, and it is here
+    because nothing else on this box compiles the shared core for the
+    msvc-target `lib ghostty` artifact. POSIX-only code can therefore enter
+    `src/` and every lane people run stays green -- `zig build
+    -Dapp-runtime=none` was red for weeks over four such call sites in
+    `src/remote/ssh_transport.zig` (T475), and the test lanes could not see it
+    because the tests that reach them `SkipZigTest` on Windows, which stops
+    Zig analyzing the bodies. A cached run costs about a second; it only
+    compiles anything when the shared core actually moved, which is exactly
+    when the canary is worth having.
 
 .PARAMETER TimeoutSeconds
     Wall-clock cap per lane run. Default 1800.
@@ -54,7 +65,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('none', 'win32', 'agent', 'all')]
+    [ValidateSet('none', 'win32', 'agent', 'lib', 'all')]
     [string]$Lane = 'all',
     [int]$TimeoutSeconds = 1800,
     # 420s, not 180: the agent lane was measured (2026-08-03) sitting in a
@@ -117,6 +128,7 @@ function Get-LaneArgs {
         'none' { return 'test -Dapp-runtime=none' }      # pure logic
         'win32' { return 'test -Dapp-runtime=win32' }     # win32 apprt units
         'agent' { return 'test-agent' }                   # incl. real-pty
+        'lib' { return '-Dapp-runtime=none' }             # compiles lib ghostty
     }
     throw "unknown lane: $Name"
 }
@@ -301,7 +313,9 @@ function Invoke-Lane {
     }
     else {
         $buildArgs = Get-LaneArgs -Name $Name
-        if ($Filter) { $buildArgs = "$buildArgs -Dtest-filter=`"$Filter`"" }
+        # `lib` runs no tests, so a test filter would only mislead the log line
+        # into claiming a filtered run happened.
+        if ($Filter -and $Name -ne 'lib') { $buildArgs = "$buildArgs -Dtest-filter=`"$Filter`"" }
 
         # `set "VAR=value"` -- the quotes are load-bearing: without them cmd folds
         # the space before && into the value and the link step then fails on a path
@@ -508,7 +522,9 @@ if ($Command) {
     exit $EXIT_FAIL
 }
 
-$lanes = if ($Lane -eq 'all') { @('none', 'win32', 'agent') } else { @($Lane) }
+# `lib` runs first: it is the cheapest lane by far and it is a pure compile, so
+# a shared-core break is reported in seconds instead of after two test lanes.
+$lanes = if ($Lane -eq 'all') { @('lib', 'none', 'win32', 'agent') } else { @($Lane) }
 $worst = $EXIT_PASS
 $summary = @()
 

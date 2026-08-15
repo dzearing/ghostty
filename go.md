@@ -298,8 +298,22 @@ Concretely, in order, with no stops in between:
    checklist, so "what was validated" is answerable without the diff.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
-   `zig build test` lanes, `zig build test-agent`, P1–P3). Run the three zig
-   lanes through `scripts\floor-lane.ps1 -Lane all` (T430) rather than bare: a
+   `zig build test` lanes, `zig build test-agent`, the `lib` compile, P1–P3).
+   Run the four zig lanes through `scripts\floor-lane.ps1 -Lane all` (T430)
+   rather than bare.
+
+   The fourth lane, `lib`, is a **build** rather than a test, and it is the
+   only thing on this box that compiles the shared core — and the libghostty
+   C API the Mac seat lives on — for a Windows target (T323/T475). Two whole
+   classes of breakage were invisible without it: POSIX-only code in `src/`,
+   and a C API edit made from this seat that the Mac seat discovers at its
+   next build. It costs about a second cached. A note on why the test lanes
+   cannot cover the first one: the tests that reach POSIX-only code open with
+   `if (builtin.os.tag == .windows) return error.SkipZigTest;`, and a
+   comptime-known `return` stops Zig analyzing the rest of the body, so the
+   lane never looks at the code it appears to cover.
+
+   The wrapper's own reason for existing: a
    bare lane can wedge with no output and no timeout, and a wedge you cannot
    tell from a slow run is worse than a red test. The wrapper watches CPU as
    well as the clock, so it always ends with `PASS`, `FAIL` or `STALL` plus a
