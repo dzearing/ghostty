@@ -266,7 +266,6 @@ function Get-SkipAuditFindings {
 $script:SkipAuditPending = @{
     'overlay-zorder.ps1' = 'T731'
     'split-divider.ps1'  = 'T731'
-    'pane-banner.ps1'    = 'T731'
 }
 
 function Get-SkipAuditPending { return $script:SkipAuditPending }
