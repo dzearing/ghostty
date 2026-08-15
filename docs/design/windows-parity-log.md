@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T500 - the last three fixed-name atomic writes are gone,
+  and a crashed save can no longer strand a credential.** The agent info
+  file (`main.zig writeInfoFile`), `enroll.saveRelayEnv` and
+  `relay_account.save` now delegate to `atomic_write.zig` (unique-nonce
+  staging, T183), so adding a second writer to any of them can no longer
+  silently reintroduce the torn-publish race. `atomic_write` gained
+  `Options.secret` (0600 POSIX staging for credential payloads; win DACL
+  hardening stays at the call sites) and `cleanStaging` (sweeps legacy +
+  unique-nonce staging debris; single-writer paths only - `writeChunks`
+  itself never sweeps, that would re-create T183). Credential saves sweep
+  after publish and both sign-out deletes sweep, so crash debris holding a
+  bearer token/DPAPI blob cannot outlive sign-out. Leftover tests upgraded
+  to exact-directory-contents. Validation: floor -Lane all PASS; P1/P2/P3
+  25/20/16; ipc-relay + machine-chooser ALL PASS (74). No new tasks - the
+  only remaining `.tmp` staging (`self_update`) is a different, deliberate
+  two-step pattern with its own cleanup. Next per queue.
 - 2026-08-15 - **T498 - a busy box can no longer turn the non-agent test
   lanes red (or wedge them) over nothing.** The T346/T258 discipline, applied
   outside the agent lane: the wall-clock wait helpers moved to a shared
