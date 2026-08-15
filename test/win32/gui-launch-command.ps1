@@ -25,6 +25,12 @@
 #   C  a plain launch (no command asked for) still gets an interactive shell and
 #      no command is forwarded to the agent - the default shell that
 #      `Config.finalize` fills in must NOT be mistaken for an explicit request.
+#   D  a launch command survives session restore (T406).
+#   E  a SECOND launch against an already-running instance forwards its
+#      `-e` command and `--working-directory` instead of dropping them (T487):
+#      the AlreadyRunning arm used to forward a bare `new-window` with a null
+#      payload, so the running instance opened an empty window and the command
+#      vanished with exit 0 and no log line.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Hermetic: a per-run
 # $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN (so no real session-layout is
@@ -332,6 +338,56 @@ $winsD = @(Snapshot-Windows $tmpD 'd2')
 Assert "D6 restore also rebuilt the previous window (>= 2 windows)" ($winsD.Count -ge 2)
 $idsD = @(Leaves-Of-Windows $winsD | ForEach-Object { [string]$_.id })
 Assert "D7 the seed pane came back with its own pane id" ($idsD -contains $seedId)
+
+Stop-TestProcs
+
+# ============================================================================
+"== E: a second launch forwards -e and --working-directory to the running instance (T487)"
+# ============================================================================
+# The AlreadyRunning arm in win32 App.init forwards `new-window` to whoever owns
+# the IPC pipe. Pre-fix the payload was null: the second launch's parsed
+# `initial-command` and working directory were thrown away, the running instance
+# opened a PLAIN window, and the exit code was 0 - so E2/E4 fail without the fix
+# while E1 (a window opened either way) passes, which is exactly the trap the
+# header warns about.
+$tmpE = Join-Path $root 'e'
+$wdE = Join-Path $root 'wd487'
+New-Item -ItemType Directory -Force $wdE | Out-Null
+
+# A distinct marker script: echoes its args AND the directory it woke up in.
+$scriptE = Join-Path $root 'marker487.cmd'
+@(
+    '@echo off'
+    'echo T487ARGS=[%1][%2]'
+    'echo T487CWD=[%CD%]'
+    'pause'
+) | Set-Content -Path $scriptE -Encoding ASCII
+
+# --- launch 1: a plain instance that owns the pipe --------------------------
+Launch $tmpE @()
+$paneE0 = First-Pane $tmpE 'e0' 60
+Assert "E1 the first launch opened a window with a pane" ($paneE0 -ne '')
+
+# --- launch 2: same endpoint, WITH a command and a cwd ----------------------
+# `--working-directory` must come BEFORE `-e`: the launch parser hands
+# everything after `-e` to the command argv, exactly like the CLI verb.
+Launch $tmpE @("--working-directory=$wdE", '-e', $scriptE, 'omega487', 'psi487')
+
+$cmdPaneE = Wait-AnyPaneText $tmpE 'e1' 'T487ARGS=[omega487][psi487]' 90
+Assert "E2 the -e command RAN in the running instance (pre-fix: dropped)" ($cmdPaneE -ne '')
+
+# The forwarding process hands off and exits; only the first instance remains.
+Start-Sleep -Milliseconds 1500
+AssertEq "E3 the second launch process exited after forwarding" 1 (Count-TestProcs 'ghoztty.exe')
+
+if ($cmdPaneE -ne '') {
+    $textE = [string](Wait-PaneText $tmpE 'e2' $cmdPaneE 'T487CWD=' 40)
+    Assert "E4 the launch's --working-directory reached the new pane" `
+        ($textE.ToLower().Contains("t487cwd=[$($wdE.ToLower())]"))
+} else {
+    "  FAIL E4 the launch's --working-directory reached the new pane (no command pane to read)"
+    $script:failures++
+}
 
 Stop-TestProcs
 

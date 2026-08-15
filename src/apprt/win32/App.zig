@@ -557,7 +557,22 @@ pub fn init(
     self.ipc_server.?.init(self) catch |err| switch (err) {
         error.AlreadyRunning => {
             log.info("another instance owns the IPC pipe; forwarding new-window", .{});
-            const ok = internal_os.ipc_client.sendAction(alloc, "new-window", null) catch false;
+            // T487: forward what THIS launch asked for, not a bare verb. A
+            // null payload threw away `-e`/`--command` and the working
+            // directory after they were parsed — exit 0, nothing logged, the
+            // command just never ran (the same silent-drop shape T406 fixed
+            // on the restore path). The process exits on the next line, so
+            // the argv is never freed.
+            const fwd_args = forwardedNewWindowArgs(
+                alloc,
+                self.config.@"initial-command",
+                self.config.@"working-directory",
+            ) catch null;
+            const ok = internal_os.ipc_client.sendAction(
+                alloc,
+                "new-window",
+                fwd_args,
+            ) catch false;
             std.process.exit(if (ok) 0 else 1);
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -822,6 +837,97 @@ pub fn pumpIpc(self: *App) void {
             IpcServer.serveOnGuiThread(pending);
         }
     }
+}
+
+/// T487: the `+new-window` argv a second launch forwards to the running
+/// instance, rebuilt from this launch's parsed config so `ghoztty -e cmd…`
+/// and `--working-directory` survive the handoff. The cwd is forwarded
+/// whenever it resolved to a path: config finalize resolves the Windows CLI
+/// default to the launching directory (T506), so this matches both a first
+/// launch and `+new-window`'s auto-inserted `--working-directory`. Returns
+/// null when there is nothing to say, preserving the bare-verb wire shape.
+/// Allocations are owned by the caller; the forward path exits the process
+/// immediately after sending, so it never frees them.
+fn forwardedNewWindowArgs(
+    alloc: Allocator,
+    initial_command: ?configpkg.Config.Command,
+    working_directory: ?configpkg.Config.WorkingDirectory,
+) Allocator.Error!?[]const [:0]const u8 {
+    var args: std.ArrayList([:0]const u8) = .empty;
+    errdefer args.deinit(alloc);
+
+    if (working_directory) |wd| {
+        if (wd.value()) |path| {
+            try args.append(alloc, try std.fmt.allocPrintSentinel(
+                alloc,
+                "--working-directory={s}",
+                .{path},
+                0,
+            ));
+        }
+    }
+
+    if (initial_command) |cmd| switch (cmd) {
+        // `-e argv…` parses to `.direct`; the IPC verb's own `-e` carries an
+        // argv the server execs without shell wrapping, so the shape maps 1:1.
+        .direct => |argv| {
+            try args.append(alloc, try alloc.dupeZ(u8, "-e"));
+            for (argv) |arg| try args.append(alloc, try alloc.dupeZ(u8, arg));
+        },
+        // `initial-command = <string>` is shell-expanded; `--command=` is the
+        // verb's shell-expanded form.
+        .shell => |command| try args.append(alloc, try std.fmt.allocPrintSentinel(
+            alloc,
+            "--command={s}",
+            .{command},
+            0,
+        )),
+    };
+
+    if (args.items.len == 0) {
+        args.deinit(alloc);
+        return null;
+    }
+    return try args.toOwnedSlice(alloc);
+}
+
+test "forwardedNewWindowArgs: nothing to forward stays a bare verb (T487)" {
+    const testing = std.testing;
+    try testing.expect(try forwardedNewWindowArgs(testing.allocator, null, null) == null);
+    // `.inherit` and `.home` resolve to no path — still a bare verb.
+    try testing.expect(try forwardedNewWindowArgs(testing.allocator, null, .inherit) == null);
+    try testing.expect(try forwardedNewWindowArgs(testing.allocator, null, .home) == null);
+}
+
+test "forwardedNewWindowArgs: -e argv and the launch cwd survive the handoff (T487)" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const args = (try forwardedNewWindowArgs(
+        alloc,
+        .{ .direct = &.{ "pwsh", "-NoExit", "-Command", "echo hi" } },
+        .{ .path = "D:\\proj" },
+    )).?;
+    try testing.expectEqual(@as(usize, 6), args.len);
+    try testing.expectEqualStrings("--working-directory=D:\\proj", args[0]);
+    try testing.expectEqualStrings("-e", args[1]);
+    try testing.expectEqualStrings("pwsh", args[2]);
+    try testing.expectEqualStrings("-NoExit", args[3]);
+    try testing.expectEqualStrings("-Command", args[4]);
+    try testing.expectEqualStrings("echo hi", args[5]);
+}
+
+test "forwardedNewWindowArgs: a shell-form initial-command maps to --command (T487)" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const args = (try forwardedNewWindowArgs(alloc, .{ .shell = "htop -d 5" }, null)).?;
+    try testing.expectEqual(@as(usize, 1), args.len);
+    try testing.expectEqualStrings("--command=htop -d 5", args[0]);
 }
 
 pub fn run(self: *App) !void {
