@@ -1,5 +1,6 @@
 const std = @import("std");
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Allocator = std.mem.Allocator;
 const Action = @import("ghostty.zig").Action;
 const configpkg = @import("../config.zig");
@@ -7,6 +8,14 @@ const Config = configpkg.Config;
 const Pager = @import("Pager.zig");
 
 pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+
+    /// Track flag diagnostics rather than erroring out of the parse: a
+    /// config key on the command line is legitimate here (`Config.load`
+    /// reads argv), and a genuinely unknown flag gets reported by name
+    /// instead of the empty-stderr exit 1 it used to produce (T489).
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// If true, do not load the user configuration, only load the defaults.
     default: bool = false,
 
@@ -21,8 +30,9 @@ pub const Options = struct {
     /// Disable automatic paging of output.
     @"no-pager": bool = false,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -70,6 +80,8 @@ pub fn run(alloc: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+show-config", Config)) return 1;
 
     var config = if (opts.default) try Config.default(alloc) else try Config.load(alloc);
     defer config.deinit();

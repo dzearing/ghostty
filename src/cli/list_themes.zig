@@ -1,5 +1,6 @@
 const std = @import("std");
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Config = @import("../config/Config.zig");
 const configpkg = @import("../config.zig");
@@ -19,6 +20,9 @@ const SMALL_LIST_THRESHOLD = 10;
 const ColorScheme = enum { all, dark, light };
 
 pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// If true, print the full path to the theme.
     path: bool = false,
 
@@ -28,8 +32,9 @@ pub const Options = struct {
     /// Specifies the color scheme of the themes to include in the list.
     color: ColorScheme = .all,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables "-h" and "--help" to work.
@@ -112,6 +117,8 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, gpa_alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+list-themes", null)) return 1;
 
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     const alloc = arena.allocator();

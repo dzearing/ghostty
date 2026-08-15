@@ -16,6 +16,15 @@ const Action = @import("../cli.zig").ghostty.Action;
 /// see: https://www.gnu.org/software/gnuastro/manual/html_node/Bash-TAB-completion-tutorial.html
 pub const completions = comptimeGenerateBashCompletions();
 
+/// Whether the options struct has any completable flags: fields whose name
+/// starts with `_` are parser internals (arena, diagnostics), not flags.
+fn hasFlags(comptime T: type) bool {
+    for (@typeInfo(T).@"struct".fields) |field| {
+        if (field.name[0] != '_') return true;
+    }
+    return false;
+}
+
 fn comptimeGenerateBashCompletions() []const u8 {
     comptime {
         @setEvalBranchQuota(50000);
@@ -167,8 +176,7 @@ fn writeBashCompletions(writer: *std.Io.Writer) !void {
 
     for (@typeInfo(Action).@"enum".fields) |field| {
         const options = @field(Action, field.name).options();
-        // assumes options will never be created with only <_name> members
-        if (@typeInfo(options).@"struct".fields.len == 0) continue;
+        if (comptime !hasFlags(options)) continue;
 
         var buffer: [field.name.len]u8 = undefined;
         const bashName: []u8 = buffer[0..field.name.len];
@@ -200,7 +208,7 @@ fn writeBashCompletions(writer: *std.Io.Writer) !void {
 
     for (@typeInfo(Action).@"enum".fields) |field| {
         const options = @field(Action, field.name).options();
-        if (@typeInfo(options).@"struct".fields.len == 0) continue;
+        if (comptime !hasFlags(options)) continue;
 
         // bash doesn't allow variable names containing '-' so replace them
         var buffer: [field.name.len]u8 = undefined;

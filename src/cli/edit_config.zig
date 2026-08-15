@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Allocator = std.mem.Allocator;
 const Action = @import("ghostty.zig").Action;
 const configpkg = @import("../config.zig");
@@ -9,8 +10,12 @@ const internal_os = @import("../os/main.zig");
 const Config = configpkg.Config;
 
 pub const Options = struct {
-    pub fn deinit(self: Options) void {
-        _ = self;
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -58,6 +63,11 @@ pub fn run(alloc: Allocator) !u8 {
         var iter = try args.argsIterator(alloc);
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
+    }
+
+    if (try args.reportCliDiagnostics(Options, &opts, "+edit-config", Config, stderr)) {
+        stderr.flush() catch {};
+        return 1;
     }
 
     const result = runInner(alloc, stderr);

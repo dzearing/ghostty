@@ -68,6 +68,18 @@ pub fn run(alloc: Allocator) !u8 {
             return Action.help_error;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             positional = try alloc.dupe(u8, arg);
+        } else {
+            // A dash argument none of the branches above understood used
+            // to be silently dropped (T489): name it and fail instead.
+            var stderr: std.fs.File = .stderr();
+            var err_buffer: [1024]u8 = undefined;
+            var stderr_writer = stderr.writer(&err_buffer);
+            try stderr_writer.interface.print(
+                "+explain-config: unknown flag {s}\nrun 'ghoztty +explain-config --help' for usage\n",
+                .{arg},
+            );
+            try stderr_writer.end();
+            return 1;
         }
     }
 

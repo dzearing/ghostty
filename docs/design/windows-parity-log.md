@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T489 - a mistyped CLI flag now names itself and fails
+  instead of being silently ignored or dying with an empty stderr.** Two
+  defect classes, one engine: verbs with a `_diagnostics` list nobody read
+  (`+list`, `+sessions`) dropped the flag and exited 0; strict-Options verbs
+  (`+show-config` et al) propagated `Error.InvalidField` with nothing on
+  either stream; `+version` never parsed argv at all and `ghoztty -h` was a
+  silent exit 1. New `reportCliDiagnostics` in `src/cli/args.zig` prints
+  `+verb: unknown flag --x (did you mean --y?)` + a `--help` pointer and
+  exits 1, wired into every field-parsing verb; verbs whose argv is also
+  read by `Config.load` (`+show-config`, `+validate-config`,
+  `+list-keybinds`, `+edit-config`, `+show-face`) tolerate config keys, so
+  `+show-config --font-size=13` now works instead of silently failing.
+  Shared-core change - both platforms get it. The forwarding verbs
+  (`+close`, `+split`, ...) hand argv to the deliberately-tolerant server
+  (compat contract) and need per-verb client allowlists: filed as T852 with
+  `+send-keys` as the pattern. bash/zsh completion generators taught to skip
+  `_`-only Options structs. Validation: 7 none-lane unit tests, new
+  `test\win32\cli-unknown-flag.ps1` ALL PASS (26) + guard-due row,
+  `guard-due.ps1` acceptance ALL PASS (36), all four lanes PASS, P1-P3 ALL
+  PASS.
 - 2026-08-15 - **T487 - `ghoztty -e cmd` against a running instance now runs
   the command instead of opening an empty window.** The AlreadyRunning arm in
   win32 `App.init` forwarded a bare `new-window` with a null payload, so the

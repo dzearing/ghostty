@@ -181,6 +181,22 @@ $GuardTable = @(
         Covers = @(
             'test\win32\reset-context.ps1'
         )
+    },
+    # The CLI's flag-rejection contract (T489): every field-parsing verb
+    # routes its unknown/misvalued flags through args.zig's reporter, and
+    # nothing in the P1-P3 floor ever types a MISTYPED flag - a regression
+    # here reads as scripts quietly doing the wrong thing, which is the
+    # silent-ignore disease the task existed for. The row stays on args.zig
+    # (the engine) rather than all of src\cli: per-verb wiring is pinned by
+    # the none-lane unit tests the floor already runs.
+    [pscustomobject]@{
+        Name   = 'cli-unknown-flag'
+        Script = 'test\win32\cli-unknown-flag.ps1'
+        Stamp  = 'test\win32\cli-unknown-flag.stamp.json'
+        Covers = @(
+            'src\cli\args.zig',
+            'test\win32\cli-unknown-flag.ps1'
+        )
     }
 )
 

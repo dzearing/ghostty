@@ -1,13 +1,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Config = @import("../config.zig").Config;
 const crash = @import("../crash/main.zig");
 
 pub const Options = struct {
-    pub fn deinit(self: Options) void {
-        _ = self;
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables "-h" and "--help" to work.
@@ -37,6 +42,8 @@ pub fn run(alloc_gpa: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc_gpa, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+crash-report", null)) return 1;
 
     var buffer: [1024]u8 = undefined;
     var stdout_file: std.fs.File = .stdout();

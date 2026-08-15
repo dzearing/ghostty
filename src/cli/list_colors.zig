@@ -3,17 +3,22 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Action = @import("ghostty.zig").Action;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const x11_color = @import("../terminal/main.zig").x11_color;
 const vaxis = @import("vaxis");
 const tui = @import("tui.zig");
 
 pub const Options = struct {
-    pub fn deinit(self: Options) void {
-        _ = self;
-    }
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
 
     /// If `true`, print without formatting even if printing to a tty
     plain: bool = false,
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
+    }
 
     /// Enables "-h" and "--help" to work.
     pub fn help(self: Options) !void {
@@ -38,6 +43,8 @@ pub fn run(alloc: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+list-colors", null)) return 1;
 
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(alloc);

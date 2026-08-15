@@ -9,6 +9,15 @@ pub const completions = comptimeGenerateZshCompletions();
 
 const equals_required = "=-:::";
 
+/// Whether the options struct has any completable flags: fields whose name
+/// starts with `_` are parser internals (arena, diagnostics), not flags.
+fn hasFlags(comptime T: type) bool {
+    for (@typeInfo(T).@"struct".fields) |field| {
+        if (field.name[0] != '_') return true;
+    }
+    return false;
+}
+
 fn comptimeGenerateZshCompletions() []const u8 {
     comptime {
         @setEvalBranchQuota(50000);
@@ -166,8 +175,7 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
         const padding = "        ";
         for (@typeInfo(Action).@"enum".fields) |field| {
             const options = @field(Action, field.name).options();
-            // assumes options will never be created with only <_name> members
-            if (@typeInfo(options).@"struct".fields.len == 0) continue;
+            if (comptime !hasFlags(options)) continue;
 
             try writer.writeAll(padding ++ "(+" ++ field.name ++ ")\n");
             try writer.writeAll(padding ++ "  _arguments \\\n");

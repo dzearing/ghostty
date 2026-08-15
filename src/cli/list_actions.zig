@@ -1,16 +1,21 @@
 const std = @import("std");
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Allocator = std.mem.Allocator;
 const helpgen_actions = @import("../input/helpgen_actions.zig");
 
 pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// If `true`, print out documentation about the action associated with the
     /// keybinds.
     docs: bool = false,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -36,6 +41,8 @@ pub fn run(alloc: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+list-actions", null)) return 1;
 
     var stdout: std.fs.File = .stdout();
     var buffer: [4096]u8 = undefined;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Arena = std.heap.ArenaAllocator;
 const Allocator = std.mem.Allocator;
@@ -12,6 +13,9 @@ const tui = @import("tui.zig");
 const Binding = input.Binding;
 
 pub const Options = struct {
+    _arena: ?Arena = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// If `true`, print out the default keybinds instead of the ones configured
     /// in the config file.
     default: bool = false,
@@ -23,8 +27,9 @@ pub const Options = struct {
     /// If `true`, print without formatting even if printing to a tty
     plain: bool = false,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -60,6 +65,8 @@ pub fn run(alloc: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+list-keybinds", Config)) return 1;
 
     var config = if (opts.default) try Config.default(alloc) else try Config.load(alloc);
     defer config.deinit();

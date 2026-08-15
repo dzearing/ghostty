@@ -10,12 +10,47 @@ const renderer = @import("../renderer.zig");
 const gtk_version = @import("../apprt/gtk/gtk_version.zig");
 const adw_version = @import("../apprt/gtk/adw_version.zig");
 const ipc_client = @import("../os/ipc_client.zig");
+const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
+const Action = @import("ghostty.zig").Action;
+const Config = @import("../config.zig").Config;
 
-pub const Options = struct {};
+pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// `--version` is itself how this action gets invoked, so the flag has
+    /// to parse as valid rather than be reported as unknown.
+    version: bool = false,
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Enables "-h" and "--help" to work.
+    pub fn help(self: Options) !void {
+        _ = self;
+        return Action.help_error;
+    }
+};
 
 /// The `version` command is used to display information about Ghostty. Recognized as
 /// either `+version` or `--version`.
 pub fn run(alloc: Allocator) !u8 {
+    // `+version --bogus-flag` used to print the version with the flag
+    // silently dropped (T489). Config keys stay tolerated so the
+    // documented "--version wins no matter what other args exist"
+    // behavior keeps holding for `ghoztty --font-size=12 --version`.
+    {
+        var opts: Options = .{};
+        defer opts.deinit();
+        var iter = try args.argsIterator(alloc);
+        defer iter.deinit();
+        try args.parse(Options, alloc, &opts, &iter);
+        if (args.reportCliDiagnosticsStderr(Options, &opts, "+version", Config)) return 1;
+    }
+
     var buffer: [1024]u8 = undefined;
     const stdout_file: std.fs.File = .stdout();
     var stdout_writer = stdout_file.writer(&buffer);

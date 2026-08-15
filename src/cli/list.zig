@@ -80,6 +80,8 @@ fn runArgs(
         },
     };
 
+    if (try args.reportCliDiagnostics(Options, &opts, "+list", null, stderr)) return 1;
+
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     const alloc = arena.allocator();

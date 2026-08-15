@@ -1,16 +1,21 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Config = @import("../config.zig").Config;
 
 pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// The path of the config file to validate. If this isn't specified,
     /// then the default config file paths will be validated.
     @"config-file": ?[:0]const u8 = null,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables "-h" and "--help" to work.
@@ -38,6 +43,8 @@ pub fn run(alloc: std.mem.Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+validate-config", Config)) return 1;
 
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&buffer);

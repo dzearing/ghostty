@@ -113,23 +113,10 @@ fn runArgs(
         },
     };
 
-    // Print out any diagnostics, unless it's likely that the diagnostic was
-    // generated trying to parse a "normal" configuration setting. Exit with an
-    // error code if any diagnostics were printed.
-    if (!opts._diagnostics.empty()) {
-        var exit: bool = false;
-        outer: for (opts._diagnostics.items()) |diagnostic| {
-            if (diagnostic.location != .cli) continue :outer;
-            inner: inline for (@typeInfo(Options).@"struct".fields) |field| {
-                if (field.name[0] == '_') continue :inner;
-                if (std.mem.eql(u8, field.name, diagnostic.key)) {
-                    try stderr.print("config error: {f}\n", .{diagnostic});
-                    exit = true;
-                }
-            }
-        }
-        if (exit) return 1;
-    }
+    // Report flag problems: a bad value for our own flags, or a flag that
+    // neither this action nor the config (which also parses argv via
+    // `Config.load` below) understands (T489).
+    if (try args.reportCliDiagnostics(Options, &opts, "+show-face", Config, stderr)) return 1;
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

@@ -294,6 +294,149 @@ fn canTrackDiags(comptime T: type) bool {
     return @hasField(T, "_diagnostics");
 }
 
+/// Report the CLI-arg diagnostics a `+action` parse accumulated, in a
+/// uniform shape: the verb, the flag that was not understood, and — when a
+/// valid flag is a close spelling — the nearest one. Returns true if
+/// anything was reported; the action should then exit non-zero without
+/// doing its work, because a mistyped flag silently dropped (or a rejected
+/// flag with an empty stderr) is indistinguishable from success or a crash
+/// respectively (T489).
+///
+/// `TolerateT` is for actions whose command line is legitimately parsed a
+/// second time by another struct — the config, for actions that call
+/// `Config.load` (it reads argv itself). A key that struct understands is
+/// that parse's business, not an error here. Diagnostics on the action's
+/// OWN flags (a bad value for a real flag) are always reported, tolerance
+/// or not.
+pub fn reportCliDiagnostics(
+    comptime T: type,
+    opts: *const T,
+    comptime verb: []const u8,
+    comptime TolerateT: ?type,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!bool {
+    var reported = false;
+    outer: for (opts._diagnostics.items()) |diag| {
+        // Only diagnostics from THIS command line belong to this report;
+        // a config-file problem is not the action's flag problem.
+        switch (diag.location) {
+            .cli, .none => {},
+            .file => continue :outer,
+        }
+
+        // A diagnostic keyed on one of the action's own flags is a bad
+        // value for a real flag: always reported, never tolerated.
+        var own_flag = false;
+        inline for (@typeInfo(T).@"struct".fields) |field| {
+            if (comptime field.name[0] != '_') {
+                if (mem.eql(u8, field.name, diag.key)) own_flag = true;
+            }
+        }
+
+        if (!own_flag) {
+            if (comptime TolerateT) |TT| {
+                inline for (@typeInfo(TT).@"struct".fields) |field| {
+                    if (comptime field.name[0] != '_') {
+                        if (mem.eql(u8, field.name, diag.key)) continue :outer;
+                    }
+                }
+                if (comptime @hasDecl(TT, "compatibility")) {
+                    if (TT.compatibility.get(diag.key) != null) continue :outer;
+                }
+            }
+        }
+
+        reported = true;
+        if (own_flag) {
+            try writer.print("{s}: --{s}: {s}\n", .{ verb, diag.key, diag.message });
+        } else if (mem.eql(u8, diag.message, "invalid field")) {
+            // A non-flag argument this action takes no positionals for.
+            try writer.print("{s}: unexpected argument \"{s}\"\n", .{ verb, diag.key });
+        } else {
+            try writer.print("{s}: unknown flag --{s}", .{ verb, diag.key });
+            if (nearestField(T, diag.key)) |suggestion| {
+                try writer.print(" (did you mean --{s}?)", .{suggestion});
+            }
+            try writer.writeAll("\n");
+        }
+    }
+
+    if (reported) {
+        try writer.print("run 'ghoztty {s} --help' for usage\n", .{verb});
+    }
+
+    return reported;
+}
+
+/// Convenience wrapper for actions that have no stderr writer in scope:
+/// reports to a fresh stderr writer and flushes it. A write failure while
+/// diagnostics exist still returns true — the action must not proceed just
+/// because the explanation could not be delivered.
+pub fn reportCliDiagnosticsStderr(
+    comptime T: type,
+    opts: *const T,
+    comptime verb: []const u8,
+    comptime TolerateT: ?type,
+) bool {
+    var buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&buffer);
+    const reported = reportCliDiagnostics(
+        T,
+        opts,
+        verb,
+        TolerateT,
+        &stderr_writer.interface,
+    ) catch true;
+    stderr_writer.interface.flush() catch {};
+    return reported;
+}
+
+/// The action flag closest to `key` by edit distance, when the spelling is
+/// close enough to plausibly be a typo of it; null otherwise.
+fn nearestField(comptime T: type, key: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_dist: usize = std.math.maxInt(usize);
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (comptime field.name[0] != '_') {
+            const dist = editDistance(field.name, key);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best = field.name;
+            }
+        }
+    }
+
+    const name = best orelse return null;
+    // At most two edits, and never a rewrite of most of what was typed.
+    if (best_dist > 2 or best_dist >= key.len) return null;
+    return name;
+}
+
+/// Levenshtein distance with a fixed buffer; inputs longer than the buffer
+/// (no flag name is) report "far apart" rather than allocating.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    const max_len = 64;
+    if (a.len > max_len or b.len > max_len) return std.math.maxInt(usize);
+
+    var prev: [max_len + 1]usize = undefined;
+    var curr: [max_len + 1]usize = undefined;
+    for (0..b.len + 1) |j| prev[j] = j;
+
+    for (a, 0..) |ca, i| {
+        curr[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const cost: usize = if (ca == cb) 0 else 1;
+            curr[j + 1] = @min(
+                @min(curr[j] + 1, prev[j + 1] + 1),
+                prev[j] + cost,
+            );
+        }
+        @memcpy(prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+    }
+
+    return prev[b.len];
+}
+
 /// Parse a single key/value pair into the destination type T.
 ///
 /// This may result in allocations. The allocations can only be freed by freeing
@@ -1452,6 +1595,176 @@ test "ArgsIterator" {
     try testing.expectEqualStrings("--a=42", iter.next().?);
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+}
+
+const TestReportOptions = struct {
+    _arena: ?ArenaAllocator = null,
+    _diagnostics: DiagnosticList = .{},
+
+    json: bool = false,
+    target: ?[]const u8 = null,
+
+    pub fn deinit(self: *TestReportOptions) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn testReportParse(
+    alloc: Allocator,
+    opts: *TestReportOptions,
+    cmdline: []const u8,
+) !void {
+    var iter = try std.process.ArgIteratorGeneral(.{}).init(alloc, cmdline);
+    defer iter.deinit();
+    try parse(TestReportOptions, alloc, opts, &iter);
+}
+
+test "reportCliDiagnostics: unknown flag names itself and suggests the nearest" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "--jsn=true");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+list",
+        null,
+        &out.writer,
+    );
+    try testing.expect(reported);
+    try testing.expect(mem.indexOf(u8, out.written(), "+list: unknown flag --jsn") != null);
+    try testing.expect(mem.indexOf(u8, out.written(), "did you mean --json?") != null);
+    try testing.expect(mem.indexOf(u8, out.written(), "--help") != null);
+}
+
+test "reportCliDiagnostics: a distant typo gets no suggestion" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "--bogus-flag=1");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+list",
+        null,
+        &out.writer,
+    );
+    try testing.expect(reported);
+    try testing.expect(mem.indexOf(u8, out.written(), "unknown flag --bogus-flag") != null);
+    try testing.expect(mem.indexOf(u8, out.written(), "did you mean") == null);
+}
+
+test "reportCliDiagnostics: clean parse reports nothing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "--json --target=abc");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+list",
+        null,
+        &out.writer,
+    );
+    try testing.expect(!reported);
+    try testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "reportCliDiagnostics: a tolerated struct's keys are not errors" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Tolerated = struct {
+        @"font-size": u8 = 12,
+    };
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "--font-size=20 --bogus=1");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+show-config",
+        Tolerated,
+        &out.writer,
+    );
+    try testing.expect(reported);
+    try testing.expect(mem.indexOf(u8, out.written(), "font-size") == null);
+    try testing.expect(mem.indexOf(u8, out.written(), "unknown flag --bogus") != null);
+}
+
+test "reportCliDiagnostics: a bad value on a real flag is reported despite tolerance" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Tolerated = struct {
+        json: bool = false,
+    };
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "--json=notabool");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+list",
+        Tolerated,
+        &out.writer,
+    );
+    try testing.expect(reported);
+    try testing.expect(mem.indexOf(u8, out.written(), "+list: --json:") != null);
+    try testing.expect(mem.indexOf(u8, out.written(), "invalid value") != null);
+}
+
+test "reportCliDiagnostics: a positional is an unexpected argument" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var opts: TestReportOptions = .{};
+    defer opts.deinit();
+    try testReportParse(alloc, &opts, "whoops");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const reported = try reportCliDiagnostics(
+        TestReportOptions,
+        &opts,
+        "+list",
+        null,
+        &out.writer,
+    );
+    try testing.expect(reported);
+    try testing.expect(mem.indexOf(u8, out.written(), "unexpected argument \"whoops\"") != null);
+}
+
+test "editDistance" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 0), editDistance("json", "json"));
+    try testing.expectEqual(@as(usize, 1), editDistance("json", "jsn"));
+    try testing.expectEqual(@as(usize, 4), editDistance("json", ""));
+    try testing.expectEqual(@as(usize, 3), editDistance("abc", "xyz"));
 }
 
 /// Returns an iterator (implements "next") that reads CLI args by line.

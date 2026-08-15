@@ -113,6 +113,8 @@ fn runArgs(
         },
     };
 
+    if (try args.reportCliDiagnostics(Options, &opts, "+sessions", null, stderr)) return 1;
+
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     // The agent `Connection` we dial below spawns reader/writer/heartbeat threads

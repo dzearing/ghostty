@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("ghostty.zig").Action;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const font = @import("../font/main.zig");
 
 const log = std.log.scoped(.list_fonts);
@@ -10,6 +11,7 @@ const log = std.log.scoped(.list_fonts);
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
     _arena: ?ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
 
     /// The font family to search for. If this is set, then only fonts
     /// matching this family will be listed.
@@ -69,6 +71,8 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype) !u8 {
     var config: Options = .{};
     defer config.deinit();
     try args.parse(Options, alloc_gpa, &config, argsIter);
+
+    if (args.reportCliDiagnosticsStderr(Options, &config, "+list-fonts", null)) return 1;
 
     // Use an arena for all our memory allocs
     var arena = ArenaAllocator.init(alloc_gpa);

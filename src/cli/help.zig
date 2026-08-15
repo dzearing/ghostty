@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 
 fn padding(comptime name_len: usize) []const u8 {
@@ -13,11 +14,28 @@ fn padding(comptime name_len: usize) []const u8 {
 // actions. That is because the help command is special and wants to handle its
 // own logic around help detection.
 pub const Options = struct {
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
     /// This must be registered so that it isn't an error to pass `--help`
     help: bool = false,
 
-    pub fn deinit(self: Options) void {
-        _ = self;
+    /// `-h` is this action's own spelling: without a `help` decl (see the
+    /// struct comment) the parser would report it as an unexpected
+    /// argument. Everything from here on is help anyway, so stop parsing.
+    pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) Allocator.Error!bool {
+        _ = alloc;
+        _ = iter;
+        if (std.mem.eql(u8, arg, "-h")) {
+            self.help = true;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -35,6 +53,8 @@ pub fn run(alloc: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, alloc, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+help", null)) return 1;
 
     var buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&buffer);

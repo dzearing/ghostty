@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
+const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
@@ -10,8 +11,12 @@ const framedata = @import("framedata").compressed;
 const vxfw = vaxis.vxfw;
 
 pub const Options = struct {
-    pub fn deinit(self: Options) void {
-        _ = self;
+    _arena: ?std.heap.ArenaAllocator = null,
+    _diagnostics: diagnostics.DiagnosticList = .{},
+
+    pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -187,6 +192,8 @@ pub fn run(gpa: Allocator) !u8 {
         defer iter.deinit();
         try args.parse(Options, gpa, &opts, &iter);
     }
+
+    if (args.reportCliDiagnosticsStderr(Options, &opts, "+boo", null)) return 1;
 
     try decompressFrames(gpa);
     defer {

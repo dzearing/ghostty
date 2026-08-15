@@ -1,0 +1,10 @@
+{
+    "guard":  "cli-unknown-flag",
+    "script":  "test/win32/cli-unknown-flag.ps1",
+    "generated":  "2026-08-15T06:22:52-07:00",
+    "commit":  "b2dab4cf6",
+    "files":  {
+                  "src/cli/args.zig":  "a08ed7927609d7e9873c479cd96be3c4b801e7386246e6c91a68b8bcafb4c7bb",
+                  "test/win32/cli-unknown-flag.ps1":  "211ad2ea2157ebbf3c8b532f655e5fb776b29c11675aa1d25ce86c62dda4067c"
+              }
+}
