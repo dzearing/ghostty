@@ -9,6 +9,30 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T486 - the local Restore All has its on-box fixture again,
+  and building it uncovered a P1 the suite had no eyes for (T851).** Decision
+  first: the button DOES still own a scenario after T194 moved crash recovery
+  to launch time - a viewer that was ALREADY RUNNING when the sessions
+  orphaned (real on this box: installed + portable release are two processes
+  on one agent). The new `test\win32\chooser-restore-all-adopt.ps1` builds it
+  with two instances - `GHOZTTY_PIPE_SUFFIX` isolates only the app pipe, the
+  shared debug agent is the premise - and oracles the local arm's own
+  behaviours: the rebuild log line, shapes over B's pipe, the agent's attach
+  flags, pane liveness, and the `markLayoutDirty` bind-back (manifest deleted
+  after the kill must reappear holding the adopted windows). The surprise:
+  instance A never launched clean - launch restore's attach set is
+  alive-or-tombstone and never asks WHO holds the session, so A adopted B's
+  window at launch, the agent rebound, and B's pane froze. That is a user
+  hitting "start the portable while the installed one is open" and watching
+  their terminal die silently - filed as **T851** (P1) with the mechanism,
+  the crash-race constraint on the fix, and the single-instance product
+  question noted. The fixture carries a section-2 skip gate naming T851
+  (verdict: `ALL PASS (2 assertions, 1 SKIPPED)` today) and becomes T851's
+  regression coverage unmodified once the fix lands. Side fix, own commit:
+  `pane-banner.ps1` was still on the skip-audit pending list after its T835
+  conversion - dropped, `skip-visibility.ps1` green again. Validation:
+  `chooser-restore-all.ps1` ALL PASS (31), `chooser-restore-all-remote.ps1`
+  ALL PASS (40), floor all 4 lanes PASS, P1/P2/P3 ALL PASS (25/20/16).
 - 2026-08-15 - **T484 - the repeated-crash scrollback loss is closed as a
   duplicate of T666, with the fix verified green on today's HEAD.** The defect
   (a second restore comes back holding one screen, all older history gone —
