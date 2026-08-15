@@ -527,6 +527,7 @@ pub const ChannelTable = struct {
 // =============================================================================
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 test "InboundRing: single-threaded push/pop round-trip with wrap" {
     const alloc = testing.allocator;
@@ -764,10 +765,15 @@ test "ChannelTable: withChannel delivers to a registered channel; unknown is gra
 const SpscCtx = struct {
     ring: *InboundRing,
     total: usize,
+    /// Set when the producer made no progress for the whole liveness bound —
+    /// the consumer's post-join assert turns that into a red failure instead
+    /// of the unbounded-loop wedge (T498; the T258 shape).
+    timed_out: bool = false,
 };
 
 fn spscProducer(ctx: *SpscCtx) void {
     var produced: usize = 0;
+    var timer = std.time.Timer.start() catch unreachable;
     while (produced < ctx.total) {
         // Pattern byte = low 8 bits of the absolute stream position.
         var chunk: [997]u8 = undefined; // odd size to misalign with capacity
@@ -777,7 +783,16 @@ fn spscProducer(ctx: *SpscCtx) void {
         while (off < want) {
             const n = ctx.ring.push(chunk[off..want]);
             off += n;
-            if (n == 0) std.Thread.yield() catch {};
+            if (n == 0) {
+                // Bounded on STALL, not on total duration: the timer resets on
+                // every successful push, so a slow loaded box cannot spend it —
+                // it fires only when the consumer NEVER drains again.
+                if (timer.read() >= test_util.liveness_ns) {
+                    ctx.timed_out = true;
+                    return;
+                }
+                std.Thread.yield() catch {};
+            } else timer.reset();
         }
         produced += want;
     }
@@ -794,21 +809,41 @@ test "InboundRing: concurrent SPSC streams 4 MiB without loss or corruption" {
     const producer = try std.Thread.spawn(.{}, spscProducer, .{&ctx});
 
     // Consumer runs on this thread: verify every byte matches its stream position.
+    // The wait is bounded on STALL (timer resets on progress): if the producer
+    // never pushes again, break out and fail red after the join, rather than
+    // spinning forever with no failure text (T498; the T258 wedge shape).
     var consumed: usize = 0;
+    var stalled = false;
+    var corrupt = false;
+    var timer = try std.time.Timer.start();
     var dst: [577]u8 = undefined; // odd size, different from producer chunk
     while (consumed < total) {
         const n = ring.pop(&dst);
         if (n == 0) {
+            if (timer.read() >= test_util.liveness_ns) {
+                stalled = true;
+                break;
+            }
             std.Thread.yield() catch {};
             continue;
         }
+        timer.reset();
         for (0..n) |i| {
             const expected: u8 = @truncate(consumed + i);
-            try testing.expectEqual(expected, dst[i]);
+            if (dst[i] != expected) {
+                corrupt = true;
+                break;
+            }
         }
+        if (corrupt) break;
         consumed += n;
     }
+    // Join BEFORE asserting: the producer's own stall bound guarantees it
+    // exits, and an early `try` here would free the ring under a live thread.
     producer.join();
+    try testing.expect(!corrupt);
+    try testing.expect(!stalled);
+    try testing.expect(!ctx.timed_out);
     try testing.expectEqual(total, consumed);
 }
 
@@ -837,19 +872,37 @@ const PaneConsumer = struct {
     // Outputs:
     received: usize = 0,
     corrupt: bool = false,
+    stalled: bool = false,
     resume_edges: usize = 0,
 
     fn run(self: *PaneConsumer) void {
-        if (self.gate) |g| g.wait(); // congested pane: wait before draining
+        if (self.gate) |g| {
+            // Congested pane: wait before draining — bounded, so a producer
+            // that never releases the gate fails the test red instead of
+            // wedging the join (T498; the T258 shape).
+            g.timedWait(test_util.liveness_ns) catch {
+                self.stalled = true;
+                return;
+            };
+        }
 
+        // The drain wait is bounded on STALL (timer resets on progress), so a
+        // slow loaded box cannot spend it — it fires only when the producer
+        // NEVER pushes to this pane again.
+        var timer = std.time.Timer.start() catch unreachable;
         var dst: [8192]u8 = undefined;
         while (self.received < self.quota) {
             const p = self.ch.pop(&dst);
             if (p.read == 0) {
+                if (timer.read() >= test_util.liveness_ns) {
+                    self.stalled = true;
+                    return;
+                }
                 self.waker.event.timedWait(2 * std.time.ns_per_ms) catch {};
                 self.waker.event.reset();
                 continue;
             }
+            timer.reset();
             if (p.send_resume) self.resume_edges += 1;
             // Verify the per-channel byte pattern (continuity == no loss/reorder).
             for (0..p.read) |i| {
@@ -916,7 +969,13 @@ test "stress: 4 channels, one firehose, quiet panes are not HOL-blocked" {
 
     const quotas = [n_channels]usize{ fire_quota, quiet_quota, quiet_quota, quiet_quota };
 
+    // Bounded on STALL like the consumers: if no ring accepts a single byte
+    // for the whole liveness bound, break out and fail red after the joins
+    // instead of spinning forever (T498).
+    var producer_stalled = false;
+    var stall_timer = try std.time.Timer.start();
     while (true) {
+        var any_progress = false;
         var all_done = true;
         for (0..n_channels) |i| {
             const quota = quotas[i];
@@ -931,6 +990,7 @@ test "stress: 4 channels, one firehose, quiet panes are not HOL-blocked" {
                 const res = channels[i].push(chunk);
                 if (res.send_pause) pause_edges += 1;
                 if (res.written > 0) {
+                    any_progress = true;
                     // Shift remainder to the front of the scratch chunk.
                     const rem = pending[i] - res.written;
                     if (rem > 0) {
@@ -959,6 +1019,12 @@ test "stress: 4 channels, one firehose, quiet panes are not HOL-blocked" {
         }
 
         if (all_done) break;
+        if (any_progress) {
+            stall_timer.reset();
+        } else if (stall_timer.read() >= test_util.liveness_ns) {
+            producer_stalled = true;
+            break;
+        }
         // If we couldn't push anything this round (all rings full), yield so the
         // consumers make progress instead of spinning hot.
         std.Thread.yield() catch {};
@@ -973,8 +1039,10 @@ test "stress: 4 channels, one firehose, quiet panes are not HOL-blocked" {
     // Every channel delivered its full quota with an intact byte pattern: proves
     // no loss, no reorder, and — critically — that the quiet panes completed
     // despite the firehose congestion (no cross-pane head-of-line blocking).
+    try testing.expect(!producer_stalled);
     for (&consumers, 0..) |*pc, i| {
         try testing.expect(!pc.corrupt);
+        try testing.expect(!pc.stalled);
         try testing.expectEqual(quotas[i], pc.received);
     }
     // The quiet panes were announced done before the firehose was even allowed to

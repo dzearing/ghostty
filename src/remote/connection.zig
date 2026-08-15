@@ -3661,6 +3661,7 @@ pub const Connection = struct {
 // =============================================================================
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 /// All three encodings, iterated by the transport tests.
 const all_encodings = [_]protocol.TransferEncoding{ .raw, .cobs, .base64 };
@@ -3676,6 +3677,14 @@ const ByteFifo = struct {
     buf: std.ArrayList(u8) = .empty,
     head: usize = 0,
     closed: bool = false,
+    /// When set, `read` on an empty fifo gives up after this long with
+    /// `error.LoopbackReadTimeout` instead of blocking forever. A liveness
+    /// bound like `waitUntil`'s (T346), not a performance assertion: it only
+    /// fires when the awaited bytes NEVER come — the T258 hang, where a test
+    /// wedged ~11 min in this wait with no failure text. Left null on the
+    /// direction the Connection's own reader threads consume, where idling
+    /// between frames is the normal state.
+    read_deadline_ns: ?u64 = null,
     alloc: Allocator,
 
     fn init(alloc: Allocator) ByteFifo {
@@ -3699,8 +3708,17 @@ const ByteFifo = struct {
     fn read(self: *ByteFifo, dst: []u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.head == self.buf.items.len and !self.closed) {
-            self.cond.wait(&self.mutex);
+        if (self.read_deadline_ns) |deadline_ns| {
+            var timer = std.time.Timer.start() catch unreachable;
+            while (self.head == self.buf.items.len and !self.closed) {
+                const elapsed = timer.read();
+                if (elapsed >= deadline_ns) return error.LoopbackReadTimeout;
+                self.cond.timedWait(&self.mutex, deadline_ns - elapsed) catch {};
+            }
+        } else {
+            while (self.head == self.buf.items.len and !self.closed) {
+                self.cond.wait(&self.mutex);
+            }
         }
         const avail = self.buf.items[self.head..];
         if (avail.len == 0) return 0; // closed + drained → EOF
@@ -3733,10 +3751,19 @@ const Loopback = struct {
     agent_to_client: ByteFifo,
 
     fn init(alloc: Allocator) Loopback {
-        return .{
+        var lb: Loopback = .{
             .client_to_agent = ByteFifo.init(alloc),
             .agent_to_client = ByteFifo.init(alloc),
         };
+        // The MockAgent — the TEST side here, the mirror of server.zig's
+        // Loopback where the client is the test side — reads client_to_agent
+        // (`nextFrame`, `expect*` helpers), often from the main test thread.
+        // Bound that direction so a frame that never arrives fails the waiting
+        // test red instead of wedging the lane (T258). The Connection's own
+        // reader threads consume agent_to_client; that stays unbounded (idle
+        // is normal there, and closeBoth wakes it at teardown).
+        lb.client_to_agent.read_deadline_ns = test_util.liveness_ns;
+        return lb;
     }
 
     fn deinit(self: *Loopback) void {
@@ -3788,6 +3815,20 @@ const Loopback = struct {
         self.agent_to_client.close();
     }
 };
+
+test "ByteFifo: a deadlined read fails cleanly instead of wedging (T258 shape)" {
+    var fifo = ByteFifo.init(testing.allocator);
+    defer fifo.deinit();
+    fifo.read_deadline_ns = 50 * std.time.ns_per_ms;
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.LoopbackReadTimeout, fifo.read(&buf));
+    // Data present → returned normally; the deadline is a liveness bound only.
+    _ = try fifo.write("ok");
+    try testing.expectEqual(@as(usize, 2), try fifo.read(&buf));
+    // Closed → EOF (0), never a timeout error.
+    fifo.close();
+    try testing.expectEqual(@as(usize, 0), try fifo.read(&buf));
+}
 
 /// A mock agent's stream-side `protocol.Reader` + writer helpers, sharing the
 /// pinned encoding. Reads frames from a stream blocking until one is available.
@@ -4042,7 +4083,10 @@ fn agentSendDataFramed(
 
 /// How long a test wait may take before it is called a timeout. Generous on
 /// purpose: it is an upper bound on a hang, not a performance assertion.
-const test_wait_ms: u64 = 10_000;
+/// Follows the shared liveness bound (60s): 10s of a liveness bound proved
+/// spendable under acceptance-script load (T183), and a spent bound turns a
+/// green run red for nothing.
+const test_wait_ms: u64 = test_util.liveness_ns / std.time.ns_per_ms;
 
 /// A wall-clock budget for a test that waits on another thread.
 ///
@@ -4052,7 +4096,7 @@ const test_wait_ms: u64 = 10_000;
 /// needed, so a green tree produced `error.Timeout` at random — and a flaky
 /// red run costs more than a real one, because it trains whoever is watching
 /// to shrug at red. A deadline cannot be starved that way, and it says what it
-/// means: "nothing arrived in ten seconds."
+/// means: "nothing arrived within the liveness bound."
 const TestDeadline = struct {
     timer: std.time.Timer,
     budget_ns: u64,
@@ -4490,7 +4534,7 @@ test "control dispatch: agent control frame invokes the handler with payload" {
         _ = try conn.waitHandshake();
 
         // Wait for the handler to fire (deterministic; no sleep-as-sync).
-        sink.done.wait();
+        try test_util.waitEvent(&sink.done);
         ath.join();
         try testing.expect(cctx.err == null);
         try testing.expectEqual(protocol.FrameType.meta, sink.got_type.?);
@@ -4944,7 +4988,7 @@ test "DETACHED steal: client is evicted and the FSM goes DEAD with a notificatio
     hctx.send_detached.store(true, .monotonic);
     // Nudge the agent loop: send a PING so it cycles and emits the DETACHED. We do
     // this by waiting for the agent to flag it sent.
-    hctx.detached_sent.wait();
+    try test_util.waitEvent(&hctx.detached_sent);
 
     // The client must observe eviction and a DEAD link, and the observer must fire.
     try spinUntil(Connection, conn, struct {
@@ -5425,7 +5469,7 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
 
     // The agent received a well-formed OPEN on the pane's channel id.
-    a.saw_request.wait();
+    try test_util.waitEvent(&a.saw_request);
     try testing.expectEqual(pane.id, a.seenChannel());
     // The pane carries the agent-assigned identity (incl. the wp3 tty).
     try testing.expectEqualStrings("session-abc", pane.session_id);
@@ -5453,7 +5497,7 @@ test "EXIT frame: signals the pane's ring so the consumer can close the pane" {
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
-    a.saw_request.wait();
+    try test_util.waitEvent(&a.saw_request);
 
     // Not exited until the agent reports it.
     try testing.expect(!pane.ring.isExited());
@@ -5491,7 +5535,7 @@ test "META foreground_pid: routed to the pane's ring; unknown channel dropped (w
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
-    a.saw_request.wait();
+    try test_util.waitEvent(&a.saw_request);
     try testing.expectEqual(@as(i64, 0), pane.ring.foregroundPid());
 
     // The agent pushes META{foreground_pid} on the session channel when the pty
@@ -5937,7 +5981,7 @@ test "cancelRpcsFor: wakes a parked OPEN promptly with error.Cancelled" {
 
     // Wait until the OPEN is on the wire (the slot is registered before the
     // send), then cancel: flag first, then the slot walk (the required order).
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const t = std.time.milliTimestamp();
     canceller.cancel();
     h.conn.cancelRpcsFor(&canceller);
@@ -6000,7 +6044,7 @@ test "control reader exit fails a parked RPC promptly (no reply can ever arrive)
     // Once the OPEN is on the wire, kill the control lane (models the
     // transport dying mid-RPC). The control reader sees EOF and exits; its
     // exit must fail the parked caller immediately.
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const t = std.time.milliTimestamp();
     h.ctrl_lb.clientStream().close();
     thread.join();
@@ -6078,7 +6122,7 @@ test "writeInput: bytes reach the agent as DATA with monotonic byte_offset" {
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
 
     // Two writes; the agent should see them as DATA with offsets 0 then 5.
     try h.conn.writeInput(pane, "hello");
@@ -6132,7 +6176,7 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     try testing.expectEqual(@as(i64, 4242), pane.pid);
     try testing.expectEqualStrings("/dev/ttys020", pane.tty.?);
 
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const ch = pane.id;
 
     // Frame A: offsets [0,5) — entirely already-applied (< 11) → dropped whole.
@@ -6196,7 +6240,7 @@ test "attachChannel: a resume point AHEAD of the agent's head is clamped, not ar
     try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
     const pane = outcome.pane orelse return error.NoPane;
 
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const ch = pane.id;
 
     // The agent's grid snapshot lands AT its head; live output follows it.
@@ -6241,7 +6285,7 @@ test "attachChannel: fresh attach (offset 0) keeps the FULL gap-fill replay (bla
     try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
     const pane = outcome.pane orelse return error.NoPane;
 
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const ch = pane.id;
 
     // The gap-fill replay ([0,10)) followed by live output ([10,15)): ALL of it
@@ -6291,7 +6335,7 @@ test "attachChannel: dead+relaunchable surfaces relaunchable + the session chann
     try testing.expect(outcome.pane == null);
     // The channel the ATTACHED arrived on is retained so a follow-up RELAUNCH can
     // target the same channel the agent will stream the respawned session on.
-    a.saw_request.wait();
+    try test_util.waitEvent(&a.saw_request);
     try testing.expectEqual(a.seenChannel(), outcome.channel);
     try testing.expect(outcome.channel != 0);
 }
@@ -6635,12 +6679,12 @@ test "closeChannel sends CLOSE and deregisters; later DATA is dropped" {
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const ch = pane.id;
 
     h.conn.closeChannel(pane);
     // The agent must receive a CLOSE frame.
-    h.agent.close_detach_seen.wait();
+    try test_util.waitEvent(&h.agent.close_detach_seen);
     try testing.expect(h.agent.saw_close.load(.monotonic));
     try testing.expect(!h.agent.saw_detach.load(.monotonic));
 
@@ -6658,11 +6702,11 @@ test "detachChannel sends DETACH (not CLOSE) and deregisters" {
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
-    h.agent.saw_request.wait();
+    try test_util.waitEvent(&h.agent.saw_request);
     const ch = pane.id;
 
     h.conn.detachChannel(pane);
-    h.agent.close_detach_seen.wait();
+    try test_util.waitEvent(&h.agent.close_detach_seen);
     try testing.expect(h.agent.saw_detach.load(.monotonic));
     try testing.expect(!h.agent.saw_close.load(.monotonic));
 
@@ -6717,7 +6761,7 @@ test "shutdown unblocks a parked OPEN caller with an error" {
     // Give the OPEN a moment to register its pending slot, then shut down.
     // (No reply will come; shutdown is what unblocks it.)
     conn.shutdown();
-    oc.done.wait();
+    try test_util.waitEvent(&oc.done);
     oth.join();
     try testing.expectError(error.ConnectionClosed, oc.result);
 }

@@ -330,6 +330,7 @@ fn dialConnected(
 // =============================================================================
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 /// A minimal in-process "agent" over ONE accepted socket that mirrors the agent's
 /// `Mux`/`StdioMux` demux rule and answers a HELLO + OPEN→OPENED, then echoes DATA.
@@ -460,17 +461,7 @@ test "dial: stands up a Connection over a real loopback socket, OPEN + DATA roun
     // DATA round-trip: input → agent echo → pane ring.
     try dialed.conn.writeInput(pane, "ping");
     var buf: [64]u8 = undefined;
-    var total: usize = 0;
-    const deadline = std.time.milliTimestamp() + 5000;
-    while (total < "ping".len) {
-        const r = pane.ring.pop(buf[total..]);
-        if (r.read > 0) {
-            total += r.read;
-        } else {
-            if (std.time.milliTimestamp() > deadline) return error.Timeout;
-            std.Thread.yield() catch {};
-        }
-    }
+    const total = try test_util.drainRing(pane.ring, &buf, "ping".len);
     try testing.expectEqualStrings("ping", buf[0..total]);
 
     dialed.conn.closeChannel(pane);
@@ -593,17 +584,7 @@ test "dialUnix: stands up a Connection over a real AF_UNIX socket, OPEN + DATA r
     // DATA round-trip: input → agent echo → pane ring.
     try dialed.conn.writeInput(pane, "ping");
     var buf: [64]u8 = undefined;
-    var total: usize = 0;
-    const deadline = std.time.milliTimestamp() + 5000;
-    while (total < "ping".len) {
-        const r = pane.ring.pop(buf[total..]);
-        if (r.read > 0) {
-            total += r.read;
-        } else {
-            if (std.time.milliTimestamp() > deadline) return error.Timeout;
-            std.Thread.yield() catch {};
-        }
-    }
+    const total = try test_util.drainRing(pane.ring, &buf, "ping".len);
     try testing.expectEqualStrings("ping", buf[0..total]);
 
     dialed.conn.closeChannel(pane);
@@ -652,17 +633,7 @@ test "dialPipe: stands up a Connection over a real named pipe, OPEN + DATA round
     // DATA round-trip: input → agent echo → pane ring.
     try dialed.conn.writeInput(pane, "ping");
     var buf: [64]u8 = undefined;
-    var total: usize = 0;
-    const deadline = std.time.milliTimestamp() + 5000;
-    while (total < "ping".len) {
-        const r = pane.ring.pop(buf[total..]);
-        if (r.read > 0) {
-            total += r.read;
-        } else {
-            if (std.time.milliTimestamp() > deadline) return error.Timeout;
-            std.Thread.yield() catch {};
-        }
-    }
+    const total = try test_util.drainRing(pane.ring, &buf, "ping".len);
     try testing.expectEqualStrings("ping", buf[0..total]);
 
     dialed.conn.closeChannel(pane);

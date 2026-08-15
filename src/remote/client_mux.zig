@@ -307,6 +307,7 @@ const Fifo = struct {
 // =============================================================================
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 // --- An in-memory bidirectional pipe (the single transport) -------------------
 
@@ -317,6 +318,12 @@ const TestFifo = struct {
     buf: std.ArrayList(u8) = .empty,
     head: usize = 0,
     closed: bool = false,
+    /// When set, `read` on an empty fifo gives up after this long with
+    /// `error.LoopbackReadTimeout` instead of blocking forever — the T258
+    /// wedge shape, bounded here the same way as the agent lane's ByteFifo.
+    /// Set only on the direction the TEST HARNESS reads (client→agent); the
+    /// pump side idling between frames is the normal state.
+    read_deadline_ns: ?u64 = null,
     alloc: Allocator,
 
     fn init(alloc: Allocator) TestFifo {
@@ -337,8 +344,17 @@ const TestFifo = struct {
     fn read(self: *TestFifo, dst: []u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.head == self.buf.items.len and !self.closed) {
-            self.cond.wait(&self.mutex);
+        if (self.read_deadline_ns) |deadline_ns| {
+            var timer = std.time.Timer.start() catch unreachable;
+            while (self.head == self.buf.items.len and !self.closed) {
+                const elapsed = timer.read();
+                if (elapsed >= deadline_ns) return error.LoopbackReadTimeout;
+                self.cond.timedWait(&self.mutex, deadline_ns - elapsed) catch {};
+            }
+        } else {
+            while (self.head == self.buf.items.len and !self.closed) {
+                self.cond.wait(&self.mutex);
+            }
         }
         const avail = self.buf.items[self.head..];
         if (avail.len == 0) return 0;
@@ -367,7 +383,13 @@ const Pipe = struct {
     a2c: TestFifo,
 
     fn init(alloc: Allocator) Pipe {
-        return .{ .c2a = TestFifo.init(alloc), .a2c = TestFifo.init(alloc) };
+        var p: Pipe = .{ .c2a = TestFifo.init(alloc), .a2c = TestFifo.init(alloc) };
+        // The mock-agent runner (a test thread) reads c2a; bound that direction
+        // so a frame that never arrives fails the test red instead of wedging
+        // the lane (T258). The pump's a2c reads stay unbounded: idling between
+        // frames is its normal state, and closeBoth wakes it at teardown.
+        p.c2a.read_deadline_ns = test_util.liveness_ns;
+        return p;
     }
     fn deinit(self: *Pipe) void {
         self.c2a.deinit();
@@ -406,6 +428,20 @@ const Pipe = struct {
         self.a2c.close();
     }
 };
+
+test "TestFifo: a deadlined read fails cleanly instead of wedging (T258 shape)" {
+    var fifo = TestFifo.init(testing.allocator);
+    defer fifo.deinit();
+    fifo.read_deadline_ns = 50 * std.time.ns_per_ms;
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.LoopbackReadTimeout, fifo.read(&buf));
+    // Data present → returned normally; the deadline is a liveness bound only.
+    _ = try fifo.write("ok");
+    try testing.expectEqual(@as(usize, 2), try fifo.read(&buf));
+    // Closed → EOF (0), never a timeout error.
+    fifo.close();
+    try testing.expectEqual(@as(usize, 0), try fifo.read(&buf));
+}
 
 /// A mock single-process agent over ONE stream. It mirrors the agent's `StdioMux`
 /// demux EXACTLY (`.data` → data lane, else → control lane) to prove the client
@@ -575,17 +611,7 @@ test "loopback: two logical lanes over ONE transport ↔ StdioMux demux — HELL
 
         // Drain the pane's inbound ring until the agent's echo arrives.
         var got: [64]u8 = undefined;
-        var total: usize = 0;
-        const deadline = std.time.milliTimestamp() + 5000;
-        while (total < "agent-echo".len) {
-            const r = pane.ring.pop(got[total..]);
-            if (r.read > 0) {
-                total += r.read;
-            } else {
-                if (std.time.milliTimestamp() > deadline) return error.Timeout;
-                std.Thread.yield() catch {};
-            }
-        }
+        const total = try test_util.drainRing(pane.ring, &got, "agent-echo".len);
         try testing.expectEqualStrings("agent-echo", got[0..total]);
 
         // The agent saw the client's input on the DATA lane verbatim.

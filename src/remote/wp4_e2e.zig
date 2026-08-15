@@ -239,8 +239,20 @@ fn runLongFreezeExperiment(alloc: Allocator, agent_path: []const u8) !bool {
     diag("[exp] t=0 SIGSTOP\n", .{});
     try std.posix.kill(child.id, std.posix.SIG.STOP);
 
-    // Wait for reconnecting.
-    while (dialed_a.conn.state() != .reconnecting) std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Wait for reconnecting — bounded like every other wait in this harness,
+    // so a missed transition fails the run red instead of wedging it (T498).
+    {
+        const deadline = std.time.milliTimestamp() + 30_000;
+        while (dialed_a.conn.state() != .reconnecting) {
+            if (std.time.milliTimestamp() > deadline) {
+                diag("[exp] FAIL: conn A never hit reconnecting (state={s})\n", .{
+                    @tagName(dialed_a.conn.state()),
+                });
+                return false;
+            }
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    }
     diag("[exp] t={d}ms conn A reconnecting\n", .{std.time.milliTimestamp() - t0});
 
     // The Swift schedule: delays between attempts 1/2/4/8/15s, each dial 10s.
