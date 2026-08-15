@@ -71,3 +71,13 @@ as the digest that showed them.
 - Copy the selection as an image
 - Predictive echo on remote panes
 - Snap groups that survive a restart
+
+## 2026-08-15
+
+- A drop-down terminal on a global hotkey (quake mode)
+- Paste guard for multi-line text
+- Pictures in the terminal (inline-graphics protocol on Windows)
+- A "new build is ready" toast with restart-and-restore
+- Search everything you ever ran (persistent cross-day command history)
+- Safe mode after a crash loop (plain launch: default config, no restore)
+- Locked side-by-side scrolling for two panes
