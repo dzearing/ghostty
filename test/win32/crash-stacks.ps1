@@ -84,15 +84,42 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     '}'
 ) | Set-Content -Path (Join-Path $work 'clean.zig') -Encoding ASCII
 
+# T478's two subjects. A Zig panic ends in `int3`, which cdb owns: with no `bpe`
+# filter the debugger swallowed it and the run was reported as having completed.
+@(
+    'const std = @import("std");',
+    'fn inner() void {',
+    '    @panic("deliberate boom");',
+    '}',
+    'pub fn main() !void {',
+    '    inner();',
+    '}'
+) | Set-Content -Path (Join-Path $work 'panic.zig') -Encoding ASCII
+
+# And the shape no debugger can explain: a nonzero exit with no exception at
+# all. It must not be called clean either.
+@(
+    'const std = @import("std");',
+    'pub fn main() void {',
+    '    std.process.exit(26);',
+    '}'
+) | Set-Content -Path (Join-Path $work 'exit26.zig') -Encoding ASCII
+
 Push-Location $work
 $b1 = & zig build-exe avthread.zig 2>&1
 $b2 = & zig build-exe clean.zig 2>&1
+$b3 = & zig build-exe panic.zig 2>&1
+$b4 = & zig build-exe exit26.zig 2>&1
 Pop-Location
 
 $avExe = Join-Path $work 'avthread.exe'
 $cleanExe = Join-Path $work 'clean.exe'
+$panicExe = Join-Path $work 'panic.exe'
+$exitExe = Join-Path $work 'exit26.exe'
 Check 'the threaded crasher built' (Test-Path $avExe) "$b1"
 Check 'the clean control built' (Test-Path $cleanExe) "$b2"
+Check 'the panicking crasher built' (Test-Path $panicExe) "$b3"
+Check 'the nonzero-exit control built' (Test-Path $exitExe) "$b4"
 Check 'the crasher has a pdb beside it' (Test-Path (Join-Path $work 'avthread.pdb'))
 
 # ------------------------------------- 3. what Zig alone can and cannot show
@@ -199,6 +226,141 @@ Check 'retention drops the transcripts with their dump' `
 Check 'retention never touches a watchdog dump' `
 ((@($watchdogs | Where-Object { Test-Path -LiteralPath $_ })).Count -eq $watchdogs.Count)
 
+# ------------------------------------------ 4c. a Zig panic (T478)
+
+# The regression this section exists for: `crash-catch` was pointed at a test
+# binary that panicked on 10 runs out of 10 and reported "ran clean in 17s" for
+# every one of them. A false negative in a crash detector reads exactly like
+# evidence of a fix.
+if (Test-Path $panicExe) {
+    # Positive control first: the binary really does die, and with the code the
+    # filters were blind to. Without this, a panic that stopped panicking would
+    # make the section below pass for the wrong reason.
+    & $panicExe *> $null
+    Check 'the panic control really does die with STATUS_BREAKPOINT' `
+    ($LASTEXITCODE -eq -2147483645) ("got 0x{0:X8}" -f $LASTEXITCODE)
+
+    $panicDir = Join-Path $work 'dumps-panic'
+    $pOut = & powershell -NoProfile -File (Join-Path $Repo 'scripts\crash-catch.ps1') `
+        -Exe $panicExe -OutDir $panicDir -TimeoutSeconds 120 2>&1
+    $pCode = $LASTEXITCODE
+    $pText = ($pOut | Out-String)
+
+    Check 'catching a Zig panic exits 1' ($pCode -eq 1) "got $pCode"
+    Check 'a Zig panic is NEVER reported as a clean run' `
+    ($pText -notmatch 'ran clean|ran to completion') "tail: $($pText -replace '\s+', ' ')"
+    Check 'the breakpoint exception is named' ($pText -match '0x80000003') "tail: $($pText -replace '\s+', ' ')"
+    Check 'the panic frames carry the panicking function' ($pText -match 'panic!inner')
+    Check 'the panic frames carry source lines' ($pText -match 'panic\.zig @ 3')
+    Check 'a dump is written for a panic' `
+    ((@(Get-ChildItem $panicDir -Filter '*.dmp' -ErrorAction SilentlyContinue)).Count -ge 1)
+}
+
+# ------------------------- 4d. arming `bpe` must not disarm planted breakpoints
+
+# The one risk this change carries: DataBreak.ps1 plants `bp0`/`ba` breakpoints
+# through New-CdbScript's -PrologCommands, and those are int3 too. cdb matches an
+# int3 against its own breakpoint list before it consults the exception filters,
+# so both must still work in the SAME run -- the planted breakpoint's command
+# file runs, and the panic that follows is still captured.
+if ((Test-Path $panicExe) -and $cdb) {
+    $bpDir = Join-Path $work 'dumps-bp'
+    New-Item -ItemType Directory -Path $bpDir -Force | Out-Null
+    $bpScript = Join-Path $bpDir 'bp.cdb'
+    $bpLog = Join-Path $bpDir 'bp.log'
+    New-CdbScript -DumpPath (Join-Path $bpDir 'bp.dmp') `
+        -PrologCommands @('bp0 panic!inner ".echo GHOZTTY-BP-HIT; g"') |
+        Set-Content -LiteralPath $bpScript -Encoding ASCII
+    Check 'the cdb script arms the breakpoint-exception filter' `
+    ((Get-Content -LiteralPath $bpScript -Raw) -match '\bbpe\b')
+
+    $prevSym = $env:_NT_SYMBOL_PATH
+    $env:_NT_SYMBOL_PATH = $work
+    & $cdb -lines -cf $bpScript $panicExe > $bpLog 2>$null
+    $env:_NT_SYMBOL_PATH = $prevSym
+
+    $bpText = (Get-Content -LiteralPath $bpLog -Raw -ErrorAction SilentlyContinue)
+    Check 'a planted breakpoint still fires with bpe armed' `
+    ($bpText -match '(?m)^\s*(?:\d+:\d+>\s*)?GHOZTTY-BP-HIT\s*$') 'the bp0 command file never ran'
+    Check 'the panic is still captured in that same run' `
+    ($bpText -match '(?m)^\s*(?:\d+:\d+>\s*)?GHOZTTY-CRASH-BEGIN\s*$')
+}
+
+# ----------------------- 4e. how a run ENDED, read out of the transcript (T478)
+
+# Unit-level, on synthetic transcripts: these are the branches that decide
+# whether a run is allowed to be called clean, and staging each of them for real
+# would take a program per case.
+function New-FakeLog {
+    param([string]$Name, [string[]]$Body)
+    $p = Join-Path $work $Name
+    $Body | Set-Content -LiteralPath $p -Encoding ASCII
+    return $p
+}
+$okLog = New-FakeLog 'fake-ok.log' @(
+    '0:000> sxe -c ".echo GHOZTTY-CRASH-BEGIN" av; g; .echo GHOZTTY-EXIT-BEGIN; .lastevent; q',
+    'GHOZTTY-EXIT-BEGIN',
+    'Last event: 1a3c.20f0: Exit process 0:1a3c, code 0',
+    'GHOZTTY-EXIT-END'
+)
+$ok = Read-CrashCatchLog -LogPath $okLog
+Check 'a watched exit 0 is clean' ((-not $ok.Crashed) -and (-not $ok.Uncaught) -and $ok.ExitObserved)
+Check 'the debuggee exit code is read out' ($ok.DebuggeeExitCode -eq 0) "got '$($ok.DebuggeeExitCode)'"
+
+$hexLog = New-FakeLog 'fake-hex.log' @(
+    'GHOZTTY-EXIT-BEGIN',
+    'Last event: 1a3c.20f0: Exit process 0:1a3c, code 1a',
+    'GHOZTTY-EXIT-END'
+)
+$hex = Read-CrashCatchLog -LogPath $hexLog
+# cdb prints that code in HEX. Reading it as decimal turns exit 26 into exit 1a
+# and every decode downstream is then wrong about which crash it was.
+Check 'the exit code is read as hex, not decimal' ($hex.DebuggeeExitCode -eq 26) "got '$($hex.DebuggeeExitCode)'"
+Check 'a nonzero exit is UNCAUGHT, never clean' ($hex.Uncaught)
+Check 'the uncaught detail names the code' ($hex.UncaughtDetail -match '0x0000001A') "got '$($hex.UncaughtDetail)'"
+
+$breakLog = New-FakeLog 'fake-break.log' @(
+    'GHOZTTY-EXIT-BEGIN',
+    'Last event: 1a3c.20f0: Break instruction exception - code 80000003 (first chance)',
+    'GHOZTTY-EXIT-END'
+)
+$brk = Read-CrashCatchLog -LogPath $breakLog
+Check 'a break that no filter claimed is UNCAUGHT' ($brk.Uncaught -and -not $brk.ExitObserved)
+Check 'the uncaught detail says the debuggee never exited' ($brk.UncaughtDetail -match 'never exited') "got '$($brk.UncaughtDetail)'"
+
+# cdb killed on timeout leaves a transcript that just stops. That is the least
+# explainable outcome of all, and the one most easily mistaken for a clean run.
+$truncLog = New-FakeLog 'fake-trunc.log' @('ModLoad: 00007ff7`ff790000 panic.exe')
+$trunc = Read-CrashCatchLog -LogPath $truncLog
+Check 'a transcript with no ending at all is UNCAUGHT' ($trunc.Uncaught)
+$missing = Read-CrashCatchLog -LogPath (Join-Path $work 'no-such-transcript.log')
+Check 'a missing transcript is UNCAUGHT' ($missing.Uncaught)
+
+# The decode is EXACT here, because the full 32-bit code survives: the low-byte
+# table CrashDiag uses would otherwise call a plain `exit(5)` an access violation.
+Check 'a real STATUS_BREAKPOINT is decoded by name' `
+((Format-DebuggeeExitCode -Code 0x80000003) -match 'STATUS_BREAKPOINT') "got '$(Format-DebuggeeExitCode -Code 0x80000003)'"
+Check 'an ordinary exit 5 is NOT called an access violation' `
+((Format-DebuggeeExitCode -Code 5) -notmatch 'ACCESS_VIOLATION') "got '$(Format-DebuggeeExitCode -Code 5)'"
+
+# ---------------------- 5-. a nonzero exit with no exception is never "clean"
+
+if (Test-Path $exitExe) {
+    $exitDir = Join-Path $work 'dumps-exit'
+    $eOut = & powershell -NoProfile -File (Join-Path $Repo 'scripts\crash-catch.ps1') `
+        -Exe $exitExe -OutDir $exitDir -TimeoutSeconds 120 2>&1
+    $eCode = $LASTEXITCODE
+    $eText = ($eOut | Out-String)
+    Check 'an unexplained death exits 3' ($eCode -eq 3) "got $eCode"
+    Check 'it is reported as UNCAUGHT with the decoded exit code' `
+    ($eText -match 'UNCAUGHT \(exit 0x0000001A\)') "tail: $($eText -replace '\s+', ' ')"
+    Check 'it is never called a clean run' `
+    ($eText -notmatch 'ran clean|ran to completion') "tail: $($eText -replace '\s+', ' ')"
+    # The transcript is evidence here, unlike on a genuinely clean attempt.
+    Check 'the transcript is kept for an uncaught death' `
+    ((@(Get-ChildItem $exitDir -Filter '*.log' -ErrorAction SilentlyContinue)).Count -ge 1)
+}
+
 # ------------------------------------- 5. a clean run must not invent a crash
 
 if (Test-Path $cleanExe) {
@@ -278,6 +440,16 @@ Check 'floor-lane self-test still passes with the catcher wired in' ($laneText -
 # --------------------------------------------------------------------- cleanup
 
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- stamp (T783 / T478) ---------------------------------------------------
+# A clean green run records the content of every file it covers, so
+# scripts\guard-due.ps1 can answer "has anybody run this harness against the
+# code as it now stands?". Only a CLEAN sweep stamps: a run with a skipped
+# section proved less than the harness claims, and a red run must stay due.
+if ($failures -eq 0 -and -not $script:skipped) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard crash-stacks -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 if ($failures -eq 0) { Write-Host "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })" } else { Write-Host "$failures FAILURE(S)" }
 exit $(if ($failures -eq 0) { 0 } else { 1 })

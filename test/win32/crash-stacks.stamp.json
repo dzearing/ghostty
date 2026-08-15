@@ -1,0 +1,11 @@
+{
+    "guard":  "crash-stacks",
+    "script":  "test/win32/crash-stacks.ps1",
+    "generated":  "2026-08-14T22:23:59-07:00",
+    "commit":  "f5bf2898e",
+    "files":  {
+                  "scripts/crash-catch.ps1":  "b83d1284fcd4ec6ebf8b306f84e31a57f3e8542e9a95339ece82a47d0bef7597",
+                  "scripts/lib/CrashCatch.ps1":  "f72438266e6c23776c9bb96942ac6da69c4c02c9df5ba098fef0ddebb4f3d04b",
+                  "test/win32/crash-stacks.ps1":  "ca64a850cc6b9b7131ec34c742e75bbcf59610aa7a17b60853250338f593f77b"
+              }
+}

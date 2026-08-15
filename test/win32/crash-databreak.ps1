@@ -551,5 +551,15 @@ Check 'the two modes cannot both be asked for' ($LASTEXITCODE -eq 2) "got $LASTE
 
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- stamp (T783 / T478) ---------------------------------------------------
+# This harness has a guard row but never stamped itself, so the only way it
+# could ever go green in `guard-due check` was somebody remembering to run
+# `guard-due update` by hand -- which is the remembering T783 exists to remove.
+# Only a CLEAN run stamps; a red one must stay due.
+if ($failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard crash-databreak -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
+
 if ($failures -eq 0) { Write-Host 'ALL PASS' } else { Write-Host "$failures FAILURE(S)" }
 exit $(if ($failures -eq 0) { 0 } else { 1 })

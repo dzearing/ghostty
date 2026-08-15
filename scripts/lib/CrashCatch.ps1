@@ -43,6 +43,12 @@
        itself and the filters are registered too late to ever fire.
 #>
 
+# The NTSTATUS table lives there, and T478 needs it to say what a nonzero exit
+# code MEANS rather than printing a bare number. Dot-sourcing twice is harmless,
+# and CrashDiag.ps1 dot-sources nothing itself, so there is no cycle to worry
+# about.
+. "$PSScriptRoot\CrashDiag.ps1"
+
 # ------------------------------------------------------------- finding cdb
 
 function Get-CdbPath {
@@ -168,9 +174,26 @@ $script:FATAL_FILTERS = @(
     'sov', # stack overflow         0xC00000FD
     'ii', # illegal instruction    0xC000001D
     'dz', # integer divide by zero 0xC0000094
+    'bpe', # break instruction     0x80000003 -- a ZIG PANIC (T478)
     'c0000374', # heap corruption
     'c0000409'      # stack buffer overrun / __fastfail
 )
+
+# `bpe` deserves its own note, because leaving it out is what made this catcher
+# lie for a month (T478). A Zig panic ends in `int3`, and cdb OWNS int3: with no
+# filter registered for it the debugger consumes the break as its own, the
+# script's `g` has already returned, and the next command in the script (`q`)
+# quits -- so the transcript holds no crash block and the run reads as clean.
+# The T477 test binary died on 10 runs out of 10 and `crash-catch` reported
+# "ran clean in 17s" for every one of them.
+#
+# The cost of arming it is that a program which raises a breakpoint on purpose
+# and handles it would now be stopped. Nothing this repo runs does that, and a
+# first-chance int3 in a process nobody is debugging is fatal by construction
+# (Zig panic, `@breakpoint()`, a CRT assert, `__debugbreak`) -- being told about
+# it is the whole point. Planted breakpoints are unaffected: cdb matches an int3
+# against its own `bp`/`ba` list first, so DataBreak.ps1's `bp0` command files
+# still run (measured, and pinned by test\win32\crash-stacks.ps1).
 
 function New-CdbScript {
     <#
@@ -210,8 +233,48 @@ function New-CdbScript {
     foreach ($c in $PrologCommands) { $cmds += $c }
     foreach ($f in $script:FATAL_FILTERS) { $cmds += ('sxe -c "' + $onCrash + '" ' + $f) }
     $cmds += 'g'
+    # Not `q` on its own (T478). `g` returns for two very different reasons --
+    # the program exited, or something broke that no filter above claimed -- and
+    # the old script could not tell them apart, so both were reported as a clean
+    # run. `.lastevent` names which, and on an exit it carries the debuggee's
+    # REAL exit code ("Exit process 0:1a3c, code 1a", in hex). cdb's own exit
+    # code cannot stand in for it: `q` terminates a still-live debuggee and
+    # returns 0, which is exactly the number that made a panicking binary look
+    # healthy.
+    $cmds += '.echo GHOZTTY-EXIT-BEGIN'
+    $cmds += '.lastevent'
+    $cmds += '.echo GHOZTTY-EXIT-END'
     $cmds += 'q'
     return ($cmds -join '; ')
+}
+
+function Format-DebuggeeExitCode {
+    <#
+    .SYNOPSIS
+        A debuggee exit code as `0xXXXXXXXX`, plus its NTSTATUS name when it is
+        one.
+    .DESCRIPTION
+        The code here is the FULL 32-bit value cdb reported, not the low byte
+        `std.process.Child` truncates it to, so the decode can be exact: a
+        status is named only when the whole value matches. That is what keeps an
+        ordinary `exit(5)` from being announced as an access violation -- the
+        risk CrashDiag's low-byte table carries by design, because through `zig
+        build` the top bits are already gone.
+    #>
+    param([Parameter(Mandatory)][AllowNull()][object]$Code)
+
+    if ($null -eq $Code) { return 'unknown' }
+    # PowerShell 5.1 parses `0x80000003` -- in this call and in CrashDiag's
+    # table -- as a NEGATIVE Int32, and `0xFFFFFFFF` as Int32 -1, so masking
+    # with the literal is a no-op that leaves the sign in place. 4294967295 as a
+    # written-out Int64 is the mask that actually widens both sides.
+    $mask = 4294967295L
+    $v = ([int64]$Code) -band $mask
+    $hex = '0x{0:X8}' -f $v
+    $decoded = @(Get-NtStatusCandidate -Code ([int]($v -band 0xFF)) |
+            Where-Object { ((([int64]$_.Status) -band $mask) -eq $v) })
+    if ($decoded.Count -gt 0) { return "$hex -> $($decoded[0].Name)" }
+    return $hex
 }
 
 function Read-CrashCatchLog {
@@ -222,16 +285,29 @@ function Read-CrashCatchLog {
     param([Parameter(Mandatory)][string]$LogPath)
 
     $res = [pscustomobject]@{
-        Crashed       = $false
-        ExceptionCode = ''
-        ExceptionName = ''
-        FaultSite     = ''
-        ThreadCount   = 0
-        SourceLines   = 0
-        FaultingStack = @()
-        AllStacks     = @()
+        Crashed          = $false
+        ExceptionCode    = ''
+        ExceptionName    = ''
+        FaultSite        = ''
+        ThreadCount      = 0
+        SourceLines      = 0
+        FaultingStack    = @()
+        AllStacks        = @()
+        # T478. "Ran clean" is a POSITIVE observation from here on: it requires
+        # having seen the debuggee exit with code 0. Anything else -- a nonzero
+        # exit, a break nothing claimed, a transcript that stops mid-run because
+        # cdb was killed on timeout -- is Uncaught, and is reported as such.
+        ExitObserved     = $false
+        DebuggeeExitCode = $null
+        LastEvent        = ''
+        Uncaught         = $false
+        UncaughtDetail   = ''
     }
-    if (-not (Test-Path -LiteralPath $LogPath)) { return $res }
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        $res.Uncaught = $true
+        $res.UncaughtDetail = 'no transcript was written'
+        return $res
+    }
     $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue)
     # ANCHORED, and only ever on a line that is nothing but the marker.
     #
@@ -246,13 +322,45 @@ function Read-CrashCatchLog {
         return ($Line -match ('^\s*(?:\d+:\d+>\s*)?' + [regex]::Escape($Marker) + '\s*$'))
     }
     $begin = -1; $faulting = -1; $all = -1; $end = -1
+    $exitBegin = -1; $exitEnd = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($begin -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-CRASH-BEGIN')) { $begin = $i }
         elseif ($faulting -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-FAULTING-THREAD')) { $faulting = $i }
         elseif ($all -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-ALL-THREADS')) { $all = $i }
         elseif ($end -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-CRASH-END')) { $end = $i }
+        elseif ($exitBegin -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-EXIT-BEGIN')) { $exitBegin = $i }
+        elseif ($exitEnd -lt 0 -and (Test-Marker $lines[$i] 'GHOZTTY-EXIT-END')) { $exitEnd = $i }
     }
-    if ($begin -lt 0) { return $res }
+
+    # How the run ENDED, read before the crash block so it is available on the
+    # path that used to return "no crash" unconditionally (T478).
+    if ($exitBegin -ge 0) {
+        $stopAt = if ($exitEnd -gt $exitBegin) { $exitEnd - 1 } else { $lines.Count - 1 }
+        if ($stopAt -ge ($exitBegin + 1)) {
+            $exitText = ($lines[($exitBegin + 1)..$stopAt]) -join "`n"
+            if ($exitText -match 'Last event:\s*(.+)') { $res.LastEvent = $Matches[1].Trim() }
+            # "Exit process 0:1a3c, code 1a" -- both numbers are HEX, which is
+            # cdb's default radix and the difference between exit 26 and exit 1a.
+            if ($exitText -match 'Exit process\s+\S+,\s*code\s+([0-9a-fA-F]+)') {
+                $res.ExitObserved = $true
+                $res.DebuggeeExitCode = [Convert]::ToInt64($Matches[1], 16)
+            }
+        }
+    }
+
+    if ($begin -lt 0) {
+        # No exception was captured. That is only good news if the program was
+        # SEEN to exit 0; every other shape is a death this catcher could not
+        # explain, and saying so is the whole point of the task.
+        if ($res.ExitObserved -and $res.DebuggeeExitCode -eq 0) { return $res }
+        $res.Uncaught = $true
+        $res.UncaughtDetail = if ($res.ExitObserved) {
+            "exit " + (Format-DebuggeeExitCode -Code $res.DebuggeeExitCode)
+        }
+        elseif ($res.LastEvent) { "the debuggee never exited -- last event: $($res.LastEvent)" }
+        else { 'the debugger reported neither an exception nor a process exit' }
+        return $res
+    }
     $res.Crashed = $true
     if ($end -lt 0) { $end = $lines.Count - 1 }
 
@@ -423,26 +531,42 @@ function Invoke-CrashCatch {
 
         $parsed = Read-CrashCatchLog -LogPath $log
         $result = [pscustomobject]@{
-            Crashed       = $parsed.Crashed
-            Attempt       = $a
-            Attempts      = $Attempts
-            ExceptionCode = $parsed.ExceptionCode
-            ExceptionName = $parsed.ExceptionName
-            FaultSite     = $parsed.FaultSite
-            ThreadCount   = $parsed.ThreadCount
-            SourceLines   = $parsed.SourceLines
-            LastTest      = Get-LastProgressLine -Path $errLog
-            DumpPath      = $(if (Test-Path -LiteralPath $dump) { $dump } else { '' })
-            LogPath       = $log
-            ErrLogPath    = $errLog
-            FaultingStack = $parsed.FaultingStack
-            AllStacks     = $parsed.AllStacks
-            ExitCode      = $p.ExitCode
-            Seconds       = $seconds
+            Crashed          = $parsed.Crashed
+            Attempt          = $a
+            Attempts         = $Attempts
+            ExceptionCode    = $parsed.ExceptionCode
+            ExceptionName    = $parsed.ExceptionName
+            FaultSite        = $parsed.FaultSite
+            ThreadCount      = $parsed.ThreadCount
+            SourceLines      = $parsed.SourceLines
+            LastTest         = Get-LastProgressLine -Path $errLog
+            DumpPath         = $(if (Test-Path -LiteralPath $dump) { $dump } else { '' })
+            LogPath          = $log
+            ErrLogPath       = $errLog
+            FaultingStack    = $parsed.FaultingStack
+            AllStacks        = $parsed.AllStacks
+            # cdb's exit code, which is NOT the debuggee's when the debuggee was
+            # still alive at a break: `q` kills it and cdb returns 0 (T478).
+            ExitCode         = $p.ExitCode
+            ExitObserved     = $parsed.ExitObserved
+            DebuggeeExitCode = $parsed.DebuggeeExitCode
+            LastEvent        = $parsed.LastEvent
+            Uncaught         = $parsed.Uncaught
+            UncaughtDetail   = $parsed.UncaughtDetail
+            Seconds          = $seconds
         }
         Remove-Item -LiteralPath $scriptFile -Force -ErrorAction SilentlyContinue
         if ($parsed.Crashed) {
             Remove-OldCrashCapture -OutDir $OutDir -Keep $Keep
+            break
+        }
+        if ($parsed.Uncaught) {
+            # The program died and the debugger could not say why. That is
+            # evidence, not noise: the transcript stays, and re-running would
+            # only paper over it, so the attempt loop stops here exactly as a
+            # caught crash stops it.
+            Remove-OldCrashCapture -OutDir $OutDir -Keep $Keep
+            & $Writer ("crash-catch: attempt $a UNCAUGHT in ${seconds}s -- " + $parsed.UncaughtDetail)
             break
         }
         # Nothing to keep from a clean attempt: no dump was written and the
@@ -473,6 +597,18 @@ function Write-CrashStack {
     if (-not $Result) { return $false }
     if (-not $Result.Crashed) {
         & $Writer "-- crash stack --"
+        if ($Result.Uncaught) {
+            # T478: the sentence that used to be printed here regardless --
+            # "the program ran to completion" -- was the bug. It is now only
+            # ever said about a run that was WATCHED exiting 0.
+            & $Writer ("  UNCAUGHT ({0}) after {1} attempt(s) -- no exception was captured, so nothing here explains it" -f `
+                    $Result.UncaughtDetail, $Result.Attempt)
+            if ($Result.LastTest) { & $Writer ("  running at the time: " + $Result.LastTest) }
+            if ($Result.LogPath -and (Test-Path -LiteralPath $Result.LogPath)) {
+                & $Writer ("  transcript: " + $Result.LogPath)
+            }
+            return $false
+        }
         & $Writer ("  no crash in {0} attempt(s) -- the program ran to completion (exit {1})" -f $Result.Attempts, $Result.ExitCode)
         return $false
     }

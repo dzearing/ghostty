@@ -41,9 +41,12 @@
 
 .OUTPUTS
     A `-- crash stack --` block, and the dump/transcript paths.
-    Exit 0 = ran clean (no crash caught), 1 = a crash was caught and captured,
-    2 = could not run (no cdb, no such exe, nothing built for the lane, no dump
-    to read).
+    Exit 0 = ran clean, and that is now a POSITIVE observation -- the debuggee
+    was watched exiting 0. 1 = a crash was caught and captured. 2 = could not
+    run (no cdb, no such exe, nothing built for the lane, no dump to read).
+    3 = UNCAUGHT (T478): the program did not exit 0 and no exception was
+    captured, so the run is unexplained rather than clean. Exit 3 is the one
+    that stops a panicking binary from being reported as healthy.
 
 .EXAMPLE
     powershell -NoProfile -File scripts\crash-catch.ps1 -Lane agent -Last
@@ -160,6 +163,9 @@ foreach ($t in $targets) {
     # be the -Last switch parameter, and assigning a result object to it throws
     # a transformation error mid-run (caught by crash-stacks.ps1).
     $lastResult = $r
+    # An unexplained death stops the sweep for the same reason a caught crash
+    # does: it is evidence, and running the next binary would bury it.
+    if ($r -and $r.Uncaught) { break }
 }
 
 if ($caught) {
@@ -168,4 +174,5 @@ if ($caught) {
 }
 
 $null = Write-CrashStack -Result $lastResult
+if ($lastResult -and $lastResult.Uncaught) { exit 3 }
 exit 0

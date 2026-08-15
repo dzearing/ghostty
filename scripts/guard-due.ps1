@@ -124,7 +124,28 @@ $GuardTable = @(
         Covers = @(
             'scripts\crash-databreak.ps1',
             'scripts\lib\DataBreak.ps1',
+            # DataBreak plants its breakpoints THROUGH New-CdbScript, so the
+            # filter list and the script's tail are load-bearing here too. T478
+            # armed the breakpoint exception and changed that tail; without this
+            # row nothing would have asked whether a planted bp still fires.
+            'scripts\lib\CrashCatch.ps1',
             'test\win32\crash-databreak.ps1'
+        )
+    },
+    # crash-stacks.ps1 is the acceptance for the catcher ITSELF, and until T478
+    # nothing tied it to the library it tests: the `bpe` blind spot -- a Zig
+    # panic reported as "ran clean" on 10 runs out of 10 -- went a month without
+    # a harness anyone was obliged to run. Overlapping crash-first-chance's
+    # coverage is deliberate; the two prove different halves (this one catches a
+    # crash live, that one reads the dump Windows already wrote).
+    [pscustomobject]@{
+        Name   = 'crash-stacks'
+        Script = 'test\win32\crash-stacks.ps1'
+        Stamp  = 'test\win32\crash-stacks.stamp.json'
+        Covers = @(
+            'scripts\lib\CrashCatch.ps1',
+            'scripts\crash-catch.ps1',
+            'test\win32\crash-stacks.ps1'
         )
     },
     # The banner is the one piece of chrome the user reads all day, and its
