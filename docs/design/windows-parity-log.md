@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T480 - the ProcSampler cpu_pct test is proven load-independent
+  at 32x contention, and it now catches over-reporting too.** Most of the fix
+  predated the task: T346 (099bd6b5c) rewrote the assert proportionally one day
+  after T480's failing 4-in-32 measurement, but the task's own validation (the
+  32x soak) was never run, and the proportional floor had no ceiling - a
+  sampler over-reporting garbage (an inverted unit conversion) would have
+  passed. This turn added the ceiling (the measured CPU burn spread over the
+  inner between-samples window, 2x slack; load only shrinks a correct reading,
+  so it cannot flake busy), then ran the validation: `test-binary-soak.ps1
+  -Mode standalone -Runs 32 -Concurrency 32` - **ProcSampler 0 failures in 32**
+  (pre-fix 4/32), plus 32 sequential build-runner lane runs fail=0 crash=0,
+  plus floor ALL LANES PASS. Surprise worth knowing: `-Concurrency` silently
+  applies only in standalone mode since T832 - the first soak ran sequentially
+  and had to be redone. The 32x soak's 10 red runs were all ONE other test:
+  ViewerPane's host-floor clipboard copy losing the machine-global clipboard
+  race to 31 sibling processes -> filed **T850** (the win32 lane's
+  next-loudest load-only noise source).
 - 2026-08-15 - **T847 - the stranded CLAUDE.md split is landed, and stranding
   itself now has a gate.** The two-day-old uncommitted restructure (CLAUDE.md
   -> a small core + seven docs/claude/ files) was audited (all 33 moved

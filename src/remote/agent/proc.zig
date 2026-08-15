@@ -959,6 +959,7 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
         out1.deinit(alloc);
     }
     _ = try s.sample(alloc, &out1, 0);
+    const t_gap0 = std.time.nanoTimestamp();
 
     // Burn ~300ms of CPU time — CPU time, not wall time: on a loaded box a
     // wall-bounded spin is descheduled for most of its window and burns almost
@@ -984,6 +985,7 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
         for (out2.items) |p| freeProc(alloc, p);
         out2.deinit(alloc);
     }
+    const t_gap1 = std.time.nanoTimestamp();
     _ = try s.sample(alloc, &out2, 0);
     const wall_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
     const burned_ns: u64 = selfCpuNs() -% cpu0;
@@ -1006,6 +1008,20 @@ test "ProcSampler: a genuinely busy thread reports a plausible per-core cpu_pct"
     const expected: f32 = @as(f32, @floatFromInt(burned_ns)) /
         @as(f32, @floatFromInt(wall_ns)) * 100.0;
     try testing.expect(mine.? >= expected / 2.0);
+
+    // And what it must at MOST report (T480): the sampler's busy delta cannot
+    // exceed the whole burn we measured, and its window contains the gap
+    // between the two sample() calls — so the burn spread over that inner
+    // (lower-bound) window is a hard ceiling for a correct reading. Doubled
+    // for skew, it still catches over-reporting garbage (an inverted unit
+    // conversion, a sign error read as huge), which the floor alone lets
+    // through. Load only shrinks a correct reading, so this arm cannot flake
+    // on a busy box.
+    const inner_wall_ns: u64 = @intCast(t_gap1 - t_gap0);
+    try testing.expect(inner_wall_ns > 0);
+    const ceiling: f32 = @as(f32, @floatFromInt(burned_ns)) /
+        @as(f32, @floatFromInt(inner_wall_ns)) * 100.0;
+    try testing.expect(mine.? <= ceiling * 2.0);
 }
 
 test "parseLinuxStat: extracts ppid/comm/utime/stime/tty_nr, comm with spaces+parens" {
