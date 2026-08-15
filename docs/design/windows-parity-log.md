@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T487 - `ghoztty -e cmd` against a running instance now runs
+  the command instead of opening an empty window.** The AlreadyRunning arm in
+  win32 `App.init` forwarded a bare `new-window` with a null payload, so the
+  second launch's parsed `initial-command` and working directory were thrown
+  away with exit 0 and no log line (the T406 silent-drop shape, different code
+  path). `forwardedNewWindowArgs` now rebuilds the verb's argv from the parsed
+  config - `-e` argv as the verb's `-e`, shell-form as `--command=`, resolved
+  cwd as `--working-directory=` (always sent: finalize pins the Windows CLI
+  default to the launch directory per T506, so this matches a first launch and
+  `+new-window`'s implicit cwd). Validated with a NEGATIVE CONTROL: a build
+  with the payload forced back to null fails exactly the new section E's
+  E2/E4 in `gui-launch-command.ps1`; the fix build is ALL PASS A-E, 3 unit
+  tests on the builder, all four lanes + P1-P3 green. Activation parity
+  checked: the handler already foregrounds the new window, matching Mac's
+  LaunchServices behaviour - nothing to file for the Mac seat. Commit
+  8a1698f75.
 - 2026-08-15 - **T486 - the local Restore All has its on-box fixture again,
   and building it uncovered a P1 the suite had no eyes for (T851).** Decision
   first: the button DOES still own a scenario after T194 moved crash recovery
