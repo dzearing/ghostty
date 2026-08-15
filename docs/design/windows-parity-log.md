@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T483 - the reset-context B7 flake is closed as died-with-the-
+  old-delivery-path, and section B can now attribute any recurrence.** The
+  1-in-3 "continuation never arrived" failure was observed 2026-08-05; the
+  delivery it rode on was replaced 08-09/10 (T604/T661/T428 framing), and
+  T664 had already measured the exact failing shape 315 deliveries deep with
+  zero losses. This turn re-proved stability on today's HEAD: **10
+  consecutive `reset-context.ps1` ALL PASS** (runs 1-4 on the old script,
+  5-10 on the hardened one). The hardening: proxy-normal grew an optional
+  out-of-band receipt, section B asserts the oracle is live every run (B2b)
+  and the handoff byte-exact (B7c), and the B7 failure diagnostics print the
+  receipt - so a recurrence self-attributes input-loss vs display-loss
+  instead of reopening the mystery. The harness also joined the T783 guard
+  table (`reset-context` row, self-stamping); teeth verified - the T664
+  break switch turns exactly the five whole-arrival arms red (5 FAILURE(S),
+  49 passed), and `test\win32\guard-due.ps1` is ALL PASS (36).
 - 2026-08-15 - **T480 - the ProcSampler cpu_pct test is proven load-independent
   at 32x contention, and it now catches over-reporting too.** Most of the fix
   predated the task: T346 (099bd6b5c) rewrote the assert proportionally one day
