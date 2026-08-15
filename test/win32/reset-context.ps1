@@ -32,7 +32,10 @@
 #        helper -> the pane receives "nn/clear" verbatim (the filed symptom,
 #        reproduced), the log carries the loud RESET-CONTEXT FAILED block,
 #        a banner tells the user, and the continuation is STILL sent
-#        (liveness beats cleanliness).
+#        (liveness beats cleanliness). Carries a receipt oracle since T483:
+#        this section once flaked with the continuation missing from the
+#        screen, and only an out-of-band receipt can attribute a recurrence
+#        (input never arrived vs the pane lost the echo).
 #   C  a session that clears and then swallows the prompt -> the clear
 #        verifies, the CONTINUATION check fails loudly, banner set.
 #   D  durability: the active plugin cache carries the wipe AND the repaint
@@ -62,12 +65,12 @@
 # in five once put `RC-TEXT[ontinue-marker-B]` on section B's screen - a text
 # run missing its FIRST character - and a basename needle in the middle of the
 # sentence is found either way, so the loss was caught by eye and nothing
-# failed. Receipt sections (E/F/G) compare the whole sentence byte for byte;
+# failed. Receipt sections (B/E/F/G) compare the whole sentence byte for byte;
 # screen sections (A/B) require it to still begin with "Read ", which is the
 # shape that was reported. The same shape is measured on the WIRE, where a
 # truncation can be attributed rather than guessed at, by rounds 13-14 of
 # test\win32\send-keys-bracketed.ps1. Re-run with GHOZTTY_TEST_T664_BREAK=1 to
-# make those four arms go red and nothing else move (their teeth check).
+# make those five arms go red and nothing else move (their teeth check).
 # Only touches ghoztty processes running from this repo's zig-out.
 param([string]$ExePath, [string]$HelperPath)
 $ErrorActionPreference = 'Stop'
@@ -119,7 +122,13 @@ Write-Sh (Join-Path $work 'proxy-normal.sh') @'
 # Composer model: readline editing (C-u = unix-line-discard), the EXACT line
 # "/clear" is a command that clears screen and scrollback, anything else is
 # ordinary text that gets echoed back.
+# $1 (optional): a receipt file every SUBMITTED line is appended to - an
+# oracle OUTSIDE the pane, so a T483-class miss can be attributed: a line in
+# the receipt but not on screen is a display/read-side loss, a line in
+# neither never reached the shell at all.
+R="$1"
 while IFS= read -r -e -p 'rc> ' l; do
+  [ -n "$R" ] && printf '%s\n' "$l" >> "$R"
   if [ "$l" = "/clear" ]; then printf '\033[2J\033[3J\033[H'; echo "RC-CLEARED"
   else echo "RC-TEXT[$l]"; fi
 done
@@ -394,13 +403,25 @@ try {
     Assert (Test-Path $r.cont) 'A9 the cont file survives for the session to read'
 
     # --- B. negative control: the C-u line deleted ------------------------
-    $p2 = New-ProxyWindow 'rc2' 'proxy-normal.sh'
+    # This section carries a receipt oracle (T483): it flaked 1-in-3 on
+    # 2026-08-05 with the continuation missing from the screen, and a screen
+    # read alone cannot say whether the bytes never reached the shell or the
+    # pane lost the echo. T664 then measured the write path byte-exact (315
+    # deliveries, zero losses) and the 08-09/08-10 send-keys overhaul
+    # (T604/T661/T428 framing) replaced the delivery this section flaked on;
+    # if it ever recurs, the receipt is what tells the two apart.
+    $recvB = Join-Path $work 'received-B.txt'
+    $p2 = New-ProxyWindow 'rc2' 'proxy-normal.sh' (To-Unix $recvB)
     & $exe +send-keys --target=$p2 'nn' | Out-Null
     Start-Sleep -Milliseconds 800
     $r = Run-Helper $prefixWin $p2 'continue-marker-B'
     $t2 = Tail $p2
     Assert ($t2.Contains('RC-TEXT[nn/clear]')) 'B1 pre-fix: "nn/clear" arrives as ordinary text (filed symptom)'
     Assert (-not $t2.Contains('RC-CLEARED')) 'B2 pre-fix: the session was never cleared'
+    # The receipt must be proven LIVE in every run, or its silence at a future
+    # B7 failure would read as "input lost" over a receipt that never worked.
+    $gotB = [string](Get-Content $recvB -Raw -ErrorAction SilentlyContinue)
+    Assert ((($gotB -split "`r?`n") -contains 'nn/clear')) 'B2b receipt oracle is live (the failed clear was recorded out-of-band)'
     Assert ($r.log -match 'RESET-CONTEXT FAILED') 'B3 failure is SHOUTED into the log'
     Assert ($r.log -match "still on screen after two submits") 'B4 log names the clear as the failing step'
     Assert ($r.log -match 'pane tail at the time of failure') 'B5 log carries the pane tail as evidence'
@@ -414,6 +435,11 @@ try {
         Write-Host '      B7 diag: helper log ->' -ForegroundColor Yellow
         ($r.log -split "`r?`n") | Where-Object { $_ -match 'continuation|send-keys|typed' } | ForEach-Object { Write-Host "        $_" }
         Write-Host ('      B7 diag: pane tail -> ' + ((Tail $p2) -replace "`r?`n", ' | ')) -ForegroundColor Yellow
+        # The attribution line (T483): sentence in the receipt = the shell got
+        # and submitted it, so the loss is display/read-side; absent = the
+        # bytes never made it through (or were typed and never submitted -
+        # then the pane tail above shows them sitting in the composer).
+        Write-Host ('      B7 diag: receipt -> ' + ((Get-Content $recvB -Raw -ErrorAction SilentlyContinue) -replace "`r?`n", ' | ')) -ForegroundColor Yellow
     }
     Assert $b7 'B7 continuation still sent despite the failure'
     # T664: the section that flaked. A lost leading character left the basename
@@ -424,6 +450,14 @@ try {
     # sentence's own first word, which a dropped leading byte destroys.
     Assert ((Tail $p2).Contains('RC-TEXT[' + $r.sentence.Substring(0, 5))) `
         'B7b the handoff arrived whole, not missing its first character'
+    # The receipt holds the submitted LINE, so B gets the same byte-for-byte
+    # equality arm the receipt sections have - `Contains` on the screen can
+    # never see a dropped leading byte (T664), but the receipt can.
+    $gotB = ''
+    for ($t = 0; $t -lt 25 -and -not (($gotB -split "`r?`n") -contains $r.sentence); $t++) {
+        $gotB = [string](Get-Content $recvB -Raw -ErrorAction SilentlyContinue); Start-Sleep -Milliseconds 200
+    }
+    Assert ((($gotB -split "`r?`n") -contains $r.sentence)) 'B7c and the receipt holds it byte for byte (T664)'
 
     # --- C. cleared, then the prompt was eaten ----------------------------
     $p3 = New-ProxyWindow 'rc3' 'proxy-amnesia.sh'
@@ -540,6 +574,17 @@ try {
     foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5', 'rc6', 'rc7')) { & $exe +close --target=$w 2>$null | Out-Null }
     Start-Sleep -Milliseconds 500
     Kill-RepoInstances
+}
+
+# --- stamp (T783) ---------------------------------------------------------
+# A green run RECORDS the content of every file it covers, so
+# scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". Stamped only on a CLEAN sweep: a run with skipped
+# sections proved less than the whole harness claims. A red run leaves the
+# stamp alone on purpose - red must stay due.
+if ($script:fail -eq 0 -and -not $script:skipped) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard reset-context -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''

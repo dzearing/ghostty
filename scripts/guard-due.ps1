@@ -167,6 +167,20 @@ $GuardTable = @(
             'src\apprt\win32\BannerDialog.zig',
             'test\win32\pane-banner.ps1'
         )
+    },
+    # The loop's own continuation mechanism, and a harness with a history of
+    # crying wolf (T483): its section B once flaked 1-in-3, so an edit to it
+    # that nobody re-runs is exactly the "trusted from memory" gap T783 closes.
+    # The helper it tests lives in the plugin cache OUTSIDE this repo, so the
+    # row can only cover the script itself - the D-section arms are what tie
+    # the cache copy to its source repo.
+    [pscustomobject]@{
+        Name   = 'reset-context'
+        Script = 'test\win32\reset-context.ps1'
+        Stamp  = 'test\win32\reset-context.stamp.json'
+        Covers = @(
+            'test\win32\reset-context.ps1'
+        )
     }
 )
 
