@@ -85,15 +85,69 @@
     They self-expire on a deadline as well as being killed at the end, so an
     interrupted soak cannot leave the box loaded.
 
+    -LoadKind chooses WHAT the workers do; see it for the compile-shaped load,
+    which is the shape the sightings actually had.
+
+.PARAMETER LoadKind
+    What each load worker does. The default `cpu` is the spin+allocate body
+    described under -LoadWorkers. The other two run a REAL COMMAND in a loop,
+    because CPU load is not the condition T443 was ever seen in:
+
+      build   - each worker loops a cold `zig build` of a test lane, so the box
+                carries compiler processes, page faults, disk and heap-manager
+                traffic, not just cycles. Every sighting arrived while another
+                compile+test lane was running; 16 spin workers cost the measured
+                lane only ~13% wall clock (192s -> 217s) and produced 0 crashes
+                in 8 runs (T443 turn 6), which is why this exists. Each worker
+                gets a PRIVATE local cache and prefix (the build manifest and
+                its locks are the hazard) and shares the already-populated
+                global package cache, so it compiles this repo's source rather
+                than rebuilding freetype on every pass.
+      command - each worker loops the command line given by -LoadCommand.
+
+    Both write one line per completed iteration, and the count lands in the
+    summary: a load claim nobody measured is exactly what T832 had to unwind.
+
+.PARAMETER LoadCommand
+    The command line a `command`-kind worker loops. Giving it implies
+    -LoadKind command.
+
+    A load command MUST NOT share the measured lane's zig cache. A second
+    `zig build` in this repo takes the same cache manifest locks, so it can
+    stall -- or be stalled by -- the lane whose timing is being measured, and a
+    wedged lane is not a data point (T401). A `zig build` load command without
+    an explicit `--cache-dir` is therefore refused rather than run; `-LoadKind
+    build` composes the isolated form for you.
+
+.PARAMETER LoadWorkDir
+    Scratch root for command/build workers: one `w<N>` directory each, holding
+    the generated worker script, its log, its iteration file and (build kind)
+    its private zig cache. Defaults to a directory on the REPO'S DRIVE, because
+    zig 0.15.2 asserts when a global cache lives on a different drive than the
+    build's cwd (T243). Private build caches are removed when the soak ends;
+    logs are kept.
+
+.PARAMETER LoadDryRun
+    Compose the load, print what each worker would run, and exit without
+    starting a worker or a round. For checking an isolation flag before
+    spending an hour of soak on it.
+
 .OUTPUTS
     A per-run table and a final one-line summary:
         SOAK <label>: mode=M runs=N pass=P fail=F crash=C  crash-rate=C/N (xx%)
-    In build-runner mode the summary also carries `load=N`, because a run
-    count that does not name its condition is what T832 had to throw away.
+    In build-runner mode the summary also carries `load=N:<kind>` and, for a
+    command-shaped load, `load-iters=N` -- because a run count that does not
+    name its condition is what T832 had to throw away, and a load nobody
+    measured is a condition nobody can check.
     Exit 0 = no crashes, 1 = at least one crash, 2 = could not run.
 
 .EXAMPLE
     powershell -NoProfile -File scripts\test-binary-soak.ps1 -Lane agent -Runs 10
+.EXAMPLE
+    # The condition every T443 sighting was actually in: the agent lane
+    # measured while two isolated `zig build test` loops churn the box.
+    powershell -NoProfile -File scripts\test-binary-soak.ps1 -Lane agent -Runs 10 `
+        -LoadWorkers 2 -LoadKind build -Label T443-compileload
 .EXAMPLE
     powershell -NoProfile -File scripts\test-binary-soak.ps1 -Exe .\zig-out\bin\x.exe -Runs 10
 #>
@@ -113,6 +167,10 @@ param(
     [int]$Runs = 10,
     [ValidateRange(1, 64)][int]$Concurrency = 1,
     [ValidateRange(0, 64)][int]$LoadWorkers = 0,
+    [ValidateSet('cpu', 'build', 'command')][string]$LoadKind = 'cpu',
+    [string]$LoadCommand = '',
+    [string]$LoadWorkDir = '',
+    [switch]$LoadDryRun,
     [string]$Label = '',
     [int]$TimeoutSeconds = 900,
     [string]$OutDir = "$env:TEMP\ghoztty-soak",
@@ -147,9 +205,45 @@ $laneName = if ($LaneCommand) { 'command' } else { $Lane }
 # Load is a build-runner instrument. Standalone already has -Concurrency for
 # oversubscription, and it is the condition T443 has never occurred in, so
 # loading it harder measures nothing new.
-if ($LoadWorkers -gt 0 -and $mode -eq 'standalone') {
+if (($LoadWorkers -gt 0 -or $LoadCommand -or $LoadKind -ne 'cpu') -and $mode -eq 'standalone') {
     Write-Host 'soak: -LoadWorkers is build-runner only (standalone has -Concurrency); ignoring it.'
     $LoadWorkers = 0
+    $LoadKind = 'cpu'
+    $LoadCommand = ''
+}
+
+# ------------------------------------------------------------ what the load IS
+#
+# The load knob started as CPU spinners, which is the one shape T443 has been
+# measured NOT to reproduce under (0 crashes in 8 loaded runs, against 5 in 26
+# unloaded-but-busy ones the same morning). Every sighting had another COMPILE
+# AND TEST LANE on the box, so the load has to be able to take a command's
+# shape, not just a CPU's.
+if ($LoadCommand -and $LoadKind -eq 'cpu') { $LoadKind = 'command' }
+if ($LoadKind -eq 'command' -and -not $LoadCommand) {
+    Write-Host 'soak: -LoadKind command needs -LoadCommand "<command line>".'
+    exit 2
+}
+if ($LoadKind -ne 'cpu' -and $LoadWorkers -eq 0) {
+    # A command-shaped load with no workers is a silent no-op; one is the
+    # shape the sightings had anyway (one other lane, not sixteen).
+    $LoadWorkers = 1
+}
+# A second `zig build` in this repo shares the measured lane's cache manifest
+# locks, so it can stall the very thing being timed -- and a wedged lane is not
+# a data point (T401). The load must be discardable; the lane must not be.
+if ($LoadKind -eq 'command' -and $LoadCommand -match 'zig\s+build' -and $LoadCommand -notmatch '--cache-dir') {
+    Write-Host 'soak: a `zig build` load command must pass its own --cache-dir (and --global-cache-dir),'
+    Write-Host '      or it takes the cache locks of the lane being measured and can wedge it (T401).'
+    Write-Host '      Use -LoadKind build, which composes the isolated command per worker.'
+    exit 2
+}
+
+# Private caches must sit on the REPO'S drive: zig 0.15.2 cannot make a cache
+# path on one drive relative to a cwd on another and asserts instead (T243).
+if (-not $LoadWorkDir) {
+    $qual = Split-Path -Qualifier $Repo -ErrorAction SilentlyContinue
+    $LoadWorkDir = if ($qual) { Join-Path ($qual + '\') 'ghoztty-soak-load' } else { Join-Path $OutDir 'load' }
 }
 
 $targets = @()
@@ -389,11 +483,131 @@ function Start-SoakLoadWorkers {
     return , $procs
 }
 
+# What a command/build worker would run, per worker index. Build kind composes
+# a FULLY ISOLATED zig build: its own local cache, global cache and prefix, so
+# it shares no lock and no output with the lane being measured.
+function Get-SoakLoadWorkerSpec {
+    param([string]$Kind, [int]$Index, [string]$WorkDir, [string]$Repo, [string]$Command)
+    $dir = Join-Path $WorkDir ("w{0}" -f $Index)
+    $cache = Join-Path $dir 'zig-cache'
+    if ($Kind -eq 'build') {
+        # A DIFFERENT lane than the one usually measured, and a real one: the
+        # point is a compiler and a test binary on the box, not a no-op. The
+        # local cache is wiped each iteration (below) or the second iteration
+        # is a cache hit and the load quietly stops being a load.
+        #
+        # LOCAL cache private, GLOBAL cache shared, deliberately. The local
+        # cache is where the build manifest and its locks live -- that is the
+        # hazard, and it is isolated. The global cache is a content-addressed
+        # store of fetched packages that is already populated, so sharing it
+        # means the worker compiles OUR source (the shape the sightings had)
+        # instead of rebuilding freetype and harfbuzz from scratch on every
+        # iteration, which is slower, noisier, and not the load being asked for.
+        $glob = if ($env:ZIG_GLOBAL_CACHE_DIR) { $env:ZIG_GLOBAL_CACHE_DIR }
+        else {
+            $q = Split-Path -Qualifier $Repo -ErrorAction SilentlyContinue
+            if ($q) { Join-Path ($q + '\') 'zig-global-cache' } else { '' }
+        }
+        $cmd = 'zig build test -Dapp-runtime=none' +
+        ' --cache-dir "' + $cache + '"'
+        if ($glob) { $cmd += ' --global-cache-dir "' + $glob + '"' }
+        $cmd += ' --prefix "' + (Join-Path $dir 'zig-out') + '"'
+    }
+    else { $cmd = $Command; $cache = '' }
+    return [pscustomobject]@{
+        Index = $Index; Dir = $dir; Command = $cmd; WipeCache = $cache
+        Script = (Join-Path $dir 'worker.ps1'); Log = (Join-Path $dir 'worker.log')
+        Iter = (Join-Path $dir 'iterations.txt')
+    }
+}
+
+# Loop a real command until the deadline. Written to a FILE and launched with
+# -File rather than assembled as a -Command one-liner: a build command carries
+# quoted paths, and re-quoting those through two layers is the exact trap that
+# has bitten this repo repeatedly (T200).
+function Start-SoakCommandWorkers {
+    param([int]$Count, [int]$Seconds, [string]$PsExe, [string]$Kind,
+        [string]$WorkDir, [string]$Repo, [string]$Command, [int]$FirstIndex = 0)
+    $deadline = (Get-Date).AddSeconds($Seconds).ToString('o')
+    $procs = @()
+    for ($w = 0; $w -lt $Count; $w++) {
+        $spec = Get-SoakLoadWorkerSpec -Kind $Kind -Index ($FirstIndex + $w) -WorkDir $WorkDir -Repo $Repo -Command $Command
+        New-Item -ItemType Directory -Force -Path $spec.Dir | Out-Null
+        $body = @(
+            '$ErrorActionPreference = ''Continue''',
+            ('$deadline = [datetime]''' + $deadline + ''''),
+            ('$wipe = ''' + $spec.WipeCache + ''''),
+            ('$cmd = ''' + ($spec.Command -replace "'", "''") + ''''),
+            ('$log = ''' + $spec.Log + ''''),
+            ('$iter = ''' + $spec.Iter + ''''),
+            ('Set-Location -LiteralPath ''' + $Repo + ''''),
+            'while ((Get-Date) -lt $deadline) {',
+            '    if ($wipe) { Remove-Item -LiteralPath $wipe -Recurse -Force -ErrorAction SilentlyContinue }',
+            # STARTED is written before the command, not only DONE after it: a
+            # build-kind iteration can legitimately outlive the whole soak, and
+            # a load measured only by completions would report the heaviest
+            # load available as no load at all.
+            '    Add-Content -LiteralPath $iter -Value ((Get-Date).ToString(''o'') + " start")',
+            '    $sw = [System.Diagnostics.Stopwatch]::StartNew()',
+            '    & $env:ComSpec /c $cmd *>> $log',
+            '    $sw.Stop()',
+            '    Add-Content -LiteralPath $iter -Value ((Get-Date).ToString(''o'') + " exit=$LASTEXITCODE $([int]$sw.Elapsed.TotalSeconds)s")',
+            '}'
+        ) -join "`r`n"
+        Set-Content -LiteralPath $spec.Script -Value $body -Encoding ASCII
+        try {
+            $p = Start-Process -FilePath $PsExe `
+                -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $spec.Script + '"') `
+                -WorkingDirectory $Repo -PassThru -WindowStyle Hidden
+            # PS 5.1: cache .Handle before the child can exit (the T473 trap).
+            $null = $p.Handle
+            $procs += $p
+        }
+        catch {}
+    }
+    return , $procs
+}
+
+# Started and completed iterations, so `load=2:build` can be read with the work
+# it actually did behind it rather than as a claim -- and so a build whose
+# single iteration outlasts the soak (the normal case for the heaviest load
+# this script offers) is not mistaken for no load at all.
+function Get-SoakLoadIterations {
+    param([string]$WorkDir, [int]$Count)
+    $started = 0
+    $done = 0
+    for ($w = 0; $w -lt $Count; $w++) {
+        $f = Join-Path (Join-Path $WorkDir ("w{0}" -f $w)) 'iterations.txt'
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        foreach ($line in @(Get-Content -LiteralPath $f -ErrorAction SilentlyContinue)) {
+            if ($line -match '\bstart$') { $started++ }
+            elseif ($line -match '\bexit=') { $done++ }
+        }
+    }
+    return [pscustomobject]@{ Started = $started; Completed = $done }
+}
+
+# Kill the worker AND anything it launched. A command worker's zig build is a
+# grandchild, and killing only the worker orphans a compiler that then loads
+# the box for the NEXT soak -- which would corrupt the very measurement this
+# knob exists to make.
 function Stop-SoakLoadWorkers {
     param($Procs)
     foreach ($p in @($Procs)) {
-        try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+        try { if (-not $p.HasExited) { Stop-SoakProcessTree -Id $p.Id } } catch {}
     }
+}
+
+function Stop-SoakProcessTree {
+    param([int]$Id, [int]$Depth = 0)
+    if ($Depth -gt 6) { return }
+    $kids = @()
+    try {
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$Id" -ErrorAction SilentlyContinue)
+    }
+    catch {}
+    foreach ($k in $kids) { Stop-SoakProcessTree -Id ([int]$k.ProcessId) -Depth ($Depth + 1) }
+    try { Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 function Get-SoakLoadAlive {
@@ -429,8 +643,56 @@ if ($mode -eq 'build-runner') {
     # the build as well as the test run.
     $loadProcs = @()
     $loadDeadline = [math]::Min(14400, ($Runs * $roundTimeout) + 600)
+
+    # One worker per slot index, so a top-up restarts the SLOT (same directory,
+    # same private cache, same iteration file) rather than growing a new one.
+    function Start-SoakLoadSlot {
+        param([int]$Index)
+        if ($LoadKind -eq 'cpu') {
+            return @(Start-SoakLoadWorkers -Count 1 -Seconds $loadDeadline -PsExe $psExe)
+        }
+        return @(Start-SoakCommandWorkers -Count 1 -FirstIndex $Index -Seconds $loadDeadline `
+                -PsExe $psExe -Kind $LoadKind -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand)
+    }
+
+    if ($LoadKind -ne 'cpu') {
+        Write-Host "      load kind=$LoadKind, scratch: $LoadWorkDir"
+        for ($w = 0; $w -lt [math]::Max(1, $LoadWorkers); $w++) {
+            $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
+            Write-Host "      worker $w runs: $($spec.Command)"
+            if ($w -eq 0 -and $LoadWorkers -gt 1 -and $LoadKind -eq 'command') {
+                Write-Host "      (all $LoadWorkers workers run the same command)"
+                break
+            }
+        }
+    }
+    if ($LoadDryRun) {
+        if ($LoadKind -eq 'cpu') {
+            Write-Host "      load kind=cpu: $LoadWorkers spin+allocate worker(s), no command"
+        }
+        Write-Host ''
+        Write-Host "soak: -LoadDryRun -- composed the load and started nothing. No rounds run."
+        exit 0
+    }
+
     if ($LoadWorkers -gt 0) {
-        $loadProcs = Start-SoakLoadWorkers -Count $LoadWorkers -Seconds $loadDeadline -PsExe $psExe
+        # This soak's count must be THIS soak's: a slot directory is reused
+        # across runs (and by a top-up), so a leftover iteration file would
+        # credit today's load with yesterday's work.
+        if ($LoadKind -ne 'cpu') {
+            for ($w = 0; $w -lt $LoadWorkers; $w++) {
+                $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
+                foreach ($f in @($spec.Iter, $spec.Log)) {
+                    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        }
+        $loadSlots = @()
+        for ($w = 0; $w -lt $LoadWorkers; $w++) {
+            $procs = @(Start-SoakLoadSlot -Index $w)
+            foreach ($p in $procs) { $loadSlots += [pscustomobject]@{ Index = $w; Proc = $p } }
+        }
+        $loadProcs = @($loadSlots | ForEach-Object { $_.Proc })
         Write-Host ("      -LoadWorkers ${LoadWorkers}: " +
             "$(Get-SoakLoadAlive $loadProcs) worker(s) holding the box busy")
     }
@@ -438,12 +700,18 @@ if ($mode -eq 'build-runner') {
     for ($i = 1; $i -le $Runs; $i++) {
         # A worker that died (or hit its own deadline) would quietly turn a
         # loaded soak into a quiesced one halfway through, and the summary
-        # would still claim the load. Top up instead.
+        # would still claim the load. Top up instead -- by slot, so a command
+        # worker comes back on its own directory and its iteration count keeps
+        # accumulating.
         if ($LoadWorkers -gt 0) {
-            $short = $LoadWorkers - (Get-SoakLoadAlive $loadProcs)
-            if ($short -gt 0) {
-                $loadProcs += Start-SoakLoadWorkers -Count $short -Seconds $loadDeadline -PsExe $psExe
+            foreach ($slot in @($loadSlots)) {
+                $dead = $false
+                try { $dead = $slot.Proc.HasExited } catch { $dead = $true }
+                if (-not $dead) { continue }
+                $again = @(Start-SoakLoadSlot -Index $slot.Index)
+                if ($again.Count -gt 0) { $slot.Proc = $again[0] }
             }
+            $loadProcs = @($loadSlots | ForEach-Object { $_.Proc })
         }
 
         $log = Join-Path $OutDir ("{0}-{1}-{2:d2}.log" -f $tag, $stamp, $i)
@@ -550,8 +818,43 @@ if ($mode -eq 'build-runner') {
     if ($LoadWorkers -gt 0) {
         $loadAliveEnd = Get-SoakLoadAlive $loadProcs
         Stop-SoakLoadWorkers $loadProcs
+        if ($LoadKind -ne 'cpu') {
+            $it = Get-SoakLoadIterations -WorkDir $LoadWorkDir -Count $LoadWorkers
+            $loadIters = $it.Completed
+            $loadStarted = $it.Started
+        }
         Write-Host ''
-        Write-Host "  load: $LoadWorkers worker(s) requested, $loadAliveEnd still running at the end"
+        $loadLine = "  load: $LoadWorkers worker(s) requested, $loadAliveEnd still running at the end"
+        if ($LoadKind -ne 'cpu') { $loadLine += ", $loadIters iteration(s) completed of $loadStarted started" }
+        Write-Host $loadLine
+        # A worker that never STARTED an iteration is a load that was not
+        # applied -- say so, rather than let a green soak imply a condition it
+        # never had. The T832 lesson, applied to the knob instead of the mode.
+        # A worker that started one and is still in it is the OPPOSITE case: a
+        # cold `zig build` of a whole lane routinely outlasts the soak, and
+        # counting only completions would report the heaviest load on offer as
+        # none at all.
+        if ($LoadKind -ne 'cpu' -and $loadStarted -eq 0) {
+            Write-Host "  load: WARNING no worker even started an iteration -- this soak was effectively UNLOADED."
+            Write-Host "        check $LoadWorkDir\w0\worker.log"
+        }
+        elseif ($LoadKind -ne 'cpu' -and $loadIters -eq 0) {
+            Write-Host "  load: 0 completed, $loadStarted in flight at the end -- the load ran throughout and"
+            Write-Host "        no iteration finished inside the soak, which is normal for -LoadKind build."
+        }
+        # The private build caches are multi-gigabyte and belong to nobody; the
+        # logs and iteration files stay, because they are the evidence.
+        if ($LoadKind -eq 'build') {
+            for ($w = 0; $w -lt $LoadWorkers; $w++) {
+                $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
+                foreach ($d in @($spec.WipeCache, (Join-Path $spec.Dir 'zig-out'))) {
+                    if (Test-Path -LiteralPath $d) {
+                        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            Write-Host "  load: private build caches under $LoadWorkDir removed; worker logs kept"
+        }
     }
 }
 
@@ -564,7 +867,15 @@ $summary = "SOAK {0}: mode={7} runs={1} concurrency={6} pass={2} fail={3} crash=
 if ($totals.hang -gt 0) { $summary += "  hang=$($totals.hang)" }
 # The condition, in the line that gets pasted into a task file. A soak number
 # that does not name its condition is the mistake T832 had to unwind.
-if ($mode -eq 'build-runner') { $summary += "  load=$LoadWorkers" }
+if ($mode -eq 'build-runner') {
+    $summary += "  load=$LoadWorkers"
+    # The KIND is part of the condition: 16 CPU spinners and 1 concurrent
+    # compile are not the same box, and T443 has a measured 0/8 under the
+    # first. A pasted `load=16` that does not say which is the ambiguity T832
+    # had to unwind, one level down.
+    if ($LoadWorkers -gt 0) { $summary += ":$LoadKind" }
+    if ($LoadKind -ne 'cpu' -and $LoadWorkers -gt 0) { $summary += " load-iters=$loadIters started=$loadStarted" }
+}
 Write-Host $summary
 if ($mode -eq 'standalone' -and $warnStandalone) {
     Write-Host '  NOTE: standalone -- see the warning above; this says nothing about T443 (T832).'

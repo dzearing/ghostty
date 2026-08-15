@@ -165,6 +165,107 @@ $r = Invoke-Soak @{ LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'brnoload' 
 Check 'an unloaded build-runner soak still says load=0' ($r.Text -match 'SOAK brnoload:.*load=0') `
     ($r.Text -replace '\s+', ' ')
 
+# ------------------------------ 3c. command-shaped load (T840)
+#
+# -LoadWorkers holds CPU spinners, and T443 turn 6 measured what that is worth:
+# 16 of them cost the lane ~13% wall clock and produced 0 crashes in 8 runs.
+# Every sighting instead had another COMPILE AND TEST LANE on the box. So the
+# load has to be able to take a command's shape -- and the two things that can
+# silently ruin such a soak are a load that never actually ran, and a load that
+# wedges the lane it is supposed to be timing. Both are asserted here.
+
+$loadWork = Join-Path $work 'load'
+
+# One iteration of this fixture is instant, so a one-round soak completes
+# several -- the count is the evidence the load was applied at all.
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'cmdload'; LoadWorkers = 2
+    LoadCommand = 'cmd /c exit 0'; LoadWorkDir = $loadWork
+}
+Check '-LoadCommand implies a command-shaped load' `
+($r.Text -match 'load kind=command') ($r.Text -replace '\s+', ' ')
+Check 'the summary names the load KIND, not just the worker count' `
+($r.Text -match 'SOAK cmdload:.*load=2:command') ($r.Text -replace '\s+', ' ')
+$iters = if ($r.Text -match 'load-iters=(\d+)') { [int]$matches[1] } else { -1 }
+Check 'the iterations the load completed are MEASURED and reported' ($iters -gt 0) `
+    "load-iters=$iters"
+Check 'the same count is in the end-of-soak load line' `
+($r.Text -match 'load: 2 worker\(s\) requested, .* iteration\(s\) completed of \d+ started') `
+    ($r.Text -replace '\s+', ' ')
+Check 'a command-loaded soak still classifies its rounds' ($r.Text -match 'pass=1 fail=0 crash=0') `
+    ($r.Text -replace '\s+', ' ')
+Check 'each worker got its own scratch directory' `
+((Test-Path (Join-Path $loadWork 'w0\worker.ps1')) -and (Test-Path (Join-Path $loadWork 'w1\worker.ps1')))
+
+# An iteration that outlives the soak is the NORMAL case for the heaviest load
+# on offer -- a cold `zig build` of a whole lane takes longer than the round it
+# is loading. So the measurement counts started as well as completed, and a
+# started-but-unfinished iteration must read as load applied, not as no load.
+# The same fixture leaves a long-running GRANDCHILD alive at kill time, which is
+# the other half: killing the worker alone orphans the compiler onto the next
+# soak's box.
+$pingTag = '-n 45 127.0.0.1'
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'cmdslow'; LoadWorkers = 1
+    LoadCommand = "cmd /c ping $pingTag > nul"; LoadWorkDir = $loadWork
+}
+$strays = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*$pingTag*" }).Count
+Check 'an iteration still in flight reads as load applied, not as an unloaded soak' `
+($r.Text -match '0 completed, 1 in flight at the end' -and -not ($r.Text -match 'effectively UNLOADED')) `
+    ($r.Text -replace '\s+', ' ')
+Check 'the summary carries both numbers, so load-iters=0 is not ambiguous' `
+($r.Text -match 'load-iters=0 started=1') ($r.Text -replace '\s+', ' ')
+Check 'a worker GRANDCHILD is killed with the worker (no orphaned load on the next soak)' `
+($strays -eq 0) "$strays ping(s) left running"
+
+# The other end of the same measurement: a load that could not start at all
+# must not leave a green soak implying a condition it never had.
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'cmddead'; LoadWorkers = 1
+    LoadCommand = 'cmd /c exit 0'; LoadWorkDir = 'Q:\no-such-drive\soak'
+}
+Check 'a load that never started is called out as an UNLOADED soak' `
+($r.Text -match 'WARNING no worker even started an iteration' -and $r.Text -match 'effectively UNLOADED') `
+    ($r.Text -replace '\s+', ' ')
+Check 'the worker log is named so the failure is findable' ($r.Text -match 'worker\.log') `
+    ($r.Text -replace '\s+', ' ')
+
+# The cache-lock hazard: a second `zig build` in this repo takes the same
+# manifest locks as the lane being measured, and a wedged lane is not a data
+# point (T401).
+$r = Invoke-Soak @{ LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'cachelock'; LoadCommand = 'zig build test' }
+Check 'a zig build load command with no --cache-dir is refused, not run' `
+($r.Code -eq 2 -and $r.Text -match 'must pass its own --cache-dir') "got $($r.Code): $($r.Text)"
+Check 'the refusal points at the mode that composes the isolated form' ($r.Text -match '-LoadKind build')
+
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'cacheok'; LoadDryRun = $true
+    LoadCommand = 'zig build test --cache-dir D:\somewhere-else'; LoadWorkDir = $loadWork
+}
+Check 'an isolated zig build load command is accepted' ($r.Code -eq 0) "got $($r.Code): $($r.Text)"
+
+# -LoadKind build composes that isolation itself, per worker, and the private
+# caches must land on the REPO'S drive (zig asserts across drives -- T243).
+$r = Invoke-Soak @{ LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'buildkind'; LoadWorkers = 2; LoadKind = 'build'; LoadDryRun = $true }
+$drive = Split-Path -Qualifier $Repo
+Check '-LoadKind build composes a real zig build per worker' `
+($r.Text -match 'worker 0 runs: zig build test' -and $r.Text -match 'worker 1 runs: zig build test') `
+    ($r.Text -replace '\s+', ' ')
+Check 'each build worker gets its own local cache and prefix (the manifest lock is the hazard)' `
+($r.Text -match '--cache-dir "[^"]*w0[^"]*"' -and $r.Text -match '--prefix "[^"]*w0[^"]*"') `
+    ($r.Text -replace '\s+', ' ')
+Check 'the populated global package cache is SHARED, so the load compiles this repo rather than freetype' `
+($r.Text -match '--global-cache-dir "[^"]*"' -and -not ($r.Text -match '--global-cache-dir "[^"]*w0[^"]*"')) `
+    ($r.Text -replace '\s+', ' ')
+Check 'worker 0 and worker 1 do not share a cache directory' `
+($r.Text -match '--cache-dir "[^"]*w1[^"]*"') ($r.Text -replace '\s+', ' ')
+Check 'the private caches default to the repo drive (zig asserts across drives)' `
+($r.Text -match ('--cache-dir "' + [regex]::Escape($drive) + '\\')) ($r.Text -replace '\s+', ' ')
+Check '-LoadDryRun starts nothing and runs no rounds' `
+($r.Code -eq 0 -and $r.Text -match 'started nothing' -and -not ($r.Text -match 'run  1/1')) `
+    ($r.Text -replace '\s+', ' ')
+
 # ------------------------------- 4. standalone still works, and admits what it is
 
 # A lane-shaped NAME is what turns the warning on: a fixture exe has no build
@@ -190,6 +291,17 @@ Check 'standalone says it is ignoring -LoadWorkers rather than loading a conditi
 ($r.Text -match 'LoadWorkers is build-runner only') ($r.Text -replace '\s+', ' ')
 Check 'standalone carries no load= claim in its summary' (-not ($r.Text -match 'SOAK saload:.*load=')) `
     ($r.Text -replace '\s+', ' ')
+
+# The command-shaped load is build-runner only for the same reason: standalone
+# is the condition T443 cannot occur in, so loading it harder measures nothing.
+$r = Invoke-Soak @{
+    Exe = $fake; Arguments = @('-NoProfile', '-Command', 'exit 0'); Runs = 1; Label = 'sacmdload'
+    LoadCommand = 'cmd /c exit 0'; LoadWorkDir = (Join-Path $work 'load-sa')
+}
+Check 'standalone refuses a command-shaped load too, and says so' `
+($r.Text -match 'LoadWorkers is build-runner only') ($r.Text -replace '\s+', ' ')
+Check 'standalone starts no load workers when one was asked for' `
+(-not (Test-Path (Join-Path $work 'load-sa\w0\worker.ps1'))) 'a worker script was written'
 
 $r = Invoke-Soak @{ Exe = $fake; Arguments = @('-NoProfile', '-Command', 'exit 5'); Runs = 1; Label = 'sacrash' }
 Check 'standalone still classifies a fatal NTSTATUS as CRASH' `
