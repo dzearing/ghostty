@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T510 - a silent remote endpoint can no longer wedge a
+  dialling thread forever: the relay dial's TLS + WebSocket-upgrade phase now
+  times out.** The T328 wedge suspect is settled: it was the unbounded
+  upgrade/TLS recv in `ws_client.connect` (the HELLO was already bounded by
+  WP-D1, and `Dialed.deinit` is join-only with forced exits - reasoning now
+  recorded on its doc comment). Fix: `socket_rw.setIoTimeout` arms
+  SO_RCVTIMEO+SO_SNDTIMEO for the handshake phase (default 15s, cleared the
+  moment the upgrade completes so idle established connections stay open;
+  WSAETIMEDOUT/EAGAIN map to ConnectionTimedOut on both platforms). Every
+  `connectUrl` caller - chooser roster, +new-remote-window, Restore All, the
+  agent's own relay links - inherits the bound with no changes. Tested with
+  silent-accept endpoints at three levels (socket_rw / ws_client /
+  relay_dial), each bounded at 500ms deadlines. Verified: floor 4/4,
+  chooser-sessions-remote ALL PASS (20) + NegativeControl (13), P1-P3 green.
+  Filed T859 (roster retry-on-fresh-dial is now safe to reintroduce).
+  Commit 75ac7fefb.
 - 2026-08-15 - **T508 - the "concurrent savers never error" promise now
   holds under load: the atomic-write rename out-waits Defender's scan
   hold.** The soak flake was root-caused with instrumentation, not guessed:
