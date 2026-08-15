@@ -51,3 +51,11 @@ macos/google-client-id.txt
 
 # Backfill drafts (raw GitHub bodies to curate from; not shipped)
 release-notes/.drafts/
+
+# Debug PNGs the sprite-face unit test (src/font/sprite/Face.zig) writes into
+# the test runner's cwd; generated on every win32 test-lane run, never source.
+sprite_face_test-*.png
+
+# MSYS tools drop these next to the cwd when they crash (e.g. grep -F
+# aborting under Git Bash on this box); never source.
+*.stackdump

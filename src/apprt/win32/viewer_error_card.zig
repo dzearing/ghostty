@@ -26,7 +26,7 @@
 const std = @import("std");
 
 /// Gap between the card and the pane edges, DIP. The same 12 as
-/// `banner_card.MARGIN` and the viewer TOC card, deliberately: CLAUDE.md's
+/// `banner_card.MARGIN` and the viewer TOC card, deliberately: docs/claude/viewers.md's
 /// "margins are one number" rule is what makes a card in one pane line up with
 /// a card in the pane next door.
 pub const MARGIN_DIP: f32 = 12;

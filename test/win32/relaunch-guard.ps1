@@ -149,7 +149,7 @@ $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
 $savedSocket = $env:GHOZTTY_IPC_SOCKET
 # A private endpoint so nothing here can reach the user's terminal. The suffix
 # OUTRANKS the baked GHOZTTY_IPC_SOCKET this script inherits from the pane it
-# was started in (CLAUDE.md, Instance addressability) - but clear the baked
+# was started in (docs/claude/cli.md, Instance addressability) - but clear the baked
 # value too, so nothing downstream can prefer it.
 $env:GHOZTTY_PIPE_SUFFIX = "-t421-$PID"
 Remove-Item env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue

@@ -2770,7 +2770,7 @@ fn unattendedRefreshActive(self: *App) bool {
 ///
 /// The DECISION is `agent_upgrade.decide` (pure, unit-tested); this function is
 /// only its mechanism. Idle ⇒ restart silently (logged, never invisible). Live
-/// sessions ⇒ the mandatory confirmation CLAUDE.md requires, never a silent
+/// sessions ⇒ the mandatory confirmation docs/claude/sessions.md requires, never a silent
 /// reset; a decline defers to the next idle moment and is not re-asked this run.
 pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     if (!self.config.@"session-persistence") return;
@@ -2978,7 +2978,7 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
 /// connection to ask. This is the case where there is no connection *because*
 /// the agent is stale — the handshake is where it failed — and until now the app
 /// simply gave up: no dialog, no explanation, session persistence quietly off
-/// for the rest of the run. CLAUDE.md's agent contract requires the opposite,
+/// for the rest of the run. docs/claude/sessions.md's agent contract requires the opposite,
 /// that an incompatible skew take the mandatory-update path.
 ///
 /// The DECISION is `agent_upgrade.evaluateSkew` (pure, unit-tested); everything

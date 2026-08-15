@@ -1782,7 +1782,7 @@ fn buildNode(
         .leaf => |pane| {
             // A viewer leaf reports the Mac's additive `type`/`url` shape and
             // none of the terminal fields — it has no shell, no pwd, and no
-            // banner (CLAUDE.md: `+list` marks viewer panes with a `view:`
+            // banner (docs/claude/cli.md: `+list` marks viewer panes with a `view:`
             // prefix; JSON `"type": "viewer"` plus `"url"`).
             const surface = pane.surface() orelse {
                 const vid = try arena.dupe(u8, pane.paneId());

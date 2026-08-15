@@ -140,7 +140,7 @@ pub const Heading = struct {
 };
 
 /// A passage the selection toolbar's Quote button sent up, with the
-/// referential context that lets an agent find it again (CLAUDE.md's
+/// referential context that lets an agent find it again (docs/claude/viewers.md's
 /// "Worktree feedback capture"). Empty strings and negative offsets arrive as
 /// null, the same normalization `handleQuoteMessage` does on Mac.
 pub const Quote = struct {

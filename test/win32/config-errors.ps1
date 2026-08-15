@@ -223,7 +223,7 @@ try {
     # T137 - the documented switch spellings are ACCEPTED, and a value that is
     # genuinely not a boolean is REPORTED rather than swallowed.
     #
-    # `session-persistence = off` is what CLAUDE.md and the tracker tell a user
+    # `session-persistence = off` is what docs/claude/sessions.md and the tracker tell a user
     # to write. It used to be error.InvalidValue, and because a bad value for a
     # known key is a diagnostic rather than a fatal error, the setting silently
     # stayed at its default `true` - the exact opposite of the request. Two

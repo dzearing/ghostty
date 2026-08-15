@@ -1,4 +1,4 @@
-# Pane-identity acceptance (tracker T113): win32 honors CLAUDE.md's "Pane
+# Pane-identity acceptance (tracker T113): win32 honors docs/claude/cli.md's "Pane
 # identity" contract.
 #
 # The contract: every pane has a stable, ghoztty-owned UUID that is

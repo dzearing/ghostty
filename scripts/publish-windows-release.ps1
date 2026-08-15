@@ -132,7 +132,7 @@ if (-not $SkipBuild) {
     # The default install also produces zig-out\bin\ghoztty-agent.exe on
     # Windows (T89h); -Dagent-semver stamps its VERSIONINFO with the release
     # semver so Explorer/Details matches the tag. -Dstrip=false keeps the
-    # shipped build's crash dumps debuggable (CLAUDE.md); the CI path in
+    # shipped build's crash dumps debuggable (docs/claude/build.md); the CI path in
     # build-release-artifacts.sh passes the same set.
     zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast `
         -Dstrip=false `

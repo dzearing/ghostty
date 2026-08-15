@@ -1,5 +1,5 @@
 //! Which git working tree a viewer pane's content belongs to (T633, the win32
-//! half of CLAUDE.md's "Worktree feedback capture"; Mac's
+//! half of docs/claude/viewers.md's "Worktree feedback capture"; Mac's
 //! `ViewerWorktreeResolver` + `ViewerWorktreeCache` in `ViewerWorktree.swift`).
 //!
 //! "Worktree" here means any git working tree — a linked worktree AND a main

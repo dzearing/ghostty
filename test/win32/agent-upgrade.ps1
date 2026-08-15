@@ -2,7 +2,7 @@
 #
 # The defect: the upgrade script deliberately swaps ghoztty-agent.exe WITHOUT
 # killing the running agent (T89h) - killing it is the silent session reset
-# CLAUDE.md's "Agent contract & upgrade compatibility" section forbids. But
+# docs/claude/sessions.md's "Agent contract & upgrade compatibility" section forbids. But
 # nothing then ever ADOPTED the new binary, so an agent-side fix reached the
 # user only after a reboot. The app now compares the running agent's HELLO build
 # stamp against the one it ships beside, and refreshes at the two safe moments -

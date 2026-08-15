@@ -1,5 +1,5 @@
 # T25 conformance (spec S8 items 1-7): the "definition of replica" checklist
-# run end-to-end from a fresh app start, including the CLAUDE.md three-pane
+# run end-to-end from a fresh app start, including the docs/claude/cli.md three-pane
 # example. Items 8-10 are covered by dedicated runs recorded in spec S9:
 # item 8 hero-mode.ps1, item 9 ipc-relay.ps1 (fake-relay E2E; live Mac dial
 # is a Mac-seat step), item 10 the skill flows (T17) which this script
@@ -7,7 +7,7 @@
 #
 # Windows substitutions (documented in spec S8 evidence): nvim -> Git Bash
 # vim, zsh -> powershell, tail -> Git Bash tail. Git's usr\bin is prepended
-# to PATH so the CLAUDE.md commands resolve verbatim inside panes.
+# to PATH so the docs/claude/cli.md commands resolve verbatim inside panes.
 #
 #   powershell -NoProfile -File test\win32\conformance.ps1
 param(
@@ -79,7 +79,7 @@ Assert "exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 1
 Assert "still exactly one ide" (([regex]::Matches((Get-List), '\[target: ide\]')).Count -eq 1)
 
-"== S8.2: three-pane CLAUDE.md layout (term shell, logs tail -f)"
+"== S8.2: three-pane docs/claude/cli.md layout (term shell, logs tail -f)"
 Set-Content -Path (Join-Path $work 'app.log') -Value 'CONF-SEED' -Encoding Ascii
 & $Exe +split --target=ide --name=term --direction=down --command=powershell 2>&1 | Out-Null
 Assert "term split exit 0" ($LASTEXITCODE -eq 0)
@@ -149,7 +149,7 @@ $osc = "powershell -NoProfile -Command `"[console]::Write([char]27+']7777;idle'+
 Start-Sleep -Seconds 6
 Assert "OSC idle clears" (-not ((Get-IdeTitle) -match '\(needs_input\)'))
 
-"== S8.6: +rename / +rearrange / +list per CLAUDE.md"
+"== S8.6: +rename / +rearrange / +list per docs/claude/cli.md"
 & $Exe +rename --target=ide --title=CONF-OVERRIDE 2>&1 | Out-Null
 Assert "rename exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 1

@@ -752,7 +752,7 @@ final class LocalAgentManager {
     /// layout restore finished with no live panes, or the last persistent pane
     /// just closed. Idle (`liveSessionCount == 0`) ⇒ restart silently — nothing
     /// to lose — logged + a subtle notice. Live sessions ⇒ NEVER silent: a
-    /// mandatory confirmation before any destructive restart (CLAUDE.md's "never
+    /// mandatory confirmation before any destructive restart (docs/claude/sessions.md's "never
     /// silently reset live sessions"). No-op when the agent is already current,
     /// the bundled build is unknown, or there is no shared connection.
     @MainActor
@@ -1072,7 +1072,7 @@ final class LocalAgentManager {
         // The stable config changed, or the job isn't loaded. We must get the new
         // plist into launchd — but NEVER by booting out a LIVE agent (FIX 1a): a
         // bootout kills the agent's children, which come back as dead tombstones
-        // (the past "everything came back tombstoned" upgrades). Per CLAUDE.md's
+        // (the past "everything came back tombstoned" upgrades). Per docs/claude/sessions.md's
         // mandated lazy / non-destructive upgrade, if the recorded agent is still
         // alive we leave it — and its sessions — untouched. The new plist is
         // already on disk, so the NEXT cold start (reboot, agent crash → KeepAlive

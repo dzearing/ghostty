@@ -153,10 +153,10 @@ if (Test-Path $Exe) {
 # ============================================================================
 # The trap is reachable by anyone who builds without that flag, so the note
 # belongs next to the build command, not only in the guard that catches it.
-$claudeMd = Get-Content -LiteralPath (Join-Path $Repo 'CLAUDE.md') -Raw
+$buildDoc = Get-Content -LiteralPath (Join-Path $Repo 'docs\claude\build.md') -Raw
 $goMd = Get-Content -LiteralPath (Join-Path $Repo 'go.md') -Raw
-Assert "G1 CLAUDE.md says Debug is about endpoint isolation" ($claudeMd -match 'endpoint isolation')
-Assert "G2 CLAUDE.md points at this script" ($claudeMd -match 'build-mode-guard\.ps1')
+Assert "G1 docs/claude/build.md says Debug is about endpoint isolation" ($buildDoc -match 'endpoint isolation')
+Assert "G2 docs/claude/build.md points at this script" ($buildDoc -match 'build-mode-guard\.ps1')
 Assert "G3 go.md carries the same warning" ($goMd -match 'endpoint isolation')
 
 ""

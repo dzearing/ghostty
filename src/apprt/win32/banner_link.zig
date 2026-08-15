@@ -12,7 +12,7 @@
 //! default app for a path. That is Mac's scheme with `Cmd` → `Ctrl`, which is
 //! the standing translation rule for this port.
 //!
-//! A URL leaves by default for the reason CLAUDE.md records: the viewer's
+//! A URL leaves by default for the reason docs/claude/cli.md records: the viewer's
 //! WebView2 keeps its own cookie store with no relationship to Edge or
 //! Chrome, so anything behind a login renders logged-out in a viewer pane and
 //! an OAuth sign-in never completes. A file is only *revealed*, never opened,

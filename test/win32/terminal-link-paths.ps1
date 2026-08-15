@@ -82,7 +82,7 @@ function Get-ActiveSurface {
 # first: without it the rows above are whatever the shell's startup printed.
 #
 # The command goes through `--keys-file=`, not as a positional argument, for
-# the reason CLAUDE.md gives: a positional is checked for key notation and
+# the reason docs/claude/cli.md gives: a positional is checked for key notation and
 # then for escape sequences, and `Q:\Users\...` is full of backslashes that
 # are not escapes it knows. The first draft of this script sent it as a
 # positional and the pane received `Q:UsersDavidclip.mp4` - three assertions

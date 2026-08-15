@@ -103,7 +103,7 @@ $ndjson = '{"id":"aaa","alive":true}' + "`r`n" + '{"id":"bbb","alive":true}'
 AssertEq "A1 pretty array yields both session ids" 2 (Get-GhozttySessionIds $prettyArray).Count
 AssertEq "A2 pretty array yields the right first id" '59777171fd211b995a94f16163ad83e0' `
     (Get-GhozttySessionIds $prettyArray)[0]
-AssertEq "A3 NDJSON still parses (the shape CLAUDE.md documents)" 2 (Get-GhozttySessionIds $ndjson).Count
+AssertEq "A3 NDJSON still parses (the shape docs/claude/cli.md documents)" 2 (Get-GhozttySessionIds $ndjson).Count
 AssertEq "A4 a leading warning line does not defeat the parse" 2 `
     (Get-GhozttySessionIds ("warning: something`r`n" + $prettyArray)).Count
 AssertEq "A5 empty output yields no sessions" 0 (Get-GhozttySessionIds '').Count

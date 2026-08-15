@@ -1,6 +1,6 @@
 //! Stable, ghoztty-owned pane identity for the win32 apprt (T113).
 //!
-//! CLAUDE.md's "Pane identity" section is a cross-platform contract: every
+//! docs/claude/cli.md's "Pane identity" section is a cross-platform contract: every
 //! pane has a stable UUID that is exported to the pane's processes as
 //! `$GHOZTTY_PANE_ID`, reported as the `+list --json` leaf `id`, and accepted
 //! directly by every `--target`/`--name` (case-insensitive) with no prior
@@ -85,7 +85,7 @@ pub fn isValid(s: []const u8) bool {
     return true;
 }
 
-/// Case-insensitive pane-id equality. CLAUDE.md promises `--target` accepts
+/// Case-insensitive pane-id equality. docs/claude/cli.md promises `--target` accepts
 /// the id "case-insensitive", and a shell that round-trips the value through
 /// a lowercasing pipeline must still resolve.
 pub fn eql(a: []const u8, b: []const u8) bool {

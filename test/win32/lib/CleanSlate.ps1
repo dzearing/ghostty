@@ -68,7 +68,7 @@ $script:CleanSlateRepo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Pat
 function Get-GhozttyAgentPath {
     <#
     .SYNOPSIS
-    The agent that belongs to $Exe: its required sibling (CLAUDE.md).
+    The agent that belongs to $Exe: its required sibling (docs/claude/build.md).
     #>
     param([Parameter(Mandatory = $true)][string]$Exe)
     Join-Path (Split-Path -Parent $Exe) 'ghoztty-agent.exe'

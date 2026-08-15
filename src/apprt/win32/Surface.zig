@@ -66,7 +66,7 @@ app: *App,
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
 
-/// This pane's stable, ghoztty-owned identity (T113): the CLAUDE.md "Pane
+/// This pane's stable, ghoztty-owned identity (T113): the docs/claude/cli.md "Pane
 /// identity" UUID, exported to the pane's processes as `$GHOZTTY_PANE_ID`,
 /// reported as the `+list --json` leaf `id`, and accepted directly by every
 /// `--target`/`--name`. Filled by `init` — either generated fresh or taken

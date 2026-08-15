@@ -228,7 +228,7 @@ pane_id: pane_id_mod.Buf = undefined,
 /// freed in `deinit`.
 title: ?[:0]u8 = null,
 
-/// Where this pane currently IS. CLAUDE.md: `+list --json`'s `url` reports
+/// Where this pane currently IS. docs/claude/viewers.md: `+list --json`'s `url` reports
 /// the current location, not the one the pane was opened with. Owned.
 location: ?[:0]u8 = null,
 
@@ -543,7 +543,7 @@ toc_mode: toc_layout.Mode = .hidden,
 
 /// Whether the compact overlay is toggled open. Deliberately EPHEMERAL — it
 /// must not survive a session restore, because restoring an overlay would
-/// hide the content it covers (CLAUDE.md's viewer contract).
+/// hide the content it covers (docs/claude/viewers.md's viewer contract).
 toc_open: bool = false,
 
 /// The shared card-width preference, DIP. 0 = not loaded yet; read from
@@ -958,7 +958,7 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
 ///
 /// Called on EVERY location change rather than once at construction: a pane
 /// moves between a file, a dev server and a remote site over its life, and each
-/// is a different worktree or none (CLAUDE.md's provenance rule). A resolution
+/// is a different worktree or none (docs/claude/viewers.md's provenance rule). A resolution
 /// that is already cached lands synchronously here; anything else arrives later
 /// on `WM_APP_VIEWER_WORKTREE`.
 fn refreshWorktree(self: *ViewerPane) void {
@@ -1367,7 +1367,7 @@ const location_cap = 4096;
 ///
 /// The FIRST location is also the pane's home — where the nav bar's Home
 /// button returns to, kept separately from where the user has since navigated
-/// (CLAUDE.md's viewer contract, and P12's manifest fields). Later navigations
+/// (docs/claude/viewers.md's viewer contract, and P12's manifest fields). Later navigations
 /// move `location` only.
 ///
 /// Safe before there is a controller: the pane is the one holding this truth,
@@ -2085,7 +2085,7 @@ fn adoptPopup(
     defer req.release();
 
     // A popup that named no URL is the blank page its script writes into, which
-    // is exactly what `--view=about:blank` opens (CLAUDE.md's blank browser
+    // is exactly what `--view=about:blank` opens (docs/claude/viewers.md's blank browser
     // pane). Naming it here rather than leaving the location empty is what
     // gives the pane a title and an address before WebView2 navigates it.
     const location = if (uri) |u| u else content.blank_page;

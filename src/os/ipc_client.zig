@@ -231,7 +231,7 @@ pub const Conn = struct {
 /// Environment variable naming the IPC endpoint of the app instance that owns
 /// the calling process's pane, baked into every pane's environment by the app
 /// that created it. See `apprt.ipc.socket_env` (which aliases this constant so
-/// there is exactly one spelling) and CLAUDE.md "Instance addressability".
+/// there is exactly one spelling) and docs/claude/cli.md "Instance addressability".
 ///
 /// T118: the same name is used on Windows even though the value there is a
 /// PIPE NAME (`\\.\pipe\ghoztty[-debug]-<user>`), not a socket path. One

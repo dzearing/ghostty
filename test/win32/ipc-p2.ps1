@@ -65,7 +65,7 @@ $transcript = Join-Path $env:TEMP 'ghoztty-ipc-p2-last.log'
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
-"== 1: three-pane layout by name (CLAUDE.md example shape)"
+"== 1: three-pane layout by name (docs/claude/cli.md example shape)"
 & $Exe +new-window --target=p2ide 2>&1 | Out-Null
 # Cold-launch guard first (T379); the settle sleep after it stays, because the
 # later +send-keys sections need the pane's shell up, not just the window row.

@@ -3,7 +3,7 @@
 //!
 //! The `ghoztty-agent` outlives the app on purpose: the upgrade script swaps
 //! `ghoztty-agent.exe` on disk WITHOUT killing the running agent (T89h), because
-//! killing it is exactly the silent session reset CLAUDE.md's "Agent contract &
+//! killing it is exactly the silent session reset docs/claude/sessions.md's "Agent contract &
 //! upgrade compatibility" section forbids. The consequence is the defect this
 //! module exists to close: the app never compares the RUNNING agent's build to
 //! the one it now ships beside, so an agent-side fix reaches the user only after
@@ -217,7 +217,7 @@ pub fn applyDeferral(d: Decision, deferred: bool) Decision {
 ///
 /// `evaluate` above answers "is the running agent an older BUILD?". This answers
 /// the question it deliberately did not: "did the handshake fail because the two
-/// ends speak DIFFERENT PROTOCOLS?" CLAUDE.md's agent contract requires that on
+/// ends speak DIFFERENT PROTOCOLS?" the agent contract (docs/claude/sessions.md) requires that on
 /// an incompatible skew the app must not replay across it and must take the
 /// mandatory-update path instead — which, on Windows, means this decision.
 ///

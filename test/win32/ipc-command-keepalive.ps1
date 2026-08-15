@@ -1,6 +1,6 @@
 # T468 acceptance: a `--command=` pane must land at a LIVE shell.
 #
-# CLAUDE.md's `--shell` table is the contract: "the shell stays alive after the
+# docs/claude/cli.md's `--shell` table is the contract: "the shell stays alive after the
 # command in every case" - `cmd /K`, `pwsh -NoExit -Command`, and for a posix
 # shell `-lic "<cmd>; exec <shell> -li"`. What actually happened was
 #
@@ -8,7 +8,7 @@
 #     Process exited. Press any key to close the terminal.
 #
 # and a pane `+send-keys` could not drive at all, which is every documented
-# `--command=` workflow (CLAUDE.md's own three-pane example makes three dead
+# `--command=` workflow (docs/claude/cli.md's own three-pane example makes three dead
 # panes) and the reason `conformance.ps1` S8.5 failed.
 #
 # The cause was NOT the wrap table, which was correct and unit-tested. It was

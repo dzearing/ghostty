@@ -37,7 +37,7 @@ pub const card_max_dip: f32 = 460.0;
 /// The one outer margin. The card floats this far inside every edge, and the
 /// document leaves the same margin on all four of its own — which is what
 /// makes a TOC card and a banner in the pane next door line up at their
-/// corners (CLAUDE.md: "Margins are one number"). Tied to the banner card's
+/// corners (docs/claude/viewers.md: "Margins are one number"). Tied to the banner card's
 /// margin BY IDENTITY, not by a copied 12: if either moved alone the corners
 /// would stop lining up, so there is exactly one number to move.
 pub const margin_dip: f32 = banner_card.MARGIN;

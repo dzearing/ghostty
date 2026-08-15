@@ -910,7 +910,7 @@ pub const BannerOverlay = struct {
 
     /// Replace every non-space token wider than `max_w` with a run of
     /// sub-tokens that each fit, so a long unbroken string breaks
-    /// mid-string instead of overflowing its column (T123 / CLAUDE.md:
+    /// mid-string instead of overflowing its column (T123 / docs/claude/cli.md:
     /// "even a long unbroken token breaks mid-string"). Returns `tokens`
     /// untouched — no allocation — when nothing is too wide, which is the
     /// overwhelmingly common case.

@@ -90,7 +90,7 @@ function Test-LoopProcAlive {
 # Parse whatever `ghoztty +sessions --json` printed into session objects.
 #
 # The upgrade script used to read this line-by-line, expecting one JSON object
-# per line (which is what CLAUDE.md describes). The command actually prints a
+# per line (which is what docs/claude/cli.md describes). The command actually prints a
 # pretty-printed ARRAY, so every line failed to parse and the pre-kill probe
 # reported "0 sessions" on a box with four live ones - which is why the
 # sessions-survive assert had been silently skipping since T89h.

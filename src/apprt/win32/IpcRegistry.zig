@@ -81,7 +81,7 @@ pub fn register(
 /// Look up a live target by name (stale entries are pruned first).
 ///
 /// Explicitly registered names win. On a miss we fall back to the pane's OWN
-/// identity (T113), which CLAUDE.md promises is "accepted directly by every
+/// identity (T113), which docs/claude/cli.md promises is "accepted directly by every
 /// `--target`/`--name` (case-insensitive), with no prior registration or
 /// `+list` needed" — the pane id itself, plus the two legacy surface-id
 /// spellings a pane's processes may be holding instead (see

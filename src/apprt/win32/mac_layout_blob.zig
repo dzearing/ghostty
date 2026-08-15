@@ -21,7 +21,7 @@
 //! An envelope or a shared schema only describes blobs written AFTER both
 //! lineages ship it. The blobs already sitting in live agents carry no tag and
 //! never will — an agent outlives the app that wrote them by design (see
-//! CLAUDE.md, "Agent contract & upgrade compatibility"). A reader that tolerates
+//! docs/claude/sessions.md, "Agent contract & upgrade compatibility"). A reader that tolerates
 //! the other lineage's shape is therefore required either way, so it is the
 //! whole fix rather than half of one. Detection needs no tag: a macOS entry has
 //! a `tree` object and no `tabs`, a win32 window has `tabs` and no `tree`.

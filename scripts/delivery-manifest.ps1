@@ -175,7 +175,7 @@ function Select-StaleBackups {
 # process and no network, and it is the one check that separates a RELEASE
 # ghoztty.exe from a Debug one without trusting a version string: debug builds
 # link the console subsystem so std.log reaches the shell, release builds link
-# GUI (CLAUDE.md, "Build, run & debug"). Returns 0 when it cannot be read.
+# GUI (docs/claude/build.md, "Build, run & debug"). Returns 0 when it cannot be read.
 function Get-PeSubsystem {
     param([Parameter(Mandatory = $true)][string]$Path)
     try {
