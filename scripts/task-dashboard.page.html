@@ -236,7 +236,13 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-
 /* Timeline ---------------------------------------------------------------- */
 .day { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 18px 0 8px; }
 .day:first-child { margin-top: 0; }
-.ev { display: flex; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--hairline); }
+/* Each event is a summary card in the same card language as .dec (T505):
+   the whole card is clickable and says so on hover — the L2 event dialog is
+   behind it. */
+.ev { display: flex; gap: 12px; padding: 12px 14px; margin-bottom: 10px; background: var(--surface-1);
+  border: 1px solid var(--hairline); border-radius: 8px; box-shadow: var(--shadow); cursor: pointer; }
+.ev:hover { background: var(--tint); border-color: var(--open); }
+.ev:focus-visible { outline: 2px solid var(--open); outline-offset: -1px; }
 .ev-rail { width: 8px; flex: none; display: flex; justify-content: center; padding-top: 5px; }
 .ev-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--done); }
 .ev.filed .ev-dot { background: var(--open); }
@@ -314,7 +320,20 @@ td.fin, td.when { white-space: nowrap; color: var(--muted); font-variant-numeric
 .prog-line { font-size: 12px; color: var(--ink-2); padding: 2px 0; display: flex; gap: 8px; align-items: baseline; }
 .prog-ts { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 11px; }
 
-/* Clickable activity titles + task-id links inside rendered markdown */
+/* Event detail dialog (T505): the kind marker reuses the timeline dot
+   colors, and each finished/filed task is a clickable row. */
+.evk { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--ink-2); white-space: nowrap; }
+.evk i { width: 8px; height: 8px; border-radius: 50%; background: var(--done); flex: none; }
+.evk.filed i { background: var(--open); }
+.evk.decision-opened i { background: var(--warning); }
+.evk.decision-resolved i { background: var(--muted); }
+.evd-task { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: var(--ink-2); padding: 3px 0; }
+.evd-task .chip { flex: none; }
+.evd-sum { font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
+.evd-sec { margin-top: 12px; }
+.evd-sec:first-child { margin-top: 0; }
+
+/* Clickable text titles (in-flight rows) + task-id links inside rendered markdown */
 .ev-link { cursor: pointer; }
 .ev-link:hover { text-decoration: underline; }
 .tid-link { color: var(--open); text-decoration: none; }
@@ -1121,17 +1140,17 @@ function activityView(d) {
       a.filed.forEach(function (c) { chips.push(taskChip(c)); });
     }
     tagChips(a.tags).forEach(function (c) { chips.push(c); });
-    // Clicking the headline opens the first finished task (or first filed).
-    var first = (a.completed[0] || a.filed[0]) ? taskById((a.completed[0] || a.filed[0]).id) : null;
-    body.push(h('div', { class: cls, 'data-anim-key': 'ev:' + (a.sha || (a.kind + ':' + (a.decision || '') + ':' + a.ts)) }, [
+    // The whole card opens the event's own L2 (T505); task chips inside it
+    // stopPropagation and open their task directly, as before.
+    body.push(h('div', {
+      class: cls, role: 'button', tabindex: '0',
+      'data-anim-key': 'ev:' + (a.sha || (a.kind + ':' + (a.decision || '') + ':' + a.ts)),
+      onclick: function () { openEvent(a); },
+      onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openEvent(a); } }
+    }, [
       h('div', { class: 'ev-rail' }, [h('div', { class: 'ev-dot' })]),
       h('div', { class: 'ev-body' }, [
-        h('div', {
-          class: 'ev-title' + (first ? ' ev-link' : ''), text: a.title,
-          role: first ? 'button' : null, tabindex: first ? '0' : null,
-          onclick: first ? function () { openTask(first); } : null,
-          onkeydown: first ? function (e) { if (e.key === 'Enter') openTask(first); } : null
-        }),
+        h('div', { class: 'ev-title', text: a.title }),
         h('div', { class: 'ev-meta' }, meta),
         a.summary ? h('div', { class: 'ev-sum', text: a.summary }) : null,
         chips.length ? h('div', { class: 'ev-chips' }, chips) : null
@@ -1147,6 +1166,95 @@ function activityView(d) {
   out.push(card('Timeline', d.activity.length + ' events since ' + fDate(d.historyStart) +
     ' — each one is a commit that finished or filed work.', body.length ? body : [h('div', { class: 'empty', text: 'No activity yet.' })]));
   return out;
+}
+
+/* --- event detail dialog (T505) -------------------------------------------
+   The timeline card is the headline; this dialog is the event's own L2: the
+   full commit message, every task it finished or filed, tags, timing. Same
+   <dialog> idiom as openTask. Task links open the task dialog ON TOP rather
+   than closing this one, so closing the task drops you back on the event and
+   closing the event drops you back on the Activity view, scroll untouched. */
+function openEvent(a) {
+  var kindCls = a.kind + (a.kind === 'work' && !a.completed.length ? ' filed' : '');
+  var kindLabel = a.kind === 'work' ? (a.completed.length ? 'Work landed' : 'Work filed')
+    : a.kind === 'decision-opened' ? 'Decision opened'
+    : a.kind === 'decision-resolved' ? 'Decision resolved' : 'Event';
+  var jump = function (id) {
+    var t = taskById(id);
+    if (t) openTask(t);
+  };
+  var taskRow = function (c) {
+    var t = taskById(c.id);
+    return h('div', { class: 'evd-task' }, [
+      h('span', {
+        class: 'chip' + (t ? ' link' : ''), text: c.id,
+        onclick: t ? function () { openTask(t); } : null
+      }),
+      h('span', { text: c.title || (t ? t.title : '') })
+    ]);
+  };
+  var body = h('div', { class: 'td-body' });
+  // Work events fetch the whole commit message below, whose first paragraph
+  // IS the summary — repeating it above would say everything twice.
+  var willFetchMsg = a.kind === 'work' && a.sha;
+  if (a.summary && !willFetchMsg) body.appendChild(h('div', { class: 'evd-sum', text: a.summary }));
+  if (a.completed.length) {
+    body.appendChild(h('div', { class: 'evd-sec' },
+      [h('div', { class: 'goals-head', text: 'Completed' })].concat(a.completed.map(taskRow))));
+  }
+  if (a.filed.length) {
+    body.appendChild(h('div', { class: 'evd-sec' },
+      [h('div', { class: 'goals-head', text: 'Follow-ups filed' })].concat(a.filed.map(taskRow))));
+  }
+  // The decision events carry a task id but no chips of their own.
+  if (a.task && taskById(a.task)) {
+    body.appendChild(h('div', { class: 'evd-sec' },
+      [h('div', { class: 'goals-head', text: 'Task' }), taskRow({ id: a.task, title: '' })]));
+  }
+  if (a.kind === 'work' && a.sha) {
+    var msg = h('div', { class: 'md', text: 'Loading…' });
+    body.appendChild(h('div', { class: 'evd-sec' },
+      [h('div', { class: 'goals-head', text: 'Commit message' }), msg]));
+    fetch('/api/commit?sha=' + encodeURIComponent(a.sha))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.error) throw new Error(j.error);
+        msg.textContent = '';
+        var md = mdRender(j.body);
+        linkifyTaskIds(md, jump);
+        msg.appendChild(md);
+      })
+      .catch(function (e) {
+        // The summary was withheld above in favor of this fetch — on failure
+        // it is the best available story, so show it with the error under it.
+        msg.textContent = '';
+        if (a.summary) msg.appendChild(h('div', { class: 'evd-sum', text: a.summary }));
+        msg.appendChild(h('div', { class: 'empty evd-err', text: 'Could not load the full message: ' + e.message }));
+      });
+  }
+  var meta = [
+    metaBit('When', fDate(a.ts) + ' ' + fTime(a.ts) + ' (' + fAgo(a.ts) + ')'),
+    a.durationMs != null ? metaBit('Took', fDur(a.durationMs)) : null,
+    a.sha ? metaBit('Commit', a.sha) : null,
+    a.decision ? metaBit('Decision', a.decision) : null
+  ];
+  var dlg = h('dialog', { class: 'taskdlg' }, [
+    h('header', null, [
+      h('div', { class: 'td-head' }, [
+        h('span', { class: 'evk ' + kindCls }, [h('i'), kindLabel]),
+        a.sha ? h('code', { class: 'td-id', text: a.sha }) : null
+      ].concat(tagChips(a.tags))),
+      h('button', { class: 'td-x', 'aria-label': 'Close', text: '×', onclick: function () { dlg.close(); } })
+    ]),
+    h('h3', { class: 'td-title', text: a.title }),
+    h('div', { class: 'td-meta' }, meta),
+    body,
+    a.decision ? h('footer', null, [h('code', { class: 'td-path', text: 'docs/design/windows-parity-decisions/' + a.decision + '.md' })]) : null
+  ]);
+  document.body.appendChild(dlg);
+  dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+  dlg.addEventListener('close', function () { dlg.remove(); });
+  dlg.showModal();
 }
 
 /* ===========================================================================
@@ -1959,6 +2067,82 @@ if (deepLink) {
     fired = true;
     clearInterval(openWhenReady);
     if (t) openTask(t);
+  }, 120);
+}
+
+/* `?event=<sha>` opens that commit's event dialog once the data has loaded —
+   the event-L2 analog of the ?task= link above, and how the dialog reaches a
+   headless screenshot. Fires once, not on every poll. */
+var evLink = /[?&]event=([0-9a-fA-F]{7,40})/.exec(location.search);
+if (evLink) {
+  var evWanted = evLink[1].toLowerCase(), evFired = false;
+  var evWhenReady = setInterval(function () {
+    if (evFired || !state.data) return;
+    var a = state.data.activity.filter(function (x) {
+      // Either side may be the shorter spelling of the same sha.
+      var s = x.sha ? x.sha.toLowerCase() : '';
+      return s && (s.indexOf(evWanted) === 0 || evWanted.indexOf(s) === 0);
+    })[0];
+    evFired = true;
+    clearInterval(evWhenReady);
+    if (a) openEvent(a);
+  }, 120);
+}
+
+/* `?selftest=event` drives the first timeline card through its event L2 from
+   inside a real browser (T505) — the acceptance script runs it under headless
+   Edge and reads the verdict back out of the DOM, because a click path is not
+   something an HTTP probe can see. Same fire-once shape as the ?task= deep
+   link above. Steps: click the card → the event dialog opens → the commit
+   message actually loads → close returns to the view. The verdict lands in
+   <title> and in a #selftest node (belt and braces: --dump-dom sees both). */
+if (/[?&]selftest=event/.test(location.search)) {
+  var stFired = false;
+  var stDone = function (verdict) {
+    document.title = verdict;
+    document.body.appendChild(h('div', { id: 'selftest', text: verdict }));
+  };
+  var stWait = setInterval(function () {
+    if (stFired || !state.data) return;
+    stFired = true;
+    clearInterval(stWait);
+    try {
+      var cardEl = document.querySelector('.ev');
+      if (!cardEl) return stDone('T505-SELFTEST FAIL: no timeline card rendered');
+      cardEl.click();
+      var dlg = document.querySelector('dialog.taskdlg');
+      if (!dlg || !dlg.open || !dlg.querySelector('.evk')) {
+        return stDone('T505-SELFTEST FAIL: clicking the card did not open the event dialog');
+      }
+      // The commit message is a fetch away; give it a few seconds.
+      var tries = 0;
+      var msgWait = setInterval(function () {
+        var md = dlg.querySelector('.md');
+        var loaded = md && md.textContent && md.textContent !== 'Loading…';
+        if (!loaded && ++tries < 50) return;
+        clearInterval(msgWait);
+        if (!loaded) return stDone('T505-SELFTEST FAIL: the commit message never loaded');
+        if (dlg.querySelector('.evd-err')) {
+          return stDone('T505-SELFTEST FAIL: ' + dlg.querySelector('.evd-err').textContent);
+        }
+        dlg.close();
+        if (dlg.open) return stDone('T505-SELFTEST FAIL: the dialog did not close');
+        // The close handler removes the node from a queued close event, and
+        // under headless virtual time that task can lag well past a fixed
+        // delay — poll, like the message wait above, rather than spot-check.
+        var rmTries = 0;
+        var rmWait = setInterval(function () {
+          if (document.querySelector('dialog.taskdlg') && ++rmTries < 50) return;
+          clearInterval(rmWait);
+          if (document.querySelector('dialog.taskdlg')) {
+            return stDone('T505-SELFTEST FAIL: closing the dialog did not remove it');
+          }
+          stDone('T505-SELFTEST PASS');
+        }, 100);
+      }, 100);
+    } catch (e) {
+      stDone('T505-SELFTEST FAIL: ' + e.message);
+    }
   }, 120);
 }
 

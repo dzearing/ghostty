@@ -1209,6 +1209,26 @@ function serve(port) {
           body: fm ? text.slice(fm.bodyStart) : text,
         }));
       }
+      // Full commit message, on demand (T505). The activity feed ships only
+      // the first paragraph of each commit body; the event detail dialog
+      // wants the whole story, and shipping every full body in the poll
+      // payload would be the same megabytes-on-the-wire mistake /api/task
+      // exists to avoid.
+      if (url === '/api/commit') {
+        const sha = new URL(req.url, 'http://x').searchParams.get('sha') || '';
+        // The sha is handed to git as a revision, so it is matched against
+        // the hex grammar rather than sanitised — nothing else resolves.
+        if (!/^[0-9a-f]{7,40}$/i.test(sha)) {
+          return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad sha' }));
+        }
+        let msg;
+        try {
+          msg = git(['show', '-s', '--format=%B', sha]);
+        } catch {
+          return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'no such commit' }));
+        }
+        return send(res, 200, 'application/json; charset=utf-8', JSON.stringify({ sha, body: msg.trim() }));
+      }
       if (url === '/api/digest') {
         const date = new URL(req.url, 'http://x').searchParams.get('date') || '';
         const d = readDigest(date); // readDigest validates the shape, so no traversal
