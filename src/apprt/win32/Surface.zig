@@ -743,6 +743,31 @@ pub fn init(
         };
     }
 
+    // T492: bake `$GHOZTTY_WINDOW_NAME` from the window's canonical IPC name,
+    // so panes of an AUTO-named window (Ctrl+N, bare `+new-window`, restore)
+    // can target their own window. The Mac injects windowName into the surface
+    // config the same way; here `Window.init` has always claimed `ipc_name`
+    // before its first surface exists, so every non-quick-terminal pane —
+    // first tab, later tabs, splits — reads the name the window actually
+    // HOLDS (an adopted `--target` that lost its name to an incumbent bakes
+    // the minted fallback, which is the routable one). Only when nothing set
+    // it yet: an explicit `--target`/`--env` override or a user `env` config
+    // arrived via the overrides above and wins. Quick terminals have no IPC
+    // name and keep the core's per-surface fallback.
+    if (parent.ipc_name) |wn| {
+        if (config.env.map.get("GHOZTTY_WINDOW_NAME") == null) {
+            const carena = config._arena.?.allocator();
+            const kv = try std.fmt.allocPrint(
+                carena,
+                "GHOZTTY_WINDOW_NAME={s}",
+                .{wn},
+            );
+            config.env.parseCLI(carena, kv) catch |err| {
+                log.warn("window name env bake failed err={}", .{err});
+            };
+        }
+    }
+
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.
     try self.core_surface.init(

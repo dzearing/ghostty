@@ -197,6 +197,21 @@ $GuardTable = @(
             'src\cli\args.zig',
             'test\win32\cli-unknown-flag.ps1'
         )
+    },
+    # The window-name env export (T492): panes of AUTO-named windows carry
+    # $GHOZTTY_WINDOW_NAME, which nothing in the P1-P3 floor reads back out of
+    # a pane's shell. The bake lives inside src\apprt\win32\Surface.zig's init,
+    # which is deliberately NOT covered - that file moves for reasons that have
+    # nothing to do with env bakes, and a gate that launches a multi-window GUI
+    # harness on every Surface edit is the noise T783 warns about. The row
+    # covers the script itself (the reset-context precedent).
+    [pscustomobject]@{
+        Name   = 'window-name-env'
+        Script = 'test\win32\window-name-env.ps1'
+        Stamp  = 'test\win32\window-name-env.stamp.json'
+        Covers = @(
+            'test\win32\window-name-env.ps1'
+        )
     }
 )
 
