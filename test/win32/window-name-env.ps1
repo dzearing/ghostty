@@ -31,6 +31,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$script:passes = 0
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-window-name-$PID"
 
@@ -38,8 +39,9 @@ $root = Join-Path $env:TEMP "ghoztty-window-name-$PID"
 $AUTO_RE = 'window-\d+'
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
@@ -307,5 +309,4 @@ if ($script:failures -eq 0) {
         update -Guard window-name-env -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
-if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
-else { "$($script:failures) FAILURE(S)"; exit 1 }
+Write-TestVerdict -Pass $script:passes -Fail $script:failures

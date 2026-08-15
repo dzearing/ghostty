@@ -28,11 +28,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$script:passes = 0
 $script:failures = 0
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
@@ -134,10 +136,4 @@ if ($script:failures -eq 0) {
 }
 
 ""
-if ($script:failures -eq 0) {
-    "T489 ACCEPTANCE: ALL PASS"
-    exit 0
-} else {
-    "T489 ACCEPTANCE: $script:failures FAILURE(S)"
-    exit 1
-}
+Write-TestVerdict -Label 'T489 ACCEPTANCE' -Pass $script:passes -Fail $script:failures
