@@ -27,6 +27,16 @@ Concretely, in order, with no stops in between:
    - **Only `[go-loop]`-marked windows are ever touched.** A second Claude
      window that is filing tasks, auditing, or reviewing is unmarked, so it is
      never a rival and never gets closed. That is the normal case on this box.
+   - **It also reports STRANDED WORK** (T847): anything dirty in the tree at
+     claim time is a dead turn's work, since this turn has not touched a file
+     yet — the CLAUDE.md split sat uncommitted for two days because nothing at
+     any boundary was obliged to notice. The claim snapshots those paths, and
+     step 6's `validate` FAILS while they stay dirty: fold them into their own
+     commit, revert them, or file a task for them and run
+     `parity-tasks.ps1 ack-stranded <Tid>` (the ack holds while that task is
+     open, so the gate cannot wedge the loop). Never sweep them silently into
+     your task's commit, and never keep working past the report as if the tree
+     were clean.
    - The arbiter is the lock, not a negotiation: whoever holds it is primary,
      which is symmetric and cannot deadlock. Ownership is keyed on the
      **pane**, so a relaunched claude in the same pane is the same slot (the
@@ -431,6 +441,11 @@ Concretely, in order, with no stops in between:
    `-NoGuardDue` hatch exists for a harness that genuinely cannot run on this
    box and prints that it was used, so a commit made under it can be explained
    rather than silently excused.
+
+   Since T847 `validate` also fails on STRANDED WORK — paths that step 0's
+   claim found already dirty and that are still dirty now. Resolve them the way
+   the claim report says (own commit / revert / `ack-stranded` to a filed
+   task); acceptance is section S of `test\win32\go-loop-guard.ps1`.
 
    Since T564 `set-status` **journals every transition** into the task's own
    `## Progress log` (`status: <old> -> <new>`, plus `[commit <sha>]`), so a

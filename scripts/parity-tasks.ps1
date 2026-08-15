@@ -39,7 +39,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'ack-stranded', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -753,6 +753,29 @@ switch ($Command) {
         Write-Host ("{0}: progress note added" -f $tid)
     }
 
+    'ack-stranded' {
+        # T847: hand the stranded paths snapshotted at claim time to an OPEN
+        # task, so validate stops failing on them without the gate going quiet.
+        # The handoff is journaled into the task, which is what makes it a
+        # receipt rather than a mute: whoever picks the task up sees exactly
+        # which paths it owes.
+        $tid = Get-TaskId $Id
+        $t = ConvertFrom-Frontmatter -Path (Get-TaskPath $tid)
+        if ($null -eq $t) { throw "ack-stranded: cannot read $tid." }
+        if (Test-Done $t.Status) { throw "ack-stranded: $tid is closed ($($t.Status)); the ack must name a task that will actually resolve the paths." }
+        $strandedRepo = $RepoRoot
+        if ($env:GHOZTTY_STRANDED_REPO) { $strandedRepo = $env:GHOZTTY_STRANDED_REPO }
+        $strandedPath = Join-Path (Join-Path $strandedRepo 'temp') 'go-loop.stranded.json'
+        if (-not (Test-Path -LiteralPath $strandedPath)) { throw "ack-stranded: no stranded-work snapshot at $strandedPath (nothing to acknowledge)." }
+        $snap = Get-Content -LiteralPath $strandedPath -Raw | ConvertFrom-Json
+        $snap | Add-Member -NotePropertyName ackTask -NotePropertyValue $tid -Force
+        $snap | Add-Member -NotePropertyName ackPaths -NotePropertyValue @($snap.paths) -Force
+        ($snap | ConvertTo-Json -Depth 4) | Out-File -FilePath $strandedPath -Encoding utf8
+        Add-ProgressNote -Path (Get-TaskPath $tid) -SessionId $Session -NoteText (
+            "took over stranded working-tree paths (dirty since before this turn's claim): " + (@($snap.paths) -join ', '))
+        Write-Host ("{0} now owns {1} stranded path(s); validate passes while it stays open" -f $tid, @($snap.paths).Count)
+    }
+
     'validate' {
         $tasks = Get-AllTasks
         $byId = @{}
@@ -843,6 +866,54 @@ switch ($Command) {
                 foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { Write-Host $line } }
                 Write-Host "  (an unrun harness is a problem here: run it, or fix what it catches, before committing)"
                 $problems++
+            }
+        }
+
+        # T847: stranded work - paths that were already dirty when this turn
+        # claimed the loop (snapshotted by go-loop-exec.ps1 claim, which owns
+        # the rationale). Failing here is what makes the claim-time report a
+        # gate rather than a line nobody must act on: 2,600 lines of a dead
+        # turn's work sat uncommitted for two days while validate passed every
+        # commit that landed around it. Resolution is any of: commit the
+        # stranded paths (their own commit), revert them, or hand them to a
+        # filed task with `ack-stranded <Tid>` - the ack holds while that task
+        # is open, so the loop keeps moving without the gate going quiet.
+        # GHOZTTY_STRANDED_REPO points the check at a fixture tree for the
+        # acceptance harness; unset in every real run. Skipped for -TaskDir
+        # fixture runs for the same reason the guard-due check is - unless the
+        # env override is set, which is the harness explicitly testing THIS
+        # gate (a fixture task dir plus a fixture repo is the only way to
+        # exercise the ack path without leaning on the real tracker's state).
+        if (-not $TaskDirGiven -or $env:GHOZTTY_STRANDED_REPO) {
+            $strandedRepo = $RepoRoot
+            if ($env:GHOZTTY_STRANDED_REPO) { $strandedRepo = $env:GHOZTTY_STRANDED_REPO }
+            $strandedPath = Join-Path (Join-Path $strandedRepo 'temp') 'go-loop.stranded.json'
+            if (Test-Path -LiteralPath $strandedPath) {
+                $snap = $null
+                try { $snap = Get-Content -LiteralPath $strandedPath -Raw | ConvertFrom-Json } catch { }
+                if ($snap -and $snap.paths) {
+                    $nowDirty = @(& git -C $strandedRepo status --porcelain 2>$null |
+                        Where-Object { $_ } | ForEach-Object { $_.Substring(3) })
+                    $still = @($snap.paths | Where-Object { $nowDirty -contains $_ })
+                    $ackPaths = @()
+                    $ackId = [string]$snap.ackTask
+                    if ($ackId -and $byId.ContainsKey($ackId) -and -not (Test-Done $byId[$ackId].Status)) {
+                        $ackPaths = @($snap.ackPaths)
+                    }
+                    $unacked = @($still | Where-Object { $ackPaths -notcontains $_ })
+                    if ($still.Count -eq 0) {
+                        # All resolved; the snapshot has served its purpose.
+                        Remove-Item -LiteralPath $strandedPath -Force -ErrorAction SilentlyContinue
+                    } elseif ($unacked.Count -gt 0) {
+                        Write-Host ("STRANDED WORK: {0} path(s) were already dirty when this turn claimed the loop and still are:" -f $unacked.Count)
+                        foreach ($p in @($unacked | Select-Object -First 8)) { Write-Host ("  {0}" -f $p) }
+                        if ($unacked.Count -gt 8) { Write-Host ("  ... and {0} more" -f ($unacked.Count - 8)) }
+                        Write-Host "  (a dead turn's work must not strand again: commit it as its own change, revert it, or file a task for it and run: parity-tasks.ps1 ack-stranded <Tid>)"
+                        $problems++
+                    } else {
+                        Write-Host ("STRANDED WORK ACKNOWLEDGED: {0} path(s) are {1}'s to resolve (not blocking while it is open)" -f $still.Count, $ackId)
+                    }
+                }
             }
         }
 

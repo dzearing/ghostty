@@ -39,6 +39,11 @@
 #      itself, so a working turn is visibly alive without anybody remembering to
 #      beat the heartbeat - and the nudge, when it does fire, is reset-first so
 #      landing it on a live session cannot queue a second task into that context.
+#   S. Stranded work (T847): paths dirty at claim time are a dead turn's work.
+#      claim snapshots and reports them; `parity-tasks.ps1 validate` fails while
+#      they stay dirty; `ack-stranded` hands them to an OPEN task (the ack
+#      survives re-claims and dies with the task); resolving the tree deletes
+#      the snapshot. All against a fixture git repo + fixture task dir.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -1022,6 +1027,79 @@ $L.claude_pid = 999999
 Write-LockFile $L
 $r = Lock-Run @('acquire', '-PaneId', 'PANE-Q-OTHER', '-ClaudePid', $PID)
 Assert 'Q7 acquire still takes over a dead owner' ($r.Code -eq 0 -and $r.Out -match 'reason=dead-owner')
+
+# --- S. stranded work at claim (T847) --------------------------------------
+""
+"S. stranded work: dirty-at-claim paths are snapshotted, gated by validate, ack-able"
+# A fixture git repo whose dirtiness this section fully controls. The claim runs
+# with -Repo pointed here, so its lock AND its snapshot land in this repo's own
+# temp\ (ignored, like the real one) and the real repo's snapshot is never
+# touched; the fixture task dir keeps the ack away from the real tracker.
+$taskScript = Join-Path $Repo 'scripts\parity-tasks.ps1'
+$sRepo = Join-Path $root 'stranded-repo'
+$sTasks = Join-Path $root 'stranded-tasks'
+New-Item -ItemType Directory -Force $sRepo, $sTasks | Out-Null
+git -C $sRepo init -q 2>$null
+[System.IO.File]::WriteAllText((Join-Path $sRepo '.gitignore'), "temp/`n", (New-Object System.Text.UTF8Encoding $false))
+git -C $sRepo add .gitignore 2>$null
+git -C $sRepo -c user.email='t@t' -c user.name='t' commit -q -m 'fixture' 2>$null
+$sSnap = Join-Path (Join-Path $sRepo 'temp') 'go-loop.stranded.json'
+$sTaskLines = @('---', 'id: T1', 'title: "fixture T1"', 'deps: []', 'status: "todo"',
+    'commits: []', '---', '', '# T1 - fixture', '', '## Progress log', '')
+[System.IO.File]::WriteAllText((Join-Path $sTasks 'T1.md'), ($sTaskLines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
+
+function SClaim([string]$paneId) {
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $execScript claim `
+        -Repo $sRepo -PaneId $paneId -GhozttyExe $Exe -NoClose 2>&1 | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
+# GHOZTTY_STRANDED_REPO is scoped to each call: a leaked value would point every
+# later validate in this shell's children at the fixture.
+function STask([string[]]$argList) {
+    $env:GHOZTTY_STRANDED_REPO = $sRepo
+    try {
+        $out = & powershell -NoProfile -File $taskScript @argList -TaskDir $sTasks 2>&1 | Out-String
+        return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+    } finally { Remove-Item Env:GHOZTTY_STRANDED_REPO -ErrorAction SilentlyContinue }
+}
+
+$paneS = New-TestWindow 'stranded-s'
+if ($null -eq $paneS) {
+    "  SKIP S (no pane for claim)"; $script:skipped++
+} else {
+    Set-Content -Path (Join-Path $sRepo 'orphan.txt') -Value 'left behind'
+    $r = SClaim $paneS.id
+    Assert 'S1 claim reports the dirty path as stranded' ($r.Code -eq 0 -and $r.Out -match 'STRANDED WORK: 1 path' -and $r.Out -match 'orphan\.txt')
+    Assert 'S2 the snapshot exists in the fixture repo temp' (Test-Path $sSnap)
+
+    $r = STask @('validate')
+    Assert 'S3 validate fails while the stranded path stays dirty' ($r.Code -ne 0 -and $r.Out -match 'STRANDED WORK' -and $r.Out -match 'orphan\.txt')
+
+    $r = STask @('ack-stranded', 'T1')
+    Assert 'S4 ack-stranded hands the paths to an open task' ($r.Code -eq 0 -and $r.Out -match 'T1 now owns 1 stranded path')
+    $r = STask @('validate')
+    Assert 'S5 validate passes on an acknowledged snapshot' ($r.Code -eq 0 -and $r.Out -match 'STRANDED WORK ACKNOWLEDGED')
+
+    # The ack must survive the next turn's re-claim - the owed task may not be
+    # picked for days, and a re-claim that dropped it would re-redden validate.
+    $r = SClaim $paneS.id
+    Assert 'S6 a re-claim carries the ack forward' ((Get-Content $sSnap -Raw) -match '"ackTask":\s*"T1"')
+
+    # A closed task cannot keep absorbing the gate.
+    & powershell -NoProfile -File $taskScript set-status T1 -Status done -TaskDir $sTasks -NoNote 2>&1 | Out-Null
+    $r = STask @('validate')
+    Assert 'S7 the ack dies with the task: validate fails once T1 closes' ($r.Code -ne 0 -and $r.Out -match 'STRANDED WORK' -and $r.Out -notmatch 'ACKNOWLEDGED')
+
+    # Resolving the tree resolves the gate, and the snapshot cleans itself up.
+    Remove-Item (Join-Path $sRepo 'orphan.txt') -Force
+    $r = STask @('validate')
+    Assert 'S8 validate passes once the tree is clean' ($r.Code -eq 0 -and $r.Out -notmatch 'STRANDED WORK')
+    Assert 'S9 the resolved snapshot deleted itself' (-not (Test-Path $sSnap))
+
+    $r = SClaim $paneS.id
+    Assert 'S10 a clean tree claims clean' ($r.Out -match 'tree clean at claim')
+    Ghoz @('+close', "--target=$($paneS.id)") | Out-Null
+}
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

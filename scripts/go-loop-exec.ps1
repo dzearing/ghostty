@@ -236,6 +236,55 @@ switch ($Action) {
             foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
         }
 
+        # T847: anything dirty in the tree RIGHT NOW is a dead turn's work -
+        # this turn has not touched a file yet. The CLAUDE.md split sat
+        # uncommitted for two days while task commits landed around it, because
+        # nothing at any turn boundary was obliged to notice; this snapshot is
+        # the noticing. Same division of labor as the guard-due report above:
+        # reported here, enforced by `parity-tasks.ps1 validate`, which fails
+        # while these paths are still dirty - fold them into their own commit,
+        # revert them, or hand them to a filed task with
+        # `parity-tasks.ps1 ack-stranded <Tid>` (the ack survives re-claims).
+        # The snapshot lives NEXT TO THE LOCK, so a harness driving claim with
+        # a fixture -LockPath never touches the real repo's snapshot. Caveat:
+        # a manual mid-turn `claim` re-snapshots the turn's own uncommitted
+        # edits as stranded; the validate failure that causes is loud and its
+        # message says what to do, which beats a silent miss in both directions.
+        $strandedPath = $LockPath -replace '\.lock\.json$', '.stranded.json'
+        if ($strandedPath -eq $LockPath) { $strandedPath = "$LockPath.stranded.json" }
+        $gitDirty = @(& git -C $Repo status --porcelain 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            "  (stranded-work check skipped: git status failed in $Repo)"
+        } elseif (@($gitDirty | Where-Object { $_ }).Count -eq 0) {
+            if (Test-Path -LiteralPath $strandedPath) {
+                Remove-Item -LiteralPath $strandedPath -Force -ErrorAction SilentlyContinue
+            }
+            "  tree clean at claim"
+        } else {
+            $paths = @($gitDirty | Where-Object { $_ } | ForEach-Object { $_.Substring(3) })
+            $ackTask = $null; $ackPaths = @()
+            if (Test-Path -LiteralPath $strandedPath) {
+                try {
+                    $old = Get-Content -LiteralPath $strandedPath -Raw | ConvertFrom-Json
+                    if ($old.ackTask) { $ackTask = [string]$old.ackTask; $ackPaths = @($old.ackPaths) }
+                } catch { }
+            }
+            $snapDir = Split-Path -Parent $strandedPath
+            if ($snapDir -and -not (Test-Path -LiteralPath $snapDir)) {
+                New-Item -ItemType Directory -Path $snapDir -Force | Out-Null
+            }
+            ([ordered]@{
+                takenAt  = (Get-Date).ToString('o')
+                pane     = $PaneId
+                paths    = $paths
+                ackTask  = $ackTask
+                ackPaths = $ackPaths
+            } | ConvertTo-Json -Depth 4) | Out-File -FilePath $strandedPath -Encoding utf8
+            "  STRANDED WORK: $($paths.Count) path(s) already dirty at claim (a dead turn's work) - validate will fail while they stay dirty; fold, revert, or ack-stranded them"
+            foreach ($p in @($paths | Select-Object -First 8)) { "    $p" }
+            if ($paths.Count -gt 8) { "    ... and $($paths.Count - 8) more" }
+        }
+
         $dupes = @()
         foreach ($w in $windows) {
             if ($mine -and $w.Id -eq $mine.Id) { continue }

@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T847 - the stranded CLAUDE.md split is landed, and stranding
+  itself now has a gate.** The two-day-old uncommitted restructure (CLAUDE.md
+  -> a small core + seven docs/claude/ files) was audited (all 33 moved
+  headings present; the 26 non-verbatim removed lines are reflows whose
+  concepts all survive; no BOM/mojibake) and pushed as 66964bfed, with 16
+  further comment retargets on top of the 19 already in the tree - mentions of
+  rules the new core still states (cache drive, ExecutablePath, HELLO
+  handshake, identical CLI surface) deliberately keep saying CLAUDE.md. The
+  D53 resolution fold-in that was also stranded went separately (91e5ac678).
+  The hole that let 2,600 lines sit invisible: nothing at any turn boundary
+  was obliged to notice a dirty tree. Now `go-loop-exec.ps1 claim` snapshots
+  whatever is dirty at claim time (this turn has touched nothing yet, so it is
+  all a dead turn's work) into temp\go-loop.stranded.json next to the lock,
+  and `parity-tasks.ps1 validate` FAILS while those paths stay dirty - resolve
+  by committing them as their own change, reverting, or `ack-stranded <Tid>`
+  to a filed open task (ack survives re-claims, dies with the task). Also
+  gitignored the sprite_face_test-*.png lane droppings and *.stackdump.
+  Floor: ALL LANES PASS (lib 51s / none 287s / win32 354s / agent 340s);
+  go-loop-guard ALL PASS incl. new section S (10 asserts, re-stamped);
+  parity-tasks-seat + split-deps ALL PASS; P1/P2/P3 ALL PASS (25/20/16).
+  T479 was handed out first by id order and unclaimed untouched in favor of
+  the blocker; it is back at the head of the queue.
 - 2026-08-14 - **T443 (turn 3) - the corrupted value is the FIELD, not a copy of
   it, and there is now a detector that does not need a debugger.** Turn 2 ended
   pointing the next armed run at "a 4-byte write onto the high half of a
