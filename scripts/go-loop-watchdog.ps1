@@ -8,8 +8,9 @@
 # and re-enters the loop when the heartbeat goes stale while tasks remain.
 #
 # Per tick:
-#   1. If the tracker has no remaining todo/in-progress/blocked rows, do
-#      nothing - the loop is finished, not stuck.
+#   1. If no open task file remains that this seat could work (status todo/
+#      in-progress/blocked under docs\design\windows-parity-tasks\, minus
+#      seat: mac tasks), do nothing - the loop is finished, not stuck.
 #   2. Read the lock. Healthy (owner alive AND a recent sign of life) -> do
 #      nothing. Since T253 "sign of life" is the newer of the heartbeat and the
 #      session transcript's mtime, so a turn that is working beats it without
@@ -63,7 +64,12 @@
 param(
     [string]$Repo = 'D:\git\ghoztty',
     [string]$LockPath,
-    [string]$Tracker,
+    # One file per task (T479). The old -Tracker parameter pointed at
+    # windows-parity-tasks.md, whose state table FROZE on 2026-07-29 when the
+    # tasks moved one-per-file - the row count was fiction from then on, and
+    # anyone tidying the historical table to zero would have switched this
+    # supervisor off forever.
+    [string]$TaskDir,
     [string]$GhozttyExe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe",
     # RESET-FIRST, on purpose (T253). This text is typed into a session that may
     # be alive and mid-task: Claude Code QUEUES input received during a turn and
@@ -128,7 +134,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 if (-not $LockPath) { $LockPath = Join-Path (Join-Path $Repo 'temp') 'go-loop.lock.json' }
-if (-not $Tracker) { $Tracker = Join-Path $Repo 'docs\design\windows-parity-tasks.md' }
+if (-not $TaskDir) { $TaskDir = Join-Path $Repo 'docs\design\windows-parity-tasks' }
 if (-not $LogPath) { $LogPath = Join-Path $env:TEMP 'ghoztty-go-loop-watchdog.log' }
 if (-not $StatePath) { $StatePath = Join-Path (Join-Path $Repo 'temp') 'go-loop.watchdog.json' }
 
@@ -241,10 +247,37 @@ if ($Uninstall) {
 
 # --- helpers --------------------------------------------------------------
 
+# How many open tasks THIS seat could still work: files under $TaskDir whose
+# frontmatter status is todo/in-progress/blocked(...), minus `seat: "mac"`
+# tasks - parity-tasks.ps1 `next` will never hand one of those to this box, so
+# they cannot justify re-entering a loop that would find nothing to do (T479).
+#
+# The status sweep is a whole-file grep on purpose: a body line that happens to
+# start with `status: "todo"` (a task quoting the frontmatter format) can only
+# INFLATE the count, and an inflated count keeps the supervisor alive - the safe
+# direction. The seat check errs the other way (a false mac match deflates), so
+# it reads only the frontmatter block of the open files it filters.
 function Get-RemainingTasks {
-    if (-not (Test-Path $Tracker)) { return -1 }   # unknown: never blocks re-entry
-    $pattern = '^\| T\S+ \|.*\| *(todo|in-progress|blocked)[^|]*\|[^|]*\|\s*$'
-    return @(Select-String -Path $Tracker -Pattern $pattern).Count
+    if (-not (Test-Path $TaskDir)) { return -1 }   # unknown: never blocks re-entry
+    $open = @(Select-String -Path (Join-Path $TaskDir 'T*.md') `
+            -Pattern '^status:\s*"?(todo|in-progress|blocked)' -List `
+            -ErrorAction SilentlyContinue | ForEach-Object Path)
+    if ($open.Count -eq 0) {
+        # A task dir with no task files at all is a broken checkout, not a
+        # finished project: stay "unknown" rather than declaring the loop done.
+        if (@(Get-ChildItem -Path $TaskDir -Filter 'T*.md' -ErrorAction SilentlyContinue).Count -eq 0) { return -1 }
+        return 0
+    }
+    $remaining = 0
+    foreach ($p in $open) {
+        $isMac = $false
+        foreach ($line in @(Get-Content -Path $p -TotalCount 40 -ErrorAction SilentlyContinue | Select-Object -Skip 1)) {
+            if ($line -match '^---') { break }                       # end of frontmatter
+            if ($line -match '^seat:\s*"?mac') { $isMac = $true; break }
+        }
+        if (-not $isMac) { $remaining++ }
+    }
+    return $remaining
 }
 
 # -NoPaneProbe is load-bearing (T440). `status` now answers "is the loop alive"
@@ -422,7 +455,7 @@ if ($Status) {
 
 function Invoke-Tick {
     $remaining = Get-RemainingTasks
-    if ($remaining -eq 0) { Log 'idle: no remaining tracker rows'; return 'none' }
+    if ($remaining -eq 0) { Log 'idle: no open tasks for this seat'; return 'none' }
 
     $lock = Get-Lock
     $state = 'free'

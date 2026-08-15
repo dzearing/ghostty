@@ -14,9 +14,10 @@
 #   F. Pid recycling cannot hold the lock: same pid, wrong recorded start time
 #      => treated as dead.
 #   G. heartbeat/release from a non-owner => exit 4, lock untouched.
-#   H. Watchdog decisions (dry run): healthy lock => none; stale + tracker rows
-#      => new-window; no remaining tracker rows => none; rearm window not
-#      elapsed => none.
+#   H. Watchdog decisions (dry run): healthy lock => none; stale + open task
+#      files => new-window; no open task for this seat (all closed, or only
+#      seat: mac left) => none; missing task dir => still re-enters; rearm
+#      window not elapsed => none.
 #   I. Watchdog REAL re-entry, against a live debug GUI: no lock at all =>
 #      it opens a window running the resume shim (asserted by reading the
 #      pane's own output back).
@@ -60,8 +61,9 @@ $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-go-loop-$PID"
 $lock = Join-Path $root 'go-loop.lock.json'
 $state = Join-Path $root 'go-loop.watchdog.json'
-$tracker = Join-Path $root 'tracker.md'
-$emptyTracker = Join-Path $root 'tracker-empty.md'
+$taskDir = Join-Path $root 'tasks'
+$emptyTaskDir = Join-Path $root 'tasks-empty'
+$macOnlyTaskDir = Join-Path $root 'tasks-mac-only'
 $log = Join-Path $root 'watchdog.log'
 $lockScript = Join-Path $Repo 'scripts\go-loop-lock.ps1'
 $dogScript = Join-Path $Repo 'scripts\go-loop-watchdog.ps1'
@@ -95,11 +97,11 @@ function Lock-Run([string[]]$extra) {
     return @{ Code = $LASTEXITCODE; Raw = $out; Out = ($out -replace '^\d{4}-\d{2}-\d{2}T[\d:.+-]+\s+', '') }
 }
 
-function Dog-Run([string[]]$extra, [string]$trackerPath) {
-    if (-not $trackerPath) { $trackerPath = $tracker }
+function Dog-Run([string[]]$extra, [string]$taskDirPath) {
+    if (-not $taskDirPath) { $taskDirPath = $taskDir }
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
-        '-Tracker', $trackerPath, '-LogPath', $log, '-Once') + $extra
+        '-TaskDir', $taskDirPath, '-LogPath', $log, '-Once') + $extra
     $out = & powershell @argList 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
@@ -197,17 +199,30 @@ function New-TestWindow($target) {
     return $null
 }
 
-# A tracker with one remaining row, and one with none.
-@(
-    '| ID | Task | Phase | Deps | Status | Commits |',
-    '|----|------|-------|------|--------|---------|',
-    '| T999 | something left to do | K | - | todo | - |'
-) -join "`r`n" | Out-File -FilePath $tracker -Encoding utf8
-@(
-    '| ID | Task | Phase | Deps | Status | Commits |',
-    '|----|------|-------|------|--------|---------|',
-    '| T999 | all finished | K | - | done | abc1234 |'
-) -join "`r`n" | Out-File -FilePath $emptyTracker -Encoding utf8
+# One-file-per-task fixtures (T479; the watchdog counts open task files, not
+# rows in the frozen tracker table). $taskDir holds exactly one task this seat
+# could work: a win todo, beside a done task and a mac-seat todo that must not
+# count - so every `remaining=1` assertion below is also asserting both
+# exclusions. $emptyTaskDir is all closed; $macOnlyTaskDir's only open task
+# belongs to the Mac seat.
+function Write-TaskFixture([string]$dir, [string]$id, [string]$status, [string]$seat) {
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    @(
+        '---'
+        "id: $id"
+        "title: `"fixture $id`""
+        "status: `"$status`""
+        "seat: `"$seat`""
+        '---'
+        ''
+        "# $id - fixture"
+    ) -join "`r`n" | Out-File -FilePath (Join-Path $dir "$id.md") -Encoding utf8
+}
+Write-TaskFixture $taskDir 'T999' 'todo' 'win'
+Write-TaskFixture $taskDir 'T998' 'done' 'win'
+Write-TaskFixture $taskDir 'T997' 'todo' 'mac'
+Write-TaskFixture $emptyTaskDir 'T999' 'done' 'win'
+Write-TaskFixture $macOnlyTaskDir 'T999' 'todo' 'mac'
 
 # --- A. lifecycle ---------------------------------------------------------
 "A. lock lifecycle"
@@ -333,9 +348,13 @@ Remove-Item $lock -Force -ErrorAction SilentlyContinue
 $r = Dog-Run @('-DryRun')
 Assert 'H5 no lock at all also re-enters' ($r.Out -match 'ACTION new-window')
 
-$r = Dog-Run @('-DryRun') $emptyTracker
-Assert 'H6 a tracker with nothing left produces no action' ($r.Out -match 'ACTION none')
-Assert 'H7 and says why' ($r.Out -match 'no remaining tracker rows')
+$r = Dog-Run @('-DryRun') $emptyTaskDir
+Assert 'H6 a task dir with nothing open produces no action' ($r.Out -match 'ACTION none')
+Assert 'H7 and says why' ($r.Out -match 'no open tasks for this seat')
+$r = Dog-Run @('-DryRun') $macOnlyTaskDir
+Assert 'H7b a dir whose only open task is seat: mac also idles' ($r.Out -match 'ACTION none' -and $r.Out -match 'no open tasks for this seat')
+$r = Dog-Run @('-DryRun') (Join-Path $root 'no-such-tasks')
+Assert 'H7c a missing task dir never blocks re-entry' ($r.Out -match 'ACTION new-window' -and $r.Out -match 'remaining=-1')
 
 # Rearm: a real (non-dry) action stamps the state file; the next tick holds off.
 ([ordered]@{ last_action = 'new-window'; last_action_at = (Get-Date).ToString('o') } |
@@ -910,12 +929,12 @@ $pState = Join-Path $root 'go-loop.watchdog-beacon.json'
 $pLog = Join-Path $root 'watchdog-beacon.log'
 # A private mutex name, or the user's real watchdog refuses this one on sight.
 $pMutex = "Global\GhozttyGoLoopWatchdogTest$PID"
-# The empty tracker makes every tick decide 'none' immediately, so this daemon
-# never reads a pane, opens a window, or types anything.
+# The all-closed task dir makes every tick decide 'none' immediately, so this
+# daemon never reads a pane, opens a window, or types anything.
 $dog = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
     '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $pState,
-    '-Tracker', $emptyTracker, '-LogPath', $pLog, '-MutexName', $pMutex,
+    '-TaskDir', $emptyTaskDir, '-LogPath', $pLog, '-MutexName', $pMutex,
     '-PollSeconds', '2', '-DryRun')
 $beacon = $null
 foreach ($i in 1..40) {
@@ -944,7 +963,7 @@ $onceState = Join-Path $root 'go-loop.watchdog-once.json'
     Out-File -FilePath $onceState -Encoding utf8
 $argsOnce = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
     '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $onceState,
-    '-Tracker', $emptyTracker, '-LogPath', $pLog, '-Once')
+    '-TaskDir', $emptyTaskDir, '-LogPath', $pLog, '-Once')
 & powershell @argsOnce | Out-Null
 $onceObj = Get-Content $onceState -Raw | ConvertFrom-Json
 Assert 'P6 a -Once tick writes no beacon' ($null -eq $onceObj.tick_at)

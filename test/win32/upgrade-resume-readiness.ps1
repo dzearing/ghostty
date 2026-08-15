@@ -181,17 +181,22 @@ New-Item -ItemType Directory -Force $root | Out-Null
 $lock = Join-Path $root 'go-loop.lock.json'
 $state = Join-Path $root 'watchdog.json'
 $log = Join-Path $root 'watchdog.log'
-$tracker = Join-Path $root 'tracker.md'
+# One open task file (T479: the watchdog counts task files, not tracker rows).
+$taskDir = Join-Path $root 'tasks'
+New-Item -ItemType Directory -Force $taskDir | Out-Null
 @(
-    '| ID | Task | Phase | Deps | Status | Commits |',
-    '|----|------|-------|------|--------|---------|',
-    '| T999 | something left to do | K | - | todo | - |'
-) -join "`r`n" | Out-File -FilePath $tracker -Encoding ascii
+    '---'
+    'id: T999'
+    'title: "something left to do"'
+    'status: "todo"'
+    'seat: "win"'
+    '---'
+) -join "`r`n" | Out-File -FilePath (Join-Path $taskDir 'T999.md') -Encoding ascii
 
 function Dog([string[]]$extra) {
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dog,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
-        '-Tracker', $tracker, '-LogPath', $log, '-Once', '-DryRun') + $extra
+        '-TaskDir', $taskDir, '-LogPath', $log, '-Once', '-DryRun') + $extra
     $out = & powershell @a 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
