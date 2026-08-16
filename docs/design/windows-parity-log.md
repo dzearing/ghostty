@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T443/T857 - the ghost's window was ACTIVE tonight (occurrences
+  3 and 4 of the day landed inside the measurement itself) and the
+  hardware-vs-software A/B is now half-run: boost-on baseline done, boost-off
+  arm waiting on the user for an elevated shell.** The 19:23 reopen was worked
+  per the cluster rule: two 15-run loaded build-runner soaks of the none lane
+  (`t857-boost-on-eve`/`-eve2`). Occurrence 3 (22:07): lane run died 0x80000003
+  in `font.Collection.test.add full`, offset resolved via cdb to
+  `TT_Load_Simple_Glyph+0x510` - the third freetype frame in that same test in
+  one day. Occurrence 4 (22:41): a load worker's own build-runner iteration
+  segfaulted (0xffffffffffffffff, recursive panic) in
+  `terminal.formatter.test.PageList plain spanning two pages` - back to the
+  classic terminal-structure victim family. Honest boost-on rate: 2 in ~57
+  observable build-runner runs (~3.5%). Both crashes were invisible in the
+  soak's own verdict lines (`crash=0`): exit-code-only deaths read as plain
+  FAILs and worker iterations are never scanned, plus each soak destroys the
+  previous soak's worker logs - filed as **T877**, and it puts an asterisk on
+  the midday probe's "not active" verdict. Elevation is unavailable to the loop
+  (non-admin shell; Windows sudo present but disabled), so per T857's fallback
+  the two powercfg commands (PROCTHROTTLEMAX 99 / restore 100) are on the pane
+  banner and T857 is `blocked(waiting on user)` with the verify + boost-off-arm
+  recipe in its unblock note. T443 re-parked `blocked(armed watch)`, order 9.
+  WHEA last 3 days: only the id-17 corrected-PCIe noise, no CPU events.
 - 2026-08-15 - **T872 - the agent-integration flow has end-to-end acceptance
   coverage, sandboxed, and the T598 split is CLOSED (8/8).** New debug-only
   `agent-integration` IPC action (`ipc_agent_integration.zig`, the
