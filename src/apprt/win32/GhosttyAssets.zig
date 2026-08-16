@@ -12,13 +12,18 @@
 //!                   acceptance harness (`test/win32/vendored-assets.ps1`)
 //!                   compares every file against `origin/main`, so drift from
 //!                   the Mac copies is loud.
-//!   - `hooks/`, `skills/`  the copies the app ships. Three of the four are
-//!                   byte-identical to `upstream/`; `hooks/ghoztty-banner.sh`
-//!                   is the one deliberate fork — its `jq` plumbing is
-//!                   replaced with `ghoztty +json` (native, dependency-free)
-//!                   until that change lands on main (mac-seat task), at
-//!                   which point the fork collapses back into the mirror and
-//!                   the Mac and Windows builds can converge on one copy.
+//!   - `hooks/`, `skills/`  the copies the app ships. The two SKILL.md files
+//!                   are byte-identical to `upstream/`; both hook scripts are
+//!                   deliberate forks — `ghoztty-banner.sh` replaces its `jq`
+//!                   plumbing with `ghoztty +json` (native, dependency-free),
+//!                   and `ghoztty-activity-state.sh` adds OSTYPE-guarded
+//!                   Windows owner/liveness probes (T605: MSYS `kill -0`
+//!                   cannot see a native pid and a native parent reads as
+//!                   PPID=1, so without them every subagent marker is reaped
+//!                   the moment it is written). Both forks are written to be
+//!                   upstreamable (mac-seat tasks); once they land on main
+//!                   each fork collapses back into the mirror and the Mac and
+//!                   Windows builds converge on one copy.
 //!
 //! No OS imports, so the unit tests run in every app-runtime lane.
 const std = @import("std");
@@ -46,7 +51,8 @@ pub fn bannerScript() []const u8 {
     return banner_script;
 }
 
-/// The busy/idle activity-state hook script (byte-identical to main's).
+/// The busy/idle activity-state hook script (the Windows-liveness fork;
+/// see header).
 pub fn activityStateScript() []const u8 {
     return activity_state_script;
 }
@@ -72,6 +78,18 @@ test "hook scripts carry the shell ownership marker" {
         try std.testing.expect(std.mem.startsWith(u8, text, "#!"));
         try std.testing.expect(std.mem.indexOf(u8, text, "# ghoztty-managed") != null);
     }
+}
+
+test "activity-state fork carries the Windows owner and liveness probes" {
+    // The deliberate divergence from main (T605): owner resolution over the
+    // native process tree and a `ps -W` liveness snapshot, both OSTYPE-guarded
+    // so the POSIX paths stay byte-identical. If a re-vendor ever pastes
+    // main's copy over the fork, this is the tripwire — without the probes the
+    // machine reaps every subagent marker instantly on Windows.
+    const text = activityStateScript();
+    try std.testing.expect(std.mem.indexOf(u8, text, "owner_winpid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ps -W") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "is_windows") != null);
 }
 
 test "banner script fork is jq-free and json-native" {

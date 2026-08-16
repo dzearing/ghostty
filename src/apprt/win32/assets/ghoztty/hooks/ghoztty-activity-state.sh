@@ -41,6 +41,15 @@ for _arg in "$@"; do
     case "$_arg" in --runtime=*) runtime="${_arg#*=}" ;; esac
 done
 
+# Git Bash / MSYS -- how these hooks run on Windows -- cannot see native
+# processes through the POSIX process APIs: `kill -0` answers "No such
+# process" for a LIVE native pid, and a hook spawned by a native agent sees
+# PPID=1, so the owner it would record is meaningless and the reap would
+# delete every marker while the work is still in flight. Both halves of the
+# owner-liveness recovery therefore branch on this; everything else is
+# byte-identical to main's copy.
+case "${OSTYPE:-}" in msys*|cygwin*) is_windows=1 ;; *) is_windows=0 ;; esac
+
 # Target the PANE ID, not the window name. An auto-named window ("window-7")
 # is not in the IPC registry until something walks it (+list, or an explicit
 # --target= at creation), so `+set-state --target=$GHOZTTY_WINDOW_NAME` fails
@@ -80,6 +89,7 @@ json_str() {
 # Walking up as a fallback keeps this correct if that spawn path ever changes,
 # and lets the same code serve a runtime that wraps its hooks in a shell.
 owner_pid() {
+  if [ "$is_windows" = 1 ]; then owner_winpid; return; fi
   local p="$PPID" c n=0
   while [ "$n" -lt 4 ] && [ -n "$p" ] && [ "$p" != 1 ]; do
     c="$(ps -o comm= -p "$p" 2>/dev/null)"
@@ -87,6 +97,30 @@ owner_pid() {
     p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; n=$((n+1))
   done
   printf '%s' "$PPID"
+}
+
+# The same walk over the NATIVE process tree, for Windows. $PPID is 1 here
+# (MSYS cannot name a native parent), but /proc/$$/winpid names this shell's
+# Windows pid and CIM walks real ancestry from there. Same contract as the
+# POSIX walk: the nearest ancestor named like the runtime, else the immediate
+# parent -- which IS the agent process for a directly spawned hook. One
+# process spawn, and only on agent-start, never on the tool-call hot path.
+owner_winpid() {
+  local w out
+  w="$(cat "/proc/$$/winpid" 2>/dev/null)"
+  case "$w" in ''|*[!0-9]*) printf '%s' "$PPID"; return ;; esac
+  out="$(powershell.exe -NoProfile -NonInteractive -Command "
+    \$ErrorActionPreference = 'SilentlyContinue'
+    \$p = $w; \$fallback = 0
+    for (\$i = 0; \$i -lt 5 -and \$p; \$i++) {
+      \$proc = Get-CimInstance Win32_Process -Filter (\"ProcessId=\" + \$p)
+      if (-not \$proc) { break }
+      if (\$i -eq 1) { \$fallback = \$proc.ProcessId }
+      if (\$i -ge 1 -and \$proc.Name -like '${runtime}*') { \$proc.ProcessId; exit }
+      \$p = \$proc.ParentProcessId
+    }
+    \$fallback" 2>/dev/null | tr -d ' \r\n')"
+  case "$out" in ''|0|*[!0-9]*) printf '%s' "$PPID" ;; *) printf '%s' "$out" ;; esac
 }
 
 # pause never touches the payload, so it skips the stdin read entirely.
@@ -114,16 +148,36 @@ agent_dir="/tmp/ghoztty-${runtime}-agents-${sid}"
 # instant recovery path: it needs no timeout and no guesswork, and it works
 # across sessions, so one crashed pane cannot litter /tmp forever. Verified
 # necessary -- killing the agent mid-subagent never fires SubagentStop.
+# Owner-liveness probe. POSIX: kill -0. Windows: membership in ONE `ps -W`
+# snapshot per sweep -- `ps -W` is the only view that includes native
+# processes at all, and it is a full-system enumeration, so it is taken once
+# per reap rather than once per marker. A marker's pid may be an MSYS pid (a
+# shell ancestor, as in the test oracle) or a native winpid (the agent
+# itself), so both the PID and WINPID columns count as alive.
+live_pid_set=""
+snapshot_live_pids() {
+  [ "$is_windows" = 1 ] || return 0
+  live_pid_set=" $(ps -W 2>/dev/null | awk 'NR > 1 { printf "%s %s ", $1, $4 }')"
+}
+pid_alive() {
+  if [ "$is_windows" = 1 ]; then
+    case "$live_pid_set" in *" $1 "*) return 0 ;; esac
+    return 1
+  fi
+  kill -0 "$1" 2>/dev/null
+}
+
 reap_dead_owners() {
   local d f pid
   shopt -s nullglob
+  snapshot_live_pids
   for d in "/tmp/ghoztty-${runtime}-agents-"*/; do
     for f in "$d"*; do
       pid="${f##*__}"
       case "$pid" in
         ''|*[!0-9]*) continue ;;                  # unparseable, leave for the age sweep
       esac
-      kill -0 "$pid" 2>/dev/null || rm -f "$f" 2>/dev/null
+      pid_alive "$pid" || rm -f "$f" 2>/dev/null
     done
     rmdir "$d" 2>/dev/null
   done

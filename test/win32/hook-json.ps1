@@ -5,9 +5,12 @@
 #
 #   A. VENDOR DRIFT - the pristine mirror under
 #      src\apprt\win32\assets\ghoztty\upstream\ must be byte-identical to
-#      tip-of-main's macos/Resources/Ghoztty/ (git blob compare), the three
-#      unforked live copies byte-identical to the mirror, and the one
-#      deliberate fork (hooks\ghoztty-banner.sh) jq-free and +json-native.
+#      tip-of-main's macos/Resources/Ghoztty/ (git blob compare), the two
+#      unforked live copies (the SKILL.md files) byte-identical to the
+#      mirror, and the two deliberate forks each carrying their divergence:
+#      hooks\ghoztty-banner.sh jq-free and +json-native (T866), and
+#      hooks\ghoztty-activity-state.sh carrying the OSTYPE-guarded Windows
+#      owner/liveness probes (T605).
 #      This is the loud-drift check T866's validation criteria demand: when
 #      main moves an asset, this section goes red until someone re-vendors.
 #
@@ -103,8 +106,8 @@ if (-not $mainOk) {
     }
 }
 
-# The live copies: three unforked (byte-identical to the mirror), one fork.
-foreach ($rel in @('hooks/ghoztty-activity-state.sh', 'skills/ghoztty/SKILL.md', 'skills/process-feedback/SKILL.md')) {
+# The live copies: two unforked (byte-identical to the mirror), two forks.
+foreach ($rel in @('skills/ghoztty/SKILL.md', 'skills/process-feedback/SKILL.md')) {
     $live = Join-Path $assetRoot ($rel -replace '/', '\')
     $mirror = Join-Path $assetRoot ("upstream\" + ($rel -replace '/', '\'))
     $a = (& git -C $repo hash-object $live 2>$null | Out-String).Trim()
@@ -119,6 +122,19 @@ Assert ($forkText -match [regex]::Escape('ghoztty +json')) 'banner fork parses t
 Assert ($forkText.Contains("`n") -and -not $forkText.Contains("`r`n")) 'banner fork is LF-only (a CRLF script dies in bash)'
 $forkBytes = [System.IO.File]::ReadAllBytes($fork)
 Assert (-not ($forkBytes.Length -ge 3 -and $forkBytes[0] -eq 0xEF)) 'banner fork has no UTF-8 BOM (a BOM breaks the shebang)'
+
+# The activity-state fork (T605): OSTYPE-guarded Windows owner/liveness
+# probes. Without them MSYS kill -0 reads every native agent pid as dead and
+# the reap deletes each subagent marker the moment it is written. The state
+# machine's transitions themselves are the subject of
+# test\win32\activity-state.ps1 (the vendored upstream oracle).
+$fork2 = Join-Path $assetRoot 'hooks\ghoztty-activity-state.sh'
+$fork2Text = [System.IO.File]::ReadAllText($fork2)
+Assert ($fork2Text -match 'owner_winpid') 'activity-state fork resolves the owner over the native process tree'
+Assert ($fork2Text -match [regex]::Escape('ps -W')) 'activity-state fork probes liveness through a ps -W snapshot'
+Assert ($fork2Text.Contains("`n") -and -not $fork2Text.Contains("`r`n")) 'activity-state fork is LF-only (a CRLF script dies in bash)'
+$fork2Bytes = [System.IO.File]::ReadAllBytes($fork2)
+Assert (-not ($fork2Bytes.Length -ge 3 -and $fork2Bytes[0] -eq 0xEF)) 'activity-state fork has no UTF-8 BOM (a BOM breaks the shebang)'
 
 Write-Host ''
 Write-Host '--- B. +json CLI ---'
@@ -180,10 +196,16 @@ $obj = Get-Content $mstate -Raw | ConvertFrom-Json
 Assert ($obj.stale -eq 'reclaimed' -and $sw.ElapsedMilliseconds -lt 2000) "stale lock reclaimed promptly (merge took $($sw.ElapsedMilliseconds)ms)"
 Assert (-not (Test-Path $lockDir)) 'reclaimed lock directory is cleaned up'
 
-# encode: JSON string literal that round-trips.
-$enc = ("a `"b`" c" | & $exe +json encode 2>$null | Out-String).Trim()
+# encode: JSON string literal that round-trips. The input bytes go through a
+# cmd file redirect, never a PS pipe: PS 5.1 prepends a UTF-8 BOM to native
+# stdin whenever the console codepage is 65001 — measured, and neither
+# $OutputEncoding nor [Console]::OutputEncoding stops it — so a piped
+# assertion is about the invoking session's codepage, not about encode.
+$encIn = Join-Path $sandbox 'encode-in.txt'
+[System.IO.File]::WriteAllBytes($encIn, [System.Text.Encoding]::UTF8.GetBytes('a "b" c'))
+$enc = (& cmd /c "`"$exe`" +json encode < `"$encIn`"" | Out-String).Trim()
 $dec = $enc | ConvertFrom-Json
-Assert ($dec -like 'a "b" c*') "+json encode emits a decodable JSON string literal (got $enc)"
+Assert ($dec -eq 'a "b" c') "+json encode emits a decodable JSON string literal (got $enc)"
 
 # usage errors are loud: unknown subcommand and odd merge pairs exit 2.
 & $exe +json frobnicate 2>$null | Out-Null

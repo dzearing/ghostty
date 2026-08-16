@@ -1,10 +1,10 @@
 {
     "guard":  "hook-json",
     "script":  "test/win32/hook-json.ps1",
-    "generated":  "2026-08-15T16:52:35-07:00",
-    "commit":  "7c7b84692",
+    "generated":  "2026-08-15T23:37:09-07:00",
+    "commit":  "b12cab800",
     "files":  {
-                  "src/apprt/win32/assets/ghoztty/hooks/ghoztty-activity-state.sh":  "6ddd430c98cb22e5d03ad8f299a5f41e38a6bb19893bfd9b2d9c9b6bdc697c6b",
+                  "src/apprt/win32/assets/ghoztty/hooks/ghoztty-activity-state.sh":  "8a37b7305be4d2b14e9c12455bee30b155ea46ea93a88f431667257e124a05b5",
                   "src/apprt/win32/assets/ghoztty/hooks/ghoztty-banner.sh":  "ea3178b42df3acbf7f7068c4842cd770f10be23fd5e2935b97e62e9b4e1b47eb",
                   "src/apprt/win32/assets/ghoztty/skills/ghoztty/SKILL.md":  "f29713f0ddadc83f17d28f665dce8dba6426fcfbb7df31235423a915f65fb1aa",
                   "src/apprt/win32/assets/ghoztty/skills/process-feedback/SKILL.md":  "5dde73c815ed6275e2c649b2e7872751c37374310719f27eb1da2ec87075b9ac",
@@ -12,8 +12,8 @@
                   "src/apprt/win32/assets/ghoztty/upstream/hooks/ghoztty-banner.sh":  "9432321fb843eb4966f88aa53427254832d6c5e492b0ed58843b178a8a883788",
                   "src/apprt/win32/assets/ghoztty/upstream/skills/ghoztty/SKILL.md":  "f29713f0ddadc83f17d28f665dce8dba6426fcfbb7df31235423a915f65fb1aa",
                   "src/apprt/win32/assets/ghoztty/upstream/skills/process-feedback/SKILL.md":  "5dde73c815ed6275e2c649b2e7872751c37374310719f27eb1da2ec87075b9ac",
-                  "src/apprt/win32/GhosttyAssets.zig":  "ce22c5e59c29ee69f4c8c6409c6651565c7e0b4ac9b4acb33ed7682e7e9400ff",
+                  "src/apprt/win32/GhosttyAssets.zig":  "0e51de1f7906565498d0c84c618b47136ce6a6f37107cebcd881c99441178fd7",
                   "src/cli/json.zig":  "3e9d5025af34529c2cc57d433306195a1c55b4c582dc385379ce9b6748e0f251",
-                  "test/win32/hook-json.ps1":  "c57d7092d32e12eb37c30ea1604912d9f42b5b45d2bfa6c019c2c72c32b21522"
+                  "test/win32/hook-json.ps1":  "6f3d34e42b558c451423b561d9714e2ce3bee15be9cde00f3a0ce8e80be79716"
               }
 }

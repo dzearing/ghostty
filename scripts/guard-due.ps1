@@ -103,6 +103,21 @@ $GuardTable = @(
             'test\win32\hook-json.ps1'
         )
     },
+    # The activity-state machine (T605): main's own oracle run verbatim under
+    # Git Bash against the live win32 hook asset, plus the native-pid arms the
+    # oracle cannot see. A hook-script edit that breaks a transition only ever
+    # fails inside an agent's hook, where stderr is discarded, and the vendored
+    # oracle mirror rots exactly like the T866 asset mirrors.
+    [pscustomobject]@{
+        Name   = 'activity-state'
+        Script = 'test\win32\activity-state.ps1'
+        Stamp  = 'test\win32\activity-state.stamp.json'
+        Covers = @(
+            'src\apprt\win32\assets\ghoztty\hooks\ghoztty-activity-state.sh',
+            'test\win32\lib\upstream\test-activity-state.sh',
+            'test\win32\activity-state.ps1'
+        )
+    },
     # Crash evidence is the other thing whose failure nothing else catches: a
     # capture path that has quietly stopped working looks exactly like a lane
     # that did not crash, and is only ever exercised on a day already going
