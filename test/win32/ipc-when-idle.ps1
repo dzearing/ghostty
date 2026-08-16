@@ -3,12 +3,16 @@
 # ghoztty processes from zig-out.
 #
 # The contract under test (src/cli/send_keys.zig waitForIdle) — busy is
-# marker OR motion; idle needs neither for 3 consecutive 500ms polls:
-#   1. static pane, no "esc to interrupt" in the last 10 lines -> send
-#      after the ~1s stability window
-#   2. marker present -> hold, send when it scrolls away
-#   3. marker never clears -> send anyway after --idle-timeout seconds
+# a caller-supplied --busy-marker OR motion; idle needs neither for 3
+# consecutive 500ms polls. The CLI bakes in no tool's marker (T517/D11):
+# "esc to interrupt" below is TEST DATA passed via --busy-marker, not a
+# string the product knows.
+#   1. static pane -> send after the ~1s stability window
+#   2. --busy-marker text present -> hold, send when it scrolls away
+#   3. --busy-marker never clears -> send anyway after --idle-timeout
 #   4. no marker but output still streaming -> hold until quiescent
+#   5. marker text present but NOT passed via --busy-marker -> the
+#      default knows no tool chrome, so a static pane sends promptly
 #
 #   powershell -NoProfile -File test\win32\ipc-when-idle.ps1
 param(
@@ -75,7 +79,7 @@ Start-Sleep -Seconds 2
 Assert "marker visible in last 10 lines" ((Read-Pane 10) -match 'esc to interrupt')
 $job = Start-Job -ScriptBlock {
     param($exe)
-    & $exe +send-keys --target=wia --when-idle --idle-timeout=60 "echo WI-DELAYED" Enter 2>&1 | Out-Null
+    & $exe +send-keys --target=wia --when-idle --idle-timeout=60 "--busy-marker=esc to interrupt" "echo WI-DELAYED" Enter 2>&1 | Out-Null
     $LASTEXITCODE
 } -ArgumentList $Exe
 Start-Sleep -Seconds 4
@@ -112,7 +116,7 @@ Assert "text executed after quiescent" (Pane-HasOutput 'WI-QUIET')
 Start-Sleep -Seconds 2
 Assert "marker visible again" ((Read-Pane 10) -match 'esc to interrupt')
 $t0 = Get-Date
-& $Exe +send-keys --target=wia --when-idle --idle-timeout=3 "echo WI-TIMEOUT" Enter 2>&1 | Out-Null
+& $Exe +send-keys --target=wia --when-idle --idle-timeout=3 "--busy-marker=esc to interrupt" "echo WI-TIMEOUT" Enter 2>&1 | Out-Null
 $elapsed = ((Get-Date) - $t0).TotalSeconds
 Assert "exit 0" ($LASTEXITCODE -eq 0)
 Assert "held for ~timeout (>=2.5s, took $([math]::Round($elapsed,1))s)" ($elapsed -ge 2.5)
@@ -120,10 +124,35 @@ Assert "did not hang (<15s)" ($elapsed -lt 15)
 Start-Sleep -Seconds 2
 Assert "text executed after timeout" (Pane-HasOutput 'WI-TIMEOUT')
 
+"== 5: the default knows no tool chrome (T517/D11 negative control)"
+# The marker text is still on screen from section 4, but nobody passes
+# --busy-marker here — a static pane must send promptly, proving the
+# product no longer pattern-matches any tool's UI on its own.
+& $Exe +send-keys --target=wia "echo WI-CHROME esc to interrupt" Enter 2>&1 | Out-Null
+Start-Sleep -Seconds 2
+Assert "marker text on screen" ((Read-Pane 10) -match 'esc to interrupt')
+$t0 = Get-Date
+& $Exe +send-keys --target=wia --when-idle --idle-timeout=15 "echo WI-NODEFAULT" Enter 2>&1 | Out-Null
+$elapsed = ((Get-Date) - $t0).TotalSeconds
+Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "sent promptly despite marker text (<5s, took $([math]::Round($elapsed,1))s)" ($elapsed -lt 5)
+Start-Sleep -Seconds 2
+Assert "text executed" (Pane-HasOutput 'WI-NODEFAULT')
+
 "== teardown"
 & $Exe +close --target=wi 2>&1 | Out-Null
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+
+# --- stamp (T783) -----------------------------------------------------------
+# A green run records the content of every file this harness covers, so
+# scripts\guard-due.ps1 can answer "has anything run it against the code as it
+# now stands?". A red run leaves the stamp alone on purpose - red must stay due.
+if ($script:failures -eq 0) {
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'scripts\guard-due.ps1') `
+        update -Guard when-idle -Repo $repoRoot | ForEach-Object { "  $_" }
+}
 
 ""
 if ($script:failures -eq 0) {

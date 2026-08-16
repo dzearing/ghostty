@@ -233,7 +233,8 @@ ghoztty +send-keys --target=<name> [flags] <text|key>...
 
 - `--target`: Named pane or window to send input to. Required.
 - `--enter`: Press Enter after the text. Same as a trailing `\n` or a trailing `Enter` argument. On its own, with no text, it just presses Enter.
-- `--when-idle`: Poll the target pane's recent output every 500ms until it looks idle before sending: no `esc to interrupt` in the tail (older Claude Code's busy marker) AND the tail unchanged across ~1s (busy TUIs animate spinners/timers every second; an idle prompt is static — this catches Claude Code ≥ 2.1.207, which dropped the marker). Sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
+- `--when-idle`: Poll the target pane's recent output every 500ms until it looks idle before sending: the tail unchanged across ~1s (busy TUIs animate spinners/timers every second; an idle prompt is static — this catches any working program, no tool-specific marker needed) AND none of the caller's `--busy-marker` texts present. Sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
+- `--busy-marker=<text>`: Extra busy signal for `--when-idle` — while `<text>` appears in the pane's last lines, the pane counts as busy even if its tail is static. Repeatable; any match counts. The CLI deliberately bakes in no tool's chrome (T517/D11): a caller that knows what its program prints while working names it here (e.g. older Claude Code rendered `esc to interrupt`; current versions animate, which motion detection already catches).
 - `--keys-file=<path>`: Send the file's bytes **verbatim** — no key notation, no
   `\n` escape processing. It keeps its position among the positional arguments,
   so `--keys-file=p.txt Enter` sends the file and then a carriage return. **Use

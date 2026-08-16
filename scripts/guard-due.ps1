@@ -85,6 +85,20 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
+    # idle poll only ever fails inside a detached automation send — the loop
+    # types into a mid-turn session and the damage reads as "the agent ignored
+    # the prompt", never as a send_keys bug — and ipc-when-idle.ps1 is not in
+    # the P1-P3 floor, so nothing else ties a send_keys.zig edit to a run of it.
+    [pscustomobject]@{
+        Name   = 'when-idle'
+        Script = 'test\win32\ipc-when-idle.ps1'
+        Stamp  = 'test\win32\ipc-when-idle.stamp.json'
+        Covers = @(
+            'src\cli\send_keys.zig',
+            'test\win32\ipc-when-idle.ps1'
+        )
+    },
     # The divergence inventory (T516) is merge-back planning's input: a set
     # computation that drifts wrong sends a future merge hunting conflicts in
     # the wrong files, and nothing in the P1-P3 floor runs its harness.

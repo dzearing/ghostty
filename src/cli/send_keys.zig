@@ -29,6 +29,7 @@ pub const Options = struct {
     target: ?[:0]const u8 = null,
     when_idle: bool = false,
     idle_timeout: u32 = 30,
+    _busy_markers: std.ArrayList([:0]const u8) = .empty,
     enter: bool = false,
 
     /// The first argument that looked like a flag and was not one. Reported
@@ -82,6 +83,12 @@ pub const Options = struct {
             }
             if (std.mem.startsWith(u8, arg, "--idle-timeout=")) {
                 self.idle_timeout = std.fmt.parseInt(u32, arg["--idle-timeout=".len..], 10) catch return error.InvalidValue;
+                return null;
+            }
+            if (std.mem.startsWith(u8, arg, "--busy-marker=")) {
+                const value = arg["--busy-marker=".len..];
+                if (value.len == 0) return error.InvalidValue;
+                try self._busy_markers.append(alloc, try alloc.dupeZ(u8, value));
                 return null;
             }
             if (std.mem.startsWith(u8, arg, "--target=")) {
@@ -141,15 +148,21 @@ pub const Options = struct {
 ///     argument. On its own, with no text, it just presses Enter.
 ///
 ///   * `--when-idle`: Before sending, poll the target pane's recent
-///     output every 500ms until it no longer looks busy: no
-///     "esc to interrupt" in the last lines (the marker older Claude
-///     Code shows while working) AND the tail unchanged across ~1s
-///     (busy TUIs animate spinners/timers; an idle prompt is static).
+///     output every 500ms until it no longer looks busy: the tail
+///     unchanged across ~1s (busy TUIs animate spinners/timers; an
+///     idle prompt is static) and no `--busy-marker` text present.
 ///     Sends anyway once `--idle-timeout` elapses or if the pane's
 ///     output cannot be read.
 ///
 ///   * `--idle-timeout=<seconds>`: Max time to wait with `--when-idle`.
 ///     Default: 30.
+///
+///   * `--busy-marker=<text>`: Extra busy signal for `--when-idle`:
+///     while <text> appears in the pane's last lines, the pane counts
+///     as busy even if its tail is static. May be given more than
+///     once; any match counts. The CLI bakes in no particular tool's
+///     chrome — a caller that knows what its program prints while
+///     working passes it here.
 ///
 ///   * `--keys-file=<path>`: Send the file's bytes VERBATIM — no key
 ///     notation, no `\n` escape processing, no shell in the way. Use
@@ -257,7 +270,7 @@ fn runArgs(
         try stderr.print(
             \\+send-keys: unknown flag '{s}'.
             \\To submit, use --enter, a trailing \n, or a separate Enter argument.
-            \\Valid flags: --target= --when-idle --idle-timeout= --keys-file= --enter
+            \\Valid flags: --target= --when-idle --idle-timeout= --busy-marker= --keys-file= --enter
             \\To send literal text starting with '--', put it after '--'.
             \\
         , .{flag});
@@ -334,6 +347,7 @@ fn runArgs(
             alloc,
             target_arg["--target=".len..],
             opts.idle_timeout,
+            opts._busy_markers.items,
             stderr,
         );
     }
@@ -379,12 +393,13 @@ fn positionalArgs(alloc: Allocator, opts: *const Options) Allocator.Error![]cons
 /// Poll the target pane's recent output until it looks idle, then
 /// return. Busy is either signal:
 ///
-///   * the literal "esc to interrupt" in the last lines (the marker
-///     Claude Code < 2.1.207 shows while working), or
+///   * any caller-supplied `--busy-marker` text in the last lines
+///     (the CLI itself knows no tool's chrome — the caller names what
+///     its program prints while working), or
 ///   * the tail CHANGING between polls — busy TUIs animate a spinner
 ///     and a per-second timer, so their tail never holds still for a
-///     full second, while an idle prompt is static. This catches
-///     Claude Code versions that no longer render the marker.
+///     full second, while an idle prompt is static. This needs no
+///     marker and works for any program.
 ///
 /// Idle therefore requires no marker AND an identical tail across
 /// three consecutive polls (spanning ~1s, so a ticking seconds timer
@@ -392,7 +407,7 @@ fn positionalArgs(alloc: Allocator, opts: *const Options) Allocator.Error![]cons
 /// proceed — after `timeout_secs`, or immediately if the pane's output
 /// cannot be read (e.g. the target is a window name rather than a
 /// pane).
-fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *std.Io.Writer) void {
+fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, markers: []const [:0]const u8, stderr: *std.Io.Writer) void {
     const read_cli = @import("read.zig");
     var prev_hash: u64 = 0;
     var have_prev = false;
@@ -400,7 +415,9 @@ fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *s
     var remaining_polls: u64 = @as(u64, timeout_secs) * 2;
     while (remaining_polls > 0) : (remaining_polls -= 1) {
         const text = read_cli.queryPaneText(alloc, name, 10, stderr) catch return;
-        const marker = std.mem.indexOf(u8, text, "esc to interrupt") != null;
+        const marker = for (markers) |m| {
+            if (std.mem.indexOf(u8, text, m) != null) break true;
+        } else false;
         const hash = std.hash.Wyhash.hash(0, text);
         const changed = !have_prev or hash != prev_hash;
         prev_hash = hash;
@@ -1187,6 +1204,47 @@ test "flags: --keys-file= survives flag parsing as a positional" {
     try std.testing.expectEqual(@as(usize, 2), opts._arguments.items.len);
     try std.testing.expectEqualStrings("--keys-file=p.txt", opts._arguments.items[0].text);
     try std.testing.expect(!opts._arguments.items[0].after_dashdash);
+}
+
+test "flags: --busy-marker= collects values and stays out of the text" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{
+        "--target=x",
+        "--busy-marker=esc to interrupt",
+        "--busy-marker=Working…",
+        "hi",
+    });
+
+    try std.testing.expect(opts.unknown_flag == null);
+    try std.testing.expectEqual(@as(usize, 2), opts._busy_markers.items.len);
+    try std.testing.expectEqualStrings("esc to interrupt", opts._busy_markers.items[0]);
+    try std.testing.expectEqualStrings("Working…", opts._busy_markers.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("hi", opts._arguments.items[0].text);
+}
+
+test "flags: an empty --busy-marker= is invalid, not an empty match-everything" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var opts: Options = .{};
+    try std.testing.expectError(error.InvalidValue, opts.checkArg(alloc, "--busy-marker="));
+}
+
+test "flags: after a bare -- a --busy-marker= is literal text, not a flag" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts = try testCheckArgs(alloc, &.{ "--target=x", "--", "--busy-marker=zzz" });
+
+    try std.testing.expectEqual(@as(usize, 0), opts._busy_markers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), opts._arguments.items.len);
+    try std.testing.expectEqualStrings("--busy-marker=zzz", opts._arguments.items[0].text);
 }
 
 test "flags: --enter becomes a synthetic trailing Enter positional" {
