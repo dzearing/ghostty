@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T535/T537 - the viewer suite's "+reload on a
+  terminal-focused window" red is closed: the server's refusal string was
+  correct all along, and both reds were the T526 capture bug wearing a
+  different assert.** Verbatim capture on the background test desktop at
+  HEAD (isolated pipe, harness launch shape): exit 1,
+  `focused pane of 'vpterms' is a terminal pane, nothing to reload` - the
+  Mac string byte for byte. The 2026-08-06 red was the consoleless
+  PowerShell host formatting native-stderr ErrorRecords as blank through
+  `Out-String`, so the string assert compared against `''` while the
+  exit-code assert beside it passed - exactly this task's symptom, fixed
+  for all 14 stderr asserts by T526's `Invoke-Verb` stringify (0fc6facf1).
+  No product change; assert unweakened; `viewer-panes.ps1` ALL PASS (185)
+  at HEAD. T537 ("fails in harness, passes live" - same assert) closed as
+  duplicate. Floor: ALL LANES PASS + P1/P2/P3 ALL PASS.
 - 2026-08-16 - **T534 - a session nobody has looked at in a day now
   introduces itself: one tray balloon naming it (cwd + command), whose click
   opens the Ctrl+Shift+N chooser where T520's badge and Resume/Kill already
