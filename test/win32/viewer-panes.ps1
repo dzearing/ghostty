@@ -96,8 +96,15 @@ function Stop-RepoInstances {
 # Run a ghoztty verb and return its exit code plus merged output. A PIPE, not
 # a `>` redirect: `ghoztty +verb > file` from PowerShell writes zero bytes
 # (T245), and the server's error text is the whole oracle here.
+#
+# Each object is stringified BEFORE Out-String (T526): `2>&1` wraps native
+# stderr lines in ErrorRecords, and a consoleless PowerShell host — which is
+# how the loop's automated runs execute this script — formats an ErrorRecord
+# through Out-String as a BLANK line while its ToString() keeps the text. In
+# a real console both spellings work; without one, every stderr assertion in
+# this file silently compared against ''.
 function Invoke-Verb([string[]]$VerbArgs) {
-    $out = (& $exe @VerbArgs 2>&1 | Out-String)
+    $out = (& $exe @VerbArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
 }
 
