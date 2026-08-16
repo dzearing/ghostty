@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T443/T857 - the 09:26 unblock was a false alarm; both
+  re-parked, T892 filed.** Both tasks were flipped to `todo` in the same
+  minute the user answered D76 (unrelated), by bare CLI `set-status` with no
+  source note — the fold commit bundled them in as "came off their
+  blocked(waiting-on-user) states". Neither unblock condition held: powercfg
+  PROCTHROTTLEMAX still reads 100 (the elevated boost-off commands were never
+  run), and the morning's three `.dumps` artifacts are the T536/T886
+  crash-watcher acceptance fixtures (`avthread.zig` under `firstchance-*`),
+  not the ghost — discriminator now recorded in T443's armed-watch log.
+  Overnight read: ~44 build-runner floor-lane runs, zero crash markers
+  (window cooling, `p ≈ 0.2` against last night's 3.5%/run). Re-parked per
+  D27; the powercfg commands are back on the pane banner. Filed **T892**:
+  CLI `set-status` out of `blocked(…)` must demand a source note and restate
+  the unblock condition (the dashboard got this guard in T564; the CLI path
+  is how both no-evidence reopens happened). Next: the boost-off arm still
+  only needs an elevated shell running two powercfg lines.
 - 2026-08-16 - **T555 - The palette can now jump to any pane.** The win32
   command palette lists a `Focus: <title>` entry per live pane across every
   window (Mac `jumpOptions` parity): a snapshot taken at palette open, each
