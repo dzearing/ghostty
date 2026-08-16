@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T555 - The palette can now jump to any pane.** The win32
+  command palette lists a `Focus: <title>` entry per live pane across every
+  window (Mac `jumpOptions` parity): a snapshot taken at palette open, each
+  entry carrying the pane's `~`-abbreviated cwd as a dimmed trailing
+  subtitle derived by the T447 tab-tooltip transform so the two surfaces
+  cannot disagree, filterable by title AND directory (matching Mac's
+  title-or-subtitle filter), and Enter dispatches through the one shared
+  focus path. Pure derivation in `palette_jump.zig` (none lane); entries
+  hold the pane's stable id, not a pointer, so a pane closed over IPC while
+  the palette is open dissolves into a no-op. The load-bearing surprise:
+  `IpcHandlers.focusTarget` never switched TABS, so focusing a
+  background-tab pane (palette jump, `ghoztty://focus`, CLI idempotent
+  focus alike) would have SetFocus'd a hidden HWND — it now selects the
+  owning tab first (`Window.tabIndexOfPane`), which fixes that latent CLI/
+  URL-scheme bug too. Rendering choice recorded: trailing dimmed text on
+  the same row (a Windows single-height list) rather than Mac's second
+  line; the task sanctioned either. Validation: 4 floor lanes + P1–P3
+  green; new `test\win32\palette-jump.ps1` ALL PASS (25 assertions:
+  cross-window jump by cwd filter, cross-tab jump reveals the background
+  tab, empty-filter Enter no-op), guard row `palette-jump` stamped. Filed
+  T891 (palette Recent section + alphabetical sort, the remaining Mac
+  palette delta).
 - 2026-08-16 - **T547 - "Share this machine" is now a checkbox in the machine
   chooser's account row.** The GUI half of the one-installer consolidation on
   this seat: the toggle sits at the band's leading edge in every account state

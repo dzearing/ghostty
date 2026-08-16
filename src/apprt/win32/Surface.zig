@@ -38,6 +38,9 @@ const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
 const menu_label = @import("menu_label.zig");
 const pane_id_mod = @import("pane_id.zig");
+const palette_jump = @import("palette_jump.zig");
+const tab_tooltip = @import("tab_tooltip.zig");
+const IpcHandlers = @import("IpcHandlers.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
@@ -283,7 +286,13 @@ palette_selected: u16 = 0,
 /// Number of items currently in the filtered list.
 palette_count: u16 = 0,
 /// Indices into palette_entries for the current filter.
-palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefined,
+palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES + palette_jump.max_entries]u16 = undefined,
+/// Arena holding the "Focus: <pane>" jump-entry snapshot (T555) — taken
+/// each time the palette opens, freed when it closes. Null while closed.
+palette_jump_arena: ?std.heap.ArenaAllocator = null,
+/// The snapshotted jump entries, one per live pane across every window.
+/// All slices are owned by `palette_jump_arena`.
+palette_jump_entries: []const JumpEntry = &.{},
 
 /// Remote-machine backend for this surface (remote-machines design §3.2),
 /// or null for a local ConPTY surface. Set from `Overrides.remote` BEFORE
@@ -980,6 +989,7 @@ pub fn deinit(self: *Surface) void {
         _ = w32.DeleteObject(f);
         self.palette_paint_font = null;
     }
+    self.freePaletteJumpEntries();
 
     // Reap the child HWND, but not from this stack (T681). Calling
     // DestroyWindow here is what the first win32 commit found segfaulting
@@ -2290,6 +2300,27 @@ const palette_entries = commands.registry;
 /// palette (bounds the fixed-size palette_filtered index array).
 pub const MAX_USER_PALETTE_ENTRIES = 64;
 
+/// Palette indexes >= JUMP_BASE refer to the "Focus: <pane>" jump-entry
+/// snapshot (T555). The base is FIXED (past the largest possible user
+/// range) rather than stacked on the live user count, so a config reload
+/// while the palette is open cannot re-map a jump index onto a command.
+const JUMP_BASE: u16 = palette_entries.len + MAX_USER_PALETTE_ENTRIES;
+
+/// One "Focus: <pane>" palette entry (T555): a live pane somewhere in the
+/// app, named the way the Mac palette's jumpOptions name it. The pane is
+/// held by its stable id rather than a pointer — a pane can be closed over
+/// IPC while the palette is open, and a stale id resolves to nothing
+/// instead of a freed pointer.
+const JumpEntry = struct {
+    /// The pane's stable id (`$GHOZTTY_PANE_ID`), arena-owned.
+    pane_id: []const u8,
+    /// The full label, `"Focus: <title>"`, arena-owned.
+    label: []const u8,
+    /// The `~`-abbreviated cwd (terminal) or location (viewer), arena-owned;
+    /// null when there is nothing to say or the title already says it.
+    subtitle: ?[]const u8,
+};
+
 /// Palette indexes >= palette_entries.len refer to user-configured
 /// command-palette-entry commands from the config, in order.
 fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
@@ -2299,6 +2330,11 @@ fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
         if (entry.quit_keep and self.app.config.@"session-persistence")
             return "Quit Ghoztty (keep sessions)";
         return entry.name;
+    }
+    if (idx >= JUMP_BASE) {
+        const jidx = idx - JUMP_BASE;
+        if (jidx >= self.palette_jump_entries.len) return "";
+        return self.palette_jump_entries[jidx].label;
     }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
@@ -2313,10 +2349,90 @@ fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
         const entry = palette_entries[idx];
         return if (entry.kind == .binding) entry.action else null;
     }
+    // Jump entries dispatch a focus, not a binding — no keybind hint.
+    if (idx >= JUMP_BASE) return null;
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
     if (uidx >= user.len) return null;
     return user[uidx].action;
+}
+
+/// The dimmed trailing text for a palette row — only jump entries carry one
+/// (the pane's abbreviated cwd, T555).
+fn paletteEntrySubtitle(self: *const Surface, idx: u16) ?[]const u8 {
+    if (idx < JUMP_BASE) return null;
+    const jidx = idx - JUMP_BASE;
+    if (jidx >= self.palette_jump_entries.len) return null;
+    return self.palette_jump_entries[jidx].subtitle;
+}
+
+/// Free the jump-entry snapshot (palette close / surface deinit).
+fn freePaletteJumpEntries(self: *Surface) void {
+    self.palette_jump_entries = &.{};
+    if (self.palette_jump_arena) |*arena| {
+        arena.deinit();
+        self.palette_jump_arena = null;
+    }
+}
+
+/// Snapshot one "Focus: <pane>" entry per live pane across every window
+/// (T555) — taken when the palette opens, exactly when Mac's `jumpOptions`
+/// computes. Quick terminals are skipped (not addressable targets, same as
+/// `+list`). Allocation failure degrades to a palette with fewer or no jump
+/// entries, never an error the user sees.
+fn buildPaletteJumpEntries(self: *Surface) void {
+    self.freePaletteJumpEntries();
+    self.palette_jump_arena = std.heap.ArenaAllocator.init(self.app.core_app.alloc);
+    const arena = self.palette_jump_arena.?.allocator();
+
+    var home_buf: [512]u8 = undefined;
+    const home: ?[]const u8 = internal_os.home(&home_buf) catch null;
+
+    var entries = std.ArrayList(JumpEntry).initCapacity(arena, 16) catch return;
+    outer: for (self.app.windows.items) |window| {
+        if (window.is_quick_terminal) continue;
+        for (0..window.tab_count) |t| {
+            // The tab title, for panes that have none of their own.
+            const tab_title: []const u8 = std.unicode.utf16LeToUtf8Alloc(
+                arena,
+                window.tab_titles[t][0..window.tab_title_lens[t]],
+            ) catch "";
+
+            var it = window.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                if (entries.items.len >= palette_jump.max_entries) break :outer;
+                const pane = entry.view;
+
+                var title: []const u8 = undefined;
+                var location: ?[]const u8 = null;
+                if (pane.surface()) |s| {
+                    title = palette_jump.displayTitle(s.getTitle(), tab_title);
+                    // Live OS cwd first, OSC-7 cache second — the same
+                    // composition as `+list` and the tab tooltip (T185).
+                    location = s.livePwd(arena) orelse s.pwd;
+                } else if (pane.viewer()) |v| {
+                    title = palette_jump.displayTitle(v.title, tab_title);
+                    location = v.location;
+                } else continue;
+
+                var tip_buf: [tab_tooltip.max_len]u8 = undefined;
+                const sub: ?[]const u8 = if (location) |loc|
+                    palette_jump.subtitle(&tip_buf, loc, home, title)
+                else
+                    null;
+
+                const label = std.mem.concat(arena, u8, &.{
+                    palette_jump.prefix, title,
+                }) catch break :outer;
+                entries.append(arena, .{
+                    .pane_id = arena.dupe(u8, pane.paneId()) catch break :outer,
+                    .label = label,
+                    .subtitle = if (sub) |s2| arena.dupe(u8, s2) catch null else null,
+                }) catch break :outer;
+            }
+        }
+    }
+    self.palette_jump_entries = entries.items;
 }
 
 /// Child window ID for the palette edit control.
@@ -2335,6 +2451,9 @@ pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
         }
         self.palette_active = true;
         self.ensureCommandPalette();
+        // Snapshot the "Focus: <pane>" jump entries at open (T555) — the
+        // moment Mac's jumpOptions computes.
+        self.buildPaletteJumpEntries();
         if (self.palette_hwnd) |popup| {
             self.positionCommandPalette();
             self.filterPaletteEntries("");
@@ -2346,6 +2465,7 @@ pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
         }
     } else {
         self.palette_active = false;
+        self.freePaletteJumpEntries();
         if (self.palette_hwnd) |popup| {
             _ = w32.ShowWindow(popup, 0); // SW_HIDE
         }
@@ -2481,6 +2601,14 @@ fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     for (user[0..user_len], 0..) |entry, i| {
         if (filter.len == 0 or std.ascii.indexOfIgnoreCase(entry.title, filter) != null) {
             self.palette_filtered[count] = @intCast(palette_entries.len + i);
+            count += 1;
+        }
+    }
+    // "Focus: <pane>" jump entries (T555), appended last. The filter also
+    // matches the SUBTITLE, so panes can be found by directory.
+    for (self.palette_jump_entries, 0..) |entry, i| {
+        if (palette_jump.matches(filter, entry.label, entry.subtitle)) {
+            self.palette_filtered[count] = @intCast(JUMP_BASE + i);
             count += 1;
         }
     }
@@ -2690,6 +2818,32 @@ pub fn executePaletteSelection(self: *Surface) void {
 
     const entry_idx = self.palette_filtered[self.palette_selected];
 
+    // A "Focus: <pane>" jump entry (T555). The pane id is copied out BEFORE
+    // the close — closing frees the jump-entry arena — and re-resolved by
+    // identity, so a pane closed while the palette was open dissolves into a
+    // no-op rather than a dangling pointer. The focus itself is the ONE
+    // focus implementation (`IpcHandlers.focusTarget`), the same path a
+    // `ghoztty://focus/<target>` link and the CLI take.
+    if (entry_idx >= JUMP_BASE) {
+        const jidx = entry_idx - JUMP_BASE;
+        if (jidx >= self.palette_jump_entries.len) {
+            self.setCommandPaletteActive(false);
+            return;
+        }
+        var id_buf: pane_id_mod.Buf = undefined;
+        const src = self.palette_jump_entries[jidx].pane_id;
+        if (src.len > id_buf.len) {
+            self.setCommandPaletteActive(false);
+            return;
+        }
+        @memcpy(id_buf[0..src.len], src);
+        const id = id_buf[0..src.len];
+        self.setCommandPaletteActive(false);
+        const target = self.app.ipcLookup(id) orelse return;
+        IpcHandlers.focusTarget(target);
+        return;
+    }
+
     // Close the palette first.
     self.setCommandPaletteActive(false);
 
@@ -2849,6 +3003,43 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
         while (name_len > 0 and entry_name[name_len - 1] & 0xC0 == 0x80) name_len -= 1;
         const wname_len = std.unicode.utf8ToUtf16Le(&wname_buf, entry_name[0..name_len]) catch 0;
         _ = w32.DrawTextW(hdc, @ptrCast(&wname_buf), @intCast(wname_len), &name_rect, 0);
+
+        // Dimmed trailing subtitle (T555): a jump entry's abbreviated cwd,
+        // right-aligned in the space after the title — the same dim gray as
+        // a keybind hint, and it cannot collide with one because jump
+        // entries never carry a keybind. Right-aligned so a clip eats the
+        // path's HEAD and the distinguishing tail survives.
+        if (self.paletteEntrySubtitle(entry_idx)) |sub| {
+            // Measure the painted title so the subtitle starts after it.
+            var meas = name_rect;
+            _ = w32.DrawTextW(
+                hdc,
+                @ptrCast(&wname_buf),
+                @intCast(wname_len),
+                &meas,
+                0x0420, // DT_CALCRECT | DT_SINGLELINE
+            );
+            const gap: i32 = @intFromFloat(@round(12.0 * s));
+            var sub_rect = w32.RECT{
+                .left = meas.right + gap,
+                .top = y + text_top_pad,
+                .right = client_rect.right - text_pad,
+                .bottom = y + item_height,
+            };
+            if (sub_rect.left < sub_rect.right) {
+                _ = w32.SetTextColor(hdc, w32.RGB(140, 140, 140));
+                var wsub_buf: [tab_tooltip.max_len]u16 = undefined;
+                const wsub_len = std.unicode.utf8ToUtf16Le(&wsub_buf, sub) catch 0;
+                _ = w32.DrawTextW(
+                    hdc,
+                    @ptrCast(&wsub_buf),
+                    @intCast(wsub_len),
+                    &sub_rect,
+                    0x0022, // DT_RIGHT | DT_SINGLELINE
+                );
+                _ = w32.SetTextColor(hdc, w32.RGB(220, 220, 220));
+            }
+        }
 
         // Draw keybinding hint on the right
         const trigger = if (entry_action) |a| self.app.config.keybind.set.getTrigger(a) else null;

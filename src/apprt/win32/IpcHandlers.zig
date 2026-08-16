@@ -210,8 +210,22 @@ pub fn focusTarget(entry: App.IpcTarget) void {
     }
     switch (entry) {
         .window => {},
-        .pane => |p| if (p.hwnd()) |h| {
-            App.deferSetFocus(h); // T48
+        .pane => |p| {
+            // A pane in a BACKGROUND tab must have its tab selected first
+            // (T555): its HWND is hidden, and SetFocus on a hidden window
+            // routes keys to a pane the user cannot see. Making it the
+            // tab's active pane before the switch makes `selectTabIndex`'s
+            // own deferred focus land on it.
+            if (window.tabIndexOfPane(p)) |tab| {
+                if (tab != window.active_tab) {
+                    window.tab_active_pane[tab] = p;
+                    window.selectTabIndex(tab);
+                    return;
+                }
+            }
+            if (p.hwnd()) |h| {
+                App.deferSetFocus(h); // T48
+            }
         },
     }
 }

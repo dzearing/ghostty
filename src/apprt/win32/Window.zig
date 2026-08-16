@@ -2208,6 +2208,20 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.updateWindowTitle();
 }
 
+/// The index of the tab whose tree holds `pane`, if any. Pub: the shared
+/// focus path (`IpcHandlers.focusTarget`) switches to this tab before
+/// focusing a pane, so a jump to a background-tab pane reveals it instead
+/// of focusing a hidden HWND (T555).
+pub fn tabIndexOfPane(self: *Window, pane: *PaneView) ?usize {
+    for (0..self.tab_count) |t| {
+        var it = self.tab_trees[t].iterator();
+        while (it.next()) |entry| {
+            if (entry.view == pane) return t;
+        }
+    }
+    return null;
+}
+
 /// Number of leaves in a tab's tree.
 fn leafCount(self: *Window, tab: usize) usize {
     var n: usize = 0;

@@ -182,6 +182,10 @@ test {
     // elision (T447), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_tooltip.zig");
 
+    // Pure win32 command-palette jump-entry derivation — title fallback,
+    // subtitle suppression, filter matching (T555), same no-OS-imports deal.
+    _ = @import("apprt/win32/palette_jump.zig");
+
     // Pure win32 icon-button geometry shared by the tab strip and the pane
     // banner (T204), same no-OS-imports deal.
     _ = @import("apprt/win32/icon_button.zig");

@@ -467,6 +467,19 @@ $GuardTable = @(
             'scripts\task-dashboard.page.html',
             'test\win32\task-dashboard.ps1'
         )
+    },
+    # The palette's "Focus: <pane>" jump entries (T555). The pure derivation
+    # rides the none lane; this row ties the HARNESS to its own family only -
+    # Surface.zig/IpcHandlers.zig move for a hundred non-palette reasons and
+    # are the P1-P3 floor's problem, so gating this harness on them is noise.
+    [pscustomobject]@{
+        Name   = 'palette-jump'
+        Script = 'test\win32\palette-jump.ps1'
+        Stamp  = 'test\win32\palette-jump.stamp.json'
+        Covers = @(
+            'src\apprt\win32\palette_jump.zig',
+            'test\win32\palette-jump.ps1'
+        )
     }
 )
 

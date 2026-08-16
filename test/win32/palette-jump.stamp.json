@@ -1,0 +1,10 @@
+{
+    "guard":  "palette-jump",
+    "script":  "test/win32/palette-jump.ps1",
+    "generated":  "2026-08-16T09:03:42-07:00",
+    "commit":  "61f47a352",
+    "files":  {
+                  "src/apprt/win32/palette_jump.zig":  "90d5a80ab69b1b8a81f676c5eaa6949d73f1a3997168b1b66cf586ff9fd95c37",
+                  "test/win32/palette-jump.ps1":  "763e2d62781ae09c8e69f94f2880265777e74bdbca6cfe00aa7a8941e3e5bec9"
+              }
+}
