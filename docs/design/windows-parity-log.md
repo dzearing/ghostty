@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T526 - viewer-panes.ps1 is a trustworthy oracle again: ALL
+  PASS (185) x2 at HEAD.** The task's original red assert (cwd fallback for a
+  split off a web viewer) was already fixed by T538's window-scoped fallback -
+  at HEAD the suite instead failed 14 DIFFERENT asserts, all stderr-text
+  oracles. Root cause is PowerShell, not the app: `2>&1` wraps native stderr
+  in ErrorRecords, and under a consoleless host (exactly how the loop's tool
+  sessions run acceptance scripts) PS 5.1 formats those records as BLANK
+  through `Out-String` while `ToString()` keeps the text; a detached conhost
+  formats fine, and raw-pipe capture proved ghoztty writes correct bytes. Fix:
+  `Invoke-Verb` stringifies each record before `Out-String`. Floor green
+  (lib/none/win32/agent ALL PASS, P1-P3 ALL PASS). T540 closed as duplicate
+  (T538 product half + this suite half); **T883** filed to sweep the same
+  blind capture out of ~33 more scripts and grow a guard - green-by-hand /
+  blind-in-the-loop is a verdict-integrity hole, not a cosmetic one.
 - 2026-08-16 - **T516 - the merge-back risk is a list now, not a guess:
   `scripts\divergence-inventory.ps1` computes the fork-point divergence vs
   upstream ghostty and writes `docs\design\windows-parity-divergence.md`.**
