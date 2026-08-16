@@ -757,6 +757,10 @@ pub fn onConfigChange(self: *Window) void {
     // (T78).
     self.createTabFont();
     self.invalidateTabBar();
+    // Drop the tab tooltip control so a `window-theme` change re-themes the
+    // next tip shown, instead of keeping the palette decided at creation
+    // (T557).
+    self.tabTipReset();
 }
 
 /// (Re)create the tab bar font at the current DPI scale, honoring
@@ -6445,8 +6449,9 @@ fn tabTipToolInfo(self: *Window) w32.TOOLINFOW {
 
 /// Create the tooltip control on first use. The dark theme is decided the
 /// way the menus decide it (`DarkMode.modeForTheme`, `system` following the
-/// OS apps theme) and applied at creation; a theme flip mid-session catches
-/// up on the next window, which is the same latitude the dialogs take.
+/// OS apps theme) and applied at creation; a mid-session flip catches up
+/// because `tabTipReset` destroys the control, so the next show re-runs
+/// this with the fresh answer (T557).
 fn tabTipEnsure(self: *Window) ?w32.HWND {
     if (self.tab_tip_hwnd) |h| return h;
     const hwnd = self.hwnd orelse return null;
@@ -6498,6 +6503,23 @@ fn tabTipEnsure(self: *Window) ?w32.HWND {
     _ = w32.SendMessageW(tip, w32.TTM_SETMAXTIPWIDTH, 0, 0x7FFF);
     self.tab_tip_hwnd = tip;
     return tip;
+}
+
+/// Destroy the tooltip control so the next show recreates it (T557). The
+/// dark theme is applied once, at creation (`tabTipEnsure`), so an OS
+/// apps-theme flip or a `window-theme` reload would otherwise leave an
+/// existing control on the stale palette for the window's lifetime. Safe
+/// from any state; a pending show timer is cancelled with the hide.
+fn tabTipReset(self: *Window) void {
+    self.tabTipHide();
+    // Logged before the control check: the WIRING (theme flip / config
+    // reload reaches the reset) is what `test\win32\tab-tooltip.ps1`
+    // section F scores, and the background test desktop cannot hold a
+    // hover long enough to have created a control first (T233).
+    log.debug("tab tooltip reset had_control={}", .{self.tab_tip_hwnd != null});
+    const tip = self.tab_tip_hwnd orelse return;
+    self.tab_tip_hwnd = null;
+    _ = w32.DestroyWindow(tip);
 }
 
 /// Hide the tooltip and cancel any pending show. Safe to call from any
@@ -7121,6 +7143,11 @@ pub fn windowWndProc(
             // and neither of those ever sees this message (T307).
             if (system_colors.isColorSettingChange(lparam)) {
                 system_colors.repaintForColorChange(hwnd);
+                // The tab tooltip's dark theme was applied at creation; an
+                // OS apps-theme flip lands here, so drop the control and
+                // let the next show recreate it with the fresh answer
+                // (T557).
+                window.tabTipReset();
             } else {
                 // Not a color broadcast — the work above is cheap and safe to
                 // run on any setting change, but a whole-window redraw is not.

@@ -28,6 +28,8 @@
 #   E: an ELIDED tab title rides above the cwd as the tip's first line, and
 #      a title that fits keeps the tip cwd-only (T556).
 #   D: a tab whose focused pane is a VIEWER reports the viewer's location.
+#   F: an OS apps-theme flip RESETS the tooltip control, so the next show
+#      recreates it on the fresh theme (T557).
 #
 # Runs on a background Win32 desktop (lib/TestDesktop.ps1); hermetic via a
 # per-run LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN + a private pipe suffix.
@@ -275,6 +277,51 @@ try {
         Start-Sleep -Seconds 3
         $probe = Probe-TipText $top2 $m2 $errlog2
         Assert ($probe -like '*tipdoc.md*') "D: a viewer pane's tooltip names its location ($probe)"
+
+        # -------------------------------------------------------------------
+        # F (T557): a mid-session theme flip RESETS the tooltip control so
+        # the next show recreates it with the fresh dark/light answer - the
+        # theme is applied once, at creation, so a control that survives the
+        # flip keeps the stale palette. The trigger exercised is the OS
+        # apps-theme flip (WM_SETTINGCHANGE lParam "ImmersiveColorSet");
+        # the other trigger, a config reload (onConfigChange), calls the
+        # SAME tabTipReset one line from here but has no externally drivable
+        # entry on this desktop: `+reload` is the viewer verb, the menu's
+        # Reload Configuration comes back in-process from TrackPopupMenuEx
+        # (never as a postable WM_COMMAND), and keybinds need a foreground
+        # keyboard the background desktop does not have. What is scored is
+        # the WIRING via the `tab tooltip reset` oracle, logged before the
+        # control-exists check: this desktop cannot hold a hover across the
+        # show delay (T233), so no control exists to destroy here, and the
+        # recreation half is tabTipEnsure - the same lazy path sections A-E
+        # already score.
+        # -------------------------------------------------------------------
+        function Wait-ResetOracle($log) {
+            for ($t = 0; $t -lt 10; $t++) {
+                $hit = @(Select-String -Path $log -Pattern 'tab tooltip reset' -ErrorAction SilentlyContinue)
+                if ($hit.Count -gt 0) { return $true }
+                Start-Sleep -Milliseconds 500
+            }
+            return $false
+        }
+        if (-not ('TabTipSettingChange' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TabTipSettingChange {
+    // lParam marshaled as a string: WM_SETTINGCHANGE is one of the system
+    // messages user32 marshals cross-process (PathInstaller relies on the
+    // same fact broadcasting "Environment").
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr wp, string lp, uint flags, uint timeout, out IntPtr result);
+}
+'@
+        }
+        Clear-Content $errlog2 -ErrorAction SilentlyContinue
+        $resF = [IntPtr]::Zero
+        # SMTO_ABORTIFHUNG, same shape as the lib's Send().
+        [void][TabTipSettingChange]::SendMessageTimeoutW($top2, 0x001A, [IntPtr]::Zero, 'ImmersiveColorSet', 0x0002, 10000, [ref]$resF)
+        Assert (Wait-ResetOracle $errlog2) 'F: an OS apps-theme flip (ImmersiveColorSet) resets the tooltip control'
     }
 
     Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) 'no window leaked onto the interactive desktop'
@@ -295,5 +342,18 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 }
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))" }
+if ($script:fail -eq 0) {
+    if ($script:skipped) {
+        # A run with skipped sections did not observe everything the stamp
+        # would claim - leave it, so the harness stays due (T783).
+        Write-Host "ALL PASS ($script:pass assertions, $script:skipped SKIPPED)"
+    } else {
+        # A clean green run records the covered files so scripts\guard-due.ps1
+        # can answer "has anyone run this harness against the code as it now
+        # stands?" (T783). Red runs leave the stamp alone - red must stay due.
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+            update -Guard tab-tooltip -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+        Write-Host "ALL PASS ($script:pass assertions)"
+    }
+}
 else { Write-Host "$script:fail FAILURE(S) / $script:pass passed" -ForegroundColor Red; exit 1 }

@@ -1,0 +1,10 @@
+{
+    "guard":  "tab-tooltip",
+    "script":  "test/win32/tab-tooltip.ps1",
+    "generated":  "2026-08-16T10:23:50-07:00",
+    "commit":  "0ec34bfba",
+    "files":  {
+                  "src/apprt/win32/tab_tooltip.zig":  "9dbb27927b691d7776b74d10e6cadaf911a7e50c548b1a6f80ceab3752473303",
+                  "test/win32/tab-tooltip.ps1":  "405d750c2d9076c6afcb5c60ca2208619da29bb9f00a8da9e6337dd7433c03b1"
+              }
+}

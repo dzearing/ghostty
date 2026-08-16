@@ -480,6 +480,21 @@ $GuardTable = @(
             'src\apprt\win32\palette_jump.zig',
             'test\win32\palette-jump.ps1'
         )
+    },
+    # The tab cwd tooltip (T447/T556/T557). Same shape as palette-jump: the
+    # text derivation lives in tab_tooltip.zig (none-lane unit tested; this
+    # harness scores it end-to-end at hover time), and the row ties the
+    # harness to that family only - the show/theme plumbing sits in
+    # Window.zig, which moves for a hundred non-tooltip reasons and is the
+    # P1-P3 floor's problem, so gating this harness on it is noise.
+    [pscustomobject]@{
+        Name   = 'tab-tooltip'
+        Script = 'test\win32\tab-tooltip.ps1'
+        Stamp  = 'test\win32\tab-tooltip.stamp.json'
+        Covers = @(
+            'src\apprt\win32\tab_tooltip.zig',
+            'test\win32\tab-tooltip.ps1'
+        )
     }
 )
 

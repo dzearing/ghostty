@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T557 - The tab tooltip re-themes on a mid-session
+  light/dark flip.** T447's tooltip decided `DarkMode_Explorer` once, at
+  control creation, so an OS apps-theme flip (or a `window-theme` reload)
+  left an existing window's tooltip on the stale palette until a new window
+  opened. New `Window.tabTipReset` (hide + `DestroyWindow` + null the field)
+  runs from the `WM_SETTINGCHANGE` ImmersiveColorSet branch and from
+  `onConfigChange`; the control lazily recreates through `tabTipEnsure`
+  with the fresh answer. `tab-tooltip.ps1` gained section F (sends the
+  ImmersiveColorSet broadcast to the live window, reads a new `tab tooltip
+  reset` oracle) and a guard-due row + green-run stamp (T783 pattern —
+  the harness had neither). Surprise: nothing external can drive a config
+  reload (no IPC action; the menu's command comes back in-process from
+  `TrackPopupMenuEx`, never a postable `WM_COMMAND`), so that arm of F is
+  unscoreable today — filed **T893** for the trigger, and cross-noted the
+  reset-on-flip pattern into T563 for the dialogs' eventual theming pass.
+  Floor lib/none/win32/agent PASS, P1–P3 ALL PASS, tab-tooltip 20/20,
+  guard-due acceptance 36/36.
 - 2026-08-16 - **T443/T857 - the 09:26 unblock was a false alarm; both
   re-parked, T892 filed.** Both tasks were flipped to `todo` in the same
   minute the user answered D76 (unrelated), by bare CLI `set-status` with no
