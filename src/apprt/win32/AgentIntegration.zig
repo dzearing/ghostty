@@ -57,8 +57,20 @@ const first_run_text: [:0]const u16 = blk: {
         "Ghoztty can set up its integration for the coding agents on\n" ++
             "this PC — skills, hooks, and a status banner — so agents can\n" ++
             "open windows, create splits, and read terminal output.\n\n" ++
-            "Files are added under each agent's configuration folder\n" ++
-            "(such as .claude). Choose which agents to set up:",
+            "Choose which agents to set up:",
+    );
+};
+
+/// The agent-config-write disclosure under the checkboxes (T600, Mac's
+/// d839b3f4a): what ticking a box writes and where, and that it is
+/// reversible — said BEFORE anything is written.
+const first_run_note: [:0]const u16 = blk: {
+    @setEvalBranchQuota(20_000);
+    break :blk L(
+        "Integrations add Ghoztty's status banner, skills, and hooks\n" ++
+            "under each agent's configuration folder (such as .claude).\n" ++
+            "You can remove them anytime from Set Up Agent Integrations…\n" ++
+            "in the command palette.",
     );
 };
 
@@ -208,6 +220,7 @@ pub fn showFirstRunPrompt(app: *App, agent_bits: usize) void {
             .ok_label = L("Set Up"),
             .cancel_label = L("Not Now"),
             .checks = checks_buf[0..n],
+            .note = first_run_note,
         },
     );
     if (result != .ok) return;

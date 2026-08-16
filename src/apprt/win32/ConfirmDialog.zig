@@ -60,6 +60,12 @@ pub const Options = struct {
     /// into `checked`; on Cancel the values are left as passed. At most
     /// `max_checks` rows.
     checks: []Check = &.{},
+    /// Optional caption-sized secondary note under the check rows — Mac's
+    /// wrapping caption label in the first-launch accessory (T600, the
+    /// agent-config-write disclosure). Rendered in the caption ramp role and
+    /// the secondary text color, so it reads as fine print rather than a
+    /// second message paragraph.
+    note: ?[:0]const u16 = null,
 };
 
 pub const Check = struct {
@@ -74,6 +80,9 @@ pub const max_checks = 4;
 /// palette and the tab bar's dark styling).
 const COLOR_BG = w32.RGB(32, 32, 32);
 const COLOR_TEXT = w32.RGB(230, 230, 230);
+/// The note's secondary text — the same gray the About box uses for its
+/// de-emphasized statics on this dark dialog surface.
+const COLOR_TEXT_SECONDARY = w32.RGB(160, 160, 160);
 /// The prompt field's fill — the same field color the chooser and the rename
 /// dialog use, one notch darker than the dialog surface.
 const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
@@ -86,6 +95,9 @@ var field_brush: ?w32.HBRUSH = null;
 
 hwnd: w32.HWND,
 static: ?w32.HWND,
+/// The optional secondary note (`Options.note`), colored separately in
+/// WM_CTLCOLORSTATIC.
+note_static: ?w32.HWND = null,
 ok_btn: w32.HWND,
 cancel_btn: ?w32.HWND,
 /// The optional text field (`Options.input`), read back by `prompt`.
@@ -112,6 +124,9 @@ pub const Layout = struct {
     /// The optional checkbox rows (only the first `n_checks` passed to
     /// `layoutFor` are meaningful; the rest stay empty).
     checks: [max_checks]w32.RECT,
+    /// The optional secondary note under the check rows (empty rect when the
+    /// dialog has none).
+    note: w32.RECT,
     ok: w32.RECT,
     cancel: w32.RECT,
     font_h: i32,
@@ -121,13 +136,15 @@ pub const Layout = struct {
 /// 88 DIP, wider when a caption needs the room (see buttonWidth).
 /// `has_input` adds a single-line field row under the message (T176);
 /// `n_checks` adds that many checkbox rows between the message and the
-/// field/buttons (T870).
+/// field/buttons (T870); `note_h` (measured caption-text height, 0 for
+/// none) adds the secondary note band under the checks (T600).
 pub fn layoutFor(
     scale: f32,
     text_w: i32,
     text_h: i32,
     has_icon: bool,
     n_checks: usize,
+    note_h: i32,
     has_input: bool,
     has_cancel: bool,
     btn_w: i32,
@@ -143,6 +160,7 @@ pub fn layoutFor(
     const check_h = px(20, scale);
     const check_gap = px(12, scale);
     const check_row_gap = px(4, scale);
+    const note_gap = px(12, scale);
 
     const icon_span: i32 = if (has_icon) icon_px + icon_gap else 0;
     const n_btns: i32 = if (has_cancel) 2 else 1;
@@ -160,8 +178,9 @@ pub fn layoutFor(
         check_gap + nc * check_h + (nc - 1) * check_row_gap
     else
         0;
+    const note_span: i32 = if (note_h > 0) note_gap + note_h else 0;
     const input_span: i32 = if (has_input) input_gap + input_h else 0;
-    const client_h = margin + content_h + checks_span + input_span + btn_gap_v + btn_h + margin;
+    const client_h = margin + content_h + checks_span + note_span + input_span + btn_gap_v + btn_h + margin;
 
     // Vertically center the shorter of icon/text within the content band.
     const icon_top = margin + @divTrunc(content_h - icon_px, 2);
@@ -179,8 +198,9 @@ pub fn layoutFor(
         };
     }
 
-    const input_top = margin + content_h + checks_span + input_gap;
-    const btn_top = margin + content_h + checks_span + input_span + btn_gap_v;
+    const note_top = margin + content_h + checks_span + note_gap;
+    const input_top = margin + content_h + checks_span + note_span + input_gap;
+    const btn_top = margin + content_h + checks_span + note_span + input_span + btn_gap_v;
     const right_left = client_w - margin - btn_w;
     const left_left = right_left - btn_gap_h - btn_w;
     // With two buttons OK sits left of Cancel; alone, OK takes the right slot.
@@ -210,6 +230,14 @@ pub fn layoutFor(
             .bottom = input_top + input_h,
         } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
         .checks = checks,
+        .note = if (note_h > 0) .{
+            .left = margin + icon_span,
+            .top = note_top,
+            // Fine print spans the text column to the trailing margin, like
+            // the check rows above it.
+            .right = client_w - margin,
+            .bottom = note_top + note_h,
+        } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
         .ok = .{ .left = ok_left, .top = btn_top, .right = ok_left + btn_w, .bottom = btn_top + btn_h },
         .cancel = if (has_cancel) .{
             .left = right_left,
@@ -290,6 +318,7 @@ fn run(
     const has_icon = opts.icon != .none;
     const has_cancel = opts.style == .ok_cancel;
     const has_input = opts.input != null;
+    const has_note = opts.note != null;
     const n_checks: usize = @min(opts.checks.len, max_checks);
 
     // DPI-scaled dialog font, needed up front to measure the text. It is the
@@ -316,6 +345,28 @@ fn run(
         _ = w32.DeleteObject(f);
     };
 
+    // The note renders (and is measured) in the caption ramp role — fine
+    // print, one step below the message's body text (T600).
+    const note_font: ?*anyopaque = if (has_note) w32.CreateFontW(
+        -type_ramp.caption(scale).height,
+        0,
+        0,
+        0,
+        type_ramp.weight_normal,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face),
+    ) else null;
+    defer if (note_font) |f| {
+        _ = w32.DeleteObject(f);
+    };
+
     // Measure the text: wrap at a max width; DrawText shrinks the rect to
     // the widest actual line (or grows it for an unbreakable run, e.g. the
     // About box's executable path — then the dialog widens to fit).
@@ -326,6 +377,7 @@ fn run(
         .bottom = 0,
     };
     var label_w: i32 = 0;
+    var note_h: i32 = 0;
     {
         const hdc = w32.GetDC(null) orelse return fallback(owner, opts);
         defer _ = w32.ReleaseDC(null, hdc);
@@ -369,6 +421,27 @@ fn run(
             );
             text_rect.right = @max(text_rect.right, text_rect.left + (r.right - r.left) + px(24, scale));
         }
+
+        // The note is measured in its own (caption) font. Its widest line
+        // widens the dialog like the message's would; its height feeds the
+        // layout's note band. The layout rect can only end up wider than
+        // measured here, which re-wraps to FEWER lines, never a clipped one.
+        if (opts.note) |note_text| {
+            const prev_note = if (note_font) |f| w32.SelectObject(hdc, f) else null;
+            defer if (prev_note) |p| {
+                _ = w32.SelectObject(hdc, p);
+            };
+            var r: w32.RECT = .{ .left = 0, .top = 0, .right = px(420, scale), .bottom = 0 };
+            _ = w32.DrawTextW(
+                hdc,
+                note_text.ptr,
+                @intCast(note_text.len),
+                &r,
+                w32.DT_CALCRECT | w32.DT_WORDBREAK | w32.DT_NOPREFIX,
+            );
+            text_rect.right = @max(text_rect.right, text_rect.left + (r.right - r.left));
+            note_h = r.bottom - r.top;
+        }
     }
     const l = layoutFor(
         scale,
@@ -376,6 +449,7 @@ fn run(
         text_rect.bottom - text_rect.top,
         has_icon,
         n_checks,
+        note_h,
         has_input,
         has_cancel,
         buttonWidth(scale, label_w),
@@ -484,6 +558,24 @@ fn run(
     }
     self.n_checks = n_checks;
 
+    // Optional secondary note (Mac's wrapping caption label, T600).
+    if (opts.note) |note_text| {
+        self.note_static = w32.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+            note_text.ptr,
+            w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.SS_NOPREFIX,
+            l.note.left,
+            l.note.top,
+            l.note.right - l.note.left,
+            l.note.bottom - l.note.top,
+            hwnd,
+            null,
+            app.hinstance,
+            null,
+        );
+    }
+
     // Optional text field (Mac's accessoryView).
     if (opts.input) |initial| {
         self.edit = w32.CreateWindowExW(
@@ -548,6 +640,9 @@ fn run(
         self.cancel_btn = cancel_btn;
     }
 
+    if (note_font) |f| {
+        if (self.note_static) |s| _ = w32.SendMessageW(s, w32.WM_SETFONT, @intFromPtr(f), 1);
+    }
     if (font) |f| {
         if (self.static) |s| _ = w32.SendMessageW(s, w32.WM_SETFONT, @intFromPtr(f), 1);
         if (self.edit) |e| _ = w32.SendMessageW(e, w32.WM_SETFONT, @intFromPtr(f), 1);
@@ -620,7 +715,23 @@ fn fallback(owner: ?w32.HWND, opts: Options) Result {
         .info => w32.MB_ICONINFORMATION,
     };
     if (opts.style == .ok_cancel and opts.default_cancel) flags |= w32.MB_DEFBUTTON2;
-    const r = w32.MessageBoxW(owner, opts.text.ptr, opts.title, flags);
+    // The note is a disclosure, not decoration (T600) — a fallback that
+    // dropped it would show a consent prompt missing its fine print, so it
+    // rides along as a trailing paragraph (or the message ships alone when
+    // the combined text cannot fit the stack buffer).
+    var buf: [1024:0]u16 = undefined;
+    const text_ptr: [*:0]const u16 = blk: {
+        const note = opts.note orelse break :blk opts.text.ptr;
+        const total = opts.text.len + 2 + note.len;
+        if (total > buf.len) break :blk opts.text.ptr;
+        @memcpy(buf[0..opts.text.len], opts.text);
+        buf[opts.text.len] = '\n';
+        buf[opts.text.len + 1] = '\n';
+        @memcpy(buf[opts.text.len + 2 ..][0..note.len], note);
+        buf[total] = 0;
+        break :blk @ptrCast(&buf);
+    };
+    const r = w32.MessageBoxW(owner, text_ptr, opts.title, flags);
     return if (opts.style == .ok_only or r == w32.IDOK) .ok else .cancel;
 }
 
@@ -667,6 +778,7 @@ fn defaultButton(self: *const ConfirmDialog) w32.HWND {
 fn ownsHwnd(self: *const ConfirmDialog, hwnd: w32.HWND) bool {
     if (hwnd == self.hwnd or hwnd == self.ok_btn) return true;
     if (self.static) |s| if (hwnd == s) return true;
+    if (self.note_static) |s| if (hwnd == s) return true;
     if (self.cancel_btn) |c| if (hwnd == c) return true;
     if (self.edit) |e| if (hwnd == e) return true;
     for (self.check_btns[0..self.n_checks]) |maybe| if (maybe) |b| {
@@ -839,7 +951,14 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
+            // lparam names the control: the note reads in the secondary
+            // gray, everything else in the message color.
+            const ctl: ?w32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const color: u32 = if (self.note_static != null and ctl == self.note_static)
+                COLOR_TEXT_SECONDARY
+            else
+                COLOR_TEXT;
+            _ = w32.SetTextColor(hdc, color);
             _ = w32.SetBkColor(hdc, COLOR_BG);
             if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -855,7 +974,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
 const testing = std.testing;
 
 test "layoutFor: controls nest inside the client area at 1.0 scale" {
-    const l = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
     try testing.expect(l.client_w > 0 and l.client_h > 0);
     for ([_]w32.RECT{ l.icon, l.text, l.ok, l.cancel }) |r| {
         try testing.expect(r.left >= 0 and r.top >= 0);
@@ -864,47 +983,47 @@ test "layoutFor: controls nest inside the client area at 1.0 scale" {
 }
 
 test "layoutFor: buttons right-aligned, OK left of Cancel, no overlap" {
-    const l = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expectEqual(l.ok.top, l.cancel.top);
     try testing.expectEqual(l.cancel.right, l.client_w - 16);
 }
 
 test "layoutFor: ok-only puts OK in the rightmost slot, no cancel rect" {
-    const l = layoutFor(1.0, 300, 40, false, 0, false, false, 88);
+    const l = layoutFor(1.0, 300, 40, false, 0, 0, false, false, 88);
     try testing.expectEqual(l.ok.right, l.client_w - 16);
     try testing.expectEqual(@as(i32, 0), l.cancel.right - l.cancel.left);
     try testing.expectEqual(@as(i32, 0), l.icon.right - l.icon.left);
 }
 
 test "layoutFor: text starts right of the icon with a gap" {
-    const l = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
     try testing.expect(l.text.left >= l.icon.right + 12);
     // Without an icon the text hugs the margin.
-    const l2 = layoutFor(1.0, 300, 40, false, 0, false, true, 88);
+    const l2 = layoutFor(1.0, 300, 40, false, 0, 0, false, true, 88);
     try testing.expectEqual(@as(i32, 16), l2.text.left);
 }
 
 test "layoutFor: short text is vertically centered against the icon" {
-    const l = layoutFor(1.0, 300, 16, true, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 16, true, 0, 0, false, true, 88);
     // Icon (32px) taller than text (16px): text drops to center.
     try testing.expect(l.text.top > l.icon.top);
     try testing.expectEqual(l.icon.top, 16);
     // Text (60px) taller than icon: icon centers instead.
-    const l2 = layoutFor(1.0, 300, 60, true, 0, false, true, 88);
+    const l2 = layoutFor(1.0, 300, 60, true, 0, 0, false, true, 88);
     try testing.expect(l2.icon.top > l2.text.top);
 }
 
 test "layoutFor: narrow text still fits the button row" {
-    const l = layoutFor(1.0, 40, 20, false, 0, false, true, 88);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, 88);
     // Two 88px buttons + 8px gap + 2*16 margins = 216, floored at 280.
     try testing.expect(l.client_w >= 280);
     try testing.expect(l.ok.left >= 16);
 }
 
 test "layoutFor: scales with DPI" {
-    const l1 = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
-    const l2 = layoutFor(2.0, 600, 80, true, 0, false, true, 176);
+    const l1 = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const l2 = layoutFor(2.0, 600, 80, true, 0, 0, false, true, 176);
     try testing.expectEqual(l1.client_w * 2, l2.client_w);
     try testing.expectEqual(l1.client_h * 2, l2.client_h);
     try testing.expectEqual(l1.ok.left * 2, l2.ok.left);
@@ -920,7 +1039,7 @@ test "buttonWidth: standard until the caption outgrows it, then padded" {
 }
 
 test "layoutFor: wide buttons widen the row and never overlap" {
-    const l = layoutFor(1.0, 40, 20, false, 0, false, true, 124);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, 124);
     try testing.expectEqual(@as(i32, 124), l.ok.right - l.ok.left);
     try testing.expectEqual(@as(i32, 124), l.cancel.right - l.cancel.left);
     try testing.expect(l.ok.right < l.cancel.left);
@@ -932,13 +1051,13 @@ test "layoutFor: wide buttons widen the row and never overlap" {
 // --- Prompt field (T176) -----------------------------------------------
 
 test "layoutFor: no input means no input rect and no extra height" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
     try testing.expectEqual(@as(i32, 0), plain.input.right - plain.input.left);
     try testing.expectEqual(@as(i32, 0), plain.input.bottom - plain.input.top);
 }
 
 test "layoutFor: the field sits between the message and the buttons" {
-    const l = layoutFor(1.0, 300, 40, true, 0, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
     try testing.expect(l.input.top >= l.text.bottom);
     try testing.expect(l.input.top >= l.icon.bottom - 1);
     try testing.expect(l.ok.top >= l.input.bottom);
@@ -954,8 +1073,8 @@ test "layoutFor: the field sits between the message and the buttons" {
 }
 
 test "layoutFor: the field's row is what makes a prompt taller" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
-    const with = layoutFor(1.0, 300, 40, true, 0, true, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const with = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
     // 12 gap + 26 field.
     try testing.expectEqual(plain.client_h + 38, with.client_h);
     // The message band above it does not move.
@@ -966,14 +1085,14 @@ test "layoutFor: the field's row is what makes a prompt taller" {
 test "layoutFor: a prompt is never too narrow to type in" {
     // A two-word message would otherwise leave a 280-wide dialog whose field
     // is barely wider than the button row.
-    const l = layoutFor(1.0, 40, 20, false, 0, true, true, 88);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, true, true, 88);
     try testing.expect(l.client_w >= 380);
     try testing.expect(l.input.right - l.input.left >= 340);
 }
 
 test "layoutFor: the field scales with DPI like everything else" {
-    const a = layoutFor(1.0, 300, 40, true, 0, true, true, 88);
-    const b = layoutFor(2.0, 600, 80, true, 0, true, true, 176);
+    const a = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
+    const b = layoutFor(2.0, 600, 80, true, 0, 0, true, true, 176);
     try testing.expectEqual(a.client_h * 2, b.client_h);
     try testing.expectEqual(a.input.top * 2, b.input.top);
     try testing.expectEqual((a.input.bottom - a.input.top) * 2, b.input.bottom - b.input.top);
@@ -982,7 +1101,7 @@ test "layoutFor: the field scales with DPI like everything else" {
 // --- Checkbox rows (T870) ----------------------------------------------
 
 test "layoutFor: no checks means no check rects and no extra height" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
     for (plain.checks) |r| {
         try testing.expectEqual(@as(i32, 0), r.right - r.left);
         try testing.expectEqual(@as(i32, 0), r.bottom - r.top);
@@ -990,7 +1109,7 @@ test "layoutFor: no checks means no check rects and no extra height" {
 }
 
 test "layoutFor: check rows sit between the message and the buttons" {
-    const l = layoutFor(1.0, 300, 40, true, 2, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
     try testing.expect(l.checks[0].top >= l.text.bottom);
     try testing.expect(l.checks[1].top >= l.checks[0].bottom);
     try testing.expect(l.ok.top >= l.checks[1].bottom);
@@ -1007,9 +1126,9 @@ test "layoutFor: check rows sit between the message and the buttons" {
 }
 
 test "layoutFor: each check row adds its height, the block adds one gap" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, false, true, 88);
-    const one = layoutFor(1.0, 300, 40, true, 1, false, true, 88);
-    const two = layoutFor(1.0, 300, 40, true, 2, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const one = layoutFor(1.0, 300, 40, true, 1, 0, false, true, 88);
+    const two = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
     // 12 gap + 20 row.
     try testing.expectEqual(plain.client_h + 32, one.client_h);
     // +4 row gap + 20 row.
@@ -1019,22 +1138,67 @@ test "layoutFor: each check row adds its height, the block adds one gap" {
 }
 
 test "layoutFor: checks stack above the input field when both are present" {
-    const l = layoutFor(1.0, 300, 40, true, 2, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 2, 0, true, true, 88);
     try testing.expect(l.input.top >= l.checks[1].bottom);
     try testing.expect(l.ok.top >= l.input.bottom);
 }
 
 test "layoutFor: check rows scale with DPI" {
-    const a = layoutFor(1.0, 300, 40, true, 2, false, true, 88);
-    const b = layoutFor(2.0, 600, 80, true, 2, false, true, 176);
+    const a = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
+    const b = layoutFor(2.0, 600, 80, true, 2, 0, false, true, 176);
     try testing.expectEqual(a.client_h * 2, b.client_h);
     try testing.expectEqual(a.checks[0].top * 2, b.checks[0].top);
     try testing.expectEqual((a.checks[1].bottom - a.checks[1].top) * 2, b.checks[1].bottom - b.checks[1].top);
 }
 
+// --- Secondary note (T600) ---------------------------------------------
+
+test "layoutFor: no note means no note rect and no extra height" {
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    try testing.expectEqual(@as(i32, 0), plain.note.right - plain.note.left);
+    try testing.expectEqual(@as(i32, 0), plain.note.bottom - plain.note.top);
+}
+
+test "layoutFor: the note sits between the checks and the buttons" {
+    const l = layoutFor(1.0, 300, 40, true, 2, 32, false, true, 88);
+    try testing.expect(l.note.top >= l.checks[1].bottom);
+    try testing.expect(l.ok.top >= l.note.bottom);
+    // Aligned with the message column, running to the trailing margin like
+    // the check rows.
+    try testing.expectEqual(l.text.left, l.note.left);
+    try testing.expectEqual(l.client_w - 16, l.note.right);
+    // And it nests.
+    try testing.expect(l.note.bottom <= l.client_h);
+}
+
+test "layoutFor: the note band is what makes a disclosing dialog taller" {
+    const plain = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
+    const with = layoutFor(1.0, 300, 40, true, 2, 32, false, true, 88);
+    // 12 gap + the measured 32.
+    try testing.expectEqual(plain.client_h + 44, with.client_h);
+    // Nothing above it moves.
+    try testing.expectEqual(plain.text.top, with.text.top);
+    try testing.expectEqual(plain.checks[1].top, with.checks[1].top);
+}
+
+test "layoutFor: the note stacks above the input field when both are present" {
+    const l = layoutFor(1.0, 300, 40, true, 1, 28, true, true, 88);
+    try testing.expect(l.note.top >= l.checks[0].bottom);
+    try testing.expect(l.input.top >= l.note.bottom);
+    try testing.expect(l.ok.top >= l.input.bottom);
+}
+
+test "layoutFor: the note scales with DPI" {
+    const a = layoutFor(1.0, 300, 40, true, 2, 30, false, true, 88);
+    const b = layoutFor(2.0, 600, 80, true, 2, 60, false, true, 176);
+    try testing.expectEqual(a.client_h * 2, b.client_h);
+    try testing.expectEqual(a.note.top * 2, b.note.top);
+    try testing.expectEqual((a.note.bottom - a.note.top) * 2, b.note.bottom - b.note.top);
+}
+
 test "layoutFor: a check count beyond capacity is clamped, not overflowed" {
-    const l = layoutFor(1.0, 300, 40, true, max_checks + 3, false, true, 88);
-    const capped = layoutFor(1.0, 300, 40, true, max_checks, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, max_checks + 3, 0, false, true, 88);
+    const capped = layoutFor(1.0, 300, 40, true, max_checks, 0, false, true, 88);
     try testing.expectEqual(capped.client_h, l.client_h);
 }
 
@@ -1056,7 +1220,7 @@ test "nextFocusIndex: cycles both ways and wraps" {
 
 test "layoutFor: the font comes from the ramp (T313)" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
-        const l = layoutFor(scale, 300, 40, true, 0, false, true, 88);
+        const l = layoutFor(scale, 300, 40, true, 0, 0, false, true, 88);
         try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
         // A confirm's message is body text, never a subtitle and never a
         // caption — one role, so it reads at the same size as the chooser it
@@ -1064,5 +1228,5 @@ test "layoutFor: the font comes from the ramp (T313)" {
         try testing.expect(l.font_h > type_ramp.caption(scale).height);
         try testing.expect(l.font_h < type_ramp.subtitle(scale).height);
     }
-    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 300, 40, true, 0, false, true, 88).font_h);
+    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88).font_h);
 }

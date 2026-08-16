@@ -264,6 +264,19 @@ try {
     Assert (-not ($btns -contains 'Set up Copilot CLI integration')) 'an undetected agent gets NO checkbox row'
     Assert (-not (Test-TestWindowEnabled -Window $g.Top)) 'the prompt is modal: its owner window is disabled'
 
+    # T600: the prompt must disclose, BEFORE anything is written, what an
+    # integration writes (banner/skills/hooks under the agent's config
+    # folder) and that it is removable afterwards. The disclosure is its own
+    # STATIC (the secondary note), separate from the message STATIC.
+    $statics = @(Get-TestControls -Window $dlg -Class 'Static' | ForEach-Object { $_.Text })
+    $note = @($statics | Where-Object { $_ -like '*status banner, skills, and hooks*' })
+    Assert ($note.Count -eq 1) 'the prompt carries the agent-config-write disclosure note'
+    if ($note.Count -eq 1) {
+        Assert ($note[0] -like '*configuration folder*.claude*') 'the note names where the files are written'
+        Assert ($note[0] -like '*remove them anytime*Set Up Agent Integrations*') 'the note names the removal path'
+        Assert (@($statics | Where-Object { $_ -like '*Choose which agents to set up*' }).Count -eq 1) 'the note is separate from the message text'
+    }
+
     Send-TestControlKey -Control $dlg -Key Escape | Out-Null
     $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
     Assert ($gone -eq [IntPtr]::Zero) 'Escape (Not Now) dismisses the prompt'
