@@ -11,7 +11,7 @@
 //! through `zsh -lic 'command -v …'` because a Mac GUI app's PATH is not the
 //! terminal's; on Windows the process environment plus a handful of
 //! well-known install dirs IS the answer, so the probe reads `PATH` directly
-//! and walks the same fallback locations `ClaudeIntegration.findClaude` was
+//! and walks the same fallback locations `AgentIntegration.findClaude` was
 //! measured against on this box (claude.exe at `~\.local\bin\` 2026-08-15).
 //!
 //! The seam is a tagged union rather than Mac's struct-of-closures — Zig has
@@ -62,6 +62,12 @@ pub const RuntimeProbe = union(enum) {
     /// The real probe: the runtime's binary on the process PATH, else in one
     /// of its well-known install locations.
     binary,
+    /// The same path walk over an EXPLICIT environment — the sandbox seam
+    /// the acceptance harness reaches through `GHOZTTY_AGENT_HOME` (T870):
+    /// only the given locations are consulted, so the box's real installs
+    /// can never leak into a sandboxed run. The env's slices must outlive
+    /// the probe.
+    env: ProbeEnv,
     /// Test seam: exactly these agents are installed, nothing consulted.
     stub: std.EnumSet(RuntimeAgent),
 
@@ -74,6 +80,11 @@ pub const RuntimeProbe = union(enum) {
     pub fn isInstalled(self: RuntimeProbe, alloc: Allocator, agent: RuntimeAgent) bool {
         switch (self) {
             .stub => |set| return set.contains(agent),
+            .env => |probe_env| {
+                var arena_state = std.heap.ArenaAllocator.init(alloc);
+                defer arena_state.deinit();
+                return binaryInstalled(arena_state.allocator(), agent, probe_env);
+            },
             .binary => {
                 var arena_state = std.heap.ArenaAllocator.init(alloc);
                 defer arena_state.deinit();

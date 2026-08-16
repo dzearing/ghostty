@@ -36,7 +36,7 @@ pub const Kind = enum {
     activity,
     /// Show the About box (T52).
     about,
-    /// Run the Claude Code plugin install (T71).
+    /// Install the agent integrations for every detected agent (T870).
     claude,
     /// Open the documentation in the default browser (macOS "Ghoztty Help").
     help,
@@ -250,7 +250,7 @@ pub const registry = [_]Command{
     .{ .id = .check_for_updates, .name = "Check for Updates…", .action = .check_for_updates },
     .{ .id = .help, .name = "Ghoztty Help", .action = .new_window, .kind = .help },
     .{ .id = .about, .name = "About Ghoztty", .action = .new_window, .kind = .about },
-    .{ .id = .claude_integration, .name = "Install Claude Code Integration", .action = .new_window, .kind = .claude },
+    .{ .id = .claude_integration, .name = "Set Up Agent Integrations", .action = .new_window, .kind = .claude },
     .{ .id = .quit, .name = "Quit", .action = .quit, .quit_keep = true },
 };
 

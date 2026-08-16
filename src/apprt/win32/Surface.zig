@@ -16,7 +16,7 @@ const internal_os = @import("../../os/main.zig");
 const remote_connection = @import("../../remote/connection.zig");
 
 const App = @import("App.zig");
-const ClaudeIntegration = @import("ClaudeIntegration.zig");
+const AgentIntegration = @import("AgentIntegration.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const PaneView = @import("PaneView.zig");
@@ -2565,9 +2565,9 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
         // Build provenance of this running instance (T52).
         .about => self.showAboutDialog(),
 
-        // Runs the plugin install on a background thread; the outcome
-        // dialog arrives via WM_APP (T71).
-        .claude => ClaudeIntegration.installAsync(self.app, .palette),
+        // Installs the integration for every detected agent on a background
+        // thread; the outcome dialog arrives via WM_APP (T870).
+        .claude => AgentIntegration.installAsync(self.app, .palette, null),
 
         // The docs, in the default browser (macOS "Ghoztty Help").
         .help => self.app.openUrl(commands.help_url),

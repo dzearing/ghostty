@@ -177,7 +177,7 @@ const KILL_ID: u16 = 103;
 const SAMPLE_TIMER_ID: usize = 1;
 
 /// A worker thread finished a sample and parked it in `pending`. WM_APP+1..+12
-/// are taken (see App.zig / Window.zig / ClaudeIntegration.zig / RelayAccountRow.zig).
+/// are taken (see App.zig / Window.zig / AgentIntegration.zig / RelayAccountRow.zig).
 pub const WM_APP_ACTIVITY_SAMPLE: u32 = w32.WM_APP + 13;
 
 /// A dial thread finished. Posted to the APP's message-only window (see the

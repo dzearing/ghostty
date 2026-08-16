@@ -6156,7 +6156,7 @@ fn buildMenuNodes(
 /// `title`, plus a tab and the accelerator when the LIVE keybind set has a
 /// trigger for this command's action (T129) — so a rebind relabels the menu
 /// and an unbound command shows no hint. Commands with no binding behind
-/// them (the machine chooser, About, the plugin install, Help) carry a
+/// them (the machine chooser, About, the agent setup, Help) carry a
 /// placeholder action in the registry and must never be labeled from it.
 fn menuItemLabel(
     self: *const Window,

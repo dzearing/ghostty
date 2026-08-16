@@ -12,7 +12,7 @@
 //! complete a browser consent screen (minutes), and `signOut` does a network
 //! revoke; either on the GUI thread would freeze every window. So both run on a
 //! detached thread and post `WM_APP_RELAY_ACCOUNT` to the app's message-only
-//! window (`ClaudeIntegration`'s pattern), which routes the outcome to whatever
+//! window (`AgentIntegration`'s pattern), which routes the outcome to whatever
 //! chooser is open — or to nobody, if the user closed it while signing in. The
 //! sign-in still took effect either way: the account store is the state, not
 //! the dialog.
@@ -31,7 +31,7 @@ const log = std.log.scoped(.win32);
 
 /// Posted by the sign-in/sign-out thread to `App.msg_hwnd`. wparam = *Result
 /// (ownership transfers to the GUI thread, which frees it in `onResult`).
-/// WM_APP+1..+8 are taken (see App.zig / ClaudeIntegration.zig).
+/// WM_APP+1..+8 are taken (see App.zig / AgentIntegration.zig).
 pub const WM_APP_RELAY_ACCOUNT: u32 = w32.WM_APP + 9;
 
 pub const Kind = enum { sign_in, sign_out };

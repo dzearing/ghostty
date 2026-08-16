@@ -29,6 +29,16 @@ pub const manifest_sub_path = ".claude/plugins/installed_plugins.json";
 /// The plugin name that means "an external install owns the integration".
 pub const external_plugin_name = "ghoztty";
 
+/// One external-plugin registration: its manifest key and every install's
+/// `installPath` (a registration can carry several installs at different
+/// scopes). The paths are what the migration slice (T870) compares the
+/// stale banner-script copy against, so ownership is proven rather than
+/// guessed.
+pub const Registration = struct {
+    key: []const u8,
+    install_paths: []const []const u8,
+};
+
 /// Every manifest key registering the external plugin, e.g.
 /// `ghoztty@dzearing-claude-marketplace`. Plural because the same plugin is
 /// registered through more than one marketplace in practice, and each
@@ -40,6 +50,15 @@ pub const external_plugin_name = "ghoztty";
 /// integration — the cost of a false negative is a duplicate skill, the cost
 /// of a false positive is Ghoztty refusing to install at all.
 pub fn registrations(arena: Allocator, home: std.fs.Dir) Allocator.Error![]const []const u8 {
+    const regs = try registrationsWithPaths(arena, home);
+    const out = try arena.alloc([]const u8, regs.len);
+    for (regs, 0..) |r, i| out[i] = r.key;
+    return out;
+}
+
+/// `registrations` plus each registration's installPaths (see
+/// `Registration`). Same arena/absent-on-unrecognized contract.
+pub fn registrationsWithPaths(arena: Allocator, home: std.fs.Dir) Allocator.Error![]const Registration {
     const contents = home.readFileAlloc(arena, manifest_sub_path, managed_file.max_managed_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return &.{},
@@ -49,26 +68,39 @@ pub fn registrations(arena: Allocator, home: std.fs.Dir) Allocator.Error![]const
     if (root != .object) return &.{};
     const plugins = root.object.get("plugins") orelse return &.{};
 
-    var out: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(Registration) = .empty;
     switch (plugins) {
-        // `"version": 2` — an object keyed by `<name>@<marketplace>`. The
-        // NAME half must match exactly; any marketplace counts.
+        // `"version": 2` — an object keyed by `<name>@<marketplace>`, each
+        // value an array of installs. The NAME half must match exactly; any
+        // marketplace counts.
         .object => |map| {
             var it = map.iterator();
             while (it.next()) |entry| {
                 const key = entry.key_ptr.*;
-                if (std.mem.eql(u8, nameOfRegistration(key), external_plugin_name))
-                    try out.append(arena, key);
+                if (!std.mem.eql(u8, nameOfRegistration(key), external_plugin_name)) continue;
+                var paths: std.ArrayList([]const u8) = .empty;
+                if (entry.value_ptr.* == .array) {
+                    for (entry.value_ptr.array.items) |install| {
+                        if (install != .object) continue;
+                        const p = install.object.get("installPath") orelse continue;
+                        if (p == .string) try paths.append(arena, p.string);
+                    }
+                }
+                try out.append(arena, .{ .key = key, .install_paths = paths.items });
             }
         },
-        // Older shape — an array of entries carrying `name`.
+        // Older shape — an array of entries carrying `name` (+ `installPath`).
         .array => |list| {
             for (list.items) |entry| {
                 if (entry != .object) continue;
                 const name = entry.object.get("name") orelse continue;
                 if (name != .string) continue;
-                if (std.mem.eql(u8, name.string, external_plugin_name))
-                    try out.append(arena, name.string);
+                if (!std.mem.eql(u8, name.string, external_plugin_name)) continue;
+                var paths: std.ArrayList([]const u8) = .empty;
+                if (entry.object.get("installPath")) |p| {
+                    if (p == .string) try paths.append(arena, p.string);
+                }
+                try out.append(arena, .{ .key = name.string, .install_paths = paths.items });
             }
         },
         // A shape we do not recognize: absent (see doc above).
@@ -133,6 +165,29 @@ test "v2 shape: a name that merely starts with ghoztty does not match" {
         \\{"version": 2, "plugins": {"ghoztty-extras@market": [{}]}}
     );
     try testing.expect(!try isExternalPluginInstalled(testing.allocator, tmp.dir));
+}
+
+test "registrationsWithPaths carries every install's installPath" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeManifest(&tmp,
+        \\{"version": 2, "plugins": {
+        \\  "other@market": [{"installPath": "/x"}],
+        \\  "ghoztty@m1": [{"installPath": "C:\\a\\1"}, {"installPath": "C:\\a\\2"}],
+        \\  "ghoztty@m2": [{"version": "1.0"}]
+        \\}}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const regs = try registrationsWithPaths(arena_state.allocator(), tmp.dir);
+    try testing.expectEqual(@as(usize, 2), regs.len);
+    try testing.expectEqualStrings("ghoztty@m1", regs[0].key);
+    try testing.expectEqual(@as(usize, 2), regs[0].install_paths.len);
+    try testing.expectEqualStrings("C:\\a\\1", regs[0].install_paths[0]);
+    try testing.expectEqualStrings("C:\\a\\2", regs[0].install_paths[1]);
+    // An install without a path still registers — with no paths to compare.
+    try testing.expectEqualStrings("ghoztty@m2", regs[1].key);
+    try testing.expectEqual(@as(usize, 0), regs[1].install_paths.len);
 }
 
 test "old array shape: entries carrying name" {

@@ -276,6 +276,24 @@ $GuardTable = @(
             'test\win32\gui-launch-command.ps1'
         )
     },
+    # The agent-integration first-run + plugin migration (T870): the prompts,
+    # the off-thread install marshalling and the migration's uninstall-first
+    # ordering are proven end-to-end only by this harness — the unit lanes pin
+    # the pure pieces (service, migration module, manifest parse) but nothing
+    # else in the floor launches the GUI with an unanswered state file. The
+    # row stays on the flow modules; the shared components underneath
+    # (RuntimeIntegration, hook specs) move under their own unit tests.
+    [pscustomobject]@{
+        Name   = 'claude-integration'
+        Script = 'test\win32\claude-integration.ps1'
+        Stamp  = 'test\win32\claude-integration.stamp.json'
+        Covers = @(
+            'src\apprt\win32\AgentIntegration.zig',
+            'src\apprt\win32\claude_plugin_migration.zig',
+            'src\apprt\win32\claude_setup.zig',
+            'test\win32\claude-integration.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.

@@ -9,7 +9,7 @@
 //!
 //! Blocking: the real binary probe walks the filesystem per runtime. Callers
 //! on the GUI thread run these off-thread and marshal back (the
-//! `ClaudeIntegration.zig` detached-thread + WM_APP pattern), exactly like
+//! `AgentIntegration.zig` detached-thread + WM_APP pattern), exactly like
 //! Mac's `AgentIntegrationsViewModel.refresh`.
 //!
 //! Plain `std.fs` + the T869 registry, no direct OS imports, so the tempdir
@@ -150,11 +150,15 @@ pub fn allAgentStatuses(
     return out;
 }
 
+/// One agent's outcome in a batch action — what `summary` renders and what
+/// the first-run flow (T870) marshals back to the GUI thread.
+pub const AgentResult = struct { agent: RuntimeAgent, outcome: IntegrationOutcome };
+
 /// `Claude Code: installed · Copilot CLI: not found` — the one-line summary
 /// dialogs show after a batch action (Mac's `summary`).
 pub fn summary(
     alloc: Allocator,
-    results: []const struct { agent: RuntimeAgent, outcome: IntegrationOutcome },
+    results: []const AgentResult,
 ) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();

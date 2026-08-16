@@ -13,7 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
-const ClaudeIntegration = @import("ClaudeIntegration.zig");
+const AgentIntegration = @import("AgentIntegration.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
 const PathInstaller = @import("PathInstaller.zig");
@@ -83,7 +83,7 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 /// Posted by the IPC listener thread to marshal a request to the GUI
 /// thread. wparam = *IpcServer.Pending. (WM_APP+2/+3 are defined below:
 /// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY. WM_APP+6 is Window.WM_APP_HERO_SNAP;
-/// WM_APP+7/+8 are ClaudeIntegration's prompt/done messages.)
+/// WM_APP+7/+8 and +30/+31 are AgentIntegration's prompt/done messages.)
 pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 
 /// Posted (via `deferSetFocus`) to move keyboard focus to a terminal
@@ -596,9 +596,9 @@ pub fn init(
     // dev instance never takes over the user's links.
     url_scheme.registerAsync();
 
-    // One-time Claude Code integration offer (T71). Background thread;
-    // same canonical-install gate as the PATH self-heal.
-    ClaudeIntegration.checkOnLaunchAsync(self);
+    // One-time agent-integration offer + Claude plugin migration (T870).
+    // Background thread; same canonical-install gate as the PATH self-heal.
+    AgentIntegration.checkOnLaunchAsync(self);
 }
 
 /// Defer a focus change to a terminal surface out of the current WndProc.
@@ -7295,16 +7295,31 @@ fn msgWndProc(
         return 0;
     }
 
-    if (msg == ClaudeIntegration.WM_APP_CLAUDE_PROMPT) {
-        ClaudeIntegration.showFirstRunPrompt(app);
+    if (msg == AgentIntegration.WM_APP_CLAUDE_PROMPT) {
+        // wparam = detected-agent bits.
+        AgentIntegration.showFirstRunPrompt(app, wparam);
         return 0;
     }
 
-    if (msg == ClaudeIntegration.WM_APP_CLAUDE_DONE) {
+    if (msg == AgentIntegration.WM_APP_CLAUDE_DONE) {
         // wparam = heap *Done owned by the handler.
         if (wparam != 0) {
-            const done: *ClaudeIntegration.Done = @ptrFromInt(wparam);
-            ClaudeIntegration.onDone(app, done);
+            const done: *AgentIntegration.Done = @ptrFromInt(wparam);
+            AgentIntegration.onDone(app, done);
+        }
+        return 0;
+    }
+
+    if (msg == AgentIntegration.WM_APP_MIGRATION_PROMPT) {
+        AgentIntegration.showMigrationPrompt(app);
+        return 0;
+    }
+
+    if (msg == AgentIntegration.WM_APP_MIGRATION_DONE) {
+        // wparam = heap *MigrationDone owned by the handler.
+        if (wparam != 0) {
+            const done: *AgentIntegration.MigrationDone = @ptrFromInt(wparam);
+            AgentIntegration.onMigrationDone(app, done);
         }
         return 0;
     }

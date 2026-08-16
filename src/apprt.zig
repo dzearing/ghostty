@@ -117,6 +117,11 @@ test {
     _ = @import("apprt/win32/RuntimeIntegration.zig");
     _ = @import("apprt/win32/agent_integration_service.zig");
 
+    // Claude plugin → app migration (T870): manifest-driven uninstall via
+    // Claude's own CLI (injected), banner-state carry-over, stale-script
+    // ownership proofs. std.fs tempdir tests, every lane.
+    _ = @import("apprt/win32/claude_plugin_migration.zig");
+
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
 
