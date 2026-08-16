@@ -7914,3 +7914,4 @@ fn msgWndProc(
 
     return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 }
+}
