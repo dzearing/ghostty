@@ -133,6 +133,22 @@ $GuardTable = @(
             'test\win32\release-artifacts.ps1'
         )
     },
+    # Release version-drift detection (T579): the checker and its CI wiring
+    # only ever matter around a release, which is exactly when nobody on this
+    # box is watching -- the same argument as release-artifacts above. Its
+    # harness overlaps fork-ci.yml with that row on purpose: section B here
+    # asserts the release-parity job's wiring, which release-artifacts.ps1
+    # does not look at.
+    [pscustomobject]@{
+        Name   = 'release-parity'
+        Script = 'test\win32\release-parity.ps1'
+        Stamp  = 'test\win32\release-parity.stamp.json'
+        Covers = @(
+            'scripts\check-release-parity.ps1',
+            '.github\workflows\fork-ci.yml',
+            'test\win32\release-parity.ps1'
+        )
+    },
     # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
     # idle poll only ever fails inside a detached automation send — the loop
     # types into a mid-turn session and the damage reads as "the agent ignored

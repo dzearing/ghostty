@@ -180,3 +180,36 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         run: |
           dist/windows-installer/build-release-artifacts.sh --semver 0.0.0
+
+  # T579. Until merge-back a full release is two tag pushes (v* on main for
+  # macOS, win-v* on the Windows branch), and forgetting the second one
+  # produces no error anywhere -- every link keeps answering 200 with an old
+  # build, which is how the Windows channel sat three weeks stale (T38) and
+  # then shipped v1.32.0/v1.33.0 macOS-only. This job asserts the newest
+  # vX.Y.Z release has a win-vX.Y.Z release at the same version, on every
+  # push to the Windows branch -- the parity loop pushes many times a day, so
+  # a forgotten tag is a red job within hours instead of a silent gap for
+  # weeks. It reads the releases API only; it lives here and not in
+  # release.yml precisely so a Windows gap can never fail or delay the macOS
+  # signing/notarization pipeline. Push-only: the check is about repo state,
+  # not a PR's content, and PR runs from forks have no useful token.
+  release-parity:
+    if: github.repository == 'dzearing/ghoztty' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Gate on the tree, matching windows-cross: the checker ships on the
+      # Windows branch, so a main push (whose tree has no scripts/
+      # check-release-parity.ps1) no-ops green here.
+      - name: Check v / win-v release parity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f scripts/check-release-parity.ps1 ]; then
+            echo "no parity checker in this tree -- nothing to check"
+            exit 0
+          fi
+          pwsh -NoProfile -File scripts/check-release-parity.ps1 -Repo "$GITHUB_REPOSITORY"
