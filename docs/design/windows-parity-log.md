@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T587 - Chrome stroke weight now grows with display scaling
+  instead of inverting at 150%.** `Metrics.stroke_w` was parity-fit to the
+  28-DIP square like an extent, and the down-round at even squares made the
+  weight NON-monotonic (3 px at 125%, 2 px at 150%) — turning scaling up drew
+  the whole chrome lighter. The stroke is now plain-rounded (monotonic, within
+  half a pixel of 2 DIP at every scale); a new `centeredExact` places stroke
+  axes exact-size so `centered`'s parity trim can never cut them; and the two
+  glyphs that genuinely need extent ≡ stroke parity (the "+", the "…" dots)
+  give the pixel up from the EXTENT via `strokeFit`. §4.2 amended: the parity
+  fit governs extents, explicitly not stroke weight. New monotonicity sweep
+  test; two legacy tests un-taught the old scheme. Module 31/31, floor
+  lib/none/win32/agent PASS, pane-banner 124, P1–P3 25/20/16 ALL PASS.
+  Guard note: release-artifacts harness ran ALL PASS but with its two
+  Docker-only sections skipped (Docker stays down per standing directive), so
+  it does not re-stamp; committed under -NoGuardDue.
 - 2026-08-16 - **T578 - Every push to the Windows branch now cross-compiles
   the full release artifacts in CI.** Resumed a dead turn's stranded tree
   (claimed 10:29, died before committing; the claim's STRANDED WORK report

@@ -420,16 +420,31 @@ first T254 build shipped. Windows' own `ChromeMaximize` is a 10x10 box with a
 widths above: equal geometry is not equal apparent weight. Asserted as
 `interior * 2 > mark_caption` in `icon_button.zig`.
 
-**Every extent — mark and stroke alike — is rounded to the PARITY of the
-square it sits in, not to an even number of pixels.** (This corrects the rule
-as first written, which said "an even number of pixels so it cannot straddle a
-half-pixel"; that is the right instinct applied to the wrong quantity.) A mark
-centered on an integer grid has equal clearance on both sides only when
-`side - extent` is even. Force that parity and the centering is exact
-arithmetic; leave it to chance and the mark lands half a pixel off at roughly
-half of all scales — which is the "one arm shorter than the other" defect,
-reappearing. Round DOWN on a mismatch, never up, or the optical order
-(`close < add < menu`) collapses at those same scales.
+**Every mark EXTENT is rounded to the PARITY of the square it sits in, not to
+an even number of pixels.** (This corrects the rule as first written, which
+said "an even number of pixels so it cannot straddle a half-pixel"; that is
+the right instinct applied to the wrong quantity.) A mark centered on an
+integer grid has equal clearance on both sides only when `side - extent` is
+even. Force that parity and the centering is exact arithmetic; leave it to
+chance and the mark lands half a pixel off at roughly half of all scales —
+which is the "one arm shorter than the other" defect, reappearing. Round DOWN
+on a mismatch, never up, or the optical order (`close < add < menu`) collapses
+at those same scales.
+
+**The parity fit governs extents and explicitly NOT the stroke weight**
+(T587; this corrects the rule as amended above, which said "mark and stroke
+alike"). The fit moves a number by one pixel, and one pixel means different
+things at the two sizes: invisible on a 12 DIP extent, a 33% weight change on
+a 3 px stroke. Applied to `stroke_w` it made the weight NON-monotonic in DPI —
+3 px at 125%, 2 px at 150%, because the 150% square is even and the fit rounds
+down — so turning display scaling up drew the whole chrome *lighter*. The
+stroke is plain-rounded (`round(2 · scale)`), asserted monotonic by
+`stroke weight tracks the scale monotonically` in `icon_button.zig`; a bar's
+placement then truncates its odd half-pixel up/left, which no one can see.
+Where a glyph genuinely needs the two parities to agree — the "+", whose bars
+must split evenly around each other, and the "…", whose three dots plus two
+equal gaps can only span an extent of the dot's parity — the EXTENT gives up
+the pixel (`strokeFit`), never the stroke.
 
 ### 4.3 Diagonal marks: thickness is not the offset
 

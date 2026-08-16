@@ -139,7 +139,14 @@ pub const Metrics = struct {
     /// rect inset in its hit box, not as a full-bleed square — the square is
     /// what made the "+" and "≡" read as one slab.
     corner_r: i32,
-    /// Mark thickness, ~2 DIP, parity-matched to `target`.
+    /// Mark thickness, 2 DIP plain-rounded — deliberately NOT parity-matched
+    /// to `target` (T587). The parity fit is an EXTENT rule: on a mismatch it
+    /// moves a number by one pixel, which is invisible on a 12 DIP extent and
+    /// a 33% weight cut on a 3 px stroke. Fitting the stroke to the square's
+    /// parity made the weight non-monotonic in DPI — 3 px at 125%, 2 px at
+    /// 150% — so turning scaling UP drew the whole chrome LIGHTER. Where a
+    /// crossing glyph needs the stroke and its extent to share parity (the
+    /// "+", the "…"), the EXTENT gives up the pixel: `strokeFit`.
     stroke_w: i32,
     /// Mark thickness for CLOSED OUTLINE glyphs (maximize, restore) — 1 DIP,
     /// floored at one physical pixel.
@@ -189,7 +196,7 @@ pub const Metrics = struct {
 
     pub fn init(scale: f32) Metrics {
         const side = px(28.0, scale);
-        const stroke = markPx(2.0, scale, side);
+        const stroke = @max(px(2.0, scale), 1);
         return .{
             .target = side,
             .hit_pad = px(2.0, scale),
@@ -213,12 +220,15 @@ pub const Metrics = struct {
         return @intFromFloat(@round(dip * scale));
     }
 
-    /// A mark extent in physical pixels, forced to the same parity as `side`.
+    /// A mark EXTENT in physical pixels, forced to the same parity as `side`.
     ///
     /// Rounds DOWN on a parity mismatch, never up: rounding up collapses the
     /// optical order (close < add < menu) at half the scales, and a mark one
     /// pixel under its nominal DIP is invisible while a mis-centered one is
     /// exactly what the user reported.
+    ///
+    /// Extents ONLY — never the stroke weight, which is small enough that the
+    /// same one-pixel adjustment is a visible weight change (T587; §4.2).
     fn markPx(dip: f32, scale: f32, side: i32) i32 {
         var e = @max(px(dip, scale), 1);
         if (((side - e) & 1) != 0) e = if (e > 1) e - 1 else e + 1;
@@ -418,6 +428,28 @@ fn centered(target: Rect, w: i32, h: i32) Rect {
     return .{ .left = left, .top = top, .right = left + cw, .bottom = top + ch };
 }
 
+/// `centered` without the parity fit: the rect keeps its exact dimensions and
+/// the leftover pixel of an odd gap lands up/left (truncation). For boxes with
+/// a STROKE axis (T587): a stroke trimmed to the square's parity is a visible
+/// weight change, while the half-pixel placement bias is not — the opposite
+/// trade from an extent, which is what `centered` is for.
+fn centeredExact(target: Rect, w: i32, h: i32) Rect {
+    const cw = @min(w, target.width());
+    const ch = @min(h, target.height());
+    const left = target.left + @divTrunc(target.width() - cw, 2);
+    const top = target.top + @divTrunc(target.height() - ch, 2);
+    return .{ .left = left, .top = top, .right = left + cw, .bottom = top + ch };
+}
+
+/// The extent a CROSSING glyph actually uses: `e`, less one pixel when its
+/// parity disagrees with the stroke's. A "+" whose bar length and stroke
+/// differ in parity cannot split evenly around the crossing member — one arm
+/// paints a pixel longer, which is the user's original complaint — and of the
+/// two numbers it is the extent that can afford the pixel (§4.2, T587).
+fn strokeFit(e: i32, t: i32) i32 {
+    return e - ((e ^ t) & 1);
+}
+
 /// An axis-aligned filled bar as a quad, wound clockwise.
 fn bar(r: Rect) Quad {
     return .{ .pts = .{
@@ -483,12 +515,17 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
 
     switch (glyph) {
         .add => {
-            out[0] = bar(centered(target, m.mark_add, t));
-            out[1] = bar(centered(target, t, m.mark_add));
+            // The bars cross, so their extent must share the stroke's parity
+            // or the halves around the crossing member differ by a pixel —
+            // and both must dodge the parity trim or the stroke itself is cut
+            // (T587).
+            const a = strokeFit(m.mark_add, t);
+            out[0] = bar(centeredExact(target, a, t));
+            out[1] = bar(centeredExact(target, t, a));
             return out[0..2];
         },
         .menu, .contents => {
-            const mid = centered(target, m.mark_menu, t);
+            const mid = centeredExact(target, m.mark_menu, t);
             out[0] = bar(.{
                 .left = mid.left,
                 .top = mid.top - m.menu_pitch,
@@ -566,7 +603,7 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             // One rule, centered. The simplest glyph in the set, and the one
             // most likely to be "just a LineTo" — which is exactly how it
             // would end up a pixel off center at half the scales.
-            out[0] = bar(centered(target, m.mark_caption, t));
+            out[0] = bar(centeredExact(target, m.mark_caption, t));
             return out[0..1];
         },
         .maximize => {
@@ -734,7 +771,7 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
                 .{ .x = b.left, .y = b.top + head_h + ht },
             } };
             out[1] = mirrorX(out[0], b.left + b.right);
-            const shaft = centered(b, t, t);
+            const shaft = centeredExact(b, t, t);
             out[2] = bar(.{
                 .left = shaft.left,
                 .top = b.top,
@@ -754,9 +791,12 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             // reflected. The two outer dots are therefore equidistant from
             // the middle BY CONSTRUCTION, which is the same rule that fixed
             // the hamburger's rules and the "+"'s arms.
+            // Three dots spanning `w` means `w = 3d + 2·gap`, whose parity is
+            // the dot's — so like the "+", the extent yields the pixel on a
+            // parity mismatch and the dots keep their full stroke (T587).
             const d = @max(t, 1);
-            const b = centered(target, m.mark_caption, d);
-            const mid = centered(b, d, d);
+            const b = centeredExact(target, strokeFit(m.mark_caption, d), d);
+            const mid = centeredExact(b, d, d);
             // Whatever is left of the box after the middle dot, split evenly
             // between the two flanks: dot, gap, dot, gap, dot.
             const step = @divTrunc(b.width() - d, 2);
@@ -1025,11 +1065,14 @@ test "every mark shares its square's parity, so it can be centered exactly" {
     // extent whose parity differs from the square's cannot be centered on an
     // integer grid, and the leftover half pixel is the "one arm shorter"
     // report. Checked over a wide sweep of scales, not just the pretty ones.
+    // `stroke_w` is deliberately absent: it is a WEIGHT, not an extent, and
+    // fitting it to the square's parity is what made it non-monotonic in DPI
+    // (T587) — thinner at 150% than at 125%.
     var scale: f32 = 1.0;
     while (scale <= 3.0) : (scale += 0.05) {
         const m = Metrics.init(scale);
         for ([_]i32{
-            m.stroke_w,   m.mark_add,        m.mark_close,
+            m.mark_add,   m.mark_close,
             m.mark_menu,  m.mark_chevron_w,  m.mark_chevron_h,
         }) |e| {
             try testing.expect(e >= 1);
@@ -1123,9 +1166,22 @@ test "every glyph is symmetric inside its target, on both axes" {
                 try testing.expect(quads.len >= min_quads);
                 const b = paintedBounds(quads);
                 // Right/bottom are exclusive, so the last painted pixel is
-                // `right - 1`; clearance on each side must match exactly.
-                try testing.expectEqual(b.left - t.left, t.right - b.right);
-                try testing.expectEqual(b.top - t.top, t.bottom - b.bottom);
+                // `right - 1`. Clearance on each side matches exactly when the
+                // leftover gap is even; an ODD gap — a stroke axis whose
+                // parity disagrees with the square's, T587 — cannot split
+                // evenly, and the truncated half pixel lands up/left, always:
+                // a bias that FLIPPED with scale would be the old pen-stroke
+                // defect back again.
+                const dx = (b.left - t.left) - (t.right - b.right);
+                const dy = (b.top - t.top) - (t.bottom - b.bottom);
+                try testing.expectEqual(
+                    @as(i32, if (((t.width() - b.width()) & 1) != 0) -1 else 0),
+                    dx,
+                );
+                try testing.expectEqual(
+                    @as(i32, if (((t.height() - b.height()) & 1) != 0) -1 else 0),
+                    dy,
+                );
             }
         }
     }
@@ -1255,6 +1311,21 @@ test "a mark is never hairline-invisible at any DPI" {
     }
 }
 
+test "stroke weight tracks the scale monotonically" {
+    // T587: the parity fit made `stroke_w` NON-monotonic — 3 px at 125%, 2 px
+    // at 150% — so turning display scaling UP drew every chrome glyph
+    // LIGHTER. The weight must never move against the scale, and must stay
+    // within a pixel of its nominal 2 DIP.
+    var prev: i32 = 0;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const w = Metrics.init(scale).stroke_w;
+        try testing.expect(w >= prev);
+        try testing.expect(@abs(@as(f32, @floatFromInt(w)) - 2.0 * scale) <= 1.0);
+        prev = w;
+    }
+}
+
 test "the plus is exactly as long as it is tall" {
     // Cheap, and it would have caught the reported asymmetry on its own: the
     // "+" is two bars of the same extent crossing at the square's center.
@@ -1266,7 +1337,10 @@ test "the plus is exactly as long as it is tall" {
         try testing.expectEqual(@as(usize, 2), q.len);
         const b = paintedBounds(q);
         try testing.expectEqual(b.width(), b.height());
-        try testing.expectEqual(m.mark_add, b.width());
+        // The extent gives up one pixel when its parity disagrees with the
+        // stroke's — the cross cannot otherwise split evenly around the
+        // crossing member (T587).
+        try testing.expectEqual(m.mark_add - ((m.mark_add ^ m.stroke_w) & 1), b.width());
         // Each bar is `stroke_w` across its short axis.
         const h_bar = paintedBounds(q[0..1]);
         const v_bar = paintedBounds(q[1..2]);
@@ -1427,8 +1501,11 @@ test "caption glyphs: the overflow dots are three, even, and never merge" {
 
         const b = paintedBounds(q);
         // It is a member of the caption cluster, so it spans that cluster's
-        // one extent — not a fourth number that happens to look similar.
-        try testing.expectEqual(m.mark_caption, b.width());
+        // one extent — not a fourth number that happens to look similar. Less
+        // one pixel when the extent's parity disagrees with the dot's: three
+        // dots plus two equal gaps can only span an extent of the dot's own
+        // parity (T587).
+        try testing.expectEqual(m.mark_caption - ((m.mark_caption ^ m.stroke_w) & 1), b.width());
 
         // Left → middle → right, each a square dot of the shared stroke.
         const left = paintedBounds(q[0..1]);
