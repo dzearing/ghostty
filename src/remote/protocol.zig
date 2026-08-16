@@ -1284,6 +1284,13 @@ pub const SessionInfo = struct {
     /// A genuinely-exited child (`alive == false`, `exit_code` set) leaves this
     /// false. Additive/optional (defaults false; older agents omit it).
     relaunchable: bool = false,
+    /// When the session last became UNATTACHED (agent clock, ms since epoch),
+    /// reported only while `alive` and not `attached`; null otherwise. Reset by
+    /// every ATTACH, so it always means "continuously unattached since" (T534:
+    /// the viewer's long-unattached notification reads it — the agent itself
+    /// never acts on it). Additive/optional: older agents omit it, and a reader
+    /// that never heard of it changes nothing.
+    unattached_since: ?i64 = null,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
@@ -3087,6 +3094,7 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
             .exit_code = 137,
             .activity = "idle",
             .pid = 99,
+            .unattached_since = 1234,
         },
     };
     const sessions: Sessions = .{ .sessions = &rows };
@@ -3105,12 +3113,14 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
     try testing.expectEqualStrings("vim .", a.argv.?);
     try testing.expectEqualStrings("editor", a.title.?);
     try testing.expect(a.pinned); // pinned round-trips (T11)
+    try testing.expect(a.unattached_since == null); // omitted → null (older agent, T534)
 
     const b = sp.value.sessions[1];
     try testing.expect(!b.alive);
     try testing.expectEqual(@as(?i64, 137), b.exit_code);
     try testing.expect(b.argv == null and b.title == null and b.cwd == null);
     try testing.expect(!b.pinned); // defaults false when omitted
+    try testing.expectEqual(@as(?i64, 1234), b.unattached_since); // round-trips (T534)
 
     // An empty roster still encodes the array key (never elided) so the client can
     // tell "answered, none" from "no reply".

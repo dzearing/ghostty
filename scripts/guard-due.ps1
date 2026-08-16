@@ -156,6 +156,19 @@ $GuardTable = @(
             'test\win32\hook-json.ps1'
         )
     },
+    # The forgotten-session notification (T534): its policy only ever acts a
+    # DAY after a session is orphaned, so a regression is invisible to every
+    # interactive use of the tree, and its harness is not in the P1-P3 floor.
+    [pscustomobject]@{
+        Name   = 'orphan-notify'
+        Script = 'test\win32\orphan-notify.ps1'
+        Stamp  = 'test\win32\orphan-notify.stamp.json'
+        Covers = @(
+            'src\apprt\win32\orphan_notify.zig',
+            'src\apprt\win32\tray_notify.zig',
+            'test\win32\orphan-notify.ps1'
+        )
+    },
     # The activity-state machine (T605): main's own oracle run verbatim under
     # Git Bash against the live win32 hook asset, plus the native-pid arms the
     # oracle cannot see. A hook-script edit that breaks a transition only ever

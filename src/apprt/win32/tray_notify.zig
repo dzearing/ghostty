@@ -32,6 +32,8 @@ const w32 = @import("win32.zig");
 /// tells the two apart in the one callback message both share.
 pub const desktop_uid: u32 = 1;
 pub const update_uid: u32 = 2;
+/// The long-unattached-session ("forgotten session") balloon, T534.
+pub const orphan_uid: u32 = 3;
 
 /// What the app should do about a callback message. `null` from `classify`
 /// means "nothing" — the overwhelmingly common case, since the shell also
@@ -43,6 +45,9 @@ pub const Action = enum {
     focus_notifying_surface,
     /// An update balloon was dismissed by a click: open the release page.
     open_release_page,
+    /// A forgotten-session balloon (T534) was dismissed by a click: open the
+    /// machine chooser, where the marked session's Resume and Kill live.
+    review_orphan_sessions,
 };
 
 /// Decode one `WM_APP_TRAY` (`uCallbackMessage`) delivery under
@@ -60,6 +65,7 @@ pub fn classify(wparam: usize, lparam: isize) ?Action {
     return switch (wparam) {
         desktop_uid => .focus_notifying_surface,
         update_uid => .open_release_page,
+        orphan_uid => .review_orphan_sessions,
         else => null,
     };
 }
@@ -74,6 +80,10 @@ test "classify: a balloon click routes by icon id" {
     try testing.expectEqual(
         Action.open_release_page,
         classify(update_uid, click).?,
+    );
+    try testing.expectEqual(
+        Action.review_orphan_sessions,
+        classify(orphan_uid, click).?,
     );
 }
 
@@ -105,6 +115,10 @@ test "classify: only a click acts, never a timeout or a hover" {
         try testing.expectEqual(
             @as(?Action, null),
             classify(update_uid, @intCast(event)),
+        );
+        try testing.expectEqual(
+            @as(?Action, null),
+            classify(orphan_uid, @intCast(event)),
         );
     }
 }

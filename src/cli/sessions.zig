@@ -423,6 +423,10 @@ const JsonRow = struct {
     /// tell a resumable tombstone from a genuinely-exited one; an older reader
     /// that does not know the key ignores it (additive, no protocol bump — T322).
     relaunchable: bool,
+    /// When the session last became continuously unattached (agent clock, ms),
+    /// null while attached/dead or from an older agent (additive — T534). This
+    /// is the independent oracle the orphan-notification acceptance reads.
+    unattached_since: ?i64,
 };
 
 fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connection.OwnedSession) !void {
@@ -442,6 +446,7 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
             .last_activity = s.last_activity,
             .pinned = s.pinned,
             .relaunchable = s.relaunchable,
+            .unattached_since = s.unattached_since,
         };
     }
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });

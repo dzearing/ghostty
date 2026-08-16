@@ -47,6 +47,7 @@ const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const tray_notify = @import("tray_notify.zig");
+const orphan_notify = @import("orphan_notify.zig");
 const session_layout = @import("session_layout.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
@@ -118,6 +119,13 @@ const WM_APP_AGENT_UPGRADE_CHECK: u32 = w32.WM_APP + 12;
 /// two-factor check that keeps a recycled handle safe.
 const WM_APP_REAP_SURFACE: u32 = w32.WM_APP + 26;
 
+/// Posted by the long-unattached session check's worker thread (T534):
+/// wparam = *OrphanRosterResult (heap; ownership transfers to the handler).
+/// The GUI thread evaluates the roster and may show the forgotten-session
+/// balloon. (+27..+32 are taken — see MachineConnectionPool / SessionCpuProbe /
+/// AgentIntegration / AgentIntegrationsDialog.)
+const WM_APP_ORPHAN_ROSTER: u32 = w32.WM_APP + 33;
+
 /// Ceiling on agent restarts spent chasing the bundled build in one app run
 /// (T147). Two: one for the ordinary "the binary was swapped under us" case,
 /// one spare for a restart that raced something, and no third because a third
@@ -157,6 +165,12 @@ const AGENT_WATCH_TIMER_ID: usize = 5;
 /// after a recovery aborted with no reachable agent, one-shot per attempt, and
 /// disarmed the moment the link is back or the schedule is spent.
 const AGENT_RETRY_TIMER_ID: usize = 7;
+
+/// Timer ID 9: the periodic long-unattached session check (T534). Armed at
+/// startup with a short first fire, then re-armed at the full cadence on every
+/// tick. (Timer 8 is the orphan balloon's icon-cleanup timer, defined beside
+/// the other NOTIF_* timer ids below.)
+const ORPHAN_CHECK_TIMER_ID: usize = 9;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
@@ -274,6 +288,10 @@ taskbar: ?*w32.ITaskbarList3 = null,
 /// A single id suffices: there is one NOTIF_DESKTOP_UID tray balloon and
 /// each new notification overwrites it.
 notif_desktop_surface_id: u64 = 0,
+
+/// True while a long-unattached session check (T534) has a worker thread out
+/// reading the local agent's roster; at most one is ever in flight.
+orphan_check_inflight: bool = false,
 
 /// Version text of the newest win-v release the update check found (heap,
 /// app allocator). A click on the update balloon opens that release's
@@ -588,6 +606,15 @@ pub fn init(
     // Check for updates in the background (non-blocking). Only acts in
     // -Dwindows-update-check channel builds (T24).
     self.startUpdateCheck(.automatic);
+
+    // First long-unattached session check (T534) shortly after launch — late
+    // enough that the launch restore has re-attached everything it is going
+    // to. Each tick re-arms at the full cadence, so only the first fire is
+    // early.
+    if (self.msg_hwnd) |mh| {
+        const first = @min(self.orphanCheckIntervalMs(), 60_000);
+        _ = w32.SetTimer(mh, ORPHAN_CHECK_TIMER_ID, first, null);
+    }
 
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
     // thread; only acts when running from the canonical install dir.
@@ -6322,6 +6349,8 @@ const NOTIF_DESKTOP_UID: u32 = tray_notify.desktop_uid;
 const NOTIF_DESKTOP_TIMER_ID: usize = 2;
 const NOTIF_UPDATE_UID: u32 = tray_notify.update_uid;
 const NOTIF_UPDATE_TIMER_ID: usize = 3;
+const NOTIF_ORPHAN_UID: u32 = tray_notify.orphan_uid;
+const NOTIF_ORPHAN_TIMER_ID: usize = 8;
 
 /// Register a notification-area icon's behavior version, which is what turns
 /// the `NIN_*` balloon notifications on. Without it the icon keeps the
@@ -6525,18 +6554,30 @@ fn showUpdateFeedback(self: *App, code: isize) void {
 }
 
 /// Show a balloon on the update tray icon. A click is delivered as
-/// WM_APP_TRAY (NOTIF_UPDATE_UID) → opens the release page. Title/body
-/// must fit the NOTIFYICONDATAW limits (64/256 UTF-16 units incl. nul);
-/// longer text is dropped rather than truncated mid-rune.
+/// WM_APP_TRAY (NOTIF_UPDATE_UID) → opens the release page.
 fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) void {
+    self.showTrayBalloon(NOTIF_UPDATE_UID, NOTIF_UPDATE_TIMER_ID, title_utf8, body_utf8);
+}
+
+/// Show a balloon on `uid`'s tray icon, cleaned up by `timer_id`. A click is
+/// delivered as WM_APP_TRAY and routed by uid (`tray_notify.classify`).
+/// Title/body must fit the NOTIFYICONDATAW limits (64/256 UTF-16 units incl.
+/// nul); longer text is dropped rather than truncated mid-rune.
+fn showTrayBalloon(
+    self: *App,
+    uid: u32,
+    timer_id: usize,
+    title_utf8: []const u8,
+    body_utf8: []const u8,
+) void {
     const hwnd = self.msg_hwnd orelse return;
 
     var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
     nid.hWnd = hwnd;
-    nid.uID = NOTIF_UPDATE_UID;
+    nid.uID = uid;
     // NIF_MESSAGE registers our callback so a click on the balloon
-    // is delivered as WM_APP_TRAY → opens the GitHub releases page.
+    // is delivered as WM_APP_TRAY.
     // NIF_INFO (the balloon itself) is added only after NIM_SETVERSION below.
     nid.uFlags = w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
     nid.uCallbackMessage = WM_APP_TRAY;
@@ -6565,10 +6606,10 @@ fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) 
     // click that dismisses it is handled under the default (Windows 95)
     // behavior and never reaches WM_APP_TRAY.
     const added = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0;
-    setNotifyIconVersion(hwnd, NOTIF_UPDATE_UID, added);
+    setNotifyIconVersion(hwnd, uid, added);
     nid.uFlags |= w32.NIF_INFO;
     _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
-    _ = w32.SetTimer(hwnd, NOTIF_UPDATE_TIMER_ID, 10000, null);
+    _ = w32.SetTimer(hwnd, timer_id, 10000, null);
 }
 
 /// Response-size cap for the releases-list fetch. Release notes can be
@@ -6789,6 +6830,235 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     // Schedule icon removal via a timer (distinct from the update
     // notification's timer so the two don't trample each other).
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
+}
+
+// -----------------------------------------------------------------------
+// Long-unattached session notification (T534)
+// -----------------------------------------------------------------------
+//
+// The agent keeps a pinned live session FOREVER once nothing shows it — that
+// keep-forever default is the contract (D18: never silently reap) — so
+// discovery is the app's job: a periodic check reads the local roster, and a
+// session continuously unattached past a generous threshold earns one tray
+// balloon naming it. Clicking the balloon opens the machine chooser, where the
+// T520 "not in any window" badge marks the session and Resume / Kill already
+// live; ignoring or dismissing it IS "Keep" — a per-episode stamp keeps that
+// episode quiet for a long while, and only an ATTACH (which resets the agent's
+// clock) starts a new episode. Policy is pure in `orphan_notify.zig`.
+
+/// Heap box a finished orphan-check worker posts back to the GUI thread.
+const OrphanRosterResult = struct {
+    alloc: Allocator,
+    roster: ?remote_connection.OwnedSessions,
+
+    fn destroy(self: *OrphanRosterResult) void {
+        if (self.roster) |*r| r.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+/// Bounded worker-side RPC budget; a wedged agent costs one missed check, not
+/// a parked thread per tick (the inflight flag holds until the reply lands).
+const orphan_rpc_timeout_ns: u64 = 5 * std.time.ns_per_s;
+
+/// Debug-only cadence/threshold override (acceptance seam). Release builds run
+/// the hard-coded policy — D18 ruled out config knobs, and these are not
+/// knobs: they exist so a test can watch a "24 hours later" story in seconds.
+fn orphanEnvMs(alloc: Allocator, name: []const u8, default_val: i64) i64 {
+    if (comptime !build_config.is_debug) return default_val;
+    const v = std.process.getEnvVarOwned(alloc, name) catch return default_val;
+    defer alloc.free(v);
+    const parsed = std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\r\n"), 10) catch return default_val;
+    return if (parsed > 0) parsed else default_val;
+}
+
+fn orphanCheckIntervalMs(self: *App) u32 {
+    const v = orphanEnvMs(
+        self.core_app.alloc,
+        "GHOZTTY_ORPHAN_CHECK_MS",
+        orphan_notify.default_check_interval_ms,
+    );
+    return @intCast(std.math.clamp(v, 500, std.math.maxInt(u32)));
+}
+
+/// Kick one background read of the local agent's roster for the check. Never
+/// spawns an agent — a notifier must not start a daemon any more than browsing
+/// does (SessionRoster's rule) — and never blocks the GUI thread.
+fn startOrphanCheck(self: *App) void {
+    if (self.orphan_check_inflight) return;
+    const hwnd = self.msg_hwnd orelse return;
+    const alloc = self.core_app.alloc;
+    const res = alloc.create(OrphanRosterResult) catch return;
+    res.* = .{ .alloc = alloc, .roster = null };
+    self.orphan_check_inflight = true;
+    const warm = self.local_agent.sharedConnectionIfWarm();
+    const thread = std.Thread.spawn(.{}, orphanCheckWorker, .{ res, hwnd, warm }) catch {
+        self.orphan_check_inflight = false;
+        res.destroy();
+        return;
+    };
+    thread.detach();
+}
+
+fn orphanCheckWorker(
+    res: *OrphanRosterResult,
+    hwnd: w32.HWND,
+    warm: ?*remote_connection.Connection,
+) void {
+    var probe: ?tcp_dial.Dialed = null;
+    const conn: ?*remote_connection.Connection = warm orelse blk: {
+        probe = LocalAgent.dialProbe(res.alloc);
+        break :blk if (probe) |p| p.conn else null;
+    };
+    defer if (probe) |*p| p.deinit();
+
+    if (conn) |c| {
+        res.roster = c.requestSessions(orphan_rpc_timeout_ns) catch |err| r: {
+            log.debug("orphan check: LIST_SESSIONS failed err={}", .{err});
+            break :r null;
+        };
+    }
+    if (w32.PostMessageW(hwnd, WM_APP_ORPHAN_ROSTER, @intFromPtr(res), 0) == 0) {
+        // The app is going away; nothing will ever collect this.
+        res.destroy();
+    }
+}
+
+/// GUI thread: a roster landed — decide whether anything deserves a balloon.
+/// The ORACLE LINE is printed before the shell is asked to show anything: on a
+/// desktop with no notification area (a background test desktop) the decision
+/// still happened and is still observable.
+fn onOrphanRoster(self: *App, res: *OrphanRosterResult) void {
+    self.orphan_check_inflight = false;
+    defer res.destroy();
+    const roster = res.roster orelse return;
+    const alloc = self.core_app.alloc;
+
+    var rows = alloc.alloc(orphan_notify.Row, roster.sessions.len) catch return;
+    defer alloc.free(rows);
+    for (roster.sessions, 0..) |s, i| rows[i] = .{
+        .id = s.id,
+        .alive = s.alive,
+        .attached = s.attached,
+        .unattached_since = s.unattached_since,
+    };
+
+    // The agent is local, so its clock and ours are the same wall clock.
+    const now_ms = std.time.milliTimestamp();
+    const notify_after = orphanEnvMs(
+        alloc,
+        "GHOZTTY_ORPHAN_NOTIFY_AFTER_MS",
+        orphan_notify.default_notify_after_ms,
+    );
+    const renotify_after = orphanEnvMs(
+        alloc,
+        "GHOZTTY_ORPHAN_RENOTIFY_MS",
+        orphan_notify.default_renotify_after_ms,
+    );
+
+    var stamps = loadOrphanStamps(alloc);
+    defer stamps.deinit();
+
+    const d = orphan_notify.decide(rows, stamps.value, now_ms, notify_after, renotify_after);
+    const idx = d.announce orelse return;
+    const s = roster.sessions[idx];
+    const since = s.unattached_since orelse return;
+
+    // The acceptance oracle: the decision, said before any shell call.
+    log.info(
+        "orphan notify: session={s} unattached_for_ms={d} eligible={d} cwd={s}",
+        .{ s.id, now_ms - since, d.eligible, s.cwd orelse "-" },
+    );
+
+    // Stamp FIRST — this is what "Keep" means: once told, this episode stays
+    // quiet for a long while regardless of what the shell did with the
+    // balloon. Existing stamps for sessions the agent no longer lists are
+    // pruned so the file cannot grow without bound.
+    var keep: std.ArrayListUnmanaged(orphan_notify.Stamp) = .empty;
+    defer keep.deinit(alloc);
+    keep.append(alloc, .{
+        .id = s.id,
+        .unattached_since = since,
+        .notified_at = now_ms,
+    }) catch return;
+    for (stamps.value) |st| {
+        if (std.mem.eql(u8, st.id, s.id)) continue;
+        const still = for (roster.sessions) |r2| {
+            if (std.mem.eql(u8, r2.id, st.id)) break true;
+        } else false;
+        if (still) keep.append(alloc, st) catch {};
+    }
+    saveOrphanStamps(alloc, keep.items);
+
+    var body_buf: [256]u8 = undefined;
+    const body = orphan_notify.formatBody(&body_buf, s.cwd, s.argv, now_ms - since, d.eligible - 1);
+    self.showTrayBalloon(
+        NOTIF_ORPHAN_UID,
+        NOTIF_ORPHAN_TIMER_ID,
+        "A terminal session is still running",
+        body,
+    );
+}
+
+/// The loaded stamp file, holding its JSON arena alive as long as the slice is
+/// read. Any failure at all loads as "no stamps" — worst case the user hears
+/// about an episode once more, never an error dialog.
+const OrphanStamps = struct {
+    parsed: ?std.json.Parsed(orphan_notify.StampFile),
+    value: []const orphan_notify.Stamp,
+
+    fn deinit(self: *OrphanStamps) void {
+        if (self.parsed) |*p| p.deinit();
+        self.* = undefined;
+    }
+};
+
+/// `%LOCALAPPDATA%\ghoztty\orphan-notify[-debug].json` — the same debug-build
+/// coexistence pattern as `session_layout.layoutPath`, so a dev build never
+/// suppresses (or burns) the release app's notifications. Caller frees.
+fn orphanStampsPath(alloc: Allocator) ?[]u8 {
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return null;
+    defer alloc.free(dir);
+    const name = if (comptime build_config.is_debug)
+        "orphan-notify-debug.json"
+    else
+        "orphan-notify.json";
+    return std.fs.path.join(alloc, &.{ dir, "ghoztty", name }) catch null;
+}
+
+fn loadOrphanStamps(alloc: Allocator) OrphanStamps {
+    const none: OrphanStamps = .{ .parsed = null, .value = &.{} };
+    const path = orphanStampsPath(alloc) orelse return none;
+    defer alloc.free(path);
+    const f = std.fs.openFileAbsolute(path, .{}) catch return none;
+    defer f.close();
+    const bytes = f.readToEndAlloc(alloc, 1024 * 1024) catch return none;
+    defer alloc.free(bytes);
+    // `.alloc_always`: the ids must be COPIES — with the default policy an
+    // unescaped string field points into `bytes`, which is freed right here,
+    // and a dangling id silently matches nothing (measured: every stamp read
+    // as "no stamp" and the balloon re-fired on every tick).
+    const parsed = std.json.parseFromSlice(orphan_notify.StampFile, alloc, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return none;
+    return .{ .parsed = parsed, .value = parsed.value.stamps };
+}
+
+fn saveOrphanStamps(alloc: Allocator, stamps: []const orphan_notify.Stamp) void {
+    const path = orphanStampsPath(alloc) orelse return;
+    defer alloc.free(path);
+    const json = std.json.Stringify.valueAlloc(
+        alloc,
+        orphan_notify.StampFile{ .stamps = stamps },
+        .{},
+    ) catch return;
+    defer alloc.free(json);
+    if (std.fs.path.dirname(path)) |dir| std.fs.makeDirAbsolute(dir) catch {};
+    const f = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer f.close();
+    f.writeAll(json) catch {};
 }
 
 /// Notify the core app of a tick.
@@ -7508,6 +7778,23 @@ fn msgWndProc(
                     }
                 }
             },
+            .review_orphan_sessions => {
+                // The forgotten-session balloon (T534): open the machine
+                // chooser, where the T520 "not in any window" badge marks the
+                // session and Resume / Kill live. Anchored on the focused
+                // window (the chooser is per-window), falling back to any
+                // open one; no window at all means nowhere to review, drop.
+                const win: ?*Window = if (app.core_app.focusedSurface()) |s|
+                    s.rt_surface.parent_window
+                else if (app.windows.items.len > 0)
+                    app.windows.items[0]
+                else
+                    null;
+                if (win) |w| {
+                    if (w.hwnd) |wh| _ = w32.SetForegroundWindow(wh);
+                    MachineChooser.open(w);
+                }
+            },
             .open_release_page => {
                 // Open the specific win-v release page when a version is
                 // known (update balloon); the releases list otherwise
@@ -7556,6 +7843,22 @@ fn msgWndProc(
         return 0;
     }
 
+    // Timer ID 9: the periodic long-unattached session check (T534). Re-armed
+    // here at the full cadence — the launch arm fires sooner on purpose.
+    if (msg == w32.WM_TIMER and wparam == ORPHAN_CHECK_TIMER_ID) {
+        _ = w32.SetTimer(hwnd, ORPHAN_CHECK_TIMER_ID, app.orphanCheckIntervalMs(), null);
+        app.startOrphanCheck();
+        return 0;
+    }
+
+    // A background orphan-check worker parked its roster (T534): evaluate it
+    // on the GUI thread (ownership of the box transfers here).
+    if (msg == WM_APP_ORPHAN_ROSTER) {
+        const res: *OrphanRosterResult = @ptrFromInt(wparam);
+        app.onOrphanRoster(res);
+        return 0;
+    }
+
     // Timer ID 7: the in-place recovery retry (T723). Armed only after a
     // recovery aborted with no reachable agent; one-shot per attempt.
     if (msg == w32.WM_TIMER and wparam == AGENT_RETRY_TIMER_ID) {
@@ -7581,12 +7884,14 @@ fn msgWndProc(
     // own (uID, timer-id) pair so an in-flight balloon isn't removed by
     // an unrelated timeout.
     if (msg == w32.WM_TIMER and
-        (wparam == NOTIF_DESKTOP_TIMER_ID or wparam == NOTIF_UPDATE_TIMER_ID))
+        (wparam == NOTIF_DESKTOP_TIMER_ID or wparam == NOTIF_UPDATE_TIMER_ID or
+            wparam == NOTIF_ORPHAN_TIMER_ID))
     {
-        const uid: u32 = if (wparam == NOTIF_DESKTOP_TIMER_ID)
-            NOTIF_DESKTOP_UID
-        else
-            NOTIF_UPDATE_UID;
+        const uid: u32 = switch (wparam) {
+            NOTIF_DESKTOP_TIMER_ID => NOTIF_DESKTOP_UID,
+            NOTIF_UPDATE_TIMER_ID => NOTIF_UPDATE_UID,
+            else => NOTIF_ORPHAN_UID,
+        };
         _ = w32.KillTimer(hwnd, wparam);
         var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
         nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);

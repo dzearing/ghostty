@@ -773,6 +773,11 @@ pub const OwnedSession = struct {
     /// false (it carries an `exit_code` instead). Additive/optional — older agents
     /// omit the wire field, which decodes to false.
     relaunchable: bool = false,
+    /// When the session last became continuously unattached (agent clock, ms),
+    /// reported only while alive and unattached (T534). Null from an attached or
+    /// dead row — and from an OLDER AGENT that never heard of the field, which is
+    /// why every consumer treats null as "no clock", never as an error.
+    unattached_since: ?i64 = null,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -1956,6 +1961,7 @@ pub const Connection = struct {
                 .last_activity = s.last_activity,
                 .pinned = s.pinned,
                 .relaunchable = s.relaunchable,
+                .unattached_since = s.unattached_since,
             };
             filled = i + 1;
         }

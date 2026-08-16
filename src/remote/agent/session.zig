@@ -537,6 +537,15 @@ pub const Session = struct {
     /// orphans (`!bound`), so an attached session never times out.
     bound: bool = false,
 
+    /// When this session last BECAME unattached (agent clock, ms): stamped at
+    /// creation and on every bound→false transition, cleared on every (re)ATTACH.
+    /// Surfaced additively as `SessionInfo.unattached_since` while the session is
+    /// alive and unbound (T534) so the viewer can tell the user about a session
+    /// nobody has looked at in a long time. Never consulted by any agent-side
+    /// reaping decision — orphan lifetime policy (pinned keep-forever, idle-TTL)
+    /// is exactly what it was before this field existed.
+    unattached_since_ms: ?i64 = null,
+
     /// When true, the idle-TTL reaper NEVER evicts this session, even while
     /// orphaned (`!bound`) and idle past the TTL (§7.1, T11). Set from
     /// `OPEN.pinned` by the local-agent client for persistent local panes: the
@@ -644,6 +653,7 @@ pub const Session = struct {
             .ring = try OutputRing.init(alloc, ring_bytes),
             .created_ms = now_ms,
             .last_activity_ms = now_ms,
+            .unattached_since_ms = now_ms,
             .alloc = alloc,
         };
         renderId(id, &self.id_str);

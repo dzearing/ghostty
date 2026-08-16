@@ -9,6 +9,33 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T534 - a session nobody has looked at in a day now
+  introduces itself: one tray balloon naming it (cwd + command), whose click
+  opens the Ctrl+Shift+N chooser where T520's badge and Resume/Kill already
+  live; ignoring it IS "Keep".** The shape D18 asked for: the app never ages
+  anything out - the only write in the whole feature is an app-local
+  per-episode stamp file (`orphan-notify[-debug].json`), and being told is
+  the stamp, so ignore/dismiss/no-notification-area all resolve to "keep,
+  quietly" while an ATTACH resets the agent-side clock and re-arms a future
+  episode. Groundwork is shared: the agent stamps
+  `Session.unattached_since_ms` on every bound→false, clears it on ATTACH,
+  and reports it additively as `SessionInfo.unattached_since` only while
+  alive+unbound - no new opcode, both skew directions degrade to the old
+  silence (round-trip + lifecycle asserted in protocol/server tests; flows
+  through `+sessions --json`, which is the acceptance's independent oracle).
+  App side: a 15-min check timer → worker (warm local connection or
+  dialProbe, never spawns an agent) → pure `orphan_notify.decide` (24 h
+  threshold, 7 d re-notify, hard-coded per D18; debug-only env seams shrink
+  them for tests) → oracle log line BEFORE any shell call → balloon uid 3 in
+  `tray_notify`. One real bug found while validating: `std.json`'s default
+  allocate mode left the loaded stamp ids pointing into a freed buffer, so
+  suppression matched nothing and the balloon re-fired every tick -
+  `.alloc_always`, and the lesson is now a comment at the parse. New
+  `test\win32\orphan-notify.ps1` (ALL PASS, 13): negative control,
+  announcement names the orphan, Keep suppression + stamp, resume resets the
+  clock to null; guard-due row `orphan-notify` ties the policy module to it
+  (guard-due acceptance 36/36). Mac sibling filed as T885 (agent half
+  already shared). Floor lib/none/win32/agent PASS, P1-P3 PASS.
 - 2026-08-16 - **T531 - a `-NoResume` delivery can no longer leave the user
   with no terminal: the flag now suppresses only the resume TYPING, and an
   upgrade that killed a running app always restarts the freshly installed exe

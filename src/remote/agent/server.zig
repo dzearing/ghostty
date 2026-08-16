@@ -572,6 +572,7 @@ pub const Server = struct {
                 s.bridge_busy = null;
                 s.has_descendants = null;
                 s.bound = false;
+                s.unattached_since_ms = self.clock.now();
                 s.streaming = false;
                 s.last_activity_ms = self.clock.now();
                 // A dead, now-unbound, non-relaunchable session is unreconnectable
@@ -1104,6 +1105,9 @@ pub const Server = struct {
         s.fg_pid = 0;
         s.has_descendants = null;
         s.bound = true;
+        // A viewer is looking at it again: the long-unattached clock (T534)
+        // restarts from the NEXT detach, not from some earlier one.
+        s.unattached_since_ms = null;
         // A client attached: the session is in use, so it is not a stale
         // reboot-floor leftover -- reset its unclaimed-restart allowance.
         s.unclaimed_restarts = 0;
@@ -1378,6 +1382,7 @@ pub const Server = struct {
             s.bridge_busy = null;
             s.has_descendants = null;
             s.bound = false;
+            s.unattached_since_ms = self.clock.now();
             s.last_activity_ms = self.clock.now();
             // A dead, now-unbound, non-relaunchable session is unreconnectable
             // garbage: reap it immediately (below, off the lock) so it can't linger
@@ -1648,6 +1653,9 @@ pub const Server = struct {
                 .last_activity = s.last_activity_ms,
                 .pinned = s.pinned,
                 .relaunchable = s.relaunchable,
+                // Only meaningful for a live orphan; an attached or dead row
+                // reports null so no reader ever times an attached session.
+                .unattached_since = if (s.alive and !s.bound) s.unattached_since_ms else null,
             }) catch break;
         }
 
@@ -5296,6 +5304,64 @@ test "P1: explicit DETACH orphans the session (kept alive, unbound, not streamin
     const s = h.store.table.getByChannel(o.channel).?;
     try testing.expect(s.alive and !s.streaming and !s.bound);
     h.store.mutex.unlock();
+}
+
+test "T534: unattached_since stamps the detach, resets on re-attach, and rides the roster" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 1000 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(53);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // A LIST_SESSIONS reply echoes on the REQUEST channel; the roster pump
+    // pushes byte-identical frames on the control channel whenever the roster
+    // changes, so the helper skips pushes by channel rather than by luck.
+    const L = struct {
+        fn unattachedOf(hh: *Harness, ch: u128, id: []const u8) !?i64 {
+            try hh.client.sendControlJson(.list_sessions, ch, protocol.ListSessions{});
+            while (true) {
+                const f = try hh.client.waitControl(.sessions);
+                if (f.channel != ch) continue;
+                var p = try protocol.parseJson(protocol.Sessions, testing.allocator, f.payload);
+                defer p.deinit();
+                for (p.value.sessions) |s| {
+                    if (std.mem.eql(u8, s.id, id)) return s.unattached_since;
+                }
+                return error.SessionMissing;
+            }
+        }
+    };
+
+    // Attached from OPEN: no unattached clock on the wire.
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    var id_buf: [32]u8 = o.id;
+    try testing.expectEqual(@as(?i64, null), try L.unattachedOf(&h, 0x111, id_buf[0..]));
+
+    // DETACH at a known instant: the roster reports exactly that instant.
+    clock.ms = 5000;
+    try h.client.sendControlRaw(.detach, o.channel, "");
+    try h.client.sendControlRaw(.ping, protocol.control_channel, "detach-sync");
+    _ = try h.client.waitControl(.pong);
+    try testing.expectEqual(@as(?i64, 5000), try L.unattachedOf(&h, 0x222, id_buf[0..]));
+
+    // Re-ATTACH: the clock resets — "continuously unattached since" never
+    // survives a viewer having looked at the session.
+    clock.ms = 9000;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+    });
+    _ = try h.client.waitControl(.attached);
+    try testing.expectEqual(@as(?i64, null), try L.unattachedOf(&h, 0x333, id_buf[0..]));
 }
 
 test "WP-D1: stale DETACH from a superseded connection must not silence the new owner" {

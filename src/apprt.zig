@@ -335,6 +335,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_sessions.zig");
 
+    // Pure win32 long-unattached ("forgotten") session notification policy —
+    // eligibility, per-episode suppression, the balloon copy (T534), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/orphan_notify.zig");
+
     // Pure win32 machine-chooser per-session CPU meter — the column's
     // geometry, the bar's fill and tone, the number's spelling, and the bounded
     // store one pushed frame lands in (T462), same no-OS-imports deal.
