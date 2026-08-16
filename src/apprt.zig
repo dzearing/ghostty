@@ -99,6 +99,16 @@ test {
     _ = @import("apprt/win32/SkillComponent.zig");
     _ = @import("apprt/win32/BannerScriptInstaller.zig");
 
+    // Hook registration (T868): deterministic JSON, the per-runtime hook
+    // specs, and the component that lands them — Copilot's dedicated file
+    // via the T865 writer, Claude's fragment merged into the shared
+    // settings.json. Pure logic + std.fs tempdir tests, every lane.
+    _ = @import("apprt/win32/stable_json.zig");
+    _ = @import("apprt/win32/hook_spec.zig");
+    _ = @import("apprt/win32/ClaudeHookSpec.zig");
+    _ = @import("apprt/win32/CopilotHookSpec.zig");
+    _ = @import("apprt/win32/HookComponent.zig");
+
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
 

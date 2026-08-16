@@ -39,6 +39,23 @@ pub fn directory(banner_script_path: []const u8) []const u8 {
     return banner_script_path[0..cut];
 }
 
+/// The banner script's full path for a given home directory, spelled the
+/// bash-facing way: forward slashes throughout (a `C:\Users\u` home becomes
+/// `C:/Users/u/...`), because this string lands inside generated hook
+/// commands that Git Bash executes — where backslashes are escapes — while
+/// `std.fs` accepts either separator on Windows. This is the ONE composition
+/// site, so the merged-fragment ownership signature (the directory substring
+/// of this path) can never drift between install runs.
+pub fn bannerPathAlloc(
+    alloc: std.mem.Allocator,
+    home_path: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    const trimmed = std.mem.trimRight(u8, home_path, "/\\");
+    const out = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trimmed, banner_sub_path });
+    std.mem.replaceScalar(u8, out[0..trimmed.len], '\\', '/');
+    return out;
+}
+
 /// The activity-state script's full path, resolved as the banner's sibling.
 /// Joined with the same separator that precedes the banner's basename, so a
 /// path stays consistently spelled whichever convention composed it.
@@ -72,6 +89,27 @@ test "directory strips the basename under either separator" {
         directory("C:\\Users\\u\\.config\\ghoztty\\hooks\\ghoztty-banner.sh"),
     );
     try testing.expectEqualStrings("", directory("ghoztty-banner.sh"));
+}
+
+test "bannerPathAlloc composes a forward-slash path from either home spelling" {
+    const alloc = testing.allocator;
+    {
+        const got = try bannerPathAlloc(alloc, "C:\\Users\\u");
+        defer alloc.free(got);
+        try testing.expectEqualStrings(
+            "C:/Users/u/.config/ghoztty/hooks/ghoztty-banner.sh",
+            got,
+        );
+    }
+    {
+        // Trailing separators collapse; a POSIX home passes through.
+        const got = try bannerPathAlloc(alloc, "/home/u/");
+        defer alloc.free(got);
+        try testing.expectEqualStrings(
+            "/home/u/.config/ghoztty/hooks/ghoztty-banner.sh",
+            got,
+        );
+    }
 }
 
 test "activityStatePath resolves the sibling with the path's own separator" {
