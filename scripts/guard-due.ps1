@@ -85,6 +85,33 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The delivery pipeline (T531): upgrade-ghoztty-windows.ps1 kills the
+    # user's terminal, swaps the installed release, and must bring the terminal
+    # back - an edit that breaks any of that only ever fails during a real
+    # delivery, where nobody is watching, and neither harness is in the P1-P3
+    # floor. The -NoResume incident (2026-08-06: a delivery left the user with
+    # no terminal at all) is exactly the class of regression these gate.
+    [pscustomobject]@{
+        Name   = 'upgrade-staleness'
+        Script = 'test\win32\upgrade-staleness.ps1'
+        Stamp  = 'test\win32\upgrade-staleness.stamp.json'
+        Covers = @(
+            'scripts\upgrade-ghoztty-windows.ps1',
+            'scripts\launch-upgrade.ps1',
+            'scripts\delivery-version.ps1',
+            'test\win32\upgrade-staleness.ps1'
+        )
+    },
+    [pscustomobject]@{
+        Name   = 'upgrade-no-fork'
+        Script = 'test\win32\upgrade-no-fork.ps1'
+        Stamp  = 'test\win32\upgrade-no-fork.stamp.json'
+        Covers = @(
+            'scripts\upgrade-ghoztty-windows.ps1',
+            'scripts\loop-session.ps1',
+            'test\win32\upgrade-no-fork.ps1'
+        )
+    },
     # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
     # idle poll only ever fails inside a detached automation send — the loop
     # types into a mid-turn session and the damage reads as "the agent ignored

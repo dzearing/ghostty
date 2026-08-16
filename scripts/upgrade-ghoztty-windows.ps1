@@ -34,6 +34,8 @@
 # kill and checks afterwards:
 #   survived -> type the prompt into its existing pane (no second session)
 #   gone     -> relaunch a window with the resume command, as before
+#   -NoResume + a killed app -> restart the app, type nothing (T531: -NoResume
+#   suppresses the resume TYPING only; the terminal always comes back)
 #
 # T200 - the launch itself is a compatibility boundary. `Start-Process
 # -ArgumentList @(...)` does NOT quote its elements: they are joined with spaces
@@ -106,6 +108,9 @@ param(
         '\\homeassistant\share\ghoztty-windows\Ghoztty-portable-x64\Ghoztty'
     ),
     [switch]$NoExtraInstalls,
+    # Skip typing the resume prompt - and ONLY that (T531). If the swap killed
+    # a running app, the freshly installed exe is still restarted; an upgrade
+    # must never end with the user's terminal gone.
     [switch]$NoResume,
     [switch]$AllowPlainResume,
     # Relaunch even if the launching session survived. Escape hatch for a
@@ -281,6 +286,11 @@ if (-not $expected) {
 # Deliberately NOT re-indented: this guard was added around code that predates
 # it (T208), and an indentation-only diff over 120 lines hides the one line that
 # changed behaviour.
+# T531: defined OUTSIDE the destructive region so the resume decision can ask
+# "did this run kill a running app?" even on the stale path, where the region
+# (and the kill inside it) never executes.
+$victims = @()
+
 if (-not $stale) {
 
 # T525: arm the deferral BEFORE the kill, not after the swap.
@@ -639,10 +649,15 @@ if ($script:deliveryFailure) {
 # behind it so a forked or stalled loop can be diagnosed from the log alone.
 $claudeAlive = Test-LoopProcAlive $loopStamp
 $action = Resolve-LoopResumeAction -NoResume:([bool]$NoResume) `
-    -ClaudeAlive:$claudeAlive -ForceRelaunch:([bool]$ForceRelaunch)
+    -ClaudeAlive:$claudeAlive -ForceRelaunch:([bool]$ForceRelaunch) `
+    -KilledApps $victims.Count
 Log ("resume decision: $action (loop claude pid=$loopPid alive=$claudeAlive " +
-     "pane=$LoopPaneId force=$([bool]$ForceRelaunch))")
+     "pane=$LoopPaneId force=$([bool]$ForceRelaunch) killedApps=$($victims.Count))")
 
+# 'none' means -NoResume AND nothing was killed: there is no terminal to bring
+# back and no prompt to type, so the delivery is complete. When the swap DID
+# kill a running app, the action is 'restart-only' and is handled below, after
+# the probe helpers exist (T531).
 if ($action -eq 'none') { Complete-Upgrade 'no-resume' }
 
 # Scrub Claude-harness env vars before the relaunch. This script is
@@ -713,6 +728,44 @@ function Wait-Instance([int]$timeoutSec, $appProc = $null) {
     }
     Log "instance probe: gave up after ${timeoutSec}s and $polls poll(s); last: $lastWhy"
     return ''
+}
+
+# ---- restart-only: -NoResume, but the swap killed a running app (T531) -----
+# -NoResume suppresses the resume TYPING, never the app restart. On 2026-08-06
+# 09:19 the two were one flag: an interactive delivery used -NoResume to keep
+# the prompt out of a busy loop pane, the run killed 2 release processes,
+# swapped, logged "UPGRADE OK (no-resume)" - and the user's terminal vanished
+# and stayed gone. An upgrade's contract is that the terminal comes back
+# (T421/T524 called exactly this outcome, from a different cause, the worst
+# possible shape). A true no-restart mode would be its own explicitly named
+# flag; no caller has ever wanted one.
+if ($action -eq 'restart-only') {
+    $listJson = (Get-ListJson).Json
+    if ($listJson) {
+        # Something already brought an instance up (e.g. the T421 relaunch
+        # guard); a second Start-Process here would double the windows.
+        Log 'restart-only: an instance is already answering +list; not starting another'
+        Complete-Upgrade 'no-resume, app already up'
+    }
+    Log "restart-only: the swap killed $($victims.Count) running app(s); starting the freshly installed exe (resume typing stays skipped)"
+    $appProc = Start-Process -FilePath $oldExe -WorkingDirectory $WorkingDirectory -PassThru
+    # Cache the handle now, or the EXITED branch below reads an empty code
+    # (test\win32\lib\ExitCodeAudit.ps1).
+    $null = $appProc.Handle
+    $listJson = Wait-Instance 180 $appProc
+    if ($listJson) {
+        Log "relaunched app pid $($appProc.Id)"
+        Complete-Upgrade 'no-resume, app relaunched'
+    }
+    # Say WHICH failure it is - they need different responses (same distinction
+    # as the reuse path, 2026-07-30).
+    $state = if ($appProc -and -not $appProc.HasExited) {
+        "pid=$($appProc.Id) is ALIVE but never answered +list (IPC unreachable, not a dead app)"
+    } else {
+        "pid=$($appProc.Id) EXITED with $($appProc.ExitCode)"
+    }
+    Log "NO-RESUME RELAUNCH FAIL: $state; the app the swap killed was not brought back"
+    exit 1
 }
 
 # Hand the stall to the watchdog NOW instead of leaving it for the heartbeat to

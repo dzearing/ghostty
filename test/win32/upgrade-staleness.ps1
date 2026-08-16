@@ -21,6 +21,9 @@
 #      installed rather than "a file copy returned success".
 #   E  go.md documents the whole procedure, since the omission there is what
 #      made the defect reachable by a turn following instructions exactly.
+#   G  T531: a -NoResume run that killed a running app still relaunches it
+#      (the typing is skipped, the terminal comes back), stated in the log as
+#      `relaunched app pid N`.
 #
 # Hermetic: every install/staging directory is under
 # %TEMP%\ghoztty-staleness-<pid>, TEMP is redirected for every child so the
@@ -550,6 +553,88 @@ if (-not $haveAgent) {
 }
 
 # ============================================================================
+"== G: -NoResume must still bring the app back (T531)"
+# ============================================================================
+# 2026-08-06 09:19: an interactive-session delivery used -NoResume to keep the
+# resume prompt out of a busy loop pane. The run killed the 2 running release
+# processes, swapped, logged `resume decision: none` / `UPGRADE OK (no-resume)`
+# - and relaunched nothing. The user's terminal vanished and stayed gone.
+# -NoResume means "do not TYPE the resume prompt", never "leave the user with
+# no terminal": a run that killed a running app must end with a live app
+# answering +list, and must say so as `relaunched app pid N`.
+#
+# Hermetic the way session-relaunch.ps1 is: a private pipe suffix isolates the
+# app's IPC endpoint on both ends, and a per-run LOCALAPPDATA with a
+# local-agent-debug state dir plus GHOSTTY_LOCAL_AGENT_BIN keeps the relaunched
+# app off the box's real debug agent (the agent pipe has no suffix override).
+# The "running release app" the kill matches is a renamed powershell sleeping
+# in the sandbox install dir, so no real terminal is ever killed.
+if (-not $haveAgent) {
+    "  (G: dropped with B7-B10 above - no agent binary)"
+} else {
+    $gRoot = Join-Path $root 'noresume'
+    $gStaging = Join-Path $gRoot 'staging'
+    $gInstall = Join-Path $gRoot 'install'
+    New-Item -ItemType Directory -Force (Join-Path $gStaging 'bin') | Out-Null
+    New-Item -ItemType Directory -Force $gInstall | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $gRoot 'ghoztty\local-agent-debug') | Out-Null
+    Copy-Item -LiteralPath $Exe (Join-Path $gStaging 'bin\ghoztty.exe') -Force
+    Copy-Item -LiteralPath $AgentExe (Join-Path $gStaging 'bin\ghoztty-agent.exe') -Force
+    $gLog = Join-Path $gRoot 'ghoztty-upgrade.log'
+    $gInstalledExe = Join-Path $gInstall 'ghoztty.exe'
+
+    # The decoy: a process NAMED ghoztty running FROM the install dir - the
+    # exact shape the kill matches - that is not a terminal at all.
+    Copy-Item -LiteralPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" $gInstalledExe -Force
+    $decoy = Start-Process -FilePath $gInstalledExe -WindowStyle Hidden -PassThru `
+        -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 300')
+    $null = $decoy.Handle
+    Assert "G1 premise: a 'release app' is running from the install dir" (-not $decoy.HasExited)
+
+    . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+    $savedSocketG = $env:GHOZTTY_IPC_SOCKET
+    $savedLadG = $env:LOCALAPPDATA
+    $savedAgentBinG = $env:GHOSTTY_LOCAL_AGENT_BIN
+    [void](Set-GhozttyTestIsolation -Tag 't531')
+    Remove-Item env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
+    Assert-GhozttyPrivateEndpoint -Exe $Exe
+    $env:LOCALAPPDATA = $gRoot
+    $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+    try {
+        $gRun = Invoke-InSandboxTemp -TempDir $gRoot -TimeoutMs 300000 -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+            '-Staging', $gStaging, '-InstallDir', $gInstall, '-WorkingDirectory', $Repo,
+            '-ExpectedCommit', $exeCommit, '-NoResume', '-NoExtraInstalls', '-DelaySeconds', '0')
+    } finally {
+        $env:LOCALAPPDATA = $savedLadG
+        if ($savedAgentBinG) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBinG }
+        else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
+    }
+    $gLogText = Get-Content -LiteralPath $gLog -Raw -ErrorAction SilentlyContinue
+    AssertEq "G2 the delivery succeeds" 0 $gRun.Code
+    Assert "G3 the decoy app really was killed" $decoy.HasExited
+    Assert "G4 the decision names the killed app (restart-only, not none)" `
+        ($gLogText -match 'resume decision: restart-only')
+    Assert "G5 THE POINT: the log states the restart" ($gLogText -match 'relaunched app pid \d+')
+    $gAppPid = 0
+    if ($gLogText -match 'relaunched app pid (\d+)') { $gAppPid = [int]$Matches[1] }
+    $gProc = if ($gAppPid) { Get-Process -Id $gAppPid -ErrorAction SilentlyContinue } else { $null }
+    Assert "G6 a live app came back, from the freshly installed exe" `
+        ($null -ne $gProc -and $gProc.Path -eq $gInstalledExe)
+    Assert "G7 the resume typing really was skipped (that half keeps working)" `
+        (-not ($gLogText -match 'upgrade-resume'))
+
+    # Teardown: the relaunched app, its private local agent, and the decoy.
+    if ($gProc) { Stop-Process -Id $gAppPid -Force -ErrorAction SilentlyContinue }
+    if (-not $decoy.HasExited) { Stop-Process -Id $decoy.Id -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe' OR Name='ghoztty-agent.exe'" |
+        Where-Object { ($_.ExecutablePath -like "$gRoot*") -or ($_.CommandLine -like "*$gRoot*") } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    if ($savedSocketG) { $env:GHOZTTY_IPC_SOCKET = $savedSocketG }
+    Remove-Item env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 600
+}
+
+# ============================================================================
 "== F: the documented procedure is the whole procedure"
 # ============================================================================
 # The omission in go.md is what made this defect reachable by a turn that
@@ -559,6 +644,21 @@ Assert "F1 go.md says the launcher builds the staging release" ($goMd -match 'BU
 Assert "F2 go.md names the failure the gate produces" ($goMd -match 'STALE STAGING')
 Assert "F3 go.md still carries the build incantation itself" ($goMd -match '--prefix zig-out-release')
 Assert "F4 go.md points at this acceptance script" ($goMd -match 'upgrade-staleness\.ps1')
+
+# --- stamp (T783/T531) ------------------------------------------------------
+# A green run records the content of every file this harness covers, so
+# scripts\guard-due.ps1 can answer "has anything run it against the code as it
+# now stands?". Stamped only on a CLEAN sweep - a run with skipped sections
+# proved less than the whole harness claims - and never on -PureOnly (that
+# path exits above without reaching here). Red leaves the stamp alone.
+if ($script:failures -eq 0) {
+    if ($script:skipped -gt 0) {
+        "  stamp NOT updated: $($script:skipped) section(s) skipped, so this run did not cover the whole harness"
+    } else {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+            update -Guard upgrade-staleness -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+    }
+}
 
 ""
 if (-not $Keep) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }

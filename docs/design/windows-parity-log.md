@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T531 - a `-NoResume` delivery can no longer leave the user
+  with no terminal: the flag now suppresses only the resume TYPING, and an
+  upgrade that killed a running app always restarts the freshly installed exe
+  (logged as `relaunched app pid N`).** The 2026-08-06 09:19 incident encoded:
+  `Resolve-LoopResumeAction` takes `-KilledApps` and answers `restart-only`
+  for -NoResume over a killed app; the upgrade script starts the exe, waits
+  for `+list`, and fails loudly (`NO-RESUME RELAUNCH FAIL`, naming
+  alive-but-unreachable vs exited) if it never answers. New section G of
+  `upgrade-staleness.ps1` reproduces the incident hermetically (a renamed-
+  powershell decoy as the killed "release app", private pipe suffix, per-run
+  LOCALAPPDATA + local agent) - ALL PASS 108; pure decision table A12b-d in
+  `upgrade-no-fork.ps1` - ALL PASS 131. Two side-finds: the delivery pipeline
+  had NO guard-due coverage at all (rows added for upgrade-staleness +
+  upgrade-no-fork; T884 filed for the four neighbouring harnesses), and
+  upgrade-no-fork's L24 was red on a T883-class blind capture (`*> file`
+  loses Fail-Launch's refusal under this host) - fixed with an all-stream
+  record-by-record capture, pattern noted on T883.
 - 2026-08-16 - **T526 - viewer-panes.ps1 is a trustworthy oracle again: ALL
   PASS (185) x2 at HEAD.** The task's original red assert (cwd fallback for a
   split off a web viewer) was already fixed by T538's window-scoped fallback -

@@ -129,6 +129,16 @@ AssertEq "A11 a dead session is relaunched (the pre-T138 behavior)" 'relaunch' `
     (Resolve-LoopResumeAction -ClaudeAlive $false)
 AssertEq "A12 -ForceRelaunch overrides a surviving session" 'relaunch' `
     (Resolve-LoopResumeAction -ClaudeAlive $true -ForceRelaunch $true)
+# T531: -NoResume suppresses the resume TYPING only. When the swap killed a
+# running app, the app is restarted (with nothing typed) - the 2026-08-06 09:19
+# incident is a -NoResume delivery that killed 2 release processes and left the
+# user with no terminal at all.
+AssertEq "A12b T531 INCIDENT ORACLE: -NoResume over a killed app RESTARTS it" 'restart-only' `
+    (Resolve-LoopResumeAction -NoResume $true -ClaudeAlive $true -KilledApps 2)
+AssertEq "A12c -NoResume with nothing killed still does nothing" 'none' `
+    (Resolve-LoopResumeAction -NoResume $true -ClaudeAlive $false -KilledApps 0)
+AssertEq "A12d a killed app changes nothing WITHOUT -NoResume (reuse keeps winning)" 'reuse' `
+    (Resolve-LoopResumeAction -ClaudeAlive $true -KilledApps 2)
 
 # --- A13 the prompt derivation ---------------------------------------------
 AssertEq "A13 the prompt comes from the resume command's trailing quotes" 'read go.md and go' `
@@ -388,14 +398,18 @@ Assert "L22 the hostile prompt reached the child intact through the file" `
 # what proved the point: the launcher rejected the bind, exit 1, not the guard).
 $spacedDir = Join-Path $lRoot 'staging with spaces'
 New-Item -ItemType Directory -Force $spacedDir | Out-Null
-$wsOut = Join-Path $lRoot 'ws.out'
 $savedTemp, $savedTmp = $env:TEMP, $env:TMP
 $env:TEMP, $env:TMP = $lRoot, $lRoot
 try {
-    & $launcher -PromptFile $promptFile -Staging $spacedDir -UpgradeScript $stubOk *> $wsOut
+    # NOT `*> file` (T883's class): Fail-Launch's [Console]::Error copy
+    # bypasses PS streams entirely and, measured 2026-08-16, the Write-Host
+    # copy never reaches the redirect file either, so the capture read '' and
+    # L24 failed against a refusal that was in fact printed. Merging every
+    # stream and stringifying record-by-record keeps the text on any host.
+    $wsText = (& $launcher -PromptFile $promptFile -Staging $spacedDir -UpgradeScript $stubOk *>&1 |
+        ForEach-Object { "$_" } | Out-String)
     $wsCode = $LASTEXITCODE
 } finally { $env:TEMP, $env:TMP = $savedTemp, $savedTmp }
-$wsText = Get-Content -LiteralPath $wsOut -Raw -ErrorAction SilentlyContinue
 Assert "L23 an argv element containing whitespace is refused (exit $wsCode)" ($wsCode -eq 2)
 Assert "L24 and it explains why (re-tokenization)" ($wsText -match 're-tokenized')
 
@@ -935,6 +949,16 @@ while ((Get-Date) -lt $deadline) {
     else { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     if ($Keep) { "  (sandbox kept: $root)" }
     else { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+}
+
+# --- stamp (T783/T531) ------------------------------------------------------
+# A green FULL run records the content of every file this harness covers, so
+# scripts\guard-due.ps1 can answer "has anything run it against the code as it
+# now stands?". -PureOnly exits above and never reaches here, so a partial run
+# cannot stamp. Red leaves the stamp alone on purpose - red must stay due.
+if ($script:failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard upgrade-no-fork -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""

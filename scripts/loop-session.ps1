@@ -144,9 +144,19 @@ function Resolve-LoopResumeAction {
     param(
         [bool]$NoResume = $false,
         [bool]$ClaudeAlive = $false,
-        [bool]$ForceRelaunch = $false
+        [bool]$ForceRelaunch = $false,
+        # T531: how many running release apps the swap killed. -NoResume
+        # suppresses the resume TYPING only - if the swap took the user's
+        # terminal down, it must come back regardless. On 2026-08-06 09:19 the
+        # two meanings were one flag: a -NoResume delivery killed 2 release
+        # processes, logged "UPGRADE OK (no-resume)", and the user's terminal
+        # was simply gone.
+        [int]$KilledApps = 0
     )
-    if ($NoResume) { return 'none' }
+    if ($NoResume) {
+        if ($KilledApps -gt 0) { return 'restart-only' }
+        return 'none'
+    }
     if ($ForceRelaunch) { return 'relaunch' }
     if ($ClaudeAlive) { return 'reuse' }
     return 'relaunch'
