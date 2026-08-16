@@ -9,6 +9,33 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T869 - the agent integrations are now one switch on
+  Windows: runtime registry, binary probe, rollback install, refcounted
+  shared scripts, and the Mac-vocabulary service layer.** Fifth T598 slice.
+  `runtime_probe.zig` detects a runtime by its BINARY (PATH walk with
+  .exe/.cmd/.bat plus the measured fallback dirs: `~\.local\bin`,
+  `<config>\local`, npm global, WinGet Links) with NO login-shell spawn -
+  Mac's zsh probe is the Mac mechanism; measured on-box: claude=true,
+  copilot=false. Test seam is a binary/stub tagged union rather than Mac's
+  closures. `claude_plugin_manifest.zig` parses `installed_plugins.json`
+  (v2 object + legacy array, name-before-@ exact match, never substring -
+  the installPath-decoy trap is a test) so a plugin-managed Claude gets
+  NEITHER skills nor hooks (half-gating recreates the split-state bug).
+  `RuntimeIntegration.zig` composes banner -> skills -> hooks (hooks LAST,
+  load-bearing): install rolls back ONLY components the failing call
+  created (the Mac retry-wipe regression is a test), uninstall runs
+  reverse best-effort with first-error rethrow, and the shared banner
+  scripts are refcounted - they survive while any OTHER agent's hooks
+  reference them. Factory + integration share one module (the refcount
+  needs the factory's scan; separate files would mutually import).
+  `agent_integration_service.zig` returns Mac's outcome vocabulary
+  (installed/up_to_date/upgraded/not_found/plugin_present/uninstalled/
+  failed(errorname)) plus per-agent statuses incl. bannerSharedWithOther;
+  jqAvailable deliberately dropped (T866 went jq-free). 27 new tests, all
+  against real components in tempdirs - no fakes. Verified: floor 4/4
+  lanes PASS, P1 (25) / P2 (20) / P3 (16) ALL PASS. No new tasks: T870-
+  T872 already cover rewire, dialog, e2e. Next slice: T870 (first-run
+  rewire + plugin migration - the user's 'old skill loaded' fix).
 - 2026-08-15 - **T868 - the hook-registration machinery exists on Windows:
   Claude's settings.json merged fragment and Copilot's dedicated hooks file,
   all native std.json.** Fourth T598 slice. `ClaudeHookSpec.zig` carries
