@@ -9,6 +9,25 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T547 - "Share this machine" is now a checkbox in the machine
+  chooser's account row.** The GUI half of the one-installer consolidation on
+  this seat: the toggle sits at the band's leading edge in every account state
+  (it belongs to the machine, not the account), writes the agent's own
+  `sharing.json` through the agent's own path rules
+  (`LocalAgent.sharingConfigPath` → `sharing.pathFor`, so writer and reader
+  cannot drift), and the T546 reconciler picks the flip up within ~5s — no
+  poke, no Run-key change, no CLI verb (T141). First flip on an unregistered
+  machine runs the real browser enrollment off the UI thread
+  (`ShareMachineRow.zig`, RelayAccountRow's exact worker pattern, WM_APP+34);
+  the box is a deliberate BS_CHECKBOX so it only ever shows persisted-or-
+  pending truth and reverts on a failed enrollment. Toggle-off keeps the
+  credential. Validation: 4 floor lanes + P1–P3 green; new
+  `test\win32\share-machine.ps1` ALL PASS (30 assertions: default-off,
+  no-enroll flip with a credential, credential kept on off, full fake-relay
+  enrollment on first flip, state survives reopen, dead-relay revert), guard
+  row `share-machine` stamped. Filed T889: say in the hint when the RUNNING
+  agent predates the reconciler, since lazy-upgrade makes that real. Mac twin
+  is T548 (already filed).
 - 2026-08-16 - **T536 - the inbound-ring undefined-memory flake is
   root-caused to the extent the evidence allows, armed with a tripwire that
   makes the next firing name itself, and stripped of every latent

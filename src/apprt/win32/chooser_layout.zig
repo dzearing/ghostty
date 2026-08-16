@@ -139,6 +139,10 @@ pub const AccountBand = struct {
     stack_gap: i32,
     /// Mac caps the email at 240 and middle-truncates the rest (2.4).
     email_max_w: i32,
+    /// What a checkbox costs beyond its caption — the box glyph plus its
+    /// built-in gap. The same 24 DIP allowance `ConfirmDialog` gives its
+    /// accessory checkboxes, so the two checkbox surfaces agree.
+    check_glyph_w: i32,
 };
 
 fn px(v: f32, scale: f32) i32 {
@@ -292,6 +296,7 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
             .link_h = link_h,
             .stack_gap = stack_gap,
             .email_max_w = px(240, scale),
+            .check_glyph_w = px(24, scale),
         },
         .header_divider_y = header_divider_y,
         .master = master,
@@ -376,6 +381,10 @@ pub const AccountText = struct {
     link: i32 = 0,
     /// The bordered control's caption, in the BODY role.
     button: i32 = 0,
+    /// The "Share this machine" checkbox caption, in the BODY role (T547).
+    /// 0 means the toggle is absent (no agent state dir to persist into) and
+    /// the row packs exactly as it did before the toggle existed.
+    share: i32 = 0,
 };
 
 /// The packed account row. Every field but `text` is optional because the row
@@ -394,6 +403,11 @@ pub const AccountRow = struct {
     /// measured caption. Finding 6: the two states used to share one 150 DIP
     /// slot, so both were as wide as "Sign in with Google…".
     button: ?Rect = null,
+    /// The "Share this machine" checkbox (T547) — the band's LEADING edge in
+    /// every state, because sharing is a property of the MACHINE, not of the
+    /// signed-in account the trailing composition describes. Null when the
+    /// toggle is absent (`AccountText.share == 0`).
+    share: ?Rect = null,
 };
 
 /// Pack the account row for `state`. Pure — unit-tested.
@@ -407,6 +421,26 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
     const a = l.account;
     const band = a.band;
 
+    // The share toggle (T547) takes the band's LEADING edge in every state —
+    // it describes the machine, and sharing works whether or not anyone is
+    // signed in here (enrollment signs in on the relay's own page). The
+    // trailing composition then packs into what remains; `content_left` is
+    // where its room now begins.
+    const share_w = if (text.share > 0)
+        @min(band.width(), text.share + a.check_glyph_w)
+    else
+        0;
+    const share: ?Rect = if (share_w > 0) blk: {
+        const share_top = band.top + @divTrunc(band.height() - l.control_h, 2);
+        break :blk .{
+            .left = band.left,
+            .top = share_top,
+            .right = band.left + share_w,
+            .bottom = share_top + l.control_h,
+        };
+    } else null;
+    const content_left = if (share) |s| s.right + a.gap else band.left;
+
     switch (state) {
         .signed_in => {
             const avatar_top = band.top + @divTrunc(band.height() - a.avatar_d, 2);
@@ -418,7 +452,7 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
             };
 
             const stack_right = avatar.left - a.gap;
-            const room = @max(0, stack_right - band.left);
+            const room = @max(0, stack_right - content_left);
             const stack_h = a.email_h + a.stack_gap + a.link_h;
             const stack_top = band.top + @divTrunc(band.height() - stack_h, 2);
 
@@ -438,11 +472,12 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
                 .bottom = email.bottom + a.stack_gap + a.link_h,
             };
 
-            return .{ .text = email, .avatar = avatar, .link = link };
+            return .{ .text = email, .avatar = avatar, .link = link, .share = share };
         },
         .signed_out, .busy => {
+            const btn_room = @max(0, band.right - content_left);
             const btn_w = @min(
-                band.width(),
+                btn_room,
                 @max(l.action_min_btn_w, @max(text.button, 0) + 2 * l.action_btn_pad),
             );
             const btn_top = band.top + @divTrunc(band.height() - l.control_h, 2);
@@ -457,23 +492,25 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
             // the button is — two things on one row share a center line.
             const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
             const status: Rect = .{
-                .left = band.left,
+                .left = content_left,
                 .top = status_top,
-                .right = @max(band.left, button.left - a.gap),
+                .right = @max(content_left, button.left - a.gap),
                 .bottom = status_top + a.link_h,
             };
-            return .{ .text = status, .button = button };
+            return .{ .text = status, .button = button, .share = share };
         },
         .unconfigured => {
-            // No control at all: this build cannot sign in, so there is nothing
-            // for a button to do — and chrome that controls nothing does not
-            // appear (design system §"Vertical space belongs to the terminal",
-            // and Mac's own answer at MachineChooserView.swift:1150-1155). The
-            // sentence gets the whole band, still right-aligned, so the row
-            // reads as the same block with its control removed.
+            // No sign-in control at all: this build cannot sign in, so there
+            // is nothing for a button to do — and chrome that controls nothing
+            // does not appear (design system §"Vertical space belongs to the
+            // terminal", and Mac's own answer at
+            // MachineChooserView.swift:1150-1155). The sentence gets the rest
+            // of the band, still right-aligned, so the row reads as the same
+            // block with its control removed. The share toggle STAYS: sharing
+            // enrolls on the relay's web page and needs no local client id.
             const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
-            return .{ .text = .{
-                .left = band.left,
+            return .{ .share = share, .text = .{
+                .left = content_left,
                 .top = status_top,
                 .right = band.right,
                 .bottom = status_top + a.link_h,
@@ -1037,6 +1074,60 @@ test "accountRow: signed-out sentence and button share a center line (T311)" {
         try testing.expectEqual(l.control_h, btn.height());
         try testing.expectEqual(l.cancel.height(), btn.height());
     }
+}
+
+test "accountRow: the share toggle leads the band in every state (T547)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const l = layout(scale, 1);
+        const band = l.account.band;
+        const text: AccountText = .{ .email = 140, .link = 50, .button = 120, .share = 110 };
+
+        inline for (.{ .signed_in, .signed_out, .busy, .unconfigured }) |state| {
+            const row = accountRow(l, state, text);
+            const share = row.share.?;
+
+            // Leading edge, inside the band, at the surface's one control
+            // height, sized to its caption plus the checkbox glyph allowance.
+            try testing.expectEqual(band.left, share.left);
+            try testing.expect(share.top >= band.top);
+            try testing.expect(share.bottom <= band.bottom);
+            try testing.expectEqual(l.control_h, share.height());
+            try testing.expectEqual(110 + l.account.check_glyph_w, share.width());
+
+            // Nothing in the trailing composition reaches into the toggle.
+            for ([_]?Rect{ row.text, row.link, row.button, row.avatar }) |maybe| {
+                const r = maybe orelse continue;
+                try testing.expect(r.left >= share.right);
+            }
+        }
+    }
+}
+
+test "accountRow: share == 0 is exactly the pre-toggle row (T547)" {
+    // A chooser with no agent state dir to persist into hides the toggle, and
+    // the row must pack as if T547 never happened.
+    const l = layout(1.0, 1);
+    const band = l.account.band;
+
+    const out = accountRow(l, .signed_out, .{ .button = 120 });
+    try testing.expect(out.share == null);
+    try testing.expectEqual(band.left, out.text.left);
+
+    const un = accountRow(l, .unconfigured, .{});
+    try testing.expect(un.share == null);
+    try testing.expectEqual(band.left, un.text.left);
+    try testing.expectEqual(band.right, un.text.right);
+}
+
+test "accountRow: a huge share caption is clamped to the band (T547)" {
+    const l = layout(1.0, 1);
+    const band = l.account.band;
+    const row = accountRow(l, .signed_out, .{ .button = 120, .share = 5000 });
+    const share = row.share.?;
+    try testing.expect(share.right <= band.right);
+    // The trailing composition still packs without escaping the band.
+    try testing.expect(row.button.?.right <= band.right);
+    try testing.expect(row.text.right >= row.text.left);
 }
 
 test "layout: every gap is on the 4 DIP spacing scale (T310)" {

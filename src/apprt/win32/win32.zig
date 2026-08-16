@@ -1227,6 +1227,10 @@ pub const CB_SETCUEBANNER: u32 = 0x1703;
 
 // Button control styles / notifications
 pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;
+/// A checkbox whose check state the OWNER sets (BM_SETCHECK) — for toggles
+/// whose flip can fail or complete asynchronously, so the box never shows a
+/// state the underlying work has not reached (T547).
+pub const BS_CHECKBOX: u32 = 0x00000002;
 /// A checkbox that toggles its own check state on click (no BM_SETCHECK from
 /// the WM_COMMAND handler needed).
 pub const BS_AUTOCHECKBOX: u32 = 0x00000003;

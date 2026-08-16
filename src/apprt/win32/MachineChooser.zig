@@ -46,6 +46,7 @@ const Window = @import("Window.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
+const ShareMachineRow = @import("ShareMachineRow.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const HostSettingsDialog = @import("HostSettingsDialog.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -83,6 +84,7 @@ const ACTIVITY_ID: u16 = 104;
 /// and one HWND cannot be both a themed push button and an owner-drawn link.
 const ACCOUNT_LINK_ID: u16 = 105;
 const RESTORE_ALL_ID: u16 = 106;
+const SHARE_ID: u16 = 107;
 
 /// The action row's captions. Measured (not assumed) to size their buttons, so
 /// they live where both the creation and the measurement can see them.
@@ -186,6 +188,9 @@ account_btn: w32.HWND,
 /// The signed-in state's "Sign Out" link (T311). Only one of it and
 /// `account_btn` is ever visible — see `accountControl`.
 account_link: w32.HWND,
+/// The "Share this machine" checkbox at the band's leading edge (T547).
+/// Hidden when `sharing_path` is null — no state dir means nothing to toggle.
+share_btn: w32.HWND,
 /// True while the pointer is over the link, so it can underline. Entering is
 /// seen from `WM_SETCURSOR` (which the child forwards to us, so the message
 /// already names the window under the cursor); LEAVING needs the link's own
@@ -240,6 +245,15 @@ email: ?[]const u8 = null,
 /// on open: it is a build/environment fact, not something the dialog can
 /// change, and the account row hides its button entirely when it is false.
 sign_in_configured: bool = true,
+
+/// Where the agent's per-machine sharing flag lives (T547), resolved once on
+/// open from the local agent's own path rules; arena-owned. Null hides the
+/// toggle entirely — a box with no agent state dir has nothing to share.
+sharing_path: ?[]const u8 = null,
+/// The persisted sharing state, re-read after every flip and every
+/// enrollment outcome. The checkbox renders `boxChecked(share_enabled,
+/// ShareMachineRow.isRunning())`, so a pending browser flow reads as ON.
+share_enabled: bool = false,
 
 /// The fetched device list. Owned by `parsed` (its own JSON arena); empty when
 /// there is no credential or the fetch failed. Freed in `close`.
@@ -362,6 +376,7 @@ pub fn open(window: *Window) void {
         .account_status = undefined,
         .account_btn = undefined,
         .account_link = undefined,
+        .share_btn = undefined,
         .arena = std.heap.ArenaAllocator.init(alloc),
         .id = next_chooser_id,
         .roster = .init(alloc),
@@ -379,6 +394,10 @@ pub fn open(window: *Window) void {
     self.token = IpcHandlers.resolveToken(arena);
     self.email = relay_signin.signedInEmail(arena);
     self.sign_in_configured = relay_signin.isConfigured(arena);
+    // The per-machine sharing flag (T547): resolved with the agent's own path
+    // rules so the toggle writes exactly where the uplink reconciler reads.
+    self.sharing_path = window.app.local_agent.sharingConfigPath(arena);
+    if (self.sharing_path) |p| self.share_enabled = ShareMachineRow.isEnabled(arena, p);
     const hint_text = self.fetchDevices(alloc);
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
@@ -506,6 +525,31 @@ pub fn open(window: *Window) void {
         w32.GWLP_WNDPROC,
         @bitCast(@intFromPtr(&linkWndProc)),
     ))));
+
+    // The "Share this machine" toggle (T547), at the band's leading edge in
+    // every account state. BS_AUTOCHECKBOX would flip itself even when the
+    // flip's real work (enrollment, the file write) fails, so this is a plain
+    // BS_CHECKBOX whose check state is set only from persisted/pending truth
+    // in `refreshAccountRow` — the box can never show a state that is not real.
+    self.share_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral(ShareMachineRow.label),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.BS_CHECKBOX,
+        l.account.band.left,
+        l.account.band.top,
+        l.account.band.width(),
+        l.control_h,
+        hwnd,
+        @ptrFromInt(@as(usize, SHARE_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    _ = w32.SetWindowTheme(self.share_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
 
     self.filter = w32.CreateWindowExW(
         0,
@@ -739,6 +783,7 @@ pub fn open(window: *Window) void {
             self.filter,          self.list,        self.account_status,
             self.account_btn,     self.primary_btn, self.restore_all_btn,
             self.activity_btn,    self.menu_btn,    self.cancel_btn,
+            self.share_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
@@ -951,6 +996,30 @@ fn refreshAccountRow(self: *MachineChooser) void {
     if (!signed_in) self.setLinkHot(false);
     _ = w32.EnableWindow(self.account_btn, if (busy) 0 else 1);
 
+    // The share toggle (T547): shown whenever there is a place to persist the
+    // flag, checked from persisted-or-pending truth, disabled while its own
+    // browser enrollment runs. The same focus hand-off rule as above applies
+    // before it is disabled.
+    const share_pending = ShareMachineRow.isRunning();
+    if (self.sharing_path != null) {
+        if (focus == @as(?w32.HWND, self.share_btn) and share_pending) {
+            _ = w32.SetFocus(self.filter);
+        }
+        _ = w32.SendMessageW(
+            self.share_btn,
+            w32.BM_SETCHECK,
+            if (ShareMachineRow.boxChecked(self.share_enabled, share_pending))
+                w32.BST_CHECKED
+            else
+                w32.BST_UNCHECKED,
+            0,
+        );
+        _ = w32.EnableWindow(self.share_btn, if (share_pending) 0 else 1);
+        _ = w32.ShowWindow(self.share_btn, w32.SW_SHOW);
+    } else {
+        _ = w32.ShowWindow(self.share_btn, w32.SW_HIDE);
+    }
+
     self.applyAccountRow(layout(self.window.scale, self.hint_lines));
 }
 
@@ -993,6 +1062,7 @@ fn applyAccountRow(self: *MachineChooser, l: Layout) void {
     );
     if (row.link) |r| _ = w32.MoveWindow(self.account_link, r.left, r.top, r.width(), r.height(), 1);
     if (row.button) |r| _ = w32.MoveWindow(self.account_btn, r.left, r.top, r.width(), r.height(), 1);
+    if (row.share) |r| _ = w32.MoveWindow(self.share_btn, r.left, r.top, r.width(), r.height(), 1);
 
     var band = rect(l.account.band);
     _ = w32.InvalidateRect(self.hwnd, &band, 1);
@@ -1003,6 +1073,12 @@ fn applyAccountRow(self: *MachineChooser, l: Layout) void {
 /// email is caption-sized while the link and the button are body-sized, so one
 /// measurement font would be wrong for one of them.
 fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountState) chooser_layout.AccountText {
+    // The share toggle is in every state (it belongs to the machine, not the
+    // account); 0 hides it when there is nowhere to persist the flag (T547).
+    const share_w: i32 = if (self.sharing_path != null)
+        self.measureWith(self.font, ShareMachineRow.label)
+    else
+        0;
     return switch (state) {
         .signed_in => .{
             .email = self.measureWith(
@@ -1010,13 +1086,15 @@ fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountStat
                 RelayAccountRow.statusText(self.email, false, self.sign_in_configured),
             ),
             .link = self.measureWith(self.font, RelayAccountRow.buttonLabel(true, false)),
+            .share = share_w,
         },
         .signed_out, .busy => .{
             .button = self.measureWith(self.font, RelayAccountRow.buttonLabel(false, state == .busy)),
+            .share = share_w,
         },
-        // Nothing to size: the sentence takes the whole band and there is no
-        // control beside it (T747).
-        .unconfigured => .{},
+        // Nothing else to size: the sentence takes the rest of the band and
+        // there is no control beside it (T747).
+        .unconfigured => .{ .share = share_w },
     };
 }
 
@@ -1051,6 +1129,51 @@ pub fn onAccountResult(self: *MachineChooser, res: *const RelayAccountRow.Result
     if (res.ok) {
         self.token = IpcHandlers.resolveToken(arena);
         self.reloadDevices();
+    }
+    self.refreshAccountRow();
+    if (res.message.len > 0) self.setHint(res.message);
+}
+
+/// The share checkbox was clicked (T547). BS_CHECKBOX does not flip itself,
+/// so the persisted state is still what the box shows: flip the REAL state
+/// first (the file write, or the enrollment that precedes it), then let
+/// `refreshAccountRow` render whatever is now true.
+fn onShareToggled(self: *MachineChooser) void {
+    const path = self.sharing_path orelse return;
+    const alloc = self.window.app.core_app.alloc;
+
+    if (ShareMachineRow.isRunning()) return;
+
+    if (self.share_enabled) {
+        if (ShareMachineRow.disable(alloc, path)) {
+            self.share_enabled = false;
+            self.setHint(ShareMachineRow.disabled_hint);
+        } else {
+            self.setHint(ShareMachineRow.save_failed_hint);
+        }
+        self.refreshAccountRow();
+        return;
+    }
+
+    switch (ShareMachineRow.enableAsync(self.window.app, self.relay_base, path)) {
+        .enabled => {
+            self.share_enabled = true;
+            self.setHint(ShareMachineRow.enabled_hint);
+        },
+        .enrolling => self.setHint(ShareMachineRow.pending_hint),
+        .busy => {},
+        .failed => self.setHint(ShareMachineRow.save_failed_hint),
+    }
+    self.refreshAccountRow();
+}
+
+/// GUI thread: the async share-enable (browser enrollment + flag write)
+/// finished. Re-read the persisted state — the worker wrote it, disk is the
+/// truth — and say what happened in the footer.
+pub fn onShareResult(self: *MachineChooser, res: *const ShareMachineRow.Result) void {
+    if (self.sharing_path) |p| {
+        const arena = self.arena.allocator();
+        self.share_enabled = ShareMachineRow.isEnabled(arena, p);
     }
     self.refreshAccountRow();
     if (res.message.len > 0) self.setHint(res.message);
@@ -2489,6 +2612,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                         self.onAccountClicked();
                         return 0;
                     },
+                    SHARE_ID => {
+                        self.onShareToggled();
+                        return 0;
+                    },
                     MENU_ID => {
                         self.openRowMenuFromButton();
                         return 0;
@@ -3087,7 +3214,8 @@ pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
         hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
         hwnd == self.account_status or hwnd == self.account_btn or
         hwnd == self.account_link or hwnd == self.restore_all_btn or
-        hwnd == self.activity_btn or hwnd == self.menu_btn;
+        hwnd == self.activity_btn or hwnd == self.menu_btn or
+        hwnd == self.share_btn;
 }
 
 /// Keyboard focus targets, in Tab order — the same left-to-right order the
@@ -3096,9 +3224,11 @@ pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
 /// action they sit beside; `account` is the sign-in/out button (T141), last in
 /// the cycle so Tab from the filter still reaches the list first, the common
 /// path.
-pub const Focusable = enum { filter, list, primary, restore_all, activity, menu, cancel, account };
+pub const Focusable = enum { filter, list, primary, restore_all, activity, menu, cancel, share, account };
 
-/// Pure Tab-order cycle. Unit-tested.
+/// Pure Tab-order cycle. Unit-tested. The account band is walked left to
+/// right — `share` (T547), then the sign-in/out control — the way the eye
+/// reads it.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
     return if (backwards) switch (cur) {
         .filter => .account,
@@ -3108,7 +3238,8 @@ pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
         .activity => .restore_all,
         .menu => .activity,
         .cancel => .menu,
-        .account => .cancel,
+        .share => .cancel,
+        .account => .share,
     } else switch (cur) {
         .filter => .list,
         .list => .primary,
@@ -3116,7 +3247,8 @@ pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
         .restore_all => .activity,
         .activity => .menu,
         .menu => .cancel,
-        .cancel => .account,
+        .cancel => .share,
+        .share => .account,
         .account => .filter,
     };
 }
@@ -3131,6 +3263,7 @@ fn hwndFor(self: *const MachineChooser, f: Focusable) w32.HWND {
         .activity => self.activity_btn,
         .menu => self.menu_btn,
         .cancel => self.cancel_btn,
+        .share => self.share_btn,
         // Whichever of the two account controls is live in this state (T311) —
         // the Tab walk already steps over anything hidden, and this keeps the
         // stop pointing at the one the user can actually press.
@@ -3190,6 +3323,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 focus == @as(?w32.HWND, self.account_link))
             {
                 self.onAccountClicked();
+            } else if (focus == @as(?w32.HWND, self.share_btn)) {
+                self.onShareToggled();
             } else if (focus == @as(?w32.HWND, self.menu_btn)) {
                 self.openRowMenuFromButton();
             } else if (focus == @as(?w32.HWND, self.activity_btn)) {
@@ -3258,6 +3393,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 .menu
             else if (focus == @as(?w32.HWND, self.cancel_btn))
                 .cancel
+            else if (focus == @as(?w32.HWND, self.share_btn))
+                .share
             else if (focus == @as(?w32.HWND, self.account_btn) or
                 focus == @as(?w32.HWND, self.account_link))
                 .account
@@ -3523,20 +3660,22 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> primary -> restore_all -> activity -> menu -> cancel -> account -> filter" {
+test "nextFocus: forward cycle filter -> list -> primary -> restore_all -> activity -> menu -> cancel -> share -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
     try testing.expectEqual(Focusable.primary, nextFocus(.list, false));
     try testing.expectEqual(Focusable.restore_all, nextFocus(.primary, false));
     try testing.expectEqual(Focusable.activity, nextFocus(.restore_all, false));
     try testing.expectEqual(Focusable.menu, nextFocus(.activity, false));
     try testing.expectEqual(Focusable.cancel, nextFocus(.menu, false));
-    try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
+    try testing.expectEqual(Focusable.share, nextFocus(.cancel, false));
+    try testing.expectEqual(Focusable.account, nextFocus(.share, false));
     try testing.expectEqual(Focusable.filter, nextFocus(.account, false));
 }
 
 test "nextFocus: backward cycle reverses" {
     try testing.expectEqual(Focusable.account, nextFocus(.filter, true));
-    try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
+    try testing.expectEqual(Focusable.share, nextFocus(.account, true));
+    try testing.expectEqual(Focusable.cancel, nextFocus(.share, true));
     try testing.expectEqual(Focusable.menu, nextFocus(.cancel, true));
     try testing.expectEqual(Focusable.activity, nextFocus(.menu, true));
     try testing.expectEqual(Focusable.restore_all, nextFocus(.activity, true));

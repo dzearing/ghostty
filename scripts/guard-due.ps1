@@ -143,6 +143,19 @@ $GuardTable = @(
             'test\win32\agent-sharing-uplink.ps1'
         )
     },
+    # The share-this-machine toggle (T547) only ever acts when a user flips it,
+    # so its enrollment worker and file plumbing are invisible to the P1-P3
+    # floor - nothing else ties an edit of the toggle's async module to a run
+    # of the harness that drives the checkbox against a fake relay.
+    [pscustomobject]@{
+        Name   = 'share-machine'
+        Script = 'test\win32\share-machine.ps1'
+        Stamp  = 'test\win32\share-machine.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ShareMachineRow.zig',
+            'test\win32\share-machine.ps1'
+        )
+    },
     # The divergence inventory (T516) is merge-back planning's input: a set
     # computation that drifts wrong sends a future merge hunting conflicts in
     # the wrong files, and nothing in the P1-P3 floor runs its harness.

@@ -979,6 +979,24 @@ fn agentCommandLine(self: *LocalAgent, arena: Allocator) ![]const u8 {
     );
 }
 
+/// The agent's `sharing.json` path — the per-machine "Share this machine"
+/// flag the chooser's toggle writes and the agent's uplink reconciler reads
+/// (T546/T547). Resolved with the agent's OWN rules (`sharing.pathFor`: the
+/// `GHOSTTY_SHARING_CONFIG` override first, else beside `sessions.json` in
+/// the state dir above), so the writer and the reader cannot drift apart.
+/// Owned by the caller; null when neither an override nor a state dir exists.
+pub fn sharingConfigPath(self: *LocalAgent, alloc: Allocator) ?[]u8 {
+    const sharing = @import("../../remote/agent/sharing.zig");
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sessions: ?[]const u8 = blk: {
+        const dir = self.agentDir(arena) catch break :blk null;
+        break :blk std.fs.path.join(arena, &.{ dir, "sessions.json" }) catch null;
+    };
+    return sharing.pathFor(alloc, sessions);
+}
+
 /// `%LOCALAPPDATA%\ghoztty\local-agent[-debug][-<instance>]` — the per-lineage
 /// state dir. Same directory `+sessions` reads (design §T89a decision 2), and
 /// the same `GHOZTTY_AGENT_INSTANCE` suffix moves both (T167).

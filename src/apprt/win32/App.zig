@@ -26,6 +26,7 @@ const SessionCpuProbe = @import("SessionCpuProbe.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
+const ShareMachineRow = @import("ShareMachineRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
@@ -123,7 +124,7 @@ const WM_APP_REAP_SURFACE: u32 = w32.WM_APP + 26;
 /// wparam = *OrphanRosterResult (heap; ownership transfers to the handler).
 /// The GUI thread evaluates the roster and may show the forgotten-session
 /// balloon. (+27..+32 are taken — see MachineConnectionPool / SessionCpuProbe /
-/// AgentIntegration / AgentIntegrationsDialog.)
+/// AgentIntegration / AgentIntegrationsDialog. +34 is ShareMachineRow's.)
 const WM_APP_ORPHAN_ROSTER: u32 = w32.WM_APP + 33;
 
 /// Ceiling on agent restarts spent chasing the bundled build in one app run
@@ -7612,6 +7613,16 @@ fn msgWndProc(
         if (wparam != 0) {
             const res: *RelayAccountRow.Result = @ptrFromInt(wparam);
             RelayAccountRow.onResult(app, res);
+        }
+        return 0;
+    }
+
+    if (msg == ShareMachineRow.WM_APP_SHARE_MACHINE) {
+        // wparam = heap *Result owned by the handler (T547 share-this-machine
+        // enrollment ran on a detached thread; this is the GUI-thread landing).
+        if (wparam != 0) {
+            const res: *ShareMachineRow.Result = @ptrFromInt(wparam);
+            ShareMachineRow.onResult(app, res);
         }
         return 0;
     }
