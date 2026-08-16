@@ -1,0 +1,23 @@
+{
+    "guard":  "agent-integrations",
+    "script":  "test/win32/agent-integrations.ps1",
+    "generated":  "2026-08-15T21:18:34-07:00",
+    "commit":  "873c261ea",
+    "files":  {
+                  "src/apprt/win32/agent_integration_service.zig":  "96462ad4254afc51d65f9c2b3e7f076096b0e9b7a930a9c0ae317cf09ffe2b08",
+                  "src/apprt/win32/BannerScriptInstaller.zig":  "e349d9a86275fb68b44211120d5859a92e14dc2ce797f9060a8b5cd701cb923d",
+                  "src/apprt/win32/claude_plugin_manifest.zig":  "a0812c8b3cb533065274a5b9be19a18df4fe2f0efd0932972e082748debf7b89",
+                  "src/apprt/win32/ClaudeHookSpec.zig":  "1f1b3c306da5bddc1ab165f3a7e99d3e22f8f444c974a639e0e33c57ecff6038",
+                  "src/apprt/win32/CopilotHookSpec.zig":  "225c5b646d5972676c0965826b60f956dda69a265500b5b6e7268d6959de08d1",
+                  "src/apprt/win32/hook_scripts.zig":  "14e615048fbb327357b088f593c277ca098cbcc9020d582bc0958aa4b93fa3d8",
+                  "src/apprt/win32/HookComponent.zig":  "3d361d52017260e9ddac744a89d6c357eeaaba30f2c0bd1d7c04aa21396109b2",
+                  "src/apprt/win32/ipc_agent_integration.zig":  "df7de6466f6d5036d5725e22d8d3913a03081c0b249931518f4a41c3a9d4cf80",
+                  "src/apprt/win32/managed_file.zig":  "986e641e52cf1d8c2e807cd38dbfd6e62e660868d1063b2d6bee1acdb5ed50ac",
+                  "src/apprt/win32/managed_marker.zig":  "4f0d8fe0c6bfdd0a7410c3eaa1d810fb1148d943d688bfef4b8eeda1e02d46a5",
+                  "src/apprt/win32/runtime_agent.zig":  "e46e400be21297cd8c35bcdfde32e7f132d8b914ad1fe8be193b2d1424ceec25",
+                  "src/apprt/win32/runtime_probe.zig":  "e9a8927087558063833d30e15d1cbd1b0f3648ead5f24a8616415e3b3efb6254",
+                  "src/apprt/win32/RuntimeIntegration.zig":  "4ea491239e8e400dadd99f2d4c8341812b323a0fabee280dd377f8376b3546f3",
+                  "src/apprt/win32/SkillComponent.zig":  "0b100dfca6ae0439091bd79254256bee80027f34d99da50ed2a68a6d926e90ca",
+                  "test/win32/agent-integrations.ps1":  "8e32ca019ad9e22493dc4c7c365f76edb77fa12023c2f952b49cf12f91313486"
+              }
+}

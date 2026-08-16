@@ -264,4 +264,6 @@ if ($script:failures -eq 0 -and $script:skips -eq 0) {
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }
+if ($script:failures -eq 0) {
+    "ALL PASS$(if ($script:skips) { " ($($script:skips) SKIPPED)" })"; exit 0
+} else { "$($script:failures) FAILURE(S)"; exit 1 }

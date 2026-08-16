@@ -298,6 +298,36 @@ $GuardTable = @(
             'test\win32\claude-integration.ps1'
         )
     },
+    # The agent-integration ENGINE end-to-end (T872): install idempotence,
+    # staleness, the typed refusals, rollback, the shared-banner refcount,
+    # uninstall exactness and the migration's script-ownership rules, driven
+    # through the real app over the debug-only `agent-integration` IPC seam.
+    # The unit lanes pin every component in tempdirs; what only this harness
+    # proves is that the APP wires them together behind the sandbox seams —
+    # so the row covers the component/service modules the claude-integration
+    # row deliberately leaves to unit tests, plus the seam itself.
+    [pscustomobject]@{
+        Name   = 'agent-integrations'
+        Script = 'test\win32\agent-integrations.ps1'
+        Stamp  = 'test\win32\agent-integrations.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ipc_agent_integration.zig',
+            'src\apprt\win32\agent_integration_service.zig',
+            'src\apprt\win32\RuntimeIntegration.zig',
+            'src\apprt\win32\runtime_probe.zig',
+            'src\apprt\win32\runtime_agent.zig',
+            'src\apprt\win32\BannerScriptInstaller.zig',
+            'src\apprt\win32\SkillComponent.zig',
+            'src\apprt\win32\HookComponent.zig',
+            'src\apprt\win32\ClaudeHookSpec.zig',
+            'src\apprt\win32\CopilotHookSpec.zig',
+            'src\apprt\win32\hook_scripts.zig',
+            'src\apprt\win32\managed_marker.zig',
+            'src\apprt\win32\managed_file.zig',
+            'src\apprt\win32\claude_plugin_manifest.zig',
+            'test\win32\agent-integrations.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.

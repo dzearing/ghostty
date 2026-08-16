@@ -17,6 +17,7 @@ const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
 const ipc_capture = @import("ipc_capture.zig");
 const ipc_hover = @import("ipc_hover.zig");
+const ipc_agent_integration = @import("ipc_agent_integration.zig");
 const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -100,6 +101,14 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         // harness cannot paint from outside at all — see ipc_hover.zig for the
         // ordering argument. Release builds fall through to unknown-action.
         return try ipc_hover.handle(ctx.alloc, request.arguments);
+    } else if (ipc_agent_integration.enabled and std.mem.eql(u8, request.action, "agent-integration")) {
+        // T872: the DEBUG-ONLY seam the agent-integrations acceptance harness
+        // drives install/uninstall/status through — the GUI offers one action
+        // per state, so idempotence, refusals, rollback and the banner
+        // refcount are unreachable from outside without it. See
+        // ipc_agent_integration.zig; release builds fall through to
+        // unknown-action.
+        return try ipc_agent_integration.handle(ctx.alloc, request.arguments);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});
