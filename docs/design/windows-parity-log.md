@@ -9,6 +9,31 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T871 - the Agent Integrations management window exists on
+  Windows.** Seventh T598 slice: `AgentIntegrationsDialog.zig` (modal dark
+  dialog in the ConfirmDialog/HostSettingsDialog nested-pump shape; pure
+  `layoutFor` pinned at 4 scales) over a new pure `agent_integrations_vm.zig`
+  (row derivation, action gating, honest uninstall copy - every lane). One
+  row per runtime: detected / Not set up / Installed / Update available /
+  Working, plugin-note and inline error lines, Set Up / Update / Uninstall
+  plus Done; all probes and actions run on detached workers that post
+  WM_APP+32 to the message-only window, routed to the ACTIVE dialog so a
+  worker outliving the window is dropped, never posted into a recycled
+  HWND. Uninstall confirms with Mac's per-situation copy (plugin-managed /
+  shared-banner / plain; gating follows Mac 26f4ea625 - uninstall stays
+  available on a plugin-managed row, skills-only). Palette entry and Help
+  menu item both open the window ("Set Up Agent Integrations…", Mac's
+  title); AgentIntegration's palette blind-install source is retired, and
+  the &A mnemonic collision with "&About Ghoztty" cost one red floor run
+  (&I now). Validation: floor ALL LANES PASS, claude-integration.ps1
+  rewritten cases 4/7 drive the window end-to-end (83 assertions ALL PASS:
+  probe fill-in, cancel-vs-Remove, Set Up reinstall, stale-marker → Update
+  heals; row buttons driven by POSTED WM_COMMAND because a sent BM_CLICK
+  would deadlock on the nested confirm), P1-P3 ALL PASS. Surprises: the
+  harness lib's child-class filter is exact case-sensitive ('static'
+  matches nothing) - filed T876; modal-vs-modeless filed as D76 (assumed
+  modal). Next: T872 (8/8) end-to-end acceptance sweep, largely seeded by
+  the rewritten case 4.
 - 2026-08-15 - **T870 - first-run now offers the built-in agent setup, and
   old-plugin boxes get the one-time switch-over - this box's real 0.8.0
   plugin is MIGRATED.** Sixth T598 slice, the user-facing one ("still has
