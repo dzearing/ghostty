@@ -14,6 +14,7 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
 const AgentIntegration = @import("AgentIntegration.zig");
+const AgentIntegrationsDialog = @import("AgentIntegrationsDialog.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
 const PathInstaller = @import("PathInstaller.zig");
@@ -83,7 +84,8 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 /// Posted by the IPC listener thread to marshal a request to the GUI
 /// thread. wparam = *IpcServer.Pending. (WM_APP+2/+3 are defined below:
 /// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY. WM_APP+6 is Window.WM_APP_HERO_SNAP;
-/// WM_APP+7/+8 and +30/+31 are AgentIntegration's prompt/done messages.)
+/// WM_APP+7/+8 and +30/+31 are AgentIntegration's prompt/done messages;
+/// +32 is AgentIntegrationsDialog's worker update.)
 pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 
 /// Posted (via `deferSetFocus`) to move keyboard focus to a terminal
@@ -7320,6 +7322,16 @@ fn msgWndProc(
         if (wparam != 0) {
             const done: *AgentIntegration.MigrationDone = @ptrFromInt(wparam);
             AgentIntegration.onMigrationDone(app, done);
+        }
+        return 0;
+    }
+
+    if (msg == AgentIntegrationsDialog.WM_APP_AGENTS_UPDATE) {
+        // wparam = heap *Update owned by the handler (T871): a dialog
+        // worker's probe/action result, dropped if the dialog closed.
+        if (wparam != 0) {
+            const up: *AgentIntegrationsDialog.Update = @ptrFromInt(wparam);
+            AgentIntegrationsDialog.onUpdate(app, up);
         }
         return 0;
     }

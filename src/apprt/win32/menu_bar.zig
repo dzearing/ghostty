@@ -222,7 +222,7 @@ const help_menu = [_]Node{
     .{ .item = .{ .cmd = .help, .title = u16lit("Ghoztty &Help") } },
     .separator,
     .{ .item = .{ .cmd = .check_for_updates, .title = u16lit("Check for &Updates…") } },
-    .{ .item = .{ .cmd = .claude_integration, .title = u16lit("Install &Claude Code Integration") } },
+    .{ .item = .{ .cmd = .claude_integration, .title = u16lit("Set Up Agent &Integrations…") } },
     .separator,
     .{ .item = .{ .cmd = .about, .title = u16lit("&About Ghoztty") } },
 };

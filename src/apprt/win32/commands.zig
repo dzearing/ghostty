@@ -250,7 +250,9 @@ pub const registry = [_]Command{
     .{ .id = .check_for_updates, .name = "Check for Updates…", .action = .check_for_updates },
     .{ .id = .help, .name = "Ghoztty Help", .action = .new_window, .kind = .help },
     .{ .id = .about, .name = "About Ghoztty", .action = .new_window, .kind = .about },
-    .{ .id = .claude_integration, .name = "Set Up Agent Integrations", .action = .new_window, .kind = .claude },
+    // Mac's palette title (TerminalCommandPalette.swift): opens the Agent
+    // Integrations management window, not a blind install (T871).
+    .{ .id = .claude_integration, .name = "Set Up Agent Integrations…", .action = .new_window, .kind = .claude },
     .{ .id = .quit, .name = "Quit", .action = .quit, .quit_keep = true },
 };
 

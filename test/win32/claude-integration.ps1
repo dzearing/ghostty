@@ -14,8 +14,14 @@
 #        the integration lands from the app itself (skills + hooks +
 #        banner scripts under the sandbox home), NO claude CLI runs, state
 #        records "accepted", and first-run success stays silent.
-#   4. Palette entry ("Set Up Agent Integrations") reruns the flow and
-#        REPORTS the outcome ("Agent Integrations Ready").
+#   4. Palette entry ("Set Up Agent Integrations...") opens the Agent
+#        Integrations MANAGEMENT window (T871, GhozttyAgentIntegrations):
+#        rows fill in off-thread (claude Installed, copilot Not detected),
+#        Uninstall asks for confirmation with honest copy (cancel keeps
+#        everything; Remove clears skills + banner scripts and flips the
+#        row), Set Up reinstalls from the row, a corrupted managed file
+#        reads Update available on reopen and Update heals it - all with
+#        NO claude CLI spawned.
 #   5. Old plugin registered + first-run already answered -> the one-time
 #        "Ghoztty Now Manages Its Claude Integration" offer; accepting runs
 #        `claude plugin uninstall <registration>` through the stub CLI,
@@ -26,7 +32,8 @@
 #        dialog, nothing changed (script + state + manifest intact) — and
 #        the answer is still recorded, so the prompt never returns.
 #   7. No agent CLI in the sandbox home -> no first-run prompt, nothing
-#        burned; the palette entry reports "No Coding Agents Found".
+#        burned; the management window shows both rows Not detected with
+#        no action buttons.
 #
 # Sandboxing: GHOZTTY_AGENT_HOME points the probe, the installers and the
 # migration at a temp home — when set, the probe consults ONLY that home,
@@ -175,7 +182,40 @@ function Launch-Gui([string]$stateDir, [string]$agentHome, [string]$stubMode) {
     return @{ App = $app; Pid = $app.Pid; Top = $top }
 }
 
-# Open the palette, type "agent", Enter — runs "Set Up Agent Integrations".
+# T871: helpers for the Agent Integrations management window. Its rows are
+# STATIC controls (WM_GETTEXT-readable); its action buttons are BUTTONs
+# whose clicks are driven by POSTING WM_COMMAND with the button's own
+# control id - a SENT BM_CLICK would block the harness's one worker thread
+# for as long as Uninstall's nested confirm dialog stays open.
+# NB: the Children class filter is an EXACT, case-sensitive GetClassNameW
+# compare — 'Static'/'Button', never 'static'/'button'.
+function Get-AgentStaticTexts([IntPtr]$dlg) {
+    return @(Get-TestControls -Window $dlg -Class 'Static' | ForEach-Object { $_.Text })
+}
+
+function Get-AgentVisibleButtons([IntPtr]$dlg) {
+    return @(Get-TestControls -Window $dlg -Class 'Button' -VisibleOnly)
+}
+
+# Wait until any row static matches $pattern (-like).
+function Wait-AgentRowStatus([IntPtr]$dlg, [string]$pattern, [int]$timeoutMs = 12000) {
+    $waited = 0
+    while ($waited -lt $timeoutMs) {
+        if (@(Get-AgentStaticTexts $dlg | Where-Object { $_ -like $pattern }).Count -gt 0) { return $true }
+        Start-Sleep -Milliseconds 150
+        $waited += 150
+    }
+    return $false
+}
+
+# Press a visible action button by caption: post WM_COMMAND(BN_CLICKED,id).
+function Invoke-AgentButton([IntPtr]$dlg, [string]$caption) {
+    $b = @(Get-AgentVisibleButtons $dlg | Where-Object { $_.Text -eq $caption })
+    if ($b.Count -lt 1) { return $false }
+    return (Send-TestRawMessage -Window $dlg -Message 0x0111 -WParam ([IntPtr][int]$b[0].Id))
+}
+
+# Open the palette, type "agent", Enter — opens "Set Up Agent Integrations…".
 function Invoke-PaletteAgentSetup($g) {
     $surface = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
     if ($surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: surface not found'; return $false }
@@ -292,22 +332,106 @@ try {
     Start-Sleep -Milliseconds 1500
     Assert ((Get-TestWindow -ProcessId $gpid -Class 'GhozttyConfirmDialog') -eq [IntPtr]::Zero) 'first-run success shows no outcome dialog'
 
-    # ------------------------------------------------------------ case 4:
-    # palette entry reruns the flow and reports the outcome (same instance).
+    # ------------------------------------------------------------ case 4
+    # (T871): the palette entry opens the Agent Integrations management
+    # window; rows fill in off-thread and the row actions drive the
+    # integration end to end.
     $paletteOk = Invoke-PaletteAgentSetup $g
-    Assert $paletteOk 'palette agent-setup flow injectable'
+    Assert $paletteOk 'palette agent-integrations flow injectable'
     if ($paletteOk) {
-        $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 20000
-        Assert ($dlg -ne [IntPtr]::Zero) 'palette install reports an outcome dialog'
+        $dlg = Wait-Class $gpid 'GhozttyAgentIntegrations' $true 10000
+        Assert ($dlg -ne [IntPtr]::Zero) 'palette opens the Agent Integrations window'
         if ($dlg -ne [IntPtr]::Zero) {
-            Assert ((Get-TestWindowText -Window $dlg) -eq 'Agent Integrations Ready') 'palette outcome title is Agent Integrations Ready'
+            Assert ((Get-TestWindowText -Window $dlg) -eq 'Agent Integrations') 'window title is Agent Integrations'
+            Assert (-not (Test-TestWindowEnabled -Window $g.Top)) 'the window is modal: its owner is disabled'
+
+            # Case 3 installed claude; the probe fills the rows in off-thread.
+            Assert (Wait-AgentRowStatus $dlg 'Installed') 'claude row reports Installed after the off-thread probe'
+            Assert (Wait-AgentRowStatus $dlg 'Not detected*Copilot*') 'copilot row reports Not detected with an install hint'
+            $vis = @(Get-AgentVisibleButtons $dlg | ForEach-Object { $_.Text })
+            Assert (($vis -contains 'Uninstall') -and ($vis -contains 'Done')) "installed row offers Uninstall (visible: $($vis -join ', '))"
+            Assert (-not ($vis -contains 'Set Up')) 'the undetected row offers no Set Up'
+
+            # Uninstall, cancelled: honest confirm; Escape keeps everything.
+            Assert (Invoke-AgentButton $dlg 'Uninstall') 'Uninstall pressable'
+            $confirm = Wait-Class $gpid 'GhozttyConfirmDialog' $true 5000
+            Assert ($confirm -ne [IntPtr]::Zero) 'Uninstall asks for confirmation first'
+            if ($confirm -ne [IntPtr]::Zero) {
+                Assert ((Get-TestWindowText -Window $confirm) -like 'Remove Ghoztty integration from Claude Code*') 'confirm title names the agent'
+                $cbtns = Get-ButtonTexts $confirm
+                Assert (($cbtns -contains 'Remove') -and ($cbtns -contains 'Cancel')) "confirm buttons are Remove / Cancel (got: $($cbtns -join ', '))"
+                Send-TestControlKey -Control $confirm -Key Escape | Out-Null
+                Wait-Class $gpid 'GhozttyConfirmDialog' $false | Out-Null
+            }
+            Assert (Test-Path (Join-Path $home1 '.claude\skills\ghoztty\SKILL.md')) 'a cancelled uninstall removes nothing'
+
+            # Uninstall, confirmed. Enter defaults to Cancel (destructive
+            # action), so Tab to Remove first.
+            Assert (Invoke-AgentButton $dlg 'Uninstall') 'Uninstall pressable again'
+            $confirm = Wait-Class $gpid 'GhozttyConfirmDialog' $true 5000
+            if ($confirm -ne [IntPtr]::Zero) {
+                Send-TestControlKey -Control $confirm -Key Tab | Out-Null
+                Start-Sleep -Milliseconds 150
+                Send-TestControlKey -Control $confirm -Key Enter | Out-Null
+                Wait-Class $gpid 'GhozttyConfirmDialog' $false | Out-Null
+            }
+            Assert (Wait-AgentRowStatus $dlg 'Not set up') 'row flips to Not set up after Remove'
+            # Managed FILES go; empty directories may stay (removeIfManaged
+            # removes what it stamped, nothing else).
+            $goneOk = $false
+            for ($t = 0; $t -lt 50 -and -not $goneOk; $t++) {
+                $goneOk = (-not (Test-Path (Join-Path $home1 '.claude\skills\ghoztty\SKILL.md'))) -and
+                    (-not (Test-Path (Join-Path $home1 '.config\ghoztty\hooks\ghoztty-banner.sh')))
+                Start-Sleep -Milliseconds 100
+            }
+            Assert $goneOk 'Remove clears the skills and the banner scripts (no other agent shares them)'
+
+            # Set Up from the row: reinstall lands and the row flips back.
+            Assert (Invoke-AgentButton $dlg 'Set Up') 'Set Up appears on the empty row and is pressable'
+            Assert (Wait-AgentRowStatus $dlg 'Installed') 'row flips to Installed after Set Up'
+            $backOk = $false
+            for ($t = 0; $t -lt 50 -and -not $backOk; $t++) {
+                $backOk = Test-Path (Join-Path $home1 '.claude\skills\ghoztty\SKILL.md')
+                Start-Sleep -Milliseconds 100
+            }
+            Assert $backOk 'Set Up reinstalls the skills'
+
+            # Close; corrupt a managed file; reopen: Update available, and
+            # Update heals it.
             Send-TestControlKey -Control $dlg -Key Escape | Out-Null
-            $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-            Assert ($gone -eq [IntPtr]::Zero) 'outcome dialog dismisses'
+            $goneDlg = Wait-Class $gpid 'GhozttyAgentIntegrations' $false
+            Assert ($goneDlg -eq [IntPtr]::Zero) 'Escape closes the window'
+            Assert (Test-TestWindowEnabled -Window $g.Top) 'owner window re-enabled on close'
+
+            $bannerPath = Join-Path $home1 '.config\ghoztty\hooks\ghoztty-banner.sh'
+            # Marked but stale: OURS to update, never a destructive set-up.
+            Set-Content -Path $bannerPath -Value "#!/bin/sh`n# ghoztty-managed`necho old`n" -Encoding ascii -NoNewline
+
+            if (Invoke-PaletteAgentSetup $g) {
+                $dlg2 = Wait-Class $gpid 'GhozttyAgentIntegrations' $true 10000
+                Assert ($dlg2 -ne [IntPtr]::Zero) 'window reopens from the palette'
+                if ($dlg2 -ne [IntPtr]::Zero) {
+                    Assert (Wait-AgentRowStatus $dlg2 'Update available') 'a corrupted managed file reads Update available'
+                    $vis2 = @(Get-AgentVisibleButtons $dlg2 | ForEach-Object { $_.Text })
+                    Assert (($vis2 -contains 'Update') -and ($vis2 -contains 'Uninstall')) "outdated row offers Update and Uninstall (visible: $($vis2 -join ', '))"
+                    Assert (Invoke-AgentButton $dlg2 'Update') 'Update pressable'
+                    Assert (Wait-AgentRowStatus $dlg2 'Installed') 'row flips back to Installed after Update'
+                    $healed = $false
+                    for ($t = 0; $t -lt 50 -and -not $healed; $t++) {
+                        $healed = (Test-Path $bannerPath) -and ((Get-Content $bannerPath -Raw) -notmatch 'echo old')
+                        Start-Sleep -Milliseconds 100
+                    }
+                    Assert $healed 'Update rewrites the stale managed file'
+                    Send-TestControlKey -Control $dlg2 -Key Escape | Out-Null
+                    Wait-Class $gpid 'GhozttyAgentIntegrations' $false | Out-Null
+                }
+            } else {
+                Assert $false 'palette reopen injectable'
+            }
         }
-        Assert ((Get-StubLines).Count -eq 0) 'the palette rerun spawns no claude CLI either'
+        Assert ((Get-StubLines).Count -eq 0) 'the management window spawns no claude CLI'
     }
-    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app alive after palette flow'
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app alive after the management flow'
     Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
 
@@ -408,18 +532,21 @@ try {
     Assert (-not (Test-Path (Join-Path $state7 'claude_setup'))) 'no agent CLI: prompt not burned (no state file)'
 
     $paletteOk = Invoke-PaletteAgentSetup $g
-    Assert $paletteOk 'palette agent-setup flow injectable (no-agent case)'
+    Assert $paletteOk 'palette agent-integrations flow injectable (no-agent case)'
     if ($paletteOk) {
-        $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 10000
-        Assert ($dlg -ne [IntPtr]::Zero) 'palette run without agents reports a dialog'
+        $dlg = Wait-Class $gpid 'GhozttyAgentIntegrations' $true 10000
+        Assert ($dlg -ne [IntPtr]::Zero) 'the management window opens with no agents installed'
         if ($dlg -ne [IntPtr]::Zero) {
-            Assert ((Get-TestWindowText -Window $dlg) -eq 'No Coding Agents Found') 'outcome title is No Coding Agents Found'
+            Assert (Wait-AgentRowStatus $dlg 'Not detected*Claude*') 'claude row reads Not detected'
+            Assert (Wait-AgentRowStatus $dlg 'Not detected*Copilot*') 'copilot row reads Not detected'
+            $vis = @(Get-AgentVisibleButtons $dlg | ForEach-Object { $_.Text })
+            Assert (($vis -contains 'Done') -and ($vis.Count -eq 1)) "undetected rows offer no actions, only Done (visible: $($vis -join ', '))"
             Send-TestControlKey -Control $dlg -Key Escape | Out-Null
-            $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-            Assert ($gone -eq [IntPtr]::Zero) 'not-found dialog dismisses'
+            $gone = Wait-Class $gpid 'GhozttyAgentIntegrations' $false
+            Assert ($gone -eq [IntPtr]::Zero) 'the window dismisses'
         }
     }
-    Assert (-not (Test-Path (Join-Path $state7 'claude_setup'))) 'not-found leaves no state file'
+    Assert (-not (Test-Path (Join-Path $state7 'claude_setup'))) 'opening the window burns no first-run state'
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

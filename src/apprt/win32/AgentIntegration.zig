@@ -89,19 +89,11 @@ pub const WM_APP_MIGRATION_PROMPT: u32 = w32.WM_APP + 30;
 /// *MigrationDone owned by the handler.
 pub const WM_APP_MIGRATION_DONE: u32 = w32.WM_APP + 31;
 
-/// Who kicked off the install: the first-run prompt stays silent on
-/// success (Mac parity — first launch stays quiet), the palette always
-/// reports the outcome.
-pub const Source = enum { first_run, palette };
-
 pub const Done = struct {
-    source: Source,
     /// Outcomes carry only static detail strings (see the service), so this
     /// struct owns no memory beyond itself.
     results: [service.agent_count]service.AgentResult,
     n: usize,
-    /// Palette flow found no agent CLI installed at all.
-    none_detected: bool,
 };
 
 pub const MigrationDone = struct {
@@ -227,19 +219,19 @@ pub fn showFirstRunPrompt(app: *App, agent_bits: usize) void {
         if (check.checked) chosen.insert(agents_buf[i]);
     }
     if (chosen.count() == 0) return;
-    installAsync(app, .first_run, chosen);
+    installAsync(app, chosen);
 }
 
-/// Kick off the integration installs on a detached thread. Safe to call
-/// from the GUI thread (palette entry) or the first-run prompt. Pass null
-/// to detect the agents on the worker (the palette flow); the first-run
-/// prompt passes what the user checked.
-pub fn installAsync(app: *App, source: Source, agents: ?std.EnumSet(RuntimeAgent)) void {
+/// Kick off the first-run integration installs on a detached thread for the
+/// agents the user checked. Safe to call from the GUI thread. (Managing
+/// integrations afterwards is the Agent Integrations dialog, T871 — the
+/// palette no longer blind-installs.)
+pub fn installAsync(app: *App, agents: std.EnumSet(RuntimeAgent)) void {
     if (install_running.swap(true, .acq_rel)) {
         log.info("agent setup: install already running; ignoring", .{});
         return;
     }
-    const thread = std.Thread.spawn(.{}, installThread, .{ app, source, agents }) catch |err| {
+    const thread = std.Thread.spawn(.{}, installThread, .{ app, agents }) catch |err| {
         install_running.store(false, .release);
         log.warn("agent setup: install thread spawn failed: {}", .{err});
         return;
@@ -247,7 +239,7 @@ pub fn installAsync(app: *App, source: Source, agents: ?std.EnumSet(RuntimeAgent
     thread.detach();
 }
 
-fn installThread(app: *App, source: Source, agents_arg: ?std.EnumSet(RuntimeAgent)) void {
+fn installThread(app: *App, agents: std.EnumSet(RuntimeAgent)) void {
     defer install_running.store(false, .release);
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -257,16 +249,11 @@ fn installThread(app: *App, source: Source, agents_arg: ?std.EnumSet(RuntimeAgen
     const alloc = app.core_app.alloc;
     const done = alloc.create(Done) catch return;
     done.* = .{
-        .source = source,
         .results = undefined,
         .n = 0,
-        .none_detected = false,
     };
 
-    const agents = agents_arg orelse detectAgents(arena);
-    if (agents.count() == 0) {
-        done.none_detected = true;
-    } else if (openAgentHome(arena)) |home| {
+    if (openAgentHome(arena)) |home| {
         var home_dir = home.dir;
         defer home_dir.close();
         const probe = probeFor(arena);
@@ -279,7 +266,13 @@ fn installThread(app: *App, source: Source, agents_arg: ?std.EnumSet(RuntimeAgen
             log.info("agent setup: {s}: {s}", .{ @tagName(agent), outcome.label() });
         }
     } else {
-        done.none_detected = true;
+        // The chosen installs never ran; report them failed rather than
+        // reporting a silent success over nothing.
+        var it = agents.iterator();
+        while (it.next()) |agent| {
+            done.results[done.n] = .{ .agent = agent, .outcome = .{ .failed = "HomeUnavailable" } };
+            done.n += 1;
+        }
     }
 
     const hwnd = app.msg_hwnd orelse {
@@ -291,54 +284,35 @@ fn installThread(app: *App, source: Source, agents_arg: ?std.EnumSet(RuntimeAgen
     }
 }
 
-/// GUI thread (msgWndProc): report an install outcome. Owns `done`.
+/// GUI thread (msgWndProc): report a first-run install outcome. Owns
+/// `done`. Success stays SILENT so the first launch is quiet (Mac parity);
+/// any failure is reported once, actionably.
 pub fn onDone(app: *App, done: *Done) void {
     const alloc = app.core_app.alloc;
     defer alloc.destroy(done);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var any_failed = false;
     for (done.results[0..done.n]) |r| {
         if (r.outcome == .failed) any_failed = true;
     }
+    if (!any_failed) return;
 
-    // First-run success stays silent so the first launch is quiet; every
-    // palette outcome and any failure is reported (Mac parity).
-    const report = switch (done.source) {
-        .first_run => any_failed,
-        .palette => true,
-    };
-    if (!report) return;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const title: [*:0]const u16 = if (done.none_detected)
-        L("No Coding Agents Found")
-    else if (any_failed)
-        L("Some Integrations Failed")
-    else
-        L("Agent Integrations Ready");
-    const icon: ConfirmDialog.Icon = if (any_failed) .warning else .info;
-    const text_w: [:0]const u16 = if (done.none_detected)
-        L("This sets up Ghoztty's integration for coding agents such as\n" ++
-            "Claude Code and Copilot CLI. Install one on this PC, then run\n" ++
-            "this again.")
-    else blk: {
+    const text_w: [:0]const u16 = blk: {
         const summary_text = service.summary(arena, done.results[0..done.n]) catch
-            break :blk L("The integration run finished.");
-        const text = if (any_failed)
-            std.mem.concat(arena, u8, &.{
-                summary_text,
-                "\n\nRun Set Up Agent Integrations to try again.",
-            }) catch summary_text
-        else
-            summary_text;
+            break :blk L("The integration run did not finish.");
+        const text = std.mem.concat(arena, u8, &.{
+            summary_text,
+            "\n\nRe-run Set Up Agent Integrations… to try again.",
+        }) catch summary_text;
         break :blk std.unicode.utf8ToUtf16LeAllocZ(arena, text) catch
-            L("The integration run finished.");
+            L("The integration run did not finish.");
     };
 
-    showAlert(app, title, text_w, icon);
+    showAlert(app, L("Some Integrations Failed"), text_w, .warning);
 }
 
 /// GUI thread (msgWndProc): show the one-time plugin-migration offer.
@@ -551,7 +525,9 @@ fn setOf(bits: usize) std.EnumSet(RuntimeAgent) {
 
 /// The home the integrations install into: `GHOZTTY_AGENT_HOME` (sandbox
 /// override for tests), else the user's profile. `path` is arena-owned.
-const AgentHome = struct {
+/// Pub: the Agent Integrations dialog's workers (T871) resolve the same
+/// home and probe, so the sandbox override governs every entry point.
+pub const AgentHome = struct {
     dir: std.fs.Dir,
     path: []const u8,
 };
@@ -563,7 +539,7 @@ fn agentHomePath(arena: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(arena, "USERPROFILE") catch null;
 }
 
-fn openAgentHome(arena: std.mem.Allocator) ?AgentHome {
+pub fn openAgentHome(arena: std.mem.Allocator) ?AgentHome {
     const path = agentHomePath(arena) orelse return null;
     const dir = std.fs.cwd().openDir(path, .{}) catch |err| {
         log.warn("agent setup: home open failed ({s}): {}", .{ path, err });
@@ -575,7 +551,7 @@ fn openAgentHome(arena: std.mem.Allocator) ?AgentHome {
 /// The runtime probe: the process environment normally; ONLY the sandbox
 /// home when `GHOZTTY_AGENT_HOME` is set, so a test's detection cannot be
 /// polluted by whatever the box really has installed.
-fn probeFor(arena: std.mem.Allocator) RuntimeProbe {
+pub fn probeFor(arena: std.mem.Allocator) RuntimeProbe {
     if (std.process.getEnvVarOwned(arena, "GHOZTTY_AGENT_HOME") catch null) |override| {
         if (override.len > 0) return .{ .env = .{ .home = override } };
     }

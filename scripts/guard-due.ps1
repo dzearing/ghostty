@@ -276,19 +276,23 @@ $GuardTable = @(
             'test\win32\gui-launch-command.ps1'
         )
     },
-    # The agent-integration first-run + plugin migration (T870): the prompts,
-    # the off-thread install marshalling and the migration's uninstall-first
-    # ordering are proven end-to-end only by this harness — the unit lanes pin
-    # the pure pieces (service, migration module, manifest parse) but nothing
-    # else in the floor launches the GUI with an unanswered state file. The
-    # row stays on the flow modules; the shared components underneath
-    # (RuntimeIntegration, hook specs) move under their own unit tests.
+    # The agent-integration first-run + plugin migration (T870) and the
+    # Agent Integrations management window (T871): the prompts, the
+    # off-thread install/probe marshalling, the migration's uninstall-first
+    # ordering and the dialog's row actions are proven end-to-end only by
+    # this harness — the unit lanes pin the pure pieces (service, migration
+    # module, manifest parse, row derivation) but nothing else in the floor
+    # launches the GUI with an unanswered state file. The row stays on the
+    # flow modules; the shared components underneath (RuntimeIntegration,
+    # hook specs) move under their own unit tests.
     [pscustomobject]@{
         Name   = 'claude-integration'
         Script = 'test\win32\claude-integration.ps1'
         Stamp  = 'test\win32\claude-integration.stamp.json'
         Covers = @(
             'src\apprt\win32\AgentIntegration.zig',
+            'src\apprt\win32\AgentIntegrationsDialog.zig',
+            'src\apprt\win32\agent_integrations_vm.zig',
             'src\apprt\win32\claude_plugin_migration.zig',
             'src\apprt\win32\claude_setup.zig',
             'test\win32\claude-integration.ps1'

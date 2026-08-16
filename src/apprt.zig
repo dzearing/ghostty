@@ -117,6 +117,10 @@ test {
     _ = @import("apprt/win32/RuntimeIntegration.zig");
     _ = @import("apprt/win32/agent_integration_service.zig");
 
+    // Agent Integrations dialog row derivation (T871): pure presentation
+    // logic over the service statuses, no OS imports, every lane.
+    _ = @import("apprt/win32/agent_integrations_vm.zig");
+
     // Claude plugin → app migration (T870): manifest-driven uninstall via
     // Claude's own CLI (injected), banner-state carry-over, stale-script
     // ownership proofs. std.fs tempdir tests, every lane.
