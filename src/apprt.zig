@@ -109,6 +109,14 @@ test {
     _ = @import("apprt/win32/CopilotHookSpec.zig");
     _ = @import("apprt/win32/HookComponent.zig");
 
+    // Runtime registry + aggregate install flow (T869): the binary probe,
+    // the external-plugin manifest gate, the rollback/refcount integration
+    // and the UI-facing service. std.fs tempdir tests, every lane.
+    _ = @import("apprt/win32/runtime_probe.zig");
+    _ = @import("apprt/win32/claude_plugin_manifest.zig");
+    _ = @import("apprt/win32/RuntimeIntegration.zig");
+    _ = @import("apprt/win32/agent_integration_service.zig");
+
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
 
