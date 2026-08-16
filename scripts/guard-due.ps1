@@ -112,6 +112,27 @@ $GuardTable = @(
             'test\win32\upgrade-no-fork.ps1'
         )
     },
+    # The release wiring (T578): the workflows, the shared artifact/toolchain
+    # scripts, and the on-box publish path only ever execute during an actual
+    # release or a CI run nobody on this box watches, so an edit to any of
+    # them can only be caught by the static harness -- which sat red for a
+    # week after T577 changed the triggers, because nothing tied these files
+    # to a run of it.
+    [pscustomobject]@{
+        Name   = 'release-artifacts'
+        Script = 'test\win32\release-artifacts.ps1'
+        Stamp  = 'test\win32\release-artifacts.stamp.json'
+        Covers = @(
+            '.github\workflows\release-windows.yml',
+            '.github\workflows\fork-ci.yml',
+            'dist\windows-installer\build-release-artifacts.sh',
+            'dist\windows-installer\install-msitools.sh',
+            'dist\windows-installer\build-msi.sh',
+            'dist\windows-installer\build-portable-zip.sh',
+            'scripts\publish-windows-release.ps1',
+            'test\win32\release-artifacts.ps1'
+        )
+    },
     # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
     # idle poll only ever fails inside a detached automation send — the loop
     # types into a mid-turn session and the damage reads as "the agent ignored

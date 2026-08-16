@@ -1,7 +1,12 @@
 on:
   pull_request: {}
   push:
-    branches: [main]
+    # The Windows branch is here for the windows-cross job (T578): the parity
+    # loop pushes straight to it (no PRs), so without a push trigger nothing
+    # in CI ever sees those commits and a broken cross-compile waits for a
+    # release attempt to be found. build-test deliberately does NOT run on
+    # those pushes -- see its `if:`.
+    branches: [main, users/dzearing/windows-amd64]
   workflow_dispatch: {}
 
 name: Fork CI
@@ -21,8 +26,12 @@ concurrency:
 jobs:
   build-test:
     # Stay inert if someone forks the fork, matching the guard style upstream
-    # uses throughout test.yml.
-    if: github.repository == 'dzearing/ghoztty'
+    # uses throughout test.yml. The second clause keeps this job's effective
+    # triggers exactly what they were before the Windows branch joined the
+    # push list above (PRs + main pushes): the Mac seat validates that branch
+    # on-box, and turning a macOS CI run on for its every push is a separate
+    # call from T578's Windows job, not a side effect of it.
+    if: github.repository == 'dzearing/ghoztty' && (github.event_name != 'push' || github.ref == 'refs/heads/main')
     runs-on: macos-latest
     # Nothing here should take an hour. The inherited vouch-* workflows had no
     # timeout and no reachable runner, so each one sat queued for a full 24h
@@ -109,3 +118,65 @@ jobs:
           name: xcresult
           path: ${{ runner.temp }}/GhosttyTests.xcresult
           retention-days: 7
+
+  # T578. Nothing outside release time built the Windows target in CI, so the
+  # first time release-windows.yml's cross-compile ever ran on a Linux runner
+  # was during an actual release (T577), three weeks after it was written.
+  # This job runs the SAME artifact build the release runs --
+  # build-release-artifacts.sh end to end, exe + MSI + portable ZIP, msitools
+  # installed by the same shared script -- so a commit that breaks any of it
+  # is red on the commit rather than at the tag. The on-box floor lanes
+  # cannot stand in for this: they build natively on Windows, a different
+  # host toolchain and linker path, and never touch the wixl/msiinfo
+  # packaging.
+  #
+  # It builds and verifies only. Nothing is uploaded, published, or tagged.
+  windows-cross:
+    if: github.repository == 'dzearing/ghoztty'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Gate on the TREE, not the branch name: the win32 frontend exists only
+      # on users/dzearing/windows-amd64 (main's apprt enum is gtk/none/
+      # embedded), so on a main push or a PR against main there is nothing to
+      # cross-compile and every later step no-ops green. Keying on content
+      # also means a PR against the Windows branch -- from any ref -- gets
+      # the real build, which is what makes the deliberate-break check in
+      # T578's validation runnable without pushing a broken commit to the
+      # shared branch.
+      - name: Detect the Windows frontend
+        id: detect
+        run: |
+          if [ -d src/apprt/win32 ] && [ -x dist/windows-installer/build-release-artifacts.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no win32 frontend in this tree -- nothing to cross-compile"
+          fi
+
+      # Same action, same (default) inputs as release-windows.yml -- it
+      # resolves the version from build.zig.zon's minimum_zig_version, and
+      # proving the release path means using the release's toolchain setup,
+      # not this job's own idea of one. Pinned by sha per this file's style;
+      # the release workflow floats on @v2, which is close enough to one
+      # definition until merge-back consolidates them.
+      - name: Setup Zig
+        if: steps.detect.outputs.present == 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - name: Build and install msitools 0.106 (wixl, msiinfo, msibuild)
+        if: steps.detect.outputs.present == 'true'
+        run: dist/windows-installer/install-msitools.sh
+
+      # The exact command the release runs, at a version no release will ever
+      # carry. 0.0.0 keeps the artifacts unmistakably CI-only while
+      # exercising every real step: the ReleaseFast x86_64-windows-gnu
+      # cross-compile, the version-string embedding check, wixl's MSI build
+      # (PATH component included), and the portable-ZIP layout gates.
+      - name: Build Windows release artifacts (not published)
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          dist/windows-installer/build-release-artifacts.sh --semver 0.0.0

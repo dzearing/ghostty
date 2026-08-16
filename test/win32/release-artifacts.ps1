@@ -65,8 +65,13 @@ $ps1 = Get-Content -LiteralPath $ps1Path -Raw
 "== A: the release cannot ship one platform (pure)"
 # ============================================================================
 
-# A1-A2: same trigger as the macOS release. A stricter pattern here is how
-# "every release ships Windows" quietly becomes "most releases do".
+# A1-A2: the Windows triggers are the macOS triggers PLUS win-v* (T577).
+# Until merge-back a Windows release is cut as its own win-v tag on the
+# Windows branch (main's tree cannot build one); at merge-back the shared v*
+# pattern takes over with nothing rewired. A dropped v* is how "every release
+# ships Windows" quietly breaks at merge-back; a dropped win-v* breaks it
+# today. A stricter macOS-side pattern is the same disease in the other
+# direction, hence per-pattern containment rather than string equality.
 function Get-TagPatterns($yaml) {
     $m = [regex]::Match($yaml, '(?ms)^on:.*?tags:\s*\r?\n((?:\s*-\s*"[^"]+"\r?\n)+)')
     if (-not $m.Success) { return @() }
@@ -76,11 +81,21 @@ function Get-TagPatterns($yaml) {
 $winTags = Get-TagPatterns $wf
 $macTags = Get-TagPatterns $macWf
 Assert "A1 release.yml has a tag trigger" ($macTags.Count -gt 0)
-AssertEq "A2 the Windows trigger is the macOS trigger" ($macTags -join ',') ($winTags -join ',')
+foreach ($t in $macTags) {
+    Assert "A2 Windows trigger carries macOS pattern '$t'" ($winTags -contains $t)
+}
+Assert "A2b Windows trigger carries win-v*" ($winTags -contains 'win-v*')
 
-# A3-A4: a tag that is not X.Y.Z must fail loudly, not be skipped.
+# A3-A4: a tag that is not X.Y.Z must fail loudly, not be skipped. The
+# version comes from the tag with BOTH shapes normalized: win- stripped
+# first, then v -- one combined substitution leaves `win-v1.31.0` untouched
+# (the prefix `refs/tags/v` never matches it) and fails the X.Y.Z regex over
+# a version that was never malformed.
 Assert "A3 non-X.Y.Z tag is an error, not a skip" ($wf -match '::error::Version must be X\.Y\.Z')
-Assert "A4 the version is taken from the tag" ($wf -match 'VERSION=\$\{GITHUB_REF#refs/tags/v\}')
+Assert "A4 the version is taken from the tag" (
+    ($wf -match 'TAG_NAME=\$\{GITHUB_REF#refs/tags/\}') -and
+    ($wf -match 'VERSION=\$\{TAG_NAME#win-\}') -and
+    ($wf -match 'VERSION=\$\{VERSION#v\}'))
 
 # A5-A6: the tag it publishes is the one installed builds look for. This is a
 # contract with shipped binaries (T24), not a naming preference.
@@ -182,6 +197,45 @@ Assert "C1 release.md covers the Windows terminal build" ($releaseMd -match 'rel
 Assert "C2 release.md names both artifacts" (($releaseMd -match '-x64\.msi') -and ($releaseMd -match 'portable-.*-x64\.zip'))
 
 # ============================================================================
+"== E: CI proves the release path before release time (T578, pure)"
+# ============================================================================
+# T577 found that release-windows.yml's cross-compile had never once executed
+# before an actual release. fork-ci's windows-cross job closes that: the same
+# artifact script, the same msitools install, on every push to the Windows
+# branch -- and publishing nothing.
+$forkCi = Get-Content -LiteralPath (Join-Path $Repo '.github\workflows\fork-ci.yml') -Raw
+$msiInstallPath = Join-Path $Repo 'dist\windows-installer\install-msitools.sh'
+$msiInstall = Get-Content -LiteralPath $msiInstallPath -Raw
+
+Assert "E1 fork-ci has a windows-cross job" ($forkCi -match '(?m)^  windows-cross:')
+Assert "E2 fork-ci pushes on the Windows branch" ($forkCi -match 'users/dzearing/windows-amd64')
+Assert "E3 windows-cross runs the shared artifact script" ($forkCi -match 'build-release-artifacts\.sh')
+
+# E4: ONE msitools install, shared by both workflows. Two inline copies is
+# how the release's toolchain and CI's would drift back apart.
+Assert "E4 fork-ci installs msitools via the shared script" ($forkCi -match 'install-msitools\.sh')
+Assert "E4b release workflow installs msitools via the shared script" ($wf -match 'install-msitools\.sh')
+Assert "E4c the shared script pins msitools 0.106" ($msiInstall -match 'MSITOOLS_TAG="\$\{MSITOOLS_TAG:-v0\.106\}"')
+
+# E5: the CI job must never publish. Slice the windows-cross job's own text
+# (from its header to end-of-file; it is the last job) so a publish step
+# elsewhere in the file cannot mask one added here.
+$jobM = [regex]::Match($forkCi, '(?ms)^  windows-cross:.*\z')
+Assert "E5 windows-cross publishes nothing" ($jobM.Success -and
+    $jobM.Value -notmatch 'gh release' -and
+    $jobM.Value -notmatch 'upload-artifact' -and
+    $jobM.Value -notmatch 'gh-pages')
+
+# E6: gated on tree content, not branch name -- main's tree has no win32
+# frontend, and a branch-name gate would also silence the deliberate-break
+# check (a PR from a scratch branch must get the real build).
+Assert "E6 windows-cross detects the win32 tree" ($jobM.Success -and
+    $jobM.Value -match 'src/apprt/win32')
+
+# E7: the runbook expects CI to have proven the build, not the release.
+Assert "E7 release.md points at the windows-cross job" ($releaseMd -match 'windows-cross')
+
+# ============================================================================
 if ($Full) {
     "== D: the on-box publish, end to end (-DryRun)"
     # ============================================================================
@@ -197,6 +251,16 @@ if ($Full) {
     Assert "D5 portable ZIP produced" ($text -match 'artifact: .*Ghoztty-portable-\d+\.\d+\.\d+-x64\.zip')
     Assert "D6 stopped before publishing" ($text -match 'DRY RUN: skipping gh release create')
     Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+}
+
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
+# can answer "has this harness been run against the release wiring as it now
+# stands?". Red leaves the stamp alone (red stays due), and so does a run
+# with skips -- a Docker-less run never looked at the packaging sections it
+# would be vouching for.
+if ($script:failures -eq 0 -and $script:skipped -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard release-artifacts -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""

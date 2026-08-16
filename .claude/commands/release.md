@@ -108,6 +108,8 @@ Either trigger publishes `Ghoztty-X.Y.Z-x64.msi` + `Ghoztty-portable-X.Y.Z-x64.z
 
 They are separate workflows so a Windows failure cannot interrupt the signing/notarization pipeline. Both artifacts are defined by `dist/windows-installer/build-release-artifacts.sh`, which the on-box path (`scripts/publish-windows-release.ps1`) runs too, so a hand publish and CI cannot drift.
 
+**The release does not prove the Windows build — it expects to find it already green** (T578). `fork-ci.yml`'s `windows-cross` job runs that same `build-release-artifacts.sh` (exe + MSI + portable ZIP, msitools from the shared `dist/windows-installer/install-msitools.sh`) on every push to `users/dzearing/windows-amd64`, so a broken cross-compile is red on the commit that broke it. Before tagging, glance at the branch's latest Fork CI run (`gh run list --repo dzearing/ghoztty --branch users/dzearing/windows-amd64 --workflow "Fork CI" --limit 1`); a red `windows-cross` there means the release tag would fail the same way, and the fix belongs on the commit, not in the release.
+
 ### Step 4: Publish the Windows Agent Installer
 
 Every release also publishes the Windows agent (installer + self-update manifest) so the two ship together. This runs LOCALLY from the tagged commit and is independent of the GitHub DMG build — do it while Step 5 monitors that build.
