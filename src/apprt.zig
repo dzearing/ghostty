@@ -91,6 +91,14 @@ test {
     // imports, so the content checks run in every lane on both seats.
     _ = @import("apprt/win32/GhosttyAssets.zig");
 
+    // Agent-runtime registry enum + hook-script layout (T867), pure logic in
+    // every lane; the skill/script installers below are std.fs + the T865
+    // writer, so their tempdir tests run everywhere too.
+    _ = @import("apprt/win32/runtime_agent.zig");
+    _ = @import("apprt/win32/hook_scripts.zig");
+    _ = @import("apprt/win32/SkillComponent.zig");
+    _ = @import("apprt/win32/BannerScriptInstaller.zig");
+
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
 
