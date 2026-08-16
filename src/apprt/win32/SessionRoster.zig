@@ -593,6 +593,10 @@ pub const VisibleRow = struct {
     /// The saved layout title. Borrows the manifest.
     persisted_title: ?[]const u8 = null,
     open_locally: bool = false,
+    /// Left over (T520): live on the LOCAL agent with no local pane holding it
+    /// and no other viewer attached. Computed here, next to `open_locally`,
+    /// because both answer against the live window set at build time.
+    orphan: bool = false,
 };
 
 /// The rows worth rendering, in agent order: connectable (alive OR a
@@ -628,6 +632,7 @@ pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const
             .live_title = live,
             .persisted_title = if (self.target == .local) self.persistedTitleFor(s.id) else null,
             .open_locally = live != null,
+            .orphan = chooser_sessions.orphaned(row, live != null, self.target == .local),
         };
         n += 1;
     }
@@ -650,6 +655,21 @@ pub fn aliveCount(self: *const SessionRoster) usize {
         if (chooser_sessions.isResumable(.{ .id = s.id, .alive = s.alive })) n += 1;
     }
     return n;
+}
+
+/// Say the T520 mark out loud, once per adopted LOCAL roster: how many live
+/// sessions no local pane holds. The rows are owner-drawn — there is no HWND to
+/// read a badge back from — so this line is the acceptance oracle for the
+/// "not in any window" mark, and it is said even at zero so a script can assert
+/// the mark's absence as strongly as its presence.
+pub fn logOrphans(self: *const SessionRoster, app: *App) void {
+    if (self.target != .local) return;
+    var rows: [max_rows]VisibleRow = undefined;
+    var n: usize = 0;
+    for (self.visible(app, &rows)) |r| {
+        if (r.orphan) n += 1;
+    }
+    log.info("chooser roster: {d} session(s) not in any window", .{n});
 }
 
 /// The title of an OPEN pane bound to `id`, or null. Also the answer to "is
@@ -863,7 +883,7 @@ fn paintRow(
 
     var badge_buf: [2]chooser_sessions.Badge = undefined;
     var exit_buf: [32]u8 = undefined;
-    const run = chooser_sessions.badges(&badge_buf, &exit_buf, row.session, row.open_locally);
+    const run = chooser_sessions.badges(&badge_buf, &exit_buf, row.session, row.open_locally, row.orphan);
 
     // Reserve the badges' width so a long name ellipsizes instead of pushing
     // them out of the card.

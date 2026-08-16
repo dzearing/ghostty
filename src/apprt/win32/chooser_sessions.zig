@@ -167,6 +167,22 @@ pub fn badgeFill(bg: Rgb, tone: Tone) Rgb {
     return chrome_theme.toneFill(bg, tone);
 }
 
+/// Is this session LEFT OVER — live on the local agent with no local pane
+/// holding it and no other viewer attached (T520)? This is the state a user
+/// would want to act on (resume it into a window, or kill it), so it is the one
+/// state in the openness slot that earns a warning tone.
+///
+/// `attached` alone is deliberately NOT the signal: a locally-open session can
+/// be detached for a moment during a reconnect swap (its pane still references
+/// the id, so `open_locally` stays true and no mark flickers on), and a session
+/// attached by ANOTHER machine's viewer is that viewer's, not left over — it
+/// already reads `attached`. Local-target only: for a remote machine, that
+/// machine's own windows are invisible from here, so "not in any window" would
+/// be a guess.
+pub fn orphaned(s: Session, open_locally: bool, local_target: bool) bool {
+    return local_target and s.alive and !open_locally and !s.attached;
+}
+
 /// The badge run for a row, in Mac's order (`MachineChooserView.swift:632-646`):
 /// the liveness/activity badge first, then an openness badge.
 ///
@@ -174,11 +190,13 @@ pub fn badgeFill(bg: Rgb, tone: Tone) Rgb {
 ///   noise.
 /// - Dead: the exit label (which is why `exit_buf` is a parameter).
 /// - Then `open` when the session is open in one of our panes, else `attached`
-///   when some other viewer holds it. Deliberately no `pinned` badge: every
-///   persistent local session is pinned, so it is noise, not signal.
+///   when some other viewer holds it, else `not in any window` when the caller
+///   says the row is `orphaned` (T520) — a live local session nothing shows.
+///   Deliberately no `pinned` badge: every persistent local session is pinned,
+///   so it is noise, not signal.
 ///
 /// Returns the filled prefix of `out` (which needs room for 2).
-pub fn badges(out: []Badge, exit_buf: []u8, s: Session, open_locally: bool) []const Badge {
+pub fn badges(out: []Badge, exit_buf: []u8, s: Session, open_locally: bool, orphan: bool) []const Badge {
     var n: usize = 0;
     if (s.alive) {
         if (activityBadge(s.activity)) |b| {
@@ -197,12 +215,21 @@ pub fn badges(out: []Badge, exit_buf: []u8, s: Session, open_locally: bool) []co
             out[n] = .{ .text = "open", .tone = .good };
             n += 1;
         }
-    } else if (s.attached and n < out.len) {
-        out[n] = .{ .text = "attached", .tone = .neutral };
+    } else if (s.attached) {
+        if (n < out.len) {
+            out[n] = .{ .text = "attached", .tone = .neutral };
+            n += 1;
+        }
+    } else if (orphan and n < out.len) {
+        out[n] = .{ .text = orphan_text, .tone = .warn };
         n += 1;
     }
     return out[0..n];
 }
+
+/// The T520 mark's wording, shared with the roster's log oracle so the badge
+/// and the sentence about it cannot drift apart.
+pub const orphan_text = "not in any window";
 
 /// The activity badge for a LIVE session, or null for idle.
 pub fn activityBadge(activity: []const u8) ?Badge {
@@ -779,15 +806,15 @@ test "badges: idle is unbadged, busy and needs_input are not" {
 
     try testing.expectEqual(
         @as(usize, 0),
-        badges(&out, &ebuf, .{ .alive = true, .activity = "idle" }, false).len,
+        badges(&out, &ebuf, .{ .alive = true, .activity = "idle" }, false, false).len,
     );
 
-    const busy = badges(&out, &ebuf, .{ .alive = true, .activity = "busy" }, false);
+    const busy = badges(&out, &ebuf, .{ .alive = true, .activity = "busy" }, false, false);
     try testing.expectEqual(@as(usize, 1), busy.len);
     try testing.expectEqualStrings("busy", busy[0].text);
     try testing.expectEqual(Tone.warn, busy[0].tone);
 
-    const needs = badges(&out, &ebuf, .{ .alive = true, .activity = "needs_input" }, false);
+    const needs = badges(&out, &ebuf, .{ .alive = true, .activity = "needs_input" }, false, false);
     try testing.expectEqualStrings("needs input", needs[0].text);
     try testing.expectEqual(Tone.danger, needs[0].tone);
 }
@@ -798,15 +825,15 @@ test "badges: open beats attached, and a dead row leads with its exit label" {
 
     // Open in one of our panes AND attached: "open" is what the user cares
     // about, so "attached" is not also shown.
-    const open = badges(&out, &ebuf, .{ .alive = true, .attached = true }, true);
+    const open = badges(&out, &ebuf, .{ .alive = true, .attached = true }, true, false);
     try testing.expectEqual(@as(usize, 1), open.len);
     try testing.expectEqualStrings("open", open[0].text);
     try testing.expectEqual(Tone.good, open[0].tone);
 
-    const elsewhere = badges(&out, &ebuf, .{ .alive = true, .attached = true }, false);
+    const elsewhere = badges(&out, &ebuf, .{ .alive = true, .attached = true }, false, false);
     try testing.expectEqualStrings("attached", elsewhere[0].text);
 
-    const dead = badges(&out, &ebuf, .{ .alive = false, .exit_code = 2, .attached = true }, false);
+    const dead = badges(&out, &ebuf, .{ .alive = false, .exit_code = 2, .attached = true }, false, false);
     try testing.expectEqual(@as(usize, 2), dead.len);
     try testing.expectEqualStrings("exited (2)", dead[0].text);
     try testing.expectEqualStrings("attached", dead[1].text);
@@ -815,8 +842,49 @@ test "badges: open beats attached, and a dead row leads with its exit label" {
 test "badges never overrun the caller's buffer" {
     var out: [1]Badge = undefined;
     var ebuf: [32]u8 = undefined;
-    const run = badges(&out, &ebuf, .{ .alive = false, .exit_code = 1, .attached = true }, false);
+    const run = badges(&out, &ebuf, .{ .alive = false, .exit_code = 1, .attached = true }, false, false);
     try testing.expectEqual(@as(usize, 1), run.len);
+}
+
+test "orphaned: precisely 'no local pane holds this live local session' (T520)" {
+    // The one true case: live, local target, no pane, nothing attached.
+    try testing.expect(orphaned(.{ .alive = true }, false, true));
+
+    // A pane of ours holds it — even a momentarily-detached one (the reconnect
+    // swap): the pane keeps `open_locally` true, so no mark can flicker on.
+    try testing.expect(!orphaned(.{ .alive = true }, true, true));
+    try testing.expect(!orphaned(.{ .alive = true, .attached = true }, true, true));
+
+    // Another viewer holds it: that is "attached", not "left over".
+    try testing.expect(!orphaned(.{ .alive = true, .attached = true }, false, true));
+
+    // A dead (even relaunchable) tombstone is not a LIVE session nothing shows.
+    try testing.expect(!orphaned(.{ .alive = false, .relaunchable = true }, false, true));
+
+    // A remote machine's windows are invisible from here — never marked.
+    try testing.expect(!orphaned(.{ .alive = true }, false, false));
+}
+
+test "badges: an orphaned row reads 'not in any window', and open/attached beat it" {
+    var out: [2]Badge = undefined;
+    var ebuf: [32]u8 = undefined;
+
+    const orphan = badges(&out, &ebuf, .{ .alive = true }, false, true);
+    try testing.expectEqual(@as(usize, 1), orphan.len);
+    try testing.expectEqualStrings(orphan_text, orphan[0].text);
+    try testing.expectEqual(Tone.warn, orphan[0].tone);
+
+    // A busy orphan carries both stories, activity first (Mac's order).
+    const busy = badges(&out, &ebuf, .{ .alive = true, .activity = "busy" }, false, true);
+    try testing.expectEqual(@as(usize, 2), busy.len);
+    try testing.expectEqualStrings("busy", busy[0].text);
+    try testing.expectEqualStrings(orphan_text, busy[1].text);
+
+    // The openness slot is one slot: open and attached still win it.
+    const open = badges(&out, &ebuf, .{ .alive = true }, true, false);
+    try testing.expectEqualStrings("open", open[0].text);
+    const attached = badges(&out, &ebuf, .{ .alive = true, .attached = true }, false, false);
+    try testing.expectEqualStrings("attached", attached[0].text);
 }
 
 test "sublineCount counts only the lines the agent reported" {
@@ -925,15 +993,25 @@ test "the CPU column is reserved for the machine, not for the row (T462)" {
 }
 
 test "the badge capsule is centered on the title line and pads both sides" {
-    const m = metrics(1.5);
-    const r = rowLayout(m, 0, 0, 600, 1, false);
-    const box = badgeBox(m, r.title.left + 100, r.title, 40);
-    try testing.expectEqual(@as(i32, 40) + m.badge_pad_x * 2, box.width());
-    try testing.expectEqual(m.badge_h, box.height());
-    // Centered: the slack above equals the slack below (within the odd pixel).
-    const above = box.top - r.title.top;
-    const below = r.title.bottom - box.bottom;
-    try testing.expect(@abs(above - below) <= 1);
+    // All four common scalings, per the design system's assertion rule — the
+    // T520 mark is the longest badge text, so its capsule geometry riding these
+    // metrics is what keeps "not in any window" on the title line at every DPI.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = metrics(scale);
+        const r = rowLayout(m, 0, 0, 600, 1, false);
+        const text_w = px(40, scale);
+        const box = badgeBox(m, r.title.left + 100, r.title, text_w);
+        try testing.expectEqual(text_w + m.badge_pad_x * 2, box.width());
+        try testing.expectEqual(m.badge_h, box.height());
+        // A capsule: the radius is half the height, whatever the scale.
+        try testing.expectEqual(@divTrunc(m.badge_h, 2), m.badge_radius);
+        // Centered: the slack above equals the slack below (within the odd pixel).
+        const above = box.top - r.title.top;
+        const below = r.title.bottom - box.bottom;
+        try testing.expect(@abs(above - below) <= 1);
+        // On the title's line box, never outside it.
+        try testing.expect(box.top >= r.title.top and box.bottom <= r.title.bottom);
+    }
 }
 
 test "clampScroll pins a short roster and stops at the last pixel" {

@@ -1526,6 +1526,9 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
             // re-clamped here, where the region is known, before anything paints
             // against it.
             chooser.clampRosterScroll();
+            // The T520 oracle rides every adopted local roster, so a refetch
+            // after a resume or a pane close re-states the mark's count.
+            if (chooser.roster.state == .loaded) chooser.roster.logOrphans(app);
             chooser.refreshSessions();
         }
         return;
