@@ -45,6 +45,7 @@
 const ViewerPane = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
@@ -2014,7 +2015,12 @@ fn onNewWindowRequested(
         if (wide.len * 3 > uri_buf.len) {
             log.warn("popup URI is too long to route ({d} units); handing it to the shell", .{wide.len});
             too_long = true;
-            _ = w32.ShellExecuteW(
+            // Same rule as `shellOpen` (T594): a test binary never reaches the
+            // shell. This branch bypasses the sink-guarded router by design, so
+            // it needs the guard of its own.
+            if (builtin.is_test) {
+                log.err("test build refused to shell-open a too-long popup URI", .{});
+            } else _ = w32.ShellExecuteW(
                 null,
                 std.unicode.utf8ToUtf16LeStringLiteral("open"),
                 raw,
@@ -2921,6 +2927,16 @@ fn openExternal(self: *ViewerPane, alloc: Allocator, url: []const u8) void {
 
 fn shellOpen(self: *ViewerPane, alloc: Allocator, target: []const u8) void {
     _ = self;
+    // A test binary must never reach the shell (T594): `ShellExecuteW(open)`
+    // launches the user's default browser in the INTERACTIVE session no matter
+    // which desktop the test runs on, so a handoff that escapes a green lane
+    // is a real Edge window left on the user's screen. Recorded when the test
+    // installed a sink; loud otherwise — never executed.
+    if (builtin.is_test) {
+        if (link_sink) |s| return s.append("shell", target);
+        log.err("test build refused to shell-open: {s}", .{target});
+        return;
+    }
     const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, target) catch return;
     defer alloc.free(wide);
     _ = w32.ShellExecuteW(
@@ -4827,6 +4843,27 @@ test "viewer pane id is a valid pane id" {
     var buf: pane_id_mod.Buf = undefined;
     const id = pane_id_mod.format(&buf, [_]u8{7} ** 16);
     try std.testing.expect(pane_id_mod.isValid(id));
+}
+
+test "T594: a test build never hands a shell-open to the OS" {
+    // The claim is structural — `builtin.is_test` short-circuits `shellOpen`
+    // before `ShellExecuteW` — and this proves the observable half: with a
+    // sink installed the refused handoff is RECORDED, so any future path that
+    // reaches `shellOpen` under test shows up in a sink assertion instead of
+    // as an Edge window on the user's desktop (the T594 leak).
+    const alloc = testing.allocator;
+    var sink: LinkSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    link_sink = &sink;
+    defer link_sink = null;
+
+    var pane: ViewerPane = .{};
+    pane.shellOpen(alloc, "http://127.0.0.1:1/t594.html");
+    try testing.expectEqual(@as(usize, 1), sink.entries.items.len);
+    try testing.expectEqualStrings(
+        "shell:http://127.0.0.1:1/t594.html",
+        sink.entries.items[0],
+    );
 }
 
 test "the 3-tier resolver picks the right tier, against a real tree" {

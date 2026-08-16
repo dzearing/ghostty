@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T594 - A test run can no longer hand a page to the user's
+  real browser.** The user's leaked `t390.html` Edge windows traced to the
+  win32 unit-test binary: the URL exists only in ViewerPane's host-floor test
+  (ReloadPage loopback server), so the open had to be a `ShellExecuteW` inside
+  that process — and in the report's era (08-02..08-10) the v1
+  NewWindowRequested handler shell-opened EVERY popup URI unconditionally
+  (T163 replaced it 08-10). No clean automated chain reproduces the leak (7
+  current + 4 report-era host-floor runs under a WMI browser-creation watcher:
+  zero launches; the era repro ran from a worktree at 93b7107d0), so the fix
+  kills the class: test builds refuse every viewer shell-open at comptime
+  (`builtin.is_test` in `shellOpen` + the too-long popup path), recorded to
+  the LinkSink when installed; a new unit test pins the refusal (filter-delta
+  positive control 77→78). Acceptance side: `test\win32\lib\BrowserLeak.ps1`
+  WMI tripwire wired into viewer-panes.ps1 fails-and-cleans-up on any browser
+  launch carrying a loopback URL (negative control: fake msedge.exe launch →
+  1 leak detected, launcher killed), plus a new `viewer-panes` guard-due row
+  stamped by green runs. Filed T897 (seat: mac) — same audit for the Mac
+  suite. Floor lib/none/win32/agent PASS, viewer-panes ALL PASS (186), P1–P3
+  25/20/16 ALL PASS. Guard note: release-artifacts ran ALL PASS with its two
+  Docker-only sections skipped (Docker stays down per standing directive), so
+  it does not re-stamp; committed under -NoGuardDue, same as the T587 turn.
 - 2026-08-16 - **T587 - Chrome stroke weight now grows with display scaling
   instead of inverting at 150%.** `Metrics.stroke_w` was parity-fit to the
   28-DIP square like an extent, and the down-round at even squares made the

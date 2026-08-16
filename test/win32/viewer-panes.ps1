@@ -75,9 +75,15 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = '-vptest'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\BrowserLeak.ps1')
 
 $script:pass = 0
 $script:fail = 0
+
+# T594's tripwire: no page a test serves may reach the user's default
+# browser. Armed before the app exists so a leak during ANY scenario is on
+# record; scored at the very end, next to the foreground-watch verdict.
+Start-TestBrowserWatch
 
 # Write-Host, not the pipeline: a helper that asserts must never also return a
 # value, or its return silently becomes an array (T217 batch 5).
@@ -1204,6 +1210,20 @@ try {
 $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
+
+# T594: a browser launched onto a loopback test page during the run is a leak
+# onto the user's desktop, whichever code path handed it over. Stop-... also
+# best-effort kills the launchers, so a red here cleans up after itself.
+$browserLeaks = @(Stop-TestBrowserWatch)
+Assert ($browserLeaks.Count -eq 0) "no test page escaped to the default browser (saw: $($browserLeaks -join ' | '))"
+
+# A green run stamps the covered files (T783) so guard-due can answer "has
+# this harness been run against the code as it now stands?". Red leaves the
+# stamp alone: red stays due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard viewer-panes -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }

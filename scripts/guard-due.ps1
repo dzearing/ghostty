@@ -85,6 +85,20 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The viewer suite carries the browser-leak tripwire (T594): the only
+    # thing that scores whether a test run handed a page to the user's real
+    # browser, and it is not in the P1-P3 floor. The zig-side guard
+    # (ViewerPane's is_test refusal) is exercised by the win32 lane every
+    # floor run and is deliberately NOT covered here.
+    [pscustomobject]@{
+        Name   = 'viewer-panes'
+        Script = 'test\win32\viewer-panes.ps1'
+        Stamp  = 'test\win32\viewer-panes.stamp.json'
+        Covers = @(
+            'test\win32\viewer-panes.ps1',
+            'test\win32\lib\BrowserLeak.ps1'
+        )
+    },
     # The delivery pipeline (T531): upgrade-ghoztty-windows.ps1 kills the
     # user's terminal, swaps the installed release, and must bring the terminal
     # back - an edit that breaks any of that only ever fails during a real
