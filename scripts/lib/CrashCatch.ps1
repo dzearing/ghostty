@@ -319,7 +319,14 @@ function Read-CrashCatchLog {
     # prompt.
     function Test-Marker {
         param([string]$Line, [string]$Marker)
-        return ($Line -match ('^\s*(?:\d+:\d+>\s*)?' + [regex]::Escape($Marker) + '\s*$'))
+        # End-anchored only (T886): the markers are cdb `.echo` output, but a
+        # debuggee whose LAST stdout write has no trailing newline glues its
+        # text onto the front of the echo line ("...linkid=2286319GHOZTTY-
+        # EXIT-BEGIN"), and a start-anchored match then reports a clean exit-0
+        # run as UNCAUGHT. Anything may precede the marker; nothing but
+        # whitespace may follow it — which is what keeps the "Reading initial
+        # command '...; q'" line (markers mid-string, text after) a non-match.
+        return ($Line -match ([regex]::Escape($Marker) + '\s*$'))
     }
     $begin = -1; $faulting = -1; $all = -1; $end = -1
     $exitBegin = -1; $exitEnd = -1

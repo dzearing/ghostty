@@ -125,7 +125,14 @@ Check 'the crasher has a pdb beside it' (Test-Path (Join-Path $work 'avthread.pd
 # ------------------------------------- 3. what Zig alone can and cannot show
 
 if (Test-Path $avExe) {
-    $bare = & cmd.exe /c "`"$avExe`"" 2>&1 | Out-String
+    # cmd-level redirection to a file, NOT `2>&1 | Out-String`: PowerShell 5.1
+    # wraps a native command's stderr lines in ErrorRecords, and in a
+    # -NoProfile -File host those render as BLANK lines — the Zig handler's
+    # whole report vanished and this check failed on output that was really
+    # there (seen live 2026-08-16 during the T886 turn).
+    $bareFile = Join-Path $work 'bare-output.txt'
+    & cmd.exe /c "`"$avExe`" > `"$bareFile`" 2>&1"
+    $bare = Get-Content -LiteralPath $bareFile -Raw -ErrorAction SilentlyContinue
     # Measured, not assumed: on a SIMPLE access violation Zig's handler works
     # and does print the faulting thread's frames. (The recursive panic T450 was
     # filed over needs a process already damaged enough that the handler faults
@@ -306,6 +313,35 @@ $okLog = New-FakeLog 'fake-ok.log' @(
 $ok = Read-CrashCatchLog -LogPath $okLog
 Check 'a watched exit 0 is clean' ((-not $ok.Crashed) -and (-not $ok.Uncaught) -and $ok.ExitObserved)
 Check 'the debuggee exit code is read out' ($ok.DebuggeeExitCode -eq 0) "got '$($ok.DebuggeeExitCode)'"
+
+# T886: a debuggee whose LAST stdout write has no trailing newline glues its
+# text onto the front of the `.echo` marker line ("...linkid=2286319GHOZTTY-
+# EXIT-BEGIN"). Seen live 2026-08-16: a clean exit-0 win32 lane run under
+# WebView2 (whose deprecation warnings end without a newline) was reported
+# UNCAUGHT, which reads exactly like the T443 ghost firing.
+$gluedLog = New-FakeLog 'fake-glued.log' @(
+    'Warning: deprecated! see https://go.microsoft.com/fwlink/?linkid=2286319GHOZTTY-EXIT-BEGIN',
+    'Last event: d730.1b08: Exit process 0:d730, code 0',
+    'GHOZTTY-EXIT-END'
+)
+$glued = Read-CrashCatchLog -LogPath $gluedLog
+Check 'a marker glued onto un-terminated debuggee output still parses (T886)' `
+((-not $glued.Crashed) -and (-not $glued.Uncaught) -and $glued.ExitObserved)
+Check 'the glued-marker run reads its exit code out (T886)' ($glued.DebuggeeExitCode -eq 0) "got '$($glued.DebuggeeExitCode)'"
+
+# ...and the guard the end-anchor keeps: cdb's own "Reading initial command"
+# echo carries every marker MID-string (always followed by `; ...`), and must
+# not be mistaken for the markers themselves.
+$cmdEchoLog = New-FakeLog 'fake-cmdecho.log' @(
+    "0:000> cdb: Reading initial command '.echo GHOZTTY-EXIT-BEGIN; .lastevent; .echo GHOZTTY-EXIT-END; q'",
+    'Last event: 9999.9999: Exit process 0:9999, code 7',
+    'GHOZTTY-EXIT-BEGIN',
+    'Last event: 1a3c.20f0: Exit process 0:1a3c, code 0',
+    'GHOZTTY-EXIT-END'
+)
+$cmdEcho = Read-CrashCatchLog -LogPath $cmdEchoLog
+Check 'the initial-command echo is not mistaken for a marker (T886)' `
+($cmdEcho.ExitObserved -and $cmdEcho.DebuggeeExitCode -eq 0) "got '$($cmdEcho.DebuggeeExitCode)'"
 
 $hexLog = New-FakeLog 'fake-hex.log' @(
     'GHOZTTY-EXIT-BEGIN',

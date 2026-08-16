@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T536 - the inbound-ring undefined-memory flake is
+  root-caused to the extent the evidence allows, armed with a tripwire that
+  makes the next firing name itself, and stripped of every latent
+  use-after-free the audit turned up.** The panic operands (index 0xAA…AB,
+  len 0xAA…AA) prove the demux producer found a still-registered channel
+  whose whole storage read as undefined; a full audit of every
+  producer/teardown path shows the §3.4 deregister-before-free invariant
+  correctly implemented everywhere, and the incidents match the T443
+  corruption-ghost victim profile instead (load-dependent, clean on re-run,
+  different report each firing, trap offset shared with T443's 2026-08-15
+  dump — cross-filed there). `InboundRing` push/pop now carry a
+  runtime-safety liveness canary: a true use-after-teardown panics
+  "use-after-deinit; T536" by name, so software-UAF vs ghost is decided by
+  the next occurrence, not another blind context. Three real latent bugs
+  fixed alongside in connection.zig's tests: the T739 repaint test freed a
+  stack ring through destroy's heap path on early failure; eleven spawn
+  sites could leak a parked thread that writes into a dead stack frame;
+  LifecycleHarness joined an undefined handle after a failed spawn.
+  Surprise: the validation itself tripped over two instrument lies in
+  crash-catch, filed+fixed as **T886** — a clean exit-0 run reported
+  UNCAUGHT because WebView2's newline-less warnings glue onto the cdb
+  `.echo` marker (Test-Marker now end-anchored only, glued + negative
+  controls in crash-stacks 4e), and crash-stacks' own bare-crasher capture
+  lost Zig's whole handler report to the PS5.1 native-stderr ErrorRecord
+  blanking (the T526/T535 trap again; now cmd-level file redirection).
+  Floor: ALL LANES PASS + P1/P2/P3 ALL PASS; crash-first-chance (49) /
+  crash-databreak / crash-stacks ALL PASS + re-stamped; 6/6 cdb-watched
+  win32 test-binary runs clean.
 - 2026-08-16 - **T535/T537 - the viewer suite's "+reload on a
   terminal-focused window" red is closed: the server's refusal string was
   correct all along, and both reds were the T526 capture bug wearing a

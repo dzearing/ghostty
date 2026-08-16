@@ -3969,10 +3969,20 @@ test "handshake: client negotiates encoding/version, agent sees client HELLO" {
         defer agent.deinit();
         var actx: HandshakeAgentCtx = .{ .agent = &agent };
         const ath = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&actx});
+        // T536 audit: without this, a failed start/handshake leaked the agent
+        // thread parked on a loopback read — it then wrote its err field into
+        // this dead stack frame while the NEXT test owned the memory. Same
+        // disarming shape as the inbound-routing test (a second join is UB).
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         const neg = try conn.waitHandshake();
         ath.join();
+        ath_joined = true;
 
         try testing.expectEqual(enc, neg.transfer_encoding);
         try testing.expectEqual(protocol.proto_version, neg.proto_version);
@@ -4029,10 +4039,17 @@ test "handshake: the agent's pty flavour crosses the wire in both directions (T4
         defer agent.deinit();
         var actx: FlavorAgentCtx = .{ .agent = &agent, .flavor = c.said };
         const ath = try std.Thread.spawn(.{}, FlavorAgentCtx.run, .{&actx});
+        // T536 audit: disarming errdefer — see the handshake test above.
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         _ = try conn.waitHandshake();
         ath.join();
+        ath_joined = true;
         try testing.expect(actx.err == null);
 
         // The peer's answer, which is what a cross-OS pane hangs its scrollback
@@ -4250,6 +4267,20 @@ test "T739: an injected repaint is rendered like DATA but advances no offset" {
         .stream_pos = .init(100),
     };
     try conn.trackPane(pane);
+    // Untrack + free on EVERY exit, failure included, and BEFORE `conn`'s
+    // destroy defer fires (LIFO): a pane still tracked at destroy gets its
+    // ring freed with `alloc.destroy(pane.ring)`, and THIS pane's ring is
+    // `&ch` — a stack address, so that path is an invalid free, and `ch`'s
+    // own deinit defer then double-frees the ring buffer (T536 audit). The
+    // remove is under `panes_mutex`, the same lock the data reader's lookup
+    // holds, so a live reader never sees the freed pane.
+    defer {
+        conn.panes_mutex.lock();
+        _ = conn.panes.remove(ch_id);
+        conn.panes_mutex.unlock();
+        alloc.free(sid);
+        alloc.destroy(pane);
+    }
 
     var data_agent = MockAgent.init(alloc, data_lb.agentStream(), .raw);
     defer data_agent.deinit();
@@ -4281,13 +4312,9 @@ test "T739: an injected repaint is rendered like DATA but advances no offset" {
     conn.shutdown();
     // Deregister only after shutdown (the data reader has joined) so the
     // stack-owned ring is safe. `teardownPane` is not usable here — it frees a
-    // heap ring this test does not have.
+    // heap ring this test does not have. The pane itself is untracked and
+    // freed by the paired defer above, on success and failure alike.
     conn.deregisterChannel(ch_id);
-    conn.panes_mutex.lock();
-    _ = conn.panes.remove(ch_id);
-    conn.panes_mutex.unlock();
-    alloc.free(sid);
-    alloc.destroy(pane);
 }
 
 test "inbound DATA routing: bytes land in the right channel; unknown is dropped" {
@@ -4377,15 +4404,26 @@ test "T693: destroy without a prior shutdown joins the threads instead of assert
         data_lb.clientStream(),
         .{ .transfer_encoding = .raw },
     );
+    // No success-path defer — the explicit destroy-with-live-threads below IS
+    // the test — but an early failure must still free the connection (T536
+    // audit; destroy joining live threads is exactly the behavior under test).
+    errdefer conn.destroy(alloc);
     try conn.registerChannel(&ch);
 
     var ctrl_agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
     defer ctrl_agent.deinit();
     var ictx: InboundAgentCtx = .{ .agent = &ctrl_agent, .channel = ch_id };
     const ath = try std.Thread.spawn(.{}, InboundAgentCtx.run, .{&ictx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
     try conn.start();
     _ = try conn.waitHandshake();
     ath.join();
+    ath_joined = true;
 
     // The live threads are the point: this is the state an error path leaves
     // behind when it returns before `shutdown`, and the state in which the old
@@ -4455,6 +4493,12 @@ test "outbound DATA: writeData reaches the agent's data stream verbatim" {
         };
         defer octx.got_bytes.deinit(alloc);
         const ath = try std.Thread.spawn(.{}, OutboundAgentCtx.run, .{&octx});
+        // T536 audit: disarming errdefer — see the handshake test above.
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         _ = try conn.waitHandshake();
@@ -4463,6 +4507,7 @@ test "outbound DATA: writeData reaches the agent's data stream verbatim" {
         try conn.writeData(ch_id, 4242, "keystrokes");
 
         ath.join();
+        ath_joined = true;
         try testing.expect(octx.err == null);
         try testing.expectEqual(ch_id, octx.got_channel);
         try testing.expectEqual(@as(u64, 4242), octx.got_offset);
@@ -4535,6 +4580,12 @@ test "control dispatch: agent control frame invokes the handler with payload" {
         defer agent.deinit();
         var cctx: CtrlDispatchAgentCtx = .{ .agent = &agent, .payload = json };
         const ath = try std.Thread.spawn(.{}, CtrlDispatchAgentCtx.run, .{&cctx});
+        // T536 audit: disarming errdefer — see the handshake test above.
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         _ = try conn.waitHandshake();
@@ -4542,6 +4593,7 @@ test "control dispatch: agent control frame invokes the handler with payload" {
         // Wait for the handler to fire (deterministic; no sleep-as-sync).
         try test_util.waitEvent(&sink.done);
         ath.join();
+        ath_joined = true;
         try testing.expect(cctx.err == null);
         try testing.expectEqual(protocol.FrameType.meta, sink.got_type.?);
         try testing.expectEqualStrings(json, sink.got_payload.items);
@@ -4572,10 +4624,17 @@ test "clean shutdown joins all threads without hanging" {
         defer agent.deinit();
         var actx: HandshakeAgentCtx = .{ .agent = &agent };
         const ath = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&actx});
+        // T536 audit: disarming errdefer — see the handshake test above.
+        var ath_joined = false;
+        errdefer if (!ath_joined) {
+            conn.shutdown();
+            ath.join();
+        };
 
         try conn.start();
         _ = try conn.waitHandshake();
         ath.join();
+        ath_joined = true;
 
         // Enqueue a couple of frames that may or may not flush before shutdown;
         // shutdown must free any unsent payloads under the testing allocator.
@@ -4895,6 +4954,12 @@ test "heartbeat integration: PONG → latency computed, link stays connected" {
     defer agent.deinit();
     var hctx = HealthAgentCtx{ .agent = &agent };
     const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
@@ -4917,6 +4982,7 @@ test "heartbeat integration: PONG → latency computed, link stays connected" {
 
     conn.shutdown();
     ath.join();
+    ath_joined = true;
 }
 
 test "heartbeat integration: silent agent → missed acks → degraded → reconnecting" {
@@ -4945,6 +5011,12 @@ test "heartbeat integration: silent agent → missed acks → degraded → recon
     var hctx = HealthAgentCtx{ .agent = &agent };
     hctx.reply_to_pings.store(false, .monotonic);
     const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
@@ -4960,6 +5032,7 @@ test "heartbeat integration: silent agent → missed acks → degraded → recon
 
     conn.shutdown();
     ath.join();
+    ath_joined = true;
 }
 
 test "DETACHED steal: client is evicted and the FSM goes DEAD with a notification" {
@@ -4986,6 +5059,12 @@ test "DETACHED steal: client is evicted and the FSM goes DEAD with a notificatio
     defer agent.deinit();
     var hctx = HealthAgentCtx{ .agent = &agent };
     const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
@@ -5013,6 +5092,7 @@ test "DETACHED steal: client is evicted and the FSM goes DEAD with a notificatio
 
     conn.shutdown();
     ath.join();
+    ath_joined = true;
 }
 
 test "reader EOF (agent closes) drives onTransportError → reconnecting" {
@@ -5039,6 +5119,12 @@ test "reader EOF (agent closes) drives onTransportError → reconnecting" {
     defer agent.deinit();
     var hctx = HealthAgentCtx{ .agent = &agent };
     const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
@@ -5057,6 +5143,7 @@ test "reader EOF (agent closes) drives onTransportError → reconnecting" {
     try testing.expect(rec.saw_reconnecting.load(.monotonic));
 
     ath.join();
+    ath_joined = true;
     conn.shutdown();
 }
 
@@ -5403,7 +5490,10 @@ const LifecycleHarness = struct {
     ctrl_agent: MockAgent,
     data_agent: MockAgent,
     agent: LifecycleAgent,
-    thread: std.Thread = undefined,
+    /// Null until `start` spawns the agent thread — so a `destroy` after a
+    /// failed spawn joins nothing instead of joining an undefined handle
+    /// (T536 audit).
+    thread: ?std.Thread = null,
 
     fn create(alloc: Allocator) !*LifecycleHarness {
         return createWithTimeout(alloc, rpc_open_timeout_ns);
@@ -5450,7 +5540,7 @@ const LifecycleHarness = struct {
 
     fn destroy(h: *LifecycleHarness) void {
         h.conn.shutdown();
-        h.thread.join();
+        if (h.thread) |t| t.join();
         for (h.agent.session_bufs.items) |b| h.alloc.free(b);
         h.agent.session_bufs.deinit(h.alloc);
         h.conn.destroy(h.alloc);
@@ -5984,6 +6074,14 @@ test "cancelRpcsFor: wakes a parked OPEN promptly with error.Cancelled" {
     };
     var w: Worker = .{ .conn = h.conn, .canceller = &canceller };
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&w});
+    // T536 audit: a failed wait below must not leave the worker parked on the
+    // RPC — it would later write `result` into this dead stack frame. Shutdown
+    // fails every pending RPC, so the join is prompt.
+    var worker_joined = false;
+    errdefer if (!worker_joined) {
+        h.conn.shutdown();
+        thread.join();
+    };
 
     // Wait until the OPEN is on the wire (the slot is registered before the
     // send), then cancel: flag first, then the slot walk (the required order).
@@ -5992,6 +6090,7 @@ test "cancelRpcsFor: wakes a parked OPEN promptly with error.Cancelled" {
     canceller.cancel();
     h.conn.cancelRpcsFor(&canceller);
     thread.join();
+    worker_joined = true;
     const elapsed = std.time.milliTimestamp() - t;
 
     try testing.expectEqual(@as(anyerror, error.Cancelled), w.result.?);
@@ -6046,6 +6145,12 @@ test "control reader exit fails a parked RPC promptly (no reply can ever arrive)
     };
     var w: Worker = .{ .conn = h.conn };
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&w});
+    // T536 audit: disarming errdefer — see the cancelRpcsFor test above.
+    var worker_joined = false;
+    errdefer if (!worker_joined) {
+        h.conn.shutdown();
+        thread.join();
+    };
 
     // Once the OPEN is on the wire, kill the control lane (models the
     // transport dying mid-RPC). The control reader sees EOF and exits; its
@@ -6054,6 +6159,7 @@ test "control reader exit fails a parked RPC promptly (no reply can ever arrive)
     const t = std.time.milliTimestamp();
     h.ctrl_lb.clientStream().close();
     thread.join();
+    worker_joined = true;
     const elapsed = std.time.milliTimestamp() - t;
 
     try testing.expectEqual(@as(anyerror, error.ConnectionClosed), w.result.?);
@@ -6097,9 +6203,19 @@ test "openChannel: N concurrent OPENs on one Connection all succeed (rapid remot
     };
     var workers: [N]Worker = undefined;
     var threads: [N]std.Thread = undefined;
+    var spawned: usize = 0;
+    // T536 audit: if spawn i fails, workers 0..i are parked on their OPENs and
+    // would outlive this frame — shutdown fails those RPCs so the joins are
+    // prompt. Once all N spawned, the join loop below owns them (spawned == N
+    // keeps this errdefer inert on later error returns).
+    errdefer if (spawned < N) {
+        h.conn.shutdown();
+        for (threads[0..spawned]) |t| t.join();
+    };
     for (&workers, 0..) |*w, i| {
         w.* = .{ .conn = h.conn };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{w});
+        spawned = i + 1;
     }
     for (threads) |t| t.join();
 
@@ -6742,10 +6858,17 @@ test "shutdown unblocks a parked OPEN caller with an error" {
     defer agent.deinit();
     var hctx = HandshakeAgentCtx{ .agent = &agent };
     const ath = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&hctx});
+    // T536 audit: disarming errdefer — see the handshake test above.
+    var ath_joined = false;
+    errdefer if (!ath_joined) {
+        conn.shutdown();
+        ath.join();
+    };
 
     try conn.start();
     _ = try conn.waitHandshake();
     ath.join();
+    ath_joined = true;
 
     // Park an openChannel on a background thread; shutdown must wake it with an err.
     const OpenCaller = struct {
@@ -6763,12 +6886,17 @@ test "shutdown unblocks a parked OPEN caller with an error" {
     };
     var oc = OpenCaller{ .conn = conn };
     const oth = try std.Thread.spawn(.{}, OpenCaller.run, .{&oc});
+    // T536 audit: the shutdown below fails the parked OPEN, so on a failed
+    // wait the caller thread still exits — join it rather than leak it.
+    var oth_joined = false;
+    errdefer if (!oth_joined) oth.join();
 
     // Give the OPEN a moment to register its pending slot, then shut down.
     // (No reply will come; shutdown is what unblocks it.)
     conn.shutdown();
     try test_util.waitEvent(&oc.done);
     oth.join();
+    oth_joined = true;
     try testing.expectError(error.ConnectionClosed, oc.result);
 }
 

@@ -31,6 +31,20 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Atomic = std.atomic.Value;
+const runtime_safety = std.debug.runtime_safety;
+
+/// T536: value of `InboundRing.live` while the ring owns a valid buffer. The
+/// push/pop hot paths check it under runtime safety so a use-after-teardown
+/// names itself ("ring used after deinit") instead of surfacing as an
+/// undefined-memory bounds panic three frames deep — which is exactly how the
+/// T536 flake presented (`index 0xAAAA…AB, len 0xAAAA…AA`, both the Debug
+/// undefined-fill pattern) and why two incidents produced no usable diagnosis.
+/// A safety-mode-only field: zero cost in ReleaseFast/ReleaseSmall.
+const ring_live_canary: usize = 0x11FE_C0DE_11FE_C0DE;
+/// What `deinit` stores in `live`. Distinct from the Debug 0xAA fill so a
+/// tripped check can in principle tell an orderly deinit (ReleaseSafe keeps
+/// this value) from stray memory reuse — either way it is `!= live`.
+const ring_dead_canary: usize = 0xDEAD_0536_DEAD_0536;
 
 /// Default ring capacity: 256 KiB. Sized ≥ the 64 KiB data-channel window (§4.3)
 /// so a full in-flight window fits even after `FLOW{pause}` is sent, without the
@@ -82,6 +96,11 @@ pub const InboundRing = struct {
     /// `capacity - 1`; capacity is a power of two so `idx & mask` wraps.
     mask: usize,
 
+    /// T536 liveness canary — see `ring_live_canary`. Runtime-safety builds
+    /// only; `void` (no storage, no cost) otherwise.
+    live: if (runtime_safety) usize else void =
+        if (runtime_safety) ring_dead_canary else {},
+
     /// Absolute (monotonic, wrapping) producer cursor. Only the producer stores
     /// it; the consumer loads it to learn how much is available.
     tail: Atomic(usize) align(std.atomic.cache_line) = .init(0),
@@ -94,12 +113,32 @@ pub const InboundRing = struct {
         assert(cap >= 2);
         assert(std.math.isPowerOfTwo(cap));
         const buf = try alloc.alloc(u8, cap);
-        return .{ .buf = buf, .mask = cap - 1 };
+        return .{
+            .buf = buf,
+            .mask = cap - 1,
+            .live = if (comptime runtime_safety) ring_live_canary else {},
+        };
     }
 
     pub fn deinit(self: *InboundRing, alloc: Allocator) void {
         alloc.free(self.buf);
         self.* = undefined;
+        // Stamped AFTER the poison so the dead value survives in every safety
+        // mode and the field is never left `undefined` for the check to read.
+        if (comptime runtime_safety) self.live = ring_dead_canary;
+    }
+
+    /// T536: fail loudly — and by name — when a producer or consumer touches
+    /// a ring whose storage has been torn down or was never initialized. The
+    /// §3.4 teardown invariant makes this unreachable; if it ever fires, the
+    /// invariant was violated by the CALLER (deinit while still registered),
+    /// which is precisely the diagnosis the T536 crash pattern could not make.
+    inline fn checkLive(self: *const InboundRing, comptime who: []const u8) void {
+        if (comptime runtime_safety) {
+            if (self.live != ring_live_canary)
+                @panic("InboundRing." ++ who ++
+                    " on a torn-down ring (use-after-deinit; T536)");
+        }
     }
 
     pub fn capacity(self: *const InboundRing) usize {
@@ -127,6 +166,7 @@ pub const InboundRing = struct {
     /// never blocks). The caller retains the unwritten remainder and is expected
     /// to send `FLOW{pause}` (see `Channel.push`).
     pub fn push(self: *InboundRing, bytes: []const u8) usize {
+        self.checkLive("push");
         const t = self.tail.load(.monotonic); // producer owns tail
         const h = self.head.load(.acquire); // observe consumer progress
         const free = self.capacity() - (t -% h);
@@ -145,6 +185,7 @@ pub const InboundRing = struct {
     /// Consumer side. Copy up to `dst.len` bytes out and return the count read
     /// (may be 0 when empty). Never blocks.
     pub fn pop(self: *InboundRing, dst: []u8) usize {
+        self.checkLive("pop");
         const h = self.head.load(.monotonic); // consumer owns head
         const t = self.tail.load(.acquire); // observe producer progress
         const avail = t -% h;
@@ -552,6 +593,30 @@ test "InboundRing: single-threaded push/pop round-trip with wrap" {
         try testing.expectEqual(@as(usize, 10), ring.pop(&dst));
         try testing.expectEqualSlices(u8, &src, &dst);
     }
+}
+
+test "T536: the liveness canary is armed by init and torn down by deinit" {
+    // The canary's panic itself cannot be exercised by a unit test (a Zig test
+    // cannot survive a @panic), so this covers the state machine around it:
+    // init arms it, deinit disarms it. The negative half — push/pop tripping
+    // the labeled panic on a dead ring — is what the check EXISTS for in the
+    // field: the next T536-shaped crash either names use-after-deinit here or
+    // proves the corruption came from somewhere else (the T443 ghost).
+    if (comptime !runtime_safety) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var ring = try InboundRing.init(alloc, 16);
+    try testing.expectEqual(ring_live_canary, ring.live);
+    // A round-trip leaves it armed.
+    _ = ring.push("abc");
+    var dst: [8]u8 = undefined;
+    _ = ring.pop(&dst);
+    try testing.expectEqual(ring_live_canary, ring.live);
+
+    // Deinit disarms: the dead stamp lands after the undefined-poison, so
+    // this is a defined read in every safety mode.
+    ring.deinit(alloc);
+    try testing.expectEqual(ring_dead_canary, ring.live);
 }
 
 test "InboundRing: push is bounded by free space (no overrun)" {
