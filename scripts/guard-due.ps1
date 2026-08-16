@@ -143,6 +143,20 @@ $GuardTable = @(
             'test\win32\agent-sharing-uplink.ps1'
         )
     },
+    # Standalone-install adoption (T549) only fires on a box that still has
+    # the old agent MSI, so the whole flow - idle-stop, the deny-terminate
+    # shield around the uninstall, the Run-key repair - is invisible to the
+    # P1-P3 floor; nothing else ties an adopt.zig edit to the harness that
+    # proves the shield still refuses a mid-uninstall kill.
+    [pscustomobject]@{
+        Name   = 'agent-adopt'
+        Script = 'test\win32\agent-adopt.ps1'
+        Stamp  = 'test\win32\agent-adopt.stamp.json'
+        Covers = @(
+            'src\remote\agent\adopt.zig',
+            'test\win32\agent-adopt.ps1'
+        )
+    },
     # The share-this-machine toggle (T547) only ever acts when a user flips it,
     # so its enrollment worker and file plumbing are invisible to the P1-P3
     # floor - nothing else ties an edit of the toggle's async module to a run

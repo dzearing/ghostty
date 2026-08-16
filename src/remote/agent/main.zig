@@ -130,6 +130,7 @@ const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
 const sharing = @import("sharing.zig");
+const adopt = @import("adopt.zig");
 const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
 const agent_lineage = @import("../agent_lineage.zig");
@@ -1420,6 +1421,12 @@ fn runListenPipe(
     // sessions_file slice is borrowed only for path derivation inside the call.
     maybeStartSharingUplink(alloc, encoding, &store, spawner.spawner(), sessions_file);
 
+    // Adoption (T549): a box that still carries the standalone 'Ghoztty
+    // Agent' MSI gets it adopted and retired in the background — sharing kept
+    // on, the relay agent stopped only at zero live sessions, the product
+    // uninstalled, the Run key repaired. No-op (and silent) everywhere else.
+    adopt.maybeStart(alloc, sessions_file);
+
     // Accept loop: same serve-each-connection-on-its-own-thread core as the
     // socket paths, over pipe instances. The DACL already gated admission (only
     // this user can open the pipe), so there is no per-connection uid check.
@@ -2678,6 +2685,7 @@ test {
     _ = @import("link_control.zig");
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
+    _ = @import("adopt.zig");
     _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
     _ = @import("../agent_lineage.zig");
