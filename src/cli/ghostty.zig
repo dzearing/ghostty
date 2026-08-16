@@ -29,6 +29,7 @@ const sessions = @import("sessions.zig");
 const read = @import("read.zig");
 const send_keys = @import("send_keys.zig");
 const set_state = @import("set_state.zig");
+const json = @import("json.zig");
 const set_banner = @import("set_banner.zig");
 const reload = @import("reload.zig");
 const new_remote_window = @import("new_remote_window.zig");
@@ -118,6 +119,10 @@ pub const Action = enum {
     // Use IPC to reload a named viewer pane's content in place.
     reload,
 
+    // Local JSON helpers (get/merge/encode) for the bundled agent hook
+    // scripts, so they need no external JSON tool (T866). No IPC.
+    json,
+
     // Use IPC to open a remote-machine terminal window (dials the agent
     // over TCP). Drives the same flow as the Cmd-Shift-N menu action.
     @"new-remote-window",
@@ -158,6 +163,7 @@ pub const Action = enum {
             .@"set-state" => "Set the activity state of a pane or window via IPC",
             .@"set-banner" => "Set or clear the sticky banner of a pane or window via IPC",
             .reload => "Reload a viewer pane's content in place via IPC",
+            .json => "JSON helpers for the bundled agent hook scripts",
             .@"new-remote-window" => "Open a remote-machine terminal window via IPC",
         };
     }
@@ -252,6 +258,7 @@ pub const Action = enum {
             .@"set-state" => try set_state.run(alloc),
             .@"set-banner" => try set_banner.run(alloc),
             .reload => try reload.run(alloc),
+            .json => try json.run(alloc),
             .@"new-remote-window" => try new_remote_window.run(alloc),
         };
     }
@@ -304,6 +311,7 @@ pub const Action = enum {
                 .@"set-state" => set_state.Options,
                 .@"set-banner" => set_banner.Options,
                 .reload => reload.Options,
+                .json => json.Options,
                 .@"new-remote-window" => new_remote_window.Options,
             };
         }

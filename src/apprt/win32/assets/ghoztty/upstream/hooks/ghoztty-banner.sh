@@ -1,0 +1,525 @@
+#!/bin/bash
+# ghoztty-managed
+# ghoztty-banner.sh — keep a Ghoztty pane banner current for a coding-agent session.
+#
+# Banner layout: the title as an `## ` h2 heading on its own line (larger than
+# the body text), then a key/value table (empty header row so the label column
+# stays narrow), then the "Last result" block and PR link below it:
+#   ## <title>
+#   |  |  |
+#   |---|---|
+#   | **Goal** | <goal> |
+#   | **Bugs fixed** | <bug links> |   # only when the task is a bug fix
+#   | **Prompt** | <asked> |
+#   | **Status** | <status> · <activity> |
+#   **Last result**
+#   <did>                     # plain-language summary; may be a multi-line
+#                             # checklist ("- [x] item" per line) that a table
+#                             # cell can't hold, so it lives below the table
+#   **PR** [<url>](<url>)
+#
+# "Prompt"/"Last result" are model-provided paraphrases (set --asked/--did):
+# "Prompt" is a plain-language paraphrase of the user's prompt (not a verbatim
+# quote) and is auto-seeded from the raw prompt as a fallback; "Last result"
+# names only the actual code fixes/features that landed this turn and is set
+# ONLY by the model's explicit --did (never auto-seeded from tool calls, which
+# are steps, not results). "Bugs fixed" (--bugs) is set only when the prompt is
+# fixing a specific bug, and holds clickable markdown link(s) to the bug(s). The
+# PR is a clickable markdown link. Fields persist in a per-tty state file, so
+# each call only passes what changed.
+# Delivery: ghoztty +set-banner CLI (multi-line + tables) targeting this pane's
+# $GHOZTTY_PANE_ID; falls back to a single-line OSC 7778 write to the tty device
+# when the pane can't be resolved (the OSC parser drops newlines, so the
+# table/multi-line form is CLI-only).
+#
+# Usage:
+#   ghoztty-banner.sh set [--title T] [--goal G] [--status S] [--asked A] [--did D] [--pr URL]
+#   ghoztty-banner.sh status <text>     # shorthand for set --status
+#   ghoztty-banner.sh activity <text>   # hook-owned suffix (working/idle)
+#   ghoztty-banner.sh prompt-hook       # UserPromptSubmit: activity=working + context JSON
+#   ghoztty-banner.sh session-start-hook # SessionStart(startup|clear): wipe + clear banner
+#   ghoztty-banner.sh stop-hook         # Stop: activity=idle
+#   ghoztty-banner.sh clear
+#
+# Silently no-ops when not running inside Ghoztty.
+
+set -u
+
+# NOTE: the env var value is "ghostty" (the upstream value Ghoztty inherits, set
+# in src/Surface.zig / src/termio/Exec.zig), NOT "ghoztty" — do not "fix" this
+# spelling to match the project name or every banner silently no-ops.
+[ "${TERM_PROGRAM:-}" = "ghostty" ] || exit 0
+
+STATE_DIR="$HOME/.config/ghoztty/banner-state"
+mkdir -p "$STATE_DIR"
+
+# Stop-hook PR staleness check: hard time budget for the network call, and how
+# long a result is trusted before re-checking (so it doesn't run every turn).
+PR_CHECK_TIMEOUT=5
+PR_CHECK_TTL=300
+
+# Extract a top-level string field (the first non-empty of the given keys) from
+# a JSON object on stdin. jq is guaranteed present (hard-required below) and it
+# DECODES JSON string escapes (\n, \") — unlike a raw substring scan — so values
+# reach the banner as real text rather than literal escape sequences. Accepting
+# several keys lets one call read either runtime's casing (session_id/sessionId).
+jfield() { # key [key2 ...]   (reads stdin)
+    local filter='' k
+    for k in "$@"; do filter="$filter${filter:+ // }.\"$k\""; done
+    jq -r "($filter) // empty" 2>/dev/null
+}
+
+# jq is required for the per-pane state file, which is what lets each call pass
+# only the fields that changed. Without it the hook cannot merge state — but it
+# CAN still reach ghoztty, so it SAYS so instead of exiting 0 invisibly. A
+# silent exit is how a dead banner hook went unnoticed on Windows (there, the
+# tty gate below was the cause; on a box with no jq the symptom is identical and
+# the user has nothing to go on). Announced once per pane, in the banner itself.
+if ! command -v jq >/dev/null 2>&1; then
+    _nojq_pane="${GHOZTTY_PANE_ID:-}"
+    if [ -n "$_nojq_pane" ]; then
+        _nojq_flag="$STATE_DIR/nojq-$_nojq_pane"
+        if [ ! -f "$_nojq_flag" ]; then
+            : > "$_nojq_flag" 2>/dev/null
+            ghoztty +set-banner --target="$_nojq_pane" \
+                "## Status banner inactive\n\`jq\` is not installed, so this session's banner cannot be tracked.\nInstall it and start a new session: \`winget install jqlang.jq\` (Windows), \`brew install jq\` (macOS)." \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+    exit 0
+fi
+
+# Walk up the process tree until we find an ancestor with a controlling tty.
+# (The hook shell and the Bash-tool shell have no tty; the agent process does.)
+find_tty() {
+    local pid=$$ t
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+        t=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [ -n "$t" ] && [ "$t" != "??" ]; then
+            echo "$t"
+            return 0
+        fi
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    done
+    return 1
+}
+
+# A tty is NOT required — it is only one of the two ways to reach this pane, and
+# on Windows it is never available: an agent-backed (session-persistence) pane
+# has no /dev tty at all, and MSYS `ps` reports none for the hook shell or any
+# of its ancestors, so this used to `exit 0` before $GHOZTTY_PANE_ID was ever
+# consulted and every banner hook silently no-opped. Bail only when BOTH ways
+# are gone.
+TTY_NAME=$(find_tty) || TTY_NAME=""
+
+# This pane's ghoztty-owned id: baked into the pane's env at spawn, inherited by
+# hook shells, and accepted directly by every --target. It is authoritative and
+# stable for the pane's whole life — including across a session-persistence
+# restore, which allocates a FRESH pty. The tty is not: a restore can hand this
+# pane a different tty, or hand this tty to a different pane, which is what used
+# to aim a session's banner at a SIBLING pane. Targeting uses this; the state
+# file stays tty-keyed so that a plugin upgrade never splits a running session's
+# state between two files (its in-process hooks keep running the old script
+# until the session restarts).
+PANE_ID="${GHOZTTY_PANE_ID:-}"
+
+# Neither route to this pane exists: nothing to target, nothing to write to.
+[ -n "$TTY_NAME" ] || [ -n "$PANE_ID" ] || exit 0
+
+# State is keyed by tty where there is one (a plugin upgrade must not split a
+# running session's state between two files), and by pane id where there isn't
+# — the id is stable for the pane's whole life, so it keys just as well.
+if [ -n "$TTY_NAME" ]; then
+    STATE_FILE="$STATE_DIR/$TTY_NAME.json"
+else
+    STATE_FILE="$STATE_DIR/pane-$PANE_ID.json"
+fi
+
+read_field() { # field
+    [ -f "$STATE_FILE" ] && jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null
+}
+
+# Merge key/value pairs into the state file. Serialized with a mkdir mutex (the
+# script is invoked BOTH by event hooks and directly by the agent against the
+# same pane, so concurrent read-modify-writes would otherwise lose updates), a
+# UNIQUE temp (a shared temp name let two writers corrupt the file), and a
+# self-heal: a corrupt/unreadable state file resets to `{}` instead of wedging
+# the banner blank forever.
+jq_merge() { # k1 v1 [k2 v2 ...]
+    local lock="$STATE_FILE.lock" tmp cur='{}' locked=0 tries=0
+    while :; do
+        if mkdir "$lock" 2>/dev/null; then locked=1; break; fi
+        # Reclaim a stale lock left behind by a killed holder (>1 min old).
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$lock" 2>/dev/null; continue
+        fi
+        tries=$((tries + 1)); [ "$tries" -gt 30 ] && break  # ~3s cap, then best-effort
+        sleep 0.1 2>/dev/null || true
+    done
+    if [ -f "$STATE_FILE" ]; then
+        cur=$(cat "$STATE_FILE" 2>/dev/null)
+        # Self-heal: never merge into unparseable state — reset it instead.
+        if [ -z "$cur" ] || ! printf '%s' "$cur" | jq empty >/dev/null 2>&1; then
+            cur='{}'
+        fi
+    fi
+    local prog='.' i=0 jqargs=()
+    while [ $# -ge 2 ]; do
+        i=$((i + 1))
+        prog="$prog | .[\$k$i] = \$v$i"
+        jqargs+=(--arg "k$i" "$1" --arg "v$i" "$2")
+        shift 2
+    done
+    # printf, not echo: banner text carries literal `\n`, which some shells'
+    # echo would expand into real newlines and corrupt the JSON. Unique temp in
+    # the state dir (same filesystem) keeps the final rename atomic.
+    if tmp=$(mktemp "$STATE_DIR/.merge.XXXXXX" 2>/dev/null); then
+        if printf '%s\n' "$cur" | jq "${jqargs[@]}" "$prog" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$STATE_FILE"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+    [ "$locked" = 1 ] && rmdir "$lock" 2>/dev/null
+    return 0
+}
+
+# Strip control characters that would corrupt an OSC sequence or IPC payload.
+sanitize() {
+    printf '%s' "$1" | tr -d '\000-\037' | tr -d '\177'
+}
+
+# Escape unescaped pipes so a value can't break out of its table cell.
+esc_cell() {
+    printf '%s' "$1" | sed 's/|/\\|/g'
+}
+
+# Render a PR URL as a clickable markdown link whose visible text is the URL.
+pr_link() {
+    printf '[%s](%s)' "$1" "$1"
+}
+
+# Escape markdown-active characters so untrusted text (e.g. the auto-seeded
+# prompt paraphrase) can't inject a clickable link or emphasis into the banner.
+# The banner renderer treats backslash as an escape, so `\[` renders a literal [.
+esc_md() {
+    printf '%s' "$1" | sed 's/[][()`*_~\\]/\\&/g'
+}
+
+# True only for a plain http(s) URL containing no characters that could break
+# out of a markdown ()/[] link — guards the PR link against a crafted --pr value.
+valid_url() {
+    case "$1" in http://*|https://*) ;; *) return 1 ;; esac
+    case "$1" in *[\ \"\<\>\`\(\)\[\]]*) return 1 ;; esac
+    return 0
+}
+
+# Render the PR field as a clickable link ONLY when it is a safe URL, otherwise
+# as plain escaped text — a crafted value can never forge a link.
+pr_render() {
+    if valid_url "$1"; then pr_link "$1"; else esc_md "$1"; fi
+}
+
+# Run a command with a hard time budget so a hung network call can't stall the
+# hook on the agent's turn-end hot path. Prefers coreutils `timeout`/`gtimeout`,
+# falls back to perl's alarm (always present on macOS; the timer survives exec
+# and kills the child), and as a last resort runs unbounded.
+with_timeout() { # seconds cmd...
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+    elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+    else "$@"; fi
+}
+
+send_osc() { # single-line text
+    [ -n "$TTY_NAME" ] || return 0
+    printf '\033]7778;%s\007' "$1" > "/dev/$TTY_NAME" 2>/dev/null
+}
+
+# The "keep the banner current" instruction handed to the model as
+# additionalContext by the prompt-hook. Single-quoted heredoc: the backticks,
+# apostrophes and literal `\n` sequences are meant to reach the model verbatim
+# (jq JSON-encodes them for whichever envelope the runtime needs).
+banner_help() {
+    cat <<'EOF'
+This session runs in a Ghoztty pane with a persistent status banner. Keep it current: run `~/.config/ghoztty/hooks/ghoztty-banner.sh set --title '<short task title>' --goal '<current goal>' --status '<one-line progress note>' [--asked '<plain-language paraphrase of the user's last prompt, NOT a verbatim quote>'] [--did '<the actual code fix/feature that landed>'] [--bugs '<markdown link(s) to the bug(s) being fixed>'] [--pr <url>]` when a task starts, whenever the goal/status meaningfully changes, and when a PR is created. --asked shows as 'Prompt' and --did as 'Last result'; keep both as short human-readable paraphrases (never raw tool names or quotes). IMPORTANT: --did is for ACTUAL fixes/features applied to the code, set it only once real changes have landed — never for exploration, reads, or intermediate tool calls (those are steps, not results); leave it alone until then. When more than one fix landed, pass a checklist with one item per line using \n, e.g. --did '- [x] Renamed Last prompt to Prompt\n- [x] Stopped auto-seeding Last result from tool calls'. When the prompt is fixing a specific bug (an issue link, a bug id, or a clearly identified defect), set --bugs to a clickable markdown link to it, e.g. --bugs '[#123](https://github.com/org/repo/issues/123)' (comma-separate multiple); it shows as a 'Bugs fixed' row under Goal. Omit --bugs entirely when the task is not a bug fix. Fields persist between calls, so pass only what changed.
+EOF
+}
+
+# Resolve the pane this session runs in. $GHOZTTY_PANE_ID is authoritative and
+# needs no lookup or cache, so it wins outright. Older app builds don't bake it:
+# those fall back to a cached name, then to +list --tty.
+#
+# The cache is validated against the pane's CURRENT tty, not merely its
+# existence — a pane id that still exists somewhere in the tree can belong to a
+# DIFFERENT pane than the one this tty maps to today, and an existence-only
+# check can never notice. A pane reporting an empty tty (some
+# session-persistence panes) can't disprove the cache, so it stays valid; a
+# different non-empty tty invalidates it and forces a re-resolve.
+resolve_pane() {
+    if [ -n "$PANE_ID" ]; then
+        echo "$PANE_ID"
+        return 0
+    fi
+    command -v ghoztty >/dev/null 2>&1 || return 1
+    local cached pane list
+    cached=$(read_field pane)
+    list=$(ghoztty +list --json 2>/dev/null) || return 1
+    if [ -n "$cached" ] && printf '%s\n' "$list" | jq -e --arg n "$cached" --arg t "/dev/$TTY_NAME" \
+        'any(.. | objects; (.name? == $n) and ((.tty? // "") | (. == "" or . == $t)))' \
+        >/dev/null 2>&1; then
+        echo "$cached"
+        return 0
+    fi
+    pane=$(ghoztty +list --tty="$TTY_NAME" 2>/dev/null) && [ -n "$pane" ] || return 1
+    jq_merge pane "$pane"
+    echo "$pane"
+}
+
+render() {
+    local title goal status activity asked did pr bugs
+    title=$(read_field title)
+    goal=$(read_field goal)
+    status=$(read_field status)
+    activity=$(read_field activity)
+    asked=$(read_field asked)
+    did=$(read_field did)
+    pr=$(read_field pr)
+    bugs=$(read_field bugs)
+
+    # Nothing meaningful set yet (only activity): don't paint a banner.
+    if [ -z "$title$goal$status$asked$did$pr$bugs" ]; then
+        return 0
+    fi
+
+    # Display the activity sentence-cased ("Working"/"Idle") regardless of the
+    # lowercase token stored in the state file.
+    local statline="$status"
+    if [ -n "$activity" ]; then
+        local act_disp="$(printf '%s' "${activity:0:1}" | tr '[:lower:]' '[:upper:]')${activity:1}"
+        [ -n "$statline" ] && statline="$statline · $act_disp" || statline="$act_disp"
+    fi
+
+    local pane
+    if pane=$(resolve_pane) && [ -n "$pane" ]; then
+        # CLI path ("\n" converted to newlines by the IPC server): the title
+        # is the table's bold header cell so its divider sits flush beneath
+        # it — no blank header row, no paragraph gap.
+        local rows=""
+        add_row() { # label value
+            [ -n "$2" ] || return 0
+            rows="$rows\n| **$1** | $(esc_cell "$2") |"
+        }
+        add_row "Goal" "$goal"
+        add_row "Bugs fixed" "$bugs"
+        add_row "Prompt" "$(esc_md "$asked")"
+        add_row "Status" "$statline"
+
+        # Title as an `## ` h2 heading on its own line above the table, so it
+        # reads larger than the body. The table keeps an empty header row so
+        # its label column stays as narrow as the labels.
+        local text=""
+        [ -n "$title" ] && text="## $title"
+        if [ -n "$rows" ]; then
+            [ -n "$text" ] && text="$text\n"
+            text="$text|  |  |\n|---|---|$rows"
+        fi
+        # "Last result" lives below the table as its own block: it may be a
+        # multi-line checklist/bullet list (items joined with \n by the model),
+        # which a single-line table cell can't hold. Its own `\n` line breaks
+        # survive to the renderer; esc_cell only neutralizes a stray `|`.
+        if [ -n "$did" ]; then
+            [ -n "$text" ] && text="$text\n"
+            text="$text**Last result**\n$(esc_cell "$did")"
+        fi
+        if [ -n "$pr" ]; then
+            [ -n "$text" ] && text="$text\n"
+            text="$text**PR** $(pr_render "$pr")"
+        fi
+        ghoztty +set-banner --target="$pane" "$text" >/dev/null 2>&1 && return 0
+    fi
+
+    # OSC fallback: single line (no newlines/tables), bold title + labels.
+    local line="" sep=" · "
+    [ -n "$title" ] && line="**$title**"
+    add_seg() { # label value
+        [ -n "$2" ] || return 0
+        [ -n "$line" ] && line="$line$sep"
+        line="$line**$1:** $2"
+    }
+    add_seg "Goal" "$goal"
+    add_seg "Bugs fixed" "$bugs"
+    add_seg "Prompt" "$(esc_md "$asked")"
+    add_seg "Status" "$statline"
+    add_seg "Last result" "$did"
+    [ -n "$pr" ] && { [ -n "$line" ] && line="$line$sep"; line="$line**PR:** $(pr_render "$pr")"; }
+    send_osc "$line"
+}
+
+cmd="${1:-}"
+shift 2>/dev/null || true
+
+# Which agent invoked us (passed by the generated hook as --runtime=<name>).
+# Selects the additionalContext envelope the prompt-hook emits and unifies the
+# session-start wipe decision across runtimes. Defaults to claude for backward
+# compatibility with hooks generated before this flag existed.
+runtime="claude"
+for _arg in "$@"; do
+    case "$_arg" in --runtime=*) runtime="${_arg#*=}" ;; esac
+done
+
+case "$cmd" in
+set)
+    pairs=()
+    newtitle=""; newtitle_set=0; pr_set=0; did_set=0; bugs_set=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --title)  newtitle=$(sanitize "${2:-}"); newtitle_set=1; pairs+=(title "$newtitle"); shift 2 ;;
+        --goal)   pairs+=(goal "$(sanitize "${2:-}")"); shift 2 ;;
+        --status) pairs+=(status "$(sanitize "${2:-}")"); shift 2 ;;
+        --asked)  pairs+=(asked "$(sanitize "${2:-}")"); shift 2 ;;
+        --did)    did_set=1; pairs+=(did "$(sanitize "${2:-}")"); shift 2 ;;
+        --bugs)   bugs_set=1; pairs+=(bugs "$(sanitize "${2:-}")"); shift 2 ;;
+        --pr)     pr_set=1; pairs+=(pr "$(sanitize "${2:-}")"); shift 2 ;;
+        --title=*)  newtitle=$(sanitize "${1#*=}"); newtitle_set=1; pairs+=(title "$newtitle"); shift ;;
+        --goal=*)   pairs+=(goal "$(sanitize "${1#*=}")"); shift ;;
+        --status=*) pairs+=(status "$(sanitize "${1#*=}")"); shift ;;
+        --asked=*)  pairs+=(asked "$(sanitize "${1#*=}")"); shift ;;
+        --did=*)    did_set=1; pairs+=(did "$(sanitize "${1#*=}")"); shift ;;
+        --bugs=*)   bugs_set=1; pairs+=(bugs "$(sanitize "${1#*=}")"); shift ;;
+        --pr=*)     pr_set=1; pairs+=(pr "$(sanitize "${1#*=}")"); shift ;;
+        *) shift ;;
+        esac
+    done
+    # A changed title means a new task: drop fields that would otherwise
+    # linger from the previous one (a stale PR link, the old "Last result", a
+    # prior bug reference), but never clobber a value passed explicitly in this
+    # same call.
+    if [ "$newtitle_set" = 1 ] && [ "$newtitle" != "$(read_field title)" ]; then
+        [ "$pr_set" = 1 ]   || pairs+=(pr "")
+        [ "$did_set" = 1 ]  || pairs+=(did "")
+        [ "$bugs_set" = 1 ] || pairs+=(bugs "")
+    fi
+    # A newly-set PR should be verified promptly, not suppressed by the previous
+    # PR's TTL — clear the last-checked stamp whenever the PR field is touched.
+    [ "$pr_set" = 1 ] && pairs+=(pr_checked_at "")
+    [ ${#pairs[@]} -gt 0 ] && jq_merge "${pairs[@]}"
+    render
+    ;;
+status)
+    jq_merge status "$(sanitize "${1:-}")"
+    render
+    ;;
+activity)
+    jq_merge activity "$(sanitize "${1:-}")"
+    render
+    ;;
+prompt-hook)
+    # Seed "You asked" with the raw prompt (first line, truncated) as a
+    # default the model refines into a paraphrase during the turn.
+    input=$(cat)
+    asked=$(printf '%s' "$input" | jfield prompt | head -n1)
+    asked=$(printf '%s' "$asked" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-500)
+    asked=$(sanitize "$asked")
+    [ ${#asked} -gt 100 ] && asked="${asked:0:97}..."
+
+    # A new ask starts fresh: clear "What I did" so the previous turn's work
+    # isn't shown until something new actually happens this turn.
+    pairs=(activity "working" did "")
+    [ -n "$asked" ] && pairs+=(asked "$asked")
+
+    # The state file is keyed by tty, so a fresh agent session starting in a
+    # pane inherits the PREVIOUS session's task fields (title/goal/status/pr).
+    # Detect a new session by its id and wipe the stale task identity, so a
+    # fresh context begins with a blank banner instead of another session's
+    # task. A resumed session keeps its id, so its banner is preserved.
+    session=$(printf '%s' "$input" | jfield session_id sessionId)
+    if [ -n "$session" ] && [ "$session" != "$(read_field session)" ]; then
+        pairs+=(session "$session" title "" goal "" status "" pr "" bugs "")
+    fi
+
+    jq_merge "${pairs[@]}"
+    render
+    # Tell the model to keep the banner current, delivered as additionalContext.
+    # Claude processes UserPromptSubmit output as a NESTED hookSpecificOutput
+    # envelope; Copilot processes it only as a FLAT {"additionalContext":...}
+    # object (verified against a live Copilot hook — the nested form is silently
+    # dropped, which is why the Copilot banner never populated). jq (guaranteed
+    # present past the gate above) builds the right shape and escapes the text.
+    if [ "$runtime" = copilot ]; then
+        jq -cn --arg ctx "$(banner_help)" '{additionalContext: $ctx}'
+    else
+        jq -cn --arg ctx "$(banner_help)" \
+            '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'
+    fi
+    ;;
+session-start-hook)
+    # Fires on SessionStart. A fresh launch (source=startup), `/clear`
+    # (source=clear), or a brand-new session (source=new) begins a new task in
+    # this pane, so wipe the previous session's task identity AND clear the
+    # on-screen banner immediately — don't wait for the next prompt to blank
+    # stale data. `resume`/`compact` continue the SAME task, so their banner is
+    # left untouched. Claude restricts this hook to a `startup|clear` matcher
+    # upstream; Copilot cannot express a matcher, so the decision is made here
+    # from the `source` field (normalized through for Copilot, native for
+    # Claude) — the two runtimes then behave identically.
+    input=$(cat)
+    session=$(printf '%s' "$input" | jfield session_id sessionId)
+    source=$(printf '%s' "$input" | jfield source)
+    case "$source" in
+    resume|compact)
+        # Same task continues in this pane: keep the live banner, just record
+        # the session id so the prompt-hook doesn't treat it as new.
+        [ -n "$session" ] && jq_merge session "$session"
+        ;;
+    *)
+        pane=$(resolve_pane)
+        [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
+        # Reset task fields but keep the resolved pane cache; record the new id
+        # so the prompt-hook doesn't re-wipe on this session's first prompt.
+        pairs=(title "" goal "" status "" asked "" did "" pr "" bugs "" activity "")
+        [ -n "$session" ] && pairs+=(session "$session")
+        jq_merge "${pairs[@]}"
+        ;;
+    esac
+    ;;
+stop-hook)
+    jq_merge activity "idle"
+    render
+    # Best-effort: drop a PR link once it's no longer open (closed/merged), so
+    # the banner never shows a stale PR. This is a network call on the turn-end
+    # hot path, so it is BOUNDED by a hard timeout and THROTTLED to at most once
+    # per TTL (recorded in the state file). GitHub + gh only; the `--` and the
+    # https-scheme guard keep an attacker-influenced $pr from becoming a gh flag.
+    # Silent on any failure (no gh, not authed, non-GitHub host, network error).
+    pr=$(read_field pr)
+    if [ -n "$pr" ] && command -v gh >/dev/null 2>&1; then
+        now=$(date +%s 2>/dev/null || echo 0)
+        last=$(read_field pr_checked_at)
+        if [ "$now" = 0 ] || [ -z "$last" ] || [ "$((now - last))" -ge "$PR_CHECK_TTL" ]; then
+            case "$pr" in
+            https://*github.com/*)
+                jq_merge pr_checked_at "$now"
+                state=$(with_timeout "$PR_CHECK_TIMEOUT" gh pr view --json state -q .state -- "$pr" 2>/dev/null)
+                if [ -n "$state" ] && [ "$state" != "OPEN" ]; then
+                    jq_merge pr ""
+                    render
+                fi
+                ;;
+            esac
+        fi
+    fi
+    ;;
+clear)
+    pane=$(resolve_pane)
+    rm -f "$STATE_FILE"
+    [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
+    send_osc ""
+    ;;
+*)
+    echo "usage: ghoztty-banner.sh set|status|activity|prompt-hook|session-start-hook|stop-hook|clear" >&2
+    exit 2
+    ;;
+esac
+exit 0

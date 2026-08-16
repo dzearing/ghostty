@@ -12,4 +12,9 @@ pub const Location = diags.Location;
 
 test {
     @import("std").testing.refAllDecls(@This());
+
+    // refAllDecls is shallow: an action file's tests only run if its
+    // namespace is referenced from a test block. The +json helpers carry
+    // pure-logic tests the hook scripts depend on (T866).
+    _ = @import("cli/json.zig");
 }

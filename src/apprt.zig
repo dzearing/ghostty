@@ -87,6 +87,10 @@ test {
     // skip themselves elsewhere).
     _ = @import("apprt/win32/managed_file.zig");
 
+    // Embedded agent-integration assets (T866): @embedFile only, no OS
+    // imports, so the content checks run in every lane on both seats.
+    _ = @import("apprt/win32/GhosttyAssets.zig");
+
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
 

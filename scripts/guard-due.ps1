@@ -85,6 +85,24 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The vendored agent assets (T866) rot silently: main edits its copy of a
+    # skill or hook script and nothing here goes red until someone re-runs the
+    # drift compare, and a banner-script or +json edit that breaks the jq-free
+    # flow only ever fails inside an agent's hook, where stderr is discarded.
+    [pscustomobject]@{
+        Name   = 'hook-json'
+        Script = 'test\win32\hook-json.ps1'
+        Stamp  = 'test\win32\hook-json.stamp.json'
+        Covers = @(
+            'src\cli\json.zig',
+            'src\apprt\win32\GhosttyAssets.zig',
+            'src\apprt\win32\assets\ghoztty\hooks\*.sh',
+            'src\apprt\win32\assets\ghoztty\skills\*\SKILL.md',
+            'src\apprt\win32\assets\ghoztty\upstream\hooks\*.sh',
+            'src\apprt\win32\assets\ghoztty\upstream\skills\*\SKILL.md',
+            'test\win32\hook-json.ps1'
+        )
+    },
     # Crash evidence is the other thing whose failure nothing else catches: a
     # capture path that has quietly stopped working looks exactly like a lane
     # that did not crash, and is only ever exercised on a day already going
