@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T868 - the hook-registration machinery exists on Windows:
+  Claude's settings.json merged fragment and Copilot's dedicated hooks file,
+  all native std.json.** Fourth T598 slice. `ClaudeHookSpec.zig` carries
+  Mac's exact nine-purpose event map (banner three + activity six, 10s
+  timeouts, `AskUserQuestion|ExitPlanMode` pause matcher) and the
+  hooks-DIRECTORY ownership signature; merge/removeFragment/fragmentState
+  proved against the full Mac ClaudeHookSpecTests coverage plus a
+  reinstall-dedupe case. `CopilotHookSpec.zig` is golden-tested to the Mac
+  schema (version-1, `_comment` marker, the three verified camelCase events
+  only). `HookComponent.zig` lands both - dedicated file via the T865
+  marker-guarded writer, merged fragment via typed UnparseableConfig refusal
+  (state=outdated, bytes untouched, no backup taken on refusal) + one-time
+  `.ghoztty.bak` + reparse-refusing atomic rewrite. New `stable_json.zig`
+  supplies the sorted-keys deterministic serializer (Zig's stringify keeps
+  insertion order) so reinstalls are byte-stable - asserted on disk. Hook
+  command shape is Mac's verbatim (`bash '<script>' <verb> --runtime=<rt>`),
+  measured viable here: the marketplace plugin's bash hooks already run
+  under Windows Claude Code on this box. Verified: floor 4/4 lanes PASS,
+  P1 (25) / P2 (20) / P3 (16) ALL PASS. Filed T875 (mac seat: adopt the
+  unreadable-settings refusal - Mac currently treats present-but-unreadable
+  as absent and would clobber). Next slice: T869 (registry/probe/factory).
+  Commit 8103126a1.
 - 2026-08-15 - **T510 - a silent remote endpoint can no longer wedge a
   dialling thread forever: the relay dial's TLS + WebSocket-upgrade phase now
   times out.** The T328 wedge suspect is settled: it was the unbounded
