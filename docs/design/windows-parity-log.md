@@ -9,6 +9,37 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T870 - first-run now offers the built-in agent setup, and
+  old-plugin boxes get the one-time switch-over - this box's real 0.8.0
+  plugin is MIGRATED.** Sixth T598 slice, the user-facing one ("still has
+  the old skill loaded" was the P0). `ClaudeIntegration.zig` became
+  `AgentIntegration.zig`: launch check probes the installed agent CLIs
+  (T869 registry) and offers "Set Up Agent Integrations?" with a checkbox
+  per detected agent (ConfirmDialog grew accessory checkbox rows - Mac's
+  NSAlert stack - with layout tests); accept installs skills+hooks+banner
+  through the service OFF-thread, first-run success silent, failures
+  reported once with the Mac summary line. The old marketplace-add/
+  plugin-install flow is retired grep-clean; the only claude invocation
+  left is the migration's uninstall. `claude_plugin_migration.zig` (pure,
+  tested in every lane) ports Mac's ClaudePluginMigration with the Windows
+  ownership twist: the plugin's SessionStart hook COPIES the banner script
+  rather than symlinking, so ownership is proven by byte-compare against
+  the registered install's own copy (decided BEFORE uninstall, since the
+  uninstaller may clear the cache) - plus the Mac symlink-target rule, and
+  a readLink gotcha (zig maps not-a-reparse-point to Unexpected, not
+  NotLink). Uninstall-first ordering: a failed uninstall changes nothing.
+  Banner state carries copy-never-overwrite, originals left in place.
+  Acceptance `test\win32\claude-integration.ps1` rewritten (7 cases, 58
+  assertions ALL PASS, GHOZTTY_AGENT_HOME sandbox so the real home is
+  untouchable) + a new guard-due row. Floor: lib/win32/agent PASS; none
+  lane died once in freetype (`font.Collection.test.add full`) - the T443
+  ghost, SECOND occurrence today (10:23 + 19:23), logged in its
+  ARMED-WATCH LOG and T857 (the Turbo-Boost discriminator) bumped to P0
+  per the cluster rule; clean PASS on re-run. P1-P3 25/20/16 ALL PASS.
+  On-box: the real migration ran - manifest entry gone via claude's own
+  uninstaller, 30 pane banner states carried, stale script removed, app
+  skills/hooks installed; the very next session listed the app-shipped
+  skills. Next slices: T871 (Agent Integrations dialog), T872 (e2e).
 - 2026-08-15 - **T869 - the agent integrations are now one switch on
   Windows: runtime registry, binary probe, rollback install, refcounted
   shared scripts, and the Mac-vocabulary service layer.** Fifth T598 slice.
