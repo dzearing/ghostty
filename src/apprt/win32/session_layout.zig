@@ -426,6 +426,62 @@ fn claimSessions(
     }
 }
 
+/// Carry unrestored manifest windows forward through a wholesale rewrite
+/// (T590). win32 regenerates the manifest from the LIVE topology on every sync,
+/// so a launch that could not restore a window — the agent was unspawnable, or
+/// the liveness probe never landed — used to erase its only surviving record
+/// the moment the blank startup window's first sync fired. macOS keeps such
+/// entries untouched for the next launch ("local agent unreachable; keeping N
+/// manifest entries", `SessionLayoutRestore.swift`); this is that rule
+/// translated to the wholesale-rewrite model: the capture is extended with the
+/// on-disk entries for every key in `carried`.
+///
+/// `carried` is the set of window keys (`windowKey`) the launch restore SKIPPED
+/// without a positive adjudication — never a window the agent answered about
+/// and disowned, which stays dropped so the manifest cannot become immortal.
+/// Two rules:
+///
+///   * **A live key adjudicates.** A carried key that appears in `live` came
+///     back (a later Restore All, an adoption) — it is removed from `carried`
+///     (its gpa-owned key freed) and its future is the live capture's business.
+///   * **The rest ride along.** Every `manifest` window whose key is still in
+///     `carried` is appended after the live windows, strings borrowed from the
+///     caller's parsed manifest (which must outlive the returned slice).
+///
+/// Returns `live` itself when there is nothing to carry, else a new slice
+/// allocated with `arena`. Pure aside from the `carried` upkeep, so it
+/// unit-tests in every app-runtime lane.
+pub fn mergeCarried(
+    arena: Allocator,
+    gpa: Allocator,
+    live: []const Window,
+    manifest: []const Window,
+    carried: *std.StringHashMapUnmanaged(void),
+) Allocator.Error![]const Window {
+    if (carried.count() == 0) return live;
+
+    for (live) |win| {
+        if (carried.fetchRemove(windowKey(win))) |kv| gpa.free(kv.key);
+    }
+    if (carried.count() == 0) return live;
+
+    var out: std.ArrayList(Window) = .empty;
+    errdefer out.deinit(arena);
+    try out.appendSlice(arena, live);
+
+    // A malformed manifest could repeat a key; append each carried key once.
+    var appended: std.StringHashMapUnmanaged(void) = .empty;
+    defer appended.deinit(gpa);
+    for (manifest) |win| {
+        const key = windowKey(win);
+        if (!carried.contains(key)) continue;
+        const gop = try appended.getOrPut(gpa, key);
+        if (gop.found_existing) continue;
+        try out.append(arena, win);
+    }
+    return try out.toOwnedSlice(arena);
+}
+
 /// Whether ANY session `win` references is already spoken for by an accepted
 /// window. One is enough — see `reconcile`'s second rule.
 fn sessionsClaimed(claimed: *const std.StringHashMapUnmanaged(void), win: Window) bool {
@@ -961,4 +1017,120 @@ test "reconcile: both sides empty is an empty answer, not an error" {
     defer alloc.free(r.windows);
     try testing.expectEqual(@as(usize, 0), r.windows.len);
     try testing.expectEqual(@as(usize, 0), r.adopted);
+}
+
+/// A carried-key set holding gpa-duped copies of `keys`, for the T590 tests.
+fn carriedSet(
+    alloc: Allocator,
+    keys: []const []const u8,
+) !std.StringHashMapUnmanaged(void) {
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer set.deinit(alloc);
+    for (keys) |k| try set.put(alloc, try alloc.dupe(u8, k), {});
+    return set;
+}
+
+fn freeCarriedSet(alloc: Allocator, set: *std.StringHashMapUnmanaged(void)) void {
+    var it = set.iterator();
+    while (it.next()) |e| alloc.free(e.key_ptr.*);
+    set.deinit(alloc);
+}
+
+test "T590: a carried manifest window rides along after the live capture" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var mn: [1]Node = undefined;
+    var mt: [1]Tab = undefined;
+    var on: [1]Node = undefined;
+    var ot: [1]Tab = undefined;
+    // The blank startup window is live; the manifest still holds the window the
+    // agentless launch could not restore, plus one that was POSITIVELY dropped
+    // (its key is not carried) and must stay dropped.
+    const live = [_]Window{reconcileWindow("blank", "uuid-live", null, &ln, &lt)};
+    const manifest = [_]Window{
+        reconcileWindow("old", "uuid-old", "sess-a", &mn, &mt),
+        reconcileWindow("dead", "uuid-dead", "sess-b", &on, &ot),
+    };
+    var carried = try carriedSet(alloc, &.{"uuid-old"});
+    defer freeCarriedSet(alloc, &carried);
+
+    const out = try mergeCarried(arena, alloc, &live, &manifest, &carried);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("uuid-live", out[0].uuid.?);
+    try testing.expectEqualStrings("uuid-old", out[1].uuid.?);
+    // The carry persists for the NEXT sync too — nothing adjudicated it.
+    try testing.expectEqual(@as(usize, 1), carried.count());
+}
+
+test "T590: a carried key that is live again is adjudicated, not duplicated" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var mn: [1]Node = undefined;
+    var mt: [1]Tab = undefined;
+    // The carried window came back (a later Restore All): the live capture and
+    // the on-disk manifest both hold its key.
+    const live = [_]Window{reconcileWindow("back", "uuid-back", "sess-a", &ln, &lt)};
+    const manifest = [_]Window{reconcileWindow("back", "uuid-back", "sess-a", &mn, &mt)};
+    var carried = try carriedSet(alloc, &.{"uuid-back"});
+    defer freeCarriedSet(alloc, &carried);
+
+    const out = try mergeCarried(arena, alloc, &live, &manifest, &carried);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("back", out[0].id);
+    // Adjudicated: the key left the carry set (and was freed), so a later
+    // CLOSE of the window shrinks the manifest — it cannot resurrect.
+    try testing.expectEqual(@as(usize, 0), carried.count());
+}
+
+test "T590: nothing carried returns the live capture untouched" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ln: [1]Node = undefined;
+    var lt: [1]Tab = undefined;
+    var mn: [1]Node = undefined;
+    var mt: [1]Tab = undefined;
+    const live = [_]Window{reconcileWindow("w", "uuid-w", null, &ln, &lt)};
+    const manifest = [_]Window{reconcileWindow("old", "uuid-old", "sess-a", &mn, &mt)};
+    var carried: std.StringHashMapUnmanaged(void) = .empty;
+    defer carried.deinit(alloc);
+
+    const out = try mergeCarried(arena, alloc, &live, &manifest, &carried);
+    // Identity, not a copy: the healthy-agent sync path stays allocation-free.
+    try testing.expectEqual(live[0..].ptr, out.ptr);
+    try testing.expectEqual(@as(usize, 1), out.len);
+}
+
+test "T590: a duplicated manifest key is appended once" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    var bn: [1]Node = undefined;
+    var bt: [1]Tab = undefined;
+    const manifest = [_]Window{
+        reconcileWindow("old", "uuid-old", "sess-a", &an, &at),
+        reconcileWindow("old2", "uuid-old", "sess-a", &bn, &bt),
+    };
+    var carried = try carriedSet(alloc, &.{"uuid-old"});
+    defer freeCarriedSet(alloc, &carried);
+
+    const out = try mergeCarried(arena, alloc, &.{}, &manifest, &carried);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("old", out[0].id);
 }

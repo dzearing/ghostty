@@ -219,6 +219,19 @@ layout_sid_retries: u16 = 0,
 /// (`win-0`, `win-1`) safe despite shifting when an earlier window closes.
 pushed_layouts: std.StringHashMapUnmanaged(u64) = .empty,
 
+/// Window keys (`session_layout.windowKey`, gpa-owned dupes) the launch
+/// restore left in the manifest WITHOUT a positive adjudication (T590): the
+/// agent was unspawnable, the liveness probe never landed, or the rebuild
+/// itself failed. `syncSessionLayout` carries the on-disk entries for these
+/// keys forward through every wholesale rewrite — the win32 translation of
+/// Mac's "agent unreachable; keeping N manifest entries for next launch" —
+/// so one bad launch cannot erase the only surviving record of the layout.
+/// A key leaves the set when its window is live again (`mergeCarried`
+/// adjudicates it) or when persistence is turned off. Never populated by a
+/// window the agent answered about and disowned: those stay dropped, which is
+/// what keeps the manifest from becoming immortal.
+carried_layout_windows: std.StringHashMapUnmanaged(void) = .empty,
+
 /// The connection `pushed_layouts` describes. A reconnect (agent restart, link
 /// recovery) means the peer's store is not the one we tracked, so the map is
 /// dropped and the whole topology re-pushed rather than assumed present.
@@ -1344,6 +1357,10 @@ pub fn terminate(self: *App) void {
     self.pushed_layouts.deinit(alloc);
     self.pushed_layouts_conn = null;
 
+    // T590: the carried-window keys are gpa-owned dupes of manifest keys.
+    self.clearCarriedLayouts();
+    self.carried_layout_windows.deinit(alloc);
+
     // T109: the last restored leaf's decoded screen. Every surface that
     // borrowed it is long gone by now (they dupe what they keep).
     if (self.restore_snapshot_scratch) |s| {
@@ -1456,6 +1473,10 @@ pub fn syncSessionLayout(self: *App) void {
     const gpa = self.core_app.alloc;
     if (!self.config.@"session-persistence") {
         session_layout.clear(gpa);
+        // Turning persistence off is the user asking to FORGET — the carried
+        // unrestored windows (T590) included, or they would resurrect if it
+        // came back on.
+        self.clearCarriedLayouts();
         // Persistence just went off (or was never on): the agent must not keep
         // offering this machine's windows for restore either.
         self.pushLayoutBlobs(.{});
@@ -1464,10 +1485,33 @@ pub fn syncSessionLayout(self: *App) void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     var pending = false;
-    const file = self.captureSessionLayout(arena_state.allocator(), &pending) catch |err| {
+    const captured = self.captureSessionLayout(arena_state.allocator(), &pending) catch |err| {
         log.warn("session-layout capture failed err={}", .{err});
         return;
     };
+    // T590: a wholesale rewrite must not erase the windows the launch restore
+    // could not adjudicate (agent unspawnable, probe never landed) — re-read
+    // their on-disk entries and carry them forward. `carried_parsed` owns the
+    // borrowed strings, so it must outlive the write AND the blob push.
+    var carried_parsed: ?session_layout.Parsed = null;
+    defer if (carried_parsed) |*p| p.deinit();
+    var windows = captured.windows;
+    if (self.carried_layout_windows.count() > 0) {
+        if (loadLocalManifest(gpa)) |p| carried_parsed = p;
+        const manifest: []const session_layout.Window =
+            if (carried_parsed) |p| p.value.windows else &.{};
+        windows = session_layout.mergeCarried(
+            arena_state.allocator(),
+            gpa,
+            captured.windows,
+            manifest,
+            &self.carried_layout_windows,
+        ) catch |err| blk: {
+            log.warn("session-layout carry-forward failed err={}", .{err});
+            break :blk captured.windows;
+        };
+    }
+    const file: session_layout.File = .{ .windows = windows };
     session_layout.write(gpa, file);
     self.pushLayoutBlobs(file);
 
@@ -1599,6 +1643,31 @@ fn clearPushedLayouts(self: *App) void {
     var it = self.pushed_layouts.iterator();
     while (it.next()) |entry| gpa.free(entry.key_ptr.*);
     self.pushed_layouts.clearRetainingCapacity();
+}
+
+/// Remember one manifest window the launch restore is leaving behind WITHOUT a
+/// positive adjudication (T590), so `syncSessionLayout` carries its on-disk
+/// entry forward instead of erasing it. Best-effort: an allocation failure
+/// costs the carry, never the restore.
+fn carryUnrestoredWindow(self: *App, win: session_layout.Window) void {
+    const gpa = self.core_app.alloc;
+    const key = session_layout.windowKey(win);
+    const gop = self.carried_layout_windows.getOrPut(gpa, key) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = gpa.dupe(u8, key) catch {
+            _ = self.carried_layout_windows.remove(key);
+            return;
+        };
+    }
+}
+
+/// Drop the carried-window keys (T590). Persistence went off, or the app is
+/// tearing down.
+fn clearCarriedLayouts(self: *App) void {
+    const gpa = self.core_app.alloc;
+    var it = self.carried_layout_windows.iterator();
+    while (it.next()) |entry| gpa.free(entry.key_ptr.*);
+    self.carried_layout_windows.clearRetainingCapacity();
 }
 
 const FrameCapture = struct {
@@ -2258,7 +2327,12 @@ const RestoreTransport = struct {
 /// so a window holding one comes back with its viewers at their recorded
 /// locations and any terminal beside them as a fresh local ConPTY pane. This
 /// used to bail before it reached them, dropping a whole viewer-only window for
-/// a reason that applied to none of its panes.
+/// a reason that applied to none of its panes. The windows it still drops are
+/// not ERASED either (T590): without a positive adjudication (agent answered,
+/// probe landed) their manifest entries are carried forward through this run's
+/// rewrites (`carried_layout_windows` → `mergeCarried`), so a launch that
+/// restores nothing no longer overwrites the recorded layout with its one
+/// blank window — the next launch, agent back, restores them.
 ///
 /// Liveness is TRI-STATE (design pin): a window is dropped ONLY when every one
 /// of its session-backed leaves is POSITIVELY gone (the agent answered and none
@@ -2364,6 +2438,15 @@ pub fn restoreSessionLayout(self: *App) bool {
     defer attached_ids.deinit();
     var attached_panes: usize = 0;
 
+    // T590: a window this restore drops is only FORGOTTEN when the drop is a
+    // positive adjudication — the agent answered AND the roster probe landed,
+    // so its every session is known gone. With no agent (or a failed probe)
+    // the drop says nothing about the sessions, so the window's manifest entry
+    // is carried forward through the coming rewrites instead of being erased
+    // by the blank startup window's first sync (Mac: "agent unreachable;
+    // keeping N manifest entries for next launch").
+    const positively_adjudicated = conn != null and probe.roster != null;
+
     var restored: usize = 0;
     for (union_set.windows) |win| {
         // T188: a window boundary is the natural yield point — nothing of this
@@ -2371,14 +2454,27 @@ pub fn restoreSessionLayout(self: *App) bool {
         // that lands mid-restore sees the windows built so far, which is a
         // truthful partial answer; before this it saw no answer at all.
         gui_pump.pump();
-        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
+        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) {
+            if (!positively_adjudicated) self.carryUnrestoredWindow(win);
+            continue;
+        }
         const tr: RestoreTransport = if (conn) |c| .local(c) else .agentless();
         self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
+            // A build failure is never an adjudication: keep the entry so the
+            // next launch can try again (Mac keeps entries on any non-dead
+            // failure too).
+            self.carryUnrestoredWindow(win);
             continue;
         };
         restored += 1;
         collectAttachedLeaves(win, attach_ptr, &attached_ids, &attached_panes);
+    }
+    if (self.carried_layout_windows.count() > 0) {
+        log.info(
+            "session-restore: keeping {d} unrestored manifest window(s) for the next launch",
+            .{self.carried_layout_windows.count()},
+        );
     }
     if (restored == 0) return false;
     log.info("session-restore: restored {d} window(s)", .{restored});

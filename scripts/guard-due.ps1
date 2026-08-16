@@ -532,6 +532,22 @@ $GuardTable = @(
             'src\apprt\win32\tab_tooltip.zig',
             'test\win32\tab-tooltip.ps1'
         )
+    },
+    # The session-layout carry-forward (T590): the manifest's loss-prevention
+    # arm only ever executes on a DEGRADED launch (agent unspawnable), which
+    # no P1-P3 floor run produces, so an edit to the schema/merge module can
+    # only be caught by this harness. Same shape as palette-jump: the row ties
+    # the harness to its own family only - the restore/sync walk lives in
+    # App.zig, which moves for a hundred non-layout reasons and is the floor's
+    # problem, so gating this harness on it is noise.
+    [pscustomobject]@{
+        Name   = 'session-layout-preserve'
+        Script = 'test\win32\session-layout-preserve.ps1'
+        Stamp  = 'test\win32\session-layout-preserve.stamp.json'
+        Covers = @(
+            'src\apprt\win32\session_layout.zig',
+            'test\win32\session-layout-preserve.ps1'
+        )
     }
 )
 
