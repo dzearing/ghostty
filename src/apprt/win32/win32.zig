@@ -1962,6 +1962,10 @@ pub const TTF_ABSOLUTE: u32 = 0x0080;
 
 pub const TTM_TRACKACTIVATE: u32 = WM_USER + 17;
 pub const TTM_TRACKPOSITION: u32 = WM_USER + 18;
+/// Without a max width a tooltip renders on ONE line and `\n` in its text is
+/// ignored — setting it is what turns newlines into line breaks (the T556
+/// two-line title+cwd tip).
+pub const TTM_SETMAXTIPWIDTH: u32 = WM_USER + 24;
 pub const TTM_ADDTOOLW: u32 = WM_USER + 50;
 pub const TTM_DELTOOLW: u32 = WM_USER + 51;
 pub const TTM_NEWTOOLRECTW: u32 = WM_USER + 52;

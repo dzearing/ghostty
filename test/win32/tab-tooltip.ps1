@@ -25,6 +25,8 @@
 #      livePwd path - the cache alone would stay frozen at the start dir).
 #   C: it is right after a session-persistence RESTORE (app killed and
 #      relaunched, same agent; the re-attached shell's real cwd answers).
+#   E: an ELIDED tab title rides above the cwd as the tip's first line, and
+#      a title that fits keeps the tip cwd-only (T556).
 #   D: a tab whose focused pane is a VIEWER reports the viewer's location.
 #
 # Runs on a background Win32 desktop (lib/TestDesktop.ps1); hermetic via a
@@ -228,6 +230,39 @@ try {
         Assert (Wait-PaneCwd (Split-Path $dirB -Leaf) 'c0' 45) 'C: the restored pane is still in the cd target'
         $probe = Probe-TipText $top2 $m2 $errlog2
         Assert ($probe -like "*$(Split-Path $dirB -Leaf)*") "C: tooltip text is right after the restore ($probe)"
+
+        # -------------------------------------------------------------------
+        # E (T556): an ELIDED tab title rides above the cwd as a first line.
+        # The oracle logs the two-line tip with the newline escaped to the
+        # literal `\n`, so one grep line carries both halves. Negative
+        # control first: the current (short) title fits, so the tip must
+        # still be cwd-only. Then a title far wider than a 700px window's
+        # 50%-capped tab forces the strip to ellipsize, and the tip must
+        # answer with the FULL title + `\n` + the cwd.
+        # -------------------------------------------------------------------
+        Assert ($probe -notlike '*\n*') "E: a title that fits keeps the tip cwd-only ($probe)"
+        Set-TestWindowSize -Window $top2 -Width 700 -Height 700 | Out-Null
+        Start-Sleep -Milliseconds 1200
+        $m2e = Get-TestChromeMetrics -Window $top2 -StripVisible $true
+        # cmd's `title` builtin sets the console title, which ConPTY forwards
+        # as a title change - the same path any shell retitle takes.
+        $longTitle = 'T556-elided-title-' + ('x' * 72)   # 90 chars, < the 96-byte tip clamp
+        $leavesE = @(All-Leaves (Get-List 'e0'))
+        $paneE = $leavesE[0].id
+        Run-CliArgs @('+send-keys', "--target=$paneE", 'title', 'Space', $longTitle, 'Enter') "$root\title.txt" 12 | Out-Null
+        # The retitle propagates async (shell -> ConPTY -> tab strip repaint);
+        # probe until the oracle names it.
+        $probe = $null
+        for ($t = 0; $t -lt 8; $t++) {
+            $probe = Probe-TipText $top2 $m2e $errlog2
+            if ($probe -like '*T556-elided-title-*') { break }
+            Start-Sleep -Milliseconds 700
+        }
+        Assert ($probe -like "*$longTitle*") "E: the tip carries the FULL title the strip elided ($probe)"
+        Assert ($probe -like "*$longTitle\n*") "E: the title is its own line above the cwd ($probe)"
+        Assert ($probe -like "*\n*$(Split-Path $dirB -Leaf)*") "E: the cwd line survives below the title ($probe)"
+        Set-TestWindowSize -Window $top2 -Width 1200 -Height 700 | Out-Null
+        Start-Sleep -Milliseconds 1200
 
         # -------------------------------------------------------------------
         # D: a viewer pane reports its location. The split takes focus, so

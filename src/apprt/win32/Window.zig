@@ -241,7 +241,16 @@ tab_tip_shown: bool = false,
 /// UTF-16 text handed to the tooltip control. The control keeps the
 /// POINTER it was given rather than copying, so the buffer must live as
 /// long as the tool does — it lives here, on the window.
-tab_tip_text: [tab_tooltip.max_len + 8]u16 = undefined,
+tab_tip_text: [tab_tooltip.max_tip_len + 8]u16 = undefined,
+
+/// Whether each tab's painted title was ELIDED at the last strip paint —
+/// the laid-out tab was narrower than `preferredWidth` of its measured
+/// title, which by the T235 inverse invariant is exactly "the title rect
+/// could not hold the text". Read by the tooltip (T556) to decide whether
+/// the full title must ride above the cwd. False until the first paint,
+/// which reads as "nothing elided" — the tip then stays cwd-only, the
+/// pre-T556 behavior.
+tab_title_elided: [64]bool = [_]bool{false} ** 64,
 
 /// Whether the "+" (new tab) button is being hovered.
 hover_new_tab: bool = false,
@@ -5323,6 +5332,16 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     self.new_tab_rect = stripRect(strip.new_tab);
     self.menu_btn_rect = stripRect(strip.menu);
 
+    // T556: remember which titles the layout ELIDED, for the tooltip. A tab
+    // narrower than its preferred width cannot hold its measured title —
+    // `preferredWidth` is the exact inverse of `titleRect`, so this is the
+    // same verdict `DT_END_ELLIPSIS` reaches at draw time, computed where
+    // the measurement already exists. Overflow tabs (zero rect) read as
+    // elided, which is moot: a zero rect is unhoverable.
+    for (0..self.tab_count) |i| {
+        self.tab_title_elided[i] = (tabs[i].right - tabs[i].left) < prefer[i];
+    }
+
     // --- Composite the tab SHAPES (T206) ---
     //
     // Per-pixel, before any GDI: rounded top corners, a specular rim that
@@ -6373,6 +6392,21 @@ fn tabTipTextFor(self: *Window, idx: usize, out: []u8) ?[]const u8 {
     const pane = self.tab_active_pane[idx];
     var home_buf: [512]u8 = undefined;
     const home: ?[]const u8 = internal_os.home(&home_buf) catch null;
+
+    // T556: when the strip ELIDED this tab's painted title, the tip carries
+    // the full title as a first line above the location — the one thing a
+    // hover could not previously rescue. A title that fit stays off the tip.
+    var title_buf: [768]u8 = undefined; // 256 UTF-16 units × ≤3 bytes each
+    const tlen = self.tab_title_lens[idx];
+    const title: []const u8 = if (tlen > 0)
+        title_buf[0 .. std.unicode.utf16LeToUtf8(
+            &title_buf,
+            self.tab_titles[idx][0..tlen],
+        ) catch 0]
+    else
+        "";
+    const elided = self.tab_title_elided[idx];
+
     if (pane.surface()) |s| {
         // The OS-read live cwd first — a shell that never reports OSC 7
         // (cmd.exe) keeps the cached seed frozen at its starting directory
@@ -6382,12 +6416,12 @@ fn tabTipTextFor(self: *Window, idx: usize, out: []u8) ?[]const u8 {
         const alloc = self.app.core_app.alloc;
         const live = s.livePwd(alloc);
         defer if (live) |p| alloc.free(p);
-        const location: []const u8 = live orelse (s.pwd orelse return null);
-        return tab_tooltip.tipText(out, location, home);
+        const location: []const u8 = live orelse (s.pwd orelse "");
+        return tab_tooltip.tipTextTitled(out, title, elided, location, home);
     }
     if (pane.viewer()) |v| {
-        const location = v.location orelse return null;
-        return tab_tooltip.tipText(out, location, home);
+        const location = v.location orelse "";
+        return tab_tooltip.tipTextTitled(out, title, elided, location, home);
     }
     return null;
 }
@@ -6457,6 +6491,11 @@ fn tabTipEnsure(self: *Window) ?w32.HWND {
     self.tab_tip_text[0] = 0;
     var ti = self.tabTipToolInfo();
     _ = w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti)));
+    // A max width is what makes `\n` break lines (the T556 two-line
+    // title+cwd tip); without one the control renders everything on one
+    // line. Wide enough to never wrap on its own — the text is already
+    // length-capped upstream (`tab_tooltip.max_len` per line).
+    _ = w32.SendMessageW(tip, w32.TTM_SETMAXTIPWIDTH, 0, 0x7FFF);
     self.tab_tip_hwnd = tip;
     return tip;
 }
@@ -6484,9 +6523,24 @@ fn tabTipOnHoverChange(self: *Window, new_hover: isize) void {
     if (new_hover < 0) return;
     const hwnd = self.hwnd orelse return;
     _ = w32.SetTimer(hwnd, TAB_TIP_TIMER_ID, w32.GetDoubleClickTime(), null);
-    var buf: [tab_tooltip.max_len + 8]u8 = undefined;
+    var buf: [tab_tooltip.max_tip_len + 8]u8 = undefined;
     if (self.tabTipTextFor(@intCast(new_hover), &buf)) |txt| {
-        log.debug("tab tooltip tab={d} text={s}", .{ new_hover, txt });
+        // The oracle stays ONE line: a two-line tip (T556) logs its newline
+        // as the literal `\n`, because `tab-tooltip.ps1` greps this line and
+        // a real newline would split the evidence across two.
+        var esc: [2 * (tab_tooltip.max_tip_len + 8)]u8 = undefined;
+        var n: usize = 0;
+        for (txt) |c| {
+            if (c == '\n') {
+                esc[n] = '\\';
+                esc[n + 1] = 'n';
+                n += 2;
+            } else {
+                esc[n] = c;
+                n += 1;
+            }
+        }
+        log.debug("tab tooltip tab={d} text={s}", .{ new_hover, esc[0..n] });
     } else {
         log.debug("tab tooltip tab={d} text=<none>", .{new_hover});
     }
@@ -6501,7 +6555,7 @@ fn tabTipTimerFire(self: *Window) void {
     const idx: usize = @intCast(self.hover_tab);
     if (idx >= self.tab_count) return;
 
-    var buf: [tab_tooltip.max_len + 8]u8 = undefined;
+    var buf: [tab_tooltip.max_tip_len + 8]u8 = undefined;
     const text = self.tabTipTextFor(idx, &buf) orelse return;
     const len16 = std.unicode.utf8ToUtf16Le(
         self.tab_tip_text[0 .. self.tab_tip_text.len - 1],

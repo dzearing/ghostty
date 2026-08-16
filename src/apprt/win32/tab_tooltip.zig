@@ -22,6 +22,10 @@ const std = @import("std");
 /// never spans half a monitor.
 pub const max_len: usize = 96;
 
+/// Max UTF-8 bytes of the whole (possibly two-line) tooltip: a clamped
+/// title line, the newline, and an elided location line (T556).
+pub const max_tip_len: usize = max_len * 2 + 1;
+
 /// The elision mark. One character, three UTF-8 bytes.
 const ellipsis = "…";
 
@@ -170,6 +174,52 @@ pub fn tipText(out: []u8, location: []const u8, home: ?[]const u8) ?[]const u8 {
     return elide(out, abbrev, max_len);
 }
 
+/// Clamp a TITLE to `max` bytes keeping the HEAD, cut on a UTF-8 boundary,
+/// with a trailing ellipsis. The head survives because that is what the
+/// strip's own `DT_END_ELLIPSIS` paint keeps — a tooltip line that elided a
+/// different end than the tab it explains would read as a second title.
+fn clampTitle(out: []u8, title: []const u8, max: usize) []const u8 {
+    if (title.len <= max) {
+        @memcpy(out[0..title.len], title);
+        return out[0..title.len];
+    }
+    var end = max -| ellipsis.len;
+    while (end > 0 and (title[end] & 0xC0) == 0x80) end -= 1;
+    @memcpy(out[0..end], title[0..end]);
+    @memcpy(out[end .. end + ellipsis.len], ellipsis);
+    return out[0 .. end + ellipsis.len];
+}
+
+/// Title-aware composition (T556). When the strip ELIDED the painted title,
+/// the full title rides as a first line above the location — the one thing a
+/// hover could not previously rescue. When the title fit, the tip stays
+/// location-only: a line repeating what the tab already shows is noise. An
+/// elided title with no location shows title-only; neither is null, exactly
+/// as `tipText`. `out.len >= max_tip_len` is the caller's contract.
+pub fn tipTextTitled(
+    out: []u8,
+    title: []const u8,
+    title_elided: bool,
+    location: []const u8,
+    home: ?[]const u8,
+) ?[]const u8 {
+    if (!title_elided or title.len == 0) return tipText(out, location, home);
+
+    var tbuf: [max_len]u8 = undefined;
+    const t = clampTitle(&tbuf, title, max_len);
+
+    var lbuf: [max_len]u8 = undefined;
+    const loc = tipText(&lbuf, location, home) orelse {
+        @memcpy(out[0..t.len], t);
+        return out[0..t.len];
+    };
+
+    @memcpy(out[0..t.len], t);
+    out[t.len] = '\n';
+    @memcpy(out[t.len + 1 .. t.len + 1 + loc.len], loc);
+    return out[0 .. t.len + 1 + loc.len];
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -315,4 +365,69 @@ test "tipText: a viewer URL passes through untouched" {
         "http://localhost:3000/",
         tipText(&buf, "http://localhost:3000/", "C:\\Users\\David").?,
     );
+}
+
+test "tipTextTitled: an elided title rides above the location" {
+    var buf: [max_tip_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "my very long tab title\n~\\git\\ghoztty",
+        tipTextTitled(
+            &buf,
+            "my very long tab title",
+            true,
+            "C:\\Users\\David\\git\\ghoztty",
+            "C:\\Users\\David",
+        ).?,
+    );
+}
+
+test "tipTextTitled: a title that fit keeps the tip location-only" {
+    var buf: [max_tip_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "~\\git\\ghoztty",
+        tipTextTitled(
+            &buf,
+            "short",
+            false,
+            "C:\\Users\\David\\git\\ghoztty",
+            "C:\\Users\\David",
+        ).?,
+    );
+}
+
+test "tipTextTitled: elided title with no location shows title-only" {
+    var buf: [max_tip_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "orphan title",
+        tipTextTitled(&buf, "orphan title", true, "", null).?,
+    );
+}
+
+test "tipTextTitled: no title and no location is null" {
+    var buf: [max_tip_len]u8 = undefined;
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        tipTextTitled(&buf, "", true, "", null),
+    );
+}
+
+test "tipTextTitled: an overlong title clamps at the head with ellipsis" {
+    var buf: [max_tip_len]u8 = undefined;
+    const long = "T" ++ ("x" ** 150);
+    const got = tipTextTitled(&buf, long, true, "C:\\d", null).?;
+    const nl = std.mem.indexOfScalar(u8, got, '\n').?;
+    const title_line = got[0..nl];
+    try testing.expect(title_line.len <= max_len);
+    try testing.expect(std.mem.startsWith(u8, title_line, "Txxx"));
+    try testing.expect(std.mem.endsWith(u8, title_line, "…"));
+    try testing.expectEqualStrings("C:\\d", got[nl + 1 ..]);
+}
+
+test "tipTextTitled: the title clamp never splits a UTF-8 sequence" {
+    var buf: [max_tip_len]u8 = undefined;
+    const long = "é" ** 120; // 240 bytes
+    const got = tipTextTitled(&buf, long, true, "", null).?;
+    try testing.expect(got.len <= max_len);
+    try testing.expect(std.unicode.utf8ValidateSlice(got));
+    try testing.expect(std.mem.endsWith(u8, got, "…"));
 }
