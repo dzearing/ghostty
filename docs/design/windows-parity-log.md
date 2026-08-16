@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T578 - Every push to the Windows branch now cross-compiles
+  the full release artifacts in CI.** Resumed a dead turn's stranded tree
+  (claimed 10:29, died before committing; the claim's STRANDED WORK report
+  named all 8 paths). fork-ci.yml gains a `windows-cross` job on
+  ubuntu-latest: gates on tree content (`src/apprt/win32` present, so main
+  pushes no-op and scratch-branch PRs get the real build), installs msitools
+  0.106 via the new shared `dist/windows-installer/install-msitools.sh`
+  (extracted from release-windows.yml so CI and the release cannot drift),
+  and runs `build-release-artifacts.sh --semver 0.0.0` end to end —
+  publishing nothing. Verified live both ways: push run 31967342644 green
+  through the full artifact build, and deliberate-break PR #12 (stray `}` in
+  App.zig) red at exactly the artifact step (run 31967370788), closed
+  unmerged. Harness section E + guard-due `release-artifacts` row cover the
+  wiring. Floor lib/none/win32/agent PASS, P1–P3 ALL PASS. Surprise: first
+  ipc-p1 run after the lanes failed all 21 assertions then passed clean on
+  rerun — filed **T894** for the cold-start cascade. Commit 1e8a3a16f.
 - 2026-08-16 - **T557 - The tab tooltip re-themes on a mid-session
   light/dark flip.** T447's tooltip decided `DarkMode_Explorer` once, at
   control creation, so an OS apps-theme flip (or a `window-theme` reload)
