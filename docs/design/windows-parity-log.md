@@ -9,6 +9,37 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-15 - **T872 - the agent-integration flow has end-to-end acceptance
+  coverage, sandboxed, and the T598 split is CLOSED (8/8).** New debug-only
+  `agent-integration` IPC action (`ipc_agent_integration.zig`, the
+  capture-pane pattern: no CLI verb per T141, release builds answer
+  unknown-action) because the GUI offers exactly one action per state, so
+  idempotence ("reports up_to_date"), typed refusals, rollback and the
+  banner-refcount walk had NO outside driver; it calls the same service
+  entry points the dialog's workers call, under the same
+  GHOZTTY_AGENT_HOME resolution. `test\win32\agent-integrations.ps1`
+  (sections A-H: marked installs + settings-merge preservation, byte-
+  identical idempotence, staleness upgrade, NotManaged/UnparseableConfig/
+  reparse refusals each with a recovery control, rollback that spares
+  pre-existing components, two-agent shared-banner refcount, uninstall
+  exactness, and the migration arm claude-integration.ps1 lacks - a
+  USER-owned plugin-era script survives the accepted migration
+  byte-identical). ALL PASS (65 assertions, 1 SKIPPED - the
+  ReparsePointRefused arm needs symlink privilege this box lacks; unit
+  tests pin it); -NegativeControl fails exactly its two inverted claims
+  and does not stamp; a real-home manifest-hash canary proves zero
+  reads/writes outside the sandbox; guard-due row `agent-integrations`
+  (15 files) proven due-on-edit both directions. Surprises: a
+  junction-at-destination surfaces as WriteFailed (unreadable pre-read),
+  not ReparsePointRefused - the harness documents both arms like the unit
+  tests; a partially-missing banner component deliberately reads outdated
+  so its recovery reports `upgraded`; PS5.1's Get/Set-Content UTF-8
+  round-trip corrupted D1's restore (byte-level IO.File now); and the
+  skip-visibility sweep was RED at HEAD - T513's edit left
+  agent-shell-integration.ps1 with 2 skip sites and a countless ALL PASS
+  (the exact T219 shape), fixed inline and its harness re-run green.
+  Floor + P1-P3 evidence in the task file. Next: T598's children are all
+  done; queue continues per priority.
 - 2026-08-15 - **T871 - the Agent Integrations management window exists on
   Windows.** Seventh T598 slice: `AgentIntegrationsDialog.zig` (modal dark
   dialog in the ConfirmDialog/HostSettingsDialog nested-pump shape; pure
