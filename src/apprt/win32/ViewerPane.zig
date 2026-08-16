@@ -5698,39 +5698,6 @@ test "host floor: a real controller on a real window, on this box" {
     // re-fetch of a page the user just opened. Modelled exactly: arm the
     // timer with the very message the watcher thread posts, then navigate
     // WITHOUT pumping in between, which is the whole window the bug lives in.
-    //
-    // Calibrate first, and calibrate against the SAME cache the assertion below
-    // will be measured against. Whether a repeat navigation to the page costs a
-    // fetch at all is Chromium's cache's business (the response is `max-age=600`
-    // and still fresh), so it is measured rather than assumed — the assertion
-    // below is "the navigation's own fetch and NOTHING else".
-    //
-    // Measuring it ONCE is what made this arm flaky (T690): the first repeat and
-    // every later one are not the same cache state. Measured over four runs on
-    // 2026-08-10 with no source change, the first cost 1 fetch twice and 0
-    // fetches twice, while the number the assertion reads was 0 every single
-    // time — so the EXPECTATION was the unstable side and the arm went red about
-    // one run in three. Running the round trip twice and keeping the second
-    // number puts both measurements on the same footing.
-    var nav_cost: u32 = 0;
-    for (0..2) |_| {
-        const t400_base = reload_page.requests.load(.acquire);
-        try pane.navigate(alloc, reload_url);
-        try waitFor(&msg, 30, struct {
-            fn ready(p: *ViewerPane) bool {
-                return p.mode == .web and p.page_loaded;
-            }
-        }.ready, &pane);
-        nav_cost = reload_page.requests.load(.acquire) - t400_base;
-        try pane.navigate(alloc, md_path);
-        try waitFor(&msg, 30, struct {
-            fn ready(p: *ViewerPane) bool {
-                return p.mode.isFile() and p.page_loaded;
-            }
-        }.ready, &pane);
-    }
-    log.warn("t400: a repeat navigation costs {d} fetch(es)", .{nav_cost});
-
     const t400_host = pane.hwnd.?;
 
     // Positive control: the watcher's message really does arm a timer on this
@@ -5759,22 +5726,32 @@ test "host floor: a real controller on a real window, on this box" {
     try pane.navigate(alloc, reload_url);
     try testing.expectEqual(@as(i32, 0), w32.KillTimer(t400_host, reload_timer_id));
 
-    // The end-to-end companion: with the debounce cancelled, settling on the
-    // destination and pumping well past it costs the navigation's own fetch
-    // and nothing more. Weaker than the line above (see why, there), but it
-    // is the user-visible claim — the page they opened is loaded once.
+    // The end-to-end companion: with the debounce cancelled, nothing fetches
+    // AFTER the destination settles, however long we pump past the window.
+    // Weaker than the line above (see why, there), but it is the user-visible
+    // claim — the page they opened is not re-loaded behind their back.
+    //
+    // Only the post-settle delta is asserted. The navigation's own cost is
+    // Chromium's cache's business (the response is `max-age=600`): 0 or 1
+    // depending on cache warmth, and equating it against a separately measured
+    // expectation is what made this arm flake about one run in three (T690
+    // calibrated it away, T596 finished the job — two cache-dependent
+    // measurements never HAVE to agree). Nothing navigates between the two
+    // reads below, so the asserted number cannot depend on cache state at
+    // all. The navigation's cost is logged, not asserted.
     try waitFor(&msg, 30, struct {
         fn ready(p: *ViewerPane) bool {
             return p.mode == .web and p.page_loaded;
         }
     }.ready, &pane);
+    const t400_settled = reload_page.requests.load(.acquire);
     pumpFor(&msg, reload_debounce_ms * 4);
-    const after_nav = reload_page.requests.load(.acquire) - before_nav;
-    log.warn("t400: stale-debounce window cost {d} fetch(es), expected {d}", .{
-        after_nav,
-        nav_cost,
+    const after_settle = reload_page.requests.load(.acquire) - t400_settled;
+    log.warn("t400: navigation cost {d} fetch(es); pumping past the debounce window cost {d}, expected 0", .{
+        t400_settled - before_nav,
+        after_settle,
     });
-    try testing.expectEqual(nav_cost, after_nav);
+    try testing.expectEqual(@as(u32, 0), after_settle);
 
     // Leave the pane where the T391 section left it: on the file, watching.
     try pane.navigate(alloc, md_path);

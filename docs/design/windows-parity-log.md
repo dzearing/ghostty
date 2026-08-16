@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T596 - the host-floor t400 fetch-count assertion can no
+  longer flake on cache state (T597/T615 closed with it).** The flake class
+  is removed rather than suppressed: the assertion no longer compares ANY two
+  cache-dependent measurements. The calibration loop (T690's mitigation) is
+  deleted; the companion now reads the request counter after the destination
+  settles, pumps `reload_debounce_ms * 4`, and asserts the delta is ZERO —
+  nothing navigates inside that window, so the cache cannot contribute to the
+  asserted number. The navigation's own cost (0 or 1, Chromium's business) is
+  logged, never asserted. No teeth were lost: with T400's bug restored (drop
+  the `KillTimer` from `syncWatcher`) the section still goes red at the timer
+  oracle (`expected 0, found 1`) — and the fetch companion never even executes
+  in that case because the oracle's `try` fails first; it was always framing.
+  The fix's value showed up in its own validation sweep: the win32 lane's
+  navigation cost 1 fetch and the agent lane's cost 0 in the same run —
+  exactly the divergence that flipped the old equality red — while the
+  asserted delta was 0 everywhere. 3 filtered host-floor runs + floor
+  lib/none/win32/agent PASS, P1–P3 25/20/16 ALL PASS. T597 and T615 (the
+  same defect filed from the agent-lane and win32-lane sightings) closed as
+  duplicates. Filed **T898**: release-artifacts ran ALL PASS again with its
+  two Docker-only sections skipped, so it cannot re-stamp while Docker stays
+  down (standing directive) — three turns running on `-NoGuardDue` is the
+  hatch becoming routine, which is the exact thing a hatch must not become.
 - 2026-08-16 - **T594 - A test run can no longer hand a page to the user's
   real browser.** The user's leaked `t390.html` Edge windows traced to the
   win32 unit-test binary: the URL exists only in ViewerPane's host-floor test
