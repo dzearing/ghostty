@@ -9,7 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
-- 2026-08-15 - **T443/T857 - the ghost's window was ACTIVE tonight (occurrences
+- 2026-08-16 - **T516 - the merge-back risk is a list now, not a guess:
+  `scripts\divergence-inventory.ps1` computes the fork-point divergence vs
+  upstream ghostty and writes `docs\design\windows-parity-divergence.md`.**
+  Fork point `063ac3ecc` (2026-05-07); since then ours moved 1780 commits /
+  2104 files, upstream 1116 / 747, and the overlap — the set a merge can
+  actually go wrong in — is 131 files, each listed with per-side status and
+  non-merge commit counts (definition documented in the report and spot-checked
+  exact against `git log --full-history --no-merges` for build.zig, CLAUDE.md,
+  include/ghostty.h). Acceptance `test\win32\divergence-inventory.ps1` (15
+  assertions: exact three-way split on a synthetic repo, merge commits not
+  double-counted, error paths exit 2 with no report) + a guard-due row so the
+  computation cannot drift silently. Surprise paid twice while writing it: the
+  PS 5.1 single-element-unroll trap (`(fn)[0]` on a one-line git answer returns
+  the first CHARACTER) bit the script and then its own test.
   3 and 4 of the day landed inside the measurement itself) and the
   hardware-vs-software A/B is now half-run: boost-on baseline done, boost-off
   arm waiting on the user for an elevated shell.** The 19:23 reopen was worked

@@ -85,6 +85,18 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The divergence inventory (T516) is merge-back planning's input: a set
+    # computation that drifts wrong sends a future merge hunting conflicts in
+    # the wrong files, and nothing in the P1-P3 floor runs its harness.
+    [pscustomobject]@{
+        Name   = 'divergence-inventory'
+        Script = 'test\win32\divergence-inventory.ps1'
+        Stamp  = 'test\win32\divergence-inventory.stamp.json'
+        Covers = @(
+            'scripts\divergence-inventory.ps1',
+            'test\win32\divergence-inventory.ps1'
+        )
+    },
     # The vendored agent assets (T866) rot silently: main edits its copy of a
     # skill or hook script and nothing here goes red until someone re-runs the
     # drift compare, and a banner-script or +json edit that breaks the jq-free

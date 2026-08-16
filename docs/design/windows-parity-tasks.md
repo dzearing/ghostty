@@ -1666,5 +1666,10 @@ Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
   entry only when you need the backstory for your current task. Append ONE
   short entry at every task boundary.
 - `windows-parity-audit.md` — the 2026-07-12 three-way audit findings.
+- `windows-parity-divergence.md` — the mechanical divergence inventory vs
+  upstream ghostty (T516): fork point, the changed-both merge risk set with
+  per-file commit counts, and the two single-side lists. Regenerate with
+  `scripts\divergence-inventory.ps1` before any merge-back planning; do not
+  hand-edit it.
 - `windows-parity-spec.md` — architecture decisions (pinned). Read its
   "Architecture decisions" section before implementing any IPC task.
