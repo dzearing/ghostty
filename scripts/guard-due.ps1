@@ -126,6 +126,23 @@ $GuardTable = @(
             'test\win32\ipc-when-idle.ps1'
         )
     },
+    # The sharing uplink (T546) only ever runs when a machine is marked shared,
+    # so a regression in the raise/park/reconcile path is invisible to the
+    # P1-P3 floor and to every local-agent test - nothing else ties an edit of
+    # the uplink graft (main.zig), its config module, or the loop/creds
+    # machinery it drives to a run of the harness that dials a real listener.
+    [pscustomobject]@{
+        Name   = 'agent-sharing-uplink'
+        Script = 'test\win32\agent-sharing-uplink.ps1'
+        Stamp  = 'test\win32\agent-sharing-uplink.stamp.json'
+        Covers = @(
+            'src\remote\agent\sharing.zig',
+            'src\remote\agent\main.zig',
+            'src\remote\agent\relay_creds.zig',
+            'src\remote\agent\link_control.zig',
+            'test\win32\agent-sharing-uplink.ps1'
+        )
+    },
     # The divergence inventory (T516) is merge-back planning's input: a set
     # computation that drifts wrong sends a future merge hunting conflicts in
     # the wrong files, and nothing in the P1-P3 floor runs its harness.

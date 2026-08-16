@@ -129,6 +129,7 @@ const atomic_write = @import("atomic_write.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
+const sharing = @import("sharing.zig");
 const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
 const agent_lineage = @import("../agent_lineage.zig");
@@ -1307,6 +1308,12 @@ fn runListenUnix(
     const stdout = std.fs.File.stdout();
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on unix:{s}\n", .{ agent_version, path }) catch "ghoztty-agent: listening\n") catch {};
 
+    // Sharing uplink (T546): if this machine is marked shared, raise the relay
+    // control loop IN THIS PROCESS over the same persisted store, so remote
+    // devices reach the sessions the user actually cares about. The
+    // sessions_file slice is borrowed only for path derivation inside the call.
+    maybeStartSharingUplink(alloc, encoding, &store, spawner.spawner(), sessions_file);
+
     // Same accept core as TCP, but with the same-uid peercred gate enabled.
     try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener, true);
 }
@@ -1406,6 +1413,12 @@ fn runListenPipe(
 
     const stdout = std.fs.File.stdout();
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on pipe:{s}\n", .{ agent_version, name }) catch "ghoztty-agent: listening\n") catch {};
+
+    // Sharing uplink (T546): if this machine is marked shared, raise the relay
+    // control loop IN THIS PROCESS over the same persisted store, so remote
+    // devices reach the sessions the user actually cares about. The
+    // sessions_file slice is borrowed only for path derivation inside the call.
+    maybeStartSharingUplink(alloc, encoding, &store, spawner.spawner(), sessions_file);
 
     // Accept loop: same serve-each-connection-on-its-own-thread core as the
     // socket paths, over pipe instances. The DACL already gated admission (only
@@ -2214,6 +2227,222 @@ fn relayLoop(
     link_control.runLoop(link, transport.transport(), relay_backoff_ms);
 }
 
+// -----------------------------------------------------------------------------
+// Sharing uplink (T546): the consolidated local agent's OPTIONAL relay uplink.
+// The `--listen-pipe`/`--listen-unix` daemon reads `sharing.json` from its
+// state dir (see `sharing.zig` for why it lives there and not on the command
+// line) and, when sharing is enabled and relay.env holds a credential, runs
+// THE SAME relay control loop as `--relay` mode — over the SAME persisted
+// `SessionStore` the local transport serves. That is the whole point of the
+// one-installer consolidation: the sessions worth transferring live in the
+// local store, so the uplink must serve that store, not a second one.
+//
+// Deliberately NOT here (design decisions, one-installer doc): no tray, no
+// tray account, no self-update — the app owns the binary and the UI; this
+// daemon stays headless. The local single-instance guard is untouched.
+// -----------------------------------------------------------------------------
+
+/// Owns the uplink's state for the daemon's lifetime. Heap-allocated by
+/// `maybeStartSharingUplink`; after the initial synchronous reconcile it is
+/// touched only by its own tick thread (LinkControl handles the cross-thread
+/// traffic with the relay loop).
+const SharingUplink = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    /// sharing.json path. Owned.
+    config_path: []const u8,
+    /// Desired/live link state shared with the relay loop once raised.
+    link: link_control.LinkControl = .{},
+    /// Whether the relay loop thread (and creds) have been built. Once true,
+    /// enable/disable is a park/reconnect on `link`, never a rebuild.
+    raised: bool = false,
+    /// Owned after a successful raise (daemon lifetime).
+    ws_base: ?[]u8 = null,
+    creds: ?*relay_creds.Creds = null,
+    creds_watch: ?*relay_creds.Watcher = null,
+    /// One "sharing is on but there is no credential" line per config change,
+    /// not one per 5s tick.
+    said_unavailable: bool = false,
+    /// Poll cadence; mirrors relay_creds.Watcher (a human-paced toggle).
+    poll_interval_ms: u64 = 5_000,
+    /// Set by tests to stop the tick thread; production never stops it.
+    stop: std.Thread.ResetEvent = .{},
+
+    /// One reconcile: read the config, compare with what is running, act.
+    /// Idempotent — safe to run every tick whether or not anything changed
+    /// (an enabled flag with a missing relay.env retries here, so writing
+    /// the credential AFTER the flag still converges).
+    fn reconcile(self: *SharingUplink) void {
+        const cfg = sharing.load(self.alloc, self.config_path);
+        if (!cfg.enabled) {
+            self.said_unavailable = false;
+            // Park only a currently-online link so a parked one is not
+            // re-woken every tick.
+            if (self.raised and self.link.display() != .offline) {
+                std.debug.print("ghoztty-agent: sharing disabled; parking the relay uplink (local sessions unaffected)\n", .{});
+                self.link.disconnect();
+            }
+            return;
+        }
+        if (self.raised) {
+            // Enabled and built: make sure it is not parked (no-op when
+            // already online — reconnect only flips offline→online).
+            self.link.reconnect();
+            return;
+        }
+        self.tryRaise();
+    }
+
+    /// Build the uplink: relay.env → wss base + credential → creds watcher +
+    /// relay loop thread over the shared store. Failure leaves `raised` false
+    /// and is retried on a later tick (all failure modes are "stay local",
+    /// never "kill the daemon").
+    fn tryRaise(self: *SharingUplink) void {
+        const alloc = self.alloc;
+        const env_path = enroll.relayEnvPath(alloc) catch |err| {
+            self.sayUnavailable("relay.env path unavailable", @errorName(err));
+            return;
+        };
+        var env_path_owned = true;
+        defer if (env_path_owned) alloc.free(env_path);
+
+        var env = enroll.loadRelayEnv(alloc, env_path) catch {
+            self.sayUnavailable("no relay.env", "enroll this machine first (Share this machine in the chooser)");
+            return;
+        };
+        defer env.deinit(alloc);
+        const relay_base = env.relay_base orelse {
+            self.sayUnavailable("relay.env has no RELAY_BASE", "re-enroll this machine");
+            return;
+        };
+        const token = env.device_token orelse {
+            self.sayUnavailable("relay.env has no device token", "re-enroll this machine");
+            return;
+        };
+
+        const ws_base = wssBase(alloc, relay_base) catch return; // wssBase already printed why
+
+        // Owner-only DACL on the credential we are about to serve with (same
+        // in-place hardening `--relay` mode does).
+        enroll.hardenLocalCredential(alloc);
+
+        const creds = alloc.create(relay_creds.Creds) catch {
+            alloc.free(ws_base);
+            return;
+        };
+        // Creds takes ownership of the token; keep env.deinit off it.
+        env.device_token = null;
+        creds.* = relay_creds.Creds.init(alloc, .relay_env, token);
+
+        self.ws_base = ws_base;
+        self.creds = creds;
+        // "Connected to <host>" label; borrowed from ws_base (daemon lifetime).
+        self.link.host = ws_base[(std.mem.indexOf(u8, ws_base, "://") orelse 0) + "://".len ..];
+
+        // Hot credential reload (re-enroll without an agent restart), same
+        // watcher as relay mode. Loss of the watcher only costs hot-reload.
+        if (alloc.create(relay_creds.Watcher)) |watch| {
+            watch.* = relay_creds.Watcher.init(alloc, env_path, creds, &self.link, ws_base);
+            env_path_owned = false; // watcher owns it now
+            if (std.Thread.spawn(.{}, relay_creds.Watcher.run, .{watch})) |t| {
+                t.detach();
+                self.creds_watch = watch;
+            } else |err| {
+                std.debug.print("ghoztty-agent: sharing: relay.env watch disabled ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
+                watch.deinit(); // frees env_path
+                alloc.destroy(watch);
+            }
+        } else |_| {}
+
+        const args: RelayArgs = .{
+            .alloc = alloc,
+            .encoding = self.encoding,
+            .ws_base = ws_base,
+            .creds = creds,
+            .store = self.store,
+            .spawner = self.spawner,
+            .link = &self.link,
+        };
+        if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
+            t.detach();
+            self.raised = true;
+            self.said_unavailable = false;
+            std.debug.print("ghoztty-agent: sharing enabled; relay uplink raised (control={s}/v1/agent/control)\n", .{ws_base});
+        } else |err| {
+            // Keep creds/ws_base for the next tick's retry-free reuse? No:
+            // simplest correct state is "not raised, resources parked"; the
+            // next tick reuses them via the raised==false path only if we
+            // free them now. Free and retry from scratch.
+            std.debug.print("ghoztty-agent: sharing: relay loop spawn failed ({s}); staying local-only\n", .{@errorName(err)});
+            if (self.creds_watch) |w| {
+                w.requestStop();
+                self.creds_watch = null;
+                // Watcher thread frees nothing on exit; its struct + path leak
+                // here by design (it may still be mid-tick) — one-shot, tiny.
+            }
+            self.creds = null;
+            self.ws_base = null;
+            creds.deinit();
+            alloc.destroy(creds);
+            alloc.free(ws_base);
+        }
+    }
+
+    fn sayUnavailable(self: *SharingUplink, what: []const u8, hint: []const u8) void {
+        if (self.said_unavailable) return;
+        self.said_unavailable = true;
+        std.debug.print("ghoztty-agent: sharing is enabled but the uplink cannot start: {s} ({s}); serving local-only until it is fixed\n", .{ what, hint });
+    }
+
+    /// Tick thread: reconcile every `poll_interval_ms` until `stop` (tests).
+    fn run(self: *SharingUplink) void {
+        const interval_ns = self.poll_interval_ms * std.time.ns_per_ms;
+        while (true) {
+            if (self.stop.timedWait(interval_ns)) {
+                return; // stop requested (tests)
+            } else |_| {}
+            self.reconcile();
+        }
+    }
+};
+
+/// Start the sharing uplink controller for a local listen daemon: resolve the
+/// config path (no persistence dir → no sharing, silently), run ONE
+/// synchronous reconcile so an enabled flag raises before the daemon starts
+/// accepting, then keep reconciling on a background tick thread. All failure
+/// modes degrade to "local-only", never to a dead daemon — same
+/// availability-first policy as the tray and the creds watcher.
+fn maybeStartSharingUplink(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    sessions_file: ?[]const u8,
+) void {
+    const config_path = sharing.pathFor(alloc, sessions_file) orelse return;
+    const self = alloc.create(SharingUplink) catch {
+        alloc.free(config_path);
+        return;
+    };
+    self.* = .{
+        .alloc = alloc,
+        .encoding = encoding,
+        .store = store,
+        .spawner = spawner,
+        .config_path = config_path,
+    };
+    self.reconcile();
+    if (std.Thread.spawn(.{}, SharingUplink.run, .{self})) |t| {
+        t.detach(); // daemon-lifetime thread; nothing ever joins it
+    } else |err| {
+        // The initial reconcile already ran: a startup-enabled uplink is up,
+        // only the hot toggle is lost.
+        std.debug.print("ghoztty-agent: sharing.json watch disabled ({s}); toggling sharing needs an agent restart\n", .{@errorName(err)});
+    }
+}
+
 /// One live relay control connection: the WebSocket plus its keepalive
 /// (dead-link detection) thread. Heap-allocated per dial so the keepalive's
 /// `*Keepalive` stays stable while its thread runs.
@@ -2448,6 +2677,7 @@ test {
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
     _ = @import("relay_creds.zig");
+    _ = @import("sharing.zig");
     _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
     _ = @import("../agent_lineage.zig");
