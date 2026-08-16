@@ -81,3 +81,13 @@ as the digest that showed them.
 - Search everything you ever ran (persistent cross-day command history)
 - Safe mode after a crash loop (plain launch: default config, no restore)
 - Locked side-by-side scrolling for two panes
+
+## 2026-08-16
+
+- A real settings window (native GUI config editor)
+- WSL distros as first-class shells (auto-detected, path translation)
+- "A pane is waiting on you" alert (stuck-at-prompt detection)
+- Theme browser with live preview
+- Acrylic window background (Windows translucency)
+- Record a pane as a shareable replay
+- Screen-reader support (UI Automation for Narrator/NVDA)
