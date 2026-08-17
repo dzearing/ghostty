@@ -176,19 +176,16 @@ if ($ResumePromptFile) {
 # Autostart is an HKCU Run entry (the mechanism T89h gave the local agent) PLUS
 # a repeating per-user scheduled task. Neither alone is enough: a Run entry
 # fires at sign-in only, so a watchdog that dies at 09:14 is gone until the next
-# logon - which is exactly what happened on 2026-08-03 (T440). `/sc ONLOGON`
-# needs elevation, but `/sc MINUTE` does not, and this loop must stay
+# logon - which is exactly what happened on 2026-08-03 (T440).
+#
+# The task carries BOTH triggers now (T829). `schtasks /sc ONLOGON` does need
+# elevation, which is why this was minute-repetition only for a year; the
+# ScheduledTasks module registering an AtLogOn trigger for one's OWN account
+# does not, measured on the box. So a session appearing revives the watchdog
+# immediately instead of up to -ReviveMinutes later, and this loop stays
 # installable from an ordinary session.
 function Get-RunCommand {
     return "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Repo `"$Repo`""
-}
-
-# schtasks wants the whole command as ONE /tr argument with its inner quotes
-# backslash-escaped; anything else silently loses the arguments after the first
-# space (verified on the box before shipping this).
-function Get-ReviveTaskCommand {
-    return '\"powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden' +
-           " -File \`"$PSCommandPath\`" -Repo \`"$Repo\`""
 }
 
 function Test-ReviveTask {
@@ -223,9 +220,19 @@ if ($Install) {
     Set-ItemProperty -Path $runKey -Name $runValue -Value $cmd
     Log "installed Run entry $runValue -> $cmd"
 
-    $tr = Get-ReviveTaskCommand
-    $out = (& schtasks /create /tn $runValue /tr "$tr" /sc MINUTE /mo $ReviveMinutes /f 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -eq 0) { Log "installed revive task $runValue (every ${ReviveMinutes}m)" }
+    # The task's SHAPE lives in one place (T829). It used to be a `schtasks
+    # /create /sc MINUTE` right here, which registered the Task Scheduler
+    # defaults along with the schedule: battery-gated, 72-hour execution limit,
+    # and no logon trigger - so a laptop on battery never revived, the 72-hour
+    # limit killed the very watchdog the task had started, and a session
+    # appearing waited up to -ReviveMinutes to be noticed. go-loop-boot.ps1
+    # owns the shape and reads it back after registering; two owners of one
+    # task is how the flags drift apart again.
+    $bootScript = Join-Path $PSScriptRoot 'go-loop-boot.ps1'
+    $out = (& powershell -NoProfile -ExecutionPolicy Bypass -File $bootScript install `
+        -Repo $Repo -WatchdogScript $PSCommandPath -TaskName $runValue -ReviveMinutes $ReviveMinutes 2>&1 |
+        Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) { Log "installed revive task $runValue (at logon + every ${ReviveMinutes}m)" }
     else { Log "WARNING: could not install the revive task (exit $LASTEXITCODE): $out" }
 
     if (Test-WatchdogRunning) {

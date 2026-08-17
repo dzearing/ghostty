@@ -45,6 +45,12 @@
 #      they stay dirty; `ack-stranded` hands them to an OPEN task (the ack
 #      survives re-claims and dies with the task); resolving the tree deletes
 #      the snapshot. All against a fixture git repo + fixture task dir.
+#   V. Boot revival (T829): after a reboot with nobody at the keyboard nothing
+#      of ours can run at all, so the loop's answer is to MEASURE the gap
+#      between power-on and a desktop existing, record it once per boot, and be
+#      loud about it on the way back. Plus the links below that one, which are
+#      ours to hold: the revive task fires AT LOGON, is not battery-gated, and
+#      carries no execution time limit that would kill the watchdog it started.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -1119,6 +1125,107 @@ if ($null -eq $paneS) {
     Assert 'S10 a clean tree claims clean' ($r.Out -match 'tree clean at claim')
     Ghoz @('+close', "--target=$($paneS.id)") | Out-Null
 }
+
+# --- V. boot revival (T829) ------------------------------------------------
+""
+"V. boot revival: the sign-in gap is measured, recorded once per boot, and loud"
+# Pure: the classifier is driven with known boot/logon times instead of
+# rebooting the box, and the task arm registers a fixture-named task so the real
+# supervisor's registration is never touched. The one arm that reads the REAL
+# task is read-only, and is there because the shape on THIS box is the thing
+# that has to be right - a fixture proving `install` can produce a good task
+# says nothing about whether anyone ran it.
+$bootScript = Join-Path $Repo 'scripts\go-loop-boot.ps1'
+$bootLedger = Join-Path $root 'boots.jsonl'
+$fixtureTask = 'GhozttyGoLoopBootGuardFixture'
+
+function Boot-Run([string[]]$extra) {
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bootScript,
+        '-Repo', $Repo, '-LedgerPath', $bootLedger) + $extra
+    $out = (& powershell @argList 2>&1 | Out-String)
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
+function Ledger-Rows { if (Test-Path $bootLedger) { @(Get-Content $bootLedger | Where-Object { $_.Trim() }) } else { @() } }
+
+# A box that signed itself back in is the outcome this task wants, and it must
+# read as a quiet success rather than an outage.
+$r = Boot-Run @('record', '-BootTime', '2026-08-01T03:00:00', '-LogonTime', '2026-08-01T03:01:00')
+Assert 'V1 an unattended sign-in records quietly' `
+    ($r.Code -eq 0 -and $r.Out -match 'signed in by itself after 1m' -and $r.Out -notmatch 'BOOT OUTAGE')
+# @(...) around the call, not just inside the function: a one-element array
+# returned from a PowerShell function unrolls to the bare string, and [-1] on a
+# string is its last CHARACTER - which matches nothing and reads as a real bug.
+Assert 'V2 it lands in the ledger as unattended' (@(Ledger-Rows)[-1] -match '"unattended":true')
+
+# The measured failure: 25 hours with no desktop. Loud, with the span and the
+# one-time human fix in the same block.
+$r = Boot-Run @('record', '-BootTime', '2026-08-02T03:00:00', '-LogonTime', '2026-08-03T04:09:00')
+Assert 'V3 a reboot nobody signed in to is a loud BOOT OUTAGE' ($r.Out -match 'BOOT OUTAGE')
+Assert 'V4 the outage names the measured span' ($r.Out -match '1d 1h 9m')
+Assert 'V5 the outage names the fix a human can act on' ($r.Out -match 'Sign-in options')
+
+# Once per boot, not once per turn: `claim` calls this every time.
+$before = (Ledger-Rows).Count
+$r = Boot-Run @('record', '-BootTime', '2026-08-02T03:00:00', '-LogonTime', '2026-08-03T04:09:00')
+Assert 'V6 re-recording the same boot says nothing' ($r.Out -eq '')
+Assert 'V7 re-recording the same boot adds no row' ((Ledger-Rows).Count -eq $before)
+
+$r = Boot-Run @('record', '-BootTime', '2026-08-04T03:00:00', '-LogonTime', '2026-08-04T03:00:30')
+Assert 'V8 a different boot is a new row' ((Ledger-Rows).Count -eq ($before + 1))
+
+# `check`'s link-1 verdict comes from the ledger, never from the registry - the
+# registry on this box reads "configured" (AutoLogonSID set to the user's own
+# SID) while the box demonstrably does not sign itself in.
+$r = Boot-Run @('check', '-Json', '-TaskName', $fixtureTask)
+$j = $null
+try { $j = ($r.Out | ConvertFrom-Json) } catch { }
+Assert 'V9 check reads link 1 off the last recorded boot' ($null -ne $j -and $j.link1 -eq 'unattended')
+Assert 'V10 check totals the downtime it has measured' ($null -ne $j -and [math]::Round([double]$j.lost_minutes) -eq 1509)
+Assert 'V11 an unregistered revive task is BROKEN, not merely noted' `
+    ($r.Code -eq 2 -and $null -ne $j -and @($j.broken).Count -gt 0)
+
+# `install` owns the task SHAPE, and reads it back rather than trusting that
+# Register-ScheduledTask did what it was told.
+$r = Boot-Run @('install', '-TaskName', $fixtureTask, '-WatchdogScript', $dogScript)
+Assert 'V12 install registers the revive task' ($r.Code -eq 0 -and $r.Out -match 'INSTALLED')
+Assert 'V13 install verifies the shape it just wrote' `
+    ($r.Out -match 'atLogon=True' -and $r.Out -match 'repeats=True' -and
+     $r.Out -match 'batteryGate=False' -and $r.Out -match 'timeLimited=False')
+$r = Boot-Run @('install', '-TaskName', $fixtureTask, '-WatchdogScript', $dogScript)
+Assert 'V14 install is idempotent' ($r.Code -eq 0 -and $r.Out -match 'atLogon=True')
+$r = Boot-Run @('check', '-Json', '-TaskName', $fixtureTask)
+$j = $null
+try { $j = ($r.Out | ConvertFrom-Json) } catch { }
+# Scoped to the task: the fixture name has no HKCU Run entry and is not
+# supposed to, so the whole `broken` list would never empty here.
+Assert 'V15 check stops calling the task broken once it is installed' `
+    ($null -ne $j -and @($j.broken | Where-Object { $_ -match 'revive task' }).Count -eq 0)
+& powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName '$fixtureTask' -Confirm:`$false -ErrorAction SilentlyContinue" *> $null
+
+# Read-only, on the REAL supervisor task, for the same reason P11/P12 are: the
+# flags that matter are the ones on this box. A laptop on battery would never
+# revive, and the default 72-hour execution limit kills the watchdog the task
+# itself started.
+$realTask = $null
+try { $realTask = Get-ScheduledTask -TaskName 'GhozttyGoLoopWatchdog' -ErrorAction Stop } catch { }
+if ($null -eq $realTask) {
+    "  SKIP V16-V18 (no GhozttyGoLoopWatchdog task; run go-loop-watchdog.ps1 -Install)"
+    $script:skipped++
+} else {
+    $realLogon = @($realTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count
+    Assert 'V16 the real revive task fires at logon (run go-loop-boot.ps1 install if this fails)' ($realLogon -gt 0)
+    Assert 'V17 the real revive task is not battery-gated' `
+        (-not ([bool]$realTask.Settings.DisallowStartIfOnBatteries -or [bool]$realTask.Settings.StopIfGoingOnBatteries))
+    Assert 'V18 the real revive task has no execution time limit' `
+        (([string]$realTask.Settings.ExecutionTimeLimit) -in @('', 'PT0S'))
+}
+
+# One owner for the shape: the watchdog must delegate rather than register its
+# own defaults again. Asserted on the source because running -Install for real
+# would re-register the supervisor this box is relying on right now.
+$dogSrc = Get-Content $dogScript -Raw
+Assert 'V19 the watchdog delegates the task shape to go-loop-boot.ps1' `
+    ($dogSrc -match 'go-loop-boot\.ps1' -and $dogSrc -notmatch 'schtasks\s+/create')
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

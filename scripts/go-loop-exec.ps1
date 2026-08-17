@@ -236,6 +236,22 @@ switch ($Action) {
             foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
         }
 
+        # T829: did the box come back from its last reboot by itself, or did the
+        # loop sit dead until somebody signed in? Reported HERE for the same
+        # reason the guard report above is: this is the one command every turn
+        # runs, and it is the first moment after a reboot that anything of ours
+        # is alive to say so. Nothing can send a signal DURING that outage -
+        # with no interactive session there is no process to send one - so the
+        # signal is the first thing seen on the way back, and it is a measured
+        # number rather than somebody's recollection. Idempotent on the boot
+        # timestamp, so it speaks once per reboot and stays silent every other
+        # turn.
+        $bootScript = Join-Path $PSScriptRoot 'go-loop-boot.ps1'
+        if (Test-Path -LiteralPath $bootScript) {
+            $bootOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $bootScript record -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($bootOut -split "`r?`n")) { if ($line.Trim()) { $line } }
+        }
+
         # T847: anything dirty in the tree RIGHT NOW is a dead turn's work -
         # this turn has not touched a file yet. The CLAUDE.md split sat
         # uncommitted for two days while task commits landed around it, because

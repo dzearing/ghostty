@@ -37,6 +37,18 @@ Concretely, in order, with no stops in between:
      open, so the gate cannot wedge the loop). Never sweep them silently into
      your task's commit, and never keep working past the report as if the tree
      were clean.
+   - **It also reports a BOOT OUTAGE** (T829): after a restart with nobody at
+     the keyboard, no process of ours can run at all — Windows creates no
+     session, so both the Run entry and the supervisor's scheduled task are
+     skipped, and one such reboot cost 25 hours. Nothing can send a signal
+     *during* that window, so the claim sends it on the way back: it measures
+     power-on against the moment a desktop actually existed and prints the gap
+     once per reboot. A quiet claim means the box signed itself back in. The
+     block names the one-time Windows sign-in setting that closes it — that
+     link is the user's to flip and nothing here will do it for them. Full
+     audit: `scripts\go-loop-boot.ps1 check`; `install` re-registers the revive
+     task with its AT LOGON trigger and without the battery gate and 72-hour
+     limit that Task Scheduler defaults to.
    - The arbiter is the lock, not a negotiation: whoever holds it is primary,
      which is symmetric and cannot deadlock. Ownership is keyed on the
      **pane**, so a relaunched claude in the same pane is the same slot (the
