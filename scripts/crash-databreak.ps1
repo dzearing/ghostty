@@ -152,7 +152,9 @@
     caught, 2 = could not run (no cdb, no exe, probe failed), 3 = the program
     crashed without touching an armed slot (crash captured a la crash-catch),
     4 = -WatchPages only: the session was ended by a break nobody routed, so
-    the program was killed mid-run and the watch covered only part of it.
+    the program was killed mid-run and the watch covered only part of it,
+    5 = -TimeoutSeconds ran out while the program was still running, so it was
+    killed there and the rest of the run was never watched (T836).
 
 .EXAMPLE
     powershell -NoProfile -File scripts\crash-databreak.ps1 -Lane agent
@@ -499,7 +501,10 @@ if ($crashed) {
     exit 3
 }
 
-if ($last.ArmCount -eq 0) {
+# A run the clock killed explains its own zero arm count below (T836); saying
+# "'X' was never called" of a program that was still running is the same lie in
+# the other direction.
+if ($last.ArmCount -eq 0 -and -not $last.TimedOut) {
     if ($WatchPages) {
         if (-not $last.Tried) {
             Write-Host ("databreak: WARNING -- nothing was armed because '{0}' was NEVER CALLED in this process." -f $Symbol)
@@ -522,6 +527,39 @@ if ($last.ArmCount -eq 0) {
     }
 }
 $modeName = if ($underBuild) { 'build-runner' } else { 'standalone' }
+# T836: the clock ending a run is a DIFFERENT outcome from the program ending
+# it, and it used to be reported as the same one. The TIMEOUT line is printed
+# eleven lines up by the runner, but the verdict is the line that gets quoted
+# into a task file, and it read `no wild write observed` either way -- with the
+# clean-run exit code under it, so an automated caller could not tell them apart
+# either. Measured on the first real armed run (T834): 335,878 arm cycles, then
+# TIMEOUT after 1200s, and the transcript's conclusion was indistinguishable
+# from a lane that ran to the end.
+if ($last.TimedOut) {
+    Write-Host ("databreak: CUT SHORT -- the {0}s -TimeoutSeconds window closed while the program was still" -f $TimeoutSeconds)
+    Write-Host ("           running (mode={0}{1}), so it was killed there. This is NOT a clean result:" -f `
+            $modeName, $(if ($WatchPages) { ', page-watch' } else { '' }))
+    Write-Host '           nothing at all is known about whatever ran after the clock.'
+    if ($WatchPages) {
+        Write-Host ("           watched {0} address(es){1}, {2} dropped as hot, for the first {3}s only." -f `
+                $last.ArmCount, $(if ($last.ArmedFull) { ', entry breakpoint disabled' } else { '' }), `
+                $last.HotDropped, $last.Seconds)
+    }
+    else {
+        Write-Host ("           {0} arm cycle(s), {1} disarm(s) in the first {2}s -- the calls after that were" -f `
+                $last.ArmCount, $last.DisarmCount, $last.Seconds)
+        Write-Host '           never armed at all.'
+    }
+    if ($WatchPages) {
+        Write-Host '           Re-run with a larger -TimeoutSeconds to cover the whole program.'
+    }
+    else {
+        Write-Host '           Re-run with a larger -TimeoutSeconds, or with -WatchPages, which arms once per'
+        Write-Host '           object instead of once per call and does not make the instrument the bottleneck.'
+    }
+    if ($last.LogPath) { Write-Host ('           transcript: ' + $last.LogPath) }
+    exit 5
+}
 if ($WatchPages -and $last.EndedEarly) {
     Write-Host 'databreak: STOPPED EARLY -- a break nobody routed ended the session and killed the program'
     Write-Host ("           mid-run, so only the first {0}s of it was watched. This is NOT a clean result." -f $last.Seconds)

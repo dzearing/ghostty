@@ -246,13 +246,41 @@ if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     '}'
 ) | Set-Content -Path (Join-Path $work 'pagewatch.zig') -Encoding ASCII
 
+# T836: a program that OUTLIVES the clock. It arms a known number of times, then
+# sleeps for ten minutes, so a short -TimeoutSeconds always kills it mid-run --
+# the shape the first real armed run had (335,878 arm cycles, then TIMEOUT at
+# 1200s) and which used to report the same verdict as a run that finished. The
+# `check(self, a, b)` layout is pagewatch's, so the same fixture proves both the
+# per-call and the -WatchPages verdicts.
+@(
+    'const std = @import("std");',
+    'const Obj = struct { ptr: [*]u8, len: usize };',
+    'var bufs: [4][4096]u8 align(4096) = undefined;',
+    'var objs: [4]Obj = undefined;',
+    'noinline fn check(self: *Obj, a: u64, b: u64) u64 {',
+    '    return @intFromPtr(self.ptr) +% self.len +% a +% b;',
+    '}',
+    'pub fn main() !void {',
+    '    var sum: u64 = 0;',
+    '    for (&objs, 0..) |*o, i| {',
+    '        o.* = .{ .ptr = &bufs[i], .len = bufs[i].len };',
+    '    }',
+    '    var round: usize = 0;',
+    '    while (round < 50) : (round += 1) {',
+    '        for (&objs) |*o| sum +%= check(o, 2, 3);',
+    '    }',
+    '    std.debug.print("sum={x}\n", .{sum});',
+    '    std.Thread.sleep(600 * std.time.ns_per_s);',
+    '}'
+) | Set-Content -Path (Join-Path $work 'sleepy.zig') -Encoding ASCII
+
 Push-Location $work
-foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig', 'bigframe.zig', 'pagewatch.zig')) {
+foreach ($src in @('stompctl.zig', 'loopctl.zig', 'overload.zig', 'crashctl.zig', 'slowstomp.zig', 'bigframe.zig', 'pagewatch.zig', 'sleepy.zig')) {
     $b = & zig build-exe $src 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Host ("build failed for {0}: {1}" -f $src, ($b -join ' ')) }
 }
 Pop-Location
-foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe', 'bigframe.exe', 'pagewatch.exe')) {
+foreach ($exe in @('stompctl.exe', 'loopctl.exe', 'overload.exe', 'crashctl.exe', 'slowstomp.exe', 'bigframe.exe', 'pagewatch.exe', 'sleepy.exe')) {
     Check "fixture $exe built" (Test-Path (Join-Path $work $exe))
 }
 if (-not (Test-Path (Join-Path $work 'stompctl.exe'))) {
@@ -533,6 +561,65 @@ $text = ($out | Out-String)
 Check 'a target that is never called says so' `
 ($code -eq 0 -and $text -match 'NEVER CALLED' -and $text -match 'measured nothing at all') `
     "got $code, tail: $($text -replace '\s+', ' ')"
+
+# ------------- 8c. a run the CLOCK ended is not a run that found nothing
+#
+# T836. The first real armed run turned over 335,878 arm cycles and was then
+# killed at its 1200s clock, and the verdict a reader would quote from that
+# transcript -- `no wild write observed ... 335878 arm cycle(s)` -- is word for
+# word what a lane that ran to the end prints. The exit code was the clean-run
+# one too, so nothing downstream could tell them apart either. A timeout means
+# "we did not look at all of it", which is the opposite conclusion, so it is now
+# its own outcome: exit 5, its own verdict line, and the transcript kept.
+
+function Stop-Sleepy {
+    # cdb kills its debuggee when it dies, but a fixture that outlived the
+    # clock must not outlive the test run if that ever fails to happen.
+    Get-Process -Name 'sleepy' -ErrorAction SilentlyContinue |
+        ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
+}
+
+$toOut = Join-Path $work 'dumps-timeout'
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'sleepy.exe') -Symbol check `
+    -TimeoutSeconds 25 -OutDir $toOut 2>&1
+$code = $LASTEXITCODE
+$text = ($out | Out-String)
+Stop-Sleepy
+
+Check 'a timed-out run exits 5, not the clean-run code' ($code -eq 5) `
+    "got $code, tail: $($text -replace '\s+', ' ')"
+Check 'the verdict says the run was cut short' ($text -match 'CUT SHORT' -and $text -match '-TimeoutSeconds') `
+    ($text -replace '\s+', ' ')
+# The whole defect in one assertion: the clean-run wording must NOT appear.
+Check 'a timed-out run never says "no wild write observed"' ($text -notmatch 'no wild write observed') `
+    ($text -replace '\s+', ' ')
+Check 'the verdict says it is not a clean result' ($text -match 'NOT a clean result') `
+    ($text -replace '\s+', ' ')
+# The evidence that IS good stays: the cycles that happened before the clock.
+Check 'the arm cycles before the clock are still reported' `
+($text -match '200 arm cycle\(s\), 200 disarm\(s\) in the first \d+s') ($text -replace '\s+', ' ')
+Check 'the verdict says how to cover the rest of the run' `
+($text -match 'larger -TimeoutSeconds') ($text -replace '\s+', ' ')
+# A partial run is evidence, so unlike a clean run its transcript is kept.
+Check 'a timed-out run keeps its transcript' `
+((@(Get-ChildItem $toOut -Filter '*.log' -ErrorAction SilentlyContinue)).Count -ge 1) `
+((Get-ChildItem $toOut -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ',')
+
+# The same, in -WatchPages mode, whose own verdict has different wording (and
+# whose EndedEarly path already exits 4 -- so the two partial-coverage outcomes
+# stay distinguishable from each other as well as from a clean run).
+$toPwOut = Join-Path $work 'dumps-timeout-pw'
+$out = & powershell -NoProfile -File $driver -Exe (Join-Path $work 'sleepy.exe') -Symbol check `
+    -WatchPages -WatchCount 4 -TimeoutSeconds 25 -OutDir $toPwOut 2>&1
+$code = $LASTEXITCODE
+$text = ($out | Out-String)
+Stop-Sleepy
+
+Check 'a timed-out page-watch exits 5 too' ($code -eq 5) "got $code, tail: $($text -replace '\s+', ' ')"
+Check 'a timed-out page-watch never says "no implausible write observed"' `
+($text -notmatch 'no implausible write observed') ($text -replace '\s+', ' ')
+Check 'the page-watch cut-short verdict names its coverage' `
+($text -match 'CUT SHORT' -and $text -match 'watched 4 address\(es\)') ($text -replace '\s+', ' ')
 
 # ---------------------------------------------- 9. bad input fails, not hangs
 

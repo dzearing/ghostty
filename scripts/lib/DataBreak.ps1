@@ -611,6 +611,7 @@ function Invoke-DataBreakPageWatch {
         Tried          = $false
         HotDropped     = 0
         EndedEarly     = $false
+        TimedOut       = $false
         StrayBreak     = ''
         SelfSlotOffset = [long]0
         SelfSlotCandidates = @()
@@ -815,6 +816,10 @@ function Invoke-DataBreakPageWatch {
         -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        # T836: the clock, not the program, ended this run -- record it on the
+        # result. Only the TIMEOUT line above used to say so, eleven lines above
+        # a verdict that then read exactly like a run that watched everything.
+        $result.TimedOut = $true
         & $Writer "databreak: TIMEOUT after ${TimeoutSeconds}s -- killing"
         try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
         $p.WaitForExit(10000) | Out-Null
@@ -876,7 +881,7 @@ function Invoke-DataBreakPageWatch {
     Remove-Item -LiteralPath $helpers -Force -ErrorAction SilentlyContinue
     if ($result.Hit -or $result.Crashed) {
         Remove-OldCrashCapture -OutDir $OutDir -Keep $Keep
-    } elseif (-not $KeepLog -and -not $result.EndedEarly) {
+    } elseif (-not $KeepLog -and -not $result.EndedEarly -and -not $result.TimedOut) {
         Remove-Item -LiteralPath $log, $errLog -Force -ErrorAction SilentlyContinue
         $result.LogPath = ''
         $result.ErrLogPath = ''
@@ -940,6 +945,7 @@ function Invoke-DataBreak {
         Crashed      = $false
         ArmCount     = 0
         DisarmCount  = 0
+        TimedOut     = $false
         WriterSite   = ''
         WriterBlock  = @()
         StackBlock   = @()
@@ -1055,6 +1061,10 @@ function Invoke-DataBreak {
         -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        # T836: see the same branch in Invoke-DataBreakPageWatch -- a run the
+        # clock ended is its own outcome, and the caller cannot tell it from a
+        # complete one unless the result says so.
+        $result.TimedOut = $true
         & $Writer "databreak: TIMEOUT after ${TimeoutSeconds}s -- killing"
         try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
         $p.WaitForExit(10000) | Out-Null
@@ -1092,7 +1102,7 @@ function Invoke-DataBreak {
     Remove-Item -LiteralPath $scriptFile, $armFile, $disarmFile, $hitFile -Force -ErrorAction SilentlyContinue
     if ($result.Hit -or $result.Crashed) {
         Remove-OldCrashCapture -OutDir $OutDir -Keep $Keep
-    } elseif (-not $KeepLog) {
+    } elseif (-not $KeepLog -and -not $result.TimedOut) {
         Remove-Item -LiteralPath $log, $errLog -Force -ErrorAction SilentlyContinue
         $result.LogPath = ''
         $result.ErrLogPath = ''
