@@ -1180,6 +1180,10 @@ pub const ODA_DRAWENTIRE: u32 = 0x0001;
 pub const ODS_SELECTED: u32 = 0x0001;
 pub const ODS_DISABLED: u32 = 0x0004;
 pub const ODS_FOCUS: u32 = 0x0010;
+/// Windows keeps focus rectangles hidden until the user navigates by keyboard
+/// (the `UISF_HIDEFOCUS` UI state), and passes that down to an owner-drawn
+/// control in `itemState` so its painter can honour it (T828).
+pub const ODS_NOFOCUSRECT: u32 = 0x0200;
 
 pub const MEASUREITEMSTRUCT = extern struct {
     CtlType: u32,

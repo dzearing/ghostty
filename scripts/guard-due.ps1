@@ -807,6 +807,27 @@ $GuardTable = @(
             'docs\claude\*.md',
             'test\win32\docs-routing.ps1'
         )
+    },
+    # The chooser's SELECTION TREATMENT (T828): the pixels a user reported as "a
+    # loud purple pill with a thick purple outline". Coverage is the row model
+    # that resolves the pill, the mark and the rim (chooser_rows.zig), the
+    # painter that draws them (MachineChooser.zig's drawRow), the session card's
+    # copy of the same treatment (chooser_sessions.zig / SessionRoster.zig) and
+    # the harness. MachineChooser.zig IS here, unlike the chooser-resume row
+    # above, because the defect lived in the painter: a model change that the
+    # painter does not draw is exactly the hole this guard exists to close, and
+    # the run is under a minute.
+    [pscustomobject]@{
+        Name   = 'chooser-selection'
+        Script = 'test\win32\chooser-selection.ps1'
+        Stamp  = 'test\win32\chooser-selection.stamp.json'
+        Covers = @(
+            'src\apprt\win32\chooser_rows.zig',
+            'src\apprt\win32\chooser_sessions.zig',
+            'src\apprt\win32\MachineChooser.zig',
+            'src\apprt\win32\SessionRoster.zig',
+            'test\win32\chooser-selection.ps1'
+        )
     }
 )
 

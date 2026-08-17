@@ -2219,6 +2219,11 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
         .selected = (dis.itemState & w32.ODS_SELECTED) != 0,
         .focused = (dis.itemState & w32.ODS_FOCUS) != 0,
         .hovered = self.hover_row == idx,
+        // Windows' own answer to "should this control show its focus visual?"
+        // (T828): the shell hides focus rectangles until the user navigates by
+        // keyboard, and tells an owner-drawn control so with `ODS_NOFOCUSRECT`.
+        // Reading it is what stops a mouse click painting a rim on the row.
+        .focus_visible = (dis.itemState & w32.ODS_NOFOCUSRECT) == 0,
     };
 
     // Background first: the column wash the row sits on, so the pill
@@ -2248,7 +2253,9 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
 
     if (paint.fill) |fill| {
         const brush = w32.CreateSolidBrush(rgb(fill));
-        const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(paint.border orelse fill));
+        // The pill has no outline of its own since T828 — pen with the fill so
+        // the rounded shape still closes the way `RoundRect` expects.
+        const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(fill));
         if (brush != null and pen != null) {
             const old_brush = w32.SelectObject(hdc, brush);
             const old_pen = w32.SelectObject(hdc, pen);
@@ -2268,7 +2275,34 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
         if (pen) |p| _ = w32.DeleteObject(p);
     }
 
-    // §2.2's focus ring, inside the pill so a focused-and-selected row reads as
+    // The selection indicator bar (T828): Windows 11 marks the selected list
+    // item with a small accent bar at its leading edge, not by tinting the whole
+    // row. Drawn after the pill and before the content, so it sits ON the pill.
+    if (paint.indicator) |ink| {
+        const brush = w32.CreateSolidBrush(rgb(ink));
+        const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(ink));
+        if (brush != null and pen != null) {
+            const old_brush = w32.SelectObject(hdc, brush);
+            const old_pen = w32.SelectObject(hdc, pen);
+            const x = r.left + m.indicator_x;
+            const y = r.top + m.indicator_y;
+            _ = w32.RoundRect(
+                hdc,
+                x,
+                y,
+                x + m.indicator_w,
+                y + m.indicator_h,
+                m.indicator_radius * 2,
+                m.indicator_radius * 2,
+            );
+            _ = w32.SelectObject(hdc, old_brush);
+            _ = w32.SelectObject(hdc, old_pen);
+        }
+        if (brush) |b| _ = w32.DeleteObject(b);
+        if (pen) |p| _ = w32.DeleteObject(p);
+    }
+
+    // §2.2's focus rim, inside the pill so a focused-and-selected row reads as
     // one control. `NULL_BRUSH` because this is a rim, not a second fill.
     if (paint.ring) |ring| {
         const pen = w32.CreatePen(w32.PS_SOLID, m.focus_ring_w, rgb(ring));

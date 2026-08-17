@@ -1019,20 +1019,21 @@ fn paintRow(
     // cursored card's text and badges are floored against the accent wash they
     // actually sit on rather than against the plain card (the T206 rule).
     const card_bg = if (cursored)
-        chooser_sessions.cursorFill(ctx.bg, ctx.accent)
+        chooser_sessions.cursorFill(ctx.bg)
     else
         chooser_sessions.cardFill(ctx.bg);
 
-    // The card, plus the cursor's ring — the mark is never fill alone, so the
-    // cursor survives a low-contrast accent and a color-blind reading (§2.4).
+    // The card, plus the cursor's accent indicator bar — the mark is never fill
+    // alone, so the cursor survives a low-contrast accent and a color-blind
+    // reading (§2.4). The bar replaced a full-perimeter accent stroke in T828:
+    // one accent mark per surface, the same one the machine list draws.
     fillRound(hdc, l.card, m.radius, card_bg);
     if (cursored) {
-        strokeRound(
+        fillRound(
             hdc,
-            l.card,
-            m.radius,
-            chooser_sessions.cursorBorder(ctx.bg, ctx.accent),
-            @max(@as(i32, @intFromFloat(@round(ctx.scale))), 1),
+            chooser_sessions.cursorIndicatorRect(l.card, m),
+            m.indicator_radius,
+            chooser_sessions.cursorIndicator(card_bg, ctx.accent),
         );
     }
 
@@ -1227,33 +1228,6 @@ fn fillRound(hdc: w32.HDC, r: chooser_layout.Rect, radius: i32, color: chooser_s
     _ = w32.SelectObject(hdc, op);
 }
 
-/// The same rounded rect, outlined instead of filled — a wide pen centered on
-/// the path, so the ring is inset by half its width the way every other ring in
-/// the chrome is.
-fn strokeRound(
-    hdc: w32.HDC,
-    r: chooser_layout.Rect,
-    radius: i32,
-    color: chooser_sessions.Rgb,
-    width: i32,
-) void {
-    const pen = w32.CreatePen(w32.PS_SOLID, width, rgb(color)) orelse return;
-    defer _ = w32.DeleteObject(pen);
-    const ob = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_BRUSH));
-    defer _ = w32.SelectObject(hdc, ob);
-    const op = w32.SelectObject(hdc, pen);
-    defer _ = w32.SelectObject(hdc, op);
-    const inset = @divTrunc(width, 2);
-    _ = w32.RoundRect(
-        hdc,
-        r.left + inset,
-        r.top + inset,
-        r.right - inset,
-        r.bottom - inset,
-        radius * 2,
-        radius * 2,
-    );
-}
 
 fn drawDot(hdc: w32.HDC, r: chooser_layout.Rect, color: chooser_sessions.Rgb, filled: bool) void {
     const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(color)) orelse return;

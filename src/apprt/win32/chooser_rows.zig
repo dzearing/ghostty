@@ -165,8 +165,22 @@ pub const RowMetrics = struct {
     /// Point size (as a negative `CreateFontW` height) for the subtitle, which
     /// is a notch smaller than the dialog font like Mac's `.caption`.
     subtitle_font_h: i32,
+    /// WinUI's selection indicator (T828): the rounded accent bar at the pill's
+    /// left edge that carries "this row is selected" in Windows 11's own list
+    /// language. It is the ONLY accent on a selected row — the accent-tinted
+    /// fill and the accent perimeter it replaced are what the user reported as
+    /// "a loud purple pill".
+    ///
+    /// `indicator_x` / `indicator_y` are relative to the row rect like every
+    /// other field here; the bar is `xs` inside the pill's left edge (so it
+    /// clears the pill's own rounded corner) and vertically centered.
+    indicator_x: i32,
+    indicator_y: i32,
+    indicator_w: i32,
+    indicator_h: i32,
+    indicator_radius: i32,
     /// Focus rim (T312), drawn INSIDE the selection pill: design system §2.2's
-    /// "2 DIP accent ring inset 1 DIP inside the painted square", applied to
+    /// "2 DIP ring inset 1 DIP inside the painted square", applied to
     /// the pill because the pill is what the row paints.
     ///
     /// `focus_ring_w` is the pen width. `focus_path_inset` is where the pen's
@@ -231,6 +245,15 @@ pub fn rowMetrics(scale: f32) RowMetrics {
     const ring_inset = @max(px(1, scale), 1);
     const path_inset = ring_inset + @divTrunc(ring_w, 2);
 
+    // The selection indicator (T828). WinUI's is 3x16 with a fully rounded cap;
+    // 3 is off this document's spacing scale, so the bar takes `sm` (4) — the
+    // smallest step — and the scale's own 16, the size a small mark is drawn at
+    // here (`glyph_mark` is the same number for the same reason). `xs` inside
+    // the pill keeps it off the pill's rounded corner, and leaves `sm` of
+    // painted gap to the status dot.
+    const indicator_w = @max(px(4, scale), 1);
+    const indicator_h = px(16, scale);
+
     return .{
         .height = height,
         .fill_inset_x = fill_inset_x,
@@ -256,6 +279,14 @@ pub fn rowMetrics(scale: f32) RowMetrics {
         .subtitle_y = subtitle_y,
         .subtitle_h = subtitle_h,
         .subtitle_font_h = type_ramp.caption(scale).height,
+        .indicator_x = fill_inset_x + px(2, scale),
+        .indicator_y = @divTrunc(height - indicator_h, 2),
+        .indicator_w = indicator_w,
+        .indicator_h = indicator_h,
+        // A capsule at every scale, like the session badges: half the width,
+        // so the bar reads as a rounded mark rather than a rectangle with
+        // slightly soft corners.
+        .indicator_radius = @divTrunc(indicator_w, 2),
         .focus_ring_w = ring_w,
         .focus_path_inset = path_inset,
         .focus_ring_radius = @max(fill_radius - path_inset, 0),
@@ -309,53 +340,67 @@ pub fn onlineOn(bg: Rgb) Rgb {
     return chrome_theme.accentOn(bg, online_green);
 }
 
-/// Selection fill: the accent at Mac's 0.25 over the row background.
+/// The selection pill's fill is a NEUTRAL wash at two weights (T828), never an
+/// accent tint. Ordered against the hover wash (0.06) so the three list states
+/// read as one ramp: hover < unfocused selection < focused selection.
 ///
-/// `accent` is a PARAMETER since T305. It used to be a `pub const` here
-/// spelling `#3D8EF8` — a blue nobody picked, and a second one
-/// (`RGB(80,160,235)`) lived in `ActivityMonitor.zig`. Callers pass
-/// `system_colors.accentCached()`, already floored to 3:1 against the surface
-/// by `chrome_theme.resolve`, so this module composites and never clamps.
-pub fn selectionFill(bg: Rgb, accent: Rgb) Rgb {
-    return blend(bg, accent, 0.25);
-}
+/// Why neutral at all: the accent used to be the fill (Mac's 0.25 tint) and the
+/// perimeter (0.7), and on a dark system accent the 3:1 chrome floor brightens
+/// that accent before it is ever composited — so the row the user picked came
+/// out a vivid violet pill with a violet outline, louder than both the Mac
+/// original and the Windows 11 list it sits next to. Windows 11 marks a list
+/// selection with a subtle neutral fill and puts the accent in a small
+/// indicator bar; that is what these weights and `selectionIndicator` are.
+pub const selection_wash_unfocused: f32 = 0.10;
+pub const selection_wash_focused: f32 = 0.16;
 
-/// Selection border — a stronger accent so the highlighted row still reads as
-/// selected against a dark background at low fill opacity.
-pub fn selectionBorder(bg: Rgb, accent: Rgb) Rgb {
-    return blend(bg, accent, 0.7);
+/// Selection fill for the list that HAS keyboard focus.
+pub fn selectionFillFocused(bg: Rgb) Rgb {
+    return color_math.wash(bg, selection_wash_focused);
 }
-
-/// How strong the selection pill is when the list does NOT hold keyboard focus
-/// (T312). Between the hover wash (0.06) and nothing else on the row, so the
-/// three list states stay ordered by weight: hover < unfocused selection <
-/// focused selection.
-pub const unfocused_selection_wash: f32 = 0.16;
 
 /// Selection fill for a list that does not have keyboard focus — macOS's
 /// `unemphasizedSelectedContentBackgroundColor`, and the "neutral unemphasized"
 /// half of §3.2's focus rule.
-///
-/// Neutral on purpose: the accent is what says *this control is the one you are
-/// driving*. A selection that keeps its accent while the caret is somewhere else
-/// tells the user the list has focus when it does not, which is the actual defect
-/// finding 10 names — a selected row looked identical either way.
 pub fn selectionFillUnfocused(bg: Rgb) Rgb {
-    return color_math.wash(bg, unfocused_selection_wash);
+    return color_math.wash(bg, selection_wash_unfocused);
 }
 
-/// The outline of that unfocused pill. A meaningful boundary, so it takes the
-/// 3:1 chrome floor (WCAG 1.4.11) — the same floor `accentOn` enforces for the
-/// focused one, sourced from `chrome_theme` rather than restated as a number.
+/// The selection indicator bar — WinUI's `ListViewItem` accent mark, in the
+/// user's accent, floored to the 3:1 chrome boundary against the PILL it sits
+/// on (WCAG 1.4.11) rather than against the row background it never touches.
 ///
-/// Without it the unfocused selection would be a faint wash and nothing else,
-/// which is state carried by color alone (§2.2).
-pub fn selectionBorderUnfocused(bg: Rgb) Rgb {
+/// This is where the accent lives on a selected row, and it is the whole of it:
+/// a 4x16 mark instead of a full-perimeter outline plus a tinted fill.
+pub fn selectionIndicator(on: Rgb, accent: Rgb) Rgb {
+    return chrome_theme.accentOn(on, accent);
+}
+
+/// The same bar when the list does NOT hold keyboard focus: neutral, so the
+/// accent still means *this control is the one you are driving*. A selection
+/// that keeps its accent while the caret is somewhere else tells the user the
+/// list has focus when it does not, which is the defect T312's finding 10
+/// names. It keeps the 3:1 chrome floor either way — it is a meaningful mark,
+/// not decoration.
+pub fn selectionIndicatorUnfocused(on: Rgb) Rgb {
     return color_math.contrastAdjustedTo(
-        color_math.wash(bg, 0.5),
-        bg,
+        color_math.wash(on, 0.5),
+        on,
         chrome_theme.ui_contrast_target,
     );
+}
+
+/// §2.2's focus rim, in the NEUTRAL high-contrast ink Windows draws a focus
+/// visual in (WinUI's `FocusStrokeColorOuter`: near-white on a dark surface,
+/// near-black on a light one) rather than in the accent.
+///
+/// The amendment §2.2 carries for list rows (T828): a row already spends the
+/// accent on its selection indicator, so an accent rim around the same row is a
+/// second accent mark on one control — which is exactly the doubled purple
+/// outline that was reported. Neutral also reads on top of ANY accent, which is
+/// what a focus visual has to do.
+pub fn focusRing(on: Rgb) Rgb {
+    return chrome_theme.textOn(on);
 }
 
 /// Hover wash: Mac's `Color.primary.opacity(0.06)`. `Color.primary` is white
@@ -394,6 +439,17 @@ pub const RowState = struct {
     selected: bool = false,
     focused: bool = false,
     hovered: bool = false,
+    /// Whether the focus VISUAL should be drawn at all (T828). Windows keeps
+    /// focus rectangles hidden until the user navigates by keyboard and then
+    /// shows them for the rest of the session — the UI-state mechanism behind
+    /// `UISF_HIDEFOCUS`, which an owner-drawn control reads as
+    /// `ODS_NOFOCUSRECT`. Clicking a row therefore selects it without painting
+    /// a rim around it, exactly as a Windows 11 list behaves.
+    ///
+    /// Defaults to true: a caller that does not know must show focus, because a
+    /// missing focus ring is an accessibility defect (§2.2) and a spurious one
+    /// is only noise.
+    focus_visible: bool = true,
 };
 
 /// Everything the row's pill draws, resolved together — the same argument
@@ -401,46 +457,44 @@ pub const RowState = struct {
 /// other (the rim's floor is taken against the fill it lands on, not against the
 /// row background it never touches).
 pub const RowPaint = struct {
-    /// The pill's fill. Null means the row paints no pill.
+    /// The pill's fill. Null means the row paints no pill. Always a neutral
+    /// wash since T828 — the pill has no outline of its own, so the painter
+    /// pens the rounded rect with this same color.
     fill: ?Rgb = null,
-    /// The pill's 1px outline. Null means it has no visible edge — the painter
-    /// pens with `fill` so the rounded shape still antialiases the same way.
-    border: ?Rgb = null,
-    /// §2.2's focus ring, drawn INSIDE the pill. Null when the list does not
-    /// hold keyboard focus.
+    /// The left-edge selection indicator bar (T828). Null means the row is not
+    /// selected; this is the only place a row's accent appears.
+    indicator: ?Rgb = null,
+    /// §2.2's focus rim, drawn INSIDE the pill in neutral ink. Null when the
+    /// list does not hold keyboard focus, or when Windows is hiding focus
+    /// visuals because the user is driving with the pointer.
     ring: ?Rgb = null,
 };
 
 /// Resolve a row's pill from its state. `accent` is the user's, already floored
-/// against `bg` by the caller (`chrome_theme.accentOn`), exactly as
-/// `selectionFill` has taken it since T305.
+/// against `bg` by the caller (`chrome_theme.accentOn`), exactly as the row's
+/// selection has taken it since T305.
 pub fn rowPaint(bg: Rgb, accent: Rgb, st: RowState) RowPaint {
     var p: RowPaint = .{};
 
     if (st.selected) {
-        if (st.focused) {
-            p.fill = selectionFill(bg, accent);
-            p.border = selectionBorder(bg, accent);
-        } else {
-            p.fill = selectionFillUnfocused(bg);
-            p.border = selectionBorderUnfocused(bg);
-        }
+        // Neutral fill at two weights, and the accent spent on the indicator —
+        // Windows 11's list selection, not Mac's tinted pill (T828).
+        p.fill = if (st.focused) selectionFillFocused(bg) else selectionFillUnfocused(bg);
+        const on = p.fill.?;
+        p.indicator = if (st.focused)
+            selectionIndicator(on, accent)
+        else
+            selectionIndicatorUnfocused(on);
     } else if (st.hovered) {
         // §2.2: hover is a fill, and only a fill. An outline here would make a
         // pointer passing over the list read as a second selection.
         p.fill = hoverFill(bg);
     }
 
-    if (st.focused) {
+    if (st.focused and st.focus_visible) {
         // Floored against what the rim actually sits on — the pill when there
         // is one, the row background when there is not.
-        const under = p.fill orelse bg;
-        p.ring = chrome_theme.accentOn(under, accent);
-        // The rim REPLACES the pill's outline rather than nesting inside it.
-        // Both would draw two concentric rounded rectangles a pixel apart, and
-        // a focused row has to read as one control, not as a control inside a
-        // control.
-        p.border = null;
+        p.ring = focusRing(p.fill orelse bg);
     }
 
     return p;
@@ -574,6 +628,11 @@ test "rowMetrics: every gap is on the 4 DIP spacing scale (T310)" {
         .{ .name = "row top pad", .v = m.title_y },
         .{ .name = "title -> subtitle", .v = m.subtitle_y - (m.title_y + m.title_h) },
         .{ .name = "row bottom pad", .v = m.height - (m.subtitle_y + m.subtitle_h) },
+        .{ .name = "pill -> indicator", .v = m.indicator_x - m.fill_inset_x },
+        .{
+            .name = "indicator -> status dot",
+            .v = (m.status_cx - @divTrunc(m.dot_d, 2)) - (m.indicator_x + m.indicator_w),
+        },
     };
     for (gaps) |g| {
         if (std.mem.indexOfScalar(i32, &on_scale, g.v) == null) {
@@ -590,6 +649,34 @@ test "rowMetrics: every gap is on the 4 DIP spacing scale (T310)" {
     try testing.expectEqual(@as(i32, 16), m.glyph_w);
     try testing.expectEqual(@as(i32, 8), m.dot_d);
     try testing.expectEqual(@as(i32, 4), m.fill_radius);
+    // The indicator bar: `sm` wide (WinUI's 3 is off this scale) and the same
+    // 16 the icon mark takes, capped so it reads as a bar and not a rectangle.
+    try testing.expectEqual(@as(i32, 4), m.indicator_w);
+    try testing.expectEqual(@as(i32, 16), m.indicator_h);
+    try testing.expectEqual(@as(i32, 2), m.indicator_radius);
+}
+
+test "rowMetrics: the selection indicator is a centered bar inside the pill (T828)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
+        const m = rowMetrics(scale);
+        // Inside the pill in both axes — a mark that hangs over the pill's edge
+        // would read as a border fragment, which is the treatment T828 removed.
+        try testing.expect(m.indicator_x > m.fill_inset_x);
+        try testing.expect(m.indicator_y > m.fill_inset_y);
+        try testing.expect(m.indicator_y + m.indicator_h <= m.height - m.fill_inset_y);
+        // Vertically centered on the row, within a pixel of rounding.
+        const above = m.indicator_y;
+        const below = m.height - (m.indicator_y + m.indicator_h);
+        try testing.expect(@abs(above - below) <= 1);
+        // A capsule, and never wider than it is tall.
+        try testing.expectEqual(@divTrunc(m.indicator_w, 2), m.indicator_radius);
+        try testing.expect(m.indicator_w < m.indicator_h);
+        // It stops short of the status dot rather than crowding it.
+        try testing.expect(m.indicator_x + m.indicator_w < m.status_cx - @divTrunc(m.dot_d, 2));
+    }
+    // It scales with DPI like everything else here.
+    try testing.expectEqual(rowMetrics(1.0).indicator_w * 2, rowMetrics(2.0).indicator_w);
+    try testing.expectEqual(rowMetrics(1.0).indicator_h * 2, rowMetrics(2.0).indicator_h);
 }
 
 test "rowMetrics: the icon column holds the text edge, the mark sits inside it" {
@@ -672,17 +759,22 @@ test "dividerColor reads above the wash it separates" {
     try testing.expect(dividerColor(bg).r < 255);
 }
 
-test "selection and hover sit between the background and their source color" {
+test "the three selection weights are one ramp, and none of them is a tint (T828)" {
     const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
-    const accent: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
-    const sel = selectionFill(bg, accent);
-    try testing.expect(sel.b > bg.b and sel.b < accent.b);
-    // The border is more accent than the fill, so the row reads as selected.
-    try testing.expect(selectionBorder(bg, accent).b > sel.b);
-    // The hover wash is a nudge, not a highlight: dimmer than the selection.
     const hov = hoverFill(bg);
+    const unfocused = selectionFillUnfocused(bg);
+    const focused = selectionFillFocused(bg);
+
+    // hover < unfocused selection < focused selection, and every one of them
+    // is a lift off the row rather than nothing.
     try testing.expect(hov.r > bg.r);
-    try testing.expect(hov.b < sel.b);
+    try testing.expect(unfocused.r > hov.r);
+    try testing.expect(focused.r > unfocused.r);
+
+    // Neutral: a wash on a neutral surface stays neutral. A selected row that
+    // came out tinted is the defect T828 reported.
+    try testing.expectEqual(focused.r, focused.b);
+    try testing.expectEqual(unfocused.r, unfocused.b);
 }
 
 test "secondaryOn / onlineOn hold their floors on every surface (T310)" {
@@ -766,7 +858,7 @@ test "rowPaint: the three list states are mutually distinguishable (T312)" {
             const rest = rowPaint(bg, accent, .{});
 
             // A resting row paints nothing — the pill is state, not decoration.
-            try testing.expect(rest.fill == null and rest.border == null and rest.ring == null);
+            try testing.expect(rest.fill == null and rest.indicator == null and rest.ring == null);
 
             // Three fills, three different colors.
             try testing.expect(!sel_focus.fill.?.eql(sel_only.fill.?));
@@ -780,29 +872,39 @@ test "rowPaint: the three list states are mutually distinguishable (T312)" {
             // selection the heaviest.
             try testing.expect(ratio(hover.fill.?, bg) < ratio(sel_only.fill.?, bg));
 
-            // Only the focused state carries the accent. Asserted as
-            // INDEPENDENCE rather than as "is it grey": on a tinted surface a
-            // wash keeps the surface's own hue, and the property that matters
-            // is that the user's color is what distinguishes the two.
+            // NO fill carries the accent any more (T828) — the pill is a
+            // neutral wash whichever accent the user picked, and the accent
+            // lives in the indicator bar instead.
             const other = chrome_theme.accentOn(bg, .{ .r = 0xFF, .g = 0xF0, .b = 0x00 });
             try testing.expect(sel_only.fill.?.eql(
                 rowPaint(bg, other, .{ .selected = true }).fill.?,
             ));
-            try testing.expect(!sel_focus.fill.?.eql(
+            try testing.expect(sel_focus.fill.?.eql(
                 rowPaint(bg, other, .{ .selected = true, .focused = true }).fill.?,
             ));
 
-            // Every meaningful boundary clears the 3:1 chrome floor against the
+            // ...and the FOCUSED indicator is the one that tracks it, so the
+            // user's color is still what says "you are driving this list".
+            try testing.expect(!sel_focus.indicator.?.eql(
+                rowPaint(bg, other, .{ .selected = true, .focused = true }).indicator.?,
+            ));
+            try testing.expect(sel_only.indicator.?.eql(
+                rowPaint(bg, other, .{ .selected = true }).indicator.?,
+            ));
+
+            // Every meaningful mark clears the 3:1 chrome floor against the
             // surface it actually sits on (WCAG 1.4.11).
             try testing.expect(ratio(sel_focus.ring.?, sel_focus.fill.?) >= 2.95);
-            try testing.expect(ratio(sel_only.border.?, bg) >= 2.95);
+            try testing.expect(ratio(sel_focus.indicator.?, sel_focus.fill.?) >= 2.95);
+            try testing.expect(ratio(sel_only.indicator.?, sel_only.fill.?) >= 2.95);
 
-            // §2.2: hover is a fill and only a fill; an outline would read as a
+            // §2.2: hover is a fill and only a fill; a mark here would read as a
             // second selection following the pointer.
-            try testing.expect(hover.border == null and hover.ring == null);
+            try testing.expect(hover.indicator == null and hover.ring == null);
 
-            // The rim REPLACES the pill outline instead of nesting inside it.
-            try testing.expect(sel_focus.border == null);
+            // Selection is never fill alone: a bar marks it in both states, so
+            // it survives a color-blind reading and a low-contrast accent.
+            try testing.expect(sel_only.indicator != null and sel_focus.indicator != null);
         }
     }
 }
@@ -824,6 +926,52 @@ test "rowPaint: a focused row is visible even when it is not selected (T312)" {
     const h = rowPaint(bg, accent, .{ .focused = true, .hovered = true });
     try testing.expect(h.fill.?.eql(hoverFill(bg)));
     try testing.expect(ratio(h.ring.?, h.fill.?) >= 2.95);
+}
+
+test "rowPaint: clicking a row selects it without painting a focus rim (T828)" {
+    // Windows hides focus visuals until the user navigates by keyboard
+    // (`UISF_HIDEFOCUS` -> `ODS_NOFOCUSRECT`). A row picked with the mouse
+    // therefore shows the quiet selection and nothing else — the rim appearing
+    // on a click is half of what read as "a thick outline".
+    const bg: Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 };
+    const accent = chrome_theme.accentOn(bg, .{ .r = 0x68, .g = 0x00, .b = 0x81 });
+
+    const mouse = rowPaint(bg, accent, .{ .selected = true, .focused = true, .focus_visible = false });
+    try testing.expect(mouse.ring == null);
+    // ...but it is still unmistakably the selected row.
+    try testing.expect(mouse.fill.?.eql(selectionFillFocused(bg)));
+    try testing.expect(mouse.indicator != null);
+    try testing.expect(ratio(mouse.indicator.?, mouse.fill.?) >= 2.95);
+
+    // Keyboard focus then brings the rim back, on the same selection.
+    const kbd = rowPaint(bg, accent, .{ .selected = true, .focused = true });
+    try testing.expect(kbd.ring != null);
+    try testing.expect(kbd.fill.?.eql(mouse.fill.?));
+
+    // The default is "show it": a caller that never learned the UI state must
+    // not silently drop the focus indicator (§2.2).
+    const st: RowState = .{ .focused = true };
+    try testing.expect(st.focus_visible);
+}
+
+test "focusRing: neutral ink, never the accent (T828)" {
+    // The §2.2 amendment for list rows: the accent is already spent on the
+    // indicator bar, so the rim is a focus VISUAL in Windows' own neutral ink.
+    for ([_]Rgb{
+        .{ .r = 0x20, .g = 0x20, .b = 0x20 },
+        .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 },
+        .{ .r = 0x1E, .g = 0x1E, .b = 0x2E },
+    }) |bg| {
+        const purple: Rgb = .{ .r = 0x68, .g = 0x00, .b = 0x81 };
+        const accent = chrome_theme.accentOn(bg, purple);
+        const ring = focusRing(bg);
+        try testing.expect(!ring.eql(accent));
+        // Independent of whatever accent the user picked...
+        try testing.expect(ring.eql(focusRing(bg)));
+        // ...and it reads: a focus visual is a meaningful boundary (WCAG
+        // 1.4.11), so it clears the chrome floor with room to spare.
+        try testing.expect(ratio(ring, bg) >= 4.4);
+    }
 }
 
 test "rowPaint: every floor holds across the background x accent space (T312)" {
@@ -852,7 +1000,8 @@ test "rowPaint: every floor holds across the background x accent space (T312)" {
 
                 try testing.expect(ratio(sf.ring.?, sf.fill.?) >= 2.95);
                 try testing.expect(ratio(fo.ring.?, bg) >= 2.95);
-                try testing.expect(ratio(so.border.?, bg) >= 2.95);
+                try testing.expect(ratio(sf.indicator.?, sf.fill.?) >= 2.95);
+                try testing.expect(ratio(so.indicator.?, so.fill.?) >= 2.95);
                 // The two selections never collapse onto each other, on any
                 // background — including the light end, where a wash that
                 // headed for white unconditionally would.
@@ -870,8 +1019,9 @@ test "selectionFillUnfocused: neutral, and it follows the surface's direction" {
     // toward a hardcoded white.
     try testing.expect(selectionFillUnfocused(dark).r > dark.r);
     try testing.expect(selectionFillUnfocused(light).r < light.r);
-    // Stronger than hover, weaker than the accent selection carries.
+    // Stronger than hover, weaker than the focused selection carries.
     try testing.expect(ratio(selectionFillUnfocused(dark), dark) > ratio(hoverFill(dark), dark));
+    try testing.expect(ratio(selectionFillFocused(dark), dark) > ratio(selectionFillUnfocused(dark), dark));
     // Neutral: a wash, never a tint that could be mistaken for the accent.
     const u = selectionFillUnfocused(.{ .r = 0x1E, .g = 0x1E, .b = 0x2E });
     try testing.expect(u.b > u.r);
@@ -881,13 +1031,15 @@ test "selectionFillUnfocused: neutral, and it follows the surface's direction" {
 test "selection tracks the accent it is given, and the washes follow luminance" {
     // The whole point of T305's parameterization: two different accents must
     // produce two different selections. A module that still held its own blue
-    // would pass every test above and none of this one.
+    // would pass every test above and none of this one. Since T828 the accent
+    // rides the INDICATOR rather than the fill, so that is where it is asserted.
     const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
+    const on = selectionFillFocused(bg);
     const blue: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
     const purple: Rgb = .{ .r = 0x68, .g = 0x00, .b = 0x81 };
-    try testing.expect(!selectionFill(bg, blue).eql(selectionFill(bg, purple)));
-    try testing.expect(selectionFill(bg, purple).r > selectionFill(bg, blue).r);
-    try testing.expect(selectionFill(bg, purple).g < selectionFill(bg, blue).g);
+    try testing.expect(!selectionIndicator(on, blue).eql(selectionIndicator(on, purple)));
+    try testing.expect(selectionIndicator(on, purple).r > selectionIndicator(on, blue).r);
+    try testing.expect(selectionIndicator(on, purple).g < selectionIndicator(on, blue).g);
 
     // And the three washes reverse direction on a light surface instead of
     // heading for white regardless, which is what `blend(bg, white, a)` did.

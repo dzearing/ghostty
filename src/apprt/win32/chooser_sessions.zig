@@ -453,6 +453,12 @@ pub const Metrics = struct {
     badge_h: i32,
     badge_pad_x: i32,
     badge_radius: i32,
+    /// The keyboard cursor's selection indicator (T828), in the machine list's
+    /// own dimensions so both surfaces mark selection with one mark.
+    indicator_inset: i32,
+    indicator_w: i32,
+    indicator_h: i32,
+    indicator_radius: i32,
     /// The Kill button: one icon-button size across the app (§2.1), with its
     /// hit box from the same module.
     kill_w: i32,
@@ -468,6 +474,9 @@ pub fn metrics(scale: f32) Metrics {
     const icon: icon_button.Metrics = .init(scale);
     const caption = type_ramp.caption(scale);
     const body = type_ramp.body(scale);
+    // The selection mark is the machine list's, taken from there rather than
+    // restated here (the T206 rule) so the two surfaces cannot drift apart.
+    const row_metrics = chooser_rows.rowMetrics(scale);
 
     // A badge is a capsule around one caption line: the line box plus `xs`
     // above and below, so its height is derived from the text it holds rather
@@ -492,6 +501,12 @@ pub fn metrics(scale: f32) Metrics {
         .badge_h = badge_h,
         .badge_pad_x = px(4, scale),
         .badge_radius = @divTrunc(badge_h, 2),
+        // `sm` in from the card's leading edge — far enough to clear the card's
+        // own 8 radius, which a 2 inset would sit on.
+        .indicator_inset = px(4, scale),
+        .indicator_w = row_metrics.indicator_w,
+        .indicator_h = row_metrics.indicator_h,
+        .indicator_radius = row_metrics.indicator_radius,
         .kill_w = icon.target,
         .kill_hit_w = icon.target + icon.hit_pad * 2,
         .kill_gap = px(8, scale),
@@ -667,18 +682,36 @@ pub fn cardHoverFill(bg: Rgb) Rgb {
     return color_math.mix(cardFill(bg), chrome_theme.textOn(bg), chrome_theme.hover_wash);
 }
 
-/// The card under the keyboard sub-cursor (T320), and its 1 DIP ring. Both come
-/// from `chooser_rows` — the SAME selection fill and border the machine list
+/// The card under the keyboard sub-cursor (T320), and its accent indicator bar.
+/// Both come from `chooser_rows` — the SAME selection treatment the machine list
 /// paints its highlighted row with — because a chooser that says "this is the
 /// thing you are driving" in two visual languages is a chooser with two
-/// selections. Mac's own session cursor is likewise its accent at a fill plus a
-/// stroke (`MachineChooserView.swift:690-697`).
-pub fn cursorFill(bg: Rgb, accent: Rgb) Rgb {
-    return chooser_rows.selectionFill(bg, accent);
+/// selections. Mac's own session cursor is its accent at a fill plus a stroke
+/// (`MachineChooserView.swift:690-697`); on Windows both surfaces take the
+/// quiet WinUI treatment instead (T828), which is that translation, not a
+/// divergence from it.
+pub fn cursorFill(bg: Rgb) Rgb {
+    // The card's own lift plus the selection wash, so a cursored card is a step
+    // above a resting one rather than a differently-coloured object.
+    return chooser_rows.selectionFillFocused(cardFill(bg));
 }
 
-pub fn cursorBorder(bg: Rgb, accent: Rgb) Rgb {
-    return chooser_rows.selectionBorder(bg, accent);
+/// The bar's ink, floored against the cursored card it sits on.
+pub fn cursorIndicator(on: Rgb, accent: Rgb) Rgb {
+    return chooser_rows.selectionIndicator(on, accent);
+}
+
+/// Where that bar sits inside a card: `sm` in from the leading edge (clear of
+/// the card's 8 radius), vertically centered whatever the card's height, and
+/// the same 4x16 mark the machine list draws.
+pub fn cursorIndicatorRect(card: Rect, m: Metrics) Rect {
+    const top = card.top + @divTrunc(card.height() - m.indicator_h, 2);
+    return .{
+        .left = card.left + m.indicator_inset,
+        .top = top,
+        .right = card.left + m.indicator_inset + m.indicator_w,
+        .bottom = top + m.indicator_h,
+    };
 }
 
 /// The liveness dot: green (floored) when alive, the de-emphasized ink when the
@@ -1187,13 +1220,41 @@ test "the cursor's index space is the RENDERED list, with a dead row planted mid
     }
 }
 
-test "the cursor card wears the chooser's own selection colors" {
+test "the cursor card wears the chooser's own selection treatment (T828)" {
     const bg: Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 };
     const accent: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
     // Same functions the machine list's highlighted row uses — asserted, not
     // just intended, so a later divergence fails here.
-    try testing.expectEqual(chooser_rows.selectionFill(bg, accent), cursorFill(bg, accent));
-    try testing.expectEqual(chooser_rows.selectionBorder(bg, accent), cursorBorder(bg, accent));
-    // And the ring is distinguishable from the fill it rings.
-    try testing.expect(!std.meta.eql(cursorFill(bg, accent), cursorBorder(bg, accent)));
+    const fill = cursorFill(bg);
+    try testing.expectEqual(chooser_rows.selectionFillFocused(cardFill(bg)), fill);
+    try testing.expectEqual(chooser_rows.selectionIndicator(fill, accent), cursorIndicator(fill, accent));
+
+    // A step above the resting card, and neutral: the accent is the bar's, not
+    // the card's, exactly as on a machine row.
+    try testing.expect(contrast(fill, bg) > contrast(cardFill(bg), bg));
+    try testing.expectEqual(fill.r, fill.b);
+    try testing.expectEqual(fill, cursorFill(bg));
+
+    // The bar reads against the card it sits on (WCAG 1.4.11).
+    try testing.expect(contrast(cursorIndicator(fill, accent), fill) >= 2.95);
+}
+
+test "the cursor indicator is centered on the card, whatever its height (T828)" {
+    const m = metrics(1.0);
+    // The machine list's mark, not a second one.
+    try testing.expectEqual(chooser_rows.rowMetrics(1.0).indicator_w, m.indicator_w);
+    try testing.expectEqual(chooser_rows.rowMetrics(1.0).indicator_h, m.indicator_h);
+
+    for ([_]i32{ 40, 64, 96 }) |h| {
+        const card: Rect = .{ .left = 100, .top = 50, .right = 400, .bottom = 50 + h };
+        const bar = cursorIndicatorRect(card, m);
+        try testing.expectEqual(m.indicator_w, bar.width());
+        try testing.expectEqual(m.indicator_h, bar.height());
+        // Inside the card, clear of its radius, and centered within rounding.
+        try testing.expect(bar.left > card.left);
+        try testing.expect(bar.left - card.left >= m.radius - m.indicator_w);
+        try testing.expect(@abs((bar.top - card.top) - (card.bottom - bar.bottom)) <= 1);
+        // And it never crowds the liveness dot column that follows it.
+        try testing.expect(bar.right <= card.left + m.pad_x);
+    }
 }

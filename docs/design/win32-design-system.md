@@ -123,6 +123,22 @@ Two hard rules:
 - **Keyboard focus is always visible.** If a control can be tabbed to, it draws
   the ring. Missing focus rings are an accessibility defect, not a polish item.
 
+**List rows are the one amendment (T828).** A row in a selectable list marks
+selection the way Windows 11 does — a **neutral** subtle fill plus a small
+**accent indicator bar** at the leading edge (4x16, capsule, `xs` inside the
+row's pill) — never an accent-tinted fill and never an accent perimeter. The
+accent is one mark per row, so the focus rim on a row is drawn in **neutral
+high-contrast ink** (WinUI's focus visual), not in the accent: an accent rim
+around an accent-marked row is two accent marks on one control, which is what
+the user reported as "a loud purple pill with a thick purple outline". The rim
+also follows Windows' own focus-visual visibility — `UISF_HIDEFOCUS`, which an
+owner-drawn control reads as `ODS_NOFOCUSRECT` — so clicking a row selects it
+without painting a rim, and the first keyboard navigation brings the rim back.
+Everything else in the table stands: hover is still a fill, and the three list
+states still read as one ramp (hover < unfocused selection < focused
+selection). Implemented in `chooser_rows.zig` (`rowPaint`), shared by the
+machine chooser's rows and the session roster's keyboard cursor.
+
 ### 2.3 Contrast (non-negotiable)
 
 | Element | Minimum ratio | Standard |
