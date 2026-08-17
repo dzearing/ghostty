@@ -9,6 +9,35 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-17 - **T830 - the composer rebuild is planned rather than guessed at.**
+  D43 was answered against its own recommendation on a component that had
+  already shipped, so T830 asked for the win32 feedback composer to be rebuilt
+  from a RichEdit onto a second WebView2 contenteditable. Scoping it against the
+  code first was the whole value of the turn: the composer is ~5.5k lines across
+  `ViewerFeedbackBar.zig` (2001), `viewer_feedback_report.zig` (1116),
+  `viewer_feedback_layout.zig` (773), `viewer_feedback_images.zig` (646) and
+  `viewer_feedback_doc.zig` (574), and the rebuild is not a control swap — it
+  flips the composer's entire read model from synchronous to asynchronous, since
+  `caret()`, `readBack()`, `lineCount()` and `quoteSpans()` all ask the control
+  and get an answer on the same stack today, and a WebView2 only answers through
+  `ExecuteScript` callbacks and `WebMessageReceived`. So the page has to own the
+  live document and push a snapshot up on every input, with native laying out
+  and serializing from that snapshot. Too big for one context, so T830 is
+  `skipped(split -> T934, T935, T936, T937)` with the design recorded in its own
+  file: T934 the web host (lazy controller, contenteditable page, plain-text
+  parity), T935 quotes as CSS blocks carrying a real per-quote id, T936 image
+  chips as DOM nodes with paste from the engine, T937 the RichEdit retirement.
+  Two things the scoping settled that the children would otherwise each
+  re-litigate: no fallback path is owed, because a viewer pane cannot exist
+  without WebView2 in the first place; and T935 gets to DELETE machinery rather
+  than port it, since `viewer_feedback_doc.zig` recovers quote identity by
+  matching line-aligned text runs only because RichEdit has no per-run user
+  field to hang an id on — a DOM node has one. The three user-facing children
+  carry T830's `milestone: M1` so the split cannot quietly shrink M1's
+  denominator; T937 is the cleanup tail and stays out. Green: floor lanes
+  lib/none/win32/agent all PASS, `test\win32\release-artifacts.ps1` re-run to
+  clear the guard it was due on.
+
 - 2026-08-17 - **T905 - a persistent session's shell no longer dies with the
   agent.** Increment 2 of T705: `PtySpawner.spawnFn` can now put a session's
   ConPTY, shell and kill-on-close job in a per-session `--pty-host` HOLDER that
