@@ -467,6 +467,21 @@ $GuardTable = @(
             'test\win32\floor-lane-cache-heal.ps1'
         )
     },
+    # The leaked-test-binary sweep (T837) is measurement first: its whole job is
+    # to make a rare leak COUNTABLE, and a detector that has quietly stopped
+    # matching reports the same "leaked test binaries: 0" as a clean run. Same
+    # rule as the rows above -- the library and this harness are covered,
+    # scripts\floor-lane.ps1 is not, so a stall-detector edit does not gate on
+    # it; the wiring arm proves the wiring instead.
+    [pscustomobject]@{
+        Name   = 'lane-leak-sweep'
+        Script = 'test\win32\floor-lane-leak-sweep.ps1'
+        Stamp  = 'test\win32\floor-lane-leak-sweep.stamp.json'
+        Covers = @(
+            'scripts\lib\LaneLeak.ps1',
+            'test\win32\floor-lane-leak-sweep.ps1'
+        )
+    },
     # The T443 instruments have the same failure profile as the crash captures,
     # in its purest form: T832 exists because both of them measured a condition
     # the defect has never occurred in, and reported "all clear" for months

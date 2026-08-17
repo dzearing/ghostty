@@ -31,6 +31,15 @@
       * It sweeps leaked `msedgewebview2.exe` hosts, which are invisible to a
         sweep that filters on zig-out/zig-cache paths (that exe lives under
         Program Files). Match on `--webview-exe-name=` instead.
+      * It counts -- and explains, and reaps -- the lane's own TEST BINARIES
+        when they outlive the verdict (T837). The agent lane was measured
+        leaving `ghoztty-agent-test.exe` and `ghoztty-agent-core-test.exe`
+        alive 25 minutes past `LANE agent PASS`, wedged with frozen CPU, and
+        nothing looked: the webview sweep above filters on a different exe
+        entirely. Every run now ends with a `leaked test binaries: N` number,
+        so a recurrence is counted rather than noticed by accident, and each
+        leak gets a non-invasive `cdb` stack before it is killed. See
+        scripts\lib\LaneLeak.ps1.
       * It self-heals a torn zig-cache entry (T494): a FAIL whose compile
         errors point into `.zig-cache\` or the global cache is a half-written
         cache file, not red code -- the entry is deleted (loudly, as
@@ -102,6 +111,12 @@ param(
     # red lane: point it at a binary that dies and watch which evidence path the
     # script takes.
     [string]$Command,
+    # Extra image names to treat as lane test binaries for the leak sweep.
+    # For the acceptance harness (test\win32\floor-lane-leak-sweep.ps1), which
+    # stages a process that deliberately outlives its lane: it must be able to
+    # do that with a fixture of its own rather than by leaking a real agent
+    # test binary, which is the thing under investigation.
+    [string[]]$ExtraTestExeNames = @(),
     [switch]$SelfTest
 )
 
@@ -122,6 +137,9 @@ $ErrorActionPreference = 'Stop'
 # compile as if the code were red) and deletes exactly that entry, so a lane
 # can heal itself and retry once instead of reporting a phantom FAIL (T494).
 . "$PSScriptRoot\lib\CacheHeal.ps1"
+# Counts, explains and reaps test binaries that are still running after their
+# lane reported a verdict (T837) -- a leak the webview sweep below cannot see.
+. "$PSScriptRoot\lib\LaneLeak.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -149,6 +167,7 @@ $TEST_EXE_NAMES = @(
     'ghoztty-agent-test.exe',
     'ghoztty-agent-core-test.exe'
 )
+foreach ($n in @($ExtraTestExeNames)) { if ($n) { $TEST_EXE_NAMES += $n } }
 
 # ------------------------------------------------------------------ helpers
 
@@ -337,6 +356,12 @@ function Invoke-Lane {
     }
     Write-Host "  log: $log"
 
+    # Which test binaries were ALREADY running, and from when. Anything holding
+    # one of those names afterwards that is not on this list, and started after
+    # this moment, is this lane's leak and nobody else's (T837).
+    $preTestPids = @(Get-LaneTestProcess -ExeNames $TEST_EXE_NAMES | ForEach-Object { $_.ProcessId })
+    $laneStart = Get-Date
+
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
     # Cache the handle NOW: without it $proc.ExitCode reads empty after the
     # child exits, which is how gating on exit codes fabricates failures.
@@ -389,6 +414,22 @@ function Invoke-Lane {
     }
 
     $elapsed = [int]((Get-Date) - $started).TotalSeconds
+
+    # The leaked test binaries go FIRST: they own the WebView2 hosts the next
+    # sweep looks for, and a host whose owner is already dead is the case that
+    # sweep (and its profile-directory cleanup) handles cleanly. Detection runs
+    # even under -NoSweep -- the count is the point of T837, the killing is the
+    # cleanup -- and the stack is taken before the kill, because cleanup that
+    # destroys the evidence guarantees the leak is still unexplained next time.
+    $leakedProcs = @(Get-LeakedLaneProcess -ExeNames $TEST_EXE_NAMES `
+            -ExcludePids $preTestPids -Since $laneStart)
+    $leakedTests = 0
+    if ($leakedProcs.Count -gt 0) {
+        $leakReport = Invoke-LaneLeakSweep -Leaked $leakedProcs -CdbPath (Get-CdbPath) `
+            -OutDir (Join-Path $Repo '.dumps') -NoStack:$NoCatch -NoKill:$NoSweep
+        $leakedTests = $leakReport.Found
+    }
+
     $leaked = 0
     if (-not $NoSweep) { $leaked = Invoke-WebViewSweep }
 
@@ -398,7 +439,7 @@ function Invoke-Lane {
         if ($lines.Count -gt 0) { $tail = $lines[-1] }
     }
 
-    Write-Host "LANE $Name $result in ${elapsed}s (leaked webview hosts swept: $leaked) | $tail"
+    Write-Host "LANE $Name $result in ${elapsed}s (leaked webview hosts swept: $leaked; leaked test binaries: $leakedTests) | $tail"
     if ($result -eq 'FAIL' -and (Test-Path $log)) {
         Write-Host "-- errors --"
         Select-String -Path $log -Pattern 'error:' -ErrorAction SilentlyContinue |
