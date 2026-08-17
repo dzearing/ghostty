@@ -148,6 +148,23 @@ $GuardTable = @(
             'src\remote\agent\pty_host_proto.zig'
         )
     },
+    # Holder-backed sessions (T905): the only harness that measures the promise
+    # the holder design exists for - kill the AGENT and the shell keeps running.
+    # It runs a real app + agent + holder and reads the outcome off the process
+    # table and `sessions.json`, with a flag-OFF negative control proving the
+    # old behavior (shell dies with the agent) is what changed. Neither test
+    # lane can see any of this: it is entirely about which PROCESS owns a
+    # ConPTY, and both children present the identical `session.Child` vtable.
+    [pscustomobject]@{
+        Name   = 'pty-holder'
+        Script = 'test\win32\pty-holder.ps1'
+        Stamp  = 'test\win32\pty-holder.stamp.json'
+        Covers = @(
+            'test\win32\pty-holder.ps1',
+            'src\remote\agent\pty_holder_child.zig',
+            'src\remote\agent\pty_host_spec.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the

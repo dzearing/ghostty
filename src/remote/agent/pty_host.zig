@@ -37,6 +37,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+const protocol = @import("../protocol.zig");
 const proto = @import("pty_host_proto.zig");
 const pty_child = @import("pty_child.zig");
 const pipe_stream = @import("../pipe_stream.zig");
@@ -66,6 +67,14 @@ pub const Options = struct {
     exit_linger_ms: i64 = 10 * 60 * 1000,
     /// Holder build stamp advertised in HELLO (the agent build version).
     stamp: []const u8,
+    /// The full OPEN this session was created from (`--spec`, T905). When
+    /// present it is spawned VERBATIM and the scalar fields above are ignored:
+    /// the agent's holder must reproduce exactly what an in-process `PtyChild`
+    /// would have — the same explicit `argv` shell-integration rewrite, the
+    /// same forwarded `OPEN.env`, the same `TERM` — and the only way to be sure
+    /// of that is to spawn from the same value. Null on the hand-driven flag
+    /// path (`--session-id --cwd --command …`, which the smoke uses).
+    open: ?protocol.Open = null,
 };
 
 /// Derive the default holder pipe name for `session_id`:
@@ -153,7 +162,7 @@ const win = struct {
         // shell subtree dies).
         var spawner = try pty_child.PtySpawner.init(alloc);
         defer spawner.deinit();
-        const pc = try spawner.spawnChild(.{
+        const pc = try spawner.spawnChild(opts.open orelse .{
             .rows = opts.rows,
             .cols = opts.cols,
             .cwd = opts.cwd,

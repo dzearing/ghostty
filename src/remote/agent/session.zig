@@ -523,6 +523,14 @@ pub const Session = struct {
     /// (no live pty). NOT persisted — a relaunch opens a fresh pty and re-reports.
     tty: ?[]u8 = null,
 
+    /// Holder-backed session (T905): the control pipe, pid and build stamp of
+    /// the `--pty-host` process that owns this session's ConPTY. All null/0 for
+    /// an in-process child, which is still the default. Persisted to
+    /// `sessions.json` so the survivor of an agent death stays findable.
+    holder_pipe: ?[]u8 = null,
+    holder_pid: u32 = 0,
+    holder_stamp: ?[]u8 = null,
+
     /// Lifecycle: while `alive`, `DETACH`/drop keeps the session; only `CLOSE` or
     /// child exit frees it. On exit it becomes a **tombstone** retaining
     /// `exit_code` + final state until GC (§7.1).
@@ -668,6 +676,8 @@ pub const Session = struct {
         if (self.argv) |a| self.alloc.free(a);
         if (self.fg_cmd) |f| self.alloc.free(f);
         if (self.tty) |t| self.alloc.free(t);
+        if (self.holder_pipe) |p| self.alloc.free(p);
+        if (self.holder_stamp) |s| self.alloc.free(s);
         if (self.last_signal) |s| self.alloc.free(s);
         self.* = undefined;
     }
@@ -788,6 +798,23 @@ pub const Session = struct {
         const copy: ?[]u8 = if (tty) |t| (self.alloc.dupe(u8, t) catch return) else null;
         if (self.tty) |t| self.alloc.free(t);
         self.tty = copy;
+    }
+
+    /// Record the `--pty-host` holder backing this session (T905). Owns copies;
+    /// best-effort like `setTty` — an allocation failure leaves the session
+    /// working and merely un-adoptable, which is strictly better than failing
+    /// the OPEN over bookkeeping.
+    pub fn setHolder(self: *Session, pipe: []const u8, pid: u32, stamp: []const u8) void {
+        const pipe_copy = self.alloc.dupe(u8, pipe) catch return;
+        const stamp_copy = self.alloc.dupe(u8, stamp) catch {
+            self.alloc.free(pipe_copy);
+            return;
+        };
+        if (self.holder_pipe) |p| self.alloc.free(p);
+        if (self.holder_stamp) |s| self.alloc.free(s);
+        self.holder_pipe = pipe_copy;
+        self.holder_stamp = stamp_copy;
+        self.holder_pid = pid;
     }
 };
 
@@ -957,6 +984,16 @@ pub const SessionTable = struct {
         if (rec.cwd) |c| s.cwd = try self.alloc.dupe(u8, c);
         errdefer if (s.cwd) |c| self.alloc.free(c);
         if (rec.title) |t| s.title = try self.alloc.dupe(u8, t);
+        errdefer if (s.title) |t| self.alloc.free(t);
+        // Carry the holder handle through (T905). This record may name a
+        // `--pty-host` process that is STILL RUNNING with a live shell — the
+        // whole point of holders — so it must survive the round trip through
+        // disk, or the next persist would erase the only pointer to it.
+        // Re-adopting it is T906; keeping it findable is this increment's job.
+        if (rec.holder_pipe) |p| s.holder_pipe = try self.alloc.dupe(u8, p);
+        errdefer if (s.holder_pipe) |p| self.alloc.free(p);
+        if (rec.holder_stamp) |st| s.holder_stamp = try self.alloc.dupe(u8, st);
+        s.holder_pid = rec.holder_pid;
 
         try self.by_id.put(self.alloc, id, s);
         errdefer _ = self.by_id.remove(id);
@@ -2083,6 +2120,10 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
     const cwd: ?[]u8 = if (s.cwd) |c| try alloc.dupe(u8, c) else null;
     errdefer if (cwd) |c| alloc.free(c);
     const title: ?[]u8 = if (s.title) |t| try alloc.dupe(u8, t) else null;
+    errdefer if (title) |t| alloc.free(t);
+    const holder_pipe: ?[]u8 = if (s.holder_pipe) |p| try alloc.dupe(u8, p) else null;
+    errdefer if (holder_pipe) |p| alloc.free(p);
+    const holder_stamp: ?[]u8 = if (s.holder_stamp) |st| try alloc.dupe(u8, st) else null;
     return .{
         .id = id,
         .argv = argv,
@@ -2092,6 +2133,9 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
         .pinned = s.pinned,
         .created_ms = s.created_ms,
         .unclaimed_restarts = s.unclaimed_restarts,
+        .holder_pipe = holder_pipe,
+        .holder_pid = s.holder_pid,
+        .holder_stamp = holder_stamp,
     };
 }
 
@@ -2102,6 +2146,8 @@ fn freeMetaRecord(alloc: Allocator, r: session_meta.Record) void {
     if (r.fg_cmd) |f| alloc.free(f);
     if (r.cwd) |c| alloc.free(c);
     if (r.title) |t| alloc.free(t);
+    if (r.holder_pipe) |p| alloc.free(p);
+    if (r.holder_stamp) |s| alloc.free(s);
 }
 
 /// Build a fully-owned `OwnedLayout` (blob + each session id duped). On any

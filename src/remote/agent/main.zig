@@ -119,6 +119,7 @@ const server = @import("server.zig");
 const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
 const pty_host = @import("pty_host.zig");
+const pty_host_spec = @import("pty_host_spec.zig");
 const pty_host_smoke = @import("pty_host_smoke.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
@@ -313,6 +314,32 @@ pub fn main() !void {
                 if (p.cwd) |v| alloc.free(v);
                 if (p.command) |v| alloc.free(v);
                 if (p.shell) |v| alloc.free(v);
+                if (p.spec) |v| alloc.free(v);
+            }
+            // `--spec` (T905): the agent staged the whole OPEN in a file. Read
+            // it — which also DELETES it, so a session's forwarded environment
+            // never outlives the spawn it configured — and let it supply every
+            // parameter. The parsed arena must outlive `run`, which owns the
+            // session for the holder's whole life.
+            var parsed_spec: ?pty_host_spec.Parsed = null;
+            defer if (parsed_spec) |ps| ps.deinit();
+            if (p.spec) |path| {
+                parsed_spec = pty_host_spec.readAndDelete(alloc, path) catch |err| {
+                    std.debug.print("ghoztty-agent: cannot read --spec '{s}': {s}\n", .{ path, @errorName(err) });
+                    return err;
+                };
+            }
+            if (parsed_spec) |ps| {
+                const s = ps.value;
+                try pty_host.run(alloc, .{
+                    .session_id = s.session_id,
+                    .pipe_name = s.pipe_name,
+                    .replay_bytes = s.replay_bytes,
+                    .exit_linger_ms = s.exit_linger_ms,
+                    .open = s.open,
+                    .stamp = agent_version,
+                });
+                return;
             }
             try pty_host.run(alloc, .{
                 .session_id = p.session_id,
@@ -582,6 +609,13 @@ const PtyHost = struct {
     /// `--exit-linger-ms <n>`: how long an ownerless holder outlives its
     /// exited shell so the agent can still collect the exit code.
     exit_linger_ms: i64 = 10 * 60 * 1000,
+    /// `--spec <path>`: a JSON spawn spec (`pty_host_spec.zig`, T905) holding
+    /// the WHOLE `OPEN` — argv, forwarded env, term, cwd — plus the session id,
+    /// pipe name and holder limits. This is how the AGENT starts a holder; the
+    /// individual flags above are the hand-driven path (the smoke). When
+    /// present, the spec supplies everything and `--session-id` is not
+    /// required. The file is read and DELETED before the shell is spawned.
+    spec: ?[]const u8 = null,
 };
 
 /// Self-enroll parameters (`--enroll --relay=<base>`). `base_url` is the
@@ -903,6 +937,7 @@ fn parsePtyHostMode(alloc: Allocator, args: []const [:0]u8) !Mode {
         if (p.cwd) |v| alloc.free(v);
         if (p.command) |v| alloc.free(v);
         if (p.shell) |v| alloc.free(v);
+        if (p.spec) |v| alloc.free(v);
     }
 
     var i: usize = 1;
@@ -916,6 +951,7 @@ fn parsePtyHostMode(alloc: Allocator, args: []const [:0]u8) !Mode {
             .{ "--cwd", &p.cwd },
             .{ "--command", &p.command },
             .{ "--shell", &p.shell },
+            .{ "--spec", &p.spec },
         };
         var matched = false;
         inline for (str_flags) |f| {
@@ -943,10 +979,12 @@ fn parsePtyHostMode(alloc: Allocator, args: []const [:0]u8) !Mode {
         }
     }
 
-    p.session_id = session_id orelse {
-        std.debug.print("ghoztty-agent: --pty-host requires --session-id <id>\n", .{});
+    // With a `--spec` the session id (and everything else) comes from the file,
+    // so it is the one path that does not need `--session-id` on the wire.
+    p.session_id = session_id orelse (if (p.spec != null) try alloc.dupe(u8, "") else {
+        std.debug.print("ghoztty-agent: --pty-host requires --session-id <id> (or --spec <file>)\n", .{});
         return error.InvalidArgs;
-    };
+    });
     return .{ .pty_host = p };
 }
 
@@ -2843,6 +2881,8 @@ test {
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
     _ = @import("pty_host_proto.zig");
+    _ = @import("pty_host_spec.zig");
+    _ = @import("pty_holder_child.zig");
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");

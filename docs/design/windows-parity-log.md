@@ -9,6 +9,42 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-17 - **T905 - a persistent session's shell no longer dies with the
+  agent.** Increment 2 of T705: `PtySpawner.spawnFn` can now put a session's
+  ConPTY, shell and kill-on-close job in a per-session `--pty-host` HOLDER that
+  escapes the agent's own job, behind `GHOZTTY_AGENT_PTY_HOLDER=1`. Measured
+  rather than argued: `test\win32\pty-holder.ps1` brings up a real app + agent,
+  finds the pane's shell parented to the HOLDER, kills the agent, and finds
+  holder + shell both alive with the control pipe still accepting a connection
+  - then runs the same steps with the flag OFF as a negative control, where the
+  shell still dies with the agent (22 assertions, ALL PASS). Two new files: a
+  JSON **spawn spec** (`pty_host_spec.zig`) that hands the holder
+  `protocol.Open` VERBATIM through `%TEMP%`, read-and-deleted before the shell
+  starts - chosen over argv (arbitrary env values and an explicit shell-
+  integration `argv` into one 32 KiB command line is a quoting bug per user with
+  a `"` in a path) and over the environment (the escape's shell-parent tier
+  donates the CALLER's env block, so one session's vars would leak into the next
+  holder); and the owner side as a plain `session.Child`
+  (`pty_holder_child.zig`), so the store, the ring, `+sessions`, CLOSE, RESIZE
+  and the exit/tombstone path are untouched - nothing above that file knows a
+  second process exists. It re-dials and gap-fills at the last delivered offset
+  when a pipe drops under a LIVE holder (the protocol's replay window, now used
+  in production), and reports an exit when the holder is really gone so a
+  session never sits alive around a shell that no longer exists. A holder-spawn
+  failure degrades to the in-process child with a warning naming what was lost.
+  `sessions.json` gains additive `holder_pipe`/`holder_pid`/`holder_stamp`,
+  round-tripped through `materialize` as well as `persistMeta` - they are the
+  only pointer to a survivor and T906 dials them. Two locking hazards found by
+  reading rather than by a red test: `terminate` closing the stream while the
+  reader was mid-reconnect would have left `reader.join()` parked forever (both
+  now interlock on `write_mutex` and re-check `closed` inside it), and the
+  dead stream's handle leaked on every reconnect. The smoke gained a scenario
+  driving the PRODUCTION owner through the vtable (28 checks ALL PASS,
+  including the forwarded `OPEN.env` arriving in the shell and resize reaching
+  the ConPTY). Validation: all four floor lanes, pty-host, pty-holder,
+  isolation-meta, agent-sharing-uplink, release-artifacts, P1-P3, and
+  session-persistence with the flag ON. Next: T906 (a starting agent adopts the
+  survivors).
 - 2026-08-16 - **T680 - every test\win32 script that dials IPC now claims a
   private endpoint, and the rule is a scan, not a convention.** The sweep read
   all 7 candidates in EXECUTION order (the filed table was a text-order scan):

@@ -4,7 +4,8 @@
 //! it after the agent (or the whole machine) restarts:
 //!
 //!   {"version":1,"sessions":[{"id":<32-hex>,"argv":?,"fg_cmd":?,"cwd":?,
-//!                             "title":?,"pinned":bool,"created_ms":i64}, ...]}
+//!                             "title":?,"pinned":bool,"created_ms":i64,
+//!                             "holder_pipe":?,"holder_pid":u32}, ...]}
 //!
 //! The upgrade demo (T06–T08) keeps the agent process ALIVE across an app
 //! restart, so it never touches disk. The reboot floor is the harder case: the
@@ -79,6 +80,28 @@ pub const Record = struct {
     /// Additive and back-compatible: an older agent omits the field, it decodes
     /// as 0, and the record simply gets a fresh allowance.
     unclaimed_restarts: u32 = 0,
+
+    // --- holder-backed sessions (T905) ---------------------------------------
+    //
+    // A holder-backed session's ConPTY, shell and kill-on-close job live in a
+    // separate `--pty-host` process that OUTLIVES this agent (design:
+    // `docs/design/agent-nondestructive-handoff.md`). These three fields are
+    // the whole handle on that survivor: the control pipe to dial, the pid to
+    // check for liveness, and the build stamp to tell a same-generation holder
+    // from one left by an older agent. A NEXT agent re-adopts from exactly this
+    // (T906); until then they are recorded so an orphan is at least findable.
+    //
+    // Strictly additive: absent on a legacy record (and on every record an
+    // agent with the flag off writes), where they decode to null/0 and the
+    // session is treated as it always was — owned in-process, not carried.
+
+    /// Full `\\.\pipe\...` path of the holder's control pipe.
+    holder_pipe: ?[]const u8 = null,
+    /// The holder process's OS pid (not the shell's — that is `Record`-less by
+    /// design, since a re-adopting agent learns it from the holder's HELLO).
+    holder_pid: u32 = 0,
+    /// The holder binary's build stamp.
+    holder_stamp: ?[]const u8 = null,
 };
 
 /// How many agent restarts a never-resumed tombstone may survive before it is

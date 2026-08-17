@@ -52,6 +52,7 @@ const server = @import("server.zig");
 const proc_spawn = @import("proc_spawn.zig");
 const proc = @import("proc.zig");
 const foreground = @import("foreground.zig");
+const pty_holder_child = @import("pty_holder_child.zig");
 
 /// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
 /// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
@@ -803,6 +804,28 @@ pub const PtySpawner = struct {
     /// Matches `server.Spawner.spawnFn`: turn an OPEN into a `Child` + pid.
     fn spawnFn(ctx: *anyopaque, open: protocol.Open) anyerror!server.Spawner.Result {
         const self: *PtySpawner = @ptrCast(@alignCast(ctx));
+
+        // Holder-backed spawn (T905), opt-in while it stabilizes: the ConPTY,
+        // the shell and its kill-on-close job move into a separate process that
+        // ESCAPES this agent's job, so an agent crash/kill/upgrade no longer
+        // takes the user's shells with it. Everything downstream is unchanged —
+        // a holder is just another `session.Child`.
+        //
+        // A failure here FALLS BACK to the in-process child rather than failing
+        // the OPEN. Losing the survive-an-agent-death property is a bad day;
+        // handing the user a dead pane because a holder would not start is a
+        // worse one, and the warning names which happened.
+        if (is_windows and pty_holder_child.enabledFor(self.env.get(pty_holder_child.env_var))) {
+            if (self.spawnHolderBacked(open)) |res| {
+                return res;
+            } else |err| {
+                log.warn(
+                    "holder-backed spawn failed ({s}); falling back to an in-process ConPTY child (this session will NOT survive an agent restart)",
+                    .{@errorName(err)},
+                );
+            }
+        }
+
         const pc = try self.spawnChild(open);
         // `Result.pid` is the child's OS process id. On POSIX `pc.pid` already is
         // one; on Windows `posix.pid_t` is the process HANDLE, so ask the OS for
@@ -821,6 +844,46 @@ pub const PtySpawner = struct {
         // Windows (ConPTY has no tty name), so no comptime gate is needed here.
         const tty: ?[]const u8 = pc.pty.getProcessInfo(.tty_name);
         return .{ .child = pc.child(), .pid = pid_i64, .tty = tty };
+    }
+
+    /// Spawn this OPEN into a per-session `--pty-host` holder process and wrap
+    /// the control pipe as a `session.Child` (T905).
+    ///
+    /// The holder gets its OWN id rather than the agent's session id: the id is
+    /// minted here, before `SessionTable.create` has assigned one, and it only
+    /// ever has to be unique and pipe-name-safe. The durable link between a
+    /// session and its holder is the pipe name recorded in `sessions.json`
+    /// (`Session.holder_pipe`), which is what a re-adopting agent dials — so
+    /// nothing depends on the two ids matching, and nothing has to reorder the
+    /// spawn against session creation to make them.
+    fn spawnHolderBacked(self: *PtySpawner, open: protocol.Open) !server.Spawner.Result {
+        var id_buf: [32]u8 = undefined;
+        var raw: [16]u8 = undefined;
+        std.crypto.random.bytes(&raw);
+        const hex = "0123456789abcdef";
+        for (raw, 0..) |b, i| {
+            id_buf[i * 2] = hex[b >> 4];
+            id_buf[i * 2 + 1] = hex[b & 0x0f];
+        }
+
+        const spawned = try pty_holder_child.open(self.alloc, .{
+            .session_id = &id_buf,
+            .open = open,
+        });
+        return .{
+            .child = spawned.child,
+            // The pid a client sees must still be the SHELL's — `+list --json`,
+            // `+sessions` and every ancestry walk are about the shell, not the
+            // process babysitting it (the holder's pid rides `sessions.json`).
+            .pid = @intCast(spawned.info.shell_pid),
+            // ConPTY has no tty name, holder or not.
+            .tty = null,
+            .holder = .{
+                .pipe = spawned.info.pipe_name,
+                .pid = spawned.info.holder_pid,
+                .stamp = spawned.info.stamp,
+            },
+        };
     }
 
     /// Matches `server.Spawner.spawnDetachedFn`: launch a detached process for

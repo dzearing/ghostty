@@ -165,6 +165,26 @@ pub const Spawner = struct {
         /// child (stable until `terminate`); consumers must copy before any
         /// window where the child could be torn down.
         tty: ?[]const u8 = null,
+
+        /// Set when this session's ConPTY lives in a separate `--pty-host`
+        /// HOLDER process (T905) instead of in the agent — the arrangement that
+        /// lets a shell outlive its agent. Null for the in-process child, which
+        /// is still the default. Same borrow rule as `tty`: valid until
+        /// `terminate`, so the store copies it on the spot.
+        holder: ?Holder = null,
+    };
+
+    /// The durable handle on a holder-backed session's owner process. Declared
+    /// here rather than imported from `pty_holder_child.zig` for the same reason
+    /// `SpawnResult` is: `server.zig`'s transport graph stays free of the
+    /// spawning machinery.
+    pub const Holder = struct {
+        /// Full `\\.\pipe\...` control-pipe path.
+        pipe: []const u8,
+        /// The holder process's OS pid.
+        pid: u32,
+        /// The holder binary's build stamp.
+        stamp: []const u8,
     };
 
     /// Result of a detached spawn (mirrors `proc_spawn.SpawnOutcome` but defined
@@ -1051,6 +1071,9 @@ pub const Server = struct {
         s.pinned = open.pinned;
         // Record the pty slave path (wp3) so a later ATTACH can re-report it.
         s.setTty(tty_copy);
+        // A holder-backed session (T905) records where its ConPTY actually
+        // lives, so `sessions.json` names a survivor an agent restart can find.
+        if (spawned.holder) |h| s.setHolder(h.pipe, h.pid, h.stamp);
         // Bind the new session to THIS connection: install the outbound bridge so
         // live output frames to our writer, mark it bound (so the idle reaper leaves
         // it alone), and track its channel so disconnect detaches just our sessions.

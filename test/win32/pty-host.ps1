@@ -8,7 +8,11 @@
 #      death leaving the shell alive, reconnect gap-replay with contiguous
 #      offsets, EXIT carrying the shell's exit code, the holder finishing
 #      after delivery, and a killed holder's Job Object taking the shell
-#      subtree with it.
+#      subtree with it. Since T905 it also drives the PRODUCTION owner client
+#      (`pty_holder_child.open`, the one the agent uses) through the
+#      `session.Child` vtable: output to the sink, the spawn spec's forwarded
+#      `OPEN.env` reaching the shell, resize, the exit code via `tryWait`, and
+#      a terminate that leaves neither shell nor holder behind.
 #   B. Pipe security: a live holder's control pipe carries an owner-only DACL
 #      - every access rule on it names the current user, nobody else.
 #
@@ -72,6 +76,16 @@ Assert 'A8 replay offsets were contiguous (no bytes lost)' ($joined -match 'ok -
 Assert 'A9 EXIT carried the shell exit code' ($joined -match 'ok - exit: shell exit code carried')
 Assert 'A10 holder finished after delivering EXIT' ($joined -match 'ok - holder exits after delivering EXIT')
 Assert 'A11 killing the holder killed the shell subtree (job)' ($joined -match 'ok - job-kill: killing the holder terminates the shell subtree')
+
+# T905's production owner (`pty_holder_child.open`) — the SAME client the agent
+# uses for every holder-backed session, driven through the `session.Child`
+# vtable so what is proven here is what the agent will get.
+Assert 'A12 production owner: holder + shell both running' (($joined -match 'ok - production owner: shell running') -and ($joined -match 'ok - production owner: holder running'))
+Assert 'A13 production owner: output reaches the session sink' ($joined -match 'ok - production owner: output reaches the session sink')
+Assert 'A14 production owner: forwarded OPEN.env reached the shell' ($joined -match 'ok - production owner: OPEN.env reached the shell')
+Assert 'A15 production owner: resize reaches the shell' ($joined -match 'ok - production owner: resize reaches the shell')
+Assert 'A16 production owner: exit code arrives via tryWait' ($joined -match 'ok - production owner: exit code via tryWait')
+Assert 'A17 production owner: terminate leaves no shell and no holder' (($joined -match 'ok - production owner: terminate leaves no shell') -and ($joined -match 'ok - production owner: terminate leaves no holder'))
 
 # --- Section B: the control pipe is owner-only ------------------------------
 #

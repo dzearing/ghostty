@@ -15,8 +15,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+const protocol = @import("../protocol.zig");
 const proto = @import("pty_host_proto.zig");
 const pty_host = @import("pty_host.zig");
+const pty_holder_child = @import("pty_holder_child.zig");
 const pipe_stream = @import("../pipe_stream.zig");
 const server = @import("server.zig");
 
@@ -270,6 +272,7 @@ const win = struct {
 
         try scenarioLifecycle(alloc, self_exe);
         try scenarioJobKill(alloc, self_exe);
+        try scenarioProductionOwner(alloc);
 
         if (failures == 0) {
             say("PTY-HOST SMOKE: ALL PASS", .{});
@@ -349,6 +352,115 @@ const win = struct {
         holder_done = true;
         _ = holder.wait() catch {};
         check(waitPidGone(shell_pid, 5_000), "shell fully gone after exit", .{});
+    }
+
+    // -------------------------------------------------------------------------
+    // The PRODUCTION owner (T905) — the same client the agent uses
+    // -------------------------------------------------------------------------
+
+    /// Collects everything a `session.Child` delivers to its sink, so the smoke
+    /// can assert on a holder-backed child exactly the way the session ring
+    /// would see it.
+    const Collector = struct {
+        alloc: Allocator,
+        mutex: std.Thread.Mutex = .{},
+        buf: std.ArrayList(u8) = .empty,
+
+        fn sink(ctx: *anyopaque, channel: u128, bytes: []const u8) void {
+            _ = channel;
+            const self: *Collector = @ptrCast(@alignCast(ctx));
+            if (bytes.len == 0) return; // the reap-check nudge
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.buf.appendSlice(self.alloc, bytes) catch {};
+        }
+
+        /// Poll for `needle` in everything delivered so far.
+        fn waitFor(self: *Collector, needle: []const u8, ms: u64) bool {
+            var waited: u64 = 0;
+            while (waited < ms) : (waited += 100) {
+                self.mutex.lock();
+                const hit = std.mem.indexOf(u8, self.buf.items, needle) != null;
+                self.mutex.unlock();
+                if (hit) return true;
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+            }
+            return false;
+        }
+    };
+
+    /// Poll `tryWait` for the shell's exit code.
+    fn waitExit(child: @import("session.zig").Child, ms: u64) ?i64 {
+        var waited: u64 = 0;
+        while (waited < ms) : (waited += 100) {
+            if (child.tryWait()) |code| return code;
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        return child.tryWait();
+    }
+
+    /// `pty_holder_child.open` is what the AGENT calls for every holder-backed
+    /// session, so this drives the real thing: spawn a holder, wrap it as a
+    /// `session.Child`, and prove that everything the agent asks of a child —
+    /// output to the sink, forwarded `OPEN.env`, RESIZE reaching the ConPTY,
+    /// the exit code through `tryWait`, a clean `terminate` — behaves like the
+    /// in-process ConPTY child it replaces.
+    fn scenarioProductionOwner(alloc: Allocator) !void {
+        var sid_buf: [64]u8 = undefined;
+        const sid = try std.fmt.bufPrint(&sid_buf, "smoke-{d}-prod", .{GetCurrentProcessId()});
+
+        var col: Collector = .{ .alloc = alloc };
+        defer col.buf.deinit(alloc);
+
+        // A forwarded env pair is the load-bearing half of the spawn spec: it
+        // is what a command line would have mangled and what an inherited
+        // environment would have leaked into the NEXT session.
+        const env = [_]protocol.Open.EnvPair{
+            .{ .key = "GHOZTTY_SMOKE_VAR", .value = "MARKER-9091" },
+        };
+        const spawned = pty_holder_child.open(alloc, .{
+            .session_id = sid,
+            .open = .{ .rows = 24, .cols = 80, .env = &env },
+        }) catch |err| {
+            check(false, "production owner: open failed ({s})", .{@errorName(err)});
+            return;
+        };
+        const child = spawned.child;
+        const shell_pid = spawned.info.shell_pid;
+        const holder_pid = spawned.info.holder_pid;
+
+        check(shell_pid != 0 and pidAlive(shell_pid), "production owner: shell running (pid {d})", .{shell_pid});
+        check(holder_pid != 0 and pidAlive(holder_pid), "production owner: holder running (pid {d})", .{holder_pid});
+        check(spawned.info.stamp.len > 0, "production owner: holder stamp recorded ({s})", .{spawned.info.stamp});
+        check(
+            std.mem.indexOf(u8, spawned.info.pipe_name, "pty-host") != null and
+                std.mem.indexOf(u8, spawned.info.pipe_name, sid) != null,
+            "production owner: control pipe recorded ({s})",
+            .{spawned.info.pipe_name},
+        );
+
+        child.attach(&col, Collector.sink, 7);
+
+        child.writeAll("echo PROD-3131\r\n") catch {};
+        check(col.waitFor("PROD-3131", 30_000), "production owner: output reaches the session sink", .{});
+
+        // `%VAR%` expands to nothing when the pair never arrived, so the
+        // bracketed value is a positive assertion, not an absence of one.
+        child.writeAll("echo [%GHOZTTY_SMOKE_VAR%]\r\n") catch {};
+        check(col.waitFor("[MARKER-9091]", 30_000), "production owner: OPEN.env reached the shell", .{});
+
+        child.resize(41, 113, 0, 0) catch {};
+        std.Thread.sleep(300 * std.time.ns_per_ms);
+        child.writeAll("mode con\r\n") catch {};
+        check(col.waitFor("113", 30_000), "production owner: resize reaches the shell (113 cols)", .{});
+
+        child.writeAll("exit 7\r\n") catch {};
+        const code = waitExit(child, 30_000);
+        check(code != null and code.? == 7, "production owner: exit code via tryWait (want 7, got {?d})", .{code});
+
+        child.terminate();
+        check(waitPidGone(shell_pid, 10_000), "production owner: terminate leaves no shell", .{});
+        check(waitPidGone(holder_pid, 10_000), "production owner: terminate leaves no holder", .{});
     }
 
     /// Kill the holder outright: its kill-on-close Job Object must take the
