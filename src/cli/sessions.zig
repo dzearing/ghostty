@@ -203,6 +203,13 @@ const AgentJson = struct {
     live_sessions: ?u32,
     sessions: ?u32,
     agent_pid: ?i64,
+    /// `unsupported` | `ready` | `draining` — whether this agent replaces itself
+    /// with a newer on-disk build without losing a session, and what it is
+    /// waiting for (T907). A machine token, like `status`.
+    handoff: []const u8,
+    /// Live sessions the agent still owns directly, i.e. the drain a `draining`
+    /// handoff is waiting on. Null when the roster was not readable.
+    legacy_sessions: ?u32,
 };
 
 fn reportAgentBuild(
@@ -217,6 +224,10 @@ fn reportAgentBuild(
         .running = if (dialed) |d| peerStamp(d) else null,
         .bundled = bundledAgentVersion(alloc),
         .agent_pid = if (dialed != null) pid else null,
+        // Reached but unreadable: the capability is known (it rode the HELLO),
+        // the drain is not — and `handoffState` reads that as `draining` rather
+        // than promising an upgrade it could not verify (T907).
+        .handoff_capable = if (dialed) |d| d.conn.peerHandsOffItself() else false,
     });
 }
 
@@ -229,9 +240,14 @@ fn reportAgentBuildWithRoster(
     sessions: []const connection.OwnedSession,
 ) !u8 {
     var live: u32 = 0;
-    for (sessions) |s| if (s.alive) {
+    var legacy: u32 = 0;
+    for (sessions) |s| {
+        if (!s.alive) continue;
         live += 1;
-    };
+        // Older agents omit the field, which decodes false — i.e. legacy, which
+        // can only hold a handoff back, never permit one (T907).
+        if (!s.holder_backed) legacy += 1;
+    }
     return emitAgentReport(alloc, stdout, json, .{
         .agent_running = true,
         .running = peerStamp(dialed),
@@ -239,6 +255,8 @@ fn reportAgentBuildWithRoster(
         .live_sessions = live,
         .total_sessions = @intCast(sessions.len),
         .agent_pid = pid,
+        .handoff_capable = dialed.conn.peerHandsOffItself(),
+        .legacy_sessions = legacy,
     });
 }
 
@@ -261,6 +279,8 @@ fn emitAgentReport(
         .live_sessions = rep.live_sessions,
         .sessions = rep.total_sessions,
         .agent_pid = rep.agent_pid,
+        .handoff = rep.handoff.token(),
+        .legacy_sessions = rep.legacy_sessions,
     };
     const text = try std.json.Stringify.valueAlloc(alloc, row, .{ .whitespace = .indent_2 });
     try stdout.writeAll(text);

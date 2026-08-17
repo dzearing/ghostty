@@ -209,7 +209,45 @@ pub const Input = struct {
     live_sessions: ?u32 = null,
     total_sessions: ?u32 = null,
     agent_pid: ?i64 = null,
+    /// The running agent advertised `capability.agent_handoff` — it replaces
+    /// ITSELF with a newer on-disk build, carrying every holder-backed session
+    /// across, so nobody has to restart it (T907).
+    handoff_capable: bool = false,
+    /// How many LIVE sessions the agent still owns directly (`holder_backed ==
+    /// false`). Each one holds a handoff back. Null when the roster could not be
+    /// read at all, which is NOT the same as zero and must not read as "ready".
+    legacy_sessions: ?u32 = null,
 };
+
+/// Whether a stale agent will fix itself, and what it is waiting for (T907).
+///
+/// Three states rather than a bool, because "it cannot" and "it will, once these
+/// close" lead a reader to completely different next steps — and the old
+/// `next:` line, which promised a restart at the next quiet moment, is a lie in
+/// both of the new ones.
+pub const Handoff = enum {
+    /// This agent does not replace itself: an older build, or a seat where the
+    /// mechanism has not landed. The pre-T907 answer applies.
+    unsupported,
+    /// It replaces itself, and nothing is in the way.
+    ready,
+    /// It replaces itself, but sessions it owns directly have to close first.
+    draining,
+
+    pub fn token(self: Handoff) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Classify the handoff state from what the CLI observed. `legacy == null` (the
+/// roster was unreadable) is `draining` rather than `ready`: claiming an upgrade
+/// is about to happen, when we could not check what is holding it back, is the
+/// direction that reads as a promise and is not one.
+pub fn handoffState(capable: bool, legacy: ?u32) Handoff {
+    if (!capable) return .unsupported;
+    const n = legacy orelse return .draining;
+    return if (n == 0) .ready else .draining;
+}
 
 /// The answer to "how far behind is the running agent?", in one struct.
 pub const Report = struct {
@@ -220,6 +258,8 @@ pub const Report = struct {
     live_sessions: ?u32,
     total_sessions: ?u32,
     agent_pid: ?i64,
+    handoff: Handoff,
+    legacy_sessions: ?u32,
 
     /// The human rendering: four aligned rows, the last of which only appears
     /// when there is something to do about it. Written to `w` so the CLI does
@@ -238,10 +278,35 @@ pub const Report = struct {
         try w.writeAll("\n");
 
         if (self.status == .stale) {
-            try w.writeAll(
-                "next:     Ghoztty restarts it onto the bundled build when no sessions " ++
-                    "are open, or when you confirm the restart it offers.\n",
-            );
+            try w.writeAll("next:     ");
+            switch (self.handoff) {
+                .unsupported => try w.writeAll(
+                    "Ghoztty restarts it onto the bundled build when no sessions " ++
+                        "are open, or when you confirm the restart it offers.\n",
+                ),
+                // T907. Deliberately says "no session closes" out loud: the whole
+                // reason someone runs this command is to find out what an update
+                // is going to cost them.
+                .ready => try w.writeAll(
+                    "It updates itself to the bundled build on its own, and no " ++
+                        "session closes.\n",
+                ),
+                .draining => {
+                    try w.writeAll(
+                        "It updates itself to the bundled build on its own, and no " ++
+                            "session closes — but not yet: ",
+                    );
+                    if (self.legacy_sessions) |n| {
+                        try w.print(
+                            "{d} older session{s} still owned by the agent " ++
+                                "must close first.\n",
+                            .{ n, if (n == 1) "" else "s" },
+                        );
+                    } else {
+                        try w.writeAll("its session roster could not be read.\n");
+                    }
+                },
+            }
         }
     }
 
@@ -290,6 +355,8 @@ pub fn report(in: Input) Report {
         .live_sessions = in.live_sessions,
         .total_sessions = in.total_sessions,
         .agent_pid = in.agent_pid,
+        .handoff = handoffState(in.handoff_capable, in.legacy_sessions),
+        .legacy_sessions = in.legacy_sessions,
     };
 }
 
@@ -500,6 +567,106 @@ test "report: no agent at all is an answer, not a blank" {
     try testing.expect(std.mem.indexOf(u8, text, "not_running") != null);
     // Nothing is running, so nothing has a pid.
     try testing.expect(std.mem.indexOf(u8, text, "pid") == null);
+}
+
+test "handoffState: only a capable agent with a KNOWN, empty drain is ready" {
+    try testing.expectEqual(Handoff.unsupported, handoffState(false, 0));
+    try testing.expectEqual(Handoff.unsupported, handoffState(false, null));
+    try testing.expectEqual(Handoff.unsupported, handoffState(false, 4));
+    try testing.expectEqual(Handoff.ready, handoffState(true, 0));
+    try testing.expectEqual(Handoff.draining, handoffState(true, 1));
+    // Capable but we could not read the roster: `draining`, never `ready`.
+    // "Your update is about to happen and costs nothing" is a promise, and we
+    // did not check the one thing that could make it false.
+    try testing.expectEqual(Handoff.draining, handoffState(true, null));
+
+    // Machine tokens, like `Status.token`.
+    for ([_]Handoff{ .unsupported, .ready, .draining }) |h| {
+        try testing.expect(h.token().len > 0);
+        for (h.token()) |c| try testing.expect(c == '_' or std.ascii.isLower(c));
+    }
+}
+
+test "report: a self-replacing agent says no session closes" {
+    const r = report(.{
+        .agent_running = true,
+        .running = "20260719-574fe0805",
+        .bundled = "20260730-e69d41755",
+        .live_sessions = 4,
+        .handoff_capable = true,
+        .legacy_sessions = 0,
+    });
+    try testing.expectEqual(Status.stale, r.status);
+    try testing.expectEqual(Handoff.ready, r.handoff);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try r.write(&out.writer);
+    const text = out.written();
+    // The whole reason someone runs this: what is an update going to cost me?
+    try testing.expect(std.mem.indexOf(u8, text, "updates itself to the bundled build on its own") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "no session closes") != null);
+    // And it must NOT still be offering the old, now-wrong promise.
+    try testing.expect(std.mem.indexOf(u8, text, "confirm the restart") == null);
+}
+
+test "report: a draining agent names what it is waiting for" {
+    const draining = report(.{
+        .agent_running = true,
+        .running = "20260719-574fe0805",
+        .bundled = "20260730-e69d41755",
+        .live_sessions = 3,
+        .handoff_capable = true,
+        .legacy_sessions = 2,
+    });
+    try testing.expectEqual(Handoff.draining, draining.handoff);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try draining.write(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "2 older sessions still owned by the agent must close first") != null);
+
+    // Singular, and the unreadable-roster arm, which must say so rather than
+    // print a number it does not have.
+    const one = report(.{
+        .agent_running = true,
+        .running = "20260719-574fe0805",
+        .bundled = "20260730-e69d41755",
+        .handoff_capable = true,
+        .legacy_sessions = 1,
+    });
+    var out2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out2.deinit();
+    try one.write(&out2.writer);
+    try testing.expect(std.mem.indexOf(u8, out2.written(), "1 older session still owned") != null);
+
+    const blind = report(.{
+        .agent_running = true,
+        .running = "20260719-574fe0805",
+        .bundled = "20260730-e69d41755",
+        .handoff_capable = true,
+    });
+    var out3: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out3.deinit();
+    try blind.write(&out3.writer);
+    try testing.expect(std.mem.indexOf(u8, out3.written(), "roster could not be read") != null);
+}
+
+test "report: an older agent keeps the pre-T907 next step, word for word" {
+    // Standing down on an agent that will never hand itself off means it is
+    // never upgraded at all, so the old sentence has to survive exactly.
+    const r = report(.{
+        .agent_running = true,
+        .running = "20260719-574fe0805",
+        .bundled = "20260730-e69d41755",
+        .live_sessions = 2,
+        .legacy_sessions = 2,
+    });
+    try testing.expectEqual(Handoff.unsupported, r.handoff);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try r.write(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "or when you confirm the restart it offers") != null);
 }
 
 test "stampForLog never yields an empty field in a log line" {

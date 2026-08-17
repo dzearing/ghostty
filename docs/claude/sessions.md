@@ -477,5 +477,49 @@ whose headline assertion is the SHELL PID being unchanged across a manager kill
 — that is what separates adoption from the relaunch path
 `test\win32\agent-recovery.ps1` section C covers.
 
+**Since T907 the agent replaces ITSELF** (`src/remote/agent/handoff.zig`), which
+is the payoff the three increments above were for: a newer `ghoztty-agent.exe`
+lands on disk and the running agent adopts it with nobody asked and no session
+closed. Five things here are contract:
+
+- **The agent decides, not the app.** A supervisor thread compares the binary at
+  its own image path with a trailing `.bak`/`.bak-*` stripped — every delivery
+  renames the running exe out of the way, so that IS the new build's path —
+  against its own stamp. The app's whole role is to STAND DOWN; it never asks for
+  a handoff and must never restart a handoff-capable agent for being stale. This
+  is deliberately not an app→agent request: the agent is the only side that knows
+  which sessions are holder-backed, and the handoff has to work with no app
+  running at all (T525's unattended refresh never touches the agent).
+- **READY gates everything, and the old agent gives up nothing before it.** The
+  old agent spawns the successor (out of its job, `spawnEscapingJob`) with the
+  SAME argv plus `--handoff-successor=<private pipe>` and `--force-replace`. The
+  successor binds that pipe, sends `READY <pid> <stamp>`, and **takes no
+  single-instance guard and binds nothing public until it is told `GO`**. Only on
+  READY does the old agent snapshot its rings, persist `sessions.json` (so the
+  successor's `ATTACH(ack)` offsets are exact) and `exit(0)` — process death is
+  what releases the holders, so nothing is terminated. Any failure before GO
+  terminates the successor and the ORIGINAL agent keeps serving: "neither agent"
+  is unreachable by construction.
+- **Mixed generations drain lazily.** A legacy session (ConPTY owned by the agent
+  itself) cannot be carried across a process boundary at all — the HPCON wall —
+  so while any live session is legacy the handoff WAITS and says so. It never
+  proceeds and never gives up. `SessionInfo.holder_backed` (additive) is what
+  reports the split, and `+sessions --agent` names the count that is holding it
+  back (`handoff: unsupported | ready | draining`, `legacy_sessions: N`).
+- **`capability.agent_handoff` is advertised by BOTH sides and negotiated as the
+  intersection.** The agent advertises it only where the mechanism exists
+  (comptime Windows-only today; the Mac half is increment 5). An app that does not
+  advertise it keeps the pre-T907 policy — refresh at idle, confirm while live —
+  because standing down on a promise it cannot hear about would leave the agent
+  stale forever. The app-side policy arm is `agent_upgrade.Action.handoff_now`.
+- **The test seam is `GHOZTTY_AGENT_HANDOFF_FORCE=1`, debug builds only.** One
+  tree cannot produce two build stamps, so without it no acceptance script could
+  reach the handoff arm at all. It skips ONLY the staleness comparison — never
+  the drain gate — and is read once and then removed from the process environment
+  block, so no successor can inherit it and hand off again forever. Kill switch:
+  `GHOZTTY_AGENT_NO_HANDOFF`; poll interval: `GHOZTTY_AGENT_HANDOFF_INTERVAL_MS`.
+  Acceptance: `test\win32\agent-handoff.ps1` (A–C the handoff and what survives
+  it, D the rollback, E the lazy drain).
+
 Design + status: `docs/design/session-persistence.md`.
 

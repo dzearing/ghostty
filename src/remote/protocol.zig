@@ -670,6 +670,27 @@ pub const capability = struct {
     /// safe), and a new client never sees 0x15 from an old agent. Neither
     /// garbles nor wedges.
     pub const repaint_data = "repaint_data";
+
+    /// **Non-destructive agent upgrade** (T907): this peer understands that a
+    /// stale agent replaces ITSELF — spawning the newer on-disk build, handing
+    /// the per-session PTY holders over to it, and exiting only once the
+    /// successor has reported READY — so no session is lost and nobody is asked.
+    ///
+    /// Advertised by the AGENT to mean "I will do this when a newer build lands
+    /// beside me and every live session is holder-backed", and by the CLIENT to
+    /// mean "I know that, so I will not restart you destructively for being
+    /// stale". The INTERSECTION is what matters, which is why both sides say it:
+    /// an older app talking to a handoff-capable agent must keep its existing
+    /// behavior (refresh at idle, confirm while live), because standing down on
+    /// a promise it cannot hear about would leave the agent stale forever from
+    /// its point of view.
+    ///
+    /// Purely additive — no new opcode and no new required field. It gates a
+    /// POLICY (`apprt/win32/agent_upgrade.zig`), and the per-session
+    /// `SessionInfo.holder_backed` flag is what turns the promise into a
+    /// live answer: an agent can only hand off once nothing legacy is left.
+    /// Skew degrades in both directions to exactly the pre-T907 behavior.
+    pub const agent_handoff = "agent_handoff";
 };
 
 /// The kind of pseudo-terminal a peer spawns its children on. Wire-visible
@@ -850,6 +871,14 @@ pub const Negotiated = struct {
     /// never emit an opcode the peer would treat as a fatal framing error) and
     /// the client over-counts by the repaint's size, exactly as before.
     repaint_data: bool = false,
+
+    /// True iff BOTH peers advertised `capability.agent_handoff` — the agent
+    /// replaces itself non-destructively when a newer build lands beside it, and
+    /// the client knows to stand down rather than restart it (T907). False
+    /// against any older peer on either side, in which case the client keeps its
+    /// pre-T907 policy (refresh at idle, confirm while live) — reduced function,
+    /// never a lost session.
+    agent_handoff: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -892,6 +921,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.attach_failed),
         .repaint_data = hasCapability(local.capabilities, capability.repaint_data) and
             hasCapability(remote.capabilities, capability.repaint_data),
+        .agent_handoff = hasCapability(local.capabilities, capability.agent_handoff) and
+            hasCapability(remote.capabilities, capability.agent_handoff),
     };
 }
 
@@ -1291,6 +1322,21 @@ pub const SessionInfo = struct {
     /// never acts on it). Additive/optional: older agents omit it, and a reader
     /// that never heard of it changes nothing.
     unattached_since: ?i64 = null,
+    /// True when this session's ConPTY, shell and kill-on-close job live in a
+    /// separate `--pty-host` HOLDER process rather than inside the agent (T905),
+    /// so the shell survives the agent going away.
+    ///
+    /// What reads it: the non-destructive upgrade policy (T907). An agent can
+    /// only replace itself without losing anything once EVERY live session is
+    /// holder-backed; a legacy session (ConPTY owned by the agent itself) cannot
+    /// be carried across a process boundary — the HPCON wall — so it holds the
+    /// handoff back until it closes. `+sessions --agent` counts the false ones
+    /// and names them as the drain.
+    ///
+    /// Additive/optional (defaults false; older agents omit it, and reading a
+    /// missing field as "not holder-backed" is the safe direction — it can only
+    /// ever hold a handoff back, never permit one that would lose a session).
+    holder_backed: bool = false,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
@@ -2254,6 +2300,48 @@ test "HELLO encode / parse / negotiate" {
         .{ .proto_version = 1, .transfer_encoding = .raw },
         .{ .proto_version = 2, .transfer_encoding = .raw },
     ));
+}
+
+test "negotiate: agent_handoff is the intersection, and skew keeps the old policy" {
+    const both = [_][]const u8{capability.agent_handoff};
+    const other = [_][]const u8{capability.rpc};
+
+    // Both advertise ⇒ the agent replaces itself and the peer stands down.
+    try testing.expect((try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+    )).agent_handoff);
+
+    // Either side missing ⇒ false, in BOTH directions. This is the one that
+    // matters: an app that stood down on an agent which never hands itself off
+    // would leave that agent stale forever, which is the T662 defect restated.
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+        .{ .transfer_encoding = .raw, .capabilities = &other },
+    )).agent_handoff);
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw, .capabilities = &other },
+        .{ .transfer_encoding = .raw, .capabilities = &both },
+    )).agent_handoff);
+    try testing.expect(!(try negotiate(
+        .{ .transfer_encoding = .raw },
+        .{ .transfer_encoding = .raw },
+    )).agent_handoff);
+}
+
+test "SessionInfo.holder_backed is additive: absent decodes as legacy" {
+    const alloc = testing.allocator;
+
+    // An older agent's row has no such key. It must parse, and it must read as
+    // NOT holder-backed — the direction that can only ever hold an upgrade back,
+    // never permit one that would lose a session.
+    var old = try parseJson(SessionInfo, alloc, "{\"id\":\"a\",\"alive\":true}");
+    defer old.deinit();
+    try testing.expect(!old.value.holder_backed);
+
+    var new = try parseJson(SessionInfo, alloc, "{\"id\":\"a\",\"alive\":true,\"holder_backed\":true}");
+    defer new.deinit();
+    try testing.expect(new.value.holder_backed);
 }
 
 test "negotiate: open_failed capability is the intersection of both HELLOs" {

@@ -922,6 +922,45 @@ pub const SessionTable = struct {
         return self.by_id.count() - self.liveCount();
     }
 
+    /// How the live sessions split between the two generations (T907). This is
+    /// the input to the non-destructive upgrade decision, and it is a COUNT of
+    /// legacy rather than a boolean because the number is what the user is told
+    /// while the handoff waits ("2 sessions still have to close first").
+    pub const LiveMix = struct {
+        /// Live sessions whose ConPTY + shell live in a `--pty-host` HOLDER, and
+        /// so survive this process going away (T905).
+        holder_backed: usize = 0,
+        /// Live sessions whose ConPTY this agent owns directly. They cannot be
+        /// carried across a process boundary — the HPCON wall — so each one
+        /// holds a handoff back until it closes.
+        legacy: usize = 0,
+
+        pub fn live(self: LiveMix) usize {
+            return self.holder_backed + self.legacy;
+        }
+
+        /// Can this agent hand its sessions to a successor and lose nothing?
+        /// True with no live sessions at all, which is the same answer for the
+        /// same reason: there is nothing a successor would fail to pick up.
+        pub fn handoffSafe(self: LiveMix) bool {
+            return self.legacy == 0;
+        }
+    };
+
+    /// The live split, walked once. Same O(n) reasoning as `liveCount`: a cached
+    /// pair would have to track every alive→dead transition AND every holder
+    /// adoption/abandonment, and a drift here decides whether a shell survives.
+    pub fn liveMix(self: *SessionTable) LiveMix {
+        var mix: LiveMix = .{};
+        var it = self.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive) continue;
+            if (s.holder_pipe != null) mix.holder_backed += 1 else mix.legacy += 1;
+        }
+        return mix;
+    }
+
     /// Mint a fresh, never-before-used crypto-random non-zero u128 not already in
     /// `map`. Retries on the (astronomically unlikely) collision.
     fn mintId(self: *SessionTable, map: anytype) u128 {

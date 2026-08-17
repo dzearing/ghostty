@@ -214,7 +214,12 @@ Assert "C: status is stale" ((Row $textC 'status') -like 'stale*')
 # The number is the point of the task: "how far behind" has to be answerable.
 Assert "C: names the distance in days" ((Row $textC 'status') -match 'stale - 10 days behind')
 Assert "C: names the live session count" ((Row $textC 'status') -match '0 live sessions')
-Assert "C: a stale agent is told how it gets updated" ((Row $textC 'next') -match 'no sessions are open')
+# What a stale agent is told happens next depends on whether it can replace
+# ITSELF (T907). This agent is the build under test, so it advertises
+# `agent_handoff` and its roster is empty - `ready`, and the honest next step is
+# "it updates itself and no session closes", not the pre-T907 restart sentence.
+Assert "C: a stale agent is told how it gets updated" ((Row $textC 'next') -match 'updates itself to the bundled build on its own')
+Assert "C: and that it costs no session" ((Row $textC 'next') -match 'no session closes')
 
 # ============================================================================
 Say "== D: a running agent NEWER than the bundled one is never 'behind'"
@@ -237,7 +242,7 @@ try { $json = $textE | ConvertFrom-Json } catch { $json = $null }
 Assert "E: output parses as JSON" ($null -ne $json)
 if ($null -ne $json) {
     $keys = $json.PSObject.Properties.Name
-    foreach ($k in @('status', 'running', 'bundled', 'days_behind', 'live_sessions', 'sessions', 'agent_pid')) {
+    foreach ($k in @('status', 'running', 'bundled', 'days_behind', 'live_sessions', 'sessions', 'agent_pid', 'handoff', 'legacy_sessions')) {
         Assert "E: key '$k' is present" ($keys -contains $k)
     }
     Assert "E: status token matches the human row" ($json.status -eq 'stale')
@@ -246,6 +251,10 @@ if ($null -ne $json) {
     Assert "E: bundled is the fabricated one" ($json.bundled -eq $newerStamp)
     Assert "E: agent_pid is the agent we started" ($json.agent_pid -eq $agent.Id)
     Assert "E: live_sessions counts the empty roster" ($json.live_sessions -eq 0)
+    # T907: whether this agent replaces itself, and what is holding it back. A
+    # machine token like `status`, and the thing the `next:` row is written from.
+    Assert "E: handoff token matches the human row" ($json.handoff -eq 'ready')
+    Assert "E: nothing is draining on an empty roster" ($json.legacy_sessions -eq 0)
 }
 
 } finally {

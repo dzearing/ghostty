@@ -180,6 +180,24 @@ $GuardTable = @(
             'src\remote\agent\session_meta.zig'
         )
     },
+    # Non-destructive agent HANDOFF (T907): the choreography that lets the
+    # session manager replace itself with a newer build while sessions are open.
+    # Two things make it un-shippable un-run. It is the only harness that proves
+    # the ROLLBACK - a successor that dies must leave the ORIGINAL agent serving,
+    # and the failure mode of getting that wrong is "no agent at all" - and it is
+    # the only one that measures the shell pid ACROSS an upgrade rather than
+    # across a kill.
+    [pscustomobject]@{
+        Name   = 'agent-handoff'
+        Script = 'test\win32\agent-handoff.ps1'
+        Stamp  = 'test\win32\agent-handoff.stamp.json'
+        Covers = @(
+            'test\win32\agent-handoff.ps1',
+            'src\remote\agent\handoff.zig',
+            'src\apprt\win32\agent_upgrade.zig',
+            'src\remote\agent_build.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the

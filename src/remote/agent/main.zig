@@ -122,6 +122,7 @@ const pty_host = @import("pty_host.zig");
 const pty_host_spec = @import("pty_host_spec.zig");
 const pty_host_smoke = @import("pty_host_smoke.zig");
 const holder_adopt = @import("holder_adopt.zig");
+const handoff = @import("handoff.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const pipe_stream = @import("../pipe_stream.zig");
@@ -147,6 +148,18 @@ const agent_lineage = @import("../agent_lineage.zig");
 /// `/dl/version.json` by the self-updater (`self_update.zig`) — dev builds
 /// never self-update.
 const agent_version: []const u8 = @import("agent_build_options").agent_version;
+
+/// The private handoff pipe a retiring agent named on our command line (T907),
+/// in a process-lifetime buffer: `parseArgs` frees `args` before the listen path
+/// runs, and this value has to outlive that. Empty ⇒ we are an ordinary launch.
+var handoff_pipe_buf: [256]u8 = undefined;
+var handoff_pipe_len: usize = 0;
+
+/// The private handoff pipe, or null when this agent was not spawned as a
+/// successor (every launch but the one at the end of a handoff).
+fn handoffSuccessorPipe() ?[]const u8 {
+    return if (handoff_pipe_len == 0) null else handoff_pipe_buf[0..handoff_pipe_len];
+}
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -252,6 +265,22 @@ pub fn main() !void {
             // --listen-unix); listenPipeMode rejects it at parse time, and this
             // comptime gate keeps the pipe daemon code out of POSIX analysis.
             if (builtin.os.tag != .windows) unreachable;
+            // HANDOFF SUCCESSOR (T907): a running agent spawned us to replace it.
+            // Report READY over its private pipe and block until it says GO —
+            // which it only does once it has snapshotted its rings and is about
+            // to exit. Everything destructive is on the far side of this call:
+            // we take no single-instance guard and bind nothing public until it
+            // returns, so a predecessor that changes its mind (or a successor
+            // that cannot start) leaves the ORIGINAL agent serving untouched.
+            if (handoffSuccessorPipe()) |p| {
+                handoff.awaitGo(alloc, p) catch |err| {
+                    std.debug.print(
+                        "ghoztty-agent: handoff: predecessor did not hand over ({s}); exiting without binding anything\n",
+                        .{@errorName(err)},
+                    );
+                    return err;
+                };
+            }
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
             // must not race the winner for the pipe name). This is THE local
             // session-persistence agent, so it takes the DISTINCT `local[-debug]`
@@ -770,6 +799,20 @@ fn parseArgs(alloc: Allocator) !Mode {
             } else if (std.mem.startsWith(u8, a, "--sessions-file=")) {
                 sessions_file_arg = a["--sessions-file=".len..];
             }
+            // Handoff successor (T907): we were spawned by a RUNNING agent that
+            // is about to retire, and this private pipe is how we tell it we are
+            // up and how it tells us to take over. Order-independent, and stored
+            // in a process-lifetime buffer because `args` is freed on the way out
+            // of this function while the value is needed by the listen path.
+            if (std.mem.startsWith(u8, a, handoff.successor_flag ++ "=")) {
+                const v = a[handoff.successor_flag.len + 1 ..];
+                if (v.len == 0 or v.len > handoff_pipe_buf.len) {
+                    std.debug.print("ghoztty-agent: invalid {s} value\n", .{handoff.successor_flag});
+                    return error.InvalidArgs;
+                }
+                @memcpy(handoff_pipe_buf[0..v.len], v);
+                handoff_pipe_len = v.len;
+            }
             // Ring size (T11): order-independent config, like --port-file.
             if (std.mem.eql(u8, a, "--ring-bytes")) {
                 j += 1;
@@ -847,7 +890,8 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.startsWith(u8, a, "--port-file=") or
             std.mem.startsWith(u8, a, "--sessions-file=") or
             std.mem.startsWith(u8, a, "--ring-bytes=") or
-            std.mem.startsWith(u8, a, "--max-sessions="))
+            std.mem.startsWith(u8, a, "--max-sessions=") or
+            std.mem.startsWith(u8, a, handoff.successor_flag ++ "="))
         {
             continue; // handled in the pre-scan above
         } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--sessions-file") or
@@ -1553,7 +1597,7 @@ fn runListenPipe(
     // the liveness probe (`probeUnixAlive` analog): a taken name means a live
     // agent owns it — refuse rather than fight over instances. A DEAD holder
     // needs no unlink step: a Windows pipe name vanishes with its last handle.
-    var listener = pipe_stream.PipeListener.bind(alloc, name) catch |err| {
+    var listener = bindListener(alloc, name) catch |err| {
         if (err == error.AlreadyListening) {
             std.debug.print("ghoztty-agent: a live agent already listens at {s}; exiting\n", .{name});
             return error.AlreadyListening;
@@ -1643,6 +1687,14 @@ fn runListenPipe(
     // uninstalled, the Run key repaired. No-op (and silent) everywhere else.
     adopt.maybeStart(alloc, sessions_file);
 
+    // Non-destructive self-replacement (T907): watch for a newer build laid down
+    // beside us and hand every holder-backed session to it, with nobody asked and
+    // nothing lost. Started AFTER adoption, so the very first check already sees
+    // the true holder/legacy split rather than a roster that has not been
+    // reconnected yet. Windows-only, and a no-op wherever holders are not in
+    // play, so a box with only legacy sessions behaves exactly as it did.
+    handoff.Supervisor.start(alloc, &store, agent_version);
+
     // Accept loop: same serve-each-connection-on-its-own-thread core as the
     // socket paths, over pipe instances. The DACL already gated admission (only
     // this user can open the pipe), so there is no per-connection uid check.
@@ -1666,6 +1718,31 @@ fn runListenPipe(
             continue;
         };
         t.detach();
+    }
+}
+
+/// How long a handoff SUCCESSOR keeps retrying the public pipe bind (T907).
+///
+/// A retiring agent sends GO and then exits, and a Windows pipe name only
+/// vanishes when its last handle closes — so for the few milliseconds between
+/// those two events the name is still taken and `FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// fails. Retrying is the whole difference between a handoff that works and one
+/// that ends with no agent at all; an ordinary launch does NOT retry, because
+/// there `AlreadyListening` means a healthy agent owns the name and the right
+/// answer is to exit immediately.
+const successor_bind_retry_ms: u64 = 10 * std.time.ms_per_s;
+
+/// Bind the public pipe, with the successor's bounded retry when we are one.
+fn bindListener(alloc: Allocator, name: []const u8) !pipe_stream.PipeListener {
+    const retry = handoffSuccessorPipe() != null;
+    var waited: u64 = 0;
+    while (true) {
+        return pipe_stream.PipeListener.bind(alloc, name) catch |err| {
+            if (!retry or err != error.AlreadyListening or waited >= successor_bind_retry_ms) return err;
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+            waited += 25;
+            continue;
+        };
     }
 }
 
@@ -2903,6 +2980,7 @@ test {
     _ = @import("pty_host_spec.zig");
     _ = @import("pty_holder_child.zig");
     _ = @import("holder_adopt.zig");
+    _ = @import("handoff.zig");
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");

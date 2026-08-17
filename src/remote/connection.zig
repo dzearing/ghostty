@@ -778,6 +778,13 @@ pub const OwnedSession = struct {
     /// dead row — and from an OLDER AGENT that never heard of the field, which is
     /// why every consumer treats null as "no clock", never as an error.
     unattached_since: ?i64 = null,
+    /// True when the session's ConPTY, shell and kill-on-close job live in a
+    /// separate `--pty-host` HOLDER process, so the shell outlives the agent
+    /// (T905). What reads it is the non-destructive upgrade policy (T907): an
+    /// agent can only replace itself once EVERY live session is holder-backed.
+    /// Additive/optional — an older agent omits the wire field, which decodes to
+    /// false, i.e. "legacy", which can only ever hold an upgrade back.
+    holder_backed: bool = false,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -1083,6 +1090,13 @@ pub const Connection = struct {
         // and we count them, exactly as before — a resume point past the head,
         // which the T532 clamp then pulls back.
         protocol.capability.repaint_data,
+        // We know that a handoff-capable agent replaces ITSELF when a newer
+        // build lands beside it, carrying every holder-backed session across
+        // (T907). Advertising it is what lets that agent's peer stand down
+        // instead of restarting it destructively; an older agent never
+        // advertises the other half, the negotiated flag stays false, and the
+        // caller keeps its pre-T907 policy.
+        protocol.capability.agent_handoff,
     };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
@@ -1962,6 +1976,7 @@ pub const Connection = struct {
                 .pinned = s.pinned,
                 .relaunchable = s.relaunchable,
                 .unattached_since = s.unattached_since,
+                .holder_backed = s.holder_backed,
             };
             filled = i + 1;
         }
@@ -2591,6 +2606,19 @@ pub const Connection = struct {
     /// the remote machine's mach timebase.
     pub fn cpuUnitsCorrected(self: *Connection) bool {
         if (self.negotiated) |n| return n.cpu_units else |_| return false;
+    }
+
+    /// True iff the peer advertised `capability.agent_handoff` — i.e. this agent
+    /// replaces ITSELF with a newer on-disk build, carrying every holder-backed
+    /// session across, so nothing here should restart it destructively for being
+    /// stale (T907).
+    ///
+    /// False for an older agent AND for a handshake that has not landed, which is
+    /// the safe direction in both cases: the caller keeps its pre-T907 policy
+    /// (refresh at idle, confirm while live) rather than waiting forever for a
+    /// handoff that is never coming.
+    pub fn peerHandsOffItself(self: *Connection) bool {
+        if (self.negotiated) |n| return n.agent_handoff else |_| return false;
     }
 
     /// End a session on the agent BY SESSION ID (the session-scoped equivalent of

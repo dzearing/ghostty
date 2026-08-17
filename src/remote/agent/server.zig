@@ -379,40 +379,60 @@ pub const Server = struct {
     /// longest list that exists, and this is comfortably above it.
     const max_advertised_caps = 32;
 
+    /// `capability.agent_handoff`, but only on the seat that has the mechanism
+    /// (T907). Advertising it is a PROMISE — "a newer build beside me replaces me
+    /// without losing your sessions, so do not restart me" — and a peer that
+    /// believes it stands down. On a seat where the holder half has not landed
+    /// (the Mac increment 5 of the T705 split) that promise would be a lie, and
+    /// the cost of the lie is an agent nothing ever upgrades. Comptime, so the
+    /// string is simply absent from the list rather than conditionally filtered
+    /// at handshake time.
+    const handoff_caps: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{protocol.capability.agent_handoff}
+    else
+        &.{};
+
+    /// Everything this agent build advertises in its HELLO, in one comptime
+    /// list so the seat-conditional tail (`handoff_caps`) is appended in exactly
+    /// one place rather than at each `Options` construction site.
+    pub const default_capabilities: []const []const u8 = base_capabilities ++ handoff_caps;
+
+    const base_capabilities: []const []const u8 = &.{
+        protocol.capability.resync,
+        protocol.capability.flow,
+        protocol.capability.close_session,
+        protocol.capability.grid_snapshot,
+        protocol.capability.session_cpu,
+        protocol.capability.sessions_push,
+        // This build's `proc.zig` converts macOS mach ticks to nanoseconds,
+        // so every `cpu_pct` it reports is in corrected units. Advertising it
+        // is what lets a new app distinguish us from a pre-fix agent whose
+        // numbers are ~24× low on Apple Silicon.
+        protocol.capability.cpu_units,
+        // This build samples each bound session's process subtree and pushes
+        // `META{has_descendants}`, so a viewer can skip the close
+        // confirmation for an idle CROSS-MACHINE pane (T356).
+        protocol.capability.session_busy,
+        // This build ANSWERS a refused OPEN instead of dropping it, so the
+        // pane says why in milliseconds rather than blaming a timeout ten
+        // seconds later (T469).
+        protocol.capability.open_failed,
+        // ...and the same for an ATTACH it cannot answer at all, which is
+        // the resume path a user meets after a reboot (T657).
+        protocol.capability.attach_failed,
+        // This build FRAMES the repaints it injects on ATTACH (the
+        // scrollback-lost marker, the grid snapshot) as `DATA_REPAINT`, so
+        // the client stops recording a resume point past our stream head by
+        // the size of our own repaint (T739).
+        protocol.capability.repaint_data,
+    };
+
     pub const Options = struct {
         /// The pinned transfer encoding for this connection (§4.2). The agent
         /// echoes it in its HELLO; both sides must already agree.
         encoding: protocol.TransferEncoding,
         /// Capabilities the agent advertises in its HELLO.
-        capabilities: []const []const u8 = &.{
-            protocol.capability.resync,
-            protocol.capability.flow,
-            protocol.capability.close_session,
-            protocol.capability.grid_snapshot,
-            protocol.capability.session_cpu,
-            protocol.capability.sessions_push,
-            // This build's `proc.zig` converts macOS mach ticks to nanoseconds,
-            // so every `cpu_pct` it reports is in corrected units. Advertising it
-            // is what lets a new app distinguish us from a pre-fix agent whose
-            // numbers are ~24× low on Apple Silicon.
-            protocol.capability.cpu_units,
-            // This build samples each bound session's process subtree and pushes
-            // `META{has_descendants}`, so a viewer can skip the close
-            // confirmation for an idle CROSS-MACHINE pane (T356).
-            protocol.capability.session_busy,
-            // This build ANSWERS a refused OPEN instead of dropping it, so the
-            // pane says why in milliseconds rather than blaming a timeout ten
-            // seconds later (T469).
-            protocol.capability.open_failed,
-            // ...and the same for an ATTACH it cannot answer at all, which is
-            // the resume path a user meets after a reboot (T657).
-            protocol.capability.attach_failed,
-            // This build FRAMES the repaints it injects on ATTACH (the
-            // scrollback-lost marker, the grid snapshot) as `DATA_REPAINT`, so
-            // the client stops recording a resume point past our stream head by
-            // the size of our own repaint (T739).
-            protocol.capability.repaint_data,
-        },
+        capabilities: []const []const u8 = default_capabilities,
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
         clock: ?Clock = null,
@@ -1679,6 +1699,11 @@ pub const Server = struct {
                 // Only meaningful for a live orphan; an attached or dead row
                 // reports null so no reader ever times an attached session.
                 .unattached_since = if (s.alive and !s.bound) s.unattached_since_ms else null,
+                // T907: whether this session's shell can outlive the agent. A
+                // recorded holder pipe IS the fact — it is what a starting agent
+                // dials to re-adopt the session — so there is no second notion
+                // of "holder-backed" that could disagree with adoption.
+                .holder_backed = s.holder_pipe != null,
             }) catch break;
         }
 

@@ -195,8 +195,8 @@ next:     Ghoztty restarts it onto the bundled build when no sessions are open, 
 
 `status` is a machine token — `current`, `stale`, `newer`, `unknown` (the
 bundled binary could not be read), `not_running` — and `--json` emits it with
-`running`, `bundled`, `days_behind`, `live_sessions`, `sessions` and
-`agent_pid`. **No agent running is an answer, not an error**: it exits 0 with
+`running`, `bundled`, `days_behind`, `live_sessions`, `sessions`, `agent_pid`,
+`handoff` and `legacy_sessions`. **No agent running is an answer, not an error**: it exits 0 with
 `not_running`, because the next persistent session simply starts the bundled
 build. `days_behind` is calendar days between the two `YYYYMMDD` stamps, and is
 absent rather than 0 or negative whenever there is no honest number to give (a
@@ -207,17 +207,28 @@ Staleness itself is defined in exactly one place for both readers —
 on cannot disagree. Acceptance: `test/win32/sessions-agent-build.ps1`.
 
 **How a long-lived box adopts a newer agent** (the state this command exists to
-make visible): the running agent is restarted onto the bundled build when the
-app's check finds it stale AND there are zero live sessions, or when the user
-accepts the mandatory confirmation. Both can go unreached indefinitely on a box
-whose panes never all close — the morning app-only refresh (T525) deliberately
-never swaps `ghoztty-agent.exe` and defers that confirmation, and the check
-re-runs only at launch and when the last persistent window closes. So today the
-documented path is an **attended full delivery** (`scripts/launch-upgrade.ps1`
-without `-AppOnly`, which does prompt), and `+sessions --agent` is how you know
-whether one is due. The non-destructive alternative the agent contract
-(`docs/claude/sessions.md`) calls the preferred path — drain, snapshot, re-exec, re-attach, no dialog and no
-lost sessions — is filed as **T705**.
+make visible). Since **T907** the answer on Windows is: **the agent replaces
+itself, and no session closes.** `handoff` is the machine token for that, and it
+is what the `next:` line is written from:
+
+- `ready` — a newer build beside it is adopted on the agent's own schedule, with
+  nothing asked and nothing lost. `next:` says so.
+- `draining` — it will, but not yet: `legacy_sessions` counts the live sessions
+  whose ConPTY the agent owns DIRECTLY. Those cannot be carried across a process
+  boundary at all, so each one has to close first. (`draining` is also what an
+  unreadable roster reports, because "your update costs nothing" is a promise and
+  that case did not verify it.)
+- `unsupported` — an older agent, or a seat where the mechanism has not landed.
+  Then the pre-T907 answer applies, and it is the one that could go unreached
+  indefinitely: restart at zero live sessions, or the mandatory confirmation. On
+  a box whose panes never all close, neither happens — the morning app-only
+  refresh (T525) deliberately never swaps `ghoztty-agent.exe` and defers that
+  confirmation, and the check re-runs only at launch and when the last persistent
+  window closes. There the documented path stays an **attended full delivery**
+  (`scripts/launch-upgrade.ps1` without `-AppOnly`, which does prompt).
+
+Mechanism and contract: `docs/claude/sessions.md`; design:
+`docs/design/agent-nondestructive-handoff.md`.
 
 ### `ghoztty +send-keys`
 

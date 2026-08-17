@@ -187,6 +187,18 @@ try {
     Remove-Job $listener -Force -ErrorAction SilentlyContinue
 }
 
+# A clean green run stamps the files this harness covers (T783), so
+# `scripts\guard-due.ps1` can answer "has anybody run this against the code as it
+# now stands?". It was in that coverage table from the start but had no stamp
+# call, which meant the guard went DUE on the first `main.zig` edit and could
+# never come back - the one shape a staleness gate must not have, since a guard
+# that is permanently red is a guard everybody learns to step over.
+if ($script:failures -eq 0 -and $script:passes -ge 18) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard agent-sharing-uplink -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
+
 # MinPass = the full-run assertion count: an abort (exception past section N
 # jumping to finally) must never score the truncated run as ALL PASS.
 Write-TestVerdict -Label 'T546 SHARING UPLINK' -Pass $script:passes -Fail $script:failures -MinPass 18

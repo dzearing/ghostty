@@ -2965,32 +2965,55 @@ pub fn scheduleAgentUpgradeCheck(self: *App) void {
     _ = w32.PostMessageW(hwnd, WM_APP_AGENT_UPGRADE_CHECK, 0, 0);
 }
 
-/// How many LIVE sessions the agent itself owns, or null when it could not be
-/// asked — the input the upgrade policy weighs a destructive restart against.
-///
-/// Asked of the AGENT, not counted from this app's panes, and the difference is
-/// load-bearing: at app quit every window is destroyed while its sessions stay
-/// alive on purpose (detach, not close), so a pane count would read 0 at exactly
-/// the moment killing the agent destroys the most work. It also sees sessions
-/// this app never adopted — another instance's, or a previous run's pinned ones
-/// — which a pane walk cannot.
-///
-/// Tombstones (`alive == false`) are NOT counted: their child is already gone
-/// and `sessions.json` brings them back as tombstones after the restart, so a
-/// restart costs them nothing.
-fn liveAgentSessionCount(self: *App) ?usize {
+/// The live session roster split into the two generations the upgrade policy
+/// cares about (T907), plus whether this agent replaces itself at all.
+const AgentSessionMix = struct {
+    /// How many LIVE sessions the agent itself owns — the input the upgrade
+    /// policy weighs a destructive restart against.
+    ///
+    /// Asked of the AGENT, not counted from this app's panes, and the difference
+    /// is load-bearing: at app quit every window is destroyed while its sessions
+    /// stay alive on purpose (detach, not close), so a pane count would read 0 at
+    /// exactly the moment killing the agent destroys the most work. It also sees
+    /// sessions this app never adopted — another instance's, or a previous run's
+    /// pinned ones — which a pane walk cannot.
+    ///
+    /// Tombstones (`alive == false`) are NOT counted: their child is already gone
+    /// and `sessions.json` brings them back as tombstones after the restart, so a
+    /// restart costs them nothing.
+    live: usize,
+    /// Live sessions whose ConPTY the agent owns DIRECTLY. Each one holds a
+    /// non-destructive handoff back, because it cannot be carried across a
+    /// process boundary at any price.
+    legacy: usize,
+    /// Both peers negotiated `capability.agent_handoff`.
+    handoff_capable: bool,
+};
+
+/// One roster probe answering everything the upgrade decision needs. Null on any
+/// failure at all — "we could not ask how much this would destroy" is never
+/// grounds for destroying it, and it is also never grounds for standing down
+/// and waiting for a handoff that may not be coming.
+fn agentSessionMix(self: *App) ?AgentSessionMix {
     const conn = self.local_agent.sharedConnectionIfWarm() orelse return null;
+    const capable = conn.peerHandsOffItself();
     var roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
         log.warn("agent upgrade check: session probe failed err={} (treating as unknown)", .{err});
         return null;
     };
     defer roster.deinit();
 
-    var n: usize = 0;
+    var live: usize = 0;
+    var legacy: usize = 0;
     for (roster.sessions) |sess| {
-        if (sess.alive) n += 1;
+        if (!sess.alive) continue;
+        live += 1;
+        // An agent too old to report the field omits it, and the default is
+        // false — i.e. "legacy", which can only ever hold a handoff back. The
+        // direction that fails silently is the other one.
+        if (!sess.holder_backed) legacy += 1;
     }
-    return n;
+    return .{ .live = live, .legacy = legacy, .handoff_capable = capable };
 }
 
 /// Is an unattended client refresh in progress (T525)?
@@ -3081,10 +3104,11 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
 
     // Unknown liveness ⇒ do nothing. "We couldn't ask how much this would
     // destroy" is never grounds for destroying it.
-    const live = self.liveAgentSessionCount() orelse {
+    const mix = self.agentSessionMix() orelse {
         log.info("agent upgrade check skipped: agent session liveness unknown [{s}]", .{reason});
         return;
     };
+    const live = mix.live;
 
     // Log the decision WHERE IT IS MADE, before acting on it (T201). Every arm
     // used to report only after the fact — and `.confirm_first` reports only
@@ -3096,24 +3120,35 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     // an operator greps reports the decision that was actually acted on. Only
     // consulted when a confirmation is on the table — the marker read is a file
     // open, and the common case is `.none`.
-    const raw = agent_upgrade.evaluate(running, bundled, live);
+    const raw = agent_upgrade.evaluate(running, bundled, live, .{
+        .capable = mix.handoff_capable,
+        .legacy_live = mix.legacy,
+    });
     const decision = agent_upgrade.applyDeferral(
         raw,
         raw.action == .confirm_first and self.unattendedRefreshActive(),
     );
     log.info(
-        "agent upgrade check: {s} (running {s}, bundled {s}, {d} live session(s)) [{s}]",
+        "agent upgrade check: {s} (running {s}, bundled {s}, {d} live session(s), {d} of them legacy, handoff-capable={}) [{s}]",
         .{
             decision.reason.description(),
             agent_upgrade.stampForLog(running),
             agent_upgrade.stampForLog(bundled),
             live,
+            mix.legacy,
+            mix.handoff_capable,
             reason,
         },
     );
 
     switch (decision.action) {
         .none => return,
+        // T907: the agent is replacing itself. Nothing to do — deliberately not
+        // even a re-dial, because there is nothing to re-dial YET: the successor
+        // takes over on the agent's own schedule, and the link drop when it does
+        // is what the existing in-place recovery is for. Touching the agent here
+        // is precisely the destructive act this arm exists to avoid.
+        .handoff_now => return,
         .refresh_now => {
             self.agent_upgrade_attempts += 1;
             // Supervised for the same reason the confirmed path is (T421): this
@@ -3143,7 +3178,12 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
                 );
                 return;
             }
-            self.promptAndRefreshLocalAgent(live, running, bundled orelse "?");
+            self.promptAndRefreshLocalAgent(
+                live,
+                running,
+                bundled orelse "?",
+                if (decision.reason == .stale_handoff_draining) mix.legacy else null,
+            );
         },
     }
 }
@@ -3163,11 +3203,24 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
 /// previously ran". (`auto` restores the old RELAUNCH-with-divider behavior for
 /// anyone who opts in.) That is the honest outcome the dialog promises: the
 /// panes come back, their processes do not, and nothing starts itself.
-fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bundled: []const u8) void {
+/// `draining_legacy` is the T907 arm: non-null when the agent WOULD replace
+/// itself and is only waiting for that many sessions it owns directly to close.
+/// The dialog then says so, because there "Later" is a promise the agent keeps
+/// rather than the indefinite wait the original wording implies.
+fn promptAndRefreshLocalAgent(
+    self: *App,
+    live: usize,
+    running: ?[]const u8,
+    bundled: []const u8,
+    draining_legacy: ?usize,
+) void {
     const alloc = self.core_app.alloc;
 
     var text_buf: [1024]u8 = undefined;
-    const text = agent_upgrade.formatConfirmText(&text_buf, live) catch return;
+    const text = if (draining_legacy) |legacy|
+        agent_upgrade.formatDrainConfirmText(&text_buf, live, legacy) catch return
+    else
+        agent_upgrade.formatConfirmText(&text_buf, live) catch return;
     const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
     defer alloc.free(text_w);
     const title_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, agent_upgrade.confirm_title) catch return;
@@ -3281,8 +3334,11 @@ fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8
         // tested for it. Handled rather than `unreachable` anyway: this is a
         // destructive path, and in a release build `unreachable` would turn a
         // future policy edit into undefined behavior instead of a log line.
-        .refresh_now => {
-            log.err("agent upgrade check: a protocol skew asked for a SILENT restart; refusing", .{});
+        .refresh_now, .handoff_now => {
+            log.err(
+                "agent upgrade check: a protocol skew asked for a non-consensual restart ({s}); refusing",
+                .{@tagName(decision.action)},
+            );
             return;
         },
         .confirm_first => {},
