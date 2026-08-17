@@ -91,3 +91,13 @@ as the digest that showed them.
 - Acrylic window background (Windows translucency)
 - Record a pane as a shareable replay
 - Screen-reader support (UI Automation for Narrator/NVDA)
+
+## 2026-08-17
+
+- Split a pane and keep the half-typed command
+- A "recording" indicator and one-click transcript export
+- Per-pane environment badges (prod / subscription / branch)
+- Instant scroll-to-bottom on typing
+- A pane you can pin always-on-top
+- Cold-start budget with a visible first frame
+- Automatic crash breadcrumb in the feedback report
