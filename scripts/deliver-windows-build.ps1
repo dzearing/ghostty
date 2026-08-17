@@ -176,12 +176,30 @@ foreach ($n in @('ghoztty.exe', 'ghoztty.com')) {
 }
 
 $stagedExe = Join-Path $stagingBin 'ghoztty.exe'
-$expect = if ($ExpectedCommit) { $ExpectedCommit.Trim().ToLowerInvariant() } else { (Resolve-GhozttyExeCommit -Exe $stagedExe).Commit }
+$stagedId = Resolve-GhozttyExeCommit -Exe $stagedExe
+$expect = if ($ExpectedCommit) { $ExpectedCommit.Trim().ToLowerInvariant() } else { $stagedId.Commit }
 if (-not $expect) {
     Say "ABORT: could not read the staged exe's commit, so nothing delivered could be verified"
     exit 2
 }
 Say "   shipping +$expect"
+
+# T795: what this delivery does to the user's ability to sign in, said out loud
+# ONCE, up front. A build with no Google OAuth client id baked in cannot start a
+# relay sign-in at all - the machine chooser says so instead of offering a dead
+# button (T747) - and that was true of every delivered Windows build for months
+# with nothing in any delivery log mentioning it. It is a WARNING and not a
+# failure on purpose: the id is build configuration the box may legitimately not
+# have (drop it in a git-ignored google-client-id.txt at the repo root, per D72),
+# and a delivery must not be held hostage to it.
+$script:stagedSignIn = $stagedId.SignIn
+if (-not $script:stagedSignIn.Known) {
+    Say "   sign-in unreported by the staged exe (a build from before T795); delivered builds cannot be checked for it this run"
+} elseif ($script:stagedSignIn.Configured) {
+    Say "   sign-in configured ($($script:stagedSignIn.ClientId))"
+} else {
+    Say "  WARNING: this build has NO google client id baked in, so relay sign-in will be unavailable in every location it reaches (see docs/claude/remote.md)"
+}
 
 # T281: the agent ships in the same delivery and was the one binary nothing ever
 # read back. It carries no semver - `ghoztty-agent --version` prints a
@@ -312,6 +330,19 @@ foreach ($dir in $Targets) {
         if (-not $got.Commit) { Bad "$dir\$n could not be asked its version ($($got.Why))"; $failedHere = $true; continue }
         if (Test-CommitsMatch $got.Commit $expect) { Ok "$n reports +$($got.Commit)" }
         else { Bad "$dir\$n reports +$($got.Commit) but this delivery is +$expect"; $failedHere = $true }
+
+        # T795: and it carries the sign-in capability the staged bytes carry.
+        # Only ever compared against STAGING - "the same build" is the claim a
+        # copy makes - so a staging prefix that reports nothing (pre-T795)
+        # asserts nothing here rather than failing every location.
+        if ($script:stagedSignIn.Known) {
+            if (Test-SignInBakesMatch $got.SignIn $script:stagedSignIn) {
+                if ($got.SignIn.Configured) { Ok "$n sign-in $(Format-SignInBake $got.SignIn)" }
+            } else {
+                Bad "$dir\$n sign-in is $(Format-SignInBake $got.SignIn) but staging is $(Format-SignInBake $script:stagedSignIn)"
+                $failedHere = $true
+            }
+        }
     }
 
     # The same read for the agent (T281). Present-and-wrong is a failure here for

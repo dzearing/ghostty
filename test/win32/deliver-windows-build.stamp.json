@@ -1,0 +1,11 @@
+{
+    "guard":  "deliver-verify",
+    "script":  "test/win32/deliver-windows-build.ps1",
+    "generated":  "2026-08-17T05:03:54-07:00",
+    "commit":  "f28ecbfc6",
+    "files":  {
+                  "scripts/deliver-windows-build.ps1":  "608bd64aca4e4b3256af329d0f8cd84971ed0097ce051b12799c7598acfffe58",
+                  "scripts/delivery-manifest.ps1":  "c919132ec03980e511d52f845317b8e9ff1c350d9585d121f6edfe48f2dca938",
+                  "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d"
+              }
+}

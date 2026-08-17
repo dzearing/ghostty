@@ -292,7 +292,56 @@ $gensAfter = @(Get-ChildItem -LiteralPath $p1 -File |
 Assert "E6 -PruneBackups keeps only what it was asked to" ($gensAfter -le 2 -and $gensBefore -ge 1)
 
 # ============================================================================
+""
+"== F: what the delivery says about relay sign-in (T795)"
+# ============================================================================
+# A build with no Google OAuth client id baked in cannot start a relay sign-in
+# at all; the machine chooser says so rather than offering a dead button (T747).
+# Every delivered Windows build was in that state for months and no delivery log
+# mentioned it once, because the id is build configuration - so a delivery that
+# silently disabled sign-in and one that enabled it produced identical output.
+#
+# The arms below are about the REPORT. The comparator itself has its teeth in
+# arms A36-A48 of upgrade-staleness.ps1, where a mismatch can be constructed:
+# here the delivered file is by definition the copy of the staged one, so a
+# forced disagreement would have to be faked rather than measured.
+. (Join-Path $Repo 'scripts\delivery-version.ps1')
+$stagedBake = (Resolve-GhozttyExeCommit -Exe (Join-Path $Staging 'bin\ghoztty.exe')).SignIn
+$r = Invoke-Deliver -Extra @{ AcceptZipShape = $true }
+AssertEq "F2 the delivery still succeeds" 0 $r.Code
+# The invariant that holds whatever staging happens to carry, and the one thing
+# that was missing for months: a delivery is never SILENT about sign-in. Which
+# of the three sentences it prints is asserted below, against the state the
+# staged binary actually reports - a staging prefix built before T795 prints no
+# line of its own and must read as unreported, not as broken.
+Assert "F1 the run says something about sign-in, in one of the three known phrasings ($(Format-SignInBake $stagedBake))" `
+    ($r.Text -match 'sign-in configured|NO google client id baked in|sign-in unreported by the staged exe')
+if ($stagedBake.Known -and -not $stagedBake.Configured) {
+    # Today's real state on this box: no google-client-id.txt exists, so the
+    # warning is what a human would need to see to know sign-in is off.
+    Assert "F3 a build that cannot sign in WARNS, in words that name the fix" `
+        ($r.Text -match 'NO google client id baked in' -and $r.Text -match 'relay sign-in will be unavailable')
+} elseif ($stagedBake.Configured) {
+    Assert "F3 a configured build names the id it is shipping" `
+        ($r.Text -match [regex]::Escape($stagedBake.ClientId))
+    Assert "F3b and every verified location reports it back" ($r.Text -match 'sign-in configured')
+} else {
+    Assert "F3 a pre-T795 staging build says it cannot be checked" `
+        ($r.Text -match 'sign-in unreported by the staged exe')
+}
+
+# ============================================================================
 if (-not $Keep) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+
+# A clean green FULL run stamps the covered files (T783) so scripts\guard-due.ps1
+# can answer "has anybody proved the delivery still measures what it claims,
+# against the code as it now stands?". Red leaves the stamp alone, and so does
+# -PureOnly, which exits above without ever having run a delivery.
+if ($script:failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard deliver-verify -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
+
 ""
 if ($script:failures -eq 0) { "ALL PASS" } else { "$script:failures FAILURE(S)" }
 exit ([int]($script:failures -gt 0))

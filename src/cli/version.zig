@@ -85,6 +85,36 @@ pub fn run(alloc: Allocator) !u8 {
     try stdout.print("  - font engine   : {}\n", .{build_config.font_backend});
     try stdout.print("  - renderer      : {}\n", .{renderer.Renderer});
     try stdout.print("  - libxev        : {t}\n", .{xev.backend});
+
+    // Whether THESE BYTES can start a relay sign-in at all (T795). A build
+    // carrying no Google OAuth client id can only ever answer
+    // `relay_signin.Error.NoClientId`, which is why both frontends' machine
+    // choosers say sign-in is unavailable rather than offering a dead button
+    // (T747) — but until this line existed that state was observable only by
+    // opening the chooser, so a DELIVERED build's sign-in capability could not
+    // be verified by the delivery that shipped it. Every published Windows
+    // artifact was in fact shipping without one, because the release pipeline
+    // passed no `-Dgoogle-client-id` while the macOS one did.
+    //
+    // The id itself is printed because it is public — it appears in the browser
+    // authorize URL, and the macOS app ships it readable in its Info.plist —
+    // so printing it makes "did the right id land?" answerable of a binary,
+    // not just of the tree it was built from. The confidential client secret
+    // lives only on the relay and never anywhere near this.
+    //
+    // The BAKE is what is reported, deliberately, not what
+    // `relay_signin.resolveClientId` would resolve: `GHOSTTY_GOOGLE_CLIENT_ID`
+    // can furnish an id at runtime, and a line under `Build Config` that
+    // changed with the environment would answer a different question than the
+    // one a delivery asks.
+    if (comptime build_config.google_client_id.len > 0) {
+        try stdout.print("  - relay sign-in : configured ({s})\n", .{
+            build_config.google_client_id,
+        });
+    } else {
+        try stdout.print("  - relay sign-in : not configured (no google client id baked in)\n", .{});
+    }
+
     if (comptime build_config.app_runtime == .gtk) {
         if (comptime builtin.os.tag == .linux) {
             const kernel_info = internal_os.getKernelInfo(alloc);

@@ -120,6 +120,14 @@ jobs:
           echo "ZIP=zig-out/Ghoztty-portable-$VERSION-x64.zip" >> $GITHUB_ENV
 
       - name: Build Windows artifacts
+        env:
+          # Public Google OAuth client id, baked into the exe via
+          # -Dgoogle-client-id so the SHIPPED terminal can start the
+          # relay-brokered sign-in (T795). The same secret release.yml's macOS
+          # job has used since T93 -- both seats must bake the SAME credential
+          # or the two clients sign in to different projects. The confidential
+          # client secret lives only on the relay, never here.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
           # The same-day rebuild counter: republishing a version on the same
           # date needs a strictly greater MSI ProductVersion or the package

@@ -58,6 +58,65 @@ function Get-CommitFromVersionText {
     return ''
 }
 
+# The RELAY SIGN-IN BAKE out of a `+version` payload (tracker T795):
+# @{ Known; Configured; ClientId }.
+#
+# `src/cli/version.zig` prints one of two lines under `Build Config`:
+#
+#   - relay sign-in : configured (<public google oauth client id>)
+#   - relay sign-in : not configured (no google client id baked in)
+#
+# `Known` is $false for a payload with neither - which is not a failure and must
+# never be reported as one: every binary built before T795 answers that way, and
+# a delivery has to keep verifying an older exe it is replacing.
+#
+# Anchored on the list-bullet line for the reason `Get-CommitFromVersionText` is
+# (A6): the section is free text, and prose that merely mentions sign-in must not
+# be able to vouch for a binary.
+function Get-SignInBakeFromVersionText {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    $unknown = @{ Known = $false; Configured = $false; ClientId = '' }
+    if (-not $Text) { return $unknown }
+    $m = [regex]::Match($Text, '(?m)^\s*-\s*relay sign-in\s*:\s*(\S.*?)\s*$')
+    if (-not $m.Success) { return $unknown }
+    $v = $m.Groups[1].Value
+    if ($v -match '^configured\s*\(\s*(\S.*?)\s*\)$') {
+        return @{ Known = $true; Configured = $true; ClientId = $Matches[1] }
+    }
+    if ($v -match '^not configured') {
+        return @{ Known = $true; Configured = $false; ClientId = '' }
+    }
+    # A line in this shape whose value we cannot classify is UNKNOWN rather than
+    # unconfigured: guessing would let a future wording change read as "sign-in
+    # is broken" in every delivery log at once.
+    return $unknown
+}
+
+# Do two sign-in bakes describe the same capability? Used to compare a DELIVERED
+# binary against the STAGED one, so the claim is "these bytes carry what the
+# bytes I copied carry" - the same claim `Test-AgentStampsMatch` makes.
+#
+# An unknown bake on EITHER side is not a match: a delivered exe with no line
+# beside a staged exe that has one means the copy did not land. Callers decide
+# what an unknown STAGED bake means (nothing to compare against, so nothing is
+# claimed) before getting here.
+function Test-SignInBakesMatch {
+    param($A, $B)
+    if (-not $A -or -not $B) { return $false }
+    if (-not $A.Known -or -not $B.Known) { return $false }
+    if ($A.Configured -ne $B.Configured) { return $false }
+    if (-not $A.Configured) { return $true }
+    return ($A.ClientId.Trim() -eq $B.ClientId.Trim())
+}
+
+# A sign-in bake as one short phrase for a log line.
+function Format-SignInBake {
+    param($Bake)
+    if (-not $Bake -or -not $Bake.Known) { return 'unreported (built before T795)' }
+    if (-not $Bake.Configured) { return 'NOT configured' }
+    return "configured ($($Bake.ClientId))"
+}
+
 # Do two short hashes name the same commit? Abbreviations are compared by
 # PREFIX: `git rev-parse --short` and the build's `git log --pretty=%h` both
 # honour core.abbrev, but they are not contractually the same LENGTH, and a
@@ -166,10 +225,14 @@ function Invoke-GhozttyVersionText {
     }
 }
 
-# The commit baked into an exe: @{ Commit; Why }. Commit is '' when it could not
-# be read, and Why then says which of the two failures it was - a probe that did
-# not run, or output with no version line in it. Both are worth distinguishing in
-# a delivery log; neither is ever silently treated as a match.
+# The commit baked into an exe: @{ Commit; Why; SignIn }. Commit is '' when it
+# could not be read, and Why then says which of the two failures it was - a probe
+# that did not run, or output with no version line in it. Both are worth
+# distinguishing in a delivery log; neither is ever silently treated as a match.
+#
+# `SignIn` is the relay sign-in bake out of the SAME probe (T795): asking a
+# second time would double every delivery's process spawns to answer a question
+# the first payload already contained.
 function Resolve-GhozttyExeCommit {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
@@ -178,7 +241,7 @@ function Resolve-GhozttyExeCommit {
     $r = Invoke-GhozttyVersionText -Exe $Exe -TimeoutSec $TimeoutSec
     $commit = Get-CommitFromVersionText $r.Text
     $why = if ($commit) { '' } elseif ($r.Why) { $r.Why } else { "no version line in the output of '$Exe +version'" }
-    return @{ Commit = $commit; Why = $why }
+    return @{ Commit = $commit; Why = $why; SignIn = (Get-SignInBakeFromVersionText $r.Text) }
 }
 
 # The build stamp of an agent binary ON DISK: @{ Stamp; Commit; Why } (tracker

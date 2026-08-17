@@ -138,6 +138,36 @@ comes from `GHOSTTY_RELAY_BASE`, else the built-in default. Shared
 implementation: `src/remote/relay_signin.zig`; win32 UI in
 `src/apprt/win32/RelayAccountRow.zig`.
 
+**Which id a BINARY carries is readable, and the delivery reads it** (T795).
+`ghoztty +version` prints, under `Build Config`, either
+`relay sign-in : configured (<id>)` or
+`relay sign-in : not configured (no google client id baked in)` — the bake, not
+what `resolveClientId` would resolve, so the line answers "what do these bytes
+carry" rather than "what would this shell do". `scripts\deliver-windows-build.ps1`
+announces the staged build's state once up front (a build that cannot sign in is
+a loud `WARNING`, never a failure — the id is build configuration a box may
+legitimately not have) and then compares every delivered `ghoztty.exe`/`.com`
+against staging. A binary from before T795 prints no such line, which reads as
+*unreported* and asserts nothing.
+
+Two ways a build ends up unable to sign in, both closed by T795:
+
+- **Published artifacts.** `release.yml`'s macOS job has passed
+  `-Dgoogle-client-id` from the `GOOGLE_CLIENT_ID` repository secret since T93;
+  `release-windows.yml` passed nothing, and a CI runner has no
+  `google-client-id.txt` to fall back on — so every published MSI and portable
+  ZIP shipped with sign-in unavailable while the DMG built from the same tag
+  worked. Both workflows now bake the same secret, threaded through
+  `dist/windows-installer/build-release-artifacts.sh`. That script passes the
+  flag **only when the variable is non-empty**, which is load-bearing: an
+  explicit `-Dgoogle-client-id=""` satisfies the build option and short-circuits
+  the fallback to the repo-root file.
+- **On-box builds.** Drop the id (`docs/design/relay-oidc-setup.md` step 10
+  stashed it in a password manager) into `google-client-id.txt` at the repo
+  root — D72's answer — and every local and delivered build picks it up with no
+  flag to remember. Until it exists, this box's builds keep saying sign-in is
+  unavailable, by design rather than by dead button.
+
 **A build with no client id says so instead of offering the button** (T747). No
 id resolves ⇒ `signIn` can only ever answer `NoClientId`, so the account row
 draws no control at all — the sentence *"Google sign-in isn't set up in this

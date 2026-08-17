@@ -218,6 +218,54 @@ AssertEq "A34 the banner fallback also names the probed binary" '2699f0dd5' `
 AssertEq "A35 no running instance changes nothing about the answer" '2699f0dd5' `
     (Get-CommitFromVersionText "Version`r`n  - version: 1.4.0-b-+2699f0dd5`r`nRunning Instance`r`n  - none detected`r`n")
 
+# --- A36-A45: the relay sign-in bake (T795) -----------------------------------
+# The third thing a delivery reads out of a `+version` payload: whether THESE
+# bytes can start a relay sign-in at all. Every published Windows artifact
+# shipped unable to, for months, because the release pipeline passed no
+# -Dgoogle-client-id while release.yml's macOS job did - and no delivery log
+# said a word, because the state was observable only by opening the chooser.
+$signedIn = @'
+Ghostty 1.4.0-users-dzearing-windows-amd64-+f71f724d0
+
+Version
+  - version: 1.4.0-users-dzearing-windows-amd64-+f71f724d0
+Build Config
+  - Zig version   : 0.15.2
+  - relay sign-in : configured (734-abc.apps.googleusercontent.com)
+Running Instance
+  - none detected
+'@
+$notSignedIn = "Build Config`r`n  - relay sign-in : not configured (no google client id baked in)`r`n"
+
+$bakeYes = Get-SignInBakeFromVersionText $signedIn
+Assert "A36 a configured payload reads as configured" ($bakeYes.Known -and $bakeYes.Configured)
+AssertEq "A37 and yields the id, so the WRONG id is detectable too" '734-abc.apps.googleusercontent.com' $bakeYes.ClientId
+$bakeNo = Get-SignInBakeFromVersionText $notSignedIn
+Assert "A38 an unconfigured payload reads as known-and-unconfigured" ($bakeNo.Known -and -not $bakeNo.Configured)
+# The compatibility arm, and the reason `Known` exists: every binary built
+# before T795 prints no such line, and a delivery still has to verify the exe it
+# is replacing. Absence must therefore be UNKNOWN, never "sign-in is broken".
+$bakeOld = Get-SignInBakeFromVersionText $realPayload
+Assert "A39 a pre-T795 payload is UNKNOWN, not unconfigured" (-not $bakeOld.Known)
+Assert "A40 empty output is UNKNOWN too" (-not (Get-SignInBakeFromVersionText '').Known)
+# A wording we do not recognise must not be classified: guessing would make one
+# future line edit read as "sign-in is broken" in every delivery log at once.
+Assert "A41 an unrecognised value is UNKNOWN rather than guessed" `
+    (-not (Get-SignInBakeFromVersionText "  - relay sign-in : who knows`r`n").Known)
+
+Assert "A42 the same bake matches itself" (Test-SignInBakesMatch $bakeYes (Get-SignInBakeFromVersionText $signedIn))
+Assert "A43 configured vs unconfigured is a MISMATCH" (-not (Test-SignInBakesMatch $bakeYes $bakeNo))
+# THE T795 ORACLE: a delivered build that carries a DIFFERENT id than the one
+# staging was built with signs in to a different Google project. Same commit,
+# same length, same mtime - only this comparison can see it.
+$otherId = Get-SignInBakeFromVersionText "  - relay sign-in : configured (999-zzz.apps.googleusercontent.com)`r`n"
+Assert "A44 T795 ORACLE: two different client ids do not match" (-not (Test-SignInBakesMatch $bakeYes $otherId))
+Assert "A45 two unconfigured builds DO match (that is a real, equal claim)" (Test-SignInBakesMatch $bakeNo $bakeNo)
+Assert "A46 an UNKNOWN bake never matches anything, including itself" `
+    ((-not (Test-SignInBakesMatch $bakeOld $bakeYes)) -and (-not (Test-SignInBakesMatch $bakeOld $bakeOld)))
+AssertEq "A47 the log phrasing names the id when there is one" 'configured (734-abc.apps.googleusercontent.com)' (Format-SignInBake $bakeYes)
+AssertEq "A48 and shouts when there is not" 'NOT configured' (Format-SignInBake $bakeNo)
+
 if ($PureOnly) {
     ""
     Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped -Label 'pure only'
@@ -236,6 +284,16 @@ $exeInfo = Resolve-GhozttyExeCommit -Exe $Exe
 $exeCommit = $exeInfo.Commit
 Assert "B1 the real exe reports a commit ('$exeCommit')" ($exeCommit -match '^[0-9a-f]{7,40}$')
 AssertEq "B2 and no reason-it-failed alongside it" '' $exeInfo.Why
+
+# T795: the sign-in bake comes out of THAT SAME probe, so a real binary is what
+# says the printer and the reader agree. A pure fixture cannot: it is a copy of
+# what src/cli/version.zig prints, and the two drifting apart is precisely the
+# failure this arm exists to catch.
+$exeBake = $exeInfo.SignIn
+Assert "B1b the real exe reports its sign-in bake ($(Format-SignInBake $exeBake))" $exeBake.Known
+if ($exeBake.Known -and $exeBake.Configured) {
+    Assert "B1c a configured exe names a plausible client id" ($exeBake.ClientId -match '\S')
+}
 
 $missing = Resolve-GhozttyExeCommit -Exe (Join-Path $root 'no-such.exe')
 AssertEq "B3 a missing exe yields no commit" '' $missing.Commit

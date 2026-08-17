@@ -83,12 +83,35 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   # -Dagent-semver: the agent sibling's VERSIONINFO matches the tag (T89h).
   # -Dstrip=false: a stripped release produces undebuggable crash dumps --
   # the same reason the on-box delivery build carries it (CLAUDE.md).
+  # The public Google OAuth client id, baked so a SHIPPED build can start the
+  # relay-brokered sign-in (T795). release.yml's macOS job has passed this from
+  # the same GOOGLE_CLIENT_ID secret since T93; the Windows path never did, so
+  # every published MSI and portable ZIP shipped with sign-in unavailable while
+  # the DMG beside it worked. The confidential client secret lives only on the
+  # relay and never here - this id is public and appears in the browser URL.
+  #
+  # Passed only when non-empty, and that is load-bearing: an explicit
+  # `-Dgoogle-client-id=""` SATISFIES the build option and so short-circuits
+  # src/build/Config.zig's fallback to a git-ignored google-client-id.txt, which
+  # is how a developer's on-box release build gets one (D72). A fork with no
+  # secret configured must still build, so an absent id is a loud note rather
+  # than an error.
+  GOOGLE_CLIENT_ID_ARGS=()
+  if [[ -n "${GOOGLE_CLIENT_ID:-}" ]]; then
+    GOOGLE_CLIENT_ID_ARGS+=("-Dgoogle-client-id=$GOOGLE_CLIENT_ID")
+    echo "    relay sign-in: baking the client id from \$GOOGLE_CLIENT_ID"
+  else
+    echo "    relay sign-in: NO \$GOOGLE_CLIENT_ID in the environment;" \
+      "falling back to google-client-id.txt if this tree has one, else this" \
+      "build ships with sign-in unavailable"
+  fi
   zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast \
     -Dstrip=false \
     "-Dwindows-file-version=$FILE_VERSION" \
     "-Dversion-string=$SEMVER+$HASH" \
     "-Dagent-semver=$SEMVER" \
-    "-Dwindows-update-check=true"
+    "-Dwindows-update-check=true" \
+    "${GOOGLE_CLIENT_ID_ARGS[@]+"${GOOGLE_CLIENT_ID_ARGS[@]}"}"
 fi
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"

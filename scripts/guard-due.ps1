@@ -231,6 +231,24 @@ $GuardTable = @(
             'test\win32\upgrade-staleness.ps1'
         )
     },
+    # The MEASURED half of the delivery (T198), which had a harness but no row
+    # here: `deliver-windows-build.ps1` is what proves the Desktop portable, the
+    # network share, the loose agent and the portable ZIP actually received the
+    # build - and every claim it makes is a read-back, so an edit that weakens
+    # one turns a delivery into an assertion again without any lane going red.
+    # Its harness is hermetic (a sandbox under %TEMP%, no Docker, no network), so
+    # there is no reason for it not to be gated. Noticed while adding the
+    # sign-in read-back in T795.
+    [pscustomobject]@{
+        Name   = 'deliver-verify'
+        Script = 'test\win32\deliver-windows-build.ps1'
+        Stamp  = 'test\win32\deliver-windows-build.stamp.json'
+        Covers = @(
+            'scripts\deliver-windows-build.ps1',
+            'scripts\delivery-manifest.ps1',
+            'test\win32\deliver-windows-build.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'upgrade-no-fork'
         Script = 'test\win32\upgrade-no-fork.ps1'

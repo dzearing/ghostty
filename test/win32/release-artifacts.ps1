@@ -236,6 +236,46 @@ Assert "E6 windows-cross detects the win32 tree" ($jobM.Success -and
 Assert "E7 release.md points at the windows-cross job" ($releaseMd -match 'windows-cross')
 
 # ============================================================================
+"== F: a published build can sign in (T795, pure)"
+# ============================================================================
+# The macOS job has baked the public Google OAuth client id from a repository
+# secret since T93. The Windows job never passed one, and the CI runner has no
+# git-ignored google-client-id.txt to fall back to - so every published MSI and
+# portable ZIP shipped with relay sign-in UNAVAILABLE while the DMG built from
+# the same tag worked. Nothing could see it: the id is build configuration, so a
+# green release and a correct release looked identical.
+$macBuild = [regex]::Match($macWf, '(?ms)^      - name: Build macOS app.*?(?=^      - name: )')
+$winBuild = [regex]::Match($wf, '(?ms)^      - name: Build Windows artifacts.*?(?=^      - name: )')
+Assert "F1 the macOS job still bakes the client id (the standard being matched)" `
+    ($macBuild.Success -and $macBuild.Value -match '-Dgoogle-client-id')
+Assert "F2 the Windows build step takes the client id from a secret" `
+    ($winBuild.Success -and $winBuild.Value -match 'GOOGLE_CLIENT_ID:\s*\$\{\{\s*secrets\.GOOGLE_CLIENT_ID\s*\}\}')
+# The SAME secret on both seats, by name. Two clients baked with two ids sign in
+# to two Google projects, which is a divergence no test of either seat alone can
+# see (CLAUDE.md: the CLI/feature surface is identical on both platforms).
+$macSecret = [regex]::Match($macBuild.Value, 'GOOGLE_CLIENT_ID:\s*\$\{\{\s*secrets\.(\w+)\s*\}\}')
+$winSecret = [regex]::Match($winBuild.Value, 'GOOGLE_CLIENT_ID:\s*\$\{\{\s*secrets\.(\w+)\s*\}\}')
+Assert "F3 both seats bake the same repository secret" `
+    ($macSecret.Success -and $winSecret.Success -and
+     $macSecret.Groups[1].Value -eq $winSecret.Groups[1].Value)
+Assert "F4 the shared artifact script passes it to zig build" `
+    ($shared -match '-Dgoogle-client-id=\$GOOGLE_CLIENT_ID')
+# Load-bearing: an explicit `-Dgoogle-client-id=""` SATISFIES the build option
+# and short-circuits src/build/Config.zig's fallback to a git-ignored
+# google-client-id.txt, which is how an on-box release build gets one (D72). So
+# the flag must be conditional, not always-present-and-sometimes-empty.
+Assert "F5 and only when the environment actually has one" `
+    ($shared -match '(?m)^\s*if \[\[ -n "\$\{GOOGLE_CLIENT_ID:-\}" \]\]; then')
+Assert "F6 a build with no id says so instead of shipping quietly" `
+    ($shared -match 'sign-in unavailable')
+# The OBSERVABLE half of T795 - the version report printing the bake, and the
+# delivery reading it back per location - is pinned where it belongs and against
+# real binaries rather than by regex: arms A36-A48/B1b of upgrade-staleness.ps1
+# and section F of deliver-windows-build.ps1. (Deliberately not spelled with the
+# literal verb: isolation-meta.ps1 scans comments too, and a static harness that
+# names one reads as a script that drives the CLI without a private endpoint.)
+
+# ============================================================================
 if ($Full) {
     "== D: the on-box publish, end to end (-DryRun)"
     # ============================================================================
