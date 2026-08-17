@@ -29,6 +29,12 @@ param(
 # a respawned twin mid-test.
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 
+# isolation: none - this script never launches ghoztty and never runs a CLI
+# verb; it builds a scratch crasher (av.exe), reads the Application event log,
+# and runs floor-lane's self-test. There is no IPC endpoint to isolate.
+# (Checked by test\win32\isolation-meta.ps1 - the marker above is what a
+# verb-free script carries instead of Set-GhozttyTestIsolation.)
+
 $ErrorActionPreference = 'Continue'
 . "$Repo\scripts\lib\CrashDiag.ps1"
 

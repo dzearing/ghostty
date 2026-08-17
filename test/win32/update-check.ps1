@@ -27,6 +27,11 @@ param([string]$ExePath)
 # a respawned twin mid-test.
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 $ErrorActionPreference = 'Stop'
+# T680: one private IPC endpoint for the whole run, claimed before anything
+# launches or dials. This replaces the old per-scenario set/remove of
+# GHOZTTY_PIPE_SUFFIX, which left gaps and reused a fixed name across runs.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 't24')
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
@@ -63,8 +68,8 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
     Remove-Item $errFile -ErrorAction SilentlyContinue
     if ($updateUrl) { $env:GHOZTTY_UPDATE_URL = $updateUrl }
     else { Remove-Item Env:GHOZTTY_UPDATE_URL -ErrorAction SilentlyContinue }
-    # Isolated pipe so the launch can't forward to a live instance and exit.
-    $env:GHOZTTY_PIPE_SUFFIX = '-t24test'
+    # The private pipe (Set-GhozttyTestIsolation, top of file) means the
+    # launch can't forward to a live instance and exit.
     try {
         # One retry on early exit: a launch racing a just-killed prior
         # instance occasionally dies during startup.
@@ -93,7 +98,6 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
         Start-Sleep -Milliseconds 500
     } finally {
         Remove-Item Env:GHOZTTY_UPDATE_URL -ErrorAction SilentlyContinue
-        Remove-Item Env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue
     }
     if (Test-Path $errFile) { return [IO.File]::ReadAllText($errFile) }
     return ''
@@ -123,15 +127,13 @@ Assert ($log3 -match 'update check: up to date \(current=\S+ latest=win-v0\.0\.1
 Assert ($log3 -notmatch 'showing update balloon') 'older: no balloon'
 
 # -- 4. no env override: dev builds gated, channel builds check ----------
-# Probe the exe flavor from its own `+version` output (isolated pipe so
+# Probe the exe flavor from its own `+version` output (the private pipe means
 # the "Running Instance" query finds nothing and only the CLI's own build
 # section prints).
-$env:GHOZTTY_PIPE_SUFFIX = '-t24probe'
 $verOut = Join-Path $env:TEMP 'ghoztty-t24-version.txt'
 # persistence: n/a - a CLI invocation, which opens no window.
 $vp = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOut -NoNewWindow -PassThru
 if (-not $vp.WaitForExit(15000)) { try { $vp.Kill() } catch {}; Write-Host 'SETUP FAIL: +version hung'; exit 1 }
-Remove-Item Env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue
 $verText = [IO.File]::ReadAllText($verOut)
 $isChannel = $verText -match 'update check: on \(win-v channel\)'
 if (-not $isChannel -and $verText -notmatch 'update check: off \(dev build\)') {

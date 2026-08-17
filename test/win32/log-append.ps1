@@ -64,8 +64,10 @@ $saved = @{ lad = $env:LOCALAPPDATA; pipe = $env:GHOZTTY_PIPE_SUFFIX }
 New-Item -ItemType Directory -Force (Join-Path $root 'ghoztty') | Out-Null
 $env:LOCALAPPDATA = $root
 # No server answers this suffix, so every +list fails fast and exits - the point
-# is the startup banner each one writes on its way through.
-$env:GHOZTTY_PIPE_SUFFIX = '-logappend'
+# is the startup banner each one writes on its way through. Per-PID (T680) so a
+# leaked instance from an earlier run can never be the thing that answers.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'logappend')
 $logPath = Join-Path $root 'ghoztty\ghoztty.log'
 
 try {

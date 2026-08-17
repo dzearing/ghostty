@@ -38,6 +38,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# isolation: none - every arm drives a fixture repo, and the one claim run uses
+# where.exe as the ghoztty stand-in, so no CLI verb ever reaches a real
+# endpoint; the +list mention below is commentary (T680 meta-check reads this).
+
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $Due = Join-Path $Repo 'scripts\guard-due.ps1'

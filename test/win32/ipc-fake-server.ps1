@@ -35,6 +35,10 @@ param(
     [string]$Response = '{"success":true,"data":{"windows":[]}}'
 )
 
+# isolation: none - this is the SERVER half: it binds a pipe and answers, and
+# never dials one; the +verbs above are usage examples for the shell that runs
+# the client. Callers isolate via -Suffix (T680 meta-check reads this marker).
+
 $ErrorActionPreference = 'Stop'
 
 $sfx = if ($PSBoundParameters.ContainsKey('Suffix')) { $Suffix }

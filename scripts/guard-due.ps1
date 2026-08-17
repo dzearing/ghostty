@@ -624,6 +624,20 @@ $GuardTable = @(
             'src\apprt\win32\chooser_session_sort.zig',
             'test\win32\chooser-session-sort.ps1'
         )
+    },
+    # The isolation meta-check (T680): the only thing that fails when a
+    # test\win32 script drives the CLI with no private IPC endpoint - the
+    # defect class that reads the user's own panes. Covering the whole top
+    # level of the test tree is the point: the property must be re-proved
+    # whenever ANY script changes, and the scan is static text, well under a
+    # second, so the wide net costs nothing.
+    [pscustomobject]@{
+        Name   = 'isolation-meta'
+        Script = 'test\win32\isolation-meta.ps1'
+        Stamp  = 'test\win32\isolation-meta.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1'
+        )
     }
 )
 

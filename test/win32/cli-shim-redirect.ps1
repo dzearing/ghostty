@@ -56,8 +56,10 @@ if (-not (Test-Path $Com)) {
 }
 
 # Isolate the IPC endpoint so no instance (the user's or a test's) answers;
-# every verb below is exercised in its no-instance shape on purpose.
-$env:GHOZTTY_PIPE_SUFFIX = '-t245shim'
+# every verb below is exercised in its no-instance shape on purpose. Per-PID
+# (T680) so a leaked instance from an earlier run can never answer either.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 't245shim')
 $tmp = Join-Path $env:TEMP "ghoztty-cli-shim-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 

@@ -56,6 +56,13 @@ function AssertEq($name, $expected, $actual) {
 }
 
 . (Join-Path $Repo 'scripts\delivery-manifest.ps1')
+# T680: those +version runs dial the IPC endpoint for their "Running Instance"
+# section, and the delivered binaries are RELEASE builds - unsuffixed, that
+# query goes to the user's own app. The suffix is inherited by the child
+# deliver script, so every read-back stays private. (Set only, no asserts:
+# a release build is the SUBJECT here, which the asserts would refuse.)
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'deliver')
 # T199: this run delivers real binaries into stand-in install dirs under $root
 # and runs them for their +version. Arm the teardown so a run that dies mid-way
 # still takes its ghoztty processes with it.

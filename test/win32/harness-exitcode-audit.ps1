@@ -25,6 +25,10 @@ $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
+# isolation: none - a static audit over script TEXT; nothing here launches
+# ghoztty or runs a CLI verb, the +list mentions are quoted fixture/commentary
+# (T680 meta-check reads this marker).
+
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }

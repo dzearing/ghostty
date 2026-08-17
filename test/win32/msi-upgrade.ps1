@@ -30,6 +30,14 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not $MsiV1) { $MsiV1 = Join-Path $repo 'zig-out\t23-v1.msi' }
 if (-not $MsiV2) { $MsiV2 = Join-Path $repo 'zig-out\t23-v2.msi' }
 
+# T680: `+version` prints a "Running Instance" section by dialing the IPC
+# endpoint - run from a Ghoztty pane, that would query the USER'S app. The
+# private suffix makes the Test-ExeRuns probes answer about the throwaway
+# install alone. (Set only, no asserts: the installed exe is a Release build
+# by design, which is exactly what Assert-GhozttyPrivateEndpoint refuses.)
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 't23msi')
+
 $script:pass = 0
 $script:fail = 0
 function Assert([bool]$cond, [string]$label) {

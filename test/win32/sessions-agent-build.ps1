@@ -41,6 +41,11 @@ $script:passes = 0
 
 $root = Join-Path $env:TEMP "ghoztty-t662-$PID"
 
+# isolation: none - every `+sessions --agent` run goes through Run-Cli, which
+# pins an explicit lineage AND a redirected LOCALAPPDATA per call, so the CLI
+# resolves a per-PID agent pipe under $root and never the user's; the app IPC
+# endpoint is never dialed at all. Build mode is still asserted below (T680).
+
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 
 function Assert($name, $cond) {

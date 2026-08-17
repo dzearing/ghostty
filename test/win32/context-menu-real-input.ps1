@@ -47,7 +47,11 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
-$env:GHOZTTY_PIPE_SUFFIX = '-ctxrealinput'
+# T680: private per-PID IPC endpoint, claimed before any launch or CLI call -
+# and Assert-GhozttyIsolated in Start-Gui proves every `+list`/`+read` below
+# reads the instance launched here, never the pane the caller is sitting in.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'ctxreal')
 
 $script:pass = 0
 $script:fail = 0
@@ -203,6 +207,10 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         exit 1
     }
+    # Throws unless the instance answering on the private endpoint is the one
+    # just launched - so the +read assertions below can never grade, or leak,
+    # the contents of the caller's own panes (T680).
+    Assert-GhozttyIsolated -Exe $exe
     $listJson = & $exe +list --json | Out-String
     $paneName = $null
     if ($listJson -match '"name"\s*:\s*"([^"]+)"') { $paneName = $Matches[1] }

@@ -42,6 +42,10 @@ $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-morning-$PID"
 
+# isolation: none - no app is ever launched and no CLI verb is ever run; the
+# +list mention below is commentary on a child script's behavior. Every path
+# the run touches sits under $root (T680 meta-check reads this marker).
+
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }

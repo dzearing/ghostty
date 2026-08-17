@@ -32,6 +32,14 @@ param(
 # a respawned twin mid-test.
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 
+# T680: private IPC endpoint before ANY CLI call. Run from a Ghoztty pane this
+# script inherits $GHOZTTY_IPC_SOCKET, which names the USER'S app - without a
+# suffix every `+list`/`+sessions` below reads their live window tree instead
+# of the instance launched here, and Wait-FirstPane "finds" a pane this run
+# never opened.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'agentauto')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-agent-autostart-$PID"
@@ -127,6 +135,10 @@ Remove-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue
 
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
+
+# Throws (and so aborts the run) if anything already answers on the private
+# suffix, or if $Exe is a release build on the user's own endpoints (T350).
+Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 

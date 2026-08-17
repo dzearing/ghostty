@@ -24,6 +24,12 @@ $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-agent-pipe-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
+# isolation: none - `+sessions` dials the AGENT pipe it finds via
+# %LOCALAPPDATA%\ghoztty\local-agent-debug\port.json, never the app IPC
+# endpoint, and LOCALAPPDATA is redirected to $tmp below with a per-PID pipe
+# name - so the user's agent and app are unreachable by construction. An app
+# pipe suffix would isolate an endpoint this script never dials (T680).
+
 # The debug ghoztty +sessions CLI reads %LOCALAPPDATA%\ghoztty\local-agent-debug\
 # port.json. Point LOCALAPPDATA at our tmp so the test is fully hermetic (never
 # touches a real local agent) and the agent's --port-file lands where the CLI looks.

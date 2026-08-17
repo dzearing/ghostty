@@ -27,6 +27,12 @@ $ErrorActionPreference = 'Stop'
 # pids it launches, and a pane-launched app would otherwise hand its work to
 # a respawned twin mid-test.
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
+# T680: no CLI verbs run here, but each Launch-Gui starts a real GUI. A private
+# suffix keeps that launch from single-instance-forwarding a new window into
+# any other zig-out instance that happens to be alive (a leaked test instance,
+# a concurrent lane) instead of coming up on its own.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'selfheal')
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }

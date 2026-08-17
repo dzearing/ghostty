@@ -9,6 +9,32 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T680 - every test\win32 script that dials IPC now claims a
+  private endpoint, and the rule is a scan, not a convention.** The sweep read
+  all 7 candidates in EXECUTION order (the filed table was a text-order scan):
+  the one live defect was agent-autostart.ps1, whose `+list`/`+sessions` dialed
+  the pane's baked `$GHOZTTY_IPC_SOCKET` - i.e. read the USER'S window tree and
+  sessions - now Set-GhozttyTestIsolation + Assert-GhozttyPrivateEndpoint;
+  crash-diagnostics was a false positive (no CLI at all). path-selfheal's GUI
+  launches got a suffix (single-instance forward risk), and update-check /
+  log-append / cli-shim-redirect / context-menu-real-input were upgraded from
+  fixed hand-rolled suffixes to per-PID isolation - context-menu-real-input now
+  also runs Assert-GhozttyIsolated after every launch. New
+  `test\win32\isolation-meta.ps1` (presence scan + built-in bite fixtures +
+  guard-due row over all of test\win32\*.ps1) immediately caught 8 MORE
+  scripts: msi-upgrade and deliver-windows-build really did dial the user's app
+  through `+version`'s Running Instance query (both isolated now); the other
+  six are hermetic by other means and carry reviewed `# isolation: none`
+  markers the scan accepts. Bite proven by reverting agent-autostart to HEAD:
+  the scan went red naming exactly that file. Validation: isolation-meta,
+  cli-shim-redirect, log-append, path-selfheal, agent-autostart, update-check,
+  deliver-windows-build, crash-diagnostics all ALL PASS; floor all-PASS;
+  P1-P3 ALL PASS; 17 edited files parser-clean. context-menu-real-input's full
+  mouse run was foreground-blocked twice (Windows Terminal held an input
+  lock), so its isolation half was proven with the identical launch shape from
+  this pane; the mouse half is unchanged by this task. Follow-up: T903 (the
+  ~90 remaining fixed suffixes -> per-PID, flake hardening only).
+
 - 2026-08-16 - **T675 - the app now escapes the agent's kill-on-close job at
   startup, so a destructive refresh can finally keep its promise.** New
   `job_escape.zig`, hooked into `main_ghostty` on the GUI path only: inside a
