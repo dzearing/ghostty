@@ -892,6 +892,56 @@ pub fn isExternalLivePageLink(page: []const u8, link: []const u8) bool {
     return !page_site.eql(link_site);
 }
 
+/// What the right-click MENU on a link in a viewer page is about to act on
+/// (T826). The shared `links.js` has already decided that the click landed on a
+/// link at all; this decides what the link IS, which is a different question
+/// from `classifyLink`'s "where should this navigation go".
+pub const MenuTarget = enum {
+    /// A `ghoztty://` link: Ghoztty addressing itself, used as written.
+    command,
+    /// A web URL, used as written.
+    web,
+    /// An explicit `file://` URL: `filePath` decodes it to a plain path.
+    file_url,
+    /// A path under the VIEWER host — a relative link in the rendered document,
+    /// which resolves against the viewed file the way a click on it would.
+    viewer_relative,
+    /// A path under the PAGE host — a link inside a rendered `.html` file
+    /// (T601), which resolves against that page's own directory.
+    page_relative,
+    /// Nothing this menu has actions for; the page keeps its own menu.
+    none,
+};
+
+/// What a right-clicked `href` names. Deliberately mode-free: the two synthetic
+/// hosts only ever appear in the mode that serves them, so the host answers the
+/// question on its own and a menu cannot be mis-resolved by a pane whose mode
+/// moved on between the click and the message arriving.
+///
+/// The two synthetic hosts are tested BEFORE the generic http(s) case for the
+/// same reason `classifyLink` tests them first: they are `https://` URLs, so the
+/// generic branch would offer "Open in Default Browser" on a location that
+/// resolves nowhere outside this process, and "Copy Link" would put it on the
+/// clipboard. What the user pointed at in both cases is a FILE.
+pub fn linkMenuTarget(uri: []const u8) MenuTarget {
+    if (url_scheme.handles(uri)) return .command;
+    if (isPageOrigin(uri)) return .page_relative;
+    if (uri.len >= origin_prefix.len and
+        std.ascii.eqlIgnoreCase(uri[0..origin_prefix.len], origin_prefix) and
+        (uri.len == origin_prefix.len or uri[origin_prefix.len] == '/'))
+    {
+        return .viewer_relative;
+    }
+    for ([_][]const u8{ "http://", "https://" }) |p| {
+        if (uri.len >= p.len and std.ascii.eqlIgnoreCase(uri[0..p.len], p)) return .web;
+    }
+    if (isFileUrl(uri)) return .file_url;
+    // Mac's `links.js` also lets its own `ghoztty-viewer:` scheme through, which
+    // on Windows is a virtual HOST rather than a scheme and is answered above.
+    // Anything still here has no destination the menu could act on.
+    return .none;
+}
+
 /// A live page's site: its host, plus the port as written when that port is not
 /// the scheme's own default (so `http://x.com:80` and `https://x.com` are the
 /// same site, and `http://x.com:443` is not).
@@ -1639,6 +1689,101 @@ test "classifyLink: the Mac policy, with the virtual host carved out first" {
         LinkClass.ghoztty_command,
         classifyLink(.web, site, "ghoztty://focus/dev"),
     );
+}
+
+test "T826: the right-click menu acts on what a link IS, not on its URL" {
+    // A real web link is itself: Copy Link puts that URL on the clipboard, and
+    // Open in Default Browser is a place the user can actually get to.
+    try testing.expectEqual(MenuTarget.web, linkMenuTarget("https://example.com/pr/1"));
+    try testing.expectEqual(MenuTarget.web, linkMenuTarget("HTTP://example.com"));
+    try testing.expectEqual(MenuTarget.web, linkMenuTarget("http://localhost:3000/x"));
+
+    // Both synthetic hosts are FILES wearing a URL. Copying `https://
+    // ghoztty-viewer/other.md` or handing it to Edge would hand over something
+    // that exists only inside this process — this is the case the generic https
+    // branch would get wrong, so it is tested first and hardest.
+    try testing.expectEqual(
+        MenuTarget.viewer_relative,
+        linkMenuTarget("https://ghoztty-viewer/other.md"),
+    );
+    try testing.expectEqual(
+        MenuTarget.viewer_relative,
+        linkMenuTarget("https://ghoztty-viewer/a/b.png#frag"),
+    );
+    try testing.expectEqual(
+        MenuTarget.page_relative,
+        linkMenuTarget("https://ghoztty-page/docs/two.html"),
+    );
+    // A look-alike host is a real website, on both.
+    try testing.expectEqual(
+        MenuTarget.web,
+        linkMenuTarget("https://ghoztty-viewer.example.com/x"),
+    );
+    try testing.expectEqual(MenuTarget.web, linkMenuTarget("https://ghoztty-page.evil.test/x"));
+
+    // An explicit file URL is a path; `filePath` decodes it before the menu is
+    // built, which is what makes Reveal in File Explorer and Copy Path work.
+    try testing.expectEqual(MenuTarget.file_url, linkMenuTarget("file:///C:/docs/a.md"));
+    try testing.expectEqual(MenuTarget.file_url, linkMenuTarget("FILE:///C:/x.txt"));
+
+    // A `ghoztty://` link addresses this app: Focus in Ghoztty and Copy Link,
+    // and none of the rows that open a destination (T695).
+    try testing.expectEqual(MenuTarget.command, linkMenuTarget("ghoztty://focus/dev"));
+    try testing.expectEqual(MenuTarget.command, linkMenuTarget("ghoztty-debug://focus/dev"));
+
+    // Everything else keeps the page's own menu. `links.js` filters these out
+    // before it ever posts, so reaching this branch means a page used the bridge
+    // directly — and there is nothing here the menu could act on.
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget("mailto:a@b.c"));
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget("javascript:void(0)"));
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget("about:blank"));
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget("data:text/plain,hi"));
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget("vscode://open"));
+    try testing.expectEqual(MenuTarget.none, linkMenuTarget(""));
+}
+
+test "T826: the menu's classification never contradicts where a click goes" {
+    // The two policies answer different questions — "what is this" and "where
+    // should this navigation go" — but they read the same URLs, and a link the
+    // click treats as a local file must not be a web URL in the menu next to it.
+    // That pairing is the whole reason the synthetic hosts are carved out in
+    // both.
+    const cases = [_]struct { uri: []const u8, mode: Mode, class: LinkClass, target: MenuTarget }{
+        .{
+            .uri = "https://ghoztty-viewer/other.md",
+            .mode = .markdown,
+            .class = .relative,
+            .target = .viewer_relative,
+        },
+        .{
+            .uri = "file:///C:/docs/a.md",
+            .mode = .markdown,
+            .class = .file_url,
+            .target = .file_url,
+        },
+        .{
+            .uri = "https://example.com/x",
+            .mode = .markdown,
+            .class = .browser,
+            .target = .web,
+        },
+        .{
+            .uri = "ghoztty://focus/dev",
+            .mode = .markdown,
+            .class = .ghoztty_command,
+            .target = .command,
+        },
+        .{
+            .uri = "mailto:a@b.c",
+            .mode = .markdown,
+            .class = .drop,
+            .target = .none,
+        },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.class, classifyLink(c.mode, null, c.uri));
+        try testing.expectEqual(c.target, linkMenuTarget(c.uri));
+    }
 }
 
 test "isExternalLivePageLink: host and port as written decide, not the origin" {

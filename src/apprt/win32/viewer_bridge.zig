@@ -66,6 +66,24 @@ pub const shim_js =
 /// build failed.
 pub const selection_js = @embedFile("../../viewer/selection.js");
 
+/// The shared right-click-on-a-link decider (T826), verbatim for the same P1
+/// reason `selection.js` is. It decides whether a right-click landed on a link
+/// Ghoztty has actions for, suppresses the browser's own menu when it did, and
+/// posts the href up; the menu itself is native, so the scheme list, the
+/// same-document rule and the inside-a-selection rule live in ONE file for both
+/// platforms.
+///
+/// One deliberate divergence from Mac, and it is the wrapper's rather than this
+/// file's: Mac injects it into subframes too, and here it rides the main-frame
+/// blob. WebView2 delivers a subframe's `postMessage` to
+/// `ICoreWebView2Frame`'s own event rather than to `add_WebMessageReceived`, so
+/// a subframe copy would suppress the browser's menu and then have nowhere to
+/// send the href — a right-click that opens nothing, which is the exact outcome
+/// the file's own "only suppress once we know we can replace it" guard exists to
+/// prevent. A link inside an iframe therefore keeps WebView2's menu until the
+/// frame plumbing lands (T928).
+pub const links_js = @embedFile("../../viewer/links.js");
+
 const prologue =
     "(function () {\n" ++
     "  \"use strict\";\n" ++
@@ -126,7 +144,7 @@ const epilogue = "\n})();\n";
 /// two-button toolbar Mac does. The flag itself still exists in the shared
 /// `selection.js`; nobody sets it.
 pub const injected_js =
-    prologue ++ shim_js ++ selection_js ++ selection_tracker_js ++ epilogue;
+    prologue ++ shim_js ++ selection_js ++ selection_tracker_js ++ links_js ++ epilogue;
 
 // -------------------------------------------------------------------------
 // Messages coming back up
@@ -168,6 +186,11 @@ pub const Message = union(enum) {
     /// cleared. Null is a real value: it is how a click into the page takes
     /// yesterday's selection back out of the next report.
     selection: ?[]const u8,
+    /// A right-click landed on a link the native menu has actions for, and the
+    /// page's own menu has already been suppressed (T826). The href is the
+    /// DOM's absolute resolution of the attribute, so a relative link arrives
+    /// resolved against the page's base.
+    link_menu: []const u8,
 };
 
 /// A parsed message and the arena its strings live in.
@@ -228,6 +251,12 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
     if (std.mem.eql(u8, kind, "selection")) {
         const raw = stringField(obj, "text") orelse "";
         return .{ .selection = nonEmpty(std.mem.trim(u8, raw, " \t\r\n")) };
+    }
+    if (std.mem.eql(u8, kind, "linkMenu")) {
+        // No href is no link: the page suppressed its own menu for nothing, and
+        // popping ours over an empty target would offer to open the void. The
+        // shared script never sends one, but this bridge is open to any page.
+        return .{ .link_menu = nonEmpty(stringField(obj, "href")) orelse return null };
     }
     return null;
 }
@@ -319,12 +348,36 @@ test "selection.js is embedded VERBATIM — P1's whole point" {
     try testing.expect(std.mem.indexOf(u8, injected_js, selection_js) != null);
     try testing.expectEqual(
         prologue.len + shim_js.len + selection_js.len +
-            selection_tracker_js.len + epilogue.len,
+            selection_tracker_js.len + links_js.len + epilogue.len,
         injected_js.len,
     );
     // And the shared file is the one on disk, not a copy under apprt/win32 —
     // a marker only that file has.
     try testing.expect(std.mem.indexOf(u8, selection_js, "window.__ghozttySelection") != null);
+}
+
+test "T826: links.js is embedded VERBATIM too, and it is the shared file" {
+    // Same claim as the selection toolbar's, for the same reason: the decline
+    // rules (which schemes have actions, what a same-document link is, what a
+    // right-click inside a selection means) are ONE file for both platforms, so
+    // a Mac change to them arrives here without a translation.
+    try testing.expect(std.mem.indexOf(u8, injected_js, links_js) != null);
+    try testing.expect(std.mem.indexOf(u8, links_js, "window.__ghozttyLinks") != null);
+    // The message it posts is the one this module parses, spelled the same way.
+    try testing.expect(std.mem.indexOf(u8, links_js, "type: \"linkMenu\"") != null);
+    // And it reaches native through the same handler everything else does,
+    // which is what makes the shim the whole of the Windows half.
+    try testing.expect(std.mem.indexOf(u8, links_js, "messageHandlers." ++ handler_name) != null);
+}
+
+test "T826: the link script runs AFTER the shim installed the bridge" {
+    // It declines a click outright when the bridge is missing — "only suppress
+    // the page's menu once we know we can replace it" — so an order that put it
+    // first would leave every right-click with the browser's menu instead of
+    // ours, silently and on every page.
+    const shim = std.mem.indexOf(u8, injected_js, "window.chrome && window.chrome.webview").?;
+    const links = std.mem.indexOf(u8, injected_js, "window.__ghozttyLinks").?;
+    try testing.expect(shim < links);
 }
 
 test "the selection toolbar names a font that resolves on Windows" {
@@ -581,6 +634,34 @@ test "parse: selection, including the empty one that clears it" {
         const cleared = parse(testing.allocator, case).?;
         defer cleared.deinit();
         try testing.expectEqual(@as(?[]const u8, null), cleared.message.selection);
+    }
+}
+
+test "parse: linkMenu carries the href the right-click landed on" {
+    const parsed = parse(testing.allocator,
+        \\{"type":"linkMenu","href":"https://ghoztty-viewer/docs/design.md"}
+    ).?;
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "https://ghoztty-viewer/docs/design.md",
+        parsed.message.link_menu,
+    );
+}
+
+test "parse: a linkMenu with no href is dropped" {
+    // The page has already suppressed its own menu by the time this arrives, so
+    // the temptation is to show SOMETHING — but a menu over an empty target
+    // offers to open the void. The shared script never sends one; a page posting
+    // straight into the bridge can.
+    for ([_][]const u8{
+        "{\"type\":\"linkMenu\"}",
+        "{\"type\":\"linkMenu\",\"href\":\"\"}",
+        "{\"type\":\"linkMenu\",\"href\":42}",
+    }) |case| {
+        if (parse(testing.allocator, case)) |p| {
+            p.deinit();
+            return error.MessageShouldHaveBeenIgnored;
+        }
     }
 }
 

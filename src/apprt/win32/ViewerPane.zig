@@ -86,6 +86,7 @@ const build_config = @import("../../build_config.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
+const banner_link = @import("banner_link.zig");
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
@@ -147,6 +148,16 @@ pub const WM_APP_VIEWER_FEEDBACK_SENT: u32 = w32.WM_APP + 24;
 /// torn down from inside its own event callback (the browser process is
 /// synchronously blocked for the length of the `Invoke`).
 pub const WM_APP_VIEWER_CLOSE: u32 = w32.WM_APP + 25;
+
+/// A right-click landed on a link in the page and the menu is owed (T826),
+/// posted rather than tracked inside the message handler for the reason
+/// `WM_APP_VIEWER_ACCEL` and `WM_APP_VIEWER_CLOSE` are: `TrackPopupMenuEx` runs
+/// its own modal message loop, and doing that from inside a WebView2 `Invoke`
+/// would hold the browser process blocked for as long as the menu is open. The
+/// target itself is parked on the pane (`link_menu_target`) rather than carried
+/// in `wparam`, so its ownership is the pane's and a pane that goes away with a
+/// menu post still in flight frees it.
+pub const WM_APP_VIEWER_LINK_MENU: u32 = w32.WM_APP + 27;
 
 /// How long the "Filed …" confirmation stays up before the composer closes
 /// itself, matching Mac's 1.8s: long enough to read, short enough that the
@@ -333,6 +344,14 @@ navigation_starting_handler: ?*NavigationStartingHandler = null,
 /// pane, which is what the pane did before this feature, while an under-count
 /// would eject a load the user asked for.
 self_nav_pending: u8 = 0,
+
+/// The link a right-click landed on, resolved to what the menu will act on
+/// (T826), waiting for `WM_APP_VIEWER_LINK_MENU` to pop the menu one message
+/// hop later. Owned by the pane, freed when the menu runs or the pane goes.
+/// A second right-click before the first pops replaces it — there is one
+/// pointer and one menu.
+link_menu_target: ?[]u8 = null,
+link_menu_kind: banner_link.Kind = .web,
 
 /// Our reference on the `DocumentTitleChanged` handler (T383), same rule.
 title_handler: ?*DocumentTitleChangedHandler = null,
@@ -766,6 +785,10 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     self.feedback_status = null;
     if (self.page_selection) |s| alloc.free(s);
     self.page_selection = null;
+    // A right-click whose menu never got its message hop (T826): the pane is
+    // going, so the target goes with it.
+    if (self.link_menu_target) |t| alloc.free(t);
+    self.link_menu_target = null;
     // After the bar (which reads the probe's answer) and before the host
     // window: `deinit` JOINS the worker, and a completion posted in the
     // meantime is dropped with the window it was addressed to. The feedback
@@ -2232,6 +2255,7 @@ fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) vo
         .active => |id| self.setActiveHeading(alloc, id),
         .quote => |q| self.acceptQuote(alloc, q),
         .selection => |text| self.setPageSelection(alloc, text),
+        .link_menu => |href| self.armLinkMenu(alloc, href),
     }
 }
 
@@ -3004,6 +3028,219 @@ fn shellOpen(self: *ViewerPane, alloc: Allocator, target: []const u8) void {
         std.unicode.utf8ToUtf16LeStringLiteral("open"),
         wide,
         null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
+// -------------------------------------------------------------------------
+// The link context menu (T826; the second half of Mac's 18acc4f6f)
+// -------------------------------------------------------------------------
+
+/// A right-click landed on a link the shared `links.js` recognised, and it has
+/// already suppressed the page's own menu — so from here a menu is OWED, and
+/// every path below either shows one or is a case the script would not have
+/// sent.
+///
+/// The href is resolved to what the menu will act on FIRST, while the pane is
+/// still the one the click happened in, and the menu itself is posted a message
+/// hop later (`WM_APP_VIEWER_LINK_MENU`) because it is modal.
+fn armLinkMenu(self: *ViewerPane, alloc: Allocator, href: []const u8) void {
+    var kind: banner_link.Kind = .web;
+    var target: ?[]u8 = null;
+    switch (content.linkMenuTarget(href)) {
+        // Nothing this menu has actions for. The shared script filters these
+        // schemes out before it ever posts, so reaching here means a page used
+        // the bridge directly — it gets no menu and nothing else.
+        .none => return,
+        .command => {
+            kind = .command;
+            target = alloc.dupe(u8, href) catch return;
+        },
+        .web => target = alloc.dupe(u8, href) catch return,
+        .file_url => {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = content.filePath(&buf, href) orelse return;
+            kind = .file;
+            target = alloc.dupe(u8, path) catch return;
+        },
+        // Both synthetic hosts name a FILE, and the menu acts on the file: the
+        // URL itself exists only inside this process, so copying it or handing
+        // it to the browser would be handing over something dead.
+        .viewer_relative => {
+            kind = .file;
+            target = self.resolveViewerRelative(alloc, href) orelse return;
+        },
+        .page_relative => {
+            kind = .file;
+            target = self.resolvePageRelative(alloc, href) orelse return;
+        },
+    }
+
+    const resolved = target orelse return;
+    if (self.link_menu_target) |old| alloc.free(old);
+    self.link_menu_target = resolved;
+    self.link_menu_kind = kind;
+
+    const hwnd = self.hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, WM_APP_VIEWER_LINK_MENU, 0, 0);
+}
+
+/// A relative link in the rendered document (`https://ghoztty-viewer/<rel>`),
+/// resolved against the viewed file exactly the way a CLICK on it resolves —
+/// next to the file first, then rooted at it (`openRelativeLink`).
+///
+/// The difference from the click is what happens when nothing exists there: a
+/// click reveals nothing and logs, while the menu still has to open, so the
+/// unchecked candidate is the answer. Copy Path then names the file the link
+/// meant, which is the useful thing to hand someone when a doc link is broken.
+fn resolveViewerRelative(self: *ViewerPane, alloc: Allocator, href: []const u8) ?[]u8 {
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = content.requestPath(&rel_buf, href) orelse return null;
+    const fp = self.file_path orelse return null;
+    const base = content.baseDirectory(fp) orelse return null;
+
+    if (self.takeIfFile(alloc, content.navCandidate(alloc, base, rel) catch null)) |p| return p;
+    if (self.takeIfFile(alloc, content.rootedCandidate(alloc, base, rel) catch null)) |p| return p;
+    return content.navCandidate(alloc, base, rel) catch null;
+}
+
+/// A link inside a rendered `.html` page (`https://ghoztty-page/<rel>`),
+/// resolved against the page host's own read grant — the same root, and the
+/// same containment refusal, that serves the page's subresources (T601).
+fn resolvePageRelative(self: *ViewerPane, alloc: Allocator, href: []const u8) ?[]u8 {
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = content.pageRequestPath(&rel_buf, href) orelse return null;
+    const root = self.html_root orelse return null;
+    return content.candidateUnder(alloc, root, rel) catch null;
+}
+
+/// Pop the menu the right-click earned and run what the user picks (T826).
+///
+/// Runs from the message loop, not from the web view's callback. The rows, the
+/// order and the ids are `banner_link`'s — the same ones a banner link shows —
+/// so the two surfaces cannot drift apart, which is the whole reason Mac
+/// re-anchored `BannerLinkOpener` on a protocol instead of forking a menu.
+fn showLinkMenu(self: *ViewerPane, alloc: Allocator) void {
+    const target = self.link_menu_target orelse return;
+    self.link_menu_target = null;
+    defer alloc.free(target);
+
+    const kind = self.link_menu_kind;
+    // The test seam the routed-click path already uses: a lane must never pop a
+    // modal menu (nothing would dismiss it) or reach the shell, so what the menu
+    // WOULD have offered is recorded and the action left to the unit tests of
+    // `banner_link`.
+    if (link_sink) |s| {
+        var name_buf: [32]u8 = undefined;
+        const label = std.fmt.bufPrint(&name_buf, "menu-{s}", .{@tagName(kind)}) catch "menu";
+        return s.append(label, target);
+    }
+
+    const hwnd = self.hwnd orelse return;
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+    var buf: [banner_link.MAX_ITEMS]banner_link.Item = undefined;
+    for (banner_link.build(kind, &buf)) |item| switch (item) {
+        .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+        .cmd => |c| _ = w32.AppendMenuW(menu, w32.MF_STRING, @intFromEnum(c.id), c.title.ptr),
+    };
+
+    // At the POINTER rather than at a position the page reported: the shared
+    // script sends only the href, and the cursor has not moved between the
+    // right-click and this message hop. It is also the coordinate space an
+    // iframe would not have shared.
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return;
+
+    // The MSDN pair for a tracked menu whose owner is not foreground, the same
+    // one `BannerOverlay.openLinkMenu` uses: foreground the top-level window
+    // first so an outside click dismisses the menu, and post it a message after
+    // so the menu's own loop exits cleanly.
+    const top: ?w32.HWND = if (self.pane_view) |pv| pv.parentWindow().hwnd else null;
+    if (top) |t| _ = w32.SetForegroundWindow(t);
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        hwnd,
+        null,
+    );
+    if (top) |t| _ = w32.PostMessageW(t, w32.WM_NULL, 0, 0);
+
+    const id = std.meta.intToEnum(
+        banner_link.Id,
+        @as(usize, @intCast(cmd)),
+    ) catch return; // 0 = dismissed without choosing
+    self.performLinkMenuAction(alloc, banner_link.action(id), target);
+}
+
+/// Run one menu action against an already-resolved target. The banner's
+/// `performLinkAction` verb for verb, on the viewer's own plumbing.
+fn performLinkMenuAction(
+    self: *ViewerPane,
+    alloc: Allocator,
+    act: banner_link.Action,
+    target: []const u8,
+) void {
+    switch (act) {
+        .open_with_system => self.openExternal(alloc, target),
+        .reveal_in_explorer => {
+            // `explorer /select,<path>` opens the containing folder with the
+            // file selected — the Windows analog of Mac's Reveal in Finder, and
+            // never an app launch for whatever claims the extension.
+            var arg_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+            const args = std.fmt.bufPrint(&arg_buf, "/select,\"{s}\"", .{target}) catch return;
+            if (link_sink) |s| return s.append("reveal", target);
+            self.shellExecuteArgs(alloc, "explorer.exe", args);
+        },
+        .open_in_side_pane => {
+            if (link_sink) |s| return s.append("split", target);
+            self.openLinkedViewerSplit(target);
+        },
+        .open_in_new_window => {
+            if (link_sink) |s| return s.append("window", target);
+            const pv = self.pane_view orelse return self.openExternal(alloc, target);
+            _ = pv.parentWindow().app.createWindow(.{ .viewer_open = .{
+                .location = target,
+                .origin_directory = self.origin_directory,
+            } }) catch |err| {
+                log.warn("viewer link menu: new window failed err={s}", .{@errorName(err)});
+            };
+        },
+        // The plain path for a file, the URL as written for anything web —
+        // Mac's `pasteboardString(for:)` rule, which `armLinkMenu`'s resolution
+        // has already applied: a `file://` string is useless in a shell or
+        // another editor, and a synthetic-host URL is useless anywhere.
+        .copy => {
+            if (link_sink) |s| return s.append("copy", target);
+            clipboardWriteText(alloc, target);
+        },
+        .focus_target => self.focusLinkTarget(target),
+    }
+}
+
+fn shellExecuteArgs(
+    self: *ViewerPane,
+    alloc: Allocator,
+    exe: []const u8,
+    args: []const u8,
+) void {
+    _ = self;
+    if (builtin.is_test) {
+        log.err("test build refused to shell-execute: {s} {s}", .{ exe, args });
+        return;
+    }
+    const wexe = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe) catch return;
+    defer alloc.free(wexe);
+    const wargs = std.unicode.utf8ToUtf16LeAllocZ(alloc, args) catch return;
+    defer alloc.free(wargs);
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        wexe,
+        wargs,
         null,
         w32.SW_SHOW,
     );
@@ -4836,6 +5073,14 @@ pub fn wndProc(
             return 0;
         },
 
+        // A right-click on a link in the page, one hop out of the web view's
+        // own callback (T826). The menu is modal, so this is the earliest place
+        // it can be tracked without holding the browser process blocked.
+        WM_APP_VIEWER_LINK_MENU => {
+            if (self.pending) |p| self.showLinkMenu(p.alloc);
+            return 0;
+        },
+
         w32.WM_TIMER => {
             if (wparam == nav_timer_id) {
                 self.navHoverTick();
@@ -6233,6 +6478,160 @@ test "host floor: a real controller on a real window, on this box" {
     }
 
     // ------------------------------------------------------------------
+    // T826: a right-click on a link offers Ghoztty's menu, on any page
+    // ------------------------------------------------------------------
+    //
+    // The whole chain, end to end: the shared `links.js` decides the click
+    // landed on a link it has actions for, suppresses the page's own menu and
+    // posts the href; the shim carries it; `parse` reads it; and the pane
+    // resolves it to what the menu will ACT on. Only the last hop — tracking a
+    // modal popup — is stubbed by the sink, because nothing on a test desktop
+    // would ever dismiss it.
+    //
+    // Three claims, each the others' control:
+    //
+    //  - a link the menu has actions for is recognised on a page we did not
+    //    author, which is the half a `<script src>` in the template could never
+    //    reach (and the reason this rides the injected blob at all);
+    //  - a synthetic-host link resolves to the FILE it stands for, not to the
+    //    URL — `https://ghoztty-page/...` exists only inside this process, so a
+    //    menu that copied it would be handing over something dead;
+    //  - a `mailto:` and a same-document `#fragment` are DECLINED, and by
+    //    position: they are right-clicked first, so anything they produced would
+    //    sit where the web link's entry is asserted.
+    {
+        @setEvalBranchQuota(30_000);
+        try tmp.dir.writeFile(.{
+            .sub_path = "t826-two.html",
+            .data = "<!doctype html><meta charset=\"utf-8\"><title>t826-two</title><p>two\n",
+        });
+        try tmp.dir.writeFile(.{ .sub_path = "t826-one.html", .data =
+        \\<!doctype html><meta charset="utf-8"><title>t826</title>
+        \\<a id="ext" href="https://example.com/x">out</a>
+        \\<a id="local" href="t826-two.html">in</a>
+        \\<a id="mail" href="mailto:a@b.c">mail</a>
+        \\<a id="frag" href="#top">top</a>
+        \\<a id="cmd" href="ghoztty://focus/dev">focus</a>
+        \\<script>
+        \\(function () {
+        \\  window.rc = function (id) {
+        \\    document.getElementById(id).dispatchEvent(
+        \\      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+        \\  };
+        \\  var w = window.webkit && window.webkit.messageHandlers
+        \\    && window.webkit.messageHandlers.viewerTOC;
+        \\  if (!w) return;
+        \\  w.postMessage({ type: "active", id: "t826-one" });
+        \\})();
+        \\</script>
+        \\
+        });
+        const one_path = try std.fs.path.join(alloc, &.{ dir_path, "t826-one.html" });
+        defer alloc.free(one_path);
+        try pane.navigate(alloc, one_path);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                const a = p.active_heading orelse return false;
+                return p.mode == .html and std.mem.eql(u8, a, "t826-one");
+            }
+        }.ready, &pane);
+
+        // The two the shared script must turn away, then the one it must not.
+        // `postMessage` delivery is ordered, so the web link's entry landing at
+        // index 5 is the assertion that neither of the first two produced one.
+        pane.executeScript(alloc, "rc('mail')");
+        pane.executeScript(alloc, "rc('frag')");
+        pane.executeScript(alloc, "rc('ext')");
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 6;
+            }
+        }.ready, &pane);
+        log.warn("t826: after three right-clicks entries={d}", .{sink.entries.items.len});
+        try testing.expectEqual(@as(usize, 6), sink.entries.items.len);
+        try testing.expectEqualStrings("menu-web:https://example.com/x", sink.entries.items[5]);
+
+        // A link to the page's neighbour: the menu acts on the FILE, resolved
+        // through the page host's own read grant.
+        pane.executeScript(alloc, "rc('local')");
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 7;
+            }
+        }.ready, &pane);
+        const two_path = try std.fs.path.join(alloc, &.{ dir_path, "t826-two.html" });
+        defer alloc.free(two_path);
+        const want_local = try std.fmt.allocPrint(alloc, "menu-file:{s}", .{two_path});
+        defer alloc.free(want_local);
+        try testing.expectEqualStrings(want_local, sink.entries.items[6]);
+
+        // And a `ghoztty://` link is a command, whose menu offers Focus and
+        // Copy and nothing that opens a destination (`banner_link` owns that
+        // shape; what is proven here is that the KIND survives the trip).
+        pane.executeScript(alloc, "rc('cmd')");
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 8;
+            }
+        }.ready, &pane);
+        try testing.expectEqualStrings(
+            "menu-command:ghoztty://focus/dev",
+            sink.entries.items[7],
+        );
+
+        // The pane never moved: a right-click is not a navigation.
+        try testing.expectEqual(content.Mode.html, pane.mode);
+        try testing.expect(std.mem.endsWith(u8, pane.file_path.?, "t826-one.html"));
+
+        // The BUNDLED template is the other half — same script, same bridge,
+        // and the relative link that a click resolves against the viewed file
+        // resolves the same way for the menu. The second one names a file that
+        // does NOT exist, where the click reveals nothing: the menu still opens
+        // (the page's own menu was already suppressed), on the path the link
+        // meant.
+        try pane.navigate(alloc, links_path);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.page_loaded and p.mode == .markdown;
+            }
+        }.ready, &pane);
+        pane.executeScript(alloc,
+            \\document.querySelector('a[href="linked.md"]').dispatchEvent(
+            \\  new MouseEvent("contextmenu", { bubbles: true, cancelable: true }))
+        );
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 9;
+            }
+        }.ready, &pane);
+        const linked_path = try std.fs.path.join(alloc, &.{ dir_path, "linked.md" });
+        defer alloc.free(linked_path);
+        const want_doc = try std.fmt.allocPrint(alloc, "menu-file:{s}", .{linked_path});
+        defer alloc.free(want_doc);
+        try testing.expectEqualStrings(want_doc, sink.entries.items[8]);
+
+        pane.executeScript(alloc,
+            \\document.querySelector('a[href="nope-linked.md"]').dispatchEvent(
+            \\  new MouseEvent("contextmenu", { bubbles: true, cancelable: true }))
+        );
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 10;
+            }
+        }.ready, &pane);
+        const missing_path = try std.fs.path.join(alloc, &.{ dir_path, "nope-linked.md" });
+        defer alloc.free(missing_path);
+        const want_missing = try std.fmt.allocPrint(alloc, "menu-file:{s}", .{missing_path});
+        defer alloc.free(want_missing);
+        try testing.expectEqualStrings(want_missing, sink.entries.items[9]);
+    }
+
+    // ------------------------------------------------------------------
     // T162: the selection toolbar's Copy — on the template AND a website
     // ------------------------------------------------------------------
     //
@@ -6891,10 +7290,16 @@ fn clipboardReadText(alloc: Allocator) ?[]u8 {
     return std.unicode.utf16LeToUtf8Alloc(alloc, wptr[0..wlen]) catch null;
 }
 
-/// Test-only: put text on the system clipboard — the sentinel before each
-/// press, and the user's own contents back afterwards. Mirrors the write in
-/// `Surface.completeClipboardRequest` (SetClipboardData owns the HGLOBAL on
-/// success; on any earlier failure we free it ourselves).
+/// Put text on the system clipboard: the link menu's Copy (T826), and in the
+/// live test the sentinel before each press plus the user's own contents back
+/// afterwards. Mirrors the write in `Surface.completeClipboardRequest`
+/// (SetClipboardData owns the HGLOBAL on success; on any earlier failure we
+/// free it ourselves).
+///
+/// No `clipboard-write = ask` gate, and deliberately: that config exists for a
+/// PROGRAM writing the clipboard behind the user's back, and this is the user's
+/// own menu choice — the same call `BannerOverlay.copyLink` makes with
+/// `confirm = false`.
 fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch return;
     defer alloc.free(utf16);

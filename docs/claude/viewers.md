@@ -134,6 +134,27 @@ ghoztty +close --target=doc
   redirects, script navigations, form posts and iframes are the page working,
   and so are the pane's own loads (`--view=<url>`, the address bar, a restored
   session).
+- **Right-clicking a link** in ANY viewer page — the bundled template, a
+  rendered `.html` file, a website — shows **Ghoztty's own link menu**, the same
+  one a terminal banner link shows: the left-click default first, then Open in
+  Side Pane / Open in New Window, then Copy (**T826**; Mac 18acc4f6f). The rows,
+  the order and the ids are `banner_link.zig`'s on Windows and
+  `BannerLinkOpener`'s on Mac — neither surface forks the menu. What decides
+  whether a right-click is one of ours is the SHARED `src/viewer/links.js`,
+  injected into every page (win32 rides the same blob as `selection.js`, behind
+  the `viewerTOC` shim): it declines `mailto:`, `javascript:`, `data:`, a
+  same-document `#anchor`, and a click inside a selection, and in each of those
+  the page keeps the browser's own menu.
+
+  The menu acts on what the link IS, not on the URL the page holds: a relative
+  doc link and a link inside a rendered `.html` page both live under a synthetic
+  host that means nothing outside this process, so win32 resolves them to the
+  FILE first (`viewer_content.linkMenuTarget` + the pane's resolution, which is
+  the click path's own). Copy on a doc link gives a path you can paste into a
+  shell. **Known win32 divergence**: a link inside an **iframe** keeps WebView2's
+  menu, because a subframe's `postMessage` reaches `ICoreWebView2Frame`'s event
+  and not the web view's — suppressing the page's menu there would leave the
+  right-click with nothing to show (T928). Mac runs the script in subframes.
 - **Links that open a new surface** in a website viewer — `target="_blank"` or
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane

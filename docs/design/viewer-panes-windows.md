@@ -377,6 +377,23 @@ Unchanged in intent; stated here so the boundaries are explicit.
   issues (`self_nav_pending`) and subtracts them; what is left is a click. The
   known divergence: a script-synthesized `a.click()` routes on Mac and stays in
   the pane here, which errs toward leaving a page's own machinery working.
+  **T826 is 18acc4f6f's other half** (2026-08-17): a right-click on a link in
+  any viewer page shows Ghoztty's own menu instead of the browser's. The shared
+  `src/viewer/links.js` decides (scheme list, same-document, inside-selection),
+  posts `{type:"linkMenu",href}` through the existing `viewerTOC` shim, and the
+  native half is `banner_link.zig`'s existing rows/order/ids -- so the viewer and
+  the banner cannot drift, which is what Mac bought by re-anchoring
+  `BannerLinkOpener` on a `LinkAnchor` protocol. Three win32-specific pieces:
+  (1) the menu is TRACKED one message hop later
+  (`WM_APP_VIEWER_LINK_MENU`), because `TrackPopupMenuEx` is modal and the
+  browser process is blocked for the length of a WebView2 `Invoke`;
+  (2) the href is RESOLVED first (`viewer_content.linkMenuTarget`) -- both
+  synthetic hosts name files, and copying `https://ghoztty-page/...` would hand
+  over something that exists only inside this process;
+  (3) it rides the MAIN-FRAME blob, so an iframe link keeps WebView2's menu
+  (T928) where Mac injects into subframes -- a subframe's `postMessage` reaches
+  `ICoreWebView2Frame`'s event, so a copy there would suppress the page's menu
+  with nowhere to send the href.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add
