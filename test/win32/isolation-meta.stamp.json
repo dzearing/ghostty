@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-17T06:11:17-07:00",
-    "commit":  "f6a8f5765",
+    "generated":  "2026-08-17T07:10:06-07:00",
+    "commit":  "f5c736c88",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -39,7 +39,7 @@
                   "test/win32/chooser-restore-all.ps1":  "ddb61579446656aa6661d05c214a3222c0b4fdfbe7a0244b630b8c04574a92b8",
                   "test/win32/chooser-restore-all-adopt.ps1":  "5e664296efe3f5fbe082fe27acad82dcea982c417af18a90fa949c59c89d1fdc",
                   "test/win32/chooser-restore-all-remote.ps1":  "ffd03fee78f88eff04d6711a715046801f4b64e8fa9b5a74107e8157a54c3f4e",
-                  "test/win32/chooser-resume.ps1":  "16e7099a2f4cfc80169fc620869f0d1d7eed62fedf21b2ab64a8b5f198f1e81e",
+                  "test/win32/chooser-resume.ps1":  "68bff5030e2c25498397ba672b8d6a46269b66171a05cb04afa8985049560d9b",
                   "test/win32/chooser-roster-refetch.ps1":  "750acf69b43f19053ddcdf147840ac36e98b5e1c91830bd544af2ba17e81fec7",
                   "test/win32/chooser-session-cpu.ps1":  "5d52f3926c52db0b5b4963413ce6e06c851fc7d53c73d9c4d4b5dcadb4f9c850",
                   "test/win32/chooser-sessions.ps1":  "eb53bfce4096e8bdba0fd20f894646ecbfb51e8229d3d3c94ae4342ce7f4592d",
@@ -180,7 +180,7 @@
                   "test/win32/tab-strip-autohide.ps1":  "32ea68773de4af2c2ba696a7741f709013fb95a432e595c84ea6b93356bf5818",
                   "test/win32/tab-tooltip.ps1":  "405d750c2d9076c6afcb5c60ca2208619da29bb9f00a8da9e6337dd7433c03b1",
                   "test/win32/target-staleness.ps1":  "9bfdcce176cbadecf1263ab9a4fc5f74a48e5f8e141220531349a670608ae54e",
-                  "test/win32/task-dashboard.ps1":  "15ffe34b80e0de958898033f7417172ab26cc4686478fce5d5f905b9b68c6969",
+                  "test/win32/task-dashboard.ps1":  "b0e22ed5b0b3fb333c475ba04633e834db7f1e8f20a179b84ac5c83b060ddeec",
                   "test/win32/terminal-link-paths.ps1":  "3e363feec18c1f1792f2ca7e898418eee7f306677c79767a18927cef783f428d",
                   "test/win32/test-binary-soak.ps1":  "7e0e5766b11e0b3a743837a4e475a463d07ebb569c48ad8bc6c52b8f15eff807",
                   "test/win32/test-desktop-harness.ps1":  "df135c7fce9eac3b08bab3900b3a68f611821c0b4d1731b987e69afb925b3aa4",
