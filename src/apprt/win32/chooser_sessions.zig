@@ -349,43 +349,10 @@ pub fn isResumable(s: Session) bool {
     return s.alive;
 }
 
-/// The keyboard sub-cursor is OUT of the roster (the machine row itself is
-/// highlighted). Mac spells this `browseCursor == nil`.
-pub const no_cursor: i32 = -1;
-
-/// Right arrow: step the cursor INTO the rendered roster (Mac's
-/// `enterSessions`, `:815-818`). A roster with nothing rendered — loading,
-/// failed, or empty — has nowhere to step, and an already-entered cursor stays
-/// where it is rather than jumping home.
-pub fn enterCursor(cur: i32, count: usize) i32 {
-    if (cur != no_cursor) return cur;
-    if (count == 0) return no_cursor;
-    return 0;
-}
-
-/// Up/Down with the cursor inside the roster (Mac's `move`, `:1313-1319`):
-/// stepping above the first row hands navigation BACK to the machine list, and
-/// stepping past the last clamps rather than wrapping — a wrap would send the
-/// user to the top of a long roster they were walking down.
-pub fn moveCursor(cur: i32, delta: i32, count: usize) i32 {
-    if (count == 0) return no_cursor;
-    const next = cur + delta;
-    if (next < no_cursor + 1) return no_cursor;
-    const last: i32 = @intCast(count - 1);
-    return @min(next, last);
-}
-
-/// Hold the cursor inside a roster that changed underneath it. A live refetch
-/// (or an optimistic Kill) can shrink the rendered list while the cursor sits
-/// past its new end; the row that slid into the index is NOT the row the user
-/// was pointing at, so the cursor clamps to the last row rather than silently
-/// re-pointing at whatever arrived.
-pub fn clampCursor(cur: i32, count: usize) i32 {
-    if (cur == no_cursor) return no_cursor;
-    if (count == 0) return no_cursor;
-    const last: i32 = @intCast(count - 1);
-    return std.math.clamp(cur, 0, last);
-}
+// The keyboard sub-cursor's index arithmetic moved to
+// `chooser_session_sort.steppedCursor` in T602, when the cursor became a
+// session-ID anchor: the list re-sorts underneath it, so an index would
+// silently re-point at whatever slid into that slot.
 
 /// What resuming a row means, resolved from the machine the roster is pointed at
 /// — Mac's `resumeTarget` (`MachineChooserView.swift:127-133`) with its caller's
@@ -1206,42 +1173,18 @@ test "the cursor's index space is the RENDERED list, with a dead row planted mid
     const rows = rendered[0..n];
     try testing.expectEqual(@as(usize, 2), rows.len);
 
-    // Enter, then walk: every cursor value indexes the rendered list, and the
-    // resume it produces names that row's session.
-    var cur = enterCursor(no_cursor, rows.len);
-    try testing.expectEqual(@as(i32, 0), cur);
-    switch (resumeTarget(.local, rows[@intCast(cur)])) {
+    // Every rendered index resolves to the session it shows, and the resume it
+    // produces names that row's session — the second rendered row is the THIRD
+    // raw session. (The cursor's own stepping lives in
+    // `chooser_session_sort.steppedCursor` since T602.)
+    switch (resumeTarget(.local, rows[0])) {
         .local => |id| try testing.expectEqualStrings("one", id),
         else => return error.TestUnexpectedResult,
     }
-    cur = moveCursor(cur, 1, rows.len);
-    try testing.expectEqual(@as(i32, 1), cur);
-    switch (resumeTarget(.local, rows[@intCast(cur)])) {
+    switch (resumeTarget(.local, rows[1])) {
         .local => |id| try testing.expectEqualStrings("two", id),
         else => return error.TestUnexpectedResult,
     }
-    // Down at the end clamps — it does not wrap to the top of the roster.
-    try testing.expectEqual(@as(i32, 1), moveCursor(cur, 1, rows.len));
-}
-
-test "the cursor enters, leaves at the top, and never enters an empty roster" {
-    // Right into an empty roster is a no-op: there is nothing to point at.
-    try testing.expectEqual(no_cursor, enterCursor(no_cursor, 0));
-    try testing.expectEqual(@as(i32, 0), enterCursor(no_cursor, 3));
-    // Already inside: Right holds position rather than jumping home.
-    try testing.expectEqual(@as(i32, 2), enterCursor(2, 3));
-    // Up off the first row hands navigation back to the machine list.
-    try testing.expectEqual(no_cursor, moveCursor(0, -1, 3));
-    // And a roster that emptied under the cursor cannot hold one.
-    try testing.expectEqual(no_cursor, moveCursor(1, 1, 0));
-}
-
-test "clampCursor holds the cursor inside a roster that shrank" {
-    try testing.expectEqual(@as(i32, 1), clampCursor(3, 2));
-    try testing.expectEqual(@as(i32, 1), clampCursor(1, 2));
-    try testing.expectEqual(no_cursor, clampCursor(0, 0));
-    // Out of the roster stays out: a refetch must not pull the cursor in.
-    try testing.expectEqual(no_cursor, clampCursor(no_cursor, 5));
 }
 
 test "the cursor card wears the chooser's own selection colors" {

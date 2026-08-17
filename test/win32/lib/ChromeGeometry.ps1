@@ -628,7 +628,14 @@ function Get-TestChooserRosterGeometry {
     $emailH = (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 4 $s)
     $linkH = (Get-TestChromeDip 14 $s) + (Get-TestChromeDip 4 $s)
     $stackGap = Get-TestChromeDip 2 $s
-    $accountH = [math]::Max([math]::Max($avatarD, $emailH + $stackGap + $linkH), $controlH)
+    # T602: the selected machine's identity stack (subtitle-role name over a
+    # caption count) lives in the band and is its tallest tenant.
+    $titleH = (Get-TestChromeDip 20 $s) + (Get-TestChromeDip 4 $s)
+    $subtitleH = (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 4 $s)
+    $identityH = $titleH + $stackGap + $subtitleH
+    $accountH = [math]::Max(
+        [math]::Max([math]::Max($avatarD, $emailH + $stackGap + $linkH), $identityH),
+        $controlH)
     $headerDividerY = $gap + $accountH + $gap
 
     $cancelTop = $clientH - $margin - $controlH
@@ -638,17 +645,16 @@ function Get-TestChooserRosterGeometry {
 
     $masterW = Get-TestChromeDip 260 $s
     $detailLeft = $masterW + 1
-    $glyphW = Get-TestChromeDip 32 $s
-    $titleH = (Get-TestChromeDip 20 $s) + (Get-TestChromeDip 4 $s)
-    $subtitleH = (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 4 $s)
-    $glyphBottom = $bodyTop + $margin + $glyphW
-    $subBottom = $bodyTop + $margin + $titleH + (Get-TestChromeDip 2 $s) + $subtitleH
-    $identityBottom = [math]::Max($glyphBottom, $subBottom)
-    $actionTop = $identityBottom + (Get-TestChromeDip 12 $s)
+    # T602: the detail pane begins at its action row (vertical padding 12); the
+    # session-list column headers take one caption line box under it, then the
+    # roster after a 4 DIP hair.
+    $actionTop = $bodyTop + (Get-TestChromeDip 12 $s)
+    $headerTop = $actionTop + $controlH + (Get-TestChromeDip 12 $s)
+    $headerH = $subtitleH
 
     $left = $detailLeft + $margin
     $right = $clientW - $margin
-    $top = $actionTop + $controlH + (Get-TestChromeDip 12 $s)
+    $top = $headerTop + $headerH + (Get-TestChromeDip 4 $s)
     $bottom = $bodyBottom - $margin
 
     # First card: padded on all sides, its Kill button a 28 DIP painted square
@@ -668,6 +674,13 @@ function Get-TestChooserRosterGeometry {
     # meter drawn" without pinning a row.
     $meterLeft = $left + $padX + (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 8 $s)
 
+    # The session-list column headers (T602): the CPU zone rides the meter
+    # column the rows reserve (present only when the machine's agent serves the
+    # stream — the local agent does), the Name zone the text column after it.
+    $cpuColW = (Get-TestChromeDip 24 $s) + (Get-TestChromeDip 4 $s) + (Get-TestChromeDip 28 $s)
+    $cpuZoneLeft = $left + $padX + (Get-TestChromeDip 12 $s) + (Get-TestChromeDip 8 $s)
+    $nameZoneLeft = $cpuZoneLeft + $cpuColW + (Get-TestChromeDip 8 $s)
+
     return [pscustomobject]@{
         Left  = $left; Top = $top; Right = $right; Bottom = $bottom
         KillX = $killX; KillY = $killY
@@ -677,5 +690,9 @@ function Get-TestChooserRosterGeometry {
         CardY = $top + $padY + [int]([math]::Floor($cardTitleH / 2))
         MeterLeft = $meterLeft
         MeterRight = $meterLeft + (Get-TestChromeDip 24 $s)
+        # Header click points (T602), mid-line in each zone.
+        HeaderY = $headerTop + [int]([math]::Floor($headerH / 2))
+        CpuHeaderX = $cpuZoneLeft + (Get-TestChromeDip 8 $s)
+        NameHeaderX = $nameZoneLeft + (Get-TestChromeDip 8 $s)
     }
 }

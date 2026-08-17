@@ -562,6 +562,20 @@ $GuardTable = @(
             'src\apprt\win32\session_layout.zig',
             'test\win32\session-layout-preserve.ps1'
         )
+    },
+    # The chooser's session-list sort (T602): the headers are owner-drawn and
+    # the order is asserted through log oracles only this harness reads - the
+    # P1-P3 floor opens no chooser, so a sort/cursor regression is invisible to
+    # it. The row covers the sort model and its persistence, not the whole
+    # chooser (chooser-*.ps1 have their own runs).
+    [pscustomobject]@{
+        Name   = 'chooser-session-sort'
+        Script = 'test\win32\chooser-session-sort.ps1'
+        Stamp  = 'test\win32\chooser-session-sort.stamp.json'
+        Covers = @(
+            'src\apprt\win32\chooser_session_sort.zig',
+            'test\win32\chooser-session-sort.ps1'
+        )
     }
 )
 

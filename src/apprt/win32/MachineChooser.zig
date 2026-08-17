@@ -63,6 +63,7 @@ const chooser_sessions = @import("chooser_sessions.zig");
 const text_search = @import("text_search.zig");
 const SessionRoster = @import("SessionRoster.zig");
 const SessionCpuProbe = @import("SessionCpuProbe.zig");
+const chooser_session_sort = @import("chooser_session_sort.zig");
 const machine_pool = @import("machine_pool.zig");
 const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
@@ -386,6 +387,14 @@ pub fn open(window: *Window) void {
     // the file does not change while a dialog is open — read it once here
     // rather than on every repaint.
     self.roster.loadManifest();
+    // The session list's persisted sort order (T602). Said out loud because
+    // the headers are owner-drawn — this line is the acceptance oracle for
+    // "the choice survives an app restart".
+    self.roster.sort = chooser_session_sort.load(alloc);
+    log.info("chooser roster: sort loaded key={s} dir={s}", .{
+        @tagName(self.roster.sort.key),
+        if (self.roster.sort.ascending) "asc" else "desc",
+    });
 
     // Resolve the relay base + bearer token and fetch the device list once.
     // Any failure degrades to a Local-only list plus a footer hint.
@@ -1090,11 +1099,21 @@ fn measureAccount(self: *const MachineChooser, state: chooser_layout.AccountStat
         },
         .signed_out, .busy => .{
             .button = self.measureWith(self.font, RelayAccountRow.buttonLabel(false, state == .busy)),
+            // Measured since T602: the sentence's STATIC shares the band with
+            // the painted identity, so "whatever is left" would erase it.
+            .status = self.measureWith(
+                self.font,
+                RelayAccountRow.statusText(self.email, state == .busy, self.sign_in_configured),
+            ),
             .share = share_w,
         },
-        // Nothing else to size: the sentence takes the rest of the band and
-        // there is no control beside it (T747).
-        .unconfigured => .{ .share = share_w },
+        .unconfigured => .{
+            .status = self.measureWith(
+                self.font,
+                RelayAccountRow.statusText(self.email, false, self.sign_in_configured),
+            ),
+            .share = share_w,
+        },
     };
 }
 
@@ -1434,7 +1453,65 @@ fn paintChrome(self: *MachineChooser, hdc: w32.HDC) void {
     }
 
     self.paintAccount(hdc, l);
+    self.paintIdentity(hdc, l);
     self.paintDetail(hdc, l);
+}
+
+/// The selected machine's identity — glyph, name, session-count subtitle —
+/// flush LEFT in the header band (T602, Mac's `headerIdentity`). It used to
+/// open the detail column, where it cost ~50 DIP of the one thing that column
+/// is short of: roster rows. The band already carried a whole row of empty
+/// space beside the account block, which is exactly what a header band is for.
+fn paintIdentity(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
+    const row = self.selectedRow() orelse return;
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    const p = self.pal();
+
+    var sub_buf: [256]u8 = undefined;
+    const detail = switch (row) {
+        .local => chooser_rows.localDetail(),
+        .device => |i| chooser_rows.deviceDetail(
+            &sub_buf,
+            self.devices[i].name,
+            self.devices[i].hostname,
+            self.devices[i].online,
+        ),
+    };
+
+    // The identity's text may run only to where the account composition
+    // begins — the layout cannot know that (it depends on measured captions),
+    // so the clamp happens here, against the same packing the controls use.
+    const state = self.accountState();
+    const acct = chooser_layout.accountRow(l, state, self.measureAccount(state));
+
+    const box = l.identity_glyph;
+    drawGlyphBox(
+        hdc,
+        box.left,
+        box.top,
+        box.width(),
+        box.height(),
+        detail.glyph,
+        p.secondary,
+    );
+
+    var title_rect = rect(l.identity_title);
+    title_rect.right = @max(title_rect.left, @min(title_rect.right, acct.identity_right));
+    const old_font = if (self.title_font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, rgb(p.text));
+    drawTextUtf8(hdc, detail.title, &title_rect);
+    if (old_font) |o| _ = w32.SelectObject(hdc, o);
+
+    // Once the roster has loaded, the subtitle LEADS with the session count,
+    // the way Mac's `detailSubtitle` does.
+    var sub_buf2: [128]u8 = undefined;
+    const subtitle = self.detailSubtitle(&sub_buf2, row, detail.subtitle);
+    var sub_rect = rect(l.identity_subtitle);
+    sub_rect.right = @max(sub_rect.left, @min(sub_rect.right, acct.identity_right));
+    const old_sub = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, rgb(p.secondary));
+    drawTextUtf8(hdc, subtitle, &sub_rect);
+    if (old_sub) |o| _ = w32.SelectObject(hdc, o);
 }
 
 /// The account row's monogram circle (T311). Mac draws the Google profile
@@ -1519,8 +1596,9 @@ fn drawAccountLink(self: *const MachineChooser, dis: *const w32.DRAWITEMSTRUCT) 
     if (focused) _ = w32.DrawFocusRect(hdc, &r);
 }
 
-/// The detail pane's header: the selected machine's glyph, name and subtitle —
-/// or Mac's centered "No machines" when the filter matched nothing.
+/// The detail pane: since T602 it begins at its action row (the identity lives
+/// in the band — `paintIdentity`), so this is the session roster, or Mac's
+/// centered "No machines" when the filter matched nothing.
 fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
     const p = self.pal();
@@ -1539,50 +1617,6 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
         );
         return;
     };
-
-    var sub_buf: [256]u8 = undefined;
-    const detail = switch (row) {
-        .local => chooser_rows.localDetail(),
-        .device => |i| chooser_rows.deviceDetail(
-            &sub_buf,
-            self.devices[i].name,
-            self.devices[i].hostname,
-            self.devices[i].online,
-        ),
-    };
-
-    // The mark is square at the system's large-icon size (T310), the way the
-    // row's is square at its small-icon size — one rule for both.
-    const box = l.detail_glyph;
-    drawGlyphBox(
-        hdc,
-        box.left,
-        box.top,
-        box.width(),
-        box.height(),
-        detail.glyph,
-        p.secondary,
-    );
-
-    var title_rect = rect(l.detail_title);
-    const old_font = if (self.title_font) |f| w32.SelectObject(hdc, f) else null;
-    _ = w32.SetTextColor(hdc, rgb(p.text));
-    drawTextUtf8(hdc, detail.title, &title_rect);
-    if (old_font) |o| _ = w32.SelectObject(hdc, o);
-
-    // The detail subtitle is the ramp's CAPTION role, like the row subline it
-    // echoes — it was drawing at body size, which made it compete with the
-    // machine name instead of supporting it.
-    //
-    // Once the roster has loaded it LEADS with the session count, the way Mac's
-    // `detailSubtitle` does (`MachineChooserView.swift:520-540`).
-    var sub_buf2: [128]u8 = undefined;
-    const subtitle = self.detailSubtitle(&sub_buf2, row, detail.subtitle);
-    var sub_rect = rect(l.detail_subtitle);
-    const old_sub = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
-    _ = w32.SetTextColor(hdc, rgb(p.secondary));
-    drawTextUtf8(hdc, subtitle, &sub_rect);
-    if (old_sub) |o| _ = w32.SelectObject(hdc, o);
 
     self.paintSessions(hdc, l, row);
 }
@@ -1616,15 +1650,15 @@ fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void 
     _ = row;
     const p = self.pal();
     var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
-    const visible = self.roster.visible(self.window.app, &rows);
-    // The newest pushed reading per row (T462). Filled here rather than inside
-    // `visible` because the stream is a different subscription with a different
-    // lifetime from the roster — and only the PAINT needs it, so the hit tests
-    // pay nothing for it.
-    for (rows[0..visible.len]) |*r| r.cpu = self.cpu.get(r.session.id);
+    // Through `sessionView`, like every hit test and the keyboard cursor: it
+    // is the ONE place the displayed list — CPU readings filled, sort applied
+    // (T602) — is built, so what is painted and what a click lands on cannot
+    // disagree about which row is where.
+    const view = self.sessionView(&rows) orelse return;
     self.roster.paint(.{
         .hdc = hdc,
-        .region = l.sessions,
+        .region = view.region,
+        .header = l.session_header,
         .scale = self.window.scale,
         .bg = p.bg,
         // The user's accent floored against the surface the cards composite on
@@ -1633,7 +1667,7 @@ fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void 
         .accent = p.accent,
         .label_font = self.strong_font,
         .caption_font = self.subtitle_font,
-    }, visible);
+    }, view.rows);
 }
 
 /// GUI thread: a roster fetch landed. Finds the chooser it was asked for by id
@@ -1653,6 +1687,9 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
             // after a resume or a pane close re-states the mark's count.
             if (chooser.roster.state == .loaded) chooser.roster.logOrphans(app);
             chooser.refreshSessions();
+            // The session count in the identity subtitle lives in the band
+            // (T602) and just changed with the roster.
+            chooser.refreshIdentity(layout(chooser.window.scale, chooser.hint_lines));
         }
         return;
     }
@@ -1827,6 +1864,15 @@ fn refreshSessions(self: *MachineChooser) void {
     self.applyActionComposition(l);
 }
 
+/// Repaint the identity block in the band (T602): the selection moved, or the
+/// roster count in its subtitle changed. Its own invalidation rather than a
+/// rider on `refreshSessions`, which runs on every hover move — repainting the
+/// band that often would flicker the identity for nothing.
+fn refreshIdentity(self: *MachineChooser, l: Layout) void {
+    var band = rect(l.account.band);
+    _ = w32.InvalidateRect(self.hwnd, &band, 1);
+}
+
 /// The highlighted row, or null when the list is empty.
 fn selectedRow(self: *const MachineChooser) ?Row {
     const sel: i32 = @intCast(w32.SendMessageW(self.list, w32.LB_GETCURSEL, 0, 0));
@@ -1841,6 +1887,9 @@ fn refreshDetail(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
     var r = rect(l.detail);
     _ = w32.InvalidateRect(self.hwnd, &r, 1);
+    // The selected machine's identity lives in the band now (T602), so a
+    // selection change repaints it too.
+    self.refreshIdentity(l);
     // The roster follows the selection (T319). Before the repaint below, so a
     // move to another machine blanks the region in the SAME frame the header
     // changes — a stale roster under a new machine name is the defect.
@@ -2792,14 +2841,29 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
 fn sessionView(
     self: *MachineChooser,
     rows: []SessionRoster.VisibleRow,
-) ?struct { region: chooser_layout.Rect, rows: []const SessionRoster.VisibleRow } {
+) ?struct {
+    region: chooser_layout.Rect,
+    header: chooser_layout.Rect,
+    rows: []const SessionRoster.VisibleRow,
+} {
     // The ROSTER's target decides, not the selected row: the two agree, but a
     // second reading of "does this row have a roster" is a second place for
     // them to stop agreeing. A remote machine's rows are hit-tested, hovered
     // and killed exactly like the local agent's (T319).
     if (self.roster.target == .none) return null;
     const l = layout(self.window.scale, self.hint_lines);
-    return .{ .region = l.sessions, .rows = self.roster.visible(self.window.app, rows) };
+    const visible = self.roster.visible(self.window.app, rows);
+    // The newest pushed CPU reading per row, filled BEFORE the sort (T462,
+    // T602): the displayed order may depend on it, and the paint, the hit
+    // tests and the keyboard cursor must all see ONE list — Mac's
+    // `displayedSessions`, in the one place that builds it.
+    for (rows[0..visible.len]) |*r| r.cpu = self.cpu.get(r.session.id);
+    self.roster.sortRows(rows[0..visible.len]);
+    return .{
+        .region = l.sessions,
+        .header = l.session_header,
+        .rows = rows[0..visible.len],
+    };
 }
 
 /// Hold the roster's scroll offset inside the content it now has (T333). A
@@ -2832,6 +2896,12 @@ fn setKillHover(self: *MachineChooser, index: i32) void {
 fn onSessionClick(self: *MachineChooser, x: i32, y: i32) bool {
     var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const view = self.sessionView(&buf) orelse return false;
+    // The column headers first (T602): click to sort, click the active one to
+    // flip.
+    if (self.roster.headerKeyAt(view.rows, view.header, self.window.scale, x, y)) |key| {
+        self.setSortOrder(chooser_session_sort.toggled(self.roster.sort, key));
+        return true;
+    }
     if (self.roster.killAt(view.rows, view.region, self.window.scale, x, y)) |idx| {
         self.confirmKill(view.rows[idx]);
         return true;
@@ -2840,12 +2910,36 @@ fn onSessionClick(self: *MachineChooser, x: i32, y: i32) bool {
         return false;
     // Point the keyboard cursor at the clicked card (Mac's `onTapGesture`), so
     // a click followed by Return resumes the row the user just touched.
-    const next: i32 = @intCast(idx);
-    if (self.roster.cursor != next) {
-        self.roster.cursor = next;
+    const id = view.rows[idx].session.id;
+    const already = if (self.roster.cursorId()) |cur| std.mem.eql(u8, cur, id) else false;
+    if (!already) {
+        self.roster.setCursor(id);
         self.refreshSessions();
     }
     return true;
+}
+
+/// Apply a new sort order (T602): persist it — a preference, like the viewer's
+/// own chrome preferences — and say it out loud with the first displayed row,
+/// which is the acceptance oracle for an owner-drawn list's order.
+fn setSortOrder(self: *MachineChooser, next: chooser_session_sort.Order) void {
+    const cur = self.roster.sort;
+    if (cur.key == next.key and cur.ascending == next.ascending) return;
+    self.roster.sort = next;
+    chooser_session_sort.save(self.roster.alloc, next);
+
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const first: []const u8 = blk: {
+        const view = self.sessionView(&buf) orelse break :blk "-";
+        if (view.rows.len == 0) break :blk "-";
+        break :blk view.rows[0].session.id;
+    };
+    log.info("chooser roster: sort key={s} dir={s} first={s}", .{
+        @tagName(next.key),
+        if (next.ascending) "asc" else "desc",
+        first,
+    });
+    self.refreshSessions();
 }
 
 /// A double click in the roster: resume that session. Returns true when
@@ -2854,6 +2948,12 @@ fn onSessionClick(self: *MachineChooser, x: i32, y: i32) bool {
 fn onSessionDoubleClick(self: *MachineChooser, x: i32, y: i32) bool {
     var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const view = self.sessionView(&buf) orelse return false;
+    // A fast second click on a column header is another toggle, not a resume —
+    // without this, every second click on a header would be swallowed.
+    if (self.roster.headerKeyAt(view.rows, view.header, self.window.scale, x, y)) |key| {
+        self.setSortOrder(chooser_session_sort.toggled(self.roster.sort, key));
+        return true;
+    }
     // A double click that landed on Kill is still a Kill (its confirmation runs
     // a nested pump, and the second click already opened it).
     if (self.roster.killAt(view.rows, view.region, self.window.scale, x, y) != null) return true;
@@ -2882,23 +2982,20 @@ fn horizontalIsNavigation(self: *const MachineChooser) bool {
 fn enterSessions(self: *MachineChooser) void {
     var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const view = self.sessionView(&buf) orelse return;
-    self.roster.cursor = chooser_sessions.enterCursor(self.roster.cursor, view.rows.len);
+    self.roster.enterCursor(view.rows);
     _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
 }
 
 /// Up/Down inside the roster. Repaints once for the move and the scroll
-/// together — they are one visual change.
+/// together — they are one visual change. The cursor is an ID anchor (T602),
+/// so the step happens in DISPLAYED order and survives a re-sort.
 fn moveSessionCursor(self: *MachineChooser, delta: i32) void {
     var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
     const view = self.sessionView(&buf) orelse {
-        self.roster.cursor = chooser_sessions.no_cursor;
+        self.roster.clearCursor();
         return;
     };
-    self.roster.cursor = chooser_sessions.moveCursor(
-        self.roster.cursor,
-        delta,
-        view.rows.len,
-    );
+    self.roster.moveCursor(view.rows, delta);
     _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
     self.refreshSessions();
 }
@@ -3331,7 +3428,7 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 self.openActivityMonitor();
             } else if (focus == @as(?w32.HWND, self.restore_all_btn)) {
                 self.restoreAll();
-            } else if (self.roster.cursor != chooser_sessions.no_cursor and self.resumeCursor()) {
+            } else if (self.roster.hasCursor() and self.resumeCursor()) {
                 // The session sub-cursor is in the roster: Return resumes THAT
                 // row, not the machine's primary action (Mac's `submit`,
                 // `MachineChooserView.swift:1373-1381`).
@@ -3346,20 +3443,19 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
         // keys, and taking those would make the filter uneditable.
         w32.VK_RIGHT, w32.VK_LEFT => {
             if (!self.horizontalIsNavigation()) return false;
-            const before = self.roster.cursor;
             if (vk == w32.VK_RIGHT) {
                 self.enterSessions();
             } else {
-                self.roster.cursor = chooser_sessions.no_cursor;
+                self.roster.clearCursor();
             }
-            if (self.roster.cursor != before) self.refreshSessions();
+            self.refreshSessions();
             return true;
         },
         w32.VK_UP, w32.VK_DOWN => {
             // With the cursor inside the roster, Up/Down walk the sessions;
             // stepping above the first row hands navigation back to the
             // machine list (Mac's `move`, `:1309-1322`).
-            if (self.roster.cursor != chooser_sessions.no_cursor) {
+            if (self.roster.hasCursor()) {
                 self.moveSessionCursor(if (vk == w32.VK_UP) -1 else 1);
                 return true;
             }

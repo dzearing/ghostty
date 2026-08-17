@@ -339,6 +339,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_sessions.zig");
 
+    // Pure win32 machine-chooser session-list sort order — the comparator, the
+    // id-anchored keyboard cursor and the persisted preference (T602), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/chooser_session_sort.zig");
+
     // Pure win32 long-unattached ("forgotten") session notification policy —
     // eligibility, per-episode suppression, the balloon copy (T534), same
     // no-OS-imports deal.

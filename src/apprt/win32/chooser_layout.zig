@@ -48,6 +48,16 @@ pub const Layout = struct {
     /// button — so the pieces come from `accountRow`, never from fixed slots.
     /// A full-width rule closes the band at `header_divider_y`.
     account: AccountBand,
+    /// The selected machine's identity — glyph, name, session-count subtitle —
+    /// flush LEFT in the band (T602, Mac's `headerIdentity`). It used to open
+    /// the detail column, where it cost ~50 DIP of the one thing that column is
+    /// short of: roster rows. The title and subtitle rects run to the band's
+    /// trailing edge here; the PAINT clamps them against `AccountRow
+    /// .identity_right`, because where the trailing composition begins depends
+    /// on measured text this module never sees.
+    identity_glyph: Rect,
+    identity_title: Rect,
+    identity_subtitle: Rect,
     header_divider_y: i32,
 
     /// The master column — a faint wash behind the filter, the row list and
@@ -62,11 +72,9 @@ pub const Layout = struct {
     /// come out of the list's height, never out of the window's.
     hint: Rect,
 
-    /// The detail pane and the pieces of its header.
+    /// The detail pane. Since T602 it BEGINS at its action row — the identity
+    /// that used to head it lives in the band above.
     detail: Rect,
-    detail_glyph: Rect,
-    detail_title: Rect,
-    detail_subtitle: Rect,
 
     /// The band the detail pane's action row is packed into, from the header's
     /// leading edge to the pane's trailing margin. The buttons themselves come
@@ -75,6 +83,13 @@ pub const Layout = struct {
     action_row: Rect,
     /// Gap between two action buttons (Mac's `HStack(spacing: 8)`, 456).
     action_gap: i32,
+    /// The session list's column-header line (T602): one caption line box
+    /// between the action row and the roster, where the clickable CPU / Name
+    /// headers sit. OUTSIDE the scrolled region, so the headers stay put while
+    /// the rows move under them. Drawn only when there are rows — headers over
+    /// "No active sessions" are furniture — but the space is always reserved,
+    /// so toggling them cannot reflow the roster.
+    session_header: Rect,
     /// Everything below the action row: the selected machine's session roster
     /// (T318), Mac's `detailSessions` scroll region
     /// (`MachineChooserView.swift:544-570`). It takes ALL the remaining height
@@ -177,14 +192,51 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
     // The band is as tall as the tallest thing that can go in it (design system
     // §2.3: size the container to the control). Signed in that is the two-line
     // email/link stack, not the 28 control height — a band pinned to `control_h`
-    // is exactly what forced the row to be one static and one button.
+    // is exactly what forced the row to be one static and one button. Since
+    // T602 the selected machine's identity stack is in the band too, and it is
+    // the tallest thing there.
     const avatar_d = px(32, scale);
     const email_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
     const link_h = type_ramp.lineBox(type_ramp.body(scale), scale);
     const stack_gap = px(2, scale);
-    const account_h = @max(@max(avatar_d, email_h + stack_gap + link_h), control_h);
+    // The identity's line boxes, from the ramp: the machine name is the
+    // subtitle role (the pane's subject, wherever it is drawn), the
+    // session-count line its caption.
+    const title_h = type_ramp.lineBox(type_ramp.subtitle(scale), scale);
+    const subtitle_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
+    const identity_stack_h = title_h + stack_gap + subtitle_h;
+    const account_h = @max(
+        @max(@max(avatar_d, email_h + stack_gap + link_h), identity_stack_h),
+        control_h,
+    );
     const account_top = gap;
     const header_divider_y = account_top + account_h + gap;
+
+    // The identity block (T602): the machine's mark at the band's leading
+    // edge — square at the system's LARGE icon size (`SM_CXICON`, 32), the way
+    // the row's is its small one — then the name over the session count, both
+    // centered on the band. The text rects run to the band's trailing edge;
+    // the paint clamps them against where the account composition begins.
+    const identity_glyph: Rect = .{
+        .left = margin,
+        .top = account_top + @divTrunc(account_h - avatar_d, 2),
+        .right = margin + avatar_d,
+        .bottom = account_top + @divTrunc(account_h - avatar_d, 2) + avatar_d,
+    };
+    const id_text_left = identity_glyph.right + px(12, scale);
+    const id_stack_top = account_top + @divTrunc(account_h - identity_stack_h, 2);
+    const identity_title: Rect = .{
+        .left = id_text_left,
+        .top = id_stack_top,
+        .right = client_w - margin,
+        .bottom = id_stack_top + title_h,
+    };
+    const identity_subtitle: Rect = .{
+        .left = id_text_left,
+        .top = identity_title.bottom + stack_gap,
+        .right = client_w - margin,
+        .bottom = identity_title.bottom + stack_gap + subtitle_h,
+    };
 
     // Footer — Cancel alone, 16 all round (737-742).
     const btn_w = px(96, scale);
@@ -247,38 +299,21 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
         .bottom = body_bottom,
     };
 
-    // Detail header — 16 padding, a 30-wide glyph column, 12 to the text, and
-    // 14 between the identity block and the action row (440-454).
-    // The pane's mark is the system's LARGE icon size (`SM_CXICON`, 32), the
-    // way the row's is its small one (`SM_CXSMICON`, 16) — one rule for both
-    // instead of Mac's 30 and our own 20.
-    const glyph_w = px(32, scale);
-    // Line boxes from the ramp plus `sm` of leading, like the row's.
-    const title_h = type_ramp.lineBox(type_ramp.subtitle(scale), scale);
-    const subtitle_h = type_ramp.lineBox(type_ramp.caption(scale), scale);
-    const detail_glyph: Rect = .{
+    // The detail pane begins at its action row (T602): the identity that used
+    // to head it lives in the band, and the reclaimed height lands on roster
+    // rows. Vertical padding is 12, not the 16 the identity block carried —
+    // the point of moving it out was the space, and padding is the obvious way
+    // to lose it again on the way down (Mac's own note on `detailActionBar`).
+    const action_top = detail.top + px(12, scale);
+
+    // The session list's column-header line (T602): one caption line box under
+    // the action row, then the roster after a hair of separation.
+    const session_header: Rect = .{
         .left = detail.left + margin,
-        .top = detail.top + margin,
-        .right = detail.left + margin + glyph_w,
-        .bottom = detail.top + margin + glyph_w,
+        .top = action_top + btn_h + px(12, scale),
+        .right = detail.right - margin,
+        .bottom = action_top + btn_h + px(12, scale) + subtitle_h,
     };
-    const text_left = detail_glyph.right + px(12, scale);
-    const text_right = detail.right - margin;
-    const detail_title: Rect = .{
-        .left = text_left,
-        .top = detail.top + margin,
-        .right = text_right,
-        .bottom = detail.top + margin + title_h,
-    };
-    const detail_subtitle: Rect = .{
-        .left = text_left,
-        .top = detail_title.bottom + px(2, scale),
-        .right = text_right,
-        .bottom = detail_title.bottom + px(2, scale) + subtitle_h,
-    };
-    const identity_bottom = @max(detail_glyph.bottom, detail_subtitle.bottom);
-    // Mac's 14 between the identity block and the actions -> `lg` (§3.2).
-    const action_top = identity_bottom + px(12, scale);
 
     return .{
         .client_w = client_w,
@@ -298,6 +333,9 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
             .email_max_w = px(240, scale),
             .check_glyph_w = px(24, scale),
         },
+        .identity_glyph = identity_glyph,
+        .identity_title = identity_title,
+        .identity_subtitle = identity_subtitle,
         .header_divider_y = header_divider_y,
         .master = master,
         .master_divider_x = master.right,
@@ -305,21 +343,18 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
         .list = list,
         .hint = hint,
         .detail = detail,
-        .detail_glyph = detail_glyph,
-        .detail_title = detail_title,
-        .detail_subtitle = detail_subtitle,
         .action_row = .{
             .left = detail.left + margin,
             .top = action_top,
             .right = detail.right - margin,
             .bottom = action_top + btn_h,
         },
-        // `lg` under the action row (§3.2's mapping of Mac's 14), then the
-        // pane's own bottom margin — the same 16 the header pays, so the
-        // roster sits in a symmetric well rather than against an edge.
+        .session_header = session_header,
+        // `xs` under the header line, then the pane's 16 bottom margin, so the
+        // roster sits in a well rather than against an edge.
         .sessions = .{
             .left = detail.left + margin,
-            .top = action_top + btn_h + px(12, scale),
+            .top = session_header.bottom + px(4, scale),
             .right = detail.right - margin,
             .bottom = detail.bottom - margin,
         },
@@ -381,6 +416,11 @@ pub const AccountText = struct {
     link: i32 = 0,
     /// The bordered control's caption, in the BODY role.
     button: i32 = 0,
+    /// The signed-out / busy / unconfigured state sentence, in the BODY role
+    /// (T602). Measured because the sentence's STATIC control now shares the
+    /// band with the painted identity: a control sized "whatever is left"
+    /// would erase the identity under its background.
+    status: i32 = 0,
     /// The "Share this machine" checkbox caption, in the BODY role (T547).
     /// 0 means the toggle is absent (no agent state dir to persist into) and
     /// the row packs exactly as it did before the toggle existed.
@@ -393,7 +433,8 @@ pub const AccountText = struct {
 pub const AccountRow = struct {
     /// The status text: the email when signed in (top of the stack), the state
     /// sentence otherwise. Right-aligned in both, so it always ends where the
-    /// trailing element begins.
+    /// trailing element begins — and sized to its MEASURED caption since T602,
+    /// because the band's leading side now belongs to the painted identity.
     text: Rect,
     /// The monogram circle — signed in only.
     avatar: ?Rect = null,
@@ -403,43 +444,50 @@ pub const AccountRow = struct {
     /// measured caption. Finding 6: the two states used to share one 150 DIP
     /// slot, so both were as wide as "Sign in with Google…".
     button: ?Rect = null,
-    /// The "Share this machine" checkbox (T547) — the band's LEADING edge in
-    /// every state, because sharing is a property of the MACHINE, not of the
-    /// signed-in account the trailing composition describes. Null when the
+    /// The "Share this machine" checkbox (T547). It held the band's LEADING
+    /// edge while that edge was empty space; since T602 the identity lives
+    /// there (Mac's `headerIdentity` claims the same spot), so the toggle
+    /// packs at the head of the TRAILING composition instead. Null when the
     /// toggle is absent (`AccountText.share == 0`).
     share: ?Rect = null,
+    /// The furthest x the identity's text may run to (T602): one gap short of
+    /// the leftmost trailing element. The identity rects in `Layout` run to
+    /// the band's trailing edge because this module never sees measured text;
+    /// the paint clamps them here.
+    identity_right: i32,
 };
 
 /// Pack the account row for `state`. Pure — unit-tested.
 ///
 /// Signed in, Mac's composition is a right-aligned email over a link with the
 /// avatar to their right (2.4); signed out it is one bordered button at the
-/// trailing edge. Everything stays inside the band: a caption wide enough to
-/// overflow is clamped to the band's leading edge and the control truncates it,
-/// which is what the email's own 240 cap already assumes.
+/// trailing edge, its state sentence beside it. The share toggle heads the
+/// trailing run in every state. Everything stays inside the band: a caption
+/// wide enough to overflow is clamped and the control truncates it, which is
+/// what the email's own 240 cap already assumes.
 pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow {
     const a = l.account;
     const band = a.band;
 
-    // The share toggle (T547) takes the band's LEADING edge in every state —
-    // it describes the machine, and sharing works whether or not anyone is
-    // signed in here (enrollment signs in on the relay's own page). The
-    // trailing composition then packs into what remains; `content_left` is
-    // where its room now begins.
     const share_w = if (text.share > 0)
         @min(band.width(), text.share + a.check_glyph_w)
     else
         0;
-    const share: ?Rect = if (share_w > 0) blk: {
-        const share_top = band.top + @divTrunc(band.height() - l.control_h, 2);
-        break :blk .{
-            .left = band.left,
-            .top = share_top,
-            .right = band.left + share_w,
-            .bottom = share_top + l.control_h,
-        };
-    } else null;
-    const content_left = if (share) |s| s.right + a.gap else band.left;
+    const share_top = band.top + @divTrunc(band.height() - l.control_h, 2);
+
+    // Place the share toggle one gap left of `edge`, clamped to the band.
+    const shareAt = struct {
+        fn f(band_: Rect, top: i32, h: i32, w: i32, gap_: i32, edge: i32) ?Rect {
+            if (w <= 0) return null;
+            const right = edge - gap_;
+            return .{
+                .left = @max(band_.left, right - w),
+                .top = top,
+                .right = @max(band_.left, right),
+                .bottom = top + h,
+            };
+        }
+    }.f;
 
     switch (state) {
         .signed_in => {
@@ -452,7 +500,8 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
             };
 
             const stack_right = avatar.left - a.gap;
-            const room = @max(0, stack_right - content_left);
+            const reserved = if (share_w > 0) share_w + a.gap else 0;
+            const room = @max(0, stack_right - band.left - reserved);
             const stack_h = a.email_h + a.stack_gap + a.link_h;
             const stack_top = band.top + @divTrunc(band.height() - stack_h, 2);
 
@@ -472,10 +521,20 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
                 .bottom = email.bottom + a.stack_gap + a.link_h,
             };
 
-            return .{ .text = email, .avatar = avatar, .link = link, .share = share };
+            const stack_left = @min(email.left, link.left);
+            const share = shareAt(band, share_top, l.control_h, share_w, a.gap, stack_left);
+            const leading = if (share) |s| s.left else stack_left;
+            return .{
+                .text = email,
+                .avatar = avatar,
+                .link = link,
+                .share = share,
+                .identity_right = @max(band.left, leading - a.gap),
+            };
         },
         .signed_out, .busy => {
-            const btn_room = @max(0, band.right - content_left);
+            const reserved = if (share_w > 0) share_w + a.gap else 0;
+            const btn_room = @max(0, band.width() - reserved);
             const btn_w = @min(
                 btn_room,
                 @max(l.action_min_btn_w, @max(text.button, 0) + 2 * l.action_btn_pad),
@@ -489,32 +548,54 @@ pub fn accountRow(l: Layout, state: AccountState, text: AccountText) AccountRow 
             };
 
             // The sentence is one body line box, centered on the band the way
-            // the button is — two things on one row share a center line.
+            // the button is — two things on one row share a center line — and
+            // sized to its measured caption, right-aligned against the button.
+            const status_right = @max(band.left, button.left - a.gap);
+            const status_room = @max(0, status_right - band.left - reserved);
+            const status_w = @min(@max(text.status, 0), status_room);
             const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
             const status: Rect = .{
-                .left = content_left,
+                .left = status_right - status_w,
                 .top = status_top,
-                .right = @max(content_left, button.left - a.gap),
+                .right = status_right,
                 .bottom = status_top + a.link_h,
             };
-            return .{ .text = status, .button = button, .share = share };
+            const share = shareAt(band, share_top, l.control_h, share_w, a.gap, status.left);
+            const leading = if (share) |s| s.left else status.left;
+            return .{
+                .text = status,
+                .button = button,
+                .share = share,
+                .identity_right = @max(band.left, leading - a.gap),
+            };
         },
         .unconfigured => {
             // No sign-in control at all: this build cannot sign in, so there
             // is nothing for a button to do — and chrome that controls nothing
             // does not appear (design system §"Vertical space belongs to the
             // terminal", and Mac's own answer at
-            // MachineChooserView.swift:1150-1155). The sentence gets the rest
-            // of the band, still right-aligned, so the row reads as the same
-            // block with its control removed. The share toggle STAYS: sharing
-            // enrolls on the relay's web page and needs no local client id.
+            // MachineChooserView.swift:1150-1155). The sentence keeps its
+            // right alignment against the band's trailing edge, so the row
+            // reads as the same block with its control removed. The share
+            // toggle STAYS: sharing enrolls on the relay's web page and needs
+            // no local client id.
+            const reserved = if (share_w > 0) share_w + a.gap else 0;
+            const status_room = @max(0, band.width() - reserved);
+            const status_w = @min(@max(text.status, 0), status_room);
             const status_top = band.top + @divTrunc(band.height() - a.link_h, 2);
-            return .{ .share = share, .text = .{
-                .left = content_left,
+            const status: Rect = .{
+                .left = band.right - status_w,
                 .top = status_top,
                 .right = band.right,
                 .bottom = status_top + a.link_h,
-            } };
+            };
+            const share = shareAt(band, share_top, l.control_h, share_w, a.gap, status.left);
+            const leading = if (share) |s| s.left else status.left;
+            return .{
+                .share = share,
+                .text = status,
+                .identity_right = @max(band.left, leading - a.gap),
+            };
         },
     }
 }
@@ -775,25 +856,73 @@ test "layout: the management menu button sits beside the primary action" {
     try testing.expect(menu.bottom < l.footer_divider_y);
 }
 
-test "layout: detail header runs glyph -> title -> subtitle -> primary action" {
+test "layout: the identity lives in the band — glyph -> title -> subtitle (T602)" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const l = layout(scale, 1);
+        const band = l.account.band;
+        // Flush left, nested in the band, square at the avatar's size — the
+        // two identity marks on the surface are one size, not two nearby ones.
+        try testing.expectEqual(band.left, l.identity_glyph.left);
+        try testing.expectEqual(l.identity_glyph.width(), l.identity_glyph.height());
+        try testing.expectEqual(l.account.avatar_d, l.identity_glyph.width());
+        // Name over the session count, stacked in order at the band's gap.
+        try testing.expect(l.identity_title.left > l.identity_glyph.right);
+        try testing.expectEqual(l.identity_title.left, l.identity_subtitle.left);
+        try testing.expectEqual(
+            l.account.stack_gap,
+            l.identity_subtitle.top - l.identity_title.bottom,
+        );
+        // Everything nests inside the band.
+        for ([_]Rect{ l.identity_glyph, l.identity_title, l.identity_subtitle }) |r| {
+            try testing.expect(r.top >= band.top);
+            try testing.expect(r.bottom <= band.bottom);
+            try testing.expect(r.left >= band.left);
+            try testing.expect(r.right <= band.right);
+        }
+        // Line boxes from the ramp, like every other line box here.
+        try testing.expectEqual(
+            type_ramp.lineBox(type_ramp.subtitle(scale), scale),
+            l.identity_title.height(),
+        );
+        try testing.expectEqual(
+            type_ramp.lineBox(type_ramp.caption(scale), scale),
+            l.identity_subtitle.height(),
+        );
+    }
+}
+
+test "layout: the detail pane begins at its action row (T602)" {
+    // The identity moved out of the pane so the roster gets the height; the
+    // action row's vertical padding is 12, not the 16 the identity block
+    // carried (Mac's own note on `detailActionBar`).
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const l = layout(scale, 1);
+        const pad: i32 = @intFromFloat(@round(12.0 * scale));
+        try testing.expectEqual(l.detail.top + pad, l.action_row.top);
+    }
+    // Everything in the pane still nests.
     const l = layout(1.0, 1);
     const row = actionRow(l, .{ .activity = true, .menu = true }, .{ .primary = 70, .activity = 48 });
-    try testing.expect(l.detail_glyph.left >= l.detail.left);
-    try testing.expect(l.detail_title.left > l.detail_glyph.right);
-    try testing.expectEqual(l.detail_title.left, l.detail_subtitle.left);
-    try testing.expect(l.detail_subtitle.top >= l.detail_title.bottom);
-    try testing.expect(l.action_row.top >= l.detail_subtitle.bottom);
-    try testing.expect(l.action_row.top >= l.detail_glyph.bottom);
-    // Everything nests inside the pane.
-    var rects: [max_actions + 3]Rect = undefined;
-    rects[0] = l.detail_glyph;
-    rects[1] = l.detail_title;
-    rects[2] = l.detail_subtitle;
-    for (row.rects[0..row.len], 0..) |r, i| rects[3 + i] = r;
-    for (rects[0 .. 3 + row.len]) |r| {
+    for (row.rects[0..row.len]) |r| {
         try testing.expect(r.left >= l.detail.left);
         try testing.expect(r.right <= l.detail.right);
         try testing.expect(r.bottom <= l.detail.bottom);
+    }
+}
+
+test "layout: the session-list header sits between the actions and the rows (T602)" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const l = layout(scale, 1);
+        // One caption line box, outside the scrolled region, sharing the
+        // roster's own edges so the header's columns can ride the row grid.
+        try testing.expect(l.session_header.top > l.action_row.bottom);
+        try testing.expect(l.session_header.bottom <= l.sessions.top);
+        try testing.expectEqual(l.sessions.left, l.session_header.left);
+        try testing.expectEqual(l.sessions.right, l.session_header.right);
+        try testing.expectEqual(
+            type_ramp.lineBox(type_ramp.caption(scale), scale),
+            l.session_header.height(),
+        );
     }
 }
 
@@ -805,14 +934,10 @@ test "layout: the session roster takes the detail pane below the action row (T31
         try testing.expect(l.sessions.left >= l.detail.left);
         try testing.expect(l.sessions.right <= l.detail.right);
         try testing.expect(l.sessions.bottom <= l.detail.bottom);
-        // The header and the roster share one margin, so the pane reads as a
+        // The actions and the roster share one margin, so the pane reads as a
         // well rather than as two differently-inset blocks.
-        try testing.expectEqual(l.detail_glyph.left, l.sessions.left);
+        try testing.expectEqual(l.action_row.left, l.sessions.left);
         try testing.expectEqual(l.action_row.right, l.sessions.right);
-        try testing.expectEqual(
-            l.detail_glyph.top - l.detail.top,
-            l.detail.bottom - l.sessions.bottom,
-        );
         // It is the tallest thing in the pane: a roster is a list of unknown
         // length, so it gets whatever is left rather than a fixed slot.
         try testing.expect(l.sessions.height() > l.action_row.height() * 3);
@@ -977,24 +1102,26 @@ test "accountRow: an unconfigured build offers no button at all (T747)" {
     // feature as broken.
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const l = layout(scale, 1);
-        const row = accountRow(l, .unconfigured, .{});
+        const row = accountRow(l, .unconfigured, .{ .status = 180 });
         try testing.expect(row.button == null);
         try testing.expect(row.avatar == null);
         try testing.expect(row.link == null);
 
-        // The sentence takes the space the control gave up — the whole band,
-        // no wider, and on the band's center line like every other state's.
+        // The sentence keeps the trailing edge the control gave up, sized to
+        // its measured caption (T602: the band's leading side belongs to the
+        // painted identity now), on the band's center line like every state's.
         const band = l.account.band;
-        try testing.expectEqual(band.left, row.text.left);
         try testing.expectEqual(band.right, row.text.right);
+        try testing.expectEqual(@as(i32, 180), row.text.width());
         try testing.expect(row.text.top >= band.top);
         try testing.expect(row.text.bottom <= band.bottom);
         try testing.expectEqual(l.account.link_h, row.text.height());
 
-        // And it is strictly more room than the signed-out sentence gets, which
-        // is the point: the message that replaces a control has to fit.
-        const out = accountRow(l, .signed_out, .{ .button = 120 });
-        try testing.expect(row.text.width() > out.text.width());
+        // And it is strictly more room than the signed-out sentence may take —
+        // the message that replaces a control has the control's room too.
+        const out = accountRow(l, .signed_out, .{ .button = 120, .status = 5000 });
+        const un = accountRow(l, .unconfigured, .{ .status = 5000 });
+        try testing.expect(un.text.width() > out.text.width());
     }
 
     // Only the signed-OUT case turns into it. A stored account (an env-supplied
@@ -1076,58 +1203,84 @@ test "accountRow: signed-out sentence and button share a center line (T311)" {
     }
 }
 
-test "accountRow: the share toggle leads the band in every state (T547)" {
+test "accountRow: the share toggle heads the trailing run in every state (T547/T602)" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
         const l = layout(scale, 1);
         const band = l.account.band;
-        const text: AccountText = .{ .email = 140, .link = 50, .button = 120, .share = 110 };
+        const text: AccountText = .{ .email = 140, .link = 50, .button = 120, .status = 90, .share = 110 };
 
         inline for (.{ .signed_in, .signed_out, .busy, .unconfigured }) |state| {
             const row = accountRow(l, state, text);
             const share = row.share.?;
 
-            // Leading edge, inside the band, at the surface's one control
-            // height, sized to its caption plus the checkbox glyph allowance.
-            try testing.expectEqual(band.left, share.left);
+            // Inside the band, at the surface's one control height, sized to
+            // its caption plus the checkbox glyph allowance.
+            try testing.expect(share.left >= band.left);
+            try testing.expect(share.right <= band.right);
             try testing.expect(share.top >= band.top);
             try testing.expect(share.bottom <= band.bottom);
             try testing.expectEqual(l.control_h, share.height());
             try testing.expectEqual(110 + l.account.check_glyph_w, share.width());
 
-            // Nothing in the trailing composition reaches into the toggle.
+            // It heads the trailing run: everything else in the composition
+            // sits to its RIGHT — the band's leading side is the identity's.
             for ([_]?Rect{ row.text, row.link, row.button, row.avatar }) |maybe| {
                 const r = maybe orelse continue;
                 try testing.expect(r.left >= share.right);
             }
+            // And the identity's room ends one gap short of the toggle.
+            try testing.expectEqual(share.left - l.account.gap, row.identity_right);
         }
     }
 }
 
-test "accountRow: share == 0 is exactly the pre-toggle row (T547)" {
+test "accountRow: share == 0 is exactly the pre-toggle trailing run (T547)" {
     // A chooser with no agent state dir to persist into hides the toggle, and
-    // the row must pack as if T547 never happened.
+    // the trailing run must pack as if T547 never happened.
     const l = layout(1.0, 1);
     const band = l.account.band;
 
-    const out = accountRow(l, .signed_out, .{ .button = 120 });
+    const out = accountRow(l, .signed_out, .{ .button = 120, .status = 90 });
     try testing.expect(out.share == null);
-    try testing.expectEqual(band.left, out.text.left);
+    try testing.expectEqual(out.button.?.left - l.account.gap, out.text.right);
+    try testing.expectEqual(out.text.left - l.account.gap, out.identity_right);
 
-    const un = accountRow(l, .unconfigured, .{});
+    const un = accountRow(l, .unconfigured, .{ .status = 90 });
     try testing.expect(un.share == null);
-    try testing.expectEqual(band.left, un.text.left);
     try testing.expectEqual(band.right, un.text.right);
+    try testing.expectEqual(un.text.left - l.account.gap, un.identity_right);
 }
 
 test "accountRow: a huge share caption is clamped to the band (T547)" {
     const l = layout(1.0, 1);
     const band = l.account.band;
-    const row = accountRow(l, .signed_out, .{ .button = 120, .share = 5000 });
+    const row = accountRow(l, .signed_out, .{ .button = 120, .status = 60, .share = 5000 });
     const share = row.share.?;
+    try testing.expect(share.left >= band.left);
     try testing.expect(share.right <= band.right);
-    // The trailing composition still packs without escaping the band.
+    // The trailing composition still packs without escaping the band, and the
+    // identity's room never runs past the band's leading edge.
     try testing.expect(row.button.?.right <= band.right);
     try testing.expect(row.text.right >= row.text.left);
+    try testing.expect(row.identity_right >= band.left);
+}
+
+test "accountRow: identity_right stops short of every trailing element (T602)" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.5) }) |scale| {
+        const l = layout(scale, 1);
+        inline for (.{ .signed_in, .signed_out, .busy, .unconfigured }) |state| {
+            const row = accountRow(
+                l,
+                state,
+                .{ .email = 140, .link = 50, .button = 120, .status = 90 },
+            );
+            for ([_]?Rect{ row.text, row.link, row.button, row.avatar, row.share }) |maybe| {
+                const r = maybe orelse continue;
+                try testing.expect(row.identity_right <= r.left);
+            }
+            try testing.expect(row.identity_right >= l.account.band.left);
+        }
+    }
 }
 
 test "layout: every gap is on the 4 DIP spacing scale (T310)" {
@@ -1148,17 +1301,22 @@ test "layout: every gap is on the 4 DIP spacing scale (T310)" {
         .{ .name = "account stack -> monogram", .v = acct_in.avatar.?.left - acct_in.link.?.right },
         .{ .name = "client -> monogram (right)", .v = l.client_w - acct_in.avatar.?.right },
         .{ .name = "account email -> link", .v = acct_in.link.?.top - acct_in.text.bottom },
-        .{ .name = "band -> monogram (top)", .v = acct_in.avatar.?.top - l.account.band.top },
+        // The monogram's distance to the band's top is deliberately NOT here:
+        // it is a CENTERING remainder, (band_h - avatar_d) / 2, not a chosen
+        // gap — it happened to be 2 while the band was 36, and T602's taller
+        // band (the identity stack is its tallest tenant now) makes it 5. The
+        // choice being asserted is "centered", which the T311 nesting test
+        // already holds at every scale.
         .{ .name = "master -> filter (top)", .v = l.filter.top - l.master.top },
         .{ .name = "master -> filter (left)", .v = l.filter.left - l.master.left },
         .{ .name = "filter -> list", .v = l.list.top - l.filter.bottom },
         .{ .name = "master -> list (left)", .v = l.list.left - l.master.left },
         .{ .name = "hint -> master bottom", .v = l.master.bottom - l.hint.bottom },
-        .{ .name = "detail -> glyph (left)", .v = l.detail_glyph.left - l.detail.left },
-        .{ .name = "detail -> glyph (top)", .v = l.detail_glyph.top - l.detail.top },
-        .{ .name = "glyph -> title", .v = l.detail_title.left - l.detail_glyph.right },
-        .{ .name = "title -> subtitle", .v = l.detail_subtitle.top - l.detail_title.bottom },
-        .{ .name = "identity -> actions", .v = l.action_row.top - @max(l.detail_glyph.bottom, l.detail_subtitle.bottom) },
+        .{ .name = "identity glyph -> title", .v = l.identity_title.left - l.identity_glyph.right },
+        .{ .name = "identity title -> subtitle", .v = l.identity_subtitle.top - l.identity_title.bottom },
+        .{ .name = "detail -> actions (top)", .v = l.action_row.top - l.detail.top },
+        .{ .name = "actions -> session header", .v = l.session_header.top - l.action_row.bottom },
+        .{ .name = "session header -> roster", .v = l.sessions.top - l.session_header.bottom },
         .{ .name = "detail right margin", .v = l.detail.right - l.action_row.right },
         .{ .name = "action gap", .v = l.action_gap },
         .{ .name = "action button padding", .v = l.action_btn_pad },
@@ -1199,20 +1357,27 @@ test "layout: the account band is sized to its tallest content, not to a control
         const l = layout(scale, 1);
         const a = l.account;
         const stack_h = a.email_h + a.stack_gap + a.link_h;
+        const identity_h = l.identity_title.height() + a.stack_gap + l.identity_subtitle.height();
         try testing.expect(a.band.height() >= stack_h);
         try testing.expect(a.band.height() >= a.avatar_d);
         try testing.expect(a.band.height() >= l.control_h);
-        try testing.expectEqual(@max(@max(stack_h, a.avatar_d), l.control_h), a.band.height());
+        // The identity stack joined the band in T602 and is its tallest tenant.
+        try testing.expect(a.band.height() >= identity_h);
+        try testing.expectEqual(
+            @max(@max(@max(stack_h, a.avatar_d), identity_h), l.control_h),
+            a.band.height(),
+        );
         // Line boxes come from the ramp: caption for the email, body for the
         // link, so the row consumes T310's ramp rather than restating sizes.
         try testing.expectEqual(type_ramp.lineBox(type_ramp.caption(scale), scale), a.email_h);
         try testing.expectEqual(type_ramp.lineBox(type_ramp.body(scale), scale), a.link_h);
         try testing.expect(a.email_h < a.link_h);
     }
-    // The band grew from the 28 control height to the stack's own height; the
-    // dialog did NOT grow with it (it is Mac's fixed 840x540), so the body took
-    // the difference.
-    try testing.expectEqual(@as(i32, 36), layout(1.0, 1).account.band.height());
+    // The band grew again in T602 — the identity stack (24 + 2 + 16) is now
+    // its tallest tenant; the dialog did NOT grow with it (it is Mac's fixed
+    // 840x540), so the body took the difference — and got it back with
+    // interest when the identity left the detail pane.
+    try testing.expectEqual(@as(i32, 42), layout(1.0, 1).account.band.height());
     try testing.expectEqual(@as(i32, 840), layout(1.0, 1).client_w);
     try testing.expectEqual(@as(i32, 540), layout(1.0, 1).client_h);
 }
@@ -1230,8 +1395,8 @@ test "layout: the fonts come from the ramp, in role order (T310)" {
         // the two smallest texts on the surface are one size, not two.
         try testing.expectEqual(l.caption_font_h, chooser_rows.rowMetrics(scale).subtitle_font_h);
         // Every line box has room for the text it holds.
-        try testing.expect(l.detail_title.height() > l.title_font_h);
-        try testing.expect(l.detail_subtitle.height() > l.caption_font_h);
+        try testing.expect(l.identity_title.height() > l.title_font_h);
+        try testing.expect(l.identity_subtitle.height() > l.caption_font_h);
         try testing.expect(l.hint_line_h > l.caption_font_h);
     }
     // Body is 14, not the 15 nobody chose and not the system metric's 12.

@@ -30,6 +30,7 @@ const App = @import("App.zig");
 const Window = @import("Window.zig");
 const chooser_cpu = @import("chooser_cpu.zig");
 const chooser_layout = @import("chooser_layout.zig");
+const chooser_session_sort = @import("chooser_session_sort.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const icon_button = @import("icon_button.zig");
@@ -103,12 +104,17 @@ inflight: bool = false,
 scroll: i32 = 0,
 /// Index (into the VISIBLE rows) whose Kill button is under the pointer, or -1.
 hover_kill: i32 = -1,
-/// The keyboard sub-cursor (T320): an index into the VISIBLE rows, or
-/// `chooser_sessions.no_cursor` when the machine row itself is highlighted and
-/// the roster is not being navigated. Same index space as `hover_kill`,
-/// `killAt` and `paint` — every one of them takes the rows array `visible()`
-/// returned, so there is no second list for the two to disagree about.
-cursor: i32 = chooser_sessions.no_cursor,
+/// How the displayed rows are ordered (T602). Loaded from the persisted
+/// preference when the chooser opens; saved when a column header is clicked.
+sort: chooser_session_sort.Order = chooser_session_sort.initial,
+/// The keyboard sub-cursor (T320): the SESSION ID it is anchored to, empty
+/// when the machine row itself is highlighted and the roster is not being
+/// navigated. An ID rather than an index since T602, because the list
+/// re-sorts underneath it — a header click, or a live CPU tick while sorted
+/// by CPU — and an index would silently re-point at whatever slid into that
+/// slot. Resolved to an index against the DISPLAYED rows at every use.
+cursor_id: [max_id_len]u8 = undefined,
+cursor_id_len: usize = 0,
 
 /// Sessions the user just killed, hidden optimistically so the row vanishes at
 /// once instead of lingering — and degrading to a "pid" label — during the
@@ -244,7 +250,7 @@ fn clear(self: *SessionRoster) void {
     // The cursor belongs to the roster it was pointing at: a new machine's
     // rows are not the rows the user was walking (Mac clears `browseCursor`
     // on every highlight move, `MachineChooserView.swift:1328`).
-    self.cursor = chooser_sessions.no_cursor;
+    self.cursor_id_len = 0;
     self.killed_count = 0;
     // Bump the serial so a reply already in flight for the OLD machine is
     // dropped instead of adopted under the new machine's name.
@@ -639,6 +645,39 @@ pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const
     return out[0..n];
 }
 
+/// One sortable row: the row plus its resolved keys. The name slices may
+/// point into the per-row label buffers; sorting moves these structs, never
+/// the buffers, so the slices stay valid through the permutation.
+const SortEntry = struct {
+    row: VisibleRow,
+    keys: chooser_session_sort.Keys,
+};
+
+fn entryLess(order: chooser_session_sort.Order, a: SortEntry, b: SortEntry) bool {
+    return chooser_session_sort.less(order, a.keys, b.keys);
+}
+
+/// Sort `rows` in place for display (T602). The name key is the label the row
+/// actually SHOWS — the user sorts by what they can read — and the CPU key the
+/// whole percent its meter displays, both resolved ONCE per row here rather
+/// than O(n log n) times in the comparator. Call after the CPU readings are
+/// filled in: a CPU sort over unfilled rows would order every row as 0%.
+pub fn sortRows(self: *const SessionRoster, rows: []VisibleRow) void {
+    var bufs: [max_rows][32]u8 = undefined;
+    var keyed: [max_rows]SortEntry = undefined;
+    const n = @min(rows.len, max_rows);
+    for (rows[0..n], 0..) |r, i| keyed[i] = .{
+        .row = r,
+        .keys = .{
+            .name = chooser_sessions.label(&bufs[i], r.session, r.live_title, r.persisted_title),
+            .cpu = chooser_session_sort.displayedCpu(r.cpu),
+            .id = r.session.id,
+        },
+    };
+    std.sort.pdq(SortEntry, keyed[0..n], self.sort, entryLess);
+    for (keyed[0..n], 0..) |e, i| rows[i] = e.row;
+}
+
 /// How many of this machine's sessions are ALIVE — the datum "Restore All" is
 /// gated on (`chooser_sessions.restoreAllAvailable`, T335). Counted off the same
 /// set `visible` renders, so an optimistically-killed session is gone from both
@@ -745,6 +784,10 @@ pub fn persistedPaneIdFor(self: *const SessionRoster, id: []const u8) ?[]const u
 pub const PaintCtx = struct {
     hdc: w32.HDC,
     region: chooser_layout.Rect,
+    /// The column-header line above the region (T602), from
+    /// `Layout.session_header`. Drawn only when there are rows — headers over
+    /// "No active sessions" are furniture.
+    header: chooser_layout.Rect,
     scale: f32,
     bg: chooser_sessions.Rgb,
     /// The user's accent, already floored against `bg` by the caller — the same
@@ -803,6 +846,10 @@ pub fn paint(self: *const SessionRoster, ctx: PaintCtx, rows: []const VisibleRow
         return;
     }
 
+    // The clickable column headers (T602), OUTSIDE the clipped scroll region
+    // so they stay put while the rows move under them.
+    self.paintHeader(ctx);
+
     const m = chooser_sessions.metrics(ctx.scale);
     // Clip to the region so a card that runs past the bottom is cut, not drawn
     // over the footer.
@@ -816,6 +863,7 @@ pub fn paint(self: *const SessionRoster, ctx: PaintCtx, rows: []const VisibleRow
         ctx.region.bottom,
     );
 
+    const cursor = self.cursorId();
     var y = ctx.region.top - self.scroll;
     for (rows, 0..) |row, i| {
         const subs = chooser_sessions.sublineCount(row.session);
@@ -823,8 +871,137 @@ pub fn paint(self: *const SessionRoster, ctx: PaintCtx, rows: []const VisibleRow
         y = l.card.bottom + m.row_gap;
         // Fully above or below the region: nothing to draw.
         if (l.card.bottom <= ctx.region.top or l.card.top >= ctx.region.bottom) continue;
-        self.paintRow(ctx, m, l, row, @intCast(i));
+        const cursored = if (cursor) |id| std.mem.eql(u8, row.session.id, id) else false;
+        self.paintRow(ctx, m, l, row, @intCast(i), cursored);
     }
+}
+
+/// The column zones the header's labels sit over — the row's OWN column
+/// widths, lifted onto the header line, so the headers ride the strip the CPU
+/// meters were deliberately aligned into rather than introducing a second,
+/// competing grid. Shared by the paint and the click hit-test, so the label
+/// the user reads and the zone that answers the click cannot drift.
+pub const HeaderZones = struct {
+    /// Null when the machine's agent cannot serve the CPU stream — no meter
+    /// column, no CPU header, and nothing to sort that would not read 0%.
+    cpu: ?chooser_layout.Rect,
+    name: chooser_layout.Rect,
+};
+
+pub fn headerZones(
+    self: *const SessionRoster,
+    header: chooser_layout.Rect,
+    scale: f32,
+) HeaderZones {
+    const m = chooser_sessions.metrics(scale);
+    const l = chooser_sessions.rowLayout(m, header.left, header.top, header.width(), 0, self.cpu_column);
+    return .{
+        .cpu = if (self.cpu_column) .{
+            .left = l.cpu.left,
+            .top = header.top,
+            .right = l.cpu.right,
+            .bottom = header.bottom,
+        } else null,
+        .name = .{
+            .left = l.title.left,
+            .top = header.top,
+            .right = l.title.right,
+            .bottom = header.bottom,
+        },
+    };
+}
+
+/// The sortable column under a client point in the header line, or null. Only
+/// answers while there are rows on screen — the same condition the paint draws
+/// the headers under, so a click can never land on furniture.
+pub fn headerKeyAt(
+    self: *const SessionRoster,
+    rows: []const VisibleRow,
+    header: chooser_layout.Rect,
+    scale: f32,
+    x: i32,
+    y: i32,
+) ?chooser_session_sort.Key {
+    if (self.state != .loaded or rows.len == 0) return null;
+    if (y < header.top or y >= header.bottom) return null;
+    const zones = self.headerZones(header, scale);
+    if (zones.cpu) |z| {
+        if (z.left <= x and x < z.right) return .cpu;
+    }
+    if (zones.name.left <= x and x < zones.name.right) return .name;
+    return null;
+}
+
+/// The header line: CPU and Name over their columns, a chevron on the ACTIVE
+/// column naming its direction — drawn, not implied, so the sort is never
+/// signalled by row order alone (§2.4).
+fn paintHeader(self: *const SessionRoster, ctx: PaintCtx) void {
+    const hdc = ctx.hdc;
+    const zones = self.headerZones(ctx.header, ctx.scale);
+    const m = chooser_sessions.metrics(ctx.scale);
+
+    const old = if (ctx.caption_font) |f| w32.SelectObject(hdc, f) else null;
+    defer if (old) |o| {
+        _ = w32.SelectObject(hdc, o);
+    };
+
+    const entries = [_]struct { key: chooser_session_sort.Key, zone: ?chooser_layout.Rect }{
+        .{ .key = .cpu, .zone = zones.cpu },
+        .{ .key = .name, .zone = zones.name },
+    };
+    for (entries) |e| {
+        const zone = e.zone orelse continue;
+        const active = self.sort.key == e.key;
+        const ink = if (active)
+            chrome_theme.textOn(ctx.bg)
+        else
+            chrome_theme.textSecondaryOn(ctx.bg);
+        _ = w32.SetTextColor(hdc, rgb(ink));
+        const title = e.key.columnTitle();
+        var r = rect(zone);
+        drawText(hdc, title, &r);
+        if (!active) continue;
+
+        // The chevron marks the active column, tight after its measured label
+        // (a width from text metrics is measured, never re-derived).
+        const label_w = @min(measure(hdc, title), zone.width());
+        const cw = @divTrunc(m.dot_d * 3, 4);
+        const ch = @divTrunc(cw, 2);
+        const cx = @min(zone.left + label_w + m.badge_gap, zone.right - cw);
+        const cy = zone.top + @divTrunc(zone.height() - ch, 2);
+        drawChevron(hdc, cx, cy, cw, ch, self.sort.ascending, ink);
+    }
+}
+
+/// A filled triangle pointing up (ascending) or down — quads via `Polygon`,
+/// never `LineTo` pen strokes (§4.2).
+fn drawChevron(
+    hdc: w32.HDC,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    ascending: bool,
+    ink: chooser_sessions.Rgb,
+) void {
+    const brush = w32.CreateSolidBrush(rgb(ink)) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    const old_brush = w32.SelectObject(hdc, brush);
+    const old_pen = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_PEN));
+    // `Polygon` excludes the pen-less boundary, so the far edges are grown by
+    // one pixel to land the intended coverage.
+    var pts = if (ascending) [3]w32.POINT{
+        .{ .x = x, .y = y + h + 1 },
+        .{ .x = x + w + 1, .y = y + h + 1 },
+        .{ .x = x + @divTrunc(w, 2), .y = y },
+    } else [3]w32.POINT{
+        .{ .x = x, .y = y },
+        .{ .x = x + w + 1, .y = y },
+        .{ .x = x + @divTrunc(w, 2), .y = y + h + 1 },
+    };
+    _ = w32.Polygon(hdc, &pts, 3);
+    _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.SelectObject(hdc, old_brush);
 }
 
 fn paintRow(
@@ -834,10 +1011,10 @@ fn paintRow(
     l: chooser_sessions.RowLayout,
     row: VisibleRow,
     index: i32,
+    cursored: bool,
 ) void {
     const hdc = ctx.hdc;
     const hovered = self.hover_kill == index;
-    const cursored = self.cursor == index;
     // Everything on the card composites against the card's OWN surface, so a
     // cursored card's text and badges are floored against the accent wash they
     // actually sit on rather than against the plain card (the T206 rule).
@@ -1180,15 +1357,67 @@ pub fn rowAt(
     return null;
 }
 
-/// The keyboard cursor as an index INTO `rows`, or null when it points nowhere.
-/// Clamped HERE, at the point of use, rather than kept in sync with every
-/// change to the roster: a refetch or an optimistic Kill can shrink the list
-/// under a parked cursor, and the row that slid into its index is not the row
-/// the user was pointing at.
-pub fn cursorIndex(self: *SessionRoster, rows: []const VisibleRow) ?usize {
-    self.cursor = chooser_sessions.clampCursor(self.cursor, rows.len);
-    if (self.cursor == chooser_sessions.no_cursor) return null;
-    return @intCast(self.cursor);
+/// Whether the keyboard sub-cursor is IN the roster at all — the test the
+/// keyboard routing branches on (Return resumes the cursored row, Up/Down walk
+/// the sessions rather than the machine list).
+pub fn hasCursor(self: *const SessionRoster) bool {
+    return self.cursor_id_len > 0;
+}
+
+/// The anchored session id, or null.
+pub fn cursorId(self: *const SessionRoster) ?[]const u8 {
+    if (self.cursor_id_len == 0) return null;
+    return self.cursor_id[0..self.cursor_id_len];
+}
+
+/// Anchor the cursor to `id` (a click, or keyboard entry). An id too long for
+/// the buffer clears instead — better no highlight than a truncated anchor
+/// that can never match its row again.
+pub fn setCursor(self: *SessionRoster, id: []const u8) void {
+    if (id.len == 0 or id.len > max_id_len) {
+        self.cursor_id_len = 0;
+        return;
+    }
+    @memcpy(self.cursor_id[0..id.len], id);
+    self.cursor_id_len = id.len;
+}
+
+pub fn clearCursor(self: *SessionRoster) void {
+    self.cursor_id_len = 0;
+}
+
+/// The keyboard cursor as an index INTO `rows` (the DISPLAYED, sorted list),
+/// or null when it points nowhere — no anchor, or the anchored session is no
+/// longer in the roster (it exited, or was killed, while the cursor sat on
+/// it). Resolved HERE, at the point of use, rather than kept in sync with
+/// every change: the list re-sorts and shrinks underneath the anchor, and the
+/// id follows the row the user is looking at through both.
+pub fn cursorIndex(self: *const SessionRoster, rows: []const VisibleRow) ?usize {
+    const id = self.cursorId() orelse return null;
+    for (rows, 0..) |r, i| {
+        if (std.mem.eql(u8, r.session.id, id)) return i;
+    }
+    return null;
+}
+
+/// Right arrow: step the cursor INTO the displayed roster (Mac's
+/// `enterSessions`). A roster with nothing rendered has nowhere to step; an
+/// anchor that still resolves stays where it is rather than jumping home, and
+/// a stale one re-enters at the first row.
+pub fn enterCursor(self: *SessionRoster, rows: []const VisibleRow) void {
+    if (rows.len == 0) return;
+    if (self.cursorIndex(rows) != null) return;
+    self.setCursor(rows[0].session.id);
+}
+
+/// Up/Down inside the roster: re-anchor to the row `delta` steps away in the
+/// DISPLAYED order. Stepping above the first row — or from an anchor whose
+/// session is gone — hands navigation back to the machine list; past the last
+/// row clamps (a wrap would send the user to the top of a long roster they
+/// were walking down).
+pub fn moveCursor(self: *SessionRoster, rows: []const VisibleRow, delta: i32) void {
+    const next = chooser_session_sort.steppedCursor(self.cursorIndex(rows), delta, rows.len);
+    if (next) |i| self.setCursor(rows[i].session.id) else self.clearCursor();
 }
 
 /// Scroll the cursor's card fully into the region. Returns true when the offset
@@ -1301,7 +1530,7 @@ test "adopt keeps the offset a refetch was parked at (T333)" {
     roster.target = .local;
     roster.serial = 7;
     roster.scroll = 140;
-    roster.cursor = 4;
+    roster.setCursor("session-4");
 
     var res: Result = .{
         .alloc = alloc,
@@ -1316,7 +1545,7 @@ test "adopt keeps the offset a refetch was parked at (T333)" {
     // The whole point: the region does not jump back to the top under a parked
     // keyboard cursor just because the same machine was refetched.
     try testing.expectEqual(@as(i32, 140), roster.scroll);
-    try testing.expectEqual(@as(i32, 4), roster.cursor);
+    try testing.expectEqualStrings("session-4", roster.cursorId().?);
 }
 
 test "a stale reply changes nothing, offset included" {
@@ -1345,13 +1574,91 @@ test "a machine change still resets the offset" {
     var roster: SessionRoster = .init(alloc);
     defer roster.deinit();
     roster.scroll = 140;
-    roster.cursor = 4;
+    roster.setCursor("session-4");
     roster.hover_kill = 2;
 
     roster.clear();
     try testing.expectEqual(@as(i32, 0), roster.scroll);
-    try testing.expectEqual(chooser_sessions.no_cursor, roster.cursor);
+    try testing.expect(!roster.hasCursor());
     try testing.expectEqual(@as(i32, -1), roster.hover_kill);
+}
+
+test "sortRows: the displayed order follows the active column, ties by name then id" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+
+    var rows = [_]VisibleRow{
+        .{ .session = .{ .id = "3", .alive = true, .title = "zeta" }, .cpu = 2.4 },
+        .{ .session = .{ .id = "1", .alive = true, .title = "alpha" }, .cpu = 90.0 },
+        .{ .session = .{ .id = "2", .alive = true, .title = "Beta" }, .cpu = null },
+    };
+
+    // The initial order: Name, A→Z, case-insensitively — what the user READS.
+    roster.sort = chooser_session_sort.initial;
+    roster.sortRows(&rows);
+    try testing.expectEqualStrings("1", rows[0].session.id);
+    try testing.expectEqualStrings("2", rows[1].session.id);
+    try testing.expectEqualStrings("3", rows[2].session.id);
+
+    // CPU busiest-first; a blank meter sorts as 0.
+    roster.sort = .{ .key = .cpu, .ascending = false };
+    roster.sortRows(&rows);
+    try testing.expectEqualStrings("1", rows[0].session.id);
+    // 2.4 displays as 2%, beating the blank 0% — and the blank row is last.
+    try testing.expectEqualStrings("3", rows[1].session.id);
+    try testing.expectEqualStrings("2", rows[2].session.id);
+
+    // Rows whose meters DISPLAY the same number tie, and the tie falls to the
+    // name regardless of direction — sub-point jitter cannot reshuffle them.
+    var jitter = [_]VisibleRow{
+        .{ .session = .{ .id = "b", .alive = true, .title = "bravo" }, .cpu = 16.6 },
+        .{ .session = .{ .id = "a", .alive = true, .title = "alpha" }, .cpu = 17.4 },
+    };
+    roster.sortRows(&jitter);
+    try testing.expectEqualStrings("a", jitter[0].session.id);
+    roster.sort = .{ .key = .cpu, .ascending = true };
+    roster.sortRows(&jitter);
+    try testing.expectEqualStrings("a", jitter[0].session.id);
+}
+
+test "the cursor anchor survives a re-sort, and a gone anchor leaves the list" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+
+    var rows = [_]VisibleRow{
+        .{ .session = .{ .id = "1", .alive = true, .title = "alpha" } },
+        .{ .session = .{ .id = "2", .alive = true, .title = "beta" } },
+    };
+
+    // Enter at the first DISPLAYED row, then flip the sort: the anchor's id
+    // follows its row to the new index instead of re-pointing at whatever slid
+    // into slot 0.
+    roster.enterCursor(&rows);
+    try testing.expectEqualStrings("1", roster.cursorId().?);
+    roster.sort = .{ .key = .name, .ascending = false };
+    roster.sortRows(&rows);
+    try testing.expectEqualStrings("2", rows[0].session.id);
+    try testing.expectEqual(@as(?usize, 1), roster.cursorIndex(&rows));
+
+    // Walking is in DISPLAYED order: up from the second row is the first.
+    roster.moveCursor(&rows, -1);
+    try testing.expectEqualStrings("2", roster.cursorId().?);
+    // Above the first row hands navigation back to the machine list.
+    roster.moveCursor(&rows, -1);
+    try testing.expect(!roster.hasCursor());
+
+    // A stale anchor (its session was killed) resolves nowhere; stepping from
+    // it leaves the list rather than adopting a stranger's row.
+    roster.setCursor("gone");
+    try testing.expectEqual(@as(?usize, null), roster.cursorIndex(&rows));
+    roster.moveCursor(&rows, 1);
+    try testing.expect(!roster.hasCursor());
+    // And entry with a stale anchor re-enters at the first row.
+    roster.setCursor("gone");
+    roster.enterCursor(&rows);
+    try testing.expectEqualStrings("2", roster.cursorId().?);
 }
 
 test "clampScrollTo pulls a parked offset back into a roster that shrank" {
