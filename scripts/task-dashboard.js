@@ -108,6 +108,33 @@ function statusReason(status) {
   return m ? m[1] : null;
 }
 
+/**
+ * What a blocked task is waiting on: a PERSON (`user`) or an EVENT nobody can
+ * perform on demand (`event`).
+ *
+ * The board used to file both under one "Blocked — needs you" heading with a
+ * "Mark unblocked" button on every card. For an armed watch — T443, whose
+ * condition is "a crash recurs" — that button is a trap: pressing it is the
+ * only offered action, it cannot possibly satisfy the condition, and the next
+ * loop turn re-parks the task per D27. The user pressed it on 2026-08-16 09:26
+ * and again on 2026-08-17 06:04; both times the task was blocked again within
+ * ~10 minutes and reappeared on the board, which reads as the board being
+ * broken. Splitting the two kinds is what stops the ping-pong: an event card
+ * asks for nothing, so there is nothing to press by mistake.
+ *
+ * Explicit `blocked-on:` wins; otherwise the reason/unblock prose is sniffed,
+ * and anything unrecognised stays `user` — a task that genuinely needs a chore
+ * must never be demoted into the passive list by a missed keyword.
+ */
+function blockedOnOf(F, status, unblock) {
+  const explicit = String(F['blocked-on'] == null ? '' : F['blocked-on']).trim().toLowerCase();
+  if (explicit === 'user' || explicit === 'event') return explicit;
+  const text = `${statusReason(status) || ''} ${unblock || ''}`;
+  return /armed watch|new occurrence|next occurrence|another occurrence|recurrence|until it recurs/i.test(text)
+    ? 'event'
+    : 'user';
+}
+
 /** First paragraph under `## Summary`, flattened to one line. */
 function extractSummary(body) {
   const m = /^##\s+Summary\s*$/m.exec(body);
@@ -167,6 +194,14 @@ function loadTasks() {
       // which is the complaint this field exists to answer.
       unblock: F.unblock == null ? null : String(F.unblock),
       unblockCommand: F['unblock-command'] == null ? null : String(F['unblock-command']),
+      // The command that does the actual WORK, as opposed to `unblock-command:`
+      // which only flips the status afterwards. Offering solely the status flip
+      // is how a card ends up inviting the one click that cannot help: T857's
+      // real blocker is two elevated `powercfg` lines, and the board showed
+      // only `set-status … -Status todo`, so pressing the button re-parked the
+      // task instead of advancing it. When present this is the primary action.
+      unblockDo: F['unblock-do'] == null ? null : String(F['unblock-do']),
+      blockedOn: bucketOf(status) === 'blocked' ? blockedOnOf(F, status, F.unblock) : null,
       // Triage rank (P0 severe / P1 feature+polish / P2 infra) and the one-line
       // reason for it. Absent means untriaged, which sorts AFTER P2 — a task
       // nobody ranked should not outrank one somebody deliberately called P2.

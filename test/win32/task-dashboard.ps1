@@ -135,8 +135,23 @@ try {
         ($work.Count -ge 1 -and $work[0].sha -match '^[0-9a-f]{7,40}$') "got '$(if ($work.Count) { $work[0].sha })'"
 
     # --- section C: /api/commit, both directions ----------------------------
+    # C4 proves the endpoint serves the WHOLE message, not just the subject, so
+    # it needs a commit that actually has a body. It used to take HEAD blindly
+    # and went red whenever the newest commit was a one-liner - which the loop's
+    # own `chore(tracker): ...` commits routinely are (ae4ba7b5b, 2026-08-17).
+    # A red that depends on what someone last committed is not evidence about
+    # the endpoint, so pick the newest commit with a body and say so when there
+    # is none rather than failing an assertion nothing in the code can satisfy.
     $head = (& git -C $Repo rev-parse --short=9 HEAD).Trim()
-    $subject = (& git -C $Repo show -s --format=%s HEAD).Trim()
+    foreach ($cand in (& git -C $Repo log -40 --format=%h)) {
+        $cand = $cand.Trim()
+        if (-not $cand) { continue }
+        if ((& git -C $Repo show -s --format=%b $cand) -join "`n" -match '\S') {
+            $head = (& git -C $Repo rev-parse --short=9 $cand).Trim()
+            break
+        }
+    }
+    $subject = (& git -C $Repo show -s --format=%s $head).Trim()
     $r = Get-Http "$Base/api/commit?sha=$head"
     Assert 'C1 a real sha answers 200' ($r.Status -eq 200) "got $($r.Status)"
     $j = $null
@@ -145,8 +160,15 @@ try {
     $firstLine = if ($null -ne $j -and $j.body) { ($j.body -split "`n")[0].Trim() } else { '' }
     Assert 'C3 the body is the full message (first line = git subject)' ($firstLine -eq $subject) `
         "got '$firstLine' want '$subject'"
-    Assert 'C4 the body reaches past the first paragraph' `
-        ($null -ne $j -and $j.body.Length -gt $firstLine.Length)
+    $bodyText = (& git -C $Repo show -s --format=%b $head) -join "`n"
+    if ($bodyText -match '\S') {
+        Assert 'C4 the body reaches past the first paragraph' `
+            ($null -ne $j -and $j.body.Length -gt $firstLine.Length)
+    }
+    else {
+        "  SKIP C4: no commit with a body in the last 40 - nothing to prove the full-message path against"
+        $script:skipped++
+    }
 
     if ($work.Count -ge 1 -and $work[0].sha) {
         $r = Get-Http "$Base/api/commit?sha=$($work[0].sha)"

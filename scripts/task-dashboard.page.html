@@ -884,8 +884,8 @@ function setStatus(t, status, label) {
     .finally(function () { state.busy = false; });
 }
 
-function copyBtn(text) {
-  return h('button', { class: 'btn', type: 'button', text: 'Copy command',
+function copyBtn(text, label) {
+  return h('button', { class: 'btn', type: 'button', text: label || 'Copy command',
     onclick: function (e) {
       var done = function () { toast('Command copied.'); };
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1032,25 +1032,41 @@ function inflightRow(t) {
 
 /** A blocked task with the step that unblocks it — never a dead end. */
 function blockedCard(t) {
+  // An armed watch waits on an EVENT (a crash recurring), not on a chore. It
+  // gets a card that states the condition and offers no call to action, because
+  // the only thing anyone could press cannot bring the event about — see
+  // blockedOnOf() in task-dashboard.js for the two reopen/re-park round trips
+  // that motivated the split.
+  var watching = t.blockedOn === 'event';
   var kids = [
     h('div', { class: 'dec-top' }, [
       h('span', { class: 'dec-id', text: t.id }),
       h('span', { class: 'dec-title', text: t.title }),
-      h('span', { class: 'pill blocked' }, [h('i'), 'Blocked']),
+      watching
+        ? h('span', { class: 'chip', text: 'Armed watch' })
+        : h('span', { class: 'pill blocked' }, [h('i'), 'Blocked']),
       t.statusSince ? h('span', { class: 'chip warn', title: 'Since ' + fDate(t.statusSince) + ' ' + fTime(t.statusSince),
-        text: 'blocked ' + fDur(Date.now() - t.statusSince) }) : null
+        text: (watching ? 'watching ' : 'blocked ') + fDur(Date.now() - t.statusSince) }) : null
     ])
   ];
   if (t.reason) kids.push(h('div', { class: 'dec-assumed' }, [h('b', { text: 'Why: ' }), t.reason]));
   if (t.unblock) {
-    kids.push(h('div', { class: 'dec-why' }, [h('b', { text: 'To unblock: ' }), t.unblock]));
+    kids.push(h('div', { class: 'dec-why' }, [
+      h('b', { text: watching ? 'Fires when: ' : 'To unblock: ' }), t.unblock]));
   } else {
     kids.push(h('div', { class: 'dec-why muted',
       text: 'No unblock steps recorded. Add an `unblock:` line to ' + t.file + ' so this is actionable next time.' }));
   }
-  if (t.unblockCommand) kids.push(h('pre', { class: 'cmd', text: t.unblockCommand }));
   var actions = [];
-  if (t.unblockCommand) actions.push(copyBtn(t.unblockCommand));
+  // The command that DOES the work outranks the one that records it. Showing
+  // only the status flip is what made T857 look like a one-click job when the
+  // real blocker was two elevated powercfg lines the user could not even see.
+  if (t.unblockDo) {
+    kids.push(h('pre', { class: 'cmd', text: t.unblockDo }));
+    actions.push(copyBtn(t.unblockDo, 'Copy the commands'));
+  }
+  if (t.unblockCommand) kids.push(h('pre', { class: 'cmd', text: t.unblockCommand }));
+  if (t.unblockCommand) actions.push(copyBtn(t.unblockCommand, t.unblockDo ? 'Copy the follow-up' : 'Copy command'));
   // Two-step, because a blocked task's `unblock:` line usually names a
   // CONDITION rather than a chore ("a new occurrence…"), and one stray click
   // used to put such a task back at the head of the queue with nothing
@@ -1059,13 +1075,18 @@ function blockedCard(t) {
   // does it: this is a speed bump, not a lock. No confirm() dialog on purpose —
   // a modal inside the viewer pane blocks the whole WebView.
   var armed = false;
-  var unblockBtn = h('button', { class: 'btn primary', type: 'button', text: 'Mark unblocked',
+  // An armed watch's control is deliberately NOT the primary action: on that
+  // card the honest answer to "what do I do?" is "nothing, wait". It stays
+  // reachable so a human who knows better can still override the loop, which
+  // is the escape hatch D27 promised when it chose the re-park rule.
+  var unblockBtn = h('button', { class: watching ? 'btn' : 'btn primary', type: 'button',
+    text: watching ? 'Reopen anyway' : 'Mark unblocked',
     onclick: function () {
       if (!armed && t.unblock) {
         armed = true;
         unblockBtn.textContent = 'Yes - reopen it anyway';
         unblockBtn.classList.add('danger');
-        toast(t.id + ' is blocked until: ' + t.unblock, true);
+        toast(t.id + (watching ? ' stays parked until: ' : ' is blocked until: ') + t.unblock, true);
         return;
       }
       setStatus(t, 'todo', 'is unblocked and back in the queue');
@@ -1101,11 +1122,20 @@ function activityView(d) {
   }
 
   var blocked = d.tasks.filter(function (t) { return t.bucket === 'blocked'; });
-  if (blocked.length) {
+  var needsYou = blocked.filter(function (t) { return t.blockedOn !== 'event'; });
+  var watching = blocked.filter(function (t) { return t.blockedOn === 'event'; });
+  if (needsYou.length) {
     var bc = card('Blocked — needs you', 'Each one says what unblocks it. Do the step, then mark it to-do so the loop can pick it up.',
-      blocked.map(blockedCard));
+      needsYou.map(blockedCard));
     bc.setAttribute('data-anim-key', 'card:blocked');
     out.push(bc);
+  }
+  if (watching.length) {
+    var wc = card('Armed watch — waiting on an event',
+      'Nothing to do here. These are parked until something happens on its own (a crash recurs, a lane goes red); the loop re-arms them and reopens them itself when it does.',
+      watching.map(blockedCard));
+    wc.setAttribute('data-anim-key', 'card:watching');
+    out.push(wc);
   }
 
   // Timeline
