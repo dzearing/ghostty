@@ -2356,6 +2356,25 @@ pub fn restoreSessionLayout(self: *App) bool {
     if (!self.config.@"session-persistence") return false;
     const gpa = self.core_app.alloc;
 
+    // A TEST SEAM (T620), earning its place the way T657's probe override does.
+    // The state this forces — a launch where NEITHER restore source yields a
+    // window (manifest gone or empty, GET_LAYOUTS faulted) while the agent
+    // still holds live sessions — is a real production shape, and it is the
+    // ONLY shape that leaves an orphaned live session for the chooser to
+    // resume. An acceptance script cannot build it any other way: the manifest
+    // and the agent's layout store are shared across pipe-suffix instances and
+    // T194's adoption has no attached-elsewhere filter, so any helper instance
+    // that launches into the fixture adopts the other instance's window and
+    // steals its session. Unset (every real launch) leaves the code below
+    // byte-identical.
+    if (std.process.getEnvVarOwned(gpa, "GHOZTTY_RESTORE_SKIP")) |v| {
+        defer gpa.free(v);
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+            log.warn("session-restore: skipped entirely by GHOZTTY_RESTORE_SKIP", .{});
+            return false;
+        }
+    } else |_| {}
+
     // The app-local manifest. An ABSENT or EMPTY file is no longer the end of
     // the story (T194): after a CRASH it can have regressed to nothing — a
     // relaunch that rebuilt no windows then overwrote it with the one blank

@@ -9,9 +9,15 @@
 # What this drives, end to end, against a REAL local agent:
 #
 #   1. a session the app does NOT have open is resumable at all. The fixture
-#      builds one the only way a user does: run panes under the agent, kill the
-#      APP (not the agent), drop the layout manifest so nothing auto-restores,
-#      and relaunch. The agent then holds live children with no viewer.
+#      runs panes under the agent, kills the APP (not the agent), and relaunches
+#      with GHOZTTY_RESTORE_SKIP=1 — the T620 seam that forces the real
+#      degradation where neither restore source yields a window (manifest gone,
+#      GET_LAYOUTS faulted). The agent then holds live children with no viewer.
+#      Dropping the manifest alone stopped working when launch-time restore
+#      learned to recover such a window from the agent's own layout store
+#      (T194); a second-instance fixture is no better, because the manifest and
+#      layout store are shared across pipe-suffix instances and the adopting
+#      launch STEALS the other instance's session (see T620).
 #   2. Right paints the cursor - the first card's fill picks up the accent wash
 #      it did not have a moment earlier (the plain card is its own control).
 #   3. Return resumes THAT row: the app logs the id it attached, the chooser
@@ -46,6 +52,9 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
 $env:GHOZTTY_PIPE_SUFFIX = '-t320'
+# The T620 restore-skip seam is set at the RELAUNCH, not before the first
+# launch; clear a leak from a parent shell so the first launch is a real one.
+Remove-Item Env:\GHOZTTY_RESTORE_SKIP -ErrorAction SilentlyContinue
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
@@ -78,9 +87,12 @@ function Reset-AgentState {
     Remove-Item (Join-Path $dir 'rings') -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Dropping the layout manifest is what makes the orphan fixture: without it the
-# relaunched app re-attaches the very sessions this test needs to be unattached,
-# and every row would take the already-open shortcut instead of resuming.
+# Half of the orphan fixture: the relaunched app must not re-attach the very
+# sessions this test needs to be unattached. The manifest delete alone stopped
+# being enough when T194 taught launch-time restore to pull layout blobs from
+# the AGENT (alive across the kill, answering GET_LAYOUTS from memory), so the
+# relaunch also sets GHOZTTY_RESTORE_SKIP — the deletion stays because it keeps
+# the fixture honest about what a crash-regressed manifest looks like.
 function Remove-LayoutManifest {
     Remove-Item (Join-Path $env:LOCALAPPDATA 'ghoztty\session-layout-debug.json') -ErrorAction SilentlyContinue
 }
@@ -145,6 +157,53 @@ function Send-ChooserKey($chooser, $filter, $key) {
     return Send-TestKeys -Window $chooser -Target $filter -Key $key
 }
 
+# --- Cursor-log navigation (T602/T620) --------------------------------------
+# Since T602 the displayed roster is SORTED (name or CPU, a persisted
+# preference), so an index computed from the agent's `+sessions` order is NOT
+# the cursor's index space - walking "down N rows" lands somewhere else. The
+# app now says where the cursor lands after every step ("chooser roster:
+# cursor on session id=..."), and the walk reads that back instead of
+# assuming an order.
+
+# Send one cursor key and wait for the app to log where the cursor landed.
+# Returns the landed session id, '' when the cursor left the list, or $null
+# when no landing was logged (the key was not roster navigation).
+function Step-Cursor($chooser, $filter, $log, $key) {
+    $pattern = 'chooser roster: cursor (on session id=([0-9a-fA-F]+)|left the list)'
+    $before = Count-LogLines $log $pattern
+    Send-ChooserKey $chooser $filter $key | Out-Null
+    $waited = 0
+    while ($waited -lt 3000) {
+        $m = @(Select-String -Path $log -Pattern $pattern -ErrorAction SilentlyContinue)
+        if ($m.Count -gt $before) {
+            $last = $m[-1]
+            if ($last.Matches[0].Groups[2].Success) { return $last.Matches[0].Groups[2].Value }
+            return ''
+        }
+        Start-Sleep -Milliseconds 100
+        $waited += 100
+    }
+    return $null
+}
+
+# Park the cursor on the first displayed row whose id is in $TargetIds: reset
+# to the top (Left leaves the list, Right re-enters at displayed row 0), then
+# Down-scan reading each landing back from the log. Returns the landed id, or
+# $null when the scan walked off the end without a match.
+function Walk-CursorToId($chooser, $filter, $log, [string[]]$TargetIds, [int]$MaxRows) {
+    Step-Cursor $chooser $filter $log 'Left' | Out-Null
+    $cur = Step-Cursor $chooser $filter $log 'Right'
+    for ($i = 0; $i -le $MaxRows; $i++) {
+        if ($null -eq $cur -or $cur -eq '') { return $null }
+        if ($TargetIds -contains $cur) { return $cur }
+        $prev = $cur
+        $cur = Step-Cursor $chooser $filter $log 'Down'
+        # The last row clamps: a Down that lands on the same id is the end.
+        if ($cur -eq $prev) { return $null }
+    }
+    return $null
+}
+
 Write-Host 'T320 chooser session resume'
 Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
 Reset-AgentState
@@ -168,30 +227,35 @@ try {
     Assert ($seeded.Count -ge 2) "the agent owns the app's panes (found $($seeded.Count))"
 
     # Kill the APP only. The agent keeps the children alive - that is the whole
-    # point of session persistence - and with the manifest gone the relaunch
-    # cannot re-attach them.
+    # point of session persistence. The relaunch runs under GHOZTTY_RESTORE_SKIP
+    # (plus the manifest delete) so launch-time restore cannot re-attach them -
+    # the T194 agent-side layout store would otherwise rebuild the window and
+    # every row would take the already-open shortcut instead of resuming.
     Stop-RepoProcesses @('ghoztty')
     Remove-LayoutManifest
     $orphans = @(Get-Sessions | Where-Object { $_.alive })
     Assert ($orphans.Count -ge 2) "the sessions outlived the app ($($orphans.Count) alive)"
 
+    $env:GHOZTTY_RESTORE_SKIP = '1'
     $g = Launch-Gui $errlog2 @('--session-persistence=true')
     if (-not $g) { Write-Host 'SETUP FAIL: GUI died on relaunch'; exit 1 }
     Start-Sleep -Seconds 2
 
+    # The seam must have ENGAGED, and say so - otherwise a future launch-order
+    # change could leave restore running and this fixture would fail three
+    # asserts down with no pointer at why.
+    $skipLine = Wait-LogLine $errlog2 'session-restore: skipped entirely by GHOZTTY_RESTORE_SKIP' 4000
+    Assert ($null -ne $skipLine) 'the relaunch skipped launch-time restore (T620 seam engaged)'
+
     $rendered = @(Get-RenderedSessions)
     Assert ($rendered.Count -ge 3) "the roster has the orphans plus the new pane ($($rendered.Count) rows)"
-    # The row to resume is an ORPHAN: alive with no viewer. The relaunched app's
-    # own pane is alive too and sits somewhere in the same list (the agent's
-    # order is its store's, not creation order), so the row is chosen by what it
-    # IS rather than by where it happens to be.
-    $targetIdx = -1
-    for ($i = 0; $i -lt $rendered.Count; $i++) {
-        if ($rendered[$i].alive -and -not $rendered[$i].attached) { $targetIdx = $i; break }
-    }
-    Assert ($targetIdx -ge 0) "a live row with no viewer is rendered (index $targetIdx of $($rendered.Count))"
-    if ($targetIdx -lt 0) { Write-Host 'SETUP FAIL: no orphaned live session'; exit 1 }
-    $target = $rendered[$targetIdx]
+    # The rows to resume are ORPHANS: alive with no viewer. The relaunched app's
+    # own pane is alive too and sits somewhere in the same displayed list (which
+    # T602 sorts by name or CPU), so rows are chosen by what they ARE and found
+    # by the cursor-landing log rather than by a precomputed index.
+    $orphanIds = @($rendered | Where-Object { $_.alive -and -not $_.attached } | ForEach-Object { $_.id })
+    Assert ($orphanIds.Count -ge 1) "a live row with no viewer is rendered ($($orphanIds.Count) of $($rendered.Count))"
+    if ($orphanIds.Count -lt 1) { Write-Host 'SETUP FAIL: no orphaned live session'; exit 1 }
 
     # --- The cursor, then the resume ---------------------------------------
     Write-Host ''
@@ -217,7 +281,8 @@ try {
         $plain = Get-TestPixel -Shot $shot -X ($client.Left + $geo.CardX) -Y ($client.Top + $geo.CardY)
     } finally { Close-TestWindowPixels -Shot $shot }
 
-    Send-ChooserKey $chooser $filter 'Right' | Out-Null
+    $entered = Step-Cursor $chooser $filter $errlog2 'Right'
+    Assert ($entered -ne $null -and $entered -ne '') "Right steps the cursor into the roster (landed on $entered)"
     Start-Sleep -Milliseconds 600
 
     $cursored = $null
@@ -233,9 +298,12 @@ try {
     # sampled one keystroke earlier at the same point, is the control.
     Assert ($bLift -gt 8) "the cursored card picks up the accent wash (B +$bLift)"
 
-    # Walk to the orphan's row. Right entered at index 0; each Down is one row
-    # in the RENDERED list, which is the property under test.
-    for ($i = 0; $i -lt $targetIdx; $i++) { Send-ChooserKey $chooser $filter 'Down' | Out-Null }
+    # Walk to an orphan's row, reading each landing back from the app's own
+    # cursor log - the displayed order is T602-sorted, so the log is the only
+    # index space the walk can trust.
+    $walkedId = Walk-CursorToId $chooser $filter $errlog2 $orphanIds $rendered.Count
+    Assert ($null -ne $walkedId) "the cursor walk lands on an orphaned live row ($walkedId)"
+    if ($null -eq $walkedId) { Write-Host 'SETUP FAIL: cursor never reached an orphan row'; exit 1 }
     Start-Sleep -Milliseconds 400
 
     $before = @(Get-Sessions)
@@ -245,8 +313,8 @@ try {
 
     $resumedId = ''
     if ($attach -and $attach -match 'id=([0-9a-fA-F]+)') { $resumedId = $Matches[1] }
-    Assert ($resumedId -eq $target.id) `
-        "the resumed session is the row the cursor was on ($resumedId vs $($target.id))"
+    Assert ($resumedId -eq $walkedId) `
+        "the resumed session is the row the cursor was on ($resumedId vs $walkedId)"
 
     Start-Sleep -Seconds 2
     Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed itself onto the resumed window'
@@ -265,6 +333,9 @@ try {
     Write-Host '3. a relaunchable tombstone is listed but not resumable'
     # Killing the agent turns every live child into a tombstone; the respawned
     # agent rematerializes them from sessions.json as relaunchable rows.
+    # GHOZTTY_RESTORE_SKIP is still set, deliberately: without it this relaunch
+    # would adopt the agent's layout blobs and RELAUNCH the tombstones as fresh
+    # shells (T89g), leaving no dead row for this section to refuse.
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Remove-LayoutManifest
     $g = Launch-Gui $errlog3 @('--session-persistence=true')
@@ -272,15 +343,11 @@ try {
     Start-Sleep -Seconds 2
 
     $rows = @(Get-RenderedSessions)
-    $deadIdx = -1
-    $liveIdx = -1
-    for ($i = 0; $i -lt $rows.Count; $i++) {
-        if ($deadIdx -lt 0 -and -not $rows[$i].alive) { $deadIdx = $i }
-        if ($liveIdx -lt 0 -and $rows[$i].alive) { $liveIdx = $i }
-    }
-    Assert ($deadIdx -ge 0) "a tombstone row is rendered (index $deadIdx of $($rows.Count))"
-    Assert ($liveIdx -ge 0) "a live row is rendered too (index $liveIdx)"
-    if ($deadIdx -lt 0 -or $liveIdx -lt 0) { Write-Host 'SETUP FAIL: need one dead and one live row'; exit 1 }
+    $deadIds = @($rows | Where-Object { -not $_.alive } | ForEach-Object { $_.id })
+    $liveIds = @($rows | Where-Object { $_.alive } | ForEach-Object { $_.id })
+    Assert ($deadIds.Count -ge 1) "a tombstone row is rendered ($($deadIds.Count) of $($rows.Count))"
+    Assert ($liveIds.Count -ge 1) "a live row is rendered too ($($liveIds.Count))"
+    if ($deadIds.Count -lt 1 -or $liveIds.Count -lt 1) { Write-Host 'SETUP FAIL: need one dead and one live row'; exit 1 }
 
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'the chooser reopens'
@@ -288,9 +355,11 @@ try {
     $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Wait-LogLine $errlog3 'chooser roster: loaded (\d+) session' 8000 | Out-Null
 
-    # Walk to the dead row: Right enters at index 0, then Down per step.
-    Send-ChooserKey $chooser $filter 'Right' | Out-Null
-    for ($i = 0; $i -lt $deadIdx; $i++) { Send-ChooserKey $chooser $filter 'Down' | Out-Null }
+    # Walk to a dead row, reading each landing from the cursor log (the
+    # displayed order is T602-sorted, so no index is assumed).
+    $deadLanded = Walk-CursorToId $chooser $filter $errlog3 $deadIds $rows.Count
+    Assert ($null -ne $deadLanded) "the cursor walk lands on a tombstone row ($deadLanded)"
+    if ($null -eq $deadLanded) { Write-Host 'SETUP FAIL: cursor never reached a tombstone row'; exit 1 }
     Start-Sleep -Milliseconds 400
     $attachesBefore = Count-LogLines $errlog3 'resume session: attaching'
     Send-ChooserKey $chooser $filter 'Return' | Out-Null
@@ -311,19 +380,24 @@ try {
     # divergence from Mac, T330). That focus is what this control reads.
     Write-Host ''
     Write-Host '4. positive control: the same keys DO act on a live row'
-    $steps = $liveIdx - $deadIdx
-    if ($steps -gt 0) {
-        for ($i = 0; $i -lt $steps; $i++) { Send-ChooserKey $chooser $filter 'Down' | Out-Null }
-    } else {
-        for ($i = 0; $i -lt (-$steps); $i++) { Send-ChooserKey $chooser $filter 'Up' | Out-Null }
-    }
+    $liveLanded = Walk-CursorToId $chooser $filter $errlog3 $liveIds $rows.Count
+    Assert ($null -ne $liveLanded) "the cursor walk lands on the live row ($liveLanded)"
     Start-Sleep -Milliseconds 400
+    # Counted, not merely awaited: a line matched from section 3's leftovers
+    # would pass a Wait with the keystroke never arriving.
+    $focusesBefore = Count-LogLines $errlog3 'session already open, focusing its pane'
     Send-ChooserKey $chooser $filter 'Return' | Out-Null
-    $focused = Wait-LogLine $errlog3 'session already open, focusing its pane' 6000
-    Assert ($null -ne $focused) 'Return on a live row that is open here focuses its pane'
+    $waited = 0
+    while ($waited -lt 6000 -and (Count-LogLines $errlog3 'session already open, focusing its pane') -le $focusesBefore) {
+        Start-Sleep -Milliseconds 200
+        $waited += 200
+    }
+    Assert ((Count-LogLines $errlog3 'session already open, focusing its pane') -gt $focusesBefore) `
+        'Return on a live row that is open here focuses its pane'
     Start-Sleep -Seconds 1
     Assert (-not (Test-TestWindowExists -Window $chooser)) 'and the chooser dismissed onto it'
 } finally {
+    Remove-Item Env:\GHOZTTY_RESTORE_SKIP -ErrorAction SilentlyContinue
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Remove-TestDesktop
 }

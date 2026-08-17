@@ -2984,6 +2984,22 @@ fn enterSessions(self: *MachineChooser) void {
     const view = self.sessionView(&buf) orelse return;
     self.roster.enterCursor(view.rows);
     _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
+    self.logCursor(view.rows);
+}
+
+/// Say where the keyboard cursor LANDED — the T318 rule again: an owner-drawn
+/// roster has no HWNDs to read back, so since T602 sorted the displayed list
+/// (by name or CPU, not the agent's store order) this line is the only way a
+/// harness can know which row a Right/Up/Down walk is actually on. One line
+/// per keystroke, none per paint.
+fn logCursor(self: *MachineChooser, rows: []const SessionRoster.VisibleRow) void {
+    if (self.roster.cursorIndex(rows)) |idx| {
+        log.info("chooser roster: cursor on session id={s} (row {d} of {d})", .{
+            rows[idx].session.id, idx, rows.len,
+        });
+    } else {
+        log.info("chooser roster: cursor left the list", .{});
+    }
 }
 
 /// Up/Down inside the roster. Repaints once for the move and the scroll
@@ -2997,6 +3013,7 @@ fn moveSessionCursor(self: *MachineChooser, delta: i32) void {
     };
     self.roster.moveCursor(view.rows, delta);
     _ = self.roster.scrollToCursor(view.rows, view.region, self.window.scale);
+    self.logCursor(view.rows);
     self.refreshSessions();
 }
 
@@ -3447,6 +3464,10 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 self.enterSessions();
             } else {
                 self.roster.clearCursor();
+                // Said out loud for the same reason `logCursor` says landings:
+                // Left is the harness's deterministic "reset to the top" step
+                // (Left, then Right, re-enters at displayed row 0).
+                log.info("chooser roster: cursor left the list", .{});
             }
             self.refreshSessions();
             return true;
