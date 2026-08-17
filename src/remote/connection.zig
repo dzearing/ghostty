@@ -1629,14 +1629,12 @@ pub const Connection = struct {
         // Any panes still registered at destroy (the caller didn't close/detach
         // them) are freed here so the connection owns no leaks. Their channels were
         // already deregistered-or-irrelevant since all threads have joined.
+        // Through the SAME helper `teardownPane` uses, deliberately: this loop was
+        // a hand-copy of that free list and had already drifted from it — it never
+        // freed `pane.tty`, so a connection dropped while an attached pane carried
+        // an agent-side tty path leaked it (T811).
         var it = self.panes.iterator();
-        while (it.next()) |entry| {
-            const pane = entry.value_ptr.*;
-            pane.ring.deinit(alloc);
-            alloc.destroy(pane.ring);
-            alloc.free(pane.session_id);
-            alloc.destroy(pane);
-        }
+        while (it.next()) |entry| self.freePaneOwned(entry.value_ptr.*);
         self.panes.deinit(alloc);
         // The pending map must be empty after `shutdown` (it fails+removes all).
         assert(self.pending.count() == 0);
@@ -2749,6 +2747,19 @@ pub const Connection = struct {
         // Deregister under the table lock: any in-flight `pushTo` has finished and no
         // new one can find the channel, so the ring is safe to free (§3.4 invariant).
         self.deregisterChannel(pane.id);
+        self.freePaneOwned(pane);
+    }
+
+    /// Free everything a `Pane` owns — its heap ring storage, session id, tty and
+    /// the pane itself. The caller is responsible for having removed it from
+    /// `panes` and deregistered its channel first; this only frees.
+    ///
+    /// The ONE place that knows a pane's free list, so the two teardown paths
+    /// (`teardownPane` for a closed/detached session, `destroy` for panes still
+    /// tracked when the connection goes away) cannot drift apart — which they had
+    /// (T811). Requires a heap-allocated `ring`, the only kind `trackPane` ever
+    /// sees in production.
+    fn freePaneOwned(self: *Connection, pane: *Pane) void {
         pane.ring.deinit(self.alloc);
         self.alloc.destroy(pane.ring);
         self.alloc.free(pane.session_id);
@@ -4343,6 +4354,44 @@ test "T739: an injected repaint is rendered like DATA but advances no offset" {
     // heap ring this test does not have. The pane itself is untracked and
     // freed by the paired defer above, on success and failure alike.
     conn.deregisterChannel(ch_id);
+}
+
+test "T811: destroy frees a still-tracked pane's tty too, not just its ring and id" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    const conn = try Connection.create(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+    );
+
+    // A pane shaped exactly as `openChannel`/`attachChannel` build one: heap ring,
+    // duped session id, duped agent-side tty path. Never closed or detached, so
+    // the connection still owns all four allocations when it goes away — the path
+    // a dropped link with attached panes takes.
+    const ch_id: u128 = 0x811;
+    const ch = try alloc.create(ring.Channel);
+    ch.* = try ring.Channel.init(alloc, ch_id, .{ .capacity = 256 });
+    try conn.registerChannel(ch);
+
+    const pane = try alloc.create(Pane);
+    pane.* = .{
+        .id = ch_id,
+        .session_id = try alloc.dupe(u8, "s811"),
+        .pid = 0,
+        .tty = try alloc.dupe(u8, "/dev/ttys811"),
+        .ring = ch,
+    };
+    try conn.trackPane(pane);
+
+    // The assertion is the allocator's: `testing.allocator` fails the test if any
+    // of the four survives. Before T811 the tty did.
+    conn.destroy(alloc);
 }
 
 test "inbound DATA routing: bytes land in the right channel; unknown is dropped" {
