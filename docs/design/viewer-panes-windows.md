@@ -347,15 +347,36 @@ Unchanged in intent; stated here so the boundaries are explicit.
   translations worth knowing: (1) relative links arrive under the `https://`
   virtual host rather than Mac's custom scheme, so the ours-check must run
   before the generic http(s) one or every relative link ships to the browser
-  as a dead URL; (2) the link gate keys on `NavigationKind == NEW_DOCUMENT`
-  (Args3, QI'd with a graceful null on old runtimes), NOT `IsUserInitiated` --
-  WebKit's `.linkActivated` covers synthesized clicks and WebView2's
-  user-initiated bit does not, while reloads and history walks are exactly the
-  two kinds excluded; (3) the pane reaches the split machinery through a
+  as a dead URL; (2) the FILE-mode gate keys on `NavigationKind == NEW_DOCUMENT`
+  (Args3, QI'd with a graceful null on old runtimes) and not on
+  `IsUserInitiated` -- in file mode the bundled template runs no navigating
+  script of its own, so a new document IS a link activation, while reloads and
+  history walks are exactly the two kinds excluded (see T825 below for what
+  `IsUserInitiated` actually means, which is not what this originally assumed);
+  (3) the pane reaches the split machinery through a
   trampoline `Window.createViewerPane` installs (`open_link_split`), because a
   direct `newViewerSplitAt` reference pulls the surface/renderer world -- and
   with it the GTK apprt branch -- into the win32 test binary's comptime
   analysis.
+  **T825 extends that policy to LIVE pages as of 2026-08-17** (main 18acc4f6f):
+  a click that leads out of a live page's own site is cancelled and handed to
+  the default browser, because this web view's cookie store is nobody else's --
+  the page would render logged-out in the pane with no way back. "Site" is host
+  plus the port AS WRITTEN (so `http`->`https` on one host stays, and
+  `:3000`->`:5173` does not), which is `isExternalLivePageLink` in
+  `viewer_content.zig`; `classifyLink` now takes the page being LEFT (the web
+  view's `Source`, which still names the committed document when
+  `NavigationStarting` fires). Two translations worth knowing: (1) Mac's second
+  rule -- `file://` containment inside the page's own directory -- has no
+  counterpart, because a rendered `.html` file is served from the synthetic
+  `ghoztty-page` host, so the read grant IS a host and a link cannot spell its
+  way out from under it; (2) WebView2 has no `.linkActivated`, and
+  `IsUserInitiated` means "not initiated by page script" -- it is TRUE for a
+  host `Navigate` and for an `ExecuteScript` click, so the first draft cancelled
+  the pane loading its own `--view=<url>`. The pane counts the navigations it
+  issues (`self_nav_pending`) and subtracts them; what is left is a click. The
+  known divergence: a script-synthesized `a.click()` routes on Mac and stays in
+  the pane here, which errs toward leaving a page's own machinery working.
 - **T90g** Chrome & command integration. NARROWED: titles, hero exclusion,
   accelerator forwarding, dim walk, split-from-viewer cwd, palette File/URL
   entries. The nav chrome, address bar, and zoom are NOT here (own tasks). Add

@@ -124,10 +124,21 @@ ghoztty +close --target=doc
   `.md` or `.html` link opens another viewer split (both render here, so handing
   either to the default app would launch the browser for a page the pane next
   door was about to show); other local files open in their default app.
+- **Links out of a LIVE page** (a website or a rendered `.html` file) open the
+  **default browser** too, and the pane stays where it was (**T825**; Mac
+  18acc4f6f). Same cookie-store reason as popups: a hop to another site renders
+  logged-out in a store nothing else shares. "Another site" is host + the port
+  as written — an `http`→`https` upgrade on one host stays in the pane,
+  `localhost:3000` → `localhost:5173` does not, and a subdomain is another
+  site. Only the person's own click on the top-level page leaves: a page's own
+  redirects, script navigations, form posts and iframes are the page working,
+  and so are the pane's own loads (`--view=<url>`, the address bar, a restored
+  session).
 - **Links that open a new surface** in a website viewer — `target="_blank"` or
   `window.open()` — go to the **system default browser**, not a new Ghoztty
   window, for the same cookie-store reason banner URLs do. Same-pane
-  navigation is untouched: a website viewer follows ordinary links in place.
+  navigation is untouched, WITHIN the site: a live-page viewer follows ordinary
+  links in place as long as they stay on the page's own site.
   **Cmd-click** (**Ctrl** on Windows) keeps the popup in Ghoztty as its own
   viewer window (honoring the size the opener asked for), and so does a popup
   the browser can't be handed — a bare `window.open()` with no URL, or a

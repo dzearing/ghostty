@@ -318,6 +318,22 @@ navigation_handler: ?*NavigationCompletedHandler = null,
 /// Our reference on the `NavigationStarting` handler (T392), same rule.
 navigation_starting_handler: ?*NavigationStartingHandler = null,
 
+/// Navigations THIS PANE asked for that have not raised their
+/// `NavigationStarting` yet (T825).
+///
+/// WebView2 has no `.linkActivated`, and the nearest thing —
+/// `IsUserInitiated` — turns out to mean "not initiated by page script", which
+/// a host `Navigate` also is not: it reports TRUE for the pane's own loads.
+/// Without this counter the cross-site route cancelled the pane navigating
+/// itself to a website, which is every `--view=<url>` there is.
+///
+/// A counter rather than a flag so two navigations issued back-to-back (a mode
+/// change that re-navigates, a reload racing a `+read`) each consume their own
+/// event; the failure mode of an over-count is one click that stays in the
+/// pane, which is what the pane did before this feature, while an under-count
+/// would eject a load the user asked for.
+self_nav_pending: u8 = 0,
+
 /// Our reference on the `DocumentTitleChanged` handler (T383), same rule.
 title_handler: ?*DocumentTitleChangedHandler = null,
 
@@ -1843,7 +1859,13 @@ fn applyNavigation(self: *ViewerPane) void {
     buf[len] = 0;
     const web = c.coreWebView() orelse return;
     defer web.release();
-    if (!web.navigate(buf[0..len :0])) log.warn("Navigate failed for this pane", .{});
+    // Claimed BEFORE the call, in case the runtime ever raises the event
+    // inside it, and given back if no navigation was started at all (T825).
+    self.self_nav_pending +|= 1;
+    if (!web.navigate(buf[0..len :0])) {
+        self.self_nav_pending -|= 1;
+        log.warn("Navigate failed for this pane", .{});
+    }
 }
 
 /// `ICoreWebView2NewWindowRequestedEventHandler`: `window.open()` and
@@ -2789,7 +2811,6 @@ fn onNavigationStarting(
     sender: ?*iface.ICoreWebView2,
     args: ?*iface.ICoreWebView2NavigationStartingEventArgs,
 ) com.HRESULT {
-    _ = sender;
     const a = args orelse return com.S_OK;
     const self = p.pane orelse return com.S_OK;
 
@@ -2799,7 +2820,29 @@ fn onNavigationStarting(
     const uri = std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(raw)) catch return com.S_OK;
     defer p.alloc.free(uri);
 
-    const class = content.classifyLink(self.mode, uri);
+    // The document the navigation is LEAVING, which is what tells a hop inside
+    // a live page's own site from one out of it (T825). `Source` still names
+    // the committed page here: `SourceChanged` fires after this event, not
+    // before, so what is read is the page the user is looking at rather than
+    // the one being asked for. Null before the pane's first commit, and on the
+    // allocation failure — either way the cross-site test declines and the
+    // navigation is left alone.
+    const page: ?[]u8 = blk: {
+        const web = sender orelse break :blk null;
+        const src = web.sourceRaw() orelse break :blk null;
+        defer w32.CoTaskMemFree(@ptrCast(src));
+        break :blk std.unicode.utf16LeToUtf8Alloc(p.alloc, std.mem.span(src)) catch null;
+    };
+    defer if (page) |b| p.alloc.free(b);
+
+    // Consumed here, ahead of every branch, so a navigation the pane issued in
+    // a mode that ignores it cannot leave the claim standing for the next one
+    // (T825). `self_nav` is the answer WebView2 has no field for: this
+    // navigation is the pane's own, not something the user clicked.
+    const self_nav = self.self_nav_pending > 0;
+    self.self_nav_pending -|= 1;
+
+    const class = content.classifyLink(self.mode, page, uri);
 
     // A `ghoztty://` link is answered in EVERY mode and for every navigation
     // kind, which is why the URI is read before the two gates below (T695).
@@ -2814,7 +2857,24 @@ fn onNavigationStarting(
     // Websites — and rendered `.html` files, which are pages (T601) — navigate
     // freely within the pane, and so do the pane's own reloads and history
     // walks (`syncCommitted` reconciles those after the fact).
-    if (self.mode.isLivePage()) return com.S_OK;
+    //
+    // The one navigation that does NOT stay is a click the user made that
+    // leaves the page's own site (T825): this web view's cookie store is
+    // nobody else's, so that page would render logged-out here with no way
+    // back to the browser. `classifyLink` decided whether the target is off the
+    // site; `routesAsLivePageLink` decides whether this was a click at all, so
+    // the page's own redirects, scripts and form posts are untouched.
+    if (self.mode.isLivePage()) {
+        if (class == .browser and content.routesAsLivePageLink(
+            navKind(a),
+            a.isUserInitiated() and !self_nav,
+            a.isRedirected(),
+        )) {
+            _ = a.setCancel(true);
+            self.openExternal(p.alloc, uri);
+        }
+        return com.S_OK;
+    }
     if (!content.routesAsLink(navKind(a))) return com.S_OK;
 
     switch (class) {
@@ -6009,6 +6069,168 @@ test "host floor: a real controller on a real window, on this box" {
     }
     try testing.expectEqual(content.Mode.markdown, pane.mode);
     try testing.expectEqualStrings(links_path, pane.location.?);
+
+    // ------------------------------------------------------------------
+    // T825: a cross-site click in a LIVE page leaves for the browser
+    // ------------------------------------------------------------------
+    //
+    // The section above is the FILE policy, where the pane owns the document.
+    // This one is the live-page policy, where it does not: a rendered `.html`
+    // mock clicks through its own pages in place, and a click OUT of them goes
+    // to the browser, because this web view's cookie store is nobody else's and
+    // the page would render logged-out here.
+    //
+    // Three claims, and each one is the other two's control:
+    //
+    //  - a page that navigates ITSELF off-site keeps the pane, so a page's own
+    //    machinery is untouched — this is the case `IsUserInitiated` decides,
+    //    and the one that proves the gate is read at all;
+    //  - a CLICK off-site is cancelled and routed — which also proves `Source`
+    //    still names the page being LEFT when `NavigationStarting` fires, since
+    //    a `Source` already moved on would compare the target against itself
+    //    and allow everything;
+    //  - a same-site click is untouched, so a multi-page local mock still
+    //    works — the regression this feature could most easily cause.
+    //
+    // The fourth claim is everything ABOVE this block: every navigation in this
+    // test so far was the PANE's own, several of them off-site (the template to
+    // a loopback server and back), and all of them still landed. That is the
+    // `self_nav_pending` half of the gate, and without it this feature cancels
+    // `--view=<url>` itself — WebView2's `IsUserInitiated` is TRUE for a host
+    // `Navigate`, measured here the hard way (the first version of this section
+    // cancelled T375's own page load).
+    //
+    // What stands in for a press is an `ExecuteScript` click, and it is a fair
+    // stand-in for the reason it is NOT a fair stand-in for a page's own
+    // script: `ExecuteScript` runs with user activation, so its click reaches
+    // `NavigationStarting` with the same `IsUserInitiated` a real press does
+    // (measured — an earlier draft used it as the negative control and it
+    // routed). The genuinely page-driven case therefore has to come from the
+    // page itself, which is what `t825-auto.html` below is.
+    {
+        // Two more UTF-16 string literals in a test function that already has
+        // many; the default quota is spent long before this block.
+        @setEvalBranchQuota(20_000);
+        try testing.expectEqual(@as(usize, 4), sink.entries.items.len);
+
+        // Both off-site targets point at the loopback server: a different site
+        // from the page host, and unlike a real external URL it is reachable,
+        // so the page-driven control can actually complete its navigation.
+        //
+        // It reports itself through the bridge, and that report — not
+        // `page_loaded` — is what the waits below key on: `page_loaded` is left
+        // standing from the PREVIOUS document while a navigation is in flight,
+        // so a wait on it can return with the old page still in the view, and
+        // the click then lands on a document that has no such link (measured:
+        // it cost a green-looking run that routed nothing).
+        const mock = try std.fmt.allocPrint(alloc,
+            \\<!doctype html><meta charset="utf-8"><title>t825</title>
+            \\<a id="ext" href="{s}">out</a>
+            \\<a id="same" href="t825-two.html">in</a>
+            \\<script>
+            \\(function () {{
+            \\  var w = window.webkit && window.webkit.messageHandlers
+            \\    && window.webkit.messageHandlers.viewerTOC;
+            \\  if (!w) return;
+            \\  w.postMessage({{ type: "active", id: "t825-one" }});
+            \\}})();
+            \\</script>
+            \\
+        , .{page_url});
+        defer alloc.free(mock);
+        try tmp.dir.writeFile(.{ .sub_path = "t825-one.html", .data = mock });
+        try tmp.dir.writeFile(.{
+            .sub_path = "t825-two.html",
+            .data = "<!doctype html><meta charset=\"utf-8\"><title>t825-two</title><p>two\n",
+        });
+        // The page's OWN navigation: script at load time, no gesture behind it
+        // anywhere — the one thing `ExecuteScript` cannot stand in for, since
+        // that carries user activation of its own.
+        const auto = try std.fmt.allocPrint(alloc,
+            \\<!doctype html><meta charset="utf-8"><title>t825-auto</title>
+            \\<script>location.href = "{s}";</script>
+            \\
+        , .{page_url});
+        defer alloc.free(auto);
+        try tmp.dir.writeFile(.{ .sub_path = "t825-auto.html", .data = auto });
+        const one_path = try std.fs.path.join(alloc, &.{ dir_path, "t825-one.html" });
+        defer alloc.free(one_path);
+        const auto_path = try std.fs.path.join(alloc, &.{ dir_path, "t825-auto.html" });
+        defer alloc.free(auto_path);
+
+        const load_mock = struct {
+            fn ready(p: *ViewerPane) bool {
+                const a = p.active_heading orelse return false;
+                return p.mode == .html and std.mem.eql(u8, a, "t825-one");
+            }
+        }.ready;
+
+        // (1) A page navigating itself off-site is the page's business: the
+        // pane follows it to the server and nothing is routed. A gate that
+        // ignored `IsUserInitiated` would cancel this and the pane would sit
+        // on the mock forever, which is the timeout below.
+        try pane.navigate(alloc, auto_path);
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.mode == .web;
+            }
+        }.ready, &pane);
+        try testing.expectEqual(@as(usize, 4), sink.entries.items.len);
+
+        // (2) The same destination, reached by a CLICK.
+        try pane.navigate(alloc, one_path);
+        try waitFor(&msg, 30, load_mock, &pane);
+        log.warn("t825: mock loaded mode={s} report={?s} self_nav={d}", .{
+            @tagName(pane.mode),
+            pane.active_heading,
+            pane.self_nav_pending,
+        });
+        pane.executeScript(alloc, "document.getElementById('ext').click()");
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                _ = p;
+                return link_sink.?.entries.items.len >= 5;
+            }
+        }.ready, &pane);
+
+        const want_ext = try std.fmt.allocPrint(alloc, "browser:{s}", .{page_url});
+        defer alloc.free(want_ext);
+        log.warn("t825: after click routed={d} mode={s}", .{
+            sink.entries.items.len,
+            @tagName(pane.mode),
+        });
+        try testing.expectEqualStrings(want_ext, sink.entries.items[4]);
+
+        // Cancelled, not merely reported: the pane is still the mock.
+        try testing.expectEqual(content.Mode.html, pane.mode);
+        {
+            const raw2 = web.sourceRaw().?;
+            defer w32.CoTaskMemFree(@ptrCast(raw2));
+            const src = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(raw2));
+            defer alloc.free(src);
+            try testing.expect(std.mem.startsWith(
+                u8,
+                src,
+                "https://" ++ content.page_virtual_host ++ "/",
+            ));
+        }
+
+        // (3) A click that stays on the site is untouched — same gesture, same
+        // gate, and the pane walks to the mock's second page in place.
+        pane.executeScript(alloc, "document.getElementById('same').click()");
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                const fp = p.file_path orelse return false;
+                return std.mem.endsWith(u8, fp, "t825-two.html");
+            }
+        }.ready, &pane);
+        log.warn("t825: same-site click walked to {?s}, routed={d}", .{
+            pane.file_path,
+            sink.entries.items.len,
+        });
+        try testing.expectEqual(@as(usize, 5), sink.entries.items.len);
+        try testing.expectEqual(content.Mode.html, pane.mode);
+    }
 
     // ------------------------------------------------------------------
     // T162: the selection toolbar's Copy — on the template AND a website

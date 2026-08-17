@@ -800,12 +800,17 @@ pub const LinkClass = enum {
     ghoztty_command,
 };
 
-/// Classify a navigation target for `mode`. The virtual-host check runs
-/// BEFORE the generic http(s) one — unlike Mac, whose relative links arrive
-/// on a custom scheme, ours live under an `https://` origin, so the generic
-/// test would ship every relative link to the default browser as a URL that
-/// resolves nowhere.
-pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
+/// Classify a navigation target for `mode`. `page` is the document the
+/// navigation is leaving — the web view's committed `Source`, which live-page
+/// mode needs to tell a hop inside the page's own site from one out of it; it
+/// is unread in every other mode, and null when the pane has committed nothing
+/// yet.
+///
+/// The virtual-host check runs BEFORE the generic http(s) one — unlike Mac,
+/// whose relative links arrive on a custom scheme, ours live under an
+/// `https://` origin, so the generic test would ship every relative link to the
+/// default browser as a URL that resolves nowhere.
+pub fn classifyLink(mode: Mode, page: ?[]const u8, uri: []const u8) LinkClass {
     // A `ghoztty://` link is Ghoztty addressing itself, and it is classified
     // FIRST — ahead of the web-mode passthrough below — for two reasons.
     // WebView2 cannot load the scheme at all, so an allowed navigation is a
@@ -818,7 +823,17 @@ pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
     // freely in the pane. That is Mac's `isLivePage` branch of `decidePolicyFor`,
     // and for the html half it is what the `python3 -m http.server` workaround
     // this replaces already did: links, Back and Forward all follow in place.
-    if (mode.isLivePage()) return .allow;
+    //
+    // The ONE exception (T825, Mac 18acc4f6f) is a link that leads OUT of the
+    // page's own site: this web view keeps a cookie store nothing else shares,
+    // so a hop to another site renders logged-out here and the browser is where
+    // that session lives. The caller decides whether the navigation is a
+    // user's click at all (`routesAsLivePageLink`) — everything a page does to
+    // itself is still the page's business.
+    if (mode.isLivePage()) {
+        const from = page orelse return .allow;
+        return if (isExternalLivePageLink(from, uri)) .browser else .allow;
+    }
     // The template itself (with or without a query/fragment): the pane's own
     // document, never a link target to route.
     if (std.ascii.eqlIgnoreCase(stripQuery(uri), page_url)) return .allow;
@@ -833,6 +848,107 @@ pub fn classifyLink(mode: Mode, uri: []const u8) LinkClass {
     }
     if (uri.len >= 7 and std.ascii.eqlIgnoreCase(uri[0..7], "file://")) return .file_url;
     return .drop;
+}
+
+/// Whether a link clicked in a LIVE-PAGE viewer (a website, or a local `.html`
+/// file, both of which own their own navigation) leads OUT of the page's own
+/// site, and so belongs somewhere other than this pane. Mac's
+/// `ViewerView.isExternalLivePageLink`, same rules.
+///
+/// "Site" here is deliberately NOT the web platform's origin. That one decides
+/// what a script may read; this one decides where a PERSON wants a page to
+/// open, and the two want different rules:
+///
+/// - **http(s) → http(s):** the same **host**, and the same **port as
+///   written**. The scheme is excluded on purpose, so an `http` → `https`
+///   upgrade on the same host — the most common same-site hop there is — keeps
+///   navigating in the pane. The port is included on purpose:
+///   `localhost:3000` → `localhost:5173` is a hop between two different dev
+///   servers. A subdomain is a different host and therefore external, which is
+///   what "a link out to another site" means to a person.
+/// - **Every other link scheme** (`javascript:`, `data:`, `blob:`, `about:`,
+///   `mailto:`, some app's custom scheme) is left exactly as it was and
+///   followed in the pane. `javascript:` links are ordinary page machinery, and
+///   handing an arbitrary scheme to `ShellExecuteW` would resolve it to
+///   whatever handler happens to be registered.
+/// - **A `file://` link from a web page** is the exception to that: the engine
+///   refuses the navigation outright, so following it in the pane is a dead
+///   click. It leaves, and the shell opens it in whatever owns that file type —
+///   which is what `NSWorkspace.open` does with the same link on Mac.
+///
+/// Where Mac needs a second family of rules and we do not: a Mac `.html` pane
+/// loads the file itself, so its same-site test is `loadFileURL`'s read grant —
+/// the page's own directory, recursively. Ours serves that file from the
+/// synthetic `ghoztty-page` host (see `page_virtual_host`), so the SAME grant
+/// is already a host, a link reaching up out of the folder cannot even be
+/// spelled (the URL normalizes back under the host), and the containment test
+/// collapses into the host comparison above. Every live page here commits an
+/// `https://` URL, which is why there is no `file://`-page branch at all.
+pub fn isExternalLivePageLink(page: []const u8, link: []const u8) bool {
+    // Not an http(s) document at all — `about:blank`, or a pane that has
+    // committed nothing yet. There is no site to be outside of.
+    const page_site = siteOf(page) orelse return false;
+    const link_site = siteOf(link) orelse return isFileUrl(link);
+    return !page_site.eql(link_site);
+}
+
+/// A live page's site: its host, plus the port as written when that port is not
+/// the scheme's own default (so `http://x.com:80` and `https://x.com` are the
+/// same site, and `http://x.com:443` is not).
+const Site = struct {
+    /// Never empty. Compared case-insensitively, like every host.
+    host: []const u8,
+    /// Null means "the scheme's default", however it was spelled.
+    port: ?u16,
+
+    fn eql(a: Site, b: Site) bool {
+        return std.meta.eql(a.port, b.port) and
+            std.ascii.eqlIgnoreCase(a.host, b.host);
+    }
+};
+
+fn siteOf(uri: []const u8) ?Site {
+    const sep = std.mem.indexOf(u8, uri, "://") orelse return null;
+    const default_port: u16 = blk: {
+        const scheme = uri[0..sep];
+        if (std.ascii.eqlIgnoreCase(scheme, "http")) break :blk 80;
+        if (std.ascii.eqlIgnoreCase(scheme, "https")) break :blk 443;
+        return null;
+    };
+
+    var authority = uri[sep + 3 ..];
+    if (std.mem.indexOfAny(u8, authority, "/?#")) |end| authority = authority[0..end];
+    // `user:pass@host` — credentials are not part of the site, and the LAST
+    // `@` starts the host (a password may legally contain one).
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (authority.len == 0) return null;
+
+    // An IPv6 literal is bracketed, and the colons inside it are not port
+    // separators — the port, if any, follows the `]`.
+    const port_scan_from: usize = if (authority[0] == '[')
+        (std.mem.indexOfScalar(u8, authority, ']') orelse return null) + 1
+    else
+        0;
+
+    var host = authority;
+    var port: ?u16 = null;
+    if (std.mem.indexOfScalarPos(u8, authority, port_scan_from, ':')) |colon| {
+        host = authority[0..colon];
+        const digits = authority[colon + 1 ..];
+        // `http://x.com:/` is a host with no port, exactly as a browser reads
+        // it. A port that is not a number is a URL we cannot classify, and an
+        // unclassifiable link stays in the pane rather than being ejected.
+        if (digits.len > 0) port = std.fmt.parseInt(u16, digits, 10) catch return null;
+    }
+    if (host.len == 0) return null;
+    if (port) |p| {
+        if (p == default_port) port = null;
+    }
+    return .{ .host = host, .port = port };
+}
+
+fn isFileUrl(uri: []const u8) bool {
+    return uri.len >= 7 and std.ascii.eqlIgnoreCase(uri[0..7], "file://");
 }
 
 /// The navigation kinds WebView2 distinguishes
@@ -856,6 +972,40 @@ pub const NavKind = enum { reload, back_or_forward, new_document };
 pub fn routesAsLink(kind: ?NavKind) bool {
     const k = kind orelse return true;
     return k == .new_document;
+}
+
+/// Whether a LIVE-PAGE navigation is the kind a cross-site route applies to
+/// (T825) — Mac's `navigationType == .linkActivated` on the main frame,
+/// translated to the three things WebView2 says about a navigation.
+///
+/// Narrower than `routesAsLink` because the document here is not ours. A file
+/// pane shows the bundled template, which runs no navigating script, so a new
+/// document there IS a link activation; an arbitrary website navigates itself
+/// constantly, and a page's own redirects, script navigations and form posts
+/// are the page's business, not the user's click.
+///
+/// - `kind`: reloads and history walks are excluded by `routesAsLink`, exactly
+///   as in file mode.
+/// - `redirected`: a server hop out of the site is the page answering the
+///   click, not a second click. Mac excludes it for the same reason.
+/// - `user_initiated`: WebView2's own answer AND the caller's, because the
+///   runtime's alone is not enough. `IsUserInitiated` means "not initiated by
+///   page script", so it is TRUE for a host `Navigate` too — the pane loading
+///   the website it was opened with reports as user-initiated, and routing
+///   that cancels the pane's whole reason for existing. The caller subtracts
+///   its own navigations (`ViewerPane.self_nav_pending`); what is left is a
+///   click. The known divergence from Mac is a script-SYNTHESIZED `a.click()`:
+///   WebKit calls that `.linkActivated` and would route it, WebView2 reports it
+///   as not user-initiated and we leave it with the page. Erring that way keeps
+///   a page's own machinery working, which is the failure a user would notice.
+///
+/// Main-frame-ness needs no test: `NavigationStarting` is the top-level frame's
+/// event, and a subframe's navigation arrives on `FrameNavigationStarting`,
+/// which nothing subscribes to.
+pub fn routesAsLivePageLink(kind: ?NavKind, user_initiated: bool, redirected: bool) bool {
+    if (!routesAsLink(kind)) return false;
+    if (redirected) return false;
+    return user_initiated;
 }
 
 /// Mac `resolveForNavigation`'s first try: the clicked link resolved against
@@ -1418,60 +1568,162 @@ test "appendJsString escapes the JS line terminators JSON does not" {
 }
 
 test "classifyLink: the Mac policy, with the virtual host carved out first" {
-    // Websites navigate freely within the pane — every target, even ones the
-    // file policy would route.
-    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "https://example.com/x"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "file:///C:/a.md"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.web, "mailto:a@b.c"));
+    // A pane that has committed nothing has no site to be outside of, so a
+    // live page still follows every link in place — every target, even ones
+    // the file policy would route.
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, null, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, null, "file:///C:/a.md"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, null, "mailto:a@b.c"));
+    // Same once it HAS committed, as long as the link stays on the site.
+    const site = "https://example.com/one";
+    try testing.expectEqual(LinkClass.allow, classifyLink(.web, site, "https://example.com/x"));
 
     // The template is the pane's own document, fragment or query included —
     // without the stripQuery, `viewer.html#x` would read as a relative link
     // to `viewer.html` and open the TEMPLATE next to the file.
-    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url ++ "#frag"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, page_url ++ "?v=1"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, null, page_url));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, null, page_url ++ "#frag"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.markdown, null, page_url ++ "?v=1"));
 
     // A relative link in the document arrives under our origin. This must win
     // over the generic https test or it ships to the browser as a dead URL.
-    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer/other.md"));
-    try testing.expectEqual(LinkClass.relative, classifyLink(.code, "https://ghoztty-viewer/a/b.png"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, null, "https://ghoztty-viewer/other.md"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.code, null, "https://ghoztty-viewer/a/b.png"));
     // The bare origin is ours too (no resource named — the dispatch drops it),
     // NOT a website to open.
-    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer"));
-    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, "https://ghoztty-viewer/"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, null, "https://ghoztty-viewer"));
+    try testing.expectEqual(LinkClass.relative, classifyLink(.markdown, null, "https://ghoztty-viewer/"));
     // A look-alike host is NOT ours — it is a real website.
-    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "https://ghoztty-viewer.example.com/x"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, null, "https://ghoztty-viewer.example.com/x"));
 
     // External links go to the default browser, whatever the case of the
     // scheme.
-    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "https://example.com/x"));
-    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, "HTTP://example.com"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, null, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, null, "HTTP://example.com"));
 
     // Explicit file URLs come through as written (markdown-it linkify or the
     // author's own `file://`).
-    try testing.expectEqual(LinkClass.file_url, classifyLink(.markdown, "file:///C:/docs/a.md"));
-    try testing.expectEqual(LinkClass.file_url, classifyLink(.code, "FILE:///C:/x.txt"));
+    try testing.expectEqual(LinkClass.file_url, classifyLink(.markdown, null, "file:///C:/docs/a.md"));
+    try testing.expectEqual(LinkClass.file_url, classifyLink(.code, null, "FILE:///C:/x.txt"));
 
     // Everything else is dropped, exactly as Mac's nil-fileURL return.
-    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "mailto:a@b.c"));
-    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "about:blank"));
-    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, "vscode://open"));
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, null, "mailto:a@b.c"));
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, null, "about:blank"));
+    try testing.expectEqual(LinkClass.drop, classifyLink(.markdown, null, "vscode://open"));
+
+    // The FILE policy never reads the page: a markdown pane is the bundled
+    // template wherever it was navigated from.
+    try testing.expectEqual(LinkClass.browser, classifyLink(.markdown, page_url, "https://example.com/x"));
 
     // T601: a rendered `.html` file is a PAGE. It navigates like a website —
-    // its own links, its own relative targets, its own external ones — because
-    // that is exactly what it did behind the http server this replaces. Routing
-    // its relative links out to a viewer split would break every multi-page
-    // local site.
-    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "https://ghoztty-page/two.html"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "https://example.com/x"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "file:///C:/a.md"));
-    try testing.expectEqual(LinkClass.allow, classifyLink(.html, "mailto:a@b.c"));
+    // its own links, its own relative targets — because that is exactly what it
+    // did behind the http server this replaces. Routing its relative links out
+    // to a viewer split would break every multi-page local site.
+    const local = "https://ghoztty-page/index.html";
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, local, "https://ghoztty-page/two.html"));
+    try testing.expectEqual(LinkClass.allow, classifyLink(.html, local, "mailto:a@b.c"));
+    // T825: but a link OUT of the page's own site leaves for the browser, in
+    // both live modes — this pane's cookie store is nobody else's.
+    try testing.expectEqual(LinkClass.browser, classifyLink(.html, local, "https://example.com/x"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.html, local, "file:///C:/a.md"));
+    try testing.expectEqual(LinkClass.browser, classifyLink(.web, site, "https://other.com/x"));
+
     // Except the one thing no engine can load: a `ghoztty://` link still means
-    // "this app", in every mode.
+    // "this app", in every mode — ahead of even the cross-site test, so a doc
+    // hosted anywhere can address this app.
     try testing.expectEqual(
         LinkClass.ghoztty_command,
-        classifyLink(.html, "ghoztty://focus/dev"),
+        classifyLink(.html, local, "ghoztty://focus/dev"),
     );
+    try testing.expectEqual(
+        LinkClass.ghoztty_command,
+        classifyLink(.web, site, "ghoztty://focus/dev"),
+    );
+}
+
+test "isExternalLivePageLink: host and port as written decide, not the origin" {
+    const page = "https://example.com/a/b?q=1#f";
+
+    // The same host is the same site, wherever on it the link points.
+    try testing.expect(!isExternalLivePageLink(page, "https://example.com/"));
+    try testing.expect(!isExternalLivePageLink(page, "https://example.com/deep/x?y#z"));
+    // The scheme is excluded on purpose: an http -> https upgrade on one host
+    // is the most common same-site hop there is.
+    try testing.expect(!isExternalLivePageLink(page, "http://example.com/x"));
+    try testing.expect(!isExternalLivePageLink("http://example.com/", "https://example.com/x"));
+    // Hosts are case-insensitive.
+    try testing.expect(!isExternalLivePageLink(page, "https://EXAMPLE.COM/x"));
+    // Credentials are not part of the site.
+    try testing.expect(!isExternalLivePageLink(page, "https://user:p@ss@example.com/x"));
+
+    // Another site, including a subdomain — "a link out to another site" is
+    // what a person means by it, not what a script may read.
+    try testing.expect(isExternalLivePageLink(page, "https://other.com/x"));
+    try testing.expect(isExternalLivePageLink(page, "https://www.example.com/x"));
+    try testing.expect(isExternalLivePageLink(page, "https://example.com.evil.test/x"));
+
+    // The port is part of the site as WRITTEN: two dev servers on one host are
+    // two different places.
+    try testing.expect(isExternalLivePageLink("http://localhost:3000/", "http://localhost:5173/"));
+    try testing.expect(!isExternalLivePageLink("http://localhost:3000/", "http://localhost:3000/x"));
+    // ...except a default port, which is the same site as no port at all.
+    try testing.expect(!isExternalLivePageLink("http://example.com:80/", "https://example.com/x"));
+    try testing.expect(!isExternalLivePageLink("https://example.com:443/", "http://example.com/x"));
+    // A non-default port spelled out is still a different place, even when it
+    // is the OTHER scheme's default.
+    try testing.expect(isExternalLivePageLink("http://example.com:443/", "https://example.com/x"));
+    // An empty port is no port, exactly as a browser reads it.
+    try testing.expect(!isExternalLivePageLink("http://example.com:/", "http://example.com/x"));
+
+    // IPv6 literals: the colons inside the brackets are not a port.
+    try testing.expect(!isExternalLivePageLink("http://[::1]:8080/", "http://[::1]:8080/x"));
+    try testing.expect(isExternalLivePageLink("http://[::1]:8080/", "http://[::1]:9090/x"));
+
+    // Schemes with no destination the shell should own stay in the pane.
+    for ([_][]const u8{
+        "javascript:void(0)",
+        "data:text/html,<p>x",
+        "blob:https://example.com/1234",
+        "about:blank",
+        "mailto:a@b.c",
+        "vscode://open",
+    }) |link| try testing.expect(!isExternalLivePageLink(page, link));
+
+    // A `file://` link is the exception: the engine refuses that navigation
+    // from an https document, so following it in the pane is a dead click.
+    try testing.expect(isExternalLivePageLink(page, "file:///C:/a.md"));
+    try testing.expect(isExternalLivePageLink(page, "FILE:///C:/a.md"));
+
+    // A page that is not an http(s) document has no site to be outside of.
+    try testing.expect(!isExternalLivePageLink("about:blank", "https://other.com/x"));
+    try testing.expect(!isExternalLivePageLink("", "https://other.com/x"));
+
+    // A link we cannot classify is not ejected: an unparseable port leaves the
+    // navigation exactly where it was.
+    try testing.expect(!isExternalLivePageLink(page, "https://example.com:80x/y"));
+
+    // The synthetic host a rendered `.html` file is served from is a site like
+    // any other — which is the whole of Mac's file:// containment rule here,
+    // because a link cannot spell its way out from under a host.
+    const local = "https://" ++ page_virtual_host ++ "/mock/index.html";
+    try testing.expect(!isExternalLivePageLink(local, "https://" ++ page_virtual_host ++ "/other/x.html"));
+    try testing.expect(isExternalLivePageLink(local, "https://example.com/x"));
+    try testing.expect(isExternalLivePageLink(local, "https://" ++ virtual_host ++ "/viewer.html"));
+}
+
+test "routesAsLivePageLink: only a user's click out of a live page routes" {
+    // The click this exists for.
+    try testing.expect(routesAsLivePageLink(.new_document, true, false));
+    // A runtime too old to report a kind still gets the other two gates.
+    try testing.expect(routesAsLivePageLink(null, true, false));
+    try testing.expect(!routesAsLivePageLink(null, false, false));
+
+    // The page's own business: a reload, a history walk, a server redirect,
+    // and any navigation the host or a script started.
+    try testing.expect(!routesAsLivePageLink(.reload, true, false));
+    try testing.expect(!routesAsLivePageLink(.back_or_forward, true, false));
+    try testing.expect(!routesAsLivePageLink(.new_document, true, true));
+    try testing.expect(!routesAsLivePageLink(.new_document, false, false));
 }
 
 test "routesAsLink: new documents route, the pane's own kinds do not" {
