@@ -187,6 +187,13 @@
 # CleanSlate.ps1, repeated here because not every GUI script sources both.
 Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
 
+# T675: BuildMode.ps1 also carries the startup-escape suppression seam, and a
+# GUI script that only sources this file must still get it - an app launched
+# on the test desktop can still tier-1 breakaway out of a permissive job
+# chain and hand its pid-tracked work to a twin. Repeated here for the same
+# reason as the endpoint drop above.
+. (Join-Path $PSScriptRoot 'BuildMode.ps1')
+
 Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
 if (-not ('GhozttyTestDesktop' -as [type])) {

@@ -9,6 +9,30 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-16 - **T675 - the app now escapes the agent's kill-on-close job at
+  startup, so a destructive refresh can finally keep its promise.** New
+  `job_escape.zig`, hooked into `main_ghostty` on the GUI path only: inside a
+  kill-on-close job (first-job flags, OR pane lineage via `$GHOZTTY_PANE_ID`),
+  the app respawns its verbatim command line through the escape tiers
+  (`spawnEscapedOnly`, split out of `spawnEscapingJob` - escaped or no child at
+  all) and exits; `GHOZTTY_JOB_ESCAPED` caps it at one attempt. Acceptance
+  `job-escape-startup.ps1` (ALL PASS, 11; + a guard-due row) reproduces the
+  field shape - launcher jailed in a 0x2000 job BEFORE the app exists - and
+  proves the twin outside the job and alive through the `TerminateJobObject`
+  that used to kill the app mid-refresh. Two surprises worth remembering: with
+  NESTED jobs the NULL-handle flags query answers only the FIRST job joined (a
+  limitless compat job hid the killer's 0x2000 - measured from a real pane
+  chain, so pane lineage is a load-bearing trigger, not belt-and-braces); and
+  the escape is a pid HANDOFF, so every pid-tracking harness needed a
+  suppression seam (`GHOZTTY_NO_STARTUP_ESCAPE`, set in BuildMode.ps1 +
+  TestDesktop.ps1 + six scripts that reach neither - relaunch-guard.ps1 was
+  also missing its T350 gate entirely and went 7-red until gated). No Mac task
+  owed: job objects have no macOS analog and the Mac agent never contains the
+  app. Floor all-PASS, P1-P3 ALL PASS, agent-job-escape + relaunch-guard ALL
+  PASS. Follow-ups: T901 (com shim could spawn the GUI already-escaped, saving
+  the re-exec hop), T902 (exact agent-job membership probe to close the
+  nested-killer blind spot).
+
 - 2026-08-16 - **T644 - Ctrl+Z in the feedback composer now undoes the edit,
   not an invisible styling step.** Root cause exactly as filed: RichEdit
   records every `EM_SETCHARFORMAT`/`EM_SETPARAFORMAT` as an undoable action,

@@ -75,11 +75,14 @@ pub const Spawned = struct {
     tier: Tier,
 };
 
-/// Spawn `cmd_w` with `base` flags, escaping the caller's job object if it can.
-/// `tag` prefixes every log line so two callers' trails stay tellable apart.
+/// Tiers 1–2 only: succeed ONLY with a child that actually got OUT of the
+/// caller's job. `error.NoEscape` when neither tier can — and no child exists
+/// in that case, which is the property the startup self-escape (T675) needs:
+/// an app deciding whether to hand itself off to a twin must never create a
+/// twin that is jailed right beside it.
 ///
 /// The caller owns `pi.hProcess`/`pi.hThread` and must close them.
-pub fn spawnEscapingJob(
+pub fn spawnEscapedOnly(
     arena: Allocator,
     cmd_w: [*:0]u16,
     base: std.os.windows.DWORD,
@@ -113,11 +116,35 @@ pub fn spawnEscapingJob(
     if (spawnViaShellParent(arena, cmd_w, base, tag)) |shell_pi| {
         return .{ .pi = shell_pi, .tier = .shell_parent };
     } else |err| {
+        log.warn("{s}: shell-parent spawn unavailable err={}", .{ tag, err });
+        return error.NoEscape;
+    }
+}
+
+/// Spawn `cmd_w` with `base` flags, escaping the caller's job object if it can.
+/// `tag` prefixes every log line so two callers' trails stay tellable apart.
+///
+/// The caller owns `pi.hProcess`/`pi.hThread` and must close them.
+pub fn spawnEscapingJob(
+    arena: Allocator,
+    cmd_w: [*:0]u16,
+    base: std.os.windows.DWORD,
+    tag: []const u8,
+) !Spawned {
+    const windows = std.os.windows;
+
+    if (spawnEscapedOnly(arena, cmd_w, base, tag)) |spawned| {
+        return spawned;
+    } else |_| {
         log.warn(
-            "{s}: shell-parent spawn unavailable err={}; spawning INSIDE the job (a job teardown that kills us kills this child too)",
-            .{ tag, err },
+            "{s}: spawning INSIDE the job (a job teardown that kills us kills this child too)",
+            .{tag},
         );
     }
+
+    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+    si.cb = @sizeOf(windows.STARTUPINFOW);
+    var pi: windows.PROCESS_INFORMATION = undefined;
 
     if (oswin.exp.kernel32.CreateProcessW(
         null,

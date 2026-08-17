@@ -104,6 +104,24 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T675: launched from inside a pane, this process is a member of the
+    // AGENT's kill-on-close PTY job — and the destructive agent refresh
+    // terminates the agent, whose death tears that job down on top of us.
+    // You cannot leave a job you are in, so if the probe finds us inside a
+    // kill-on-close job the app respawns its own command line OUTSIDE it
+    // (job_spawn's escape tiers) and exits here; the escaped twin carries on
+    // as the app.
+    //
+    // Gated on there being no `+action`: a CLI verb lives milliseconds, its
+    // console wiring and exit code belong to the caller, and a job teardown
+    // is not a hazard it lives long enough to meet.
+    if (@hasDecl(apprt.App, "escapeHostileJobAtStartup") and state.action == null) {
+        if (apprt.App.escapeHostileJobAtStartup(alloc)) {
+            posix.exit(0);
+            return;
+        }
+    }
+
     if (comptime builtin.mode == .Debug) {
         std.log.warn("This is a debug build. Performance will be very poor.", .{});
         std.log.warn("You should only use a debug build for developing Ghostty.", .{});

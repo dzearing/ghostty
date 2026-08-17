@@ -56,6 +56,7 @@ const window_placement = @import("window_placement.zig");
 const agent_recovery = @import("agent_recovery.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
+const job_escape = @import("job_escape.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const url_scheme = @import("url_scheme.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -6814,6 +6815,18 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
 /// `startQuitTimer`, instead of importing a win32 module directly.
 pub fn runRelaunchGuard(alloc: Allocator) ?u8 {
     return relaunch_guard.runFromEnv(alloc);
+}
+
+/// T675: is this process inside a kill-on-close job it does not own — the
+/// agent's PTY job, when the app is launched from inside a pane? If so,
+/// respawn outside it and tell `main` to exit: the escaped twin is THE app,
+/// and this jailed one must not create a single window. Without this, the
+/// destructive agent refresh tears the app down mid-kill (T268's mechanism).
+///
+/// A DECL on the apprt for the same reason as `runRelaunchGuard`:
+/// `main_ghostty` reaches it without importing a win32 module directly.
+pub fn escapeHostileJobAtStartup(alloc: Allocator) bool {
+    return job_escape.escapeAtStartup(alloc);
 }
 
 /// Was this process launched BY a `ghoztty://` link (T695)? If so, focus what

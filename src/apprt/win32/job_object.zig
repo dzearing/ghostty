@@ -86,26 +86,23 @@ fn tri(v: ?bool) []const u8 {
     return if (v) |b| (if (b) "yes" else "no") else "?";
 }
 
-/// Measure the facts for `other_pid`. Never fails: every step that cannot be
-/// answered leaves its field null.
-///
-/// `other_handle` is an ALREADY-OPEN handle to that process when the caller has
-/// one (the refresh does — it opened it to terminate it), so the probe does not
-/// need `PROCESS_QUERY_*` rights of its own. Null is fine; the membership
-/// question is answered from our own job's process-id list either way.
-pub fn probe(other_pid: u32, other_handle: ?windows.HANDLE) Facts {
+/// Just this process's side of the question: are WE in a job, and with what
+/// limit flags? The startup self-escape (T675) asks exactly this, with no other
+/// process in the picture. Same degradation rule as `probe`: null is "could not
+/// tell", never "no".
+pub const SelfJob = struct {
+    in_job: ?bool = null,
+    flags: ?u32 = null,
+};
+
+pub fn selfJob() SelfJob {
     if (comptime builtin.os.tag != .windows) return .{};
 
-    var facts: Facts = .{};
+    var facts: SelfJob = .{};
 
     var b: windows.BOOL = 0;
     if (IsProcessInJob(windows.kernel32.GetCurrentProcess(), null, &b) != 0)
-        facts.self_in_job = b != 0;
-
-    if (other_handle) |h| {
-        var ob: windows.BOOL = 0;
-        if (IsProcessInJob(h, null, &ob) != 0) facts.other_in_job = ob != 0;
-    }
+        facts.in_job = b != 0;
 
     // A NULL job handle asks about the CALLER's job. Denied ⇒ we are not in one
     // (or may not ask), which the null already says.
@@ -117,7 +114,31 @@ pub fn probe(other_pid: u32, other_handle: ?windows.HANDLE) Facts {
         &ext,
         @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
         &ret,
-    ) != 0) facts.self_flags = ext.BasicLimitInformation.LimitFlags;
+    ) != 0) facts.flags = ext.BasicLimitInformation.LimitFlags;
+
+    return facts;
+}
+
+/// Measure the facts for `other_pid`. Never fails: every step that cannot be
+/// answered leaves its field null.
+///
+/// `other_handle` is an ALREADY-OPEN handle to that process when the caller has
+/// one (the refresh does — it opened it to terminate it), so the probe does not
+/// need `PROCESS_QUERY_*` rights of its own. Null is fine; the membership
+/// question is answered from our own job's process-id list either way.
+pub fn probe(other_pid: u32, other_handle: ?windows.HANDLE) Facts {
+    if (comptime builtin.os.tag != .windows) return .{};
+
+    const self = selfJob();
+    var facts: Facts = .{
+        .self_in_job = self.in_job,
+        .self_flags = self.flags,
+    };
+
+    if (other_handle) |h| {
+        var ob: windows.BOOL = 0;
+        if (IsProcessInJob(h, null, &ob) != 0) facts.other_in_job = ob != 0;
+    }
 
     facts.shared = ownJobContains(other_pid);
     return facts;

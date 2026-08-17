@@ -39,6 +39,10 @@
 # Takes the foreground while it runs (SendInput needs it). Only touches
 # ghoztty processes running from this repo's zig-out.
 param([string]$ExePath, [switch]$NegativeControl)
+# T675: suppress the app's startup job self-escape - this harness tracks the
+# pids it launches, and a pane-launched app would otherwise hand its work to
+# a respawned twin mid-test.
+$env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'

@@ -45,6 +45,11 @@ param(
     [switch]$NegativeControl
 )
 
+# T675: suppress the app's startup job self-escape - this harness tracks the
+# pids it launches, and a pane-launched app would otherwise hand its work to
+# a respawned twin mid-test.
+$env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:passes = 0

@@ -85,6 +85,22 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The startup job self-escape (T675): the only harness that proves a
+    # pane-launched app respawns itself OUT of a kill-on-close job and
+    # survives the teardown that used to kill it mid-refresh. Interactive
+    # desktop only (the escape rides the shell-parent hop), so it is not in
+    # the P1-P3 floor; the unit lanes see shouldEscape but never a real job.
+    [pscustomobject]@{
+        Name   = 'job-escape-startup'
+        Script = 'test\win32\job-escape-startup.ps1'
+        Stamp  = 'test\win32\job-escape-startup.stamp.json'
+        Covers = @(
+            'test\win32\job-escape-startup.ps1',
+            'src\apprt\win32\job_escape.zig',
+            'src\apprt\win32\job_spawn.zig',
+            'src\apprt\win32\job_object.zig'
+        )
+    },
     # The viewer suite carries the browser-leak tripwire (T594): the only
     # thing that scores whether a test run handed a page to the user's real
     # browser, and it is not in the P1-P3 floor. The zig-side guard

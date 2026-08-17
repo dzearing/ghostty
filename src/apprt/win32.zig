@@ -46,6 +46,11 @@ test {
     // their own right rather than only through their callers.
     _ = @import("win32/job_spawn.zig");
     _ = @import("win32/job_object.zig");
+    // The startup self-escape from the agent's kill-on-close PTY job (T675).
+    // Its decision function is what stands between a pane-launched app and
+    // dying mid-refresh — and equally between a clean launch and a pointless
+    // re-exec — so the lane checks it in its own right.
+    _ = @import("win32/job_escape.zig");
     // The named-target registry (T121). Its auto `window-N` allocator is the
     // thing that must never re-mint a name a restored window already adopted,
     // and that is pure logic worth checking in its own right.

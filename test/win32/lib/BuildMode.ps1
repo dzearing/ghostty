@@ -65,6 +65,19 @@
 
 Set-StrictMode -Off
 
+# T675: suppress the app's startup job self-escape for everything this script
+# process launches. A script run from a Ghoztty pane hands every app it starts
+# real pane lineage (GHOZTTY_PANE_ID) inside a real kill-on-close job chain, so
+# the app would - correctly, in the field - respawn itself outside the job and
+# EXIT, handing its work to a twin with a different pid. Every harness that
+# tracks the pid it launched (dialog ownership, jail assignment, Stop-Process
+# cleanup) would silently lose its subject. Harness launches are pid-tracked by
+# definition, so the seam rides the one file every acceptance script already
+# dot-sources. Deliberately inherited by nested launches; a script whose SUBJECT
+# is the startup escape re-enables it for its own launcher
+# (test\win32\job-escape-startup.ps1).
+$env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
+
 # One `+version` per exe per process: three libraries may ask, and the answer
 # cannot change while a run is in flight.
 if (-not (Get-Variable -Name GhozttyBuildModeCache -Scope Script -ErrorAction SilentlyContinue)) {

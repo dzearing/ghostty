@@ -48,6 +48,13 @@ function Assert($name, $cond) {
 }
 function Say($m) { Write-Host $m }
 
+# T350 gate (was missing here) - and, since T675, ALSO the startup-escape
+# suppression seam: this harness tracks the exact pids it launches, and an app
+# started from a pane would otherwise respawn itself out of the pane's job
+# chain and hand its work to a twin the assertions cannot see.
+. (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
+
 # Only processes started from the exe under test. The user's installed release
 # runs from %LOCALAPPDATA%\Programs\Ghoztty and must never be matched.
 #
