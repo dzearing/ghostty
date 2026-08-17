@@ -388,5 +388,27 @@ ring/snapshot/gap-fill replay, HELLO handshake):
   and keep both robust, and a breaking change becomes a conscious, bounded cost
   rather than a corrupted-session incident.
 
+### The per-session PTY holder (Windows, T904+)
+
+The non-destructive agent upgrade (T705, design:
+`docs/design/agent-nondestructive-handoff.md`) inverts PTY ownership on
+Windows: each persistent session's ConPTY + shell + kill-on-close job lives in
+a tiny **holder process** (`ghoztty-agent.exe --pty-host`, one per session),
+and the agent talks to it over an owner-only-DACL named pipe
+(`\\.\pipe\ghoztty-pty-host[-debug]-<user>-<session-id>`). An agent restart
+then carries nothing, because nothing moves — holders keep every shell alive
+and the next agent re-adopts them.
+
+The holder⇄owner protocol (`src/remote/agent/pty_host_proto.zig`: versioned
+HELLO, DATA both ways, RESIZE/SIGNAL/EXIT, offset-acknowledged bounded replay)
+is a **second compatibility boundary with the same rules as the app⇄agent
+contract above** — a holder outlives the agent that spawned it BY DESIGN, so a
+reconnecting owner is routinely a different build. Evolve it additively
+(decoders ignore unknown frame types and trailing payload bytes), bump its
+`proto_version` only for a conscious break, and keep the holder's surface
+frozen-tiny so it almost never needs upgrading itself. Increment status lives
+in T705's split (T904 holder+protocol, T905 spawn path, T906 adoption, T907
+choreography). Acceptance: `test\win32\pty-host.ps1`.
+
 Design + status: `docs/design/session-persistence.md`.
 

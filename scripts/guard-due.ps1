@@ -131,6 +131,23 @@ $GuardTable = @(
             'src\apprt\win32\viewer_feedback_doc.zig'
         )
     },
+    # The per-session ConPTY holder (T904): the only harness that drives a
+    # real `--pty-host` process over its real control pipe - ConPTY output,
+    # resize, reconnect gap-replay, exit-code delivery, the Job Object
+    # subtree kill, and the pipe's owner-only DACL. The pure protocol/replay
+    # units run in the test-agent lane every floor run and are deliberately
+    # NOT covered here; the runtime files are.
+    [pscustomobject]@{
+        Name   = 'pty-host'
+        Script = 'test\win32\pty-host.ps1'
+        Stamp  = 'test\win32\pty-host.stamp.json'
+        Covers = @(
+            'test\win32\pty-host.ps1',
+            'src\remote\agent\pty_host.zig',
+            'src\remote\agent\pty_host_smoke.zig',
+            'src\remote\agent\pty_host_proto.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the

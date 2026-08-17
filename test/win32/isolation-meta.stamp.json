@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-16T20:34:44-07:00",
-    "commit":  "f3edf1622",
+    "generated":  "2026-08-16T22:34:34-07:00",
+    "commit":  "094f25cc2",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -136,6 +136,7 @@
                   "test/win32/persistence-flag.ps1":  "bd7b7e85a8c14a1972bae96f1343ce8eef86bb96a81df9a094ef398cba5dce70",
                   "test/win32/probe-topmost-restore.ps1":  "4c21c3082b1d49bafccfb7bd6176396586d1a1d0c89ca3f05b67542381770f8a",
                   "test/win32/profile-latency.ps1":  "740f59bee48415b9c566c0a5dfe13c30fd062c2a668e5f13a42b298107ea4615",
+                  "test/win32/pty-host.ps1":  "65d22b49aa520bc22a55bd2bc2596f7a8bfd12ac79acd9df6b7a86e4c9408f27",
                   "test/win32/readonly-badge.ps1":  "a284e7b8517e1b5e110337cce3f7a4c554347ba7880492686e454f2f95347bb4",
                   "test/win32/rearrange-session-drop.ps1":  "581a3ec58c4ebf777faf556318f9b628220b0be4e88af1adc481e23c46a151eb",
                   "test/win32/relaunch-guard.ps1":  "c9eba909ca4f70a63bad193281df40f31b001c8da9cf6253809e1b9247f23bdb",

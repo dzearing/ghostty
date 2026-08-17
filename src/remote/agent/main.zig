@@ -118,6 +118,8 @@ const protocol = @import("../protocol.zig");
 const server = @import("server.zig");
 const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
+const pty_host = @import("pty_host.zig");
+const pty_host_smoke = @import("pty_host_smoke.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const pipe_stream = @import("../pipe_stream.zig");
@@ -302,6 +304,30 @@ pub fn main() !void {
             // alive as long as any connection borrows a snapshot of it).
             try runRelay(alloc, encoding, r.base_url, ti.token, ti.source, r.headless);
         },
+        .pty_host => |p| {
+            // Per-session ConPTY holder (T904): no daemon lock — one holder per
+            // session, and its pipe bind (FIRST_PIPE_INSTANCE) is the guard.
+            defer {
+                alloc.free(p.session_id);
+                if (p.pipe) |v| alloc.free(v);
+                if (p.cwd) |v| alloc.free(v);
+                if (p.command) |v| alloc.free(v);
+                if (p.shell) |v| alloc.free(v);
+            }
+            try pty_host.run(alloc, .{
+                .session_id = p.session_id,
+                .pipe_name = p.pipe,
+                .rows = p.rows,
+                .cols = p.cols,
+                .cwd = p.cwd,
+                .command = p.command,
+                .shell = p.shell,
+                .replay_bytes = p.replay_bytes,
+                .exit_linger_ms = p.exit_linger_ms,
+                .stamp = agent_version,
+            });
+        },
+        .pty_host_smoke => try pty_host_smoke.run(alloc),
         .enroll => |e| {
             // Self-enroll (browser-first, device-code fallback): register this
             // machine (by its hostname) under the owner's account and persist
@@ -531,6 +557,31 @@ const Mode = union(enum) {
     listen_pipe: ListenPipe,
     relay: Relay,
     enroll: Enroll,
+    pty_host: PtyHost,
+    pty_host_smoke,
+};
+
+/// Per-session ConPTY holder parameters (`--pty-host`, T904 — increment 1 of
+/// the T705 non-destructive agent upgrade). One holder process per persistent
+/// session: it owns the ConPTY + shell + kill-on-close job and serves the
+/// `pty_host_proto` control pipe. Windows-only (parse-time rejected elsewhere).
+/// All string fields are owned (duped from argv so they outlive `argsFree`).
+const PtyHost = struct {
+    /// `--session-id <id>` (required; pipe-name-safe charset).
+    session_id: []const u8,
+    /// `--pipe <\\.\pipe\name>`: explicit control-pipe path. Null ⇒ the
+    /// build-mode-isolated default (`pty_host.defaultPipeName`).
+    pipe: ?[]const u8 = null,
+    rows: u16 = 24,
+    cols: u16 = 80,
+    cwd: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    shell: ?[]const u8 = null,
+    /// `--replay-bytes <n>`: bounded un-acked output ring.
+    replay_bytes: usize = 1024 * 1024,
+    /// `--exit-linger-ms <n>`: how long an ownerless holder outlives its
+    /// exited shell so the agent can still collect the exit code.
+    exit_linger_ms: i64 = 10 * 60 * 1000,
 };
 
 /// Self-enroll parameters (`--enroll --relay=<base>`). `base_url` is the
@@ -737,6 +788,20 @@ fn parseArgs(alloc: Allocator) !Mode {
         }
     }
 
+    // Holder modes (T904) parse their OWN flag set (several of which take
+    // free-form values like --command), so they divert before the main loop —
+    // and before it can trip on a holder flag that precedes `--pty-host`.
+    for (args[1..]) |a| {
+        if (std.mem.eql(u8, a, "--pty-host")) return parsePtyHostMode(alloc, args);
+        if (std.mem.eql(u8, a, "--pty-host-smoke")) {
+            if (builtin.os.tag != .windows) {
+                std.debug.print("ghoztty-agent: --pty-host-smoke is Windows-only\n", .{});
+                return error.InvalidArgs;
+            }
+            return .pty_host_smoke;
+        }
+    }
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -816,6 +881,95 @@ fn parseArgs(alloc: Allocator) !Mode {
     // does NOT open a listener — the TCP path is unauthenticated, so defaulting
     // to it would expose a shell to the network (see the SECURITY note).
     return .usage;
+}
+
+/// Parse the `--pty-host` flag set (T904). Windows-only; every value flag
+/// accepts both `--flag value` and `--flag=value`. Unknown arguments are
+/// rejected — a holder is spawned programmatically (by the agent or the
+/// smoke), so a typo is a bug, not a user to be lenient with.
+fn parsePtyHostMode(alloc: Allocator, args: []const [:0]u8) !Mode {
+    if (builtin.os.tag != .windows) {
+        std.debug.print("ghoztty-agent: --pty-host is Windows-only\n", .{});
+        return error.InvalidArgs;
+    }
+
+    var p: PtyHost = .{ .session_id = &.{} };
+    var session_id: ?[]const u8 = null;
+
+    // Owned-dupe bookkeeping: on an error return, free what was duped.
+    errdefer {
+        if (session_id) |v| alloc.free(v);
+        if (p.pipe) |v| alloc.free(v);
+        if (p.cwd) |v| alloc.free(v);
+        if (p.command) |v| alloc.free(v);
+        if (p.shell) |v| alloc.free(v);
+    }
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--pty-host")) continue;
+
+        const str_flags = .{
+            .{ "--session-id", &session_id },
+            .{ "--pipe", &p.pipe },
+            .{ "--cwd", &p.cwd },
+            .{ "--command", &p.command },
+            .{ "--shell", &p.shell },
+        };
+        var matched = false;
+        inline for (str_flags) |f| {
+            if (!matched) if (try takeValue(args, &i, f[0])) |v| {
+                if (f[1].*) |old| alloc.free(old);
+                f[1].* = try alloc.dupe(u8, v);
+                matched = true;
+            };
+        }
+        if (matched) continue;
+
+        if (try takeValue(args, &i, "--rows")) |v| {
+            p.rows = std.fmt.parseInt(u16, v, 10) catch return badPtyHostValue("--rows", v);
+        } else if (try takeValue(args, &i, "--cols")) |v| {
+            p.cols = std.fmt.parseInt(u16, v, 10) catch return badPtyHostValue("--cols", v);
+        } else if (try takeValue(args, &i, "--replay-bytes")) |v| {
+            const n = std.fmt.parseInt(usize, v, 10) catch return badPtyHostValue("--replay-bytes", v);
+            if (n < 4096) return badPtyHostValue("--replay-bytes", v);
+            p.replay_bytes = n;
+        } else if (try takeValue(args, &i, "--exit-linger-ms")) |v| {
+            p.exit_linger_ms = std.fmt.parseInt(i64, v, 10) catch return badPtyHostValue("--exit-linger-ms", v);
+        } else {
+            std.debug.print("ghoztty-agent: unknown --pty-host argument '{s}'\n", .{a});
+            return error.InvalidArgs;
+        }
+    }
+
+    p.session_id = session_id orelse {
+        std.debug.print("ghoztty-agent: --pty-host requires --session-id <id>\n", .{});
+        return error.InvalidArgs;
+    };
+    return .{ .pty_host = p };
+}
+
+fn badPtyHostValue(comptime flag: []const u8, v: []const u8) error{InvalidArgs} {
+    std.debug.print("ghoztty-agent: invalid " ++ flag ++ " value '{s}'\n", .{v});
+    return error.InvalidArgs;
+}
+
+/// If `args[i.*]` is `<flag> <value>` or `<flag>=<value>`, return the value
+/// (advancing `i` past a separate value argument); else null. Errors when the
+/// flag is present but its value is missing.
+fn takeValue(args: []const [:0]u8, i: *usize, comptime flag: []const u8) !?[]const u8 {
+    const a = args[i.*];
+    if (std.mem.eql(u8, a, flag)) {
+        i.* += 1;
+        if (i.* >= args.len) {
+            std.debug.print("ghoztty-agent: " ++ flag ++ " requires a value\n", .{});
+            return error.InvalidArgs;
+        }
+        return args[i.*];
+    }
+    if (std.mem.startsWith(u8, a, flag ++ "=")) return a[flag.len + 1 ..];
+    return null;
 }
 
 /// Build a `.listen` mode, enforcing the loopback/public policy: an
@@ -950,6 +1104,11 @@ fn printUsage() void {
         \\                                  named pipe (the SECURE local transport on
         \\                                  Windows — only this user can open it). Used by
         \\                                  the app's session-persistence local agent.
+        \\  ghoztty-agent --pty-host --session-id=<id>
+        \\                                  Per-session ConPTY holder (Windows): owns one
+        \\                                  session's shell + pty so the agent can restart
+        \\                                  without killing it. Spawned by the agent, not
+        \\                                  by hand. (--pty-host-smoke runs its self-test.)
         \\                                  --port-file publishes {"port":0,"pid":P,
         \\                                  "pipe":"<name>",...} (atomic).
         \\  ghoztty-agent --listen=127.0.0.1:<port>
@@ -2683,6 +2842,7 @@ test {
     std.testing.refAllDecls(@This());
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
+    _ = @import("pty_host_proto.zig");
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");
