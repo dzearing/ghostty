@@ -190,6 +190,19 @@ pub const Child = struct {
         /// syscall (a Toolhelp walk + PEB read on Windows), so it is called on
         /// a slow periodic tick OUTSIDE the store lock.
         queryForegroundCommand: ?*const fn (ctx: *anyopaque, alloc: Allocator) ?ForegroundCommand = null,
+        /// Optional: how many bytes of this child's output stream have been
+        /// handed to the sink so far, in the child's OWN offset space (T906).
+        /// Only a holder-backed child answers — its stream offsets are shared
+        /// with a separate process's replay buffer, so persisting the number
+        /// lets a LATER agent re-ATTACH exactly where this one stopped.
+        /// Everything else returns null and reconciles nothing.
+        ///
+        /// Contract that makes the number trustworthy: it must already include
+        /// the bytes of the sink call currently in progress. The store reads it
+        /// from inside `onChildOutput` — under the store lock, with the child's
+        /// reader thread parked in that very call — so "what is in the ring"
+        /// and "what offset that is" cannot disagree by a frame.
+        deliveredOffset: ?*const fn (ctx: *anyopaque) ?u64 = null,
     };
 
     /// Hand the child its owning channel + output sink (see `VTable.attach`).
@@ -253,6 +266,13 @@ pub const Child = struct {
     pub fn queryForegroundCommand(self: Child, alloc: Allocator) ?ForegroundCommand {
         const f = self.vtable.queryForegroundCommand orelse return null;
         return f(self.ctx, alloc);
+    }
+
+    /// Bytes delivered to the sink in the child's own offset space (see
+    /// `VTable.deliveredOffset`). Null for every child that is not holder-backed.
+    pub fn deliveredOffset(self: Child) ?u64 {
+        const f = self.vtable.deliveredOffset orelse return null;
+        return f(self.ctx);
     }
 };
 
@@ -530,6 +550,18 @@ pub const Session = struct {
     holder_pipe: ?[]u8 = null,
     holder_pid: u32 = 0,
     holder_stamp: ?[]u8 = null,
+
+    /// Holder stream offset of the last byte appended to `ring` (T906), kept in
+    /// step with the ring from inside `onChildOutput`. Meaningless (0) for an
+    /// in-process child.
+    holder_offset: u64 = 0,
+    /// The value `holder_offset` had when the ring was last snapshotted to disk
+    /// — i.e. the holder offset the SNAPSHOT ends at. This is what
+    /// `sessions.json` carries and what a re-adopting agent sends as its ATTACH
+    /// `ack`, so the holder replays exactly the bytes the snapshot is missing.
+    /// Pairing it with the snapshot rather than with the live ring is the whole
+    /// point: after a crash, the snapshot is all that survived.
+    holder_snapshot_offset: u64 = 0,
 
     /// Lifecycle: while `alive`, `DETACH`/drop keeps the session; only `CLOSE` or
     /// child exit frees it. On exit it becomes a **tombstone** retaining
@@ -994,6 +1026,11 @@ pub const SessionTable = struct {
         errdefer if (s.holder_pipe) |p| self.alloc.free(p);
         if (rec.holder_stamp) |st| s.holder_stamp = try self.alloc.dupe(u8, st);
         s.holder_pid = rec.holder_pid;
+        // The ATTACH `ack` a re-adoption will send (T906). Both fields start
+        // here: nothing has been delivered this run, so "in the ring" and "in
+        // the snapshot" are the same offset until adoption streams the gap.
+        s.holder_offset = rec.holder_offset;
+        s.holder_snapshot_offset = rec.holder_offset;
 
         try self.by_id.put(self.alloc, id, s);
         errdefer _ = self.by_id.remove(id);
@@ -1172,6 +1209,12 @@ pub const SessionStore = struct {
         const now_ms = self.now();
         if (bytes.len > 0) {
             const at = s.recordOutput(bytes, now_ms);
+            // Keep the holder stream offset in lockstep with the ring (T906).
+            // Read HERE, not on a timer: the child's reader thread is parked in
+            // this very call, so its counter and the ring describe the same
+            // instant. A snapshot taken later can then name the exact holder
+            // offset its bytes end at.
+            if (s.child.deliveredOffset()) |off| s.holder_offset = off;
             if (s.streaming and s.bound) {
                 if (s.bridge_data) |f| f(s.bridge_ctx.?, s.channel, at, bytes);
             }
@@ -1707,7 +1750,14 @@ pub const SessionStore = struct {
                 // eventual RELAUNCH replays pre-restart scrollback + divider + live
                 // output. Best-effort; a missing/corrupt snapshot just leaves the
                 // ring empty (the pane comes back without pre-restart scrollback).
-                self.preloadRingSnapshot(sess);
+                //
+                // The restart DIVIDER is deferred for a holder-backed record
+                // (T906): its shell may still be running in a `--pty-host`
+                // process, in which case nothing restarted and drawing the
+                // divider would be a lie the user reads as lost work. Adoption
+                // decides — `adoptHolder` leaves the ring seamless, and
+                // `abandonHolder` draws it on the way to the tombstone path.
+                self.preloadRingSnapshot(sess, sess.holder_pipe == null);
             }
         }
         if (refused > 0) std.log.warn(
@@ -1724,7 +1774,11 @@ pub const SessionStore = struct {
     /// with no resync watermark — a non-zero base would manufacture a phantom gap).
     /// No-op when ring snapshots are disabled or none exists. Called under the store
     /// lock from `loadPersisted`, before any connection or the reaper runs.
-    fn preloadRingSnapshot(self: *SessionStore, sess: *Session) void {
+    ///
+    /// `with_divider = false` loads the scrollback but leaves the divider off,
+    /// for a holder-backed record whose shell may not have restarted at all
+    /// (T906); `appendRestartDivider` adds it later if adoption fails.
+    fn preloadRingSnapshot(self: *SessionStore, sess: *Session, with_divider: bool) void {
         const dir = self.rings_dir orelse return;
         const alloc = self.table.alloc;
         const path = ring_snapshot.pathFor(alloc, dir, sess.idStr()) catch return;
@@ -1745,10 +1799,163 @@ pub const SessionStore = struct {
         // relaunched child's first output lands immediately after the divider.
         sess.ring.preload(0, loaded.bytes);
         sess.out_offset.value = sess.ring.tailOffset();
-        sess.ring.append(sess.out_offset.value, reboot_divider);
-        sess.out_offset.value +%= reboot_divider.len;
+        if (with_divider) appendRestartDivider(sess);
         // Not dirty: this is loaded-from-disk content, not new child output.
         sess.last_snapshot_offset = sess.out_offset.value;
+    }
+
+    /// Append the restart divider to `sess`'s ring at its current tail. Split
+    /// out of `preloadRingSnapshot` so a holder-backed session can defer the
+    /// decision until adoption has answered "did anything actually restart?"
+    /// (T906). Caller holds the store lock. No-op on an empty ring — a divider
+    /// with nothing above it marks a boundary the user never crossed.
+    fn appendRestartDivider(sess: *Session) void {
+        if (sess.ring.len == 0) return;
+        sess.ring.append(sess.out_offset.value, reboot_divider);
+        sess.out_offset.value +%= reboot_divider.len;
+        sess.last_snapshot_offset = sess.out_offset.value;
+    }
+
+    // -------------------------------------------------------------------------
+    // Holder adoption (T906)
+    // -------------------------------------------------------------------------
+    //
+    // A session materialized from disk whose record names a `--pty-host` holder
+    // is only a TOMBSTONE-SHAPED PLACEHOLDER: the shell behind it may still be
+    // running in that separate process. Turning it back into a live session is a
+    // three-step conversation the store cannot have on its own, because dialing
+    // the holder lives in `pty_holder_child.zig` and that module imports THIS
+    // one. So the store supplies the halves that touch session state —
+    // `holderCandidates` (who to try), `adoptHolder` (it answered),
+    // `abandonHolder` (it did not) — and `holder_adopt.zig` does the dialing.
+
+    /// A materialized session that names a holder worth dialing.
+    pub const HolderCandidate = struct {
+        id: u128,
+        /// Hex form, for logs and for matching the holder's HELLO `session_id`.
+        id_str: [32]u8,
+        /// Owned by the caller (`freeHolderCandidates`).
+        pipe: []u8,
+        holder_pid: u32,
+        /// What to send as the ATTACH `ack`: the holder offset this session's
+        /// preloaded ring already ends at.
+        ack: u64,
+    };
+
+    /// Snapshot every materialized session that carries a holder pipe. Takes the
+    /// lock briefly and hands back owned copies, so the caller can spend seconds
+    /// dialing pipes without holding up child output.
+    pub fn holderCandidates(self: *SessionStore, alloc: Allocator) Allocator.Error![]HolderCandidate {
+        var out: std.ArrayList(HolderCandidate) = .empty;
+        errdefer {
+            for (out.items) |c| alloc.free(c.pipe);
+            out.deinit(alloc);
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (s.alive) continue; // already live: not a survivor to pick up
+            const pipe = s.holder_pipe orelse continue;
+            try out.append(alloc, .{
+                .id = s.id,
+                .id_str = s.id_str,
+                .pipe = try alloc.dupe(u8, pipe),
+                .holder_pid = s.holder_pid,
+                .ack = s.holder_snapshot_offset,
+            });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeHolderCandidates(alloc: Allocator, list: []HolderCandidate) void {
+        for (list) |c| alloc.free(c.pipe);
+        alloc.free(list);
+    }
+
+    /// Every holder pipe this store currently claims, alive or tombstoned —
+    /// the "leave these alone" set for the orphan sweep. Owned copies; the
+    /// caller frees each entry and the slice.
+    pub fn holderPipes(self: *SessionStore, alloc: Allocator) Allocator.Error![][]u8 {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |p| alloc.free(p);
+            out.deinit(alloc);
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const pipe = sp.*.holder_pipe orelse continue;
+            try out.append(alloc, try alloc.dupe(u8, pipe));
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// The holder answered: adopt `child` as this session's live child. Returns
+    /// the session's channel so the caller can `child.attach(...)` it to the
+    /// store sink AFTER this returns — attaching under the store lock would
+    /// deadlock against the sink (see `remove`'s deadlock warning).
+    ///
+    /// Returns null (and adopts nothing) if the session went away or is already
+    /// alive; the caller then terminates the child it opened.
+    pub fn adoptHolder(
+        self: *SessionStore,
+        id: u128,
+        child: Child,
+        shell_pid: u32,
+        stamp: []const u8,
+    ) ?u128 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.table.getById(id) orelse return null;
+        if (s.alive) return null;
+        // The placeholder is `deadChild()` — inert, nothing to tear down.
+        s.child.terminate();
+        s.child = child;
+        s.pid = @intCast(shell_pid);
+        s.alive = true;
+        // Not a reboot-floor tombstone any more: the process it describes never
+        // stopped, so it must not be offered a RELAUNCH that would replace a
+        // running shell. And the restart allowance resets — a session whose
+        // shell is still running has plainly not gone stale.
+        s.relaunchable = false;
+        s.unclaimed_restarts = 0;
+        s.exit_code = null;
+        s.last_activity_ms = self.now();
+        if (s.holder_stamp) |old| self.table.alloc.free(old);
+        s.holder_stamp = self.table.alloc.dupe(u8, stamp) catch null;
+        return s.channel;
+    }
+
+    /// Adoption did not happen: put the session back on the plain
+    /// relaunchable-tombstone path it would have taken before holders existed,
+    /// drawing the restart divider `loadPersisted` deferred.
+    ///
+    /// `forget_pipe` is the difference between the two ways adoption can fail.
+    /// The holder did not answer at all — it is gone, and so is the shell — so
+    /// the stale handle is dropped and nothing dials it again. But a holder
+    /// this agent merely cannot SERVE (a newer protocol, after a rollback) is
+    /// still alive and still adoptable by a newer build, so its record is KEPT:
+    /// that record is also what marks the pipe as claimed, and without it the
+    /// orphan sweep would immediately shut down the very holder we just
+    /// promised to leave running.
+    pub fn abandonHolder(self: *SessionStore, id: u128, forget_pipe: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.table.getById(id) orelse return;
+        if (s.alive) return;
+        if (forget_pipe) {
+            if (s.holder_pipe) |p| self.table.alloc.free(p);
+            if (s.holder_stamp) |st| self.table.alloc.free(st);
+            s.holder_pipe = null;
+            s.holder_stamp = null;
+            s.holder_pid = 0;
+            s.holder_offset = 0;
+            s.holder_snapshot_offset = 0;
+        }
+        appendRestartDivider(s);
     }
 
     /// Flush every dirty ALIVE session's output ring to `<rings_dir>/<id>.ring`
@@ -1808,6 +2015,9 @@ pub const SessionStore = struct {
             // it and then reflow to the live pane width (§5.4 smear fix).
             const cap_cols = s.cols;
             const cap_rows = s.rows;
+            // The holder offset these bytes end at (T906) — captured under the
+            // same lock as the ring copy, so the pair cannot drift.
+            const cap_holder_offset = s.holder_offset;
             var id_str_buf: [32]u8 = s.id_str;
             self.mutex.unlock();
 
@@ -1823,6 +2033,12 @@ pub const SessionStore = struct {
             self.mutex.lock();
             if (self.table.getById(id)) |s2| {
                 if (s2.last_snapshot_offset < at) s2.last_snapshot_offset = at;
+                // Advance the adoption watermark with the file that was just
+                // written. Monotonic, like `last_snapshot_offset`: a later pass
+                // that raced ahead must not be walked backwards.
+                if (s2.holder_snapshot_offset < cap_holder_offset) {
+                    s2.holder_snapshot_offset = cap_holder_offset;
+                }
             }
             self.mutex.unlock();
         }
@@ -2136,6 +2352,9 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
         .holder_pipe = holder_pipe,
         .holder_pid = s.holder_pid,
         .holder_stamp = holder_stamp,
+        // The SNAPSHOT's watermark, never the live one: after a crash the
+        // snapshot is what the next agent's ring is built from.
+        .holder_offset = s.holder_snapshot_offset,
     };
 }
 
@@ -2252,6 +2471,10 @@ const FakeChild = struct {
     fake_fg: ??[]const u8 = null,
     /// How many times `queryForegroundCommand` was asked (dead-session skip proof).
     fg_queries: usize = 0,
+    /// Stands in for a holder-backed child's stream position (T906). Null keeps
+    /// the child answering like every in-process child does — "I have no holder
+    /// offset" — so the reconciliation code paths stay off unless a test asks.
+    fake_holder_offset: ?u64 = null,
     alloc: Allocator,
 
     fn child(self: *FakeChild) Child {
@@ -2265,7 +2488,12 @@ const FakeChild = struct {
         .terminate = tm,
         .queryCwd = qcwd,
         .queryForegroundCommand = qfg,
+        .deliveredOffset = dof,
     };
+    fn dof(ctx: *anyopaque) ?u64 {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        return self.fake_holder_offset;
+    }
     fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         self.cwd_queries += 1;
@@ -3175,4 +3403,243 @@ test "SessionStore ring snapshot: dirty alive ring persists; reload preloads scr
         try testing.expect(std.mem.startsWith(u8, buf[0..n], payload));
         try testing.expect(std.mem.endsWith(u8, buf[0..n], reboot_divider));
     }
+}
+
+// -----------------------------------------------------------------------------
+// T906 — holder adoption + ring reconciliation
+// -----------------------------------------------------------------------------
+
+test "holder offset: sessions.json carries the SNAPSHOT's watermark, not the live ring's" {
+    // This is the whole no-gap/no-duplicate guarantee in one assertion. The
+    // number a re-adopting agent sends as its ATTACH `ack` must describe the
+    // bytes that SURVIVED — i.e. the on-disk ring snapshot. Persisting the live
+    // position instead would silently skip every byte written since the last
+    // snapshot, which is exactly the hole an agent crash produces.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    var prng = std.Random.DefaultPrng.init(0xa906);
+    var clock: MutClock = .{ .ms = 500 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    store.meta_path = meta;
+    store.rings_dir = rings;
+    defer store.deinit();
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 500);
+    s.pinned = true;
+    s.setHolder("\\\\.\\pipe\\ghoztty-pty-host-x-aa", 777, "stamp-1");
+    const id_buf: [32]u8 = s.id_str;
+
+    // Output arrives: the store reads the child's stream position from inside
+    // the sink, so ring and offset move together.
+    fake.fake_holder_offset = 100;
+    store.onChildOutput(s.channel, "a" ** 100);
+    try testing.expectEqual(@as(u64, 100), s.holder_offset);
+    try testing.expectEqual(@as(u64, 0), s.holder_snapshot_offset); // nothing on disk yet
+
+    store.snapshotRings();
+    try testing.expectEqual(@as(u64, 100), s.holder_snapshot_offset);
+
+    // More output, NO snapshot: the live position runs ahead, the durable one
+    // must not follow it.
+    fake.fake_holder_offset = 250;
+    store.onChildOutput(s.channel, "b" ** 150);
+    try testing.expectEqual(@as(u64, 250), s.holder_offset);
+    try testing.expectEqual(@as(u64, 100), s.holder_snapshot_offset);
+
+    store.persistMeta();
+    var parsed = (try session_meta.load(alloc, meta)).?;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.sessions.len);
+    const rec = parsed.value.sessions[0];
+    try testing.expectEqualStrings(id_buf[0..], rec.id);
+    try testing.expectEqual(@as(u64, 100), rec.holder_offset);
+    try testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-pty-host-x-aa", rec.holder_pipe.?);
+
+    // And the round trip: a fresh store loads that number as the ack to send.
+    var prng2 = std.Random.DefaultPrng.init(0xb906);
+    var clock2: MutClock = .{ .ms = 9000 };
+    var store2 = SessionStore.init(alloc, prng2.random(), &clock2, MutClock.nowFn, 100000);
+    store2.meta_path = meta;
+    store2.rings_dir = rings;
+    defer store2.deinit();
+    try testing.expectEqual(@as(usize, 1), store2.loadPersisted(1 << 16));
+    const s2 = store2.table.getByIdStr(id_buf[0..]).?;
+    try testing.expectEqual(@as(u64, 100), s2.holder_snapshot_offset);
+
+    const cands = try store2.holderCandidates(alloc);
+    defer SessionStore.freeHolderCandidates(alloc, cands);
+    try testing.expectEqual(@as(usize, 1), cands.len);
+    try testing.expectEqual(@as(u64, 100), cands[0].ack);
+    try testing.expectEqual(@as(u32, 777), cands[0].holder_pid);
+    try testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-pty-host-x-aa", cands[0].pipe);
+}
+
+test "a holder-backed record loads with NO restart divider; abandoning it draws one" {
+    // The divider says "your shell died and came back". For a session whose
+    // holder is still running that is a lie the user reads as lost work, so it
+    // is deferred until adoption has answered — and drawn on the way to the
+    // tombstone when the holder turns out to be gone.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+    try std.fs.cwd().makePath(rings);
+
+    const id = "cccccccccccccccccccccccccccccccc";
+    const payload = "before the agent died";
+    const rp = try ring_snapshot.pathFor(alloc, rings, id);
+    defer alloc.free(rp);
+    try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, payload);
+
+    const recs = [_]session_meta.Record{.{
+        .id = id,
+        .argv = "pwsh",
+        .created_ms = 100,
+        .holder_pipe = "\\\\.\\pipe\\ghoztty-pty-host-x-cc",
+        .holder_pid = 4321,
+        .holder_offset = 512,
+    }};
+    const body = try session_meta.serialize(alloc, &recs);
+    defer alloc.free(body);
+    try session_meta.writeAtomic(alloc, meta, body);
+
+    var prng = std.Random.DefaultPrng.init(0xc906);
+    var clock: MutClock = .{ .ms = 9000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    store.meta_path = meta;
+    store.rings_dir = rings;
+    defer store.deinit();
+    try testing.expectEqual(@as(usize, 1), store.loadPersisted(1 << 16));
+    const s = store.table.getByIdStr(id).?;
+
+    // Scrollback restored, seam clean.
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(@as(u64, payload.len), s.out_offset.value);
+    try testing.expectEqualStrings(payload, buf[0..s.ring.copyRetained(&buf)]);
+    try testing.expectEqual(@as(u64, 512), s.holder_snapshot_offset);
+
+    // The holder did not answer: NOW the user is told the session restarted,
+    // and the dead pipe stops being advertised to anybody.
+    store.abandonHolder(s.id, true);
+    const n = s.ring.copyRetained(&buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..n], payload));
+    try testing.expect(std.mem.endsWith(u8, buf[0..n], reboot_divider));
+    try testing.expect(s.holder_pipe == null);
+    try testing.expectEqual(@as(u32, 0), s.holder_pid);
+    try testing.expect(!s.alive and s.relaunchable); // the path it always took
+
+    const cands = try store.holderCandidates(alloc);
+    defer SessionStore.freeHolderCandidates(alloc, cands);
+    try testing.expectEqual(@as(usize, 0), cands.len);
+}
+
+test "adoptHolder: a tombstone becomes the live session it never stopped being" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xd906);
+    var clock: MutClock = .{ .ms = 9000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    defer store.deinit();
+
+    const id = "dddddddddddddddddddddddddddddddd";
+    const s = (try store.table.materialize(.{
+        .id = id,
+        .argv = "pwsh",
+        .created_ms = 100,
+        .unclaimed_restarts = 1,
+        .holder_pipe = "\\\\.\\pipe\\ghoztty-pty-host-x-dd",
+        .holder_pid = 4321,
+        .holder_stamp = "old-stamp",
+        .holder_offset = 900,
+    }, 1024, 9000)).?;
+    try testing.expect(!s.alive and s.relaunchable);
+    try testing.expectEqual(@as(u32, 2), s.unclaimed_restarts); // one more restart survived
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const channel = store.adoptHolder(s.id, fake.child(), 31337, "new-stamp").?;
+    try testing.expectEqual(s.channel, channel);
+    try testing.expect(s.alive);
+    // NOT relaunchable: offering to relaunch a shell that is still running
+    // would spawn a second one beside it.
+    try testing.expect(!s.relaunchable);
+    try testing.expectEqual(@as(i64, 31337), s.pid); // the SHELL, from HELLO
+    try testing.expect(s.exit_code == null);
+    // A session whose shell never stopped is not a stale reboot-floor leftover.
+    try testing.expectEqual(@as(u32, 0), s.unclaimed_restarts);
+    try testing.expectEqualStrings("new-stamp", s.holder_stamp.?);
+
+    // It is no longer a candidate (it is live), but the orphan sweep must still
+    // see its pipe as claimed — otherwise the sweep reaps what it just adopted.
+    const cands = try store.holderCandidates(alloc);
+    defer SessionStore.freeHolderCandidates(alloc, cands);
+    try testing.expectEqual(@as(usize, 0), cands.len);
+    const pipes = try store.holderPipes(alloc);
+    defer {
+        for (pipes) |p| alloc.free(p);
+        alloc.free(pipes);
+    }
+    try testing.expectEqual(@as(usize, 1), pipes.len);
+    try testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-pty-host-x-dd", pipes[0]);
+
+    // Adopting twice is refused rather than swapping a live child out from
+    // under the reader thread that owns it.
+    var second: FakeChild = .{ .alloc = alloc };
+    defer second.deinit();
+    try testing.expect(store.adoptHolder(s.id, second.child(), 1, "x") == null);
+    try testing.expect(store.adoptHolder(0xdead, second.child(), 1, "x") == null);
+}
+
+test "abandonHolder: keeping the pipe is what stops the orphan sweep killing a healthy holder" {
+    // The two ways adoption can fail are not the same failure. "The holder is
+    // gone" drops the record; "we could not get an answer in two seconds" must
+    // NOT — because an un-claimed pipe is exactly what the orphan sweep reaps,
+    // and the sweep dials again with a longer patience. Forgetting on a busy
+    // box would end a live session over a hiccup.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xe906);
+    var clock: MutClock = .{ .ms = 9000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    defer store.deinit();
+
+    const id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const s = (try store.table.materialize(.{
+        .id = id,
+        .created_ms = 100,
+        .holder_pipe = "\\\\.\\pipe\\ghoztty-pty-host-x-ee",
+        .holder_pid = 4321,
+        .holder_offset = 77,
+    }, 1024, 9000)).?;
+    _ = s.recordOutput("some scrollback", 9000);
+
+    store.abandonHolder(s.id, false);
+
+    // The user is still told the session restarted (it is a tombstone now)...
+    var buf: [256]u8 = undefined;
+    const n = s.ring.copyRetained(&buf);
+    try testing.expect(std.mem.endsWith(u8, buf[0..n], reboot_divider));
+    // ...but the pipe stays CLAIMED, so nothing reaps the holder behind it, and
+    // the next agent start gets to try adopting it again.
+    try testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-pty-host-x-ee", s.holder_pipe.?);
+    try testing.expectEqual(@as(u64, 77), s.holder_snapshot_offset);
+    const pipes = try store.holderPipes(alloc);
+    defer {
+        for (pipes) |p| alloc.free(p);
+        alloc.free(pipes);
+    }
+    try testing.expectEqual(@as(usize, 1), pipes.len);
 }

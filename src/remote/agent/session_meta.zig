@@ -102,6 +102,12 @@ pub const Record = struct {
     holder_pid: u32 = 0,
     /// The holder binary's build stamp.
     holder_stamp: ?[]const u8 = null,
+    /// The holder OUTPUT-stream offset that this session's on-disk ring snapshot
+    /// ends at (T906). A re-adopting agent sends it as its ATTACH `ack`, so the
+    /// holder replays precisely the bytes the snapshot is missing — no gap, no
+    /// duplicate. 0 (the legacy/absent value) means "replay everything you still
+    /// retain", which is also correct: with no snapshot the ring is empty.
+    holder_offset: u64 = 0,
 };
 
 /// How many agent restarts a never-resumed tombstone may survive before it is

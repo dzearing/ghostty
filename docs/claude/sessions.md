@@ -437,5 +437,45 @@ agent and asserts the shell and holder live on — with a flag-OFF negative
 control asserting the shell still dies with the agent, so the measurement is of
 the change rather than of the box.
 
+**Since T906 a starting agent re-adopts them** (`src/remote/agent/holder_adopt.zig`,
+run from every listen path right after `loadPersisted` and BEFORE the listener
+accepts anybody — a viewer that ATTACHed mid-sweep would see a tombstone and
+offer a RELAUNCH, spawning a second shell beside the running one). Four rules
+here are contract:
+
+- **Reconciliation is offset-exact, and the offset is the SNAPSHOT's.**
+  `sessions.json` gains `holder_offset` (additive): the holder stream offset the
+  session's on-disk ring snapshot ends at, so `ATTACH(ack = holder_offset)`
+  replays precisely the bytes the snapshot is missing. It is captured beside the
+  ring copy under one lock, and the live position is read from inside
+  `onChildOutput` via `Child.deliveredOffset()` — the child's reader thread is
+  parked in that very call, so ring content and offset cannot disagree by a
+  frame. Persisting the LIVE offset instead would skip everything written since
+  the last snapshot, which is exactly the hole a crash produces.
+- **The restart divider is deferred, not skipped.** `loadPersisted` leaves it
+  off for a holder-backed record; `adoptHolder` never draws it (nothing
+  restarted — saying so reads to the user as lost work) and `abandonHolder`
+  draws it on the way to the ordinary tombstone.
+- **An adopted session is `alive`, not `relaunchable`.** Offering to relaunch a
+  shell that is still running would spawn a second one beside it.
+- **A holder this agent cannot serve is left running and reported**, never
+  killed — a rollback must not destroy sessions a newer build created. Identity
+  is checked twice before adopting: the holder's HELLO must claim the session id
+  being adopted, and the process handle comes from
+  `GetNamedPipeServerProcessId`, not the recorded pid (Windows recycles pids,
+  and `terminate` would otherwise be able to kill an innocent process).
+
+T906 also owns the **orphan sweep**: after adoption, the holder pipe namespace
+is enumerated and every holder no live session record claims is shut down.
+Without it a holder whose record aged out (`max_unclaimed_restarts`) is
+immortal while its shell lives — unreachable by every agent and every viewer,
+running until the box reboots. It is destructive by design, so it is fenced:
+the pipe name carries the username AND the build-mode segment (T350 endpoint
+isolation), and a holder serves one owner at a time, so a successful connect is
+itself proof that nobody owns it. Acceptance: `test\win32\holder-adopt.ps1`,
+whose headline assertion is the SHELL PID being unchanged across a manager kill
+— that is what separates adoption from the relaunch path
+`test\win32\agent-recovery.ps1` section C covers.
+
 Design + status: `docs/design/session-persistence.md`.
 

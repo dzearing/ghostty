@@ -165,6 +165,21 @@ $GuardTable = @(
             'src\remote\agent\pty_host_spec.zig'
         )
     },
+    # Holder RE-ADOPTION (T906): the only harness that measures the number that
+    # separates adoption from the relaunch path agent-recovery.ps1 covers - the
+    # SHELL PID is unchanged across a manager kill. It also owns the orphan
+    # sweep, which is destructive by design (it shuts holders down), so the
+    # rules that decide who gets reaped must never ship un-run.
+    [pscustomobject]@{
+        Name   = 'holder-adopt'
+        Script = 'test\win32\holder-adopt.ps1'
+        Stamp  = 'test\win32\holder-adopt.stamp.json'
+        Covers = @(
+            'test\win32\holder-adopt.ps1',
+            'src\remote\agent\holder_adopt.zig',
+            'src\remote\agent\session_meta.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the

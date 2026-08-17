@@ -109,11 +109,63 @@ pub fn enabledFor(value: ?[]const u8) bool {
         std.ascii.eqlIgnoreCase(v, "yes");
 }
 
+/// Everything a LATER agent needs to pick up a holder this one left behind
+/// (T906). All of it comes out of `sessions.json`.
+pub const AdoptOptions = struct {
+    /// The recorded control pipe. Dialed VERBATIM — never re-derived from the
+    /// session id, because the holder's own id is a different random value
+    /// minted before the session had one.
+    pipe_name: []const u8,
+    /// The AGENT's session id, for log lines only. It is deliberately NOT what
+    /// the holder's HELLO is checked against: a holder's id is minted in
+    /// `spawnHolderBacked` before `SessionTable.create` has assigned a session
+    /// id, so the two are unrelated by construction and comparing them would
+    /// refuse every adoption there is.
+    session_id: []const u8,
+    /// Recorded holder pid, for the liveness handle. 0 ⇒ unknown, and adoption
+    /// then relies on the dial alone.
+    holder_pid: u32 = 0,
+    /// Last output offset this session's ring already holds — the ATTACH `ack`.
+    ack: u64 = 0,
+    /// How long to wait for the pipe. Short: an adoption sweep runs before the
+    /// agent serves anybody, and a holder that is up has its pipe bound already
+    /// (it binds before spawning the shell), so this covers a busy box, not a
+    /// startup race.
+    dial_timeout_ms: u64 = 2_000,
+};
+
+/// Whether `pipe_name` is the control pipe a holder calling itself `holder_id`
+/// would have bound — i.e. the id is the name's last `-`-separated component
+/// (`pty_host.defaultPipeName`).
+///
+/// This is the identity check adoption makes, and getting it wrong in either
+/// direction is expensive: too strict and no session is ever adopted, too loose
+/// and a user's pane is wired to somebody else's shell. The holder's id is NOT
+/// the agent's session id — it is a fresh random value minted before the
+/// session had an id — so the recorded pipe NAME is the only thing the two ends
+/// share, which is why the comparison is against the name.
+///
+/// A suffix match rather than "split on the last dash" so an id containing a
+/// dash (the hand-driven `--session-id` path) is handled exactly.
+pub fn pipeNamesHolder(pipe_name: []const u8, holder_id: []const u8) bool {
+    if (holder_id.len == 0 or holder_id.len >= pipe_name.len) return false;
+    const start = pipe_name.len - holder_id.len;
+    if (pipe_name[start - 1] != '-') return false;
+    return std.mem.eql(u8, pipe_name[start..], holder_id);
+}
+
 pub const open = if (is_windows) win.open else stub.open;
+/// Attach to an ALREADY RUNNING holder (T906) — the adoption half of `open`.
+/// Same `Spawned` result and the same `HolderChild` behind it, so an adopted
+/// session is indistinguishable from one this agent spawned itself.
+pub const adopt = if (is_windows) win.adopt else stub.adopt;
 
 const stub = struct {
     fn open(_: Allocator, _: Options) !Spawned {
         return error.PtyHolderUnsupported; // Windows-only for now (Mac half: T908)
+    }
+    fn adopt(_: Allocator, _: AdoptOptions) !Spawned {
+        return error.PtyHolderUnsupported;
     }
 };
 
@@ -195,7 +247,20 @@ const win = struct {
             .queryCwd = queryCwdFn,
             .queryForegroundPid = queryForegroundPidFn,
             .queryForegroundCommand = queryForegroundCommandFn,
+            .deliveredOffset = deliveredOffsetFn,
         };
+
+        /// Where this child's output stream stands, in the HOLDER's offset space
+        /// (T906). `received` is advanced BEFORE the sink call that carries those
+        /// bytes, and the store reads this from inside that sink call — so the
+        /// answer always includes the bytes the caller is appending right now,
+        /// which is exactly the invariant the persisted watermark needs.
+        fn deliveredOffsetFn(ctx: *anyopaque) ?u64 {
+            const self: *HolderChild = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.received;
+        }
 
         // --- frame writing ----------------------------------------------------
 
@@ -715,6 +780,142 @@ const win = struct {
         };
     }
 
+    extern "kernel32" fn OpenProcess(
+        dwDesiredAccess: windows.DWORD,
+        bInheritHandle: windows.BOOL,
+        dwProcessId: windows.DWORD,
+    ) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn GetNamedPipeServerProcessId(
+        Pipe: windows.HANDLE,
+        ServerProcessId: *windows.ULONG,
+    ) callconv(.winapi) windows.BOOL;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: windows.DWORD = 0x1000;
+    const PROCESS_TERMINATE: windows.DWORD = 0x0001;
+    const SYNCHRONIZE: windows.DWORD = 0x00100000;
+
+    /// Pick up a holder that is already running (T906).
+    ///
+    /// Two identity checks stand between "a pipe answered" and "this is the
+    /// shell that pane was showing", because getting it wrong wires a user's
+    /// pane to somebody else's process:
+    ///
+    ///   1. The holder's HELLO must claim the HOLDER id embedded in the pipe
+    ///      name we recorded — NOT the agent's session id, which a holder has
+    ///      never heard of (`holderIdFromPipe`). That is what proves the
+    ///      process answering this name is the one that bound it, rather than a
+    ///      later holder that reused the name.
+    ///   2. The process we take a handle to is the pipe's SERVER
+    ///      (`GetNamedPipeServerProcessId`), and it must match the recorded pid
+    ///      when we have one. Windows recycles pids, so trusting the record
+    ///      alone would let `terminate` kill an innocent process that inherited
+    ///      it; trusting the pipe alone would let a stranger on the name be
+    ///      adopted.
+    ///
+    /// Failure NEVER terminates the holder — an agent that cannot serve it
+    /// leaves it running and says so, so a newer-protocol holder outlives a
+    /// rollback instead of being destroyed by it.
+    fn adopt(alloc: Allocator, opts: AdoptOptions) !Spawned {
+        const handle = try dialExisting(alloc, opts.pipe_name, opts.dial_timeout_ms);
+        var pstream_ok = false;
+        errdefer if (!pstream_ok) {
+            var s = pipe_stream.PipeStream.init(handle);
+            s.serverStream().close();
+        };
+
+        var server_pid: windows.ULONG = 0;
+        const pid: u32 = if (GetNamedPipeServerProcessId(handle, &server_pid) != 0 and server_pid != 0)
+            @intCast(server_pid)
+        else
+            opts.holder_pid;
+        if (pid == 0) return error.HolderPidUnknown;
+        if (opts.holder_pid != 0 and pid != opts.holder_pid) {
+            log.warn(
+                "pipe '{s}' is served by pid {d}, not the recorded holder {d}; not adopting",
+                .{ opts.pipe_name, pid, opts.holder_pid },
+            );
+            return error.HolderPidMismatch;
+        }
+        const holder_proc = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+            0,
+            pid,
+        ) orelse return error.HolderUnreachable;
+        errdefer windows.CloseHandle(holder_proc);
+
+        const pstream = try pipe_stream.PipeStream.create(alloc, handle);
+        pstream_ok = true;
+        errdefer {
+            pstream.serverStream().close();
+            pstream.destroy(alloc);
+        }
+        const stream = pstream.serverStream();
+
+        var accum = proto.Accum.init(alloc);
+        errdefer accum.deinit();
+        const hello = try helloThenAttach(stream, &accum, opts.ack);
+        if (!pipeNamesHolder(opts.pipe_name, hello.session_id)) {
+            log.warn(
+                "holder on '{s}' identifies as '{s}', which is not the holder that name belongs to; not adopting",
+                .{ opts.pipe_name, hello.session_id },
+            );
+            return error.HolderSessionMismatch;
+        }
+
+        const pipe_copy = try alloc.dupe(u8, opts.pipe_name);
+        errdefer alloc.free(pipe_copy);
+        const stamp = try alloc.dupe(u8, hello.stamp);
+        errdefer alloc.free(stamp);
+
+        const self = try alloc.create(HolderChild);
+        self.* = .{
+            .alloc = alloc,
+            .pstream = pstream,
+            .stream = stream,
+            .pipe_name = pipe_copy,
+            .stamp = stamp,
+            .holder_proc = holder_proc,
+            .holder_pid = pid,
+            .shell_pid = hello.shell_pid,
+            .accum = accum,
+            // We told the holder we already have everything below `ack`, so the
+            // stream resumes there. Starting at 0 instead would make the first
+            // adopted frame look like a replay gap the size of the scrollback.
+            .received = opts.ack,
+            .acked = opts.ack,
+        };
+        log.info(
+            "adopted holder for session '{s}': holder pid {d}, shell pid {d}, stamp {s}, retained [{d},{d}), resuming at {d}",
+            .{ opts.session_id, pid, hello.shell_pid, stamp, hello.start, hello.end, opts.ack },
+        );
+        if (hello.start > opts.ack) log.warn(
+            "session '{s}': {d} byte(s) of output were dropped from the holder's replay buffer while no agent was running",
+            .{ opts.session_id, hello.start - opts.ack },
+        );
+        return .{
+            .child = self.child(),
+            .info = .{
+                .pipe_name = self.pipe_name,
+                .holder_pid = self.holder_pid,
+                .shell_pid = self.shell_pid,
+                .stamp = self.stamp,
+            },
+        };
+    }
+
+    /// Dial a holder that should ALREADY be serving. Unlike `dial` there is no
+    /// process handle to early-out on, so this is a plain bounded retry — a
+    /// holder that is not there simply never answers.
+    fn dialExisting(alloc: Allocator, pipe_name: []const u8, timeout_ms: u64) !windows.HANDLE {
+        var waited: u64 = 0;
+        while (true) {
+            if (pipe_stream.dialHandle(alloc, pipe_name)) |h| return h else |_| {}
+            if (waited >= timeout_ms) return error.HolderDialTimeout;
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            waited += 50;
+        }
+    }
+
     /// Connect to `pipe_name`, retrying while the holder starts up. Gives up
     /// early — and says so — if the holder process dies, so a holder that
     /// refuses its spec surfaces as a spawn failure the user is told about
@@ -735,6 +936,31 @@ const win = struct {
 // =============================================================================
 
 const testing = std.testing;
+
+test "pipeNamesHolder: the recorded NAME is the shared identity, not the session id" {
+    const pipe = "\\\\.\\pipe\\ghoztty-pty-host-debug-dave-0123456789abcdef0123456789abcdef";
+
+    // The holder answers with the id it was spawned under, which is the last
+    // component of the name it bound. This is the case that must pass, and the
+    // first version of this check compared against the AGENT's session id
+    // instead — which a holder has never heard of, so every adoption was
+    // refused and every session was silently relaunched with a fresh shell.
+    try testing.expect(pipeNamesHolder(pipe, "0123456789abcdef0123456789abcdef"));
+
+    // A different holder squatting the name is refused: adopting it would wire
+    // a user's pane to somebody else's shell.
+    try testing.expect(!pipeNamesHolder(pipe, "ffffffffffffffffffffffffffffffff"));
+    // A trailing FRAGMENT of the id is not the id — the boundary must be a
+    // real `-`, or "…-dave-abc" would match a holder calling itself "c".
+    try testing.expect(!pipeNamesHolder(pipe, "cdef0123456789abcdef"));
+    try testing.expect(!pipeNamesHolder(pipe, ""));
+    try testing.expect(!pipeNamesHolder(pipe, pipe));
+
+    // An id containing a dash (the hand-driven `--pty-host --session-id` path)
+    // still matches exactly — which is why this is a suffix test and not a
+    // split on the last dash.
+    try testing.expect(pipeNamesHolder("\\\\.\\pipe\\ghoztty-pty-host-dave-smoke-1", "smoke-1"));
+}
 
 test "enabledFor: only an explicit opt-in turns holders on" {
     // Off is the default and every unset/near-miss value keeps it off — the

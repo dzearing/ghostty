@@ -121,6 +121,7 @@ const pty_child = @import("pty_child.zig");
 const pty_host = @import("pty_host.zig");
 const pty_host_spec = @import("pty_host_spec.zig");
 const pty_host_smoke = @import("pty_host_smoke.zig");
+const holder_adopt = @import("holder_adopt.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const pipe_stream = @import("../pipe_stream.zig");
@@ -1325,6 +1326,12 @@ fn runListen(
     // gone), so a stale layouts.json never advertises unattachable windows.
     if (store.reapLayouts() > 0) store.persistLayouts();
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Holder re-adoption (T906): before the listener takes its first
+    // connection, dial every recorded `--pty-host` holder and pick the live
+    // ones back up. A session whose holder answers is ALIVE again — same shell,
+    // same scrollback, no restart divider — and one whose holder is gone falls
+    // back to the relaunchable tombstone it was a moment ago.
+    _ = holder_adopt.run(alloc, &store);
     // Graceful SIGTERM → flush dirty rings before exit (T13b). Started here (the
     // store now exists); SIGTERM was already blocked process-wide by
     // `blockSigterm()` in main before any thread spawned, so this watcher's
@@ -1499,6 +1506,12 @@ fn runListenUnix(
     // gone), so a stale layouts.json never advertises unattachable windows.
     if (store.reapLayouts() > 0) store.persistLayouts();
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Holder re-adoption (T906): before the listener takes its first
+    // connection, dial every recorded `--pty-host` holder and pick the live
+    // ones back up. A session whose holder answers is ALIVE again — same shell,
+    // same scrollback, no restart divider — and one whose holder is gone falls
+    // back to the relaunchable tombstone it was a moment ago.
+    _ = holder_adopt.run(alloc, &store);
     // Graceful SIGTERM → flush dirty rings before exit (T13b) — see runListen.
     startSigtermWatcher(&store);
     try store.startReaper();
@@ -1601,6 +1614,12 @@ fn runListenPipe(
     // gone), so a stale layouts.json never advertises unattachable windows.
     if (store.reapLayouts() > 0) store.persistLayouts();
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Holder re-adoption (T906): before the listener takes its first
+    // connection, dial every recorded `--pty-host` holder and pick the live
+    // ones back up. A session whose holder answers is ALIVE again — same shell,
+    // same scrollback, no restart divider — and one whose holder is gone falls
+    // back to the relaunchable tombstone it was a moment ago.
+    _ = holder_adopt.run(alloc, &store);
     // Graceful stop → flush dirty rings before exit: the console-ctrl handler is
     // the Windows analog of the POSIX SIGTERM watcher (T13b). It covers Ctrl-C/
     // Ctrl-Break from a console, console-window close, and logoff/shutdown
@@ -2883,6 +2902,7 @@ test {
     _ = @import("pty_host_proto.zig");
     _ = @import("pty_host_spec.zig");
     _ = @import("pty_holder_child.zig");
+    _ = @import("holder_adopt.zig");
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");
