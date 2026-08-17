@@ -2360,9 +2360,9 @@ const RestoreTransport = struct {
 /// gap-filled scrollback) OR a relaunchable TOMBSTONE (T89g): the agent
 /// restarted (reboot / agent upgrade) and materialized the session from disk as
 /// dead-but-relaunchable. ATTACHing a tombstone lets the shared termio path
-/// (`termio/Remote.zig`) apply `session-relaunch` (T230): `notify`, the default,
+/// (`termio/Remote.zig`) apply `session-relaunch` (T230): `restore`, the default,
 /// opens a fresh shell in the recorded cwd with a notice naming the command and
-/// runs NOTHING; `auto` respawns in-place with a `--- session restarted ---`
+/// runs NOTHING; `rerun` respawns in-place with a `--- session restarted ---`
 /// divider + ring-snapshot scrollback; `prompt` leaves a press-any-key pane).
 /// A leaf whose session is
 /// genuinely gone / has no id re-opens a FRESH agent-backed pane (the tree shape
@@ -3196,11 +3196,11 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
 /// the respawned agent materializes them as relaunchable tombstones and the
 /// re-ATTACH finds each one dead.
 ///
-/// What happens next is `session-relaunch` (T230), and the DEFAULT is `notify`:
+/// What happens next is `session-relaunch` (T230), and the DEFAULT is `restore`:
 /// each pane comes back on a FRESH shell in its recorded working directory,
 /// above a notice naming the command that had been running. It is deliberately
 /// NOT re-run — "We should not ever re-execute the commands which were
-/// previously ran". (`auto` restores the old RELAUNCH-with-divider behavior for
+/// previously ran". (`rerun` restores the old RELAUNCH-with-divider behavior for
 /// anyone who opts in.) That is the honest outcome the dialog promises: the
 /// panes come back, their processes do not, and nothing starts itself.
 /// `draining_legacy` is the T907 arm: non-null when the agent WOULD replace

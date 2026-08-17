@@ -666,7 +666,7 @@ pub const AttachOutcome = struct {
     title: ?[]u8,
     /// The command the session was running, as the agent's recorded label
     /// (`protocol.Attached.argv`). Only a DEAD reply carries it, and only from
-    /// an agent new enough to send it — it exists so the `notify` relaunch
+    /// an agent new enough to send it — it exists so the `restore` relaunch
     /// policy (T230) can name the command it is deliberately NOT re-running.
     /// Display text: never parsed, never executed.
     argv: ?[]u8 = null,
@@ -2651,7 +2651,7 @@ pub const Connection = struct {
     /// `CLOSE_SESSION_RESULT` lands on a channel nobody claimed and is dropped).
     ///
     /// For callers whose success does not depend on the answer, and who must not
-    /// pay for it. The T230 `notify` path is exactly that: it retires the dead
+    /// pay for it. The T230 `restore` path is exactly that: it retires the dead
     /// tombstone it is replacing as housekeeping, on the pane's IO thread, in the
     /// middle of bringing a fresh shell up for a user who is watching. A bounded
     /// RPC there costs the whole timeout on any hiccup — measured at 1.5 s per

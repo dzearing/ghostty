@@ -1229,27 +1229,32 @@ command: ?Command = null,
 /// metadata from disk but the child process is not running. There are three
 /// options:
 ///
-///   * `notify` (the default) - do NOT re-run anything. The pane comes up on a
-///     fresh shell in the session's recorded working directory, above a notice
-///     saying the background process was restarted and naming the command that
-///     WAS running so it can be copied and re-issued deliberately.
-///   * `auto` - immediately `RELAUNCH` the recorded command/shell in the same
+///   * `restore` (the default) - do NOT re-run anything. The pane comes up on a
+///     fresh login shell in the session's recorded working directory, above a
+///     notice saying the background process was restarted and naming the command
+///     that WAS running so it can be copied and re-issued deliberately.
+///   * `rerun` - immediately `RELAUNCH` the recorded command/shell in the same
 ///     pane and print a `--- session restarted ---` divider above the fresh
 ///     output.
 ///   * `prompt` - do NOT auto-respawn; the pane comes up in its exited state
 ///     with a "press any key to relaunch" affordance, so the user decides
-///     whether to bring the old command back.
+///     whether to bring the old command back. Consenting gets you `rerun`.
 ///
-/// `notify` is the default because silently re-executing a recorded command is
+/// `restore` is the default because silently re-executing a recorded command is
 /// unsafe: it was recorded in a world that no longer exists (a different tree
 /// state, a build or migration or agent loop that must not run twice), and the
-/// user never asked for it a second time. `auto` and `prompt` remain available
+/// user never asked for it a second time. `rerun` and `prompt` remain available
 /// for anyone who wants the old behavior, but they are opt-ins.
+///
+/// The working directory a `restore` comes back in is the one the session was
+/// last in, as the agent recorded it — a shell that `cd`ed elsewhere comes back
+/// where it actually was — and a session the agent recorded no directory for
+/// comes back in the app's own default working directory.
 ///
 /// This has no effect when the agent kept running (the ordinary app-upgrade /
 /// crash case): the session is still alive and simply re-attaches with its
 /// scrollback intact. It only matters across an agent restart.
-@"session-relaunch": SessionRelaunch = .notify,
+@"session-relaunch": SessionRelaunch = .restore,
 
 /// Controls when command finished notifications are sent. There are
 /// three options:
@@ -10637,8 +10642,8 @@ pub const Scrollbar = enum {
 
 /// See session-relaunch
 pub const SessionRelaunch = enum {
-    notify,
-    auto,
+    restore,
+    rerun,
     prompt,
 };
 
@@ -11052,6 +11057,54 @@ test "clone preserves conditional set" {
     defer clone1.deinit();
 
     try testing.expect(clone1._conditional_set.contains(.theme));
+}
+
+test "T823 session-relaunch defaults to restore and parses all three values" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try testing.expectEqual(SessionRelaunch.restore, cfg.@"session-relaunch");
+    }
+
+    // Every value the Mac seat accepts must parse here too — the whole point of
+    // the T823 rename. A value that only one platform's CLI understands is the
+    // divergence this project does not ship.
+    for ([_]struct { arg: []const u8, want: SessionRelaunch }{
+        .{ .arg = "--session-relaunch=restore", .want = .restore },
+        .{ .arg = "--session-relaunch=rerun", .want = .rerun },
+        .{ .arg = "--session-relaunch=prompt", .want = .prompt },
+    }) |tc| {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{tc.arg} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(tc.want, cfg.@"session-relaunch");
+    }
+}
+
+test "T823 a pre-rename session-relaunch value leaves the safe default standing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // `notify` and `auto` were this fork's names for `restore` and `rerun`
+    // before T823. A config still carrying one must not silently become a
+    // re-run: the value is rejected (a diagnostic the user sees) and the
+    // default — which MEANS what `notify` meant — stands.
+    for ([_][]const u8{
+        "--session-relaunch=notify",
+        "--session-relaunch=auto",
+    }) |arg| {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{arg} };
+        cfg.loadIter(alloc, &it) catch {};
+        try testing.expectEqual(SessionRelaunch.restore, cfg.@"session-relaunch");
+        try testing.expect(!cfg._diagnostics.empty());
+    }
 }
 
 test "working-directory expands tilde" {

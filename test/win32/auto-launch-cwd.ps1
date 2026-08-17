@@ -269,7 +269,7 @@ Assert "B4 the startup window did NOT inherit the launcher's directory" `
 # Kill the app AND the agent - the upgrade script's exact move, since it swaps
 # both binaries. The agent's children die with it; its on-disk state survives, so
 # the next launch re-materializes each session as a relaunchable tombstone and
-# `session-relaunch = auto` respawns it. The respawn must use the RECORDED cwd.
+# `session-relaunch = rerun` respawns it. The respawn must use the RECORDED cwd.
 Assert "C0 an agent is running before the kill" ((Count-TestProcs 'ghoztty-agent.exe') -ge 1)
 Stop-TestProcs
 Assert "C1 app and agent are both stopped" `

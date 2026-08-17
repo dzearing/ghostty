@@ -122,7 +122,7 @@ variant proves it end to end:
    `sessions.json` and materializes every session as a *relaunchable tombstone*
    before it accepts connections.
 3. **Recover** — relaunch the app. It rebuilds the layout from the manifest,
-   re-attaches each leaf by session id, and (session-relaunch = `auto`) fires
+   re-attaches each leaf by session id, and (session-relaunch = `rerun`) fires
    `RELAUNCH` per pane: the agent respawns the child from recorded argv/cwd.
 
 Each cycle asserts the **opposite** of the survival tests: the agent PID

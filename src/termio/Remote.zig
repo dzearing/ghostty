@@ -102,7 +102,7 @@ argv: ?[]const []const u8,
 /// `command`. Coexists with `command`, which stays the session's label.
 ///
 /// Used on the OPEN and on the two paths that deliberately RE-RUN the recorded
-/// command (`auto` / `prompt` relaunch) — never on the `notify` fresh-shell
+/// command (`rerun` / `prompt` relaunch) — never on the `restore` fresh-shell
 /// open, whose whole purpose is to not re-run it (T230). Each element is duped
 /// into `arena`. Null everywhere else, leaving `argv` in charge.
 command_argv: ?[]const []const u8,
@@ -117,8 +117,8 @@ local: bool,
 
 /// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
 /// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
-/// T12c). `.notify` (the default) refuses to re-run it and opens a fresh shell
-/// with a notice instead (T230); `.auto` respawns it in place (`RELAUNCH`) and
+/// T12c). `.restore` (the default) refuses to re-run it and opens a fresh shell
+/// with a notice instead (T230); `.rerun` respawns it in place (`RELAUNCH`) and
 /// shows a restarted divider; `.prompt` leaves the pane in its exited state for
 /// the user to decide. Only meaningful for the LOCAL-agent ATTACH path;
 /// irrelevant on OPEN-new.
@@ -325,8 +325,10 @@ pub const Config = struct {
     pinned: bool = false,
 
     /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
-    /// `relaunch_policy` field doc. Defaults to `.auto`.
-    relaunch_policy: RelaunchPolicy = .auto,
+    /// `relaunch_policy` field doc. Defaults to `.restore` — the same default the
+    /// config ships, so a caller that leaves this out gets the safe policy rather
+    /// than silently re-running a recorded command (T823).
+    relaunch_policy: RelaunchPolicy = .restore,
 
     /// True when `conn` dials the LOCAL agent (same machine, UDS) — the
     /// session-persistence path. Gates surfacing the agent-reported tty from
@@ -392,12 +394,17 @@ pub fn openWorkingDirectory(
 /// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
 /// `config.SessionRelaunch`; kept local so this backend need not import config.
 ///
-/// `notify` is the default (T230) and is the only one of the three that never
+/// `restore` is the default (T230) and is the only one of the three that never
 /// puts a recorded command back on a CPU: it opens a brand-new session on a
 /// fresh shell in the dead session's working directory and prints
-/// `session_notice` above it. `auto` respawns the recorded command; `prompt`
+/// `session_notice` above it. `rerun` respawns the recorded command; `prompt`
 /// respawns it on the first keystroke.
-pub const RelaunchPolicy = enum { notify, auto, prompt };
+///
+/// The three names are the ones the Mac seat ships (T823): the policy landed on
+/// both platforms independently — `notify`/`auto` here, `restore`/`rerun` there
+/// — and a setting the user can spell on one platform and not the other is the
+/// divergence this project does not ship.
+pub const RelaunchPolicy = enum { restore, rerun, prompt };
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -628,7 +635,7 @@ pub fn threadEnter(
     // used after bring-up to print a "session restarted" divider (T12c).
     var did_relaunch = false;
     // Set when the pane's persisted session was a dead tombstone and the
-    // `.notify` policy (T230) opened a FRESH session instead of respawning the
+    // `.restore` policy (T230) opened a FRESH session instead of respawning the
     // recorded command. Holds the command we refused to re-run (arena-owned, so
     // it outlives the ATTACH outcome), or null when the agent recorded none /
     // is too old to report one. Drives the notice printed after bring-up.
@@ -657,7 +664,7 @@ pub fn threadEnter(
     // the re-attached session actually lives — so `+list --json` answered the
     // default for every restored pane while `+sessions --json` had the truth.
     // Every attach-family reply carries the recorded cwd (ATTACHED alive,
-    // ATTACHED dead → notify/auto/prompt); null means an older agent, and the
+    // ATTACHED dead → restore/rerun/prompt); null means an older agent, and the
     // seeded value stands (degrade, don't fail). Arena-owned.
     var attach_cwd: ?[]const u8 = null;
 
@@ -775,14 +782,14 @@ pub fn threadEnter(
         // unsafe as a default — it was recorded in a world that no longer
         // exists, it may be a build/migration/agent loop that must not run
         // twice, and the user never asked for it again ("We should not ever
-        // re-execute the commands which were previously ran"). So `notify` (the
+        // re-execute the commands which were previously ran"). So `restore` (the
         // default) opens a BRAND-NEW session on a fresh shell, placed in the
         // dead session's recorded working directory — a cwd is not a command; it
         // re-creates no side effects — and prints a notice naming the command it
-        // did not run. `auto` and `prompt` keep the old respawning behavior for
+        // did not run. `rerun` and `prompt` keep the old respawning behavior for
         // anyone who opts back in.
         if (outcome.status == .dead and outcome.relaunchable and
-            self.relaunch_policy == .notify)
+            self.relaunch_policy == .restore)
         {
             // Copy out of `outcome` before its `defer deinit()` frees it. The
             // arena lives as long as this backend, which outlives the notice.
@@ -816,7 +823,7 @@ pub fn threadEnter(
             // and it timed out) for a result we would only have logged. An agent
             // too old to advertise CLOSE_SESSION just keeps the tombstone.
             self.conn.closeSessionNoWait(sid) catch |err| {
-                log.info("notify policy: could not retire dead session err={} (harmless)", .{err});
+                log.info("restore policy: could not retire dead session err={} (harmless)", .{err});
             };
 
             const open: protocol.Open = .{
@@ -835,22 +842,22 @@ pub fn threadEnter(
             };
             var refusal: protocol.RefusalCopy = .{};
             const p = self.conn.openChannelRefusable(open, &self.canceller, &refusal) catch |err| {
-                log.warn("notify policy: fresh session open failed err={}", .{err});
+                log.warn("restore policy: fresh session open failed err={}", .{err});
                 if (err == error.OpenRefused) self.recordOpenRefusal(refusal);
                 return error.RemoteAttachFailed;
             };
             did_notify = true;
             log.info(
-                "dead relaunchable session NOT re-run (notify policy); opened a fresh shell instead",
+                "dead relaunchable session NOT re-run (restore policy); opened a fresh shell instead",
                 .{},
             );
             break :pane p;
         }
 
-        // `auto`: RELAUNCH it in place on the SAME channel the dead ATTACHED
+        // `rerun`: RELAUNCH it in place on the SAME channel the dead ATTACHED
         // arrived on and stream fresh output.
         if (outcome.status == .dead and outcome.relaunchable and
-            self.relaunch_policy == .auto)
+            self.relaunch_policy == .rerun)
         {
             // The respawn runs in the RECORDED cwd (the agent's on-disk floor),
             // so report that rather than the restore-path seed (T166).
@@ -868,7 +875,7 @@ pub fn threadEnter(
                 // Respawn fidelity (wp3): the agent's on-disk record has no
                 // env/TERM/argv, so send our live copies — the respawned shell
                 // keeps GHOZTTY_PANE_ID & co. and its shell integration. A
-                // command pane sends its keep-alive invocation (T468): `auto`
+                // command pane sends its keep-alive invocation (T468): `rerun`
                 // exists to re-run the recorded command, so it should come back
                 // the way it was opened, keep-alive included.
                 .{
@@ -1217,7 +1224,7 @@ pub fn threadEnter(
         }
     }
 
-    // T532, the WRITER half. A relaunch, a notify-policy fresh shell, and a
+    // T532, the WRITER half. A relaunch, a restore-policy fresh shell, and a
     // prompt-deferred relaunch all begin a NEW byte stream at 0 — `Connection`
     // arms their panes with `discard_below = 0` for exactly that reason. Our
     // absolute base has to follow, or `appliedOffset()` keeps counting from the
@@ -1387,7 +1394,7 @@ pub fn queueWrite(
 
 /// Fire the deferred `RELAUNCH` for a `.prompt`-policy pane once the user consents
 /// with a keystroke (T12c2). Runs on the IO thread (from `queueWrite`), which parks
-/// on the RPC exactly like `threadEnter`'s `.auto` relaunch — `shutdown` cancels the
+/// on the RPC exactly like `threadEnter`'s `.rerun` relaunch — `shutdown` cancels the
 /// canceller so a doomed relaunch under teardown wakes immediately. On success the
 /// pane's child is live and streaming on its already-armed ring; we print the
 /// "restarted" divider above the fresh output. On failure the pane stays childless
@@ -1410,7 +1417,7 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
         cols,
         px_w,
         px_h,
-        // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
+        // Respawn fidelity (wp3): same live env/TERM/argv as the rerun path.
         .{
             .env = self.env,
             .term = self.term,

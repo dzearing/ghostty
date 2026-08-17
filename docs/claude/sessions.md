@@ -18,12 +18,13 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
   processes outlive the app. On next launch the app re-attaches: layout, split
   ratios, titles, working dirs, and gap-filled scrollback come back with the
   **same PIDs** (no restart) as long as the agent stayed alive.
-- `session-relaunch = notify|auto|prompt` (default `notify`). Only matters across
+- `session-relaunch = restore|rerun|prompt` (default `restore`; the same three
+  names the Mac seat ships, since T823). Only matters across
   an **agent** restart (reboot / agent upgrade), where the child is gone but its
   metadata was materialized from disk as a relaunchable tombstone.
   **A recorded command is never re-executed by default** — it was recorded in a
   world that no longer exists, and nobody asked for it twice.
-  - `notify` (default) — the pane comes up on a **fresh shell** in the session's
+  - `restore` (default) — the pane comes up on a **fresh shell** in the session's
     recorded working directory (a missing directory falls back to `$HOME` /
     `%USERPROFILE%` rather than failing the pane), with a notice above it
     naming the command that WAS running so it can be copied and re-issued
@@ -32,7 +33,7 @@ crashes). It is **on by default** (disable with `session-persistence = off`).
     repaint (cmd.exe's `ESC[H ESC[2J`) erases the former, and the banner is the
     copy that survives it. The dead tombstone is retired (fire-and-forget
     `CLOSE_SESSION`) so it does not accumulate in `sessions.json`.
-  - `auto` — respawns the recorded command in-place with a
+  - `rerun` — respawns the recorded command in-place with a
     `--- session restarted ---` divider.
   - `prompt` — leaves the pane in its exited state for the user to decide.
 

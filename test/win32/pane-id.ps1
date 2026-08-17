@@ -188,7 +188,7 @@ function Launch($tmp, $title, $restore) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    $launchArgs = @('--session-relaunch=auto')
+    $launchArgs = @('--session-relaunch=rerun')
     if (-not $restore) { $launchArgs += "--title=$title" }
     # persistence: on (default), into a throwaway $env:LOCALAPPDATA - the restore leg is what proves the pane id is stable. Launch-NoPersist is the =false twin.
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null

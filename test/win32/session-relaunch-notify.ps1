@@ -9,8 +9,13 @@
 # session was closed could list the previous command executed so the user can
 # choose to copy/paste it."
 #
-# The new default is `notify`: no respawn, a fresh shell in the recorded working
+# The new default is `restore`: no respawn, a fresh shell in the recorded working
 # directory, and a notice above it naming the command that was running.
+#
+# (T823 renamed the three values to the ones the Mac seat ships - `notify` ->
+# `restore`, `auto` -> `rerun` - so the setting can be spelled the same way on
+# both platforms. This file keeps its name so the evidence pointers in the task
+# files that cite it still resolve; the behavior it measures is unchanged.)
 #
 # Measured by OUTCOME - whether the recorded process is RUNNING, what the pane
 # actually shows, and whether the pane takes input - not by log scraping:
@@ -22,7 +27,7 @@
 #      on a live shell. Since T423 it also proves the notice is in the pane's
 #      own SCROLLBACK, above the shell's output - not only in the banner
 #      overlay, which is all that used to survive.
-#   B: negative control / opt-in - `--session-relaunch=auto` still respawns the
+#   B: negative control / opt-in - `--session-relaunch=rerun` still respawns the
 #      recorded command. Without this, A would also pass against a build that
 #      simply broke restore.
 #   C: a pane whose recorded cwd was DELETED while the agent was down still
@@ -353,12 +358,12 @@ $workA = Join-Path $root 'workA'
 New-Item -ItemType Directory -Force $workA | Out-Null
 
 # ============================================================================
-Say "== A: the default (notify) - the recorded commands are NOT re-run"
+Say "== A: the default (restore) - the recorded commands are NOT re-run"
 # ============================================================================
 Reset-State 'a'
 Build-AndKill $workA | Out-Null
 
-$appPidA = Start-App 'notify'
+$appPidA = Start-App 'restore'
 Assert "A1 the GUI came back" ($appPidA -ne 0)
 $treeA = Wait-Leaves 'a0' 3 60
 Assert "A2 the layout restored (3 panes)" ((All-Leaves $treeA).Count -ge 3)
@@ -445,7 +450,7 @@ foreach ($leaf in $leavesA) { if (Test-PaneResponsive $leaf.id "a$($leaf.id.Subs
 Assert "A9 every restored pane is on a live, interactive shell ($respA/$($leavesA.Count))" `
     ($respA -eq $leavesA.Count)
 
-# T237: the notify policy must also RETIRE the dead tombstone it replaced -
+# T237: the restore policy must also RETIRE the dead tombstone it replaced -
 # the fire-and-forget CLOSE_SESSION (`closeSessionNoWait`, Remote.zig) - or
 # every agent restart leaks one dead(relaunchable) row per pane into
 # sessions.json forever. Scored on the agent's own sessions.json: the marker
@@ -471,11 +476,11 @@ Assert "A14 the dead tombstones were retired from sessions.json (live=$liveA14)"
 Stop-TestProcs
 
 # ============================================================================
-Say "== B: opt-in - session-relaunch=auto STILL respawns the recorded command"
+Say "== B: opt-in - session-relaunch=rerun STILL respawns the recorded command"
 # ============================================================================
 Reset-State 'b'
 Build-AndKill $workA | Out-Null
-$appPidB = Start-App 'auto' @('--session-relaunch=auto')
+$appPidB = Start-App 'rerun' @('--session-relaunch=rerun')
 Assert "B1 the GUI came back" ($appPidB -ne 0)
 Wait-Leaves 'b2' 3 60 | Out-Null
 Assert "B2 '$CMD_A' WAS respawned under the auto policy" (Wait-MarkerPings $MARK_A 1 40)
@@ -722,7 +727,7 @@ while ((Get-Date) -lt $deadlineF2) {
 Assert "F10 the banner notice names the typed command" $sawBanF
 Assert "F11 the scrollback notice names it under 'Previous command:'" `
     (Wait-PaneTextTight $paneF2 'f-txt' "Previouscommand:ping-n$MARK_F" 1 40)
-Assert "F12 the typed command was NOT re-executed (notify policy)" ((Count-MarkerPings $MARK_F) -eq 0)
+Assert "F12 the typed command was NOT re-executed (restore policy)" ((Count-MarkerPings $MARK_F) -eq 0)
 Assert "F13 the restored pane is on a live, interactive shell" (Test-PaneResponsive $paneF2 'f-post')
 Stop-TestProcs
 
@@ -742,6 +747,19 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert "G1 the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert "G2 no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
+
+# --- stamp (T783/T823) ------------------------------------------------------
+# A green run records the content of every file this harness covers, so
+# scripts\guard-due.ps1 can answer "has anything run it against the code as it
+# now stands?". The reboot floor's promise - an agent restart never re-runs a
+# recorded command - is invisible to every lane and to P1-P3, so without this a
+# Remote.zig edit that broke it would surface at the user's next reboot. Red
+# leaves the stamp alone, so a failure stays due.
+if ($script:failures -eq 0) {
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'scripts\guard-due.ps1') `
+        update -Guard session-relaunch -Repo $repoRoot 2>&1 | ForEach-Object { Say "  $_" }
 }
 
 Say ""

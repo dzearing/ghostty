@@ -222,7 +222,16 @@ $badPaths = @()
 $badCites = @()
 $headingCache = @{}
 
+# THIS file is section A's fixture bank: it holds deliberately dangling
+# literals - `docs/claude/nope.md`, CLAUDE.md "Naming" - because the unit
+# assertions above prove the parser REPORTS a broken pointer. Scanned like any
+# other tracked file they are five guaranteed failures, and the harness cannot
+# ever go green (found running it for T823, two commits after it landed). Its
+# own pointers are exercised by section A rather than skipped altogether.
+$SelfRel = 'test/win32/docs-routing.ps1'
+
 foreach ($rel in $tracked) {
+    if ($rel -eq $SelfRel) { continue }
     if ($rel -match $HistoryPattern) { continue }
     if ($TextExt -notcontains ([System.IO.Path]::GetExtension($rel))) { continue }
     $full = Join-Path $Repo ($rel -replace '/', '\')

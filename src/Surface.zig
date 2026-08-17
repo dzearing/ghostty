@@ -1183,12 +1183,12 @@ pub fn init(
                     .local = rb.local_shell_integration,
                     // Reboot-floor policy (T12c/T230): if this ATTACH target
                     // comes back dead-but-relaunchable (the agent restarted),
-                    // `notify` (the default) opens a FRESH shell and names the
-                    // old command without running it, `auto` respawns it in
+                    // `restore` (the default) opens a FRESH shell and names the
+                    // old command without running it, `rerun` respawns it in
                     // place, and `prompt` shows the exited overlay.
                     .relaunch_policy = switch (config.@"session-relaunch") {
-                        .notify => .notify,
-                        .auto => .auto,
+                        .restore => .restore,
+                        .rerun => .rerun,
                         .prompt => .prompt,
                     },
                     // WP-D3: the persisted screen snapshot + offset for a fast,

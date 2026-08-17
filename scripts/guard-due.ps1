@@ -249,6 +249,27 @@ $GuardTable = @(
             'test\win32\deliver-windows-build.ps1'
         )
     },
+    # The reboot floor's ONE user-visible promise (T230/T823): an agent restart
+    # must never put a recorded command back on a CPU. Nothing in the P1-P3 floor
+    # or either unit lane can see it - the policy only fires when the agent has
+    # restarted and materialized a dead tombstone from disk, which takes a real
+    # reboot-equivalent cycle - so a `termio\Remote.zig` edit that broke it would
+    # stay invisible until the user's next reboot silently started a brand-new
+    # Claude Code session in every pane, which is the exact complaint that
+    # produced T230. Only the DEFAULT-policy harness is gated: `rerun`/`prompt`
+    # are opt-ins nobody's reboot lands on by accident, and their harness
+    # (`session-relaunch.ps1`) is one more long GUI run per Remote.zig edit for a
+    # path the default never takes.
+    [pscustomobject]@{
+        Name   = 'session-relaunch'
+        Script = 'test\win32\session-relaunch-notify.ps1'
+        Stamp  = 'test\win32\session-relaunch-notify.stamp.json'
+        Covers = @(
+            'src\termio\Remote.zig',
+            'src\termio\session_notice.zig',
+            'test\win32\session-relaunch-notify.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'upgrade-no-fork'
         Script = 'test\win32\upgrade-no-fork.ps1'

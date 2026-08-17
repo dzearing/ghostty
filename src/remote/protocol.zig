@@ -1158,7 +1158,7 @@ pub const Attached = struct {
 
     /// The command the session was running, as the human-readable label the
     /// agent recorded at OPEN time (`SessionInfo.argv`). Sent with `status ==
-    /// .dead` so a viewer that refuses to re-execute it (T230's `notify`
+    /// .dead` so a viewer that refuses to re-execute it (T230's `restore`
     /// policy, the default) can still NAME it in the notice it prints above the
     /// fresh shell — the user's own words: "the console message which says the
     /// session was closed could list the previous command executed so the user

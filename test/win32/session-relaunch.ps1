@@ -8,7 +8,7 @@
 # each recorded session id, and the shared termio path fires RELAUNCH per the
 # `session-relaunch` policy:
 #
-#   A (auto):   restore ATTACHes the tombstones and each pane auto-RELAUNCHes with
+#   A (rerun):  restore ATTACHes the tombstones and each pane auto-RELAUNCHes with
 #               NO user input. The agent replays the pane's on-disk ring snapshot
 #               (pre-kill scrollback) and then emits the "--- session restarted ---"
 #               divider, so +read shows the pre-kill marker FOLLOWED BY the divider,
@@ -238,10 +238,10 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 # ============================================================================
-"== A: session-relaunch=auto - agent restart auto-RELAUNCHes with divider + ring scrollback"
+"== A: session-relaunch=rerun - agent restart auto-RELAUNCHes with divider + ring scrollback"
 # ============================================================================
-$tmpA = Join-Path $root 'auto'
-Launch $tmpA 't89g-auto' 'auto' $false
+$tmpA = Join-Path $root 'rerun'
+Launch $tmpA 't89g-rerun' 'rerun' $false
 $paneA = Wait-FirstPane $tmpA 25
 Assert "A1 startup pane came up under the local agent" ($null -ne $paneA)
 Assert-GhozttyIsolated -Exe $Exe
@@ -289,9 +289,9 @@ $agentAlive = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'"
 Assert "A8 the agent process is gone after the kill" ($agentAlive -eq 0)
 
 # Relaunch. A fresh agent loads sessions.json -> relaunchable tombstones; restore
-# ATTACHes each id; policy=auto respawns each pane in-place. Suppress the blank
+# ATTACHes each id; policy=rerun respawns each pane in-place. Suppress the blank
 # window and rebuild the layout.
-Launch $tmpA 't89g-auto' 'auto' $true
+Launch $tmpA 't89g-rerun' 'rerun' $true
 
 # The SAME relp session id must come back ALIVE - proof the tombstone RELAUNCHed
 # (a fresh OPEN would mint a new id and leave relp's id dead/absent).
@@ -406,7 +406,7 @@ Assert "B8 the keystroke-relaunched pane is LIVE (input reaches the NEW child, o
 
 # ============================================================================
 if ($script:failures -gt 0) {
-    "== DIAG: auto read-post =="
+    "== DIAG: rerun read-post =="
     if (Test-Path "$tmpA\read-post.txt") { Get-Content "$tmpA\read-post.txt" -Raw }
     "== DIAG: prompt read =="
     if (Test-Path "$tmpB\read-prompt.txt") { Get-Content "$tmpB\read-prompt.txt" -Raw }

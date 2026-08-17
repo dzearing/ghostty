@@ -532,7 +532,7 @@ pub const Session = struct {
     /// sent on the dead `ATTACHED` reply so the restart notice can name what a
     /// plain shell pane was actually running. Deliberately a SEPARATE field
     /// from `argv`: `handleRelaunch` re-executes `argv`, and overwriting it
-    /// with a sampled foreground command would make `session-relaunch = auto`
+    /// with a sampled foreground command would make `session-relaunch = rerun`
     /// re-run e.g. `claude` in place of the shell.
     fg_cmd: ?[]u8 = null,
 

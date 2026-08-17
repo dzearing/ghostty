@@ -41,7 +41,7 @@
 # TOMBSTONES rather than the same PIDs. That is still a supported attach path
 # (`restoreWindowHasAttachableLeaf`: "alive or relaunchable tombstone") and the
 # ATTACHes are what this script reads. What it deliberately does NOT assert is
-# the roster afterwards: `session-relaunch = notify` (the default) brings the
+# the roster afterwards: `session-relaunch = restore` (the default) brings the
 # pane up on a FRESH shell in the recorded cwd and RETIRES the tombstone, so the
 # three ids on the roster at the end are new by design - a fact about the
 # relaunch policy, not about blob translation. `session-crash-recover.ps1` is
@@ -354,7 +354,7 @@ foreach ($w in @(Tree-Windows $treeC)) {
 }
 
 # Every session id the Mac blobs named was ATTACHed to. The roster afterwards is
-# deliberately NOT the oracle - `session-relaunch = notify` retires each
+# deliberately NOT the oracle - `session-relaunch = restore` retires each
 # tombstone and opens a fresh shell, so those ids are new by design (header).
 $logC = "$tmp\app-c.log"
 $logText = Out-Text $logC

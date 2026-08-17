@@ -1,0 +1,11 @@
+{
+    "guard":  "session-relaunch",
+    "script":  "test/win32/session-relaunch-notify.ps1",
+    "generated":  "2026-08-17T08:34:51-07:00",
+    "commit":  "9cad17087",
+    "files":  {
+                  "src/termio/Remote.zig":  "fb4de81e717fb19c13b93ceb4b55c69a056ada04d0c1eb3c6427b0d7e6284c83",
+                  "src/termio/session_notice.zig":  "4a5ee710213b6f2e64692e1f99edda06d7370a2b0c3a5fff23c7554ceac17b96",
+                  "test/win32/session-relaunch-notify.ps1":  "569a61e9f819d0decd6a7355ceeadb973263638bc8d406c4d3d08826e4fd0040"
+              }
+}

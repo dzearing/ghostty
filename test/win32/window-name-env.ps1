@@ -150,7 +150,7 @@ function Launch($tmp, $title, $restore) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    $launchArgs = @('--session-relaunch=auto')
+    $launchArgs = @('--session-relaunch=rerun')
     if (-not $restore) { $launchArgs += "--title=$title" }
     Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
 }
