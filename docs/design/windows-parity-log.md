@@ -9,7 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
-- 2026-08-16 - **T596 - the host-floor t400 fetch-count assertion can no
+- 2026-08-16 - **T644 - Ctrl+Z in the feedback composer now undoes the edit,
+  not an invisible styling step.** Root cause exactly as filed: RichEdit
+  records every `EM_SETCHARFORMAT`/`EM_SETPARAFORMAT` as an undoable action,
+  and `ensurePlainAtCaret` sends both before every keystroke and paste, so
+  the undo stack interleaved `[format, edit, format, edit]` and one Ctrl+Z
+  popped a record that changed no text. Fix is both candidate halves at once:
+  new `richedit_tom.zig` reaches the control's `ITextDocument` (via
+  `EM_GETOLEINTERFACE`) and suspends the undo recorder
+  (`Undo(tomSuspend/tomResume)`) around ALL programmatic formatting —
+  `ensurePlainAtCaret`, the quote-wash sweep, and `applyTheme`'s recolour —
+  and `ensurePlainAtCaret` now reads the caret's format first and skips
+  identical sets, because even an unrecorded message between two keystrokes
+  ends RichEdit's group-typing aggregation (the difference between undoing
+  the word and undoing a letter). Arm J of `viewer-feedback.ps1` went green
+  and grew three assertions: a second Ctrl+Z steps back again, a typed word
+  undoes as a word, and the T641 quote arms still hold. ALL PASS (70); floor
+  lib/none/win32/agent all PASS (the first sweep caught an off-by-one in the
+  new module's own vtable-size test — the layout test doing its job before
+  the layout ever reached RichEdit). Surprise worth remembering: the agent
+  core test binary compiles `apprt.win32` tests too, so a red win32 unit test
+  fails BOTH lanes.
   longer flake on cache state (T597/T615 closed with it).** The flake class
   is removed rather than suppressed: the assertion no longer compares ANY two
   cache-dependent measurements. The calibration loop (T690's mitigation) is

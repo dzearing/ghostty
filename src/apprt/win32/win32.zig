@@ -1274,6 +1274,15 @@ pub const MSFTEDIT_DLL = std.unicode.utf8ToUtf16LeStringLiteral("Msftedit.dll");
 pub const EM_SETBKGNDCOLOR: u32 = 0x0443; // WM_USER + 67
 pub const EM_SETCHARFORMAT: u32 = 0x0444; // WM_USER + 68
 pub const EM_SETEVENTMASK: u32 = 0x0445; // WM_USER + 69
+/// Read the formatting the composer would otherwise blindly re-set (T644):
+/// skipping a set that would change nothing is what keeps RichEdit's
+/// group-typing aggregation — and therefore word-at-a-time undo — intact.
+pub const EM_GETCHARFORMAT: u32 = 0x043A; // WM_USER + 58
+pub const EM_GETPARAFORMAT: u32 = 0x043D; // WM_USER + 61
+/// The door to RichEdit's COM side (`IRichEditOle`, and through it the TOM's
+/// `ITextDocument`) — how programmatic formatting is kept OFF the undo stack
+/// (T644, `richedit_tom.zig`).
+pub const EM_GETOLEINTERFACE: u32 = 0x043C; // WM_USER + 60
 /// Cap on the undo stack. 0 disables undo entirely; the composer leaves the
 /// default in place and only names the message so the intent is greppable.
 pub const EM_SETUNDOLIMIT: u32 = 0x0452; // WM_USER + 82
@@ -1316,6 +1325,14 @@ pub const CFM_COLOR: u32 = 0x40000000;
 /// as tight line boxes, which is why the accent bar down the left is drawn by
 /// hand rather than asked for here.
 pub const CFM_BACKCOLOR: u32 = 0x04000000;
+
+/// `CHARFORMAT2W.dwEffects` bits. Each shares its value with its `CFM_` twin;
+/// an effect bit SET on a read means the colour is "auto" and the matching
+/// `crTextColor`/`crBackColor` is not what is on screen — which is why the
+/// composer's is-it-already-plain check (T644) must see them clear before it
+/// trusts the colour fields.
+pub const CFE_AUTOCOLOR: u32 = 0x40000000;
+pub const CFE_AUTOBACKCOLOR: u32 = 0x04000000;
 
 /// `PARAFORMAT2.dwMask` bits the composer sets: the left indent that makes a
 /// quoted block read as a block.

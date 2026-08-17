@@ -72,6 +72,7 @@ const doc = @import("viewer_feedback_doc.zig");
 const feedback_images = @import("viewer_feedback_images.zig");
 const utf16_offset = @import("utf16_offset.zig");
 const clipboard_image = @import("clipboard_image.zig");
+const richedit_tom = @import("richedit_tom.zig");
 const gdiplus_decode = @import("gdiplus_decode.zig");
 const RegionSelector = @import("RegionSelector.zig");
 const system_colors = @import("system_colors.zig");
@@ -152,6 +153,13 @@ swallow_paste_char: bool = false,
 /// The RichEdit's own window procedure, kept so the subclass can hand every
 /// message it does not add to.
 prev_edit_proc: ?*const anyopaque = null,
+
+/// The control's TOM document, held so programmatic formatting can run with
+/// the undo recorder suspended (T644) — without this, every
+/// `ensurePlainAtCaret` pushed a format record and Ctrl+Z popped those
+/// instead of the user's edit. Null on a control that would not answer
+/// `EM_GETOLEINTERFACE`, in which case formatting simply stays undoable.
+tom_doc: ?*richedit_tom.ITextDocument = null,
 
 /// The screenshot region selector while one is up (T647). Non-null means a
 /// capture is in flight, which is what makes `+` and Ctrl+Shift+S idempotent
@@ -324,7 +332,14 @@ pub fn create(
         .pane = pane,
         .alloc = alloc,
         .cue_banner = cue != 0,
+        // Before applyTheme below: its SCF_ALL recolour is programmatic
+        // formatting too, and it must not open the undo stack with a record.
+        .tom_doc = richedit_tom.fromEdit(edit),
     };
+    if (self.tom_doc == null) log.warn(
+        "viewer feedback composer has no ITextDocument; formatting stays on the undo stack",
+        .{},
+    );
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     // Subclassed LAST, and only once the bar is reachable from the parent:
     // `editProc` finds its bar through `owningEdit`, so a message arriving
@@ -372,6 +387,12 @@ pub fn destroy(self: *ViewerFeedbackBar) void {
     // synchronously, and they must not find a half-dead object.
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
     _ = w32.DestroyWindow(self.hwnd);
+    // After the window: the reference is ours either way, and RichEdit does
+    // not need the document released before the control it belongs to goes.
+    if (self.tom_doc) |d| {
+        self.tom_doc = null;
+        d.release();
+    }
     if (self.body_font) |f| _ = w32.DeleteObject(@ptrCast(f));
     if (self.caption_font) |f| _ = w32.DeleteObject(@ptrCast(f));
     self.dropThumbs();
@@ -467,8 +488,12 @@ pub fn applyTheme(self: *ViewerFeedbackBar) void {
     // DEFAULT sets what the NEXT character typed inherits; ALL recolours what
     // is already there. An empty composer needs the first, a re-themed one
     // mid-report needs the second, and there is no single flag that is both.
+    // Recorder off for both (T644): a theme change mid-report must not cost
+    // the user their undo history's reachability.
+    const suspended = self.suspendUndo();
     _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_DEFAULT, @bitCast(@intFromPtr(&cf)));
     _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_ALL, @bitCast(@intFromPtr(&cf)));
+    if (suspended) self.resumeUndo();
     // ...and the quote washes on top of it, in the theme's new colours. The
     // SCF_ALL above just flattened them.
     self.applyQuoteFormatting();
@@ -1085,6 +1110,12 @@ fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
     var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
     _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
 
+    // The whole sweep is derived styling, not an edit: recorded, it would sit
+    // ON TOP of the insert that triggered it and Ctrl+Z would have to chew
+    // through a record per formatRange before reaching any text (T644).
+    const suspended = self.suspendUndo();
+    defer if (suspended) self.resumeUndo();
+
     _ = w32.SendMessageW(self.edit, w32.WM_SETREDRAW, 0, 0);
     self.formatRange(0, -1, false);
     if (spans) |list| {
@@ -1143,22 +1174,70 @@ fn ensurePlainAtCaret(self: *ViewerFeedbackBar) void {
     const list: []const doc.Span = if (spans) |s| s else &.{};
     if (doc.insideQuote(list, pos)) return;
 
-    var cf = std.mem.zeroes(w32.CHARFORMAT2W);
-    cf.cbSize = @sizeOf(w32.CHARFORMAT2W);
-    cf.dwMask = w32.CFM_COLOR | w32.CFM_BACKCOLOR;
-    cf.crTextColor = self.text_ref;
-    cf.crBackColor = w32.RGB(self.pill_rgb.r, self.pill_rgb.g, self.pill_rgb.b);
-    _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_SELECTION, @bitCast(@intFromPtr(&cf)));
+    const back = w32.RGB(self.pill_rgb.r, self.pill_rgb.g, self.pill_rgb.b);
+
+    // Read before writing, and skip a set that would change nothing. Not an
+    // optimisation (T644): any message sent here lands between two of the
+    // user's keystrokes, and even unrecorded it ends RichEdit's group-typing
+    // aggregation — the difference between Ctrl+Z taking back the word and
+    // taking back one letter. On the ordinary keystroke, nothing is sent.
+    var cur = std.mem.zeroes(w32.CHARFORMAT2W);
+    cur.cbSize = @sizeOf(w32.CHARFORMAT2W);
+    _ = w32.SendMessageW(self.edit, w32.EM_GETCHARFORMAT, w32.SCF_SELECTION, @bitCast(@intFromPtr(&cur)));
+    // A mask bit CLEAR means the attribute varies across the selection; an
+    // auto-colour effect means the colour field is not what is painted.
+    // Either way the colour cannot be trusted to be plain, so it is set.
+    const char_plain = (cur.dwMask & w32.CFM_COLOR) != 0 and
+        (cur.dwMask & w32.CFM_BACKCOLOR) != 0 and
+        (cur.dwEffects & (w32.CFE_AUTOCOLOR | w32.CFE_AUTOBACKCOLOR)) == 0 and
+        cur.crTextColor == self.text_ref and cur.crBackColor == back;
 
     // The indent is per PARAGRAPH, and the caret one past a quote's last
     // character is still in the quote's last paragraph — resetting from there
     // would un-indent the block the user is typing at the end of.
-    if (doc.lineTouchesQuote(self.pane.feedbackText(), list, pos)) return;
-    var pf = std.mem.zeroes(w32.PARAFORMAT2);
-    pf.cbSize = @sizeOf(w32.PARAFORMAT2);
-    pf.dwMask = w32.PFM_STARTINDENT;
-    pf.dxStartIndent = 0;
-    _ = w32.SendMessageW(self.edit, w32.EM_SETPARAFORMAT, 0, @bitCast(@intFromPtr(&pf)));
+    const para_applies = !doc.lineTouchesQuote(self.pane.feedbackText(), list, pos);
+    var para_plain = true;
+    if (para_applies) {
+        var curp = std.mem.zeroes(w32.PARAFORMAT2);
+        curp.cbSize = @sizeOf(w32.PARAFORMAT2);
+        _ = w32.SendMessageW(self.edit, w32.EM_GETPARAFORMAT, 0, @bitCast(@intFromPtr(&curp)));
+        para_plain = (curp.dwMask & w32.PFM_STARTINDENT) != 0 and curp.dxStartIndent == 0;
+    }
+    if (char_plain and para_plain) return;
+
+    // Something IS inherited (the caret just left a quote): reset it, with
+    // the undo recorder off — this styling is ours, not an edit of theirs.
+    const suspended = self.suspendUndo();
+    defer if (suspended) self.resumeUndo();
+
+    if (!char_plain) {
+        var cf = std.mem.zeroes(w32.CHARFORMAT2W);
+        cf.cbSize = @sizeOf(w32.CHARFORMAT2W);
+        cf.dwMask = w32.CFM_COLOR | w32.CFM_BACKCOLOR;
+        cf.crTextColor = self.text_ref;
+        cf.crBackColor = back;
+        _ = w32.SendMessageW(self.edit, w32.EM_SETCHARFORMAT, w32.SCF_SELECTION, @bitCast(@intFromPtr(&cf)));
+    }
+    if (para_applies and !para_plain) {
+        var pf = std.mem.zeroes(w32.PARAFORMAT2);
+        pf.cbSize = @sizeOf(w32.PARAFORMAT2);
+        pf.dwMask = w32.PFM_STARTINDENT;
+        pf.dxStartIndent = 0;
+        _ = w32.SendMessageW(self.edit, w32.EM_SETPARAFORMAT, 0, @bitCast(@intFromPtr(&pf)));
+    }
+}
+
+/// True when the undo recorder was actually turned off — pair every true
+/// with `resumeUndo`. False (no TOM document) means formatting stays
+/// undoable, which is the pre-T644 behaviour, not a reason to skip it.
+fn suspendUndo(self: *ViewerFeedbackBar) bool {
+    const d = self.tom_doc orelse return false;
+    return d.suspendUndo();
+}
+
+fn resumeUndo(self: *ViewerFeedbackBar) void {
+    const d = self.tom_doc orelse return;
+    d.resumeUndo();
 }
 
 /// The accent bar down each quoted block's left edge.

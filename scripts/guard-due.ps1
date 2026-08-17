@@ -99,6 +99,22 @@ $GuardTable = @(
             'test\win32\lib\BrowserLeak.ps1'
         )
     },
+    # The feedback composer (T644): its undo behaviour, quote formatting and
+    # send path live in ViewerFeedbackBar and are proved only by this harness
+    # - the unit lanes see the pure modules but never a RichEdit. T644 itself
+    # arrived through this gap: arm J sat red with nothing tying a composer
+    # edit to a re-run.
+    [pscustomobject]@{
+        Name   = 'viewer-feedback'
+        Script = 'test\win32\viewer-feedback.ps1'
+        Stamp  = 'test\win32\viewer-feedback.stamp.json'
+        Covers = @(
+            'test\win32\viewer-feedback.ps1',
+            'src\apprt\win32\ViewerFeedbackBar.zig',
+            'src\apprt\win32\richedit_tom.zig',
+            'src\apprt\win32\viewer_feedback_doc.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the

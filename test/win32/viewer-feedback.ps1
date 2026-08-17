@@ -607,6 +607,30 @@ try {
     Assert ($afterUndo -eq 'copyme') `
         "Ctrl+Z undoes the last edit (got '$afterUndo', want 'copyme')"
 
+    # ...and a second Ctrl+Z steps back again (the first paste) rather than
+    # idling on a formatting record that changes no text (T644).
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key Z -Modifiers Ctrl)
+    Start-Sleep -Milliseconds 400
+    $afterUndo2 = Flatten (Get-TestControlText $rich)
+    Assert ($afterUndo2 -eq '') `
+        "a second Ctrl+Z undoes the first paste too (got '$afterUndo2', want '')"
+
+    # Typed text undoes as the WORD, not a letter and not nothing: the
+    # composer's per-keystroke plain-format reset must stay off the undo stack
+    # AND leave RichEdit's group-typing aggregation alone (T644) — a message
+    # sent between two keystrokes ends the group even when it is unrecorded.
+    [void](Send-TestControlText -Control $rich -Text 'undome')
+    Start-Sleep -Milliseconds 300
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key Z -Modifiers Ctrl)
+    Start-Sleep -Milliseconds 400
+    $afterTypeUndo = Flatten (Get-TestControlText $rich)
+    Assert ($afterTypeUndo -eq '') `
+        "Ctrl+Z after typing a word removes the word (got '$afterTypeUndo', want '')"
+
+    # Text back for the mirror check below, typed the ordinary way.
+    [void](Send-TestControlText -Control $rich -Text 'copyme')
+    Start-Sleep -Milliseconds 300
+
     # The pane's own buffer tracked all of it. The oracle is the CONTROL's own
     # text, canonicalised to LF the way the mirror does -- the invariant is
     # "the buffer is what the control holds", not a hard-coded number, and it
@@ -678,6 +702,14 @@ try {
 $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
+
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
+# can answer "has this harness been run against the composer as it now
+# stands?". Red leaves the stamp alone - red stays due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard viewer-feedback -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }
