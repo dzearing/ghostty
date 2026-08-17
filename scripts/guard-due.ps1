@@ -727,6 +727,30 @@ $GuardTable = @(
             'test\win32\chooser-session-sort.ps1'
         )
     },
+    # The chooser's session RESUME (T320/T620/T816): taking over a live session
+    # that has no window is the machine chooser's reason to list sessions at
+    # all, and no other harness drives it - the P1-P3 floor never opens the
+    # chooser, and the sort harness above stops at the cursor. The row exists
+    # because this one went red for eight days without anybody noticing: its
+    # FIXTURE broke when launch-time restore grew a second source, so the run
+    # exited SETUP FAIL having proved nothing about resume. Coverage is the
+    # roster the cursor walks - the RPC/state/paint half (SessionRoster.zig) and
+    # the pure row model whose connectable filter decides which rows render
+    # (chooser_sessions.zig) - plus the harness itself. MachineChooser.zig is
+    # deliberately NOT here: it hosts sixteen chooser features, moves about
+    # daily, and gating a four-minute GUI run on it would make this due for
+    # reasons that have nothing to do with resume (the same call the
+    # session-layout-preserve row makes about App.zig).
+    [pscustomobject]@{
+        Name   = 'chooser-resume'
+        Script = 'test\win32\chooser-resume.ps1'
+        Stamp  = 'test\win32\chooser-resume.stamp.json'
+        Covers = @(
+            'src\apprt\win32\SessionRoster.zig',
+            'src\apprt\win32\chooser_sessions.zig',
+            'test\win32\chooser-resume.ps1'
+        )
+    },
     # The isolation meta-check (T680): the only thing that fails when a
     # test\win32 script drives the CLI with no private IPC endpoint - the
     # defect class that reads the user's own panes. Covering the whole top

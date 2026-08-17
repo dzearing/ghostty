@@ -402,6 +402,18 @@ try {
     Remove-TestDesktop
 }
 
+# --- stamp (T783/T816) ------------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?".
+# This harness earned its row the hard way: it sat red at SETUP FAIL for eight
+# days (2026-08-04 -> T620) because nothing tied a restore-path change to the
+# fixture it broke. Every SETUP FAIL path above exits before here, so a run
+# that proved nothing cannot stamp.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard chooser-resume -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
+
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red }
