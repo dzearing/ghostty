@@ -2,7 +2,7 @@
 # is exported to its panes as $GHOZTTY_WINDOW_NAME - AUTO-named windows
 # included, which is the half win32 was missing.
 #
-# The contract (CLAUDE.md "Naming"): a window opened WITHOUT an explicit
+# The contract (docs/claude/cli.md "Naming"): a window opened WITHOUT an explicit
 # --target (Ctrl+N, a bare `+new-window`, the launch window) still gets an auto
 # name (`window-1`, ...) which is exported to its panes as
 # $GHOZTTY_WINDOW_NAME. Before T492 only the `--target=` IPC path delivered the

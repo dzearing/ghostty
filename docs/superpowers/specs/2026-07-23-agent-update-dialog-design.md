@@ -13,8 +13,8 @@ shows a mandatory confirmation before the destructive agent restart
    information about what the update actually gives them, so there is no basis to
    choose "Update Now" over "Later."
 
-This is part of the mandatory agent-update UX (CLAUDE.md, "Agent contract &
-upgrade compatibility"). The change must **not** weaken the "never silently
+This is part of the mandatory agent-update UX (docs/claude/sessions.md, "Agent
+contract & upgrade compatibility"). The change must **not** weaken the "never silently
 reset live sessions" guarantee: the confirmation stays mandatory, the idle path
 stays silent, and buttons still gate the destructive refresh.
 

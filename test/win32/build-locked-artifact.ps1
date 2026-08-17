@@ -56,7 +56,7 @@ if (-not (Get-Command zig -ErrorAction SilentlyContinue)) {
     exit 1
 }
 # Must live on the repo's drive or zig 0.15.2's build runner panics in
-# convertPathArg before any step runs (CLAUDE.md, Windows build section).
+# convertPathArg before any step runs (docs/claude/build.md, "Build, run & debug").
 if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
     $env:ZIG_GLOBAL_CACHE_DIR = (Split-Path -Qualifier $Repo) + '\zig-global-cache'
 }

@@ -503,7 +503,7 @@ was not.
 **The fix is on the read side, and it has to be.** There is no version or
 lineage tag to add, because the blobs already sitting in live agents predate any
 tag we could introduce now — an agent outlives the app that wrote its blobs by
-design (see CLAUDE.md, "Agent contract & upgrade compatibility"), so an envelope
+design (see docs/claude/sessions.md, "Agent contract & upgrade compatibility"), so an envelope
 would describe only future blobs while the old ones stayed undecodable. A reader
 that tolerates the other shape is therefore required either way, which makes it
 the whole fix rather than half of one.

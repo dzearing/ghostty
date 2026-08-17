@@ -764,6 +764,25 @@ $GuardTable = @(
         Covers = @(
             'test\win32\*.ps1'
         )
+    },
+    # The docs routing meta-check (T822): the pointers that make the
+    # progressive-disclosure split navigable - the root routing table, every
+    # `docs/claude/<file>.md` path cited in the tree, and every `<doc>
+    # "<section>"` citation. The split shipped with two citations already
+    # dangling at CLAUDE.md sections that had moved into a partition, and
+    # nothing but a human reading validation criteria found them. Covering the
+    # root and the whole partitions directory is the point: rename a heading or
+    # a partition and the pointers at it must be re-proved. Static text, well
+    # under a second.
+    [pscustomobject]@{
+        Name   = 'docs-routing'
+        Script = 'test\win32\docs-routing.ps1'
+        Stamp  = 'test\win32\docs-routing.stamp.json'
+        Covers = @(
+            'CLAUDE.md',
+            'docs\claude\*.md',
+            'test\win32\docs-routing.ps1'
+        )
     }
 )
 
