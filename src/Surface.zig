@@ -5634,6 +5634,26 @@ pub fn cursorPosCallback(
     }
 }
 
+/// True when a drag event lands on the very cell the click landed on, i.e.
+/// the pointer has not left the clicked cell yet.
+///
+/// A word/line selection re-derived from that cell can only reproduce what
+/// the click already selected — or DESTROY something richer that the click
+/// established: a double-click selects the whole LINK under the pointer when
+/// there is one, and a ctrl+triple-click selects the whole command OUTPUT.
+/// Both collapse to the plain word/line if a drag at the same pin is allowed
+/// to recompute them.
+///
+/// This is not hypothetical jitter (T802): every Windows mouse message
+/// carries a client point, so the button-up that ENDS a double-click arrives
+/// as a position update with the button still down — a zero-distance drag on
+/// every double-click, which is why double-clicking a URL on Windows put the
+/// bare word `https` on the clipboard. A trackpad tap that wobbles a pixel
+/// inside the same cell does the same thing on any platform.
+fn samePin(a: terminal.Pin, b: terminal.Pin) bool {
+    return a.node == b.node and a.y == b.y and a.x == b.x;
+}
+
 /// Double-click dragging moves the selection one "word" at a time.
 fn dragLeftClickDouble(
     self: *Surface,
@@ -5641,6 +5661,10 @@ fn dragLeftClickDouble(
 ) !void {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
+
+    // Still in the clicked cell: keep what the double-click selected (the
+    // link, when it found one) rather than collapsing it to the word.
+    if (samePin(drag_pin, click_pin)) return;
 
     // Get the word closest to our starting click.
     const word_start = screen.selectWordBetween(
@@ -5686,6 +5710,10 @@ fn dragLeftClickTriple(
 ) !void {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
+
+    // Still in the clicked cell: keep what the triple-click selected (the
+    // command output, under ctrl) rather than collapsing it to the line.
+    if (samePin(drag_pin, click_pin)) return;
 
     // Get the line selection under our current drag point. If there isn't a
     // line, do nothing.
@@ -7368,6 +7396,32 @@ fn testMouseSelectionIsNull(
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: samePin only matches the identical cell" {
+    // T802: the guard that stops a zero-distance drag from recomputing —
+    // and so destroying — the selection a double/triple click made.
+    var screen = try terminal.Screen.init(
+        std.testing.allocator,
+        .{ .cols = 10, .rows = 5, .max_scrollback = 0 },
+    );
+    defer screen.deinit();
+
+    const at = struct {
+        fn pin(s: *terminal.Screen, x: terminal.size.CellCountInt, y: u32) terminal.Pin {
+            return s.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse unreachable;
+        }
+    }.pin;
+
+    const click = at(&screen, 3, 2);
+    // The same cell, resolved independently: this is the release of a
+    // double-click, which carries the click's own coordinates.
+    try std.testing.expect(samePin(at(&screen, 3, 2), click));
+    // One cell over in either axis is a real drag and must NOT be swallowed.
+    try std.testing.expect(!samePin(at(&screen, 4, 2), click));
+    try std.testing.expect(!samePin(at(&screen, 2, 2), click));
+    try std.testing.expect(!samePin(at(&screen, 3, 3), click));
+    try std.testing.expect(!samePin(at(&screen, 3, 1), click));
 }
 
 test "Surface: selection logic" {

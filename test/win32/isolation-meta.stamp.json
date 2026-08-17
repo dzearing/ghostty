@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-17T05:03:13-07:00",
-    "commit":  "f28ecbfc6",
+    "generated":  "2026-08-17T06:11:17-07:00",
+    "commit":  "f6a8f5765",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -181,7 +181,7 @@
                   "test/win32/tab-tooltip.ps1":  "405d750c2d9076c6afcb5c60ca2208619da29bb9f00a8da9e6337dd7433c03b1",
                   "test/win32/target-staleness.ps1":  "9bfdcce176cbadecf1263ab9a4fc5f74a48e5f8e141220531349a670608ae54e",
                   "test/win32/task-dashboard.ps1":  "15ffe34b80e0de958898033f7417172ab26cc4686478fce5d5f905b9b68c6969",
-                  "test/win32/terminal-link-paths.ps1":  "20a24aeb5f3d68afbd8876c91da87ab52c58b0f1cb930f208b2271882a158a3b",
+                  "test/win32/terminal-link-paths.ps1":  "3e363feec18c1f1792f2ca7e898418eee7f306677c79767a18927cef783f428d",
                   "test/win32/test-binary-soak.ps1":  "7e0e5766b11e0b3a743837a4e475a463d07ebb569c48ad8bc6c52b8f15eff807",
                   "test/win32/test-desktop-harness.ps1":  "df135c7fce9eac3b08bab3900b3a68f611821c0b4d1731b987e69afb925b3aa4",
                   "test/win32/test-desktop-spike.ps1":  "4ef2f0bdb231b611651469256a713615899de8f35814fa058e928dbf4562335b",

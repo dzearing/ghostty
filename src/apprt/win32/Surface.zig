@@ -3471,6 +3471,35 @@ pub fn cursorFromLparam(lparam: isize) w32.POINT {
     };
 }
 
+/// Whether a mouse message's point is NEWS to the core (T802).
+///
+/// `null` — nothing delivered yet this surface — is news, so the very first
+/// message always positions the core. An identical point is not: forwarding
+/// it again with a button held reads as a zero-distance drag.
+pub fn cursorMoved(last: ?w32.POINT, now: w32.POINT) bool {
+    const prev = last orelse return true;
+    return prev.x != now.x or prev.y != now.y;
+}
+
+test "cursorMoved only reports a point the core has not seen" {
+    const testing = std.testing;
+    const p: w32.POINT = .{ .x = 120, .y = 48 };
+
+    // First message on this surface: nothing to compare against, so deliver.
+    try testing.expect(cursorMoved(null, p));
+
+    // The button-up of a double-click carries the press's own point. This is
+    // the T802 case: delivering it again is a zero-distance drag that
+    // replaces the link the double-click selected with the bare word.
+    try testing.expect(!cursorMoved(p, p));
+
+    // Real travel in either axis is still delivered, including the negative
+    // coordinates a capture-held drag past the top-left produces.
+    try testing.expect(cursorMoved(p, .{ .x = 121, .y = 48 }));
+    try testing.expect(cursorMoved(p, .{ .x = 120, .y = 49 }));
+    try testing.expect(cursorMoved(p, .{ .x = -5, .y = -10 }));
+}
+
 test "viewer_accel.keyFromVk never drifts from mapVirtualKey" {
     // `viewer_accel.zig` cannot import an OS surface, so its VK table is
     // literals. This lane CAN name the `w32.VK_*` constants through
@@ -3519,6 +3548,9 @@ pub fn handleMouseButton(
     if (!self.core_surface_ready) return;
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    // Read before noteCursorFromLparam overwrites it: the point the core was
+    // last told about is what decides whether this message carries news.
+    const prev_cursor_client = self.last_cursor_client;
     self.noteCursorFromLparam(lparam);
 
     var mods = getModifiers();
@@ -3570,10 +3602,26 @@ pub fn handleMouseButton(
         return;
     }
 
-    // Update cursor position first
-    self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
-        log.err("cursor pos callback error: {}", .{err});
-    };
+    // Update cursor position first — but only when this message actually
+    // carries a NEW point (T802).
+    //
+    // Every Windows mouse message carries a client point, and forwarding it
+    // ahead of the button is what makes a press land on the right cell when
+    // no WM_MOUSEMOVE preceded it (posted input, a pane appearing under a
+    // stationary cursor). Re-sending a point the core already has is not
+    // free: with a button down the core reads a position update as a DRAG,
+    // so the button-up that ends a double-click used to arrive as a
+    // zero-distance word-drag and replaced the link the double-click had
+    // selected with the bare word under the pointer. macOS never had this —
+    // its mouseUp sends no position at all.
+    //
+    // The core is guarded too (`samePin` in `Surface.zig`); this half keeps
+    // the redundant event from being manufactured in the first place.
+    if (cursorMoved(prev_cursor_client, cursorFromLparam(lparam))) {
+        self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
+            log.err("cursor pos callback error: {}", .{err});
+        };
+    }
 
     const consumed = self.core_surface.mouseButtonCallback(action, button, mods) catch |err| blk: {
         log.err("mouse button callback error: {}", .{err});

@@ -110,12 +110,12 @@ function Write-Lines([string]$text, [int]$count = 14) {
 # context-menu), so the selection it leaves behind IS the link the terminal
 # found - or the plain word, when it found none.
 #
-# The obvious gesture, a double-click, is deliberately not used. It reaches
-# link detection too (with no modifier at all), and the instrumented build
-# showed it FINDING the whole link - and then the clipboard came back holding
-# the plain word anyway, so something replaces the selection right after. That
-# is filed as its own defect (T802); this script must not be a verdict on it,
-# in either direction.
+# The obvious gesture, a double-click, is asserted separately in sections D
+# and E rather than used as this script's oracle. It reaches link detection
+# too (with no modifier at all), but it USED to hand back the plain word: the
+# button-up re-entered the core as a zero-distance drag and re-selected the
+# word under the pointer, which is T802. Keeping the T757 oracle on the
+# right-press keeps sections 0-C a verdict on the REGEX rather than on that.
 #
 # The row is probed rather than computed: mapping a row index to a client y
 # needs the cell height, which nothing reports - so walk down the pane until
@@ -149,6 +149,56 @@ function Get-Column0Selections([int]$Rows = 12) {
     return , @($seen | Select-Object -Unique)
 }
 
+<#
+T802: the same probe driven by the gesture a USER makes - a plain
+double-click, no modifier - and read the same way, through ctrl+c.
+
+-Gesture atomic posts the OS's own double-click shape (move, down, up, down,
+up in one burst), which is what a mouse delivers.
+
+-Gesture jitter posts the four button messages as four separate calls, and
+since Send-TestMouse puts a WM_MOUSEMOVE at the point ahead of every button
+message, that lands a pointer event BETWEEN the second press and its release.
+That is a trackpad double-tap wobbling inside the clicked cell, and it is the
+half of T802 that lives in the shared core (`samePin`) rather than in the
+win32 message pump: without the guard, the move alone re-selects the word and
+the link selection the press made is gone before the release.
+
+No modifier is held, so `over_link` is false and the release cannot open
+anything - nothing is launched at the user's browser (T594's rule).
+#>
+function Get-Column0DoubleClickSelections {
+    param(
+        [ValidateSet('atomic', 'jitter')][string]$Gesture = 'atomic',
+        [int]$Rows = 12
+    )
+    $surface = Get-ActiveSurface
+    $pr = Get-TestWindowRect -Window $surface -Client
+    $x = $pr.Left + 4
+    $seen = @()
+    for ($i = 1; $i -le $Rows; $i++) {
+        $y = [int]($pr.Top + ($pr.Bottom - $pr.Top) * $i / ($Rows + 2))
+        Set-Clipboard -Value 'T802_CLIP_SENTINEL'
+        if ($Gesture -eq 'atomic') {
+            [void](Send-TestMouse -Window $script:top -Target $surface -X $x -Y $y `
+                -Action doubleclick)
+        } else {
+            foreach ($act in @('down', 'up', 'down', 'up')) {
+                [void](Send-TestMouse -Window $script:top -Target $surface -X $x -Y $y `
+                    -Action $act)
+            }
+        }
+        Start-Sleep -Milliseconds 300
+        [void](Send-TestKeys -Window $script:top -Target $surface -Key C -Modifiers ctrl)
+        Start-Sleep -Milliseconds 450
+        $clip = (Get-Clipboard -Raw -ErrorAction SilentlyContinue) -join ''
+        if ($null -eq $clip) { $clip = '' }
+        $clip = $clip.TrimEnd("`r", "`n")
+        if ($clip -ne 'T802_CLIP_SENTINEL' -and $clip -ne '') { $seen += $clip }
+    }
+    return , @($seen | Select-Object -Unique)
+}
+
 Stop-RepoGhoztty
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
@@ -158,7 +208,16 @@ $launched = @()
 try {
     # persistence: --session-persistence=false so a previous run's manifest is
     # never restored over the single pane this script measures.
-    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    # click-repeat-interval: the D/E double-clicks are POSTED, and four
+    # marshalled posts can straddle the 500ms default well enough that the
+    # second press counts as a fresh single click - which would fail sections
+    # D/E for a timing reason that has nothing to do with what they assert.
+    # The interval is the only thing widened; the gesture and the selection
+    # logic under test are untouched by it.
+    $app = Start-OnTestDesktop -Exe $Exe -StdErr $errlog -Arguments @(
+        '--session-persistence=false',
+        '--click-repeat-interval=3000'
+    )
     $launched += $app.Pid
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) {
@@ -225,6 +284,38 @@ try {
     Assert ($selC -contains 'Z') 'C: control - column 0 of prose selects the single word'
     Assert (-not ($selC -contains 'Z: not a path here')) 'C: control - prose with a colon is not treated as a path'
 
+    # --- D/E: T802 - the user's own gesture, a plain double-click ------------
+    # The regression signature is exact: `:` is a word boundary, so a build
+    # that lets the release (D) or a mid-gesture pointer event (E) recompute
+    # the selection hands back `https` instead of the whole URL.
+    Assert (Write-Lines $ctl) "D: transport control - the pane really holds $ctl"
+
+    $selD = Get-Column0DoubleClickSelections -Gesture atomic -Rows 8
+    Write-Host "  double-click selections seen: $($selD -join ' | ')"
+    Assert ($selD -contains $ctl) "D: a plain double-click selects the whole URL ($ctl)"
+    Assert (-not ($selD -contains 'https')) 'D: no probed row came back with the bare word https'
+
+    # E asserts SHAPE rather than one exact string. Which row a probe lands on
+    # drifts once a ctrl+c falls through to the shell (no selection -> the
+    # performable binding sends ^C, the shell prints a prompt, the screen
+    # scrolls), so "row i held the URL" is not stable across two passes over
+    # the same points - see T916. What IS stable is the granularity: every
+    # selection the gesture produces must be a WHOLE link (a URL or a drive
+    # path), never the fragment before the first `:`.
+    $selE = Get-Column0DoubleClickSelections -Gesture jitter -Rows 8
+    Write-Host "  double-click (jitter) selections seen: $($selE -join ' | ')"
+    $linksE = @($selE | Where-Object { $_ -match '^(https?://|[A-Za-z]:[\\/])' })
+    Assert ($linksE.Count -gt 0) 'E: a double-click that wobbles inside the cell still selects a whole link'
+    Assert (-not ($selE -contains 'https')) 'E: no probed row came back with the bare word https'
+    Assert (-not ($selE -contains 'C')) 'E: no probed row came back with a bare drive letter'
+
+    # --- F: the same gesture on a Windows path -------------------------------
+    Assert (Write-Lines $pathA) "F: transport control - the pane really holds $pathA"
+    $selF = Get-Column0DoubleClickSelections -Gesture atomic -Rows 8
+    Write-Host "  double-click selections seen: $($selF -join ' | ')"
+    Assert ($selF -contains $pathA) "F: a plain double-click selects the whole drive path ($pathA)"
+    Assert (-not ($selF -contains 'Q')) 'F: no probed row fell back to the bare drive letter'
+
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'
 } finally {
     if ($app -and $app.Pid) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue }
@@ -237,6 +328,14 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
+# --- stamp (T783) ----------------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?".
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard terminal-link-paths -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''

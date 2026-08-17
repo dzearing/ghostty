@@ -585,6 +585,23 @@ $GuardTable = @(
             'test\win32\gui-launch-command.ps1'
         )
     },
+    # Windows paths and URLs as LINKS in a pane (T757), and the gestures that
+    # select one (T802's double-click arms). The regex half is pinned
+    # exhaustively in the none lane; what only this harness can answer is what
+    # the surface selects when clicked. The row covers the URL regex — the one
+    # source file whose edits change this script's verdict and nothing else —
+    # plus the harness itself. Deliberately NOT core src\Surface.zig: it moves
+    # for a hundred reasons a 4-minute GUI harness cannot see (same call the
+    # gui-launch-command row makes).
+    [pscustomobject]@{
+        Name   = 'terminal-link-paths'
+        Script = 'test\win32\terminal-link-paths.ps1'
+        Stamp  = 'test\win32\terminal-link-paths.stamp.json'
+        Covers = @(
+            'src\config\url.zig',
+            'test\win32\terminal-link-paths.ps1'
+        )
+    },
     # The agent-integration first-run + plugin migration (T870) and the
     # Agent Integrations management window (T871): the prompts, the
     # off-thread install/probe marshalling, the migration's uninstall-first
