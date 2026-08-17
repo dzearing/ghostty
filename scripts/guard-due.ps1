@@ -99,6 +99,22 @@ $GuardTable = @(
             'test\win32\lib\BrowserLeak.ps1'
         )
     },
+    # Cross-lineage layout blobs (T337/T623): the only harness that proves the
+    # REAL binary translates a Mac-shaped blob on the launch-restore path and,
+    # since T623, that the restored window lands the right way up (the
+    # primaryScreenHeight flip). Not in the P1-P3 floor, and the unit lanes
+    # cannot see whether decodeLayouts is actually wired into restore.
+    [pscustomobject]@{
+        Name   = 'layout-blob-cross-lineage'
+        Script = 'test\win32\layout-blob-cross-lineage.ps1'
+        Stamp  = 'test\win32\layout-blob-cross-lineage.stamp.json'
+        Covers = @(
+            'src\apprt\win32\mac_layout_blob.zig',
+            'src\apprt\win32\layout_blobs.zig',
+            'src\apprt\win32\restore_frame.zig',
+            'test\win32\layout-blob-cross-lineage.ps1'
+        )
+    },
     # The delivery pipeline (T531): upgrade-ghoztty-windows.ps1 kills the
     # user's terminal, swaps the installed release, and must bring the terminal
     # back - an edit that breaks any of that only ever fails during a real

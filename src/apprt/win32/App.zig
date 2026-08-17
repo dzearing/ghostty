@@ -1675,6 +1675,18 @@ const FrameCapture = struct {
     maximized: bool = false,
 };
 
+/// The primary display's full height in pixels, or null when the metric is
+/// unreadable. Recorded next to every captured frame (T623): it is the one
+/// number a Mac reader needs to flip our top-down y into Cocoa's bottom-up y
+/// (`y' = h_primary - y - h`), and the same field arriving FROM a Mac blob is
+/// what lets `mac_layout_blob` flip in the other direction. Full frame height
+/// on purpose, not the work area — the coordinate spaces are anchored at the
+/// primary's full frame, and a work-area flip is off by the taskbar.
+fn primaryScreenHeight() ?i32 {
+    const h = w32.GetSystemMetrics(1); // SM_CYSCREEN
+    return if (h > 0) h else null;
+}
+
 /// Read a window's outer rect + maximized flag (T89f). For a maximized OR
 /// minimized window this is the RESTORED rect (`rcNormalPosition`) so restore
 /// comes back to a sane size — the same split `persistPlacement` (T85) uses.
@@ -1935,6 +1947,9 @@ fn captureWindow(
         // not: both spellings restart per process.
         .uuid = try arena.dupe(u8, win.layoutUuid()),
         .frame = frame_max.frame,
+        // Only meaningful next to a frame it can convert; a frameless capture
+        // records nothing rather than a stray metric.
+        .primary_screen_height = if (frame_max.frame != null) primaryScreenHeight() else null,
         .maximized = frame_max.maximized,
         .title_override = if (win.title_override) |t| try arena.dupe(u8, t) else null,
         .ipc_name = if (win.ipc_name) |n| try arena.dupe(u8, n) else null,

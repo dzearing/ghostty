@@ -39,18 +39,25 @@
 //!     offset, so the leaves this module produces never carry the pair.
 //!   * **The window ORIGIN is a different coordinate system.** Cocoa measures
 //!     y UP from the bottom-left of the primary screen; win32 measures it DOWN
-//!     from the top-left, and the blob does not record the source screen's
-//!     height, so the flip cannot be undone from the data. The origin is passed
-//!     through verbatim, which lands the window vertically mirrored but on
-//!     screen — and `restore_frame.reanchor` re-centers any window that lands
-//!     on no monitor at all. Centering them all instead would stack every
-//!     restored window on one spot, which is worse for the multi-window case
-//!     this feature exists for. Size (width/height) translates exactly.
-//!     Follow-up: T623.
+//!     from the top-left. Since T623 a blob may carry `primaryScreenHeight` —
+//!     the full height of the source machine's primary display, the one number
+//!     the flip needs — and when it does, the origin converts exactly:
+//!     `y_win = primaryScreenHeight - y_mac - h`, valid for every monitor of
+//!     the source arrangement because both global spaces are anchored at the
+//!     primary's full frame. (The formula is its own inverse, so the Mac seat
+//!     reads our `primary_screen_height` with the same arithmetic — T622.)
+//!     A blob WITHOUT the field — anything written before both seats shipped
+//!     T622/T623 — keeps the old behavior: the origin is passed through
+//!     verbatim, which lands the window vertically mirrored but on screen, and
+//!     `restore_frame.reanchor` re-centers any window that lands on no monitor
+//!     at all. Centering them all instead would stack every restored window on
+//!     one spot, which is worse for the multi-window case this feature exists
+//!     for. Size (width/height) translates exactly either way.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const restore_frame = @import("restore_frame.zig");
 const session_layout = @import("session_layout.zig");
 
 /// Ceiling on the nodes one entry's tree may flatten to. `Split.left`/`right`
@@ -121,7 +128,7 @@ pub fn parseEntry(arena: Allocator, v: std.json.Value) !Entry {
 
     return .{
         .id = str(obj.get("id")) orelse "",
-        .frame = frameFrom(obj.get("frame")),
+        .frame = frameFrom(obj.get("frame"), num(obj.get("primaryScreenHeight"))),
         .tab_group_id = str(obj.get("tabGroupID")),
         .tab_index = int(obj.get("tabIndex")) orelse 0,
         .tab_title = str(obj.get("titleOverride")),
@@ -347,8 +354,17 @@ fn num(v: ?std.json.Value) ?f64 {
 
 /// Mac's `{x, y, width, height}` doubles as a win32 `Frame`. A frame with no
 /// usable SIZE is dropped outright — a zero-extent window restores invisible and
-/// reports success — while the ORIGIN is passed through unconverted (header).
-fn frameFrom(v: ?std.json.Value) ?session_layout.Frame {
+/// reports success.
+///
+/// `primary_h` is the blob's `primaryScreenHeight` (T623): the full height of
+/// the SOURCE machine's primary display, in the same units as the frame. When
+/// it is present and sane, the ORIGIN converts out of Cocoa's bottom-up y with
+/// the flip about the primary's top edge — `y_win = primary_h - y - h` — which
+/// is exact for every monitor of the source arrangement. Absent or degenerate
+/// (a pre-T622 Mac, or a garbled value), the origin is passed through
+/// unconverted exactly as before (header). The x axis is shared between the two
+/// conventions and never converts.
+fn frameFrom(v: ?std.json.Value, primary_h: ?f64) ?session_layout.Frame {
     const obj = switch (v orelse return null) {
         .object => |o| o,
         else => return null,
@@ -356,9 +372,14 @@ fn frameFrom(v: ?std.json.Value) ?session_layout.Frame {
     const w = num(obj.get("width")) orelse return null;
     const h = num(obj.get("height")) orelse return null;
     if (w <= 0 or h <= 0) return null;
+    const y_mac = num(obj.get("y")) orelse 0;
+    const y: f64 = if (primary_h) |ph|
+        if (ph > 0) ph - y_mac - h else y_mac
+    else
+        y_mac;
     return .{
         .x = toI32(num(obj.get("x")) orelse 0),
-        .y = toI32(num(obj.get("y")) orelse 0),
+        .y = toI32(y),
         .w = toI32(w),
         .h = toI32(h),
     };
@@ -716,6 +737,97 @@ test "T337: two standalone entries never merge, and an id-less one still names i
     try testing.expectEqual(@as(usize, 2), windows.len);
     try testing.expectEqualStrings("e1", windows[0].id);
     try testing.expectEqualStrings("mac-window-1", windows[1].id);
+}
+
+test "T623: a blob carrying primaryScreenHeight lands the right way up" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A 1440x900 window whose bottom edge sits 300pt up a 1600pt-tall primary
+    // display: its top is 1600 - (300 + 900) = 400 down from the screen top.
+    const entry = try translate(arena,
+        \\{"id":"e","primaryScreenHeight":1600,
+        \\ "frame":{"x":120,"y":300,"width":1440,"height":900},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+    );
+    const f = entry.frame.?;
+    try testing.expectEqual(@as(i32, 120), f.x); // x never converts
+    try testing.expectEqual(@as(i32, 400), f.y);
+    try testing.expectEqual(@as(i32, 1440), f.w);
+    try testing.expectEqual(@as(i32, 900), f.h);
+
+    // Fractional points (a Retina half-point origin) round rather than truncate.
+    const frac = try translate(arena,
+        \\{"id":"e","primaryScreenHeight":1117.5,
+        \\ "frame":{"x":0,"y":100.25,"width":800,"height":600},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+    );
+    // 1117.5 - 100.25 - 600 = 417.25 → 417
+    try testing.expectEqual(@as(i32, 417), frac.frame.?.y);
+}
+
+test "T623: a blob without the field keeps the verbatim pass-through" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No field at all (every pre-T622 Mac blob), and every degenerate spelling
+    // of one: none may invent a conversion.
+    const cases = [_][]const u8{
+        \\{"id":"e","frame":{"x":10,"y":250,"width":800,"height":600},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+        ,
+        \\{"id":"e","primaryScreenHeight":0,
+        \\ "frame":{"x":10,"y":250,"width":800,"height":600},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+        ,
+        \\{"id":"e","primaryScreenHeight":-900,
+        \\ "frame":{"x":10,"y":250,"width":800,"height":600},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+        ,
+        \\{"id":"e","primaryScreenHeight":"tall",
+        \\ "frame":{"x":10,"y":250,"width":800,"height":600},
+        \\ "tree":{"leaf":{"_0":{"sessionID":"a"}}}}
+        ,
+    };
+    for (cases) |bytes| {
+        const entry = try translate(arena, bytes);
+        try testing.expectEqual(@as(i32, 250), entry.frame.?.y);
+        try testing.expectEqual(@as(i32, 10), entry.frame.?.x);
+    }
+}
+
+test "T623: a same-sized target screen never needs the reanchor rescue" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Windows fully on a 2560x1440 source primary, converted for a 2560x1440
+    // target: every one must land where `reanchor` leaves it alone. This is the
+    // guarantee that the flip cannot trade "mirrored but visible" for
+    // "correct but rescued to center".
+    const screen: restore_frame.Rect = .{ .x = 0, .y = 0, .w = 2560, .h = 1440 };
+    const frames = [_][4]i64{ // Cocoa {x, y, w, h}, all inside the source screen
+        .{ 0, 0, 800, 600 }, // bottom-left corner
+        .{ 1760, 840, 800, 600 }, // top-right corner
+        .{ 400, 300, 1200, 900 }, // middle
+        .{ 0, 0, 2560, 1440 }, // full screen
+    };
+    for (frames) |f| {
+        const blob = try std.fmt.allocPrint(arena,
+            \\{{"id":"e","primaryScreenHeight":1440,
+            \\ "frame":{{"x":{d},"y":{d},"width":{d},"height":{d}}},
+            \\ "tree":{{"leaf":{{"_0":{{"sessionID":"a"}}}}}}}}
+        , .{ f[0], f[1], f[2], f[3] });
+        const entry = try translate(arena, blob);
+        const out = entry.frame.?;
+        const rect: restore_frame.Rect = .{ .x = out.x, .y = out.y, .w = out.w, .h = out.h };
+        try testing.expectEqual(rect, restore_frame.reanchor(rect, &.{screen}, screen));
+        // And the flip really is a flip: the window's distance from the screen
+        // top equals its Cocoa distance from the screen bottom's complement.
+        try testing.expectEqual(@as(i32, @intCast(1440 - f[1] - f[3])), out.y);
+    }
 }
 
 test "T337: grouping an empty set is an empty set" {

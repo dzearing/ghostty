@@ -237,6 +237,19 @@ pub const Window = struct {
     id: []const u8,
     uuid: ?[]const u8 = null,
     frame: ?Frame = null,
+    /// Height in pixels of the PRIMARY display of the machine that captured
+    /// `frame` (T623). This is the one number a cross-lineage reader needs to
+    /// convert the frame's vertical origin between conventions: Cocoa measures
+    /// y UP from the bottom-left of the primary screen, win32 DOWN from its
+    /// top-left, and the flip about the primary's full frame —
+    /// `y' = primary_screen_height - y - h` — is exact for every monitor in
+    /// the arrangement and is its own inverse, so the same formula serves both
+    /// directions. The work-area height would NOT do: the global coordinate
+    /// spaces are anchored at the primary's full frame, and a work-area flip
+    /// is off by the menubar/taskbar. Additive: absent in older blobs, and a
+    /// reader without it passes the origin through unconverted (the pre-T623
+    /// vertically-mirrored fallback). Mac's spelling is `primaryScreenHeight`.
+    primary_screen_height: ?i32 = null,
     maximized: bool = false,
     title_override: ?[]const u8 = null,
     ipc_name: ?[]const u8 = null,

@@ -272,6 +272,7 @@ fn twoPaneWindow() session_layout.Window {
     return .{
         .id = "win-0",
         .frame = .{ .x = 10, .y = 20, .w = 800, .h = 600 },
+        .primary_screen_height = 1440,
         .active_tab = 0,
         .tabs = &S.tabs,
     };
@@ -364,6 +365,9 @@ test "serializeWindow round-trips through the manifest parser" {
     const w = parsed.value;
     try testing.expectEqualStrings("win-0", w.id);
     try testing.expectEqual(@as(i32, 800), w.frame.?.w);
+    // The cross-lineage flip constant (T623) rides the blob out and back: it is
+    // what a Mac reader converts our top-down origin with.
+    try testing.expectEqual(@as(i32, 1440), w.primary_screen_height.?);
     try testing.expectEqual(@as(usize, 1), w.tabs.len);
     try testing.expectEqual(@as(usize, 3), w.tabs[0].nodes.len);
     try testing.expectEqualStrings("aaaa", w.tabs[0].nodes[1].leaf.?.session_id.?);

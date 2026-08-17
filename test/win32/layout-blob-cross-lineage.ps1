@@ -29,6 +29,9 @@
 # C is the assertion that was RED before T337: every blob was skipped as
 # unreadable and the relaunch opened a blank window. `-NegativeControl` inverts
 # it, so a run that scores this build as still-broken is available on demand.
+# C5 is the T623 half: the blobs carry `primaryScreenHeight`, so the restored
+# window must land the same way UP it was left (Cocoa's bottom-up y flipped
+# about the source primary's top edge), not vertically mirrored.
 #
 # Why the agent is stopped in B: it holds its blob store in MEMORY and answers
 # GET_LAYOUTS from there, so editing `layouts.json` under a live agent would
@@ -174,7 +177,11 @@ function New-MacEntry($entryId, $groupId, $tabIndex, $title, $ipcName, $leafIds)
         tabIndex = $tabIndex
         titleOverride = $title
         tree     = $tree
+        # Cocoa coordinates: y is measured UP from the bottom-left of a
+        # 1400pt-tall source primary (primaryScreenHeight, T623), so the
+        # window's top sits 1400-60-620 = 720 down from the screen top.
         frame    = @{ x = 80; y = 60; width = 900; height = 620 }
+        primaryScreenHeight = 1400
     }
     if ($ipcName) { $entry['ipcName'] = $ipcName }
     return ($entry | ConvertTo-Json -Depth 20 -Compress)
@@ -367,6 +374,27 @@ if ($NegativeControl) {
     Assert "C3 all three session ids the Mac blobs named were ATTACHed to" (
         $attached.Count -eq 3)
     Assert "C4 no extra window was opened alongside the rebuild" ($winsC -eq 1)
+
+    # C5 (T623): the Mac blobs carried primaryScreenHeight=1400 with a Cocoa
+    # (bottom-up) frame y=60 h=620, so the restored window's top must sit at
+    # 1400-60-620 = 720 from the screen top - NOT at the vertically mirrored 60
+    # a pass-through would produce. The oracle is the re-synced local manifest,
+    # which records the captured frame of the window the restore actually
+    # placed. Tolerance covers workspace-vs-screen conversion drift for a
+    # minimized window; it is far smaller than the 660px flip being asserted.
+    $frameY = $null
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $man = (Get-Content (Manifest-Path $tmp) -Raw -ErrorAction Stop) | ConvertFrom-Json
+            $manWins = @($man.windows | Where-Object { $null -ne $_.frame })
+            if ($manWins.Count -ge 1) { $frameY = $manWins[0].frame.y; break }
+        } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    "  (restored window frame y = $frameY, flip target 720, mirrored value 60)"
+    Assert "C5 the restored window came back the right way up (y ~ 720, not 60)" (
+        $null -ne $frameY -and [math]::Abs($frameY - 720) -le 80)
 }
 
 if ($script:failures -gt 0) {
@@ -389,6 +417,16 @@ if ($script:failures -gt 0) {
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
     if ($script:failures -eq 0) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
     else { "artifacts preserved at $root" }
+}
+
+# A green NORMAL run stamps the covered files (T783) so guard-due can answer
+# "has this harness been run against the code as it now stands?". Red leaves
+# the stamp alone (red stays due), and a -NegativeControl run - green or not -
+# is scoring an inverted claim, which is not a sweep of the guard's subject.
+if ($script:failures -eq 0 -and -not $NegativeControl) {
+    $repo = Split-Path (Split-Path $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard layout-blob-cross-lineage -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""
