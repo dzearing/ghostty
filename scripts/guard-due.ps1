@@ -259,7 +259,10 @@ $GuardTable = @(
     # produced T230. Only the DEFAULT-policy harness is gated: `rerun`/`prompt`
     # are opt-ins nobody's reboot lands on by accident, and their harness
     # (`session-relaunch.ps1`) is one more long GUI run per Remote.zig edit for a
-    # path the default never takes.
+    # path the default never takes. That ungated harness is where T824's DECRQM
+    # oracle lives (section A: the replay re-arms the dead program's mouse
+    # tracking, and the reset must land behind it) - run it by hand when the
+    # RELAUNCH path in `termio\Remote.zig` changes.
     [pscustomobject]@{
         Name   = 'session-relaunch'
         Script = 'test\win32\session-relaunch-notify.ps1'

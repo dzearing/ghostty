@@ -409,6 +409,10 @@ pub const Server = struct {
         // is what lets a new app distinguish us from a pre-fix agent whose
         // numbers are ~24× low on Apple Silicon.
         protocol.capability.cpu_units,
+        // `handleRelaunch` splices the viewer's `RELAUNCH.notice` into the ring
+        // ahead of the replay, so the mode reset that undoes what the replay
+        // re-armed lands where the respawned child cannot race it (T824).
+        protocol.capability.relaunch_notice,
         // This build samples each bound session's process subtree and pushes
         // `META{has_descendants}`, so a viewer can skip the close
         // confirmation for an idle CROSS-MACHINE pane (T356).
@@ -1948,6 +1952,31 @@ pub const Server = struct {
         // stable) and replay it to the reattaching viewer BEFORE the child's live
         // output — the client sees pre-restart scrollback → divider → fresh output,
         // with no offset hole (its relaunch pane keeps every byte from offset 0).
+        //
+        // The viewer's `notice` (if any) is appended to the ring FIRST, so it
+        // rides the replay in the one slot where it is safe: after the restored
+        // scrollback and the divider, before the respawned child's first byte.
+        // The viewer's fallback is to inject the same bytes into its own terminal
+        // the moment bring-up finishes, which RACES the child — for the `rerun`
+        // policy that means it can disable the mouse tracking the re-run TUI has
+        // just enabled, i.e. the opposite of what the reset is for. Ordering
+        // against the child's output can only be done by the producer.
+        //
+        // `replayed` deliberately reports whether there was a real SNAPSHOT,
+        // sampled BEFORE this append, so a notice on an otherwise-empty ring
+        // doesn't make the viewer suppress its own divider.
+        const had_snapshot = rs.ring.len > 0;
+        if (req.notice) |notice| {
+            if (notice.len > 0) {
+                // Same append+advance the reboot divider does in
+                // `preloadRingSnapshot`: `out_offset` must move with the ring or
+                // the child's first output would claim these offsets too.
+                const text = notice[0..@min(notice.len, protocol.Relaunch.max_notice_bytes)];
+                rs.ring.append(rs.out_offset.value, text);
+                rs.out_offset.value +%= text.len;
+                rs.last_snapshot_offset = rs.out_offset.value;
+            }
+        }
         const replay_lo = rs.ring.base_offset;
         const replay_len = rs.ring.len;
         var replay_buf: ?[]u8 = null;
@@ -1977,12 +2006,14 @@ pub const Server = struct {
             .pid = pid,
             .found = true,
             // Tell the client we already replayed scrollback + the divider so it
-            // suppresses its own snapshot-less divider (no double marker).
-            .replayed = replay_n > 0,
+            // suppresses its own snapshot-less divider (no double marker). This
+            // means a real SNAPSHOT, sampled BEFORE any `notice` was appended —
+            // a notice on an otherwise-empty ring must not read as scrollback.
+            .replayed = had_snapshot and replay_n > 0,
             // Width the replayed bytes were drawn at (0 when unknown) so the client
             // can replay at that width then reflow — see Relaunched.replay_cols.
-            .replay_cols = if (replay_n > 0) replay_cols else 0,
-            .replay_rows = if (replay_n > 0) replay_rows else 0,
+            .replay_cols = if (had_snapshot and replay_n > 0) replay_cols else 0,
+            .replay_rows = if (had_snapshot and replay_n > 0) replay_rows else 0,
             .tty = tty_copy,
         }) catch {};
 
@@ -4884,6 +4915,159 @@ test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before l
     const dp1 = try protocol.DataPayload.decode(d1.payload);
     try testing.expectEqual(@as(u64, want.len), dp1.byte_offset);
     try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
+}
+
+test "T824 RELAUNCH: the viewer's notice is spliced into the tail of the replay" {
+    // The raw reboot-scrollback replay re-arms every mode the DEAD program
+    // enabled — mouse tracking above all — in a pane that program no longer
+    // controls, so hovering types `35;1;12M` into the respawned shell. The undo
+    // has to be ORDERED between the replay and the respawned child's first byte:
+    // a viewer that injects it locally races the child, and under `rerun` can
+    // switch off the tracking the re-run TUI has just switched on. Only the
+    // producer can order it, hence `Relaunch.notice`.
+    const ring_snapshot = @import("ring_snapshot.zig");
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xC0DE5);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
+
+    var tmp = testing.tmpDir(.{});
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    h.store.meta_path = meta;
+    h.store.rings_dir = rings;
+    // Same deinit-then-free ordering as the sibling replay test above: the store
+    // only BORROWS these paths and the reader threads touch them after acking a
+    // frame.
+    defer {
+        h.deinit();
+        alloc.free(rings);
+        alloc.free(meta);
+        alloc.free(dir_path);
+        tmp.cleanup();
+    }
+
+    const rec_id = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    const scrollback = "PANE=3 PID=4242\r\n\x1b[?1003h\x1b[?1006htick-3-0\r\n";
+    {
+        const recs = [_]@import("session_meta.zig").Record{.{ .id = rec_id, .argv = "htop", .pinned = true, .created_ms = 50 }};
+        const body = try @import("session_meta.zig").serialize(alloc, &recs);
+        defer alloc.free(body);
+        try @import("session_meta.zig").writeAtomic(alloc, meta, body);
+        const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
+        defer alloc.free(rp);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, scrollback);
+    }
+    try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+    });
+    const af = try h.client.waitControl(.attached);
+    const channel = af.channel;
+
+    const notice = "\x1b[?1003l\x1b[?1006l";
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+        .notice = notice,
+    });
+
+    const d0 = (try h.client.nextData()).?;
+    const dp0 = try protocol.DataPayload.decode(d0.payload);
+    // Order is the whole point: restored scrollback, then the agent's divider,
+    // then our reset — and the reset is the TAIL, so the respawned child's first
+    // output continues after it instead of being undone by it.
+    const idx_back = std.mem.indexOf(u8, dp0.bytes, "PANE=3 PID=4242").?;
+    const idx_arm = std.mem.indexOf(u8, dp0.bytes, "\x1b[?1003h").?;
+    const idx_div = std.mem.indexOf(u8, dp0.bytes, session.reboot_divider).?;
+    const idx_notice = std.mem.indexOf(u8, dp0.bytes, notice).?;
+    try testing.expect(idx_back < idx_arm);
+    try testing.expect(idx_arm < idx_div);
+    try testing.expect(idx_div < idx_notice);
+    try testing.expectEqual(dp0.bytes.len, idx_notice + notice.len);
+
+    const rf = try h.client.waitControl(.relaunched);
+    var rp2 = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp2.deinit();
+    try testing.expect(rp2.value.ok and rp2.value.found);
+    // `replayed` still means "there was a real snapshot" — sampled BEFORE the
+    // notice was appended — so a notice alone can never make the viewer suppress
+    // its own divider.
+    try testing.expect(rp2.value.replayed);
+
+    // No offset hole: the child's first byte lands immediately after the notice,
+    // so the reset can never be re-applied on top of the respawned program.
+    h.server.onChildOutput(channel, "fresh-prompt$ ");
+    const d1 = (try h.client.nextData()).?;
+    const dp1 = try protocol.DataPayload.decode(d1.payload);
+    try testing.expectEqual(@as(u64, dp0.bytes.len), dp1.byte_offset);
+    try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
+}
+
+test "T824 RELAUNCH: a notice on an EMPTY ring does not read as replayed scrollback" {
+    // `replayed` is what makes the viewer suppress its own "session restarted"
+    // divider. Sampled after the notice append it would be true for a blank
+    // relaunch too, and the pane would come back with no marker at all.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xBEEF5);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{
+        .command = "sleep 600",
+        .rows = 24,
+        .cols = 80,
+    });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+
+    // A reboot-materialized tombstone in place, with nothing in its ring.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByIdStr(op.value.session_id).?;
+    s.alive = false;
+    s.relaunchable = true;
+    const sid = s.id_str;
+    h.server.store.mutex.unlock();
+
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = &sid,
+        .rows = 24,
+        .cols = 80,
+        .notice = "\x1b[?1003l",
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expect(!rp.value.replayed);
+    try testing.expectEqual(@as(u16, 0), rp.value.replay_cols);
+    try testing.expectEqual(@as(u16, 0), rp.value.replay_rows);
 }
 
 test "OPEN records cwd → sessions.json carries it (T132 reboot floor)" {

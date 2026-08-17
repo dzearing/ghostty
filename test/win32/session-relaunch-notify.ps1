@@ -610,6 +610,13 @@ foreach ($leaf in $leavesE) {
     if ($b -match 'Session interrupted') { $noticed++ }
     if ($b -eq '') { $bannerless++ }
 }
+# E3/E4 are counting assertions, and a bare "FAIL" on one leaves three different
+# stories indistinguishable (the notice took a slot it shouldn't have / it took
+# none at all / a fourth pane appeared). Print what was actually read.
+"    DIAG E: ownA=$ownA ownB=$ownB noticed=$noticed bannerless=$bannerless leaves=$($leavesE.Count)"
+foreach ($leaf in $leavesE) {
+    "    DIAG E leaf: name='$($leaf.ipc_name)' banner='$(([string]$leaf.banner) -replace '\s+', ' ')'"
+}
 Assert "E1 the pane that had banner '$BAN_A' still shows it" ($ownA -eq 1)
 Assert "E2 the pane that had banner '$BAN_B' still shows it" ($ownB -eq 1)
 Assert "E3 neither of those panes had its banner replaced by the notice" `

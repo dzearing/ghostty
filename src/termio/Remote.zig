@@ -404,7 +404,84 @@ pub fn openWorkingDirectory(
 /// both platforms independently — `notify`/`auto` here, `restore`/`rerun` there
 /// — and a setting the user can spell on one platform and not the other is the
 /// divergence this project does not ship.
-pub const RelaunchPolicy = enum { restore, rerun, prompt };
+pub const RelaunchPolicy = enum {
+    restore,
+    rerun,
+    prompt,
+
+    /// The bytes this policy asks the AGENT to splice into the replay stream
+    /// (`protocol.Relaunch.notice`) — the only slot that is reliably between the
+    /// restored scrollback and the respawned child's first output.
+    ///
+    /// The mode reset has to be ordered by the producer because a local inject
+    /// races the respawned program: under `rerun` that means we could disable the
+    /// mouse tracking the re-run TUI had just enabled, which is the opposite of
+    /// the bug this fixes. Gated on `Connection.supportsRelaunchNotice`; against
+    /// an older agent the client injects the same bytes itself, which is
+    /// visible-but-racy rather than absent.
+    ///
+    /// Empty for `restore` by construction: it never reaches a `RELAUNCH` (it
+    /// opens a fresh session instead), so it replays nothing and has nothing to
+    /// undo, and its own notice is `session_notice`, held above the viewport by
+    /// `Termio.holdNoticeAboveLocked` rather than carried on the wire.
+    pub fn streamNotice(self: RelaunchPolicy) []const u8 {
+        return switch (self) {
+            .rerun, .prompt => replay_mode_reset,
+            .restore => "",
+        };
+    }
+};
+
+/// VT state the reboot-scrollback replay leaves stuck ON in the respawned pane,
+/// reset once the replay has landed and before the new child owns the screen.
+///
+/// The replay is the DEAD session's raw byte stream (`agent/ring_snapshot.zig`),
+/// so every mode the dead program enabled is re-enabled by replaying it — but the
+/// program that consumed those reports is gone. Left set, mouse tracking makes a
+/// plain shell receive SGR mouse reports as typed input (`35;1;12M` → a
+/// `command not found` on every pointer move), and a hidden cursor / disabled
+/// autowrap / stuck SGR make the pane look broken. The respawned program
+/// re-enables whatever it needs, so resetting is safe.
+///
+/// Only the two RESPAWNING-with-replay policies use it: `rerun` and the
+/// keystroke-deferred `prompt`. `restore` (the default) opens a BRAND-NEW session
+/// and replays nothing (T230), and the ordinary alive re-attach must be left
+/// alone — there the child is still running and still OWNS these modes, so a
+/// live TUI that enabled mouse tracking would stop receiving events.
+///
+/// Scoped to MODE state on purpose. `RIS` (`\x1bc`) would throw away the very
+/// scrollback the replay exists to restore. Three tempting extras are also
+/// deliberately absent because ghostty applies them UNCONDITIONALLY — i.e. they
+/// misfire on the overwhelmingly common pane that the replay left in a perfectly
+/// good state:
+///
+///   - `?1049l`/`?1047l`/`?47l` (alt screen): `switchScreenMode` restores the
+///     saved cursor (1049) or erases the display (1047) even when we are already
+///     on the primary screen, which is where a replay that restored visible
+///     scrollback necessarily left us.
+///   - `?6l` (origin): `setMode` homes the cursor whether or not the value changed.
+///   - `\x1b[r` (DECSTBM): resetting the scroll region homes the cursor too.
+///
+/// Each would move the respawned shell's first prompt on top of the restored
+/// output. A pane whose snapshot genuinely ends inside an alt-screen TUI is the
+/// residual gap; it is rarer than "every relaunched pane" and the cure is worse
+/// there.
+pub const replay_mode_reset =
+    "\x1b[?9l" ++ // X10 mouse reporting
+    "\x1b[?1000l" ++ // normal button-press mouse tracking
+    "\x1b[?1002l" ++ // button-event (drag) tracking
+    "\x1b[?1003l" ++ // any-event (hover) tracking — the reported spam
+    "\x1b[?1004l" ++ // focus in/out reporting
+    "\x1b[?1005l" ++ // UTF-8 mouse encoding
+    "\x1b[?1006l" ++ // SGR mouse encoding
+    "\x1b[?1015l" ++ // urxvt mouse encoding
+    "\x1b[?1016l" ++ // SGR-pixel mouse encoding
+    "\x1b[?2004l" ++ // bracketed paste
+    "\x1b[?1l" ++ // DECCKM: normal (not application) cursor keys
+    "\x1b>" ++ // DECKPNM: normal (not application) keypad
+    "\x1b[?7h" ++ // DECAWM: autowrap back on (its default)
+    "\x1b[?25h" ++ // DECTCEM: cursor visible again
+    "\x1b[0m"; // SGR: default text attributes
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -641,6 +718,16 @@ pub fn threadEnter(
     // is too old to report one. Drives the notice printed after bring-up.
     var notice_command: ?[]const u8 = null;
     var did_notify = false;
+    // True when the AGENT is new enough to splice `RelaunchPolicy.streamNotice()`
+    // into the replay stream itself. When it is, the client injects nothing of its
+    // own; when it isn't (older agent), the client injects the same bytes after
+    // the drain, which works but races the respawned child.
+    //
+    // Read INSIDE the relaunch branch rather than here: the negotiated set is only
+    // certainly resolved once an RPC has round-tripped (`child_pty_flavor` above
+    // says the same thing about the same handshake), and reading it too early
+    // would answer "old agent" against a new one and silently pick the racy path.
+    var agent_owns_notice = false;
     // Set true when the agent ALREADY replayed pre-restart scrollback + the restart
     // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
     // own snapshot-less divider so there is exactly one marker.
@@ -865,6 +952,9 @@ pub fn threadEnter(
                 attach_cwd = self.arena.allocator().dupe(u8, c) catch null;
             const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
             const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+            // The ATTACH above round-tripped, so the handshake has resolved and
+            // this answer is the real one (T824).
+            agent_owns_notice = self.conn.supportsRelaunchNotice();
             const r = self.conn.relaunchChannelCancellable(
                 sid,
                 outcome.channel,
@@ -882,6 +972,11 @@ pub fn threadEnter(
                     .env = self.env,
                     .term = self.term,
                     .argv = self.command_argv orelse self.argv,
+                    // T824: undo the VT modes the ring replay re-arms, spliced by
+                    // the agent between the replayed scrollback and the re-run
+                    // command's first byte. Null against an older agent — the
+                    // fallback inject happens after the drain below.
+                    .notice = if (agent_owns_notice) self.relaunch_policy.streamNotice() else null,
                 },
                 &self.canceller,
             ) catch |err| {
@@ -1257,6 +1352,30 @@ pub fn threadEnter(
     // output (produced at the live width — the authoritative RESIZE above set the
     // agent pty) then continues to land at the live width.
     if (reflow_replay) io.reflowLocalGrid(live_cols, live_rows);
+
+    // T824, the OLD-AGENT fallback. The replayed reboot-scrollback has now landed
+    // IN FULL: the agent queues every replay DATA frame ahead of `RELAUNCHED` on
+    // the same channel, and the demux thread pushes them into the ring in order
+    // before it wakes the waiter this `threadEnter` was parked on — so the drain
+    // above saw all of them. Which makes this the first point at which we can undo
+    // what the replay did to the terminal's MODE state; injected before the drain,
+    // the replay's own `ESC[?1003h` would just turn mouse tracking back on.
+    //
+    // Only when the agent could NOT do it for us. A new agent splices the same
+    // bytes into the stream (`RelaunchPolicy.streamNotice`), which is strictly better:
+    // this inject still races the RESPAWNED child, so a `rerun` TUI that has
+    // already re-enabled mouse tracking can have it switched back off here.
+    //
+    // Deliberately NOT done on the ordinary alive re-attach path, nor on the
+    // `restore` policy. There the child is still running and still OWNS these
+    // modes — a live TUI that enabled mouse tracking would stop receiving events
+    // the moment we reset it — and `restore` replays nothing at all.
+    if (did_relaunch and relaunch_replayed and !agent_owns_notice) {
+        const reset = self.relaunch_policy.streamNotice();
+        if (reset.len > 0) {
+            @call(.always_inline, termio.Termio.processOutput, .{ io, reset });
+        }
+    }
 }
 
 pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
@@ -1411,6 +1530,14 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
     const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
 
+    // The pane has been up since `threadEnter`, so the handshake has long since
+    // resolved. No local fallback here, unlike `threadEnter`: the replay arrives
+    // asynchronously AFTER this call returns and there is no point at which we
+    // know it has all landed, so an inject would as likely be overwritten by the
+    // replay as apply to it. Against an old agent the `prompt` policy keeps
+    // today's behavior (modes stay as the replay left them) rather than a reset
+    // that lands in an arbitrary place.
+    const agent_owns_notice = rd.conn.supportsRelaunchNotice();
     const res = rd.conn.sendRelaunchOnPane(
         rd.pane,
         rows,
@@ -1422,6 +1549,9 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
             .env = self.env,
             .term = self.term,
             .argv = self.command_argv orelse self.argv,
+            // T824: same replay mode reset as the rerun path, and for the same
+            // reason — the agent replays this tombstone's ring here too.
+            .notice = if (agent_owns_notice) self.relaunch_policy.streamNotice() else null,
         },
         &self.canceller,
     ) catch |err| {
@@ -2130,4 +2260,63 @@ test "T657 every ATTACHED status that yields no pane maps to its own sentence" {
     const missing = attach_failed_notice.format(&a, reason.session_not_found, null);
     const ended = attach_failed_notice.format(&b, reason.session_ended, null);
     try testing.expect(!std.mem.eql(u8, missing, ended));
+}
+
+test "T824 replay_mode_reset disarms every mode a dead TUI could leave armed" {
+    const testing = std.testing;
+    // The user-visible symptom is mouse reports typed into a shell, so the mouse
+    // family is the part that must not quietly lose a member: a TUI that used
+    // any-event tracking with SGR-pixel encoding leaves BOTH set, and disarming
+    // only the tracking still spams on every pointer move.
+    for ([_][]const u8{
+        "\x1b[?9l", // X10
+        "\x1b[?1000l", // button press
+        "\x1b[?1002l", // drag
+        "\x1b[?1003l", // any-event / hover
+        "\x1b[?1005l", // UTF-8 encoding
+        "\x1b[?1006l", // SGR encoding
+        "\x1b[?1015l", // urxvt encoding
+        "\x1b[?1016l", // SGR-pixel encoding
+        "\x1b[?1004l", // focus reporting
+        "\x1b[?2004l", // bracketed paste
+        "\x1b[?1l", // DECCKM
+        "\x1b>", // DECKPNM
+        "\x1b[?7h", // DECAWM back ON
+        "\x1b[?25h", // cursor visible
+        "\x1b[0m", // SGR reset
+    }) |seq| {
+        try testing.expect(std.mem.indexOf(u8, replay_mode_reset, seq) != null);
+    }
+
+    // And NONE of the four that ghostty applies unconditionally: each one homes
+    // the cursor or erases, which would drop the respawned shell's first prompt
+    // on top of the scrollback the replay exists to restore.
+    for ([_][]const u8{
+        "\x1b[?1049", // alt screen (save/restore cursor)
+        "\x1b[?1047", // alt screen (erase on exit)
+        "\x1b[?6l", // origin mode (homes)
+        "\x1bc", // RIS (throws away the scrollback)
+    }) |banned| {
+        try testing.expect(std.mem.indexOf(u8, replay_mode_reset, banned) == null);
+    }
+    // DECSTBM reset (`ESC [ r`) homes too. Checked as a whole sequence so the
+    // `\x1b[?...` members above cannot mask its absence.
+    try testing.expect(std.mem.indexOf(u8, replay_mode_reset, "\x1b[r") == null);
+
+    // It fits the wire cap the agent enforces, or the tail would be truncated
+    // off and the last modes in the list would silently never be reset.
+    try testing.expect(replay_mode_reset.len <= protocol.Relaunch.max_notice_bytes);
+}
+
+test "T824 only the replaying policies ask the agent to splice a mode reset" {
+    const testing = std.testing;
+    // `rerun` and `prompt` are the two that RELAUNCH, i.e. the two whose panes
+    // get the dead session's raw ring replayed into them.
+    try testing.expectEqualStrings(replay_mode_reset, RelaunchPolicy.rerun.streamNotice());
+    try testing.expectEqualStrings(replay_mode_reset, RelaunchPolicy.prompt.streamNotice());
+
+    // `restore` (the default, T230) opens a BRAND-NEW session instead of
+    // respawning: nothing is replayed, so there is nothing to undo. Sending a
+    // reset there would be a reset of a live fresh shell's own modes.
+    try testing.expectEqual(@as(usize, 0), RelaunchPolicy.restore.streamNotice().len);
 }

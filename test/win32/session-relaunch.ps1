@@ -217,6 +217,107 @@ function Launch($tmp, $title, $relaunch, $restore) {
 # same technique as session-reattach.ps1's marker/scrollback assertions).
 function Stripped($f) { return ((Out-Text $f) -replace '\s', '') }
 
+# ---- VT mode probes (T824) -------------------------------------------------
+# The reboot replay is the DEAD program's RAW byte stream, so replaying it
+# re-enables every mode that program had enabled - in a pane it no longer
+# controls. Left armed, mouse tracking turns every pointer move into typed input
+# (`35;1;12M` at the shell prompt). The fix resets those modes once the replay
+# has landed; these helpers are the oracle for it.
+#
+# DECRQM (`CSI ? Ps $ p`) is the only way to ASK the terminal what a mode's value
+# is, and its answer (`CSI ? Ps ; Pv $ y`, Pv 1 = set / 2 = reset) is delivered as
+# INPUT to the pane's child. So the probe has to be a program that both asks and
+# reads the answer back: left to the shell, the reply is raced by the prompt and
+# echoed as a broken command.
+#
+# Three things about `+send-keys` shape these helpers, each measured on box:
+#   * adjacent text arguments CONCATENATE WITH NO SEPARATOR, so a probe cannot be
+#     parameterised as `probe.cmd VTPRE 1003` - it arrives as `probe.cmdVTPRE1003`.
+#     Every probe therefore gets its own generated `.cmd` with the tag and mode
+#     already baked in, and exactly ONE text word is ever sent.
+#   * `\t`, `\n`, `\r`, `\\` and `\e` are ESCAPES in text, so a path with `\t` in
+#     it (`...\Temp\t824...`) arrives with a TAB in the middle. `$root` is under
+#     `$env:TEMP\ghoztty-session-relaunch-<pid>`, whose remaining separators are
+#     all safe - keep it that way if this moves.
+#   * `-NoProfile` would be parsed as one of send-keys' OWN flags, which is the
+#     other reason everything goes through a `.cmd` shim.
+#
+# The reader is `$Host.UI.RawUI` (ReadConsoleInput) rather than
+# `[Console]::KeyAvailable`, which throws outright the moment stdin is anything
+# but a console - true for every nested invocation this harness might grow.
+function Write-ModeProbes($dir) {
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $probe = @'
+param([string]$Tag, [int]$Mode)
+$esc = [char]27
+$sb = New-Object System.Text.StringBuilder
+[Console]::Write($esc + '[?' + $Mode + '$p')
+$deadline = (Get-Date).AddSeconds(5)
+try {
+    $ui = $Host.UI.RawUI
+    while ((Get-Date) -lt $deadline) {
+        if ($ui.KeyAvailable) {
+            $k = $ui.ReadKey('NoEcho,IncludeKeyDown')
+            [void]$sb.Append($k.Character)
+            if ($k.Character -eq 'y') { break }
+        }
+        else { Start-Sleep -Milliseconds 20 }
+    }
+}
+catch { }
+$raw = $sb.ToString() -replace '[^0-9;?$y]', ''
+Write-Host ($Tag + '=' + $raw)
+'@
+    Set-Content -Path (Join-Path $dir 'vt-mode-probe.ps1') -Value $probe -Encoding ascii
+    $arm = @'
+$esc = [char]27
+[Console]::Write($esc + '[?1003h')
+[Console]::Write($esc + '[?1006h')
+[Console]::Write($esc + '[?2004h')
+Write-Host 'MODESARMEDOK'
+'@
+    Set-Content -Path (Join-Path $dir 'vt-mode-arm.ps1') -Value $arm -Encoding ascii
+    Set-Content -Path (Join-Path $dir 'vtarm.cmd') `
+        -Value '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0vt-mode-arm.ps1"' -Encoding ascii
+}
+
+# Ask the pane's child to enable any-event mouse tracking + SGR encoding +
+# bracketed paste, and confirm the child ran (so the bytes are really in the
+# session's ring and will be replayed). Returns $true on confirmation.
+function Invoke-ArmModes($dir, $tmp, $target, $timeoutSec = 25) {
+    Run-Cli "+send-keys --target=$target $dir\vtarm.cmd Enter" "$tmp\arm-send.txt" 12 | Out-Null
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Run-Cli "+read --name=$target --lines=200" "$tmp\arm-read.txt" 10 | Out-Null
+        # The echoed command line does not contain the marker, only the output does.
+        if ((Stripped "$tmp\arm-read.txt") -match 'MODESARMEDOK') { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+# DECRQM one mode in the pane and return its reported value ('1' set, '2' reset,
+# '' = no answer). $tag must be unique per call: a pane's PREVIOUS answer is
+# replayed back into its scrollback across a relaunch, so a shared tag would read
+# the pre-kill answer as the current one.
+function Get-ModeValue($dir, $tmp, $target, $tag, $mode, $timeoutSec = 30) {
+    $shim = Join-Path $dir "vtp$tag.cmd"
+    Set-Content -Path $shim -Encoding ascii `
+        -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0vt-mode-probe.ps1`" -Tag $tag -Mode $mode"
+    Run-Cli "+send-keys --target=$target $shim Enter" "$tmp\probe-send-$tag.txt" 12 | Out-Null
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Run-Cli "+read --name=$target --lines=400" "$tmp\probe-read-$tag.txt" 10 | Out-Null
+        $s = Stripped "$tmp\probe-read-$tag.txt"
+        $m = [regex]::Match($s, [regex]::Escape("$tag=") + '\?' + $mode + ';(\d)')
+        if ($m.Success) { return $m.Groups[1].Value }
+        # 1s, not 300ms: each poll is a CLI process against the same app, and a
+        # tight loop here starves the agent's periodic ring flush that A5 waits on.
+        Start-Sleep -Seconds 1
+    }
+    return ''
+}
+
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
@@ -267,6 +368,19 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
 }
 Assert "A4 marker is in the named pane before the agent dies" $preOk
+
+# T824: arm the modes a dead TUI would leave behind, so the ring we are about to
+# flush contains them and the replay re-arms them - the exact defect. Done BEFORE
+# the ring-flush wait below so the arming bytes are in the snapshot.
+$probeDir = Join-Path $root 'probes'
+Write-ModeProbes $probeDir
+Assert "A4b the pane's child enabled mouse tracking (armed into the ring)" (
+    Invoke-ArmModes $probeDir $tmpA 'relp')
+# Positive control: without it, a post-relaunch "reset" reading is unfalsifiable -
+# it would also be what a pane that never armed anything reports.
+$preMode = Get-ModeValue $probeDir $tmpA 'relp' 'VTPRE' 1003
+Assert "A4c DECRQM reports any-event mouse tracking SET before the agent dies (control)" (
+    $preMode -eq '1')
 
 # Ensure the agent flushes relp's ring (with the marker) to disk before we kill
 # it - otherwise a -Force kill would lose the tail and there'd be nothing to
@@ -333,6 +447,18 @@ Assert "A11 the pre-kill ring scrollback (marker) precedes the divider" $autoOrd
 # actually needs, and the half a frozen pane would fail.
 Assert "A12 the auto-relaunched pane is LIVE (input reaches the NEW child, output returns)" (
     Test-PaneLive -Exe $Exe -Target 'relp' -Tmp $tmpA -Tag 'SRA')
+
+# A13 (T824): the replay put the DEAD program's modes back on, in a pane that
+# program no longer controls. A4c proved they were on before the kill and A11
+# proved the replay happened, so a `2` here can only be the reset the agent
+# spliced in behind the replay. Without it the user's next mouse move types
+# `35;1;12M` at the respawned shell's prompt.
+$postMode = Get-ModeValue $probeDir $tmpA 'relp' 'VTPOST' 1003
+Assert "A13 the replayed pane reports any-event mouse tracking RESET after relaunch" (
+    $postMode -eq '2')
+$postPaste = Get-ModeValue $probeDir $tmpA 'relp' 'VTPOSTBP' 2004
+Assert "A13b bracketed paste is reset too (the whole replay_mode_reset set, not just mouse)" (
+    $postPaste -eq '2')
 
 Stop-TestProcs
 

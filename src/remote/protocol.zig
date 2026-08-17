@@ -53,6 +53,7 @@
 //! | v1 | `open_failed` | `OPEN_FAILED` 0x06 (refused OPEN, with a reason) | silence ⇒ client times out |
 //! | v1 | `attach_failed` | `ATTACH_FAILED` 0x07 (ATTACH the agent cannot answer) | silence ⇒ client times out |
 //! | v1 | `repaint_data` | `DATA_REPAINT` 0x15 (injected repaint, advances no offset) | repaint counted as stream bytes |
+//! | v1 | `relaunch_notice` | `RELAUNCH.notice` spliced into the replay stream | viewer injects it locally (races the child) |
 //!
 //! Two rules make that table load-bearing rather than decorative:
 //!
@@ -544,6 +545,19 @@ pub const capability = struct {
     /// combination degrades gracefully to today's behavior — no garble, no wedge.
     pub const grid_snapshot = "grid_snapshot";
 
+    /// `RELAUNCH.notice`: the agent appends the viewer's text to the ring before
+    /// replaying, putting it in the stream between the restored scrollback and
+    /// the respawned child's first output.
+    ///
+    /// Purely additive — no new opcode, one new optional field. This string
+    /// exists because the FALLBACK has to differ, not because the field would
+    /// break anything: an older agent silently ignores `notice`, and the client
+    /// must know that so it can inject the bytes itself instead of showing
+    /// nothing. (The local inject is the inferior path — it races the respawned
+    /// child, so a `rerun` TUI that re-enables mouse tracking can have it
+    /// switched straight back off — which is exactly why the field exists.)
+    pub const relaunch_notice = "relaunch_notice";
+
     /// Every `cpu_pct` this peer reports is in CORRECTED units.
     ///
     /// Unlike every capability above, this one gates no opcode and no field. It
@@ -818,6 +832,13 @@ pub const Negotiated = struct {
     /// ring-only replay and the client just renders whatever DATA arrives.
     grid_snapshot: bool = false,
 
+    /// True iff BOTH peers advertised `capability.relaunch_notice` — i.e. the
+    /// agent will append `Relaunch.notice` to the ring ahead of the replay. False
+    /// against any older peer, in which case the client injects those bytes into
+    /// its own terminal instead (correct for the mode reset, but liable to race
+    /// the respawned child).
+    relaunch_notice: bool = false,
+
     /// True iff BOTH peers advertised `capability.session_cpu` — i.e. the pushed
     /// per-session CPU stream (0x79-0x7b) is safe to use. False against any older
     /// peer, in which case the client never sends `session_cpu_sub` (an unknown
@@ -907,6 +928,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.close_session),
         .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
             hasCapability(remote.capabilities, capability.grid_snapshot),
+        .relaunch_notice = hasCapability(local.capabilities, capability.relaunch_notice) and
+            hasCapability(remote.capabilities, capability.relaunch_notice),
         .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
             hasCapability(remote.capabilities, capability.session_cpu),
         .sessions_push = hasCapability(local.capabilities, capability.sessions_push) and
@@ -1446,6 +1469,30 @@ pub const Relaunch = struct {
     env: []const Open.EnvPair = &.{},
     term: ?[]const u8 = null,
     argv: ?[]const []const u8 = null,
+
+    /// Bytes the agent APPENDS TO THE RING before it replays, so they land in the
+    /// stream between the restored scrollback and the respawned child's first
+    /// output — the same slot the reboot divider occupies. Used by the viewer to
+    /// undo the VT modes the raw replay re-arms (`termio/Remote.zig`'s
+    /// `replay_mode_reset`), and available for any short line that must appear
+    /// above the respawned child's first prompt.
+    ///
+    /// It has to travel rather than being injected locally because a client-side
+    /// inject is NOT in the stream: it is applied the moment `threadEnter`
+    /// finishes, racing the respawned child, so a `rerun` TUI that re-enables
+    /// mouse tracking can have it switched straight back off. Anything that must
+    /// be ORDERED against the child's output has to be ordered by the producer.
+    ///
+    /// Gated on `capability.relaunch_notice` so the client knows whether to fall
+    /// back to injecting it itself; the field is additive and optional, so an
+    /// older agent that ignores it just leaves the client's fallback standing.
+    /// Bounded by `max_notice_bytes` on the agent side.
+    notice: ?[]const u8 = null,
+
+    /// Hard cap on `notice` the agent will append. It is a short control-sequence
+    /// prelude plus at most one line of UI text, and the ring it lands in is the
+    /// user's scrollback.
+    pub const max_notice_bytes: usize = 1024;
 };
 
 /// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
@@ -2656,6 +2703,77 @@ test "negotiate: cpu_units gates the MEANING of an existing field" {
         );
         try testing.expect(!n.cpu_units);
     }
+}
+
+test "T824 relaunch_notice negotiates on the intersection and the field is additive" {
+    const alloc = testing.allocator;
+
+    const modern = [_][]const u8{
+        capability.close_session,
+        capability.relaunch_notice,
+    };
+    const older = [_][]const u8{capability.close_session};
+
+    // Both sides know it ⇒ the agent will splice the client's bytes into the
+    // replay and the client must NOT inject them itself.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+        );
+        try testing.expect(n.relaunch_notice);
+    }
+    // Either side missing it ⇒ false, in BOTH skew directions. This is the flag
+    // the client reads to decide between "the agent ordered it" and "inject it
+    // locally after the drain"; a false positive means the mode reset is never
+    // applied at all.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+            .{ .transfer_encoding = .raw, .capabilities = &older },
+        );
+        try testing.expect(!n.relaunch_notice);
+        // A capability skew degrades one behavior, never the connection.
+        try testing.expect(n.close_session);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &older },
+            .{ .transfer_encoding = .raw, .capabilities = &modern },
+        );
+        try testing.expect(!n.relaunch_notice);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.relaunch_notice);
+    }
+
+    // The FIELD is additive: absent from the encoding when null (an older agent
+    // sees byte-identical JSON to today's), and an older agent's payload — which
+    // never carries it — still parses.
+    const bare = try encodeJson(alloc, Relaunch{ .session_id = "abc", .rows = 24, .cols = 80 });
+    defer alloc.free(bare);
+    try testing.expect(std.mem.indexOf(u8, bare, "notice") == null);
+
+    const with = try encodeJson(alloc, Relaunch{
+        .session_id = "abc",
+        .rows = 24,
+        .cols = 80,
+        .notice = "\x1b[?1003l",
+    });
+    defer alloc.free(with);
+    var p = try parseJson(Relaunch, alloc, with);
+    defer p.deinit();
+    try testing.expectEqualStrings("\x1b[?1003l", p.value.notice.?);
+
+    var legacy = try parseJson(Relaunch, alloc,
+        \\{"session_id":"abc","rows":24,"cols":80}
+    );
+    defer legacy.deinit();
+    try testing.expect(legacy.value.notice == null);
 }
 
 test "HELLO parse ignores unknown fields (forward-compat)" {
