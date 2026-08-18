@@ -203,6 +203,27 @@ pub const Child = struct {
         /// reader thread parked in that very call — so "what is in the ring"
         /// and "what offset that is" cannot disagree by a frame.
         deliveredOffset: ?*const fn (ctx: *anyopaque) ?u64 = null,
+        /// Optional: everything below `offset` — in the same offset space
+        /// `deliveredOffset` answers in — is now DURABLE, i.e. on disk in this
+        /// session's ring snapshot, and the child may let go of it (T911).
+        ///
+        /// This exists because an ACK to a holder is permission to FREE. Acking
+        /// on DELIVERY meant that after an agent crash the holder no longer held
+        /// anything between the last ring snapshot and the crash, while the
+        /// snapshot did not hold it either — so a viewer that also restarted
+        /// replayed the agent's ring and saw a hole in its scrollback. Acking on
+        /// DURABILITY closes it: the holder's replay buffer covers the snapshot
+        /// interval, and a shell that outruns that buffer drops oldest and
+        /// reports the gap exactly as it always did.
+        ///
+        /// The FIRST call also ARMS the child. Until it arrives the child acks
+        /// what it delivered, unchanged — so a store with no ring snapshots
+        /// (persistence off, and every test) has no durability to wait for and
+        /// its holder never retains bytes nobody is going to release.
+        ///
+        /// Called OUTSIDE the store lock: it writes a frame on the holder pipe.
+        /// Null for every child that is not holder-backed.
+        releaseTo: ?*const fn (ctx: *anyopaque, offset: u64) void = null,
     };
 
     /// Hand the child its owning channel + output sink (see `VTable.attach`).
@@ -273,6 +294,13 @@ pub const Child = struct {
     pub fn deliveredOffset(self: Child) ?u64 {
         const f = self.vtable.deliveredOffset orelse return null;
         return f(self.ctx);
+    }
+
+    /// Everything below `offset` is durable; release it (see
+    /// `VTable.releaseTo`). No-op for a child that is not holder-backed.
+    pub fn releaseTo(self: Child, offset: u64) void {
+        const f = self.vtable.releaseTo orelse return;
+        f(self.ctx, offset);
     }
 };
 
@@ -1192,6 +1220,18 @@ pub const SessionStore = struct {
     /// disables ring snapshots entirely (tests / non-persistent paths unchanged).
     rings_dir: ?[]const u8 = null,
 
+    /// Whether a holder-backed child ACKs what is DURABLE rather than what it
+    /// DELIVERED (T911) — see `Child.VTable.releaseTo`. On by default, and only
+    /// meaningful with `rings_dir` set, since without ring snapshots there is no
+    /// durability to wait for.
+    ///
+    /// The off switch exists for two reasons: it is the escape hatch if keeping
+    /// a snapshot interval of output inside each holder ever misbehaves on a
+    /// real box, and it is what lets the acceptance harness run its negative
+    /// control — the SAME build, on the SAME box, losing the marker — instead of
+    /// merely inverting its own assertions.
+    durable_ack: bool = true,
+
     /// Opaque per-window layout blobs pushed by owning viewers (§5.4 "Resume
     /// all", T18), keyed by the viewer's manifest-entry id. The agent stores +
     /// returns each blob VERBATIM (topology-agnostic); it only inspects the
@@ -2070,6 +2110,7 @@ pub const SessionStore = struct {
             // Mark clean only after a successful write, and only if no newer output
             // arrived in the meantime (else leave it dirty so the next pass retries).
             self.mutex.lock();
+            var release_child: ?Child = null;
             if (self.table.getById(id)) |s2| {
                 if (s2.last_snapshot_offset < at) s2.last_snapshot_offset = at;
                 // Advance the adoption watermark with the file that was just
@@ -2078,8 +2119,15 @@ pub const SessionStore = struct {
                 if (s2.holder_snapshot_offset < cap_holder_offset) {
                     s2.holder_snapshot_offset = cap_holder_offset;
                 }
+                // Value copy of the vtable handle, used after the unlock below —
+                // the same collect-then-act shape as `refreshForegroundCommands`.
+                if (s2.alive and self.durable_ack) release_child = s2.child;
             }
             self.mutex.unlock();
+            // The bytes are on disk now, so the holder may stop keeping them
+            // (T911). OUTSIDE the lock: this writes a frame on the holder pipe,
+            // and no OS I/O runs under the mutex that serializes child output.
+            if (release_child) |c| c.releaseTo(cap_holder_offset);
         }
     }
 
@@ -2514,6 +2562,11 @@ const FakeChild = struct {
     /// the child answering like every in-process child does — "I have no holder
     /// offset" — so the reconciliation code paths stay off unless a test asks.
     fake_holder_offset: ?u64 = null,
+    /// The last offset `releaseTo` was called with, and how many times (T911) —
+    /// so a test can tell "released at the snapshot's offset" from "never
+    /// released at all", which are the two outcomes that matter.
+    released_to: ?u64 = null,
+    releases: usize = 0,
     alloc: Allocator,
 
     fn child(self: *FakeChild) Child {
@@ -2528,10 +2581,16 @@ const FakeChild = struct {
         .queryCwd = qcwd,
         .queryForegroundCommand = qfg,
         .deliveredOffset = dof,
+        .releaseTo = rel,
     };
     fn dof(ctx: *anyopaque) ?u64 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         return self.fake_holder_offset;
+    }
+    fn rel(ctx: *anyopaque, offset: u64) void {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.released_to = offset;
+        self.releases += 1;
     }
     fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
@@ -3521,6 +3580,82 @@ test "holder offset: sessions.json carries the SNAPSHOT's watermark, not the liv
     try testing.expectEqual(@as(u64, 100), cands[0].ack);
     try testing.expectEqual(@as(u32, 777), cands[0].holder_pid);
     try testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-pty-host-x-aa", cands[0].pipe);
+}
+
+test "the holder is released at the SNAPSHOT's offset, never at the live one (T911)" {
+    // An ACK is the holder's permission to FREE, so the store may only issue one
+    // for bytes that survived it — the ring snapshot it just wrote. Releasing on
+    // delivery (what happened before T911) meant an agent crash left the stretch
+    // since the last snapshot in no surviving buffer at all, and a viewer that
+    // restarted with the agent replayed a hole.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    var prng = std.Random.DefaultPrng.init(0xa911);
+    var clock: MutClock = .{ .ms = 500 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    store.rings_dir = rings;
+    defer store.deinit();
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 500);
+    s.setHolder("\\\\.\\pipe\\ghoztty-pty-host-x-911", 777, "stamp-1");
+
+    // Output with no snapshot behind it releases NOTHING. This is the case the
+    // fix exists for: the first seconds of a session, before any snapshot pass.
+    fake.fake_holder_offset = 100;
+    store.onChildOutput(s.channel, "a" ** 100);
+    try testing.expectEqual(@as(usize, 0), fake.releases);
+
+    // The snapshot lands: exactly those 100 bytes are now on disk, and exactly
+    // those may be freed.
+    store.snapshotRings();
+    try testing.expectEqual(@as(usize, 1), fake.releases);
+    try testing.expectEqual(@as(u64, 100), fake.released_to.?);
+
+    // More output, no snapshot: the live position runs to 250 and the release
+    // watermark stays at 100 — the 150 bytes in between are the ones the holder
+    // has to keep, because nothing else holds them.
+    fake.fake_holder_offset = 250;
+    store.onChildOutput(s.channel, "b" ** 150);
+    try testing.expectEqual(@as(usize, 1), fake.releases);
+    try testing.expectEqual(@as(u64, 100), fake.released_to.?);
+
+    // Next pass writes them; now they can go.
+    store.snapshotRings();
+    try testing.expectEqual(@as(usize, 2), fake.releases);
+    try testing.expectEqual(@as(u64, 250), fake.released_to.?);
+
+    // A clean ring is not re-snapshotted, so it does not re-release either: the
+    // holder hears from us only when its retained window actually shrank.
+    store.snapshotRings();
+    try testing.expectEqual(@as(usize, 2), fake.releases);
+}
+
+test "with ring snapshots off, the store releases nothing at all (T911)" {
+    // No `rings_dir` means no durability to wait for. The store must then say
+    // nothing about durability, which is what leaves the child on its pre-T911
+    // ack-on-delivery behavior instead of retaining for a releaser that will
+    // never come.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xb911);
+    var clock: MutClock = .{ .ms = 500 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    defer store.deinit();
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 500);
+    fake.fake_holder_offset = 100;
+    store.onChildOutput(s.channel, "a" ** 100);
+    store.snapshotRings();
+    try testing.expectEqual(@as(usize, 0), fake.releases);
 }
 
 test "a holder-backed record loads with NO restart divider; abandoning it draws one" {

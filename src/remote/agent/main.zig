@@ -550,6 +550,25 @@ fn surfaceEnrollFailure(err: anyerror) void {
     tray.showStartupError(msg);
 }
 
+/// The T911 durability gate: whether a holder-backed session's ACK means the
+/// bytes are on disk (default) or merely delivered (the pre-T911 behavior).
+///
+/// `GHOZTTY_AGENT_DURABLE_ACK=0` (or `false`/`off`/`no`) is the off switch. It
+/// exists as the escape hatch if retaining a snapshot interval inside each
+/// holder ever misbehaves on a box, and because it is what makes the acceptance
+/// harness's negative control a real measurement — the same build losing the
+/// marker — rather than an inverted assertion.
+fn durableAckFromEnv(alloc: Allocator) bool {
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_DURABLE_ACK") catch return true;
+    defer alloc.free(v);
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return true;
+    return !(std.mem.eql(u8, t, "0") or
+        std.ascii.eqlIgnoreCase(t, "false") or
+        std.ascii.eqlIgnoreCase(t, "off") or
+        std.ascii.eqlIgnoreCase(t, "no"));
+}
+
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
     const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_ENCODING") catch return .raw;
     defer alloc.free(v);
@@ -1351,6 +1370,7 @@ fn runListen(
     const rings_dir = ringsDirFor(alloc, sessions_file);
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
+    store.durable_ack = durableAckFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): opaque per-window layout blobs live
     // in a `layouts.json` beside the sessions file. Borrowed; freed after
     // `store.deinit` (LIFO defers).
@@ -1537,6 +1557,7 @@ fn runListenUnix(
     const rings_dir = ringsDirFor(alloc, sessions_file);
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
+    store.durable_ack = durableAckFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);
@@ -1645,6 +1666,7 @@ fn runListenPipe(
     const rings_dir = ringsDirFor(alloc, sessions_file);
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
+    store.durable_ack = durableAckFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);

@@ -180,6 +180,21 @@ $GuardTable = @(
             'src\remote\agent\session_meta.zig'
         )
     },
+    # Holder DURABILITY (T911): the only harness that measures the ring snapshot
+    # FILE rather than the pane, which is the difference between "the app still
+    # has the pixels" and "a fresh viewer can replay it". It owns the meaning of
+    # an ACK to a holder - permission to FREE - and getting that wrong is silent:
+    # every other holder harness passes while the tail of a user's scrollback
+    # stops existing the moment the agent dies.
+    [pscustomobject]@{
+        Name   = 'holder-durable'
+        Script = 'test\win32\holder-durable.ps1'
+        Stamp  = 'test\win32\holder-durable.stamp.json'
+        Covers = @(
+            'test\win32\holder-durable.ps1',
+            'src\remote\agent\ring_snapshot.zig'
+        )
+    },
     # Holders AT SCALE (T909): once holder-backed spawning became the default,
     # the per-session process stopped being a cost an opt-in user chose and
     # became one every box pays. This is the only harness that runs a realistic

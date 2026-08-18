@@ -146,6 +146,11 @@ pub fn run(alloc: Allocator, store: *session.SessionStore) Outcome {
             spawned.child.terminate();
             continue;
         };
+        // Arm the durability gate at the offset the ring snapshot ends at — the
+        // very offset we just resumed from, so nothing is released that the file
+        // does not already hold (T911).
+        if (store.rings_dir != null and store.durable_ack) spawned.child.releaseTo(c.ack);
+
         // Outside the store lock, exactly like RELAUNCH: the sink takes it.
         spawned.child.attach(store, session.SessionStore.onChildOutputTrampoline, channel);
         out.adopted += 1;

@@ -1,0 +1,10 @@
+{
+    "guard":  "holder-durable",
+    "script":  "test/win32/holder-durable.ps1",
+    "generated":  "2026-08-18T06:23:32-07:00",
+    "commit":  "73483fe6a",
+    "files":  {
+                  "src/remote/agent/ring_snapshot.zig":  "9beb3bc88d8050b9ffeb448d2d117485e85a8855fa01ebc7719f6c8cd1244166",
+                  "test/win32/holder-durable.ps1":  "a5b9b6f20cbad68b7f0649d1de2d96937ca71ec644ae859ecde344139632514e"
+              }
+}

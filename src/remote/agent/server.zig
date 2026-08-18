@@ -1108,6 +1108,14 @@ pub const Server = struct {
         const child = s.child; // value copy of the vtable handle
         self.store.mutex.unlock();
 
+        // Arm the durability gate BEFORE the reader thread exists (T911): from
+        // here on a holder-backed child acks what is on disk rather than what it
+        // delivered, so an agent crash cannot take the stretch since the last
+        // ring snapshot with it. Zero releases nothing — `snapshotRings` raises
+        // the watermark from there. Only when this store actually snapshots
+        // rings; with persistence off there is no durability to wait for.
+        if (self.store.rings_dir != null and self.store.durable_ack) child.releaseTo(0);
+
         // Hand the (real pty) child its channel + output sink so its reader thread
         // routes master-fd output to the STORE (stable across reconnects). Done
         // AFTER unlock because the sink itself takes the store lock. The fake child
@@ -1995,6 +2003,11 @@ pub const Server = struct {
             defer self.alloc.free(rb);
             if (replay_n > 0) self.sendData(channel, replay_lo, rb[0..replay_n]) catch {};
         }
+
+        // Arm the durability gate before the reader exists, exactly as the OPEN
+        // path does (T911) — a relaunched session gets a brand-new holder, and
+        // its first seconds of output are as worth keeping as any other's.
+        if (self.store.rings_dir != null and self.store.durable_ack) child.releaseTo(0);
 
         // Start the real child's reader routing output to the STORE sink on our
         // channel (done after unlock — the sink takes the store lock).

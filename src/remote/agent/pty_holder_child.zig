@@ -122,6 +122,31 @@ pub fn enabledFor(value: ?[]const u8) bool {
         std.ascii.eqlIgnoreCase(t, "no"));
 }
 
+/// How far the owner may ACK — i.e. how much the holder is allowed to FREE from
+/// its replay buffer (T911).
+///
+/// `durable_gate` off is the pre-T911 world and the right answer for a store
+/// that keeps no ring snapshots: an ACK means DELIVERED, so the holder retains
+/// only what has not reached the agent yet. On, an ACK means DURABLE, and the
+/// answer is the LOWER of the two watermarks:
+///
+///   - never past `received`, because the owner cannot vouch for bytes it has
+///     not taken (and a holder that freed them would leave a hole no snapshot
+///     covers either);
+///   - never past `durable`, because that is the point the session's ring
+///     snapshot on disk stops at, and everything after it exists ONLY in the
+///     holder until the next snapshot. Freeing it is precisely what made an
+///     agent crash cost a user the tail of their scrollback.
+///
+/// `durable == 0` — armed, nothing snapshotted yet — therefore releases
+/// nothing, which is the whole first-30-seconds case the fix is about.
+///
+/// Pure, so the arithmetic is a unit test rather than a claim.
+pub fn ackTarget(durable_gate: bool, received: u64, durable: u64) u64 {
+    if (!durable_gate) return received;
+    return @min(received, durable);
+}
+
 /// Everything a LATER agent needs to pick up a holder this one left behind
 /// (T906). All of it comes out of `sessions.json`.
 pub const AdoptOptions = struct {
@@ -238,6 +263,17 @@ const win = struct {
         received: u64 = 0,
         acked: u64 = 0,
 
+        /// Highest offset the OWNER has told us is durable — written to the
+        /// session's ring snapshot on disk (T911). Only meaningful once
+        /// `durable_gate` is set; see `ackDelivered` for what it gates.
+        durable: u64 = 0,
+        /// Set by the first `releaseTo` call. Before it, an ACK means DELIVERED
+        /// (the pre-T911 behavior, and the right one for a store that keeps no
+        /// ring snapshots — nothing there would ever raise `durable`, so the
+        /// holder would retain until its ring wrapped for no benefit). After it,
+        /// an ACK means DURABLE.
+        durable_gate: bool = false,
+
         exited: bool = false,
         exit_code: i64 = 0,
         reaped: bool = false,
@@ -261,6 +297,7 @@ const win = struct {
             .queryForegroundPid = queryForegroundPidFn,
             .queryForegroundCommand = queryForegroundCommandFn,
             .deliveredOffset = deliveredOffsetFn,
+            .releaseTo = releaseToFn,
         };
 
         /// Where this child's output stream stands, in the HOLDER's offset space
@@ -273,6 +310,24 @@ const win = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             return self.received;
+        }
+
+        /// The owner's ring snapshot now covers everything below `offset`, so the
+        /// holder may free it (T911). Monotonic — a later snapshot pass that
+        /// raced ahead must not be walked backwards by an earlier one — and the
+        /// first call arms the durability gate for good.
+        ///
+        /// ACKs immediately rather than waiting for the next read batch: a
+        /// session that has gone quiet (the common case right after a burst of
+        /// output was snapshotted) may not produce another batch for minutes,
+        /// and the holder would keep bytes it no longer has to.
+        fn releaseToFn(ctx: *anyopaque, offset: u64) void {
+            const self: *HolderChild = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            self.durable_gate = true;
+            if (offset > self.durable) self.durable = offset;
+            self.mutex.unlock();
+            self.ackDelivered();
         }
 
         // --- frame writing ----------------------------------------------------
@@ -394,19 +449,27 @@ const win = struct {
             return false;
         }
 
-        /// Release the holder's retained bytes up to what we have delivered.
+        /// Release the holder's retained bytes up to what is safe to lose.
         /// One ACK per read batch, not per frame: the ring only needs to know
         /// the high-water mark.
+        ///
+        /// What "safe to lose" means depends on the gate (T911): with a store
+        /// that snapshots rings it is `min(received, durable)` — never ahead of
+        /// what we actually took, never ahead of what is on disk — and without
+        /// one it is what we delivered, as it was before durability existed.
         fn ackDelivered(self: *HolderChild) void {
             self.mutex.lock();
-            const want = self.received;
+            const want = ackTarget(self.durable_gate, self.received, self.durable);
             const have = self.acked;
             self.mutex.unlock();
-            if (want == have) return;
+            // `<=`, not `!=`: under the gate `want` trails `received`, so a
+            // re-ATTACH that resumed at a higher offset than the last snapshot
+            // must not send the holder an ACK that walks backwards.
+            if (want <= have) return;
             var buf: [8]u8 = undefined;
             self.sendFrame(.ack, proto.Ack.encode(.{ .offset = want }, &buf)) catch return;
             self.mutex.lock();
-            self.acked = want;
+            if (want > self.acked) self.acked = want;
             self.mutex.unlock();
         }
 
@@ -896,6 +959,11 @@ const win = struct {
             // adopted frame look like a replay gap the size of the scrollback.
             .received = opts.ack,
             .acked = opts.ack,
+            // `opts.ack` IS the ring snapshot's end (T906 resumes at exactly the
+            // offset the file stops at), so it is durable by construction. The
+            // gate itself is still the owner's to arm — this only keeps a
+            // freshly armed child from re-acking ground already given up.
+            .durable = opts.ack,
         };
         log.info(
             "adopted holder for session '{s}': holder pid {d}, shell pid {d}, stamp {s}, retained [{d},{d}), resuming at {d}",
@@ -1011,4 +1079,32 @@ test "enabledFor: holders are the default and only an explicit off opts out (T90
     try testing.expect(enabledFor("11"));
     try testing.expect(enabledFor("00"));
     try testing.expect(enabledFor("nope"));
+}
+
+test "ackTarget: an ACK means DELIVERED until the store arms durability (T911)" {
+    // Ungated is the pre-T911 contract, unchanged: whatever we took, we release.
+    // `durable` is ignored outright, so a stale value can never hold the ring.
+    try testing.expectEqual(@as(u64, 0), ackTarget(false, 0, 0));
+    try testing.expectEqual(@as(u64, 4096), ackTarget(false, 4096, 0));
+    try testing.expectEqual(@as(u64, 4096), ackTarget(false, 4096, 99));
+}
+
+test "ackTarget: armed, nothing is released past the ring snapshot on disk (T911)" {
+    // The case the whole task is about: armed, but no snapshot has been written
+    // yet, so the holder keeps everything. Releasing here is exactly what used
+    // to lose a session's first seconds to an agent crash.
+    try testing.expectEqual(@as(u64, 0), ackTarget(true, 0, 0));
+    try testing.expectEqual(@as(u64, 0), ackTarget(true, 8192, 0));
+
+    // Snapshot behind the stream: release up to the snapshot, keep the tail.
+    try testing.expectEqual(@as(u64, 4096), ackTarget(true, 8192, 4096));
+
+    // Caught up: the two agree and everything delivered is durable.
+    try testing.expectEqual(@as(u64, 8192), ackTarget(true, 8192, 8192));
+
+    // Snapshot AHEAD of what we took. It cannot happen from one holder's
+    // stream, but the two numbers come from different threads and the ack must
+    // never claim bytes this child has not seen — the holder would free them
+    // and no later re-ATTACH could ask for them back.
+    try testing.expectEqual(@as(u64, 8192), ackTarget(true, 8192, 12288));
 }
