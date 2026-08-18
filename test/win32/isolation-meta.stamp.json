@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-18T01:41:38-07:00",
-    "commit":  "5a2a09864",
+    "generated":  "2026-08-18T02:55:41-07:00",
+    "commit":  "20af19530",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -18,6 +18,7 @@
                   "test/win32/agent-open-refused.ps1":  "2159e67016b439695165e785487da6842cf5005d10c1691bf03db43f10fa17a9",
                   "test/win32/agent-pipe.ps1":  "8c69dd382637196baa44fb46af36235aa81ecebad3422bbbb3bbf1255ac566cf",
                   "test/win32/agent-recovery.ps1":  "d924d4f25292f4686ef0354f3c775e4f389a7fc3c954940bce1c888e85cf9403",
+                  "test/win32/agent-relay-session-e2e.ps1":  "b78fa8208ffef0848d9b694f62a9809e0e0b0ecf9405b28b8025867a04e79f43",
                   "test/win32/agent-session-cap.ps1":  "85e0936d162a76d5c970d5dbd670da22eddf2094fdb24a38a32157e0a05574ae",
                   "test/win32/agent-sharing-uplink.ps1":  "183edf2ea64d35211987947d44f85961c30ef0f1da1d5ced9e3423d0ff107900",
                   "test/win32/agent-shell-integration.ps1":  "390a036f6a5467ede7f5b173276ae946ffa3aa5b13f5628fcdcdecd2763e1478",

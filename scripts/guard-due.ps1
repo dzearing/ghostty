@@ -351,6 +351,28 @@ $GuardTable = @(
             'test\win32\agent-sharing-uplink.ps1'
         )
     },
+    # The PAYLOAD half of the same uplink (T887). agent-sharing-uplink proves
+    # the machine dials the relay; this one proves what arrives down that dial
+    # becomes a session in the SAME store the local pipe serves. It is the only
+    # thing on the box that exercises serveControl's open command, RelayWorker's
+    # data dial, and serveOne over a relay transport - so an edit to any of them
+    # that keeps the DIAL green can still break the one-store claim, which is
+    # the whole point of the consolidated agent.
+    [pscustomobject]@{
+        Name   = 'agent-relay-session'
+        Script = 'test\win32\agent-relay-session-e2e.ps1'
+        Stamp  = 'test\win32\agent-relay-session-e2e.stamp.json'
+        Covers = @(
+            'src\remote\agent\main.zig',
+            'src\remote\agent\server.zig',
+            'src\remote\agent\session.zig',
+            'src\remote\agent\link_control.zig',
+            'src\remote\ws_client.zig',
+            'src\cli\sessions.zig',
+            'test\win32\lib\FakeAgentRelay.ps1',
+            'test\win32\agent-relay-session-e2e.ps1'
+        )
+    },
     # Standalone-install adoption (T549) only fires on a box that still has
     # the old agent MSI, so the whole flow - idle-stop, the deny-terminate
     # shield around the uninstall, the Run-key repair - is invisible to the

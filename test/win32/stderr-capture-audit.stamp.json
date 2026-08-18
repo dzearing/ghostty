@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-18T01:41:37-07:00",
-    "commit":  "5a2a09864",
+    "generated":  "2026-08-18T02:55:47-07:00",
+    "commit":  "20af19530",
     "files":  {
                   "docs/claude/testing.md":  "8e0bb377ceb3d1d67ec00ca4aaaba0723de0012c8da25f8d521b1d54ee957f13",
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
@@ -19,6 +19,7 @@
                   "test/win32/agent-open-refused.ps1":  "2159e67016b439695165e785487da6842cf5005d10c1691bf03db43f10fa17a9",
                   "test/win32/agent-pipe.ps1":  "8c69dd382637196baa44fb46af36235aa81ecebad3422bbbb3bbf1255ac566cf",
                   "test/win32/agent-recovery.ps1":  "d924d4f25292f4686ef0354f3c775e4f389a7fc3c954940bce1c888e85cf9403",
+                  "test/win32/agent-relay-session-e2e.ps1":  "b78fa8208ffef0848d9b694f62a9809e0e0b0ecf9405b28b8025867a04e79f43",
                   "test/win32/agent-session-cap.ps1":  "85e0936d162a76d5c970d5dbd670da22eddf2094fdb24a38a32157e0a05574ae",
                   "test/win32/agent-sharing-uplink.ps1":  "183edf2ea64d35211987947d44f85961c30ef0f1da1d5ced9e3423d0ff107900",
                   "test/win32/agent-shell-integration.ps1":  "390a036f6a5467ede7f5b173276ae946ffa3aa5b13f5628fcdcdecd2763e1478",
@@ -127,6 +128,7 @@
                   "test/win32/lib/CleanSlate.ps1":  "57265e2660407f6b859c66c8a4400f501a16325f420638f8859873ad47d72fbf",
                   "test/win32/lib/ColorMath.ps1":  "126214e0bae8af4baab253f75dc9f70545bc7dcd6f9dd3e39f9723b06b59697e",
                   "test/win32/lib/ExitCodeAudit.ps1":  "c6aa6eb8adbe8d682bdacc2a0034e4accf17ee1790b5867a856de3105ba6806c",
+                  "test/win32/lib/FakeAgentRelay.ps1":  "75beb6bffdb603e237860dc7bcbda4cfc41ace110f7f12b13777395244c232c7",
                   "test/win32/lib/FakeRelay.ps1":  "e30d00b4c6d6d58bbdc23d82fa76b586a84143111b8d00bcd5a7777736088075",
                   "test/win32/lib/ForegroundAudit.ps1":  "7b5deda440053a6ce0b0e8fa4047a3febd432bdbabd4b65a09e5425f81dc9e3c",
                   "test/win32/lib/HarnessLeak.ps1":  "cffcda1f77dc3c966327c93cf4fd8b6f374c08e99c7d9775b030bacc58f89a3c",
