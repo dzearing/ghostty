@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-17T16:57:02-07:00",
-    "commit":  "a6d0f588c",
+    "generated":  "2026-08-17T17:58:23-07:00",
+    "commit":  "eaafea9f3",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -91,7 +91,7 @@
                   "test/win32/holder-adopt.ps1":  "c592e195c245a6e802a87e774e6bd1368959b165be54e92bbd114875117c453f",
                   "test/win32/hook-json.ps1":  "6f3d34e42b558c451423b561d9714e2ce3bee15be9cde00f3a0ce8e80be79716",
                   "test/win32/host-settings.ps1":  "485d1ea5811a561947af45826714bbbdc55027eaa428a9fd07f727c648042895",
-                  "test/win32/hover-capture.ps1":  "91106c391b02cc4a915ca107168435485d9f03c11354760f4c44257edc32479c",
+                  "test/win32/hover-capture.ps1":  "ca5ba4250380227c23e581282d5b5bfafe20ea1abef3da4edfefa4eb04b74851",
                   "test/win32/ipc-child-exited.ps1":  "c2e3d40d79afeb6be9315e72770301530fe0d762854dab0214f97a34f04f0286",
                   "test/win32/ipc-command-keepalive.ps1":  "3c5995333bf1cf7dec551f5242ced1f2eb01011f281d7b8c4e9ed4357d208f4b",
                   "test/win32/ipc-fake-server.ps1":  "d8a18c722615e1ca8582e804d794886cb7734a9eb084f87add9d411b285a689b",
@@ -130,7 +130,7 @@
                   "test/win32/overlay-zorder.ps1":  "db90e3415f307749fb2bc3c81d290168b89e3160a6a045930ad0a8c6b644c3af",
                   "test/win32/palette-close-crash.ps1":  "de82217d80d8e8a2b3888a79e28c98cee6691ecee62384e652aca08b37703807",
                   "test/win32/palette-jump.ps1":  "763e2d62781ae09c8e69f94f2880265777e74bdbca6cfe00aa7a8941e3e5bec9",
-                  "test/win32/pane-banner.ps1":  "908abe0e777820c61c0e8588cdacfb9fd53ece2a3efc88fc6bd2be792d7aaa29",
+                  "test/win32/pane-banner.ps1":  "f79cdfedab7a36c8050e5d29058b72914ee27d42b5975fa3ab616c9fbe0de54e",
                   "test/win32/pane-capture.ps1":  "ca5ce15ac55d9c7b979137f4b923ac1139ad6fcbe766dbb921f4329eca1ed8b5",
                   "test/win32/pane-hwnd-reap.ps1":  "120b3358e611d7e624ba6bae89bfb7bc571d2924560f699280c2503c36c9028a",
                   "test/win32/pane-id.ps1":  "ee5d069def980b08e7592b91e5fc359326059acd5fd258fcda5b6762de8b6ab0",

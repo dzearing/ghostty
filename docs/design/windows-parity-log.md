@@ -9,6 +9,40 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-17 - **T845 (filed T946) - a hovered capture that photographs the
+  wrong moment now says so, instead of passing as a working button.** 6g of
+  `pane-banner.ps1` failed about one run in twenty with the chevron's hovered
+  numbers exactly equal to its un-hovered ones and no error anywhere: the
+  `capture-hover` seam had returned a valid PNG of the rest frame. The obvious
+  suspect was the capture itself - it still went through
+  `PrintWindow(PW_RENDERFULLCONTENT)`, the asynchronous DWM copy T835 measured
+  tearing on, and the banner overlay is layered, which is precisely the case
+  T835 measured. **That hypothesis did not survive the experiment.** With the
+  app still on the old flag, 60 iterations of 6g's whole chevron sequence inside
+  one launch produced 0 misses, and 12 back-to-back chevron captures were all
+  lit and identical. So the cause is still unknown, and the fix taken is the
+  second one the task itself allows: make the failure impossible to have
+  quietly. `capture-hover` now photographs the window BEFORE the move as well
+  and reports `changed` - whether the move altered a single pixel - which is a
+  fact the caller can assert instead of a difference it has to infer from two
+  probes it hoped were comparable. `pane-banner.ps1` asserts both polarities in
+  one run (`changed=True` over the chevron, `changed=False` over the card's left
+  edge), so the field is shown to discriminate rather than always agree. The
+  capture also moved to the synchronous `WM_PRINT`/`WM_PRINTCLIENT` path anyway
+  (T835's precedent - DWM is simply not in the picture now) and pre-fills its
+  surface with a sentinel, so a window with no `WM_PRINTCLIENT` handler is
+  refused by name rather than photographed blank. Both harnesses grew a
+  twelve-capture repeat oracle, because one sample cannot tell a reliable seam
+  from a nine-in-ten one - the exact shape of assertion this bug lived inside
+  for weeks. The seam finally has its own `guard-due` row
+  (`hover-capture` covering `ipc_hover.zig`, `hover_capture.zig`,
+  `lib\HoverCapture.ps1`), which is what it was missing when the flake showed up
+  in a *different* script. Evidence: hover-capture ALL PASS (26), pane-banner
+  ALL PASS (130) and green across 12 consecutive runs, negative control still
+  red, four floor lanes + P1-P3 green. T946 files the two consumer scripts
+  (`split-divider.ps1`, `tab-strip.ps1`) that still infer the hover instead of
+  asking.
+
 - 2026-08-17 - **T940 (T843 split; T839 parked) - every window the test suite
   photographs can now hold still for the camera.** T835 found that
   `Get-TestWindowPixels` captures through `PrintWindow(PW_RENDERFULLCONTENT)`,

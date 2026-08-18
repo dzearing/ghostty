@@ -23,6 +23,12 @@
 # Nothing that captured an un-hovered frame, a latched hover, or a flat fill
 # can produce both of those right answers.
 #
+# Section 3b is the T845 oracle: the same capture taken twelve times over must
+# be lit EVERY time and read the SAME value every time. One sample cannot tell a
+# reliable seam from a nine-in-ten one, and nine-in-ten is what this was from
+# T282 until T845 - the capture asked DWM for a copy of the composited surface,
+# which is asynchronous, so about one in ten was a frame from before the hover.
+#
 # Section 4 asserts the other half of the design: the hover does NOT latch. The
 # leave arrives on the next pump exactly as it does today, so a plain capture
 # right after a hover capture reads the control at REST - which is what makes
@@ -186,8 +192,22 @@ Assert ((Get-TestDistinctColors -Shot $hotPlus) -ge 8) `
 Assert (-not $hotPlus.NonClient) `
     "the '+' routes as CLIENT, so the strip's own WM_MOUSEMOVE hover path is what ran (hit=$($hotPlus.Hit))"
 
+# ... and the MOMENT is reported too (T845). The app photographs the window
+# before the move as well and says whether the move altered a single pixel, so a
+# capture that came back un-hovered is a named failure instead of a valid PNG of
+# the wrong instant. Asserted here and not only inferred from the pixel probes
+# below, because the two are different claims: "these pixels differ from a
+# separately-taken rest shot" can be satisfied by two captures of the same
+# moment with something else moving, and "the move changed this frame" cannot.
+Assert ($hotPlus.Changed) `
+    "the capture over the '+' is a frame the move CHANGED, not the resting one (changed=$($hotPlus.Changed))"
+
 # --- 3. THE DISCRIMINATOR: each capture lights ITS OWN control -------------
-$rest = Get-TestWindowPixels -Window $top
+# -Sync (T835) rather than the default capture: every assertion below is stated
+# RELATIVE to this frame, so a torn baseline would move all of them at once.
+# That is T941's sweep for the rest of the suite; it is taken here early because
+# 3b's stricter oracle is only as trustworthy as the number it compares against.
+$rest = Get-TestWindowPixels -Window $top -Sync
 $restPlus = Probe $rest $plusEdgeX $plusCornX
 $restClose = Probe $rest $closeEdgeX $closeCornX
 Close-TestWindowPixels $rest
@@ -200,6 +220,8 @@ $pCloseWhilePlus = Probe $hotPlus $closeEdgeX $closeCornX
 
 $hotClose = Get-TestHoverCapture -Hwnd $top -X $closeSx -Y $closeSy
 Assert ($null -ne $hotClose) "capture-hover returns an image over the close x ($(Get-LastHoverCaptureError))"
+Assert ($null -ne $hotClose -and $hotClose.Changed) `
+    "the capture over the close 'x' is a frame the move CHANGED too (changed=$(if($hotClose){$hotClose.Changed}))"
 $pCloseHot = Probe $hotClose $closeEdgeX $closeCornX
 $pPlusWhileClose = Probe $hotClose $plusEdgeX $plusCornX
 
@@ -227,13 +249,50 @@ if ($NegativeControl) {
         "the 'x' stays DARK while the '+' is the hovered one (edge=$(if($pCloseWhilePlus){$pCloseWhilePlus.Edge}) rest=$($restClose.Edge))"
 }
 
+# --- 3b. EVERY capture, not most of them (T845) ----------------------------
+# The discriminator above takes ONE hovered capture of each control, and that is
+# exactly the shape of assertion T845 slipped through: the capture went through
+# `PrintWindow(PW_RENDERFULLCONTENT)`, which is a DWM copy of the composited
+# surface and asynchronous, so roughly one capture in ten was of a frame painted
+# BEFORE the hover. It reported success and returned a picture; the only thing
+# that ever noticed was pane-banner.ps1's fill assertion going red on a build
+# where nothing was wrong. A single sample cannot tell a reliable seam from a
+# nine-in-ten one, so this samples it repeatedly.
+#
+# Two oracles, because "lit" alone is the weaker one: every capture must be lit,
+# AND they must all read the SAME value. A torn or stale copy shows up in the
+# second one even when it happens to catch a lit frame - T835 measured three
+# back-to-back captures of an UNCHANGED window disagreeing by 200+ px on where a
+# row ended.
+$repeatN = 12
+$repeatEdges = @()
+$repeatFail = 0
+$repeatUnchanged = 0
+for ($i = 0; $i -lt $repeatN; $i++) {
+    $shot = Get-TestHoverCapture -Hwnd $top -X $plusSx -Y $plusSy
+    $p = Probe $shot $plusEdgeX $plusCornX
+    if ($null -eq $p) { $repeatFail++ } else { $repeatEdges += $p.Edge }
+    if ($shot -and -not $shot.Changed) { $repeatUnchanged++ }
+    if ($shot) { Close-TestHoverCapture $shot }
+}
+$repeatDistinct = @($repeatEdges | Sort-Object -Unique)
+Write-Host "INFO  repeat hover: $repeatN captures, edges $($repeatDistinct -join '/') (rest=$($restPlus.Edge)), $repeatFail unreadable, $repeatUnchanged unchanged"
+Assert ($repeatFail -eq 0 -and $repeatEdges.Count -eq $repeatN) `
+    "$repeatN back-to-back hovered captures all came back readable ($repeatFail unreadable)"
+Assert ($repeatUnchanged -eq 0) `
+    "...and the app reports every one of them as a frame the move CHANGED ($repeatUnchanged came back identical to the un-hovered one)"
+Assert ($repeatEdges.Count -gt 0 -and -not ($repeatEdges | Where-Object { $_ -lt ($restPlus.Edge + 8) })) `
+    "...and the '+' fill is lit in EVERY one of them, not most (edges $($repeatDistinct -join '/') vs rest=$($restPlus.Edge))"
+Assert ($repeatDistinct.Count -eq 1) `
+    "...and they all read the SAME value, so the capture is the window's own paint and not a DWM copy of it (distinct: $($repeatDistinct -join '/'))"
+
 # --- 4. The hover does NOT latch -------------------------------------------
 # The leave arrives on the next pump, exactly as it does today, so the frame
 # after the probe is back at rest. This is the property that makes a capture
 # the right shape for this seam: there is no state to leak into the next
 # assertion, and no "release" call anyone can forget.
 Start-Sleep -Milliseconds 400
-$after = Get-TestWindowPixels -Window $top
+$after = Get-TestWindowPixels -Window $top -Sync
 $pAfter = Probe $after $plusEdgeX $plusCornX
 Close-TestWindowPixels $after
 Assert ($null -ne $pAfter -and $pAfter.Edge -lt ($restPlus.Edge + 8)) `
@@ -291,6 +350,24 @@ Assert ($leaked.Count -eq 0) "the user's foreground was never taken ($($leaked -
     if ($appPid) { Stop-Process -Id $appPid -Force -ErrorAction SilentlyContinue }
     Kill-RepoInstances
     if ($td) { Remove-TestDesktop $td }
+}
+
+# --- stamp (T783, row added by T845) --------------------------------------
+# A green run records the content of the capture-hover seam, so
+# scripts\guard-due.ps1 can answer "has anybody run this against the code as it
+# now stands?". The seam has no in-app symptom when it goes wrong: T845 was a
+# capture that returned the UN-hovered frame roughly one run in ten and
+# reported success, and what noticed was a DIFFERENT script's fill assertion
+# reading a correct build as a dead button. Stamped only on a CLEAN sweep - a
+# run with skipped sections proved less than the whole harness claims - and a
+# red run leaves the stamp alone on purpose.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    if ($script:skipped -gt 0) {
+        Write-Host "  stamp NOT updated: $script:skipped section(s) skipped, so this run did not cover the whole harness"
+    } else {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+            update -Guard hover-capture -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+    }
 }
 
 Write-TestVerdict -Pass $script:pass -Fail $script:fail -Skipped $script:skipped -Label 'hover-capture'

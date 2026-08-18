@@ -24,9 +24,13 @@
 # be un-done: the leave arrives on the next pump and clears the hover exactly
 # as it does today.
 #
-# The pixels are the same pixels Get-TestWindowPixels reads - the same
-# PrintWindow(PW_RENDERFULLCONTENT) call, made from inside instead of outside -
-# so a probe migrates by swapping the capture call and keeping its math.
+# The pixels are the same pixels Get-TestWindowPixels -Sync reads - the same
+# synchronous PrintWindow (no flags, so WM_PRINT -> WM_PRINTCLIENT), made from
+# inside instead of outside - so a probe migrates by swapping the capture call
+# and keeping its math. It was PW_RENDERFULLCONTENT until T845, and that DWM
+# copy is asynchronous: about one run in ten it handed back a frame painted
+# BEFORE the hover, which pane-banner.ps1 saw as a chevron that never lit. Same
+# consequence as the -Sync switch on this side, and the same fix.
 #
 # WHAT IT IS NOT. There is deliberately no `ghoztty +capture-hover` CLI verb,
 # for the reason there is no `+capture-pane` one: `src/cli/ghostty.zig`'s
@@ -64,6 +68,15 @@ same decision Send-TestMouse makes (T263). ASSERT THEM when the point is
 supposed to be a particular control - a probe that landed on the wrong route
 and a probe that landed on a control which did not light look identical in
 pixels.
+
+And { Changed }: whether the move altered a single pixel of the window, which
+the app answers by photographing the window BEFORE the move as well (T845).
+ASSERT IT on any probe whose point is supposed to light something - a capture
+that silently came back un-hovered is the one failure of this action that looks
+exactly like a success, and comparing it against a separately-taken "rest" shot
+is a weaker test than asking the app whether anything moved. A probe hovering
+dead space asserts $false and gets a sharper oracle than "these two pixels are
+close".
 
 -Client forces the client message even where the point hit-tests non-client,
 the twin of Send-TestMouse -Client.
@@ -126,6 +139,7 @@ function Get-TestHoverCapture {
         Top       = [int]$resp.data.top
         Hit       = [int]$resp.data.hit
         NonClient = [bool]$resp.data.nonclient
+        Changed   = [bool]$resp.data.changed
         Path      = $Path
         Bytes     = [int]$resp.data.bytes
     }

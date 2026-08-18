@@ -566,6 +566,25 @@ $GuardTable = @(
             'test\win32\pane-banner.ps1'
         )
     },
+    # The hovered-frame capture is the ONLY way any script can photograph a
+    # hover fill off the background desktop (T282), and it is a seam nothing
+    # else exercises: four scripts consume it, none of them would fail
+    # obviously if it started handing back the wrong frame. That is not
+    # hypothetical - T845 is exactly that, a capture that returned the
+    # UN-hovered frame about one run in ten and reported success, so the fill
+    # assertions in pane-banner.ps1 read a correct build as a dead button. This
+    # row ties the seam's own harness to the seam.
+    [pscustomobject]@{
+        Name   = 'hover-capture'
+        Script = 'test\win32\hover-capture.ps1'
+        Stamp  = 'test\win32\hover-capture.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ipc_hover.zig',
+            'src\apprt\win32\hover_capture.zig',
+            'test\win32\lib\HoverCapture.ps1',
+            'test\win32\hover-capture.ps1'
+        )
+    },
     # The loop's own continuation mechanism, and a harness with a history of
     # crying wolf (T483): its section B once flaked 1-in-3, so an edit to it
     # that nobody re-runs is exactly the "trusted from memory" gap T783 closes.

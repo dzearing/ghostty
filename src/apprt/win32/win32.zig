@@ -1772,6 +1772,10 @@ pub extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
 pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) i32;
+/// Flush the calling thread's GDI batch. Needed before READING the bits of a
+/// DIB section that GDI drew into: the drawing calls are batched, so a direct
+/// read can otherwise see the surface as it was before them.
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
 pub extern "gdi32" fn BitBlt(hdcDest: HDC, x: i32, y: i32, cx: i32, cy: i32, hdcSrc: HDC, x1: i32, y1: i32, rop: u32) callconv(.winapi) i32;
 // DrawTextW is exported by user32.dll, not gdi32.dll. The previous
 // declaration on gdi32 worked only because user32 was linked anyway.

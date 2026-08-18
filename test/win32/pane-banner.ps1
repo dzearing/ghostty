@@ -746,7 +746,19 @@ try {
         $elseShot = Get-TestHoverCapture -Hwnd $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy)
         $chHot  = Probe-Chev $hotShot
         $chCold = Probe-Chev $elseShot
-        Write-Host "INFO  chevron fill: rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge}) otherhover=$(if($chCold){$chCold.Edge})"
+        Write-Host ("INFO  chevron fill: rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge}) " +
+                    "otherhover=$(if($chCold){$chCold.Edge}) changed=$(if($hotShot){$hotShot.Changed})/$(if($elseShot){$elseShot.Changed}) " +
+                    "hit=$(if($hotShot){$hotShot.Hit})")
+        # T845: the app photographed the overlay before the move as well, so
+        # "the hover took" is a fact rather than an inference from two probes.
+        # This is the assertion that names the T845 failure instead of leaving
+        # it to look like a chevron that does not light: a capture which came
+        # back un-hovered says changed=False here, and the pixel assertions
+        # below then have a cause printed next to them.
+        Assert ($null -ne $hotShot -and $hotShot.Changed) `
+            "T845: the hovered capture of the chevron is a DIFFERENT frame from the un-hovered one (changed=$(if($hotShot){$hotShot.Changed}))"
+        Assert ($null -ne $elseShot -and -not $elseShot.Changed) `
+            "T845: ...and hovering the card's left edge changes nothing, so the chevron's fill is the chevron's (changed=$(if($elseShot){$elseShot.Changed}))"
         Assert ($null -ne $chHot -and $null -ne $chRest -and $chHot.Edge -ge ($chRest.Edge + 6)) `
             "T204: hovering the chevron lights a fill (rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge}); $(Get-LastHoverCaptureError))"
         Assert ($null -ne $chHot -and $chHot.Corner -lt ($chHot.Edge - 4)) `
@@ -755,6 +767,38 @@ try {
             "T204: ...and the fill follows the pointer - the chevron is dark while the card's left edge is hovered (edge=$(if($chCold){$chCold.Edge}))"
         Close-TestHoverCapture $hotShot
         Close-TestHoverCapture $elseShot
+
+        # T845: the same capture, twelve times over. The three assertions above
+        # take ONE hovered frame each, and that is how a capture which was right
+        # nine times in ten passed as a working seam for weeks: `capture-hover`
+        # went through PrintWindow(PW_RENDERFULLCONTENT), a DWM copy of the
+        # composited surface, and THIS overlay is layered - the exact case T835
+        # measured tearing on. About one run in twenty, the picture predated the
+        # hover, the two fill assertions read hot == rest, and pane-banner.ps1
+        # went red on a build with nothing wrong with it. The seam now paints
+        # the frame itself under WM_PRINTCLIENT; what says so is that every one
+        # of these reads the SAME lit value, not that one of them did.
+        $chN = 12
+        $chEdges = @()
+        $chUnreadable = 0
+        $chUnchanged = 0
+        for ($i = 0; $i -lt $chN; $i++) {
+            $s = Get-TestHoverCapture -Hwnd $ovHwnd2 -X ($ovC.Left + $chCx) -Y ($ovC.Top + $chCy)
+            $p = Probe-Chev $s
+            if ($null -eq $p) { $chUnreadable++ } else { $chEdges += $p.Edge }
+            if ($s -and -not $s.Changed) { $chUnchanged++ }
+            if ($s) { Close-TestHoverCapture $s }
+        }
+        $chDistinct = @($chEdges | Sort-Object -Unique)
+        Write-Host "INFO  chevron repeat: $chN captures, edges $($chDistinct -join '/') (rest=$(if($chRest){$chRest.Edge})), $chUnreadable unreadable, $chUnchanged unchanged"
+        Assert ($chUnreadable -eq 0 -and $chEdges.Count -eq $chN) `
+            "T845: $chN back-to-back hovered captures of the chevron all came back readable ($chUnreadable unreadable)"
+        Assert ($chUnchanged -eq 0) `
+            "T845: ...and every one of them is a frame the move actually changed ($chUnchanged came back identical to the un-hovered one)"
+        Assert ($null -ne $chRest -and $chEdges.Count -gt 0 -and -not ($chEdges | Where-Object { $_ -lt ($chRest.Edge + 6) })) `
+            "T845: ...and the fill is lit in EVERY one of them, not most (edges $($chDistinct -join '/') vs rest=$(if($chRest){$chRest.Edge}))"
+        Assert ($chDistinct.Count -eq 1) `
+            "T845: ...and they all read the SAME value, so the capture is the overlay's own paint and not a DWM copy of it (distinct: $($chDistinct -join '/'))"
     }
 
     & $exe +set-banner --target=bw --clear | Out-Null

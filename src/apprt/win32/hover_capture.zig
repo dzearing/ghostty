@@ -178,6 +178,44 @@ pub fn rgbLen(size: Size) usize {
     return @as(usize, size.w) * @as(usize, size.h) * 3;
 }
 
+/// The BGRA the capture surface is pre-filled with before `PrintWindow`, so
+/// "the window drew nothing" is distinguishable from "the window drew this".
+///
+/// The same magenta `TestDesktop.ps1` uses for its own synchronous capture, and
+/// for the same reason: nothing in the win32 chrome paints it, so a surface
+/// still holding it everywhere means the paint never happened. Alpha is
+/// deliberately not part of it — a GDI paint leaves the fourth byte at whatever
+/// it feels like, which is why `toRgb` drops it (T845).
+pub const sentinel_bgr = [3]u8{ 0xFF, 0x00, 0xFF }; // B, G, R
+
+/// Pre-fill a 32-bit DIB with `sentinel_bgr`.
+pub fn fillSentinel(dib: []u8) void {
+    var i: usize = 0;
+    while (i + 4 <= dib.len) : (i += 4) {
+        dib[i + 0] = sentinel_bgr[0];
+        dib[i + 1] = sentinel_bgr[1];
+        dib[i + 2] = sentinel_bgr[2];
+        dib[i + 3] = 0;
+    }
+}
+
+/// Did `PrintWindow` leave the surface exactly as `fillSentinel` left it?
+///
+/// Every pixel is examined rather than a grid sampled: the answer decides
+/// whether the caller gets an error or a picture, and a grid that happens to
+/// miss the one drawn region turns a real capture into a refusal. A full pass
+/// over the DIB is already paid once by `toRgb`, so paying it twice is noise
+/// next to the `PrintWindow` call itself.
+pub fn allSentinel(dib: []const u8) bool {
+    var i: usize = 0;
+    while (i + 4 <= dib.len) : (i += 4) {
+        if (dib[i + 0] != sentinel_bgr[0] or
+            dib[i + 1] != sentinel_bgr[1] or
+            dib[i + 2] != sentinel_bgr[2]) return false;
+    }
+    return true;
+}
+
 /// Convert a TOP-DOWN BGRA DIB into the top-down RGB `png_encode` takes.
 ///
 /// Top-down in and top-down out, unlike `pane_capture.toRgbTopDown`: the DIB
@@ -297,6 +335,31 @@ test "toRgb: BGRA becomes RGB with the row order kept" {
         255, 0,   0,   0,   255, 0,
         0,   0,   255, 255, 255, 255,
     }, &dst);
+}
+
+test "sentinel: a surface nothing drew into is still entirely sentinel" {
+    const testing = std.testing;
+    var dib: [4 * 4]u8 = undefined;
+    fillSentinel(&dib);
+    try testing.expect(allSentinel(&dib));
+    // Alpha is not part of the comparison: a GDI paint scribbles it and that
+    // must not read as "the window drew something".
+    dib[3] = 0xFF;
+    dib[7] = 0x7F;
+    try testing.expect(allSentinel(&dib));
+}
+
+test "sentinel: one drawn pixel anywhere is enough to be a real capture" {
+    const testing = std.testing;
+    var dib: [4 * 64]u8 = undefined;
+    fillSentinel(&dib);
+    // The LAST pixel, which a sampling grid is exactly what would miss.
+    dib[4 * 63 + 1] = 0x20;
+    try testing.expect(!allSentinel(&dib));
+
+    fillSentinel(&dib);
+    dib[0] = 0x00; // first pixel's blue
+    try testing.expect(!allSentinel(&dib));
 }
 
 test "toRgb: a short buffer is refused rather than partially filled" {

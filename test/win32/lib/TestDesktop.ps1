@@ -112,7 +112,10 @@
 # and PrintWindow on ONE GUI-thread stack, which the message loop is never
 # reached in the middle of. Use it for ANY hover fill; a Send-TestMouse move
 # plus Get-TestWindowPixels cannot see one. The hover does not latch - the
-# leave lands on the next pump exactly as before.
+# leave lands on the next pump exactly as before. That app-side PrintWindow is
+# the SYNCHRONOUS one for the same reason -Sync is on this side (T845): the
+# PW_RENDERFULLCONTENT copy it used at first is a DWM copy, and one in ten of
+# them predated the hover paint.
 #
 # TERMINAL-CONTENT PROBES THAT STAY ON THE INPUT DESKTOP (declared, not
 # missed - an undeclared exception is indistinguishable from an oversight):
