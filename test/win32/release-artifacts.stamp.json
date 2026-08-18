@@ -1,16 +1,14 @@
 {
     "guard":  "release-artifacts",
     "script":  "test/win32/release-artifacts.ps1",
-    "generated":  "2026-08-16T10:37:04-07:00",
-    "commit":  "5f3f8f45b",
+    "generated":  "2026-08-18T04:26:43-07:00",
+    "commit":  "f23489b05",
     "files":  {
-                  ".github/workflows/fork-ci.yml":  "be6378d74108735c8a8a9300be5165eb945f192242596657a6bc535598bf2818",
-                  ".github/workflows/release-windows.yml":  "cfd7cbe95ecca5ca561ca106764181cfc6de8797f91593ea73237edaf9fb4cad",
-                  "dist/windows-installer/build-msi.sh":  "e3dc180e865afafef6035f9bd6bee34ddb27f23c300bf1f3fcfe983339284d4a",
-                  "dist/windows-installer/build-portable-zip.sh":  "0adc05d0eb7ef0d29d4308dd2ab914722fdb9e81c6031eaaa77301ab62474917",
-                  "dist/windows-installer/build-release-artifacts.sh":  "d86359921b387d0af61c5aa88d2bb9e01965baaf9abc064323dc94b458d33641",
+                  ".github/workflows/fork-ci.yml":  "e24534682138d71b3da3d1f63bdc01233e4c2ef53ba93733d3f735489a8bad51",
+                  ".github/workflows/release-windows.yml":  "04c5232124877d270146e288ab9bd4c1005849eb0adce5b99829bf3dcf7c8bff",
+                  "dist/windows-installer/build-release-artifacts.sh":  "71d839249b11f69083447113c546bfeaa219161c1daa93b92f48de38e30c331a",
                   "dist/windows-installer/install-msitools.sh":  "445350af31c5bdb39d1ee9c75dd37b76ec11e62b993642c8802e1b01e1e53e9a",
                   "scripts/publish-windows-release.ps1":  "4b2b82d21d6c04e291499716220bfa102fdb194433bb2f707ec54f878b45b146",
-                  "test/win32/release-artifacts.ps1":  "e1744c9a240172b1c4e6d6da628adde5e92919c94ff65257e480be1230473c38"
+                  "test/win32/release-artifacts.ps1":  "c3a89c4d2e318b464e58def8afb62ee9227b4357380796b22a2f866155a8c619"
               }
 }

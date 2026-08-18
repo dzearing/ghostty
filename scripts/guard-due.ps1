@@ -289,6 +289,18 @@ $GuardTable = @(
     # them can only be caught by the static harness -- which sat red for a
     # week after T577 changed the triggers, because nothing tied these files
     # to a run of it.
+    #
+    # SPLIT IN TWO (T898). release-artifacts.ps1 has a Docker-gated section, and
+    # it only stamped on a run with zero skips - the right bar for the packaging
+    # payload, and the wrong one for a workflow file. Docker is deliberately kept
+    # down on this box, so between 2026-08-16 and 2026-08-18 an edit to
+    # fork-ci.yml left this row due FOREVER: twelve turns met a permanently-red
+    # guard, twelve filed a duplicate task for it, and every commit in between
+    # went out under the `-NoGuardDue` hatch, which is how a hatch stops meaning
+    # anything. The wiring files below are proved end to end by sections A, C, E
+    # and F, none of which touch Docker, so this row stamps from an ordinary
+    # green run. The two payload scripts moved to the packaging row, which keeps
+    # the zero-skip bar.
     [pscustomobject]@{
         Name   = 'release-artifacts'
         Script = 'test\win32\release-artifacts.ps1'
@@ -298,10 +310,26 @@ $GuardTable = @(
             '.github\workflows\fork-ci.yml',
             'dist\windows-installer\build-release-artifacts.sh',
             'dist\windows-installer\install-msitools.sh',
-            'dist\windows-installer\build-msi.sh',
-            'dist\windows-installer\build-portable-zip.sh',
             'scripts\publish-windows-release.ps1',
             'test\win32\release-artifacts.ps1'
+        )
+    },
+    # The PACKAGING half of the same harness (T898): the two scripts that
+    # actually build the payload, whose only real proof is section B running
+    # them under the msitools-local image. A Docker-less run vouching for the
+    # MSI/ZIP payload is the exact lie T783's mechanism exists to prevent, so
+    # this row is stamped ONLY by a zero-skip run - which means that when Docker
+    # is down it stays due, and honestly so. The harness itself is deliberately
+    # NOT covered here: it is the wiring row's subject, and an edit to a static
+    # assertion must not put this row out of reach until someone starts Docker.
+    [pscustomobject]@{
+        Name    = 'release-artifacts-packaging'
+        Script  = 'test\win32\release-artifacts.ps1'
+        RunArgs = '-RequireDocker'
+        Stamp   = 'test\win32\release-artifacts-packaging.stamp.json'
+        Covers  = @(
+            'dist\windows-installer\build-msi.sh',
+            'dist\windows-installer\build-portable-zip.sh'
         )
     },
     # Release version-drift detection (T579): the checker and its CI wiring
@@ -1035,7 +1063,7 @@ function Get-GuardState($row) {
     # be mistaken for one.
     if ($live.Count -eq 0 -and $null -eq $stamp) {
         return [pscustomobject]@{
-            Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+            Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
             Kind = 'n/a'; Reason = 'no-covered-files'; Findings = @()
             Files = @(); StampedAt = ''; StampedCommit = ''
         }
@@ -1047,7 +1075,7 @@ function Get-GuardState($row) {
 
     if ($null -eq $stamp) {
         return [pscustomobject]@{
-            Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+            Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
             Kind = 'due'; Reason = 'no-stamp'; Findings = @()
             Files = @($live.Keys); StampedAt = ''; StampedCommit = ''
         }
@@ -1069,7 +1097,7 @@ function Get-GuardState($row) {
     $kind = if ($findings.Count -gt 0) { 'due' } else { 'current' }
     $reason = if ($findings.Count -gt 0) { 'covered-files-changed' } else { '' }
     return [pscustomobject]@{
-        Name = $row.Name; Script = $row.Script; Stamp = $row.Stamp
+        Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
         Kind = $kind; Reason = $reason; Findings = $findings
         Files = @($live.Keys)
         StampedAt = [string]$stamp.generated
@@ -1173,7 +1201,12 @@ switch ($Action) {
                 "GUARD DUE {0}: {1} has not been run since these changed:" -f $s.Name, $s.Script
                 foreach ($f in $s.Findings) { "    {0,-8} {1}" -f $f.Kind, $f.Path }
             }
-            "  run: powershell -NoProfile -File {0}" -f $s.Script
+            # RunArgs is how a row says "this harness needs more than its bare
+            # name to clear ME" - the packaging row wants -RequireDocker, which
+            # turns the Docker skips into failures so a run that cannot clear it
+            # says so instead of reporting ALL PASS and leaving it due.
+            "  run: powershell -NoProfile -File {0}{1}" -f $s.Script,
+                $(if ($s.RunArgs) { " $($s.RunArgs)" } else { '' })
         }
         exit ([int]($due -gt 0))
     }

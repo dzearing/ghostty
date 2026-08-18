@@ -289,10 +289,85 @@ try {
         ($guardSrc -match '(?s)if \(\$script:failures -eq 0\) \{.*?guard-due\.ps1') ''
     Check 'F2 a run with skipped sections does not stamp' `
         ($guardSrc -match '(?s)if \(\$script:skipped -gt 0\) \{\s*\r?\n\s*"\s*stamp NOT updated') ''
+
+    # --- G. a harness with a Docker-gated section: two rows, two bars -------
+    # T898. release-artifacts.ps1 stamped ONE row and only on a zero-skip run.
+    # That bar is right for the payload sections and wrong for the workflow
+    # files, and on a box where Docker is deliberately kept down it made the
+    # row unclearable: an edit to fork-ci.yml stayed due forever, twelve turns
+    # filed a duplicate task about it, and every commit in between went out
+    # under `-NoGuardDue`. The claims below are the two halves of the split -
+    # a wiring edit clears WITHOUT Docker, a payload edit still does not.
+    Write-Host "`n-- G. the release rows: wiring clears without Docker, payload does not --"
+
+    # G1-G3 read the LIVE table (not the fixture): which files each row claims
+    # is the whole substance of the split, so it is asserted where it ships.
+    $wiring = Invoke-Due list -Guard 'release-artifacts' -AtRepo $Repo
+    $packaging = Invoke-Due list -Guard 'release-artifacts-packaging' -AtRepo $Repo
+    Check 'G1 the wiring row covers the workflow files' `
+        ($wiring.Text -match '\.github/workflows/fork-ci\.yml' -and
+         $wiring.Text -match '\.github/workflows/release-windows\.yml') $wiring.Text
+    Check 'G2 and does NOT cover the Docker-only payload scripts' `
+        ($wiring.Text -notmatch 'build-msi\.sh' -and $wiring.Text -notmatch 'build-portable-zip\.sh') $wiring.Text
+    Check 'G3 the packaging row covers exactly those two' `
+        ($packaging.Text -match 'build-msi\.sh' -and $packaging.Text -match 'build-portable-zip\.sh' -and
+         $packaging.Text -notmatch 'fork-ci\.yml') $packaging.Text
+
+    # G4-G7 measure the behaviour itself, over a fixture shaped like both rows.
+    $RelFixture = Join-Path $env:TEMP ("ghoztty-guard-due-rel-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    function Set-RelFile([string]$rel, [string]$text) {
+        $p = Join-Path $RelFixture $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+        [System.IO.File]::WriteAllText($p, ($text -replace "`r`n", "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    Set-RelFile '.github\workflows\release-windows.yml'          "# fake release workflow v1`n"
+    Set-RelFile '.github\workflows\fork-ci.yml'                  "# fake CI workflow v1`n"
+    Set-RelFile 'dist\windows-installer\build-release-artifacts.sh' "# fake shared artifact script v1`n"
+    Set-RelFile 'dist\windows-installer\install-msitools.sh'     "# fake msitools install v1`n"
+    Set-RelFile 'dist\windows-installer\build-msi.sh'            "# fake msi builder v1`n"
+    Set-RelFile 'dist\windows-installer\build-portable-zip.sh'   "# fake zip builder v1`n"
+    Set-RelFile 'scripts\publish-windows-release.ps1'            "# fake on-box publish v1`n"
+    Set-RelFile 'test\win32\release-artifacts.ps1'               "# fake harness v1`n"
+
+    Invoke-Due update -Guard 'release-artifacts' -AtRepo $RelFixture | Out-Null
+    Invoke-Due update -Guard 'release-artifacts-packaging' -AtRepo $RelFixture | Out-Null
+
+    # The wiring edit: what a Docker-less green run has to be able to clear.
+    Set-RelFile '.github\workflows\fork-ci.yml' "# fake CI workflow v2 - a trigger changed`n"
+    $rw = Invoke-Due check -Guard 'release-artifacts' -AtRepo $RelFixture
+    $rp = Invoke-Due check -Guard 'release-artifacts-packaging' -AtRepo $RelFixture
+    Check 'G4 a workflow edit makes the WIRING row due' `
+        ($rw.Exit -eq 1 -and $rw.Text -match 'changed\s+\.github/workflows/fork-ci\.yml') $rw.Text
+    Check 'G5 and leaves the packaging row alone (no Docker needed to clear it)' `
+        ($rp.Exit -eq 0 -and $rp.Text -match 'GUARD CURRENT release-artifacts-packaging') $rp.Text
+    Invoke-Due update -Guard 'release-artifacts' -AtRepo $RelFixture | Out-Null
+    $rw = Invoke-Due check -Guard 'release-artifacts' -AtRepo $RelFixture
+    Check 'G6 stamping the wiring row alone clears it' ($rw.Exit -eq 0) $rw.Text
+
+    # The negative control: the zero-skip bar must survive the split, or a
+    # Docker-less run ends up vouching for the MSI/ZIP payload.
+    Set-RelFile 'dist\windows-installer\build-msi.sh' "# fake msi builder v2 - payload rule changed`n"
+    $rp = Invoke-Due check -Guard 'release-artifacts-packaging' -AtRepo $RelFixture
+    $rw = Invoke-Due check -Guard 'release-artifacts' -AtRepo $RelFixture
+    Check 'G7 a payload edit makes the PACKAGING row due' `
+        ($rp.Exit -eq 1 -and $rp.Text -match 'changed\s+dist/windows-installer/build-msi\.sh') $rp.Text
+    Check 'G8 and does not touch the wiring row' ($rw.Exit -eq 0) $rw.Text
+    Check 'G9 the packaging row asks for the run that can actually clear it' `
+        ($rp.Text -match 'run: powershell -NoProfile -File test\\win32\\release-artifacts\.ps1 -RequireDocker') $rp.Text
+
+    # G10-G11: the policy that decides which stamp a run earns. Source-level
+    # for the same reason F1/F2 are - the alternative is a Docker-up run per arm.
+    $relSrc = [System.IO.File]::ReadAllText((Join-Path $Repo 'test\win32\release-artifacts.ps1'))
+    Check 'G10 the wiring stamp is reached with NO skip condition in the way' `
+        ($relSrc -match '(?s)if \(\$script:failures -eq 0\) \{(?:(?!skipped).)*?-Guard release-artifacts -Repo') ''
+    Check 'G11 the packaging stamp is behind a zero-skip condition' `
+        ($relSrc -match '(?s)if \(\$script:skipped -eq 0\) \{(?:(?!-Guard).)*?-Guard release-artifacts-packaging') ''
 }
 finally {
     Remove-Item -LiteralPath $Fixture -Recurse -Force -ErrorAction SilentlyContinue
+    if ($RelFixture) { Remove-Item -LiteralPath $RelFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 25
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 32

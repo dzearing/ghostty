@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-18T03:30:48-07:00",
-    "commit":  "5af6a227c",
+    "generated":  "2026-08-18T04:48:31-07:00",
+    "commit":  "f23489b05",
     "files":  {
                   "docs/claude/testing.md":  "8e0bb377ceb3d1d67ec00ca4aaaba0723de0012c8da25f8d521b1d54ee957f13",
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
@@ -82,7 +82,7 @@
                   "test/win32/foreground-audit.ps1":  "fedd69018bf2fed928af04af89e82cb994ca1a467b8ad573585cedc28d883c66",
                   "test/win32/go-loop-guard.ps1":  "aad0ca697329b8ce17f023e4f6b13d1b0765b16292592421787fb4d2f0652c3e",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
-                  "test/win32/guard-due.ps1":  "a6f9612430798010df0c48cdd9ab8c3270fbb554c555fbbe61e084008b0ec618",
+                  "test/win32/guard-due.ps1":  "aa32ee1565ef6136799c682f2794a460cd5f7593c4063a954d2f2dffb6f5dee3",
                   "test/win32/gui-launch-command.ps1":  "90c55316959e28ebec3bf7e04b7ff91ad98f78a1b6905c99ed989811e9be4a54",
                   "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
                   "test/win32/harness-process-leak.ps1":  "68d9dd61e6dc556835e337a6a762b690013eedf55ce843d4b4427723d3de84cc",
@@ -174,7 +174,7 @@
                   "test/win32/rearrange-session-drop.ps1":  "581a3ec58c4ebf777faf556318f9b628220b0be4e88af1adc481e23c46a151eb",
                   "test/win32/relaunch-guard.ps1":  "c9eba909ca4f70a63bad193281df40f31b001c8da9cf6253809e1b9247f23bdb",
                   "test/win32/relay-account.ps1":  "a3a8fdb9acd69ab41304308f1cc529c7013bafb86c7dc3d60c42e516fc9cf0ac",
-                  "test/win32/release-artifacts.ps1":  "d1659c6b3c70372c5ce5b7b00123c55af999687b64a64714b9ae53a1eec9e0d0",
+                  "test/win32/release-artifacts.ps1":  "c3a89c4d2e318b464e58def8afb62ee9227b4357380796b22a2f866155a8c619",
                   "test/win32/release-parity.ps1":  "50b0d7631386940e259ed6462750aadb628d10244a8608a2dc484c0295e3fa90",
                   "test/win32/remote-inherit.ps1":  "9e02e4869ce88671af453e4c6997588df9061e29bb210cb41c869cd6c97c4361",
                   "test/win32/remote-pill.ps1":  "f1e8a013737edbe93f7e2c9a6e988b44b921bac7e297d39a91ac1d54ef13fe04",

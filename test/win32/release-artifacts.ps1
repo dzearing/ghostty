@@ -134,6 +134,14 @@ Assert "A17 publish-windows-release.ps1 is ASCII (no BOM-less mojibake)" ($nonAs
 $ps1Code = ($ps1 -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
 Assert "A18 no Select-Object -First on a native pipeline" ($ps1Code -notmatch 'Select-Object -First')
 
+# A19: the on-box script ASKS build-msi.sh for the yy.m.d.NN rule instead of
+# restating it (four private copies of a shared datum is how T257's rounding
+# bug survived four scripts). This is a regex over the script's own text and
+# needs no Docker; it lived inside section B's Docker branch until T898, which
+# meant a Docker-less run silently stopped covering publish-windows-release.ps1
+# while the guard row that watches it went on being stamped.
+Assert "A19 on-box script asks for the FILEVERSION rule instead of restating it" ($ps1 -match '--print-file-version')
+
 # ============================================================================
 "== B: packaging (Docker + msitools-local)"
 # ============================================================================
@@ -164,7 +172,6 @@ if (-not $dockerUp) {
         Select-Object -Last 1).Trim()
     $expect = "{0}.{1}.{2}.7" -f [int](Get-Date -Format yy), [int](Get-Date -Format MM), [int](Get-Date -Format dd)
     AssertEq "B1 FILEVERSION single source" $expect $printed
-    Assert "B1b on-box script asks for it instead of restating it" ($ps1 -match '--print-file-version')
 
     # B2: the ZIP really is the MSI's payload, laid out for a human.
     $out = "test-portable-$PID.zip"
@@ -300,12 +307,34 @@ if ($Full) {
 
 # A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
 # can answer "has this harness been run against the release wiring as it now
-# stands?". Red leaves the stamp alone (red stays due), and so does a run
-# with skips -- a Docker-less run never looked at the packaging sections it
-# would be vouching for.
-if ($script:failures -eq 0 -and $script:skipped -eq 0) {
+# stands?". Red leaves both stamps alone: red stays due.
+#
+# TWO STAMPS, TWO BARS (T898). The zero-skip bar is right for the payload and
+# wrong for the wiring, and applying it to both is what left this harness's
+# guard permanently due on a box where Docker is deliberately kept down -- an
+# edit to fork-ci.yml could not be cleared by any run, twelve turns filed a
+# duplicate task about it, and every commit in between used `-NoGuardDue`.
+#
+#   release-artifacts (wiring)     stamped by any run with zero FAILURES.
+#     Sections A, C, E and F prove the workflows, the shared artifact and
+#     msitools scripts, the on-box publish script and this harness end to end,
+#     and not one of them touches Docker. A skipped section B says nothing
+#     about them.
+#   release-artifacts-packaging    stamped only by a run with zero skips too.
+#     Its two files (build-msi.sh, build-portable-zip.sh) are only really
+#     proved by section B running them under the msitools-local image, so a
+#     Docker-less run must not vouch for them. That row staying due while
+#     Docker is down is the honest answer, not a wedge: it names two files
+#     nobody edited, so it is only ever due when somebody edits them.
+if ($script:failures -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard release-artifacts -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+    if ($script:skipped -eq 0) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+            update -Guard release-artifacts-packaging -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+    } else {
+        "  packaging stamp NOT updated ($($script:skipped) section(s) skipped; re-run with Docker up)"
+    }
 }
 
 ""
