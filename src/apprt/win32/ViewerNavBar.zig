@@ -705,6 +705,16 @@ fn wndProc(
             }
             return 0;
         },
+        // The same bar into a caller's DC, so a pixel probe can photograph it
+        // synchronously rather than through DWM's asynchronous copy of the
+        // composited surface, which tears mid-row (T835/T940).
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            var r: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &r) == 0) return 0;
+            self.paint(@ptrFromInt(wparam), r.right - r.left, r.bottom - r.top);
+            return 0;
+        },
 
         w32.WM_MOUSEMOVE => {
             const x: i32 = @intCast(@as(i16, @bitCast(@as(u16, @intCast(lparam & 0xFFFF)))));

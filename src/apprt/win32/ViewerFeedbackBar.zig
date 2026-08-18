@@ -1862,6 +1862,19 @@ fn wndProc(
             }
             return 0;
         },
+        // The bar's OWN chrome into a caller's DC, for a synchronous pixel
+        // capture that cannot tear (T835/T940). Note what this does not cover:
+        // the RichEdit composer is a child control that ignores WM_PRINT and
+        // WM_PRINTCLIENT (see the note at the subclass above), so the typed
+        // text is not in a synchronous capture of this bar. A probe that needs
+        // the composer's contents has to read them some other way.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            var r: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &r) == 0) return 0;
+            self.paint(@ptrFromInt(wparam), r.right - r.left, r.bottom - r.top);
+            return 0;
+        },
 
         // Focus lands on the text control, not on the band; a click that
         // reaches the band itself hands it straight on so the caret is never

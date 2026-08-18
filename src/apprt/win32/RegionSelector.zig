@@ -829,6 +829,18 @@ fn wndProc(
             self.paint(hdc, ps.rcPaint);
             return 0;
         },
+        // The same selection UI into a caller's DC, so a pixel probe can
+        // photograph it synchronously rather than through DWM's asynchronous
+        // copy of the composited surface, which tears (T835/T940). The whole
+        // client area, not a clipped region: a caller's DC carries no invalid
+        // rect for `ps.rcPaint` to have narrowed.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            var r: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &r) == 0) return 0;
+            self.paint(@ptrFromInt(wparam), r);
+            return 0;
+        },
 
         w32.WM_LBUTTONDOWN => {
             const p: region.Point = .{ .x = xOf(lparam), .y = yOf(lparam) };

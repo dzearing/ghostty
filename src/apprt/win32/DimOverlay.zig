@@ -120,6 +120,15 @@ pub const DimOverlay = struct {
     pub fn hide(self: *DimOverlay) void {
         _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
     }
+
+    /// The dim wash, into whichever DC this overlay is handed — the paint
+    /// cycle's own, or a caller's under WM_PRINTCLIENT (T940).
+    fn paintInto(self: *const DimOverlay, hwnd: w32.HWND, hdc: w32.HDC) void {
+        const brush = self.brush orelse return;
+        var rect: w32.RECT = undefined;
+        if (w32.GetClientRect(hwnd, &rect) == 0) return;
+        _ = w32.FillRect(hdc, &rect, brush);
+    }
 };
 
 var class_registered: bool = false;
@@ -174,12 +183,17 @@ fn dimWndProc(
             var ps: w32.PAINTSTRUCT = undefined;
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);
-            if (self.brush) |brush| {
-                var rect: w32.RECT = undefined;
-                if (w32.GetClientRect(hwnd, &rect) != 0) {
-                    _ = w32.FillRect(hdc, &rect, brush);
-                }
-            }
+            self.paintInto(hwnd, hdc);
+            return 0;
+        },
+        // The same wash into a caller's DC, so a pixel probe can photograph the
+        // dimmed pane synchronously rather than through DWM's asynchronous copy
+        // of the composited surface (T835/T940). This one is layered, which is
+        // the case that tears worst: the async copy is the whole point of
+        // PW_RENDERFULLCONTENT for a layered window.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            self.paintInto(hwnd, @ptrFromInt(wparam));
             return 0;
         },
 

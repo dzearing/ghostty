@@ -5128,6 +5128,16 @@ pub fn wndProc(
             }
             return 0;
         },
+        // The same page into a caller's DC, so a pixel probe can photograph
+        // the viewer synchronously rather than through DWM's asynchronous copy
+        // of the composited surface, which tears (T835/T940).
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            var r: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &r) == 0) return 0;
+            self.paint(@ptrFromInt(wparam), r.right - r.left, r.bottom - r.top);
+            return 0;
+        },
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }

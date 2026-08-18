@@ -9,6 +9,43 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-17 - **T940 (T843 split; T839 parked) - every window the test suite
+  photographs can now hold still for the camera.** T835 found that
+  `Get-TestWindowPixels` captures through `PrintWindow(PW_RENDERFULLCONTENT)`,
+  which asks DWM for an ASYNCHRONOUS copy of the composited surface: three
+  back-to-back captures of ONE UNCHANGED window read the end of the same table
+  row at 1062, 1283 and 1179 px, and a P0 investigation went hunting that in the
+  layout code. The cure - `-Sync`, i.e. `PrintWindow` with no flags, so the
+  window paints the frame itself before the call returns - works only on a
+  window whose WndProc answers `WM_PRINTCLIENT`, and exactly one class did. That
+  is why 65 probes across 34 scripts were still on the torn capture: not
+  un-converted, but un-convertible. All 11 painting classes that can have a
+  handler now have one - `Window` (via a new `paintChromeInto`, so the painted
+  and printed copies cannot drift), `MachineChooser`, `ActivityMonitor`,
+  `ConfirmDialog`, `DimOverlay`, `RegionSelector`, `ViewerPane`, `ViewerNavBar`,
+  `ViewerTOCPanel`, `ViewerFeedbackBar`. `App.zig` is the single exemption: it
+  owns the renderer-drawn terminal surface that `Get-TestWindowPixels` already
+  REFUSES to capture (T214), so a handler there would manufacture the very blank
+  frame that refusal prevents. Guarded by a static audit rather than unit tests -
+  `test\win32\printclient-audit.ps1` with a `guard-due` row armed by any
+  `src\apprt\win32\*.zig` edit - because most of these classes cannot be built
+  standalone in a test the way `BannerOverlay` can, and because the case worth
+  catching is a NEW class arriving without a handler, which no per-class test can
+  see; its section A proves a COMMENT naming `WM_PRINTCLIENT` is not scored as a
+  handler, which is what would otherwise make the sweep permanently green. End to
+  end proof is `tab-color.ps1` converted to `-Sync`: its stripe assertions read
+  pixels only `paintTabBar` draws, so ALL PASS 3/3 means the handler ran, not
+  merely that the capture returned something. Green: four floor lanes (lib 52s,
+  none 277s, win32 361s, agent 357s), printclient-audit, tab-color 3/3, plus the
+  two guards that were stale at claim - isolation-meta and release-artifacts.
+  T843 is `skipped(split)` into T940 (this) and T941/T942/T943 (convert the
+  chrome, chooser and monitor/dialog probe families, each with its own re-run
+  evidence) and T944 (state the windows we do not own, and consider enforcing the
+  exception). Separately, **T839 was parked, not worked**: its live scope is
+  "once the sweep names a corrupting test, arm the data breakpoint at that code
+  path", T443 still has had no occurrence, and building an aiming shape before
+  the evidence names one is exactly what T474 did and measurement refuted (2
+  armed, both recycled hot, 0 watched to the end). Now `blocked-on: event`.
 - 2026-08-17 - **T830 - the composer rebuild is planned rather than guessed at.**
   D43 was answered against its own recommendation on a component that had
   already shipped, so T830 asked for the win32 feedback composer to be rebuilt

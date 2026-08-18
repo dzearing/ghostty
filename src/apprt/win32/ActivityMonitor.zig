@@ -4487,6 +4487,22 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
             self.gateShown();
             return 0;
         },
+        // The same panel into a caller's DC, so a pixel probe can photograph it
+        // synchronously rather than through DWM's asynchronous copy of the
+        // composited surface, which tears mid-row (T835/T940). This panel's
+        // probes read TABLE COLUMNS, and a torn frame stops mid-text at a glyph
+        // boundary — which is why the readings it produces look like stable
+        // layout values rather than noise, and why they sent one investigation
+        // into the column-share math for nothing.
+        //
+        // No `gateShown` here: this is a photograph, not the panel coming back
+        // into view, and refreshing the table underneath a capture would change
+        // the thing being measured.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            self.paint(@ptrFromInt(wparam));
+            return 0;
+        },
         w32.WM_SIZE => {
             self.applyLayout();
             if (wparam == w32.SIZE_MINIMIZED) self.gateHidden() else self.gateShown();

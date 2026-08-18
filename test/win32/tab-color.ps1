@@ -69,9 +69,18 @@ function Kill-RepoInstances {
 # screen x matches the target color. Takes its own capture, and refuses to
 # score one that has not painted yet - "no red here" is the assertion this
 # script makes most often, and a flat fill satisfies it for free.
+#
+# -Sync (T940): the default capture asks DWM for an ASYNCHRONOUS copy of the
+# composited surface, and that copy tears - three back-to-back captures of one
+# unchanged window read the end of the same row at 1062, 1283 and 1179 px
+# (T835). A stripe assertion over a torn frame is a coin flip in both
+# directions. -Sync is PrintWindow with no flags, so the window paints the
+# frame itself before the call returns; the window class answers WM_PRINTCLIENT
+# to make that possible, and a capture that comes back untouched FAILS rather
+# than handing a blank frame to the comparison below.
 function Stripe-HasColor([IntPtr]$top, [int]$x, [int]$stripeTop, [int]$stripeH, [int]$tr, [int]$tg, [int]$tb, [int]$tol = 40) {
     for ($t = 0; $t -lt 20; $t++) {
-        $shot = Get-TestWindowPixels -Window $top
+        $shot = Get-TestWindowPixels -Window $top -Sync
         try {
             if ((Get-TestDistinctColors -Shot $shot) -lt 8) { Start-Sleep -Milliseconds 150; continue }
             for ($y = $stripeTop; $y -lt ($stripeTop + $stripeH); $y++) {
@@ -88,7 +97,7 @@ function Stripe-HasColor([IntPtr]$top, [int]$x, [int]$stripeTop, [int]$stripeH, 
 }
 
 function Dump-Stripe([IntPtr]$top, [int]$x, [int]$stripeTop, [int]$stripeH, [string]$label) {
-    $shot = Get-TestWindowPixels -Window $top
+    $shot = Get-TestWindowPixels -Window $top -Sync
     try {
         $px = @()
         for ($y = $stripeTop; $y -lt ($stripeTop + $stripeH); $y++) {

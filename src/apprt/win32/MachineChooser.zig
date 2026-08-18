@@ -2816,6 +2816,18 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             _ = w32.EndPaint(hwnd, &ps);
             return 0;
         },
+        // The same chrome into a caller's DC, so a pixel probe can photograph
+        // this dialog synchronously instead of through DWM's asynchronous copy
+        // of the composited surface, which tears mid-row (T835/T940). The
+        // chooser's assertions read a row's text extent and its selection
+        // highlight, which is exactly the measurement a torn frame corrupts.
+        // The background comes from WM_ERASEBKGND above, which DefWindowProc's
+        // WM_PRINT handling sends ahead of this message.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            self.paintChrome(@ptrFromInt(wparam));
+            return 0;
+        },
         // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
         // a panel is one (T308). Drop the cached accent and repaint: the
         // palette is derived per paint, so the repaint IS the re-theme.

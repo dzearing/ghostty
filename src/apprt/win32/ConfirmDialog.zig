@@ -775,6 +775,24 @@ fn defaultButton(self: *const ConfirmDialog) w32.HWND {
     return self.ok_btn;
 }
 
+/// The dialog's own owner-drawn content, into whichever DC it is handed — the
+/// paint cycle's own, or a caller's under WM_PRINTCLIENT (T940).
+fn paintInto(self: *const ConfirmDialog, hdc: w32.HDC) void {
+    if (self.icon_handle) |icon| {
+        _ = w32.DrawIconEx(
+            hdc,
+            self.icon_rect.left,
+            self.icon_rect.top,
+            icon,
+            self.icon_rect.right - self.icon_rect.left,
+            self.icon_rect.bottom - self.icon_rect.top,
+            0,
+            null,
+            w32.DI_NORMAL,
+        );
+    }
+}
+
 fn ownsHwnd(self: *const ConfirmDialog, hwnd: w32.HWND) bool {
     if (hwnd == self.hwnd or hwnd == self.ok_btn) return true;
     if (self.static) |s| if (hwnd == s) return true;
@@ -914,19 +932,17 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             var ps: w32.PAINTSTRUCT = undefined;
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);
-            if (self.icon_handle) |icon| {
-                _ = w32.DrawIconEx(
-                    hdc,
-                    self.icon_rect.left,
-                    self.icon_rect.top,
-                    icon,
-                    self.icon_rect.right - self.icon_rect.left,
-                    self.icon_rect.bottom - self.icon_rect.top,
-                    0,
-                    null,
-                    w32.DI_NORMAL,
-                );
-            }
+            self.paintInto(hdc);
+            return 0;
+        },
+        // The same icon into a caller's DC, so a pixel probe can photograph
+        // this dialog synchronously instead of through DWM's asynchronous copy
+        // of the composited surface, which tears (T835/T940). The dialog's
+        // TEXT is in child statics, which DefWindowProc's WM_PRINT handling
+        // prints for us; only the owner-drawn icon comes from here.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            self.paintInto(@ptrFromInt(wparam));
             return 0;
         },
         w32.WM_ACTIVATE => {

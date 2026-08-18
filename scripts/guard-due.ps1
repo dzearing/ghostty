@@ -512,6 +512,24 @@ $GuardTable = @(
             'test\win32\crash-databreak.ps1'
         )
     },
+    # A window class that paints itself but cannot paint into a caller's DC has
+    # NO in-app symptom (T940): the app looks right and every pixel assertion
+    # over that window silently goes back to the DWM capture that tears. Nothing
+    # at compile time or run time notices, which is how 65 probes across 34
+    # scripts stayed on the torn capture (T843). The guard is armed by any win32
+    # source, deliberately: the case worth catching is a NEW window class, which
+    # no narrower list could name in advance. The audit is static text over
+    # source and finishes in about a second, so being due often costs a second,
+    # not a turn.
+    [pscustomobject]@{
+        Name   = 'printclient-audit'
+        Script = 'test\win32\printclient-audit.ps1'
+        Stamp  = 'test\win32\printclient-audit.stamp.json'
+        Covers = @(
+            'src\apprt\win32\*.zig',
+            'test\win32\printclient-audit.ps1'
+        )
+    },
     # crash-stacks.ps1 is the acceptance for the catcher ITSELF, and until T478
     # nothing tied it to the library it tests: the `bpe` blind spot -- a Zig
     # panic reported as "ran clean" on 10 runs out of 10 -- went a month without

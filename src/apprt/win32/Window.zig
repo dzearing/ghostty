@@ -5086,6 +5086,12 @@ fn paintWindow(self: *Window) void {
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
+    self.paintChromeInto(hdc_screen);
+}
+
+/// Every owner-painted pixel of the window chrome, into whichever DC it is
+/// handed — the paint cycle's own, or a caller's under WM_PRINTCLIENT.
+fn paintChromeInto(self: *Window, hdc_screen: w32.HDC) void {
     self.paintCaption(hdc_screen);
     self.paintTabBar(hdc_screen);
     // Dividers are part of the paint cycle (T155). BeginPaint clips to the
@@ -7349,6 +7355,31 @@ pub fn windowWndProc(
         },
         w32.WM_PAINT => {
             window.paintWindow();
+            return 0;
+        },
+        // The same chrome, drawn into a DC somebody else owns — which is how
+        // an acceptance script photographs this window without the photo
+        // tearing (T835/T940).
+        //
+        // `Get-TestWindowPixels` captures through
+        // `PrintWindow(PW_RENDERFULLCONTENT)` by default, and that asks DWM
+        // for an ASYNCHRONOUS copy of the composited surface: three
+        // back-to-back captures of one UNCHANGED window put the end of the
+        // same row at 1062, 1283 and 1179 px while the app's own paint was
+        // byte-identical every time. A whole P0 investigation went looking for
+        // that in the layout code. `-Sync` is `PrintWindow` with no flags,
+        // which is this message and nothing else, so the window draws the
+        // frame itself before the call returns.
+        //
+        // A handler going missing here does not fail loudly in the app — it
+        // quietly puts every pixel assertion over this window back onto a
+        // capture that measures noise. The harness makes that visible from its
+        // side: the capture bitmap is pre-filled with a sentinel colour, and
+        // one that comes back entirely sentinel is a hard failure rather than
+        // a blank frame handed to an assertion.
+        w32.WM_PRINTCLIENT => {
+            if (wparam == 0) return 0;
+            window.paintChromeInto(@ptrFromInt(wparam));
             return 0;
         },
         w32.WM_COMMAND => {
