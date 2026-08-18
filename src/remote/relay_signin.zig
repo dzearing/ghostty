@@ -81,14 +81,53 @@ pub const Outcome = struct {
     email: []const u8,
 };
 
+/// Makes this build resolve NO client id at all, exactly as if it had been
+/// built without `-Dgoogle-client-id` and launched with no
+/// `GHOSTTY_GOOGLE_CLIENT_ID` — so the unconfigured experience (T747: no
+/// sign-in button, a sentence saying why) is measurable on a seat that HAS a
+/// client id set up. Tests and automation only; same shape and spirit as
+/// `GHOZTTY_ENROLL_NO_OPEN` below.
+///
+/// It exists because the alternative — a test that skips itself when the
+/// checkout has a client id — is the reason T747 shipped: the unconfigured
+/// path was unmeasured on every seat that had ever configured sign-in, which
+/// is every seat that runs the rest of the suite. Windows cannot hold a
+/// present-but-empty environment variable (setting one to "" deletes it), so
+/// "no id" cannot be expressed through `GHOSTTY_GOOGLE_CLIENT_ID` itself.
+pub const env_force_unconfigured = "GHOZTTY_RELAY_NO_CLIENT_ID";
+
 /// Resolve the OAuth client id: explicit, then `GHOSTTY_GOOGLE_CLIENT_ID`,
 /// then the id baked into this build. Null when the build carries none and
 /// nothing was supplied. The returned slice may be allocated on `alloc` (env
 /// case) or static (bake case) — arena-allocate and free everything at once.
 pub fn resolveClientId(alloc: Allocator, explicit: ?[]const u8) ?[]const u8 {
+    return resolveClientIdFrom(
+        explicit,
+        envNonEmpty(alloc, "GHOSTTY_GOOGLE_CLIENT_ID"),
+        envFlag(alloc, env_force_unconfigured),
+        build_config.google_client_id,
+    );
+}
+
+/// The resolution order as pure logic, so every branch — the force-unconfigured
+/// knob included — is testable in the `none` lane without mutating the process
+/// environment (which the tests in this file must not do).
+///
+/// `force_unconfigured` suppresses the two AMBIENT sources (env id, bake) and
+/// not an `explicit` argument: a caller that hands over an id has stated one,
+/// and an environment variable silently overruling a function argument is a
+/// worse surprise than the knob is worth. Nothing in the app passes one — the
+/// GUI calls `signIn(.{})` — so the knob is total in practice.
+fn resolveClientIdFrom(
+    explicit: ?[]const u8,
+    env_id: ?[]const u8,
+    force_unconfigured: bool,
+    baked: []const u8,
+) ?[]const u8 {
     if (nonEmpty(explicit)) |v| return v;
-    if (envNonEmpty(alloc, "GHOSTTY_GOOGLE_CLIENT_ID")) |v| return v;
-    return nonEmpty(build_config.google_client_id);
+    if (force_unconfigured) return null;
+    if (nonEmpty(env_id)) |v| return v;
+    return nonEmpty(baked);
 }
 
 /// Whether a sign-in can be STARTED at all: true when a client id resolves
@@ -243,6 +282,14 @@ fn envNonEmpty(alloc: Allocator, name: []const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
+/// A boolean environment knob, read the way the agent's kill switches are
+/// (`handoff.zig`): set and not `"0"` is on.
+fn envFlag(alloc: Allocator, name: []const u8) bool {
+    const v = std.process.getEnvVarOwned(alloc, name) catch return false;
+    defer alloc.free(v);
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
 /// Open `url` in the default browser (best-effort). `GHOZTTY_ENROLL_NO_OPEN`
 /// suppresses it for tests/automation, which then drive the loopback redirect
 /// themselves from the logged URL.
@@ -281,6 +328,25 @@ test "resolveClientId: explicit wins, empty is absent" {
     // env/bake. Whatever that resolves to on this machine, it must NOT be the
     // empty string masquerading as an id.
     if (resolveClientId(alloc, "")) |v| try testing.expect(v.len > 0);
+}
+
+test "resolveClientIdFrom: env id beats the bake, bake is the fallback" {
+    try testing.expectEqualStrings("cid-env", resolveClientIdFrom(null, "cid-env", false, "cid-bake").?);
+    try testing.expectEqualStrings("cid-bake", resolveClientIdFrom(null, null, false, "cid-bake").?);
+    try testing.expectEqualStrings("cid-bake", resolveClientIdFrom(null, "", false, "cid-bake").?);
+    try testing.expect(resolveClientIdFrom(null, null, false, "") == null);
+}
+
+test "resolveClientIdFrom: force-unconfigured hides env id AND bake" {
+    // The point of the knob (T918): a seat WITH a client id configured both
+    // ways must still be able to observe the no-client-id experience.
+    try testing.expect(resolveClientIdFrom(null, "cid-env", true, "cid-bake") == null);
+    try testing.expect(resolveClientIdFrom(null, null, true, "cid-bake") == null);
+    try testing.expect(resolveClientIdFrom(null, "cid-env", true, "") == null);
+
+    // An explicit id is a caller's statement, not an ambient source, so the
+    // knob leaves it alone (documented on `resolveClientIdFrom`).
+    try testing.expectEqualStrings("cid-x", resolveClientIdFrom("cid-x", null, true, "cid-bake").?);
 }
 
 test "errorMessage: every error has a distinct non-empty sentence" {

@@ -185,6 +185,19 @@ long is that the test always supplied one: every GUI section of
 every real user meets was never once exercised. Its section 8 now launches
 without one, and ends with the configured relaunch as its control.
 
+Launching "without one" takes a knob, because on a configured seat the id is
+BAKED in and no environment variable can unbake it (Windows cannot even hold a
+present-but-empty variable). `GHOZTTY_RELAY_NO_CLIENT_ID=1`
+(`relay_signin.env_force_unconfigured`) makes `resolveClientId` find nothing —
+env id and bake alike — so the unconfigured experience is measurable on every
+seat. Tests and automation only, same shape as `GHOZTTY_ENROLL_NO_OPEN`. Before
+T918 the section instead SKIPPED itself when `macos/google-client-id.txt`
+existed, which read only the legacy path while `Config.zig` prefers the
+repo-root spelling the Windows seat is told to use: a documented setup produced
+six phantom FAILs, and a seat that fixed the path would have lost the coverage
+to a skip instead — on exactly the seats that have sign-in configured, which is
+the population that hid T747 in the first place.
+
 Once signed in, `+new-remote-window --relay/--device` with **no** `--token`
 uses the account's session token (token-resolution order: explicit `--token`
 → signed-in account → `GHOSTTY_RELAY_TOKEN`). A pre-brokered store
