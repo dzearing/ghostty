@@ -55,6 +55,12 @@ test {
     // thing that must never re-mint a name a restored window already adopted,
     // and that is pure logic worth checking in its own right.
     _ = @import("win32/IpcRegistry.zig");
+    // The retried clipboard open (T850). Every clipboard user on Windows
+    // shares one machine-wide, serialized resource, and the difference between
+    // one attempt and a bounded retry is whether "copy did nothing" is a
+    // routine outcome — so the budget is checked in its own right rather than
+    // only through whichever caller happens to be compiled.
+    _ = @import("win32/clipboard_open.zig");
     // The `ghoztty://` URL scheme's win32 half (T695): the registry entry a
     // clicked link is resolved through, and the activation process that
     // answers it. The registration strings decide whether a link reaches this

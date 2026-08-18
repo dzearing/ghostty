@@ -55,9 +55,10 @@ const max_pixels: usize = 64 * 1024 * 1024;
 
 /// `OpenClipboard` fails while another process holds it, which happens
 /// routinely for a few milliseconds after a copy. Retried rather than refused,
-/// because "paste did nothing" is indistinguishable from a bug.
-const open_attempts: u32 = 8;
-const open_retry_ms: u32 = 15;
+/// because "paste did nothing" is indistinguishable from a bug. The retry
+/// itself moved to `clipboard_open.zig` (T850) once a second clipboard user
+/// needed the same budget.
+const clipboard_open = @import("clipboard_open.zig");
 
 /// Whether the clipboard holds a picture. Cheap enough for a keystroke: it
 /// opens nothing and allocates nothing.
@@ -96,12 +97,7 @@ pub fn read(alloc: Allocator, owner: ?w32.HWND) ?[]u8 {
 }
 
 fn open(owner: ?w32.HWND) bool {
-    var i: u32 = 0;
-    while (i < open_attempts) : (i += 1) {
-        if (w32.OpenClipboard(owner) != 0) return true;
-        w32.Sleep(open_retry_ms);
-    }
-    return false;
+    return clipboard_open.open(owner);
 }
 
 /// The registered `"PNG"` format id, resolved once. Zero when it could not be

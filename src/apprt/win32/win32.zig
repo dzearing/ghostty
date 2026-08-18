@@ -962,6 +962,16 @@ pub extern "kernel32" fn CreateMutexW(
     lpName: ?[*:0]const u16,
 ) callconv(.winapi) ?HANDLE;
 
+/// Ownership taken by a thread that died without releasing it (T850). The wait
+/// SUCCEEDED — the caller owns the mutex — and the only extra fact is that the
+/// state it guards may be torn. For the clipboard test lock that is a non-event:
+/// the clipboard is re-established from scratch inside every critical section.
+pub const WAIT_ABANDONED: u32 = 0x00000080;
+
+pub extern "kernel32" fn ReleaseMutex(
+    hMutex: HANDLE,
+) callconv(.winapi) i32;
+
 pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
 pub const WAIT_FAILED: u32 = 0xFFFFFFFF;

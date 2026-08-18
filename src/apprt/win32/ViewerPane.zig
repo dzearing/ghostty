@@ -87,6 +87,7 @@ const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const banner_link = @import("banner_link.zig");
+const clipboard_open = @import("clipboard_open.zig");
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
@@ -6664,13 +6665,26 @@ test "host floor: a real controller on a real window, on this box" {
     // not). Neither changes what the toolbar DOES — they remove the two
     // environmental refusals that have nothing to do with the code under test.
     {
+        // The clipboard is one machine-wide resource and this section's whole
+        // verdict is what sits on it, so every process running this test takes
+        // its turn (T850). Held only across the critical regions below, not the
+        // navigations, so 32 concurrent binaries queue for seconds rather than
+        // minutes.
+        var clip_lock = ClipboardTestLock.init();
+        defer clip_lock.deinit();
+
         // The lane runs on the real window station, so the user's clipboard is
         // saved and put back — a test that eats what they had copied is a
-        // defect of its own.
+        // defect of its own. The restore takes the lock too: putting their
+        // bytes back in the middle of ANOTHER process's poll is the same
+        // clobber, just wearing a polite hat.
         const saved_clip = clipboardReadText(alloc);
         defer {
             if (saved_clip) |s| {
-                clipboardWriteText(alloc, s);
+                if (clip_lock.take(&msg, 300)) {
+                    defer clip_lock.give();
+                    clipboardWriteText(alloc, s);
+                }
                 alloc.free(s);
             }
         }
@@ -6712,6 +6726,15 @@ test "host floor: a real controller on a real window, on this box" {
                 ),
                 null,
             );
+
+            // The critical region: from the sentinel that establishes "the
+            // needle is NOT on the clipboard yet" to the read that finds it
+            // there, nothing else running this test may touch the clipboard.
+            // 300s to get in, which is two orders of magnitude past what a
+            // waiting turn costs and still bounded — a lane that hangs teaches
+            // nobody anything (T850).
+            if (!clip_lock.take(&msg, 300)) return error.ClipboardTestLock;
+            defer clip_lock.give();
 
             clipboardWriteText(alloc, "t162-sentinel");
 
@@ -7288,8 +7311,13 @@ fn selectionDriverJs(
 /// Test-only: the system clipboard's current text, owned by the caller, or
 /// null when it holds none. The live copy test's oracle — the toolbar's whole
 /// job is landing bytes HERE, outside the browser process.
+///
+/// The open is retried (`clipboard_open`, T850): another process holding the
+/// clipboard for a few milliseconds is routine, and a single refused attempt
+/// here reads as "the copy never landed" — which is the failure this test's
+/// whole verdict rests on.
 fn clipboardReadText(alloc: Allocator) ?[]u8 {
-    if (w32.OpenClipboard(null) == 0) return null;
+    if (!clipboard_open.open(null)) return null;
     defer _ = w32.CloseClipboard();
     const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return null;
     const ptr = w32.GlobalLock(hglobal) orelse return null;
@@ -7310,6 +7338,10 @@ fn clipboardReadText(alloc: Allocator) ?[]u8 {
 /// PROGRAM writing the clipboard behind the user's back, and this is the user's
 /// own menu choice — the same call `BannerOverlay.copyLink` makes with
 /// `confirm = false`.
+///
+/// The open is retried (`clipboard_open`, T850). Without it, a link Copy issued
+/// in the few milliseconds another process holds the clipboard silently did
+/// nothing, which the user cannot tell from a broken menu item.
 fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch return;
     defer alloc.free(utf16);
@@ -7323,7 +7355,7 @@ fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
     @memcpy(dst16[0..utf16.len], utf16);
     dst16[utf16.len] = 0;
     _ = w32.GlobalUnlock(hglobal);
-    if (w32.OpenClipboard(null) == 0) {
+    if (!clipboard_open.open(null)) {
         _ = w32.GlobalFree(hglobal);
         return;
     }
@@ -7333,6 +7365,108 @@ fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
         _ = w32.GlobalFree(hglobal);
     }
 }
+
+/// Test-only: a machine-wide turn-taking lock for the sections whose ORACLE is
+/// the system clipboard (T850).
+///
+/// A retried open (`clipboard_open`) makes one clipboard operation reliable; it
+/// cannot make a SEQUENCE of them reliable, because the clipboard holds one set
+/// of bytes for the whole machine and any other process may replace them
+/// between two of ours. The live copy test's sequence is exactly that shape:
+/// write a sentinel, press Copy, then poll until the needle appears. A second
+/// test binary writing its own sentinel — or putting the user's saved clipboard
+/// back — in the middle of that poll erases the very bytes being waited for,
+/// and the poll then runs out and reports "the copy never landed" over a copy
+/// that landed perfectly.
+///
+/// That is not hypothetical: 32 concurrent copies of the win32 test binary
+/// (`scripts\test-binary-soak.ps1`) failed this assert 10 times in 32 runs. So
+/// the processes take turns. The lock is a named mutex, which gives two
+/// properties nothing local could: it is visible to every process on the
+/// desktop, and Windows releases it automatically if its holder dies — a
+/// crashed run cannot wedge the lane.
+///
+/// It guards only OUR sections. Another application copying at the same instant
+/// still wins; nothing on Windows can prevent that, which is why the section
+/// also re-checks rather than assuming.
+const ClipboardTestLock = struct {
+    /// Session-local by design: the contenders are test binaries in one logon
+    /// session, and `Global\` would need privileges a test should not want.
+    const name = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Local\\ghoztty-viewer-clipboard-test",
+    );
+
+    /// Waited in slices rather than one blocking call, so the pane's message
+    /// loop keeps running while we queue. WebView2 delivers everything through
+    /// that loop, and a test that stops pumping for minutes is a test that
+    /// stalls the browser side of whatever it is about to measure.
+    const slice_ms: u32 = 100;
+
+    handle: ?w32.HANDLE,
+    owned: bool = false,
+
+    fn init() ClipboardTestLock {
+        return .{ .handle = w32.CreateMutexW(null, 0, name) };
+    }
+
+    fn deinit(self: *ClipboardTestLock) void {
+        self.give();
+        if (self.handle) |h| _ = w32.CloseHandle(h);
+        self.handle = null;
+    }
+
+    /// Take the lock, pumping `msg` while waiting. False means it was not
+    /// taken, with the reason logged — never a quiet proceed-anyway, since
+    /// proceeding unlocked is precisely the flake this exists to remove.
+    fn take(self: *ClipboardTestLock, msg: *w32.MSG, timeout_s: u64) bool {
+        // Take/give are paired one-for-one. A Windows mutex is recursive, so a
+        // nested take would succeed and the first give would then hand the
+        // clipboard to the next process while this section is still using it —
+        // the exact bug the lock exists to prevent, wearing the lock's name.
+        std.debug.assert(!self.owned);
+        const h = self.handle orelse {
+            log.err("clipboard test lock: CreateMutexW failed (err={d})", .{w32.GetLastError()});
+            return false;
+        };
+        var timer = std.time.Timer.start() catch return false;
+        while (true) {
+            while (w32.PeekMessageW(msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(msg);
+                _ = w32.DispatchMessageW(msg);
+            }
+            switch (w32.WaitForSingleObject(h, slice_ms)) {
+                // ABANDONED is an acquisition: the previous holder died. The
+                // clipboard state it left behind is irrelevant — every section
+                // writes its own sentinel before it measures anything.
+                w32.WAIT_OBJECT_0, w32.WAIT_ABANDONED => {
+                    self.owned = true;
+                    return true;
+                },
+                w32.WAIT_TIMEOUT => {},
+                else => |r| {
+                    log.err("clipboard test lock: wait failed ({d})", .{r});
+                    return false;
+                },
+            }
+            if (timer.read() >= timeout_s * std.time.ns_per_s) {
+                log.err(
+                    "clipboard test lock: not acquired within {d}s; another " ++
+                        "process is holding it far longer than a copy takes",
+                    .{timeout_s},
+                );
+                return false;
+            }
+        }
+    }
+
+    /// Idempotent, so it is safe both as a `defer` and on the way out of
+    /// `deinit` after an assertion has already unwound past the release.
+    fn give(self: *ClipboardTestLock) void {
+        if (!self.owned) return;
+        if (self.handle) |h| _ = w32.ReleaseMutex(h);
+        self.owned = false;
+    }
+};
 
 /// Pump the message loop until `ready` says so or `timeout_s` elapses.
 ///
