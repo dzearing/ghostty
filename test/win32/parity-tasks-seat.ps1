@@ -48,6 +48,12 @@
 #      "(by dashboard: <label>)". Runs a private node server on port 7913 with
 #      GHOZTTY_TASK_DIR pointed at the fixture, so the real tracker and the
 #      real dashboard on 7788 are never touched. Skipped if node is absent.
+#   P. Un-blocking needs evidence (T892): moving a task OUT of `blocked(...)`
+#      is refused without `-SourceNote`, restates the task's `unblock:`
+#      condition both in the refusal and on the way through, and leaves the
+#      file untouched when it refuses. `-NoNote` keeps the bulk pass and says
+#      it took it. Every other transition - claim, close, re-park - is
+#      unchanged.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -60,6 +66,9 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
+# Set when a section could not run at all (node absent). A run with a skipped
+# section is green but not WHOLE, so it must not stamp the guard (T783's rule).
+$script:skipped = $false
 
 $taskScript = Join-Path $Repo 'scripts\parity-tasks.ps1'
 $realDir = Join-Path $Repo 'docs\design\windows-parity-tasks'
@@ -85,7 +94,10 @@ function New-FixtureTask {
         [string]$Deps = '[]',
         # Emitted verbatim like $SeatLine, so '' reproduces a pre-priority file.
         [string]$PriorityLine = '',
-        [string]$OrderLine = ''
+        [string]$OrderLine = '',
+        # Extra frontmatter lines, emitted verbatim after the fixed ones. Used
+        # for fields only some tasks carry, e.g. `unblock:` on a parked task.
+        [string[]]$ExtraLines = @()
     )
     $lines = @(
         '---'
@@ -102,6 +114,7 @@ function New-FixtureTask {
     if ($SeatLine) { $lines += $SeatLine }
     if ($PriorityLine) { $lines += $PriorityLine }
     if ($OrderLine) { $lines += $OrderLine }
+    foreach ($extra in $ExtraLines) { if ($extra) { $lines += $extra } }
     $lines += @('---', '', "# $Id - fixture", '')
     $path = Join-Path $fixture "$Id.md"
     [System.IO.File]::WriteAllText($path, ($lines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
@@ -527,6 +540,7 @@ Assert 'a journaled fixture still validates' ($r.Code -eq 0)
 $node = (Get-Command node -ErrorAction SilentlyContinue)
 if (-not $node) {
     Assert 'SKIP: node is not on PATH, so the server half cannot be exercised' $true
+    $script:skipped = $true
 }
 else {
     Reset-Fixture
@@ -580,8 +594,85 @@ else {
     }
 }
 
+# --- P. un-blocking needs evidence (T892) ------------------------------------
+""
+"P. set-status gates the way OUT of blocked(...)"
+Reset-Fixture
+$unblockText = 'powercfg PROCTHROTTLEMAX must read 99 (boost off) before this comes back.'
+New-FixtureTask -Id 'T1' -Status 'blocked(armed watch - needs an occurrence)' `
+    -ExtraLines @(("unblock: " + (ConvertTo-Json $unblockText -Compress)))
+
+function Get-FixtureText { param([string]$Id = 'T1') [System.IO.File]::ReadAllText((Join-Path $fixture "$Id.md")) }
+function Get-PLines { param([string]$Id = 'T1') @([regex]::Matches((Get-FixtureText $Id), '(?m)^- \d{4}-\d{2}-\d{2} \d{2}:\d{2}')) }
+
+# The 2026-08-16 09:26 shape exactly: a bare flip out of blocked, with nothing
+# said about the condition and nobody having checked it.
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo')
+Assert 'a bare un-block FAILS' ($r.Code -ne 0)
+Assert 'and says why in words' ($r.Out -match 'un-blocking needs evidence')
+Assert 'and restates the unblock condition' ($r.Out -match 'PROCTHROTTLEMAX must read 99')
+Assert 'and names the -SourceNote it wants' ($r.Out -match '-SourceNote')
+Assert 'the file is untouched: still blocked' (
+    (Get-FixtureText) -match '(?m)^status: "blocked\(armed watch - needs an occurrence\)"$')
+Assert 'and nothing was journaled' ((Get-PLines).Count -eq 0)
+
+# With evidence it goes through, and the condition is echoed at the moment
+# somebody claims it is satisfied.
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo', '-SourceNote', 'powercfg re-read: PROCTHROTTLEMAX is 99')
+Assert 'an un-block WITH a source note exits 0' ($r.Code -eq 0)
+Assert 'the status moved' ((Get-FixtureText) -match '(?m)^status: "todo"$')
+Assert 'the receipt names what was checked' (
+    (Get-FixtureText) -match '\(by powercfg re-read: PROCTHROTTLEMAX is 99\)')
+Assert 'and the command echoed the condition being claimed' (
+    $r.Out -match 'unblock condition you are claiming is satisfied' -and $r.Out -match 'PROCTHROTTLEMAX')
+
+# The bulk hatch still opens, and is loud about it - same contract as
+# -NoGuardDue: a flip made under it can be explained rather than excused.
+$r = Task-Run @('set-status', 'T1', '-Status', 'blocked(re-parked)')
+$before = (Get-PLines).Count
+$r = Task-Run @('set-status', 'T1', '-Status', 'todo', '-NoNote')
+Assert '-NoNote gets a bulk pass through the gate' ($r.Code -eq 0)
+Assert 'and says out loud that it bypassed it' ($r.Out -match 'bypassed the un-block evidence gate')
+Assert 'the status still moved' ((Get-FixtureText) -match '(?m)^status: "todo"$')
+Assert 'and no receipt was written' ((Get-PLines).Count -eq $before)
+
+# A parked task with no `unblock:` field is gated just the same - the gate is
+# about the transition, not about the field being present.
+New-FixtureTask -Id 'T2' -Status 'blocked(no condition recorded)'
+$r = Task-Run @('set-status', 'T2', '-Status', 'todo')
+Assert 'a blocked task with no unblock: is still gated' ($r.Code -ne 0)
+Assert 'and the message says the condition is missing' ($r.Out -match 'records no')
+
+# Everything that is NOT an un-block is untouched.
+New-FixtureTask -Id 'T3' -Status 'todo'
+$r = Task-Run @('set-status', 'T3', '-Status', 'in-progress')
+Assert 'todo -> in-progress needs no source note' ($r.Code -eq 0)
+$r = Task-Run @('set-status', 'T3', '-Status', 'done', '-Commit', 'abc1234')
+Assert 'in-progress -> done needs no source note' ($r.Code -eq 0)
+New-FixtureTask -Id 'T4' -Status 'blocked(first reason)'
+$r = Task-Run @('set-status', 'T4', '-Status', 'blocked(second reason)')
+Assert 'a re-park (blocked -> blocked) needs no source note' ($r.Code -eq 0)
+Assert 'and still journals the transition' (
+    (Get-FixtureText 'T4') -match 'status: blocked\(first reason\) -> blocked\(second reason\)')
+
+$r = Task-Run @('validate')
+Assert 'the gated fixture still validates' ($r.Code -eq 0)
+
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }
+
+# --- stamp (T783/T892) ------------------------------------------------------
+# A clean green run with nothing skipped records the covered files, so
+# scripts\guard-due.ps1 can answer "has anyone run this harness against
+# parity-tasks.ps1 as it now stands?". Nothing in the zig lanes or the P1-P3
+# floor executes the tracker CLI, so this is its only gate.
+if ($script:failures -eq 0 -and -not $script:skipped) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard parity-tasks -Repo $Repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
+elseif ($script:skipped) {
+    "  (no stamp: a section was skipped, so this run does not prove the harness ran whole)"
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }

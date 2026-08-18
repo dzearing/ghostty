@@ -26,6 +26,13 @@
   The note preserves the old status verbatim, reason included. `-NoNote` opts a
   bulk normalisation pass out; nothing else should.
 
+  UN-BLOCKING NEEDS EVIDENCE (T892). Moving a task OUT of `blocked(...)` is the
+  transition that puts work back in front of the loop, and it asserts something
+  nobody checked: that the park condition is now satisfied. `set-status`
+  therefore refuses that transition without `-SourceNote` saying what was
+  checked, and prints the task's `unblock:` text so the caller sees the
+  condition they are claiming. Every other transition is untouched.
+
 .EXAMPLE
   scripts\parity-tasks.ps1 list -Status todo
   scripts\parity-tasks.ps1 next
@@ -97,14 +104,18 @@ param(
 
     # Who or what asked for a `set-status`, in words a reader will understand
     # ("dashboard: Mark unblocked", "daily triage sweep"). It is appended to the
-    # transition's progress-log entry. Optional, because the transition is
-    # journaled either way - this only says whose hand was on it.
+    # transition's progress-log entry. Optional for most transitions, because
+    # the transition is journaled either way - this only says whose hand was on
+    # it. REQUIRED when a `set-status` moves a task out of `blocked(...)`, where
+    # the flip claims a park condition is satisfied and the note is the only
+    # place that claim can be checked (T892).
     [string]$SourceNote,
 
     # Suppress the progress-log entry `set-status` writes. Exists for a bulk
     # normalisation pass that would otherwise stamp a note into two hundred
     # files; it is NOT for ordinary use, because a status flip with no receipt
-    # is the exact defect T564 fixed.
+    # is the exact defect T564 fixed. It is also the bulk hatch past T892's
+    # un-block gate, and prints that it was used when it takes it.
     [switch]$NoNote,
 
     # Escape hatch so the acceptance script can drive a fixture directory
@@ -210,6 +221,11 @@ function ConvertFrom-Frontmatter {
         Priority     = $priority
         TriageReason = & $unquote (& $get 'triage-reason')
         Tags         = & $parseList (& $get 'tags')
+        # What has to be TRUE before this task comes back into the queue, in the
+        # parker's own words (the dashboard has rendered it on blocked cards
+        # since T564's follow-ups). `set-status` reads it so an un-block can
+        # restate the condition the caller is claiming is satisfied - see T892.
+        Unblock      = & $unquote (& $get 'unblock')
         Path         = $Path
     }
 }
@@ -238,6 +254,24 @@ function Add-ProgressNote {
         $new = $text.TrimEnd() + "`n`n## Progress log`n`n$entry`n"
     }
     [System.IO.File]::WriteAllText($Path, $new, (New-Object System.Text.UTF8Encoding $false))
+}
+
+# Wrap a long free-text field to a readable width and indent every line, so a
+# 900-character `unblock:` condition prints as a block a human can read instead
+# of one console line that scrolls sideways. Returns a single multi-line string.
+function Format-Indented {
+    param([string]$Text, [string]$Indent = '    ', [int]$Width = 74)
+    $out = @()
+    foreach ($para in ($Text -split "`r?`n")) {
+        $line = ''
+        foreach ($word in ($para -split '\s+' | Where-Object { $_ -ne '' })) {
+            if ($line -eq '') { $line = $word }
+            elseif (($line.Length + 1 + $word.Length) -le $Width) { $line = "$line $word" }
+            else { $out += ($Indent + $line); $line = $word }
+        }
+        $out += ($Indent + $line)
+    }
+    return ($out -join "`n")
 }
 
 # Split, trim and validate a -Tags argument (which `-File` invocation hands
@@ -563,6 +597,49 @@ switch ($Command) {
         # the reason is simply gone (T564).
         $before = ConvertFrom-Frontmatter -Path $path
         $was = if ($before) { [string]$before.Status } else { '' }
+
+        # UN-BLOCKING NEEDS EVIDENCE (T892). Leaving a `blocked(...)` state is
+        # the one transition that puts work back in front of the loop on the
+        # strength of a claim nobody checked: the park recorded a condition,
+        # and a bare `set-status <id> -Status todo` asserts it is met while
+        # saying nothing about it. That happened twice on T443's armed watch
+        # (2026-08-16 09:26, and D27's earlier reopen) and both times the next
+        # turn spent its context re-verifying the same watch and re-parking it.
+        # T564 made the transition visible; this makes it answerable. The gate
+        # is only on the way OUT of blocked - a re-park, a claim, a close all
+        # stay as cheap as they were.
+        $isUnblock = ($was -match '^blocked') -and ($Status -notmatch '^blocked')
+        if ($isUnblock) {
+            if ($NoNote) {
+                # Same shape as -NoGuardDue: the hatch stays open for a bulk
+                # normalisation pass, and says out loud that it was used, so a
+                # flip made under it can be explained rather than looking like
+                # an evidence-backed one.
+                Write-Host ("      WARNING: -NoNote bypassed the un-block evidence gate (T892) for {0}; no receipt was written." -f $tid)
+            }
+            elseif ([string]::IsNullOrWhiteSpace($SourceNote)) {
+                $msg = @()
+                $msg += ("{0}: un-blocking needs evidence. It is {1}, and moving it to '{2}' claims that park condition is satisfied." -f $tid, $was, $Status)
+                if ($before -and $before.Unblock) {
+                    $msg += '  Its unblock condition reads:'
+                    $msg += (Format-Indented -Text $before.Unblock -Indent '    ')
+                }
+                else {
+                    $msg += '  It records no `unblock:` condition, so say what you checked in your own words.'
+                }
+                $msg += ''
+                $msg += ('  Re-run with -SourceNote "<what you checked and what it showed>", e.g.')
+                $msg += ('    set-status {0} -Status {1} -SourceNote "powercfg PROCTHROTTLEMAX reads 99; boost is off"' -f $tid, $Status)
+                $msg += '  (-NoNote is for a bulk normalisation pass only, and prints that it was used.)'
+                # Printed rather than thrown: this message is several lines of
+                # text a human is meant to READ, and a throw buries it under
+                # PowerShell's exception furniture. Exit 2 keeps it distinct
+                # from a plain usage error.
+                $msg | ForEach-Object { Write-Host $_ }
+                exit 2
+            }
+        }
+
         $json = ConvertTo-Json $Status -Compress
         $new = [regex]::Replace($text, '(?m)^status:\s*.*$', "status: $json", 1)
         if ($Commit) {
@@ -587,6 +664,16 @@ switch ($Command) {
             if ($Commit) { $line += (" [commit {0}]" -f $Commit) }
             Add-ProgressNote -Path $path -SessionId $Session -NoteText $line
             Write-Host ("      journaled: {0}" -f $line)
+        }
+
+        # Restate what the parker asked for, at the moment somebody says it is
+        # satisfied (T892). The condition is written down precisely so it can be
+        # checked, and the one place it was never shown was the command that
+        # ends the wait - T857's is machine-checkable (`powercfg
+        # PROCTHROTTLEMAX` must read 99) and the reopen that skipped it read 100.
+        if ($isUnblock -and $before -and $before.Unblock) {
+            Write-Host  "      unblock condition you are claiming is satisfied:"
+            Write-Host (Format-Indented -Text $before.Unblock -Indent '        ')
         }
     }
 

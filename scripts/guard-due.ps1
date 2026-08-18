@@ -759,6 +759,23 @@ $GuardTable = @(
             'test\win32\agent-integrations.ps1'
         )
     },
+    # The tracker CLI itself (T892). `scripts\parity-tasks.ps1` is what the loop
+    # picks work with and what the dashboard writes through, and NOTHING in the
+    # zig lanes or the P1-P3 floor executes a line of it - its only proof is
+    # this harness. A silent regression here does not show up as a red test, it
+    # shows up as the loop taking the wrong task or a status flip going
+    # unrecorded, which is exactly the class of defect T564 and T892 exist to
+    # stop. The task DIRECTORY is deliberately not covered: 200 task files move
+    # every day for reasons the CLI's behaviour cannot notice.
+    [pscustomobject]@{
+        Name   = 'parity-tasks'
+        Script = 'test\win32\parity-tasks-seat.ps1'
+        Stamp  = 'test\win32\parity-tasks-seat.stamp.json'
+        Covers = @(
+            'scripts\parity-tasks.ps1',
+            'test\win32\parity-tasks-seat.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.

@@ -161,6 +161,29 @@ worth knowing:
 A no-op (setting the status it already has) writes nothing, so re-running a
 command is not an event.
 
+**Un-blocking needs evidence** (T892). Moving a task OUT of `blocked(...)` is
+the one transition that asserts something nobody checked — the park recorded a
+condition, and a bare `set-status <id> -Status todo` claims it is now met while
+saying nothing about it. `set-status` therefore refuses that transition without
+`-SourceNote`, and prints the task's `unblock:` text so the caller sees the
+condition they are claiming is satisfied:
+
+```powershell
+# refused (exit 2), and prints T443's unblock condition back at you
+scripts\parity-tasks.ps1 set-status T443 -Status todo
+
+# accepted, and the receipt says what was checked
+scripts\parity-tasks.ps1 set-status T443 -Status todo `
+    -SourceNote "fresh access violation in the 03:02 win32 lane; dump appended to the watch log"
+```
+
+Every other transition is untouched — a claim, a close, a re-park
+(`blocked(a)` → `blocked(b)`) all stay as cheap as they were. `-NoNote` is
+still the bulk hatch, and prints that it took it. This exists because T443's
+armed watch was reopened twice with nothing behind it (D27, then 2026-08-16),
+and each time the next turn spent its whole context re-verifying the same watch
+and re-parking it.
+
 **Always mint ids with `new`.** Hand-picking a number reintroduces exactly
 the race this layout removes.
 

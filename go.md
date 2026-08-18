@@ -467,6 +467,12 @@ Concretely, in order, with no stops in between:
    from the turn. `-NoNote` exists for a bulk normalisation pass and nothing
    else.
 
+   Since T892 the one transition that needs more than a receipt is the way OUT
+   of `blocked(...)`: it asserts that the park condition is satisfied, so
+   `set-status` refuses it without `-SourceNote "<what you checked>"` and prints
+   the task's `unblock:` text back at you. Two evidence-free reopens of T443's
+   armed watch each cost the following turn its whole context.
+
    **Your commit message is the activity feed.** The dashboard builds each
    feed item from the commit that finished the work: the subject becomes the
    headline, the first paragraph of the body becomes "what changed", and the

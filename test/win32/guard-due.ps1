@@ -64,7 +64,11 @@ function Check {
 # A tree with the same SHAPE the go-loop row describes, so the row's globs are
 # what is exercised rather than a bespoke test row: three scripts\go-loop-*.ps1,
 # scripts\loop-session.ps1, the harness itself, and one script the row does not
-# cover (the scope control).
+# cover (the scope control). That control file has a SYNTHETIC name on purpose:
+# it used to be `scripts\parity-tasks.ps1`, which was uncovered right up until
+# T892 gave the tracker CLI a row of its own - and then three arms here failed
+# over a table entry that had nothing to do with them. A name no row can ever
+# claim keeps the scope control measuring scope.
 $Fixture = Join-Path $env:TEMP ("ghoztty-guard-due-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 
 function New-Fixture {
@@ -74,7 +78,7 @@ function New-Fixture {
     Set-FixtureFile 'scripts\go-loop-exec.ps1'    "# fake exec v1`n"
     Set-FixtureFile 'scripts\go-loop-watchdog.ps1' "# fake watchdog v1`n"
     Set-FixtureFile 'scripts\loop-session.ps1'    "# fake loop-session v1`n"
-    Set-FixtureFile 'scripts\parity-tasks.ps1'    "# not covered by the go-loop row`n"
+    Set-FixtureFile 'scripts\uncovered-by-any-row.ps1' "# not covered by the go-loop row`n"
     Set-FixtureFile 'test\win32\go-loop-guard.ps1' "# fake harness v1`n"
 }
 
@@ -106,7 +110,7 @@ try {
         ($r.Text -match 'scripts/go-loop-lock\.ps1' -and $r.Text -match 'scripts/loop-session\.ps1' `
             -and $r.Text -match 'test/win32/go-loop-guard\.ps1') $r.Text
     Check 'A2 list excludes a script the row does not cover' `
-        ($r.Text -notmatch 'parity-tasks\.ps1') $r.Text
+        ($r.Text -notmatch 'uncovered-by-any-row\.ps1') $r.Text
 
     $r = Invoke-Due check
     Check 'A3 with no stamp the guard is DUE' ($r.Text -match 'GUARD DUE go-loop') $r.Text
@@ -174,7 +178,7 @@ try {
     Check 'C5 a UTF-8 BOM is not a change' ($r.Exit -eq 0) $r.Text
     Set-FixtureFile 'scripts\loop-session.ps1' "# fake loop-session v1`n"
 
-    Set-FixtureFile 'scripts\parity-tasks.ps1' "# an uncovered script changed a lot`n"
+    Set-FixtureFile 'scripts\uncovered-by-any-row.ps1' "# an uncovered script changed a lot`n"
     $r = Invoke-Due check
     Check 'C6 an uncovered file changing does not make the row due' ($r.Exit -eq 0) $r.Text
 
