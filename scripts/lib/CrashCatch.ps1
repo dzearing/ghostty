@@ -92,6 +92,283 @@ $script:LANE_TEST_EXES = @{
     'agent' = @('ghoztty-agent-test.exe', 'ghoztty-agent-core-test.exe')
 }
 
+# What a lane's test binary is MADE OF, so a candidate can be checked rather
+# than assumed (T855).
+#
+# Newest-mtime alone is not a lane: `none` and `win32` both build
+# `ghostty-test.exe`, so whichever lane linked last wins the name for both, and
+# `-Lane none` silently ran the win32 binary during the T504 triage. Nothing in
+# the output said so, and every number that came out of it was about the other
+# program.
+#
+# Zig embeds each test's fully-qualified name in the binary, and `-Dtest-filter`
+# leaves the excluded ones OUT, so the test names answer both questions this
+# resolution has to ask:
+#
+#   Core    - names every full build of that lane must carry. All missing-but-one
+#             is a filtered (`-Dtest-filter`) build, which must never stand in
+#             for the lane it was cut from.
+#   Only    - names ONLY this lane compiles. The win32 apprt is not in the none
+#             lane's module graph at all, so its GUI tests are the discriminator.
+#             (Pure-logic win32 files like layout_blobs ARE in both lanes -- the
+#             markers here are deliberately ones that touch HWNDs.)
+#   NotThis - the other lane's `Only` markers, whose PRESENCE proves the
+#             candidate is that other lane's binary.
+#
+# The agent lane's exes have unique names and cannot be confused with a lane, so
+# they carry Core alone -- there is still a filtered build to catch.
+$script:LANE_MARKERS = @{
+    'none'  = @{
+        'ghostty-test.exe' = @{
+            Core    = @(
+                'terminal.Screen.test.', 'terminal.PageList.test.', 'input.Binding.test.',
+                'config.Config.test.', 'cli.args.test.', 'datastruct.blocking_queue.test.'
+            )
+            Only    = @()
+            NotThis = @('apprt.win32.Window.test.', 'apprt.win32.Scrollbar.test.', 'apprt.win32.IpcRegistry.test.')
+        }
+    }
+    'win32' = @{
+        'ghostty-test.exe' = @{
+            Core    = @(
+                'terminal.Screen.test.', 'terminal.PageList.test.', 'input.Binding.test.',
+                'config.Config.test.', 'cli.args.test.', 'datastruct.blocking_queue.test.'
+            )
+            Only    = @('apprt.win32.Window.test.', 'apprt.win32.Scrollbar.test.', 'apprt.win32.IpcRegistry.test.')
+            NotThis = @()
+        }
+    }
+    'agent' = @{
+        'ghoztty-agent-test.exe'      = @{
+            Core    = @('remote.agent.server.test.', 'remote.protocol.test.', 'remote.pipe_stream.test.')
+            Only    = @()
+            NotThis = @()
+        }
+        'ghoztty-agent-core-test.exe' = @{
+            Core    = @('remote.agent.server.test.', 'remote.protocol.test.', 'remote.pipe_stream.test.')
+            Only    = @()
+            NotThis = @()
+        }
+    }
+}
+
+# Verdicts are keyed on path+size+mtime, so re-resolving inside one run (the
+# soak asks twice, the harness asks per lane) does not re-read 96 MB each time.
+$script:LANE_MARKER_CACHE = @{}
+
+function Test-FileHasStrings {
+    <#
+    .SYNOPSIS
+        Which of these ASCII needles appear anywhere in the file.
+    .DESCRIPTION
+        Streamed in chunks with an overlap of one needle length, so a marker
+        that straddles a chunk boundary is still found, and a 96 MB test binary
+        never lands in memory whole. Proving a needle ABSENT requires reading to
+        the end, which is the cost of the check being trustworthy.
+    .OUTPUTS
+        A hashtable: needle -> [bool].
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$Needles
+    )
+    $found = @{}
+    foreach ($n in $Needles) { $found[$n] = $false }
+    if (-not $Needles -or $Needles.Count -eq 0) { return $found }
+    if (-not (Test-Path -LiteralPath $Path)) { return $found }
+
+    $maxNeedle = ($Needles | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+    # Opened FileShare.ReadWrite: a lane may be relinking the very file being
+    # probed, and a sharing violation here would read as "no marker".
+    $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $size = 4MB
+        $buf = New-Object byte[] $size
+        $carry = ''
+        while (($read = $fs.Read($buf, 0, $size)) -gt 0) {
+            $s = $carry + [Text.Encoding]::ASCII.GetString($buf, 0, $read)
+            foreach ($n in $Needles) {
+                if (-not $found[$n] -and $s.Contains($n)) { $found[$n] = $true }
+            }
+            $keep = [Math]::Min($maxNeedle, $s.Length)
+            $carry = $s.Substring($s.Length - $keep)
+        }
+    }
+    finally { $fs.Dispose() }
+    return $found
+}
+
+function Get-BinaryLaneVerdict {
+    <#
+    .SYNOPSIS
+        Is this exe the FULL test binary of that lane -- and if not, what is it?
+    .OUTPUTS
+        Ok, Reason, Path, CacheDir, Name, Lane, Missing (core markers absent),
+        Foreign (other-lane markers present), Absent (own markers absent),
+        Checked ($false when nothing is known about that exe name).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('none', 'win32', 'agent')][string]$Lane
+    )
+    $name = Split-Path -Leaf $Path
+    $res = [pscustomobject]@{
+        Path     = $Path
+        CacheDir = (Split-Path -Parent $Path)
+        Name     = $name
+        Lane     = $Lane
+        Ok       = $false
+        Checked  = $false
+        # Set when the candidate is positively identified as a DIFFERENT lane's
+        # build, as opposed to merely not verifiable -- the difference between
+        # "this answer would be about the wrong program" and "I cannot tell".
+        OtherLane = $false
+        Reason   = ''
+        Missing  = @()
+        Foreign  = @()
+        Absent   = @()
+    }
+    $spec = $null
+    if ($script:LANE_MARKERS.ContainsKey($Lane)) { $spec = $script:LANE_MARKERS[$Lane][$name] }
+    if (-not $spec) {
+        # Nothing known about this name: say so rather than pretending to check.
+        $res.Ok = $true
+        $res.Reason = "no lane signature for $name -- not checked"
+        return $res
+    }
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $item) {
+        $res.Reason = 'the file is gone'
+        return $res
+    }
+    $key = '{0}|{1}|{2}|{3}' -f $Path, $item.Length, $item.LastWriteTimeUtc.Ticks, $Lane
+    if ($script:LANE_MARKER_CACHE.ContainsKey($key)) { return $script:LANE_MARKER_CACHE[$key] }
+
+    $needles = @($spec.Core) + @($spec.Only) + @($spec.NotThis)
+    $hit = Test-FileHasStrings -Path $Path -Needles $needles
+    $res.Checked = $true
+    $res.Missing = @($spec.Core | Where-Object { -not $hit[$_] })
+    $res.Absent = @($spec.Only | Where-Object { -not $hit[$_] })
+    $res.Foreign = @($spec.NotThis | Where-Object { $hit[$_] })
+
+    if ($res.Foreign.Count -gt 0) {
+        $res.OtherLane = $true
+        $res.Reason = "another lane's binary -- it carries $($res.Foreign[0])"
+    }
+    elseif ($res.Absent.Count -gt 0 -and $res.Absent.Count -eq @($spec.Only).Count) {
+        # Every one of this lane's exclusive tests is missing: that is the OTHER
+        # lane's build wearing the same file name, not a filtered one.
+        $res.OtherLane = $true
+        $res.Reason = "another lane's binary -- none of this lane's own tests are in it (no $($res.Absent[0]))"
+    }
+    elseif ($res.Missing.Count -gt 0 -or $res.Absent.Count -gt 0) {
+        $gone = @($res.Missing) + @($res.Absent)
+        $res.Reason = ("a partial build -- {0} expected test name(s) missing, e.g. {1} (a -Dtest-filter build is not the lane)" -f `
+                $gone.Count, $gone[0])
+    }
+    else {
+        $res.Ok = $true
+        $res.Reason = ("verified: {0} core test(s) present{1}{2}" -f `
+                @($spec.Core).Count,
+            $(if (@($spec.Only).Count) { ", {0} {1}-only test(s) present" -f @($spec.Only).Count, $Lane } else { '' }),
+            $(if (@($spec.NotThis).Count) { ", {0} other-lane test(s) absent" -f @($spec.NotThis).Count } else { '' }))
+    }
+    $script:LANE_MARKER_CACHE[$key] = $res
+    return $res
+}
+
+function Resolve-LaneTestBinary {
+    <#
+    .SYNOPSIS
+        The lane's own test binary, CHECKED -- with the rejects and the reasons.
+    .DESCRIPTION
+        Candidates are still gathered newest-first (a lane that relinked is the
+        one being asked about), but "newest" no longer decides: each candidate is
+        read for the lane's test-name markers and the first one that IS this
+        lane's full build wins. When none is, the answer is a loud failure
+        naming what was found instead -- never the other lane's program.
+    .PARAMETER MaxCandidates
+        How deep to look per exe name. Reading a candidate costs about half a
+        second; the cache holds every build of the day, and a lane that is not in
+        the newest handful has not been built recently enough to be the subject.
+    .OUTPUTS
+        One object per exe name the lane builds: Name, Path, CacheDir, Ok,
+        Reason, Verdict, Rejected (path+reason pairs), Candidates.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('none', 'win32', 'agent')][string]$Lane,
+        [string]$Repo = 'D:\git\ghoztty',
+        [int]$MaxCandidates = 8
+    )
+    $root = Join-Path $Repo '.zig-cache\o'
+    $out = @()
+    foreach ($name in $script:LANE_TEST_EXES[$Lane]) {
+        $entry = [pscustomobject]@{
+            Name       = $name
+            Path       = $null
+            CacheDir   = $null
+            Ok         = $false
+            Reason     = "nothing named $name is built under $root"
+            Verdict    = $null
+            Rejected   = @()
+            Candidates = 0
+        }
+        $cands = @()
+        if (Test-Path -LiteralPath $root) {
+            $cands = @(Get-ChildItem -LiteralPath $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First $MaxCandidates)
+        }
+        $entry.Candidates = $cands.Count
+        foreach ($c in $cands) {
+            $v = Get-BinaryLaneVerdict -Path $c.FullName -Lane $Lane
+            if ($v.Ok) {
+                $entry.Path = $c.FullName
+                $entry.CacheDir = Split-Path -Parent $c.FullName
+                $entry.Ok = $true
+                $entry.Reason = $v.Reason
+                $entry.Verdict = $v
+                break
+            }
+            $entry.Rejected += , [pscustomobject]@{ Path = $c.FullName; Reason = $v.Reason }
+        }
+        if (-not $entry.Ok -and $entry.Rejected.Count -gt 0) {
+            $entry.Reason = ("no $name under $root is the $Lane lane's full build ({0} candidate(s) read; newest is {1})" -f `
+                    $entry.Rejected.Count, $entry.Rejected[0].Reason)
+        }
+        $out += , $entry
+    }
+    return @($out)
+}
+
+function Write-LaneResolution {
+    <#
+    .SYNOPSIS
+        Say which binary was picked, out of where, and what it passed.
+    .DESCRIPTION
+        The cache directory is printed on purpose: it is the only thing that
+        tells two same-named lane binaries apart, and T855 exists because it was
+        never shown.
+    #>
+    param(
+        [Parameter(Mandatory)]$Resolution,
+        [string]$Prefix = 'lane',
+        [scriptblock]$Writer = { param($s) Write-Host $s }
+    )
+    foreach ($e in @($Resolution)) {
+        if ($e.Ok) {
+            & $Writer ("{0} {1} -> {2}" -f $Prefix, $e.Name, $e.Path)
+            & $Writer ("{0}   {1}" -f $Prefix, $e.Reason)
+        }
+        else {
+            & $Writer ("{0} {1} -> REFUSED: {2}" -f $Prefix, $e.Name, $e.Reason)
+        }
+        foreach ($r in @($e.Rejected)) {
+            & $Writer ("{0}   skipped {1} -- {2}" -f $Prefix, $r.Path, $r.Reason)
+        }
+    }
+}
+
 function Get-NewestBuiltBinary {
     <#
     .SYNOPSIS
@@ -146,20 +423,33 @@ function Get-FailingTestBinaryFromLog {
 function Get-LaneTestBinary {
     <#
     .SYNOPSIS
-        The most recently built test exe(s) for a lane, newest first.
+        The lane's test exe(s), verified to BE that lane's full build.
     .DESCRIPTION
         `zig build` leaves them under .zig-cache\o\<hash>\. Running one directly
         is far cheaper than re-running the lane (no build, no build runner) and
         is how T443's repro loop already works.
+
+        A path comes back only when Resolve-LaneTestBinary has confirmed the
+        lane (T855). An unconfirmed candidate is dropped rather than returned,
+        so a caller that only checks `.Count` still cannot end up running the
+        other lane's program; callers that want to SAY why should ask
+        Resolve-LaneTestBinary directly and print with Write-LaneResolution.
+    .PARAMETER AllowUnverified
+        Fall back to newest-by-write-time when nothing verifies. For a caller
+        that has no lane claim to falsify -- and it still says so.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('none', 'win32', 'agent')][string]$Lane,
-        [string]$Repo = 'D:\git\ghoztty'
+        [string]$Repo = 'D:\git\ghoztty',
+        [switch]$AllowUnverified
     )
     $out = @()
-    foreach ($n in $script:LANE_TEST_EXES[$Lane]) {
-        $hit = Get-NewestBuiltBinary -Name $n -Repo $Repo
-        if ($hit) { $out += $hit }
+    foreach ($e in @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)) {
+        if ($e.Ok) { $out += $e.Path }
+        elseif ($AllowUnverified) {
+            $hit = Get-NewestBuiltBinary -Name $e.Name -Repo $Repo
+            if ($hit) { $out += $hit }
+        }
     }
     return @($out)
 }

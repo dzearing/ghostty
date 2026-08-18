@@ -254,9 +254,14 @@ $targets = @()
 if ($mode -eq 'standalone') {
     if ($Exe) { $targets = @((Resolve-Path -LiteralPath $Exe).Path) }
     else {
-        $targets = @(Get-LaneTestBinary -Lane $Lane -Repo $Repo)
+        # Verified, not newest (T855). A soak's whole output is a count of runs
+        # against a named lane; resolving that name by write-time alone let the
+        # other lane's binary be soaked and reported under this one.
+        $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)
+        Write-LaneResolution -Resolution $resolved -Prefix "soak: lane $Lane"
+        $targets = @($resolved | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
         if ($targets.Count -eq 0) {
-            Write-Host "soak: nothing built for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first."
+            Write-Host "soak: no verified test binary for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first, or pass -Exe."
             exit 2
         }
     }

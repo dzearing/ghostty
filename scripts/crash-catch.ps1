@@ -101,9 +101,11 @@ if ($Last -or $FromDump) {
             Write-Host 'crash-catch: -Last needs -Lane <none|win32|agent> (whose binary died?).'
             exit 2
         }
-        $bins = @(Get-LaneTestBinary -Lane $Lane -Repo $Repo)
+        $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)
+        Write-LaneResolution -Resolution $resolved -Prefix 'crash-catch:'
+        $bins = @($resolved | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
         if ($bins.Count -eq 0) {
-            Write-Host "crash-catch: nothing built for lane '$Lane' -- run the lane once first."
+            Write-Host "crash-catch: no verified test binary for lane '$Lane' -- build the lane, or name the dump with -FromDump."
             exit 2
         }
         $names = @($bins | ForEach-Object { Split-Path -Leaf $_ })
@@ -121,6 +123,37 @@ if ($Last -or $FromDump) {
         Write-Host "crash-catch: no such dump: $dumpPath"
         exit 2
     }
+
+    # WHOSE crash is this? `<exe>.<pid>.dmp` cannot say -- both lanes build a
+    # ghostty-test.exe -- but the dump records the module path it was taken of,
+    # and that names the cache directory (T855). Reading a win32-lane dump under
+    # `-Lane none` would explain a crash that never happened in that program.
+    $dumpModule = Get-MinidumpMainModulePath -Path $dumpPath
+    if ($dumpModule) {
+        Write-Host "crash-catch: the dump was taken of $dumpModule"
+        if (Test-Path -LiteralPath $dumpModule) {
+            if ($Lane) {
+                $v = Get-BinaryLaneVerdict -Path $dumpModule -Lane $Lane
+                if ($v.OtherLane) {
+                    Write-Host ("crash-catch: REFUSED -- that dump is $($v.Reason).")
+                    Write-Host '             Name the lane it belongs to, or drop -Lane to read it unattributed.'
+                    exit 2
+                }
+                if (-not $v.Ok -and $v.Checked) {
+                    Write-Host ("crash-catch: NOTE -- the crashed build is $($v.Reason)")
+                }
+            }
+            # Symbols from the build that ACTUALLY died, not from whatever the
+            # lane linked most recently: a pdb from a different build turns the
+            # stack into confident nonsense.
+            $sym = Split-Path -Parent $dumpModule
+        }
+        elseif ($Lane) {
+            Write-Host 'crash-catch: NOTE -- that build is no longer in the cache, so its lane cannot be confirmed'
+            Write-Host '             and the symbols below come from the current build of this lane instead.'
+        }
+    }
+
     if (-not $sym -and $Lane) {
         $bins = @(Get-LaneTestBinary -Lane $Lane -Repo $Repo)
         if ($bins.Count -gt 0) { $sym = Split-Path -Parent $bins[0] }
@@ -136,12 +169,15 @@ if ($Last -or $FromDump) {
 $targets = @()
 if ($Exe) { $targets = @($Exe) }
 elseif ($Lane) {
-    $targets = @(Get-LaneTestBinary -Lane $Lane -Repo $Repo)
+    # Verified, not newest (T855): the two lanes build the same file name, so
+    # "newest" ran the other lane's program and said nothing about it.
+    $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)
+    Write-LaneResolution -Resolution $resolved -Prefix "crash-catch: lane $Lane"
+    $targets = @($resolved | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
     if ($targets.Count -eq 0) {
-        Write-Host "crash-catch: nothing built for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first."
+        Write-Host "crash-catch: no verified test binary for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first, or pass -Exe."
         exit 2
     }
-    Write-Host ("crash-catch: lane $Lane -> " + (($targets | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
 }
 else {
     Write-Host 'crash-catch: pass -Lane <none|win32|agent> or -Exe <path>.'

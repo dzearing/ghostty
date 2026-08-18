@@ -428,13 +428,20 @@ Check 'no target exits 2 with guidance' ($LASTEXITCODE -eq 2 -and ($noArgs | Out
 # ------------------------------------------------- 7. lane binary resolution
 
 foreach ($lane in @('none', 'win32', 'agent')) {
-    $bins = @(Get-LaneTestBinary -Lane $lane -Repo $Repo)
-    if ($bins.Count -eq 0) {
+    $real = @(Resolve-LaneTestBinary -Lane $lane -Repo $Repo)
+    $bins = @($real | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
+    if ($bins.Count -eq 0 -and @($real | Where-Object { $_.Candidates -gt 0 }).Count -eq 0) {
         Write-Host "SKIP lane '$lane' has no built test binary to resolve"
         $script:skipped++
         continue
     }
-    Check "lane '$lane' resolves to a real exe" ((Test-Path -LiteralPath $bins[0]) -and $bins[0] -match '\.exe$') $bins[0]
+    # A lane that HAS a binary and still does not verify is a FAILURE, not a
+    # skip: that is what marker-table drift looks like (a renamed or deleted
+    # test), and turning it into "nothing built" would hide the one thing this
+    # check exists to notice.
+    Check "lane '$lane' resolves to a real exe" `
+    (($bins.Count -gt 0) -and (Test-Path -LiteralPath $bins[0]) -and $bins[0] -match '\.exe$') `
+    (($real | ForEach-Object { "$($_.Name): $($_.Reason)" }) -join ' | ')
 }
 
 # --------------------------------- 7b. the lane log names the exact binary
@@ -465,6 +472,147 @@ Check 'a log with no command names nothing' ($null -eq (Get-FailingTestBinaryFro
 $goneLog = Join-Path $work 'lane-gone.log'
 '".\\.zig-cache\\o\\deadbeef\\ghostty-test.exe" "--cache-dir=.\\.zig-cache"' | Set-Content -LiteralPath $goneLog -Encoding ASCII
 Check 'a stale path in the log is rejected' ($null -eq (Get-FailingTestBinaryFromLog -LogPath $goneLog -Repo $fakeRepo))
+
+# ------------------------- 7c. a lane never resolves to the OTHER lane's binary
+
+# T855. `none` and `win32` both build `ghostty-test.exe`, and resolution used to
+# be "newest wins", so asking about one lane silently ran, soaked and explained
+# the other. The fixtures below are plain files carrying the marker strings the
+# real binaries carry, which is exactly what the resolver reads, and the WIN32
+# one is written LAST so newest-mtime would pick it every time.
+$laneRepo = Join-Path $work 'lanerepo'
+$laneCache = Join-Path $laneRepo '.zig-cache\o'
+$coreMarkers = @(
+    'terminal.Screen.test.a', 'terminal.PageList.test.a', 'input.Binding.test.a',
+    'config.Config.test.a', 'cli.args.test.a', 'datastruct.blocking_queue.test.a'
+)
+$win32Markers = @('apprt.win32.Window.test.a', 'apprt.win32.Scrollbar.test.a', 'apprt.win32.IpcRegistry.test.a')
+function New-LaneFixture {
+    param([string]$Dir, [string[]]$Markers, [string]$Name = 'ghostty-test.exe')
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    $p = Join-Path $Dir $Name
+    # Padded so a marker straddles the reader's chunk boundary sometimes; the
+    # content is otherwise irrelevant, the resolver only reads strings.
+    Set-Content -LiteralPath $p -Value (($Markers + @('x' * 64)) -join "`n") -Encoding ASCII
+    return $p
+}
+$noneFix = New-LaneFixture (Join-Path $laneCache 'aaaa1111') $coreMarkers
+Start-Sleep -Milliseconds 1100
+$win32Fix = New-LaneFixture (Join-Path $laneCache 'bbbb2222') ($coreMarkers + $win32Markers)
+
+Check 'the win32 fixture is the newest on disk' `
+((Get-Item $win32Fix).LastWriteTime -gt (Get-Item $noneFix).LastWriteTime)
+
+$rNone = @(Resolve-LaneTestBinary -Lane none -Repo $laneRepo)
+Check 'lane none resolves past the newer win32 binary' `
+($rNone[0].Ok -and $rNone[0].Path -eq $noneFix) "got '$($rNone[0].Path)' -- $($rNone[0].Reason)"
+Check 'the rejected win32 binary is named with a reason' `
+(@($rNone[0].Rejected | Where-Object { $_.Path -eq $win32Fix -and $_.Reason -match "another lane" }).Count -eq 1) `
+    (($rNone[0].Rejected | ForEach-Object { $_.Reason }) -join ' | ')
+
+$rWin = @(Resolve-LaneTestBinary -Lane win32 -Repo $laneRepo)
+Check 'lane win32 resolves to the win32 binary' `
+($rWin[0].Ok -and $rWin[0].Path -eq $win32Fix) "got '$($rWin[0].Path)' -- $($rWin[0].Reason)"
+
+# The picked cache directory and the check it passed must be VISIBLE: the whole
+# defect was that the wrong choice looked exactly like the right one.
+$printed = @()
+Write-LaneResolution -Resolution $rNone -Prefix 'test:' -Writer { param($s) $script:printed += $s }
+Check 'the resolution prints the cache directory it picked' `
+((($printed -join ' ') -match [regex]::Escape($noneFix)))  ($printed -join ' / ')
+Check 'the resolution prints the lane check that passed' `
+((($printed -join ' ') -match 'verified: \d+ core test')) ($printed -join ' / ')
+
+# A -Dtest-filter build has the same name, the same lane and only some of the
+# tests. Soaking it and reporting the number as the lane's is the same lie.
+$filtered = New-LaneFixture (Join-Path $laneCache 'cccc3333') (@($coreMarkers[0], $coreMarkers[1]) + $win32Markers)
+$rFiltered = @(Resolve-LaneTestBinary -Lane win32 -Repo $laneRepo)
+Check 'a filtered build is not picked over the full lane build' `
+($rFiltered[0].Ok -and $rFiltered[0].Path -eq $win32Fix) "got '$($rFiltered[0].Path)'"
+$vFiltered = Get-BinaryLaneVerdict -Path $filtered -Lane win32
+Check 'a filtered build is called out as partial' `
+((-not $vFiltered.Ok) -and $vFiltered.Reason -match 'partial build') "got '$($vFiltered.Reason)'"
+Check 'a filtered build is not mistaken for another lane' (-not $vFiltered.OtherLane) $vFiltered.Reason
+
+# Nothing but the other lane's binary present: that must FAIL, never fall back.
+$onlyWin = Join-Path $work 'onlywin'
+New-Item -ItemType Directory -Path (Join-Path $onlyWin '.zig-cache\o') -Force | Out-Null
+$null = New-LaneFixture (Join-Path $onlyWin '.zig-cache\o\dddd4444') ($coreMarkers + $win32Markers)
+$rOnly = @(Resolve-LaneTestBinary -Lane none -Repo $onlyWin)
+Check 'a lane with only the other lane built refuses' (-not $rOnly[0].Ok) "got '$($rOnly[0].Path)'"
+Check 'the refusal says which lane was found instead' ($rOnly[0].Reason -match "another lane") $rOnly[0].Reason
+Check 'Get-LaneTestBinary returns nothing rather than the wrong lane' `
+((@(Get-LaneTestBinary -Lane none -Repo $onlyWin)).Count -eq 0)
+
+# End to end: the script refuses rather than running something it cannot vouch
+# for, and says so in words.
+$refuseLog = Join-Path $work 'refuse.log'
+cmd.exe /c "powershell -NoProfile -File `"$Repo\scripts\crash-catch.ps1`" -Lane none -Repo `"$onlyWin`" > `"$refuseLog`" 2>&1" | Out-Null
+$refuseCode = $LASTEXITCODE
+$refuseText = (Get-Content $refuseLog -Raw -ErrorAction SilentlyContinue)
+Check 'crash-catch exits 2 rather than run the other lane' ($refuseCode -eq 2) "got $refuseCode"
+Check 'crash-catch says why it refused' ($refuseText -match 'REFUSED' -and $refuseText -match "another lane") `
+    "tail: $($refuseText -replace '\s+', ' ')"
+
+# --------------------------- 7d. a dump is attributed to the build that died
+
+# `<exe>.<pid>.dmp` cannot say which lane crashed, but the dump records the
+# module path it was taken of. A synthetic minidump is enough to prove the
+# reader: header, one-entry stream directory, a one-module list, one string.
+. "$Repo\scripts\lib\CrashDump.ps1"
+function New-FakeMinidump {
+    param([string]$Path, [string]$ModulePath)
+    $ms = New-Object IO.MemoryStream
+    $bw = New-Object IO.BinaryWriter($ms)
+    $nameBytes = [Text.Encoding]::Unicode.GetBytes($ModulePath)
+    $dirRva = 32
+    $modRva = $dirRva + 12
+    $strRva = $modRva + 4 + 108
+    $bw.Write([uint32]0x504D444D)       # 'MDMP'
+    $bw.Write([uint32]0xA793)           # version
+    $bw.Write([uint32]1)                # NumberOfStreams
+    $bw.Write([uint32]$dirRva)
+    $bw.Write([uint32]0)                # CheckSum
+    $bw.Write([uint32]0)                # TimeDateStamp
+    $bw.Write([uint64]0)                # Flags
+    $bw.Write([uint32]4)                # ModuleListStream
+    $bw.Write([uint32](4 + 108))
+    $bw.Write([uint32]$modRva)
+    $bw.Write([uint32]1)                # NumberOfModules
+    $bw.Write([uint64]0x140000000)      # BaseOfImage
+    $bw.Write([uint32]4096)             # SizeOfImage
+    $bw.Write([uint32]0)                # CheckSum
+    $bw.Write([uint32]0)                # TimeDateStamp
+    $bw.Write([uint32]$strRva)          # ModuleNameRva
+    $bw.Write((New-Object byte[] (52 + 8 + 8 + 8 + 8)))   # VersionInfo, Cv, Misc, Reserved0/1
+    $bw.Write([uint32]$nameBytes.Length)
+    $bw.Write($nameBytes)
+    $bw.Write([uint16]0)
+    $bw.Flush()
+    [IO.File]::WriteAllBytes($Path, $ms.ToArray())
+    $bw.Close()
+}
+$fakeDump = Join-Path $work 'fake-win32.dmp'
+New-FakeMinidump -Path $fakeDump -ModulePath $win32Fix
+Check 'the module the dump was taken of is read out of it' `
+((Get-MinidumpMainModulePath -Path $fakeDump) -eq $win32Fix) "got '$(Get-MinidumpMainModulePath -Path $fakeDump)'"
+Check 'a non-dump yields no module path' ($null -eq (Get-MinidumpMainModulePath -Path $noneFix))
+
+$attrLog = Join-Path $work 'attr.log'
+cmd.exe /c "powershell -NoProfile -File `"$Repo\scripts\crash-catch.ps1`" -FromDump `"$fakeDump`" -Lane none -Repo `"$laneRepo`" > `"$attrLog`" 2>&1" | Out-Null
+$attrCode = $LASTEXITCODE
+$attrText = (Get-Content $attrLog -Raw -ErrorAction SilentlyContinue)
+Check 'a win32-lane dump is refused under -Lane none' ($attrCode -eq 2) "got $attrCode"
+Check 'the refusal names the build the dump came from' `
+($attrText -match [regex]::Escape($win32Fix) -and $attrText -match 'REFUSED') "tail: $($attrText -replace '\s+', ' ')"
+
+# The same dump under its OWN lane is read, not refused.
+$okDump = Join-Path $work 'fake-none.dmp'
+New-FakeMinidump -Path $okDump -ModulePath $noneFix
+$okLog = Join-Path $work 'attr-ok.log'
+cmd.exe /c "powershell -NoProfile -File `"$Repo\scripts\crash-catch.ps1`" -FromDump `"$okDump`" -Lane none -Repo `"$laneRepo`" > `"$okLog`" 2>&1" | Out-Null
+$okText = (Get-Content $okLog -Raw -ErrorAction SilentlyContinue)
+Check 'a dump from this lane is not refused' ($okText -notmatch 'REFUSED') "tail: $($okText -replace '\s+', ' ')"
 
 # --------------------------------------------- 8. the wrapper still runs with it
 

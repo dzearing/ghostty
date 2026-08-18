@@ -1,10 +1,10 @@
 {
     "guard":  "test-binary-soak",
     "script":  "test/win32/test-binary-soak.ps1",
-    "generated":  "2026-08-15T11:42:35-07:00",
-    "commit":  "03ee215b1",
+    "generated":  "2026-08-17T21:04:15-07:00",
+    "commit":  "095303837",
     "files":  {
-                  "scripts/test-binary-soak.ps1":  "8a05eb9aab8f393948a1fd5e4ad46972cd47e485a63e6a7f2764d53656567b3d",
-                  "test/win32/test-binary-soak.ps1":  "7e0e5766b11e0b3a743837a4e475a463d07ebb569c48ad8bc6c52b8f15eff807"
+                  "scripts/test-binary-soak.ps1":  "0337dac6b4c36ca5168259058bb96f4f6bd8a2b1247f73f24380727934cae9d9",
+                  "test/win32/test-binary-soak.ps1":  "a680b748cf89fd779c41454fbd4c6ab19d96d76cb5594792f0451f971484d34a"
               }
 }

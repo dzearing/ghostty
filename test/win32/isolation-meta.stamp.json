@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-17T20:34:59-07:00",
-    "commit":  "b180544b5",
+    "generated":  "2026-08-17T21:26:06-07:00",
+    "commit":  "095303837",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -66,7 +66,7 @@
                   "test/win32/crash-databreak.ps1":  "59c9648cfff1725ea328f79f5e674ac042eb4109870b61707b8c378e6436f1d6",
                   "test/win32/crash-diagnostics.ps1":  "1d06d58b9b8b0155427126144e55599f3e2598408ff8a0b5af3d076bd9bc50c7",
                   "test/win32/crash-first-chance.ps1":  "873e46349005273ea8336c92f22f6bb71b1b3a9d2bd1cf83c14b4bd1d8bd12ee",
-                  "test/win32/crash-stacks.ps1":  "8562b0924c0cc699eebd8fbb27eb8196c23c8e87a5237583a9f4d746a2757922",
+                  "test/win32/crash-stacks.ps1":  "a0c6fa51f11530a9915fcb8477517a6757b48ced7a9aff89aaf5c1313c33e710",
                   "test/win32/dark-menus.ps1":  "f122fcdcff5b6472ccbba32be65414c1e80b4b61f839a09b960b9343baefc974",
                   "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d",
                   "test/win32/divergence-inventory.ps1":  "9448dd5ca9f5eff21606e38ded4e762689ca4726d03cdfec075801a50bec0501",
@@ -186,7 +186,7 @@
                   "test/win32/target-staleness.ps1":  "9bfdcce176cbadecf1263ab9a4fc5f74a48e5f8e141220531349a670608ae54e",
                   "test/win32/task-dashboard.ps1":  "b0e22ed5b0b3fb333c475ba04633e834db7f1e8f20a179b84ac5c83b060ddeec",
                   "test/win32/terminal-link-paths.ps1":  "3e363feec18c1f1792f2ca7e898418eee7f306677c79767a18927cef783f428d",
-                  "test/win32/test-binary-soak.ps1":  "7e0e5766b11e0b3a743837a4e475a463d07ebb569c48ad8bc6c52b8f15eff807",
+                  "test/win32/test-binary-soak.ps1":  "a680b748cf89fd779c41454fbd4c6ab19d96d76cb5594792f0451f971484d34a",
                   "test/win32/test-desktop-harness.ps1":  "df135c7fce9eac3b08bab3900b3a68f611821c0b4d1731b987e69afb925b3aa4",
                   "test/win32/test-desktop-spike.ps1":  "4ef2f0bdb231b611651469256a713615899de8f35814fa058e928dbf4562335b",
                   "test/win32/title-font.ps1":  "fbab90df0fdf0a5ead18d6e0134213c621eba331287eb5e064476bdc54b7a101",

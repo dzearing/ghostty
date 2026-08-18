@@ -267,6 +267,76 @@ function Test-MinidumpHasException {
     }
 }
 
+function Get-MinidumpMainModulePath {
+    <#
+    .SYNOPSIS
+        The full path of the EXE this dump was taken of, as recorded in it.
+    .DESCRIPTION
+        WER names its files `<exe>.<pid>.dmp`, and both zig test lanes build a
+        `ghostty-test.exe`, so the file name cannot say which program died
+        (T855). The dump itself can: MINIDUMP_MODULE_LIST (stream type 4) lists
+        every loaded module, and the FIRST entry is the executable, recorded with
+        the .zig-cache\o\<hash>\ directory it was built into.
+
+        That directory is what tells a none-lane crash from a win32-lane one --
+        and it is also the right place to look for the pdb, which is how a stack
+        gets source lines that belong to the build that actually crashed rather
+        than to whatever was linked last.
+
+        Layout: MINIDUMP_HEADER {sig,ver,count,dirRva}; directory entries
+        {type,size,rva} of 12 bytes; the module list is {count:u32, modules...}
+        with each MINIDUMP_MODULE 108 bytes and ModuleNameRva at offset 20; a
+        MINIDUMP_STRING is {byteLength:u32, UTF-16 chars}.
+    .OUTPUTS
+        A string path, or $null when the dump does not carry one.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $fs = $null
+    $br = $null
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $br = New-Object IO.BinaryReader($fs)
+        if ($fs.Length -lt 32) { return $null }
+        if ($br.ReadUInt32() -ne 0x504D444D) { return $null }   # 'MDMP'
+        $null = $br.ReadUInt32()                                # version
+        $count = $br.ReadUInt32()
+        $dirRva = $br.ReadUInt32()
+        if ($count -eq 0 -or $count -gt 4096) { return $null }
+        if (($dirRva + 12 * $count) -gt $fs.Length) { return $null }
+
+        $modRva = 0
+        $fs.Position = $dirRva
+        for ($i = 0; $i -lt $count; $i++) {
+            $type = $br.ReadUInt32()
+            $size = $br.ReadUInt32()
+            $rva = $br.ReadUInt32()
+            if ($type -eq 4 -and $size -gt 4) { $modRva = $rva; break }   # ModuleListStream
+        }
+        if ($modRva -eq 0 -or ($modRva + 4) -gt $fs.Length) { return $null }
+
+        $fs.Position = $modRva
+        $nModules = $br.ReadUInt32()
+        if ($nModules -eq 0) { return $null }
+        # First module = the executable. Its name RVA sits 20 bytes in
+        # (BaseOfImage u64, SizeOfImage u32, CheckSum u32, TimeDateStamp u32).
+        $fs.Position = $modRva + 4 + 20
+        $nameRva = $br.ReadUInt32()
+        if (($nameRva + 4) -gt $fs.Length) { return $null }
+        $fs.Position = $nameRva
+        $bytes = $br.ReadUInt32()
+        if ($bytes -eq 0 -or $bytes -gt 4096 -or ($nameRva + 4 + $bytes) -gt $fs.Length) { return $null }
+        $raw = $br.ReadBytes([int]$bytes)
+        return ([Text.Encoding]::Unicode.GetString($raw)).TrimEnd([char]0)
+    }
+    catch { return $null }
+    finally {
+        if ($br) { $br.Close() }
+        if ($fs) { $fs.Dispose() }
+    }
+}
+
 function New-CrashDumpScript {
     <#
     .SYNOPSIS

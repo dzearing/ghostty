@@ -334,8 +334,20 @@ Check 'a fixture exe gets no T443 warning' (-not ($r.Text -match 'NEVER been obs
 $fakeRepo = Join-Path $work 'repo509'
 $oDir = Join-Path $fakeRepo '.zig-cache\o\cafef00d'
 New-Item -ItemType Directory -Force -Path $oDir | Out-Null
-Copy-Item -LiteralPath $psExe -Destination (Join-Path $oDir 'ghoztty-agent-test.exe') -Force
-Copy-Item -LiteralPath $psExe -Destination (Join-Path $oDir 'ghoztty-agent-core-test.exe') -Force
+# The fixtures stand in for the lane's real binaries, so they have to be able to
+# PROVE it: since T855 a lane is resolved by reading the test names zig embeds,
+# and a copy of powershell.exe carries none of them. The names are appended past
+# the end of the PE image, which the loader ignores -- the fixture still runs,
+# and the resolution under test is the real one rather than a bypass.
+$agentMarkers = "`nremote.agent.server.test.fixture remote.protocol.test.fixture remote.pipe_stream.test.fixture`n"
+foreach ($fixName in @('ghoztty-agent-test.exe', 'ghoztty-agent-core-test.exe')) {
+    $fixPath = Join-Path $oDir $fixName
+    Copy-Item -LiteralPath $psExe -Destination $fixPath -Force
+    $fixFs = [IO.File]::Open($fixPath, 'Append', 'Write')
+    $fixBytes = [Text.Encoding]::ASCII.GetBytes($agentMarkers)
+    $fixFs.Write($fixBytes, 0, $fixBytes.Length)
+    $fixFs.Close()
+}
 # Single-quoted so $PID reaches the fixture unexpanded; the exe name is the
 # only thing that tells the two binaries apart, since both get the same args.
 $body509 = 'Write-Output ((Get-Process -Id $PID).Path); if ((Get-Process -Id $PID).Path -like ''*-core-*'') { exit 0 } else { exit 1 }'
@@ -369,6 +381,37 @@ Check 'the summary attributes fails per binary' `
 $r = Invoke-Soak @{ Exe = $plain; Arguments = @('-NoProfile', '-Command', 'exit 0'); Runs = 1; Label = 'onebin' }
 Check 'a single-binary soak carries no per-exe breakdown line' `
 (-not ($r.Text -match '\.exe: runs=')) ($r.Text -replace '\s+', ' ')
+
+# ------------- 6. a lane soak never soaks the OTHER lane's binary (T855)
+#
+# `none` and `win32` both build `ghostty-test.exe`, and this resolved by newest
+# write time -- so a soak labelled `-Lane none` ran the win32 binary and
+# reported the count under the none lane. The fixture repo holds nothing but a
+# win32-marked binary: the run must refuse rather than soak it, and say so.
+$wrongRepo = Join-Path $work 'repo855'
+$wrongDir = Join-Path $wrongRepo '.zig-cache\o\feedface'
+New-Item -ItemType Directory -Force -Path $wrongDir | Out-Null
+$wrongExe = Join-Path $wrongDir 'ghostty-test.exe'
+Set-Content -LiteralPath $wrongExe -Encoding ASCII -Value @(
+    'terminal.Screen.test.x', 'terminal.PageList.test.x', 'input.Binding.test.x',
+    'config.Config.test.x', 'cli.args.test.x', 'datastruct.blocking_queue.test.x',
+    'apprt.win32.Window.test.x', 'apprt.win32.Scrollbar.test.x', 'apprt.win32.IpcRegistry.test.x'
+)
+$r = Invoke-Soak @{
+    Lane = 'none'; Mode = 'standalone'; Runs = 1; Label = 'wronglane'
+    Repo = $wrongRepo; OutDir = (Join-Path $work 'out855')
+}
+Check 'a none-lane soak refuses the win32 binary' ($r.Code -eq 2) "got $($r.Code)"
+Check 'it says the binary belongs to another lane' ($r.Text -match "another lane") ($r.Text -replace '\s+', ' ')
+Check 'it soaked nothing' (-not ($r.Text -match 'SOAK wronglane')) ($r.Text -replace '\s+', ' ')
+# And the same repo IS resolvable as the lane it really is -- the check is a
+# lane test, not a blanket refusal.
+$r = Invoke-Soak @{
+    Lane = 'win32'; Mode = 'standalone'; Runs = 0; Label = 'rightlane'
+    Repo = $wrongRepo; OutDir = (Join-Path $work 'out855b')
+}
+Check 'the win32 lane resolves that same binary' ($r.Text -match [regex]::Escape($wrongExe)) `
+    ($r.Text -replace '\s+', ' ')
 
 # --------------------------------------------------------------------- cleanup
 

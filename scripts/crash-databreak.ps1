@@ -217,12 +217,15 @@ Write-Host "databreak: cdb = $cdbPath"
 $targets = @()
 if ($Exe) { $targets = @($Exe) }
 elseif ($Lane) {
-    $targets = @(Get-LaneTestBinary -Lane $Lane -Repo $Repo)
+    # Verified, not newest (T855): both lanes build `ghostty-test.exe`, so a
+    # breakpoint planted by write-time alone can arm in the other lane's program.
+    $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)
+    Write-LaneResolution -Resolution $resolved -Prefix "databreak: lane $Lane"
+    $targets = @($resolved | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
     if ($targets.Count -eq 0) {
-        Write-Host "databreak: nothing built for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first."
+        Write-Host "databreak: no verified test binary for lane '$Lane' under $Repo\.zig-cache\o -- run the lane once first, or pass -Exe."
         exit 2
     }
-    Write-Host ("databreak: lane $Lane -> " + (($targets | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
 }
 else {
     Write-Host 'databreak: pass -Lane <none|win32|agent> or -Exe <path>.'
