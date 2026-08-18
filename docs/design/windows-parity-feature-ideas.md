@@ -101,3 +101,14 @@ as the digest that showed them.
 - A pane you can pin always-on-top
 - Cold-start budget with a visible first frame
 - Automatic crash breadcrumb in the feedback report
+
+## 2026-08-18
+
+- Type the same command into a whole group of panes (grouped broadcast)
+- A per-pane task list built from what you actually ran
+- Bring back the pane I closed by accident, with its scrollback
+- Explain this error (plain-language reading of selected output)
+- A quiet warning before a destructive command
+- Remember where I was in this project (cwd + last command per pane)
+- A pane that never blocks on a wedged program
+- Show me what this build is (running vs installed version, in-app)
