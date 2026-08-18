@@ -85,7 +85,7 @@ function Invoke-Cli([string]$Suffix, [string[]]$CliArgs) {
     Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
     # `ghoztty +verb > file` writes zero bytes from PowerShell (T245) - capture
     # through a pipe instead.
-    $out = (& $Exe @CliArgs 2>&1 | Out-String)
+    $out = (& $Exe @CliArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Text = $out }
 }
 

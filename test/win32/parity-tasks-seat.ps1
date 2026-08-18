@@ -72,7 +72,8 @@ function Assert($name, $cond) {
 # Run parity-tasks.ps1 against the fixture dir; return @{ Code; Out }.
 function Task-Run {
     param([string[]]$CmdArgs, [string]$Dir = $fixture)
-    $out = & powershell -NoProfile -File $taskScript @CmdArgs -TaskDir $Dir 2>&1 | Out-String
+    $out = & powershell -NoProfile -File $taskScript @CmdArgs -TaskDir $Dir 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out }
 }
 

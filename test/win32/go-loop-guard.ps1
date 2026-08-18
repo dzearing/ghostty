@@ -99,7 +99,7 @@ function Assert($name, $cond) {
 function Lock-Run([string[]]$extra) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $lockScript,
         '-Repo', $Repo, '-LockPath', $lock) + $extra
-    $out = (& powershell @argList 2>&1 | Out-String).Trim()
+    $out = (& powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String).Trim()
     return @{ Code = $LASTEXITCODE; Raw = $out; Out = ($out -replace '^\d{4}-\d{2}-\d{2}T[\d:.+-]+\s+', '') }
 }
 
@@ -108,14 +108,14 @@ function Dog-Run([string[]]$extra, [string]$taskDirPath) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
         '-TaskDir', $taskDirPath, '-LogPath', $log, '-Once') + $extra
-    $out = & powershell @argList 2>&1 | Out-String
+    $out = & powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 
 function Exec-Run([string[]]$extra) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $execScript,
         '-Repo', $Repo, '-LockPath', $lock, '-GhozttyExe', $Exe) + $extra
-    $out = & powershell @argList 2>&1 | Out-String
+    $out = & powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 
@@ -163,7 +163,7 @@ function Stop-DebugGhoztty {
 }
 
 function Ghoz($argList) {
-    $out = & $Exe @argList 2>&1 | Out-String
+    $out = & $Exe @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 
@@ -978,7 +978,7 @@ Assert 'P7 a -Once tick leaves the action history alone' ($onceObj.last_action -
 # -Status is the human-readable version of the same question.
 $argsStatus = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
     '-Repo', $Repo, '-StatePath', $pState, '-Status')
-$statusOut = (& powershell @argsStatus 2>&1 | Out-String)
+$statusOut = (& powershell @argsStatus 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
 Assert 'P8 -Status reports liveness' ($statusOut -match 'running:')
 Assert 'P9 -Status reports the last tick' ($statusOut -match 'last tick:\s+\d')
 Assert 'P10 -Status reports both autostart hooks' `
@@ -988,7 +988,8 @@ Assert 'P10 -Status reports both autostart hooks' `
 # re-launches the watchdog, which the single-instance mutex makes a no-op while
 # it is alive. Read-only here - installing/uninstalling would touch the real
 # supervisor this box is running.
-$taskQuery = (& schtasks /query /tn 'GhozttyGoLoopWatchdog' /fo LIST /v 2>&1 | Out-String)
+$taskQuery = (& schtasks /query /tn 'GhozttyGoLoopWatchdog' /fo LIST /v 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-String)
 Assert 'P11 the revive task is registered (run -Install if this fails)' ($LASTEXITCODE -eq 0)
 Assert 'P12 the revive task launches the watchdog' ($taskQuery -match 'go-loop-watchdog\.ps1')
 
@@ -996,7 +997,7 @@ Assert 'P12 the revive task launches the watchdog' ($taskQuery -match 'go-loop-w
 # dashboard's own code (a rule re-implemented here would drift from it).
 $dash = Join-Path $Repo 'scripts\task-dashboard.js'
 if (Get-Command node -ErrorAction SilentlyContinue) {
-    $dashOut = (& node $dash --selftest 2>&1 | Out-String)
+    $dashOut = (& node $dash --selftest 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     Assert 'P13 the dashboard reads the beacon correctly' ($LASTEXITCODE -eq 0 -and $dashOut -match 'ALL PASS')
     if ($dashOut -notmatch 'ALL PASS') { $dashOut.Trim() }
 } else {
@@ -1075,7 +1076,8 @@ $sTaskLines = @('---', 'id: T1', 'title: "fixture T1"', 'deps: []', 'status: "to
 
 function SClaim([string]$paneId) {
     $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $execScript claim `
-        -Repo $sRepo -PaneId $paneId -GhozttyExe $Exe -NoClose 2>&1 | Out-String
+        -Repo $sRepo -PaneId $paneId -GhozttyExe $Exe -NoClose 2>&1 |
+            ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 # GHOZTTY_STRANDED_REPO is scoped to each call: a leaked value would point every
@@ -1083,7 +1085,8 @@ function SClaim([string]$paneId) {
 function STask([string[]]$argList) {
     $env:GHOZTTY_STRANDED_REPO = $sRepo
     try {
-        $out = & powershell -NoProfile -File $taskScript @argList -TaskDir $sTasks 2>&1 | Out-String
+        $out = & powershell -NoProfile -File $taskScript @argList -TaskDir $sTasks 2>&1 |
+            ForEach-Object { $_.ToString() } | Out-String
         return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
     } finally { Remove-Item Env:GHOZTTY_STRANDED_REPO -ErrorAction SilentlyContinue }
 }
@@ -1142,7 +1145,7 @@ $fixtureTask = 'GhozttyGoLoopBootGuardFixture'
 function Boot-Run([string[]]$extra) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bootScript,
         '-Repo', $Repo, '-LedgerPath', $bootLedger) + $extra
-    $out = (& powershell @argList 2>&1 | Out-String)
+    $out = (& powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 function Ledger-Rows { if (Test-Path $bootLedger) { @(Get-Content $bootLedger | Where-Object { $_.Trim() }) } else { @() } }

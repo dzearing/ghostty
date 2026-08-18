@@ -104,7 +104,7 @@ function Stop-RepoInstances {
 # Run the registered command line by hand: exactly what the shell does in arm D,
 # minus the registry lookup. Returns the exit code.
 function Invoke-Activation([string]$url) {
-    $out = (& $exe $url 2>&1 | Out-String)
+    $out = (& $exe $url 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
 }
 

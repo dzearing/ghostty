@@ -128,7 +128,7 @@ function Get-GhozttyBuildMode {
         # Piped capture, never `> file` from PowerShell: that writes 0 bytes for
         # a native ghoztty command (T245). Never `Select-Object -First` either -
         # it tears down the still-running child and reports a false failure.
-        $raw = (& $Exe +version 2>&1 | Out-String)
+        $raw = (& $Exe +version 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
         if ($raw -match '(?m)^\s*-\s*build mode\s*:\s*\.?(\w+)') {
             $mode = $matches[1]
         }

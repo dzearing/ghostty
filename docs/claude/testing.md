@@ -290,7 +290,59 @@ real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
 suite is clean.
 
-**And a harness nobody RAN proves nothing either** (T783). The four audits above
+**And an oracle must read the same text wherever it runs** (T526, T531, T883).
+The audits above ask whether a run happened and whether it scored itself
+honestly. This one asks whether what it MEASURED was real. `2>&1` does not merge
+bytes: it wraps each of a native command's stderr lines in an **ErrorRecord** and
+puts the object on the pipeline, so `... 2>&1 | Out-String` hands the FORMATTER
+the oracle's input — and formatting is a property of the host. The same
+`git --nosuchflag` capture measured 774 characters in this box's tool session
+(buffer width 134) and 778 in a consoleless child (width 120), because the
+`NormalView` block it pads the message with is wrapped to the host's width and a
+phrase an assert matches can land across a wrap. In a host PS 5.1 cannot format
+for at all the record renders **blank**: that is what hid 14 red stderr-text
+asserts in `viewer-panes.ps1` behind one apparently-stale failure, all of them
+silently comparing against `''` (T526). The flip side is worse than a plain red —
+the unfixed spelling works in a real console, so the same script is green by hand
+and blind in the loop.
+
+Stringify each object BEFORE the formatter and the formatter leaves the path
+entirely, since `Out-String` passes plain strings through verbatim (measured: a
+300-character string survives it unwrapped at any width):
+
+```powershell
+$out = (& $exe @VerbArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+```
+
+`cmd /c "exe args > file 2>&1"` is the other host-independent shape — bytes on
+disk, written by cmd, PowerShell never holding an object — and is what
+`cli-unknown-flag.ps1` and `ipc-target-exists-note.ps1` use. A PowerShell
+redirect to a FILE (`*> $log`) is NOT one of them: it formats on the way to disk
+the same way, which is how a launcher refusal that was in fact printed reached
+`upgrade-no-fork.ps1`'s L24 as `''` (T531).
+
+The error stream is not the only one that does this. `6>&1` — how a script
+captures a PowerShell helper's `Write-Host` output — puts **InformationRecords**
+on the pipeline and `Out-String` wraps them at the host width just the same:
+measured, a 300-character `LEAK …` line came back with a newline through it and
+a `-match` on the whole phrase failed, while the stringified capture kept it
+whole. Five sites in the leak-sweep and cache-heal harnesses were in that state,
+and no grep for `2>&1` would ever have found them.
+
+The sweep is `test\win32\lib\StderrCaptureAudit.ps1` — AST-based, so a `2>&1` in
+a comment or a here-string is not a finding and a stringify three elements
+downstream still counts — enforcing `merged-formatted` (a merged stream reaching
+`Out-String`/`Format-*` unstringified) at zero across `test\win32\*.ps1` **and**
+`test\win32\lib\*.ps1`; the lib is swept because one of T883's 56 converted sites
+was in `lib\BuildMode.ps1`. A second kind, `merged-to-file`, is reported under a
+ceiling that may only fall rather than enforced: most such sites discard to a
+file nobody reads back, and only a human can say which are oracles. Exemption:
+the same stated-intent `# capture-audit: <reason>` marker. Acceptance:
+`test\win32\stderr-capture-audit.ps1`, which measures both shapes live before it
+scores anybody, and whose `-TeethCheck` synthesizes a violator so the sweep keeps
+its teeth once the suite is clean.
+
+**And a harness nobody RAN proves nothing either** (T783). The five audits above
 all ask what a run said; this one asks whether the run happened at all. Outside
 the P1–P3 floor an acceptance script is run when somebody remembers it, so a
 harness can go red against code that changed under it and stay red unnoticed:

@@ -204,7 +204,7 @@ function Read-Text([string]$name, [int]$lines = 20) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $exe +read --name=$name --lines=$lines 2>&1 | Out-String
+        $out = & $exe +read --name=$name --lines=$lines 2>&1 | ForEach-Object { $_.ToString() } | Out-String
         if ($LASTEXITCODE -ne 0) { return '' }
         return $out
     } finally { $ErrorActionPreference = $old }

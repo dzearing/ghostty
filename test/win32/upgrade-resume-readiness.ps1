@@ -197,7 +197,7 @@ function Dog([string[]]$extra) {
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dog,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
         '-TaskDir', $taskDir, '-LogPath', $log, '-Once', '-DryRun') + $extra
-    $out = & powershell @a 2>&1 | Out-String
+    $out = & powershell @a 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 

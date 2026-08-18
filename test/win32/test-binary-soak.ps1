@@ -67,7 +67,7 @@ function Invoke-Soak {
     # -Width, or Out-String wraps at the host width (80 in a hidden console)
     # and an assertion about the one-line summary fails on a line break rather
     # than on the thing it is asserting.
-    $text = (& $soak @P *>&1 | Out-String -Width 4096)
+    $text = (& $soak @P *>&1 | ForEach-Object { $_.ToString() } | Out-String -Width 4096)
     return [pscustomobject]@{ Text = $text; Code = $LASTEXITCODE }
 }
 

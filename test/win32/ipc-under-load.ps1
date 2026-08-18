@@ -87,7 +87,7 @@ $ok = 0
 $bad = 0
 $firstErr = ''
 1..40 | ForEach-Object {
-    $out = & $exe +list 2>&1 | Out-String
+    $out = & $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     if ($LASTEXITCODE -eq 0) { $ok++ }
     else { $bad++; if (-not $firstErr) { $firstErr = ($out.Trim() -split "`n")[0] } }
     Start-Sleep -Milliseconds 150

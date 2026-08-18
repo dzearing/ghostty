@@ -218,7 +218,7 @@ try {
     Assert ($withUrlKey.Count -eq $leaves.Count) "every leaf carries a url key ($($withUrlKey.Count)/$($leaves.Count))"
     $nullUrl = @($leaves | Where-Object { $null -eq $_.url })
     Assert ($nullUrl.Count -eq $leaves.Count) "every terminal leaf reports url=null ($($nullUrl.Count)/$($leaves.Count))"
-    $human = (& $exe +list 2>&1 | Out-String)
+    $human = (& $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     Assert ($human -match 'pid:\d+') '+list (human) prints terminal rows'
     Assert ($human -notmatch '(?m)^\s*view:') '+list (human) prints no view: rows while there are no viewers'
 
@@ -280,7 +280,7 @@ try {
         "the about:blank pane's address field is empty (got '$($blankAddr -join "','")')"
 
     # --- 4. the human renderer switches to its view: row ---------------------
-    $human = (& $exe +list 2>&1 | Out-String)
+    $human = (& $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     Assert ($human -match '(?m)^\s*view:') '+list (human) prints a view: row for the viewer pane'
     Assert ($human -match [regex]::Escape($blank)) '+list (human) prints the viewer location'
 
@@ -411,7 +411,7 @@ try {
 
     # And the human `+list` prints it: the row used to be `view:` followed by a
     # location and nothing else where the Mac prints the document's name.
-    $human = (& $exe +list 2>&1 | Out-String)
+    $human = (& $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     # Anchored right after `view:` -- the row is `view: <title>  <url>`, so a
     # loose match would be satisfied by the URL's own basename and pass with the
     # title still empty.
@@ -448,7 +448,7 @@ try {
 
     # And the human renderer prints the file on its view: row, the same way it
     # prints a URL.
-    $human = (& $exe +list 2>&1 | Out-String)
+    $human = (& $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     Assert ($human -match [regex]::Escape((Split-Path $viewFile -Leaf))) '+list (human) prints the viewed file on a view: row'
 
     # The GUI's OWN log is the only oracle out here for whether the page

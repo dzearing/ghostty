@@ -85,7 +85,7 @@ function Stop-DebugGhoztty {
 # terminal output" from a comment into an assertion - see the load-shape block
 # below for why a green run without it proves nothing.
 function Get-FloodCounter {
-    $tail = (& $Exe +read --name=fdb --lines=400 2>&1 | Out-String)
+    $tail = (& $Exe +read --name=fdb --lines=400 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     $m = [regex]::Matches($tail, 'FD-LOAD-(\d+)')
     if ($m.Count -eq 0) { return -1 }
     return [int]$m[$m.Count - 1].Groups[1].Value

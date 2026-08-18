@@ -203,7 +203,8 @@ try {
     }
 
     # The viewer, split off the launch window's terminal.
-    $splitOut = (& $exe +split --direction=right --name=t682view "--view=http://127.0.0.1:$($script:port)/" 2>&1 | Out-String).Trim()
+    $splitOut = (& $exe +split --direction=right --name=t682view "--view=http://127.0.0.1:$($script:port)/" 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String).Trim()
     Write-Host "INFO  +split --view: $splitOut"
     Start-Sleep -Seconds 4
 
@@ -234,7 +235,7 @@ try {
     Assert ($log0 -eq 'keys=none') "setup: the page is up and its key log is empty (got '$log0')"
     if ($log0 -ne 'keys=none') {
         Write-Host '--- +list --json ---'
-        Write-Host ((& $exe +list --json 2>&1 | Out-String).Trim())
+        Write-Host ((& $exe +list --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String).Trim())
         Write-Host 'ABORT: no page key log to read'; exit 1
     }
 

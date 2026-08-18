@@ -280,8 +280,13 @@ if ($Full) {
     "== D: the on-box publish, end to end (-DryRun)"
     # ============================================================================
     $log = Join-Path $env:TEMP "ghoztty-release-artifacts-$PID.log"
+    # Stringified into the log rather than `*> $log` (T883): D2-D6 below are
+    # text oracles, and a PowerShell file redirection formats the child's
+    # merged streams through the host on the way to disk - wrapped to the
+    # buffer width, or blank in a host that cannot format at all.
     powershell -NoProfile -File (Join-Path $Repo 'scripts\publish-windows-release.ps1') `
-        -DryRun -BuildNum 99 *> $log
+        -DryRun -BuildNum 99 2>&1 | ForEach-Object { $_.ToString() } |
+        Set-Content -LiteralPath $log -Encoding utf8
     $code = $LASTEXITCODE
     $text = Get-Content -LiteralPath $log -Raw
     AssertEq "D1 dry-run publish exits 0" 0 $code

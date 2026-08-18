@@ -848,6 +848,26 @@ $GuardTable = @(
             'test\win32\*.ps1'
         )
     },
+    # The host-dependent capture meta-check (T883): a merged stream formatted
+    # through Out-String reads differently in every host - decorated and
+    # wrapped where one can format, blank where none can - so a stderr-text
+    # oracle can pass for the wrong reason or fail for a phantom one. 14 red
+    # asserts in viewer-panes.ps1 hid behind that for months (T526), and the
+    # split brain is the worst part: green when a human runs the script by
+    # hand, blind in the loop. Same wide net as isolation-meta, for the same
+    # reason - the property must be re-proved whenever ANY script changes, and
+    # the scan is AST over source in about a second. lib\ IS covered here: one
+    # of the 56 swept sites was in lib\BuildMode.ps1.
+    [pscustomobject]@{
+        Name   = 'stderr-capture'
+        Script = 'test\win32\stderr-capture-audit.ps1'
+        Stamp  = 'test\win32\stderr-capture-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\*.ps1',
+            'docs\claude\testing.md'
+        )
+    },
     # The docs routing meta-check (T822): the pointers that make the
     # progressive-disclosure split navigable - the root routing table, every
     # `docs/claude/<file>.md` path cited in the tree, and every `<doc>

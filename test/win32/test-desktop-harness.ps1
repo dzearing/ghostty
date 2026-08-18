@@ -159,7 +159,8 @@ try {
     $j = Get-Tree
     if ($j) { $paneName = $j.data.windows[0].tabs[0].splits.terminal.name }
     $paneText = ''
-    if ($paneName) { $paneText = (& $exe +read --name=$paneName --lines=20 2>&1 | Out-String) }
+    if ($paneName) { $paneText = (& $exe +read --name=$paneName --lines=20 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String) }
     Assert ($paneText -match [regex]::Escape($token)) "Send-TestText delivered '$token' to the terminal"
     Assert (-not ($paneText -match 'hhaarrnneessss')) 'Send-TestText did NOT double characters (no WM_CHAR)'
 

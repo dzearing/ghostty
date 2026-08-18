@@ -62,7 +62,7 @@ function Stop-RepoInstances {
 }
 
 function Invoke-Verb([string[]]$VerbArgs) {
-    $out = (& $exe @VerbArgs 2>&1 | Out-String)
+    $out = (& $exe @VerbArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
 }
 

@@ -95,7 +95,7 @@ Assert "output is a +version document" ($psTxt -match 'build mode')
 "== 3: exit codes propagate"
 & $Com +version 2>&1 | Out-Null
 Assert "passing verb exits 0" ($LASTEXITCODE -eq 0)
-$listOut = & $Com +list 2>&1 | Out-String
+$listOut = & $Com +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String
 Assert "failing verb (no instance) exits nonzero" ($LASTEXITCODE -ne 0)
 Assert "failing verb's error text is visible" ($listOut.Trim().Length -gt 0)
 
@@ -128,12 +128,12 @@ foreach ($try in 1..30) {
 Assert "detached sibling ran with the tail passed through" $seen
 # And a CLI verb through the copied twin answers in-process - the sibling
 # (still fake) is never involved for actions.
-$fakeDirOut = & "$tmp\ghoztty.com" +version 2>&1 | Out-String
+$fakeDirOut = & "$tmp\ghoztty.com" +version 2>&1 | ForEach-Object { $_.ToString() } | Out-String
 Assert "CLI verb runs in the twin itself, not the sibling" (($LASTEXITCODE -eq 0) -and ($fakeDirOut -match 'Ghostty'))
 
 "== 6: pipe capture through the twin matches the exe's"
-$viaCom = & $Com +version 2>&1 | Out-String
-$viaExe = & $Exe +version 2>&1 | Out-String
+$viaCom = & $Com +version 2>&1 | ForEach-Object { $_.ToString() } | Out-String
+$viaExe = & $Exe +version 2>&1 | ForEach-Object { $_.ToString() } | Out-String
 Assert "pipe output identical through the twin" ($viaCom -eq $viaExe)
 
 } finally {

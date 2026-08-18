@@ -437,7 +437,7 @@ if ($spikePid -gt 0) {
 $tabs = -1
 $json = ''
 try {
-    $json = (& $exe +list --json 2>&1 | Out-String)
+    $json = (& $exe +list --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     if ($json.Trim()) {
         $tree = $json | ConvertFrom-Json
         $tabs = @($tree.data.windows[0].tabs).Count
@@ -447,7 +447,8 @@ try {
 $paneText = ''
 try {
     $pane = $tree.data.windows[0].tabs[0].splits.terminal.name
-    if ($pane) { $paneText = (& $exe +read --name=$pane --lines=10 2>&1 | Out-String) }
+    if ($pane) { $paneText = (& $exe +read --name=$pane --lines=10 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String) }
 } catch { Write-Host "read error: $_" }
 $sawSendInput = [bool]($paneText -match 'SPIKEA')
 $sawPost = [bool]($paneText -match 'spikeb')

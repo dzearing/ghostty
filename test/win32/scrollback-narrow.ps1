@@ -91,7 +91,7 @@ function Kill-RepoInstances {
 # `ghoztty +verb > file` writes 0 bytes from PowerShell; a pipe is the only
 # capture that works (T245).
 function Read-Pane([string]$name, [int]$lines) {
-    return (& $exe +read --name=$name --lines=$lines 2>&1 | Out-String)
+    return (& $exe +read --name=$name --lines=$lines 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
 }
 
 # The set of `line <N>` numbers present in a read. `,` keeps PowerShell from
@@ -204,7 +204,7 @@ try {
     [void](Set-TestWindowPos -Window ([IntPtr]$top) -X 40 -Y 40 -Width 1400 -Height 820)
     Start-Sleep -Seconds 2
 
-    $json = & $exe +list --json 2>&1 | Out-String
+    $json = & $exe +list --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     $wins = ($json | ConvertFrom-Json).data.windows
     $w = if ($shellPath) { @($wins | Where-Object { $_.target -eq 'flavor' })[0] } else { $wins[0] }
     $paneId = Get-FirstLeafId $w.tabs[0].splits

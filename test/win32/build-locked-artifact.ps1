@@ -113,7 +113,13 @@ function Invoke-ZigBuild {
     if ($Stamp) { $zargs += "-Dagent-version=$Stamp" }
     if ($Unlock) { $env:GHOZTTY_INSTALL_UNLOCK = $Unlock }
     Push-Location $Repo
-    & zig @zargs *> $log
+    # Stringified into the log rather than `*> $log` (T883): a PowerShell file
+    # redirection FORMATS the ErrorRecords `2>&1` makes of zig's stderr, and
+    # what lands on disk is then host-dependent (wrapped to the buffer width,
+    # or blank in a host that cannot format at all). Every assert below reads
+    # this text.
+    & zig @zargs 2>&1 | ForEach-Object { $_.ToString() } |
+        Set-Content -LiteralPath $log -Encoding utf8
     $code = $LASTEXITCODE
     Pop-Location
     Remove-Item env:GHOZTTY_INSTALL_UNLOCK -ErrorAction SilentlyContinue

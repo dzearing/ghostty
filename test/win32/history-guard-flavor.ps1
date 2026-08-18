@@ -82,7 +82,7 @@ function Kill-RepoInstances {
 # `ghoztty +verb > file` writes 0 bytes from PowerShell; a pipe is the only
 # capture that works (T245).
 function Read-Pane([string]$name, [int]$lines) {
-    return (& $exe +read --name=$name --lines=$lines 2>&1 | Out-String)
+    return (& $exe +read --name=$name --lines=$lines 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
 }
 
 # The set of `line <N>` numbers present in a read. `,` keeps PowerShell from
@@ -144,11 +144,11 @@ function Invoke-GrowTrial([string]$Label, [string]$Flavor) {
     # Reported, not asserted here: section B is the assertion that can only pass
     # through a real HELLO.
     try {
-        $sj = & $exe +sessions --json 2>&1 | Out-String
+        $sj = & $exe +sessions --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String
         $result.Sessions = @(($sj | ConvertFrom-Json).data.sessions).Count
     } catch { $result.Sessions = -1 }
 
-    $json = & $exe +list --json 2>&1 | Out-String
+    $json = & $exe +list --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     $w = (($json | ConvertFrom-Json).data.windows)[0]
     $paneId = Get-FirstLeafId $w.tabs[0].splits
     if ($paneId -notmatch '^[0-9A-Fa-f-]{36}$') { return $result }

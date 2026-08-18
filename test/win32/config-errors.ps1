@@ -237,7 +237,7 @@ try {
     function Get-ConfigDiagnostics([string]$body) {
         $p = Join-Path $probeDir 'probe.conf'
         Set-Content -Path $p -Value $body -Encoding ascii
-        $out = & $exe +validate-config --config-file="$p" 2>&1 | Out-String
+        $out = & $exe +validate-config --config-file="$p" 2>&1 | ForEach-Object { $_.ToString() } | Out-String
         return $out.Trim()
     }
 

@@ -195,7 +195,8 @@ exit 9
         $harness = Join-Path $PSScriptRoot 'lib\TestDesktop.ps1'
         Set-Content -Path $childPath -Value $childBody -Encoding UTF8
         try {
-            $out = & powershell -NoProfile -File $childPath -Desk $dDesk -Hwnd ([int64]$d.Hwnd) -Harness $harness 2>&1 | Out-String
+            $out = & powershell -NoProfile -File $childPath -Desk $dDesk -Hwnd ([int64]$d.Hwnd) -Harness $harness 2>&1 |
+                ForEach-Object { $_.ToString() } | Out-String
             $childCode = $LASTEXITCODE
             Assert ($out -match 'CHILD: pinned') "D: the child really did pin the window (child said: $($out.Trim()))"
             Assert ($childCode -eq 9) "D: the child died mid-run without cleaning up (exit $childCode)"

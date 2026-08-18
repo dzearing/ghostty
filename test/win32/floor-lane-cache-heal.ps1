@@ -115,18 +115,23 @@ try {
     $warn = @(Get-CacheCorruptionWarning -LogPath $log)
     Check 'timestamp-overflow warning is surfaced' ($warn.Count -eq 1) "got $($warn.Count)"
 
-    $healOut = Invoke-CacheHeal -Entries $torn 6>&1 | Out-String
+    # Stringified before Out-String (T883): `6>&1` puts InformationRecords on
+    # the pipeline and Out-String FORMATS them to the host's width, so a
+    # `CACHE HEAL` line long enough to wrap fails a -match on a host the author
+    # never ran. ToString() keeps the message whole everywhere.
+    $healOut = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
     Check 'heal deletes the torn entry' (-not (Test-Path $EntryDir)) 'entry dir still exists'
     Check 'heal is loud (CACHE HEAL line names the entry)' ($healOut -match [regex]::Escape($EntryDir)) $healOut
 
     # a second heal of the same (now missing) entry is a SKIP, not an error
-    $healOut2 = Invoke-CacheHeal -Entries $torn 6>&1 | Out-String
+    $healOut2 = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
     Check 'second heal of the same entry is a skip' ($healOut2 -match 'CACHE HEAL SKIP') $healOut2
 
     # -- 8: Invoke-CacheHeal refuses an entry that is not cache-shaped, even if handed one
     $bogus = [pscustomobject]@{ Entry = (Join-Path $FakeRepo 'src'); File = 'x'; Line = 'y' }
     New-Item -ItemType Directory -Path (Join-Path $FakeRepo 'src') -Force | Out-Null
-    $healOut3 = Invoke-CacheHeal -Entries @($bogus) 6>&1 | Out-String
+    $healOut3 = Invoke-CacheHeal -Entries @($bogus) 6>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
     Check 'heal refuses a non-cache directory' `
         ((Test-Path (Join-Path $FakeRepo 'src')) -and $healOut3 -match 'CACHE HEAL REFUSED') $healOut3
 
@@ -142,6 +147,16 @@ try {
 }
 finally {
     if (Test-Path $Sandbox) { Remove-Item $Sandbox -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1 can
+# answer "has this harness been run against the heal library as it now stands?".
+# Added by T883: the `cache-heal` row has existed since T494 but nothing here
+# ever wrote its stamp, so the row could only be satisfied by hand and read as
+# permanently due after any edit. Red leaves the stamp alone (red stays due).
+if ($script:Failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\guard-due.ps1') `
+        update -Guard cache-heal -Repo $RepoRoot 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''

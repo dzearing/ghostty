@@ -37,6 +37,7 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $RepoRoot 'scripts\lib\CrashCatch.ps1')   # Get-CdbPath
 
 $script:Failures = 0
+$script:Skipped = 0
 function Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = '')
     if ($Ok) { Write-Host ("PASS  {0}" -f $Name) }
@@ -101,7 +102,12 @@ try {
 
     # -- 5: reporting is loud, and -NoKill leaves the process alone
     $mine = @($leaks | Where-Object { $_.ProcessId -eq $fx1.Id })
-    $out = Invoke-LaneLeakSweep -Leaked $mine -NoStack -NoKill 6>&1 | Out-String
+    # Stringified before Out-String (T883): `6>&1` puts InformationRecords on
+    # the pipeline and Out-String FORMATS them to the host's width, so a
+    # `LANE LEAK:` line long enough to wrap fails a -match on a host the author
+    # never ran. ToString() keeps the message whole everywhere.
+    $out = Invoke-LaneLeakSweep -Leaked $mine -NoStack -NoKill 6>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
     Check 'the leak prints a LANE LEAK line naming pid and cpu' `
         ($out -match 'LANE LEAK:' -and $out -match "pid=$($fx1.Id)" -and $out -match 'cpu=') $out
     Check '-NoKill leaves the process running' `
@@ -111,6 +117,7 @@ try {
     $cdb = Get-CdbPath
     if (-not $cdb) {
         Write-Host 'SKIP  no cdb.exe installed, so the stack arm cannot run'
+        $script:Skipped++
     }
     else {
         $stack = Get-LeakedProcessStack -ProcessId $fx1.Id -CdbPath $cdb -OutDir $Sandbox -TimeoutSeconds 90
@@ -124,7 +131,8 @@ try {
     }
 
     # -- 7: the sweep reaps it, and says so
-    $out = Invoke-LaneLeakSweep -Leaked $mine -NoStack 6>&1 | Out-String
+    $out = Invoke-LaneLeakSweep -Leaked $mine -NoStack 6>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
     Start-Sleep -Milliseconds 500
     Check 'the sweep reaps the leaked process' `
         ($null -eq (Get-Process -Id $fx1.Id -ErrorAction SilentlyContinue)) 'fixture survived the sweep'
@@ -144,7 +152,8 @@ try {
     # immediately, which is what makes the fixture outlive the lane.
     $cmd = "start /b $Fixture /t 600 $sig"
     $laneOut = & powershell -NoProfile -File (Join-Path $RepoRoot 'scripts\floor-lane.ps1') `
-        -Command $cmd -ExtraTestExeNames $FixtureName -NoCatch -SampleSeconds 2 2>&1 | Out-String
+        -Command $cmd -ExtraTestExeNames $FixtureName -NoCatch -SampleSeconds 2 2>&1 |
+            ForEach-Object { $_.ToString() } | Out-String
     Check 'the lane still passes' ($laneOut -match 'LANE command PASS') $laneOut
     Check 'the LANE line counts the leaked test binary' `
         ($laneOut -match 'leaked test binaries: 1') $laneOut
@@ -176,7 +185,22 @@ finally {
     if (Test-Path $Sandbox) { Remove-Item $Sandbox -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1 can
+# answer "has this harness been run against the sweep library as it now stands?".
+# Added by T883: the `lane-leak-sweep` row has existed since T837 but nothing
+# here ever wrote its stamp, so the row could only be satisfied by hand and read
+# as permanently due after any edit. Red leaves the stamp alone, and so does a
+# run that SKIPPED the stack arm - a box with no cdb never looked at the half it
+# would be vouching for.
+if ($script:Failures -eq 0 -and $script:Skipped -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\guard-due.ps1') `
+        update -Guard lane-leak-sweep -Repo $RepoRoot 2>&1 | ForEach-Object { "  $_" }
+}
+
 Write-Host ''
-if ($script:Failures -eq 0) { Write-Host 'ALL PASS'; exit 0 }
+if ($script:Failures -eq 0) {
+    if ($script:Skipped -gt 0) { Write-Host "ALL PASS ($($script:Skipped) skipped)" } else { Write-Host 'ALL PASS' }
+    exit 0
+}
 Write-Host "$($script:Failures) FAILURE(S)"
 exit 1

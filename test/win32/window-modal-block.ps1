@@ -93,7 +93,7 @@ function Start-Subject {
 # rather than an exit code (the harness exit-code rule): the JSON is the
 # answer, and a CLI that printed it worked.
 function Get-PaneId {
-    $raw = & $com +list --json 2>&1 | Out-String
+    $raw = & $com +list --json 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     $doc = $raw | ConvertFrom-Json
     return $doc.data.windows[0].tabs[0].splits.terminal.name
 }
