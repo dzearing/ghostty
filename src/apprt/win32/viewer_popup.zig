@@ -15,7 +15,8 @@
 //! Safari/Chrome/Edge — a site opened here renders logged out and an OAuth
 //! popup never completes. Three things keep a popup in Ghoztty instead:
 //!
-//!   1. a **Cmd-held** click (**Ctrl** here), the deliberate escape hatch;
+//!   1. a **Cmd-held** click (**Ctrl** here), the deliberate escape hatch — a
+//!      CLICK, so it takes a user gesture as well as the key (see `ctrlEscape`);
 //!   2. a popup with **no URL** — a bare `window.open()`, where the script goes
 //!      on to write into the window it was handed, so there is nothing to give
 //!      a browser;
@@ -54,8 +55,9 @@ pub const Destination = enum {
 
 /// Decide where a popup goes. `uri` is what the runtime reported (null when it
 /// could not be read at all, which is treated as "no URL"); `ctrl_held` is the
-/// Ctrl-held escape hatch.
-pub fn destination(uri: ?[]const u8, ctrl_held: bool) Destination {
+/// Ctrl-held escape hatch, and `user_initiated` is whether a user gesture asked
+/// for the popup at all (see `ctrlEscape`).
+pub fn destination(uri: ?[]const u8, ctrl_held: bool, user_initiated: bool) Destination {
     // A `ghoztty://` link is a command, not a destination, and it outranks the
     // Ctrl modifier: there is nothing to put in a window. Without this it fell
     // through the "non-web scheme ⇒ keep it here" rule below and a
@@ -63,12 +65,27 @@ pub fn destination(uri: ?[]const u8, ctrl_held: bool) Destination {
     // command — window creation from the one scheme that must never create
     // anything (T695).
     if (uri) |u| if (url_scheme.handles(u)) return .ghoztty_command;
-    if (ctrl_held) return .ghoztty_window;
+    if (ctrlEscape(ctrl_held, user_initiated)) return .ghoztty_window;
     const u = uri orelse return .ghoztty_window;
     if (u.len == 0) return .ghoztty_window;
     if (isBlank(u)) return .ghoztty_window;
     if (!isWebScheme(u)) return .ghoztty_window;
     return .default_browser;
+}
+
+/// Whether the Ctrl escape hatch applies to this popup.
+///
+/// The hatch is Mac's **Cmd-held click**, and the word doing the work is
+/// *click*: `WKUIDelegate` reads the modifier off the `navigationAction` that
+/// asked for the window, so a script calling `window.open()` in the background
+/// sees no modifiers at all, whatever the user's hands are doing. Win32 has no
+/// modifier on the event, so `ViewerPane` reads Ctrl off `GetAsyncKeyState` —
+/// which answers for the WHOLE DESKTOP, including a Ctrl held for something
+/// else entirely in another app. Pairing it with `IsUserInitiated` puts the
+/// modifier back on the gesture, which is both the Mac behavior and the only
+/// version that is not decided by unrelated typing (T860).
+pub fn ctrlEscape(ctrl_held: bool, user_initiated: bool) bool {
+    return ctrl_held and user_initiated;
 }
 
 /// The bare-`window.open()` location, in WebView2's spelling. Compared
@@ -143,32 +160,60 @@ fn scaleDim(css: u32, scale: f32) i32 {
 const testing = std.testing;
 
 test "an http(s) popup leaves for the default browser" {
-    try testing.expectEqual(Destination.default_browser, destination("http://example.com/", false));
-    try testing.expectEqual(Destination.default_browser, destination("https://example.com/x?y=1", false));
+    try testing.expectEqual(Destination.default_browser, destination("http://example.com/", false, false));
+    try testing.expectEqual(Destination.default_browser, destination("https://example.com/x?y=1", false, false));
     // Scheme comparison is case-insensitive, the way every URL parser's is.
-    try testing.expectEqual(Destination.default_browser, destination("HTTPS://example.com/", false));
+    try testing.expectEqual(Destination.default_browser, destination("HTTPS://example.com/", false, false));
 }
 
-test "Ctrl keeps any popup in ghoztty" {
-    try testing.expectEqual(Destination.ghoztty_window, destination("https://example.com/", true));
-    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank", true));
-    try testing.expectEqual(Destination.ghoztty_window, destination(null, true));
+test "Ctrl on a user's own click keeps any popup in ghoztty" {
+    try testing.expectEqual(Destination.ghoztty_window, destination("https://example.com/", true, true));
+    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank", true, true));
+    try testing.expectEqual(Destination.ghoztty_window, destination(null, true, true));
+}
+
+test "a Ctrl the user is holding for something else does not reroute a scripted popup" {
+    // The T860 flake, as a rule: win32 reads Ctrl off `GetAsyncKeyState`, which
+    // is the whole desktop's keyboard, so a page's own `window.open()` — no
+    // click, no keypress, the user is in another app entirely — was being sent
+    // to a Ghoztty window whenever a Ctrl happened to be down at that instant.
+    // Mac cannot do that: its modifier comes off the navigation action.
+    try testing.expectEqual(
+        Destination.default_browser,
+        destination("https://example.com/", true, false),
+    );
+    // The rest of the routing is unchanged by the gesture — a popup the browser
+    // cannot be handed still stays here, gesture or no gesture.
+    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank", true, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination(null, true, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("mailto:a@b.c", true, false));
+    // And a gesture without Ctrl is not the escape hatch either: an ordinary
+    // ctrl-less click on `target="_blank"` still leaves for the browser.
+    try testing.expectEqual(
+        Destination.default_browser,
+        destination("https://example.com/", false, true),
+    );
+    // The predicate itself, since both halves are load-bearing.
+    try testing.expect(ctrlEscape(true, true));
+    try testing.expect(!ctrlEscape(true, false));
+    try testing.expect(!ctrlEscape(false, true));
+    try testing.expect(!ctrlEscape(false, false));
 }
 
 test "a popup the browser cannot be handed stays in ghoztty" {
     // A bare `window.open()`: Mac sees a nil URL, WebView2 says `about:blank`.
-    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank", false));
-    try testing.expectEqual(Destination.ghoztty_window, destination("ABOUT:BLANK", false));
-    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank#frag", false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank", false, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("ABOUT:BLANK", false, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("about:blank#frag", false, false));
     // Nothing readable at all.
-    try testing.expectEqual(Destination.ghoztty_window, destination(null, false));
-    try testing.expectEqual(Destination.ghoztty_window, destination("", false));
+    try testing.expectEqual(Destination.ghoztty_window, destination(null, false, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("", false, false));
     // Non-web schemes: ShellExecuteW would hand these to whatever is registered.
-    try testing.expectEqual(Destination.ghoztty_window, destination("mailto:a@b.c", false));
-    try testing.expectEqual(Destination.ghoztty_window, destination("file:///C:/x.txt", false));
-    try testing.expectEqual(Destination.ghoztty_window, destination("ghoztty-viewer://page/", false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("mailto:a@b.c", false, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("file:///C:/x.txt", false, false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("ghoztty-viewer://page/", false, false));
     // No scheme at all is not a web URL either.
-    try testing.expectEqual(Destination.ghoztty_window, destination("example.com", false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("example.com", false, false));
 }
 
 test "a ghoztty:// popup is a command, not a window — under every modifier" {
@@ -178,33 +223,33 @@ test "a ghoztty:// popup is a command, not a window — under every modifier" {
     // nothing.
     try testing.expectEqual(
         Destination.ghoztty_command,
-        destination("ghoztty://focus/dev", false),
+        destination("ghoztty://focus/dev", false, false),
     );
     try testing.expectEqual(
         Destination.ghoztty_command,
-        destination("ghoztty-debug://focus/dev", false),
+        destination("ghoztty-debug://focus/dev", false, false),
     );
     // Ctrl is the escape hatch for CONTENT; a command has none to escape to.
     try testing.expectEqual(
         Destination.ghoztty_command,
-        destination("ghoztty://focus/dev", true),
+        destination("ghoztty://focus/dev", true, true),
     );
     // A malformed one is still ours — it must not leak to the browser.
     try testing.expectEqual(
         Destination.ghoztty_command,
-        destination("ghoztty://open/dev", false),
+        destination("ghoztty://open/dev", false, false),
     );
     // ...and a lookalike scheme is not.
     try testing.expectEqual(
         Destination.ghoztty_window,
-        destination("ghoztty-viewer://page/", false),
+        destination("ghoztty-viewer://page/", false, false),
     );
 }
 
 test "about:blank's prefix is not enough on its own" {
     // `about:blankety` is a different location, and a naive `startsWith` would
     // call it the blank page.
-    try testing.expectEqual(Destination.ghoztty_window, destination("about:blankety", false));
+    try testing.expectEqual(Destination.ghoztty_window, destination("about:blankety", false, false));
     // …though only because it is not http(s) either. The point of the case is
     // that `isBlank` does not claim it.
     try testing.expect(!isBlank("about:blankety"));

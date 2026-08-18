@@ -163,7 +163,10 @@ ghoztty +close --target=doc
   **Cmd-click** (**Ctrl** on Windows) keeps the popup in Ghoztty as its own
   viewer window (honoring the size the opener asked for), and so does a popup
   the browser can't be handed — a bare `window.open()` with no URL, or a
-  non-web scheme. The tradeoff: a popup that lands in the browser can't
+  non-web scheme. The modifier belongs to the **click**: a popup a script opens
+  on its own routes normally whatever keys are down, since win32 reads Ctrl off
+  the whole desktop's keyboard and would otherwise let a Ctrl held in another
+  app decide where a background popup lands (T860, `viewer_popup.ctrlEscape`). The tradeoff: a popup that lands in the browser can't
   `window.close()` itself back to the Ghoztty page that opened it, so an OAuth
   flow finishes in the browser. That flow wasn't authenticating in Ghoztty
   anyway.

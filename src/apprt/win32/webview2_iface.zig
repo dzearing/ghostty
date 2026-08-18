@@ -364,7 +364,7 @@ pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
         get_NewWindow: *const anyopaque,
         put_Handled: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, BOOL) callconv(.winapi) HRESULT,
         get_Handled: *const anyopaque,
-        get_IsUserInitiated: *const anyopaque,
+        get_IsUserInitiated: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *BOOL) callconv(.winapi) HRESULT,
         GetDeferral: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?*ICoreWebView2Deferral) callconv(.winapi) HRESULT,
         get_WindowFeatures: *const fn (*ICoreWebView2NewWindowRequestedEventArgs, *?*ICoreWebView2WindowFeatures) callconv(.winapi) HRESULT,
     };
@@ -401,6 +401,24 @@ pub const ICoreWebView2NewWindowRequestedEventArgs = extern struct {
         web: *ICoreWebView2,
     ) bool {
         return !com.failed(self.vtable.put_NewWindow(self, web));
+    }
+
+    /// Whether a USER ACTION caused this popup — a click, a keypress on a link
+    /// — as opposed to a script calling `window.open()` on its own.
+    ///
+    /// This is win32's half of Mac's `navigationAction.modifierFlags`: the
+    /// modifier that keeps a popup in Ghoztty belongs to the gesture that asked
+    /// for the popup, and a scripted `window.open()` has no gesture to read one
+    /// off. Without it the Ctrl escape hatch is decided by
+    /// `GetAsyncKeyState` alone, which answers for the whole desktop.
+    ///
+    /// False when the runtime cannot answer: an unreadable gesture is not a
+    /// gesture, and the alternative (assuming one) is what routes a background
+    /// popup by whatever key happens to be down.
+    pub fn isUserInitiated(self: *ICoreWebView2NewWindowRequestedEventArgs) bool {
+        var out: BOOL = 0;
+        if (com.failed(self.vtable.get_IsUserInitiated(self, &out))) return false;
+        return out != 0;
     }
 
     /// Park the request until `Complete` is called on the returned deferral.

@@ -2018,6 +2018,26 @@ pub const PopupOpen = struct {
 /// pure module: the popup size travels from here to there and nowhere else.
 pub const PopupSize = viewer_popup.Size;
 
+/// What the runtime said about each popup's gesture, for the live test to read
+/// back: the FIRST popup of a run and the most recent one. The claim the T860
+/// gate rests on is a runtime behavior — that a page opening a window on its own
+/// is not a user gesture — so it is asserted against the live runtime rather
+/// than assumed. (The pair is deliberate: `ExecuteScript` DOES carry a transient
+/// gesture, so a test that drives a popup through it measures the opposite of
+/// what a page's own script does. That is what the second slot records.)
+var first_popup_user_initiated: ?bool = null;
+var last_popup_user_initiated: ?bool = null;
+
+/// Test seam for the Ctrl escape hatch's keyboard read.
+///
+/// Null in production, where the answer comes from `GetAsyncKeyState` — the
+/// whole desktop's keyboard. That is exactly why the seam exists: a live popup
+/// test asserting where a popup GOES cannot have its answer decided by whatever
+/// the person at the machine is typing, which is the ~13% flake T860 was filed
+/// for. What Ctrl does to the routing is a decision, and decisions are checked
+/// in `viewer_popup`'s own tests, where both states are reachable on purpose.
+var ctrl_probe: ?*const fn () bool = null;
+
 fn onNewWindowRequested(
     p: *Pending,
     sender: ?*iface.ICoreWebView2,
@@ -2086,9 +2106,24 @@ fn onNewWindowRequested(
     // the keyboard directly. `GetAsyncKeyState`, not `GetKeyState`: the latter
     // answers for the message this thread is currently dispatching, which is a
     // browser-process message here and not the click at all.
-    const ctrl_held = (w32.GetAsyncKeyState(w32.VK_CONTROL) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+    const ctrl_held = if (ctrl_probe) |probe| probe() else
+        (w32.GetAsyncKeyState(w32.VK_CONTROL) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
 
-    switch (viewer_popup.destination(uri, ctrl_held)) {
+    // …and that read is the whole desktop's keyboard, not this page's event, so
+    // it only counts when a user gesture asked for the popup at all. Mac gets
+    // that pairing for free (the modifier IS part of the navigation action);
+    // here it is the difference between an escape hatch and a coin flip decided
+    // by whatever the user is typing in another app (T860).
+    const user_initiated = a.isUserInitiated();
+    if (ctrl_held and !user_initiated) {
+        log.warn("popup: Ctrl is down but no user gesture asked for this popup; routing normally", .{});
+    }
+    if (builtin.is_test) {
+        if (first_popup_user_initiated == null) first_popup_user_initiated = user_initiated;
+        last_popup_user_initiated = user_initiated;
+    }
+
+    switch (viewer_popup.destination(uri, ctrl_held, user_initiated)) {
         .default_browser => {
             // Non-null by construction: `destination` only ever routes a
             // readable http(s) URI here.
@@ -7468,11 +7503,18 @@ const ClipboardTestLock = struct {
     }
 };
 
-/// Pump the message loop until `ready` says so or `timeout_s` elapses.
+/// Pump the message loop until `ready` says so, or FAIL.
 ///
 /// A viewer test's every oracle is something a browser process does on the
 /// message loop, so "wait" here can never be a sleep: the callbacks that
 /// deliver the answer only run while messages are being dispatched.
+///
+/// The failure is the point. This used to fall out of its loop and return `void`
+/// on timeout, so a wait that never came true was reported by whatever assertion
+/// happened to follow it — T860's live popup flake surfaced as `expected 1,
+/// found 0` on a length, thirty seconds and one silent timeout away from the
+/// thing that actually went wrong, and three tasks in a row could not read it.
+/// A wait that ran out is a failure with a name.
 fn waitFor(
     msg: *w32.MSG,
     timeout_s: u64,
@@ -7488,6 +7530,19 @@ fn waitFor(
         if (ready(pane)) return;
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
+    // One last look after the deadline: a predicate that came true inside the
+    // final sleep is not a timeout, and calling it one would trade the old
+    // silent failure for a new flaky one.
+    while (w32.PeekMessageW(msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+        _ = w32.TranslateMessage(msg);
+        _ = w32.DispatchMessageW(msg);
+    }
+    if (ready(pane)) return;
+    log.err("waitFor: nothing satisfied the wait within {d}s (pane state {s})", .{
+        timeout_s,
+        @tagName(pane.state),
+    });
+    return error.WaitForTimeout;
 }
 
 /// Dispatch messages for a fixed span with nothing to wait FOR — the negative
@@ -8126,25 +8181,51 @@ const PopupSink = struct {
     location_buf: [256]u8 = undefined,
     location_len: usize = 0,
 
-    /// The adopted pane. Deliberately WITHOUT a `pane_view`: a leaf implies a
-    /// live `parent_window` (that is what `notifyTitle` dereferences), and this
-    /// pane has none. Both seams the popup path uses are keyed on the pane for
-    /// exactly this reason.
-    pane: ?*ViewerPane = null,
+    /// Every adopted pane, in the order they were adopted. Deliberately WITHOUT
+    /// a `pane_view` on any of them: a leaf implies a live `parent_window` (that
+    /// is what `notifyTitle` dereferences), and these panes have none. Both
+    /// seams the popup path uses are keyed on the pane for exactly this reason.
+    ///
+    /// A LIST, not a single slot, because the single slot leaked: an unexpected
+    /// second adoption overwrote the first pane's pointer and the test's own
+    /// harness became the leak the lane reported (T860). A run that adopts twice
+    /// must fail on the routing, not on the allocator.
+    panes: [max_panes]?*ViewerPane = @splat(null),
 
     /// Whether the pane's close seam ran — the observable end of
     /// `window.close()`.
     closed: bool = false,
 
+    /// More than this many adoptions is a runaway, not a test: the extras are
+    /// freed on the spot so the sink cannot grow without bound.
+    const max_panes = 4;
+
     fn location(self: *const PopupSink) []const u8 {
         return self.location_buf[0..self.location_len];
     }
 
+    /// The FIRST adopted pane — the one every assertion in the test is about.
+    fn pane(self: *const PopupSink) ?*ViewerPane {
+        return self.panes[0];
+    }
+
+    /// Take ownership of a newly adopted pane. Returns false when there is no
+    /// room, in which case the caller frees it.
+    fn adopt(self: *PopupSink, p: *ViewerPane) bool {
+        for (&self.panes) |*slot| {
+            if (slot.* != null) continue;
+            slot.* = p;
+            return true;
+        }
+        return false;
+    }
+
     fn deinit(self: *PopupSink) void {
-        if (self.pane) |p| {
+        for (&self.panes) |*slot| {
+            const p = slot.* orelse continue;
             p.deinit(self.alloc);
             self.alloc.destroy(p);
-            self.pane = null;
+            slot.* = null;
         }
     }
 };
@@ -8157,6 +8238,10 @@ fn testPopupOpen(v: *ViewerPane, open: PopupOpen) void {
     sink.size = open.size;
     sink.location_len = @min(open.location.len, sink.location_buf.len);
     @memcpy(sink.location_buf[0..sink.location_len], open.location[0..sink.location_len]);
+    // Named, every time. An adoption the test did not expect is the failure
+    // itself, and its LOCATION is what says which popup was misrouted — without
+    // it a second adoption reads as a leak thirty seconds later (T860).
+    log.warn("T163: popup adoption #{d} at '{s}'", .{ sink.seen, open.location });
 
     // Everything below mirrors `Window.createViewerPane`, in the same order and
     // for the same reasons — most of all the retain before anything fallible.
@@ -8170,7 +8255,12 @@ fn testPopupOpen(v: *ViewerPane, open: PopupOpen) void {
     viewer.close_from_page = &testPopupClose;
     open.req.retain();
     viewer.popup = open.req;
-    sink.pane = viewer;
+    if (!sink.adopt(viewer)) {
+        log.err("T163: more popups than the sink can hold; freeing this one", .{});
+        viewer.deinit(sink.alloc);
+        sink.alloc.destroy(viewer);
+        return;
+    }
 
     viewer.createHostWindow(
         sink.hinstance,
@@ -8276,6 +8366,25 @@ test "T163: a popup is adopted as a pane, sized, and can close itself" {
     defer sink.deinit();
     popup_sink = &sink;
     defer popup_sink = null;
+    first_popup_user_initiated = null;
+    last_popup_user_initiated = null;
+    defer first_popup_user_initiated = null;
+    defer last_popup_user_initiated = null;
+
+    // No Ctrl, stated rather than sampled. Production reads this key off
+    // `GetAsyncKeyState`, which is the whole desktop's keyboard: before T860 a
+    // Ctrl the user was holding in ANOTHER APP at the instant the http leg
+    // below ran flipped that popup from "goes to the browser" to "becomes a
+    // pane", and this test failed ~13% of the time under load — as a leak,
+    // thirty seconds downstream of the routing it was really about. What Ctrl
+    // does to the routing is decided in `viewer_popup`, and tested there with
+    // both states reachable on purpose.
+    ctrl_probe = &struct {
+        fn f() bool {
+            return false;
+        }
+    }.f;
+    defer ctrl_probe = null;
 
     // The browser leg must never reach `ShellExecuteW` from a test lane: it
     // would open the user's real browser over a green run.
@@ -8352,7 +8461,7 @@ test "T163: a popup is adopted as a pane, sized, and can close itself" {
     try testing.expectEqual(want, sink.size.?);
     log.warn("T163: popup asked for {d}x{d} physical", .{ want.w, want.h });
 
-    const popup = sink.pane orelse return error.NoPopupPane;
+    const popup = sink.pane() orelse return error.NoPopupPane;
     try waitFor(&msg, 30, popupSettled, popup);
     try testing.expectEqual(State.ready, popup.state);
 
@@ -8388,7 +8497,17 @@ test "T163: a popup is adopted as a pane, sized, and can close itself" {
     var script_buf: [192]u8 = undefined;
     const script = try std.fmt.bufPrint(&script_buf, "window.open('{s}')", .{web_url});
     opener.executeScript(alloc, script);
-    try waitFor(&msg, 30, aLinkWasRouted, &opener);
+    waitFor(&msg, 30, aLinkWasRouted, &opener) catch |err| {
+        // The two ways this leg goes wrong are worth telling apart in the log:
+        // the popup was ADOPTED instead of routed (a routing bug — `seen` grew,
+        // and the adoption line above names where it went), or nothing happened
+        // at all (the script or the event never arrived).
+        log.err(
+            "T163: the http popup never reached the browser; adoptions={d}, last location='{s}'",
+            .{ sink.seen, sink.location() },
+        );
+        return err;
+    };
     try testing.expectEqual(@as(usize, 1), links.entries.items.len);
     var expect_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(&expect_buf, "browser:{s}", .{web_url});
@@ -8396,4 +8515,72 @@ test "T163: a popup is adopted as a pane, sized, and can close itself" {
     // And it did NOT also become a pane.
     try testing.expectEqual(@as(u32, 1), sink.seen);
     log.warn("T163: an http popup still reached the default browser", .{});
+
+    // ------------------------------------------------------------------
+    // The gesture half of the Ctrl escape hatch (T860), measured live.
+    //
+    // The hatch is Mac's Cmd-held CLICK, and win32 has no modifier on the
+    // event, so it pairs a desktop-wide key read with the runtime's
+    // `IsUserInitiated`. That flag has to be REAL for the pairing to mean
+    // anything, and here it is: the first popup is the opener page's own
+    // load-time `window.open()` — nobody clicked anything — and the runtime
+    // says so.
+    //
+    // The second value is recorded and NOT asserted on purpose: it came from
+    // `ExecuteScript`, which carries a transient user gesture of its own, so it
+    // reads `true` and would say nothing about a page acting alone. Finding
+    // that out is why this pair exists rather than one slot.
+    // ------------------------------------------------------------------
+    try testing.expectEqual(@as(?bool, false), first_popup_user_initiated);
+    log.warn(
+        "T163: gesture flags: page's own window.open()={?}, ExecuteScript's={?}",
+        .{ first_popup_user_initiated, last_popup_user_initiated },
+    );
+
+    // ------------------------------------------------------------------
+    // THE ESCAPE HATCH, live, and the positive control for the leg above.
+    //
+    // Everything so far says an http popup leaves for the browser. On its own
+    // that is also what a broken Ctrl hatch looks like, so the same popup is
+    // now opened with Ctrl DOWN and must land here instead. Two claims in one:
+    // the hatch reaches the COM handshake at all (it had no live coverage
+    // before — only `viewer_popup`'s pure decision), and the routing above was
+    // the no-Ctrl answer rather than the only answer.
+    //
+    // This is also the T860 mechanism, executable: with the pre-fix code, THIS
+    // is what a stray desktop Ctrl did to the leg above — an adoption where a
+    // browser hand-off belonged, and (before the sink held a list) a leaked
+    // pane reported against whatever test ran next.
+    // ------------------------------------------------------------------
+    // The leg below drives its popup through `ExecuteScript`, and the hatch now
+    // needs a gesture as well as the key — so it rests on `ExecuteScript`
+    // carrying one. Stated, so that if a future runtime stops granting it this
+    // leg fails by NAME instead of as a baffling "Ctrl did nothing".
+    try testing.expectEqual(@as(?bool, true), last_popup_user_initiated);
+
+    ctrl_probe = &struct {
+        fn f() bool {
+            return true;
+        }
+    }.f;
+    const links_before = links.entries.items.len;
+    opener.executeScript(alloc, script);
+    waitFor(&msg, 30, struct {
+        fn ready(p: *ViewerPane) bool {
+            _ = p;
+            const s = popup_sink orelse return false;
+            return s.seen >= 2;
+        }
+    }.ready, &opener) catch |err| {
+        log.err(
+            "T163: Ctrl did not keep the http popup here; adoptions={d}, routed={d}",
+            .{ sink.seen, links.entries.items.len },
+        );
+        return err;
+    };
+    try testing.expectEqual(@as(u32, 2), sink.seen);
+    try testing.expectEqualStrings(web_url, sink.location());
+    // …and it did NOT also go to the browser.
+    try testing.expectEqual(links_before, links.entries.items.len);
+    log.warn("T163: with Ctrl held, the same http popup stayed in ghoztty", .{});
 }
