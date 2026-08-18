@@ -221,7 +221,11 @@ fn worker(job: *Job) void {
         log.warn("restore all: {d} blob(s) skipped as unreadable", .{decoded.skipped});
     }
 
-    job.probe = App.AttachProbe.take(alloc, pull.conn());
+    // `.attachable` on the CROSS-MACHINE arm (T851 keeps the local one). A
+    // remote roster's attached flag can be our own dropped connection the far
+    // agent has not reaped, and the relay path already adjudicates a genuine
+    // second holder with `attached_elsewhere` + the steal retry.
+    job.probe = App.AttachProbe.take(alloc, pull.conn(), .attachable);
     const attach_ptr = job.probe.attachSet();
 
     var list: std.ArrayList(Prepared) = .empty;

@@ -1981,6 +1981,17 @@ pub fn captureOneWindow(
 /// never drop) rather than hanging startup.
 pub const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 
+/// How long launch restore will wait for the agent's ATTACHED flags to settle
+/// before treating them as the truth (T851), and how long it sleeps between
+/// re-probes. Only paid when a window this launch would restore reads as held
+/// by a live viewer — i.e. after a crash whose cleanup has not landed yet, or
+/// when a second instance of this lineage really is running. The budget is the
+/// crash side's guarantee: it must comfortably outlast the agent noticing a
+/// dead client's broken pipe (milliseconds in practice), because the cost of
+/// being too impatient there is a launch that recovers nothing.
+pub const restore_attach_settle_budget_ns: u64 = 2000 * std.time.ns_per_ms;
+pub const restore_attach_settle_interval_ns: u64 = 200 * std.time.ns_per_ms;
+
 /// The liveness probe every rebuild takes before replaying a topology: the
 /// agent's roster, plus the set of session ids we will ATTACH (alive, or a
 /// relaunchable tombstone).
@@ -1995,8 +2006,33 @@ pub const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 pub const AttachProbe = struct {
     roster: ?remote_connection.OwnedSessions = null,
     set: ?std.StringHashMap(void) = null,
+    /// The sessions a LIVE viewer is currently bound to, and which `set`
+    /// therefore does NOT list (empty under `.attachable`). Borrows its keys
+    /// from `roster` exactly as `set` does.
+    held: ?std.StringHashMap(void) = null,
 
-    pub fn take(gpa: Allocator, conn: *remote_connection.Connection) AttachProbe {
+    /// What "attachable" means for THIS probe.
+    ///
+    /// `.attachable` is the historical rule: alive or a relaunchable tombstone.
+    /// It is what the REMOTE paths keep, because across a network our own
+    /// attach can outlive the connection that made it (a half-open TCP the peer
+    /// has not reaped), so "the roster says attached" there is not evidence
+    /// that somebody else is holding the session — `attached_elsewhere` and the
+    /// steal retry adjudicate that case instead.
+    ///
+    /// `.skip_live_holders` additionally excludes every session the agent
+    /// reports as ATTACHED (T851). The agent rebinds a session to the newest
+    /// attach, so attaching to a session another running app already holds does
+    /// not share it — it steals it, and the first app's pane becomes a frozen
+    /// picture (T652's attached-is-not-alive, from the other side). Locally the
+    /// evidence is good: an app that dies drops its named pipe, the agent's
+    /// `detachAll` clears `bound` on the broken connection, and the flag is
+    /// accurate again within milliseconds. The caller still owns the RACE
+    /// (a relaunch that beats that cleanup) — see the settle loop in
+    /// `restoreSessionLayout`.
+    pub const Policy = enum { attachable, skip_live_holders };
+
+    pub fn take(gpa: Allocator, conn: *remote_connection.Connection, policy: Policy) AttachProbe {
         // A TEST SEAM (T657), and it earns its place the way T469's two did.
         // The probe is what normally spares a stale leaf an ATTACH it cannot
         // win: a session the roster does not list gets `session_id = null` and
@@ -2020,7 +2056,7 @@ pub const AttachProbe = struct {
             log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
             return .{};
         };
-        return .fromRoster(gpa, roster);
+        return .fromRoster(gpa, roster, policy);
     }
 
     /// Build the probe from a roster that was ALREADY fetched, taking ownership
@@ -2029,14 +2065,29 @@ pub const AttachProbe = struct {
     /// blocks on a machine that may be gone — so by the time the decision is
     /// made the blocking half has happened. A null roster is a FAILED probe and
     /// keeps the tri-state's "unknown ⇒ attempt every leaf" meaning.
-    pub fn fromRoster(gpa: Allocator, roster: ?remote_connection.OwnedSessions) AttachProbe {
+    pub fn fromRoster(
+        gpa: Allocator,
+        roster: ?remote_connection.OwnedSessions,
+        policy: Policy,
+    ) AttachProbe {
         var self: AttachProbe = .{ .roster = roster };
         const r = roster orelse return self;
         var m = std.StringHashMap(void).init(gpa);
+        var h = std.StringHashMap(void).init(gpa);
         for (r.sessions) |sess| {
-            if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
+            if (!(sess.alive or sess.relaunchable)) continue;
+            // A live viewer holds it: attaching would take it away from them
+            // (T851). Recorded rather than merely dropped, so the caller can
+            // tell "somebody else has this window" from "these sessions are
+            // gone" — two drops that mean opposite things.
+            if (policy == .skip_live_holders and sess.alive and sess.attached) {
+                h.put(sess.id, {}) catch {};
+                continue;
+            }
+            m.put(sess.id, {}) catch {};
         }
         self.set = m;
+        self.held = h;
         return self;
     }
 
@@ -2055,6 +2106,13 @@ pub const AttachProbe = struct {
         return if (self.set) |*m| m else null;
     }
 
+    /// The sessions withheld because a live viewer holds them, or null when the
+    /// probe never landed. Null and empty mean the same thing to every reader
+    /// here (nothing is held), unlike `attachSet`.
+    pub fn heldSet(self: *const AttachProbe) ?*const std.StringHashMap(void) {
+        return if (self.held) |*m| m else null;
+    }
+
     /// Whether the agent that answered still owns `id`. Tri-state, and the
     /// caller must keep it that way: null means the probe never landed, which
     /// is NOT "the session is gone" (T366 reads it as "attempt anyway").
@@ -2065,6 +2123,7 @@ pub const AttachProbe = struct {
 
     pub fn deinit(self: *AttachProbe) void {
         if (self.set) |*m| m.deinit();
+        if (self.held) |*m| m.deinit();
         if (self.roster) |*s| s.deinit();
     }
 };
@@ -2119,7 +2178,11 @@ fn countUnattachedLive(
 ) usize {
     var n: usize = 0;
     for (sessions) |s| {
-        if (s.alive and !attached.contains(s.id)) n += 1;
+        // A session another running app holds is not an orphan and never was
+        // the gap this counter reports (T851): somebody is looking at it. Only
+        // a session NOBODY is bound to — including us, once this restore's
+        // attaches are counted — is the invisible pinned shell worth a warning.
+        if (s.alive and !s.attached and !attached.contains(s.id)) n += 1;
     }
     return n;
 }
@@ -2146,6 +2209,130 @@ test "leafAttachSessionId applies the one attach rule (T411 counts what restore 
         leafAttachSessionId(.{ .kind = "viewer", .session_id = "alive-1" }, &set) == null,
     );
     try std.testing.expect(leafAttachSessionId(.{}, &set) == null);
+}
+
+test "AttachProbe.skip_live_holders withholds sessions a live viewer holds (T851)" {
+    const alloc = std.testing.allocator;
+
+    // A roster with one of each: a session another running app is attached to,
+    // an orphaned live one, a relaunchable tombstone, and a genuinely-exited
+    // session. The middle two are what a second launch may take; the first is
+    // somebody's screen and the last is gone.
+    //
+    // The probe OWNS the roster it is handed and `deinit` frees every string in
+    // it, so each row is built with duped ones — a literal here would be a free
+    // of static memory the moment the probe is torn down.
+    const Row = struct {
+        id: []const u8,
+        alive: bool,
+        attached: bool,
+        relaunchable: bool = false,
+        exit_code: ?i64 = null,
+    };
+    const spec = [_]Row{
+        .{ .id = "held-1", .alive = true, .attached = true },
+        .{ .id = "orphan-1", .alive = true, .attached = false },
+        .{ .id = "tomb-1", .alive = false, .attached = false, .relaunchable = true },
+        .{ .id = "gone-1", .alive = false, .attached = false, .exit_code = 0 },
+    };
+    const build = struct {
+        fn roster(a: Allocator, rows: []const Row) !remote_connection.OwnedSessions {
+            const out = try a.alloc(remote_connection.OwnedSession, rows.len);
+            for (rows, 0..) |r, i| out[i] = .{
+                .id = try a.dupe(u8, r.id),
+                .alive = r.alive,
+                .exit_code = r.exit_code,
+                .attached = r.attached,
+                .activity = try a.dupe(u8, "idle"),
+                .pid = 0,
+                .title = null,
+                .cwd = null,
+                .argv = null,
+                .created_at = 0,
+                .last_activity = 0,
+                .pinned = false,
+                .relaunchable = r.relaunchable,
+            };
+            return .{ .sessions = out, .alloc = a };
+        }
+    }.roster;
+
+    var probe = AttachProbe.fromRoster(alloc, try build(alloc, &spec), .skip_live_holders);
+    defer probe.deinit();
+    const set = probe.attachSet().?;
+    try std.testing.expect(!set.contains("held-1"));
+    try std.testing.expect(set.contains("orphan-1"));
+    try std.testing.expect(set.contains("tomb-1"));
+    try std.testing.expect(!set.contains("gone-1"));
+    // Held is recorded, not merely dropped: the caller must be able to tell
+    // "somebody has this" from "this is gone".
+    const held = probe.heldSet().?;
+    try std.testing.expect(held.contains("held-1"));
+    try std.testing.expect(!held.contains("orphan-1"));
+    try std.testing.expect(!held.contains("gone-1"));
+
+    // The remote arms keep the old rule verbatim: an attached session is still
+    // attachable there, because the flag may be our own un-reaped connection.
+    var plain = AttachProbe.fromRoster(alloc, try build(alloc, &spec), .attachable);
+    defer plain.deinit();
+    try std.testing.expect(plain.attachSet().?.contains("held-1"));
+    try std.testing.expectEqual(@as(u32, 0), plain.heldSet().?.count());
+}
+
+test "restoreWindowHeldByLiveViewer distinguishes a stolen window from a gone one (T851)" {
+    const alloc = std.testing.allocator;
+    var held = std.StringHashMap(void).init(alloc);
+    defer held.deinit();
+    try held.put("held-1", {});
+
+    const held_nodes = [_]session_layout.Node{.{ .leaf = .{ .session_id = "held-1" } }};
+    const gone_nodes = [_]session_layout.Node{.{ .leaf = .{ .session_id = "gone-1" } }};
+    const viewer_nodes = [_]session_layout.Node{
+        .{ .leaf = .{ .kind = "viewer", .viewer_location = "https://example.com/" } },
+    };
+    const held_tabs = [_]session_layout.Tab{.{ .nodes = &held_nodes, .active = true }};
+    const gone_tabs = [_]session_layout.Tab{.{ .nodes = &gone_nodes, .active = true }};
+    const viewer_tabs = [_]session_layout.Tab{.{ .nodes = &viewer_nodes, .active = true }};
+
+    const held_win: session_layout.Window = .{ .id = "w-held", .tabs = &held_tabs };
+    const gone_win: session_layout.Window = .{ .id = "w-gone", .tabs = &gone_tabs };
+    const viewer_win: session_layout.Window = .{ .id = "w-view", .tabs = &viewer_tabs };
+
+    try std.testing.expect(restoreWindowHeldByLiveViewer(held_win, &held));
+    try std.testing.expect(!restoreWindowHeldByLiveViewer(gone_win, &held));
+    // A viewer leaf owns no session, so it can never be held by anyone.
+    try std.testing.expect(!restoreWindowHeldByLiveViewer(viewer_win, &held));
+    // No probe (agentless, or the probe never landed) ⇒ nothing is held, which
+    // must not turn into "everything is held" and stall the settle loop.
+    try std.testing.expect(!restoreWindowHeldByLiveViewer(held_win, null));
+
+    // The settle loop's condition is scoped to the windows THIS restore would
+    // replay: a held window anywhere in the set arms the wait, a set with none
+    // does not (so an unrelated instance never slows a launch down).
+    const wins = [_]session_layout.Window{ gone_win, held_win };
+    try std.testing.expect(anyRestoreWindowHeld(&wins, &held));
+    const clean = [_]session_layout.Window{ gone_win, viewer_win };
+    try std.testing.expect(!anyRestoreWindowHeld(&clean, &held));
+    try std.testing.expect(!anyRestoreWindowHeld(&wins, null));
+}
+
+test "countUnattachedLive ignores sessions another viewer holds (T411/T851)" {
+    const alloc = std.testing.allocator;
+    var attached = std.StringHashMap(void).init(alloc);
+    defer attached.deinit();
+    try attached.put("mine-1", {});
+
+    const rows = [_]remote_connection.OwnedSession{
+        // Attached by this restore: accounted for.
+        .{ .id = "mine-1", .alive = true, .exit_code = null, .attached = false, .activity = "idle", .pid = 1, .title = null, .cwd = null, .argv = null, .created_at = 0, .last_activity = 0, .pinned = false },
+        // Held by another running app: not an orphan, so not a gap.
+        .{ .id = "held-1", .alive = true, .exit_code = null, .attached = true, .activity = "idle", .pid = 2, .title = null, .cwd = null, .argv = null, .created_at = 0, .last_activity = 0, .pinned = false },
+        // Nobody's: the one the counter exists to report.
+        .{ .id = "orphan-1", .alive = true, .exit_code = null, .attached = false, .activity = "idle", .pid = 3, .title = null, .cwd = null, .argv = null, .created_at = 0, .last_activity = 0, .pinned = false },
+        // Dead: T278's problem, never counted.
+        .{ .id = "gone-1", .alive = false, .exit_code = 0, .attached = false, .activity = "idle", .pid = 0, .title = null, .cwd = null, .argv = null, .created_at = 0, .last_activity = 0, .pinned = false },
+    };
+    try std.testing.expectEqual(@as(usize, 1), countUnattachedLive(&rows, &attached));
 }
 
 test "restoreWindowHasAttachableLeaf keeps viewer-bearing windows with no agent (T398)" {
@@ -2460,10 +2647,51 @@ pub fn restoreSessionLayout(self: *App) bool {
     // leaf); a present set holds every session we can ATTACH: alive (same-PID
     // re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
     // Genuinely-exited/unknown ids are absent → their leaves re-open fresh.
-    var probe = if (conn) |c| AttachProbe.take(gpa, c) else AttachProbe.agentless(gpa);
+    var probe = if (conn) |c|
+        AttachProbe.take(gpa, c, .skip_live_holders)
+    else
+        AttachProbe.agentless(gpa);
     defer probe.deinit();
     gui_pump.pump();
+
+    // T851, the SETTLE. `.skip_live_holders` leaves out every session the agent
+    // says is attached, and at launch there are exactly two reasons a session
+    // reads attached: another app instance really is holding it (do not steal
+    // it), or the app that WAS holding it just died and the agent has not
+    // noticed the broken pipe yet (attach anyway — this is crash recovery, the
+    // reason launch restore exists). Only the clock tells them apart, so wait
+    // for the flag to settle instead of guessing: a dead holder's flag clears
+    // as soon as the agent's reader errors out (measured well under a second on
+    // this box), a live holder's never does. The wait is bounded, it is paid
+    // only while a window we would actually restore is held, and the fallback
+    // when the budget runs out is the safe one — treat it as live, leave the
+    // window alone, and carry it to the next launch.
+    if (conn) |c| {
+        var waited: u64 = 0;
+        while (anyRestoreWindowHeld(union_set.windows, probe.heldSet()) and
+            waited < restore_attach_settle_budget_ns)
+        {
+            std.Thread.sleep(restore_attach_settle_interval_ns);
+            waited += restore_attach_settle_interval_ns;
+            gui_pump.pump();
+            const next = AttachProbe.take(gpa, c, .skip_live_holders);
+            probe.deinit();
+            probe = next;
+            gui_pump.pump();
+        }
+        if (waited > 0) log.info(
+            "session-restore: waited {d}ms for attach flags to settle; {s}",
+            .{
+                waited / std.time.ns_per_ms,
+                if (anyRestoreWindowHeld(union_set.windows, probe.heldSet()))
+                    "a running instance still holds them"
+                else
+                    "they cleared (the holder was gone)",
+            },
+        );
+    }
     const attach_ptr = probe.attachSet();
+    const held_ptr = probe.heldSet();
 
     // T411: track which agent sessions the restored panes actually attach to,
     // so the launch can say — in the same breath as "restored N window(s)" —
@@ -2490,7 +2718,18 @@ pub fn restoreSessionLayout(self: *App) bool {
         // truthful partial answer; before this it saw no answer at all.
         gui_pump.pump();
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) {
-            if (!positively_adjudicated) self.carryUnrestoredWindow(win);
+            // T851: two drops that look identical here and mean opposite
+            // things. "Every session is gone" is an adjudication and the
+            // window may be forgotten; "a running instance is showing this
+            // window" is not — the window is alive on somebody's screen, so it
+            // is carried forward rather than erased by this launch's first
+            // manifest rewrite.
+            const held = restoreWindowHeldByLiveViewer(win, held_ptr);
+            if (held) log.info(
+                "session-restore: '{s}' is open in another running instance; leaving it there",
+                .{win.id},
+            );
+            if (held or !positively_adjudicated) self.carryUnrestoredWindow(win);
             continue;
         }
         const tr: RestoreTransport = if (conn) |c| .local(c) else .agentless();
@@ -2628,6 +2867,42 @@ pub fn restoreWindowHasAttachableLeaf(
         }
     }
     // No leaves at all, or every session-backed leaf positively gone.
+    return false;
+}
+
+/// Whether any leaf of this window names a session a LIVE viewer holds (T851).
+/// The window is somebody else's screen right now: restoring it here would not
+/// copy it, it would take it, and the app that has it would keep drawing the
+/// last picture it received. Null/empty `held` ⇒ false, which is every launch
+/// with no second instance running.
+pub fn restoreWindowHeldByLiveViewer(
+    win: session_layout.Window,
+    held: ?*const std.StringHashMap(void),
+) bool {
+    const h = held orelse return false;
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            if (leaf.isViewer()) continue;
+            const sid = leaf.session_id orelse continue;
+            if (h.contains(sid)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether ANY window we are about to restore is held by a live viewer — the
+/// settle loop's condition (T851). It is deliberately scoped to the windows
+/// this restore would replay rather than to the roster at large: a live
+/// instance holding sessions that appear in no window of ours is not a reason
+/// to make this launch wait.
+pub fn anyRestoreWindowHeld(
+    windows: []const session_layout.Window,
+    held: ?*const std.StringHashMap(void),
+) bool {
+    for (windows) |win| {
+        if (restoreWindowHeldByLiveViewer(win, held)) return true;
+    }
     return false;
 }
 
@@ -4560,22 +4835,41 @@ fn restoreAllLocalFrom(
         log.warn("restore all: {d} blob(s) skipped as unreadable", .{decoded.skipped});
     }
 
-    var probe = AttachProbe.take(gpa, pull);
+    // T851: the same no-stealing rule launch restore follows. This arm needs no
+    // settle window — the button is pressed long after any crash that orphaned
+    // these sessions, so an ATTACHED flag here is a live viewer, and the one
+    // whose windows are already open HERE is caught by `windowIsOpenOn` below.
+    var probe = AttachProbe.take(gpa, pull, .skip_live_holders);
     defer probe.deinit();
     const attach_ptr = probe.attachSet();
+    const held_ptr = probe.heldSet();
 
     var restored: usize = 0;
     for (decoded.windows) |win| {
-        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
         // Mac's double-attach guard (`SessionLayoutRestore.swift:695-699`) in the
         // identity win32 actually has: the agent rebinds a session to the NEWEST
         // attach, so rebuilding a window whose panes are already on screen would
         // quietly steal them from the window that has them — and the user would
         // watch their own terminal go blank to make a copy of itself.
+        //
+        // It runs FIRST, ahead of the liveness gates: our own open window's
+        // sessions read as held by a live viewer (they are — by us), and a skip
+        // that says "you are already looking at this" is a better answer than a
+        // silent drop for the same fact.
         if (self.windowIsOpenOn(win, null)) {
             log.info("restore all: '{s}' is already open here, skipping", .{win.id});
             continue;
         }
+        // T851: the same window open in ANOTHER running instance. Rebuilding it
+        // here would take it off their screen, so say so and leave it.
+        if (restoreWindowHeldByLiveViewer(win, held_ptr)) {
+            log.info(
+                "restore all: '{s}' is open in another running instance; leaving it there",
+                .{win.id},
+            );
+            continue;
+        }
+        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
         const tr: RestoreTransport = .local(pull);
         self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("restore all: window '{s}' failed err={}", .{ win.id, err });

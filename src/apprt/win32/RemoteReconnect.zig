@@ -656,7 +656,12 @@ pub fn onDialed(app: *App, res: *Result) void {
         return;
     }
 
-    var probe = App.AttachProbe.fromRoster(app.core_app.alloc, res.roster);
+    // `.attachable`, deliberately: this is a RE-attach of sessions that are very
+    // likely still flagged as attached to the connection this reconnect is
+    // replacing — a network drop the far agent has not reaped yet. T851's
+    // no-stealing rule reads local pipe breaks, which are instant; across a
+    // relay the same flag would refuse us our own sessions.
+    var probe = App.AttachProbe.fromRoster(app.core_app.alloc, res.roster, .attachable);
     res.roster = null; // ownership moved into the probe
     defer probe.deinit();
 

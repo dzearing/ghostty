@@ -157,6 +157,26 @@ never prompts for persistent windows — their sessions re-attach on relaunch).
 E2E: `scripts/e2e/session-persistence.py` (incl. `--winsize` for re-attach
 PTY-geometry integrity).
 
+**Launch restore never takes a session another running app is holding** (T851).
+The agent rebinds a session to the NEWEST attach, so two same-lineage instances
+— the installed release and the Desktop portable copy share one agent and one
+manifest — used to mean that starting the second one adopted the first one's
+windows and froze its panes. The rule now: `AttachProbe` takes a `Policy`, and
+the two LOCAL rebuilds (launch restore, the chooser's local Restore All) use
+`.skip_live_holders`, which withholds every session the roster reports as
+`attached` and records it in the probe's `held` set instead. The two REMOTE arms
+(`RemoteReconnect`, `RestoreAllRelay`) keep `.attachable`: across a relay that
+flag is as likely to be our own dropped connection the far agent has not reaped,
+and the steal there is adjudicated by `attached_elsewhere` instead. Crash
+recovery is not weakened, because the local flag is only trusted after it
+SETTLES — `restoreSessionLayout` re-probes every 200 ms for up to 2 s while a
+window it would restore reads held, which a dead holder's flag clears out of
+(the agent's `detachAll` runs on the broken pipe) and a live holder's does not.
+A window left alone is CARRIED rather than forgotten, and says so in the log
+(`'<id>' is open in another running instance`). Acceptance:
+`test/win32/chooser-restore-all-adopt.ps1` (0 skipped) plus
+`session-crash-recover.ps1` for the race.
+
 **A restored screen is PARKED into scrollback before anything repaints over
 it** (T666). A re-attaching pane paints the app's own persisted VT repaint of
 the screen it had when it was last saved (WP-D3, `Remote.restore_snapshot`) —
