@@ -494,6 +494,11 @@ $GuardTable = @(
         Stamp  = 'test\win32\test-binary-soak.stamp.json'
         Covers = @(
             'scripts\test-binary-soak.ps1',
+            # The verdict the soak reports is DECIDED here since T877:
+            # Get-CrashOccurrenceLine is what turns a round into `crash=` rather
+            # than `fail=`. An edit to the classifier that never re-ran this
+            # harness is the same hole T877 itself was, one layer down.
+            'scripts\lib\CrashDiag.ps1',
             'test\win32\test-binary-soak.ps1'
         )
     },

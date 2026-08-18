@@ -9,6 +9,52 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-18 - **T877 (filed T955) - the crash counter now counts the crash
+  its own log already decoded.** `test-binary-soak.ps1` is the instrument the
+  T443 hunt measures occurrence RATES with, and it recognised a dead test
+  binary only from stderr handler text or zig's `exited with ERROR code 3|5`
+  wording. On 2026-08-15 22:07 a run died with neither: zig's other wording
+  (`exited with code 3`) plus floor-lane's own `-- crash diagnostics --` block
+  naming `ghostty-test.exe pid=0xE570 0x80000003` in
+  `font.Collection.test.add full`. The soak read past all of it and reported
+  `pass=14 fail=1 crash=0  crash-rate=0/15 (0%)` - the one number it exists to
+  produce, biased low, over evidence printed six lines above the verdict. The
+  classification now comes from a single shared definition,
+  `Get-CrashOccurrenceLine` in `scripts\lib\CrashDiag.ps1`: a `CRASH ...` line
+  out of the diagnostics block whose process is one of OUR test binaries (the
+  block itself is not name-filtered - it reports every crash in the window -
+  so the classifier has to be), or zig naming a command whose exit code's low
+  byte decodes to a fatal NTSTATUS. `floor-lane.ps1` now seeds its own
+  `$TEST_EXE_NAMES` from that same list, so the printer and the counter cannot
+  drift apart on what "one of ours" means. Re-scanned against the real
+  artifact: run 04 of the 15 t857-boost-on-eve logs classifies CRASH and the
+  other 14 clean, and a sweep of all 236 retained soak logs finds exactly that
+  one - so no other historical count was understated. Second half, same
+  instrument: `-LoadKind build` load workers each run a full `zig build test`
+  lane, so a worker iteration can BE an occurrence (one was, 22:41, segfault +
+  recursive panic in terminal.formatter, exit 5) - worker logs were never
+  scanned, and every soak cleared the flat `w<N>` slots, so two soaks later
+  that evidence was gone along with 73 unscanned iterations. Worker logs and
+  the iteration ledger are now scanned by the same definition, `worker-crash=N`
+  is in the pasted summary line (always, including zero - an absent field is
+  the same ambiguity one level down), and each soak gets its own
+  `<label>-<stamp>` directory so a later soak cannot destroy an earlier one's
+  evidence. Reported separately from `crash=` because `crash-rate` is per
+  measured ROUND. One trap worth naming: a Mandatory `[string[]]` implies
+  ValidateNotNullOrEmpty PER ELEMENT, so passing a transcript split into lines
+  - every real one has a blank line - failed to bind and silently returned
+  nothing; caught only by running the classifier against the real 2026-08-15
+  log rather than the fixture, and pinned by a unit assertion. Also widened the
+  soak's guard row to cover `scripts\lib\CrashDiag.ps1`, since the verdict is
+  decided there now. Validation: `test\win32\test-binary-soak.ps1` ALL PASS
+  (77, was 51), floor lanes lib+none+win32+agent ALL PASS, P1 25 / P2 20 / P3
+  16 ALL PASS, isolation-meta ALL PASS. Filed T955: floor-lane itself still
+  prints `FAIL` for a confirmed crash, which is this same undercount one layer
+  up. Not filed: a seventh duplicate of the Docker-blocked release-artifacts
+  guard - T898/T939/T945/T949/T951/T953 already say it and T938 tracks the
+  duplication, so the recurrence went into T938's log and validate ran under
+  `-NoGuardDue`.
+
 - 2026-08-17 - **T845 (filed T946) - a hovered capture that photographs the
   wrong moment now says so, instead of passing as a working button.** 6g of
   `pane-banner.ps1` failed about one run in twenty with the chevron's hovered

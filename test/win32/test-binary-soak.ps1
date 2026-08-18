@@ -132,6 +132,80 @@ Check 'the victim test is named from the lane log' `
 ($r.Text -match 'victim: 1234/3913 terminal\.PageList') ($r.Text -replace '\s+', ' ')
 Check 'the lane log is named so the evidence is findable' ($r.Text -match 'lane log: .+floor-lane-command-')
 
+# ------------------------- 3a. the occurrence floor-lane already decoded (T877)
+#
+# The 2026-08-15 22:07 shape, reproduced line for line: a test binary that died
+# by EXIT CODE alone -- zig's `exited with code 3`, no handler text anywhere,
+# because the segfault handler printed nothing that time -- with floor-lane's
+# own `-- crash diagnostics --` block in the same log naming the dead process.
+# The soak counted it `crash=0`, which is the single number this script exists
+# to produce.
+$diagCmd = Join-Path $work 'diagcrash.cmd'
+@(
+    '@echo off',
+    'echo 2851/3913 font.Collection.test.add full',
+    "echo error: while executing test 'font.Collection.test.add full', the following command exited with code 3 (expected exited with code 0):",
+    'echo -- crash diagnostics --',
+    'echo   exit code 3 is the low byte of 0x80000003 STATUS_BREAKPOINT (Zig panic / segfault handler abort)',
+    'echo   CRASH 22:07:14 ghostty-test.exe pid=0xE570 0x80000003 STATUS_BREAKPOINT (Zig panic / segfault handler abort) in ghostty-test.exe+0x0000000002a896c0',
+    'exit /b 1'
+) | Set-Content -LiteralPath $diagCmd -Encoding ASCII
+$r = Invoke-Soak @{ LaneCommand = "cmd /c $diagCmd"; Runs = 1; Label = 'brdiag'; NoCatch = $true }
+Check 'a CrashDiag-confirmed death with no handler text is CRASH, not FAIL' `
+($r.Text -match 'SOAK brdiag: mode=build-runner runs=1 concurrency=1 pass=0 fail=0 crash=1') `
+    ($r.Text -replace '\s+', ' ')
+Check 'that soak exits 1 like any other crashed soak' ($r.Code -eq 1) "got $($r.Code)"
+Check 'the run row quotes the decoded evidence rather than a bare exit code' `
+($r.Text -match 'exited with code 3' -or $r.Text -match 'CRASH 22:07:14 ghostty-test\.exe') `
+    ($r.Text -replace '\s+', ' ')
+
+# The block is NOT name-filtered when floor-lane writes it -- it reports every
+# crash in the window, ours or somebody else's -- so the classifier has to be.
+# A CRASH line for an unrelated process must leave a red lane red.
+$otherCmd = Join-Path $work 'othercrash.cmd'
+@(
+    '@echo off',
+    'echo 2851/3913 font.Collection.test.add full',
+    'echo error: 1 tests failed',
+    'echo -- crash diagnostics --',
+    'echo   CRASH 22:07:14 SomeOtherApp.exe pid=0x1234 0xC0000005 STATUS_ACCESS_VIOLATION in SomeOtherApp.exe+0x1000',
+    'exit /b 1'
+) | Set-Content -LiteralPath $otherCmd -Encoding ASCII
+$r = Invoke-Soak @{ LaneCommand = "cmd /c $otherCmd"; Runs = 1; Label = 'brother'; NoCatch = $true }
+Check 'a CRASH line naming somebody ELSE''s process does not count as our crash' `
+($r.Text -match 'SOAK brother: mode=build-runner runs=1 concurrency=1 pass=0 fail=1 crash=0') `
+    ($r.Text -replace '\s+', ' ')
+
+# The classifier itself, against the exact lines of the 2026-08-15 transcript.
+# Through the library rather than a fixture lane because one of its failure
+# modes is invisible end to end: a Mandatory [string[]] implies
+# ValidateNotNullOrEmpty per ELEMENT, so a transcript split into lines -- every
+# real one has a blank line in it -- failed to bind and handed back nothing,
+# while a second lookup path quietly covered for it.
+. (Join-Path $Repo 'scripts\lib\CrashDiag.ps1')
+$realLines = @(
+    'LANE none FAIL in 5s (leaked webview hosts swept: 0) | build.exe test -Dapp-runtime=none',
+    '-- errors --',
+    "  error: while executing test 'font.Collection.test.add full', the following command exited with code 3 (expected exited with code 0):",
+    '  error: the following build command failed with exit code 1:',
+    '-- crash diagnostics --',
+    '  exit code 3 is the low byte of 0x80000003 STATUS_BREAKPOINT (Zig panic / segfault handler abort)',
+    '  CRASH 22:07:14 ghostty-test.exe pid=0xE570 0x80000003 STATUS_BREAKPOINT (Zig panic / segfault handler abort) in ghostty-test.exe+0x0000000002a896c0',
+    '',
+    'FLOOR SUMMARY: none#1=FAIL'
+)
+Check 'the classifier binds a transcript that contains a blank line' `
+((Get-CrashOccurrenceLine -Lines $realLines) -ne '') 'empty-string element refused the bind'
+Check 'the CRASH line alone is enough, with no handler text anywhere' `
+((Get-CrashOccurrenceLine -Lines @('', '  CRASH 22:07:14 ghostty-test.exe pid=0xE570 0x80000003 X in ghostty-test.exe+0x1')) -ne '')
+Check 'a CRASH line for a process that is not one of ours is ignored' `
+((Get-CrashOccurrenceLine -Lines @('  CRASH 22:07:14 chrome.exe pid=0x1 0xC0000005 X in chrome.exe+0x1')) -eq '')
+Check 'a clean transcript classifies as nothing' `
+((Get-CrashOccurrenceLine -Lines @('', 'LANE none PASS in 190s', 'FLOOR SUMMARY: none#1=PASS')) -eq '')
+Check 'a red lane exit code (1) is not a crash, and neither is the expected 0' `
+((Get-CrashOccurrenceLine -Lines @(
+            '  error: the following command exited with code 1 (expected exited with code 0):')) -eq '')
+
 # --------------------------------------------- 3b. -LoadWorkers (T443 turn 6)
 
 # The cell with all of T443's sightings in it and no measurement is
@@ -195,7 +269,10 @@ Check 'the same count is in the end-of-soak load line' `
 Check 'a command-loaded soak still classifies its rounds' ($r.Text -match 'pass=1 fail=0 crash=0') `
     ($r.Text -replace '\s+', ' ')
 Check 'each worker got its own scratch directory' `
-((Test-Path (Join-Path $loadWork 'w0\worker.ps1')) -and (Test-Path (Join-Path $loadWork 'w1\worker.ps1')))
+((Test-Path (Join-Path $loadWork 'cmdload-*\w0\worker.ps1')) -and
+    (Test-Path (Join-Path $loadWork 'cmdload-*\w1\worker.ps1'))) `
+    ((Get-ChildItem -Path $loadWork -Recurse -Filter 'worker.ps1' -ErrorAction SilentlyContinue |
+            ForEach-Object FullName) -join ', ')
 
 # An iteration that outlives the soak is the NORMAL case for the heaviest load
 # on offer -- a cold `zig build` of a whole lane takes longer than the round it
@@ -266,6 +343,59 @@ Check '-LoadDryRun starts nothing and runs no rounds' `
 ($r.Code -eq 0 -and $r.Text -match 'started nothing' -and -not ($r.Text -match 'run  1/1')) `
     ($r.Text -replace '\s+', ' ')
 
+# ------------------- 3d. a load worker can BE an occurrence, and be kept (T877)
+#
+# A `-LoadKind build` worker runs a whole `zig build test` lane per iteration,
+# so it can crash exactly the way a measured round can -- and one did, on
+# 2026-08-15 22:41 (segfault + recursive panic in terminal.formatter, exit 5, in
+# w3). Nothing scanned worker logs, so it landed in no verdict line; and every
+# soak cleared the flat `w<N>` slots, so two soaks later the evidence was gone
+# along with 73 unscanned iterations.
+
+$crashLoad = Join-Path $work 'loadcrash.cmd'
+@(
+    '@echo off',
+    'echo 900/3913 terminal.formatter.test.PageList plain spanning two pages',
+    'echo Segmentation fault at address 0x0',
+    'exit /b 5'
+) | Set-Content -LiteralPath $crashLoad -Encoding ASCII
+$keepWork = Join-Path $work 'keep'
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'wcrash'; LoadWorkers = 1
+    LoadCommand = "cmd /c $crashLoad"; LoadWorkDir = $keepWork
+}
+Check 'a crashed load-worker iteration is counted in the summary line' `
+($r.Text -match 'SOAK wcrash:.*worker-crash=[1-9]') ($r.Text -replace '\s+', ' ')
+Check 'the crashed worker is named with its slot and its log' `
+($r.Text -match 'w0: .*(Segmentation fault|exited with .*code 5)' -and $r.Text -match 'worker\.log') `
+    ($r.Text -replace '\s+', ' ')
+Check 'the measured round is still classified on its own evidence, not the worker''s' `
+($r.Text -match 'pass=1 fail=0 crash=0') ($r.Text -replace '\s+', ' ')
+
+# The negative control: a clean load must report the field, and report zero.
+# An ABSENT field would be ambiguous between "none" and "nobody counted", which
+# is the complaint this whole task is about, one level down.
+$r = Invoke-Soak @{
+    LaneCommand = 'cmd /c exit 0'; Runs = 1; Label = 'wclean'; LoadWorkers = 1
+    LoadCommand = 'cmd /c exit 0'; LoadWorkDir = $keepWork
+}
+Check 'a clean load still says worker-crash=0 rather than omitting the field' `
+($r.Text -match 'SOAK wclean:.*worker-crash=0') ($r.Text -replace '\s+', ' ')
+
+# ...and the second soak did not destroy the first soak's worker evidence.
+$wcrashLogs = @(Get-ChildItem -Path (Join-Path $keepWork 'wcrash-*\w0\worker.log') -ErrorAction SilentlyContinue)
+$wcleanLogs = @(Get-ChildItem -Path (Join-Path $keepWork 'wclean-*\w0\worker.log') -ErrorAction SilentlyContinue)
+Check 'each soak keeps its worker logs in its own directory' `
+($wcrashLogs.Count -eq 1 -and $wcleanLogs.Count -eq 1) `
+    ((Get-ChildItem -Path $keepWork -Recurse -Filter 'worker.log' -ErrorAction SilentlyContinue |
+            ForEach-Object FullName) -join ', ')
+$keptText = if ($wcrashLogs.Count -eq 1) {
+    (Get-Content -LiteralPath $wcrashLogs[0].FullName -ErrorAction SilentlyContinue) -join "`n"
+}
+else { '' }
+Check 'a later soak does not delete the earlier soak''s crash evidence' `
+($keptText -match 'Segmentation fault') "kept log: $keptText"
+
 # ------------------------------- 4. standalone still works, and admits what it is
 
 # A lane-shaped NAME is what turns the warning on: a fixture exe has no build
@@ -301,7 +431,8 @@ $r = Invoke-Soak @{
 Check 'standalone refuses a command-shaped load too, and says so' `
 ($r.Text -match 'LoadWorkers is build-runner only') ($r.Text -replace '\s+', ' ')
 Check 'standalone starts no load workers when one was asked for' `
-(-not (Test-Path (Join-Path $work 'load-sa\w0\worker.ps1'))) 'a worker script was written'
+(@(Get-ChildItem -Path (Join-Path $work 'load-sa') -Recurse -Filter 'worker.ps1' `
+        -ErrorAction SilentlyContinue).Count -eq 0) 'a worker script was written'
 
 $r = Invoke-Soak @{ Exe = $fake; Arguments = @('-NoProfile', '-Command', 'exit 5'); Runs = 1; Label = 'sacrash' }
 Check 'standalone still classifies a fatal NTSTATUS as CRASH' `

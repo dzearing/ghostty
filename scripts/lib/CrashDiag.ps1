@@ -52,6 +52,18 @@ $script:NT_STATUS_BY_LOW_BYTE = @{
     0xFD = @(@{ Status = 0xC00000FD; Name = 'STATUS_STACK_OVERFLOW' })
 }
 
+# The test binaries this repo's zig lanes produce. Here rather than in each
+# caller because two of them already ask the same question -- floor-lane.ps1
+# ("did one of OURS crash?") and test-binary-soak.ps1 ("was this round an
+# occurrence?") -- and a classifier that disagrees with the diagnostic it reads
+# is the T877 defect. floor-lane seeds its list from this one and may extend it
+# with -ExtraTestExeNames for a fixture run.
+$script:CRASHDIAG_TEST_EXES = @(
+    'ghostty-test.exe',
+    'ghoztty-agent-test.exe',
+    'ghoztty-agent-core-test.exe'
+)
+
 function Get-NtStatusCandidate {
     <#
     .SYNOPSIS
@@ -151,6 +163,59 @@ function Get-TruncatedExitCodeFromLog {
             }
         }
     return @($codes.Keys | Sort-Object)
+}
+
+function Get-CrashOccurrenceLine {
+    <#
+    .SYNOPSIS
+        The first line of a lane transcript that says a TEST BINARY died --
+        T443's own definition of an occurrence, rather than a stderr signature.
+    .DESCRIPTION
+        Two shapes count here, and neither of them is handler text:
+
+          - a `CRASH <hh:mm:ss> <exe> pid=... <code> <name> in <mod>+<off>` line
+            out of Write-CrashDiagnostic's own block. That line is already
+            corroborated by the Windows `Application Error` record, so it is
+            evidence rather than a guess. It IS name-filtered, because the block
+            is not: Write-CrashDiagnostic reports every crash in the window,
+            ours or somebody else's.
+          - zig naming a command that `exited with [error] code N` whose low
+            byte decodes to a fatal NTSTATUS (3 = 0x80000003 breakpoint, i.e. a
+            panic/segfault-handler abort; 5 = 0xC0000005 access violation).
+
+        T877 is why this is a function instead of a pattern in one caller: the
+        soak's classifier knew neither shape, so a round whose own log carried a
+        decoded CRASH line was counted as a plain red test, and the crash rate
+        the T443 hunt records was biased low by the instrument built to measure
+        it. A run's classification must agree with the diagnostic printed in the
+        same log.
+    .OUTPUTS
+        The matching line, trimmed; the empty string when nothing in $Lines says
+        a test binary died.
+    #>
+    param(
+        # AllowEmptyString is load-bearing, not defensive: a Mandatory [string[]]
+        # implies ValidateNotNullOrEmpty PER ELEMENT, so `-Lines ($txt -split
+        # "`n")` on any real transcript -- every one of which has a blank line --
+        # fails to bind and the caller silently gets nothing back.
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowNull()][AllowEmptyString()][string[]]$Lines,
+        [string[]]$ExeNames = $script:CRASHDIAG_TEST_EXES
+    )
+
+    foreach ($l in @($Lines)) {
+        if ($null -eq $l) { continue }
+        if ($l -match '^\s*CRASH\s+\d{1,2}:\d{2}:\d{2}\s+(\S+)\s+pid=') {
+            if ($ExeNames -contains $matches[1]) { return $l.Trim() }
+            continue
+        }
+        # "(expected exited with code 0)" is the EXPECTATION, so a zero never
+        # counts -- the same rule Get-TruncatedExitCodeFromLog applies.
+        if ($l -match 'exited with (?:error )?code\s+(\d+)') {
+            $c = [int]$matches[1]
+            if ($c -ne 0 -and @(Get-NtStatusCandidate -Code $c).Count -gt 0) { return $l.Trim() }
+        }
+    }
+    return ''
 }
 
 function Write-CrashDiagnostic {

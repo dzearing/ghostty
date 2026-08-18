@@ -161,12 +161,11 @@ function Get-LaneArgs {
 }
 
 # Test binaries the zig lanes produce. Used to name the processes in a
-# diagnostic and to match the WebView2 hosts they leak.
-$TEST_EXE_NAMES = @(
-    'ghostty-test.exe',
-    'ghoztty-agent-test.exe',
-    'ghoztty-agent-core-test.exe'
-)
+# diagnostic and to match the WebView2 hosts they leak. Seeded from
+# lib\CrashDiag.ps1 rather than re-listed here: the soak classifies a round by
+# asking the same question of the same names (T877), and two copies of this list
+# is exactly the drift that would let the two answers disagree.
+$TEST_EXE_NAMES = @($script:CRASHDIAG_TEST_EXES)
 foreach ($n in @($ExtraTestExeNames)) { if ($n) { $TEST_EXE_NAMES += $n } }
 
 # ------------------------------------------------------------------ helpers

@@ -120,12 +120,18 @@
     build` composes the isolated form for you.
 
 .PARAMETER LoadWorkDir
-    Scratch root for command/build workers: one `w<N>` directory each, holding
-    the generated worker script, its log, its iteration file and (build kind)
-    its private zig cache. Defaults to a directory on the REPO'S DRIVE, because
-    zig 0.15.2 asserts when a global cache lives on a different drive than the
-    build's cwd (T243). Private build caches are removed when the soak ends;
-    logs are kept.
+    Scratch ROOT for command/build workers. Each soak gets its own
+    `<label>-<stamp>` directory under it, holding one `w<N>` directory per
+    worker: the generated worker script, its log, its iteration file and (build
+    kind) its private zig cache. Defaults to a directory on the REPO'S DRIVE,
+    because zig 0.15.2 asserts when a global cache lives on a different drive
+    than the build's cwd (T243). Private build caches are removed when the soak
+    ends; logs are kept.
+
+    The per-soak directory is not tidiness, it is evidence retention (T877): the
+    slots used to be flat `w0..wN` cleared at every startup, so each soak
+    destroyed the previous soak's worker logs -- including, on 2026-08-15, the
+    only record of a worker iteration that had itself crashed.
 
 .PARAMETER LoadDryRun
     Compose the load, print what each worker would run, and exit without
@@ -136,9 +142,17 @@
     A per-run table and a final one-line summary:
         SOAK <label>: mode=M runs=N pass=P fail=F crash=C  crash-rate=C/N (xx%)
     In build-runner mode the summary also carries `load=N:<kind>` and, for a
-    command-shaped load, `load-iters=N` -- because a run count that does not
-    name its condition is what T832 had to throw away, and a load nobody
-    measured is a condition nobody can check.
+    command-shaped load, `load-iters=N` and `worker-crash=N` -- because a run
+    count that does not name its condition is what T832 had to throw away, and a
+    load nobody measured is a condition nobody can check.
+
+    A round counts as CRASH when the lane transcript or the lane log says a test
+    binary died, which since T877 includes floor-lane's own decoded
+    `-- crash diagnostics --` verdict (a `CRASH ... <test exe> pid=...` line, or
+    zig reporting a command that `exited with code 3/5`) and not only handler
+    text. `worker-crash=N` is the same question asked of the load workers'
+    logs, which each run a real lane and so can crash in the same way; it is
+    reported separately because `crash-rate` is per measured ROUND.
     When more than one binary was soaked (-Lane agent standalone), a per-binary
     line follows the summary attributing pass/fail/crash to each exe, and each
     per-run log name carries the exe basename so the two binaries' logs cannot
@@ -602,6 +616,59 @@ function Get-SoakLoadIterations {
     return [pscustomobject]@{ Started = $started; Completed = $done }
 }
 
+# Worker iterations that DIED, by the same definition a measured round uses.
+#
+# A `-LoadKind build` worker runs a full `zig build test` lane per iteration, so
+# a worker iteration can BE a T443 occurrence -- and one was, on 2026-08-15
+# 22:41: a segfault plus a recursive panic in
+# `terminal.formatter.test.PageList plain spanning two pages`, exit 5, in w3.
+# Nothing scanned worker logs, so it appeared in no verdict line at all, and the
+# next soak deleted the log. An instrument that runs the defect's own condition
+# N extra times per round and then throws the results away is undercounting on
+# purpose (T877).
+function Get-SoakWorkerCrash {
+    param([string]$WorkDir, [int]$Count, [string[]]$Patterns)
+    $hits = @()
+    for ($w = 0; $w -lt $Count; $w++) {
+        $dir = Join-Path $WorkDir ("w{0}" -f $w)
+        $log = Join-Path $dir 'worker.log'
+        if (-not (Test-Path -LiteralPath $log)) { continue }
+        # The decoded shapes first (a CRASH block line, or an exit code whose
+        # low byte is a fatal NTSTATUS), then the handler signatures -- a worker
+        # log has no floor-lane wrapper, so both halves have to be asked for.
+        $line = Get-CrashOccurrenceLine -Lines @(
+            Select-String -LiteralPath $log -ErrorAction SilentlyContinue `
+                -Pattern '^\s*CRASH\s+\d', 'exited with (?:error )?code' |
+                ForEach-Object { $_.Line })
+        if (-not $line) {
+            foreach ($pat in $Patterns) {
+                $h = @(Select-String -LiteralPath $log -Pattern $pat -List -ErrorAction SilentlyContinue)
+                if ($h.Count -ge 1) { $line = $h[0].Line.Trim(); break }
+            }
+        }
+        # The iteration ledger carries the one thing the log cannot: what the
+        # worker's own command exited WITH. A death that printed nothing is
+        # still a death, and that is the shape T877 was filed about.
+        if (-not $line) {
+            $iter = Join-Path $dir 'iterations.txt'
+            foreach ($l in @(Select-String -LiteralPath $iter -Pattern 'exit=(-?\d+)' -ErrorAction SilentlyContinue)) {
+                $c = [int]$l.Matches[0].Groups[1].Value
+                if ($c -ne 0 -and @(Get-NtStatusCandidate -Code $c).Count -gt 0) {
+                    $line = 'iteration ' + $l.Line.Trim()
+                    break
+                }
+            }
+        }
+        if ($line) { $hits += [pscustomobject]@{ Index = $w; Log = $log; Line = $line } }
+    }
+    # `return ,` so a ONE-hit result does not unroll to a bare object whose
+    # .Count is $null at the call site (the PS 5.1 trap this script already
+    # documents once) -- but NOT on an empty result, where the wrapper survives
+    # `@()` as a single element and invents a crash that never happened.
+    if ($hits.Count -eq 0) { return @() }
+    return , $hits
+}
+
 # Kill the worker AND anything it launched. A command worker's zig build is a
 # grandchild, and killing only the worker orphans a compiler that then loads
 # the box for the NEXT soak -- which would corrupt the very measurement this
@@ -679,6 +746,17 @@ if ($mode -eq 'build-runner') {
     # the build as well as the test run.
     $loadProcs = @()
     $loadDeadline = [math]::Min(14400, ($Runs * $roundTimeout) + 600)
+    $workerHits = @()
+    $workerCrashes = 0
+
+    # THIS soak's workers get THIS soak's directory. The slots used to be
+    # `<LoadWorkDir>\w0..wN` flat, reused by every soak and cleared at startup,
+    # so each run destroyed the previous run's worker evidence -- and a worker
+    # iteration is a full `zig build test` lane, which means a worker CAN BE an
+    # occurrence (one was, 2026-08-15 22:41: segfault + recursive panic in
+    # terminal.formatter, exit 5). Two soaks later that log was gone and 73
+    # iterations were unscannable (T877).
+    $loadRunDir = Join-Path $LoadWorkDir ("{0}-{1}" -f $tag, $stamp)
 
     # One worker per slot index, so a top-up restarts the SLOT (same directory,
     # same private cache, same iteration file) rather than growing a new one.
@@ -688,13 +766,13 @@ if ($mode -eq 'build-runner') {
             return @(Start-SoakLoadWorkers -Count 1 -Seconds $loadDeadline -PsExe $psExe)
         }
         return @(Start-SoakCommandWorkers -Count 1 -FirstIndex $Index -Seconds $loadDeadline `
-                -PsExe $psExe -Kind $LoadKind -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand)
+                -PsExe $psExe -Kind $LoadKind -WorkDir $loadRunDir -Repo $Repo -Command $LoadCommand)
     }
 
     if ($LoadKind -ne 'cpu') {
-        Write-Host "      load kind=$LoadKind, scratch: $LoadWorkDir"
+        Write-Host "      load kind=$LoadKind, scratch: $loadRunDir"
         for ($w = 0; $w -lt [math]::Max(1, $LoadWorkers); $w++) {
-            $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
+            $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $loadRunDir -Repo $Repo -Command $LoadCommand
             Write-Host "      worker $w runs: $($spec.Command)"
             if ($w -eq 0 -and $LoadWorkers -gt 1 -and $LoadKind -eq 'command') {
                 Write-Host "      (all $LoadWorkers workers run the same command)"
@@ -712,17 +790,11 @@ if ($mode -eq 'build-runner') {
     }
 
     if ($LoadWorkers -gt 0) {
-        # This soak's count must be THIS soak's: a slot directory is reused
-        # across runs (and by a top-up), so a leftover iteration file would
-        # credit today's load with yesterday's work.
-        if ($LoadKind -ne 'cpu') {
-            for ($w = 0; $w -lt $LoadWorkers; $w++) {
-                $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
-                foreach ($f in @($spec.Iter, $spec.Log)) {
-                    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-                }
-            }
-        }
+        # No startup clear any more: $loadRunDir is this soak's alone, so a
+        # leftover iteration file cannot credit today's load with yesterday's
+        # work, and yesterday's worker log survives to be read. A top-up still
+        # restarts a slot INTO its own directory, so its iterations keep
+        # accumulating across the soak.
         $loadSlots = @()
         for ($w = 0; $w -lt $LoadWorkers; $w++) {
             $procs = @(Start-SoakLoadSlot -Index $w)
@@ -797,6 +869,24 @@ if ($mode -eq 'build-runner') {
             }
         }
 
+        # floor-lane ALREADY decoded this round's death in its own transcript
+        # (T444's `-- crash diagnostics --` block), so the counter reads that
+        # verdict instead of re-guessing from handler text. On 2026-08-15 a run
+        # died in 5s with `exited with code 3` and a CRASH line naming
+        # ghostty-test.exe, and this soak reported `crash=0` -- the one number it
+        # exists to produce, biased low, because none of the stderr signatures
+        # were present that time (T877).
+        $diagHit = Get-CrashOccurrenceLine -Lines ($txt -split "`n")
+        if (-not $diagHit -and $laneLog -and (Test-Path -LiteralPath $laneLog)) {
+            # Select-String first: a lane log is thousands of test lines, and
+            # only these two shapes can ever be an occurrence. Matches come back
+            # in file order, so the first hit is still the first hit.
+            $diagHit = Get-CrashOccurrenceLine -Lines @(
+                Select-String -LiteralPath $laneLog -ErrorAction SilentlyContinue `
+                    -Pattern '^\s*CRASH\s+\d', 'exited with (?:error )?code' |
+                    ForEach-Object { $_.Line })
+        }
+
         $verdict = 'PASS'
         $note = ''
         if ($timedOut) {
@@ -808,7 +898,7 @@ if ($mode -eq 'build-runner') {
             $verdict = 'HANG'; $totals.hang++
             $note = "floor-lane reported $laneResult"
         }
-        elseif ($sig) {
+        elseif ($sig -or $diagHit) {
             $verdict = 'CRASH'; $totals.crash++
             $hitLine = ''
             foreach ($pat in $laneCrashPatterns) {
@@ -819,6 +909,7 @@ if ($mode -eq 'build-runner') {
                     if ($h.Count -ge 1) { $hitLine = $h[0].Line.Trim(); break }
                 }
             }
+            if (-not $hitLine) { $hitLine = $diagHit }
             $note = if ($hitLine) { $hitLine } else { "exit $code" }
         }
         else {
@@ -855,9 +946,16 @@ if ($mode -eq 'build-runner') {
         $loadAliveEnd = Get-SoakLoadAlive $loadProcs
         Stop-SoakLoadWorkers $loadProcs
         if ($LoadKind -ne 'cpu') {
-            $it = Get-SoakLoadIterations -WorkDir $LoadWorkDir -Count $LoadWorkers
+            $it = Get-SoakLoadIterations -WorkDir $loadRunDir -Count $LoadWorkers
             $loadIters = $it.Completed
             $loadStarted = $it.Started
+            # A `build`-kind worker iteration IS a lane run, so it can be an
+            # occurrence in exactly the way a measured round can -- and until
+            # T877 nothing ever looked. Scanned AFTER the workers are stopped,
+            # so a log still being written cannot be half-read.
+            $workerHits = @(Get-SoakWorkerCrash -WorkDir $loadRunDir -Count $LoadWorkers `
+                    -Patterns $laneCrashPatterns)
+            $workerCrashes = $workerHits.Count
         }
         Write-Host ''
         $loadLine = "  load: $LoadWorkers worker(s) requested, $loadAliveEnd still running at the end"
@@ -872,24 +970,34 @@ if ($mode -eq 'build-runner') {
         # none at all.
         if ($LoadKind -ne 'cpu' -and $loadStarted -eq 0) {
             Write-Host "  load: WARNING no worker even started an iteration -- this soak was effectively UNLOADED."
-            Write-Host "        check $LoadWorkDir\w0\worker.log"
+            Write-Host "        check $loadRunDir\w0\worker.log"
         }
         elseif ($LoadKind -ne 'cpu' -and $loadIters -eq 0) {
             Write-Host "  load: 0 completed, $loadStarted in flight at the end -- the load ran throughout and"
             Write-Host "        no iteration finished inside the soak, which is normal for -LoadKind build."
         }
+        # Named, not just counted: a worker crash is the same T443 evidence a
+        # round crash is, and the whole reason it was invisible for three soaks
+        # is that nobody was told where to look.
+        if ($LoadKind -ne 'cpu') {
+            Write-Host "  load: worker-crash=$workerCrashes"
+            foreach ($h in $workerHits) {
+                Write-Host "        w$($h.Index): $($h.Line)"
+                Write-Host "             $($h.Log)"
+            }
+        }
         # The private build caches are multi-gigabyte and belong to nobody; the
         # logs and iteration files stay, because they are the evidence.
         if ($LoadKind -eq 'build') {
             for ($w = 0; $w -lt $LoadWorkers; $w++) {
-                $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $LoadWorkDir -Repo $Repo -Command $LoadCommand
+                $spec = Get-SoakLoadWorkerSpec -Kind $LoadKind -Index $w -WorkDir $loadRunDir -Repo $Repo -Command $LoadCommand
                 foreach ($d in @($spec.WipeCache, (Join-Path $spec.Dir 'zig-out'))) {
                     if (Test-Path -LiteralPath $d) {
                         Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
                     }
                 }
             }
-            Write-Host "  load: private build caches under $LoadWorkDir removed; worker logs kept"
+            Write-Host "  load: private build caches under $loadRunDir removed; worker logs kept"
         }
     }
 }
@@ -910,7 +1018,16 @@ if ($mode -eq 'build-runner') {
     # first. A pasted `load=16` that does not say which is the ambiguity T832
     # had to unwind, one level down.
     if ($LoadWorkers -gt 0) { $summary += ":$LoadKind" }
-    if ($LoadKind -ne 'cpu' -and $LoadWorkers -gt 0) { $summary += " load-iters=$loadIters started=$loadStarted" }
+    if ($LoadKind -ne 'cpu' -and $LoadWorkers -gt 0) {
+        $summary += " load-iters=$loadIters started=$loadStarted"
+        # Always, including zero: a worker iteration is a lane run, so its
+        # crashes belong in the pasted line beside the measured ones -- and an
+        # absent field would be ambiguous between "none" and "nobody counted",
+        # which is the whole T877 complaint one level down. It is a separate
+        # number rather than folded into crash=, because crash-rate is per
+        # measured ROUND and a worker crash is not one of those.
+        $summary += " worker-crash=$workerCrashes"
+    }
 }
 Write-Host $summary
 
