@@ -805,11 +805,12 @@ pub const PtySpawner = struct {
     fn spawnFn(ctx: *anyopaque, open: protocol.Open) anyerror!server.Spawner.Result {
         const self: *PtySpawner = @ptrCast(@alignCast(ctx));
 
-        // Holder-backed spawn (T905), opt-in while it stabilizes: the ConPTY,
-        // the shell and its kill-on-close job move into a separate process that
+        // Holder-backed spawn (T905), the DEFAULT since T909: the ConPTY, the
+        // shell and its kill-on-close job move into a separate process that
         // ESCAPES this agent's job, so an agent crash/kill/upgrade no longer
         // takes the user's shells with it. Everything downstream is unchanged —
-        // a holder is just another `session.Child`.
+        // a holder is just another `session.Child`. `GHOZTTY_AGENT_PTY_HOLDER=0`
+        // is the escape hatch back to the in-process child.
         //
         // A failure here FALLS BACK to the in-process child rather than failing
         // the OPEN. Losing the survive-an-agent-death property is a bad day;

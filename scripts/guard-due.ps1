@@ -180,6 +180,25 @@ $GuardTable = @(
             'src\remote\agent\session_meta.zig'
         )
     },
+    # Holders AT SCALE (T909): once holder-backed spawning became the default,
+    # the per-session process stopped being a cost an opt-in user chose and
+    # became one every box pays. This is the only harness that runs a realistic
+    # fleet of sessions at once and reads the cost off the process table - and
+    # the only one where a per-session teardown leak shows up as a pile of
+    # orphans rather than as one process nobody notices. It also owns the
+    # spawn-time decision in `pty_child.zig`, which no other harness covers:
+    # a holder-spawn failure falls back to the in-process child with only a log
+    # line, so "every live session has a holder" is the assertion that catches
+    # a silent fallback.
+    [pscustomobject]@{
+        Name   = 'holder-soak'
+        Script = 'test\win32\holder-soak.ps1'
+        Stamp  = 'test\win32\holder-soak.stamp.json'
+        Covers = @(
+            'test\win32\holder-soak.ps1',
+            'src\remote\agent\pty_child.zig'
+        )
+    },
     # Non-destructive agent HANDOFF (T907): the choreography that lets the
     # session manager replace itself with a newer build while sessions are open.
     # Two things make it un-shippable un-run. It is the only harness that proves

@@ -88,25 +88,38 @@ pub const Spawned = struct {
     info: Info,
 };
 
-/// The opt-in environment variable, read from the AGENT's own environment
+/// The escape-hatch environment variable, read from the AGENT's own environment
 /// snapshot (`PtySpawner.env`) rather than the live process environment, so
 /// every session in one agent's lifetime is spawned the same way.
 pub const env_var = "GHOZTTY_AGENT_PTY_HOLDER";
 
 /// Whether new sessions should be spawned holder-backed, given the value of
-/// `env_var` (null when unset). Flag-gated while the mechanism stabilizes
-/// (T905): opting in is deliberate, and with the flag off the spawn path stays
-/// bit-identical to the in-process ConPTY child that has shipped all along —
-/// which is what makes a regression here attributable to the flag.
+/// `env_var` (null when unset).
+///
+/// Holder-backed is the DEFAULT since T909. It was opt-in for exactly as long
+/// as the mechanism was new (T905): a flag that is off ships a spawn path
+/// bit-identical to the in-process ConPTY child, which is what made an early
+/// regression attributable — but it also means the survive-an-agent-restart
+/// property only reaches whoever sets a variable, and the adoption (T906) and
+/// self-upgrade (T907) halves that ride on it never run on a real box. Now that
+/// all three are in, the variable inverts: it is the OFF switch for a box where
+/// holders misbehave, not the ON switch for the feature.
+///
+/// Only an explicit falsey value turns holders off (`0`/`false`/`off`/`no`,
+/// case-insensitive, surrounding whitespace ignored so a hand-typed value in a
+/// launcher script still lands). Anything else — including an unset or empty
+/// variable, and including the `1` that boxes and scripts set today — is on.
 ///
 /// Pure, so the truth table is a unit test rather than a claim.
 pub fn enabledFor(value: ?[]const u8) bool {
     if (!is_windows) return false; // POSIX holder half is T908 (seat: mac)
-    const v = value orelse return false;
-    return std.mem.eql(u8, v, "1") or
-        std.ascii.eqlIgnoreCase(v, "true") or
-        std.ascii.eqlIgnoreCase(v, "on") or
-        std.ascii.eqlIgnoreCase(v, "yes");
+    const v = value orelse return true;
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return true;
+    return !(std.mem.eql(u8, t, "0") or
+        std.ascii.eqlIgnoreCase(t, "false") or
+        std.ascii.eqlIgnoreCase(t, "off") or
+        std.ascii.eqlIgnoreCase(t, "no"));
 }
 
 /// Everything a LATER agent needs to pick up a holder this one left behind
@@ -962,25 +975,40 @@ test "pipeNamesHolder: the recorded NAME is the shared identity, not the session
     try testing.expect(pipeNamesHolder("\\\\.\\pipe\\ghoztty-pty-host-dave-smoke-1", "smoke-1"));
 }
 
-test "enabledFor: only an explicit opt-in turns holders on" {
-    // Off is the default and every unset/near-miss value keeps it off — the
-    // flag exists so a regression is attributable, which only holds if nothing
-    // enables it by accident.
-    try testing.expect(!enabledFor(null));
-    try testing.expect(!enabledFor(""));
-    try testing.expect(!enabledFor("0"));
-    try testing.expect(!enabledFor("false"));
-    try testing.expect(!enabledFor("11"));
-    try testing.expect(!enabledFor(" 1"));
-
+test "enabledFor: holders are the default and only an explicit off opts out (T909)" {
     if (!is_windows) {
-        // POSIX has no holder yet (T908): the flag must not half-enable one.
+        // POSIX has no holder yet (T908): neither the default nor an explicit
+        // opt-in may half-enable one.
+        try testing.expect(!enabledFor(null));
         try testing.expect(!enabledFor("1"));
         return;
     }
+
+    // Unset is ON — that IS the flip. An empty value is unset as far as this
+    // question goes (`set VAR=` on Windows removes it; an EnvMap can still
+    // carry one).
+    try testing.expect(enabledFor(null));
+    try testing.expect(enabledFor(""));
+
+    // The values boxes and scripts already set keep working.
     try testing.expect(enabledFor("1"));
     try testing.expect(enabledFor("true"));
     try testing.expect(enabledFor("TRUE"));
     try testing.expect(enabledFor("on"));
     try testing.expect(enabledFor("Yes"));
+
+    // The escape hatch, in the spellings someone would actually type.
+    try testing.expect(!enabledFor("0"));
+    try testing.expect(!enabledFor("false"));
+    try testing.expect(!enabledFor("FALSE"));
+    try testing.expect(!enabledFor("off"));
+    try testing.expect(!enabledFor("No"));
+    try testing.expect(!enabledFor(" 0 "));
+
+    // A near-miss is NOT an opt-out: the hatch has to be deliberate, and
+    // silently falling back to the legacy path on a typo is the failure mode
+    // this whole task exists to end.
+    try testing.expect(enabledFor("11"));
+    try testing.expect(enabledFor("00"));
+    try testing.expect(enabledFor("nope"));
 }

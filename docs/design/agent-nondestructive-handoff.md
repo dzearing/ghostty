@@ -163,9 +163,10 @@ Filed as parity tasks (T705 is split into these; ids in T705's log):
 
 1. Holder process mode + control-pipe protocol + replay buffer (unit-tested in
    the `test-agent` lane; ConPTY smoke on the box).
-2. New persistent sessions spawn holder-backed (flag-gated), holder escapes the
-   agent's job, `sessions.json` carries the additive fields; acceptance: kill
-   the agent, the shell survives.
+2. New persistent sessions spawn holder-backed (flag-gated while new; DEFAULT
+   since T909, with `GHOZTTY_AGENT_PTY_HOLDER=0` as the escape hatch), holder
+   escapes the agent's job, `sessions.json` carries the additive fields;
+   acceptance: kill the agent, the shell survives.
 3. A starting agent adopts live holders — discovery, re-attach, gap-fill;
    acceptance: pane typed into before and after an agent kill (`Test-PaneLive`).
 4. Upgrade choreography + rollback + `handoff_now` policy + mixed-generation

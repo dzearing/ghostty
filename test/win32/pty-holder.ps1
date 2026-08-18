@@ -9,18 +9,19 @@
 # session HOLDER process that escapes the agent's job.
 #
 # Sections:
-#   A. Flag ON: a new agent-backed pane is holder-backed. `sessions.json`
-#      records the holder's control pipe + pid, a `--pty-host` process is
-#      really running under that pid, and the pane's shell is a child of the
-#      HOLDER (not of the agent).
+#   A. DEFAULT (nothing set, T909): a new agent-backed pane is holder-backed.
+#      `sessions.json` records the holder's control pipe + pid, a `--pty-host`
+#      process is really running under that pid, and the pane's shell is a child
+#      of the HOLDER (not of the agent).
 #   B. Kill the AGENT. The holder survives, the shell survives, and the
 #      holder's control pipe still accepts a connection - which is what makes
 #      the session re-adoptable (T906 does the adopting).
-#   C. NEGATIVE CONTROL, flag OFF: the same steps record no holder fields, the
-#      shell is a child of the AGENT, and killing the agent DOES take the shell
-#      with it. Without this arm, section B would pass on a box where nothing
-#      ever dies, and the flag's "bit-identical when off" claim would be
-#      untested.
+#   C. NEGATIVE CONTROL, explicit opt-OUT (`GHOZTTY_AGENT_PTY_HOLDER=0`): the
+#      same steps record no holder fields, the shell is a child of the AGENT,
+#      and killing the agent DOES take the shell with it. Two things ride on
+#      this arm: section B would pass on a box where nothing ever dies without
+#      it, and the escape hatch is only an escape hatch if something proves it
+#      still reaches the legacy path.
 #
 # Hermetic: a per-run $env:LOCALAPPDATA, a private IPC pipe suffix, and
 # GHOSTTY_LOCAL_AGENT_BIN pinned to the agent under test. Only processes whose
@@ -128,16 +129,21 @@ function Test-PipeConnects([string]$fullPipePath) {
     }
 }
 
-# One arm of the experiment: bring up an app + agent with the holder flag in a
-# given state, open a pane, and report what the agent recorded.
+# One arm of the experiment: bring up an app + agent with holders in a given
+# state, open a pane, and report what the agent recorded.
+#
+# Since T909 the ON arm sets NOTHING - holder-backed is the default, and an arm
+# that set `=1` would keep passing on the day the default silently regressed.
+# The OFF arm sets the explicit opt-out, which is the only thing that reaches
+# the legacy path now.
 function Invoke-Arm([bool]$HolderOn, [string]$Tag) {
     $root = Join-Path $env:TEMP "ghoztty-pty-holder-$Tag-$PID"
     New-Item -ItemType Directory -Force $root | Out-Null
 
     $env:LOCALAPPDATA = $root
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    if ($HolderOn) { $env:GHOZTTY_AGENT_PTY_HOLDER = '1' }
-    else { Remove-Item env:GHOZTTY_AGENT_PTY_HOLDER -ErrorAction SilentlyContinue }
+    if ($HolderOn) { Remove-Item env:GHOZTTY_AGENT_PTY_HOLDER -ErrorAction SilentlyContinue }
+    else { $env:GHOZTTY_AGENT_PTY_HOLDER = '0' }
 
     Stop-TestProcs
     $before = @((Get-TestAgents) | ForEach-Object { [int]$_.ProcessId })
@@ -196,7 +202,7 @@ Remove-Item env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
 $roots = @()
 try {
     # ========================================================================
-    Say "== A: flag ON - the pane's shell lives in a holder, not in the agent"
+    Say "== A: DEFAULT (nothing set) - the pane's shell lives in a holder, not in the agent"
     # ========================================================================
     $on = Invoke-Arm $true 'on'
     $roots += $on.Root
@@ -243,15 +249,15 @@ try {
         (Get-TestHolders).Count -eq 0)
 
     # ========================================================================
-    Say "== C: negative control, flag OFF - today's behavior, unchanged"
+    Say "== C: negative control, explicit opt-OUT (=0) - the pre-T905 path, still reachable"
     # ========================================================================
     $off = Invoke-Arm $false 'off'
     $roots += $off.Root
     Assert 'C1 premise: the app is up and answering IPC' $off.Ready
     Assert 'C2 premise: a local agent is running' ($off.AgentPid -ne 0)
     Assert 'C3 premise: the agent persisted a session record' ($null -ne $off.MetaPath)
-    Assert 'C4 with the flag off, no holder fields are written' ($null -eq $off.HolderPipe)
-    Assert 'C5 with the flag off, no holder process is spawned' ((Get-TestHolders).Count -eq 0)
+    Assert 'C4 with the opt-out set, no holder fields are written' ($null -eq $off.HolderPipe)
+    Assert 'C5 with the opt-out set, no holder process is spawned' ((Get-TestHolders).Count -eq 0)
 
     $offKids = if ($off.AgentPid -ne 0) { Get-Children $off.AgentPid } else { @() }
     $offShell = @($offKids | Where-Object { $_.Name -match '^(cmd|powershell|pwsh)\.exe$' } |

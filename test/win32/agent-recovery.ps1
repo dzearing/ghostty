@@ -16,9 +16,13 @@
 #      gone, the panes are genuinely broken before recovery is asserted.
 #   C: recovery — within the settle window + re-dial, the window is back to 2
 #      panes and BOTH ARE RESPONSIVE AGAIN (a fresh marker round-trips). The
-#      shell pids are NEW (the children died with the agent; the respawned
-#      agent RELAUNCHes them), which is what separates a real rebuild from a
-#      pane that merely still exists.
+#      shell pids are UNCHANGED: since T909 every session is holder-backed by
+#      default, so the children outlive the agent and the replacement ADOPTS
+#      them (T906) instead of relaunching. Until then the same assertion read
+#      the other way round — new pids, because the shells died with the agent —
+#      and the flip is the whole user-visible point of T705. What separates a
+#      real rebuild from a pane that merely still exists is the SURFACE set
+#      (E7), never the pids.
 #   D: the e65cfa4d5 lesson — recovery must not KILL the sessions it recovers.
 #      The alive-session count is 2 after recovery AND still 2 after the
 #      departing surfaces have had time to finish tearing down (their DETACH
@@ -244,11 +248,13 @@ function Test-PaneResponsive($tmp, $target, $tag, $timeoutSec = 20) {
 # after a rebuild and the same set after a no-op.
 #
 # Child PIDS deliberately are NOT the oracle here, and that is a correction to
-# the plan T195 was filed with. Pids answer the KILL (the children died with the
-# agent, so the respawned one relaunches them - section C), but they cannot
-# answer a SUSPEND: a frozen agent never loses a child, so a rebuild after a blip
-# would re-ATTACH the very same pids and read as "nothing happened". The surface
-# set separates the two cases under either stimulus.
+# the plan T195 was filed with. They cannot answer a SUSPEND: a frozen agent
+# never loses a child, so a rebuild after a blip would re-ATTACH the very same
+# pids and read as "nothing happened". Since T909 they cannot answer a KILL
+# either - holder-backed sessions survive it and are adopted, so the pids are
+# unchanged there too. The surface set separates the two cases under either
+# stimulus, which is why it is the oracle and the pids are only evidence about
+# the SHELLS.
 if (-not ('GhozttyRecoveryNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -509,7 +515,7 @@ Assert "B4 the panes are BROKEN before recovery (trap armed)" (
     -not (Test-PaneResponsive $tmp 't145b' 'b' 4))
 
 # ============================================================================
-"== C: recovery - the panes come back, on NEW children, with no relaunch"
+"== C: recovery - the panes come back on the SAME children, with no relaunch"
 # ============================================================================
 # Settle window (5s) + re-dial/spawn (<=2s) + agent restore + RELAUNCH.
 $rowsC = Wait-AliveCount $tmp 'c' 2 45
@@ -524,11 +530,18 @@ Assert "C3 it is NOT the process that was killed" (
 $stillHere = Get-Process -Id $appPid -ErrorAction SilentlyContinue
 Assert "C4 the app pid never changed across recovery" ($null -ne $stillHere)
 
+# Since T909 holder-backed spawning is the DEFAULT, so the agent's death no
+# longer reaches the shells: the replacement adopts the surviving holders
+# (T906) and the user's running commands, cwd and scrollback come back with
+# them. This assertion used to demand the opposite - two brand-new pids,
+# because the children died with the agent - and flipping it is the whole
+# user-visible payoff of T705. `+list`'s pid is the SHELL's on both paths
+# (holder or not), so the two sides are comparable.
 $pidsC = Alive-Pids $rowsC
 $newPids = @($pidsC | Where-Object { $pidsA -notcontains $_ })
-if ($newPids.Count -ne 2) { "    [C5] before=$($pidsA -join ',') after=$($pidsC -join ',')" }
-Assert "C5 the shells are NEW children (the old ones died with the agent)" (
-    $newPids.Count -eq 2)
+if ($newPids.Count -ne 0) { "    [C5] before=$($pidsA -join ',') after=$($pidsC -join ',')" }
+Assert "C5 the shells SURVIVED the agent and were adopted (same pids, nothing relaunched)" (
+    $newPids.Count -eq 0 -and (Alive-Rows $rowsC).Count -eq 2)
 
 Assert "C6 the named pane is RESPONSIVE again - the actual defect" (
     Test-PaneResponsive $tmp 't145b' 'c' 30)

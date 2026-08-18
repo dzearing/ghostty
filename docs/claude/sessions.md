@@ -431,10 +431,14 @@ frozen-tiny so it almost never needs upgrading itself. Increment status lives
 in T705's split (T904 holder+protocol, T905 spawn path, T906 adoption, T907
 choreography). Acceptance: `test\win32\pty-host.ps1`.
 
-**Since T905 the agent can actually spawn one**, behind
-`GHOZTTY_AGENT_PTY_HOLDER=1` (read from the agent's own environment at start, so
-one agent's sessions are all spawned the same way). Three things about that path
-are contract, not detail:
+**Since T905 the agent can actually spawn one, and since T909 that is the
+DEFAULT** — every persistent session on Windows is holder-backed unless
+`GHOZTTY_AGENT_PTY_HOLDER` is set to `0`/`false`/`off`/`no`, which is the escape
+hatch back to the in-process ConPTY child. The variable is read from the agent's
+own environment at start, so one agent's sessions are all spawned the same way,
+and only an explicitly falsey value opts out (a near-miss like `00` stays ON: a
+typo must not silently return a box to the lossy path). Three things about that
+path are contract, not detail:
 
 - **A holder is spawned from a JSON spawn spec**, not from flags: the agent
   writes `%TEMP%\ghoztty-ptyhost-<id>.json` holding the whole `protocol.Open`
@@ -454,9 +458,9 @@ are contract, not detail:
   day; a dead pane because a holder would not start is a worse one.
 
 Acceptance for that half is `test\win32\pty-holder.ps1`, which kills a real
-agent and asserts the shell and holder live on — with a flag-OFF negative
-control asserting the shell still dies with the agent, so the measurement is of
-the change rather than of the box.
+agent (with nothing set, i.e. the default) and asserts the shell and holder live
+on — with an opt-OUT negative control (`=0`) asserting the shell still dies with
+the agent, so the measurement is of the change rather than of the box.
 
 **Since T906 a starting agent re-adopts them** (`src/remote/agent/holder_adopt.zig`,
 run from every listen path right after `loadPersisted` and BEFORE the listener

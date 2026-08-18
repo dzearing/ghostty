@@ -282,7 +282,9 @@ try {
     Copy-Item -LiteralPath $AgentExe -Destination $runningAgent -Force
     Remove-Item -LiteralPath $canonicalAgent -Force -ErrorAction SilentlyContinue
     $env:GHOSTTY_LOCAL_AGENT_BIN = $runningAgent
-    $env:GHOZTTY_AGENT_PTY_HOLDER = '1'
+    # Holder-backed is the DEFAULT since T909 - clear an inherited opt-out
+    # rather than setting the flag, so this measures what a real box does.
+    Remove-Item env:GHOZTTY_AGENT_PTY_HOLDER -ErrorAction SilentlyContinue
     $env:GHOZTTY_AGENT_HANDOFF_FORCE = '1'
     $env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = '2000'
 

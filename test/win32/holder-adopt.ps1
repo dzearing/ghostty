@@ -239,10 +239,12 @@ try {
     New-Item -ItemType Directory -Force $tmp | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    # The subject. Holder-backed spawning is still flag-gated (T905) - with it
-    # off there is nothing to adopt, and this whole script would be measuring
-    # the relaunch path agent-recovery.ps1 already covers.
-    $env:GHOZTTY_AGENT_PTY_HOLDER = '1'
+    # The subject. Holder-backed spawning is the DEFAULT since T909, so this
+    # arm sets NOTHING and asserts what a real box does - it only CLEARS an
+    # inherited opt-out, because with holders off there is nothing to adopt and
+    # the whole script would silently degrade into the relaunch path
+    # agent-recovery.ps1 already covers.
+    Remove-Item env:GHOZTTY_AGENT_PTY_HOLDER -ErrorAction SilentlyContinue
 
     . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
     [void](Set-GhozttyTestIsolation -Tag 'adopt906')
