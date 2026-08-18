@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-17T17:58:23-07:00",
-    "commit":  "eaafea9f3",
+    "generated":  "2026-08-17T20:34:59-07:00",
+    "commit":  "b180544b5",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -53,7 +53,7 @@
                   "test/win32/cli-launch-cwd.ps1":  "edb38ad42e77f5c9b77d6afcc42602dda81a6848a8db0f25442bc5c698a32573",
                   "test/win32/clipboard-paste.ps1":  "c0e8a0909c3e3214bccf8942fe9c59f038d7b58852c311bcde5961a9984a1ae9",
                   "test/win32/cli-shim-redirect.ps1":  "e109aa7cabf710ec0a49209a1cf7c1ea885613e5fd2f8dabc70f04a176c79c6b",
-                  "test/win32/cli-unknown-flag.ps1":  "11458deb814890ac37d5404d8eec260571b5c85caae24ee625eaec8eddb64625",
+                  "test/win32/cli-unknown-flag.ps1":  "aa17e6db87488baaaece91033034f507becae5c905a0596cbdc03f868789661c",
                   "test/win32/close-confirm-idle.ps1":  "7cd9abdb900e35dd99845633928c8741bc0a920563129e595f0744bdf9849a48",
                   "test/win32/close-glyph-white.ps1":  "fe9f91e49f6f6a9998fa3c8e67c2d09be29c595ecbd7fc9238c7744d09b1c36d",
                   "test/win32/color-contrast.ps1":  "877d24782a2c55fa9f410907b61c28425ea1fb566552546ace645811f4482a02",

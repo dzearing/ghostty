@@ -7,6 +7,7 @@ const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const lib = @import("../lib/main.zig");
 const view_arg = @import("view_arg.zig");
+const verb_flags = @import("verb_flags.zig");
 const homedir = @import("../os/homedir.zig");
 const global = &@import("../global.zig").state;
 
@@ -27,6 +28,14 @@ pub const Options = struct {
     /// Enable arg parsing diagnostics so that we don't get an error if
     /// there is a "normal" config setting on the cli.
     _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852). This verb forwards a fixed set —
+    /// the handlers read `--working-directory`, `--command`, `--title` and the
+    /// window/split flags below and nothing else — so an unknown `--flag`
+    /// before `-e` is a typo, not a config override. Everything AFTER `-e` is
+    /// the command and is never checked.
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.new_window },
 
     /// Manual parse hook, collect all of the arguments after `+new-window`.
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || homedir.ExpandError || std.fs.Dir.RealPathAllocError || Allocator.Error)!bool {
@@ -55,6 +64,8 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || homedir.ExpandError || std.fs.Dir.RealPathAllocError || Allocator.Error)!?[:0]const u8 {
+        if (!try self._flags.accept(alloc, arg)) return null;
+
         if (lib.cutPrefix(u8, arg, "--class=")) |rest| {
             self.class = try alloc.dupeZ(u8, std.mem.trim(u8, rest, &std.ascii.whitespace));
             return null;
@@ -229,6 +240,10 @@ pub const Options = struct {
 ///     the background. Also suppresses focus when an existing `--target`
 ///     is found.
 ///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the running instance.
+/// Everything after `-e` is the command and is never checked.
+///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
     var iter = try args.argsIterator(alloc);
@@ -276,6 +291,11 @@ fn runArgs(
         }
         if (exit) return 1;
     }
+
+    // Before anything that could launch an instance: a typo must not open a
+    // window and then be reported.
+    if (opts._flags.help_requested) return Action.help_error;
+    if (try opts._flags.report(stderr)) return 1;
 
     if (!opts._working_directory_seen) {
         const alloc = opts._arena.?.allocator();

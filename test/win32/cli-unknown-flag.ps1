@@ -14,9 +14,15 @@
 # exits nonzero. Config keys stay legitimate on the verbs whose command line
 # is also read by Config.load (+show-config, +validate-config,
 # +list-keybinds, +edit-config, +show-face) - a tolerance, not a hole, and
-# unit-tested in the none lane. The forwarding verbs (+close, +split, ...)
-# hand their argv to the server by design and are T852's follow-up, not
-# covered here.
+# unit-tested in the none lane.
+#
+# T852 closed the other half: the FORWARDING verbs (+close, +split,
+# +new-window, ...) collect their whole command line and hand it to the
+# running instance, whose parser ignores an argument it does not recognize
+# ON PURPOSE - that tolerance is the app<->CLI compatibility contract. So a
+# typo reached the server, was dropped, and left the verb doing something
+# else at exit 0. Each of those verbs now carries an explicit flag allowlist
+# in src\cli\verb_flags.zig; sections 13-18 cover them.
 #
 # Exit codes are read through cmd.exe redirection, not a PS 5.1 pipeline:
 # $LASTEXITCODE after a native command in a pipeline is not trustworthy here
@@ -120,6 +126,111 @@ Assert "exits 0" ($r.exit -eq 0)
 Assert "prints usage" ($r.out -match 'Available actions')
 $r = Invoke-Verb '+help --bogus-flag=1'
 Assert "+help still rejects an unknown flag" ($r.exit -ne 0 -and $r.out -match 'unknown flag --bogus-flag')
+
+# --- T852: the forwarding verbs -------------------------------------------
+#
+# These hand their argv to the running instance. None of the command lines
+# below may reach one: `+new-window` is the only verb that AUTO-LAUNCHES the
+# app when none is running, so it is never given a command line that survives
+# to the IPC call (a stray GUI is not a test result).
+
+$forwarding = @(
+    @{ verb = '+close';             typo = '--targt=x';     near = '--target' }
+    @{ verb = '+rename';            typo = '--titel=y';     near = '--title' }
+    @{ verb = '+rearrange';         typo = '--layot={}';    near = '--layout' }
+    @{ verb = '+read';              typo = '--nme=x';       near = '--name' }
+    @{ verb = '+set-banner';        typo = '--clr';         near = '--clear' }
+    @{ verb = '+set-state';         typo = '--stat=busy';   near = '--state' }
+    @{ verb = '+reload';            typo = '--targt=x';     near = '--target' }
+    @{ verb = '+split';             typo = '--dirction=r';  near = '--direction' }
+    @{ verb = '+new-window';        typo = '--targt=x';     near = '--target' }
+    @{ verb = '+new-remote-window'; typo = '--hst=box';     near = '--host' }
+)
+
+"== 13: every forwarding verb rejects an unknown flag by name"
+foreach ($f in $forwarding) {
+    $r = Invoke-Verb "$($f.verb) --bogus-flag=1"
+    Assert "$($f.verb) exits nonzero" ($r.exit -ne 0)
+    Assert "$($f.verb) names verb and flag" ($r.out -match "\$($f.verb): unknown flag --bogus-flag")
+    Assert "$($f.verb) points at --help" ($r.out -match "ghoztty \$($f.verb) --help")
+}
+
+"== 14: a near-miss on a forwarding verb gets a suggestion"
+foreach ($f in $forwarding) {
+    $r = Invoke-Verb "$($f.verb) $($f.typo)"
+    Assert "$($f.verb) suggests $($f.near)" ($r.out -match "did you mean $($f.near)\?")
+}
+
+# The sentinel control. Every flag the verb really accepts is listed FIRST,
+# then one flag that certainly is not. The checker records the FIRST unknown
+# flag it sees, so the message naming the sentinel - and only the sentinel -
+# is proof that everything ahead of it was accepted. It also fails before the
+# IPC call, which is what keeps +new-window from launching anything.
+"== 15: every documented flag of every forwarding verb is still accepted"
+$accepted = @(
+    @{ verb = '+close';     flags = '--target=x' }
+    @{ verb = '+rename';    flags = '--target=x --title=y' }
+    @{ verb = '+rearrange'; flags = '--target=x --layout={}' }
+    @{ verb = '+read';      flags = '--name=x --lines=5' }
+    @{ verb = '+set-banner'; flags = '--target=x --clear' }
+    @{ verb = '+set-state'; flags = '--target=x --state=busy' }
+    @{ verb = '+reload';    flags = '--target=x' }
+    @{ verb = '+split'; flags = '--target=x --name=n --pane=p --direction=right --split=right --percent=40 --split-percent=40 --from-focused --view=README.md --command=pwsh --split-command=pwsh --shell=bash --env=A=B --color=#abc --working-directory=D:\git\ghoztty' }
+    @{ verb = '+new-window'; flags = '--class=com.x --target=x --name=n --title=t --command=pwsh --view=README.md --working-directory=D:\git\ghoztty --shell=bash --env=A=B --color=#abc --split-color=#abc --split=right --direction=right --split-command=pwsh --split-percent=40 --percent=40 --no-activate --from-focused --cwd-implicit' }
+    @{ verb = '+new-remote-window'; flags = '--host=h --port=1 --relay=r --device=d --token=t --name=n --title=t --working-directory=/tmp --shell=/bin/sh --command=ls --no-activate' }
+)
+foreach ($a in $accepted) {
+    $r = Invoke-Verb "$($a.verb) $($a.flags) --zzz-sentinel=1"
+    Assert "$($a.verb) exits nonzero on the sentinel" ($r.exit -ne 0)
+    Assert "$($a.verb) names ONLY the sentinel (all real flags accepted)" `
+        ($r.out -match 'unknown flag --zzz-sentinel')
+}
+
+# The other direction: a clean command line gets past the flag layer and
+# fails at the IPC call instead, which is the pre-T852 behavior for anything
+# spelled right. +new-window is absent on purpose (it would auto-launch).
+"== 16: a correct command line still reaches the server"
+$reaches = @(
+    @{ verb = '+rename';    flags = '--target=x --title=y' }
+    @{ verb = '+read';      flags = '--name=x --lines=5' }
+    @{ verb = '+set-banner'; flags = '--target=x --clear' }
+    @{ verb = '+set-state'; flags = '--target=x --state=busy' }
+    @{ verb = '+reload';    flags = '--target=x' }
+    @{ verb = '+rearrange'; flags = '--target=x --layout={}' }
+    @{ verb = '+split';     flags = '--target=x --direction=right' }
+)
+foreach ($a in $reaches) {
+    $r = Invoke-Verb "$($a.verb) $($a.flags)"
+    Assert "$($a.verb) is not a flag error" ($r.out -notmatch 'unknown flag')
+    Assert "$($a.verb) reports no running instance" ($r.out -match 'running Ghoztty instance')
+}
+$r = Invoke-Verb '+close --target=x'
+Assert "+close stays idempotent with no instance (exit 0)" ($r.exit -eq 0 -and $r.out -notmatch 'unknown flag')
+
+"== 17: +set-banner text after a bare -- is text, not a flag typo"
+$r = Invoke-Verb '+set-banner --target=x -- "--- build failed ---"'
+Assert "no flag error for dashed banner text" ($r.out -notmatch 'unknown flag')
+Assert "it reached the server" ($r.out -match 'running Ghoztty instance')
+$r = Invoke-Verb '+set-banner --target=x "--- build failed ---"'
+Assert "without the -- it IS a flag error (the escape hatch is required)" `
+    ($r.exit -ne 0 -and $r.out -match 'unknown flag')
+
+"== 18: the -e command tail and single-dash arguments are never checked"
+$r = Invoke-Verb '+split --name=x -e pwsh -NoLogo --not-a-ghoztty-flag'
+Assert "the -e tail is not flag-checked" ($r.out -notmatch 'unknown flag')
+Assert "it reached the server" ($r.out -match 'running Ghoztty instance')
+$r = Invoke-Verb '+set-banner --target=x -la'
+Assert "a single-dash argument stays banner text" ($r.out -notmatch 'unknown flag')
+
+# `args.parse` only looks for --help at the FRONT. Past that it lands in the
+# allowlist, where "unknown flag --help" would be a worse answer than help.
+"== 19: --help past the first position still prints help"
+$r = Invoke-Verb '+split --target=x --help'
+Assert "+split prints its help" ($r.exit -eq 0 -and $r.out -match 'split pane')
+Assert "it is not reported as an unknown flag" ($r.out -notmatch 'unknown flag')
+$r = Invoke-Verb '+set-banner --target=x -- --help'
+Assert "after a bare -- it is banner text, not help" `
+    ($r.out -notmatch 'unknown flag' -and $r.out -match 'running Ghoztty instance')
 
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

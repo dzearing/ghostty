@@ -7,6 +7,7 @@ const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const lib = @import("../lib/main.zig");
 const view_arg = @import("view_arg.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
@@ -19,6 +20,11 @@ pub const Options = struct {
     /// Enable arg parsing diagnostics so that we don't get an error if
     /// there is a "normal" config setting on the cli.
     _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852). The `-e` tail never reaches
+    /// this: it is appended straight to `_arguments` by the parse hook.
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.split },
 
     /// Manual parse hook, collect all of the arguments after `+split`.
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
@@ -45,7 +51,7 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (!try self._flags.accept(alloc, arg)) return null;
         if (lib.cutPrefix(u8, arg, "--color=")) |rest| {
             const trimmed = std.mem.trim(u8, rest, &std.ascii.whitespace);
             if (!isValidColor(trimmed))
@@ -147,6 +153,10 @@ pub const Options = struct {
 ///   * `-e`: Any arguments after this will be interpreted as a command to
 ///     execute in the split pane.
 ///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the server. Everything
+/// after `-e` is the command and is never checked.
+///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
     var iter = try args.argsIterator(alloc);
@@ -176,6 +186,10 @@ fn runArgs(
             return 1;
         },
     };
+
+    if (opts._flags.help_requested) return Action.help_error;
+
+    if (try opts._flags.report(stderr)) return 1;
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

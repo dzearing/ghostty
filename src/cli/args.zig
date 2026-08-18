@@ -394,15 +394,32 @@ pub fn reportCliDiagnosticsStderr(
 /// The action flag closest to `key` by edit distance, when the spelling is
 /// close enough to plausibly be a typo of it; null otherwise.
 fn nearestField(comptime T: type, key: []const u8) ?[]const u8 {
+    const names = comptime names: {
+        var list: []const []const u8 = &.{};
+        for (@typeInfo(T).@"struct".fields) |field| {
+            if (field.name[0] != '_') list = list ++ [_][]const u8{field.name};
+        }
+        break :names list;
+    };
+
+    return nearestName(names, key);
+}
+
+/// The name in `names` closest to `key` by edit distance, when the spelling
+/// is close enough to plausibly be a typo of it; null otherwise.
+///
+/// Shared by the field-parsing verbs, which pass their `Options` fields, and
+/// the FORWARDING verbs, which have no fields to parse into and pass an
+/// explicit allowlist instead (`cli/verb_flags.zig`). One suggestion rule for
+/// both is the point: a typo should read the same however the verb is built.
+pub fn nearestName(names: []const []const u8, key: []const u8) ?[]const u8 {
     var best: ?[]const u8 = null;
     var best_dist: usize = std.math.maxInt(usize);
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (comptime field.name[0] != '_') {
-            const dist = editDistance(field.name, key);
-            if (dist < best_dist) {
-                best_dist = dist;
-                best = field.name;
-            }
+    for (names) |name| {
+        const dist = editDistance(name, key);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = name;
         }
     }
 

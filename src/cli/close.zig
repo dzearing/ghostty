@@ -5,6 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
@@ -17,6 +18,10 @@ pub const Options = struct {
     /// Enable arg parsing diagnostics so that we don't get an error if
     /// there is a "normal" config setting on the cli.
     _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852).
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.close },
 
     /// Manual parse hook, collect all of the arguments after `+close`.
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
@@ -32,7 +37,7 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (!try self._flags.accept(alloc, arg)) return null;
         return try alloc.dupeZ(u8, arg);
     }
 
@@ -58,6 +63,9 @@ pub const Options = struct {
 ///   * `--target=<name>`: The name of the pane or window to close.
 ///     Required. The target must have been created with
 ///     `+new-window --target=<name>` or `+split --name=<name>`.
+///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the server.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -88,6 +96,10 @@ fn runArgs(
             return 1;
         },
     };
+
+    if (opts._flags.help_requested) return Action.help_error;
+
+    if (try opts._flags.report(stderr)) return 1;
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

@@ -22,6 +22,27 @@ re-focus stays quiet. (win32 server done; Mac server half is T523 — the
 shared CLI already prints any note it receives.) The verbs, flags, and semantics below are the
 same on both platforms.
 
+**A flag this list does not contain is an error, not a no-op** (T489, T852).
+Every verb — the ones that parse their own flags and the ones that forward
+their whole command line to the running instance — rejects an unknown `--flag`
+by name, suggests the nearest real spelling when the typo is close, and exits
+non-zero without doing its work:
+
+```
+$ ghoztty +split --dirction=right
++split: unknown flag --dirction (did you mean --direction?)
+run 'ghoztty +split --help' for usage
+```
+
+The SERVER stays tolerant of flags it does not know — that is the
+compatibility contract that lets a week-old running instance accept a
+CLI that learned a flag this morning — so the check lives in the CLI, which
+knows exactly what each verb accepts (`src/cli/verb_flags.zig` for the
+forwarding verbs). Two things are deliberately never checked: everything after
+`-e`, which is the command, and single-dash arguments, which are content. To
+pass literal text starting with `--` (banner text, `+send-keys` payloads), put
+it after a bare `--`, which stops flag parsing.
+
 ### `ghoztty +new-window`
 
 Create or focus a terminal window. Auto-launches Ghoztty if no instance is running.

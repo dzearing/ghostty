@@ -5,6 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
@@ -12,6 +13,11 @@ pub const Options = struct {
     _arguments: std.ArrayList([:0]const u8) = .empty,
 
     _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852). Banner TEXT that begins with
+    /// `--` goes after a bare `--`, which stops flag parsing.
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.set_banner },
 
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
@@ -26,7 +32,7 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (!try self._flags.accept(alloc, arg)) return null;
         return try alloc.dupeZ(u8, arg);
     }
 
@@ -58,7 +64,13 @@ pub const Options = struct {
 ///   * `--clear`: Remove the banner. Equivalent to passing an empty
 ///     banner text.
 ///
-/// All other arguments are treated as the banner text.
+/// All other arguments are treated as the banner text — except one that
+/// starts with `--`, which is a misspelled flag rather than text and is an
+/// error, so a typo is rejected instead of being dropped by the server. To
+/// set banner text that genuinely begins with `--`, put it after a bare
+/// `--`, which stops flag parsing:
+///
+///   ghoztty +set-banner --target=dev -- "--- build failed ---"
 ///
 /// Banner text is markdown a program composed, so it routinely carries
 /// the two characters PowerShell 5.1 cannot put on a native command line
@@ -98,6 +110,10 @@ fn runArgs(
             return 1;
         },
     };
+
+    if (opts._flags.help_requested) return Action.help_error;
+
+    if (try opts._flags.report(stderr)) return 1;
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

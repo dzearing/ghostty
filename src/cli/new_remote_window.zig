@@ -5,11 +5,16 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const ipc_client = @import("../os/ipc_client.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     _arguments: std.ArrayList([:0]const u8) = .empty,
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852).
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.new_remote_window },
 
     host: ?[:0]const u8 = null,
     port: u16 = 0,
@@ -32,6 +37,8 @@ pub const Options = struct {
     }
 
     fn absorb(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!void {
+        if (!try self._flags.accept(alloc, arg)) return;
+
         if (std.mem.startsWith(u8, arg, "--host=")) {
             self.host = try alloc.dupeZ(u8, arg["--host=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
@@ -91,6 +98,9 @@ pub const Options = struct {
 ///     interactive shell. Runs THROUGH the resolved shell using its native
 ///     convention (POSIX `-lic`, cmd `/c`, powershell `-Command`, wsl `--`).
 ///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the server.
+///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
     var iter = try args.argsIterator(alloc);
@@ -120,6 +130,11 @@ fn runArgs(
             return 1;
         },
     };
+
+    // Before the required-flag checks: `--hst=box` is a typo of `--host`, and
+    // saying so beats "--host is required" over a command line that has one.
+    if (opts._flags.help_requested) return Action.help_error;
+    if (try opts._flags.report(stderr)) return 1;
 
     // Validation: require EITHER a direct TCP dial (--host + --port) OR a relay
     // dial (--relay + --device). The relay path takes precedence when present.

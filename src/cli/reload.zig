@@ -5,6 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
@@ -12,6 +13,10 @@ pub const Options = struct {
     _arguments: std.ArrayList([:0]const u8) = .empty,
 
     _diagnostics: diagnostics.DiagnosticList = .{},
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852).
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.reload },
 
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
@@ -26,7 +31,7 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (!try self._flags.accept(alloc, arg)) return null;
         return try alloc.dupeZ(u8, arg);
     }
 
@@ -55,6 +60,9 @@ pub const Options = struct {
 ///
 ///   * `--target=<name>`: The named window or pane. Required. For a
 ///     window target the reload applies to its focused pane.
+///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the server.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -85,6 +93,10 @@ fn runArgs(
             return 1;
         },
     };
+
+    if (opts._flags.help_requested) return Action.help_error;
+
+    if (try opts._flags.report(stderr)) return 1;
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

@@ -17,4 +17,8 @@ test {
     // namespace is referenced from a test block. The +json helpers carry
     // pure-logic tests the hook scripts depend on (T866).
     _ = @import("cli/json.zig");
+
+    // The forwarding verbs' flag allowlists (T852): pure logic, and the only
+    // place that says which flags each of those verbs accepts.
+    _ = @import("cli/verb_flags.zig");
 }

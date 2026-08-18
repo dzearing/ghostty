@@ -5,11 +5,16 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const ipc_client = @import("../os/ipc_client.zig");
+const verb_flags = @import("verb_flags.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     _arguments: std.ArrayList([:0]const u8) = .empty,
+
+    /// The server ignores a flag it does not know, on purpose, so the CLI is
+    /// where a typo has to be caught (T852).
+    _flags: verb_flags.Checker = .{ .spec = verb_flags.read },
 
     name: ?[:0]const u8 = null,
     lines: u32 = 50,
@@ -38,7 +43,7 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (!try self._flags.accept(alloc, arg)) return null;
         return try alloc.dupeZ(u8, arg);
     }
 
@@ -67,6 +72,9 @@ pub const Options = struct {
 ///
 ///   * `--lines=<N>`: Number of lines to read from the end of the
 ///     scrollback buffer. Default: 50.
+///
+/// Any other argument starting with `--` is an error, so a misspelled
+/// flag is rejected instead of being dropped by the server.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -97,6 +105,11 @@ fn runArgs(
             return 1;
         },
     };
+
+    // Before the required-flag check: `--nme=dev` is a typo of `--name`, and
+    // saying so beats "--name is required" over a command line that has one.
+    if (opts._flags.help_requested) return Action.help_error;
+    if (try opts._flags.report(stderr)) return 1;
 
     if (opts.name == null) {
         try stderr.print("Error: --name is required for +read\n", .{});
