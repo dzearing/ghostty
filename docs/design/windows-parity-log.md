@@ -9,6 +9,43 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-19 - **T962 (filed T995) - the audit that catches a test which
+  measured nothing was itself letting one through, and its own ratchet had
+  been running backwards for eight days.** Two reds at HEAD, both found by
+  T883 and neither in its diff. `job-escape-startup.ps1`'s no-shell-window
+  branch printed `ALL PASS (0 assertions, skipped)` and exited 0 - the exact
+  `zero-count` shape T271 exists to forbid, in the one harness whose subject
+  is a startup escape nobody would notice was unmeasured. It now goes through
+  `Write-TestAssertedNothing`, so that desktop ends `ASSERTED NOTHING (0
+  assertions, 1 SKIPPED) - this run proved nothing; it is not a pass` and
+  **exits 2**, which keeps it distinct from a 1 saying the escape broke.
+  Proven where it actually happens rather than by reading: the branch was run
+  on a real background test desktop (`lib\TestDesktop.ps1`), exit code read
+  off a cached process handle because an uncached one reads back empty.
+  The second red is the more interesting one. The `uncounted-final` ceiling is
+  a ratchet that may only fall, and it stood at 41 against 39 - because the
+  FOUR acceptance harnesses filed since it was set (`floor-lane-cache-heal`,
+  `floor-lane-leak-sweep`, `printclient-audit`, `release-parity`) each
+  hand-rolled their own `if ($failures -eq 0) { "ALL PASS" }` tail, and
+  nothing obliges a new script to start on the shared scorer. All four now
+  count their passes and end on `Write-TestVerdict`, which takes the number
+  41 -> 37; the ceiling comes down to 37 with a comment saying which
+  direction it moves and why an exceeded ceiling is work rather than a number
+  to edit. `docs\claude\testing.md` says the same thing where a new harness
+  is written. One free fix fell out: `release-parity.ps1`'s old tail was also
+  half of T963 (a failure path that exits 0), so that audit's sweep is down to
+  `tab-tooltip.ps1` alone - noted on T963 rather than closed.
+  Evidence: `asserted-nothing.ps1` ALL PASS (28) where it was `2 FAILURE(S)
+  (26 passed)`, and still ALL PASS under `-TeethCheck` (C1 goes red on a
+  synthesized violator); the hard-kind sweep is empty; all five touched
+  harnesses green on the interactive desktop and re-stamped their guard rows
+  (job-escape-startup 11, cache-heal 16, leak-sweep 36, printclient-audit 8,
+  release-parity 22); floor `-Lane all` and P1-P3 green; `guard-due check`
+  clean. Filed T995 - `skip-visibility.ps1` is red the same way, on
+  `agent-handoff.ps1`: a skip site that counts nothing and a verdict line that
+  names no skip count, so a run that dropped a whole section prints what a
+  full one prints. That these three meta-audits were all red at once, all
+  found by hand, is T777/T856's gap and not a coincidence.
 - 2026-08-19 - **T943 (filed T989) - the last torn probes now photograph a
   window that poses, and the probe that measured them found a crash.** 14
   `Get-TestWindowPixels` sites across five scripts moved onto `-Sync`:

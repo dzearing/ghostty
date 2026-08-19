@@ -32,14 +32,17 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+
 $script:failures = 0
 $script:skipped = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 function AssertEq($name, $expected, $actual) {
-    if ($expected -eq $actual) { "  PASS $name" }
+    if ($expected -eq $actual) { "  PASS $name"; $script:passes++ }
     else { "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
 }
 function Skip($name, $why) {
@@ -189,10 +192,4 @@ if ($script:failures -eq 0 -and $script:skipped -eq 0) {
 }
 
 ""
-if ($script:failures -eq 0) {
-    if ($script:skipped -gt 0) { "ALL PASS ($($script:skipped) skipped)" } else { "ALL PASS" }
-    exit 0
-} else {
-    "$($script:failures) FAILURE(S)"
-    exit 1
-}
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped

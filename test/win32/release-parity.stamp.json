@@ -1,11 +1,11 @@
 {
     "guard":  "release-parity",
     "script":  "test/win32/release-parity.ps1",
-    "generated":  "2026-08-16T12:41:52-07:00",
-    "commit":  "b2fb51887",
+    "generated":  "2026-08-19T12:01:58-07:00",
+    "commit":  "df5219032",
     "files":  {
                   ".github/workflows/fork-ci.yml":  "e24534682138d71b3da3d1f63bdc01233e4c2ef53ba93733d3f735489a8bad51",
                   "scripts/check-release-parity.ps1":  "77af0cf9fe13157bb79a6bd9ee29b1df7713c170169c2c049e1884d89d7fdb98",
-                  "test/win32/release-parity.ps1":  "50b0d7631386940e259ed6462750aadb628d10244a8608a2dc484c0295e3fa90"
+                  "test/win32/release-parity.ps1":  "ed1ca81f2c6975fd0d800415123f85b94b6988a2984e1c80cf61d490effdc0c0"
               }
 }

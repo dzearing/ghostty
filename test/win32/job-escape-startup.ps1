@@ -52,6 +52,7 @@ if (-not (Test-Path $Exe)) {
 }
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 $agentExe = Join-Path (Split-Path -Parent $Exe) 'ghoztty-agent.exe'
@@ -87,11 +88,15 @@ Add-Type -TypeDefinition $jobSig -ErrorAction SilentlyContinue
 # The escape under test rides the shell-parent hop (breakaway is forbidden in
 # the field shape this jail reproduces). No shell window means no hop - a
 # SKIP, not a failure, and T674 is the task that makes this unconditional.
+#
+# It is scored as ASSERTED NOTHING (exit 2), not as a pass: this run measured
+# no part of the escape, and a green line over zero assertions is the exact
+# T271 shape - it read as "the escape still works" on every background-desktop
+# run. Exit 2 keeps that distinct from a 1, which would say the escape broke.
 if ([T675Job]::GetShellWindow() -eq [IntPtr]::Zero) {
-    Say "SKIP: no shell window on this desktop; the shell-parent escape tier cannot run here (see T674)"
     Say ""
-    Say "ALL PASS (0 assertions, skipped)"
-    exit 0
+    Write-TestAssertedNothing -Skipped 1 `
+        -Reason "no shell window on this desktop; the shell-parent escape tier cannot run here (see T674)"
 }
 
 # $true / $false / $null when the process is gone or unopenable.
@@ -298,8 +303,5 @@ if ($script:failures -eq 0) {
     $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
         update -Guard job-escape-startup -Repo $repo 2>&1 | ForEach-Object { "  $_" }
-    Say "ALL PASS ($($script:passes) assertions)"
-    exit 0
 }
-Say "$($script:failures) FAILURE(S) ($($script:passes) passed)"
-exit 1
+Write-TestVerdict -Pass $script:passes -Fail $script:failures

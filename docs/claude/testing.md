@@ -282,9 +282,12 @@ verdict hardcoding a zero count) and `early-green` (a pass verdict that ends the
 run with exit 0 anywhere but the final verdict, i.e. an abort branch scoring the
 whole run green). A third, `uncounted-final` — a final verdict that prints no
 count at all, so nothing can tell a full run from an empty one — is reported with
-its number under a ceiling that may only fall, rather than as a 39-name allowlist
+its number under a ceiling that may only fall, rather than as a 37-name allowlist
 nobody would read; **T775** converts those onto the scorer and then promotes the
-kind. Exemption: the same stated-intent `# asserted-nothing-audit: <reason>`
+kind. **A new harness starts on `Write-TestVerdict`** — the ceiling went 2 OVER
+for eight days (T962) because the four filed after it was set each hand-rolled
+their own verdict, and the fix for an exceeded ceiling is to convert scripts, not
+to raise the number. Exemption: the same stated-intent `# asserted-nothing-audit: <reason>`
 marker. Acceptance: `test\win32\asserted-nothing.ps1` (the scorer on the wire as
 real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the

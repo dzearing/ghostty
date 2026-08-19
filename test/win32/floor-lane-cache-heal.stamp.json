@@ -1,10 +1,10 @@
 {
     "guard":  "cache-heal",
     "script":  "test/win32/floor-lane-cache-heal.ps1",
-    "generated":  "2026-08-18T01:41:25-07:00",
-    "commit":  "5a2a09864",
+    "generated":  "2026-08-19T12:01:49-07:00",
+    "commit":  "df5219032",
     "files":  {
                   "scripts/lib/CacheHeal.ps1":  "6b307f90bc97b1b3441f742fb1f165c9c77f7c714c5555dca5cc3590333f926a",
-                  "test/win32/floor-lane-cache-heal.ps1":  "25e423c3a3e69e0af09a26f2dcd392abe32cfeb154ce4ca2b159c78646b303e6"
+                  "test/win32/floor-lane-cache-heal.ps1":  "2cdc33a64f779de521bf297e6839656bf7bcc3789bbb8091d807e33c30024a6f"
               }
 }

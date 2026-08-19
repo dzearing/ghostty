@@ -29,11 +29,13 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $RepoRoot 'scripts\lib\CacheHeal.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $script:Failures = 0
+$script:Passes = 0
 function Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = '')
-    if ($Ok) { Write-Host ("PASS  {0}" -f $Name) }
+    if ($Ok) { Write-Host ("PASS  {0}" -f $Name); $script:Passes++ }
     else {
         Write-Host ("FAIL  {0}{1}" -f $Name, $(if ($Detail) { " - $Detail" } else { '' }))
         $script:Failures++
@@ -160,6 +162,4 @@ if ($script:Failures -eq 0) {
 }
 
 Write-Host ''
-if ($script:Failures -eq 0) { Write-Host 'ALL PASS'; exit 0 }
-Write-Host "$($script:Failures) FAILURE(S)"
-exit 1
+Write-TestVerdict -Pass $script:Passes -Fail $script:Failures

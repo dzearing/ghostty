@@ -222,7 +222,13 @@ Write-Host "  ($($uncountedFinal.Count) script(s) still print an UNCOUNTED final
 
 # T775's ratchet: the number may fall, never rise. A name list of 40-odd files
 # would be noise nobody reads; a ceiling is the same guarantee in one number.
-$ceiling = 39
+#
+# LOWER THIS when you convert a script onto the shared scorer; never raise it to
+# make a red run go green. It sat 2 OVER for eight days (T962) because the four
+# harnesses filed since it was set each hand-rolled their own verdict, and this
+# assertion is the only thing that says so - the ceiling is a ratchet exactly to
+# the extent that a run that finds it exceeded is treated as work to do.
+$ceiling = 37
 Assert "C3 the uncounted-final count did not grow past $ceiling" ($uncountedFinal.Count -le $ceiling)
 
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

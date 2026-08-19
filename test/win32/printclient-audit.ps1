@@ -34,10 +34,14 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+
 $script:failures = 0
+$script:passes = 0
 
 function Assert($name, $cond, $detail = '') {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name$(if ($detail) { " -- $detail" })"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ }
+    else { "  FAIL $name$(if ($detail) { " -- $detail" })"; $script:failures++ }
 }
 
 # A window class "paints itself" if its WndProc has a `w32.WM_PAINT =>` arm, and
@@ -159,5 +163,4 @@ if ($script:failures -eq 0) {
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ($script:failures -gt 0)
+Write-TestVerdict -Pass $script:passes -Fail $script:failures
