@@ -1,10 +1,10 @@
 {
     "guard":  "lane-leak-sweep",
     "script":  "test/win32/floor-lane-leak-sweep.ps1",
-    "generated":  "2026-08-18T01:41:32-07:00",
-    "commit":  "5a2a09864",
+    "generated":  "2026-08-19T00:25:05-07:00",
+    "commit":  "4a98ccd69",
     "files":  {
-                  "scripts/lib/LaneLeak.ps1":  "c275bf203e516926bb1ef5a5ef6e3f9596ab5712a47d1ba934c0972aef41f2c4",
-                  "test/win32/floor-lane-leak-sweep.ps1":  "a77c5259c2752292154d1c5d56ce0977ac4a6d114d1dad29917a633d16989ec3"
+                  "scripts/lib/LaneLeak.ps1":  "52d845a7784965ac36942cc92e1a80752bc6be1f71e4763e2bfa155c0377f09f",
+                  "test/win32/floor-lane-leak-sweep.ps1":  "8740fdb9b3f7b2b92817b07dff9603667e579fc355147c67717a302c8541e0ae"
               }
 }

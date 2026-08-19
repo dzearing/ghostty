@@ -38,6 +38,11 @@
       Get-LeakedProcessStack a non-invasive `cdb -pv -p <pid>` stack for one of
                              them, which is what turns "it leaked again" into a
                              named wait
+      Get-SelfSpawnedTestPids  the pids in a live tree that are a test binary
+                             under a test binary -- the shape of a self-spawn,
+                             and the CPU the stall detector must not count
+      Test-BuildRunnerCommandLine  did the build runner launch this, or did the
+                             code under test launch its own image?
       Invoke-LaneLeakSweep   report each leak loudly, capture its stack, kill it
 
     Explaining before killing is the point of the ordering: the sweep is
@@ -64,11 +69,16 @@ function Get-LaneTestProcess {
                 $cpu = [math]::Round(([double]$p.UserModeTime + [double]$p.KernelModeTime) / 10000000.0, 1)
             }
             $out += [pscustomobject]@{
-                ProcessId      = [int]$p.ProcessId
-                Name           = [string]$p.Name
-                ExecutablePath = [string]$p.ExecutablePath
-                CreationDate   = $p.CreationDate
-                CpuSeconds     = $cpu
+                ProcessId       = [int]$p.ProcessId
+                ParentProcessId = [int]$p.ParentProcessId
+                Name            = [string]$p.Name
+                ExecutablePath  = [string]$p.ExecutablePath
+                # The command line is what NAMES the leak's cause: the build
+                # runner launches a test binary with `--listen=-`, and anything
+                # else is the code under test spawning its own image (T933).
+                CommandLine     = [string]$p.CommandLine
+                CreationDate    = $p.CreationDate
+                CpuSeconds      = $cpu
             }
         }
     }
@@ -111,6 +121,108 @@ function Get-LeakedLaneProcess {
         $out += $p
     }
     return $out
+}
+
+function Test-BuildRunnerCommandLine {
+    <#
+    .SYNOPSIS
+        Was this test binary launched by the ZIG BUILD RUNNER, or by something
+        else?
+    .DESCRIPTION
+        The build runner speaks to a test binary over stdin/stdout and always
+        passes `--listen=-`. Every other command line on a test binary image is
+        the code under test spawning its OWN exe -- which inside a test build is
+        the test runner, not the product (T933). An empty/unreadable command
+        line is treated as the build runner's: a leak is reported either way,
+        and only the EXPLANATION line differs, so the uncertain case must not
+        accuse.
+    #>
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return $true }
+    return ($CommandLine -like '*--listen=-*')
+}
+
+function Get-SelfSpawnedTestPids {
+    <#
+    .SYNOPSIS
+        The pids in a lane's process tree that are a test binary launched BY a
+        test binary -- plus everything under them.
+    .DESCRIPTION
+        The build runner launches each test binary directly, so a test binary
+        whose ANCESTOR is also a test binary is never a legitimate step of the
+        lane: it is the code under test spawning its own image (T933). That
+        distinction is what keeps the stall detector honest. The detector calls
+        any CPU in the tree "progress", so a self-spawned copy of the suite --
+        which burns a core running every test again, and hosts a tree of
+        WebView2 children while it does -- reads as a lane that is working. It
+        is the opposite: the lane is waiting, and the noise is the bug.
+
+        Descendants are included because the copy's own children (its shells,
+        its WebView2 hosts) are its CPU too, and counting them would leave the
+        detector fooled by the same run through a different process.
+    .PARAMETER Tree
+        Process objects carrying ProcessId, ParentProcessId and Name -- e.g.
+        floor-lane.ps1's Get-ProcessTree output, or a CIM snapshot.
+    .PARAMETER ExeNames
+        The lane's test-binary image names.
+    .OUTPUTS
+        [int[]] pids. Empty (the normal case) when nothing self-spawned.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]$Tree,
+        [Parameter(Mandatory)][string[]]$ExeNames
+    )
+    $names = @{}
+    foreach ($n in @($ExeNames)) { if ($n) { $names[$n.ToLowerInvariant()] = $true } }
+
+    $byPid = @{}
+    $kids = @{}
+    foreach ($p in @($Tree)) {
+        if ($null -eq $p) { continue }
+        $id = [int]$p.ProcessId
+        $byPid[$id] = $p
+        $par = [int]$p.ParentProcessId
+        if (-not $kids.ContainsKey($par)) { $kids[$par] = New-Object System.Collections.ArrayList }
+        $null = $kids[$par].Add($id)
+    }
+
+    function Test-IsTestBinary($proc) {
+        if ($null -eq $proc) { return $false }
+        $n = [string]$proc.Name
+        if (-not $n) { return $false }
+        return $names.ContainsKey($n.ToLowerInvariant())
+    }
+
+    # Roots: a test binary with a test-binary ancestor INSIDE this tree.
+    $roots = @()
+    foreach ($id in @($byPid.Keys)) {
+        if (-not (Test-IsTestBinary $byPid[$id])) { continue }
+        $cur = [int]$byPid[$id].ParentProcessId
+        $guard = 0
+        while ($byPid.ContainsKey($cur) -and $guard -lt 64) {
+            if (Test-IsTestBinary $byPid[$cur]) { $roots += [int]$id; break }
+            $cur = [int]$byPid[$cur].ParentProcessId
+            $guard++
+        }
+    }
+
+    # ...and everything under each root.
+    $out = @{}
+    foreach ($r in $roots) {
+        $queue = New-Object System.Collections.Queue
+        $queue.Enqueue([int]$r)
+        while ($queue.Count -gt 0) {
+            $cur = [int]$queue.Dequeue()
+            if ($out.ContainsKey($cur)) { continue }
+            $out[$cur] = $true
+            if ($kids.ContainsKey($cur)) {
+                foreach ($c in $kids[$cur]) { $queue.Enqueue([int]$c) }
+            }
+        }
+    }
+    $ids = @()
+    foreach ($k in @($out.Keys)) { $ids += [int]$k }
+    return $ids
 }
 
 function Get-LeakedProcessStack {
@@ -208,6 +320,16 @@ function Invoke-LaneLeakSweep {
         }
         Write-Host ("LANE LEAK: {0} pid={1} still running after the lane's verdict (cpu={2}s{3})" -f `
                 $p.Name, $p.ProcessId, $p.CpuSeconds, $age)
+        if ($p.PSObject.Properties['CommandLine']) {
+            if ($p.CommandLine) { Write-Host "  launched as: $($p.CommandLine)" }
+            if (-not (Test-BuildRunnerCommandLine -CommandLine $p.CommandLine)) {
+                # The whole diagnosis, on the line where the leak is reported:
+                # this copy was started by the code under test, which inside a
+                # test build means the test runner was spawned as if it were the
+                # product (T933, src/os/self_exe.zig).
+                Write-Host '  SELF-SPAWN: the code under test launched its own image (no --listen=-, so this is not the build runner)'
+            }
+        }
 
         if (-not $NoStack -and $CdbPath -and $OutDir) {
             $sym = $null

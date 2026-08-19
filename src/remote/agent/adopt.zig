@@ -70,6 +70,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const sharing = @import("sharing.zig");
 const atomic_write = @import("atomic_write.zig");
+const internal_os = @import("../../os/main.zig");
 
 /// File name, beside `sessions.json`/`sharing.json` in the agent state dir.
 pub const file_name = "adoption.json";
@@ -506,7 +507,11 @@ fn run(ctx: *Ctx) void {
 }
 
 fn composeOwnCommand(alloc: Allocator) ![]u8 {
-    const exe = try std.fs.selfExePathAlloc(alloc);
+    // This command line goes into the Run key, so "our own exe" had better be
+    // the agent: a test binary would register the TEST RUNNER to start at every
+    // logon (T933). The caller treats a failure here as "leave the Run entry
+    // alone", which is the only sane answer in a test build.
+    const exe = try internal_os.self_exe.productExePathAlloc(alloc);
     defer alloc.free(exe);
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);

@@ -5426,7 +5426,11 @@ fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!std.o
     const windows = std.os.windows;
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = std.fs.selfExePath(&exe_buf) catch return error.IPCFailed;
+    // Our own exe, and a TEST binary's own exe is the test runner: launching it
+    // starts a second copy of the suite instead of an app, detached and outside
+    // the lane that made it (T933). The refusal reads as an IPC failure, which
+    // is exactly what "no instance could be launched" already means here.
+    const exe = internal_os.self_exe.productExePath(&exe_buf) catch return error.IPCFailed;
 
     // The explicit config argument for the startup window (see above). Best-
     // effort like the wide-encode below: an unrepresentable path just drops

@@ -787,7 +787,13 @@ const win = struct {
         // 2. Spawn the holder OUT of the agent's kill-on-close job — the entire
         //    point is that it outlives us. `spawnEscapingJob` is the existing
         //    tiered escape (breakaway → shell-parent hop → in-job, loudly).
-        const self_exe = try std.fs.selfExePathAlloc(alloc);
+        //    The exe we spawn is OUR OWN — and inside a test binary that is the
+        //    test runner, which has no `--pty-host` mode: it would launch a
+        //    detached copy of the suite that this escape puts beyond the reach
+        //    of the lane that made it (T933). `productExePathAlloc` refuses
+        //    there, and the refusal lands on `spawnFn`'s existing fallback to
+        //    the in-process ConPTY child, which is what those tests want anyway.
+        const self_exe = try internal_os.self_exe.productExePathAlloc(alloc);
         defer alloc.free(self_exe);
 
         var cmd: std.ArrayList(u8) = .empty;
@@ -1071,6 +1077,31 @@ test "pipeNamesHolder: the recorded NAME is the shared identity, not the session
     // still matches exactly — which is why this is a suffix test and not a
     // split on the last dash.
     try testing.expect(pipeNamesHolder("\\\\.\\pipe\\ghoztty-pty-host-dave-smoke-1", "smoke-1"));
+}
+
+test "open: a test binary is never spawned as its own holder (T933)" {
+    if (!is_windows) return error.SkipZigTest;
+
+    // The measured leak: `open` spawns `<self exe> --pty-host --spec …`, and
+    // inside this binary that is the TEST RUNNER. It has no `--pty-host` mode,
+    // so the copy panics on the argument — but it is spawned DETACHED and
+    // deliberately escaped from every job object, so nothing takes it down with
+    // the lane, and copies that do not die promptly are what left test binaries
+    // burning a core 40 minutes after the agent lane printed PASS.
+    //
+    // The refusal has to happen before any CreateProcess, which is what this
+    // asserts: the error is the guard's, not a spawn or dial failure.
+    const err = open(testing.allocator, .{
+        .session_id = "0123456789abcdef0123456789abcdef",
+        .open = .{ .rows = 24, .cols = 80 },
+        // Short, so a regression here fails fast instead of hanging the lane
+        // for the full default dial while a copy of the suite runs.
+        .dial_timeout_ms = 200,
+    });
+    try testing.expectError(
+        internal_os.self_exe.Error.SelfSpawnFromTestBinary,
+        err,
+    );
 }
 
 test "enabledFor: holders are the default and only an explicit off opts out (T909)" {

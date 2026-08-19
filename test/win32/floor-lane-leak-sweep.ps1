@@ -23,6 +23,14 @@
   (SKIPped, loudly, when no cdb is installed), 7 the sweep, 8 the empty case,
   9 end-to-end through floor-lane.ps1 -Command, 10 the parse/wiring arm.
 
+  Arms 11-14 are T933's half: a test binary launched BY a test binary is the
+  code under test spawning its own image (in a test build, `selfExePath` is the
+  test runner), and the wrapper must both NAME that and stop counting its CPU
+  as lane progress. Arm 14 stages exactly that shape -- a nested fixture
+  spinning while the lane itself does nothing -- and requires the verdict to be
+  WEDGED, which is what the detector answered wrongly for as long as any CPU in
+  the tree counted.
+
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
   ASCII-only by design (PS 5.1 on this box mangles non-ASCII on rewrite).
@@ -162,6 +170,86 @@ try {
     Check 'the lane reaped the leak' `
         (@(Get-LaneTestProcess -ExeNames @($FixtureName)).Count -eq 0) 'fixture still running after the lane'
 
+    # -- 11: a test binary UNDER a test binary is a self-spawn, and so is
+    #        everything beneath it. The build runner launches each test binary
+    #        directly, so this shape only ever means the code under test
+    #        launched its own image (T933).
+    $tree = @(
+        [pscustomobject]@{ ProcessId = 100; ParentProcessId = 1; Name = 'cmd.exe' },
+        [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100; Name = 'zig.exe' },
+        [pscustomobject]@{ ProcessId = 102; ParentProcessId = 101; Name = $FixtureName },
+        [pscustomobject]@{ ProcessId = 103; ParentProcessId = 102; Name = $FixtureName },
+        [pscustomobject]@{ ProcessId = 104; ParentProcessId = 103; Name = 'msedgewebview2.exe' },
+        [pscustomobject]@{ ProcessId = 105; ParentProcessId = 102; Name = 'cmd.exe' }
+    )
+    $nested = @(Get-SelfSpawnedTestPids -Tree $tree -ExeNames @($FixtureName))
+    Check 'a test binary launched by a test binary is a self-spawn' `
+        ($nested -contains 103) "got [$($nested -join ',')]"
+    Check "the self-spawn's own children count as its CPU too" `
+        ($nested -contains 104) "got [$($nested -join ',')]"
+    Check 'the test binary the BUILD RUNNER launched is not a self-spawn' `
+        (-not ($nested -contains 102)) "got [$($nested -join ',')]"
+    Check 'an unrelated child of the real test binary is left alone' `
+        (-not ($nested -contains 105)) "got [$($nested -join ',')]"
+    $none = @(Get-SelfSpawnedTestPids -Tree @($tree[0], $tree[1], $tree[2]) -ExeNames @($FixtureName))
+    Check 'a tree with no self-spawn answers empty' ($none.Count -eq 0) "got $($none.Count)"
+    $empty = @(Get-SelfSpawnedTestPids -Tree @() -ExeNames @($FixtureName))
+    Check 'an empty tree answers empty' ($empty.Count -eq 0) "got $($empty.Count)"
+
+    # -- 12: which command line means which launcher. This is the line that
+    #        turns "it leaked again" into "the code under test spawned itself".
+    Check 'the build runner is recognized by --listen=-' `
+        (Test-BuildRunnerCommandLine -CommandLine 'x.exe --cache-dir=. --seed=0x1 --listen=-') ''
+    Check 'a self-spawn command line is not the build runner' `
+        (-not (Test-BuildRunnerCommandLine -CommandLine 'x.exe --pty-host --spec y.json')) ''
+    Check 'an unreadable command line does not accuse' `
+        (Test-BuildRunnerCommandLine -CommandLine '') ''
+
+    # -- 13: the sweep NAMES a self-spawn when it reports one, so the cause is
+    #        on the same line as the leak.
+    $selfLeak = @([pscustomobject]@{
+            ProcessId       = 424242
+            ParentProcessId = 4
+            Name            = $FixtureName
+            ExecutablePath  = $Fixture
+            CommandLine     = "$Fixture --pty-host --spec nope.json"
+            CreationDate    = (Get-Date)
+            CpuSeconds      = 12.5
+        })
+    $out = Invoke-LaneLeakSweep -Leaked $selfLeak -NoStack -NoKill 6>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    Check 'the report prints the command line the leak was launched with' `
+        ($out -match [regex]::Escape('--pty-host')) $out
+    Check 'the report names a self-spawn as one' ($out -match 'SELF-SPAWN') $out
+
+    # -- 14: the stall detector is NOT fooled by a self-spawned copy burning a
+    #        core. The staged lane makes no progress of its own while a nested
+    #        fixture spins; before T933 that CPU read as work and the lane ran
+    #        to completion, so this arm fails on a regression rather than on a
+    #        timing accident (the burner outlives the stall window by design).
+    $Spinner = Join-Path $Sandbox 'ghoztty-leakspin-fixture.exe'
+    Copy-Item -LiteralPath (Join-Path $PSHOME 'powershell.exe') -Destination $Spinner -Force
+    $stallCmd = Join-Path $Sandbox 'stall.cmd'
+    # A (the parent) is launched by cmd, so it is NOT a self-spawn; B is
+    # launched by A, which is exactly the shape under test. Only B burns CPU.
+    $burn = "`$e=(Get-Date).AddSeconds(60); while((Get-Date) -lt `$e){ `$null = 1 }"
+    @(
+        '@echo off',
+        ('start /b "" "{0}" -NoProfile -Command "Start-Process -FilePath ''{0}'' -ArgumentList ''-NoProfile'',''-Command'',''{1}'' -WindowStyle Hidden; Start-Sleep -Seconds 60"' -f $Spinner, $burn),
+        ('"{0}" /t 60 GhozttyStallArm14' -f $Fixture)
+    ) | Set-Content -LiteralPath $stallCmd -Encoding ASCII
+    $laneOut = & powershell -NoProfile -File (Join-Path $RepoRoot 'scripts\floor-lane.ps1') `
+        -Command $stallCmd -ExtraTestExeNames 'ghoztty-leakspin-fixture.exe' -NoCatch `
+        -SampleSeconds 2 -StallSeconds 12 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    Check 'a lane whose only CPU is a self-spawned copy is reported WEDGED' `
+        ($laneOut -match 'LANE command STALL') $laneOut
+    Check 'the lane says whose CPU it stopped counting' `
+        ($laneOut -match 'LANE SELF-SPAWN:') $laneOut
+    foreach ($sp in @(Get-LaneTestProcess -ExeNames @('ghoztty-leakspin-fixture.exe'))) {
+        try { Stop-Process -Id $sp.ProcessId -Force -ErrorAction Stop } catch {}
+    }
+
     # -- 10: floor-lane.ps1 parses, and its wiring is the wiring described above
     $tokens = $null; $errors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -172,13 +260,16 @@ try {
     Check 'floor-lane snapshots pre-existing test binaries' ($src -match 'preTestPids') ''
     Check 'floor-lane reports the count on every lane line' `
         ($src -match 'leaked test binaries: \$leakedTests') ''
+    Check 'floor-lane asks which pids are self-spawned' ($src -match 'Get-SelfSpawnedTestPids') ''
+    Check 'floor-lane keeps their CPU out of the progress signal' `
+        ($src -match 'Get-TreeCpu -Tree \$tree -IgnorePids') ''
 }
 finally {
     foreach ($p in $Started) {
         try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {}
     }
     # Anything the end-to-end arm started, whatever its pid.
-    foreach ($p in @(Get-LaneTestProcess -ExeNames @($FixtureName))) {
+    foreach ($p in @(Get-LaneTestProcess -ExeNames @($FixtureName, 'ghoztty-leakspin-fixture.exe'))) {
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
     }
     Start-Sleep -Milliseconds 300

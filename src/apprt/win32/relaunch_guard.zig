@@ -56,6 +56,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const build_config = @import("../../build_config.zig");
+const internal_os = @import("../../os/main.zig");
 const job_spawn = @import("job_spawn.zig");
 const w32 = @import("win32.zig");
 
@@ -165,7 +166,12 @@ fn armImpl(alloc: Allocator) !Armed {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const exe = try std.fs.selfExePathAlloc(arena);
+    // The guard we are about to spawn IS this exe, so a test binary must not
+    // get one: with no arguments at all the test runner runs the whole suite
+    // again, detached and job-escaped, and every one of those copies arms
+    // another guard (T933). `arm` already treats any failure here as "NOT
+    // armed", which is the right answer in a test build.
+    const exe = try internal_os.self_exe.productExePathAlloc(arena);
     const marker = try markerPath(arena);
     if (std.fs.path.dirname(marker)) |dir| {
         std.fs.cwd().makePath(dir) catch |err| switch (err) {

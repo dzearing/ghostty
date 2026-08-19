@@ -209,9 +209,22 @@ function Get-ProcessTree {
 }
 
 function Get-TreeCpu {
-    param($Tree)
+    <#
+        The lane's CPU, which is what the stall detector reads as progress.
+        -IgnorePids drops processes whose CPU is NOT the lane working: a test
+        binary spawned by a test binary is a copy of the suite the code under
+        test launched (T933), and it burns a whole core running every test
+        again. Counting it turns a wedged lane into one that looks busy for as
+        long as the copy lives, which is exactly the reading that hid 40 minutes
+        of dead time per floor run.
+    #>
+    param($Tree, [int[]]$IgnorePids = @())
+    $skip = @{}
+    foreach ($i in @($IgnorePids)) { $skip[[int]$i] = $true }
     $total = [uint64]0
     foreach ($p in $Tree) {
+        if ($null -eq $p) { continue }
+        if ($skip.ContainsKey([int]$p.ProcessId)) { continue }
         if ($null -ne $p.UserModeTime) { $total += [uint64]$p.UserModeTime }
         if ($null -ne $p.KernelModeTime) { $total += [uint64]$p.KernelModeTime }
     }
@@ -368,6 +381,7 @@ function Invoke-Lane {
     $rootPid = $proc.Id
 
     $started = Get-Date
+    $selfSpawnNoted = $false
     $lastCpu = [uint64]0
     $lastLogLen = [int64]0
     $lastProgress = Get-Date
@@ -384,7 +398,14 @@ function Invoke-Lane {
         $elapsed = [int]((Get-Date) - $started).TotalSeconds
         $snapshot = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
         $tree = Get-ProcessTree -RootPid $rootPid -Snapshot $snapshot
-        $cpu = Get-TreeCpu -Tree $tree
+        # A test binary under a test binary is the code under test spawning its
+        # own image, not a step of this lane -- so its CPU is not progress (T933).
+        $selfSpawned = @(Get-SelfSpawnedTestPids -Tree $tree -ExeNames $TEST_EXE_NAMES)
+        if ($selfSpawned.Count -gt 0 -and -not $selfSpawnNoted) {
+            Write-Host ("  LANE SELF-SPAWN: {0} process(es) in this lane's tree are a test binary launched by a test binary; their CPU is NOT counted as progress (T933)" -f $selfSpawned.Count)
+            $selfSpawnNoted = $true
+        }
+        $cpu = Get-TreeCpu -Tree $tree -IgnorePids $selfSpawned
         $logLen = 0
         if (Test-Path $log) { $logLen = (Get-Item $log).Length }
 
