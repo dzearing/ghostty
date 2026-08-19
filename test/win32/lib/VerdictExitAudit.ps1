@@ -113,13 +113,71 @@ function Get-VerdictSite($Ast) {
     return $cands[-1]
 }
 
-function Get-EnclosingIf($Node) {
-    $n = $Node
+# Which branch of a candidate `if` holds the pass verdict, which are the others,
+# and what runs after the whole statement. One place, because the verdict-`if`
+# search and the analyzer proper both need the same split.
+function Split-VerdictBranches($If, $Site) {
+    $passBody = $null
+    $otherBodies = New-Object System.Collections.ArrayList
+    foreach ($c in $If.Clauses) {
+        if ($c.Item2.Extent.StartOffset -le $Site.Extent.StartOffset -and
+            $c.Item2.Extent.EndOffset -ge $Site.Extent.EndOffset) { $passBody = $c.Item2 }
+        else { [void]$otherBodies.Add($c.Item2) }
+    }
+    if ($null -ne $If.ElseClause) {
+        if ($If.ElseClause.Extent.StartOffset -le $Site.Extent.StartOffset -and
+            $If.ElseClause.Extent.EndOffset -ge $Site.Extent.EndOffset) { $passBody = $If.ElseClause }
+        else { [void]$otherBodies.Add($If.ElseClause) }
+    }
+    return [pscustomobject]@{
+        PassBody    = $passBody
+        OtherBodies = $otherBodies
+        After       = @(Get-StatementsAfter $If)
+    }
+}
+
+# The verdict `if` is not always the INNERMOST one around the `ALL PASS` (T963).
+# `tab-tooltip.ps1` picks its wording inside the pass branch:
+#
+#     if ($script:fail -eq 0) {
+#         if ($script:skipped) { "ALL PASS (N, K SKIPPED)" } else { stamp; "ALL PASS (N)" }
+#     } else { "$script:fail FAILURE(S)"; exit 1 }
+#
+# The innermost `if` around the last `ALL PASS` there partitions SKIPPED from
+# clean, not pass from fail. Scored against that one the file reads as a
+# `fallthrough` - neither of its branches exits and nothing follows it - while
+# the real failure path exits 1 correctly. The other direction is the dangerous
+# one: an `exit 0` sitting in such a nested branch would ANSWER for a failure
+# path that never runs it, and the audit would go quiet over the very defect it
+# exists for.
+#
+# So walk outward and take the innermost enclosing `if` whose failure path
+# actually ANNOUNCES failure - its other branches if it has any, otherwise the
+# code after it. That is the pass/fail branch point by the only static evidence
+# there is. If no enclosing `if` qualifies (a script that words its failure
+# verdict outside what `Test-EmitsFailureVerdict` reads), fall back to the
+# innermost, which is what this did before.
+function Get-VerdictIf($Site) {
+    $innermost = $null
+    $n = $Site
     while ($n) {
-        if ($n -is [System.Management.Automation.Language.IfStatementAst]) { return $n }
+        if ($n -is [System.Management.Automation.Language.IfStatementAst]) {
+            if ($null -eq $innermost) { $innermost = $n }
+            $split = Split-VerdictBranches $n $Site
+            $failStatements = New-Object System.Collections.ArrayList
+            foreach ($b in $split.OtherBodies) {
+                foreach ($s in $b.Statements) { [void]$failStatements.Add($s) }
+            }
+            $announces = if ($failStatements.Count -gt 0) {
+                Test-EmitsFailureVerdict $failStatements
+            } else {
+                Test-EmitsFailureVerdict $split.After
+            }
+            if ($announces) { return $n }
+        }
         $n = $n.Parent
     }
-    return $null
+    return $innermost
 }
 
 # Statements that run AFTER $Node, walking outward through every enclosing
@@ -237,7 +295,7 @@ function Get-VerdictExitFindings {
         return $findings
     }
 
-    $if = Get-EnclosingIf $site
+    $if = Get-VerdictIf $site
     if ($null -eq $if) {
         [void]$findings.Add([pscustomobject]@{
             Path = $Path; Line = $site.Extent.StartLineNumber; Kind = 'fallthrough'
@@ -246,20 +304,10 @@ function Get-VerdictExitFindings {
     }
 
     # Which branch holds the pass verdict, and what are the others?
-    $passBody = $null
-    $otherBodies = New-Object System.Collections.ArrayList
-    foreach ($c in $if.Clauses) {
-        if ($c.Item2.Extent.StartOffset -le $site.Extent.StartOffset -and
-            $c.Item2.Extent.EndOffset -ge $site.Extent.EndOffset) { $passBody = $c.Item2 }
-        else { [void]$otherBodies.Add($c.Item2) }
-    }
-    if ($null -ne $if.ElseClause) {
-        if ($if.ElseClause.Extent.StartOffset -le $site.Extent.StartOffset -and
-            $if.ElseClause.Extent.EndOffset -ge $site.Extent.EndOffset) { $passBody = $if.ElseClause }
-        else { [void]$otherBodies.Add($if.ElseClause) }
-    }
-
-    $after = @(Get-StatementsAfter $if)
+    $split = Split-VerdictBranches $if $site
+    $passBody = $split.PassBody
+    $otherBodies = $split.OtherBodies
+    $after = $split.After
 
     # --- the failure path -----------------------------------------------
     # A failure branch that does not exit falls out of the `if` and continues

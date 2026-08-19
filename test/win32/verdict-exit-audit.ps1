@@ -108,6 +108,25 @@ Assert "A12 the # verdict-audit: marker exempts a helper" ((KindsOf @(
     '# verdict-audit: a helper process, nothing to score',
     '"hello"')) -eq '')
 
+# A13/A14 (T963): the wording of the PASS verdict is itself a choice in several
+# scripts - `ALL PASS (N)` for a clean run, `ALL PASS (N, K SKIPPED)` for one
+# that skipped sections - so the innermost `if` around the last ALL PASS is the
+# SKIPPED question, not the pass/fail question. Reading that one scored
+# `tab-tooltip.ps1` as a fallthrough while its real failure path exited 1, and
+# would have gone quiet over an `exit 0` nested where no failure ever reaches.
+Assert "A13 a pass verdict nested inside its own if is scored against the real failure branch" ((KindsOf @(
+    'if ($script:fail -eq 0) {',
+    '    if ($script:skipped) { "ALL PASS ($script:pass assertions, $script:skipped SKIPPED)" }',
+    '    else { stamp-the-guard; "ALL PASS ($script:pass assertions)" }',
+    '}',
+    'else { "$script:fail FAILURE(S) / $script:pass passed"; exit 1 }')) -eq '')
+Assert "A14 and an exit 0 nested in the pass branch does not answer for the failure path" ((KindsOf @(
+    'if ($script:fail -eq 0) {',
+    '    if ($script:skipped) { "ALL PASS ($script:pass assertions, $script:skipped SKIPPED)"; exit 0 }',
+    '    else { "ALL PASS ($script:pass assertions)"; exit 0 }',
+    '}',
+    'else { "$script:fail FAILURE(S) / $script:pass passed" }')) -eq 'fallthrough')
+
 # ============================================================================
 ""
 "== B: the sweep - every acceptance script scores its own verdict"
@@ -227,6 +246,17 @@ $brokenRed = Measure-Fixture 'broken' $broken '-Fail 2'
 Assert "C the unfixed shape is the defect: prints FAILURE(S), exits 0" (
     $brokenRed.Last -match 'FAILURE\(S\)' -and $brokenRed.Code -eq 0)
 Assert "C and the analyzer would have caught it" ((KindsOf $broken) -eq 'fallthrough')
+
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
+# can answer "has this sweep been run against the suite as it now stands?" -
+# the question nobody could answer while this audit sat red at HEAD (T963).
+# NOT under -TeethCheck: that run plants a violator in the swept directory and
+# scores the analyzer for finding it, so it never observes a clean suite and
+# must not claim to have.
+if ($script:failures -eq 0 -and -not $TeethCheck) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard verdict-exit -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }

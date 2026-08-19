@@ -1044,6 +1044,23 @@ $GuardTable = @(
             'test\win32\*.ps1'
         )
     },
+    # The verdict/exit meta-check (T221, given a guard by T963): a script that
+    # PRINTS failure and EXITS 0 reports a red run to the loop as green. Its two
+    # siblings above were guarded and this one was not, so it sat red at HEAD
+    # until T883 happened to run it by hand - which is the exact question this
+    # table answers, asked about the audit that answers it. Same wide net and
+    # the same reason: the sweep reads every acceptance script, so a new script
+    # (or a new verdict tail on an old one) must re-prove the property. lib\ is
+    # covered because the analyzer lives there. AST over source, about a second.
+    [pscustomobject]@{
+        Name   = 'verdict-exit'
+        Script = 'test\win32\verdict-exit-audit.ps1'
+        Stamp  = 'test\win32\verdict-exit-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\*.ps1'
+        )
+    },
     # The host-dependent capture meta-check (T883): a merged stream formatted
     # through Out-String reads differently in every host - decorated and
     # wrapped where one can format, blank where none can - so a stderr-text

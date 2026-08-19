@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T12:25:19-07:00",
-    "commit":  "df5219032",
+    "generated":  "2026-08-19T12:57:47-07:00",
+    "commit":  "a40f44bdc",
     "files":  {
                   "docs/claude/testing.md":  "637306a00851c42dc1dfbb084bec74c8f38e622268c4fdcdcf5e193d710a6edb",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -146,7 +146,7 @@
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestDesktop.ps1":  "a9ad01fe403efadb0336a014500aad69521fe0522f3d5d5a44747d308e563a35",
                   "test/win32/lib/TestScore.ps1":  "37db326a009ca4b70c4a4938efd120d7dff54801e8213afc1003cd12f584b3f8",
-                  "test/win32/lib/VerdictExitAudit.ps1":  "03e495d28dd626aa86f0650619955a25aeee1ca618dd545ba0d20722e3e135c2",
+                  "test/win32/lib/VerdictExitAudit.ps1":  "8a22b157dc4e93add59e9b3da93a0620c667644cefb1b3641dc2f6cd370f226e",
                   "test/win32/local-split-no-command-rerun.ps1":  "3082b46b8f8bf46de32ed931df5442a4a5cdd145b5688cb3f8c87fda0302cb28",
                   "test/win32/log-append.ps1":  "3efa789d3fa6ba6e8dc28a81c4d7ea67a55b6172e70ab588fc9cb05b1158e568",
                   "test/win32/machine-chooser.ps1":  "f6bde8b537cc63ddab0e773e7883543336d6749fd0f16d6d3d363f2057fcf451",
@@ -227,7 +227,7 @@
                   "test/win32/upgrade-resume-readiness.ps1":  "9df12a1d37c47dddc89f67af6056dd1c850a055e8b11b119ba272f24922e61f8",
                   "test/win32/upgrade-staleness.ps1":  "94fea7cc8c3081a7c1229e9084a39a61110a1e9c56d385778aff4e508048c9ac",
                   "test/win32/url-scheme.ps1":  "1436e523b7a94f32b5f868743ddedf5f3d01d64b5bebb663da3d0f1a40bdfedd",
-                  "test/win32/verdict-exit-audit.ps1":  "c0fd6de0418f204072df5f96845fd2ea307d6f0fe29e793e4904e01f497a0255",
+                  "test/win32/verdict-exit-audit.ps1":  "02f5dc6471e5790a9609eeb47a5cb4b3810c8d480ec19626b89bc716bb025d8d",
                   "test/win32/viewer-composer.ps1":  "2230abb79bc3527769eb2b95917fbf302e29857cb41fee98cbd6c5ac25193546",
                   "test/win32/viewer-diff.ps1":  "ed358c7963adb4a6d7736ba2714293218f6e5e4b3749d7a116d4652afd182b86",
                   "test/win32/viewer-feedback.ps1":  "65f0c04d21f3f15421830b0b5979e50865b80a9bec2fee48d0ecedb0c0bacb94",
