@@ -142,6 +142,7 @@ const probe_mod = @import("activity_probe.zig");
 const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
 const sample_gate = @import("sample_gate.zig");
+const utf16_text = @import("utf16_text.zig");
 const icon_button = @import("icon_button.zig");
 const icon_button_paint = @import("icon_button_paint.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -204,6 +205,12 @@ const rpc_timeout_ns: u64 = 5 * std.time.ns_per_s;
 /// `default_limit`. Fixed-size state (order/selection/spawned) is sized to it, so
 /// the panel allocates nothing per poll beyond its snapshot arena.
 const max_rows: usize = remote_proc.default_limit;
+
+/// UTF-16 units read out of the filter EDIT in one go, NUL included — so at
+/// most `filter_wide_cap - 1` characters of the field take part in the filter.
+/// `needle_buf` is derived from this rather than chosen next to it, because the
+/// two sizes drifting apart is exactly what T989 was.
+const filter_wide_cap: usize = 256;
 
 // ---------------------------------------------------------------------
 // Palette (T308)
@@ -757,7 +764,12 @@ gate: sample_gate.Gate = .{},
 /// Current view state.
 sort: rows_mod.Sort = rows_mod.default_sort,
 show_all: bool = false,
-needle_buf: [128]u8 = @splat(0),
+/// The filter box's text, UTF-8. Sized for what the SOURCE can hold rather
+/// than for what a filter is expected to be (T989): `onFilterChanged` reads
+/// `filter_wide_cap` UTF-16 units and UTF-8 needs up to three bytes per unit,
+/// so anything smaller is a length at which typing crashes the app. It was
+/// 128 bytes, and about 130 typed characters took the terminal down.
+needle_buf: [(filter_wide_cap - 1) * 3]u8 = @splat(0),
 needle_len: usize = 0,
 
 /// `order[0..order_len]` are indices into `snap.rows`, filtered and sorted.
@@ -4251,10 +4263,15 @@ fn scrollIntoView(self: *ActivityMonitor, index: i32) void {
 }
 
 fn onFilterChanged(self: *ActivityMonitor) void {
-    var wbuf: [256]u16 = undefined;
+    var wbuf: [filter_wide_cap]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.filter, &wbuf, wbuf.len));
-    const n = std.unicode.utf16LeToUtf8(&self.needle_buf, wbuf[0..wlen]) catch 0;
-    self.needle_len = @min(n, self.needle_buf.len);
+    // `utf16_text.toUtf8Truncating`, never `std.unicode.utf16LeToUtf8` (T989):
+    // the latter does not bounds-check its destination, so a filter longer
+    // than the needle buffer panicked here rather than returning an error the
+    // `catch` could see. `needle_buf` is sized so nothing `wbuf` can hold is
+    // truncated; the truncating call is the guarantee that a future edit to
+    // either size cannot bring the crash back.
+    self.needle_len = utf16_text.toUtf8Truncating(&self.needle_buf, wbuf[0..wlen]);
     self.scroll = 0;
     self.rebuild();
     _ = w32.InvalidateRect(self.hwnd, null, 0);

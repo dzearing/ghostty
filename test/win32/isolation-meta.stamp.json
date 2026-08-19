@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-19T08:08:08-07:00",
-    "commit":  "91598d897",
+    "generated":  "2026-08-19T09:13:36-07:00",
+    "commit":  "f5b7f7eda",
     "files":  {
-                  "test/win32/activity-monitor.ps1":  "119d4ec45660913f50865694d4d08ba846c8f24ed37970cf572bb0251a4f1670",
+                  "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
                   "test/win32/activity-monitor-remote.ps1":  "c4b4449dd7df216285a0fdb3dc607f4336d21e320a8752833cdf062392a10034",
                   "test/win32/activity-state.ps1":  "9cf643a93354cfadd2061c0a46a0018a22ada8a3b2833bab7ce3b47293569a70",

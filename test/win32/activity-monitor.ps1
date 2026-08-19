@@ -16,6 +16,9 @@
 #      leaves exactly one panel and says so;
 #   D. the filter narrows the table, including against a KNOWN pid (the app's
 #      own), and a needle that matches nothing empties it;
+#   D2. (T989) an over-long filter - typed past the old 130-character crash
+#      threshold, then pasted, then pasted as three-byte characters - leaves the
+#      app RUNNING, with no panic in its log and the table still filtering;
 #   E. "Show all" widens it from the ghoztty-spawned tree to every process;
 #   H. (T286) "New Process..." opens a modal dialog whose Start is disabled
 #      until a command is typed, and starting one puts a REAL process on the box
@@ -590,6 +593,54 @@ try {
     } else {
         Assert ($st.Shown -eq 0) "D an unmatchable needle empties the table (shown=$($st.Shown))"
     }
+
+    # --- D2. An over-long filter does not take the app down (T989) ----------
+    # The panel read its filter EDIT into a 128-byte needle through
+    # `std.unicode.utf16LeToUtf8`, whose error set covers malformed UTF-16 and
+    # NOT an undersized destination - so the `catch` around it looked like an
+    # overflow guard and was not one. About 130 characters panicked the process
+    # and took every pane in every window with it.
+    #
+    # Typed, not set, for the first case: the crash was per-keystroke, so the
+    # arm has to walk through the threshold rather than jump over it.
+    Set-TestControlText -Control $filterEdit -Text '' | Out-Null
+    $before = Count-PanelLines
+    $typed = 'a' * 140
+    Send-TestControlText -Control $filterEdit -Text $typed -PerKeyMs 5 | Out-Null
+    $st = Wait-PanelState $before
+    # Settle before asking: a panic writes its stack trace before the process
+    # goes, so a liveness check taken the instant a state line appears can beat
+    # the death it is looking for (measured against the unfixed build).
+    Start-Sleep -Milliseconds 600
+    Assert (Test-PidAlive $app.Pid) 'D2 typing 140 characters into the filter leaves the app running'
+    Assert ($st -and $st.Needle -eq $typed) "D2 the whole 140-character needle reached the panel (len=$(if ($st) { $st.Needle.Length } else { 'no state line' }))"
+
+    # A paste arrives as one message and gets there in one action. 300 is past
+    # what the wide buffer itself holds (255 characters plus a NUL), so this is
+    # also the assertion that the SOURCE truncation is clean.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text ('b' * 300) | Out-Null
+    $st = Wait-PanelState $before
+    Assert (Test-PidAlive $app.Pid) 'D2 a 300-character paste leaves the app running'
+    Assert ($st -and $st.Needle.Length -eq 255) "D2 an over-long filter is truncated to what the field can read, not dropped (len=$(if ($st) { $st.Needle.Length } else { 'no state line' }))"
+
+    # The widest characters in the BMP cost three UTF-8 bytes each, which is
+    # what sizes the needle buffer: 255 of them is its exact capacity, and one
+    # byte less would have to cut a character in half. The needle text itself is
+    # deliberately NOT asserted here - the state line goes through a log file,
+    # and what this arm is about is that the app survived and kept filtering.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text ([string]([char]0x65E5) * 300) | Out-Null
+    $st = Wait-PanelState $before
+    Assert (Test-PidAlive $app.Pid) 'D2 a 300-character non-ASCII paste leaves the app running'
+    Assert ($st -and $st.Shown -eq 0) "D2 the panel kept filtering behind the non-ASCII paste (shown=$(if ($st) { $st.Shown } else { 'no state line' }))"
+    Assert (-not (Select-String -Path $errlog -Pattern 'panic:' -Quiet)) 'D2 no panic reached the app log'
+
+    # And it still works afterwards: the filter that narrowed in D narrows again.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text "$($app.Pid)" | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st -and $st.Shown -ge 1) "D2 the filter still finds the app's own pid after the over-long entries (shown=$(if ($st) { $st.Shown } else { 'no state line' }))"
 
     # --- E. "Show all" widens from the spawned tree to every process ---------
     $before = Count-PanelLines
@@ -1355,6 +1406,16 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
+# --- stamp (T783) ----------------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?".
+# This script has no skippable sections - it either drives the panel or fails -
+# so a green run is by definition a whole-harness run.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard activity-monitor -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''

@@ -558,6 +558,24 @@ $GuardTable = @(
             'test\win32\activity-state.ps1'
         )
     },
+    # The Activity Monitor PANEL (T989), which is a different subject from the
+    # activity-state hook above: a window with a text field, a live table and
+    # two destructive actions, and the only harness that drives any of it.
+    # T989 was a panic reachable by typing into that field, found by accident
+    # while measuring something else - the class of defect the floor lanes
+    # cannot see, since the panel's own logic only runs behind an HWND.
+    # Deliberately narrow: the panel's pure modules (layout, rows, cards, the
+    # gauge) carry their own unit tests in the win32 lane, and covering them
+    # here would fire this gate on edits the script cannot fail on.
+    [pscustomobject]@{
+        Name   = 'activity-monitor'
+        Script = 'test\win32\activity-monitor.ps1'
+        Stamp  = 'test\win32\activity-monitor.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ActivityMonitor.zig',
+            'test\win32\activity-monitor.ps1'
+        )
+    },
     # Crash evidence is the other thing whose failure nothing else catches: a
     # capture path that has quietly stopped working looks exactly like a lane
     # that did not crash, and is only ever exercised on a day already going

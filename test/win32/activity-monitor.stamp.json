@@ -1,0 +1,10 @@
+{
+    "guard":  "activity-monitor",
+    "script":  "test/win32/activity-monitor.ps1",
+    "generated":  "2026-08-19T09:12:04-07:00",
+    "commit":  "f5b7f7eda",
+    "files":  {
+                  "src/apprt/win32/ActivityMonitor.zig":  "c00b234fe43059555fb301db5b8c207e47ded855a9f94ab3891265e88e78eab4",
+                  "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d"
+              }
+}
