@@ -1,0 +1,11 @@
+{
+    "guard":  "clipboard-retry",
+    "script":  "test/win32/clipboard-retry.ps1",
+    "generated":  "2026-08-19T10:58:26-07:00",
+    "commit":  "c3966f6b2",
+    "files":  {
+                  "src/apprt/win32/clipboard_image.zig":  "2feb8e5a035d1d2044d6737fb9527b59045512ba4098de328e6b55137c90e713",
+                  "src/apprt/win32/clipboard_open.zig":  "b2268f91cb5eb18d393e6bf8be1e4f196c9fd77aaa846b0ddd4d41cdee1bf99c",
+                  "test/win32/clipboard-retry.ps1":  "c7f8f01beafd4680783ed5f3e721f39a551932869c7bde60d1c81ee033557360"
+              }
+}

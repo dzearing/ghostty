@@ -1,8 +1,8 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-08-19T09:57:59-07:00",
-    "commit":  "2d4c65962",
+    "generated":  "2026-08-19T10:55:25-07:00",
+    "commit":  "c3966f6b2",
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
                   "src/apprt/win32/activity_borrow.zig":  "8be5e4ba3e61feeaf28f2d7027fbadb5607c7e5541562795e984c9dc4a2e43a7",
@@ -129,7 +129,7 @@
                   "src/apprt/win32/split_geometry.zig":  "69514bdbff35a6c396f0498129e50a93e9695c10286019cffb9fc833a2cfaff2",
                   "src/apprt/win32/split_resize.zig":  "569cf57d9c6f44cc28457ecc8b1ada8dbec432d17eae4a70d2f682a26672cfb1",
                   "src/apprt/win32/stable_json.zig":  "a71caadbdf70b93bc1b39e1155fa69135a1e34b33693a82a7084a6f9a52656c8",
-                  "src/apprt/win32/Surface.zig":  "942c171290438b5161d8ca2d0c7fa13adc594b71de0a1dac2f0dfa31ede6e7a0",
+                  "src/apprt/win32/Surface.zig":  "4750ef87962af8e1e58ab8346ba4f9b199ed2e26182a8c22b1a5c10f4d237984",
                   "src/apprt/win32/surface_reap.zig":  "ba55e7ecb6cec9383f704064427889dc276ac8dff7e46844f8a4a790e6b586e9",
                   "src/apprt/win32/surface_window_role.zig":  "a92643966de125115d58668bd4073483fe1225aa7581351470d718924a042c4e",
                   "src/apprt/win32/system_colors.zig":  "cd31bc592b4340e2f6c32b9ff034ef30f826dee9a68322df79bbd472ba22ae50",

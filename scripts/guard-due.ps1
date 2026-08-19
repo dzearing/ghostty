@@ -345,6 +345,25 @@ $GuardTable = @(
             'test\win32\session-relaunch-notify.ps1'
         )
     },
+    # The clipboard is a machine-wide resource with a give-up-at-once API, so
+    # its regressions are INTERMITTENT by construction: a copy that vanishes one
+    # time in ten reads to a user as flakiness in their own hands, and to every
+    # other harness here as a pass. This one manufactures the contention (a
+    # second process holding the clipboard on a real HWND) and drives a real
+    # copy through OSC 52, so the give-up shape fails ON PURPOSE rather than on
+    # somebody's unlucky afternoon. Surface.zig is deliberately NOT covered - it
+    # is edited by most tasks and would leave this due every turn; the retry
+    # helper and the source guard in arm C are what keep the call sites honest.
+    [pscustomobject]@{
+        Name   = 'clipboard-retry'
+        Script = 'test\win32\clipboard-retry.ps1'
+        Stamp  = 'test\win32\clipboard-retry.stamp.json'
+        Covers = @(
+            'src\apprt\win32\clipboard_open.zig',
+            'src\apprt\win32\clipboard_image.zig',
+            'test\win32\clipboard-retry.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'upgrade-no-fork'
         Script = 'test\win32\upgrade-no-fork.ps1'

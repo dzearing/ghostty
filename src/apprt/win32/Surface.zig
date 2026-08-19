@@ -25,6 +25,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+const clipboard_open = @import("clipboard_open.zig");
 const utf16_text = @import("utf16_text.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
@@ -1685,7 +1686,10 @@ pub fn clipboardRequest(
     // dialog can be up for an unbounded time and would otherwise block every
     // other process's clipboard access.
     const utf8z: [:0]const u8 = blk: {
-        if (w32.OpenClipboard(self.hwnd) == 0) {
+        // Retried: another process holding the clipboard for a few
+        // milliseconds is normal, and a refused open here means the paste
+        // silently does nothing (T947).
+        if (!clipboard_open.open(self.hwnd)) {
             log.warn("OpenClipboard failed", .{});
             return false;
         }
@@ -1816,7 +1820,9 @@ pub fn setClipboard(
     _ = w32.GlobalUnlock(hglobal);
 
     // null owner: the write is not tied to the (possibly freed) surface hwnd.
-    if (w32.OpenClipboard(null) == 0) {
+    // Retried for the same reason as the paste read above (T947): a copy that
+    // loses the race is a keystroke that vanished with no message.
+    if (!clipboard_open.open(null)) {
         log.warn("OpenClipboard failed for clipboard write", .{});
         _ = w32.GlobalFree(hglobal);
         return;
