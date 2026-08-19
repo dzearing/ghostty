@@ -243,18 +243,33 @@ function Wait-Leaves($tag, $target, $timeoutSec = 45) {
 # The settle condition is deliberately NOT the assertion: it asks only that
 # every pane holds a banner, never which. A build that put the notice over a
 # pane's own banner settles just as fast and still fails E3.
+# How long the LAST Wait-BannerSettle waited, in seconds, measured from the
+# moment `+list` first showed every pane to the moment every pane held a banner
+# (-1 = it never settled). T977: the notice banner is published from the pane's
+# own IO thread AFTER the leaf is already listed, so "did it arrive?" and "how
+# late was it?" are different questions and only the first one has an assertion.
+# Without the number in the log, a regression that pushed the notice from 2s to
+# 39s would still read as a clean pass, and the arm that this exact blind spot
+# already sent red once (E3/E4, filed as T977 against a build that was fine)
+# would give no warning the second time.
+$script:settleSec = -1
 function Wait-BannerSettle($tag, $target, $timeoutSec = 40) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $script:settleSec = -1
     # NOT `@(All-Leaves ...)`: All-Leaves already hands back its array as one
     # pipeline item, so wrapping it re-wraps - `$leaves` becomes a one-element
     # array holding the leaf array, every `$leaf.banner` becomes every banner
     # joined, and the arms score nonsense. (Measured: A5/A8/A11/A13 all went red
     # against a build that had just passed them.)
     $leaves = All-Leaves (Wait-Leaves $tag $target 30)
+    $started = Get-Date
     while ((Get-Date) -lt $deadline) {
         if ($leaves.Count -ge $target) {
             $withBanner = @($leaves | Where-Object { ([string]$_.banner) -ne '' }).Count
-            if ($withBanner -eq $leaves.Count) { break }
+            if ($withBanner -eq $leaves.Count) {
+                $script:settleSec = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+                break
+            }
         }
         Start-Sleep -Milliseconds 700
         $leaves = All-Leaves (Get-List "$tag-settle")
@@ -791,6 +806,7 @@ Build-AndKill $workA $true | Out-Null
 $appPidE = Start-App 'notifyban'
 Assert "E0 the GUI came back" ($appPidE -ne 0)
 $leavesE = Wait-BannerSettle 'e0' 3 60
+$settleE = $script:settleSec
 Assert "E0b the layout restored (3 panes)" ($leavesE.Count -ge 3)
 
 $ownA = 0; $ownB = 0; $noticed = 0; $bannerless = 0
@@ -804,7 +820,7 @@ foreach ($leaf in $leavesE) {
 # E3/E4 are counting assertions, and a bare "FAIL" on one leaves three different
 # stories indistinguishable (the notice took a slot it shouldn't have / it took
 # none at all / a fourth pane appeared). Print what was actually read.
-"    DIAG E: ownA=$ownA ownB=$ownB noticed=$noticed bannerless=$bannerless leaves=$($leavesE.Count)"
+"    DIAG E: ownA=$ownA ownB=$ownB noticed=$noticed bannerless=$bannerless leaves=$($leavesE.Count) settle=${settleE}s"
 foreach ($leaf in $leavesE) {
     "    DIAG E leaf: name='$($leaf.ipc_name)' banner='$(([string]$leaf.banner) -replace '\s+', ' ')'"
 }
@@ -813,6 +829,17 @@ Assert "E2 the pane that had banner '$BAN_B' still shows it" ($ownB -eq 1)
 Assert "E3 neither of those panes had its banner replaced by the notice" `
     ($noticed -le 1 -and $bannerless -eq 0)
 Assert "E4 the bannerless pane DID take the notice (the slot was free)" ($noticed -eq 1)
+# E4b (T977): PROMPTLY, not eventually. The notice banner is published from the
+# pane's own IO thread after the ATTACH round-trip, so it is always a moment
+# behind the leaf appearing in `+list` - which is exactly why E3/E4 were red
+# against a build that was fine, and why the settle wait above exists at all.
+# But a settle wait with a 60s ceiling cannot tell "the banner was there before
+# the user looked" from "the banner crawled in half a minute after the restore",
+# and the second one is the user-visible defect T977 was filed for. Measured at
+# 0.8s on box, so 15s is a wide margin over a loaded box and still an order of
+# magnitude under the ceiling that would otherwise pass silently.
+Assert "E4b the notice banner arrived promptly after the panes came back (${settleE}s)" `
+    ($settleE -ge 0 -and $settleE -le 15)
 
 # Nothing is lost by yielding the slot: the notice is still in the scrollback of
 # every pane, which is where the user asked for it (T423). Without this, E1-E3

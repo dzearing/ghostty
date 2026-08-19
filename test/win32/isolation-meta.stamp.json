@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-18T21:48:16-07:00",
-    "commit":  "f15501943",
+    "generated":  "2026-08-18T22:40:36-07:00",
+    "commit":  "2f31e1a9c",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "83e91bd5d63dab494b4fe342d1087274251dc41b56bd5b91eb434e2e398f2a29",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -170,7 +170,7 @@
                   "test/win32/session-reattach.ps1":  "ba1ab363e15d168f85374f9c5bd22754ce36287cfe641b583c36248a251ebf87",
                   "test/win32/session-reattach-zombie.ps1":  "de8d44568f5fd19cc6138ac6f4204bce90410d3c99b1fecf44a68061ed64e951",
                   "test/win32/session-relaunch.ps1":  "93461f2bc08616d2bb4d6603d9bc8eb3a968ff3f7c4df0da542972470d1b354a",
-                  "test/win32/session-relaunch-notify.ps1":  "6146d3293432fd32044305f3cf050dd68b02292912e37b42c21ba57c61c4ff17",
+                  "test/win32/session-relaunch-notify.ps1":  "cf6306972ee254e46127aaf50a43adb62cf2cafa37c39c6d76a972f2ce69a46b",
                   "test/win32/session-restore-maximized.ps1":  "71d7637cc3548075a140f93e31c2d1b195f2bfe931d913bff453696d313b7065",
                   "test/win32/session-resume-offset.ps1":  "7c802c1c6e37aaf441a6aedcd046ba600b104f3963b12794f82f5bb583796eed",
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",
