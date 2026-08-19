@@ -36,6 +36,18 @@
 # ignores whatever else is sitting in the shared index. That is what keeps the
 # theft from running in the other direction as well.
 #
+# One thing `commit` deliberately cannot carry: an INDEX-ONLY change, such as a
+# mode bit set with `git update-index --chmod=+x` (core.filemode is false on
+# Windows, so that is the only way to record one). A pathspec commit takes the
+# WORKING TREE content of its paths and ignores the index, which is exactly what
+# makes it immune to the other window - and equally blind to a staged mode. For
+# those, hold the lock and commit the index yourself:
+#
+#   $k = 'modebit'
+#   scripts\git-commit-guard.ps1 hold -Key $k
+#   $env:GHOZTTY_COMMIT_LOCK_KEY = $k; git commit -m '...'
+#   scripts\git-commit-guard.ps1 release -Force
+#
 # Actions: install | status | hold | release | commit | verify
 # Exit codes: 0 ok, 2 usage/error, 3 lock held by another session,
 #             4 not the owner (release), 5 the commit contains foreign paths,
