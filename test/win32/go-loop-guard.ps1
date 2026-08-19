@@ -45,6 +45,13 @@
 #      they stay dirty; `ack-stranded` hands them to an OPEN task (the ack
 #      survives re-claims and dies with the task); resolving the tree deletes
 #      the snapshot. All against a fixture git repo + fixture task dir.
+#   W. Shared-index commit guard (T948): two sessions, one working tree, one
+#      index. The 2026-08-17 swallow is reproduced against a fixture repo - A
+#      stages, B commits with -A - and must be REFUSED by the pre-commit hook
+#      while A holds; A's own git passes through on its key; a hold past its ttl
+#      is cleared rather than obeyed; the commit path commits only its pathspec
+#      and reads the result back; and `verify` still catches a foreign path in a
+#      finished commit, which is what a bypassed hook leaves behind.
 #   V. Boot revival (T829): after a reboot with nobody at the keyboard nothing
 #      of ours can run at all, so the loop's answer is to MEASURE the gap
 #      between power-on and a desktop existing, record it once per boot, and be
@@ -1229,6 +1236,122 @@ if ($null -eq $realTask) {
 $dogSrc = Get-Content $dogScript -Raw
 Assert 'V19 the watchdog delegates the task shape to go-loop-boot.ps1' `
     ($dogSrc -match 'go-loop-boot\.ps1' -and $dogSrc -notmatch 'schtasks\s+/create')
+
+# --- W. shared-index commit guard (T948) -----------------------------------
+""
+"W. commit guard: one index, two sessions - the swallow is prevented, and caught"
+# The 2026-08-17 shape, reproduced: session A stages its own paths, session B
+# commits with -A in the gap, and git commits the INDEX - which holds both. Run
+# against a fixture repo so the real one is never committed to; the guard script
+# is pointed at it with -Repo, and `install` deliberately wires the fixture to
+# the REAL scripts\githooks, because the hook under test is the shipped one.
+$cgScript = Join-Path $Repo 'scripts\git-commit-guard.ps1'
+$wRepo = Join-Path $root 'commit-guard-repo'
+New-Item -ItemType Directory -Force $wRepo | Out-Null
+git -C $wRepo init -q 2>$null
+git -C $wRepo config user.email 't@t' 2>$null
+git -C $wRepo config user.name 't' 2>$null
+Set-Content -Path (Join-Path $wRepo 'base.txt') -Value 'base'
+git -C $wRepo add base.txt 2>$null
+git -C $wRepo commit -q -m 'fixture' 2>$null
+
+function CG([string[]]$argList) {
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $cgScript @argList -Repo $wRepo 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
+# A commit attempted the way the OTHER window attempts it: whatever is in the
+# tree, no lock key, straight `git commit`.
+function WCommit([string]$msg) {
+    $out = & git -C $wRepo commit -m $msg 2>&1 | ForEach-Object { $_.ToString() } | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
+function WHead { (& git -C $wRepo rev-parse HEAD 2>$null | Select-Object -First 1) }
+
+$r = CG @('install')
+Assert 'W1 install arms the hook via core.hooksPath' `
+    ($r.Code -eq 0 -and (& git -C $wRepo config --local --get core.hooksPath) -match 'githooks')
+
+# Session A holds while it stages; session B stages everything and commits.
+CG @('hold', '-Key', 'AAA', '-Holder', 'session A') | Out-Null
+Set-Content -Path (Join-Path $wRepo 'a-work.txt') -Value 'session A work, half written'
+$headBefore = WHead
+Set-Content -Path (Join-Path $wRepo 'b-work.txt') -Value 'session B work'
+git -C $wRepo add -A 2>$null
+$r = WCommit 'session B: a -A commit in the gap'
+Assert 'W2 the -A commit from the second session is REFUSED' ($r.Code -ne 0 -and $r.Out -match 'COMMIT REFUSED')
+Assert 'W3 the refusal names the holder and the remedy' ($r.Out -match 'session A' -and $r.Out -match 'git-commit-guard\.ps1 release')
+Assert 'W4 nothing was committed: HEAD did not move' ((WHead) -eq $headBefore)
+
+# The holder's own git carries the key and is never in its own way.
+$env:GHOZTTY_COMMIT_LOCK_KEY = 'AAA'
+$r = WCommit 'session A: my own commit'
+Remove-Item Env:GHOZTTY_COMMIT_LOCK_KEY -ErrorAction SilentlyContinue
+Assert 'W5 the holder itself commits normally' ($r.Code -eq 0 -and (WHead) -ne $headBefore)
+
+# A second session cannot take a live hold, and cannot quietly overwrite it.
+$r = CG @('hold', '-Key', 'BBB', '-Holder', 'session B')
+Assert 'W6 a second hold is BUSY (exit 3)' ($r.Code -eq 3 -and $r.Out -match 'BUSY' -and $r.Out -match 'session A')
+$r = CG @('status')
+Assert 'W7 the lock still names the first holder' ($r.Out -match 'held' -and $r.Out -match 'session A')
+
+# A crashed holder must never wedge the repo: past its ttl the hook clears the
+# lock instead of obeying it.
+CG @('release', '-Force') | Out-Null
+CG @('hold', '-Key', 'CCC', '-TtlSeconds', '1') | Out-Null
+Start-Sleep -Seconds 2
+Set-Content -Path (Join-Path $wRepo 'after-stale.txt') -Value 'x'
+git -C $wRepo add -A 2>$null
+$r = WCommit 'after a stale hold'
+Assert 'W8 a hold past its ttl is cleared, not obeyed' ($r.Code -eq 0)
+$r = CG @('status')
+Assert 'W9 and the stale lock file is gone' ($r.Out -match '^free')
+
+# The commit path proves what it committed. A foreign path staged in the shared
+# index is EXCLUDED by the pathspec and named out loud, rather than riding along.
+Set-Content -Path (Join-Path $wRepo 'mine.txt') -Value 'mine'
+Set-Content -Path (Join-Path $wRepo 'theirs.txt') -Value 'theirs'
+git -C $wRepo add theirs.txt 2>$null
+$r = CG @('commit', '-Paths', 'mine.txt', '-Message', 'only my own path')
+$committed = @(& git -C $wRepo show --pretty=format: --name-only HEAD 2>$null | Where-Object { $_ })
+Assert 'W10 commit reports exactly the requested paths' ($r.Code -eq 0 -and $r.Out -match 'COMMITTED')
+Assert 'W11 the commit contains only the requested path' ($committed.Count -eq 1 -and $committed[0] -eq 'mine.txt')
+Assert 'W12 the excluded foreign path is named, not silently dropped' ($r.Out -match 'theirs\.txt')
+
+# And the detection arm, which is what a bypassed hook leaves: read a finished
+# commit back and refuse to call it clean when it carries somebody else's work.
+$r = CG @('verify', '-Paths', 'docs/nothing-like-this.md', '-Sha', 'HEAD')
+Assert 'W13 verify catches a commit carrying foreign paths (exit 5)' ($r.Code -eq 5 -and $r.Out -match 'SWALLOWED WORK' -and $r.Out -match 'mine\.txt')
+$r = CG @('verify', '-Paths', 'mine.txt', '-Sha', 'HEAD')
+Assert 'W14 verify passes a commit that carries only its own paths' ($r.Code -eq 0 -and $r.Out -match 'CLEAN')
+
+# The documented invocation is `-Paths 'a','b'`, and `powershell -File` hands
+# that over as ONE string - it binds every argument as text and never splits an
+# array. Caught the first real turn that used it: git rejected a single absurd
+# pathspec. Both spellings must mean the same thing.
+Set-Content -Path (Join-Path $wRepo 'two-a.txt') -Value 'a'
+Set-Content -Path (Join-Path $wRepo 'two-b.txt') -Value 'b'
+$r = CG @('commit', '-Paths', 'two-a.txt,two-b.txt', '-Message', 'a comma-separated pathspec')
+$committed = @(& git -C $wRepo show --pretty=format: --name-only HEAD 2>$null | Where-Object { $_ })
+Assert 'W16 a comma-separated -Paths is two paths, not one' `
+    ($r.Code -eq 0 -and $committed.Count -eq 2 -and ($committed -contains 'two-a.txt') -and ($committed -contains 'two-b.txt'))
+
+# git narrates on stderr while succeeding ("LF will be replaced by CRLF", push
+# progress), and PowerShell 5.1 turns each such line into a terminating
+# ErrorRecord under $ErrorActionPreference = 'Stop'. That killed the guard's
+# first real commit with exit code 0 in hand, so the fixture is made to produce
+# exactly that warning: a CRLF file under autocrlf, staged through the guard.
+git -C $wRepo config core.autocrlf true 2>$null
+[System.IO.File]::WriteAllText((Join-Path $wRepo 'crlf.txt'), "one`r`ntwo`r`n")
+$r = CG @('commit', '-Paths', 'crlf.txt', '-Message', 'a file that makes git warn')
+Assert 'W17 a git warning on stderr is not a failure' ($r.Code -eq 0 -and $r.Out -match 'COMMITTED')
+git -C $wRepo config --unset core.autocrlf 2>$null
+
+# The one arm about THIS box: claim arms the guard every turn, so the real repo
+# should be wired right now. Read-only - nothing here reconfigures the real repo.
+$realHooks = (& git -C $Repo config --local --get core.hooksPath 2>$null)
+Assert 'W15 the real repo has the guard armed (run go-loop-exec.ps1 claim if this fails)' `
+    ($realHooks -match 'githooks')
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

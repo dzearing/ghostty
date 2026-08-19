@@ -82,6 +82,8 @@ $GuardTable = @(
         Covers = @(
             'scripts\go-loop-*.ps1',
             'scripts\loop-session.ps1',
+            'scripts\git-commit-guard.ps1',
+            'scripts\githooks\*',
             'test\win32\go-loop-guard.ps1'
         )
     },

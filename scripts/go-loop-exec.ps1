@@ -236,6 +236,18 @@ switch ($Action) {
             foreach ($line in ($dueOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
         }
 
+        # T948: arm the shared-index commit guard. core.hooksPath is LOCAL
+        # config - it cannot arrive by `git pull`, and a clone where nobody ran
+        # `install` has no guard at all - so it is re-asserted here, in the one
+        # command every turn runs first. Idempotent and silent-ish when already
+        # set; never fatal, because a repo that cannot take a hook config is
+        # still a repo the loop must be able to work in.
+        $guardScript = Join-Path $PSScriptRoot 'git-commit-guard.ps1'
+        if (Test-Path -LiteralPath $guardScript) {
+            $guardOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $guardScript install -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($guardOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
+        }
+
         # T829: did the box come back from its last reboot by itself, or did the
         # loop sit dead until somebody signed in? Reported HERE for the same
         # reason the guard report above is: this is the one command every turn

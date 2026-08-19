@@ -1,0 +1,71 @@
+#!/bin/sh
+# ghoztty pre-commit: refuse a commit while ANOTHER session holds the commit
+# lock (tracker T948).
+#
+# Two Claude windows routinely share ONE working tree here (go.md step 0: an
+# unmarked window filing tasks or auditing is never a rival and is never
+# closed). One working tree means ONE index. On 2026-08-17 the second window
+# ran a `-A` commit in the gap between the go-loop window's `git add` and its
+# `git commit`, and git committed the index - which by then held both sets of
+# changes. The loop's whole clipboard fix landed inside a commit whose subject
+# described none of it, and it was pushed before anyone noticed.
+#
+# The lock is advisory and is held only across a stage->commit window (seconds)
+# by scripts\git-commit-guard.ps1. The holder's own git children carry
+# GHOZTTY_COMMIT_LOCK_KEY and pass straight through; every other session is
+# refused - loudly, with the remedy in the message - so the collision arrives
+# the way `.git/index.lock` already arrives for the instant of the write:
+# visibly, instead of as a silent theft.
+#
+# A lock older than its ttl is stale and is REMOVED rather than obeyed, so a
+# holder that crashed mid-commit can never wedge the repo for the next window.
+#
+# Installed per clone by `scripts\git-commit-guard.ps1 install` (core.hooksPath),
+# which go-loop-exec.ps1's claim runs every turn.
+
+git_dir="${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null)}"
+[ -n "$git_dir" ] || exit 0
+
+lock="$git_dir/ghoztty-commit.lock"
+[ -f "$lock" ] || exit 0
+
+field() { sed -n "s/^$1=//p" "$lock" | head -n 1 | tr -d '\r'; }
+
+key=$(field key)
+holder=$(field holder)
+epoch=$(field epoch)
+ttl=$(field ttl)
+[ -n "$ttl" ] || ttl=900
+
+now=$(date +%s 2>/dev/null)
+[ -n "$now" ] || now=0
+
+if [ -n "$epoch" ] && [ "$now" -gt 0 ]; then
+    age=$((now - epoch))
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$ttl" ]; then
+        rm -f "$lock"
+        echo "ghoztty commit guard: cleared a stale commit lock (${age}s old, ttl ${ttl}s)" >&2
+        exit 0
+    fi
+else
+    age="?"
+fi
+
+if [ -n "$GHOZTTY_COMMIT_LOCK_KEY" ] && [ "$GHOZTTY_COMMIT_LOCK_KEY" = "$key" ]; then
+    exit 0
+fi
+
+echo "" >&2
+echo "COMMIT REFUSED - another session in this working tree is composing a commit." >&2
+echo "" >&2
+echo "  holder : ${holder:-unknown}" >&2
+echo "  held   : ${age}s (ttl ${ttl}s)" >&2
+echo "" >&2
+echo "You share one index with that session, so committing now would take its" >&2
+echo "staged work into YOUR commit (T948). Wait a few seconds and retry - the" >&2
+echo "hold lasts for one stage-then-commit, not a whole turn." >&2
+echo "" >&2
+echo "  powershell -NoProfile -File scripts\\git-commit-guard.ps1 status" >&2
+echo "  powershell -NoProfile -File scripts\\git-commit-guard.ps1 release -Force   # holder is gone" >&2
+echo "" >&2
+exit 1

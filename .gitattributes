@@ -28,6 +28,11 @@ Makefile text eol=lf
 # Text data files - always LF (embedded in Zig, parsed with \n split)
 *.txt text eol=lf
 
+# Git hooks - extensionless POSIX sh, run by git's own sh even on Windows.
+# A CRLF checkout of these turns the shebang into `#!/bin/sh\r` and the hook
+# dies with "bad interpreter" - which on a guard means it silently is not there.
+scripts/githooks/* text eol=lf
+
 # Windows resource files - preserve as-is (native Windows tooling)
 *.rc -text
 *.manifest -text

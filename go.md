@@ -447,6 +447,29 @@ Concretely, in order, with no stops in between:
    `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
    validate` before committing. Commit and push.
 
+   **Commit through the guard, not with a bare `git commit -a`** (T948) — you
+   share this working tree, and therefore this INDEX, with the other Claude
+   window:
+
+   ```
+   powershell -NoProfile -File scripts\git-commit-guard.ps1 commit -Push ^
+       -Paths 'src\...','docs\design\windows-parity-log.md' -MessageFile temp\msg.txt
+   ```
+
+   It holds a seconds-long advisory lock across stage→commit (the other
+   window's commit is REFUSED by the `pre-commit` hook while it is held, with
+   the remedy in the message), commits with an explicit pathspec so whatever
+   else is sitting in the shared index cannot ride along, and then READS THE
+   COMMIT BACK and fails loudly if it contains a path you did not ask for. On
+   2026-08-17 the other window's `git add -A; git commit` landed in the gap
+   between this loop's `git add` and its `git commit`: a whole clipboard fix
+   shipped under a subject describing none of it, and it was pushed before
+   anyone noticed. `install` (which step 0's claim re-runs every turn) is what
+   arms the hook — `core.hooksPath` is local config, so it never arrives by
+   `git pull`. `status` / `release -Force` are the escape hatches, and a hold
+   older than its ttl is cleared rather than obeyed, so a crashed holder cannot
+   wedge the repo. Acceptance: section W of `test\win32\go-loop-guard.ps1`.
+
    Since T783 `validate` is also the gate with TEETH for harness staleness: it
    fails when `scripts\guard-due.ps1` reports an acceptance harness that has not
    been run since the code it covers changed (step 3). Run that harness; the
