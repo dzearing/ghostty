@@ -360,6 +360,14 @@ $GuardTable = @(
             # only a run of this harness catches.
             'src\apprt\win32\session_layout.zig',
             'src\apprt\win32\layout_refresh.zig',
+            # T974: arm M is the only place the ADOPTION path is scored on what
+            # the user sees - the program they were running is the same process,
+            # and no pane claims an interruption. `holder-adopt` covers the same
+            # file on the mechanism side (same shell pid, same holder); this
+            # harness is what notices when adoption still "works" and the panes
+            # get told they died anyway. Rarely edited, so the twelve-minute run
+            # this makes due is not a per-turn cost.
+            'src\remote\agent\holder_adopt.zig',
             'test\win32\session-relaunch-notify.ps1'
         )
     },

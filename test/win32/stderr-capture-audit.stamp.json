@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T15:43:15-07:00",
-    "commit":  "f02dd936c",
+    "generated":  "2026-08-19T16:37:54-07:00",
+    "commit":  "310d82923",
     "files":  {
                   "docs/claude/testing.md":  "637306a00851c42dc1dfbb084bec74c8f38e622268c4fdcdcf5e193d710a6edb",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -198,7 +198,7 @@
                   "test/win32/session-reattach.ps1":  "ba1ab363e15d168f85374f9c5bd22754ce36287cfe641b583c36248a251ebf87",
                   "test/win32/session-reattach-zombie.ps1":  "de8d44568f5fd19cc6138ac6f4204bce90410d3c99b1fecf44a68061ed64e951",
                   "test/win32/session-relaunch.ps1":  "93461f2bc08616d2bb4d6603d9bc8eb3a968ff3f7c4df0da542972470d1b354a",
-                  "test/win32/session-relaunch-notify.ps1":  "cf6306972ee254e46127aaf50a43adb62cf2cafa37c39c6d76a972f2ce69a46b",
+                  "test/win32/session-relaunch-notify.ps1":  "fd1d0c4862d58e835a6a0ff2f7464fa63bcee48b54e84d2824be512dfc2c4d23",
                   "test/win32/session-restore-maximized.ps1":  "71d7637cc3548075a140f93e31c2d1b195f2bfe931d913bff453696d313b7065",
                   "test/win32/session-resume-offset.ps1":  "7c802c1c6e37aaf441a6aedcd046ba600b104f3963b12794f82f5bb583796eed",
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",

@@ -38,6 +38,13 @@
 #      restores where they actually were, not where the shell was spawned.
 #      Scored on the agent's own sessions.json AND on what the restored shell
 #      prints for `cd`.
+#   M: the INVERSE (T974). Every arm above kills the session manager AND its PTY
+#      holders, because that is the reboot shape. Kill only the MANAGER and the
+#      outcome must be the opposite of arm A's: since T909 the holders outlive
+#      it, so the command the user was running is still the SAME process, no
+#      pane claims an interruption in either carrier, and the panes stay on
+#      their own sessions and keep taking input. Without this arm an agent
+#      upgrade that started killing panes would leave the file green.
 #
 # The commands are `ping -n <unique> 127.0.0.1`: long-lived, harmless, and each
 # carries a unique count that makes it findable in Win32_Process.CommandLine -
@@ -59,6 +66,12 @@ param(
     # end, deliberately, so this has to be somewhere else.
     [string]$DumpPanesTo = '',
     [switch]$NegativeControl,
+    # T974 teeth check for arm M. Takes the PTY holders down with the manager,
+    # which is exactly the regression arm M exists to catch (an agent restart
+    # that kills the panes). Arm M must go RED under it - a green run here means
+    # the arm is asserting nothing. Arms A-F still run and still pass, so the
+    # whole run exits 1 by design and nothing is stamped.
+    [switch]$BreakHolders,
     # Keep the per-run temp tree (every arm's app stderr log, its CLI captures
     # and its session-layout manifest) instead of deleting it at the end. For
     # diagnosing an arm that `-DumpPanesTo` cannot explain: that flag only
@@ -91,9 +104,14 @@ function Say($m) { Write-Host $m }
 $MARK_A = 9700 + ($PID % 89)
 $MARK_B = 8700 + ($PID % 89)
 $MARK_F = 7700 + ($PID % 89)
+# T974: arm M's command, which must OUTLIVE the manager rather than be
+# tombstoned by it. Its own number so a leftover from arm A/B/F can neither
+# satisfy nor spoil "the same process is still running".
+$MARK_M = 6700 + ($PID % 89)
 $CMD_A = "ping -n $MARK_A 127.0.0.1"
 $CMD_B = "ping -n $MARK_B 127.0.0.1"
 $CMD_F = "ping -n $MARK_F 127.0.0.1"
+$CMD_M = "ping -n $MARK_M 127.0.0.1"
 # T422: per-pane banners and a window title pin for arm E. Distinguishable from
 # each other so "each pane kept ITS OWN banner" is a real claim rather than "some
 # banner survived", and space-free so `Run-CliArgs` cannot re-tokenize them.
@@ -154,8 +172,23 @@ function Count-MarkerPings($mark) {
 }
 function Stop-MarkerPings {
     Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" |
-        Where-Object { $_.CommandLine -like "*-n $MARK_A *" -or $_.CommandLine -like "*-n $MARK_B *" -or $_.CommandLine -like "*-n $MARK_F *" } |
+        Where-Object { $_.CommandLine -like "*-n $MARK_A *" -or $_.CommandLine -like "*-n $MARK_B *" -or $_.CommandLine -like "*-n $MARK_F *" -or $_.CommandLine -like "*-n $MARK_M *" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+# T974: WHICH processes, not how many. "The recorded command is still running"
+# is only the claim it sounds like if it is the SAME process - a manager that
+# re-executed the command would leave the count at 1 with a brand new pid, which
+# is precisely the outcome arm M exists to rule out.
+# Returned PLAIN, never `, $ids` — the comma form hands the array back as a
+# single pipeline item, so the `@(...)` every call site wraps it in produces a
+# one-element array holding an array, and `-join` prints `System.Object[]` while
+# `.Count` reads 1 no matter how many pings are running. (Measured: M13's first
+# run.) `@(f)` on a plain return counts 0/1/n correctly, which is all this is
+# ever asked for.
+function Get-MarkerPingPids($mark) {
+    return @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" |
+        Where-Object { $_.CommandLine -like "*-n $mark *" } |
+        ForEach-Object { [int]$_.ProcessId } | Sort-Object)
 }
 function Wait-MarkerPings($mark, $want, $timeoutSec = 25) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -180,6 +213,43 @@ function Wait-AgentPid($t, $timeoutSec = 25, $notPid = 0) {
         Start-Sleep -Milliseconds 400
     }
     return (Get-RunAgentPid $t)
+}
+# T974: the SESSION MANAGER specifically, told apart from the per-session PTY
+# holders that are the same binary in `--pty-host` mode. Every arm above kills
+# manager and holders together, so "the first ghoztty-agent carrying this run's
+# state dir" was always the manager by construction. Arm M kills only the
+# manager and leaves the holders up on purpose, so that shortcut would happily
+# hand back a holder pid and score the whole arm against the wrong process.
+function Get-RunManagerPids($t) {
+    return @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.CommandLine -like "*$t*" -and $_.CommandLine -notlike '*--pty-host*' } |
+        ForEach-Object { [int]$_.ProcessId })
+}
+# Holders are found by EXE, not by this run's state dir: the manager passes them
+# a spec file in TEMP and nothing on their command line names LOCALAPPDATA, so
+# the `*$tmp*` filter that identifies the manager matches no holder at all.
+# (Measured: M7/M11 scored 0 holders against a run that had one.) Keying on
+# `ExecutablePath -eq $AgentExe` is what keeps the user's installed agent - which
+# owns their real sessions - out of the answer.
+function Get-RunHolderPids {
+    return @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.ExecutablePath -eq $AgentExe -and $_.CommandLine -like '*--pty-host*' } |
+        ForEach-Object { [int]$_.ProcessId })
+}
+function Wait-ManagerPid($t, $timeoutSec = 45, $notPid = 0) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $p = @((Get-RunManagerPids $t) | Where-Object { $_ -ne $notPid })
+        if ($p.Count -gt 0) { return [int]$p[0] }
+        Start-Sleep -Milliseconds 400
+    }
+    $p = @((Get-RunManagerPids $t) | Where-Object { $_ -ne $notPid })
+    if ($p.Count -gt 0) { return [int]$p[0] }
+    return 0
+}
+function Test-PidAlive([int]$procId) {
+    if ($procId -le 0) { return $false }
+    return $null -ne (Get-Process -Id $procId -ErrorAction SilentlyContinue)
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
@@ -954,6 +1024,128 @@ Assert "F11 the scrollback notice names it under 'Previous command:'" `
     (Wait-PaneTextTight $paneF2 'f-txt' "Previouscommand:ping-n$MARK_F" 1 40)
 Assert "F12 the typed command was NOT re-executed (restore policy)" ((Count-MarkerPings $MARK_F) -eq 0)
 Assert "F13 the restored pane is on a live, interactive shell" (Test-PaneResponsive $paneF2 'f-post')
+Stop-TestProcs
+
+# ============================================================================
+Say "== M: the MANAGER alone restarts - nothing was interrupted (T974)"
+# ============================================================================
+# Arm A's inverse, against the same build, in the same script.
+#
+# Arm A is the REBOOT shape: the manager and every holder die, so the next
+# launch finds tombstones and each pane comes back with the interrupted notice
+# over a fresh shell. Since T909 the AGENT-RESTART shape is a different thing -
+# the ConPTY, the shell and whatever the user was running live in a `--pty-host`
+# holder that outlives its manager on purpose, so a manager that crashes or is
+# upgraded comes back, ADOPTS its holders, and nothing was ever interrupted.
+# T922 pointed the arms above squarely at the reboot shape by killing the
+# holders too (correctly - that IS a reboot), and in doing so left the
+# agent-restart shape measured by nothing: a regression that started killing
+# panes on every agent upgrade would take this whole file green with it.
+#
+# So: kill ONLY the manager, leave the app and the holders alone, and assert the
+# opposite outcome on the same oracles arm A uses.
+#   - the recorded command is still running, as THE SAME PROCESS (a re-execute
+#     would show the same marker under a brand new pid)
+#   - no pane claims an interruption, in the banner OR in its own scrollback
+#   - the plain pane still holds what it printed before the kill, is on the same
+#     session id, and still takes input
+#
+# The absence claims are only worth something with positive controls beside
+# them, and they are all in this file: arm A proves this build DOES raise the
+# notice when a session really died, and M's own marker and liveness assertions
+# prove the panes being read are real panes rather than empty dumps.
+#
+# Which assertions actually carry the claim, measured under `-BreakHolders`
+# (holders killed with the manager - the regression shape): M11, M13, M15, M16
+# and M18 go red. M17 and M19 stay GREEN there and are controls, not claims -
+# a rebuilt pane still takes input, and since T922/D78 it is even repainted with
+# the dead session's last screen, so "the marker is still there" cannot by
+# itself tell a survivor from a replacement. Only the session id and the shell's
+# own process can.
+Reset-State 'm'
+$workM = Join-Path $root 'workM'
+New-Item -ItemType Directory -Force $workM | Out-Null
+
+$appPidM = Start-App 'mgronly' @("--working-directory=$workM")
+Assert "M1 the GUI came up" ($appPidM -ne 0)
+$leavesM0 = All-Leaves (Wait-Leaves 'm0' 1 45)
+Assert "M2 there is a plain shell pane" ($leavesM0.Count -ge 1)
+$paneM = if ($leavesM0.Count -ge 1) { [string]$leavesM0[0].id } else { '' }
+
+# A marker only THIS session could have printed, so "the pane was never rebuilt"
+# is a claim about continuity rather than about a pane merely existing. Waited
+# for TWICE - the echoed input line and the command's output - because one hit
+# is keystrokes sitting in a line editor and proves nothing ran.
+$MGR_MARK = "T974mark$MARK_M"
+Run-CliArgs @('+send-keys', "--target=$paneM", 'echo', 'Space', $MGR_MARK, 'Enter') "$tmp\keys-m.txt" 15 | Out-Null
+Assert "M3 the plain pane printed its marker before the kill" `
+    (Wait-PaneTextTight $paneM 'm-pre' $MGR_MARK 2 30)
+
+# The commanded pane: a long-lived program that must still be running, untouched,
+# once the manager is back. Its own window, and the `--command=` value carries
+# its own quotes, because `Run-CliArgs` joins with spaces and quotes nothing.
+Run-CliArgs @('+new-window', '--target=nM', "--command=`"$CMD_M`"", "--working-directory=$workM") "$tmp\nwM.txt" 25 | Out-Null
+$leavesM1 = All-Leaves (Wait-Leaves 'm1' 2 45)
+Assert "M4 the commanded pane exists" ($leavesM1.Count -ge 2)
+Assert "M5 '$CMD_M' is actually running" (Wait-MarkerPings $MARK_M 1 30)
+$pingPidsBefore = @(Get-MarkerPingPids $MARK_M)
+
+$mgrM = Wait-ManagerPid $tmp 30
+Assert "M6 a session manager is running for this run" ($mgrM -ne 0)
+$holdersBefore = @(Get-RunHolderPids)
+Assert "M7 the sessions are holder-backed (the property this arm rests on)" ($holdersBefore.Count -ge 1)
+
+# Session ids BEFORE, so "the same session" is a comparison rather than a vibe.
+$sidBefore = @{}
+foreach ($lf in $leavesM1) { $sidBefore[[string]$lf.id] = [string]$lf.session_id }
+Assert "M8 the plain pane is agent-backed (it carries a session id)" (
+    $paneM -ne '' -and [string]$sidBefore[$paneM] -ne '')
+
+# ---- the kill: the MANAGER only. Not the app, not the holders. -------------
+Stop-Process -Id $mgrM -Force -ErrorAction SilentlyContinue
+if ($BreakHolders) {
+    Say '  TEETH CHECK (-BreakHolders): taking the holders down with the manager - arm M MUST go red'
+    foreach ($h in $holdersBefore) { Stop-Process -Id $h -Force -ErrorAction SilentlyContinue }
+}
+Start-Sleep -Seconds 3
+Assert "M9 the session manager is really gone" (-not (Test-PidAlive $mgrM))
+Assert "M10 the app did NOT restart (this is not the reboot shape)" (Test-PidAlive $appPidM)
+$holdersLived = @(@($holdersBefore) | Where-Object { Test-PidAlive $_ })
+Assert "M11 the holders outlived their manager ($($holdersLived.Count)/$($holdersBefore.Count))" (
+    $holdersBefore.Count -gt 0 -and $holdersLived.Count -eq $holdersBefore.Count)
+
+$mgrM2 = Wait-ManagerPid $tmp 60 $mgrM
+Assert "M12 a replacement session manager came up" ($mgrM2 -ne 0 -and $mgrM2 -ne $mgrM)
+
+# ---- THE assertion: the user's program never stopped ------------------------
+$pingPidsAfter = @(Get-MarkerPingPids $MARK_M)
+$survived = @(@($pingPidsAfter) | Where-Object { $pingPidsBefore -contains $_ })
+$sameProc = ($pingPidsBefore.Count -ge 1 -and $survived.Count -eq $pingPidsBefore.Count)
+Assert "M13 the recorded command is STILL RUNNING as the same process (before: $($pingPidsBefore -join ',') / after: $($pingPidsAfter -join ','))" $sameProc
+
+# ---- and nothing told the user otherwise -----------------------------------
+$leavesM2 = All-Leaves (Wait-Leaves 'm2' 2 60)
+Assert "M14 both panes are still listed after the restart" ($leavesM2.Count -ge 2)
+$bannersM = @($leavesM2 | ForEach-Object { [string]$_.banner }) -join ' | '
+Assert "M15 no pane banner claims the session was interrupted (banners: '$bannersM')" (
+    $bannersM -notmatch 'Session interrupted')
+$noticedPanes = @()
+foreach ($lf in $leavesM2) {
+    $tightM = (Read-Pane ([string]$lf.id) "m-post-$([string]$lf.id)" 400) -replace '\s', ''
+    if ($tightM.IndexOf('sessioninterrupted', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $noticedPanes += [string]$lf.id
+    }
+}
+Assert "M16 no pane scrollback carries the notice ($($noticedPanes.Count) did)" ($noticedPanes.Count -eq 0)
+
+# ---- continuity, which is also M15/M16's positive control -------------------
+Assert "M17 the plain pane still holds what it printed before the kill" `
+    (Wait-PaneTextTight $paneM 'm-hist' $MGR_MARK 2 40)
+$sidAfter = @{}
+foreach ($lf in $leavesM2) { $sidAfter[[string]$lf.id] = [string]$lf.session_id }
+Assert "M18 the plain pane is on the SAME session ('$($sidBefore[$paneM])' -> '$($sidAfter[$paneM])')" (
+    $paneM -ne '' -and [string]$sidAfter[$paneM] -ne '' -and $sidAfter[$paneM] -eq $sidBefore[$paneM])
+Assert "M19 the plain pane still takes input" (Test-PaneResponsive $paneM 'm-post')
 Stop-TestProcs
 
 } finally {
