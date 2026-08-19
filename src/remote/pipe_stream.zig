@@ -139,6 +139,9 @@ const win = struct {
         hNamedPipe: W.HANDLE,
         lpOverlapped: ?*W.OVERLAPPED,
     ) callconv(.winapi) W.BOOL;
+    extern "kernel32" fn DisconnectNamedPipe(
+        hNamedPipe: W.HANDLE,
+    ) callconv(.winapi) W.BOOL;
     extern "kernel32" fn WaitNamedPipeW(
         lpNamedPipeName: [*:0]const u16,
         nTimeOut: W.DWORD,
@@ -389,13 +392,13 @@ const win = struct {
                             switch (W.GetLastError()) {
                                 // Client connected in the create→connect gap.
                                 .PIPE_CONNECTED => {},
-                                else => return error.AcceptFailed,
+                                else => return self.dropPending(inst),
                             }
                         }
                     },
                     // Client connected in the create→connect gap.
                     .PIPE_CONNECTED => {},
-                    else => return error.AcceptFailed,
+                    else => return self.dropPending(inst),
                 }
             }
 
@@ -403,6 +406,34 @@ const win = struct {
             // finds an instance (PIPE_BUSY at worst — dialHandle retries).
             self.next = createInstance(self.name_w, self.sd, false) catch W.INVALID_HANDLE_VALUE;
             return inst;
+        }
+
+        /// A pending instance whose `ConnectNamedPipe` failed is DEAD, and
+        /// reusing it wedges the listener for good (T975).
+        ///
+        /// The shape that produces one: a client OPENS the instance and gives
+        /// up before the server gets around to `accept()` — exactly what the
+        /// app's bounded dial does while a starting agent is still adopting
+        /// holders. The instance is then in the closing state, so every later
+        /// `ConnectNamedPipe` on that handle fails with the same error; the old
+        /// code returned `AcceptFailed` and left the handle in `next`, so the
+        /// daemon's accept loop retried the same corpse forever — 10 log lines a
+        /// second and not one connection served again for the life of the
+        /// process. It is not recoverable by waiting, and it took the whole
+        /// session layout with it after a reboot: the app's first dial poisoned
+        /// the very agent it had just spawned.
+        ///
+        /// So the broken instance is dropped and replaced. The replacement is
+        /// created BEFORE the close so the pipe NAME never goes unbound (a
+        /// dialer in that gap would see FileNotFound, which reads as "no agent"
+        /// rather than "try again"). The caller still sees `AcceptFailed` and
+        /// still backs off — the difference is that the next accept waits on a
+        /// healthy instance.
+        fn dropPending(self: *Listener, inst: W.HANDLE) error{AcceptFailed} {
+            self.next = createInstance(self.name_w, self.sd, false) catch W.INVALID_HANDLE_VALUE;
+            _ = DisconnectNamedPipe(inst);
+            W.CloseHandle(inst);
+            return error.AcceptFailed;
         }
 
         fn createInstance(name_w: [:0]const u16, sd: ?*anyopaque, first: bool) BindError!W.HANDLE {
@@ -743,6 +774,59 @@ test "PipeListener: serves multiple concurrent client connections" {
     total = 0;
     while (total < 3) total += try s2.serverStream().read(buf[total..]);
     try testing.expectEqualStrings("two", buf[0..3]);
+}
+
+test "PipeListener: a client that vanishes before accept() does not wedge the listener" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var nbuf: [128]u8 = undefined;
+    const name = try testPipeName(&nbuf, "abort");
+
+    var listener = try PipeListener.bind(alloc, name);
+    defer listener.deinit();
+
+    // The poison (T975): a client OPENS the pending instance and gives up
+    // before the server ever calls accept(). That is what the app's bounded
+    // dial does to an agent still busy adopting holders — and it used to end
+    // the listener's life: `ConnectNamedPipe` on the half-closed instance
+    // failed forever, the handle stayed in `next`, and the daemon spun on the
+    // same corpse without serving one more connection.
+    const doomed = try dialHandle(alloc, name);
+    std.os.windows.CloseHandle(doomed);
+
+    // The accept loop is the daemon's — log, back off, retry — but bounded, so
+    // a regression fails the test instead of hanging the lane.
+    const Accepter = struct {
+        listener: *PipeListener,
+        served: bool = false,
+        fn run(self: *@This()) void {
+            for (0..40) |_| {
+                const h = self.listener.accept() catch {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                };
+                var s = PipeStream.init(h);
+                var buf: [8]u8 = undefined;
+                const n = s.serverStream().read(&buf) catch 0;
+                s.serverStream().close();
+                if (n == 2 and std.mem.eql(u8, buf[0..2], "hi")) {
+                    self.served = true;
+                    return;
+                }
+            }
+        }
+    };
+    var accepter = Accepter{ .listener = &listener };
+    const t = try std.Thread.spawn(.{}, Accepter.run, .{&accepter});
+
+    const client_h = try dialHandle(alloc, name);
+    var client = PipeStream.init(client_h);
+    try client.connectionStream().writeAll("hi");
+    t.join();
+    client.connectionStream().close();
+
+    try testing.expect(accepter.served);
 }
 
 test {

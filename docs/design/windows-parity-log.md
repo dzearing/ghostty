@@ -9,6 +9,44 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-18 - **T975 (filed T976, T977; unblocked T922) - a reboot brings the
+  windows back.** The panes recorded on disk were being replaced by one empty
+  window, and it took two defects that only meet after a restart. First, the
+  agent's own listener could be killed by a client that walked away:
+  `PipeListener.accept` pre-creates the next pipe instance, and when a client
+  OPENED that instance and gave up before the server called `ConnectNamedPipe`,
+  the call failed, `accept` returned `AcceptFailed` - and left the dead instance
+  in `next`, so every later accept retried the same corpse. Ten
+  `pipe accept error: AcceptFailed` lines a second, forever, and not one
+  connection served for the life of the process. Second, startup holder adoption
+  dials each recorded holder for 2s, serially, before the listener accepts
+  anybody - and after a reboot every recorded holder is dead, so three sessions
+  bought six seconds of silence. The app spawns the agent, waits its 2s
+  `spawn_deadline_ms`, gives up - and its abandoned dial is exactly the poison in
+  the first defect, so the agent it had just started never served anyone again.
+  That is also why the report's hand-started agent looked healthy: nothing had
+  aborted a dial on it yet. `accept` now drops and replaces a pending instance
+  whose connect failed (replacement created BEFORE the close, so the pipe name
+  never goes unbound), and `adopt` asks the process table before it dials - a
+  recorded holder whose pid is gone is abandoned immediately, one-directionally,
+  so anything unanswerable still reads as "still there" and the dial stays the
+  authority. Both have unit tests in the agent lane and the wedge test was run
+  as a negative control (revert `dropPending` and it fails). End to end, the
+  reboot shape now logs `session-restore: restored 2 window(s)` and
+  `attached 3 pane(s)` with three holders back, where it used to log
+  `local agent did not become dialable within 2000ms`. Two surprises worth the
+  next turn's time: `session-relaunch-notify.ps1` went from arm A unscoreable to
+  98 passed / 6 failed, and all six reds belong elsewhere - A12/A15/A16/A17 are
+  T922's restored-screen arms (blocked on this task, now unblocked and P0) and
+  E3/E4 are new: a rebooted pane's interrupted-session notice reaches its
+  scrollback but never its banner (T977, P0). Both are what keeps the
+  session-relaunch guard stamp due, so this commit takes `-NoGuardDue`.
+  Also filed T976: the launch restore is still one-shot - it gives the agent 2s
+  and then keeps the windows "for the next launch", which on a loaded box is
+  still a blank terminal. `src\remote\pipe_stream.zig` was added to the
+  session-relaunch guard's coverage, since that harness is the only thing that
+  noticed the transport had broken.
+
 - 2026-08-18 - **T877 (filed T955) - the crash counter now counts the crash
   its own log already decoded.** `test-binary-soak.ps1` is the instrument the
   T443 hunt measures occurrence RATES with, and it recognised a dead test

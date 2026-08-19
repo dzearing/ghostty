@@ -304,6 +304,14 @@ $GuardTable = @(
         Covers = @(
             'src\termio\Remote.zig',
             'src\termio\session_notice.zig',
+            # T975: the agent's pipe TRANSPORT belongs here because this harness
+            # is the only thing that noticed when it broke. A listener that
+            # stopped accepting after one abandoned dial passed every test lane
+            # (nothing there aborts a dial) and every other acceptance script
+            # (they all reach a healthy agent first) - and cost a rebooting user
+            # their entire layout, because the app's own timed-out dial was the
+            # thing that wedged the agent it had just spawned.
+            'src\remote\pipe_stream.zig',
             'test\win32\session-relaunch-notify.ps1'
         )
     },

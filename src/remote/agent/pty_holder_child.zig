@@ -685,6 +685,22 @@ const win = struct {
 
     const still_active: windows.DWORD = 259;
 
+    /// Whether the holder pid we RECORDED is definitively gone: no such
+    /// process, or a process that has already exited.
+    ///
+    /// Deliberately one-directional. Anything we cannot answer — a pid we are
+    /// not allowed to open, a query that fails — reads as "still there", so the
+    /// dial stays the authority and a permission hiccup can never abandon a
+    /// live holder. Windows recycles pids, so a `true` from a recycled pid is
+    /// impossible by construction (a recycled pid IS alive) and the identity
+    /// checks after the dial still guard the other direction.
+    fn recordedHolderGone(pid: u32) bool {
+        const h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse
+            return windows.GetLastError() == .INVALID_PARAMETER;
+        defer windows.CloseHandle(h);
+        return !processAlive(h);
+    }
+
     fn processAlive(h: windows.HANDLE) bool {
         var code: windows.DWORD = 0;
         if (windows.kernel32.GetExitCodeProcess(h, &code) == 0) return false;
@@ -892,6 +908,20 @@ const win = struct {
     /// leaves it running and says so, so a newer-protocol holder outlives a
     /// rollback instead of being destroyed by it.
     fn adopt(alloc: Allocator, opts: AdoptOptions) !Spawned {
+        // A recorded holder whose PROCESS is gone cannot be on that pipe — a
+        // pipe name dies with its server's last handle — so ask the process
+        // table first and skip the dial entirely (T975).
+        //
+        // The dial is bounded, but the bound is `dial_timeout_ms` PER session
+        // and the whole sweep runs before the agent serves its first
+        // connection. After a reboot every recorded holder is gone, so three
+        // sessions used to hold the listener shut for six seconds — past the
+        // app's 2s spawn deadline, which is how a relaunch decided the agent it
+        // had just started did not exist and replaced the user's whole layout
+        // with one empty window.
+        if (opts.holder_pid != 0 and recordedHolderGone(opts.holder_pid))
+            return error.HolderProcessGone;
+
         const handle = try dialExisting(alloc, opts.pipe_name, opts.dial_timeout_ms);
         var pstream_ok = false;
         errdefer if (!pstream_ok) {
@@ -1108,3 +1138,37 @@ test "ackTarget: armed, nothing is released past the ring snapshot on disk (T911
     // and no later re-ATTACH could ask for them back.
     try testing.expectEqual(@as(u64, 8192), ackTarget(true, 8192, 12288));
 }
+
+test "adopt: a recorded holder whose process is gone is abandoned without paying the dial timeout (T975)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // A pid that is definitively dead: run a process to completion and keep its
+    // number. Nothing else can be answering on the name below either, so an
+    // adoption that still dialed would sit here for the full `dial_timeout_ms`
+    // — which is the whole point being measured.
+    var child = std.process.Child.init(&.{ "cmd.exe", "/c", "exit" }, alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const dead_pid: u32 = GetProcessId(child.id);
+    _ = try child.wait();
+    try testing.expect(dead_pid != 0);
+
+    var timer = try std.time.Timer.start();
+    const err = win.adopt(alloc, .{
+        .pipe_name = "\\\\.\\pipe\\ghoztty-pty-host-test-t975-nobody",
+        .session_id = "t975",
+        .holder_pid = dead_pid,
+        .dial_timeout_ms = 2_000,
+    });
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+
+    try testing.expectError(error.HolderProcessGone, err);
+    // The startup sweep runs before the agent accepts anybody and the app gives
+    // that whole startup 2s, so "fast" here is the contract, not a nicety.
+    try testing.expect(elapsed_ms < 500);
+}
+
+extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
