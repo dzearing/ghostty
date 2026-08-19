@@ -369,6 +369,11 @@ fn apply(self: *ViewerFeedbackWeb, message: page.Message) void {
             self.caret = s.caret;
             self.bar.composerState(s.text, s.quotes);
         },
+        // Deliberately NOT generation-guarded (T936): a picture is not a
+        // measurement of a document that may have been replaced, it is a thing
+        // the user just did, and dropping it because a seed happened to be in
+        // flight would be a paste that silently did nothing.
+        .image => |img| self.bar.composerImage(img),
     }
 }
 
@@ -405,6 +410,7 @@ pub fn seed(
     text: []const u8,
     caret: ?u32,
     quotes: []const page.QuoteSpan,
+    images: []const page.ImageSpan,
 ) void {
     if (!self.ready) return;
     self.seed_gen +%= 1;
@@ -416,9 +422,36 @@ pub fn seed(
         if (caret) |c| @intCast(c) else -1,
         self.seed_gen,
         quotes,
+        images,
     ) catch return;
     defer self.alloc.free(json);
     self.post(json);
+}
+
+/// Select image chip `n`'s node, whole — what a click on its thumbnail does
+/// (T936).
+pub fn pick(self: *ViewerFeedbackWeb, n: u32) void {
+    const json = page.pickJson(self.alloc, n) catch return;
+    defer self.alloc.free(json);
+    self.post(json);
+}
+
+/// Run one script in the composer's page.
+///
+/// The only caller is the host floor test, and it is here rather than in the
+/// test because a `paste` is the one path in this file that no acceptance
+/// script can reach: the suite runs on a background desktop where SendInput is
+/// dead and a Chromium window ignores posted key messages, so dispatching a
+/// synthetic `ClipboardEvent` from inside the page is the only way to prove the
+/// engine's own clipboard path end to end. Fire and forget — nothing here reads
+/// a result back, exactly like `ViewerPane.executeScript`.
+pub fn executeScript(self: *ViewerFeedbackWeb, js: []const u8) void {
+    const c = self.controller orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, js) catch return;
+    defer self.alloc.free(wide);
+    _ = web.executeScript(wide.ptr, null);
 }
 
 pub fn setBounds(self: *ViewerFeedbackWeb, r: iface.RECT) void {

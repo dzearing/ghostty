@@ -654,11 +654,19 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
     else
         null;
 
+    // The live image chips, derived from the buffer exactly as the carousel and
+    // the report's `images` array are (T936) — so the nodes the page builds and
+    // the pictures the report will carry cannot disagree, and the two rules
+    // that derivation enforces (an unknown chip is plain text, an entry is live
+    // at most once) hold for the nodes without being restated.
+    const images = self.imageSeedSpans(text);
+    defer if (images.len > 0) self.alloc.free(images);
+
     // Byte spans, as the pane knows them — from the page's own last snapshot
     // when there is one, and derived from the registry when the buffer has
     // moved behind the page's back (a reopen, a native insertion, a clear).
     const spans = self.pane.feedbackQuoteSpans(self.alloc) orelse {
-        wv.seed(text, units, &.{});
+        wv.seed(text, units, &.{}, images);
         return;
     };
     defer self.alloc.free(spans);
@@ -666,7 +674,7 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
     const out = self.alloc.alloc(composer_page.QuoteSpan, spans.len) catch {
         // Seeding without the quotes still gets the user's words onto the
         // page; dropping the seed would lose them.
-        wv.seed(text, units, &.{});
+        wv.seed(text, units, &.{}, images);
         return;
     };
     defer self.alloc.free(out);
@@ -681,7 +689,25 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
         };
         n += 1;
     }
-    wv.seed(text, units, out[0..n]);
+    wv.seed(text, units, out[0..n], images);
+}
+
+/// Every live chip in `text`, as the page's UTF-16 spans. Empty rather than
+/// null on any failure: a seed without its chips still carries the report's
+/// words, which is the half that cannot be recovered.
+fn imageSeedSpans(self: *ViewerFeedbackBar, text: []const u8) []const composer_page.ImageSpan {
+    const spans = self.pane.feedbackImageSpans(self.alloc) orelse return &.{};
+    defer self.alloc.free(spans);
+    if (spans.len == 0) return &.{};
+    const out = self.alloc.alloc(composer_page.ImageSpan, spans.len) catch return &.{};
+    for (spans, 0..) |s, i| {
+        out[i] = .{
+            .n = self.pane.feedbackImageEntry(s).number,
+            .start = @intCast(utf16_offset.unitsBeforeByte(text, s.start)),
+            .end = @intCast(utf16_offset.unitsBeforeByte(text, s.end)),
+        };
+    }
+    return out;
 }
 
 /// One snapshot from the page: the document as it now stands.
@@ -811,6 +837,13 @@ fn pushComposerVars(self: *ViewerFeedbackBar, force: bool) void {
         .quote_indent_px = quote_indent_dip,
         .quote_bar_px = quote_bar_dip,
         .quote_bar_x_px = quote_bar_x_dip,
+        // The chip's own shape, and the cap the page refuses a picture at —
+        // the store's own number, so a drop the store would reject is rejected
+        // before 40 MB of base64 crosses the channel to be rejected here
+        // (T936).
+        .image_pad_px = chip_pad_dip,
+        .image_radius_px = chip_radius_dip,
+        .image_max_bytes = feedback_images.max_image_bytes,
     });
 }
 
@@ -1121,6 +1154,15 @@ const quote_indent_dip: f32 = 16;
 const quote_bar_dip: f32 = 3;
 const quote_bar_x_dip: f32 = 5;
 
+/// An image chip's two, in DIPs (T936): the design system's 4 DIP step for the
+/// wash either side of the chip's text, and the same 4 for its corner — the
+/// radius the rest of the win32 chrome uses for a small pill. The RichEdit
+/// fallback draws no chip at all (its chip is plain text), so unlike the quote
+/// numbers these have one renderer today; they are stated here anyway because
+/// the rule is that the design system lives in this file, not in a stylesheet.
+const chip_pad_dip: f32 = 4;
+const chip_radius_dip: f32 = 4;
+
 /// The left indent of a quoted block, in TWIPs (1/1440"): 15 twips is one DIP,
 /// so this is the design system's 16 DIP step. Twips rather than pixels
 /// because RichEdit does the DPI conversion itself — the same number is right
@@ -1286,6 +1328,30 @@ fn tryPasteImage(self: *ViewerFeedbackBar) bool {
     const png = clipboard_image.read(self.alloc, self.hwnd) orelse return false;
     defer self.alloc.free(png);
     return self.attachImage(png);
+}
+
+/// A picture the composer's PAGE took off a paste or a drop (T936).
+///
+/// The engine decoded it, so there is nothing to intercept and nothing to ask
+/// the clipboard: what arrives here is the same PNG `attachImage` has always
+/// been handed, and it goes the same way. A picture the page could not hand
+/// over says so in the footer rather than vanishing — a paste that appears to
+/// do nothing is the failure this whole path exists to end.
+pub fn composerImage(self: *ViewerFeedbackBar, image: composer_page.Image) void {
+    if (image.png) |png| {
+        _ = self.attachImage(png);
+        return;
+    }
+    log.warn("viewer feedback pane={s} image refused by the page: {s} bytes={d}", .{
+        self.pane.paneId(),
+        @tagName(image.problem),
+        image.bytes,
+    });
+    self.pane.setFeedbackStatus(self.alloc, switch (image.problem) {
+        .too_large => "That image is too large to attach",
+        else => "That is not an image this can attach",
+    });
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
 /// Store one PNG and put its chip at the caret. False when the picture could
@@ -1520,11 +1586,11 @@ fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
     const s = spans[index];
 
     if (self.web) |wv| {
-        // Plain-text parity only: the caret goes to the chip, and SELECTING the
-        // run is T936's, where a chip is a DOM node that can be selected as one
-        // thing rather than as a character range.
+        // T936: the chip is a NODE, so pointing at it is selecting the node —
+        // not re-seeding the document to park a caret, which would throw the
+        // page's undo stack away for a click that changed no text.
         wv.takeFocus();
-        self.seedPage(s.end);
+        wv.pick(self.pane.feedbackImageEntry(s).number);
     } else {
         const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(s.start), .cpMax = self.charIndex(s.end) };
         _ = w32.SetFocus(self.edit);

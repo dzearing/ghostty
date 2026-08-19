@@ -46,6 +46,20 @@ pub const box_id = "c";
 pub const quote_class = "q";
 pub const quote_attr = "data-qid";
 
+/// The class an image chip carries, and the attribute holding the number it
+/// names (T936). Same rule as the quote's two: stated once, asserted below.
+///
+/// A chip's identity is NOT its node the way a quote's is — the chip's own text
+/// is `[Image #3]`, which says which picture it is without any help — so the
+/// node buys something different: atomicity. `contenteditable="false"` on an
+/// inline element makes the engine treat the whole thing as one character, so
+/// Backspace beside it takes the chip out whole instead of eating the `]` and
+/// leaving text that no longer parses as a chip (an image silently dropped
+/// from the report by one keystroke, which is what `chipEndingAt` had to
+/// hand-carry on the RichEdit).
+pub const image_class = "i";
+pub const image_attr = "data-img";
+
 /// One quoted passage's place in the composer's text, in UTF-16 CODE UNITS —
 /// what a JS string offset is, and what the host converts against the pane's
 /// UTF-8 buffer with `utf16_offset.zig`.
@@ -59,6 +73,23 @@ pub const quote_attr = "data-qid";
 /// edited still is, carrying the same id.
 pub const QuoteSpan = struct {
     id: u32,
+    start: u32,
+    end: u32,
+};
+
+/// One live image chip's place in the composer's text, in UTF-16 CODE UNITS
+/// (T936). `n` is the number the chip names — the `N` of `[Image #N]`, the
+/// `images/image-N.png` the report writes, and the key the store's entry
+/// carries.
+///
+/// It only ever goes DOWN. A chip is self-describing in the text, so the host
+/// keeps deriving the live set from the buffer with `Store.live` exactly as it
+/// did on the RichEdit — which is also what keeps the two rules that derivation
+/// enforces (a chip the store does not know stays plain text; an entry is live
+/// at most once) true for the nodes without restating them here. What the seed
+/// says is only "these runs are chips, build them as atomic nodes".
+pub const ImageSpan = struct {
+    n: u32,
     start: u32,
     end: u32,
 };
@@ -93,6 +124,17 @@ pub const Vars = struct {
     quote_indent_px: f32,
     quote_bar_px: f32,
     quote_bar_x_px: f32,
+    /// An image chip's own two numbers, in CSS pixels (T936): how far its wash
+    /// reaches past the text, and how round its corners are. Here rather than
+    /// in the stylesheet for the same reason every other number is — one
+    /// source, which is D43's mitigation.
+    image_pad_px: f32,
+    image_radius_px: f32,
+    /// The most bytes one pasted or dropped picture may carry (T936) — the
+    /// store's own `max_image_bytes`, handed over rather than restated in the
+    /// script, so the page refuses a 200 MB drop where it is instead of
+    /// base64-ing it across the channel for the host to refuse.
+    image_max_bytes: u64,
 
     /// The `vars` message, ready for `PostWebMessageAsJson`. Caller owns it.
     pub fn json(self: Vars, alloc: Allocator) ![]u8 {
@@ -111,6 +153,9 @@ pub const Vars = struct {
             .qindent = self.quote_indent_px,
             .qbar = self.quote_bar_px,
             .qbarx = self.quote_bar_x_px,
+            .ipad = self.image_pad_px,
+            .iradius = self.image_radius_px,
+            .imgMax = self.image_max_bytes,
         }, .{});
     }
 };
@@ -134,12 +179,17 @@ pub const Vars = struct {
 /// outlived its page — a composer closed and reopened, a native insertion, a
 /// report cleared behind a send — gets its quote identity back: the buffer is
 /// plain text and cannot carry it.
+/// `images` names the runs of it that are image chips (T936), for the same
+/// reason and with the same cost: the buffer is plain text, so a page built
+/// from it would otherwise hold `[Image #3]` as ordinary characters that
+/// Backspace can bite a `]` off.
 pub fn seedJson(
     alloc: Allocator,
     text: []const u8,
     caret: i64,
     gen: u32,
     quotes: []const QuoteSpan,
+    images: []const ImageSpan,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, .{
         .t = "seed",
@@ -147,11 +197,23 @@ pub fn seedJson(
         .caret = caret,
         .gen = gen,
         .quotes = quotes,
+        .images = images,
     }, .{});
 }
 
 /// The `focus` message: put the caret in the box.
 pub const focus_json = "{\"t\":\"focus\"}";
+
+/// The `pick` message: select image chip `n`'s node, whole (T936).
+///
+/// A tile click points at a picture, and pointing at a chip means highlighting
+/// all of it — which a node can be and a character range on the RichEdit had to
+/// be spelled out as. It is deliberately not a seed: re-stating the document to
+/// move a selection would throw the page's undo stack away for a click that
+/// changed no text.
+pub fn pickJson(alloc: Allocator, n: u32) ![]u8 {
+    return std.json.Stringify.valueAlloc(alloc, .{ .t = "pick", .n = n }, .{});
+}
 
 /// What the page pushes up. Anything else — malformed JSON, a non-object, an
 /// unknown `t` — parses to null and is dropped, the same rule
@@ -166,6 +228,37 @@ pub const Message = union(enum) {
     state: State,
     /// The box gained (`true`) or lost the caret.
     focus: bool,
+    /// A picture the user pasted or dropped into the box (T936).
+    image: Image,
+};
+
+/// A picture arriving from the page's own clipboard and drag-and-drop events.
+///
+/// This is the direction D43 was answered for. On the RichEdit the composer had
+/// to intercept Ctrl+V, ask the clipboard itself whether it held a bitmap,
+/// encode it, and then swallow the `WM_CHAR` the interception left behind —
+/// three hand-carried steps for a thing every browser does. Here the page gets
+/// a `paste` event with the picture already decoded, hands the bytes over, and
+/// the host does what it always did with them.
+pub const Image = struct {
+    /// The PNG, decoded from the base64 the page sent. Null when the page could
+    /// not hand one over, in which case `problem` says why — a message rather
+    /// than silence, because a paste that does nothing at all is exactly the
+    /// failure this path exists to end.
+    png: ?[]const u8,
+    problem: Problem = .none,
+    /// What the page reported, when it reported one.
+    bytes: u64 = 0,
+
+    pub const Problem = enum {
+        none,
+        /// Over `Vars.image_max_bytes` — refused at the page rather than
+        /// base64-ed across the channel to be refused here.
+        too_large,
+        /// The engine could not read it as an image at all, or could not
+        /// re-encode it as a PNG.
+        unreadable,
+    };
 };
 
 /// One snapshot of the live document. `text` points into the parse arena.
@@ -255,7 +348,53 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
             .caret = if (caret) |c| (if (c >= 0) @as(u32, @intCast(@min(c, std.math.maxInt(u32)))) else null) else null,
         } };
     }
+    if (std.mem.eql(u8, kind, "image")) return imageMessage(aa, obj);
     return null;
+}
+
+/// The `image` message: base64 in, PNG bytes out — or a named problem.
+///
+/// Decoded HERE rather than in the COM callback because this module is where
+/// the protocol lives and the `none` lane is where it can be tested without a
+/// browser. Base64 rather than a binary channel because `PostWebMessageAsJson`
+/// carries a JSON string and nothing else; the size cap the page enforces is
+/// what keeps that from being a problem (a 32 MB picture is a 43 MB string,
+/// once, on a paste).
+fn imageMessage(aa: Allocator, obj: std.json.ObjectMap) ?Message {
+    const bytes: u64 = if (intField(obj, "bytes")) |b|
+        (if (b > 0) @intCast(b) else 0)
+    else
+        0;
+
+    if (obj.get("err")) |err| switch (err) {
+        .string => |s| return .{ .image = .{
+            .png = null,
+            .bytes = bytes,
+            .problem = if (std.mem.eql(u8, s, "too-large"))
+                .too_large
+            else
+                .unreadable,
+        } },
+        else => {},
+    };
+
+    const b64 = switch (obj.get("png") orelse return null) {
+        .string => |s| s,
+        else => return null,
+    };
+    const dec = std.base64.standard.Decoder;
+    const len = dec.calcSizeForSlice(b64) catch return .{ .image = .{
+        .png = null,
+        .bytes = bytes,
+        .problem = .unreadable,
+    } };
+    const png = aa.alloc(u8, len) catch return null;
+    dec.decode(png, b64) catch return .{ .image = .{
+        .png = null,
+        .bytes = bytes,
+        .problem = .unreadable,
+    } };
+    return .{ .image = .{ .png = png, .bytes = png.len } };
 }
 
 /// The `quotes` array of a snapshot, kept to what the host can act on:
@@ -422,6 +561,9 @@ test "vars serialize to the property names the script reads" {
         .quote_indent_px = 16,
         .quote_bar_px = 3,
         .quote_bar_x_px = 5,
+        .image_pad_px = 4,
+        .image_radius_px = 4,
+        .image_max_bytes = 32 * 1024 * 1024,
     };
     const out = try v.json(testing.allocator);
     defer testing.allocator.free(out);
@@ -441,6 +583,9 @@ test "vars serialize to the property names the script reads" {
         "qindent",
         "qbar",
         "qbarx",
+        "ipad",
+        "iradius",
+        "imgMax",
     }) |key| {
         // In the message...
         const quoted = try std.fmt.allocPrint(testing.allocator, "\"{s}\":", .{key});
@@ -456,7 +601,7 @@ test "vars serialize to the property names the script reads" {
 }
 
 test "seed carries the text verbatim and escapes what JSON must" {
-    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3, &.{});
+    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3, &.{}, &.{});
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"seed\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\\n") != null);
@@ -470,12 +615,138 @@ test "seed carries the text verbatim and escapes what JSON must" {
 test "a seed names the runs of the text that are quotes" {
     const out = try seedJson(testing.allocator, "intro\n\nquoted\n\n", -1, 1, &.{
         .{ .id = 4, .start = 7, .end = 13 },
-    });
+    }, &.{});
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"quotes\":[{\"id\":4,\"start\":7,\"end\":13}]") != null);
     // ...and the page has to build them, or the seed's whole quote half is a
     // field nobody reads.
     try testing.expect(std.mem.indexOf(u8, js, "m.quotes") != null);
+}
+
+// ---------------------------------------------------------------------
+// Image chips (T936)
+// ---------------------------------------------------------------------
+
+test "both assets agree on what an image chip is" {
+    // Same contract as the quote block's, and the same failure if it breaks:
+    // the host seeds spans the page renders with one class and reads back with
+    // another, so every chip silently becomes ordinary text a Backspace can
+    // bite the bracket off.
+    const class_css = "#" ++ box_id ++ " ." ++ image_class ++ " {";
+    try testing.expect(std.mem.indexOf(u8, css, class_css) != null);
+    try testing.expect(std.mem.indexOf(u8, js, "\"" ++ image_class ++ "\"") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "\"" ++ image_attr ++ "\"") != null);
+    // The one attribute that makes the node atomic. Without it the chip is a
+    // span the caret walks into, and the whole feature is styling.
+    try testing.expect(std.mem.indexOf(u8, js, "\"contenteditable\", \"false\"") != null);
+}
+
+test "the image chip has no vertical air of its own" {
+    // Identical reasoning to the quote block's: the wrapped line count is
+    // measured as scrollHeight / lineHeight, so vertical padding, margin or a
+    // border on an inline chip would make the pill grow by a line the text
+    // does not occupy. Horizontal is free.
+    const start = std.mem.indexOf(u8, css, "#" ++ box_id ++ " ." ++ image_class ++ " {").?;
+    const end = std.mem.indexOfPos(u8, css, start, "}").?;
+    const rule = css[start..end];
+    for ([_][]const u8{ "padding:", "margin:", "border:" }) |prop| {
+        const at = std.mem.indexOf(u8, rule, prop) orelse continue;
+        const line = rule[at..std.mem.indexOfScalarPos(u8, rule, at, '\n').?];
+        // `padding: 0 var(--i-pad)` — the vertical half is the first number and
+        // it has to be a zero.
+        const value = std.mem.trim(u8, line[prop.len..], " \t;");
+        try testing.expect(std.mem.startsWith(u8, value, "0"));
+    }
+}
+
+test "a seed names the runs of the text that are image chips" {
+    const out = try seedJson(testing.allocator, "see [Image #3] here", -1, 1, &.{}, &.{
+        .{ .n = 3, .start = 4, .end = 14 },
+    });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"images\":[{\"n\":3,\"start\":4,\"end\":14}]") != null);
+    // ...and the page builds them, or the field is one nobody reads.
+    try testing.expect(std.mem.indexOf(u8, js, "m.images") != null);
+}
+
+test "a pasted picture arrives as bytes" {
+    // The base64 of the eight bytes below, which is what the page's own
+    // `base64()` produces from an ArrayBuffer.
+    const p = parse(testing.allocator, "{\"t\":\"image\",\"png\":\"iVBORw0KGgo=\",\"bytes\":8}") orelse
+        return error.NotParsed;
+    defer p.deinit();
+    switch (p.message) {
+        .image => |img| {
+            try testing.expectEqualSlices(
+                u8,
+                &.{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A },
+                img.png.?,
+            );
+            try testing.expectEqual(Image.Problem.none, img.problem);
+        },
+        else => return error.WrongMessage,
+    }
+}
+
+test "a picture the page refused says why, and how big it was" {
+    const p = parse(
+        testing.allocator,
+        "{\"t\":\"image\",\"err\":\"too-large\",\"bytes\":99000000}",
+    ) orelse return error.NotParsed;
+    defer p.deinit();
+    switch (p.message) {
+        .image => |img| {
+            try testing.expect(img.png == null);
+            try testing.expectEqual(Image.Problem.too_large, img.problem);
+            try testing.expectEqual(@as(u64, 99000000), img.bytes);
+        },
+        else => return error.WrongMessage,
+    }
+}
+
+test "an image the page could not encode is a problem, not a crash" {
+    // Two shapes: the page saying so, and base64 that is not base64 (a
+    // truncated post, a channel that mangled it). Neither may be read as a
+    // picture, and neither may take the message channel down.
+    for ([_][]const u8{
+        "{\"t\":\"image\",\"err\":\"unreadable\",\"bytes\":12}",
+        "{\"t\":\"image\",\"png\":\"not base64 at all!!\"}",
+        "{\"t\":\"image\",\"png\":\"iVBORw0KGg\"}",
+    }) |payload| {
+        const p = parse(testing.allocator, payload) orelse return error.NotParsed;
+        defer p.deinit();
+        try testing.expect(p.message.image.png == null);
+        try testing.expectEqual(Image.Problem.unreadable, p.message.image.problem);
+    }
+}
+
+test "an image message with nothing in it is dropped" {
+    try testing.expect(parse(testing.allocator, "{\"t\":\"image\"}") == null);
+    try testing.expect(parse(testing.allocator, "{\"t\":\"image\",\"png\":5}") == null);
+}
+
+test "pick names one chip and the page selects it" {
+    const out = try pickJson(testing.allocator, 7);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("{\"t\":\"pick\",\"n\":7}", out);
+    try testing.expect(std.mem.indexOf(u8, js, "\"pick\"") != null);
+    // Selecting the NODE rather than a character range is the whole point of
+    // the message; a `pick` that placed a caret would be the T934 behaviour
+    // under a new name.
+    try testing.expect(std.mem.indexOf(u8, js, "selectNode(") != null);
+}
+
+test "the page takes a picture off both of the engine's own events" {
+    // The RichEdit path had to intercept Ctrl+V, ask the clipboard whether it
+    // held a bitmap and swallow the WM_CHAR behind it. These two listeners are
+    // what replaced all of that, and a rebuild that dropped one of them would
+    // be a composer that silently ignores a paste.
+    try testing.expect(std.mem.indexOf(u8, js, "addEventListener(\"paste\"") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "addEventListener(\"drop\"") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "clipboardData") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "dataTransfer") != null);
+    // ...and it posts what this module parses.
+    try testing.expect(std.mem.indexOf(u8, js, "t: \"image\"") != null);
 }
 
 test "a snapshot's quotes are the live blocks, in order" {

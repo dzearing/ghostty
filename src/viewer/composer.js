@@ -13,11 +13,14 @@
 //   {t:"ready"}                                   the document exists, seed it
 //   {t:"state", text, lines, caret, gen, quotes}  the snapshot, after every edit
 //   {t:"focus", on}                               the box gained or lost the caret
+//   {t:"image", png}                              a picture was pasted or dropped
+//   {t:"image", err, bytes}                       ...and could not be taken
 //
 // Down (`chrome.webview.addEventListener("message")`):
-//   {t:"vars", ...}                       the design-system numbers, per layout
-//   {t:"seed", text, caret, gen, quotes}  replace the document
-//   {t:"focus"}                           put the caret in the box
+//   {t:"vars", ...}                               the design numbers, per layout
+//   {t:"seed", text, caret, gen, quotes, images}  replace the document
+//   {t:"focus"}                                   put the caret in the box
+//   {t:"pick", n}                                 select image chip n, whole
 //
 // ## Quotes are NODES, and their identity is an attribute (T935)
 //
@@ -45,6 +48,31 @@
 // converts it against the same buffer with `utf16_offset.zig`, because the
 // pane's buffer is UTF-8 and the two agree only for ASCII (the T648 boundary,
 // unchanged by this rebuild).
+//
+// ## Image chips are NODES too, but for a different reason (T936)
+//
+// A chip is a `<span class="i" data-img="N" contenteditable="false">` whose
+// text is literally `[Image #N]`. Unlike a quote it needs no identity from the
+// node — that text says which picture it is, which is why the host goes on
+// deriving the live set from the buffer and nothing about the report, the
+// carousel or `Store.live` changed. What the node buys is ATOMICITY: an inline
+// non-editable element is one character to the engine, so Backspace beside it
+// removes the chip whole instead of eating the `]` and leaving text that no
+// longer parses — the thing `chipEndingAt` had to hand-carry, now the
+// browser's.
+//
+// The serialization is therefore load-bearing: a chip contributes exactly its
+// own text and no line break, so a document with chips in it reads back
+// byte-for-byte as the buffer that seeded it.
+//
+// ## Pictures arrive through the engine's own events
+//
+// `paste` and `drop` carry the picture already decoded. The composer takes it
+// off the event, re-encodes anything that is not a PNG through a canvas, and
+// posts the bytes up. That replaces the RichEdit path's three hand-carried
+// steps — intercept Ctrl+V, ask the clipboard whether it holds a bitmap,
+// swallow the `WM_CHAR` the interception left behind — with the event the
+// engine was already going to fire.
 (function () {
   "use strict";
 
@@ -58,6 +86,14 @@
   // host's assertions and every read below all key on these two.
   var QCLASS = "q";
   var QATTR = "data-qid";
+  // An image chip, and where its number lives (T936). Same rule.
+  var ICLASS = "i";
+  var IATTR = "data-img";
+  // The most bytes one pasted picture may carry, from the host's `vars`. Zero
+  // until it arrives, which reads as "no cap yet" rather than "refuse
+  // everything": a paste in that window is better refused by the store, which
+  // has the same number and a message for it.
+  var imgMax = 0;
 
   function post(msg) {
     if (host) host.postMessage(msg);
@@ -83,6 +119,12 @@
         var last = !n.nextSibling && node === el;
         if (last && out.s.charAt(out.s.length - 1) === "\n") continue;
         out.s += "\n";
+      } else if (isChip(n)) {
+        // An image chip is INLINE and atomic: its text is the chip, it starts
+        // no line, and there is nothing inside it worth walking. Anything else
+        // here would put a newline into the buffer that the seed did not have,
+        // and the round trip is what everything downstream stands on.
+        out.s += n.textContent;
       } else if (n.nodeType === 1) {
         // A block: a quote of ours, or one a paste dropped in. Its content
         // counts; its boundary is a line break, the way any block-level
@@ -103,11 +145,28 @@
   }
 
   function quoteId(node) {
+    return attrNumber(node, QATTR);
+  }
+
+  function isChip(node) {
+    return node.nodeType === 1 && attrNumber(node, IATTR) > 0;
+  }
+
+  function attrNumber(node, name) {
     if (!node.getAttribute) return 0;
-    var raw = node.getAttribute(QATTR);
+    var raw = node.getAttribute(name);
     if (!raw) return 0;
-    var id = parseInt(raw, 10);
-    return id > 0 ? id : 0;
+    var n = parseInt(raw, 10);
+    return n > 0 ? n : 0;
+  }
+
+  // What a chip carrying `n` must read as, and the ONLY text a node may keep
+  // its chip role with. Spelled the same way `viewer_feedback_images.zig`
+  // spells it, because the host parses the serialized text with that grammar
+  // and a node whose text drifted from it would be a picture the report has
+  // and the buffer does not.
+  function chipText(n) {
+    return "[Image #" + n + "]";
   }
 
   // Keep the quote blocks in a state the host's model can describe, and do it
@@ -150,8 +209,34 @@
     }
   }
 
+  // Keep the chip nodes honest, on the same schedule and for the same reason
+  // as the quotes above — before every read, not after the edit that might
+  // have been the one that broke them.
+  //
+  // A chip is atomic, so the engine cannot damage one in place; what it CAN do
+  // is duplicate one (copy a chip, paste it twice) or carry one into a document
+  // where its picture is not the picture that number names any more. Either way
+  // the answer is the same as the text derivation's, which has always let the
+  // SECOND reference be plain text: the node loses its role and becomes exactly
+  // the characters it was showing. Nothing is deleted — the user's text is
+  // theirs — and `Store.live` then reads the result the way it always has.
+  function normalizeChips() {
+    var nodes = el.querySelectorAll("." + ICLASS);
+    var seen = {};
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var num = attrNumber(n, IATTR);
+      if (num > 0 && !seen[num] && n.textContent === chipText(num)) {
+        seen[num] = true;
+        continue;
+      }
+      if (n.parentNode) n.parentNode.replaceChild(document.createTextNode(n.textContent), n);
+    }
+  }
+
   function readAll() {
     normalizeQuotes();
+    normalizeChips();
     var out = { s: "", quotes: [] };
     walk(el, out);
     return out;
@@ -231,9 +316,9 @@
   // Writing the document
   // -----------------------------------------------------------------------
 
-  function seed(text, caret, atGen, quotes) {
+  function seed(text, caret, atGen, quotes, images) {
     gen = typeof atGen === "number" ? atGen : gen;
-    build(text, sane(quotes, text.length));
+    build(text, sane(quotes, text.length, "id"), sane(images, text.length, "n"));
     var at = typeof caret === "number" && caret >= 0 ? Math.min(caret, text.length) : text.length;
     placeCaret(at);
     el.scrollTop = el.scrollHeight;
@@ -245,17 +330,21 @@
   // those describes a document that cannot be built, so the offending span is
   // dropped rather than the seed - the report text arriving without one of its
   // washes is survivable; the text not arriving is not.
-  function sane(quotes, len) {
+  //
+  // `key` is which field carries the number: `id` for a quote block, `n` for an
+  // image chip. Both lists are checked the same way because both describe runs
+  // of the same string; what differs is only what the run becomes.
+  function sane(spans, len, key) {
     var out = [];
-    if (!quotes || !quotes.length) return out;
+    if (!spans || !spans.length) return out;
     var at = 0;
-    for (var i = 0; i < quotes.length; i++) {
-      var q = quotes[i];
-      if (!q || !(q.id > 0)) continue;
-      var start = q.start | 0;
-      var end = q.end | 0;
+    for (var i = 0; i < spans.length; i++) {
+      var s = spans[i];
+      if (!s || !(s[key] > 0)) continue;
+      var start = s.start | 0;
+      var end = s.end | 0;
       if (start < at || end <= start || end > len) continue;
-      out.push({ id: q.id, start: start, end: end });
+      out.push({ v: s[key], start: start, end: end });
       at = end;
     }
     return out;
@@ -265,20 +354,67 @@
   // named one. The serialization above reproduces `text` exactly as long as
   // each block starts a line, which is the invariant native's own insertion
   // guarantees (a quote is inserted as its own block, with air either side).
-  function build(text, quotes) {
+  function build(text, quotes, images) {
     el.textContent = "";
     var at = 0;
     for (var i = 0; i < quotes.length; i++) {
       var q = quotes[i];
-      if (q.start > at) el.appendChild(document.createTextNode(text.slice(at, q.start)));
+      if (q.start > at) fill(el, text, at, q.start, images);
       var block = document.createElement("div");
       block.className = QCLASS;
-      block.setAttribute(QATTR, String(q.id));
-      block.appendChild(document.createTextNode(text.slice(q.start, q.end)));
+      block.setAttribute(QATTR, String(q.v));
+      fill(block, text, q.start, q.end, images);
       el.appendChild(block);
       at = q.end;
     }
-    if (at < text.length) el.appendChild(document.createTextNode(text.slice(at)));
+    if (at < text.length) fill(el, text, at, text.length, images);
+  }
+
+  // `text[from..to)` into `parent`, as text nodes with an atomic chip node
+  // wherever the host named one INSIDE the range. A chip can sit inside a
+  // quote (paste a picture with the caret in a quoted block), so the two span
+  // lists are not siblings - the images are laid into whichever run contains
+  // them, and a span straddling a boundary is skipped rather than split.
+  function fill(parent, text, from, to, images) {
+    var at = from;
+    for (var i = 0; i < images.length; i++) {
+      var im = images[i];
+      if (im.start < at || im.end > to) continue;
+      if (im.start > at) parent.appendChild(document.createTextNode(text.slice(at, im.start)));
+      parent.appendChild(chipNode(im.v, text.slice(im.start, im.end)));
+      at = im.end;
+    }
+    if (at < to) parent.appendChild(document.createTextNode(text.slice(at, to)));
+  }
+
+  // One chip. `contenteditable="false"` is the whole feature: it is what makes
+  // the engine treat the run as a single character for the caret, for
+  // selection and - the part that matters - for Backspace.
+  function chipNode(n, label) {
+    var span = document.createElement("span");
+    span.className = ICLASS;
+    span.setAttribute(IATTR, String(n));
+    span.setAttribute("contenteditable", "false");
+    span.textContent = label;
+    return span;
+  }
+
+  // Select image chip `n`, whole - what a click on its thumbnail does.
+  function pick(n) {
+    var nodes = el.querySelectorAll("." + ICLASS);
+    for (var i = 0; i < nodes.length; i++) {
+      if (attrNumber(nodes[i], IATTR) !== n) continue;
+      var r = document.createRange();
+      r.selectNode(nodes[i]);
+      var sel = window.getSelection();
+      if (sel) {
+        sel.removeAllRanges();
+        sel.addRange(r);
+      }
+      if (nodes[i].scrollIntoView) nodes[i].scrollIntoView({ block: "nearest" });
+      report(false);
+      return;
+    }
   }
 
   // Put the caret `at` code units into the serialized text. The walk is the
@@ -288,8 +424,14 @@
     var pos = 0;
     var node = null;
     var off = 0;
+    // A chip the caret landed against, and which side of it. The caret never
+    // goes INSIDE one - it is one character as far as editing is concerned, and
+    // a caret between its brackets is a caret in a place the user cannot get to
+    // with an arrow key.
+    var edge = null;
+    var before = false;
     (function visit(parent) {
-      for (var n = parent.firstChild; n && !node; n = n.nextSibling) {
+      for (var n = parent.firstChild; n && !node && !edge; n = n.nextSibling) {
         if (n.nodeType === 3) {
           if (at <= pos + n.data.length) {
             node = n;
@@ -297,6 +439,18 @@
             return;
           }
           pos += n.data.length;
+        } else if (isChip(n)) {
+          var len = n.textContent.length;
+          if (at <= pos) {
+            edge = n;
+            before = true;
+            return;
+          }
+          if (at <= pos + len) {
+            edge = n;
+            return;
+          }
+          pos += len;
         } else if (n.nodeType === 1) {
           visit(n);
         }
@@ -306,7 +460,10 @@
     var sel = window.getSelection();
     var r = document.createRange();
     if (node) r.setStart(node, Math.min(off, node.data.length));
-    else r.setStart(el, el.childNodes.length);
+    else if (edge) {
+      if (before) r.setStartBefore(edge);
+      else r.setStartAfter(edge);
+    } else r.setStart(el, el.childNodes.length);
     r.collapse(true);
     if (sel) {
       sel.removeAllRanges();
@@ -330,6 +487,10 @@
     if (v.qindent) root.setProperty("--q-indent", v.qindent + "px");
     if (v.qbar) root.setProperty("--q-bar", v.qbar + "px");
     if (v.qbarx) root.setProperty("--q-bar-x", v.qbarx + "px");
+    // The chip's own two numbers, and the cap it refuses a picture at.
+    if (v.ipad) root.setProperty("--i-pad", v.ipad + "px");
+    if (v.iradius) root.setProperty("--i-radius", v.iradius + "px");
+    if (typeof v.imgMax === "number") imgMax = v.imgMax;
     if (typeof v.text === "string") el.setAttribute("data-placeholder", v.text);
     // A scale change moves the line box, so the count the host is laying out
     // from is stale until this is re-measured.
@@ -340,9 +501,11 @@
     host.addEventListener("message", function (e) {
       var m = e.data;
       if (!m || typeof m !== "object") return;
-      if (m.t === "seed") seed(typeof m.text === "string" ? m.text : "", m.caret, m.gen, m.quotes);
+      if (m.t === "seed")
+        seed(typeof m.text === "string" ? m.text : "", m.caret, m.gen, m.quotes, m.images);
       else if (m.t === "vars") applyVars(m);
       else if (m.t === "focus") el.focus();
+      else if (m.t === "pick") pick(m.n | 0);
     });
   }
 
@@ -368,14 +531,102 @@
     post({ t: "focus", on: false });
   });
 
-  // Dropping a file into the composer is T936's business; until then a drop
-  // that navigated this view away would take the whole composer with it.
+  // -----------------------------------------------------------------------
+  // Pictures (T936)
+  //
+  // The engine hands them over already decoded, in the two events a user would
+  // expect to work: paste and drop. Everything below is about getting the bytes
+  // to the host as a PNG - the host's store, the chip, the carousel and the
+  // report are unchanged, because what arrives there is what always arrived.
+  // -----------------------------------------------------------------------
+
+  el.addEventListener("paste", function (e) {
+    var file = imageIn(e.clipboardData);
+    if (!file) return; // text: the engine's own paste, which is the point
+    // Only once we KNOW there is a picture: a preventDefault on every paste
+    // would take plain text with it.
+    e.preventDefault();
+    attach(file);
+  });
+
+  // A drop that is not handled navigates this view to the file, which would
+  // take the whole composer with it - so the default goes either way, and only
+  // then do we look for a picture.
   el.addEventListener("dragover", function (e) {
     e.preventDefault();
   });
   el.addEventListener("drop", function (e) {
     e.preventDefault();
+    var file = imageIn(e.dataTransfer);
+    if (file) attach(file);
   });
+
+  // The first image in a clipboard or a drag. `files` covers a dropped file and
+  // a copied one; `items` covers a screenshot, which arrives as an item with no
+  // file entry on some paths.
+  function imageIn(dt) {
+    if (!dt) return null;
+    var i;
+    if (dt.files) {
+      for (i = 0; i < dt.files.length; i++) {
+        if (dt.files[i].type.indexOf("image/") === 0) return dt.files[i];
+      }
+    }
+    if (dt.items) {
+      for (i = 0; i < dt.items.length; i++) {
+        var it = dt.items[i];
+        if (it.kind !== "file" || it.type.indexOf("image/") !== 0) continue;
+        var f = it.getAsFile();
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+
+  function attach(file) {
+    if (imgMax > 0 && file.size > imgMax) {
+      post({ t: "image", err: "too-large", bytes: file.size });
+      return;
+    }
+    toPng(file)
+      .then(function (buf) {
+        post({ t: "image", png: base64(buf), bytes: buf.byteLength });
+      })
+      .catch(function () {
+        post({ t: "image", err: "unreadable", bytes: file.size });
+      });
+  }
+
+  // The store takes PNGs and nothing else, so anything else is re-encoded
+  // through a canvas - which is how a dropped JPEG or a WebP off a web page
+  // becomes an attachment instead of a refusal.
+  function toPng(file) {
+    if (file.type === "image/png") return file.arrayBuffer();
+    if (!window.createImageBitmap || !window.OffscreenCanvas) return Promise.reject();
+    return createImageBitmap(file)
+      .then(function (bmp) {
+        var canvas = new OffscreenCanvas(bmp.width, bmp.height);
+        canvas.getContext("2d").drawImage(bmp, 0, 0);
+        bmp.close();
+        return canvas.convertToBlob({ type: "image/png" });
+      })
+      .then(function (blob) {
+        return blob.arrayBuffer();
+      });
+  }
+
+  // `PostWebMessageAsJson` carries a JSON string, so the bytes cross as base64.
+  // Chunked because `String.fromCharCode.apply` on a megabyte-long array blows
+  // the argument limit, which shows up as a paste that silently does nothing.
+  function base64(buf) {
+    var bytes = new Uint8Array(buf);
+    var out = "";
+    var chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      out += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(out);
+  }
 
   el.classList.add("empty");
   post({ t: "ready" });

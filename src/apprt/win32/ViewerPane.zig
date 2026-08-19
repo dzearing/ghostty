@@ -1318,7 +1318,10 @@ fn completeFeedbackSend(self: *ViewerPane) void {
 /// What the composer's footer says instead of its destination. Owned by the
 /// pane; cleared when the composer next opens, so a stale "Filed …" never
 /// greets the next report.
-fn setFeedbackStatus(self: *ViewerPane, alloc: Allocator, text: []const u8) void {
+/// Public since T936: the composer's page can refuse a picture before the pane
+/// ever sees its bytes (too big to be worth base64-ing across the channel), and
+/// the footer is where that has to be said.
+pub fn setFeedbackStatus(self: *ViewerPane, alloc: Allocator, text: []const u8) void {
     const dup: ?[]u8 = if (text.len == 0) null else (alloc.dupe(u8, text) catch null);
     if (self.feedback_status) |s| alloc.free(s);
     self.feedback_status = dup;
@@ -7272,6 +7275,103 @@ test "host floor: a real controller on a real window, on this box" {
         // a user selects the block and hits Delete.)
         pane.feedbackSetText(alloc, "just my own words\n");
         try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
+
+        // ------------------------------------------------------------------
+        // T936: a picture pasted into the page, and a chip that deletes whole
+        // ------------------------------------------------------------------
+        //
+        // The only place on this box that can prove either half. An acceptance
+        // script cannot paste into a Chromium window from the background test
+        // desktop (no SendInput, no posted key messages), so the paste is
+        // dispatched as the engine's own `ClipboardEvent` from inside the page
+        // — everything after that is the real path: the page reads the file off
+        // `clipboardData`, base64s it up the channel, the host decodes it into
+        // the pane's store, splices the chip and re-seeds, and the page rebuilds
+        // the chip as an atomic node.
+        {
+            const bar = pane.feedback.?;
+            // The caret has to be somewhere known before the chip is spliced in
+            // at it. Waiting for the page's own snapshot rather than assuming:
+            // the seed puts the caret at the end, and 18 is the end of the line
+            // above.
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    const composer_bar = p.feedback orelse return false;
+                    const wv = composer_bar.web orelse return false;
+                    return (wv.caret orelse 0) == 18 and
+                        std.mem.eql(u8, p.feedbackText(), "just my own words\n");
+                }
+            }.ready, &pane);
+
+            // A PNG the store will take: the signature and an IHDR naming 1x1,
+            // which is all `pngSize` reads. Built byte by byte in the page so
+            // the bytes cross the channel through the composer's OWN base64,
+            // which is the encoder under test.
+            bar.web.?.executeScript(
+                \\(function () {
+                \\  var bytes = [137,80,78,71,13,10,26,10, 0,0,0,13,
+                \\               73,72,68,82, 0,0,0,1, 0,0,0,1, 8,6,0,0,0];
+                \\  var buf = new Uint8Array(bytes);
+                \\  var file = new File([buf], "shot.png", { type: "image/png" });
+                \\  var dt = new DataTransfer();
+                \\  dt.items.add(file);
+                \\  var box = document.getElementById("c");
+                \\  box.focus();
+                \\  box.dispatchEvent(new ClipboardEvent("paste", {
+                \\    clipboardData: dt,
+                \\    bubbles: true,
+                \\    cancelable: true,
+                \\  }));
+                \\})()
+            );
+
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackImageCount(testing.allocator) == 1;
+                }
+            }.ready, &pane);
+            log.warn("image: pasted through the page, live={d}", .{
+                pane.feedbackImageCount(alloc),
+            });
+
+            // The buffer is EXACTLY the words plus the chip: no newline, no
+            // stray characters. That is the load-bearing property of making a
+            // chip a node — its serialization has to be the chip's own text and
+            // nothing else, or every read of the composer disagrees with what
+            // was seeded. The trailing space is `insertion`'s, unchanged from
+            // the RichEdit path.
+            try testing.expectEqualStrings("just my own words\n[Image #1] ", pane.feedbackText());
+
+            // ...and it is a NODE, proven the only way that distinguishes it
+            // from text: Backspace against its trailing edge takes the whole
+            // chip. On the RichEdit this needed `chipEndingAt` to widen the
+            // selection by hand first; here `contenteditable="false"` makes the
+            // engine treat the run as one character. A chip that was still text
+            // would leave `[Image #1` behind — text that no longer parses, i.e.
+            // a picture silently dropped from the report by one keystroke.
+            bar.web.?.executeScript(
+                \\(function () {
+                \\  var chip = document.querySelector("#c .i");
+                \\  var r = document.createRange();
+                \\  r.setStartAfter(chip);
+                \\  r.collapse(true);
+                \\  var sel = window.getSelection();
+                \\  sel.removeAllRanges();
+                \\  sel.addRange(r);
+                \\  document.execCommand("delete");
+                \\})()
+            );
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackImageCount(testing.allocator) == 0;
+                }
+            }.ready, &pane);
+            log.warn("image: one Backspace left '{s}'", .{pane.feedbackText()});
+            // Nothing of the chip survives — not even a `[Image #1` that would
+            // read as prose and carry no picture.
+            try testing.expect(std.mem.indexOf(u8, pane.feedbackText(), "[Image #") == null);
+            try testing.expect(std.mem.startsWith(u8, pane.feedbackText(), "just my own words"));
+        }
     }
 
     // ------------------------------------------------------------------

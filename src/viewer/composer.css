@@ -93,6 +93,38 @@ body {
 }
 
 /*
+ * An image chip (T936).
+ *
+ * The text is still `[Image #3]` - it is what the buffer holds and what the
+ * report is derived from - but it now reads as ONE object, which is the honest
+ * picture of how it behaves: the caret steps over it, a selection takes all of
+ * it, and Backspace removes it whole. A run of characters that deletes like a
+ * single character and does not LOOK like a single thing is the confusing
+ * version.
+ *
+ * The wash and the accent are the quote block's, handed down by the host from
+ * the same derivation, so the composer has one accent colour rather than two.
+ *
+ * NO vertical padding, margin or border, for the quote block's exact reason:
+ * the wrapped line count is measured as scrollHeight / lineHeight, and vertical
+ * air of its own would make the composer grow by a line the text does not
+ * occupy. Horizontal padding is free - it only makes the run wider.
+ */
+#c .i {
+  display: inline;
+  padding: 0 var(--i-pad, 4px);
+  margin: 0;
+  border: 0;
+  border-radius: var(--i-radius, 4px);
+  background: var(--q-bg, #242428);
+  /* The chip is atomic, so a caret cannot be inside it and a text cursor over
+     it would promise otherwise. */
+  cursor: default;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+/*
  * The placeholder. Mac carries it as an accessibility label on an empty field;
  * here it is the cue an empty composer shows, and it is driven by a CLASS the
  * script sets rather than by `:empty` - a contenteditable that has been typed
