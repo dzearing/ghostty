@@ -1347,6 +1347,21 @@ $r = CG @('commit', '-Paths', 'crlf.txt', '-Message', 'a file that makes git war
 Assert 'W17 a git warning on stderr is not a failure' ($r.Code -eq 0 -and $r.Out -match 'COMMITTED')
 git -C $wRepo config --unset core.autocrlf 2>$null
 
+# -Push is the shape go.md step 6 uses, and it was unexercised until it failed
+# on a real turn: `$push = ...` inside the script assigned a hashtable to the
+# [switch]$Push PARAMETER (PowerShell variable names are case-insensitive) and
+# died in parameter binding before the verb ran. A bare repo makes the whole
+# path real without a network.
+$wBare = Join-Path $root 'commit-guard-remote.git'
+git init -q --bare $wBare 2>$null
+git -C $wRepo remote add origin $wBare 2>$null
+git -C $wRepo push -q -u origin HEAD 2>$null
+Set-Content -Path (Join-Path $wRepo 'pushed.txt') -Value 'pushed'
+$r = CG @('commit', '-Push', '-Paths', 'pushed.txt', '-Message', 'a commit that pushes')
+$remoteHead = (& git -C $wBare rev-parse HEAD 2>$null | Select-Object -First 1)
+Assert 'W18 -Push commits and pushes' `
+    ($r.Code -eq 0 -and $r.Out -match 'PUSHED' -and $remoteHead -eq (WHead))
+
 # The one arm about THIS box: claim arms the guard every turn, so the real repo
 # should be wired right now. Read-only - nothing here reconfigures the real repo.
 $realHooks = (& git -C $Repo config --local --get core.hooksPath 2>$null)

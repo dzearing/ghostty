@@ -1,10 +1,10 @@
 {
     "guard":  "go-loop",
     "script":  "test/win32/go-loop-guard.ps1",
-    "generated":  "2026-08-19T11:44:10-07:00",
-    "commit":  "d4e74f585",
+    "generated":  "2026-08-19T11:48:21-07:00",
+    "commit":  "aba4ff4c2",
     "files":  {
-                  "scripts/git-commit-guard.ps1":  "34b5ee5552cf823e756e2c0ad7f4473523b5553ac12ee481c725832f0887cfb2",
+                  "scripts/git-commit-guard.ps1":  "187273f4d5bfb640108cce7e8636385f9dd83513443ca76de6caf112fb90c0a9",
                   "scripts/githooks/pre-commit":  "eac5e129af9f636f296b1acb4d91c8d97671cc6497cfe1e16e6930c9f859f990",
                   "scripts/go-loop-boot.ps1":  "499af9eafeb07c45163649feb280c41efaf42ef6a335447747bb5fa7366fb387",
                   "scripts/go-loop-exec.ps1":  "46a5904e0625b55d6d0b5e492d100dfb8513a0a677655bd077a3d848684d6fe9",
@@ -13,6 +13,6 @@
                   "scripts/go-loop-pane-probe.ps1":  "2e47e9267738b8b32a2f9ab05659da2f5994105ae1b1540747f6a20c72bf8678",
                   "scripts/go-loop-watchdog.ps1":  "d9eec29246bac5644f5867046da2513c19b18e5e384d76e7b8befd99db9360ef",
                   "scripts/loop-session.ps1":  "a250930b73b74fe14cab3ff63be4fd2f4a52c06a6ecb95f3b814b322547f9a96",
-                  "test/win32/go-loop-guard.ps1":  "8738445614b7cf975a05678e61bc30c1cef56f41ecc94f7a613f9e82b126e36b"
+                  "test/win32/go-loop-guard.ps1":  "e280a9caecc315d984cc39cd962f21117c08f0f067e5864bcb820edbeb06b0e3"
               }
 }

@@ -335,8 +335,11 @@ switch ($Action) {
             # git push narrates progress on stderr even when it works - the same
             # trap Git-Run exists for, and here it would report a good push as a
             # failure right after a commit that is already made.
-            $push = Git-Run @('push')
-            if ($push.Code -ne 0) { "ERROR push failed:"; $push.Out; exit 6 }
+            # NOT $push: PowerShell variable names are case-insensitive, so that
+            # would assign a hashtable to the [switch]$Push parameter and die in
+            # its type conversion before a line of this block ran.
+            $pushRes = Git-Run @('push')
+            if ($pushRes.Code -ne 0) { "ERROR push failed:"; $pushRes.Out; exit 6 }
             "PUSHED $short"
         }
         exit 0
