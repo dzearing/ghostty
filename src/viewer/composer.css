@@ -69,6 +69,30 @@ body {
 }
 
 /*
+ * A quoted passage (T935).
+ *
+ * The same three signals the RichEdit carried in character and paragraph
+ * formats, expressed as one box: a wash behind the block, an accent bar down
+ * its left edge, and the text indented clear of both. Every number arrives
+ * from `ViewerFeedbackBar` - the wash is the pill pulled 14% toward the
+ * accent, the bar is 3 DIP at 5 DIP in, and the text sits at the design
+ * system's 16 DIP step - so the web surface and the native fallback are drawn
+ * from ONE derivation rather than two that drift.
+ *
+ * NO vertical padding, margin or border, deliberately: the wrapped line count
+ * that decides how tall the pill is is measured as scrollHeight / lineHeight,
+ * so a block with vertical air of its own would make the composer grow by a
+ * line the text does not occupy.
+ */
+#c .q {
+  box-sizing: border-box;
+  margin: 0 0 0 var(--q-bar-x, 5px);
+  padding: 0 0 0 calc(var(--q-indent, 16px) - var(--q-bar-x, 5px) - var(--q-bar, 3px));
+  border-left: var(--q-bar, 3px) solid var(--q-accent, #3a6ea5);
+  background: var(--q-bg, #242428);
+}
+
+/*
  * The placeholder. Mac carries it as an accessibility label on an empty field;
  * here it is the cue an empty composer shows, and it is driven by a CLASS the
  * script sets rather than by `:empty` - a contenteditable that has been typed

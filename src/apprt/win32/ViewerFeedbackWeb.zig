@@ -367,7 +367,7 @@ fn apply(self: *ViewerFeedbackWeb, message: page.Message) void {
             if (s.gen != self.seed_gen) return;
             self.lines = s.lines;
             self.caret = s.caret;
-            self.bar.composerState(s.text);
+            self.bar.composerState(s.text, s.quotes);
         },
     }
 }
@@ -397,8 +397,15 @@ pub fn pushVars(self: *ViewerFeedbackWeb, vars: page.Vars) void {
 }
 
 /// Replace the page's whole document with `text`, caret at `caret` UTF-16 code
-/// units in (null means the end).
-pub fn seed(self: *ViewerFeedbackWeb, text: []const u8, caret: ?u32) void {
+/// units in (null means the end), and `quotes` naming the runs of it that are
+/// quoted blocks (T935 — in UTF-16 units too, and the only way the ids reach a
+/// page built from a buffer that outlived the last one).
+pub fn seed(
+    self: *ViewerFeedbackWeb,
+    text: []const u8,
+    caret: ?u32,
+    quotes: []const page.QuoteSpan,
+) void {
     if (!self.ready) return;
     self.seed_gen +%= 1;
     // Never zero, which is what a page that has not been seeded reports.
@@ -408,6 +415,7 @@ pub fn seed(self: *ViewerFeedbackWeb, text: []const u8, caret: ?u32) void {
         text,
         if (caret) |c| @intCast(c) else -1,
         self.seed_gen,
+        quotes,
     ) catch return;
     defer self.alloc.free(json);
     self.post(json);

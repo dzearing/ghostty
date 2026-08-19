@@ -7,6 +7,23 @@
 //! `ViewerFeedbackBar` drives the RichEdit from what this decides, and
 //! `ViewerPane` owns the `Registry`.
 //!
+//! ## Since T935, identity is a NODE — and this is the bridge to it
+//!
+//! The composer's text surface is a web page now, so a quote IS a
+//! `<div class="q" data-qid="N">` and its identity is that attribute: deleting
+//! the block drops the metadata with it, and editing the passage keeps it,
+//! which is what the derivation below could never do. The page reports its live
+//! blocks in every snapshot, and `ViewerPane` keeps those as the truth the
+//! report is written from.
+//!
+//! What survives here, and why it is not dead code: the pane's buffer is PLAIN
+//! TEXT and outlives the page (a composer closed and reopened, a report cleared
+//! behind a send, the RichEdit fallback), so something has to say which runs of
+//! a restored buffer are quotes before the page can build them as nodes. That
+//! is `live` — run once at SEED time, not on every read. Everything below is
+//! written for the old world, in which it was the only answer; it is still
+//! correct, and it is now the on-ramp rather than the road.
+//!
 //! ## Identity is DERIVED, never stored
 //!
 //! Mac hangs a `feedbackQuoteID` attribute on the quote's text run, so deleting
@@ -122,6 +139,21 @@ pub const Registry = struct {
         if (e.heading_text) |v| alloc.free(v);
         if (e.block_selector) |v| alloc.free(v);
         if (e.block_text) |v| alloc.free(v);
+    }
+
+    /// Where the entry with `id` sits in `entries`, or null when nothing does.
+    ///
+    /// The lookup the page's snapshots need (T935): a quote block names itself
+    /// by id, and everything downstream — the report's metadata, the span the
+    /// body is quoted from — is addressed by index. An id nobody knows is
+    /// dropped rather than guessed at; that is a block from a composer session
+    /// whose registry is gone, and inventing a match for it would attach one
+    /// passage's heading to another's text.
+    pub fn indexOfId(self: *const Registry, id: u32) ?usize {
+        for (self.entries.items, 0..) |e, i| {
+            if (e.id == id) return i;
+        }
+        return null;
     }
 
     /// The quotes still present in `text`, in document order. See the header:

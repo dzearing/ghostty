@@ -634,8 +634,54 @@ fn closeComposer(self: *ViewerFeedbackBar) void {
 /// the right line box.
 pub fn composerReady(self: *ViewerFeedbackBar) void {
     self.pushComposerVars(true);
+    self.seedPage(null);
+}
+
+/// Make the page equal the pane's buffer, with the caret at byte offset
+/// `caret` (null means the end) and every live quote rebuilt as a block.
+///
+/// The one write path down, and the reason it is one: the page cannot be told
+/// "insert this here", so every native edit is a whole-document seed — and a
+/// seed that forgot the quotes would silently flatten every washed block into
+/// plain text, which is precisely the regression T935 exists to end. Building
+/// the span list HERE rather than at each call site is what makes that
+/// impossible to forget.
+fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
     const wv = self.web orelse return;
-    wv.seed(self.pane.feedbackText(), null);
+    const text = self.pane.feedbackText();
+    const units: ?u32 = if (caret_at) |b|
+        @intCast(utf16_offset.unitsBeforeByte(text, b))
+    else
+        null;
+
+    // Byte spans, as the pane knows them — from the page's own last snapshot
+    // when there is one, and derived from the registry when the buffer has
+    // moved behind the page's back (a reopen, a native insertion, a clear).
+    const spans = self.pane.feedbackQuoteSpans(self.alloc) orelse {
+        wv.seed(text, units, &.{});
+        return;
+    };
+    defer self.alloc.free(spans);
+
+    const out = self.alloc.alloc(composer_page.QuoteSpan, spans.len) catch {
+        // Seeding without the quotes still gets the user's words onto the
+        // page; dropping the seed would lose them.
+        wv.seed(text, units, &.{});
+        return;
+    };
+    defer self.alloc.free(out);
+    var n: usize = 0;
+    for (spans) |s| {
+        const entries = self.pane.feedback_quotes.entries.items;
+        if (s.index >= entries.len) continue;
+        out[n] = .{
+            .id = entries[s.index].id,
+            .start = @intCast(utf16_offset.unitsBeforeByte(text, s.start)),
+            .end = @intCast(utf16_offset.unitsBeforeByte(text, s.end)),
+        };
+        n += 1;
+    }
+    wv.seed(text, units, out[0..n]);
 }
 
 /// One snapshot from the page: the document as it now stands.
@@ -644,10 +690,20 @@ pub fn composerReady(self: *ViewerFeedbackBar) void {
 /// same three things - mirror into the pane's buffer (the thing that outlives
 /// this window), re-inset the page if the band's height moved, and keep the
 /// carousel's selection with the caret.
-pub fn composerState(self: *ViewerFeedbackBar, text: []const u8) void {
+pub fn composerState(
+    self: *ViewerFeedbackBar,
+    text: []const u8,
+    quotes: []const composer_page.QuoteSpan,
+) void {
     self.suppress_sync = true;
     defer self.suppress_sync = false;
     self.pane.feedbackSetText(self.alloc, text);
+    // ...then where its quote BLOCKS are, converted against the buffer that
+    // was just written. Order is load-bearing twice over: the offsets only
+    // mean anything against this text, and `feedbackSetText` drops the
+    // previous snapshot's spans on the way through, so a page that reports no
+    // quotes leaves the pane with none rather than with yesterday's.
+    self.publishQuoteSpans(text, quotes);
     const grew = self.syncMetrics();
     // The acceptance oracle for a surface nothing outside the process can look
     // at (T233: no screenshots, no SendInput on the test desktop). Bounded on
@@ -666,6 +722,36 @@ pub fn composerState(self: *ViewerFeedbackBar, text: []const u8) void {
     self.syncCarouselToCaret();
 }
 
+/// Turn one snapshot's quote blocks into the spans the report is written from.
+///
+/// UTF-16 code units in, bytes out (the T648 boundary, unchanged), and ids in,
+/// registry indices out — a block whose id this composer session never issued
+/// is dropped rather than matched to a neighbour, because the metadata it would
+/// carry would be some other passage's.
+fn publishQuoteSpans(
+    self: *ViewerFeedbackBar,
+    text: []const u8,
+    quotes: []const composer_page.QuoteSpan,
+) void {
+    if (quotes.len == 0) {
+        self.pane.feedbackSetQuoteSpans(self.alloc, &.{});
+        return;
+    }
+    const out = self.alloc.alloc(doc.Span, quotes.len) catch return;
+    defer self.alloc.free(out);
+    var n: usize = 0;
+    for (quotes) |q| {
+        const index = self.pane.feedback_quotes.indexOfId(q.id) orelse continue;
+        out[n] = .{
+            .start = utf16_offset.byteForUnits(text, q.start),
+            .end = utf16_offset.byteForUnits(text, q.end),
+            .index = index,
+        };
+        n += 1;
+    }
+    self.pane.feedbackSetQuoteSpans(self.alloc, out[0..n]);
+}
+
 /// The pane's buffer changed from the NATIVE side; make the page equal it.
 ///
 /// Called from `feedbackSetText` itself, so it covers every writer rather than
@@ -674,8 +760,8 @@ pub fn composerState(self: *ViewerFeedbackBar, text: []const u8) void {
 /// that fights the user's typing.
 pub fn composerSync(self: *ViewerFeedbackBar) void {
     if (self.suppress_sync) return;
-    const wv = self.web orelse return;
-    wv.seed(self.pane.feedbackText(), null);
+    if (self.web == null) return;
+    self.seedPage(null);
 }
 
 /// Push the design-system numbers into the page's CSS custom properties.
@@ -702,6 +788,8 @@ fn pushComposerVars(self: *ViewerFeedbackBar, force: bool) void {
     var bg_buf: [8]u8 = undefined;
     var ph_buf: [8]u8 = undefined;
     var sel_buf: [8]u8 = undefined;
+    var qbg_buf: [8]u8 = undefined;
+    var qac_buf: [8]u8 = undefined;
 
     self.vars_scale = self.scale;
     self.vars_pill = self.pill_rgb;
@@ -714,6 +802,15 @@ fn pushComposerVars(self: *ViewerFeedbackBar, force: bool) void {
         .placeholder = hexRef(&ph_buf, self.secondary_ref),
         .selection = hexRef(&sel_buf, self.accent_ref),
         .placeholder_text = placeholder_utf8,
+        // A quoted block's wash and bar, from the SAME derivation the native
+        // fallback paints with (T935) - the pill pulled 14% toward the accent,
+        // and the accent itself. Its metrics go over in CSS pixels, which are
+        // DIPs here because the controller rasterizes at the pane's scale.
+        .quote_bg = hexRgb(&qbg_buf, self.quote_rgb),
+        .quote_accent = hexRef(&qac_buf, self.accent_ref),
+        .quote_indent_px = quote_indent_dip,
+        .quote_bar_px = quote_bar_dip,
+        .quote_bar_x_px = quote_bar_x_dip,
     });
 }
 
@@ -904,8 +1001,8 @@ pub fn seedControl(self: *ViewerFeedbackBar) void {
     // The web surface takes the buffer whole, caret at the end, in one message
     // — the page owns the document, so there is no line-ending conversion and
     // no formatting to re-derive on this side.
-    if (self.web) |wv| {
-        wv.seed(self.pane.feedbackText(), null);
+    if (self.web) |_| {
+        self.seedPage(null);
         if (self.syncMetrics()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
         return;
     }
@@ -1013,11 +1110,22 @@ fn readBack(self: *ViewerFeedbackBar) void {
 // Quotes (T641)
 // -------------------------------------------------------------------------
 
+/// A quoted block's three metrics, in DIPs — the design system's 16 DIP step
+/// for the text, a 3 DIP accent bar, 5 DIP in from the pill's left edge.
+///
+/// One statement, three renderers: the RichEdit's paragraph indent (in twips),
+/// the accent bar this file paints for it, and the CSS custom properties the
+/// web surface is dressed with. Before T935 the last of those did not exist and
+/// the middle two each carried their own literal.
+const quote_indent_dip: f32 = 16;
+const quote_bar_dip: f32 = 3;
+const quote_bar_x_dip: f32 = 5;
+
 /// The left indent of a quoted block, in TWIPs (1/1440"): 15 twips is one DIP,
 /// so this is the design system's 16 DIP step. Twips rather than pixels
 /// because RichEdit does the DPI conversion itself — the same number is right
 /// at every scale.
-const quote_indent_twips: i32 = 16 * 15;
+const quote_indent_twips: i32 = @intFromFloat(quote_indent_dip * 15);
 
 // -------------------------------------------------------------------------
 // The offset boundary (T648)
@@ -1064,11 +1172,11 @@ fn caret(self: *const ViewerFeedbackBar) usize {
 }
 
 fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
-    if (self.web) |wv| {
+    if (self.web != null) {
         // Placing the caret means re-stating the document, because a `seed` is
         // the only write the page accepts. That is deliberate: one write path
         // cannot drift from the buffer, and the buffer is the truth.
-        wv.seed(self.pane.feedbackText(), @intCast(self.charIndex(at)));
+        self.seedPage(at);
         return;
     }
     const u = self.charIndex(at);
@@ -1088,8 +1196,10 @@ fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
 /// document equal the buffer", so the splice happens where the buffer lives and
 /// the page is told the result. The cost is the page's undo stack — a quote or
 /// a chip put in this way is not a step Ctrl+Z walks back, which is the one
-/// thing the RichEdit path did better and which T935/T936 restore by making
-/// both of them the page's own DOM nodes.
+/// thing the RichEdit path did better and which T983 tracks. The quote's
+/// IDENTITY does not depend on this path: the seed carries its span, the page
+/// builds it as a node with the id on it, and every snapshot after that reports
+/// where that node actually is (T935).
 fn spliceComposer(self: *ViewerFeedbackBar, at: usize, insert: []const u8, caret_after: usize) void {
     const cur = self.pane.feedbackText();
     const cut = @min(at, cur.len);
@@ -1106,8 +1216,7 @@ fn spliceComposer(self: *ViewerFeedbackBar, at: usize, insert: []const u8, caret
     self.pane.feedbackSetText(self.alloc, next.items);
     self.suppress_sync = false;
 
-    const units = utf16_offset.unitsBeforeByte(self.pane.feedbackText(), caret_after);
-    if (self.web) |wv| wv.seed(self.pane.feedbackText(), @intCast(units));
+    if (self.web != null) self.seedPage(caret_after);
     // The band's height follows the page's next snapshot, which the seed above
     // is about to produce; all this owes is the repaint of the chrome around
     // it.
@@ -1415,7 +1524,7 @@ fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
         // run is T936's, where a chip is a DOM node that can be selected as one
         // thing rather than as a character range.
         wv.takeFocus();
-        wv.seed(self.pane.feedbackText(), @intCast(self.charIndex(s.end)));
+        self.seedPage(s.end);
     } else {
         const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(s.start), .cpMax = self.charIndex(s.end) };
         _ = w32.SetFocus(self.edit);
@@ -1467,10 +1576,10 @@ fn quoteSpans(self: *const ViewerFeedbackBar) ?[]doc.Span {
 /// run, so the only formatting that cannot drift out of step with the report
 /// is formatting computed from the text the report is made of.
 fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
-    // The web surface has no character formats: a quoted block is CSS on the
-    // page, which is T935. Until then a quote there is plain text that still
-    // parses, still serializes and still shows in the report - the WASH is what
-    // is missing, not the quote.
+    // The web surface has no character formats, and does not need them: a
+    // quoted block there is a `<div class="q">` the page washes in CSS (T935),
+    // from the same two colours derived above. What follows is the RichEdit
+    // fallback's half of the same picture, and it stays until T937 retires it.
     if (self.web != null) return;
     const spans = self.quoteSpans();
     defer if (spans) |s| self.alloc.free(s);
@@ -1623,14 +1732,16 @@ fn paintQuoteBars(self: *ViewerFeedbackBar, hdc: w32.HDC) void {
     // Positions come from `EM_POSFROMCHAR` on the RichEdit, which is not the
     // control the text is in any more when the web surface is up - painting
     // from it would draw accent bars at coordinates nothing on screen matches.
+    // The web surface draws its own with `border-left` on the block (T935),
+    // from the same three DIP numbers this uses.
     if (self.web != null) return;
     const spans = self.quoteSpans() orelse return;
     defer self.alloc.free(spans);
 
     const scale = if (self.scale > 0) self.scale else 1.0;
     const line_h = type_ramp.lineBox(type_ramp.body(scale), scale);
-    const w: i32 = @max(2, @as(i32, @intFromFloat(@round(3 * scale))));
-    const x: i32 = @max(1, @as(i32, @intFromFloat(@round(5 * scale))));
+    const w: i32 = @max(2, @as(i32, @intFromFloat(@round(quote_bar_dip * scale))));
+    const x: i32 = @max(1, @as(i32, @intFromFloat(@round(quote_bar_x_dip * scale))));
 
     const brush = w32.CreateSolidBrush(self.accent_ref) orelse return;
     defer _ = w32.DeleteObject(@ptrCast(brush));

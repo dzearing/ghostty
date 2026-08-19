@@ -40,6 +40,29 @@ pub const js = @embedFile("../../viewer/composer.js");
 /// and asserted in the tests below rather than typed three times.
 pub const box_id = "c";
 
+/// The class a quoted block carries, and the attribute its identity lives in
+/// (T935). Stated here for the same reason `box_id` is: three files agree on
+/// them and a test checks that they still do.
+pub const quote_class = "q";
+pub const quote_attr = "data-qid";
+
+/// One quoted passage's place in the composer's text, in UTF-16 CODE UNITS —
+/// what a JS string offset is, and what the host converts against the pane's
+/// UTF-8 buffer with `utf16_offset.zig`.
+///
+/// It crosses in both directions and means something slightly different each
+/// way, which is the whole shape of T935: DOWN it is the host saying "these
+/// runs of the buffer are quotes, build them as blocks" (the only way a buffer
+/// that outlived the page gets its ids back); UP it is the page reporting where
+/// its quote NODES actually are now, which is the truth the report is written
+/// from — a block the user deleted is simply not in the list, and a block they
+/// edited still is, carrying the same id.
+pub const QuoteSpan = struct {
+    id: u32,
+    start: u32,
+    end: u32,
+};
+
 /// The design-system numbers the page is dressed with, in CSS pixels and CSS
 /// color syntax. Built by the host from a `viewer_feedback_layout.Layout` and
 /// the bar's own theme; see `Vars.json`.
@@ -60,6 +83,16 @@ pub const Vars = struct {
     selection: []const u8,
     /// The cue an empty composer shows.
     placeholder_text: []const u8,
+    /// A quoted block's wash and its accent bar, as `#rrggbb` — the same two
+    /// colours the band derives for the native fallback, handed over rather
+    /// than re-picked (T935).
+    quote_bg: []const u8,
+    quote_accent: []const u8,
+    /// The block's metrics in CSS pixels: where its text sits, how wide the
+    /// accent bar is, and how far in the bar starts.
+    quote_indent_px: f32,
+    quote_bar_px: f32,
+    quote_bar_x_px: f32,
 
     /// The `vars` message, ready for `PostWebMessageAsJson`. Caller owns it.
     pub fn json(self: Vars, alloc: Allocator) ![]u8 {
@@ -73,6 +106,11 @@ pub const Vars = struct {
             .placeholder = self.placeholder,
             .sel = self.selection,
             .text = self.placeholder_text,
+            .qbg = self.quote_bg,
+            .qaccent = self.quote_accent,
+            .qindent = self.quote_indent_px,
+            .qbar = self.quote_bar_px,
+            .qbarx = self.quote_bar_x_px,
         }, .{});
     }
 };
@@ -91,12 +129,24 @@ pub const Vars = struct {
 /// seed went down is recognisable as older than the buffer and dropped — which
 /// is the difference between a native write and a keystroke racing to the same
 /// millisecond, and a report that silently reverts to what it said before.
-pub fn seedJson(alloc: Allocator, text: []const u8, caret: i64, gen: u32) ![]u8 {
+/// `quotes` names the runs of `text` that are quoted blocks, so the page can
+/// build them as nodes with their ids on them (T935). It is how a buffer that
+/// outlived its page — a composer closed and reopened, a native insertion, a
+/// report cleared behind a send — gets its quote identity back: the buffer is
+/// plain text and cannot carry it.
+pub fn seedJson(
+    alloc: Allocator,
+    text: []const u8,
+    caret: i64,
+    gen: u32,
+    quotes: []const QuoteSpan,
+) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, .{
         .t = "seed",
         .text = text,
         .caret = caret,
         .gen = gen,
+        .quotes = quotes,
     }, .{});
 }
 
@@ -132,6 +182,12 @@ pub const State = struct {
     /// A snapshot whose generation is not the current one describes a document
     /// that has since been replaced. Zero for a page that has not been seeded.
     gen: u32,
+    /// Where the live quote BLOCKS are, in document order (T935) — the answer
+    /// to "which quotes is this report still carrying", read off the nodes
+    /// rather than recovered by matching text. Empty for a page with none, and
+    /// for a snapshot from a page too old to send the field, which is the
+    /// honest degrade: no quotes claimed rather than quotes invented.
+    quotes: []const QuoteSpan = &.{},
 };
 
 pub const Parsed = struct {
@@ -190,6 +246,7 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
         const gen = intField(obj, "gen") orelse 0;
         return .{ .state = .{
             .text = text,
+            .quotes = quoteSpans(aa, obj),
             .gen = if (gen > 0) @intCast(@min(gen, std.math.maxInt(u32))) else 0,
             .lines = if (lines > 0) @intCast(@min(lines, std.math.maxInt(u32))) else 1,
             // The page sends -1 for "no caret I can name", which is not the
@@ -199,6 +256,40 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
         } };
     }
     return null;
+}
+
+/// The `quotes` array of a snapshot, kept to what the host can act on:
+/// positive ids, non-empty, ascending and non-overlapping.
+///
+/// A span that breaks any of those is DROPPED rather than the snapshot, for
+/// the same reason a malformed message is: the composer's text is the thing
+/// the user typed and it must arrive. Anything missing or of the wrong shape
+/// answers "no quotes", which is what makes the field additive — an older page
+/// simply claims none, and the host falls back to deriving them.
+fn quoteSpans(aa: Allocator, obj: std.json.ObjectMap) []const QuoteSpan {
+    const array = switch (obj.get("quotes") orelse return &.{}) {
+        .array => |a| a,
+        else => return &.{},
+    };
+    var out: std.ArrayListUnmanaged(QuoteSpan) = .empty;
+    var at: i64 = 0;
+    for (array.items) |item| {
+        const o = switch (item) {
+            .object => |v| v,
+            else => continue,
+        };
+        const id = intField(o, "id") orelse continue;
+        const start = intField(o, "start") orelse continue;
+        const end = intField(o, "end") orelse continue;
+        if (id <= 0 or start < at or end <= start) continue;
+        out.append(aa, .{
+            .id = @intCast(@min(id, std.math.maxInt(u32))),
+            .start = @intCast(@min(start, std.math.maxInt(u32))),
+            .end = @intCast(@min(end, std.math.maxInt(u32))),
+        }) catch return out.items;
+        at = end;
+    }
+    return out.items;
 }
 
 fn intField(obj: std.json.ObjectMap, name: []const u8) ?i64 {
@@ -274,6 +365,33 @@ test "both assets agree with box_id" {
     try testing.expect(std.mem.indexOf(u8, js, "getElementById(\"" ++ box_id ++ "\")") != null);
 }
 
+test "both assets agree on what a quote block is" {
+    // The stylesheet paints `.q`, the script builds and reads `.q[data-qid]`,
+    // and this module names both. Three files, one fact — and the failure mode
+    // if they drift is silent: quotes stop being washed, or stop being found.
+    try testing.expect(std.mem.indexOf(u8, css, "#" ++ box_id ++ " ." ++ quote_class ++ " {") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "QCLASS = \"" ++ quote_class ++ "\"") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "QATTR = \"" ++ quote_attr ++ "\"") != null);
+}
+
+test "the quote block has no vertical air of its own" {
+    // Vertical padding or margin on a block would add to `scrollHeight`, which
+    // is what the wrapped line count — and therefore the pill's height — is
+    // measured from. A composer that grows by a line the text does not occupy
+    // is the bug this asserts against, and it is invisible until someone
+    // quotes something.
+    const at = std.mem.indexOf(u8, css, "#" ++ box_id ++ " ." ++ quote_class ++ " {").?;
+    const end = std.mem.indexOfPos(u8, css, at, "}").?;
+    const block = css[at..end];
+    // Both shorthands are written longhand-first (`0 0 0 <left>`), so a
+    // non-zero vertical value would show up as a first token that is not 0.
+    for ([_][]const u8{ "margin:", "padding:" }) |prop| {
+        const p = std.mem.indexOf(u8, block, prop).?;
+        const decl = std.mem.trim(u8, block[p + prop.len .. std.mem.indexOfPos(u8, block, p, ";").?], " \t");
+        try testing.expect(std.mem.startsWith(u8, decl, "0 0 0 "));
+    }
+}
+
 test "the stylesheet states no size or color of its own outside a fallback" {
     // Every design number arrives in a `vars` message. A literal that is not a
     // `var(--x, fallback)` default is the divergence D43's mitigation exists to
@@ -299,12 +417,31 @@ test "vars serialize to the property names the script reads" {
         .placeholder = "#aaaaaa",
         .selection = "#0078d4",
         .placeholder_text = "What's wrong?",
+        .quote_bg = "#242428",
+        .quote_accent = "#0078d4",
+        .quote_indent_px = 16,
+        .quote_bar_px = 3,
+        .quote_bar_x_px = 5,
     };
     const out = try v.json(testing.allocator);
     defer testing.allocator.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"vars\"") != null);
-    for ([_][]const u8{ "fontPx", "linePx", "fg", "bg", "placeholder", "sel", "face", "text" }) |key| {
+    for ([_][]const u8{
+        "fontPx",
+        "linePx",
+        "fg",
+        "bg",
+        "placeholder",
+        "sel",
+        "face",
+        "text",
+        "qbg",
+        "qaccent",
+        "qindent",
+        "qbar",
+        "qbarx",
+    }) |key| {
         // In the message...
         const quoted = try std.fmt.allocPrint(testing.allocator, "\"{s}\":", .{key});
         defer testing.allocator.free(quoted);
@@ -319,7 +456,7 @@ test "vars serialize to the property names the script reads" {
 }
 
 test "seed carries the text verbatim and escapes what JSON must" {
-    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3);
+    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3, &.{});
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"seed\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\\n") != null);
@@ -328,6 +465,72 @@ test "seed carries the text verbatim and escapes what JSON must" {
     try testing.expect(std.mem.indexOf(u8, out, "\"gen\":3") != null);
     // The page has to echo it back, or the guard it exists for never fires.
     try testing.expect(std.mem.indexOf(u8, js, "gen") != null);
+}
+
+test "a seed names the runs of the text that are quotes" {
+    const out = try seedJson(testing.allocator, "intro\n\nquoted\n\n", -1, 1, &.{
+        .{ .id = 4, .start = 7, .end = 13 },
+    });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"quotes\":[{\"id\":4,\"start\":7,\"end\":13}]") != null);
+    // ...and the page has to build them, or the seed's whole quote half is a
+    // field nobody reads.
+    try testing.expect(std.mem.indexOf(u8, js, "m.quotes") != null);
+}
+
+test "a snapshot's quotes are the live blocks, in order" {
+    const p = parse(
+        testing.allocator,
+        "{\"t\":\"state\",\"text\":\"a\\n\\nq1\\n\\nq2\",\"lines\":5,\"caret\":9,\"gen\":2," ++
+            "\"quotes\":[{\"id\":1,\"start\":3,\"end\":5},{\"id\":7,\"start\":7,\"end\":9}]}",
+    ) orelse return error.NotParsed;
+    defer p.deinit();
+    const q = p.message.state.quotes;
+    try testing.expectEqual(@as(usize, 2), q.len);
+    try testing.expectEqual(@as(u32, 1), q[0].id);
+    try testing.expectEqual(@as(u32, 3), q[0].start);
+    try testing.expectEqual(@as(u32, 5), q[0].end);
+    try testing.expectEqual(@as(u32, 7), q[1].id);
+}
+
+test "a snapshot with no quotes field claims none" {
+    const p = parse(testing.allocator, "{\"t\":\"state\",\"text\":\"a\",\"lines\":1,\"caret\":1,\"gen\":1}") orelse
+        return error.NotParsed;
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 0), p.message.state.quotes.len);
+}
+
+test "a quote span the host could not act on is dropped, not the snapshot" {
+    // Every one of these is a document that cannot be built: an id that names
+    // nothing, an empty or inverted run, and a run that overlaps the one
+    // before it. The TEXT still has to arrive - that is what the user typed.
+    const p = parse(
+        testing.allocator,
+        "{\"t\":\"state\",\"text\":\"abcdefgh\",\"lines\":1,\"caret\":0,\"gen\":1,\"quotes\":[" ++
+            "{\"id\":0,\"start\":0,\"end\":2}," ++ // no id
+            "{\"id\":1,\"start\":2,\"end\":2}," ++ // empty
+            "{\"id\":2,\"start\":5,\"end\":3}," ++ // inverted
+            "{\"id\":3,\"start\":2,\"end\":4}," ++ // the one good span
+            "{\"id\":4,\"start\":3,\"end\":6}," ++ // overlaps it
+            "\"nonsense\"]}",
+    ) orelse return error.NotParsed;
+    defer p.deinit();
+    try testing.expectEqualStrings("abcdefgh", p.message.state.text);
+    try testing.expectEqual(@as(usize, 1), p.message.state.quotes.len);
+    try testing.expectEqual(@as(u32, 3), p.message.state.quotes[0].id);
+}
+
+test "a quotes field of the wrong shape is no quotes at all" {
+    for ([_][]const u8{
+        "{\"t\":\"state\",\"text\":\"a\",\"lines\":1,\"caret\":0,\"quotes\":5}",
+        "{\"t\":\"state\",\"text\":\"a\",\"lines\":1,\"caret\":0,\"quotes\":\"q\"}",
+        "{\"t\":\"state\",\"text\":\"a\",\"lines\":1,\"caret\":0,\"quotes\":[[]]}",
+        "{\"t\":\"state\",\"text\":\"a\",\"lines\":1,\"caret\":0,\"quotes\":[{}]}",
+    }) |payload| {
+        const p = parse(testing.allocator, payload) orelse return error.NotParsed;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.message.state.quotes.len);
+    }
 }
 
 test "a snapshot carries the generation it was measured under" {

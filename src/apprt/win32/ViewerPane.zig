@@ -545,6 +545,18 @@ feedback_text: std.ArrayListUnmanaged(u8) = .empty,
 /// notice the deletion.
 feedback_quotes: feedback_doc.Registry = .{},
 
+/// Where the live quote BLOCKS are, as the composer's page last reported them
+/// (T935). Null until a snapshot arrives, and dropped again by every write to
+/// `feedback_text` that did not come from the page.
+///
+/// This is the pane's answer to "which quotes is the report still carrying",
+/// and it is the DOM's answer rather than the text's: a quote is a node with
+/// its id on it, so deleting the block drops its metadata and editing the
+/// passage keeps it. `feedbackQuoteSpans` falls back to matching the text when
+/// this is null, which is the bridge for a buffer that outlived its page — see
+/// `viewer_feedback_doc.zig`'s header. Owned; freed in `deinit`.
+feedback_quote_spans: ?[]feedback_doc.Span = null,
+
 /// Every image pasted into the composer, PNG-encoded (T637). On the pane for
 /// the same reason the quotes are, and derived the same way: which of them are
 /// still in the report comes from the `[Image #N]` chips still in
@@ -780,6 +792,8 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     }
     self.feedback_text.deinit(alloc);
     self.feedback_quotes.deinit(alloc);
+    if (self.feedback_quote_spans) |spans| alloc.free(spans);
+    self.feedback_quote_spans = null;
     self.feedback_images.deinit(alloc);
     self.feedback_open = false;
     if (self.feedback_status) |s| alloc.free(s);
@@ -1335,6 +1349,14 @@ pub fn feedbackText(self: *const ViewerPane) []const u8 {
 pub fn feedbackSetText(self: *ViewerPane, alloc: Allocator, bytes: []const u8) void {
     self.feedback_text.clearRetainingCapacity();
     self.feedback_text.appendSlice(alloc, bytes) catch {};
+    // T935: the quote spans describe the text that was just replaced, and an
+    // offset into a buffer that no longer exists is worse than no offset —
+    // it would quote the wrong run of the report. Dropped here rather than
+    // updated, because the two writers each answer for what comes next: the
+    // page re-publishes them from its own nodes in the same breath, and a
+    // native write re-derives them at seed time.
+    if (self.feedback_quote_spans) |spans| alloc.free(spans);
+    self.feedback_quote_spans = null;
     // T934: the composer's page holds a copy of this buffer, so a write from
     // the native side has to reach it - otherwise the next snapshot the page
     // pushes is measured against the text this write replaced and quietly
@@ -2356,7 +2378,56 @@ fn acceptQuote(self: *ViewerPane, alloc: Allocator, q: bridge.Quote) void {
 /// the derivation could not be done at all (an allocation failure), which
 /// callers treat as "no quotes" rather than as a reason to stop.
 pub fn feedbackQuoteSpans(self: *const ViewerPane, alloc: Allocator) ?[]feedback_doc.Span {
+    // The page's own nodes when it has told us about them (T935), and matching
+    // the text when it has not. Duplicated rather than handed out, so a caller
+    // freeing its answer cannot free the pane's copy.
+    if (self.feedback_quote_spans) |spans| return alloc.dupe(feedback_doc.Span, spans) catch null;
     return self.feedback_quotes.live(alloc, self.feedback_text.items) catch null;
+}
+
+/// Take the composer page's live quote blocks as the truth (T935).
+///
+/// Validated on the way in rather than trusted: every span has to name a real
+/// registry entry and a real, non-empty, ascending run of the buffer, because
+/// what reads them next is the report writer, which quotes `text[start..end]`.
+/// A span that fails is dropped and the rest stand — one block losing its wash
+/// is a smaller lie than a report quoting the wrong sentence.
+pub fn feedbackSetQuoteSpans(
+    self: *ViewerPane,
+    alloc: Allocator,
+    spans: []const feedback_doc.Span,
+) void {
+    // Counted first, then allocated exactly: what is stored here is handed to
+    // the report writer, and a slice whose tail is uninitialised is a report
+    // quoting whatever that memory held.
+    var keep: usize = 0;
+    var at: usize = 0;
+    for (spans) |s| {
+        if (!self.quoteSpanIsSane(s, at)) continue;
+        keep += 1;
+        at = s.end;
+    }
+    const out = alloc.alloc(feedback_doc.Span, keep) catch return;
+    var n: usize = 0;
+    at = 0;
+    for (spans) |s| {
+        if (!self.quoteSpanIsSane(s, at)) continue;
+        out[n] = s;
+        n += 1;
+        at = s.end;
+    }
+    if (self.feedback_quote_spans) |old| alloc.free(old);
+    self.feedback_quote_spans = out;
+}
+
+/// Whether one reported span can be acted on: it names a real registry entry,
+/// and a real, non-empty run of the buffer that starts at or after `at` (the
+/// end of the previous kept span, so the list stays ascending and
+/// non-overlapping the way `renderBody` needs).
+fn quoteSpanIsSane(self: *const ViewerPane, s: feedback_doc.Span, at: usize) bool {
+    if (s.index >= self.feedback_quotes.entries.items.len) return false;
+    if (s.start < at or s.end <= s.start) return false;
+    return s.end <= self.feedback_text.items.len;
 }
 
 /// How many quotes the report would carry right now — the number that drops
@@ -7036,6 +7107,46 @@ test "host floor: a real controller on a real window, on this box" {
             try testing.expectEqualStrings(want, pane.feedbackText());
         }
 
+        // T935: the quote is a NODE now, and this is the proof — the page was
+        // seeded with the block's span, built a `<div class="q" data-qid>` for
+        // it, and reported that node back with its id on it. Nothing else can
+        // produce this: `feedback_quote_spans` is null until a snapshot fills
+        // it, and every native write empties it again, so a non-null value one
+        // round trip after the insertion is the DOM's own answer rather than
+        // the text-matching derivation's.
+        //
+        // Why it matters beyond the mechanism: identity that lives on the node
+        // is identity that survives the user EDITING the passage and vanishes
+        // when they delete the block, which is what the matching could never
+        // do (`viewer_feedback_doc.zig`'s header).
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                return p.feedback_quote_spans != null;
+            }
+        }.ready, &pane);
+        {
+            const live = pane.feedback_quote_spans.?;
+            try testing.expectEqual(@as(usize, 1), live.len);
+            // The span the PAGE measured, converted back to bytes, is exactly
+            // the passage — through a document that holds five non-ASCII
+            // characters ahead of it, so a code-unit offset used as a byte one
+            // would land three bytes short.
+            try testing.expectEqualStrings(
+                entry.text,
+                pane.feedbackText()[live[0].start..live[0].end],
+            );
+            // ...and it names the registry entry whose id the block carries,
+            // which is what puts THIS passage's heading on THIS quote in the
+            // report.
+            try testing.expectEqual(@as(usize, 0), live[0].index);
+            try testing.expectEqual(entry.id, pane.feedback_quotes.entries.items[live[0].index].id);
+            log.warn("quote: page reported id={d} span={d}..{d}", .{
+                entry.id,
+                live[0].start,
+                live[0].end,
+            });
+        }
+
         // ------------------------------------------------------------------
         // T636: press send, and read the report back off disk
         // ------------------------------------------------------------------
@@ -7961,6 +8072,83 @@ test "page messages land on the pane, in the pane's own memory" {
     try testing.expect(!pane.feedback_open);
     try testing.expectEqual(@as(usize, 0), pane.feedback_quotes.entries.items.len);
     try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
+}
+
+test "T935: the page's quote blocks are the pane's truth, and a native write drops them" {
+    // The pane half of the identity flip, with no browser: what a snapshot
+    // does to `feedbackQuoteSpans`, and what it takes to make the pane forget
+    // it. The whole point is that the answer stops being a function of the
+    // TEXT — so the buffer here deliberately contains the passage twice.
+    const alloc = testing.allocator;
+    var pane: ViewerPane = .{};
+    defer pane.deinit(alloc);
+
+    const first = try pane.feedback_quotes.add(alloc, .{ .text = "quoted", .heading_text = "Alpha" });
+    _ = try pane.feedback_quotes.add(alloc, .{ .text = "second", .heading_text = "Beta" });
+    pane.feedbackSetText(alloc, "quoted\n\nnotes\n\nquoted\n\nsecond");
+
+    // Derivation, the pre-T935 answer and still the seeding bridge: with no
+    // snapshot, the FIRST line-aligned occurrence of each passage wins.
+    {
+        const derived = pane.feedbackQuoteSpans(alloc).?;
+        defer alloc.free(derived);
+        try testing.expectEqual(@as(usize, 2), derived.len);
+        try testing.expectEqual(@as(usize, 0), derived[0].start);
+    }
+
+    // Now the page speaks: its `quoted` block is the SECOND occurrence, which
+    // is a document the matching could not describe (it always picks the
+    // first). This is the assertion that the DOM wins.
+    pane.feedbackSetQuoteSpans(alloc, &.{
+        .{ .start = 15, .end = 21, .index = 0 },
+        .{ .start = 23, .end = 29, .index = 1 },
+    });
+    {
+        const live = pane.feedbackQuoteSpans(alloc).?;
+        defer alloc.free(live);
+        try testing.expectEqual(@as(usize, 2), live.len);
+        try testing.expectEqual(@as(usize, 15), live[0].start);
+        try testing.expectEqualStrings("quoted", pane.feedbackText()[live[0].start..live[0].end]);
+        try testing.expectEqual(first, pane.feedback_quotes.entries.items[live[0].index].id);
+    }
+
+    // A block the user deleted is simply not in the next snapshot, and the
+    // report loses its metadata with it. No text changed here at all — the
+    // passage is still typed in the buffer twice — which is exactly the case
+    // the old derivation got wrong.
+    pane.feedbackSetQuoteSpans(alloc, &.{.{ .start = 23, .end = 29, .index = 1 }});
+    try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
+
+    // What the report writer must never be handed: a span past the end of the
+    // buffer, an empty or inverted run, one that overlaps its neighbour, and
+    // one naming a registry entry that does not exist. Each is dropped; the
+    // sane one stands.
+    pane.feedbackSetQuoteSpans(alloc, &.{
+        .{ .start = 0, .end = 6, .index = 9 },
+        .{ .start = 0, .end = 0, .index = 0 },
+        .{ .start = 15, .end = 21, .index = 0 },
+        .{ .start = 16, .end = 22, .index = 1 },
+        .{ .start = 25, .end = 900, .index = 1 },
+    });
+    {
+        const live = pane.feedbackQuoteSpans(alloc).?;
+        defer alloc.free(live);
+        try testing.expectEqual(@as(usize, 1), live.len);
+        try testing.expectEqual(@as(usize, 15), live[0].start);
+    }
+
+    // A write from the NATIVE side invalidates them outright: the offsets
+    // describe a buffer that no longer exists, and quoting the wrong run of a
+    // report is worse than quoting none. The derivation takes over, which is
+    // what re-attaches the ids at the next seed.
+    pane.feedbackSetText(alloc, "quoted\n\nrewritten\n\nsecond");
+    try testing.expect(pane.feedback_quote_spans == null);
+    {
+        const derived = pane.feedbackQuoteSpans(alloc).?;
+        defer alloc.free(derived);
+        try testing.expectEqual(@as(usize, 2), derived.len);
+        try testing.expectEqual(@as(usize, 0), derived[0].start);
+    }
 }
 
 test "a page message that arrives after the pane is gone is dropped" {
