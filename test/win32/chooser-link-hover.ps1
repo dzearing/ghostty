@@ -41,10 +41,12 @@
 # thing being measured, which is the app's own repaint.
 #
 # T217/T218: runs on a BACKGROUND Win32 desktop, so it never takes the user's
-# foreground - asserted at the end, not assumed. Capture is PrintWindow
-# (PW_RENDERFULLCONTENT), the only path that works there, and the chooser is
-# GDI-painted chrome so it captures for real (the OpenGL terminal surface, the
-# one thing PrintWindow flattens, is not involved).
+# foreground - asserted at the end, not assumed. Capture is PrintWindow, the
+# only path that works there, and since T942 the SYNCHRONOUS one: the chooser
+# paints the frame itself in answer to WM_PRINTCLIENT (T940) instead of DWM
+# handing back a copy of the composited surface that may not be finished. The
+# chooser is GDI-painted chrome so it captures for real (the OpenGL terminal
+# surface, the one thing PrintWindow flattens, is not involved).
 #
 # The account store is redirected to a temp DPAPI blob (GHOSTTY_ACCOUNT_STORE)
 # so the box's real account is never read or written. Only ever touches ghoztty
@@ -160,7 +162,7 @@ function Measure-Ink($shot, $rect) {
 # renders its children, and the dialog is the window that owns the band).
 function Get-LinkInk([IntPtr]$chooser, $linkRect) {
     Start-Sleep -Milliseconds 250
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try { return (Measure-Ink $shot $linkRect) } finally { Close-TestWindowPixels $shot }
 }
 

@@ -196,7 +196,7 @@ try {
     # Client origin: the dialog is WS_CAPTION, so the client top is below the
     # frame. Capture and address in SCREEN coordinates via the capture's own
     # origin plus the client offset the layout is expressed in.
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $distinct = Get-TestDistinctColors -Shot $shot
         Assert ($distinct -gt 3) "the capture is a real frame, not a black mid-paint one ($distinct colors)"
@@ -297,7 +297,7 @@ try {
     Assert ($chooser2 -ne [IntPtr]::Zero) 'the chooser opens with no agent running'
     if ($chooser2 -ne [IntPtr]::Zero) {
         Start-Sleep -Seconds 3
-        $shot2 = Get-TestWindowPixels -Window $chooser2
+        $shot2 = Get-TestWindowPixels -Window $chooser2 -Sync
         try {
             $client2 = Get-TestWindowRect -Window $chooser2 -Client
             $px2 = Get-TestPixel -Shot $shot2 -X ($client2.Left + $geo.CardX) -Y ($client2.Top + $geo.CardY)

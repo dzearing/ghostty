@@ -129,16 +129,20 @@ function Get-ChooserScale([IntPtr]$h) {
 function Dip($scale, $v) { return [int][Math]::Round($v * $scale) }
 
 # --- capture -----------------------------------------------------------------
-# PrintWindow(PW_RENDERFULLCONTENT) - CopyFromScreen is dead off the input
-# desktop. Retried until the capture holds real content: a window captured
-# mid-paint comes back solid black, and black would satisfy every
+# PrintWindow with no flags - the chooser paints the frame itself, synchronously,
+# in answer to WM_PRINTCLIENT (T940/T942), rather than DWM handing back an
+# asynchronous copy of the composited surface. CopyFromScreen is dead off the
+# input desktop either way. Still retried: a capture taken before the dialog has
+# a frame to give either throws (the sync path refuses a window that drew
+# nothing) or comes back near-solid, and a solid frame would satisfy every
 # drawn-pixel/tint probe below while proving nothing (T216).
 function Get-Shot([IntPtr]$h) {
     $shot = $null
     for ($t = 0; $t -lt 15; $t++) {
         if ($shot) { Close-TestWindowPixels $shot }
+        $shot = $null
         Start-Sleep -Milliseconds 200
-        $shot = Get-TestWindowPixels -Window $h
+        try { $shot = Get-TestWindowPixels -Window $h -Sync } catch { continue }
         if ((Get-TestDistinctColors -Shot $shot) -ge 8) { break }
     }
     return $shot

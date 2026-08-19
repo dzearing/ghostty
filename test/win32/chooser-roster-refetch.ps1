@@ -141,7 +141,7 @@ function Send-ChooserKey($chooser, $filter, $key) {
 
 # One pixel of the chooser, in screen coordinates.
 function Sample($chooser, $x, $y) {
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try { return Get-TestPixel -Shot $shot -X $x -Y $y } finally { Close-TestWindowPixels -Shot $shot }
 }
 
@@ -189,7 +189,7 @@ try {
     $probeX = $client.Left + $geo.CardX
     $probeY = $client.Top + $geo.Bottom - (Get-TestChromeDip 12 $scale)
 
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $distinct = Get-TestDistinctColors -Shot $shot
         Assert ($distinct -gt 3) "the capture is a real frame, not a black mid-paint one ($distinct colors)"

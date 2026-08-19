@@ -132,7 +132,7 @@ function Wait-LogLine($path, $pattern, $timeoutMs) {
 # zone, whose x-range comes from the same shared geometry the app's layout is
 # asserted against.
 function Get-HeaderInkPixels($chooser, $geo) {
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $client = Get-TestWindowRect -Window $chooser -Client
         # The dialog surface, sampled left of the name zone on the same line
@@ -233,7 +233,7 @@ try {
 
     Write-Host ''
     Write-Host '4. the cards and the header line are painted at their T602 positions'
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $distinct = Get-TestDistinctColors -Shot $shot
         Assert ($distinct -gt 3) "the capture is a real frame ($distinct colors)"

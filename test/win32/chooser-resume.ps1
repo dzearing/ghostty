@@ -274,7 +274,7 @@ try {
     $client = Get-TestWindowRect -Window $chooser -Client
 
     $plain = $null
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $distinct = Get-TestDistinctColors -Shot $shot
         Assert ($distinct -gt 3) "the capture is a real frame, not a black mid-paint one ($distinct colors)"
@@ -286,7 +286,7 @@ try {
     Start-Sleep -Milliseconds 600
 
     $cursored = $null
-    $shot = Get-TestWindowPixels -Window $chooser
+    $shot = Get-TestWindowPixels -Window $chooser -Sync
     try {
         $cursored = Get-TestPixel -Shot $shot -X ($client.Left + $geo.CardX) -Y ($client.Top + $geo.CardY)
     } finally { Close-TestWindowPixels -Shot $shot }

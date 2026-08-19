@@ -271,7 +271,7 @@ try {
     $scale = (Get-TestWindowDpi -Window $g.Chooser) / 96.0
     $geo = Get-TestChooserRosterGeometry -Scale $scale
     $client = Get-TestWindowRect -Window $g.Chooser -Client
-    $shot = Get-TestWindowPixels -Window $g.Chooser
+    $shot = Get-TestWindowPixels -Window $g.Chooser -Sync
     $meterRun = -1
     # Two thirds of the column: the pinned session's bar is full, and the slack
     # covers the capsule's rounded ends and one pixel of rounding at each edge.
@@ -312,7 +312,7 @@ try {
         $scale2 = (Get-TestWindowDpi -Window $g2.Chooser) / 96.0
         $geo2 = Get-TestChooserRosterGeometry -Scale $scale2
         $client2 = Get-TestWindowRect -Window $g2.Chooser -Client
-        $shot2 = Get-TestWindowPixels -Window $g2.Chooser
+        $shot2 = Get-TestWindowPixels -Window $g2.Chooser -Sync
         try {
             $distinct2 = Get-TestDistinctColors -Shot $shot2
             Assert ($distinct2 -gt 3) "F the control capture is a real frame ($distinct2 colors)"
