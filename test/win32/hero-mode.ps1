@@ -221,7 +221,7 @@ function Get-HeroHwnd([IntPtr]$top) {
 # the caller can score "the capture held real content" as its own assertion -
 # a flat fill must never satisfy a pixel oracle (T216).
 function Get-RegionSignature([IntPtr]$top, [int]$xMin) {
-    $shot = Get-TestWindowPixels -Window $top
+    $shot = Get-TestWindowPixels -Window $top -Sync
     try {
         $s = To-Screen $top $xMin 0
         $x0 = [int]($s[0] - $shot.Left)
@@ -260,7 +260,7 @@ function Get-ExpectedGrabPx([int]$dpi) {
 # probe. Returns $null when the capture held no real content, so an empty
 # capture reads as "this probe is meaningless" and never as "no divider".
 function Get-HeroDividerStrip([IntPtr]$top, $hero, [int]$grab, [int]$pad = 4) {
-    $shot = Get-TestWindowPixels -Window $top
+    $shot = Get-TestWindowPixels -Window $top -Sync
     try {
         if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
         $midY = [int](($hero.Top + $hero.Bottom) / 2)
@@ -300,7 +300,7 @@ function Get-ColorRun([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
 }
 
 function Save-WindowShot([IntPtr]$top, [string]$path) {
-    $shot = Get-TestWindowPixels -Window $top
+    $shot = Get-TestWindowPixels -Window $top -Sync
     try { $shot.Bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) }
     finally { Close-TestWindowPixels $shot }
 }

@@ -37,10 +37,12 @@
 #
 # T218: migrated onto the BACKGROUND test desktop (test/win32/lib/TestDesktop.ps1),
 # so it never takes the user's foreground - asserted here, not assumed. This
-# script was already captured with PrintWindow(PW_RENDERFULLCONTENT), which is
-# exactly the capture path that survives off the input desktop (the tab strip
-# is GDI-painted CHROME - the half of the CAPTURE LIMIT that migrates), so the
-# pixel oracle is unchanged. What did change:
+# script was already captured with PrintWindow, which is exactly the capture
+# path that survives off the input desktop (the tab strip is GDI-painted
+# CHROME - the half of the CAPTURE LIMIT that migrates), so the pixel oracle is
+# unchanged. T941 moved it to the SYNCHRONOUS form (-Sync): the window paints
+# the strip into the harness's DC before the call returns, instead of the
+# harness reading whatever DWM had composited by then. What T218 changed:
 #
 #   * Clicks are POSTED at the TOP-LEVEL window, which is what paints and
 #     hit-tests the strip. SetCursorPos + mouse_event is refused off the input
@@ -232,7 +234,7 @@ try {
     # client origin, i.e. exactly the pre-migration math.
     function Get-Shot {
         for ($t = 0; $t -lt 20; $t++) {
-            $s = Get-TestWindowPixels -Window $top
+            $s = Get-TestWindowPixels -Window $top -Sync
             if ((Get-TestDistinctColors -Shot $s) -ge 8) { return $s }
             Close-TestWindowPixels $s
             Start-Sleep -Milliseconds 150
@@ -834,7 +836,7 @@ try {
         # Rest readings first, with the pointer parked off both buttons.
         [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
         Start-Sleep -Milliseconds 250
-        $restShot  = Get-TestWindowPixels -Window $top
+        $restShot  = Get-TestWindowPixels -Window $top -Sync
         $restClose = Probe-Fill $restShot $cSqL $cCx $cSqT
         $restPlus  = Probe-Fill $restShot $pSqL $pCx $cSqT
         Close-TestWindowPixels $restShot

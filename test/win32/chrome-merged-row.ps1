@@ -331,11 +331,12 @@ try {
         # Ink = pixels in the band that differ from the strip background,
         # sampled inside the group gap the title deliberately leaves after
         # the "+" - never painted, pinned or not. -1 = the window never
-        # produced a real capture (PrintWindow returns a flat fill for a few
-        # frames on a fresh paint).
+        # produced a real capture. The capture is -Sync (T941), so the window
+        # draws the frame on demand; what the retry still covers is chrome
+        # that has not been built yet, not a frame that arrived half-composed.
         function Get-BandInk {
             for ($t = 0; $t -lt 20; $t++) {
-                $shot = Get-TestWindowPixels -Window $h
+                $shot = Get-TestWindowPixels -Window $h -Sync
                 $real = ((Get-TestDistinctColors -Shot $shot) -ge 8)
                 if ($real) {
                     $bg = $shot.Bitmap.GetPixel($m7.OffX + $tL - [int]($m7.PadMd / 2), $midY7)

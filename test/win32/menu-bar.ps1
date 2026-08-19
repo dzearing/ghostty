@@ -626,8 +626,10 @@ Assert ($tabsAfterPlus -eq $tabsBefore + 1) "A: the rect after the last tab is t
 # --- A(pixels): the glyph is painted --------------------------------------
 # Everything else here is hit-testing; this is the only assertion that the
 # button is VISIBLE. PrintWindow, not a screen grab: the strip is GDI-painted
-# chrome, so it survives a window capture on the background desktop.
-$shot = Get-TestWindowPixels -Window $g.Top
+# chrome, so it survives a window capture on the background desktop. -Sync so
+# the window paints that strip on demand instead of the harness reading a DWM
+# copy composed at some other moment (T941).
+$shot = Get-TestWindowPixels -Window $g.Top -Sync
 try {
     # A capture with nothing in it satisfies "no ink" for entirely the wrong
     # reason, so real content is a precondition, not an assumption (T216).

@@ -122,13 +122,15 @@ function Get-InkProfile {
     return $sb.ToString()
 }
 
-# A capture with real content in it. PrintWindow on a window that is mid-paint
-# comes back solid black, and solid black satisfies "no ink anywhere" - one
-# false PASS per frame if this is skipped (T216).
+# A capture with real content in it. A capture that came back empty satisfies
+# "no ink anywhere" for entirely the wrong reason - one false PASS per frame if
+# this is skipped (T216). The capture is -Sync (T941): the window paints the
+# frame into our DC before the call returns, so an empty one now means the
+# chrome is not there yet rather than that the photo was taken too early.
 function Get-PaintedShot {
     param([IntPtr]$Window)
     for ($t = 0; $t -lt 20; $t++) {
-        $s = Get-TestWindowPixels -Window $Window
+        $s = Get-TestWindowPixels -Window $Window -Sync
         if ((Get-TestDistinctColors -Shot $s) -ge 8) { return $s }
         Close-TestWindowPixels $s
         Start-Sleep -Milliseconds 150

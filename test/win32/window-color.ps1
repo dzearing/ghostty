@@ -148,7 +148,7 @@ function Measure-BannerBand([int]$procId, [IntPtr]$top, [string]$target) {
         if ($pane.Count -ge 1) { $overlay = Get-Overlay $procId $pane[0] }
     }
     if (-not $overlay) { return @{ Px = '(no overlay)'; Colors = 0 } }
-    $shot = Get-TestWindowPixels -Window ([IntPtr]$overlay.Hwnd)
+    $shot = Get-TestWindowPixels -Window ([IntPtr]$overlay.Hwnd) -Sync
     try {
         return @{
             Px = (Get-ShotPx $shot 2 2)

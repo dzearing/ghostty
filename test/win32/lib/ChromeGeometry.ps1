@@ -472,8 +472,10 @@ Returns an empty array when the strip has no tabs or the window never paints.
 Always index it as `@(...)` - a single-element result unrolls in PowerShell.
 
 Pass -Shot to reuse a capture you already have; otherwise one is taken (and
-disposed) here, retrying until the window paints real content - PrintWindow on
-a freshly shown window returns a flat fill for a few frames.
+disposed) here with -Sync, so the window paints the frame itself before the
+call returns (T941) rather than handing back whatever DWM had composited. The
+retry loop stays because a window can be up before its tabs are: it now covers
+content that is genuinely not there yet, not a capture that arrived early.
 #>
 function Get-TestTabExtents {
     param(
@@ -495,7 +497,7 @@ function Get-TestTabExtents {
     $owned = $false
     if (-not $shot) {
         for ($t = 0; $t -lt 20; $t++) {
-            $s = Get-TestWindowPixels -Window $Window -Desktop $Desktop
+            $s = Get-TestWindowPixels -Window $Window -Desktop $Desktop -Sync
             if ((Get-TestDistinctColors -Shot $s) -ge 8) { $shot = $s; $owned = $true; break }
             Close-TestWindowPixels $s
             Start-Sleep -Milliseconds 150

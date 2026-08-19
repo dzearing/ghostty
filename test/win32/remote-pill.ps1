@@ -158,7 +158,7 @@ try {
     Write-Host "  scale=$scale pillRight=$pillRight cy=$pillCy dotX=$dotCx fillX=$fillCx"
 
     function PillPixel([int]$sx) {
-        $shot = Get-TestWindowPixels -Window $remote
+        $shot = Get-TestWindowPixels -Window $remote -Sync
         try { return Get-TestPixel -Shot $shot -X $sx -Y $sy } finally { Close-TestWindowPixels $shot }
     }
 
@@ -240,7 +240,7 @@ try {
     $lwin = Get-TestWindowRect -Window $local
     $lcli = Get-TestWindowRect -Window $local -Client
     $lborder = [int](($lwin.Width - $lcli.Width) / 2)
-    $lshot = Get-TestWindowPixels -Window $local
+    $lshot = Get-TestWindowPixels -Window $local -Sync
     try {
         $bare = Get-TestPixel -Shot $lshot -X ($lwin.Left + $lborder + $pillRight - (& $px 40.0)) -Y ($lwin.Top + 2)
         $clean = $true

@@ -107,7 +107,7 @@ try {
 
     # At rest the slab is bare band - the control that says the fill below is
     # the lit state and not something painted there all along.
-    $restShot = Get-TestWindowPixels -Window $h
+    $restShot = Get-TestWindowPixels -Window $h -Sync
     if ((Get-TestDistinctColors $restShot) -lt 3) { throw 'SETUP FAIL: captured a mid-paint frame' }
     $rest = Get-TestPixel -Shot $restShot -X ($win.Left + $borderX + $closeL + 3) -Y $cy
     Close-TestWindowPixels $restShot
@@ -117,7 +117,7 @@ try {
     Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONDOWN `
         -WParam ([IntPtr]$HTCLOSE) -LParam (PackPoint 0 0) | Out-Null
     Start-Sleep -Milliseconds 500
-    $shot = Get-TestWindowPixels -Window $h
+    $shot = Get-TestWindowPixels -Window $h -Sync
 
     # The fill, sampled at the slab's left edge where no glyph reaches.
     $fill = Get-TestPixel -Shot $shot -X ($win.Left + $borderX + $closeL + 3) -Y $cy

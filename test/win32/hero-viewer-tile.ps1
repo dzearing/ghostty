@@ -28,9 +28,10 @@
 #
 # Oracles are PrintWindow reads of the TOP window, which is the one capture
 # route that works for the carousel: it has no child HWNDs of its own and
-# `HeroCarousel.paint` draws into the parent's DC inside BeginPaint/EndPaint,
-# so it reaches the backing store PrintWindow reads (hero-mode.ps1's header
-# has the full argument). Tile rects are computed here as a mirror of
+# `HeroCarousel.paint` draws into whatever DC the window is handed, so it is
+# reached by the capture (hero-mode.ps1's header has the full argument). Since
+# T941 that is the SYNCHRONOUS capture: the window repaints the carousel into
+# the harness's DC on demand, rather than the harness reading a DWM copy. Tile rects are computed here as a mirror of
 # hero_math.zig, the same way hero-mode.ps1's click step does.
 #
 # -NegativeControl inverts claim A to "the viewer tile is bare band backdrop",
@@ -278,7 +279,7 @@ try {
 
     # --- Claim A: every tile is painted -------------------------------------
     $tiles = Get-TileRects $hero $client -1 1
-    $shot = Get-TestWindowPixels -Window $top
+    $shot = Get-TestWindowPixels -Window $top -Sync
     try {
         $mSel = Measure-Tile $shot $top $tiles[0]
         $mUp = Measure-Tile $shot $top $tiles[-1]

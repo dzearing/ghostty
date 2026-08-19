@@ -23,8 +23,9 @@
 # so it never takes the user's foreground - asserted here, not assumed. Three
 # mechanism swaps, all forced by the desktop:
 #
-#   * The signature is read from PrintWindow(PW_RENDERFULLCONTENT) instead of a
-#     screen-DC GetPixel sweep. The tab bar is GDI-painted CHROME, which is the
+#   * The signature is read from a PrintWindow capture instead of a screen-DC
+#     GetPixel sweep (the SYNCHRONOUS one since T941, so the window draws the
+#     frame itself). The tab bar is GDI-painted CHROME, which is the
 #     half of the CAPTURE LIMIT that survives on a background desktop (the
 #     OpenGL terminal surface is the half that does not) - so this probe
 #     migrates as-is, and Get-TestDistinctColors guards every signature against
@@ -115,10 +116,11 @@ function Get-ColSig($shot, [int]$x0, [int]$x1, [int]$y0, [int]$y1, [int]$step) {
 # 1 tab: tabW = clamp(clientW-..., 60s, 200s) = 200s on any normal window.
 # barH is 40 DIP since T232 (4 + 4 + 28 + 4), and the strip's text pad is 8.
 #
-# The capture is retried until it holds real content: PrintWindow taken while
-# the window is still painting returns a flat fill, and a flat fill scores a
+# The capture is retried until it holds real content: an empty capture scores a
 # perfectly stable all-zero signature that would make every "same raster"
-# assertion pass for the wrong reason (the T216 lesson).
+# assertion pass for the wrong reason (the T216 lesson). Under -Sync (T941) the
+# window paints on demand, so what the retry covers is a window whose chrome is
+# not built yet rather than a frame photographed mid-paint.
 function Get-Signature($g) {
     $scale = $g.BarH / 40.0
     $tabW = [math]::Round(200 * $scale)
@@ -128,7 +130,7 @@ function Get-Signature($g) {
     $y0 = $g.ClientTop + 4
     $y1 = $g.ClientTop + $g.BarH - 5                   # skip accent-stripe rows
     for ($t = 0; $t -lt 20; $t++) {
-        $shot = Get-TestWindowPixels -Window $g.Top
+        $shot = Get-TestWindowPixels -Window $g.Top -Sync
         try {
             if ((Get-TestDistinctColors -Shot $shot) -ge 8) {
                 return (Get-ColSig $shot ([int]$x0) ([int]$x1) ([int]$y0) ([int]$y1) 2)

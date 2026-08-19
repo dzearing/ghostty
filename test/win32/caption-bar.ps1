@@ -221,7 +221,7 @@ try {
     $expectCapH = $m.CaptionH
     Write-Host "  dpi=$dpi scale=$scale window=$($win.Width)x$($win.Height) client=$($cli.Width)x$($cli.Height) borderX=$borderX expectCapH=$expectCapH"
 
-    $shot = Get-TestWindowPixels -Window $h
+    $shot = Get-TestWindowPixels -Window $h -Sync
     $distinct = Get-TestDistinctColors $shot
     if ($distinct -lt 3) { throw "SETUP FAIL: captured a mid-paint frame (distinct=$distinct)" }
 
@@ -355,7 +355,7 @@ try {
     # instead would read the mark and fail against a build that is behaving
     # correctly.
     function FillShade($h, $win, $borderX, $left, $w, $padSm) {
-        $shot2 = Get-TestWindowPixels -Window $h
+        $shot2 = Get-TestWindowPixels -Window $h -Sync
         $x = $win.Left + $borderX + $left + [int]($w / 2)
         $y = $win.Top + $padSm + 4
         $c = Get-TestPixel -Shot $shot2 -X $x -Y $y
@@ -464,10 +464,12 @@ try {
         $work = Get-TestWorkArea
         Check ($mcli.Top -ge $work.Top) `
             "maximized: the caption row is on screen (client top $($mcli.Top) vs work top $($work.Top))"
-        # Scan from the CLIENT top, not the window top: the rows above it
-        # are the off-screen frame, which PrintWindow renders black, and
-        # counting them measured the frame instead of the band.
-        $mshot = Get-TestWindowPixels -Window $h
+        # Scan from the CLIENT top, not the window top: the rows above it are
+        # the off-screen frame, which the capture renders in neither the band's
+        # color nor the content's, and counting them measured the frame instead
+        # of the band. (Under -Sync those rows carry the real border color
+        # rather than black - one more reason not to start the scan in them.)
+        $mshot = Get-TestWindowPixels -Window $h -Sync
         $mProbe = $mw.Left + [int]($mw.Width / 2)
         $mChrome = Get-TestPixel -Shot $mshot -X $mProbe -Y ($mcli.Top + 2)
         $mEdge = -1

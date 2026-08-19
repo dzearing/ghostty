@@ -375,7 +375,7 @@ try {
             $m = Get-TestChromeMetrics -Window $g.Top -StripVisible $false
             Assert ($m.CaptionH -gt 0) "A/$($case.Name) the window paints its own caption band"
 
-            $shot = Get-TestWindowPixels -Window $g.Top
+            $shot = Get-TestWindowPixels -Window $g.Top -Sync
             try {
                 # Client-relative band, in the screen coordinates Get-TestPixel
                 # takes. Inset by 1 so a client edge cannot contribute.
@@ -496,7 +496,7 @@ try {
     Assert ($panel -ne [IntPtr]::Zero) 'B the Activity Monitor opened'
     if ($panel -eq [IntPtr]::Zero) { Write-Host 'ABORT: no panel to score'; exit 1 }
 
-    $shot = Get-TestWindowPixels -Window $panel
+    $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
         Assert ((Get-TestDistinctColors -Shot $shot) -ge 8) "B the panel capture holds real content ($(Get-TestDistinctColors -Shot $shot) distinct colors)"
         Assert (Test-ShotHasColor $shot $ACCENT_A) "B1 the panel paints the system accent $(Format-Rgb $ACCENT_A)"
@@ -512,7 +512,7 @@ try {
     $panel = Open-Panel $g.Top $g.Pane
     Assert ($panel -ne [IntPtr]::Zero) 'B2 the panel reopened'
     if ($panel -eq [IntPtr]::Zero) { Write-Host 'ABORT: no panel to score'; exit 1 }
-    $shot = Get-TestWindowPixels -Window $panel
+    $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
         Assert (Test-ShotHasColor $shot $ACCENT_A) 'B2 with no notification the cached accent still paints'
         Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) 'B2 the un-notified registry change did NOT leak through'
@@ -528,7 +528,7 @@ try {
     $panel = Open-Panel $g.Top $g.Pane
     Assert ($panel -ne [IntPtr]::Zero) 'B3 the panel reopened'
     if ($panel -eq [IntPtr]::Zero) { Write-Host 'ABORT: no panel to score'; exit 1 }
-    $shot = Get-TestWindowPixels -Window $panel
+    $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
         Assert (Test-ShotHasColor $shot $ACCENT_B) "B3 after the accent-change message the panel paints $(Format-Rgb $ACCENT_B)"
         Assert (-not (Test-ShotHasColor $shot $ACCENT_A)) 'B3 and the old accent is gone - the pixel MOVED'
@@ -549,7 +549,7 @@ try {
         Send-TestRawMessage -Window $h -Message $WM_DWMCOLORIZATIONCOLORCHANGED -WParam 0 -LParam 0 | Out-Null
     }
     Start-Sleep -Milliseconds 900
-    $shot = Get-TestWindowPixels -Window $panel
+    $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
         Assert (Test-ShotHasColor $shot $ACCENT_A) "B4 the OPEN panel repaints to $(Format-Rgb $ACCENT_A) without being reopened"
         Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) 'B4 and the accent it opened with is gone - it repainted, it did not just gain a pixel'
@@ -601,7 +601,7 @@ try {
                 Assert ($h -ne [IntPtr]::Zero) "D/$($case.Name)/$($panel.Label) the panel opened"
                 if ($h -eq [IntPtr]::Zero) { continue }
 
-                $shot = Get-TestWindowPixels -Window $h
+                $shot = Get-TestWindowPixels -Window $h -Sync
                 try {
                     # The panel BODY: below the caption the frame draws (which
                     # is DWM's, not ours) and inside the border, so neither can

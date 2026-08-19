@@ -178,7 +178,7 @@ function Get-TestStrips {
         # across two calls out here. Not disposed: the caller owns it.
         $Shot
     )
-    $shot = if ($Shot) { $Shot } else { Get-TestWindowPixels -Window $Window }
+    $shot = if ($Shot) { $Shot } else { Get-TestWindowPixels -Window $Window -Sync }
     try {
         if ((Get-TestDistinctColors -Shot $shot) -lt 8) { return $null }
         $strips = New-Object System.Collections.Generic.List[object]
