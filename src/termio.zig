@@ -42,4 +42,5 @@ test {
     _ = @import("termio/open_failed_notice.zig");
     _ = @import("termio/attach_failed_notice.zig");
     _ = @import("termio/history_guard.zig");
+    _ = @import("termio/restore_history.zig");
 }

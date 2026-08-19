@@ -26,7 +26,9 @@
 #      naming ITS OWN command and not the other's, and each pane accepts input
 #      on a live shell. Since T423 it also proves the notice is in the pane's
 #      own SCROLLBACK, above the shell's output - not only in the banner
-#      overlay, which is all that used to survive.
+#      overlay, which is all that used to survive. Since T922/D78 it also proves
+#      the pane comes back showing WHAT THE DEAD SESSION LEFT ON SCREEN, above
+#      that notice, instead of an empty prompt.
 #   B: negative control / opt-in - `--session-relaunch=rerun` still respawns the
 #      recorded command. Without this, A would also pass against a build that
 #      simply broke restore.
@@ -90,6 +92,11 @@ $CMD_F = "ping -n $MARK_F 127.0.0.1"
 # T422: per-pane banners and a window title pin for arm E. Distinguishable from
 # each other so "each pane kept ITS OWN banner" is a real claim rather than "some
 # banner survived", and space-free so `Run-CliArgs` cannot re-tokenize them.
+# T922: what the plain pane prints before the kill, so the restore arm can ask
+# whether the dead session's last screen came back. Space-free (`Run-CliArgs`
+# joins with spaces and quotes nothing) and carrying this run's unique number,
+# so a leftover pane from an earlier run cannot satisfy the assertion.
+$HIST_MARK = "T922hist$MARK_A"
 $BAN_A = "T422banA$MARK_A"
 $BAN_B = "T422banB$MARK_B"
 $WIN_TITLE = "T422title$MARK_A"
@@ -102,6 +109,31 @@ function Stop-TestProcs {
     }
     Stop-MarkerPings
     Start-Sleep -Milliseconds 700
+}
+# THE reboot shape, and since T909 it is no longer "kill the agent".
+#
+# A persistent session's ConPTY now lives in its own holder process
+# (`ghoztty-agent --pty-host --spec ...`, src\remote\agent\pty_holder_child.zig)
+# precisely SO THAT it outlives the session manager: an agent that crashes or is
+# upgraded comes back and ADOPTS its holders, and the panes re-attach to sessions
+# that never died. That is the point of T909/T911 and it is right - but it means
+# killing the agent pid alone no longer produces the dead-but-relaunchable
+# tombstones this whole script is about. Measured on 2026-08-18: every notice arm
+# scored FAIL against a correct build, because the restored panes had re-attached
+# to LIVE sessions and there was nothing to notify about.
+#
+# A reboot takes the holders too, so this takes the holders too: every
+# ghoztty-agent process launched from the repo zig-out, the manager and its
+# holders alike. The `zig-out` filter is what keeps the user's installed agent -
+# which owns their real sessions - out of it.
+function Stop-AgentAndHolders($agentPid) {
+    if ($agentPid) { Stop-Process -Id $agentPid -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.CommandLine -like '*zig-out*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 900
+    return @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.CommandLine -like '*zig-out*' }).Count
 }
 function Stop-AppOnly {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
@@ -264,13 +296,25 @@ function Start-App($title, $extraArgs = @()) {
     return [int]$app.Pid
 }
 
-# Build the 2-pane layout, then take the app AND the agent down so the next
-# launch finds dead-but-relaunchable tombstones - exactly the reboot / agent-
-# upgrade shape.
+# Build the 2-pane layout, then take the app AND every session owner down so the
+# next launch finds dead-but-relaunchable tombstones - the REBOOT shape.
+#
+# Since T909 that is no longer the same thing as the agent-upgrade shape: a
+# holder-backed session survives its manager on purpose, so an upgrade now ends
+# with the panes re-attached and alive, and nothing to notify about. See
+# Stop-AgentAndHolders.
 function Build-AndKill($cwdA, $withBanners = $false) {
     $appPid = Start-App 'build' @("--working-directory=$cwdA")
     Assert "setup: the GUI came up" ($appPid -ne 0)
-    Wait-Leaves 'b0' 1 | Out-Null
+    # T922: the plain shell pane is the one the history arm scores, and this is
+    # the only moment its id is unambiguous - it is the sole leaf, before the
+    # commanded window and its split exist. Remembered rather than re-derived,
+    # because after the restore there is nothing in `+list` that says which leaf
+    # used to be the plain one.
+    $script:plainPane = ''
+    $tree0 = Wait-Leaves 'b0' 1
+    $leaves0 = All-Leaves $tree0
+    if ($leaves0.Count -ge 1) { $script:plainPane = [string]$leaves0[0].id }
     # The `--command=` value MUST carry its own quotes: `Start-Process
     # -ArgumentList` joins the array with spaces and quotes NOTHING, so a bare
     # `--command=ping -n 9717 127.0.0.1` is re-tokenized into four positional
@@ -307,9 +351,24 @@ function Build-AndKill($cwdA, $withBanners = $false) {
         Start-Sleep -Seconds 1
     }
 
+    # T922/D78: leave something on the plain pane's screen that only THAT
+    # session could have produced, so the restore arm can ask whether the dead
+    # session's screen came back. `echo <token>`, waited for TWICE - the echoed
+    # input line and the command's output - because one hit is keystrokes in a
+    # line editor and would not prove the shell ever painted the token. It has
+    # to land BEFORE the manifest debounce below: the snapshot the restore
+    # paints is whatever the app had captured when the layout was last written.
+    if ($script:plainPane -ne '') {
+        Run-CliArgs @('+send-keys', "--target=$($script:plainPane)", 'echo', 'Space', $HIST_MARK, 'Enter') "$tmp\hist.txt" 15 | Out-Null
+        Assert "setup: the plain pane printed the history marker before the kill" `
+            (Wait-PaneTextTight $script:plainPane 'hist' $HIST_MARK 2 25)
+    }
+
     Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
     Stop-AppOnly
-    Stop-Process -Id $agent -Force -ErrorAction SilentlyContinue
+    $ownersLeft = Stop-AgentAndHolders $agent
+    Assert "setup: no session manager or PTY holder survived the reboot shape ($ownersLeft)" `
+        ($ownersLeft -eq 0)
     Start-Sleep -Seconds 2
     # Killing the agent SHOULD take its ConPTY children with it. Sweep anyway:
     # a survivor would silently satisfy (or spoil) the "did it run again?" oracle
@@ -434,6 +493,42 @@ Assert "A12 every pane showing the notice shows it ABOVE the shell content ($tex
     ($textNotice -ge 2 -and $textAbove -eq $textNotice)
 Assert "A13 the commanded panes name their previous command in the TEXT ($textCmd)" `
     ($textCmd -ge 2)
+
+# T922/D78: the pane must also bring back WHAT THE DEAD SESSION LEFT ON SCREEN.
+#
+# Until D78 a restored pane came up holding only the notice and an empty prompt:
+# the app's own persisted screen snapshot was deliberately not painted on this
+# path, because the pane is running a brand-new session that shares no byte
+# stream with it. The user settled that against the Mac's behavior - "you can
+# read the error, the build output or the last thing your agent said before the
+# reboot took it" - so the old screen is now painted as HISTORY, above the
+# notice, and the notice's fold carries the pair into the scrollback.
+#
+# Scored on the marker `Build-AndKill` printed in the plain pane before the kill,
+# which no fresh shell can produce. Offsets into the whitespace-stripped dump,
+# for the same wrap-proofing Get-NoticePlacement documents: these panes are
+# narrow enough that a line-index comparison would score a real pass FAIL.
+$histPanes = 0; $histAbove = 0; $histBelowShell = 0
+foreach ($leaf in $leavesA) {
+    $short = $leaf.id.Substring(0, 4)
+    $tight = (Read-Pane $leaf.id "ahist$short" 400) -replace '\s', ''
+    $iHist = $tight.IndexOf($HIST_MARK, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($iHist -lt 0) { continue }
+    $histPanes++
+    $iNotice = $tight.IndexOf('sessioninterrupted', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($iNotice -ge 0 -and $iHist -lt $iNotice) { $histAbove++ }
+    # The restored screen must be HISTORY, not the live frame: everything the
+    # dead session left has to sit above the fresh shell's first prompt, or it
+    # is sharing the active screen with a shell that will erase it.
+    $iShell = $tight.IndexOf('>')
+    if ($iShell -ge 0 -and $iHist -lt $iShell) { $histBelowShell++ }
+}
+Assert "A15 a restored pane brings back what the dead session left on screen ($histPanes)" `
+    ($histPanes -ge 1)
+Assert "A16 the restored screen sits ABOVE the interrupted notice ($histAbove/$histPanes)" `
+    ($histPanes -ge 1 -and $histAbove -eq $histPanes)
+Assert "A17 the restored screen is scrollback, above the fresh shell's prompt ($histBelowShell/$histPanes)" `
+    ($histPanes -ge 1 -and $histBelowShell -eq $histPanes)
 if ($DumpPanesTo -ne '') {
     New-Item -ItemType Directory -Force $DumpPanesTo | Out-Null
     foreach ($leaf in $leavesA) {
@@ -562,7 +657,7 @@ $agentD = Wait-AgentPid $tmp 25
 Assert "D6 an agent is running for this run" ($agentD -ne 0)
 Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
 Stop-AppOnly
-Stop-Process -Id $agentD -Force -ErrorAction SilentlyContinue
+Stop-AgentAndHolders $agentD | Out-Null
 Start-Sleep -Seconds 2
 
 $appPidD2 = Start-App 'cwdrestore'
@@ -707,7 +802,7 @@ $agentF = Wait-AgentPid $tmp 25
 Assert "F6 an agent is running for this run" ($agentF -ne 0)
 Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
 Stop-AppOnly
-Stop-Process -Id $agentF -Force -ErrorAction SilentlyContinue
+Stop-AgentAndHolders $agentF | Out-Null
 Start-Sleep -Seconds 2
 Stop-MarkerPings
 Start-Sleep -Milliseconds 800

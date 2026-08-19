@@ -50,6 +50,7 @@ const session_notice = @import("session_notice.zig");
 const open_failed_notice = @import("open_failed_notice.zig");
 const attach_failed_notice = @import("attach_failed_notice.zig");
 const restore_park = @import("restore_park.zig");
+const restore_history = @import("restore_history.zig");
 
 const log = std.log.scoped(.io_remote);
 
@@ -421,9 +422,13 @@ pub const RelaunchPolicy = enum {
     /// visible-but-racy rather than absent.
     ///
     /// Empty for `restore` by construction: it never reaches a `RELAUNCH` (it
-    /// opens a fresh session instead), so it replays nothing and has nothing to
-    /// undo, and its own notice is `session_notice`, held above the viewport by
-    /// `Termio.holdNoticeAboveLocked` rather than carried on the wire.
+    /// opens a fresh session instead), so there is no agent-side stream to splice
+    /// anything into, and its own notice is `session_notice`, held above the
+    /// viewport by `Termio.holdNoticeAboveLocked` rather than carried on the
+    /// wire. It does still emit `replay_mode_reset` — directly, in
+    /// `threadEnter` — behind the restored screen it paints for itself (T922);
+    /// there the mode hazard arrives from OUR snapshot rather than from the
+    /// agent's replay, so there is nobody else to order it.
     pub fn streamNotice(self: RelaunchPolicy) []const u8 {
         return switch (self) {
             .rerun, .prompt => replay_mode_reset,
@@ -443,11 +448,14 @@ pub const RelaunchPolicy = enum {
 /// autowrap / stuck SGR make the pane look broken. The respawned program
 /// re-enables whatever it needs, so resetting is safe.
 ///
-/// Only the two RESPAWNING-with-replay policies use it: `rerun` and the
-/// keystroke-deferred `prompt`. `restore` (the default) opens a BRAND-NEW session
-/// and replays nothing (T230), and the ordinary alive re-attach must be left
-/// alone — there the child is still running and still OWNS these modes, so a
-/// live TUI that enabled mouse tracking would stop receiving events.
+/// Used by every path that puts a DEAD program's screen back in front of a pane
+/// whose program is gone: the two respawning-with-replay policies (`rerun` and
+/// the keystroke-deferred `prompt`, which get it spliced into the agent's replay
+/// stream) and, since T922, `restore` — which respawns nothing but paints the
+/// app's own persisted snapshot of the dead screen, and so re-arms the same
+/// modes by a different carrier. The ordinary alive re-attach must be left alone
+/// — there the child is still running and still OWNS these modes, so a live TUI
+/// that enabled mouse tracking would stop receiving events.
 ///
 /// Scoped to MODE state on purpose. `RIS` (`\x1bc`) would throw away the very
 /// scrollback the replay exists to restore. Three tempting extras are also
@@ -1187,6 +1195,53 @@ pub fn threadEnter(
     // when there was NO snapshot (blank relaunch) do we print the divider ourselves,
     // so the restart is visible rather than looking like a spontaneous new prompt.
     if (did_notify) {
+        // T922/D78: FIRST, bring back what the dead session left on screen.
+        //
+        // The pane is on a brand-new session that shares no byte stream with the
+        // snapshot — which is why this used to be skipped — but the user settled
+        // what a reboot should feel like in favour of the Mac's answer: "you can
+        // read the error, the build output or the last thing your agent said
+        // before the reboot took it". The old screen is HISTORY here, not a live
+        // frame: it is painted above the notice, and the notice's own fold
+        // carries the pair into the scrollback below.
+        //
+        // Ordering matters and is the whole trick. The notice fold
+        // (`session_notice.foldIntoScrollback`, armed below and fired on the last
+        // tick before the child's first byte) scrolls by `cursor.y` — everything
+        // above the cursor — so painting the restored screen first makes that one
+        // move carry the history too, landing it directly above the notice with
+        // no blank gap and nothing left on the active screen for the fresh
+        // shell's `ESC[H ESC[2J` to erase. That is why this path needs no
+        // `restore_park`-style park of its own (T666), and no `park_target`:
+        // there is no agent repaint to wait for, because there is no gap-fill —
+        // the new session's stream starts at 0.
+        if (restore_history.historyToPaint(self.restore_snapshot, self.attach_offset)) |snap| {
+            @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+
+            // The snapshot restores MODES as well as rows (the formatter emits
+            // every differing mode), and the program that armed them is gone —
+            // the same hazard T824 named on the relaunch path, arriving by a
+            // different carrier. Left set, mouse tracking turns every pointer
+            // move into typed input at the fresh prompt, and a snapshot taken
+            // inside a TUI would leave the new shell running on the alternate
+            // screen with no scrollback to scroll. Read the screen back rather
+            // than assuming: the alt-screen exit must not fire on a pane that is
+            // already on the primary, where it would erase the restored rows.
+            const on_alt = alt: {
+                io.renderer_state.mutex.lock();
+                defer io.renderer_state.mutex.unlock();
+                break :alt io.terminal.screens.active_key == .alternate;
+            };
+            if (on_alt) @call(.always_inline, termio.Termio.processOutput, .{
+                io, restore_history.alt_screen_exit,
+            });
+            @call(.always_inline, termio.Termio.processOutput, .{ io, replay_mode_reset });
+            log.info("restore policy: restored {d} bytes of the dead session's screen (alt={})", .{
+                snap.len,
+                on_alt,
+            });
+        }
+
         // T230: this pane's session is gone and we deliberately did not put its
         // command back on a CPU. Say so, name what it was, and leave the user on
         // the fresh prompt below to decide.
@@ -1293,11 +1348,12 @@ pub fn threadEnter(
     // scrollback), NOT the agent's raw in-place-redraw ring, so it reflows to
     // the live width without smearing and parses in well under a frame.
     //
-    // `did_notify` (T230) is excluded for the same reason as a relaunch: the
-    // pane is running a BRAND-NEW session that shares no byte stream with the
-    // snapshot, so painting the old screen under it would be a lie about what
-    // the pane is, and the offset bookkeeping the gap-fill depends on does not
-    // apply.
+    // `did_notify` (T230) is excluded because it has ALREADY painted the
+    // snapshot, up where the notice is written (T922): the pane is running a
+    // BRAND-NEW session that shares no byte stream with it, so the old screen
+    // goes in as history above the notice rather than as a frame this replay
+    // continues — and none of the offset bookkeeping below applies to it, since
+    // there is no gap-fill to meet.
     if (!did_relaunch and !did_notify and !self.awaiting_relaunch and self.attach_offset > 0) {
         if (self.restore_snapshot) |snap| {
             if (snap.len > 0) {
@@ -1367,9 +1423,12 @@ pub fn threadEnter(
     // already re-enabled mouse tracking can have it switched back off here.
     //
     // Deliberately NOT done on the ordinary alive re-attach path, nor on the
-    // `restore` policy. There the child is still running and still OWNS these
-    // modes — a live TUI that enabled mouse tracking would stop receiving events
-    // the moment we reset it — and `restore` replays nothing at all.
+    // `restore` policy. On the live re-attach the child is still running and
+    // still OWNS these modes — a live TUI that enabled mouse tracking would stop
+    // receiving events the moment we reset it. `restore` is excluded for the
+    // opposite reason: since T922 it does paint a dead screen, so it does have
+    // modes to undo, but it emits the same reset ITSELF at the point it paints,
+    // with no respawned child to race.
     if (did_relaunch and relaunch_replayed and !agent_owns_notice) {
         const reset = self.relaunch_policy.streamNotice();
         if (reset.len > 0) {

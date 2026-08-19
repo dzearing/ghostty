@@ -99,10 +99,16 @@ pub fn format(buf: []u8, command: ?[]const u8) []const u8 {
 /// coordinate frame down and get painted over anyway. Above the viewport is the
 /// one region conhost never addresses, and `ESC[2J` does not reach it.
 ///
-/// `cursor.y` is the exact row count the notice occupied, wrapping included —
-/// the notice ends every line with CRLF, so the cursor sits on the first row
-/// below it. Scrolling by that much puts the notice directly above the shell's
-/// first line with no blank filler between them.
+/// `cursor.y` is the exact row count of everything written since the pane came
+/// up, wrapping included — the notice ends every line with CRLF, so the cursor
+/// sits on the first row below it. Scrolling by that much puts the notice
+/// directly above the shell's first line with no blank filler between them.
+///
+/// T922: "everything written" is now the notice AND, above it, the restored
+/// screen of the session that was lost (`termio.Remote` paints its persisted
+/// snapshot first). One fold carries both, which is why that paint needs no park
+/// of its own — and why this must keep measuring the cursor rather than the
+/// notice's own known height.
 ///
 /// Re-homing afterwards is not cosmetic. Conhost believes the cursor is at
 /// (1,1) when the child starts; a shell flavor that does NOT open with a
