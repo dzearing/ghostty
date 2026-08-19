@@ -569,6 +569,25 @@ fn durableAckFromEnv(alloc: Allocator) bool {
         std.ascii.eqlIgnoreCase(t, "no"));
 }
 
+/// The T969 volume trigger: how many un-snapshotted bytes make a ring snapshot
+/// due before the reaper's 30-second timer says so. Defaults to
+/// `session.default_snapshot_volume_bytes` (half the holder's replay capacity).
+///
+/// `GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES=0` turns the trigger off — the escape
+/// hatch if the extra writes ever misbehave on a box, and what makes the
+/// acceptance harness's negative control a real measurement (the same build, on
+/// the same box, losing the marker) rather than an inverted assertion. Anything
+/// unparseable is ignored in favour of the default: a typo in an env var must
+/// not silently disable crash recovery.
+fn snapshotVolumeBytesFromEnv(alloc: Allocator) u64 {
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES") catch
+        return session.default_snapshot_volume_bytes;
+    defer alloc.free(v);
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return session.default_snapshot_volume_bytes;
+    return std.fmt.parseInt(u64, t, 10) catch session.default_snapshot_volume_bytes;
+}
+
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
     const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_ENCODING") catch return .raw;
     defer alloc.free(v);
@@ -1371,6 +1390,9 @@ fn runListen(
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
     store.durable_ack = durableAckFromEnv(alloc);
+    // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
+    // faster than the holder retains still has a recoverable window.
+    store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): opaque per-window layout blobs live
     // in a `layouts.json` beside the sessions file. Borrowed; freed after
     // `store.deinit` (LIFO defers).
@@ -1558,6 +1580,9 @@ fn runListenUnix(
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
     store.durable_ack = durableAckFromEnv(alloc);
+    // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
+    // faster than the holder retains still has a recoverable window.
+    store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);
@@ -1667,6 +1692,9 @@ fn runListenPipe(
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
     store.durable_ack = durableAckFromEnv(alloc);
+    // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
+    // faster than the holder retains still has a recoverable window.
+    store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);

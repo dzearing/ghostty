@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T12:57:47-07:00",
-    "commit":  "a40f44bdc",
+    "generated":  "2026-08-19T14:58:19-07:00",
+    "commit":  "e6a64b58d",
     "files":  {
                   "docs/claude/testing.md":  "637306a00851c42dc1dfbb084bec74c8f38e622268c4fdcdcf5e193d710a6edb",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -94,6 +94,7 @@
                   "test/win32/holder-adopt.ps1":  "e32c7c783e50f0337681e79d2a8e4405228ffa761f3807d509393c91e815e6eb",
                   "test/win32/holder-durable.ps1":  "a5b9b6f20cbad68b7f0649d1de2d96937ca71ec644ae859ecde344139632514e",
                   "test/win32/holder-soak.ps1":  "f66cbea6643e142dc656a7d939e021b00c66e5f1aff1f0e4371c45ab95368663",
+                  "test/win32/holder-volume.ps1":  "3e397cde297c6fdbef8ffb213fc0220aceccfb8b5db0c653b73979e3a3b437a6",
                   "test/win32/hook-json.ps1":  "6f3d34e42b558c451423b561d9714e2ce3bee15be9cde00f3a0ce8e80be79716",
                   "test/win32/host-settings.ps1":  "485d1ea5811a561947af45826714bbbdc55027eaa428a9fd07f727c648042895",
                   "test/win32/hover-capture.ps1":  "ca5ba4250380227c23e581282d5b5bfafe20ea1abef3da4edfefa4eb04b74851",

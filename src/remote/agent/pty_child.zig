@@ -870,6 +870,12 @@ pub const PtySpawner = struct {
         const spawned = try pty_holder_child.open(self.alloc, .{
             .session_id = &id_buf,
             .open = open,
+            // Same env-read shape as the holder on/off switch above, and read
+            // here rather than cached so a holder spawned after the variable
+            // changed uses the value the agent actually has (T969).
+            .replay_bytes = pty_holder_child.replayBytesFor(
+                self.env.get(pty_holder_child.replay_env_var),
+            ),
         });
         return .{
             .child = spawned.child,

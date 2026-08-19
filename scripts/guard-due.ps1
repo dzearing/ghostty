@@ -215,6 +215,22 @@ $GuardTable = @(
             'src\remote\agent\ring_snapshot.zig'
         )
     },
+    # Holder VOLUME (T969): the sibling of the row above, for the other half of
+    # the recoverable window. Durability answers "is anything still holding it";
+    # this answers "was it written down before the holder had to drop it". The
+    # failure it guards is a busy pane silently getting a smaller crash-recovery
+    # guarantee than a quiet one, which no per-pane test can see - the pane is
+    # correct either way, and only the file on disk is short.
+    [pscustomobject]@{
+        Name   = 'holder-volume'
+        Script = 'test\win32\holder-volume.ps1'
+        Stamp  = 'test\win32\holder-volume.stamp.json'
+        Covers = @(
+            'test\win32\holder-volume.ps1',
+            'src\remote\agent\session.zig',
+            'src\remote\agent\pty_holder_child.zig'
+        )
+    },
     # Holders AT SCALE (T909): once holder-backed spawning became the default,
     # the per-session process stopped being a cost an opt-in user chose and
     # became one every box pays. This is the only harness that runs a realistic

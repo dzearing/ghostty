@@ -60,8 +60,11 @@ pub const Options = struct {
     session_id: []const u8,
     /// The OPEN this session is being created from, forwarded verbatim.
     open: protocol.Open,
-    /// Bounded un-acked output ring inside the holder.
-    replay_bytes: usize = 1024 * 1024,
+    /// Bounded un-acked output ring inside the holder. The default lives in
+    /// `session.zig` because the store's volume-snapshot threshold (T969) is
+    /// derived from it — half of it — and a capacity that moved without the
+    /// threshold moving would shrink the crash-recoverable window silently.
+    replay_bytes: usize = session.default_holder_replay_bytes,
     /// How long an ownerless holder outlives its exited shell.
     exit_linger_ms: i64 = 10 * 60 * 1000,
     /// How long `open` waits for the freshly spawned holder to bind its pipe.
@@ -120,6 +123,34 @@ pub fn enabledFor(value: ?[]const u8) bool {
         std.ascii.eqlIgnoreCase(t, "false") or
         std.ascii.eqlIgnoreCase(t, "off") or
         std.ascii.eqlIgnoreCase(t, "no"));
+}
+
+pub const replay_env_var = "GHOZTTY_AGENT_HOLDER_REPLAY_BYTES";
+
+/// How big a new holder's un-acked replay ring should be, given the value of
+/// `replay_env_var` (null when unset). Defaults to
+/// `session.default_holder_replay_bytes`.
+///
+/// It exists for the same two reasons the other agent knobs do: an escape hatch
+/// if a box wants to spend more (or less) memory per holder on how much a crash
+/// can hand back, and a dial the acceptance harness can turn DOWN so it can
+/// overrun a holder's ring in a fraction of a second instead of printing a
+/// megabyte through a ConPTY and racing the snapshot timer while it does.
+///
+/// A floor of 4 KB matches `--replay-bytes`: a ring smaller than a single write
+/// retains nothing, and a typo must not quietly become that. Anything
+/// unparseable, below the floor, or empty keeps the default — the same
+/// discipline `snapshotVolumeBytesFromEnv` uses, and for the same reason: a
+/// mistyped variable must not silently shrink what a crash can recover.
+///
+/// Pure, so the truth table is a unit test rather than a claim.
+pub fn replayBytesFor(value: ?[]const u8) usize {
+    const v = value orelse return session.default_holder_replay_bytes;
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return session.default_holder_replay_bytes;
+    const n = std.fmt.parseInt(usize, t, 10) catch return session.default_holder_replay_bytes;
+    if (n < 4096) return session.default_holder_replay_bytes;
+    return n;
 }
 
 /// How far the owner may ACK — i.e. how much the holder is allowed to FREE from
@@ -1140,6 +1171,28 @@ test "enabledFor: holders are the default and only an explicit off opts out (T90
     try testing.expect(enabledFor("11"));
     try testing.expect(enabledFor("00"));
     try testing.expect(enabledFor("nope"));
+}
+
+test "replayBytesFor: a typo keeps the default rather than shrinking the window (T969)" {
+    const dflt = session.default_holder_replay_bytes;
+    try testing.expectEqual(dflt, replayBytesFor(null));
+    try testing.expectEqual(dflt, replayBytesFor(""));
+    try testing.expectEqual(@as(usize, 65536), replayBytesFor("65536"));
+    try testing.expectEqual(@as(usize, 65536), replayBytesFor(" 65536 "));
+
+    // Everything a mistake looks like keeps the default. A holder that quietly
+    // retained 12 bytes because someone wrote `64k` would lose exactly the
+    // scrollback T911 and T969 exist to keep, and nothing would say so.
+    try testing.expectEqual(dflt, replayBytesFor("64k"));
+    try testing.expectEqual(dflt, replayBytesFor("-1"));
+    try testing.expectEqual(dflt, replayBytesFor("0"));
+    try testing.expectEqual(dflt, replayBytesFor("4095")); // below the floor
+    try testing.expectEqual(@as(usize, 4096), replayBytesFor("4096")); // at it
+
+    // The default is what the store's volume threshold is derived from, so the
+    // pair has to stay in the ratio the design assumes: a snapshot due at half
+    // capacity refills the ring before it can wrap (T969).
+    try testing.expect(session.default_snapshot_volume_bytes * 2 == dflt);
 }
 
 test "ackTarget: an ACK means DELIVERED until the store arms durability (T911)" {

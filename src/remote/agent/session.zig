@@ -103,6 +103,20 @@ pub const max_dead_sessions: usize = 256;
 /// possible on reattach (§7.3). Lowered freely in tests.
 pub const default_ring_bytes: usize = 2 * 1024 * 1024;
 
+/// Default bounded un-acked output ring inside a pty holder (`pty_holder_child`).
+/// Lives HERE, beside the snapshot threshold derived from it, because the two
+/// numbers together decide what a crash can hand back: the holder is the only
+/// place output lives between the agent's memory and the last ring snapshot, so
+/// a threshold that is not sized off this capacity is a guarantee that drifts
+/// silently the day either number moves (T969).
+pub const default_holder_replay_bytes: usize = 1024 * 1024;
+
+/// Default unsaved-byte threshold that triggers a ring snapshot on VOLUME rather
+/// than on the reaper's 30-second timer (T969). Half the holder's replay
+/// capacity, so the holder's ring is refilled from disk before it can wrap and
+/// drop the oldest un-snapshotted bytes.
+pub const default_snapshot_volume_bytes: u64 = default_holder_replay_bytes / 2;
+
 /// The divider baked into a reboot-restored ring between the replayed pre-restart
 /// scrollback and the freshly-relaunched shell's output (§5.4, T13). Byte-for-byte
 /// the SAME string the client prints on a snapshot-less relaunch (termio/Remote.zig)
@@ -1232,6 +1246,31 @@ pub const SessionStore = struct {
     /// merely inverting its own assertions.
     durable_ack: bool = true,
 
+    /// Unsaved-byte threshold that makes a ring snapshot due on VOLUME (T969).
+    /// The window a crash can hand back is `min(time since the last snapshot,
+    /// what the holder still retains)` — the reaper's 30-second timer covers
+    /// only the first half, so a pane printing faster than the holder's replay
+    /// capacity divided by that interval (~35 KB/s at the defaults) wraps the
+    /// holder's ring and loses its OLDEST unsaved bytes before the timer fires.
+    /// Checked once a reaper tick against every alive session's
+    /// `out_offset - last_snapshot_offset`; the busiest session decides.
+    /// 0 disables the trigger — the off switch for the acceptance harness's
+    /// negative control, and the escape hatch if the extra writes ever misbehave
+    /// on a real box.
+    snapshot_volume_bytes: u64 = default_snapshot_volume_bytes,
+
+    /// Floor between two snapshot passes made by the reaper, in milliseconds
+    /// (T969). A snapshot rewrites each dirty ring WHOLE, so without a floor a
+    /// pane printing at MB/s would turn the volume trigger into a disk hammer;
+    /// with it the write amplification is bounded by
+    /// `ring size / max(threshold, rate x floor)`. The periodic 30-tick pass is
+    /// far outside this floor and is unaffected by it.
+    snapshot_volume_min_interval_ms: i64 = 1000,
+
+    /// Wall-clock (`nowFn`) of the last snapshot pass the reaper ran, for the
+    /// floor above. Touched only from the reaper thread.
+    last_snapshot_ms: i64 = 0,
+
     /// Opaque per-window layout blobs pushed by owning viewers (§5.4 "Resume
     /// all", T18), keyed by the viewer's manifest-entry id. The agent stores +
     /// returns each blob VERBATIM (topology-agnostic); it only inspects the
@@ -1375,9 +1414,19 @@ pub const SessionStore = struct {
             // still attached / recently detached (the connection-drop trigger only
             // fires on disconnect). No-op when ring snapshots are disabled or
             // nothing is dirty.
+            //
+            // ...and the same pass on VOLUME (T969), because the timer alone
+            // sizes the recoverable window in SECONDS while what actually bounds
+            // it on a noisy pane is BYTES: a build or a log tail can print more
+            // than the holder retains between two ticks of the timer, and the
+            // holder drops oldest to stay bounded. Checked here rather than on
+            // the output path so the pty reader thread pays nothing for it; the
+            // cost is up to one tick (1 s) of extra latency, which is the
+            // granularity everything else in this loop already runs at.
             ticks +%= 1;
-            if (ticks >= snapshot_every_ticks) {
+            if (ticks >= snapshot_every_ticks or self.volumeSnapshotDue()) {
                 ticks = 0;
+                self.last_snapshot_ms = self.now();
                 self.snapshotRings();
             }
         }
@@ -2035,6 +2084,65 @@ pub const SessionStore = struct {
             s.holder_snapshot_offset = 0;
         }
         appendRestartDivider(s);
+    }
+
+    /// The volume trigger's decision (T969), as a pure function: no store, no
+    /// clock, no disk — so the threshold and the floor can be unit tested for the
+    /// thing that actually matters, which is that they fire at the boundary and
+    /// not one byte or one millisecond before.
+    ///
+    ///   `unsaved`          bytes recorded since the last successful snapshot
+    ///   `threshold`        `snapshot_volume_bytes` (0 ⇒ the trigger is off)
+    ///   `ms_since_last`    time since the last snapshot pass
+    ///   `min_interval_ms`  `snapshot_volume_min_interval_ms`
+    pub fn volumeSnapshotFires(
+        unsaved: u64,
+        threshold: u64,
+        ms_since_last: i64,
+        min_interval_ms: i64,
+    ) bool {
+        if (threshold == 0) return false; // disabled
+        if (unsaved < threshold) return false;
+        return ms_since_last >= min_interval_ms;
+    }
+
+    /// Is a ring snapshot due on VOLUME right now (T969)? True when the BUSIEST
+    /// alive session holds at least `snapshot_volume_bytes` of un-snapshotted
+    /// output and the floor since the last pass has elapsed. Called once a reaper
+    /// tick; takes the store lock only long enough to read offsets.
+    ///
+    /// The busiest session decides for the whole pass because `snapshotRings`
+    /// flushes every dirty session anyway — a second scan to decide per session
+    /// would write the same files and cost another lock round-trip.
+    pub fn volumeSnapshotDue(self: *SessionStore) bool {
+        if (self.rings_dir == null) return false;
+        if (self.snapshot_volume_bytes == 0) return false;
+
+        var most_unsaved: u64 = 0;
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive) continue;
+            const unsaved = s.out_offset.value -% s.last_snapshot_offset;
+            if (unsaved > most_unsaved) most_unsaved = unsaved;
+        }
+        self.mutex.unlock();
+
+        // A store that has never snapshotted has no floor to respect — else a
+        // fake clock starting at 0 (tests) or a box whose first tick lands
+        // inside the floor would suppress the very first volume snapshot.
+        const elapsed: i64 = if (self.last_snapshot_ms == 0)
+            self.snapshot_volume_min_interval_ms
+        else
+            self.now() -| self.last_snapshot_ms;
+
+        return volumeSnapshotFires(
+            most_unsaved,
+            self.snapshot_volume_bytes,
+            elapsed,
+            self.snapshot_volume_min_interval_ms,
+        );
     }
 
     /// Flush every dirty ALIVE session's output ring to `<rings_dir>/<id>.ring`
@@ -3656,6 +3764,102 @@ test "with ring snapshots off, the store releases nothing at all (T911)" {
     store.onChildOutput(s.channel, "a" ** 100);
     store.snapshotRings();
     try testing.expectEqual(@as(usize, 0), fake.releases);
+}
+
+test "the volume trigger fires AT the threshold, and the floor suppresses the next one (T969)" {
+    // The decision, isolated from the store: what matters is that it fires at
+    // the boundary and not one byte or one millisecond early, because both
+    // errors are invisible in a passing end-to-end run — too eager is a disk
+    // hammer, too lazy is the lost scrollback this task exists to stop.
+    const fires = SessionStore.volumeSnapshotFires;
+    try testing.expect(!fires(511, 512, 5_000, 1_000)); // one byte short
+    try testing.expect(fires(512, 512, 5_000, 1_000)); // exactly at it
+    try testing.expect(fires(4096, 512, 1_000, 1_000)); // floor exactly elapsed
+    try testing.expect(!fires(4096, 512, 999, 1_000)); // ...and one ms short
+    try testing.expect(!fires(1 << 30, 0, 5_000, 1_000)); // threshold 0 = off
+}
+
+test "a busy session makes a ring snapshot due before the 30s timer (T969)" {
+    // The case the task is about: a pane printing faster than the holder
+    // retains. The store must notice on BYTES, not only on the reaper's timer,
+    // or the oldest of those bytes is dropped by the holder's bounded ring
+    // before anything writes them down.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    var prng = std.Random.DefaultPrng.init(0xc969);
+    var clock: MutClock = .{ .ms = 10_000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    store.rings_dir = rings;
+    store.snapshot_volume_bytes = 512;
+    store.snapshot_volume_min_interval_ms = 1_000;
+    defer store.deinit();
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 10_000);
+
+    // A quiet pane is never due — the timer alone is the right cadence for it.
+    store.onChildOutput(s.channel, "a" ** 100);
+    try testing.expect(!store.volumeSnapshotDue());
+
+    // Crossing the threshold makes it due without the timer being anywhere near.
+    store.onChildOutput(s.channel, "b" ** 412);
+    try testing.expect(store.volumeSnapshotDue());
+
+    // The pass writes the ring and clears the debt, so nothing is due again
+    // until the next 512 bytes — a snapshot that stayed "due" would rewrite the
+    // same file every tick.
+    store.last_snapshot_ms = clock.ms;
+    store.snapshotRings();
+    try testing.expect(!store.volumeSnapshotDue());
+
+    // Past the threshold again, but INSIDE the floor: still not due. This is the
+    // bound on disk churn — a pane printing at MB/s cannot turn every tick into
+    // a whole-ring rewrite.
+    store.onChildOutput(s.channel, "c" ** 600);
+    clock.ms += 999;
+    try testing.expect(!store.volumeSnapshotDue());
+
+    // ...and due the moment the floor has elapsed.
+    clock.ms += 1;
+    try testing.expect(store.volumeSnapshotDue());
+}
+
+test "the volume trigger is off with no rings dir, and off at threshold 0 (T969)" {
+    // Two off switches with different reasons: no `rings_dir` means there is no
+    // durability to write to at all, and `snapshot_volume_bytes = 0` is the
+    // deliberate opt-out the acceptance harness's negative control runs under.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    var prng = std.Random.DefaultPrng.init(0xd969);
+    var clock: MutClock = .{ .ms = 10_000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+    store.snapshot_volume_bytes = 512;
+    defer store.deinit();
+
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 10_000);
+    store.onChildOutput(s.channel, "a" ** 4096);
+    try testing.expect(!store.volumeSnapshotDue()); // no rings_dir
+
+    store.rings_dir = rings;
+    try testing.expect(store.volumeSnapshotDue()); // ...and now there is one
+
+    store.snapshot_volume_bytes = 0;
+    try testing.expect(!store.volumeSnapshotDue()); // explicit opt-out
 }
 
 test "a holder-backed record loads with NO restart divider; abandoning it draws one" {
