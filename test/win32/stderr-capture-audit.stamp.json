@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T14:58:19-07:00",
-    "commit":  "e6a64b58d",
+    "generated":  "2026-08-19T15:43:15-07:00",
+    "commit":  "f02dd936c",
     "files":  {
                   "docs/claude/testing.md":  "637306a00851c42dc1dfbb084bec74c8f38e622268c4fdcdcf5e193d710a6edb",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -75,7 +75,7 @@
                   "test/win32/divergence-inventory.ps1":  "9448dd5ca9f5eff21606e38ded4e762689ca4726d03cdfec075801a50bec0501",
                   "test/win32/docs-routing.ps1":  "a41cfb788e2bece0a400d8214b6149d9e97a6dd823c3924a1ea098ce738dec76",
                   "test/win32/float-on-top.ps1":  "11ba0d4e8dc81d329bcf50eaa57d85685e8b5ba04b3ad8f74cff97d2a1e57532",
-                  "test/win32/floor-lane-cache-heal.ps1":  "2cdc33a64f779de521bf297e6839656bf7bcc3789bbb8091d807e33c30024a6f",
+                  "test/win32/floor-lane-cache-heal.ps1":  "5cb4ca0351c7a18c483b91ebebfc5624326850a8911558fec4cb9f732727a702",
                   "test/win32/floor-lane-leak-sweep.ps1":  "e49c855dc9fb28abfc3103cf7784a010385fcf3d24077be68437d16fe2502b3e",
                   "test/win32/focus-defer.ps1":  "2fca936f5f0c6f04974a228b0a5f303bcebb76dee4bc5714c6fd89ce199d5119",
                   "test/win32/focus-follows-mouse.ps1":  "0c9df1d9df9cf82cb1cb8db80353da9fe5284f25b353d3ad7922a90642a10779",

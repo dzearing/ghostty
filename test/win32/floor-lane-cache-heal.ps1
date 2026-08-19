@@ -146,6 +146,86 @@ try {
     Check 'floor-lane dot-sources CacheHeal.ps1' ($src -match 'CacheHeal\.ps1') ''
     Check 'floor-lane heals at most once per lane' ($src -match 'healedThisLane') ''
     Check 'floor-lane re-runs after a heal' ($src -match 'Get-TornCacheEntry') ''
+
+    # -- 10: Test-CacheFileIntact knows the shapes a half-written file takes
+    $probeDir = Join-Path $Sandbox 'probe'
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    $whole = Join-Path $probeDir 'whole.zig'
+    Set-Content -Path $whole -Value 'pub const x: bool = false;' -Encoding Ascii  # adds the newline
+    $empty = Join-Path $probeDir 'empty.zig'
+    [System.IO.File]::WriteAllBytes($empty, (New-Object byte[] 0))
+    $zeros = Join-Path $probeDir 'zeros.zig'
+    [System.IO.File]::WriteAllBytes($zeros, (New-Object byte[] 2036))
+    $cut = Join-Path $probeDir 'cut.zig'
+    [System.IO.File]::WriteAllText($cut, "pub const x: bool = false;`npub const y")
+    Check 'intact file reads as intact' (Test-CacheFileIntact -Path $whole) ''
+    Check 'empty file reads as torn' (-not (Test-CacheFileIntact -Path $empty)) ''
+    Check 'zero-filled file reads as torn' (-not (Test-CacheFileIntact -Path $zeros)) ''
+    Check 'unterminated file reads as torn' (-not (Test-CacheFileIntact -Path $cut)) ''
+    Check 'missing file reads as torn' (-not (Test-CacheFileIntact -Path (Join-Path $probeDir 'gone.zig'))) ''
+
+    # -- 11: the T973 shape -- the cache is named ONLY by a declaration note,
+    # every error: line points at intact source. Lines are the 2026-08-18
+    # win32-lane log verbatim.
+    $h11 = '0b3c0f31d02be43a2a65f80447be46bd'
+    $e11 = Join-Path $LocalCache "c\$h11"
+    New-Item -ItemType Directory -Path $e11 -Force | Out-Null
+    # The truncated file still PARSES and is newline-terminated, so only the
+    # note rule can see it: this arm fails if the heal leans on the disk check.
+    Set-Content -Path (Join-Path $e11 'options.zig') -Value 'pub const flatpak: bool = false;' -Encoding Ascii
+    $log = New-Log @(
+        "src\build\Config.zig:689:27: error: root source file struct 'options' has no member named 'app_version'"
+        '        .version = options.app_version,'
+        '                   ~~~~~~~^~~~~~~~~~~~'
+        ".zig-cache\c\$h11\options.zig:1:1: note: struct declared here"
+        'pub const flatpak: bool = false;'
+        'src\build_config.zig:37:39: note: called at comptime here'
+    )
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'the 2026-08-18 log names its entry' ($torn.Count -eq 1 -and $torn[0].Entry -ieq $e11) `
+        $(if ($torn.Count -ge 1) { "$($torn.Count): $($torn[0].Entry)" } else { '(none)' })
+    Check 'and says which rule fired' ($torn.Count -eq 1 -and $torn[0].Reason -eq 'declared-in-cache') `
+        $(if ($torn.Count -ge 1) { $torn[0].Reason } else { '(none)' })
+
+    # -- 12: a note that merely PASSES THROUGH intact generated code heals
+    # nothing -- otherwise every genuine error with a generated frame in its
+    # note chain would cost a rebuild.
+    $log = New-Log @(
+        "src\apprt\win32\App.zig:12:5: error: expected type 'u8', found 'bool'"
+        ".zig-cache\c\$h11\options.zig:4:9: note: called at comptime here"
+    )
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'a pass-through note on an intact file heals nothing' ($torn.Count -eq 0) "got $($torn.Count)"
+
+    # -- 13: the same pass-through note DOES heal once the file is torn on disk
+    [System.IO.File]::WriteAllBytes((Join-Path $e11 'options.zig'), (New-Object byte[] 2036))
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'a torn-on-disk file heals whatever line named it' `
+        ($torn.Count -eq 1 -and $torn[0].Reason -eq 'corrupt-on-disk') `
+        $(if ($torn.Count -ge 1) { $torn[0].Reason } else { "got $($torn.Count)" })
+
+    # -- 14: a declaration note in REAL SOURCE is still never a heal target
+    $log = New-Log @(
+        "src\apprt\win32\App.zig:12:5: error: no field named 'nope' in struct 'Surface'"
+        'D:\git\ghoztty\src\Surface.zig:40:1: note: struct declared here'
+    )
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'a declaration note in source is never detected' ($torn.Count -eq 0) "got $($torn.Count)"
+
+    # -- 15: the /z ZIR store keeps one FILE per hash; that file is the entry
+    $h15 = '5c2e7ab90d4f18e3aa71b6c0d9e4f2a1'
+    $zFile = Join-Path $LocalCache "z\$h15"
+    New-Item -ItemType Directory -Path (Join-Path $LocalCache 'z') -Force | Out-Null
+    [System.IO.File]::WriteAllBytes($zFile, (New-Object byte[] 512))
+    $log = New-Log @(
+        ".zig-cache\z\${h15}:1:1: error: expected type expression, found 'invalid token'"
+    )
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'a hash-file entry resolves to the file itself' ($torn.Count -eq 1 -and $torn[0].Entry -ieq $zFile) `
+        $(if ($torn.Count -ge 1) { $torn[0].Entry } else { '(none)' })
+    $healOut4 = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
+    Check 'heal deletes a hash-file entry' (-not (Test-Path $zFile)) $healOut4
+    Check 'heal names the rule that fired' ($healOut4 -match 'rule: error-in-cache') $healOut4
 }
 finally {
     if (Test-Path $Sandbox) { Remove-Item $Sandbox -Recurse -Force -ErrorAction SilentlyContinue }
