@@ -112,3 +112,14 @@ as the digest that showed them.
 - Remember where I was in this project (cwd + last command per pane)
 - A pane that never blocks on a wedged program
 - Show me what this build is (running vs installed version, in-app)
+
+## 2026-08-19
+
+- Pick up where the crash left off (restore prompt with a layout preview)
+- A scrollback you can leave and come back to (named marks, across restarts)
+- Compare two panes side by side (diff view of their output)
+- Type into the terminal with the composer's editing (multi-line input line)
+- Name a window after what it is for, and have it stick
+- A pane that tells you what it is waiting on (working / input / network)
+- Never a red suite as background noise (new failures louder than old ones)
+- Open the window before the work (first frame before session attach)
