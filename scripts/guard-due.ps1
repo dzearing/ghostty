@@ -131,6 +131,24 @@ $GuardTable = @(
             'src\apprt\win32\viewer_feedback_doc.zig'
         )
     },
+    # The composer's WEB surface (T934): the second WebView2 controller that
+    # replaced the RichEdit, its page, and the two-way message channel between
+    # them. Separate from `viewer-feedback` above because the two drive
+    # different surfaces - that suite pins itself to the RichEdit fallback,
+    # which is the only one window messages can reach from the background test
+    # desktop, and this one proves the surface users actually get.
+    [pscustomobject]@{
+        Name   = 'viewer-composer'
+        Script = 'test\win32\viewer-composer.ps1'
+        Stamp  = 'test\win32\viewer-composer.stamp.json'
+        Covers = @(
+            'test\win32\viewer-composer.ps1',
+            'src\apprt\win32\ViewerFeedbackWeb.zig',
+            'src\apprt\win32\viewer_feedback_page.zig',
+            'src\viewer\composer.js',
+            'src\viewer\composer.css'
+        )
+    },
     # The per-session ConPTY holder (T904): the only harness that drives a
     # real `--pty-host` process over its real control pipe - ConPTY output,
     # resize, reconnect gap-replay, exit-code delivery, the Job Object

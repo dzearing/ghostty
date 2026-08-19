@@ -448,10 +448,55 @@ the queue; consuming it is separate and not built here).
   chrome: `ViewerFeedbackBar.zig`; acceptance: `test/win32/viewer-feedback.ps1`.
   **The composer's TEXT and its open flag live on the pane, not on the toolbar
   window**, which is what makes contents survive a close/reopen on both
-  platforms. The win32 editing surface is a **RichEdit** (`Msftedit.dll`,
-  class `RichEdit50W`) filling the pill's text rect — D43's answer, landed in
-  **T635** — so caret, selection, word wrap, undo, clipboard and IME
-  composition come from the OS rather than from a hand-rolled model. The
+  platforms.
+
+  **The win32 editing surface is a WebView2 contenteditable** (T934) — a
+  SECOND `ICoreWebView2Controller` filling the pill's text rect, on the pane's
+  own environment, hosting a page we author
+  (`ViewerFeedbackWeb.zig` + `viewer_feedback_page.zig` +
+  `src/viewer/composer.{css,js}`). D43 was answered *against* its own
+  recommendation for the reason the answer gives: caret, selection, wrap, undo,
+  clipboard, drag-drop, IME composition and a screen reader that can read the
+  field all come from the browser engine rather than from us. Four things to
+  know before touching it:
+
+  - **The direction of truth is inverted.** A RichEdit answers `caret()` and
+    `lineCount()` on the caller's stack; a WebView2 cannot. So the PAGE owns the
+    live document and pushes a snapshot up (`{t:"state", text, lines, caret,
+    gen}`) on every edit, and native keeps the last snapshot as what it lays out
+    and serializes from. Native writes go down as `{t:"seed", …}` — "make the
+    document equal the buffer", the only write there is, because it cannot drift
+    from the buffer.
+  - **`gen` is not optional.** Every seed is stamped and every snapshot echoes
+    the stamp, so a snapshot measured before the latest seed is recognisable and
+    dropped. Without it a keystroke racing a native write silently resurrects
+    the text that write replaced. `ViewerPane.feedbackSetText` re-seeds the page
+    itself, so every native writer is covered rather than the ones somebody
+    remembered.
+  - **The controller is created on the first OPEN and destroyed on CLOSE** —
+    D43's own mitigation for the memory and startup cost. Nothing a user would
+    miss lives on it; the report text is the pane's.
+  - **Keys reach Chromium, not the app's message loop.** The composer's chords
+    and the whole pane/keybind table are claimed in `AcceleratorKeyPressed` with
+    `put_Handled`, which is also the only thing that stops the browser acting on
+    a chord we took (an unclaimed Ctrl+R would reload the composer's own page).
+  - **The design numbers come from the layout module**, pushed in as CSS custom
+    properties on each theme or scale change (D43's other mitigation); the
+    stylesheet states no size or colour of its own, and a unit test asserts that.
+
+  **The RichEdit below it is the FALLBACK**, not dead code: a box whose
+  environment cannot produce a controller still gets a composer, and
+  `GHOZTTY_COMPOSER_SURFACE=richedit` forces it. **T937** retires it. Which one
+  is live is stated on every open —
+  `viewer feedback composer surface=web|richedit(...)`. Acceptance is split to
+  match: `test/win32/viewer-composer.ps1` proves the web surface's lifecycle and
+  its round trip, `test/win32/viewer-feedback.ps1` pins itself to the fallback
+  and keeps proving the editing semantics (window messages cannot drive a
+  Chromium window off the input desktop, T233), and the in-process `host floor`
+  test in `ViewerPane.zig` drives a real controller end to end — open, seed,
+  quote, send, report on disk.
+
+  The RichEdit half, as it was and as the fallback still is (T635): the
   control is the storage while the composer is open and every change mirrors
   back into the pane from `EN_CHANGE`; the pane is still what outlives the
   window. Three win32 details worth knowing: RichEdit sends **no** notifications

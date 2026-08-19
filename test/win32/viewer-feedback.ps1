@@ -62,6 +62,24 @@ if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW).
 $env:GHOZTTY_PIPE_SUFFIX = '-fbtest'
 
+# WHICH SURFACE THIS SUITE DRIVES, and why it is pinned (T934).
+#
+# The composer's text surface is a WebView2 contenteditable since T934; the
+# RichEdit below it is the FALLBACK that still ships (a box with no working
+# environment still gets a composer) and is retired by T937. Every arm in this
+# file drives the surface with window messages -- Send-TestControlText,
+# Send-TestControlKey, Get-TestControlText -- which reach a native control and
+# cannot reach a Chromium window from the background test desktop, where
+# SendInput and CopyFromScreen are dead (T233).
+#
+# So this suite pins itself to the fallback and keeps proving the EDITING
+# semantics on a control it can actually drive, and the web surface's own
+# acceptance lives in `test\win32\viewer-composer.ps1` (its structure and
+# lifecycle) plus the in-process `host floor` test in `ViewerPane.zig`, which
+# drives a REAL controller end to end -- open, seed, quote, send, report on
+# disk. T937 removes the fallback and re-points these arms.
+$env:GHOZTTY_COMPOSER_SURFACE = 'richedit'
+
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
@@ -344,6 +362,16 @@ try {
     # pill's text rect. Everything below types into THAT, which is also the
     # check that it exists at all -- a missing Msftedit.dll leaves the pane
     # with no composer, and this is where that shows up.
+    #
+    # Since T934 that control is the FALLBACK, pinned by the environment
+    # variable set at the top of this file -- so this arm also asserts that the
+    # pin WORKED. Without that assertion a suite that silently ran against the
+    # web surface would fail every typing arm below with no explanation.
+    $forced = $false
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match 'viewer feedback composer surface=richedit\(forced\)') { $forced = $true }
+    }
+    Assert $forced 'the suite pinned the composer to its RichEdit fallback (T934)'
     $rich = $null
     $richClass = '<none>'
     foreach ($c in @(Get-TestChildWindows -Window $fb -Class $null)) {

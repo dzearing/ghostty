@@ -1461,6 +1461,10 @@ pub extern "user32" fn SetFocus(
 ) callconv(.winapi) ?HWND;
 
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+/// Whether `child` is `parent` itself or a descendant of it at any depth.
+/// The composer's focus test (T934): its caret lives in a Chromium window
+/// several levels down inside the band, which no equality test can name.
+pub extern "user32" fn IsChild(parent: HWND, child: HWND) callconv(.winapi) BOOL;
 
 pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
 

@@ -918,8 +918,6 @@ pub const ICoreWebView2Profile = extern struct {
 pub const ICoreWebView2 = extern struct {
     vtable: *const Vtbl,
 
-    /// Slot 6: `NavigateToString`.
-    pub const pre_nav_starting_slots = 1;
     /// Slots 8..10: `remove_NavigationStarting` through
     /// `remove_ContentLoading`.
     pub const post_nav_starting_slots = 3;
@@ -934,8 +932,6 @@ pub const ICoreWebView2 = extern struct {
     pub const remove_script_slots = 1;
     /// `COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT`.
     pub const CaptureFormat = enum(u32) { png = 0, jpeg = 1 };
-    /// Slots 32..33: `PostWebMessageAsJson`, `PostWebMessageAsString`.
-    pub const post_reload_slots = 2;
     /// Slot 35: `remove_WebMessageReceived`.
     pub const remove_message_slots = 1;
     /// Slot 37: `get_BrowserProcessId`.
@@ -961,7 +957,11 @@ pub const ICoreWebView2 = extern struct {
         get_Settings: *const anyopaque,
         get_Source: *const fn (*ICoreWebView2, *?[*:0]u16) callconv(.winapi) HRESULT,
         Navigate: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
-        pre_nav_starting: [pre_nav_starting_slots]*const anyopaque,
+        /// Slot 6. Load a document from a string rather than from a URI — how
+        /// the feedback composer's own page gets in (T934). The string is a
+        /// whole HTML document and the runtime copies it; the resulting page
+        /// has an opaque origin, which is exactly right for chrome we author.
+        NavigateToString: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
         add_NavigationStarting: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         post_nav_starting: [post_nav_starting_slots]*const anyopaque,
         add_SourceChanged: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
@@ -980,7 +980,12 @@ pub const ICoreWebView2 = extern struct {
             *anyopaque,
         ) callconv(.winapi) HRESULT,
         Reload: *const fn (*ICoreWebView2) callconv(.winapi) HRESULT,
-        post_reload: [post_reload_slots]*const anyopaque,
+        /// Slot 32. Post a JSON payload DOWN to the page, where it arrives as
+        /// the already-parsed `event.data` of a `chrome.webview` message — the
+        /// other direction of `add_WebMessageReceived` (T934).
+        PostWebMessageAsJson: *const fn (*ICoreWebView2, [*:0]const u16) callconv(.winapi) HRESULT,
+        /// Slot 33. The same, as a bare string.
+        PostWebMessageAsString: *const anyopaque,
         add_WebMessageReceived: *const fn (*ICoreWebView2, *anyopaque, *EventRegistrationToken) callconv(.winapi) HRESULT,
         remove_message: [remove_message_slots]*const anyopaque,
         CallDevToolsProtocolMethod: *const fn (
@@ -1016,6 +1021,21 @@ pub const ICoreWebView2 = extern struct {
     /// STARTED, and the page arrives later on the message loop.
     pub fn navigate(self: *ICoreWebView2, uri: [*:0]const u16) bool {
         return !com.failed(self.vtable.Navigate(self, uri));
+    }
+
+    /// Load `html` as this view's document (T934). Asynchronous like
+    /// `navigate`: success means the load STARTED. The runtime caps the string
+    /// at 2 MB, which the composer's own page is three orders of magnitude
+    /// under.
+    pub fn navigateToString(self: *ICoreWebView2, html: [*:0]const u16) bool {
+        return !com.failed(self.vtable.NavigateToString(self, html));
+    }
+
+    /// Post `json` to the page as a `chrome.webview` message. The payload must
+    /// be valid JSON — the runtime rejects anything else, which is why every
+    /// caller here builds it with `std.json.Stringify` rather than by hand.
+    pub fn postWebMessageAsJson(self: *ICoreWebView2, json: [*:0]const u16) bool {
+        return !com.failed(self.vtable.PostWebMessageAsJson(self, json));
     }
 
     /// Encode the view's current visual into `stream` and call `handler` when
@@ -1636,6 +1656,7 @@ test "the slots we actually call sit where the header puts them" {
     // T392's interception point, one slot past `NavigateToString`. The slot
     // after it is `remove_NavigationStarting`, a token-taking remove —
     // subscribing there would hand the runtime a handler pointer as an i64.
+    try testing.expectEqual(6 * ptr, @offsetOf(ICoreWebView2.Vtbl, "NavigateToString"));
     try testing.expectEqual(7 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_NavigationStarting"));
     // T159's events, carved out of what used to be the one 9-slot `pre_nav`
     // run. `add_HistoryChanged` at 13 has `remove_SourceChanged` (a
@@ -1657,6 +1678,8 @@ test "the slots we actually call sit where the header puts them" {
     // would hand the runtime a method name and a JSON string as if they were
     // nothing, which is the kind of mistake that corrupts rather than fails.
     try testing.expectEqual(31 * ptr, @offsetOf(ICoreWebView2.Vtbl, "Reload"));
+    try testing.expectEqual(32 * ptr, @offsetOf(ICoreWebView2.Vtbl, "PostWebMessageAsJson"));
+    try testing.expectEqual(33 * ptr, @offsetOf(ICoreWebView2.Vtbl, "PostWebMessageAsString"));
     try testing.expectEqual(34 * ptr, @offsetOf(ICoreWebView2.Vtbl, "add_WebMessageReceived"));
     try testing.expectEqual(36 * ptr, @offsetOf(ICoreWebView2.Vtbl, "CallDevToolsProtocolMethod"));
     // T159's history quartet, out of the old 7-slot `post_devtools` run. The

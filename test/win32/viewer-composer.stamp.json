@@ -1,0 +1,13 @@
+{
+    "guard":  "viewer-composer",
+    "script":  "test/win32/viewer-composer.ps1",
+    "generated":  "2026-08-19T01:58:01-07:00",
+    "commit":  "3eb8c78a8",
+    "files":  {
+                  "src/apprt/win32/viewer_feedback_page.zig":  "805baaa5338a4afe7d67e2fb1a39e38ea3931fde9c21b9917732a7af954b348d",
+                  "src/apprt/win32/ViewerFeedbackWeb.zig":  "9460b36bea41d45456eb5cba382d9a506ce43bb3d9d41467dd85b620fbcc7b86",
+                  "src/viewer/composer.css":  "1fa7c4d192c2040f29952769d52ab86c4d8a09c1776a15bd9cb675c48a254b7f",
+                  "src/viewer/composer.js":  "a51b37e08808cb4643419ba2e48bca8041c07de7f64334e9ecc51b3f9bdc84c2",
+                  "test/win32/viewer-composer.ps1":  "2230abb79bc3527769eb2b95917fbf302e29857cb41fee98cbd6c5ac25193546"
+              }
+}

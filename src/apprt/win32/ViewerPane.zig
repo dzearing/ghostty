@@ -1335,6 +1335,11 @@ pub fn feedbackText(self: *const ViewerPane) []const u8 {
 pub fn feedbackSetText(self: *ViewerPane, alloc: Allocator, bytes: []const u8) void {
     self.feedback_text.clearRetainingCapacity();
     self.feedback_text.appendSlice(alloc, bytes) catch {};
+    // T934: the composer's page holds a copy of this buffer, so a write from
+    // the native side has to reach it - otherwise the next snapshot the page
+    // pushes is measured against the text this write replaced and quietly
+    // resurrects it. A write that CAME from the page suppresses this itself.
+    if (self.feedback) |bar| bar.composerSync();
 }
 
 /// Mirror of `Surface.setVisible`. A viewer has no renderer thread to park, so
@@ -4292,6 +4297,25 @@ fn claimsChord(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) 
     return self.chordAction(vk, extended, mods) != null;
 }
 
+/// The composer's web surface saw a chord its page did not claim: does the
+/// PANE want it (T934)?
+///
+/// The same question, the same table and the same delivery as this pane's own
+/// accelerator handler below — which is the point. Before T934 the composer was
+/// a native control, so its keys went through the app's message loop and the
+/// keybind table saw them for free; a Chromium window sees them first instead,
+/// and without this a focused composer would be the one place in the app where
+/// ctrl+shift+n, the zoom chords and every user keybind quietly stopped
+/// working.
+pub fn claimAccel(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) bool {
+    if (!self.claimsChord(vk, extended, mods)) return false;
+    const hwnd = self.hwnd orelse return false;
+    const wparam: usize = @as(usize, vk) | (@as(usize, @intFromBool(extended)) << 16);
+    const lparam: isize = @as(u16, @bitCast(mods));
+    _ = w32.PostMessageW(hwnd, WM_APP_VIEWER_ACCEL, wparam, lparam);
+    return true;
+}
+
 fn onAcceleratorKeyPressed(
     p: *Pending,
     sender: ?*iface.ICoreWebView2Controller,
@@ -6919,12 +6943,47 @@ test "host floor: a real controller on a real window, on this box" {
         pane.feedbackSetText(alloc, seeded);
         pane.setFeedbackOpen(true);
         try testing.expect(pane.feedback_open);
+
+        // T934: the surface under everything below is the WEB composer, not
+        // the RichEdit fallback. Asserted rather than assumed, because every
+        // arm here would pass against the fallback too - and this test is the
+        // only place on the box that can tell them apart (an acceptance script
+        // cannot type into a Chromium window from the background desktop).
+        const composer = pane.feedback.?;
+        try testing.expect(composer.web != null);
+
+        // ...and it is a live round trip, not just a controller: wait for the
+        // page to load, be seeded, read its own document back and push the
+        // snapshot up. What that snapshot has to say is that the buffer is
+        // UNCHANGED - five non-ASCII characters, a blank line and a tail
+        // survived a trip through the DOM and back, which is the read path's
+        // whole contract.
+        try waitFor(&msg, 30, struct {
+            fn ready(p: *ViewerPane) bool {
+                const bar = p.feedback orelse return false;
+                return bar.echoed;
+            }
+        }.ready, &pane);
+        try testing.expectEqualStrings(seeded, pane.feedbackText());
+        log.warn("composer: echoed {d} bytes back, {d} line(s)", .{
+            pane.feedbackText().len,
+            composer.web.?.lines,
+        });
         {
-            // Straight at the control, because the caret is what this arm is
-            // about and the bar's own `setCaret` is the thing under test.
+            // Straight at the surface, because the caret is what this arm is
+            // about and the bar's own byte/unit conversion is the thing under
+            // test. Which surface that is moved in T934: the web composer's
+            // caret IS the last snapshot its page pushed, so putting 7 there is
+            // the same act as an `EM_EXSETSEL` on the RichEdit — a caret at
+            // UTF-16 unit 7, which is what a browser and a `W` control both
+            // count in.
             const bar = pane.feedback.?;
-            const cr: w32.CHARRANGE = .{ .cpMin = 7, .cpMax = 7 };
-            _ = w32.SendMessageW(bar.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+            if (bar.web) |wv| {
+                wv.caret = 7;
+            } else {
+                const cr: w32.CHARRANGE = .{ .cpMin = 7, .cpMax = 7 };
+                _ = w32.SendMessageW(bar.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+            }
         }
 
         const driver = try selectionDriverJs(alloc, "ghoztty quoted this passage", "quote", true);

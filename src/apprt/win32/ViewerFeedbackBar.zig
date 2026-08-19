@@ -21,6 +21,25 @@
 //!
 //! ## Which text control this IS
 //!
+//! A **WebView2 contenteditable** (`ViewerFeedbackWeb.zig` +
+//! `viewer_feedback_page.zig`): a second `ICoreWebView2Controller` filling the
+//! pill's text rect, created on the first open and destroyed on close. That is
+//! D43's answer, taken against its own recommendation, and T934 is where the
+//! composer stopped contradicting it. What the engine brings — caret,
+//! selection, wrap, undo, clipboard, IME, a screen reader that can read the
+//! field — is the whole reason; see that file's header.
+//!
+//! The **RichEdit below is the fallback**, not the surface. It is still
+//! created (hidden) and every message path it owns still works, so a box whose
+//! WebView2 environment is missing gets a composer rather than a dead pill; the
+//! moment the web view comes up the RichEdit stays hidden and inert. T937
+//! retires it once the web surface has soaked. Which one is live is stated in
+//! the pane's own stderr on every open, so the answer is never a guess:
+//!
+//!     viewer feedback composer surface=web|richedit ...
+//!
+//! ### The RichEdit, as it was
+//!
 //! A **RichEdit** (`Msftedit.dll`, class `RichEdit50W`) hosted as a child
 //! filling the pill's text rect — D43's recommended answer, taken in T635.
 //! T634 shipped this file's chrome over a deliberately minimal editing
@@ -69,6 +88,8 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const layout_mod = @import("viewer_feedback_layout.zig");
 const doc = @import("viewer_feedback_doc.zig");
+const ViewerFeedbackWeb = @import("ViewerFeedbackWeb.zig");
+const composer_page = @import("viewer_feedback_page.zig");
 const feedback_images = @import("viewer_feedback_images.zig");
 const utf16_offset = @import("utf16_offset.zig");
 const clipboard_image = @import("clipboard_image.zig");
@@ -99,17 +120,35 @@ const WM_APP_RELAYOUT: u32 = w32.WM_APP + 1;
 /// The placeholder an empty composer shows, Mac's accessibility label turned
 /// into the cue an empty field needs (`EM_SETCUEBANNER`'s job, hand-drawn
 /// here because the pill is not an EDIT).
-const placeholder_w = std.unicode.utf8ToUtf16LeStringLiteral(
-    "What's wrong with what you're looking at?",
-);
+const placeholder_utf8 = "What's wrong with what you're looking at?";
+const placeholder_w = std.unicode.utf8ToUtf16LeStringLiteral(placeholder_utf8);
 
 /// The key hints in the footer's trailing slot. Spelled in the Windows
 /// chords, which is the whole reason it is not Mac's string.
 const hints = "Ctrl+Enter send  ·  Esc close";
 
 hwnd: w32.HWND,
-/// The RichEdit filling the pill's text rect. See "Which text control this IS".
+/// The RichEdit. The FALLBACK surface since T934 — hidden and inert whenever
+/// `web` is non-null. See "Which text control this IS".
 edit: w32.HWND,
+/// The web composer, while the composer is open. Null when it is closed (D43's
+/// mitigation: the controller is created lazily and given back on close, with
+/// the report text kept on the pane) and null when the environment could not
+/// produce one, which is the case the RichEdit above still covers.
+web: ?*ViewerFeedbackWeb = null,
+/// True while a write to the pane's buffer CAME from the page, so the pane's
+/// own "tell the composer" hook does not send it straight back.
+suppress_sync: bool = false,
+/// Whether the page has echoed anything back since this composer opened. The
+/// FIRST echo is the only proof from outside the process that the whole round
+/// trip works, so it is logged; see `composerState`.
+echoed: bool = false,
+/// The scale and pill colour the page's CSS custom properties were last built
+/// from. Pushing them is cheap but not free — the page re-measures its wrapped
+/// line count on every push — so it happens when they MOVE, not on every
+/// bounds sync.
+vars_scale: f32 = 0,
+vars_pill: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
 pane: *ViewerPane,
 alloc: Allocator,
 
@@ -280,11 +319,15 @@ pub fn create(
     // beep (Ctrl+Enter sends, and that is routed in App.zig); ES_AUTOVSCROLL
     // so a report past the pill's six-line cap scrolls with the caret. No
     // WS_VSCROLL: a scrollbar inside a capsule is not a thing this design has.
+    //
+    // NOT `WS_VISIBLE` since T934: this is the fallback surface now, and it is
+    // shown only when the web composer could not be created. Creating it up
+    // front anyway costs one hidden window and buys the whole degrade path.
     const edit = w32.CreateWindowExW(
         0,
         w32.MSFTEDIT_CLASS,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.ES_MULTILINE |
+        w32.WS_CHILD | w32.ES_MULTILINE |
             w32.ES_AUTOVSCROLL | w32.ES_WANTRETURN,
         0,
         0,
@@ -371,6 +414,10 @@ pub fn owningEdit(hwnd: w32.HWND) ?*ViewerFeedbackBar {
 }
 
 pub fn destroy(self: *ViewerFeedbackBar) void {
+    // The web composer's controller is parented to this window, so it goes
+    // FIRST: a renderer whose parent HWND has been destroyed under it is the
+    // one teardown order WebView2 does not forgive.
+    self.closeComposer();
     // A capture still up has nowhere to deliver to once this is gone, and its
     // overlay covers the whole desktop — so it comes down first, silently.
     if (self.selector) |s| {
@@ -497,8 +544,229 @@ pub fn applyTheme(self: *ViewerFeedbackBar) void {
     // ...and the quote washes on top of it, in the theme's new colours. The
     // SCF_ALL above just flattened them.
     self.applyQuoteFormatting();
+    // The web surface's colours are the SAME derivations, handed over as CSS
+    // custom properties rather than as control messages - one source, two
+    // renderers, which is D43's mitigation in one call.
+    self.pushComposerVars(true);
 
     _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
+// -------------------------------------------------------------------------
+// The web composer (T934)
+//
+// Everything below is the seam between this band and `ViewerFeedbackWeb`. The
+// band keeps owning its window, its paint, its hit testing and its geometry;
+// the web view owns the text rect's interior and pushes a snapshot up whenever
+// it changes.
+// -------------------------------------------------------------------------
+
+/// Create the web composer, or fall back to the RichEdit and say so.
+///
+/// Called from `setVisible(true)` rather than from `create`, which is D43's
+/// mitigation for the memory and startup cost: a pane whose composer nobody
+/// opens never pays for a renderer.
+fn openComposer(self: *ViewerFeedbackBar) void {
+    if (self.web != null) return;
+
+    const surface: []const u8 = surface: {
+        if (forcedRichEdit(self.alloc)) break :surface "richedit(forced)";
+        const env = self.pane.env orelse break :surface "richedit(no-environment)";
+        const wv = ViewerFeedbackWeb.create(self.alloc, self, self.hwnd, env) orelse
+            break :surface "richedit(controller-refused)";
+        self.web = wv;
+        // The band has already been placed by the pane's bounds sync, so the
+        // text rect is current and the view can be born the right size - a
+        // controller adopted at 0x0 lays its document out twice.
+        const l = self.currentLayout();
+        wv.setScale(self.scale);
+        wv.setBounds(.{
+            .left = l.text.left,
+            .top = l.text.top,
+            .right = l.text.left + @max(l.text.width(), 0),
+            .bottom = l.text.top + @max(l.text.height(), 0),
+        });
+        wv.setVisible(true);
+        _ = w32.ShowWindow(self.edit, w32.SW_HIDE);
+        break :surface "web";
+    };
+    if (self.web == null) {
+        // The degrade: the RichEdit becomes the surface it used to be.
+        _ = w32.ShowWindow(self.edit, w32.SW_SHOWNA);
+        self.seedControl();
+    }
+    // The acceptance script's oracle for WHICH control is live. Without it the
+    // fallback is indistinguishable from the feature, which is exactly how a
+    // degrade becomes the default nobody notices.
+    log.info("viewer feedback composer surface={s} pane={s}", .{ surface, self.pane.paneId() });
+}
+
+/// Whether `GHOZTTY_COMPOSER_SURFACE=richedit` asked for the fallback.
+///
+/// Two callers, one of them not a test: `test\win32\viewer-feedback.ps1` drives
+/// the composer's EDITING semantics (select-all, cut, paste, undo, the buffer
+/// mirror) through window messages, which reach a native control and cannot
+/// reach a Chromium window from the background test desktop — so that suite
+/// pins itself to the surface it can drive until T937 removes the fallback and
+/// re-points it. The other is a user whose WebView2 composer misbehaves and who
+/// needs their terminal to keep working while it is being fixed.
+///
+/// Anything other than `richedit` means the default, including a value we do
+/// not recognise: an env var is not a place to be strict.
+fn forcedRichEdit(alloc: Allocator) bool {
+    const want = std.process.getEnvVarOwned(alloc, "GHOZTTY_COMPOSER_SURFACE") catch return false;
+    defer alloc.free(want);
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, want, " \t"), "richedit");
+}
+
+/// Give the renderer back. The report text is untouched - it lives on the pane,
+/// which is what makes destroying the controller on every close affordable.
+fn closeComposer(self: *ViewerFeedbackBar) void {
+    const wv = self.web orelse return;
+    self.web = null;
+    self.vars_scale = 0;
+    self.echoed = false;
+    wv.destroy();
+}
+
+/// The page loaded (or reloaded itself). Dress it and fill it - in that order,
+/// so the wrapped line count it measures on the way back is measured against
+/// the right line box.
+pub fn composerReady(self: *ViewerFeedbackBar) void {
+    self.pushComposerVars(true);
+    const wv = self.web orelse return;
+    wv.seed(self.pane.feedbackText(), null);
+}
+
+/// One snapshot from the page: the document as it now stands.
+///
+/// This is the async replacement for `EN_CHANGE` + `readBack`, and it does the
+/// same three things - mirror into the pane's buffer (the thing that outlives
+/// this window), re-inset the page if the band's height moved, and keep the
+/// carousel's selection with the caret.
+pub fn composerState(self: *ViewerFeedbackBar, text: []const u8) void {
+    self.suppress_sync = true;
+    defer self.suppress_sync = false;
+    self.pane.feedbackSetText(self.alloc, text);
+    const grew = self.syncMetrics();
+    // The acceptance oracle for a surface nothing outside the process can look
+    // at (T233: no screenshots, no SendInput on the test desktop). Bounded on
+    // purpose - the FIRST echo after an open, then only when the pill's VISIBLE
+    // line count moves - because a line per keystroke would be a log nobody can
+    // read in a terminal somebody is working in.
+    if (!self.echoed or grew) {
+        self.echoed = true;
+        log.info("viewer composer echo pane={s} bytes={d} lines={d}", .{
+            self.pane.paneId(),
+            self.pane.feedbackText().len,
+            self.lineCount(),
+        });
+    }
+    if (grew) self.textChanged() else _ = w32.InvalidateRect(self.hwnd, null, 1);
+    self.syncCarouselToCaret();
+}
+
+/// The pane's buffer changed from the NATIVE side; make the page equal it.
+///
+/// Called from `feedbackSetText` itself, so it covers every writer rather than
+/// the ones anybody remembered — including a test and the post-send clear. Skip
+/// it for a write that came from the page, which would otherwise be an echo
+/// that fights the user's typing.
+pub fn composerSync(self: *ViewerFeedbackBar) void {
+    if (self.suppress_sync) return;
+    const wv = self.web orelse return;
+    wv.seed(self.pane.feedbackText(), null);
+}
+
+/// Push the design-system numbers into the page's CSS custom properties.
+///
+/// `force` is for the two moments the numbers themselves moved (a theme change,
+/// a fresh page); otherwise this is a no-op unless the scale or the pill colour
+/// has changed since the last push. The dedupe is load-bearing rather than an
+/// optimisation: every push makes the page re-measure and re-report, and a
+/// report arriving from inside a bounds sync is a bounds sync that runs again.
+fn pushComposerVars(self: *ViewerFeedbackBar, force: bool) void {
+    const wv = self.web orelse return;
+    if (!force and self.vars_scale == self.scale and
+        std.meta.eql(self.vars_pill, self.pill_rgb)) return;
+    const scale = if (self.scale > 0) self.scale else 1.0;
+
+    // Physical metrics divided by the rasterization scale, so one CSS pixel is
+    // exactly one of the physical pixels the layout module reserved. Dividing
+    // here rather than passing DIP constants is what keeps the two in step at
+    // 1.25, where `@round` moves the font and the leading independently.
+    const body = type_ramp.body(scale);
+    const line_h = type_ramp.lineBox(body, scale);
+
+    var fg_buf: [8]u8 = undefined;
+    var bg_buf: [8]u8 = undefined;
+    var ph_buf: [8]u8 = undefined;
+    var sel_buf: [8]u8 = undefined;
+
+    self.vars_scale = self.scale;
+    self.vars_pill = self.pill_rgb;
+    wv.pushVars(.{
+        .face = type_ramp.face,
+        .font_px = @as(f32, @floatFromInt(body.height)) / scale,
+        .line_px = @as(f32, @floatFromInt(line_h)) / scale,
+        .fg = hexRef(&fg_buf, self.text_ref),
+        .bg = hexRgb(&bg_buf, self.pill_rgb),
+        .placeholder = hexRef(&ph_buf, self.secondary_ref),
+        .selection = hexRef(&sel_buf, self.accent_ref),
+        .placeholder_text = placeholder_utf8,
+    });
+}
+
+/// `#rrggbb` for a `COLORREF`, which is 0x00BBGGRR - the byte order that makes
+/// a hand-written formatter here safer than a `{x}` of the whole word.
+fn hexRef(buf: *[8]u8, ref: u32) []const u8 {
+    return hexRgb(buf, .{
+        .r = @intCast(ref & 0xFF),
+        .g = @intCast((ref >> 8) & 0xFF),
+        .b = @intCast((ref >> 16) & 0xFF),
+    });
+}
+
+fn hexRgb(buf: *[8]u8, rgb: color_math.Rgb) []const u8 {
+    return std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ rgb.r, rgb.g, rgb.b }) catch "#000000";
+}
+
+/// The modifier state right now. Shared with `ViewerFeedbackWeb`'s accelerator
+/// handler, which runs while the browser process is blocked on its answer and
+/// so cannot be handed a stale copy.
+pub fn keyMods() input.Mods {
+    return .{
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
+    };
+}
+
+/// Whether a chord belongs to the composer or the pane rather than to the page.
+///
+/// The web surface's answer to the question `App.zig`'s `owningEdit` hook
+/// answers for the RichEdit: keys reach a Chromium window, not our message
+/// loop, so the claim has to be made inside `AcceleratorKeyPressed` - and made
+/// there rather than in the page's own `keydown`, because only `put_Handled`
+/// stops the browser ALSO acting on it (an unclaimed Ctrl+R would reload the
+/// composer's page out from under a half-written report).
+pub fn claimsComposerKey(self: *const ViewerFeedbackBar, vk: u16, mods: input.Mods) bool {
+    _ = self;
+    return viewer_accel.composerChord(vk, mods) != null;
+}
+
+/// Run a chord the accelerator handler claimed. Posted to this window rather
+/// than run inside the runtime's `Invoke`, because closing the composer tears
+/// the controller down and it must not happen under its own callback frame.
+fn runComposerChord(self: *ViewerFeedbackBar, vk: u16, mods: input.Mods) void {
+    const chord = viewer_accel.composerChord(vk, mods) orelse return;
+    switch (chord) {
+        .send => self.pane.sendFeedback(self.alloc),
+        .close => self.pane.setFeedbackOpen(false),
+        .snapshot => self.beginSnapshot(),
+    }
 }
 
 /// How many lines the composer currently shows: the control's own WRAPPED line
@@ -512,8 +780,10 @@ fn lineCount(self: *const ViewerFeedbackBar) u32 {
 /// Re-read the control's wrapped line count. Returns true when it changed, i.e.
 /// when the pill has to grow or shrink and the pane has to re-inset the page.
 fn syncLines(self: *ViewerFeedbackBar) bool {
-    const n = w32.SendMessageW(self.edit, w32.EM_GETLINECOUNT, 0, 0);
-    const lines: u32 = if (n > 0) @intCast(@as(usize, @bitCast(n))) else 1;
+    const lines: u32 = if (self.web) |wv| @max(wv.lines, 1) else plain: {
+        const n = w32.SendMessageW(self.edit, w32.EM_GETLINECOUNT, 0, 0);
+        break :plain if (n > 0) @intCast(@as(usize, @bitCast(n))) else 1;
+    };
     if (layout_mod.visibleLines(lines) == layout_mod.visibleLines(self.lines)) {
         self.lines = lines;
         return false;
@@ -599,6 +869,20 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
         @max(l.text.height(), 0),
         1,
     );
+    // The web surface fills the same rect, in the same coordinates: the
+    // controller is parented to this band, so `Layout`'s own client-space
+    // numbers are already what `put_Bounds` wants.
+    if (self.web) |wv| {
+        wv.setScale(scale);
+        wv.setBounds(.{
+            .left = l.text.left,
+            .top = l.text.top,
+            .right = l.text.left + @max(l.text.width(), 0),
+            .bottom = l.text.top + @max(l.text.height(), 0),
+        });
+        // Only when the scale actually moved — see `pushComposerVars`.
+        self.pushComposerVars(false);
+    }
 
     // A narrower pane re-wraps the text, so the line count this layout was
     // built from can be wrong the moment the control is moved — which is how
@@ -617,6 +901,14 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
 /// given a bare LF renders it but reports its own CR back, so normalising in
 /// both directions here keeps the buffer canonical.
 pub fn seedControl(self: *ViewerFeedbackBar) void {
+    // The web surface takes the buffer whole, caret at the end, in one message
+    // — the page owns the document, so there is no line-ending conversion and
+    // no formatting to re-derive on this side.
+    if (self.web) |wv| {
+        wv.seed(self.pane.feedbackText(), null);
+        if (self.syncMetrics()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
+        return;
+    }
     const text = self.pane.feedbackText();
 
     // Converted whole, in one pass, rather than line by line: splitting UTF-8
@@ -757,12 +1049,28 @@ fn byteOffset(self: *const ViewerFeedbackBar, unit: i32) usize {
 
 /// Where the caret is, as a byte offset into the pane's buffer.
 fn caret(self: *const ViewerFeedbackBar) usize {
+    // The web surface answers from the last snapshot the page pushed, not from
+    // a question asked now: there is no synchronous way to ask a browser where
+    // its caret is, which is the whole shape change T934 carries. A snapshot
+    // with no caret in it means focus is not in the box, and the end of the
+    // document is where the next insertion belongs.
+    if (self.web) |wv| {
+        const units = wv.caret orelse return self.pane.feedbackText().len;
+        return utf16_offset.byteForUnits(self.pane.feedbackText(), units);
+    }
     var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
     _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
     return self.byteOffset(sel.cpMin);
 }
 
 fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
+    if (self.web) |wv| {
+        // Placing the caret means re-stating the document, because a `seed` is
+        // the only write the page accepts. That is deliberate: one write path
+        // cannot drift from the buffer, and the buffer is the truth.
+        wv.seed(self.pane.feedbackText(), @intCast(self.charIndex(at)));
+        return;
+    }
     const u = self.charIndex(at);
     const cr: w32.CHARRANGE = .{ .cpMin = u, .cpMax = u };
     _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
@@ -774,6 +1082,38 @@ fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
 /// The passage has already been registered by the pane, so this is only the
 /// editing half: compute the block purely, put it in with `EM_REPLACESEL` so
 /// it lands on the undo stack, then re-derive the formatting from the text.
+/// Apply one computed insertion to the PANE's buffer and re-state the page.
+///
+/// The web surface has no `EM_REPLACESEL`: every native-side edit is "make the
+/// document equal the buffer", so the splice happens where the buffer lives and
+/// the page is told the result. The cost is the page's undo stack — a quote or
+/// a chip put in this way is not a step Ctrl+Z walks back, which is the one
+/// thing the RichEdit path did better and which T935/T936 restore by making
+/// both of them the page's own DOM nodes.
+fn spliceComposer(self: *ViewerFeedbackBar, at: usize, insert: []const u8, caret_after: usize) void {
+    const cur = self.pane.feedbackText();
+    const cut = @min(at, cur.len);
+    var next: std.ArrayList(u8) = .empty;
+    defer next.deinit(self.alloc);
+    next.ensureTotalCapacity(self.alloc, cur.len + insert.len) catch return;
+    next.appendSliceAssumeCapacity(cur[0..cut]);
+    next.appendSliceAssumeCapacity(insert);
+    next.appendSliceAssumeCapacity(cur[cut..]);
+    // Suppressed, then seeded by hand: `feedbackSetText`'s own sync would put
+    // the caret at the END, and where the caret lands after a quote or a chip
+    // is the whole point of `caret_after`.
+    self.suppress_sync = true;
+    self.pane.feedbackSetText(self.alloc, next.items);
+    self.suppress_sync = false;
+
+    const units = utf16_offset.unitsBeforeByte(self.pane.feedbackText(), caret_after);
+    if (self.web) |wv| wv.seed(self.pane.feedbackText(), @intCast(units));
+    // The band's height follows the page's next snapshot, which the seed above
+    // is about to produce; all this owes is the repaint of the chrome around
+    // it.
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
 pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
     const ins = doc.insertion(
         self.alloc,
@@ -782,6 +1122,11 @@ pub fn insertQuote(self: *ViewerFeedbackBar, passage: []const u8) void {
         passage,
     ) catch return;
     defer ins.deinit(self.alloc);
+
+    if (self.web != null) {
+        self.spliceComposer(ins.at, ins.insert, ins.caret_after);
+        return;
+    }
 
     // LF -> CRLF on the way in, the same conversion `seedControl` does: a bare
     // LF handed to RichEdit is not a paragraph break.
@@ -847,6 +1192,18 @@ pub fn attachImage(self: *ViewerFeedbackBar, png: []const u8) bool {
         number,
     ) catch return false;
     defer ins.deinit(self.alloc);
+
+    if (self.web != null) {
+        self.spliceComposer(ins.at, ins.insert, ins.caret_after);
+        self.showThumb(number);
+        log.info("viewer feedback pane={s} image=#{d} bytes={d} live={d}", .{
+            self.pane.paneId(),
+            number,
+            png.len,
+            self.pane.feedbackImageCount(self.alloc),
+        });
+        return true;
+    }
 
     const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, ins.insert) catch return false;
     defer self.alloc.free(wide);
@@ -1053,10 +1410,18 @@ fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
     if (index >= spans.len) return;
     const s = spans[index];
 
-    const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(s.start), .cpMax = self.charIndex(s.end) };
-    _ = w32.SetFocus(self.edit);
-    _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
-    _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+    if (self.web) |wv| {
+        // Plain-text parity only: the caret goes to the chip, and SELECTING the
+        // run is T936's, where a chip is a DOM node that can be selected as one
+        // thing rather than as a character range.
+        wv.takeFocus();
+        wv.seed(self.pane.feedbackText(), @intCast(self.charIndex(s.end)));
+    } else {
+        const cr: w32.CHARRANGE = .{ .cpMin = self.charIndex(s.start), .cpMax = self.charIndex(s.end) };
+        _ = w32.SetFocus(self.edit);
+        _ = w32.SendMessageW(self.edit, w32.EM_EXSETSEL, 0, @bitCast(@intFromPtr(&cr)));
+        _ = w32.SendMessageW(self.edit, w32.EM_SCROLLCARET, 0, 0);
+    }
 
     self.carousel_selected = index;
     self.carousel_scroll = self.currentLayout().scrollToShow(index, self.carousel_scroll);
@@ -1102,6 +1467,11 @@ fn quoteSpans(self: *const ViewerFeedbackBar) ?[]doc.Span {
 /// run, so the only formatting that cannot drift out of step with the report
 /// is formatting computed from the text the report is made of.
 fn applyQuoteFormatting(self: *ViewerFeedbackBar) void {
+    // The web surface has no character formats: a quoted block is CSS on the
+    // page, which is T935. Until then a quote there is plain text that still
+    // parses, still serializes and still shows in the report - the WASH is what
+    // is missing, not the quote.
+    if (self.web != null) return;
     const spans = self.quoteSpans();
     defer if (spans) |s| self.alloc.free(s);
 
@@ -1163,6 +1533,7 @@ fn formatRange(self: *ViewerFeedbackBar, from: i32, to: i32, quoted: bool) void 
 /// after the fact is what keeps a select-all + delete + type from leaving the
 /// user writing inside a quote that no longer exists.
 fn ensurePlainAtCaret(self: *ViewerFeedbackBar) void {
+    if (self.web != null) return;
     var sel: w32.CHARRANGE = .{ .cpMin = 0, .cpMax = 0 };
     _ = w32.SendMessageW(self.edit, w32.EM_EXGETSEL, 0, @bitCast(@intFromPtr(&sel)));
     // A non-empty selection is about to be REPLACED; the format that matters
@@ -1249,6 +1620,10 @@ fn resumeUndo(self: *ViewerFeedbackBar) void {
 /// reason the placeholder is: the control is opaque and on top, so there is no
 /// "behind" to paint into.
 fn paintQuoteBars(self: *ViewerFeedbackBar, hdc: w32.HDC) void {
+    // Positions come from `EM_POSFROMCHAR` on the RichEdit, which is not the
+    // control the text is in any more when the web surface is up - painting
+    // from it would draw accent bars at coordinates nothing on screen matches.
+    if (self.web != null) return;
     const spans = self.quoteSpans() orelse return;
     defer self.alloc.free(spans);
 
@@ -1305,11 +1680,20 @@ pub fn setVisible(self: *ViewerFeedbackBar, visible: bool) void {
     // away from the page. Focus is given deliberately, by the pane, on the
     // click that opened it.
     _ = w32.ShowWindow(self.hwnd, if (visible) w32.SW_SHOWNA else w32.SW_HIDE);
+    // The renderer is created on the way in and given back on the way out.
+    // Order matters both times: the band has to be placed (it is, by the
+    // pane's bounds sync) before the view can be born the right size, and the
+    // view has to go before anything else stops being able to host it.
+    if (visible) self.openComposer() else self.closeComposer();
 }
 
 /// Put the caret in the composer. Separate from `setVisible` on purpose — see
 /// the comment there.
 pub fn takeFocus(self: *ViewerFeedbackBar) void {
+    if (self.web) |wv| {
+        wv.takeFocus();
+        return;
+    }
     _ = w32.SetFocus(self.edit);
 }
 
@@ -1317,8 +1701,13 @@ pub fn takeFocus(self: *ViewerFeedbackBar) void {
 /// poll reads this to hold the nav bar open — and "inside" includes the text
 /// control, which is where focus actually sits while anyone is typing.
 pub fn hasFocus(self: *const ViewerFeedbackBar) bool {
-    const f = w32.GetFocus();
-    return f == @as(?w32.HWND, self.hwnd) or f == @as(?w32.HWND, self.edit);
+    const f = w32.GetFocus() orelse return false;
+    if (f == self.hwnd or f == self.edit) return true;
+    // The web surface's caret lives several windows down inside Chromium's own
+    // hierarchy, all of it parented to this band - so the test is descent, not
+    // equality. Equality is what would have made the nav bar auto-hide out from
+    // under a composer somebody was typing into.
+    return w32.IsChild(self.hwnd, f) != 0;
 }
 
 /// The text changed: the pill may have grown or shrunk, so the pane has to
@@ -1881,7 +2270,7 @@ fn wndProc(
         // somewhere the user cannot type.
         w32.WM_SETFOCUS => {
             self.focused = true;
-            _ = w32.SetFocus(self.edit);
+            self.takeFocus();
             return 0;
         },
 
@@ -1991,6 +2380,17 @@ fn wndProc(
 
         WM_APP_RELAYOUT => {
             self.textChanged();
+            return 0;
+        },
+
+        // A chord the web surface's accelerator handler claimed, delivered here
+        // so it runs on the message loop rather than inside the runtime's own
+        // callback - where `close` would tear the controller down under its own
+        // Invoke frame.
+        ViewerFeedbackWeb.WM_APP_COMPOSER_CHORD => {
+            const vk: u16 = @intCast(wparam & 0xFFFF);
+            const mods: input.Mods = @bitCast(@as(u16, @intCast(@as(usize, @bitCast(lparam)) & 0xFFFF)));
+            self.runComposerChord(vk, mods);
             return 0;
         },
 

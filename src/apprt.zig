@@ -273,6 +273,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_feedback_images.zig");
 
+    // Pure win32 viewer feedback composer PAGE — the contenteditable document
+    // the composer's own WebView2 loads and the two-way message protocol it
+    // speaks (T934), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_feedback_page.zig");
+
     // Pure win32 byte-offset ⇄ UTF-16 code-unit conversion — the boundary
     // between the pane's UTF-8 buffer and a `W` edit control's character
     // indices (T648), same no-OS-imports deal.

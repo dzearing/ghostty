@@ -1,0 +1,86 @@
+/*
+ * The feedback composer's text surface (T934).
+ *
+ * Every number here is a CUSTOM PROPERTY the host writes, never a constant:
+ * `viewer_feedback_layout.zig` and `type_ramp.zig` own the design system, and
+ * a second hand-maintained copy in a stylesheet is exactly the divergence
+ * D43's mitigation asked to avoid. What this file owns is the SHAPE - how the
+ * text wraps, where the placeholder sits, what the scrollbar does - not the
+ * sizes or the colors.
+ *
+ * The page is loaded with NavigateToString into a controller that covers the
+ * pill's text rect only. The pill, its accent, the carousel and the send row
+ * are still painted natively by the bar underneath, so this document has no
+ * chrome of its own: it is a single editable box that fills its viewport.
+ */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  /* The pill's fill, pushed down by the host. Painted here rather than left
+     transparent because a WebView2 with no background composites WHITE, and a
+     white flash inside a dark capsule is what the user would see on every
+     open. */
+  background: var(--bg, #1a1a1a);
+}
+
+#c {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+
+  font-family: var(--face, "Segoe UI"), system-ui, sans-serif;
+  font-size: var(--font-px, 14px);
+  line-height: var(--line-px, 18px);
+  color: var(--fg, #ffffff);
+  caret-color: var(--fg, #ffffff);
+
+  /* pre-wrap is what makes a bare "\n" in the text node a real line break, so
+     the document model stays FLAT: one text node whose content is the report.
+     Without it the engine would have to reach for <br> elements and the read
+     path would have to reassemble them. */
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+
+  /* Past the layout's six-line cap the box scrolls with the caret. No visible
+     scrollbar: a scrollbar inside a capsule is not a thing this design has,
+     which is the same call the RichEdit made by omitting WS_VSCROLL. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+#c::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+#c::selection {
+  background: var(--sel, #3a6ea5);
+  color: var(--fg, #ffffff);
+}
+
+/*
+ * The placeholder. Mac carries it as an accessibility label on an empty field;
+ * here it is the cue an empty composer shows, and it is driven by a CLASS the
+ * script sets rather than by `:empty` - a contenteditable that has been typed
+ * into and emptied again keeps a stray text node or placeholder <br>, so
+ * `:empty` stops matching the moment anyone has ever typed.
+ */
+#c.empty::before {
+  content: attr(data-placeholder);
+  color: var(--placeholder, #aaaaaa);
+  pointer-events: none;
+  /* Out of flow, so the box the caret sits in is still one line tall and the
+     placeholder never contributes to the wrapped line count. */
+  position: absolute;
+  white-space: pre;
+}
