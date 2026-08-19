@@ -50,6 +50,7 @@ const update_check = @import("update_check.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
 const session_layout = @import("session_layout.zig");
+const layout_refresh = @import("layout_refresh.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
 const window_placement = @import("window_placement.zig");
@@ -168,6 +169,32 @@ const AGENT_WATCH_TIMER_ID: usize = 5;
 /// disarmed the moment the link is back or the schedule is spent.
 const AGENT_RETRY_TIMER_ID: usize = 7;
 
+/// Timer ID (on `msg_hwnd`) for the periodic session-layout REFRESH (T922).
+/// Repeating, armed once at startup while persistence is on.
+///
+/// The manifest carries each pane's persisted SCREEN, and a screen goes stale
+/// the moment the pane prints anything — but every other write trigger is a
+/// TOPOLOGY mutation (a split, a tab, a rename, a banner). So a pane that has
+/// simply been running for an hour had its screen recorded as of the last time
+/// a window moved, and a reboot brought THAT back: on D78's restore path the
+/// user reads an hour-old screen instead of the error the crash interrupted.
+/// This tick re-captures; `session_layout.writeIfChanged` keeps an idle
+/// terminal from paying for it.
+const LAYOUT_REFRESH_TIMER_ID: usize = 10;
+
+/// Poll cadence for that refresh, and the quiet window it waits for. Each tick
+/// is one lock-free atomic read per pane (`Termio.remoteAppliedOffset`), so an
+/// idle terminal pays nothing measurable and never writes; the capture happens
+/// on the FIRST tick that finds the panes quiet again, which is what keeps a
+/// build's whole output from costing a manifest rewrite every two seconds.
+const LAYOUT_REFRESH_MS: u32 = 2_000;
+
+/// …and the ceiling on that "wait for quiet" (T922; see `layout_refresh`).
+/// Matched to the local agent's own ring-snapshot cadence (`session.zig`, 30
+/// ticks of 1s): the two halves of what a reboot brings back, the app's screen
+/// and the agent's ring, are then recorded at the same worst-case rhythm.
+const LAYOUT_REFRESH_MAX_MS: i64 = 30_000;
+
 /// Timer ID 9: the periodic long-unattached session check (T534). Armed at
 /// startup with a short first fire, then re-armed at the full cadence on every
 /// tick. (Timer 8 is the orphan balloon's icon-cleanup timer, defined beside
@@ -245,6 +272,21 @@ pushed_layouts_conn: ?*remote_connection.Connection = null,
 /// can free it and reuse the slot. That keeps the peak cost at a single pane's
 /// screen no matter how many windows a restore rebuilds. Freed in `deinit`.
 restore_snapshot_scratch: ?[]u8 = null,
+
+/// Identity of the last session-layout body this process wrote to disk (T922),
+/// so a refresh tick that decides to capture can still skip the write when the
+/// capture turns out identical — a repaint that lands back on the same screen,
+/// or a pane whose output never reached the snapshotted region. Null until the
+/// first write.
+layout_body_id: ?session_layout.BodyId = null,
+
+/// T922 refresh bookkeeping, all in the units the tick compares: the summed
+/// agent-stream offset across every pane, which moves iff some pane applied
+/// output. `seen` is the last poll, `captured` the poll the manifest on disk
+/// reflects, `last_write_ms` when that capture happened.
+layout_refresh_seen: u64 = 0,
+layout_refresh_captured: u64 = 0,
+layout_refresh_last_write_ms: i64 = 0,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -629,6 +671,14 @@ pub fn init(
     if (self.msg_hwnd) |mh| {
         const first = @min(self.orphanCheckIntervalMs(), 60_000);
         _ = w32.SetTimer(mh, ORPHAN_CHECK_TIMER_ID, first, null);
+    }
+
+    // Keep each pane's persisted SCREEN current (T922). Repeating, so it needs
+    // no re-arm; started here rather than on the first mutation because a pane
+    // that never triggers one is exactly the pane whose screen goes stalest.
+    if (self.config.@"session-persistence") {
+        if (self.msg_hwnd) |mh|
+            _ = w32.SetTimer(mh, LAYOUT_REFRESH_TIMER_ID, LAYOUT_REFRESH_MS, null);
     }
 
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
@@ -1283,7 +1333,10 @@ pub fn terminate(self: *App) void {
     // alive (T89f). Quit DETACHES sessions (they survive under the agent), so
     // the topology we capture here is exactly what the next launch re-attaches.
     // Kill any pending debounce timer first so it can't fire mid-teardown.
-    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
+    if (self.msg_hwnd) |hwnd| {
+        _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
+        _ = w32.KillTimer(hwnd, LAYOUT_REFRESH_TIMER_ID); // T922
+    }
     // T145: no in-place recovery during teardown — the windows are about to go.
     self.endAgentSettleWatch();
     self.syncSessionLayout();
@@ -1467,6 +1520,60 @@ pub fn markLayoutDirty(self: *App) void {
     _ = w32.SetTimer(hwnd, LAYOUT_SYNC_TIMER_ID, LAYOUT_SYNC_DEBOUNCE_MS, null);
 }
 
+/// The summed agent-stream offset across every terminal pane (T922).
+///
+/// A cursor, not a quantity: it moves iff some pane applied output, which is
+/// exactly the event that invalidates the persisted screens and is invisible to
+/// every other layout-write trigger. Summing is safe for this use — offsets only
+/// ever grow, so the sum only ever grows, and two panes cannot cancel out. Each
+/// read is a lock-free atomic (`Remote.appliedOffset`), so the whole poll costs
+/// one load per pane.
+fn paneStreamOffsetSum(self: *App) u64 {
+    var sum: u64 = 0;
+    for (self.windows.items) |win| {
+        if (win.tab_count == 0) continue;
+        for (0..win.tab_count) |ti| {
+            for (win.tab_trees[ti].nodes) |node| {
+                const pane = switch (node) {
+                    .leaf => |p| p,
+                    .split => continue,
+                };
+                const surface = pane.surface() orelse continue;
+                if (!surface.core_surface_ready) continue;
+                sum +%= surface.core_surface.io.remoteAppliedOffset() orelse 0;
+            }
+        }
+    }
+    return sum;
+}
+
+/// One tick of the session-layout REFRESH (T922): persist the panes' screens
+/// again if — and only if — some pane has painted since the last time they were
+/// persisted. The decision itself is `layout_refresh.decide`, where it is unit
+/// tested; this owns reading the panes and the clock.
+fn tickLayoutRefresh(self: *App) void {
+    if (!self.config.@"session-persistence") return;
+
+    const now = self.paneStreamOffsetSum();
+    const ms = std.time.milliTimestamp();
+    const action = layout_refresh.decide(.{
+        .now = now,
+        .seen = self.layout_refresh_seen,
+        .captured = self.layout_refresh_captured,
+        .since_write_ms = ms - self.layout_refresh_last_write_ms,
+        .max_wait_ms = LAYOUT_REFRESH_MAX_MS,
+    });
+    self.layout_refresh_seen = now;
+    switch (action) {
+        .idle, .wait => return,
+        .capture => {},
+    }
+
+    self.layout_refresh_captured = now;
+    self.layout_refresh_last_write_ms = ms;
+    self.syncSessionLayout();
+}
+
 /// Capture the live window/tab/split topology and atomically persist it to the
 /// session-layout manifest (T89f). Best-effort. When persistence is off the
 /// stale manifest is deleted so a later launch never restores it.
@@ -1474,6 +1581,10 @@ pub fn syncSessionLayout(self: *App) void {
     const gpa = self.core_app.alloc;
     if (!self.config.@"session-persistence") {
         session_layout.clear(gpa);
+        // Forget what was on disk: if persistence comes back on, the next
+        // capture must write even when it happens to serialize to the same
+        // bytes as the file this just deleted.
+        self.layout_body_id = null;
         // Turning persistence off is the user asking to FORGET — the carried
         // unrestored windows (T590) included, or they would resurrect if it
         // came back on.
@@ -1513,7 +1624,11 @@ pub fn syncSessionLayout(self: *App) void {
         };
     }
     const file: session_layout.File = .{ .windows = windows };
-    session_layout.write(gpa, file);
+    _ = session_layout.writeIfChanged(gpa, file, &self.layout_body_id);
+    // The blob push is NOT gated on that write. It reconciles against what this
+    // process has already pushed, so an unchanged topology costs nothing — but
+    // it is also how a re-established agent link gets the whole set back, and
+    // that recovery must not wait for the layout to happen to change.
     self.pushLayoutBlobs(file);
 
     // If an agent-backed pane hasn't published its session id yet, the manifest
@@ -8337,6 +8452,18 @@ fn msgWndProc(
     if (msg == w32.WM_TIMER and wparam == LAYOUT_SYNC_TIMER_ID) {
         _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
         app.syncSessionLayout();
+        return 0;
+    }
+
+    // Timer ID 10: the periodic session-layout REFRESH (T922). Repeating, so it
+    // is not killed here. Its whole job is to re-capture each pane's SCREEN,
+    // which no mutation trigger ever notices. `tickLayoutRefresh` owns both the
+    // "has anything painted?" question and the persistence-off check — the
+    // latter re-read per tick rather than disarmed, so a config reload that
+    // turns persistence off does not leave the tick deleting the manifest and
+    // the agent's blobs on a loop.
+    if (msg == w32.WM_TIMER and wparam == LAYOUT_REFRESH_TIMER_ID) {
+        app.tickLayoutRefresh();
         return 0;
     }
 

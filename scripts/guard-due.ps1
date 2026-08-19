@@ -312,6 +312,18 @@ $GuardTable = @(
             # their entire layout, because the app's own timed-out dial was the
             # thing that wedged the agent it had just spawned.
             'src\remote\pipe_stream.zig',
+            # T922: what a restored pane can possibly SHOW is decided before the
+            # kill, by the manifest. The writer and the refresh policy are
+            # therefore part of this harness's subject - arm A15 is scored on a
+            # marker that only reaches the pane through this file - even though
+            # neither is on the restore path itself. `App.zig` is deliberately
+            # NOT here: it is edited by most tasks and would leave this
+            # twelve-minute GUI run due every turn, so the policy was split out
+            # into `layout_refresh.zig` to be watchable on its own. The residual
+            # gap is App.zig's WIRING of it (the timer, the pane walk), which
+            # only a run of this harness catches.
+            'src\apprt\win32\session_layout.zig',
+            'src\apprt\win32\layout_refresh.zig',
             'test\win32\session-relaunch-notify.ps1'
         )
     },

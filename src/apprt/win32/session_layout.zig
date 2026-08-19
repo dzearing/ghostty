@@ -325,20 +325,77 @@ pub fn layoutPath(alloc: Allocator) ?[]u8 {
     return std.fs.path.join(alloc, &.{ dir, "ghoztty", name }) catch null;
 }
 
-/// Best-effort persist of `file` to the default path. Failures are swallowed —
-/// the manifest is a convenience, never worth an error dialog (window_memory
-/// parity). An empty window set deletes the file rather than leaving a stale
-/// one that would restore nothing (Mac `saveLocked` parity).
-pub fn write(alloc: Allocator, file: File) void {
-    const path = layoutPath(alloc) orelse return;
-    defer alloc.free(path);
-    if (file.windows.len == 0) {
-        std.fs.cwd().deleteFile(path) catch {};
-        return;
+/// The identity of a manifest body, for "has anything actually changed since I
+/// last wrote?" (T922). `null` is "nothing written yet / unknown"; `deleted` is
+/// the empty-window-set case `write` spells as a file delete, kept distinct so
+/// it can never collide with a real body's hash.
+pub const BodyId = union(enum) {
+    deleted,
+    hash: u64,
+
+    pub fn eql(self: BodyId, other: BodyId) bool {
+        return switch (self) {
+            .deleted => other == .deleted,
+            .hash => |h| switch (other) {
+                .deleted => false,
+                .hash => |o| h == o,
+            },
+        };
     }
-    const body = serialize(alloc, file) catch return;
+};
+
+fn hashBody(body: []const u8) BodyId {
+    return .{ .hash = std.hash.Wyhash.hash(0, body) };
+}
+
+/// The identity `writeIfChanged` would compare for `file`, without touching the
+/// disk — the same derivation, so a test can assert what the skip rule sees.
+/// Null only when the body could not be serialized.
+pub fn bodyId(alloc: Allocator, file: File) ?BodyId {
+    if (file.windows.len == 0) return .deleted;
+    const body = serialize(alloc, file) catch return null;
     defer alloc.free(body);
-    writeAtomic(alloc, path, body) catch {};
+    return hashBody(body);
+}
+
+/// Best-effort persist of `file` to the default path — SKIPPED when the bytes
+/// would be identical to the last ones this process wrote (`prev`, updated in
+/// place). Returns true when the disk was actually touched. Failures are
+/// swallowed: the manifest is a convenience, never worth an error dialog
+/// (window_memory parity). An empty window set deletes the file rather than
+/// leaving a stale one that would restore nothing (Mac `saveLocked` parity).
+///
+/// Why the skip (T922): the manifest carries each pane's persisted SCREEN, and
+/// a screen goes stale the moment the pane prints anything — so `App` now
+/// re-captures it on a timer rather than only when the window/tab/split topology
+/// mutates. Some of those captures find nothing new, and an atomic write for a
+/// byte-identical body is pure churn: a rename over the user's manifest, on a
+/// loop, forever. Serializing is the expensive half and happens either way, so
+/// the comparison is made on the serialized body rather than by asking the
+/// topology whether it changed — which is also the only version that catches "a
+/// pane repainted itself back to what it already looked like".
+pub fn writeIfChanged(alloc: Allocator, file: File, prev: *?BodyId) bool {
+    const path = layoutPath(alloc) orelse return false;
+    defer alloc.free(path);
+
+    if (file.windows.len == 0) {
+        if (prev.*) |p| if (p.eql(.deleted)) return false;
+        std.fs.cwd().deleteFile(path) catch {};
+        prev.* = .deleted;
+        return true;
+    }
+
+    const body = serialize(alloc, file) catch return false;
+    defer alloc.free(body);
+    const id = hashBody(body);
+    if (prev.*) |p| if (p.eql(id)) return false;
+    // Only a write that LANDED may be remembered: recording the hash of a body
+    // that failed to reach disk would make every later tick skip it as
+    // "already written", and the manifest would stay at whatever the last
+    // successful write left there.
+    writeAtomic(alloc, path, body) catch return false;
+    prev.* = id;
+    return true;
 }
 
 /// Delete the manifest (persistence turned off, or nothing to restore).
@@ -766,6 +823,44 @@ test "writeAtomic + load round-trip; no .tmp leftover; missing file loads null" 
         "abcabcabcabcabcabcabcabcabcabcab",
         loaded.value.windows[0].tabs[0].nodes[0].leaf.?.session_id.?,
     );
+}
+
+test "T922: the write-skip rule sees a changed pane SCREEN, not just topology" {
+    const alloc = testing.allocator;
+
+    const tabs = [_]Tab{.{ .nodes = &[_]Node{.{ .leaf = .{
+        .session_id = "abcabcabcabcabcabcabcabcabcabcab",
+        .screen_snapshot = "b2xkIHNjcmVlbg==",
+        .screen_snapshot_offset = 4096,
+    } }}, .active = true }};
+    const windows = [_]Window{.{ .id = "w1", .tabs = &tabs }};
+
+    // The same topology captured twice is the same body: an idle terminal must
+    // not cost a manifest rewrite on every refresh tick.
+    const first = bodyId(alloc, .{ .windows = &windows }).?;
+    try testing.expect(first.eql(bodyId(alloc, .{ .windows = &windows }).?));
+
+    // A pane that painted something new IS a change, even though no window,
+    // tab or split moved — the whole reason the refresh exists.
+    const moved_tabs = [_]Tab{.{ .nodes = &[_]Node{.{ .leaf = .{
+        .session_id = "abcabcabcabcabcabcabcabcabcabcab",
+        .screen_snapshot = "bmV3IHNjcmVlbg==",
+        .screen_snapshot_offset = 8192,
+    } }}, .active = true }};
+    const moved = [_]Window{.{ .id = "w1", .tabs = &moved_tabs }};
+    try testing.expect(!first.eql(bodyId(alloc, .{ .windows = &moved }).?));
+}
+
+test "T922: an empty window set is its own identity, never a body hash" {
+    const alloc = testing.allocator;
+
+    const empty = bodyId(alloc, .{}).?;
+    try testing.expect(empty.eql(.deleted));
+    try testing.expect(empty.eql(bodyId(alloc, .{ .windows = &.{} }).?));
+
+    const tabs = [_]Tab{.{ .nodes = &[_]Node{.{ .leaf = .{ .session_id = "a" } }}, .active = true }};
+    const windows = [_]Window{.{ .id = "w1", .tabs = &tabs }};
+    try testing.expect(!empty.eql(bodyId(alloc, .{ .windows = &windows }).?));
 }
 
 test "viewer leaf round-trips all four fields; a terminal leaf emits none of them" {

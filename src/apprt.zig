@@ -426,6 +426,11 @@ test {
     // Windows / in the none lane).
     _ = @import("apprt/win32/session_layout.zig");
 
+    // Pure win32 refresh policy: whether a tick should re-persist the panes'
+    // screens, wait for their output to go quiet, or do nothing at all (T922),
+    // same no-OS-imports deal — it is arithmetic over a cursor and a clock.
+    _ = @import("apprt/win32/layout_refresh.zig");
+
     // Pure win32 agent-owned layout blobs — one window in and out of the
     // SET_LAYOUT/GET_LAYOUTS wire shape (T334), same no-OS-imports deal (its
     // only non-std import is `remote/protocol.zig`, which builds in every lane).

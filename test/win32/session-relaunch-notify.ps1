@@ -59,6 +59,11 @@ param(
     # end, deliberately, so this has to be somewhere else.
     [string]$DumpPanesTo = '',
     [switch]$NegativeControl,
+    # Keep the per-run temp tree (every arm's app stderr log, its CLI captures
+    # and its session-layout manifest) instead of deleting it at the end. For
+    # diagnosing an arm that `-DumpPanesTo` cannot explain: that flag only
+    # reaches arm A's panes, and a failure in D/E/F leaves nothing behind.
+    [switch]$KeepTemp,
     [switch]$Interactive
 )
 
@@ -224,6 +229,38 @@ function Wait-Leaves($tag, $target, $timeoutSec = 45) {
     }
     return (Get-List "$tag-last")
 }
+# Wait-Leaves, then wait for every restored pane to hold SOME banner.
+#
+# A leaf appears in `+list` as soon as its pane exists; its banner arrives later,
+# from the pane's own IO thread, after the ATTACH round-trips and - since
+# T922/D78 - after the dead session's screen is repainted into it. So a bare
+# Wait-Leaves can answer with three leaves whose banner fields are simply not
+# filled in yet, and the arms below would score "which banner did this pane end
+# up with?" against a pane that has not chosen one. (Measured: arm E read
+# `noticed=0` off a restore whose own manifest, written moments later, recorded
+# the notice banner on exactly the pane E4 expects it on.)
+#
+# The settle condition is deliberately NOT the assertion: it asks only that
+# every pane holds a banner, never which. A build that put the notice over a
+# pane's own banner settles just as fast and still fails E3.
+function Wait-BannerSettle($tag, $target, $timeoutSec = 40) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    # NOT `@(All-Leaves ...)`: All-Leaves already hands back its array as one
+    # pipeline item, so wrapping it re-wraps - `$leaves` becomes a one-element
+    # array holding the leaf array, every `$leaf.banner` becomes every banner
+    # joined, and the arms score nonsense. (Measured: A5/A8/A11/A13 all went red
+    # against a build that had just passed them.)
+    $leaves = All-Leaves (Wait-Leaves $tag $target 30)
+    while ((Get-Date) -lt $deadline) {
+        if ($leaves.Count -ge $target) {
+            $withBanner = @($leaves | Where-Object { ([string]$_.banner) -ne '' }).Count
+            if ($withBanner -eq $leaves.Count) { break }
+        }
+        Start-Sleep -Milliseconds 700
+        $leaves = All-Leaves (Get-List "$tag-settle")
+    }
+    return , $leaves
+}
 function Read-Pane($id, $tag, $lines = 300) {
     Run-CliArgs @('+read', "--name=$id", "--lines=$lines") "$tmp\read-$tag.txt" 12 | Out-Null
     return ((Out-Text "$tmp\read-$tag.txt") -replace "`0", '')
@@ -243,6 +280,41 @@ function Wait-PaneTextTight($id, $tag, $needle, $want = 1, $timeoutSec = 30) {
     }
     return $false
 }
+# T922: has the app PERSISTED a pane screen carrying `$needle` yet?
+#
+# The restore paints the screen the session-layout manifest recorded, so what
+# the restored pane can possibly show is decided before the kill, by whether
+# that file has caught up with the pane. Waiting on the file itself rather than
+# sleeping a guessed interval is the difference between an arm that measures the
+# restore and one that measures the refresh cadence: the app re-captures a pane's
+# screen a couple of seconds after its output goes quiet, and any sleep short
+# enough to keep this script fast is long enough to be a coin flip.
+function Wait-LayoutSnapshotHas($needle, $timeoutSec = 40) {
+    $path = Join-Path $env:LOCALAPPDATA 'ghoztty\session-layout-debug.json'
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $path) {
+            try {
+                $doc = Get-Content -Raw -Encoding utf8 $path | ConvertFrom-Json
+                foreach ($w in @($doc.windows)) {
+                    foreach ($t in @($w.tabs)) {
+                        foreach ($n in @($t.nodes)) {
+                            $b64 = [string]$n.leaf.screen_snapshot
+                            if ($b64 -eq '') { continue }
+                            $txt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+                            if (($txt -replace '\s', '').Contains($needle)) { return $true }
+                        }
+                    }
+                }
+            } catch {
+                # A torn read of the atomic replace, or a half-written file:
+                # both are transient by construction, so just look again.
+            }
+        }
+        Start-Sleep -Milliseconds 700
+    }
+    return $false
+}
 function Wait-PaneText($id, $tag, $pattern, $timeoutSec = 30) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -258,9 +330,17 @@ function Wait-PaneText($id, $tag, $pattern, $timeoutSec = 30) {
 # would score a real pass as a FAIL. `>` is the shell's prompt terminator and
 # appears nowhere in the notice or in a `ping -n N 127.0.0.1` label, so the
 # first one marks where the shell's content begins.
+#
+# `shell` is the FIRST prompt in the dump and `fresh` the first one at or after
+# the notice. The two differ since T922/D78: a restored pane now opens with the
+# DEAD session's last screen painted above the notice, and that screen ends in
+# the old shell's prompt - so "the first `>` in the pane" stopped meaning "the
+# new shell painted" the day the restore started bringing history back, and
+# scored a correct build FAIL. `shell` is still the positive control (something
+# painted at all); `fresh` is what the placement claim is about.
 function Get-NoticePlacement($id, $tag, $timeoutSec = 40) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
-    $out = @{ notice = -1; shell = -1 }
+    $out = @{ notice = -1; shell = -1; fresh = -1 }
     while ((Get-Date) -lt $deadline) {
         $tight = (Read-Pane $id $tag 400) -replace '\s', ''
         # Ordinal-ignore-case on purpose: String.IndexOf(string) is case
@@ -270,7 +350,8 @@ function Get-NoticePlacement($id, $tag, $timeoutSec = 40) {
         # in the pure session_notice tests, not here.
         $out.notice = $tight.IndexOf('sessioninterrupted', [System.StringComparison]::OrdinalIgnoreCase)
         $out.shell = $tight.IndexOf('>')
-        if ($out.notice -ge 0 -and $out.shell -ge 0) { break }
+        $out.fresh = if ($out.notice -ge 0) { $tight.IndexOf('>', $out.notice) } else { -1 }
+        if ($out.notice -ge 0 -and $out.shell -ge 0 -and $out.fresh -ge 0) { break }
         Start-Sleep -Milliseconds 700
     }
     return $out
@@ -362,6 +443,11 @@ function Build-AndKill($cwdA, $withBanners = $false) {
         Run-CliArgs @('+send-keys', "--target=$($script:plainPane)", 'echo', 'Space', $HIST_MARK, 'Enter') "$tmp\hist.txt" 15 | Out-Null
         Assert "setup: the plain pane printed the history marker before the kill" `
             (Wait-PaneTextTight $script:plainPane 'hist' $HIST_MARK 2 25)
+        # …and that it reached the MANIFEST, which is the only copy that
+        # survives the kill. This is the positive control for A15: without it,
+        # a red A15 cannot be told apart from a screen that was never persisted.
+        Assert "setup: the plain pane's screen was persisted with the history marker" `
+            (Wait-LayoutSnapshotHas $HIST_MARK 45)
     }
 
     Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
@@ -442,7 +528,7 @@ if ($NegativeControl) {
 # Scored first on the PANE BANNER (`+list --json`'s `banner` field), which is a
 # native overlay a screen clear cannot reach. A5-A8 below are the banner's arm;
 # A10-A13 are the in-stream copy's, added by T423.
-$leavesA = All-Leaves (Wait-Leaves 'a1' 3 30)
+$leavesA = Wait-BannerSettle 'a1' 3 40
 $sawNotice = 0; $sawA = 0; $sawB = 0; $crossTalk = 0
 foreach ($leaf in $leavesA) {
     $b = [string]$leaf.banner
@@ -475,13 +561,18 @@ Assert "A8 no pane shows the OTHER pane's command" ($crossTalk -eq 0)
 # A10 is the positive control for A12: without proof that the shell painted at
 # all, "the notice is above the shell content" is satisfied by a pane where
 # there IS no shell content.
+#
+# A12 scores the FRESH shell's prompt (`place.fresh`) since T922/D78 - see
+# Get-NoticePlacement. The claim is unchanged ("the repaint never got above the
+# notice"); what changed is that a restored pane now also carries the DEAD
+# shell's prompt, above the notice, where it belongs.
 $textNotice = 0; $textAbove = 0; $shellPainted = 0; $textCmd = 0
 foreach ($leaf in $leavesA) {
     $short = $leaf.id.Substring(0, 4)
     $place = Get-NoticePlacement $leaf.id "atxt$short"
     if ($place.notice -ge 0) { $textNotice++ }
     if ($place.shell -ge 0) { $shellPainted++ }
-    if ($place.notice -ge 0 -and $place.shell -ge 0 -and $place.notice -lt $place.shell) { $textAbove++ }
+    if ($place.notice -ge 0 -and $place.fresh -ge 0) { $textAbove++ }
     $tight = (Read-Pane $leaf.id "acmd$short" 400) -replace '\s', ''
     if ($tight.Contains("-n$MARK_A") -or $tight.Contains("-n$MARK_B")) { $textCmd++ }
 }
@@ -518,10 +609,15 @@ foreach ($leaf in $leavesA) {
     $iNotice = $tight.IndexOf('sessioninterrupted', [System.StringComparison]::OrdinalIgnoreCase)
     if ($iNotice -ge 0 -and $iHist -lt $iNotice) { $histAbove++ }
     # The restored screen must be HISTORY, not the live frame: everything the
-    # dead session left has to sit above the fresh shell's first prompt, or it
+    # dead session left has to sit above the FRESH shell's first prompt, or it
     # is sharing the active screen with a shell that will erase it.
-    $iShell = $tight.IndexOf('>')
-    if ($iShell -ge 0 -and $iHist -lt $iShell) { $histBelowShell++ }
+    #
+    # "Fresh" is the first prompt at or after the notice, not the first prompt in
+    # the dump - the restored screen ends in the DEAD shell's prompt, so the
+    # naive index scores a correct restore FAIL. Same correction as A12; see
+    # Get-NoticePlacement.
+    $iFresh = if ($iNotice -ge 0) { $tight.IndexOf('>', $iNotice) } else { $tight.IndexOf('>') }
+    if ($iFresh -ge 0 -and $iHist -lt $iFresh) { $histBelowShell++ }
 }
 Assert "A15 a restored pane brings back what the dead session left on screen ($histPanes)" `
     ($histPanes -ge 1)
@@ -694,7 +790,7 @@ Build-AndKill $workA $true | Out-Null
 
 $appPidE = Start-App 'notifyban'
 Assert "E0 the GUI came back" ($appPidE -ne 0)
-$leavesE = All-Leaves (Wait-Leaves 'e0' 3 60)
+$leavesE = Wait-BannerSettle 'e0' 3 60
 Assert "E0b the layout restored (3 panes)" ($leavesE.Count -ge 3)
 
 $ownA = 0; $ownB = 0; $noticed = 0; $bannerless = 0
@@ -839,7 +935,8 @@ Stop-TestProcs
     $env:LOCALAPPDATA = $saved.lad
     $env:GHOSTTY_LOCAL_AGENT_BIN = $saved.bin
     $env:GHOZTTY_PIPE_SUFFIX = $saved.pipe
-    Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+    if ($KeepTemp) { Write-Host "  kept the run tree: $root" }
+    else { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)
