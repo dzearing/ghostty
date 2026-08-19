@@ -47,6 +47,7 @@ const tab_color = @import("tab_color.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
+const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
 const session_layout = @import("session_layout.zig");
@@ -6114,8 +6115,11 @@ pub fn performAction(
                         var wbuf: [512]u16 = undefined;
                         const wlen: usize = @intCast(w32.GetWindowTextW(h, &wbuf, @intCast(wbuf.len)));
                         if (wlen > 0) {
+                            // 512 units can need 1536 bytes, so a long CJK
+                            // title used to panic here — copying a title is
+                            // the last thing that should end the app (T990).
                             var utf8_buf: [1024]u8 = undefined;
-                            const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+                            const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
                             if (utf8_len > 0) {
                                 // Copy to clipboard via the core surface
                                 const alloc = self.core_app.alloc;

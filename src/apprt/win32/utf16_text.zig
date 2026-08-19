@@ -47,15 +47,57 @@ const testing = std.testing;
 /// blanking the user's filter because their last character was an emoji is a
 /// worse answer than dropping the emoji.
 pub fn toUtf8Truncating(out: []u8, wide: []const u16) usize {
+    return toUtf8Counting(out, wide).bytes;
+}
+
+/// What one `toUtf8Counting` pass moved. `units` is what a caller that must
+/// not lose text needs in order to continue from where the destination ran
+/// out (the IME commit path does exactly that).
+pub const Converted = struct {
+    /// Bytes written to `out`.
+    bytes: usize,
+    /// UTF-16 units of `wide` that produced them — always a codepoint
+    /// boundary, so `wide[units..]` is a well-formed continuation.
+    units: usize,
+    /// True when all of `wide` was converted. False means the destination
+    /// filled up, or the source held a malformed surrogate.
+    complete: bool,
+};
+
+/// `toUtf8Truncating`, plus how much of the source it got through.
+pub fn toUtf8Counting(out: []u8, wide: []const u16) Converted {
     var n: usize = 0;
+    var units: usize = 0;
     var it = std.unicode.Utf16LeIterator.init(wide);
     while (true) {
         const cp = (it.nextCodepoint() catch break) orelse break;
         const need = std.unicode.utf8CodepointSequenceLength(cp) catch break;
         if (n + need > out.len) break;
         n += std.unicode.utf8Encode(cp, out[n..]) catch break;
+        // `it.i` is a BYTE index into the source, and only advances on a
+        // whole codepoint — so this is the unit count of what is now in
+        // `out`, recorded after the encode so a codepoint that did not fit
+        // is not counted as consumed.
+        units = it.i / 2;
     }
-    return n;
+    return .{ .bytes = n, .units = units, .complete = units == wide.len };
+}
+
+/// Convert `wide` into `out` only if ALL of it fits; otherwise write nothing
+/// meaningful and return 0.
+///
+/// This is the other half of the sizing rule, for the call sites whose text
+/// is an identity rather than a search: a truncated device name, host name,
+/// path or command is a DIFFERENT one, so those readers documented
+/// themselves as returning "0 when it does not fit" long before anything
+/// made that true. Malformed UTF-16 also returns 0 here — half a name is the
+/// same problem as a short one.
+///
+/// `out` may be partially written when the answer is 0; callers read
+/// `out[0..n]`, so there is nothing to see.
+pub fn toUtf8AllOrNothing(out: []u8, wide: []const u16) usize {
+    const r = toUtf8Counting(out, wide);
+    return if (r.complete) r.bytes else 0;
 }
 
 test "toUtf8Truncating: ASCII that fits is copied whole" {
@@ -126,6 +168,74 @@ test "toUtf8Truncating: a dangling surrogate half keeps the text before it" {
     var out: [8]u8 = undefined;
     const n = toUtf8Truncating(&out, &wide);
     try testing.expectEqualStrings("hi", out[0..n]);
+}
+
+test "toUtf8Counting: a full conversion reports every unit and completeness" {
+    var out: [16]u8 = undefined;
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral("ghoztty");
+    const r = toUtf8Counting(&out, wide);
+    try testing.expectEqual(@as(usize, 7), r.bytes);
+    try testing.expectEqual(@as(usize, 7), r.units);
+    try testing.expect(r.complete);
+}
+
+test "toUtf8Counting: a truncated conversion names where to resume" {
+    // Three three-byte characters into eight bytes: two fit, and `units`
+    // points at the third so a chunking caller loses nothing.
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral("日本語");
+    var out: [8]u8 = undefined;
+    const r = toUtf8Counting(&out, wide);
+    try testing.expectEqual(@as(usize, 6), r.bytes);
+    try testing.expectEqual(@as(usize, 2), r.units);
+    try testing.expect(!r.complete);
+    // The continuation converts the rest.
+    const rest = toUtf8Counting(&out, wide[r.units..]);
+    try testing.expectEqualStrings("語", out[0..rest.bytes]);
+    try testing.expect(rest.complete);
+}
+
+test "toUtf8Counting: a surrogate pair counts as its two units" {
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral("x\u{1F600}y");
+    var out: [5]u8 = undefined; // x + the emoji, no room for y
+    const r = toUtf8Counting(&out, wide);
+    try testing.expectEqualStrings("x\u{1F600}", out[0..r.bytes]);
+    try testing.expectEqual(@as(usize, 3), r.units);
+    try testing.expect(!r.complete);
+}
+
+test "toUtf8Counting: a dangling surrogate half is incomplete, not a panic" {
+    const wide = [_]u16{ 'h', 'i', 0xD83D };
+    var out: [8]u8 = undefined;
+    const r = toUtf8Counting(&out, &wide);
+    try testing.expectEqualStrings("hi", out[0..r.bytes]);
+    try testing.expectEqual(@as(usize, 2), r.units);
+    try testing.expect(!r.complete);
+}
+
+test "toUtf8AllOrNothing: everything that fits is converted whole" {
+    var out: [16]u8 = undefined;
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral("C:\\Users\\dave");
+    const n = toUtf8AllOrNothing(&out, wide);
+    try testing.expectEqualStrings("C:\\Users\\dave", out[0..n]);
+}
+
+test "toUtf8AllOrNothing: one byte short answers 0 rather than half a name" {
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral("workstation");
+    var out: [10]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), toUtf8AllOrNothing(&out, wide));
+    var exact: [11]u8 = undefined;
+    try testing.expectEqual(@as(usize, 11), toUtf8AllOrNothing(&exact, wide));
+}
+
+test "toUtf8AllOrNothing: malformed UTF-16 answers 0" {
+    const wide = [_]u16{ 'p', 'c', 0xDC00 }; // lone low surrogate
+    var out: [32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), toUtf8AllOrNothing(&out, &wide));
+}
+
+test "toUtf8AllOrNothing: empty input is a complete conversion of nothing" {
+    var out: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), toUtf8AllOrNothing(&out, &.{}));
 }
 
 test "toUtf8Truncating: three-byte characters cost three bytes each" {

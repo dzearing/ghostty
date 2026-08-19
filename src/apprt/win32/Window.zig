@@ -109,6 +109,7 @@ const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const system_colors = @import("system_colors.zig");
 const tab_color = @import("tab_color.zig");
+const utf16_text = @import("utf16_text.zig");
 const title_font = @import("title_font.zig");
 const title_spinner = @import("title_spinner.zig");
 const window_memory = @import("window_memory.zig");
@@ -6408,11 +6409,13 @@ fn tabTipTextFor(self: *Window, idx: usize, out: []u8) ?[]const u8 {
     // hover could not previously rescue. A title that fit stays off the tip.
     var title_buf: [768]u8 = undefined; // 256 UTF-16 units × ≤3 bytes each
     const tlen = self.tab_title_lens[idx];
+    // Measured above, and converted with the bounded helper (T990) so the
+    // measurement is enforced rather than remembered.
     const title: []const u8 = if (tlen > 0)
-        title_buf[0 .. std.unicode.utf16LeToUtf8(
+        title_buf[0..utf16_text.toUtf8Truncating(
             &title_buf,
             self.tab_titles[idx][0..tlen],
-        ) catch 0]
+        )]
     else
         "";
     const elided = self.tab_title_elided[idx];

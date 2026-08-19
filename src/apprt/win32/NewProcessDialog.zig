@@ -29,6 +29,7 @@ const App = @import("App.zig");
 const actions = @import("activity_actions.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -513,10 +514,14 @@ fn utf16z(buf: []u16, text: []const u8) ?[:0]const u16 {
 
 /// Copy a control's text into `buf` as UTF-8, returning its length (0 when it
 /// does not fit — a truncated command is worse than none).
+///
+/// T990: running half a command line is the failure this comment was written
+/// to prevent, and the plain `std.unicode.utf16LeToUtf8` it used to call
+/// panicked rather than returning 0 when the destination was short.
 fn readText(h: w32.HWND, buf: []u8) usize {
     var wbuf: [MAX_VALUE_LEN + 1]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(h, &wbuf, wbuf.len));
-    return std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch 0;
+    return utf16_text.toUtf8AllOrNothing(buf, wbuf[0..wlen]);
 }
 
 /// Is the command field non-blank? Read live off the control, so the Start

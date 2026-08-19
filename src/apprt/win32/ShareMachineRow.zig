@@ -31,6 +31,7 @@ const MachineChooser = @import("MachineChooser.zig");
 const enroll = @import("../../remote/agent/enroll.zig");
 const sharing = @import("../../remote/agent/sharing.zig");
 const w32 = @import("win32.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -221,7 +222,10 @@ fn hostName(out: []u8) ?[]const u8 {
         var size: u32 = wbuf.len;
         // 1 == ComputerNameDnsHostname
         if (kernel32.GetComputerNameExW(1, &wbuf, &size) == 0) return null;
-        const n = std.unicode.utf16LeToUtf8(out, wbuf[0..size]) catch return null;
+        // All or nothing (T990): half a host name is a different machine, and
+        // the plain `std.unicode.utf16LeToUtf8` this used to call panicked on
+        // a short `out` rather than erroring — the `catch` could not see it.
+        const n = utf16_text.toUtf8AllOrNothing(out, wbuf[0..size]);
         return if (n == 0) null else out[0..n];
     } else {
         var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;

@@ -61,6 +61,7 @@ const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const text_search = @import("text_search.zig");
+const utf16_text = @import("utf16_text.zig");
 const SessionRoster = @import("SessionRoster.zig");
 const SessionCpuProbe = @import("SessionCpuProbe.zig");
 const chooser_session_sort = @import("chooser_session_sort.zig");
@@ -3358,12 +3359,19 @@ fn confirmKill(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
     self.roster.fetch(window.app, self.id, id);
 }
 
-/// Read the current filter edit text into `buf` (truncated to fit).
+/// Read the current filter edit text into `buf`, truncated on a codepoint
+/// boundary when `buf` cannot hold all of it.
+///
+/// T990: this used `std.unicode.utf16LeToUtf8`, which does not bounds-check
+/// its destination — every caller passes a `[256]u8` and 256 UTF-16 units can
+/// need 768 bytes, so typing enough into the filter (86 CJK characters, or
+/// 256 ASCII ones) panicked the whole app. `toUtf8Truncating` is the bounded
+/// conversion, and it keeps this function's documented behavior rather than
+/// making the caller size a buffer correctly forever.
 fn filterText(self: *const MachineChooser, buf: []u8) []const u8 {
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.filter, &wbuf, wbuf.len));
-    const n = std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch return "";
-    return buf[0..n];
+    return buf[0..utf16_text.toUtf8Truncating(buf, wbuf[0..wlen])];
 }
 
 /// True when `hwnd` is the dialog or one of its controls. The message loop

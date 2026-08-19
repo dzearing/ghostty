@@ -88,6 +88,7 @@ const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const banner_link = @import("banner_link.zig");
 const clipboard_open = @import("clipboard_open.zig");
+const utf16_text = @import("utf16_text.zig");
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const PaneView = @import("PaneView.zig");
 const Window = @import("Window.zig");
@@ -2126,7 +2127,10 @@ fn onNewWindowRequested(
             );
             break :uri null;
         }
-        const len = std.unicode.utf16LeToUtf8(&uri_buf, wide) catch break :uri null;
+        // All or nothing (T990): the explicit guard above already refused
+        // anything that cannot fit, and half a URI routes to the wrong place.
+        const len = utf16_text.toUtf8AllOrNothing(&uri_buf, wide);
+        if (len == 0 and wide.len > 0) break :uri null; // malformed, as before
         break :uri uri_buf[0..len];
     };
     if (too_long) return com.S_OK;
@@ -3549,7 +3553,11 @@ fn onWebResourceRequested(
     defer w32.CoTaskMemFree(@ptrCast(raw));
 
     var uri_buf: [4096]u8 = undefined;
-    const uri_len = std.unicode.utf16LeToUtf8(&uri_buf, std.mem.span(raw)) catch return com.S_OK;
+    // All or nothing (T990): a WebView2 request URI has no length bound we
+    // control, and half a URI would be resolved against the page root as if
+    // the page had asked for it. Too long is simply not ours to serve.
+    const uri_len = utf16_text.toUtf8AllOrNothing(&uri_buf, std.mem.span(raw));
+    if (uri_len == 0) return com.S_OK;
     const uri = uri_buf[0..uri_len];
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
@@ -5730,8 +5738,9 @@ test "host floor: a real controller on a real window, on this box" {
                 p.ok = !com.failed(result);
                 if (value) |v| {
                     const span = std.mem.span(v);
-                    const n = std.unicode.utf16LeToUtf8(&p.text, span) catch 0;
-                    p.len = @min(n, p.text.len);
+                    // Bounded (T990): the probe's value is whatever the page
+                    // handed back, and `p.text` is a fixed 256 bytes.
+                    p.len = utf16_text.toUtf8Truncating(&p.text, span);
                 }
                 return com.S_OK;
             }
@@ -7464,8 +7473,9 @@ test "host floor: a real controller on a real window, on this box" {
                     p.ok = !com.failed(result);
                     if (value) |v| {
                         const span = std.mem.span(v);
-                        const n = std.unicode.utf16LeToUtf8(&p.text, span) catch 0;
-                        p.len = @min(n, p.text.len);
+                        // Bounded (T990): the probe's value is whatever the page
+                        // handed back, and `p.text` is a fixed 256 bytes.
+                        p.len = utf16_text.toUtf8Truncating(&p.text, span);
                     }
                     return com.S_OK;
                 }

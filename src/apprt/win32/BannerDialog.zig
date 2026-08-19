@@ -22,6 +22,7 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -499,8 +500,10 @@ pub fn handleKey(self: *BannerDialog, vk: u16) bool {
 pub fn finish(self: *BannerDialog) void {
     var wbuf: [MAX_TEXT]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
+    // `MAX_TEXT * 3` is the measured worst case, and the bounded conversion
+    // (T990) is what keeps it true if either size is ever edited alone.
     var utf8_buf: [MAX_TEXT * 3]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
     const text = normalizeText(utf8_buf[0..utf8_len]);
 
     const surface = self.surface;

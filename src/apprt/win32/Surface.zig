@@ -25,6 +25,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+const utf16_text = @import("utf16_text.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
@@ -2243,8 +2244,11 @@ pub fn handleSearchChange(self: *Surface) void {
     var wbuf: [512]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(search, &wbuf, @intCast(wbuf.len)));
 
+    // 512 units can need 1536 bytes: searching for a long CJK phrase used to
+    // panic here rather than search (T990). Truncating keeps the search box a
+    // search box.
     var utf8_buf: [1024]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
 
     // Need a null-terminated slice for performBindingAction
     var needle_buf: [1025]u8 = undefined;
@@ -2627,8 +2631,11 @@ pub fn handlePaletteChange(self: *Surface) void {
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, @intCast(wbuf.len)));
 
+    // Same shape as the Activity Monitor's filter (T989) and the machine
+    // chooser's (T990): 256 units can need 768 bytes, so a long non-ASCII
+    // palette query panicked here. Truncating filters on what fits.
     var utf8_buf: [512]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
 
     self.filterPaletteEntries(utf8_buf[0..utf8_len]);
 }
@@ -2771,7 +2778,8 @@ fn viewerOpenFilePrompt(self: *Surface) void {
     if (w32.GetOpenFileNameW(&ofn) == 0) return;
     const wlen = std.mem.indexOfSentinel(u16, 0, &file_buf);
     var utf8_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const len = std.unicode.utf16LeToUtf8(&utf8_buf, file_buf[0..wlen]) catch return;
+    // All or nothing (T990): half a path names a different file, or nothing.
+    const len = utf16_text.toUtf8AllOrNothing(&utf8_buf, file_buf[0..wlen]);
     if (len == 0) return;
     self.openViewerSplitBeside(utf8_buf[0..len], false);
 }
@@ -3362,7 +3370,9 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
                 // handles modifier combos via key + mods, and emitting
                 // the control char here would double-encode.
                 if (utf16_slice[0] >= 0x20) {
-                    const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16_slice) catch 0;
+                    // 4 units into 16 bytes is measured; the bounded call
+                    // (T990) keeps it measured for whoever edits either.
+                    const len = utf16_text.toUtf8Truncating(&utf8_buf, utf16_slice);
                     if (len > 0) {
                         utf8_text = utf8_buf[0..len];
                         if (mods.shift) consumed_mods.shift = true;
@@ -4077,7 +4087,10 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
         // UTF-16 → UTF-8.
         const utf8_buf = alloc.alloc(u8, u16_buf.len * 4) catch return;
         defer alloc.free(utf8_buf);
-        const utf8_len = std.unicode.utf16LeToUtf8(utf8_buf, u16_buf[0..got]) catch continue;
+        // The destination is sized from the source (4 bytes per unit covers
+        // the worst case), so nothing truncates here; the bounded call is the
+        // house rule rather than a fix (T990).
+        const utf8_len = utf16_text.toUtf8Truncating(utf8_buf, u16_buf[0..got]);
         const path = utf8_buf[0..utf8_len];
 
         if (i > 0) buf.append(alloc, ' ') catch return;
@@ -4246,9 +4259,10 @@ fn updateImePreedit(self: *Surface) void {
     if (got <= 0 or got & 1 != 0) return;
     const n: usize = @intCast(@divTrunc(got, 2));
 
-    // Worst case 3 bytes of UTF-8 per UTF-16 code unit.
+    // Worst case 3 bytes of UTF-8 per UTF-16 code unit — and the bounded
+    // conversion (T990) rather than the sizing comment alone.
     var buf8: [buf16.len * 3]u8 = undefined;
-    const len8 = std.unicode.utf16LeToUtf8(&buf8, buf16[0..n]) catch return;
+    const len8 = utf16_text.toUtf8Truncating(&buf8, buf16[0..n]);
     self.core_surface.preeditCallback(if (len8 == 0) null else buf8[0..len8]) catch |err| {
         log.warn("preeditCallback failed err={}", .{err});
     };
@@ -4264,27 +4278,43 @@ fn sendImeText(self: *Surface, utf16: []const u16) void {
         return;
     }
 
-    // Convert UTF-16LE to UTF-8 in a stack buffer (256 bytes covers
-    // even long CJK phrases — each CJK char is 3 bytes in UTF-8).
-    var utf8_buf: [256]u8 = undefined;
-    const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16) catch |err| {
-        log.warn("IME utf16→utf8 error: {}", .{err});
-        return;
-    };
-    if (len == 0) return;
+    // Convert UTF-16LE to UTF-8 in a stack buffer, IN CHUNKS (T990). The
+    // buffer used to be sized by a guess at how much anyone would commit at
+    // once ("256 bytes covers even long CJK phrases") and converted with
+    // `std.unicode.utf16LeToUtf8`, which does not bounds-check its
+    // destination — an 86-character CJK commit, or a paste through the IME,
+    // panicked the app instead of typing. Truncating would be the wrong
+    // answer here too, since this is the user's actual text and not a search
+    // needle, so send as many whole codepoints as fit and continue from where
+    // the conversion stopped: the terminal sees the same bytes, just in more
+    // than one callback.
+    var rest = utf16;
+    while (rest.len > 0) {
+        var utf8_buf: [256]u8 = undefined;
+        const converted = utf16_text.toUtf8Counting(&utf8_buf, rest);
+        if (converted.bytes == 0) {
+            // A whole codepoint always fits in 256 bytes, so nothing consumed
+            // means malformed UTF-16 (a dangling surrogate half). Stop rather
+            // than spin.
+            log.warn("IME text stopped at malformed UTF-16", .{});
+            return;
+        }
+        rest = rest[converted.units..];
 
-    // Send through keyCallback with .unidentified key — this is the
-    // standard path for IME/text input (same as GTK's imCommit).
-    _ = self.core_surface.keyCallback(.{
-        .action = .press,
-        .key = .unidentified,
-        .mods = .{},
-        .consumed_mods = .{},
-        .composing = false,
-        .utf8 = utf8_buf[0..len],
-    }) catch |err| {
-        log.err("IME text callback error: {}", .{err});
-    };
+        // Send through keyCallback with .unidentified key — this is the
+        // standard path for IME/text input (same as GTK's imCommit).
+        _ = self.core_surface.keyCallback(.{
+            .action = .press,
+            .key = .unidentified,
+            .mods = .{},
+            .consumed_mods = .{},
+            .composing = false,
+            .utf8 = utf8_buf[0..converted.bytes],
+        }) catch |err| {
+            log.err("IME text callback error: {}", .{err});
+            return;
+        };
+    }
 }
 
 /// Position the IME candidate/composition window near the terminal cursor.

@@ -31,6 +31,7 @@ const Surface = @import("Surface.zig");
 const viewer_nav = @import("viewer_nav.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -509,8 +510,11 @@ pub fn finish(self: *RenameDialog) void {
     if (self.level == .viewer_url) return self.finishViewerUrl();
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
+    // 256 units can need 768 bytes, so 1024 fits any title the edit can hold;
+    // the bounded conversion (T990) is what keeps a later edit to either size
+    // from turning a long CJK title into a crash.
     var utf8_buf: [1024]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
     const title: ?[]const u8 = if (utf8_len > 0) utf8_buf[0..utf8_len] else null;
 
     const window = self.window;
@@ -544,7 +548,7 @@ fn finishViewerUrl(self: *RenameDialog) void {
     var wbuf: [viewer_nav.max_address]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
     var utf8_buf: [viewer_nav.max_address * 3]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const utf8_len = utf16_text.toUtf8Truncating(&utf8_buf, wbuf[0..wlen]);
     const typed = std.mem.trim(u8, utf8_buf[0..utf8_len], " \t\r\n");
 
     const window = self.window;

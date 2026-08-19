@@ -22,6 +22,7 @@ const std = @import("std");
 const App = @import("App.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -696,10 +697,14 @@ fn run(
 
 /// Copy the edit control's text into `buf` as UTF-8, returning its length
 /// (0 when it does not fit — a truncated device name is worse than none).
+///
+/// T990: `std.unicode.utf16LeToUtf8` never checked `buf`, so "does not fit"
+/// was a panic rather than the 0 this comment promised. `toUtf8AllOrNothing`
+/// is that promise, kept.
 fn readEdit(edit: w32.HWND, buf: []u8) usize {
     var wbuf: [512]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, wbuf.len));
-    return std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch 0;
+    return utf16_text.toUtf8AllOrNothing(buf, wbuf[0..wlen]);
 }
 
 /// Last-resort fallback when dialog construction fails: the old (light)

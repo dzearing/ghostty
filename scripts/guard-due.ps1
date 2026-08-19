@@ -991,6 +991,24 @@ $GuardTable = @(
             'test\win32\chooser-resume.ps1'
         )
     },
+    # The chooser's TEXT FIELD (T990), the sibling of the activity-monitor row
+    # above: both harnesses exist because a fixed-size UTF-8 destination behind
+    # a win32 EDIT is a crash with a threshold, and neither floor lane can see
+    # it - the conversion only runs behind an HWND. Coverage is the bounded
+    # conversion itself (`utf16_text.zig`, which every text field in the app now
+    # goes through) plus the harness. MachineChooser.zig is deliberately NOT
+    # here for the reason the chooser-resume row states: it hosts sixteen
+    # features and moves about daily, and a four-minute GUI run gated on it
+    # would be due for reasons this script cannot fail on.
+    [pscustomobject]@{
+        Name   = 'machine-chooser'
+        Script = 'test\win32\machine-chooser.ps1'
+        Stamp  = 'test\win32\machine-chooser.stamp.json'
+        Covers = @(
+            'src\apprt\win32\utf16_text.zig',
+            'test\win32\machine-chooser.ps1'
+        )
+    },
     # The isolation meta-check (T680): the only thing that fails when a
     # test\win32 script drives the CLI with no private IPC endpoint - the
     # defect class that reads the user's own panes. Covering the whole top

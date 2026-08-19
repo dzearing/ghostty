@@ -41,6 +41,7 @@ const viewer_worktree = @import("viewer_worktree.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const input = @import("../../input.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.viewer_nav);
 
@@ -529,7 +530,9 @@ pub fn addressText(self: *ViewerNavBar, buf: []u8) []const u8 {
     var wide: [address_cap_utf16]u16 = undefined;
     const n = w32.GetWindowTextW(self.edit, &wide, wide.len);
     if (n <= 0) return "";
-    const len = std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]) catch return "";
+    // The in-repo caller sizes `buf` at `address_cap_utf16 * 3`, which cannot
+    // truncate — but the bound belongs here, where every caller gets it (T990).
+    const len = utf16_text.toUtf8Truncating(buf, wide[0..@intCast(n)]);
     return buf[0..len];
 }
 

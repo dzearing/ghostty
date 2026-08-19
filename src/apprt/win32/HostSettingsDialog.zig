@@ -27,6 +27,7 @@ const App = @import("App.zig");
 const host_defaults = @import("host_defaults.zig");
 const type_ramp = @import("type_ramp.zig");
 const w32 = @import("win32.zig");
+const utf16_text = @import("utf16_text.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -565,10 +566,15 @@ fn utf16z(buf: []u16, text: []const u8) ?[:0]const u16 {
 
 /// Copy a control's text into `buf` as UTF-8, returning its length (0 when it
 /// does not fit — a truncated path is worse than none).
+///
+/// T990: the bounded conversion is what makes that "0" true; the plain
+/// `std.unicode.utf16LeToUtf8` this used to call panics on a short
+/// destination instead of erroring, and `MAX_VALUE_LEN` units can need three
+/// times `MAX_VALUE_LEN` bytes.
 fn readText(h: w32.HWND, buf: []u8) usize {
     var wbuf: [host_defaults.MAX_VALUE_LEN + 1]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(h, &wbuf, wbuf.len));
-    return std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch 0;
+    return utf16_text.toUtf8AllOrNothing(buf, wbuf[0..wlen]);
 }
 
 // ---------------------------------------------------------------------
