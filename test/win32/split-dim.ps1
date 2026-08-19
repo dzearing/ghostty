@@ -117,22 +117,37 @@ function Wait-OverlayOver([int]$procId, $pane) {
 
 # The overlay's OWN painted fill, as "r,g,b" - see the header. $null if the
 # capture fails, so the caller can report that rather than score a guess.
+#
+# SYNCHRONOUS (T943), and this window is the case that route exists for: the
+# overlay is WS_EX_LAYERED, which is exactly the shape whose DWM copy tore in
+# T835 (one unchanged banner row read 1062 / 1283 / 1179 px across three
+# back-to-back captures). Under WM_PRINTCLIENT the overlay paints its own fill
+# into our DC before the call returns. The route throws on a window that drew
+# nothing rather than returning a blank frame, so a capture taken between the
+# overlay becoming visible and its first paint is RETRIED here instead of
+# scored as "the overlay painted nothing".
 function Get-OverlayFill($overlay) {
     $h = [IntPtr]$overlay.Hwnd
-    $shot = $null
-    try {
-        $shot = Get-TestWindowPixels -Window $h
-        $cx = [int](($overlay.Left + $overlay.Right) / 2)
-        $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
-        $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
-        if (-not $c) { return $null }
-        return "$($c.R),$($c.G),$($c.B)"
-    } catch {
-        Write-Host "DEBUG overlay capture failed: $_"
-        return $null
-    } finally {
-        if ($shot) { Close-TestWindowPixels -Shot $shot }
+    for ($t = 0; $t -lt 10; $t++) {
+        $shot = $null
+        try {
+            $shot = Get-TestWindowPixels -Window $h -Sync
+            $cx = [int](($overlay.Left + $overlay.Right) / 2)
+            $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
+            $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
+            if (-not $c) { return $null }
+            return "$($c.R),$($c.G),$($c.B)"
+        } catch {
+            if ($t -eq 9) {
+                Write-Host "DEBUG overlay capture failed: $_"
+                return $null
+            }
+            Start-Sleep -Milliseconds 150
+        } finally {
+            if ($shot) { Close-TestWindowPixels -Shot $shot }
+        }
     }
+    return $null
 }
 
 function Start-Gui([string]$label, [string[]]$extraArgs, [bool]$control) {

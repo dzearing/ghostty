@@ -71,11 +71,18 @@ function Kill-RepoInstances {
 
 # Mean luminance of a dialog's client area, retried until the capture holds
 # real content (see the header note on mid-paint black).
+#
+# Synchronous capture (T943): the dialog draws the frame itself under
+# WM_PRINTCLIENT before the call returns. That route throws on a window that
+# drew nothing instead of returning a blank frame, which is the same case this
+# loop retries for - so the throw is caught and retried rather than ending the
+# run on a capture taken a moment too early.
 function Get-DialogDark([IntPtr]$dlg) {
     $lum = -1; $colors = 0
     for ($t = 0; $t -lt 15; $t++) {
         Start-Sleep -Milliseconds 200
-        $shot = Get-TestWindowPixels -Window $dlg
+        $shot = $null
+        try { $shot = Get-TestWindowPixels -Window $dlg -Sync } catch { continue }
         try {
             $c = Get-TestWindowRect -Window $dlg -Client
             $colors = Get-TestDistinctColors -Shot $shot

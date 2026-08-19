@@ -9,6 +9,62 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-19 - **T943 (filed T989) - the last torn probes now photograph a
+  window that poses, and the probe that measured them found a crash.** 14
+  `Get-TestWindowPixels` sites across five scripts moved onto `-Sync`:
+  `activity-monitor.ps1` (10), `confirm-dialogs.ps1`, `config-errors.ps1`,
+  `split-dim.ps1` and `split-dim-viewer.ps1`. That closes the three classes
+  T843 surveyed and T940 taught to answer `WM_PRINTCLIENT`; a sweep of the
+  whole `test/win32` tree leaves exactly two default-route captures standing,
+  both deliberate - `dark-menus.ps1` photographs a system `#32768` popup we do
+  not own, and `test-desktop-harness.ps1`'s subject IS the default route.
+  Three sites needed more than the flag, all for the same reason: the sync
+  route THROWS on a window that drew nothing where the old one handed back a
+  blank frame. `Get-DialogDark` in both dialog scripts was already retrying for
+  exactly that case (its own comment calls it "mid-paint black"), so the throw
+  is caught inside the loop it was already running; `Get-OverlayFill` in both
+  split-dim scripts had one shot and answered `$null`, which the caller scores
+  as "the overlay painted nothing", and now retries ten times at 150 ms first.
+  **The measurement came back as T941's answer, not T835's**, and the task file
+  records the numbers rather than the impression. Two purpose-built probes on
+  the Debug build, each immediate frame scored against its OWN settled
+  successor: for the ActivityMonitor - 242 sample points over the TABLE band
+  only, since the two trend gauges repaint on the panel's own 1.5s poll and a
+  probe that samples them measures the poll - the default route disagreed 0 of
+  19 times on a steady panel and 0 of 30 on the first frame after a focus
+  change. For the DimOverlay, which IS `WS_EX_LAYERED` and was the one place a
+  tear was expected, 0 of 40 steady centre reads and 0 of 20 first reads after
+  the overlay moves, in both modes. The overlay's reason is worth keeping: it
+  paints a SOLID single-colour fill, so a torn frame of it is indistinguishable
+  from a whole one at any pixel - the tear can be there and this assertion
+  cannot see it. `-Sync` disagreeing 5 of 30 (worst 1 point of 242) where the
+  default never does is not the capture being worse: `WM_PRINTCLIENT` forces a
+  FRESH paint, so two sync frames 1.2s apart differ wherever the panel
+  re-rendered live data between them, while a DWM copy of one composited
+  surface cannot disagree with itself. **The surprise is T989, and it is a P0
+  the probe found by accident.** Driving the panel's filter EDIT to make it
+  repaint, the app panicked: `onFilterChanged` reads up to 256 UTF-16 units out
+  of the EDIT and converts them into a `[128]u8` needle buffer, and
+  `utf16LeToUtf8` does not RETURN an error for an undersized destination - it
+  asserts inside `utf8Encode`, so the `catch 0` that looks like the guard
+  catches nothing and the `@min` clamp on the next line runs after the write
+  that already went past the end. Reproduced deliberately afterwards: 130
+  characters typed into the filter, panic within two seconds, whole terminal
+  down. Green: floor lanes lib/none/win32/agent ALL LANES PASS; `ipc-p1/p2/p3`
+  ALL PASS (25/20/16); the five converted scripts ALL PASS on three consecutive
+  runs each (`activity-monitor` 149, `split-dim` 29, `split-dim-viewer` 29,
+  `confirm-dialogs` 27, `config-errors` 27); `isolation-meta` (7) and
+  `stderr-capture-audit` (25) re-run green and re-stamped. One thing changed
+  underneath this turn without being touched: `chooser-selection.ps1`, which
+  T942 recorded at 2 FAILED / 19 passed on three runs yesterday and which had
+  been holding its guard due, is ALL PASS (29 assertions) on three consecutive
+  runs today - a different assertion COUNT as well as a different verdict, so
+  yesterday's runs stopped short of sections this one reaches. Noted into T988
+  rather than closing it, since the premise that its probes describe the
+  pre-T828 accent pill has not been re-read against the code, and an
+  intermittent red is exactly the standing-red shape today's digest called out.
+  Its guard re-stamped on the green run, so this commit needs no `-NoGuardDue`.
+
 - 2026-08-18 - **T975 (filed T976, T977; unblocked T922) - a reboot brings the
   windows back.** The panes recorded on disk were being replaced by one empty
   window, and it took two defects that only meet after a restart. First, the

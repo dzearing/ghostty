@@ -108,23 +108,32 @@ function Wait-NoOverlays([int]$procId) {
     return @(Get-Overlays $procId | Where-Object Visible)
 }
 
-# The overlay's OWN painted fill, as "r,g,b" (split-dim.ps1's migrated oracle).
+# The overlay's OWN painted fill, as "r,g,b" (split-dim.ps1's migrated oracle,
+# synchronous since T943 - the overlay is layered, which is the shape T835's
+# torn capture was measured on; a capture taken before its first paint throws
+# and is retried rather than scored).
 function Get-OverlayFill($overlay) {
     $h = [IntPtr]$overlay.Hwnd
-    $shot = $null
-    try {
-        $shot = Get-TestWindowPixels -Window $h
-        $cx = [int](($overlay.Left + $overlay.Right) / 2)
-        $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
-        $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
-        if (-not $c) { return $null }
-        return "$($c.R),$($c.G),$($c.B)"
-    } catch {
-        Write-Host "DEBUG overlay capture failed: $_"
-        return $null
-    } finally {
-        if ($shot) { Close-TestWindowPixels -Shot $shot }
+    for ($t = 0; $t -lt 10; $t++) {
+        $shot = $null
+        try {
+            $shot = Get-TestWindowPixels -Window $h -Sync
+            $cx = [int](($overlay.Left + $overlay.Right) / 2)
+            $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
+            $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
+            if (-not $c) { return $null }
+            return "$($c.R),$($c.G),$($c.B)"
+        } catch {
+            if ($t -eq 9) {
+                Write-Host "DEBUG overlay capture failed: $_"
+                return $null
+            }
+            Start-Sleep -Milliseconds 150
+        } finally {
+            if ($shot) { Close-TestWindowPixels -Shot $shot }
+        }
     }
+    return $null
 }
 
 Stop-RepoInstances

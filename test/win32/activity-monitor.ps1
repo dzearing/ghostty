@@ -312,7 +312,7 @@ function Get-PanelButton([IntPtr]$Panel, [string]$Like) {
 # and past its bottom rule (COLOR_DIVIDER). Re-deriving the layout module's band
 # offsets here is exactly what T257 is about.
 function Get-TestFirstRowY([IntPtr]$Panel, $Client, $Fr) {
-    $shot = Get-TestWindowPixels -Window $Panel
+    $shot = Get-TestWindowPixels -Window $Panel -Sync
     try {
         $x = $Client.Right - 20
         $headerY = -1
@@ -412,7 +412,7 @@ function Get-TestRowPitch([IntPtr]$Panel, $Client, [int]$RowY) {
     $x0 = $Client.Left + 40
     $x1 = $x0 + 24
     $w = $x1 - $x0
-    $shot = Get-TestWindowPixels -Window $Panel
+    $shot = Get-TestWindowPixels -Window $Panel -Sync
     try {
         $top = -1
         for ($y = $RowY; $y -lt $RowY + 240 -and $y -lt $Client.Bottom; $y++) {
@@ -526,7 +526,7 @@ try {
 
     $client = Get-TestWindowRect -Window $panel -Client
     $fr = Get-TestWindowRect -Window $filterEdit
-    $shot = Get-TestWindowPixels -Window $panel
+    $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
         $colors = Get-TestDistinctColors -Shot $shot
         Assert ($colors -ge 8) "B2 the panel painted a real surface, not a flat fill ($colors distinct colors)"
@@ -609,7 +609,7 @@ try {
     # The header band is FOUND, not derived: scan down the panel's right edge
     # for the first row painted in the derived header band. Re-deriving the
     # layout module's band offsets here is what T257 is about.
-    $shot2 = Get-TestWindowPixels -Window $panel
+    $shot2 = Get-TestWindowPixels -Window $panel -Sync
     $headerY = -1
     try {
         for ($y = [int]$fr.Bottom; $y -lt $client.Bottom -and $headerY -lt 0; $y++) {
@@ -865,7 +865,7 @@ try {
     # screen, in the warn hue composited over the panel at `banner_alpha`.
     $BANNER_BG = Get-PanelBanner $PANEL_BG
     $GLYPH = Get-PanelSecondary $PANEL_BG   # the dismiss glyph rides the secondary ramp
-    $shotB = Get-TestWindowPixels -Window $panel
+    $shotB = Get-TestWindowPixels -Window $panel -Sync
     $xspot = $null
     try {
         Assert (Test-ExactPixel $shotB $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG) 'J the error banner painted at the panel bottom'
@@ -880,7 +880,7 @@ try {
     if ($null -ne $xspot) {
         Send-TestMouse -Window $panel -X $xspot.X -Y $xspot.Y -Button left -Action click | Out-Null
         Start-Sleep -Milliseconds 600
-        $shotC = Get-TestWindowPixels -Window $panel
+        $shotC = Get-TestWindowPixels -Window $panel -Sync
         try {
             Assert (-not (Test-ExactPixel $shotC $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG)) 'J clicking the glyph DISMISSES the banner'
         } finally {
@@ -998,7 +998,7 @@ try {
     $ringX1 = $client.Left + 6
     $ringY0 = $rowY + 3
     $ringY1 = $rowY + 10
-    $shotL = Get-TestWindowPixels -Window $panel
+    $shotL = Get-TestWindowPixels -Window $panel -Sync
     try {
         $bare = Count-NonMatching $shotL $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
         if ($NegativeControl) {
@@ -1026,7 +1026,7 @@ try {
 
     # L3. The ring is now painted on the caret row - the same band that was bare
     # a moment ago, with nothing else about the panel changed.
-    $shotL2 = Get-TestWindowPixels -Window $panel
+    $shotL2 = Get-TestWindowPixels -Window $panel -Sync
     try {
         $ring = Count-NonMatching $shotL2 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
         Assert ($ring -gt 0) "L3 the table's focus ring PAINTS on the caret row once the table holds focus ($ring px)"
@@ -1081,7 +1081,7 @@ try {
 
     # Tabbing in gave the table a caret WITHOUT selecting anything - so this
     # rim is focus and nothing else.
-    $shotL4 = Get-TestWindowPixels -Window $panel
+    $shotL4 = Get-TestWindowPixels -Window $panel -Sync
     try {
         $rimOnly = Count-NonMatching $shotL4 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
         Assert ($rimOnly -gt 0) "L6 tabbing in rings the caret row without selecting it ($rimOnly px)"
@@ -1102,7 +1102,7 @@ try {
     Send-TestControlKey -Control $panel -Key Tab | Out-Null
     Start-Sleep -Milliseconds 400
     Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'L6 Tab moved focus off the table'
-    $shotL5 = Get-TestWindowPixels -Window $panel
+    $shotL5 = Get-TestWindowPixels -Window $panel -Sync
     try {
         $gone = Count-NonMatching $shotL5 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
         Assert ($gone -eq 0) "L6 the ring LEAVES with the focus ($gone px still painted)"

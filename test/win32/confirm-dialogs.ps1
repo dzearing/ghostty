@@ -66,11 +66,19 @@ function Kill-RepoInstances {
 # real content. A mid-paint capture is solid black (1 distinct color) and
 # would pass a "< 90" assertion while proving nothing - so the number is only
 # believed once the chrome is actually there.
+#
+# The capture is SYNCHRONOUS (T943): the dialog paints the frame into our DC
+# under WM_PRINTCLIENT before the call returns, instead of us reading whatever
+# DWM had composited. That route THROWS on a window that drew nothing rather
+# than handing back the blank frame the old one did - which is the same case
+# this loop already retried for, so the throw is caught and retried too rather
+# than ending the run on a capture taken a moment too early.
 function Get-DialogDark([IntPtr]$dlg) {
     $lum = -1; $colors = 0
     for ($t = 0; $t -lt 15; $t++) {
         Start-Sleep -Milliseconds 200
-        $shot = Get-TestWindowPixels -Window $dlg
+        $shot = $null
+        try { $shot = Get-TestWindowPixels -Window $dlg -Sync } catch { continue }
         try {
             $c = Get-TestWindowRect -Window $dlg -Client
             $colors = Get-TestDistinctColors -Shot $shot
