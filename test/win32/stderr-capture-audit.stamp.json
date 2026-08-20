@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T20:02:15-07:00",
-    "commit":  "286676957",
+    "generated":  "2026-08-19T20:31:07-07:00",
+    "commit":  "429293453",
     "files":  {
                   "docs/claude/testing.md":  "a9ea00091a84cdd3b18261bbba93ac28e86073168cd462a4c8d94dfd41c07ce5",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -12,7 +12,7 @@
                   "test/win32/agent-adopt.ps1":  "5d595f428e084280958590817410538241a014f4d42a9f0033e2dcb425980764",
                   "test/win32/agent-attach-refused.ps1":  "afda0675b08258f43f32969ce906f665d6ffe532b50e10cf02633b3c8992c36e",
                   "test/win32/agent-autostart.ps1":  "e0d6e8fa0e26c8aca73ad44003e06a062adf926e4ce834b6d23ae8b580686ae7",
-                  "test/win32/agent-handoff.ps1":  "b028aa5853106cd6a15599e77e266b59e633dea4ec0b5fdfb532d196be4af721",
+                  "test/win32/agent-handoff.ps1":  "cf3a353fbd65cc1e03691fe62346cdaa8c6f31775ca18fcf93c891a5a7a3f521",
                   "test/win32/agent-instance-lineage.ps1":  "dc541791d775a710429ac54da0f77de105f45bdfdc2959d05ba5b1e9fee2e06c",
                   "test/win32/agent-integrations.ps1":  "8e32ca019ad9e22493dc4c7c365f76edb77fa12023c2f952b49cf12f91313486",
                   "test/win32/agent-job-escape.ps1":  "e742c49a3cf744abeb3c7013c827361b29ea6c61aebf6d3874f18f443b1cc5ba",

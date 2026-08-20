@@ -1,12 +1,12 @@
 {
     "guard":  "agent-handoff",
     "script":  "test/win32/agent-handoff.ps1",
-    "generated":  "2026-08-18T05:19:13-07:00",
-    "commit":  "39496ebb4",
+    "generated":  "2026-08-19T20:11:56-07:00",
+    "commit":  "429293453",
     "files":  {
                   "src/apprt/win32/agent_upgrade.zig":  "69cb9263387c632381fbb006d75dd7142054b46cb334db6715e4ed0bfb88d032",
                   "src/remote/agent/handoff.zig":  "66bc9725f4e8632ad47df28b9ac01ec383f4a3d5483281445ef52852999712df",
                   "src/remote/agent_build.zig":  "a5c429e91c7eed2a6995e2fbf8459962a16e0dc519c96f6c479fa3ad2d744d2f",
-                  "test/win32/agent-handoff.ps1":  "b028aa5853106cd6a15599e77e266b59e633dea4ec0b5fdfb532d196be4af721"
+                  "test/win32/agent-handoff.ps1":  "cf3a353fbd65cc1e03691fe62346cdaa8c6f31775ca18fcf93c891a5a7a3f521"
               }
 }

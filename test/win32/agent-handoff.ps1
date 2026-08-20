@@ -55,6 +55,7 @@ $ErrorActionPreference = 'Continue'
 
 $script:passes = 0
 $script:failures = 0
+$script:skipped = 0
 
 function Assert([string]$name, [bool]$cond) {
     if ($cond) { Write-Host "  PASS $name"; $script:passes++ }
@@ -300,12 +301,12 @@ try {
     $boot = Start-AppAndWait 't907-handoff' $pane 'a' 60
     $appPid = [int]$boot.App
     Assert 'A1 premise: the app is up and answering IPC' ($appPid -gt 0)
-    if ($appPid -le 0) { Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures }
+    if ($appPid -le 0) { Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures -Skipped $script:skipped }
     Assert-GhozttyIsolated -Exe $Exe
 
     $agentA = $boot.Agent
     Assert 'A2 premise: a session manager is running' ($null -ne $agentA)
-    if ($null -eq $agentA) { Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures }
+    if ($null -eq $agentA) { Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures -Skipped $script:skipped }
     $agentPidA = [int]$agentA.ProcessId
     Assert 'A3 premise: it is running the RENAMED image, as it is after any delivery' (
         [string]$agentA.ExecutablePath -eq $runningAgent)
@@ -384,7 +385,8 @@ try {
     if (-not $NegativeControl -and ($null -eq $agentB)) {
         Write-Host "  SKIP C: no handoff took place, so 'nothing was lost' would measure nothing" -ForegroundColor Yellow
         $script:failures++
-        Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures
+        $script:skipped++
+        Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures -Skipped $script:skipped
     }
 
     $rowsC = Wait-AliveCount 'c' 1 60
@@ -513,4 +515,4 @@ if ($script:failures -eq 0 -and -not $NegativeControl) {
         update -Guard agent-handoff -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
-Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures
+Write-TestVerdict -Label 'AGENT-HANDOFF' -Pass $script:passes -Fail $script:failures -Skipped $script:skipped
