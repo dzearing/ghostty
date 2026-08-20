@@ -254,6 +254,19 @@ a helper process with nothing to score. Acceptance:
 `test\win32\verdict-exit-audit.ps1`, whose `-TeethCheck` plants a real violator
 inside the swept directory and requires the sweep to find it.
 
+**Those exit codes only reach you if you do not pipe them away** (T982). The
+scripts hold up their end; the way an agent runs them routinely does not. In a
+POSIX shell `powershell -File x.ps1 | tail -5` reports **tail's** status, so a
+run that died mid-way reads as 0 — which is how T1000 came to claim that a floor
+run "died mid-lane and STILL EXITED 0" when `-File` had in fact exited 1. Worse,
+PowerShell cmdlets are not commands in that shell: `... | Select-String error`
+fails with `command not found` while the powershell child **keeps running**,
+output going nowhere, so a lane looks like it failed instantly and is still
+burning a core when the next one starts. Redirect and then filter —
+`powershell -File x.ps1 > out.log 2>&1; echo "EXIT=$?"; grep -E 'PASS|FAIL' out.log`
+— and gate on the OUTPUT, which is why every script here ends in one parseable
+verdict line.
+
 **And a run that asserted NOTHING is not a pass** (T271). The three audits above
 all assume a run happened; this is the one that asks whether it did. A
 precondition fails — a port still held by the previous run, a shell flavor not

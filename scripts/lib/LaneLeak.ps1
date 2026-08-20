@@ -110,7 +110,11 @@ function Get-LeakedLaneProcess {
         [int]$SkewSeconds = 5
     )
     $exclude = @{}
-    foreach ($p in @($ExcludePids)) { $exclude[[int]$p] = $true }
+    # Same null rule as the tree parameters (T982): a caller whose "pids that
+    # were already running" sample found none passes an unrolled $null, and
+    # `[int]$null` is 0 -- which would quietly put the idle process on the
+    # exclude list instead of leaving it empty.
+    foreach ($p in @($ExcludePids)) { if ($null -eq $p) { continue }; $exclude[[int]$p] = $true }
     $cutoff = $null
     if ($PSBoundParameters.ContainsKey('Since')) { $cutoff = $Since.AddSeconds(-$SkewSeconds) }
 
@@ -163,13 +167,22 @@ function Get-SelfSpawnedTestPids {
     .PARAMETER Tree
         Process objects carrying ProcessId, ParentProcessId and Name -- e.g.
         floor-lane.ps1's Get-ProcessTree output, or a CIM snapshot.
+
+        $null is accepted and means the same thing as an empty tree (T982).
+        `Mandatory` on its own REFUSES null, and a caller cannot always tell it
+        is passing one: a PS 5.1 function returning an empty collection unrolls
+        it to $null on the way out, so a sample that found no processes -- a
+        tree whose root exited a millisecond ago, or a CIM query that came back
+        empty on a loaded box -- arrives here as null and used to abort the
+        whole floor run with a binding exception instead of failing one lane.
+        A watchdog that dies on the sample it took is worse than no watchdog.
     .PARAMETER ExeNames
         The lane's test-binary image names.
     .OUTPUTS
         [int[]] pids. Empty (the normal case) when nothing self-spawned.
     #>
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()]$Tree,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()]$Tree,
         [Parameter(Mandatory)][string[]]$ExeNames
     )
     $names = @{}
@@ -297,14 +310,18 @@ function Invoke-LaneLeakSweep {
         summary line.
     #>
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()]$Leaked,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()]$Leaked,
         [string]$CdbPath,
         [string]$OutDir,
         [int]$StackTimeoutSeconds = 90,
         [switch]$NoStack,
         [switch]$NoKill
     )
-    $found = @($Leaked)
+    # Null is an empty leak set, not a leak (T982): an empty result unrolls to
+    # $null on the way out of a PS 5.1 function, and `@($null)` is a ONE-element
+    # array holding null -- so counting it straight would report a phantom leak
+    # with no pid, on exactly the runs where nothing leaked.
+    $found = @(@($Leaked) | Where-Object { $null -ne $_ })
     $swept = 0
     $stacks = @()
     if ($found.Count -eq 0) {

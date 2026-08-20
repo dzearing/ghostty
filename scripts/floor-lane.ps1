@@ -205,6 +205,12 @@ function Get-ProcessTree {
             foreach ($c in $byParent[$cur]) { $queue.Enqueue([int]$c.ProcessId) }
         }
     }
+    # Plain return, no comma, and callers WRAP IN @() (T982): an empty result
+    # unrolls to $null on the way out, and the sample legitimately comes back
+    # empty -- the root exited between the HasExited check and the CIM query, or
+    # the query itself returned nothing on a loaded box. `return ,$out` would fix
+    # the null and break the other end, since an empty comma-return counts as one
+    # item at an @() call site (PS 5.1).
     return $out
 }
 
@@ -263,7 +269,11 @@ function Write-Diagnostic {
     Write-Host "=============================================================="
 
     Write-Host "-- process tree --"
-    foreach ($p in $Tree) {
+    # `foreach ($p in $null)` iterates ONCE with $p = $null in PS 5.1, so every
+    # loop over a tree skips nulls explicitly (T982) -- otherwise a diagnostic
+    # taken from an empty sample prints a row for a process that never existed.
+    foreach ($p in @($Tree)) {
+        if ($null -eq $p) { continue }
         $cpuSec = 0
         if ($null -ne $p.UserModeTime) {
             $cpuSec = [math]::Round(([double]$p.UserModeTime + [double]$p.KernelModeTime) / 10000000.0, 1)
@@ -273,7 +283,8 @@ function Write-Diagnostic {
 
     Write-Host "-- threads of the test binaries (state / wait reason) --"
     $anyThreads = $false
-    foreach ($p in $Tree) {
+    foreach ($p in @($Tree)) {
+        if ($null -eq $p) { continue }
         if ($TEST_EXE_NAMES -notcontains $p.Name) { continue }
         $anyThreads = $true
         Write-Host ("  [{0}] pid={1}" -f $p.Name, $p.ProcessId)
@@ -306,7 +317,7 @@ function Stop-Tree {
     # Children first: killing the root first orphans the test binaries, and an
     # orphaned test binary keeps its WebView2 hosts alive under a pid nobody is
     # tracking any more.
-    $ordered = @($Tree)
+    $ordered = @(@($Tree) | Where-Object { $null -ne $_ })
     [array]::Reverse($ordered)
     foreach ($p in $ordered) {
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
@@ -387,50 +398,84 @@ function Invoke-Lane {
     $lastProgress = Get-Date
     $result = $null
 
-    while ($true) {
-        Start-Sleep -Seconds ([math]::Max(1, $SampleSeconds))
+    # The watchdog's own contract (T982): this lane ALWAYS ends with a verdict.
+    # An unexpected error in here used to escape Invoke-Lane under
+    # $ErrorActionPreference='Stop', which killed the whole -Lane all run before
+    # the summary line, skipped the lanes behind it, and left the lane's build
+    # tree running under a pid nobody was tracking any more. A watchdog that can
+    # die on its own instrumentation turns the standing gate into a coin flip on
+    # a loaded box, so the error is reported loudly and charged to THIS lane.
+    try {
+        while ($true) {
+            Start-Sleep -Seconds ([math]::Max(1, $SampleSeconds))
 
-        if ($proc.HasExited) {
-            $result = if ($proc.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }
-            break
+            if ($proc.HasExited) {
+                $result = if ($proc.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }
+                break
+            }
+
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            $snapshot = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+            # Fault injection for the acceptance harness: the only way to stage an
+            # unexpected watchdog error deterministically, since the real ones are
+            # rare races. Never set outside test\win32\floor-lane-leak-sweep.ps1.
+            if ($env:GHOZTTY_FLOOR_LANE_FAULT) {
+                throw "injected watchdog fault (GHOZTTY_FLOOR_LANE_FAULT=$($env:GHOZTTY_FLOOR_LANE_FAULT))"
+            }
+            # @() is load-bearing: an empty sample unrolls to $null, and every
+            # consumer below then sees a null tree (T982).
+            $tree = @(Get-ProcessTree -RootPid $rootPid -Snapshot $snapshot)
+            # A test binary under a test binary is the code under test spawning its
+            # own image, not a step of this lane -- so its CPU is not progress (T933).
+            $selfSpawned = @(Get-SelfSpawnedTestPids -Tree $tree -ExeNames $TEST_EXE_NAMES)
+            if ($selfSpawned.Count -gt 0 -and -not $selfSpawnNoted) {
+                Write-Host ("  LANE SELF-SPAWN: {0} process(es) in this lane's tree are a test binary launched by a test binary; their CPU is NOT counted as progress (T933)" -f $selfSpawned.Count)
+                $selfSpawnNoted = $true
+            }
+            $cpu = Get-TreeCpu -Tree $tree -IgnorePids $selfSpawned
+            $logLen = 0
+            if (Test-Path $log) { $logLen = (Get-Item $log).Length }
+
+            if ($cpu -ne $lastCpu -or $logLen -ne $lastLogLen) {
+                $lastProgress = Get-Date
+                $lastCpu = $cpu
+                $lastLogLen = $logLen
+            }
+
+            $stalledFor = [int]((Get-Date) - $lastProgress).TotalSeconds
+
+            if ($elapsed -ge $TimeoutSeconds) {
+                Write-Diagnostic -Reason 'WALL-CLOCK CAP' -Tree $tree -LogPath $log -ElapsedSeconds $elapsed
+                Stop-Tree -Tree $tree
+                $result = 'TIMEOUT'
+                break
+            }
+
+            if ($stalledFor -ge $StallSeconds) {
+                Write-Diagnostic -Reason "WEDGED (no CPU and no output for ${stalledFor}s)" `
+                    -Tree $tree -LogPath $log -ElapsedSeconds $elapsed
+                Stop-Tree -Tree $tree
+                $result = 'STALL'
+                break
+            }
         }
-
-        $elapsed = [int]((Get-Date) - $started).TotalSeconds
-        $snapshot = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
-        $tree = Get-ProcessTree -RootPid $rootPid -Snapshot $snapshot
-        # A test binary under a test binary is the code under test spawning its
-        # own image, not a step of this lane -- so its CPU is not progress (T933).
-        $selfSpawned = @(Get-SelfSpawnedTestPids -Tree $tree -ExeNames $TEST_EXE_NAMES)
-        if ($selfSpawned.Count -gt 0 -and -not $selfSpawnNoted) {
-            Write-Host ("  LANE SELF-SPAWN: {0} process(es) in this lane's tree are a test binary launched by a test binary; their CPU is NOT counted as progress (T933)" -f $selfSpawned.Count)
-            $selfSpawnNoted = $true
+    }
+    catch {
+        Write-Host ("LANE {0} WATCHDOG ERROR: {1}" -f $Name, $_.Exception.Message)
+        Write-Host '  the lane could not be watched, so its result cannot be trusted: reporting FAIL and reaping its tree'
+        # Re-sample rather than trusting $tree: the error may have come from the
+        # sampling itself, and leaving the build running is how a killed floor
+        # run poisons the next one. The reap gets its own guard, because a
+        # handler that can throw is a handler that does not hold the contract --
+        # the root pid is killed either way.
+        try {
+            $reap = @(Get-ProcessTree -RootPid $rootPid `
+                    -Snapshot (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue))
+            Stop-Tree -Tree $reap
         }
-        $cpu = Get-TreeCpu -Tree $tree -IgnorePids $selfSpawned
-        $logLen = 0
-        if (Test-Path $log) { $logLen = (Get-Item $log).Length }
-
-        if ($cpu -ne $lastCpu -or $logLen -ne $lastLogLen) {
-            $lastProgress = Get-Date
-            $lastCpu = $cpu
-            $lastLogLen = $logLen
-        }
-
-        $stalledFor = [int]((Get-Date) - $lastProgress).TotalSeconds
-
-        if ($elapsed -ge $TimeoutSeconds) {
-            Write-Diagnostic -Reason 'WALL-CLOCK CAP' -Tree $tree -LogPath $log -ElapsedSeconds $elapsed
-            Stop-Tree -Tree $tree
-            $result = 'TIMEOUT'
-            break
-        }
-
-        if ($stalledFor -ge $StallSeconds) {
-            Write-Diagnostic -Reason "WEDGED (no CPU and no output for ${stalledFor}s)" `
-                -Tree $tree -LogPath $log -ElapsedSeconds $elapsed
-            Stop-Tree -Tree $tree
-            $result = 'STALL'
-            break
-        }
+        catch { Write-Host "  (could not walk the tree to reap it: $($_.Exception.Message))" }
+        try { Stop-Process -Id $rootPid -Force -ErrorAction Stop } catch {}
+        if (-not $result) { $result = 'FAIL' }
     }
 
     $elapsed = [int]((Get-Date) - $started).TotalSeconds

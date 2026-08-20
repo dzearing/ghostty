@@ -23,6 +23,13 @@
   (SKIPped, loudly, when no cdb is installed), 7 the sweep, 8 the empty case,
   9 end-to-end through floor-lane.ps1 -Command, 10 the parse/wiring arm.
 
+  Arms 15-16 are T982's half: the watchdog must survive its OWN sampling. An
+  empty process-tree sample unrolls to $null in PS 5.1, and binding that null
+  used to abort the entire floor run mid-lane -- so arm 15 drives the shipped
+  Get-ProcessTree with samples that find nothing, and arm 16 injects a fault
+  into the watchdog loop and requires the lane to still end with a verdict, a
+  summary line, a non-zero exit, and no build tree left running.
+
   Arms 11-14 are T933's half: a test binary launched BY a test binary is the
   code under test spawning its own image (in a test build, `selfExePath` is the
   test runner), and the wrapper must both NAME that and stop counting its CPU
@@ -253,6 +260,69 @@ try {
         try { Stop-Process -Id $sp.ProcessId -Force -ErrorAction Stop } catch {}
     }
 
+    # -- 15: a sample that found NOTHING is an empty tree, never a crash (T982).
+    #        Get-ProcessTree legitimately comes back empty -- the root exited
+    #        between the HasExited check and the CIM query, or the query itself
+    #        returned nothing on a loaded box -- and a PS 5.1 function unrolls
+    #        that to $null on the way out. Bound to a Mandatory parameter, that
+    #        null aborted the whole -Lane all run mid-lane with a binding
+    #        exception: no verdict, no summary, and the lanes behind it skipped.
+    #        The real function is lifted out of floor-lane.ps1 by the parser, so
+    #        this arm exercises the shipped code rather than a copy of it.
+    $laneScript = Join-Path $RepoRoot 'scripts\floor-lane.ps1'
+    $laneAst = [System.Management.Automation.Language.Parser]::ParseFile($laneScript, [ref]$null, [ref]$null)
+    $treeFn = @($laneAst.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Get-ProcessTree'
+            }, $true))
+    Check 'floor-lane defines Get-ProcessTree once' ($treeFn.Count -eq 1) "found $($treeFn.Count)"
+    if ($treeFn.Count -eq 1) {
+        . ([scriptblock]::Create($treeFn[0].Extent.Text))
+        # 999999 is not a live pid, so nothing in the snapshot roots the walk.
+        $rawTree = Get-ProcessTree -RootPid 999999 -Snapshot @()
+        Check 'a sample that matches no process is an empty tree' `
+            (@($rawTree).Count -eq 0) "got $(@($rawTree).Count)"
+        # ...and the CIM query itself failing (-ErrorAction SilentlyContinue
+        # leaves $snapshot null) must read the same way.
+        $nullSnap = Get-ProcessTree -RootPid 999999 -Snapshot $null
+        Check 'a snapshot that could not be taken is an empty tree' `
+            (@($nullSnap).Count -eq 0) "got $(@($nullSnap).Count)"
+
+        $bound = $true
+        $ids = @()
+        try { $ids = @(Get-SelfSpawnedTestPids -Tree $rawTree -ExeNames @($FixtureName)) }
+        catch { $bound = $false; $script:LastBindError = $_.Exception.Message }
+        Check 'the empty sample can be handed straight to the self-spawn check' `
+            ($bound -and $ids.Count -eq 0) "bound=$bound err=$($script:LastBindError)"
+    }
+    $r = Invoke-LaneLeakSweep -Leaked $null -NoStack
+    Check 'a null leak set counts zero, not one phantom leak' `
+        ($r.Found -eq 0 -and $r.Swept -eq 0) "found=$($r.Found)"
+
+    # -- 16: whatever goes wrong inside the watchdog, the lane still ENDS with a
+    #        verdict (T982). Before this, an unexpected error escaped Invoke-Lane
+    #        under $ErrorActionPreference='Stop' and took the run with it, which
+    #        is indistinguishable from "the floor was never run" and leaves the
+    #        lane's build tree running under a pid nobody tracks. The fault is
+    #        injected because the real ones are rare races.
+    $env:GHOZTTY_FLOOR_LANE_FAULT = 'arm16'
+    $faultExit = -1
+    try {
+        $faultOut = & powershell -NoProfile -File $laneScript `
+            -Command "$Fixture /t 60 GhozttyFaultArm16" -NoCatch -SampleSeconds 2 2>&1 |
+            ForEach-Object { $_.ToString() } | Out-String
+        $faultExit = $LASTEXITCODE
+    }
+    finally { Remove-Item Env:\GHOZTTY_FLOOR_LANE_FAULT -ErrorAction SilentlyContinue }
+    Check 'an unexpected watchdog error names itself' ($faultOut -match 'WATCHDOG ERROR') $faultOut
+    Check 'the lane it happened in is charged FAIL' ($faultOut -match 'LANE command FAIL') $faultOut
+    Check 'the run still reaches its summary line' ($faultOut -match 'FLOOR SUMMARY') $faultOut
+    Check 'the run exits non-zero, so the gate cannot read as green' ($faultExit -ne 0) "exit=$faultExit"
+    Start-Sleep -Milliseconds 500
+    Check 'the failed lane took its process tree with it' `
+        (@(Get-LaneTestProcess -ExeNames @($FixtureName)).Count -eq 0) 'fixture outlived the watchdog error'
+
     # -- 10: floor-lane.ps1 parses, and its wiring is the wiring described above
     $tokens = $null; $errors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -266,6 +336,10 @@ try {
     Check 'floor-lane asks which pids are self-spawned' ($src -match 'Get-SelfSpawnedTestPids') ''
     Check 'floor-lane keeps their CPU out of the progress signal' `
         ($src -match 'Get-TreeCpu -Tree \$tree -IgnorePids') ''
+    Check 'floor-lane wraps the tree sample so an empty one cannot become null' `
+        ($src -match '\$tree = @\(Get-ProcessTree') ''
+    Check 'floor-lane cannot leave its watchdog loop without a verdict' `
+        ($src -match 'WATCHDOG ERROR') ''
 }
 finally {
     foreach ($p in $Started) {
