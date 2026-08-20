@@ -21,11 +21,23 @@
 #      into the user's accent, which clears the 3:1 chrome floor against the
 #      fill it sits on and is a narrow BAR, not a filled column;
 #   D. the pill has no outline in either state: every pixel along its top, right
-#      and bottom edges is the fill itself.
+#      and bottom edges is the fill itself;
+#   E. and when Windows says focus visuals are SHOWN (UISF_HIDEFOCUS cleared,
+#      which is what keyboard navigation does), the one outline the row is
+#      allowed grows inside the pill - the design system's 2.2 focus rim, in
+#      NEUTRAL ink rather than a second accent mark.
 #
 # D is the assertion that would have caught the reported defect (a
 # full-perimeter accent border stacked with an accent focus ring), and B/C are
 # what keep the fix from drifting back a wash at a time.
+#
+# C/D and E each PIN the UI-state bit they are claiming about (T988), rather
+# than inheriting whatever the harness's own input left behind. D's claim is
+# "no outline", the rim IS an outline drawn on purpose, and which one the app
+# paints is Windows' call and not the script's - so a section that does not say
+# which state it measures is red or green by luck. This one was measured red and
+# then green on 2026-08-19 against the same build. (B needs no pin: there the
+# list does not hold focus at all, so there is no rim either way.)
 #
 # The oracles read EDGES and the mark's own column, never a scan for "coloured
 # pixels": the row's text is drawn with subpixel antialiasing, whose fringes are
@@ -78,6 +90,23 @@ function Px([double]$dip, [double]$scale) { return [int][math]::Floor($dip * $sc
 # pasted as colours: move the weight in the Zig and this script moves with it.
 $SELECTION_WASH_UNFOCUSED = 0.10
 $SELECTION_WASH_FOCUSED = 0.16
+
+# Windows' UI-state mechanism (T988). Focus rectangles stay hidden until the
+# user navigates by keyboard, and an owner-drawn listbox reads that back as
+# `ODS_NOFOCUSRECT` -> `RowState.focus_visible`. Sections C/D and E each pin
+# the bit they are making a claim about instead of inheriting whichever state
+# the harness's own input happened to leave behind: a posted chord and a real
+# one do not agree on it, which is why C/D were intermittently red.
+$WM_CHANGEUISTATE = 0x0127
+$WM_QUERYUISTATE = 0x0129
+$UIS_SET = 1
+$UIS_CLEAR = 2
+$UISF_HIDEFOCUS = 0x1
+
+# MAKEWPARAM(action, flags) - the action is the low word, the flags the high.
+function UiStateWParam([int]$action, [int]$flags) {
+    return [IntPtr]($action -bor ($flags -shl 16))
+}
 
 # The most common colour over a grid of a capture's region, in SCREEN
 # coordinates. A modal colour - not a single sample - is what makes this robust
@@ -271,6 +300,18 @@ try {
 
     Write-Host ''
     Write-Host 'C/D. clicking the row emphasizes it and spends the accent on the mark'
+    # Pointer-driven, so focus visuals are hidden - Windows' own convention, and
+    # the state D's "no outline anywhere on the perimeter" claim belongs to. The
+    # rim IS an outline, drawn on purpose (design system 2.2), so D can only be honest about
+    # a state that names whether the rim is showing; before T988 it named
+    # neither and went red whenever a real keyboard chord had cleared the bit.
+    $null = Invoke-TestMessage -Window $chooser -Message $WM_CHANGEUISTATE `
+        -WParam (UiStateWParam $UIS_SET $UISF_HIDEFOCUS)
+    Start-Sleep -Milliseconds 250
+    $uiState = [int](Invoke-TestMessage -Window ([IntPtr]$lr.Hwnd) -Message $WM_QUERYUISTATE)
+    Assert (($uiState -band $UISF_HIDEFOCUS) -ne 0) `
+        "the list is in the pointer-driven state: focus visuals hidden (UI state 0x$('{0:x}' -f $uiState))"
+
     # Posted to the LIST, not to the dialog: a click the dialog receives never
     # reaches the listbox's own focus handling, and the row would stay
     # unemphasized while the script believed it had clicked it.
@@ -278,10 +319,57 @@ try {
         -Button left -Action click | Out-Null
     Start-Sleep -Milliseconds 500
 
+    $fillFocused = $null
     $shot2 = Get-TestWindowPixels -Window $chooser -Sync
     try {
         Measure-Row $shot2 'focused' $SELECTION_WASH_FOCUSED $true
+        $fp = Get-TestPixel -Shot $shot2 -X ($lr.Left + $midX) -Y ($lr.Top + $fillInsetY)
+        if ($fp) { $fillFocused = @([int]$fp.R, [int]$fp.G, [int]$fp.B) }
     } finally { Close-TestWindowPixels -Shot $shot2 }
+
+    Write-Host ''
+    Write-Host 'E. once Windows says focus visuals are shown, the rim appears - in NEUTRAL ink'
+    # The other half of the same bit. `rowPaint` draws the 2.2 focus rim only when
+    # `focus_visible`, and T828's amendment is that it is drawn in
+    # `chrome_theme.textOn` and not in the accent: the row already spends the
+    # accent on its indicator, and two accent marks on one control is the
+    # doubled purple outline that was reported. Nothing measured the rim's
+    # PIXELS until now - the unit tests assert the colour model, and C/D only
+    # ever saw the state where it is not drawn.
+    $null = Invoke-TestMessage -Window $chooser -Message $WM_CHANGEUISTATE `
+        -WParam (UiStateWParam $UIS_CLEAR $UISF_HIDEFOCUS)
+    Start-Sleep -Milliseconds 350
+    $uiState2 = [int](Invoke-TestMessage -Window ([IntPtr]$lr.Hwnd) -Message $WM_QUERYUISTATE)
+    Assert (($uiState2 -band $UISF_HIDEFOCUS) -eq 0) `
+        "the list is in the keyboard-driven state: focus visuals shown (UI state 0x$('{0:x}' -f $uiState2))"
+    Assert ($null -ne $fillFocused) 'the emphasized fill was carried over from C'
+
+    if ($null -ne $fillFocused -and ($uiState2 -band $UISF_HIDEFOCUS) -eq 0) {
+        $shot3 = Get-TestWindowPixels -Window $chooser -Sync
+        try {
+            # Walk down the pill's own column from its top edge. The rim is
+            # inset a pixel or two inside the pill (`focus_path_inset`), so it
+            # is the first thing on that column that is not the fill - found by
+            # reading, never by re-deriving the inset here (the T256 rule).
+            $rim = $null
+            $rimY = -1
+            for ($y = $fillInsetY; $y -lt ($fillInsetY + (Px 8 $scale)); $y++) {
+                $p = Get-TestPixel -Shot $shot3 -X ($lr.Left + $midX) -Y ($lr.Top + $y)
+                if (-not $p) { continue }
+                $c = @([int]$p.R, [int]$p.G, [int]$p.B)
+                if ((Get-ChannelDistance $c $fillFocused) -gt 6) { $rim = $c; $rimY = $y; break }
+            }
+            Assert ($null -ne $rim) "the focus rim is drawn inside the pill (y=$rimY, $(if ($rim) { Format-Rgb $rim } else { 'nothing but fill' }))"
+            if ($null -ne $rim) {
+                $rimChroma = ($rim | Measure-Object -Maximum).Maximum - ($rim | Measure-Object -Minimum).Minimum
+                Assert ($rimChroma -le 12) `
+                    "the rim is NEUTRAL ink, not a second accent mark ($(Format-Rgb $rim), chroma $rimChroma)"
+                $rimContrast = Get-Contrast $rim $fillFocused
+                Assert ($rimContrast -ge 3.0) `
+                    "the rim reads against the pill it sits in ($([math]::Round($rimContrast, 2)):1)"
+            }
+        } finally { Close-TestWindowPixels -Shot $shot3 }
+    }
 
     Send-TestControlKey -Control $chooser -Key Escape | Out-Null
     Start-Sleep -Milliseconds 300

@@ -179,13 +179,15 @@ function Get-FirstBrightColumn($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [i
 
 # The strongest blue tint (b - r) anywhere in a screen rect.
 #
-# The focus rim (T312) is `chrome_theme.accentOn(fill, accent)` - the accent
-# clamped to 3:1 against the pill it sits INSIDE - so with the accent this
-# script pins it is far bluer than the 25%-blend fill around it. A max is the
-# right statistic because the rim is two DIP of a rounded rectangle: its exact
-# x moves with DPI rounding, and a fixed-coordinate probe would be asserting
-# where the rim is rather than that it exists. Everything else in the band is
-# grey text or a grey glyph, so nothing else competes.
+# Since T828 the accent on a selected row lives on ONE thing: the 4x16
+# indicator capsule at the pill's leading edge, `chrome_theme.accentOn(fill,
+# accent)` - the accent clamped to 3:1 against the pill it sits on - so with the
+# accent this script pins it is far bluer than the neutral wash around it. (It
+# used to be a full accent rim, and this comment used to say so; T988.) A max is
+# the right statistic because the mark is four DIP of a capsule: its exact x
+# moves with DPI rounding, and a fixed-coordinate probe would be asserting where
+# the mark is rather than that it exists. Everything else in the band is grey
+# text or a grey glyph, so nothing else competes.
 function Get-MaxBlueTint($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
     $max = -255
     for ($y = $Y0; $y -lt $Y1; $y++) {
@@ -450,22 +452,43 @@ try {
         # --- T312 finding 10: focus is visible, and it is a THIRD state -----
         #
         # Three claims, each measured in the state it belongs to:
-        #   1. list unfocused -> the selected row is a NEUTRAL pill. Drawn
-        #      (brighter than the row background beside it) but carrying none
-        #      of the accent, which is what says "the caret is elsewhere".
-        #   2. list focused   -> the pill takes the accent AND grows a rim
-        #      that is more accent than the fill it sits inside.
+        #   1. list unfocused -> the selected row is a NEUTRAL pill, and so is
+        #      the mark at its leading edge. Drawn (brighter than the row
+        #      background beside it) but carrying none of the accent, which is
+        #      what says "the caret is elsewhere".
+        #   2. list focused   -> the FILL stays neutral and steps up a weight
+        #      (`selection_wash_unfocused` 0.10 -> `_focused` 0.16), and the
+        #      accent appears on the 4x16 indicator capsule at the pill's
+        #      leading edge. That is T828's treatment - Windows 11's list
+        #      selection instead of Mac's tinted pill - and the indicator is
+        #      the WHOLE of the row's accent, so the pill body has none.
         #   3. focus leaves   -> it goes back.
+        #
+        # This probe used to demand an accent TINT in the pill body (b - r >= 25
+        # at Left+14) and went red the day T828 deliberately removed it. Its
+        # successor is not a deletion (T988): the colour half of the oracle
+        # moved to the band the accent moved to, and gained the fill-weight
+        # check, so "the row repainted into the emphasized state" is still
+        # measured in colour and not only in the region signature.
         #
         # The trigger and the color are separate oracles (T233): the region
         # signature says the row repainted at all, the tints say what it
         # repainted INTO. A signature alone would pass on any change; a tint
         # alone cannot tell a repaint from a stale capture.
+        #
+        # The two bands are split at the body sample: the mark lives at DIP
+        # 6..10 (`fill_inset_x` + `xs`, 4 wide), the body sample at +14 is past
+        # it, and the pill runs to DIP 60. Splitting there rather than
+        # re-deriving the capsule's rect keeps the probe off a rounding
+        # assumption at fractional scales.
+        $markX1 = $lr.Left + 14
         Assert ($pillTint -le 10) "unfocused list: the selected row carries no accent (b-r = $pillTint)"
         Assert (($pill[0] - $gutter[0]) -ge 12) "unfocused list: the selected row still draws a neutral pill (r $($pill[0]) vs gutter $($gutter[0]))"
-        $rimUnfocused = Get-MaxBlueTint $shot $pillX0 $rowTop $pillX1 $rowBot
+        $markUnfocused = Get-MaxBlueTint $shot $pillX0 $rowTop $markX1 $rowBot
+        $bodyUnfocused = Get-MaxBlueTint $shot $markX1 $rowTop $pillX1 $rowBot
         $sigUnfocused = Get-RegionSignature $shot $pillX0 $rowTop $pillX1 $rowBot
-        Assert ($rimUnfocused -le 12) "unfocused list: no focus rim anywhere in the pill (max b-r = $rimUnfocused)"
+        Assert ($markUnfocused -le 12) "unfocused list: the indicator mark is neutral too (max b-r = $markUnfocused in the mark band)"
+        Assert ($bodyUnfocused -le 12) "unfocused list: no accent anywhere in the pill body (max b-r = $bodyUnfocused)"
 
         # One Tab from the filter is the list (`nextFocus`: filter -> list).
         Send-TestControlKey -Control $chooser -Key Tab | Out-Null
@@ -473,12 +496,15 @@ try {
         $shotFocus = Get-Shot $chooser
         $pillF = Get-ShotPixel $shotFocus ($lr.Left + 14) $yRow0
         $pillFTint = $pillF[2] - $pillF[0]
-        $rimFocused = Get-MaxBlueTint $shotFocus $pillX0 $rowTop $pillX1 $rowBot
+        $markFocused = Get-MaxBlueTint $shotFocus $pillX0 $rowTop $markX1 $rowBot
+        $bodyFocused = Get-MaxBlueTint $shotFocus $markX1 $rowTop $pillX1 $rowBot
         $sigFocused = Get-RegionSignature $shotFocus $pillX0 $rowTop $pillX1 $rowBot
         Close-TestWindowPixels $shotFocus
         Assert ($sigFocused -ne $sigUnfocused) "Tab onto the list repaints the focused row (signature $sigUnfocused -> $sigFocused)"
-        Assert ($pillFTint -ge 25) "focused list: the selected row is accent-tinted (b-r = $pillFTint at the pill)"
-        Assert ($rimFocused -ge ($pillFTint + 40)) "focused list: a focus rim reads above the fill it sits in (rim b-r = $rimFocused vs fill $pillFTint)"
+        Assert ($pillFTint -le 10) "focused list: the pill fill stays neutral, the accent is not in it (b-r = $pillFTint at the pill body)"
+        Assert (($pillF[0] - $pill[0]) -ge 4) "focused list: the fill steps up to the emphasized wash (r $($pill[0]) -> $($pillF[0]))"
+        Assert ($markFocused -ge 25) "focused list: the accent is on the indicator mark (max b-r = $markFocused in the mark band)"
+        Assert ($bodyFocused -le 12) "focused list: and nowhere else on the row (max b-r = $bodyFocused across the pill body)"
 
         # And it reverts. Tab again rather than Shift+Tab: the app asks
         # `GetKeyState(VK_SHIFT)`, which a POSTED message never sets, so a
@@ -489,10 +515,10 @@ try {
         Start-Sleep -Milliseconds 350
         $shotBlur = Get-Shot $chooser
         $pillB = Get-ShotPixel $shotBlur ($lr.Left + 14) $yRow0
-        $rimBlur = Get-MaxBlueTint $shotBlur $pillX0 $rowTop $pillX1 $rowBot
+        $markBlur = Get-MaxBlueTint $shotBlur $pillX0 $rowTop $pillX1 $rowBot
         Close-TestWindowPixels $shotBlur
         Assert ((($pillB[2] - $pillB[0])) -le 10) "Tab away: the selection gives the accent back (b-r = $(($pillB[2] - $pillB[0])))"
-        Assert ($rimBlur -le 12) "Tab away: the focus rim is gone (max b-r = $rimBlur)"
+        Assert ($markBlur -le 12) "Tab away: the indicator mark is neutral again (max b-r = $markBlur)"
 
         # T310 finding 8: the icon column is 28, not 20, so the text column's
         # left edge is 68 DIP from the row's edge (4 pill inset + 8 + a 12
