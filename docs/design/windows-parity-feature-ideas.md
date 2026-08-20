@@ -123,3 +123,13 @@ as the digest that showed them.
 - A pane that tells you what it is waiting on (working / input / network)
 - Never a red suite as background noise (new failures louder than old ones)
 - Open the window before the work (first frame before session attach)
+
+## 2026-08-20
+
+- Put my windows back on the right monitors (multi-monitor restore placement)
+- Copy what that command printed, without selecting it (copy last output)
+- Tell me how long that took, and whether it is slower than usual (per-command timing vs baseline)
+- A link to a line of output that you can paste anywhere (deep link into scrollback)
+- Follow the system's text size, not just its colors (Windows text scaling)
+- A "why is this slow" readout you can actually send (frame time / backlog / RTT panel)
+- A first run that finds your shells for you (guided shell-flavor setup)
