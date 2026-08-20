@@ -511,7 +511,11 @@ pub fn init(
     // classic light palette otherwise, breaking dark chrome — T79). Must
     // happen before any menu is shown; kept in sync on config reload and
     // WM_SETTINGCHANGE.
-    DarkMode.apply(config.@"window-theme", config.background);
+    DarkMode.apply(
+        config.@"window-theme",
+        config.background,
+        Window.systemUsesLightTheme(),
+    );
 
     self.* = .{
         .core_app = core_app,
@@ -5962,6 +5966,7 @@ pub fn performAction(
                 DarkMode.apply(
                     self.config.@"window-theme",
                     self.config.background,
+                    Window.systemUsesLightTheme(),
                 );
 
                 // Re-register global hotkeys against the new keybinds.

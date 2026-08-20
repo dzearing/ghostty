@@ -200,6 +200,34 @@ pub fn chromeBase(theme: anytype, terminal_bg: Rgb, system_light: bool) Rgb {
     };
 }
 
+/// Which side of light/dark this window is on, for a `window-theme` value —
+/// the ONE answer to that question (T309).
+///
+/// Derived FROM `chromeBase` rather than beside it, so the DWM immersive
+/// dark-mode attribute, the USER menu palette and the color the chrome paints
+/// cannot disagree: they are the same decision read two ways. `applyChromeTheme`
+/// and `DarkMode.modeForTheme` each used to re-answer it with their own inline
+/// Rec.709 `0.2126/0.7152/0.0722` luminance, which agrees with this on every
+/// ordinary background and is not guaranteed to near the crossover — the same
+/// defect T203/T304 was filed against, one level up: not a disagreeing color
+/// but a disagreeing DECISION that colors are picked from.
+///
+/// The weighting is `color_math.isLight`'s Rec.601, which is the repo's answer
+/// everywhere else AND the Mac's: `OSColor.isLightColor` is
+/// `0.299/0.587/0.114 > 0.5` (`macos/Sources/Helpers/Extensions/
+/// OSColor+Extension.swift`), and this is the decision that picks the same
+/// title bar Mac picks. Note the boundary moved with it: a background at
+/// exactly 0.5 luminance is now DARK (`> 0.5` is light), matching Mac, where
+/// the old `< 0.5` call read it as light.
+///
+/// Not to be confused with `color_math.contrastForeground`, which deliberately
+/// does NOT use `isLight` — picking ink for a surface is a contrast question
+/// with a measurable better answer, while which theme a window is in is a
+/// single either/or that every surface must agree on.
+pub fn isDark(theme: anytype, terminal_bg: Rgb, system_light: bool) bool {
+    return !color_math.isLight(chromeBase(theme, terminal_bg, system_light));
+}
+
 /// Every flat color the chrome paints, resolved together.
 ///
 /// Together, in one shot, on purpose: these colors are only correct RELATIVE
@@ -411,6 +439,81 @@ test "chromeBase: explicit themes leave the terminal background behind" {
     // T305 wires to WM_SETTINGCHANGE.
     try testing.expectEqual(surface_light, chromeBase(Theme.system, term, true));
     try testing.expectEqual(surface_dark, chromeBase(Theme.system, term, false));
+}
+
+test "isDark: the chrome's side never disagrees with the surface it paints" {
+    // The assertion T309 exists to make possible, and it is only an assertion
+    // because there is one function left to assert about: while the DWM
+    // attribute and `chromeBase` were computed by different code with different
+    // luminance weightings, "they agree" was a claim about two crossovers
+    // landing in the same place, which nothing checked and which is false in
+    // principle near mid-grey.
+    const Theme = enum { auto, system, light, dark, ghostty };
+    const themes = [_]Theme{ .auto, .system, .light, .dark, .ghostty };
+
+    // Sweep the grey ramp plus the saturated corners, both OS answers. A grey
+    // ramp is where the two weightings differ least and a saturated color is
+    // where they differ most, so both belong in the sweep.
+    var v: u16 = 0;
+    while (v <= 255) : (v += 1) {
+        const c: u8 = @intCast(v);
+        const cases = [_]Rgb{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = 0, .b = 0 },
+            .{ .r = 0, .g = c, .b = 0 },
+            .{ .r = 0, .g = 0, .b = c },
+            .{ .r = c, .g = 0xFF - c, .b = 0x80 },
+        };
+        for (cases) |bg| {
+            for (themes) |theme| {
+                for ([_]bool{ true, false }) |sys_light| {
+                    const base = chromeBase(theme, bg, sys_light);
+                    try testing.expectEqual(
+                        !color_math.isLight(base),
+                        isDark(theme, bg, sys_light),
+                    );
+                }
+            }
+        }
+    }
+}
+
+test "isDark: the decision table, and the surfaces are on their nominal sides" {
+    const Theme = enum { auto, system, light, dark, ghostty };
+    const dark_bg: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+    const light_bg: Rgb = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+
+    // The explicit themes are their own answer whatever else moves — which
+    // requires the OS surfaces to actually BE light and dark. If `surface_light`
+    // were ever edited to something the luminance test reads as dark, the
+    // sweep above would still pass (it compares two views of one value) and a
+    // `window-theme = light` window would get a dark title bar; this is the
+    // check that catches it.
+    for ([_]Rgb{ dark_bg, light_bg }) |bg| {
+        for ([_]bool{ true, false }) |sys| {
+            try testing.expect(!isDark(Theme.light, bg, sys));
+            try testing.expect(isDark(Theme.dark, bg, sys));
+        }
+    }
+
+    // `system` is the OS's call; `auto`/`ghostty` are the terminal's.
+    try testing.expect(!isDark(Theme.system, dark_bg, true));
+    try testing.expect(isDark(Theme.system, light_bg, false));
+    try testing.expect(isDark(Theme.auto, dark_bg, true));
+    try testing.expect(!isDark(Theme.auto, light_bg, false));
+    try testing.expect(isDark(Theme.ghostty, dark_bg, true));
+
+    // Rec.601, matching the Mac's `isLightColor`: green weighs most, blue
+    // least, so pure green is a LIGHT window and pure blue a dark one.
+    try testing.expect(!isDark(Theme.auto, Rgb{ .r = 0, .g = 0xFF, .b = 0 }, false));
+    try testing.expect(isDark(Theme.auto, Rgb{ .r = 0, .g = 0, .b = 0xFF }, true));
+
+    // The boundary, stated rather than left to be discovered: `isLight` is
+    // `> 0.5`, so a background at exactly half luminance is DARK. #808080 is
+    // 0.50196 and lands light; the old `< 0.5` Rec.709 call read both the same
+    // way, and this is the one background where the migration is visible.
+    try testing.expect(!isDark(Theme.auto, Rgb{ .r = 0x80, .g = 0x80, .b = 0x80 }, false));
+    try testing.expect(isDark(Theme.auto, Rgb{ .r = 0x7F, .g = 0x7F, .b = 0x7F }, false));
 }
 
 test "resolve: the light theme the old arithmetic could not express" {

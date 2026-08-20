@@ -9,6 +9,48 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T309 (filed T1018, T1019) - a window is light or dark for
+  exactly one reason now, instead of three pieces of code each working it out
+  their own way.** The title bar's DWM immersive-dark attribute, the USER menu
+  palette and the band the chrome paints were three answers to one question,
+  and two of them carried an inline Rec.709 `0.2126/0.7152/0.0722` luminance
+  that is a DIFFERENT weighting from the `color_math.isLight` Rec.601 the
+  painted surface already used. They agree on every ordinary background, which
+  is why nobody has seen it; near the crossover they need not, and nothing
+  asserted that they did. The same defect T203/T304 was filed against, one
+  level up: not a disagreeing color but a disagreeing DECISION that colors are
+  picked from.
+  `chrome_theme.isDark(theme, terminal_bg, system_light)` is the one answer,
+  and it is `!color_math.isLight(chromeBase(...))` - derived FROM the surface
+  rather than beside it, so the two cannot drift apart by construction; that is
+  also what makes the sweep test possible at all. `Window.applyChromeTheme`,
+  `DarkMode.modeForTheme` and `tabTipEnsure` consume it; both inline copies are
+  gone, and the tooltip stopped unpacking the answer back out of the menu
+  modes. `modeForTheme` grew a `system_light` argument, which is honest about
+  the one branch (`system` -> allow-dark) that is the OS's call rather than
+  ours.
+  The weighting kept is Rec.601, because it is what the Mac decides with
+  (`OSColor.isLightColor`) - so parity here is the same title bar for the same
+  background on both platforms, not just internal agreement. One visible
+  consequence, stated in the test rather than discovered later: `isLight` is
+  `> 0.5`, so a background at exactly half luminance is now DARK where the old
+  `< 0.5` call read it as light.
+  Evidence: the sweep (background x theme x both OS answers) and the
+  decision-table test run in the `none` lane - 76 tests with
+  `-Dtest-filter=isDark` against 74 with a nonsense filter, which is how the
+  count was proven rather than assumed; the new DarkMode test likewise 78 vs 77
+  in win32. `floor-lane.ps1 -Lane all` ALL LANES PASS; `printclient-audit`
+  ALL PASS (8) and re-stamped; `chrome-theme.ps1` ALL PASS (64);
+  `dark-menus.ps1` ALL PASS (10) - the harness that actually exercises the menu
+  half; P1/P2/P3 ALL PASS.
+  Two gaps filed rather than swept up: **T1018** - `chrome-theme.ps1` has no
+  `guard-due` row, so a `chrome_theme.zig`/`color_math.zig` edit obliges nobody
+  to re-run the script that measures the colors it moves (the only guard that
+  went due here was `printclient-audit`, which watches all 189 win32 sources
+  and is not about color). **T1019** - of the three consumers of the light/dark
+  decision, the DWM title bar is the one with no oracle at all; the band and
+  the menus are measured, the caption is not.
+
 - 2026-08-19 - **T962 (filed T995) - the audit that catches a test which
   measured nothing was itself letting one through, and its own ratchet had
   been running backwards for eight days.** Two reds at HEAD, both found by

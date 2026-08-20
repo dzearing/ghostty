@@ -684,17 +684,16 @@ pub fn invalidateChrome(self: *Window) void {
 /// explicit dark/light/system themes the caption is reset to the system
 /// default so the standard themed title bar (and legible glyphs) is drawn.
 fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
-    const luminance: f32 = (0.2126 * @as(f32, @floatFromInt(bg.r)) +
-        0.7152 * @as(f32, @floatFromInt(bg.g)) +
-        0.0722 * @as(f32, @floatFromInt(bg.b))) / 255.0;
-    const by_luminance = luminance < 0.5;
-    const dark = switch (theme) {
-        .dark => true,
-        .light => false,
-        .system => !systemUsesLightTheme(),
-        // `ghostty` is a Linux/GTK-only theme; treat it as auto on Windows.
-        .auto, .ghostty => by_luminance,
-    };
+    // The light/dark call itself belongs to `chrome_theme` and is made in
+    // exactly one place (T309) — this used to re-derive it here with its own
+    // luminance weighting, which is how the DWM title bar and the band painted
+    // under it could in principle land on opposite sides of the same
+    // background.
+    const dark = chrome_theme.isDark(
+        theme,
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+        systemUsesLightTheme(),
+    );
 
     const dark_mode: u32 = if (dark) 1 else 0;
     _ = w32.DwmSetWindowAttribute(
@@ -6456,9 +6455,11 @@ fn tabTipToolInfo(self: *Window) w32.TOOLINFOW {
     };
 }
 
-/// Create the tooltip control on first use. The dark theme is decided the
-/// way the menus decide it (`DarkMode.modeForTheme`, `system` following the
-/// OS apps theme) and applied at creation; a mid-session flip catches up
+/// Create the tooltip control on first use. The dark theme is the window's own
+/// (`chrome_theme.isDark`, the single light/dark answer this chrome has —
+/// `system` following the OS apps theme) and applied at creation; the value it
+/// used to unpack out of `DarkMode.modeForTheme` was that same answer routed
+/// through the menu modes and back (T309). A mid-session flip catches up
 /// because `tabTipReset` destroys the control, so the next show re-runs
 /// this with the fresh answer (T557).
 fn tabTipEnsure(self: *Window) ?w32.HWND {
@@ -6486,14 +6487,12 @@ fn tabTipEnsure(self: *Window) ?w32.HWND {
         null,
     ) orelse return null;
 
-    const dark = switch (DarkMode.modeForTheme(
+    const tip_bg = self.app.config.background;
+    const dark = chrome_theme.isDark(
         self.app.config.@"window-theme",
-        self.app.config.background,
-    )) {
-        .force_dark => true,
-        .allow_dark => !systemUsesLightTheme(),
-        .default, .force_light => false,
-    };
+        .{ .r = tip_bg.r, .g = tip_bg.g, .b = tip_bg.b },
+        systemUsesLightTheme(),
+    );
     if (dark) {
         _ = w32.SetWindowTheme(
             tip,
@@ -7141,6 +7140,7 @@ pub fn windowWndProc(
             DarkMode.apply(
                 window.app.config.@"window-theme",
                 window.app.config.background,
+                systemUsesLightTheme(),
             );
             // The client-painted chrome derives from the same light/dark
             // signal (`chrome_theme.chromeBase` under `window-theme = system`),
