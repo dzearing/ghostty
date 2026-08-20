@@ -232,6 +232,26 @@ Where the two sides disagree, this is the ruling and the reason.
   action order primary → Restore All → Activity → `…`.
 - The `…` menu is a **glyph button**, never a fourth labeled command.
 - Empty / loading / error states exist and are centered, not blank.
+- **The signed-out account row is the button alone** (T316) — no "Not signed
+  in" sentence beside it, which is what win32 used to show and Mac never has
+  (2.4). Windows dialogs do generally label state rather than leaving it to be
+  inferred from a caption, and that is the case that kept the sentence through
+  T311; the ruling goes the other way because on THIS surface the state is
+  already named twice without it. The button says "Sign in with Google…", and
+  the footer hint under the empty list says "Not signed in — use Sign in with
+  Google above to list your machines." — the fuller sentence, with the remedy
+  the band's one line has no room for. A third copy in the band was the only
+  text in the chooser with no Mac counterpart in any state.
+  - The other three states keep their sentence, because Mac has one in each:
+    the email when signed in, "Finish signing in in your browser…" against
+    Mac's "Waiting for browser sign-in…", and the setup pointer an
+    unconfigured build shows in place of a button it could not honour (T747).
+    The unconfigured state is the reason "signed out shows nothing" is a rule
+    about the button and not about the band: with no button drawn, a silent
+    band would be a dead end.
+  - The STATIC is **hidden**, not merely blanked, so `IsWindowVisible` stays
+    the honest answer — a blank control and a control the app failed to fill
+    read identically through `WM_GETTEXT`.
 
 ### 3.2 Take from Windows (type, metrics, shape, color)
 

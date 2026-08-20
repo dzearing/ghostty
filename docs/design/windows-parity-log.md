@@ -9,6 +9,45 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T316 (filed T1028) - the machine chooser stops telling you
+  three times that you are not signed in.** Open it signed out and the surface
+  said so with the button's caption ("Sign in with Google..."), with a "Not
+  signed in" label beside it, and with the footer hint under the empty list
+  ("Not signed in - use Sign in with Google above to list your machines."). Mac
+  says it once, with the button alone (win32-machine-chooser.md 2.4), and the
+  label was the only text in the chooser with no Mac counterpart in ANY state -
+  T311 recomposed the row around Mac's signed-IN block and left it there
+  because removing it was a product call. The ruling: it goes. The Windows
+  convention of labelling state rather than leaving it to a caption is real and
+  is what kept it, but it is satisfied here by the hint, which is this
+  surface's designated state line and carries the remedy the band's one line
+  has no room for. The other three states KEEP their sentence, each having a
+  Mac counterpart: the email signed in, "Finish signing in in your browser..."
+  against Mac's "Waiting for browser sign-in...", and the setup pointer an
+  unconfigured build shows in place of a button it could not honour (T747) -
+  which is why this is a rule about the BUTTON and not about the band, since
+  with no button drawn a silent band would be a dead end. Mechanically
+  `statusText` returns "" for signed-out-and-configured and the STATIC is
+  HIDDEN rather than blanked, because a blank control and a control the app
+  failed to fill read identically through WM_GETTEXT. Not filed as a user
+  decision: go.md 5b's experience test asks whether the Mac-to-Windows
+  translation is ambiguous and it is not - 2.4 states Mac's answer outright.
+  Also closed a coverage gap the task walked into: `relay-account.ps1` is the
+  ONLY check on what that row says in any of its four compositions and it had
+  no `guard-due` row, so nothing tied an edit of `RelayAccountRow.zig` to
+  running it; it has one now, and stamps only on a run with zero failures AND
+  zero skips. Green: floor lanes lib/none/win32/agent ALL PASS, ipc-p1 25 / p2
+  20 / p3 16 ALL PASS, relay-account ALL PASS (guard stamped),
+  ipc-machine-chooser 77 ALL PASS, and the five guards the edit made due
+  (printclient-audit 8, isolation-meta 7, verdict-exit, stderr-capture 25,
+  chooser-selection 35) green and re-stamped. **Surprise, filed as T1028:** the
+  first relay-account run reported 3 FAILURE(S) that were entirely a stale
+  `zig-out\bin\ghoztty.exe` - the harness drives that exe and never builds it,
+  and nothing checks it was built from the code under test. The false red is
+  self-correcting; the false GREEN is the defect, because since T783 a green
+  run stamps the guard, so `guard-due` can be made to answer "current" about an
+  exe that never saw the change.
+
 - 2026-08-20 - **T957 (filed T1024, T1025, T1026) - the six commits the whole
   merge-back plan is built on can no longer be deleted out from under it, and
   the files both sides only ever append to stop conflicting.** Stage 0 of

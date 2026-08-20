@@ -482,7 +482,15 @@ try {
     $btn = Get-ChooserAccountButton -Chooser $chooser
     Assert "account row has a button" ($null -ne $btn)
     Assert "signed-out label is the Google sign-in" ($null -ne $btn -and $btn.Text -eq $SignInLabel)
-    Assert "signed-out status says 'Not signed in'" ((Get-ChooserAccountStatusText -Chooser $chooser) -eq 'Not signed in')
+    # T316: the signed-out row is the button alone, Mac's composition. The state
+    # is named by the button's caption and by the footer hint, never a third
+    # time in the band. Hidden as well as blank, because a STATIC the app failed
+    # to fill would also read as ''.
+    $so = Get-ChooserStatic -Chooser $chooser -Edge top
+    Assert "signed-out row shows no status sentence (T316)" (
+        $null -ne $so -and $so.Text -eq '' -and -not $so.Visible)
+    Assert "the state is still named, in the footer hint" (
+        (Get-ChooserHintText -Chooser $chooser) -match 'Not signed in')
 
     if ($null -ne $btn) {
         Send-TestControlClick -Control $btn.Hwnd | Out-Null
@@ -535,7 +543,11 @@ try {
             Start-Sleep -Milliseconds 500
             $out = Get-ChooserAccountButton -Chooser $chooser
             Assert "button back to the Google sign-in" ($null -ne $out -and $out.Text -eq $SignInLabel)
-            Assert "status back to 'Not signed in'" ((Get-ChooserAccountStatusText -Chooser $chooser) -eq 'Not signed in')
+            # And the email goes with it: back to the signed-out composition,
+            # which is the button on its own (T316).
+            $back = Get-ChooserStatic -Chooser $chooser -Edge top
+            Assert "status sentence gone again after sign out (T316)" (
+                $null -ne $back -and $back.Text -eq '' -and -not $back.Visible)
             Assert "hint says signed out" ((Get-ChooserHintText -Chooser $chooser) -match 'Signed out|Already signed out')
         }
     }
@@ -787,8 +799,12 @@ try {
             $b8b = Get-ChooserAccountButton -Chooser $ch8b
             Assert "CONTROL: with a client id the sign-in button IS visible" (
                 $null -ne $b8b -and $b8b.Text -eq $SignInLabel)
-            Assert "CONTROL: and the row is back to 'Not signed in'" (
-                (Get-ChooserAccountStatusText -Chooser $ch8b) -eq 'Not signed in')
+            # The delta the section is about: an unconfigured build REPLACES
+            # the button with a sentence, a configured one shows the button and
+            # no sentence at all (T316).
+            $c8b = Get-ChooserStatic -Chooser $ch8b -Edge top
+            Assert "CONTROL: and the row carries no sentence beside it (T316)" (
+                $null -ne $c8b -and $c8b.Text -eq '' -and -not $c8b.Visible)
         }
         if ($g8b.App.Process -and -not $g8b.App.Process.HasExited) {
             Stop-Process -Id $g8b.Pid -Force -ErrorAction SilentlyContinue
@@ -842,5 +858,20 @@ if ($NegativeControl -and -not $script:negReached) {
 }
 
 if ($script:skipped -gt 0) { "($($script:skipped) section(s) SKIPPED)" }
+
+# --- stamp (T783/T316) ------------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?". This
+# harness is the ONLY check on what the account row says in each of its four
+# compositions, and until T316 nothing tied an edit of `RelayAccountRow.zig` to
+# running it. A run with SKIPPED sections does not stamp: it left part of the
+# subject unmeasured, so it cannot vouch for the code as it stands. A
+# -NegativeControl run inverts an assertion and is likewise not evidence.
+if ($script:failures -eq 0 -and $script:skipped -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $PSScriptRoot '..\..\scripts\guard-due.ps1') `
+        update -Guard relay-account 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
+
 if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

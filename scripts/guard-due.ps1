@@ -1118,6 +1118,29 @@ $GuardTable = @(
             'test\win32\chooser-resume.ps1'
         )
     },
+    # The chooser's ACCOUNT ROW (T316): the sign-in flow and the four
+    # compositions the row takes (signed in / signing in / signed out /
+    # unconfigured). No other harness drives it - the P1-P3 floor opens no
+    # chooser, and the two rows above stop at the session list. The row exists
+    # because this harness IS the only check on what the row says: T316 changed
+    # the signed-out composition and every assertion that could have caught a
+    # mistake lives here, in a script nothing obliged anyone to run. Coverage is
+    # the row's own module (the pure label/status/monogram logic plus the async
+    # sign-in it drives), the account state the CLI and the tray read the same
+    # way, and the harness itself. MachineChooser.zig is deliberately NOT here
+    # for the reason the chooser-resume row states: it hosts sixteen features
+    # and moves about daily, and a GUI run gated on it would be due for reasons
+    # this row cannot fail on.
+    [pscustomobject]@{
+        Name   = 'relay-account'
+        Script = 'test\win32\relay-account.ps1'
+        Stamp  = 'test\win32\relay-account.stamp.json'
+        Covers = @(
+            'src\apprt\win32\RelayAccountRow.zig',
+            'src\remote\relay_signin.zig',
+            'test\win32\relay-account.ps1'
+        )
+    },
     # The chooser's TEXT FIELD (T990), the sibling of the activity-monitor row
     # above: both harnesses exist because a fixed-size UTF-8 destination behind
     # a win32 EDIT is a crash with a threshold, and neither floor lane can see

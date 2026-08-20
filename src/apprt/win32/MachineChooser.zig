@@ -971,7 +971,14 @@ fn refreshAccountRow(self: *MachineChooser) void {
     // and an unconfigured build has no control at all (T747).
     const hide_button = signed_in or state == .unconfigured;
 
-    setText(self.account_status, RelayAccountRow.statusText(self.email, busy, self.sign_in_configured));
+    // Empty in the signed-out state since T316 — Mac's signed-out row is the
+    // bordered button alone. Hidden rather than merely blank, so
+    // `IsWindowVisible` is the honest answer for the acceptance script the same
+    // way it is for the two controls below (a blank STATIC and a STATIC the app
+    // failed to fill read identically through WM_GETTEXT).
+    const status = RelayAccountRow.statusText(self.email, busy, self.sign_in_configured);
+    setText(self.account_status, status);
+    _ = w32.ShowWindow(self.account_status, if (status.len == 0) w32.SW_HIDE else w32.SW_SHOW);
     setText(self.account_link, RelayAccountRow.buttonLabel(true, false));
     setText(self.account_btn, RelayAccountRow.buttonLabel(false, busy));
 

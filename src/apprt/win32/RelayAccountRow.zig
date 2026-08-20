@@ -193,12 +193,22 @@ pub const unconfigured_hint =
     "(-Dgoogle-client-id, or GHOSTTY_GOOGLE_CLIENT_ID in the environment). " ++
     "See docs/design/relay-oidc-setup.md.";
 
-/// The account status line shown next to the button. `configured` is false when
-/// no client id resolves; the signed-OUT line then says so instead of naming a
-/// button that is no longer drawn (T747).
+/// The account status line shown next to the button, or "" when the state has
+/// no sentence — the caller hides the STATIC on empty.
+///
+/// Three of the four states say something Mac says too: the email (2.4), the
+/// browser-flow sentence beside Mac's "Waiting for browser sign-in…", and the
+/// setup pointer an unconfigured build shows instead of a button it cannot
+/// honour (T747). The **signed-out** state says nothing, because Mac says
+/// nothing there — §2.4 records its signed-out row as the bordered button
+/// alone — and on this surface the fact was already stated twice over: the
+/// button's own caption is "Sign in with Google…", and the footer hint under
+/// the empty list reads "Not signed in — use Sign in with Google above to list
+/// your machines." A third copy in the band was the only text in the chooser
+/// with no Mac counterpart at all (T316).
 pub fn statusText(email: ?[]const u8, busy: bool, configured: bool) []const u8 {
     if (busy) return "Finish signing in in your browser…";
-    const signed_out = if (configured) "Not signed in" else unconfigured_status;
+    const signed_out = if (configured) "" else unconfigured_status;
     const e = email orelse return signed_out;
     return if (e.len == 0) signed_out else e;
 }
@@ -244,16 +254,22 @@ test "buttonLabel: signed-in offers sign out, busy overrides both" {
     try testing.expectEqualStrings("Signing in…", buttonLabel(false, true));
 }
 
-test "statusText: email when signed in, never a blank line" {
+test "statusText: email when signed in, and nothing at all when signed out (T316)" {
     try testing.expectEqualStrings("me@example.com", statusText("me@example.com", false, true));
-    try testing.expectEqualStrings("Not signed in", statusText(null, false, true));
-    try testing.expectEqualStrings("Not signed in", statusText("", false, true));
+    // Signed out is Mac's composition: the bordered button alone. The state is
+    // named by the button's caption and by the footer hint, not a third time
+    // here.
+    try testing.expectEqualStrings("", statusText(null, false, true));
+    try testing.expectEqualStrings("", statusText("", false, true));
+    // The browser-flow sentence stays — Mac shows one too (2.4).
     try testing.expect(statusText("me@example.com", true, true).len > 0);
+    try testing.expect(statusText(null, true, true).len > 0);
 }
 
-test "statusText: an unconfigured build says so instead of 'Not signed in' (T747)" {
-    // "Not signed in" next to a button is an invitation; with no client id
-    // there is nothing to accept, so the line has to name the real state.
+test "statusText: an unconfigured build says so where signed-out says nothing (T747)" {
+    // A drawn button IS the invitation, so the ordinary signed-out row needs no
+    // words (T316); with no client id there is no button, and a row that said
+    // nothing at all would be an empty band with no way out of it.
     try testing.expectEqualStrings(unconfigured_status, statusText(null, false, false));
     try testing.expectEqualStrings(unconfigured_status, statusText("", false, false));
 

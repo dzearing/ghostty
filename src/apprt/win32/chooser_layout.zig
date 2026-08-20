@@ -1251,6 +1251,41 @@ test "accountRow: share == 0 is exactly the pre-toggle trailing run (T547)" {
     try testing.expectEqual(un.text.left - l.account.gap, un.identity_right);
 }
 
+test "accountRow: signed out packs with no sentence at all (T316)" {
+    // The signed-out state stopped carrying one — Mac's row is the button
+    // alone — so the ordinary case here is now `status = 0`. Nothing may
+    // collapse: the button keeps its own width, the share toggle packs against
+    // where the sentence would have been, and the identity gains the room.
+    const l = layout(1.0, 1);
+    const band = l.account.band;
+
+    inline for (.{ @as(i32, 0), @as(i32, 110) }) |share_w| {
+        const none = accountRow(l, .signed_out, .{ .button = 120, .status = 0, .share = share_w });
+        const some = accountRow(l, .signed_out, .{ .button = 120, .status = 90, .share = share_w });
+
+        // The button is placed off the band's trailing edge, so dropping the
+        // sentence must not move or resize it.
+        try testing.expectEqual(some.button.?.left, none.button.?.left);
+        try testing.expectEqual(some.button.?.right, none.button.?.right);
+
+        // The empty sentence is a zero-width rect where the sentence began,
+        // still inside the band and still on the button's leading side.
+        try testing.expectEqual(none.text.left, none.text.right);
+        try testing.expect(none.text.left >= band.left);
+        try testing.expectEqual(none.button.?.left - l.account.gap, none.text.right);
+
+        // Everything the sentence used to occupy goes to the identity.
+        try testing.expect(none.identity_right > some.identity_right);
+        try testing.expect(none.identity_right >= band.left);
+    }
+
+    // With the toggle present it heads the trailing run either way, one gap
+    // left of the (now empty) sentence.
+    const row = accountRow(l, .signed_out, .{ .button = 120, .status = 0, .share = 110 });
+    try testing.expectEqual(row.text.left - l.account.gap, row.share.?.right);
+    try testing.expectEqual(row.share.?.left - l.account.gap, row.identity_right);
+}
+
 test "accountRow: a huge share caption is clamped to the band (T547)" {
     const l = layout(1.0, 1);
     const band = l.account.band;

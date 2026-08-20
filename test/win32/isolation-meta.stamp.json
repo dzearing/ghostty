@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-20T13:57:06-07:00",
-    "commit":  "ac4722719",
+    "generated":  "2026-08-20T14:45:30-07:00",
+    "commit":  "fa4b8ad58",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "383cc42ce06e2b0201ccc7aedb3951eef309584a36beebef0f4e0faaf8d52c07",
@@ -156,7 +156,7 @@
                   "test/win32/readonly-badge.ps1":  "a284e7b8517e1b5e110337cce3f7a4c554347ba7880492686e454f2f95347bb4",
                   "test/win32/rearrange-session-drop.ps1":  "581a3ec58c4ebf777faf556318f9b628220b0be4e88af1adc481e23c46a151eb",
                   "test/win32/relaunch-guard.ps1":  "c9eba909ca4f70a63bad193281df40f31b001c8da9cf6253809e1b9247f23bdb",
-                  "test/win32/relay-account.ps1":  "f827e8ed5bf087f80bcde0e491e6f700de94899298805aa07815c9f5cd4022e6",
+                  "test/win32/relay-account.ps1":  "996aa87fe7e3d21cacfcbbe180529dab25dd80916e751ce8226cf22280bed50f",
                   "test/win32/release-artifacts.ps1":  "c3a89c4d2e318b464e58def8afb62ee9227b4357380796b22a2f866155a8c619",
                   "test/win32/release-parity.ps1":  "ed1ca81f2c6975fd0d800415123f85b94b6988a2984e1c80cf61d490effdc0c0",
                   "test/win32/remote-inherit.ps1":  "9e02e4869ce88671af453e4c6997588df9061e29bb210cb41c869cd6c97c4361",
