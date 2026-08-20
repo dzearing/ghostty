@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-19T18:01:54-07:00",
-    "commit":  "358f30939",
+    "generated":  "2026-08-19T18:58:31-07:00",
+    "commit":  "68610a090",
     "files":  {
                   "docs/claude/testing.md":  "a9ea00091a84cdd3b18261bbba93ac28e86073168cd462a4c8d94dfd41c07ce5",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -151,7 +151,7 @@
                   "test/win32/local-split-no-command-rerun.ps1":  "3082b46b8f8bf46de32ed931df5442a4a5cdd145b5688cb3f8c87fda0302cb28",
                   "test/win32/log-append.ps1":  "3efa789d3fa6ba6e8dc28a81c4d7ea67a55b6172e70ab588fc9cb05b1158e568",
                   "test/win32/machine-chooser.ps1":  "f6bde8b537cc63ddab0e773e7883543336d6749fd0f16d6d3d363f2057fcf451",
-                  "test/win32/menu-bar.ps1":  "7ae8432aa53a027aaccca971124becc4cc23813742f2d733297b49e639b662cf",
+                  "test/win32/menu-bar.ps1":  "ce2f4a4a365bc4e6942e0c7b9048326c56727ad528edefa0903ce05491fd135a",
                   "test/win32/morning-refresh.ps1":  "4af22c6e66fb4a9dc95140dc46176890ab28ff0d1a8d3482608b04b61627a6c3",
                   "test/win32/mouse-nc-routing.ps1":  "a5266509803b961abb4feefde544be320157b4f0ae9a41bf7f44ebd19b2da845",
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",

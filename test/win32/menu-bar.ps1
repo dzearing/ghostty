@@ -552,7 +552,7 @@ $expectedTree = @(
     "&Help/Ghoztty &Help"
     '&Help/---'
     "&Help/Check for &Updates$EL"
-    "&Help/Install &Claude Code Integration"
+    "&Help/Set Up Agent &Integrations$EL"
     '&Help/---'
     "&Help/&About Ghoztty"
     '---'
@@ -1109,6 +1109,14 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
+# A green run stamps the covered files (T783/T987) so guard-due can answer
+# "has this harness been run against the menu tables as they now stand?". Red
+# leaves the stamp alone: red stays due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard menu-bar -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''

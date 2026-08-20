@@ -621,6 +621,23 @@ $GuardTable = @(
             'test\win32\activity-monitor.ps1'
         )
     },
+    # The menu bar (T987): menu-bar.ps1 carries a full model of every submenu,
+    # row and separator, and nothing tied that model to the tables it mirrors -
+    # so T871's rename of one Help row left the harness one assertion red for
+    # months, which is how a red suite becomes background noise. Covers the two
+    # tables the model IS (menu_bar.zig's node tree, commands.zig's titles) and
+    # the harness itself; the rest of the win32 chrome is out of scope, since a
+    # gate that fires on every chrome edit is the noise T783 warns about.
+    [pscustomobject]@{
+        Name   = 'menu-bar'
+        Script = 'test\win32\menu-bar.ps1'
+        Stamp  = 'test\win32\menu-bar.stamp.json'
+        Covers = @(
+            'src\apprt\win32\menu_bar.zig',
+            'src\apprt\win32\commands.zig',
+            'test\win32\menu-bar.ps1'
+        )
+    },
     # Crash evidence is the other thing whose failure nothing else catches: a
     # capture path that has quietly stopped working looks exactly like a lane
     # that did not crash, and is only ever exercised on a day already going
