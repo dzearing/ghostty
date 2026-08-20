@@ -9,6 +9,71 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T957 (filed T1024, T1025, T1026) - the six commits the whole
+  merge-back plan is built on can no longer be deleted out from under it, and
+  the files both sides only ever append to stop conflicting.** Stage 0 of
+  `docs/design/windows-parity-merge-back-plan.md`, two of its three items; item
+  2, the branding overlay script, is T956 and still open. The plan pins six
+  staged merge points plus the fork point by sha, and every one of those objects
+  was in the store for exactly one reason: `divergence-inventory.ps1` had
+  fetched them once, by sha, into no ref. Nothing kept them alive. A `git gc`
+  was free to drop them all and the plan would still have READ perfectly with
+  none of its shas resolving - which is the failure worth naming, because a
+  dangling plan looks exactly like preparation. `upstream` now points at
+  `https://github.com/ghostty-org/ghostty.git` and all seven cited shas are
+  ancestors of `upstream/main` (fetched at `e6605009b`, which is already past
+  the `ad6e72ddc` the inventory is pinned to - that pin is deliberate and the
+  doc now says so).
+  A remote is LOCAL config, though, so "somebody ran `git remote add` once" is
+  not the durable form: it cannot arrive by `git pull`, the Mac seat's clone has
+  never had one, and a fresh clone starts without it - the same shape as
+  `core.hooksPath` (T948) and the same remedy. `scripts\upstream-remote.ps1`
+  adds the remote, CORRECTS a drifted URL (the dangerous case: it resolves, so
+  nothing complains, and the shas it fetches are somebody else's), fetches at
+  most once a day off a stamp in `.git\`, and is re-asserted every turn from
+  `go-loop-exec.ps1 claim`. A failed fetch is a WARNING and exit 0 - an offline
+  box must not be able to wedge the claim - while `check` is the half with
+  teeth: it exits 1 unless every sha cited in the plan resolves AND is reachable
+  from `upstream/main`, and it reads that sha list OUT of the doc, so a re-cut
+  stage is covered the day it is written rather than the day someone remembers
+  the script.
+  The second half is `.gitattributes`. `.gitignore` is under git's built-in
+  `merge=union`, which needs no local config and therefore travels to every
+  clone - measured on the real divergence rather than a fixture: ours grew 28
+  lines and upstream's 4 in the same two regions, and the identical three-way
+  merge CONFLICTS with no `.gitattributes` and is clean with it, losing no entry
+  from either side. That negative control is the whole point; a "merged clean"
+  with nothing to resolve asserts nothing. Two of our own ledgers joined it for
+  a different reason - both seats append to `windows-parity-log.md` and
+  `windows-parity-feature-ideas.md` on the same branch, so their conflict is a
+  `git pull --rebase` away on any turn, not a merge stage away. The list stays
+  short deliberately, because union NEVER conflicts and so is only correct where
+  taking both sides always is: a `.zig` or `.json` under a union driver merges
+  into something that does not parse, which is worse than the conflict it
+  avoided. New acceptance `test\win32\upstream-remote.ps1` (30 assertions, with
+  a `guard-due` row) holds both halves: A checks the remote and the plan's shas
+  on this box, B proves `ensure` REPAIRS rather than only reports - a missing
+  remote, a drifted URL, idempotence, and exit 0 with no network - C is the
+  union merge with its no-driver control, and D asks `git check-attr` (not a
+  re-implementation of its pattern matching) whether each declared path really
+  resolves to `union`, that each exists, and that no structured-syntax file is
+  ever listed. Two PowerShell 5.1 traps were paid writing it and both are
+  recorded in place: a helper named `Git` shadows `git.exe` and recurses until
+  the call depth gives out - which fell through to the verdict and printed ALL
+  PASS over the four assertions that had run, so the harness now catches its own
+  crash as a FAIL - and a local `$url` IS the `-Url` parameter, since PowerShell
+  names are case-insensitive, which silently compared the configured URL against
+  itself and disabled the drift repair (caught red by B3). Green: floor lanes
+  lib/none/win32/agent ALL PASS, ipc-p1 25 / p2 20 / p3 16 ALL PASS,
+  upstream-remote 30 ALL PASS (`-NegativeControl` turns over), and the four
+  guards the edits made due (go-loop 10 files, isolation-meta 7 over 229,
+  verdict-exit over 253, stderr-capture 25 over 254) green and re-stamped,
+  `guard-due.ps1 check` exit 0. Filed T1024 (`divergence-inventory.ps1` still
+  fetches into `FETCH_HEAD`, recreating the very condition this task ended),
+  T1025 (union trades a conflict for a possible DUPLICATE entry and nothing is
+  obliged to notice one) and T1026 (nothing runs `check` before a merge stage is
+  cut - the moment it actually matters).
+
 - 2026-08-20 - **T309 (filed T1018, T1019) - a window is light or dark for
   exactly one reason now, instead of three pieces of code each working it out
   their own way.** The title bar's DWM immersive-dark attribute, the USER menu

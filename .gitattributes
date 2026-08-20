@@ -45,6 +45,33 @@ scripts/githooks/* text eol=lf
 *.otf binary
 
 #--------------------------------------------------------------------
+# Merge drivers (T957, Stage 0 of docs/design/windows-parity-merge-back-plan.md)
+#--------------------------------------------------------------------
+# `union` is git's built-in append-both-sides driver: it needs no local config,
+# so unlike core.hooksPath it travels with the repo to every clone and every
+# seat. It NEVER reports a conflict, which is exactly why the list below is
+# short and deliberate: it may only name files where keeping both sides is
+# always the right answer. A source file or any structured syntax (.zig, .json,
+# .zon, .yml) under a union driver would merge into something that does not
+# parse - worse than the conflict it avoided. Acceptance:
+# test/win32/upstream-remote.ps1 section D enforces both halves.
+#
+# .gitignore: ours grew 28 lines and upstream's grew 4, in the same two regions
+# of a file where every line is an independent entry. That is a textual conflict
+# in every one of the six merge stages, and there is no version of resolving it
+# by hand that is better than keeping both sides' entries.
+.gitignore merge=union
+
+# The two shared append-only ledgers. Both seats append to these on the same
+# branch, so the conflict they produce is not a merge-stage problem - it is a
+# `git pull --rebase` on any turn where the other seat pushed first. Each entry
+# is a self-contained block, so union keeps both entries whole; the worst case
+# is two entries ordered by luck rather than by clock, against a hand
+# resolution of a file that is history-only by charter.
+docs/design/windows-parity-log.md merge=union
+docs/design/windows-parity-feature-ideas.md merge=union
+
+#--------------------------------------------------------------------
 # Linguist
 #--------------------------------------------------------------------
 build.zig.zon.nix linguist-generated=true

@@ -27,6 +27,11 @@ daily process and does not need a plan.
 - **Fork point:** `063ac3ecc` (2026-05-07)
 - **Ours:** 1780 commits, 2104 files changed
 - **Upstream:** `ad6e72ddc` (2026-08-15), 764 non-merge commits, 747 files changed
+  - Every number below is measured against that pin, which is deliberate: an
+    inventory that moves under S6 is not an inventory. `upstream/main` has since
+    moved on (T957 fetched it at `e6605009b`), so S6's range grows a little each
+    week until it is taken - re-run `scripts\divergence-inventory.ps1` before
+    S6, not before S1.
 - **Risk set (both sides touched):** 131 files
 - **Changed only here:** 1973 files - no conflict possible
 - **Changed only upstream:** 616 files - arrive clean
@@ -188,23 +193,49 @@ project.** S5-S6 are ordinary again but only once S4 has landed.
 The first mergeable stage is S1, but S1 should not be attempted until three
 things exist, because each of them is needed by every later stage:
 
-1. **A permanent `upstream` remote.** Right now `ad6e72ddc` is only in the
-   object store because `divergence-inventory.ps1` fetched it; there is no ref
-   keeping it alive. `git remote add upstream https://github.com/ghostty-org/ghostty.git`
-   and fetch, so the shas in this doc stay resolvable.
+1. **A permanent `upstream` remote.** ✅ **Done (T957.)** `ad6e72ddc` used to be
+   in the object store for one reason only - `divergence-inventory.ps1` had
+   fetched it, into no ref - so a `git gc` was free to drop every sha this doc
+   pins while the doc went on reading correctly. `upstream` now points at
+   `https://github.com/ghostty-org/ghostty.git`, and all seven shas cited here
+   (the six stage points plus the fork point) are ancestors of `upstream/main`,
+   so the ref keeps them alive.
+
+   A remote is LOCAL config, though - it cannot arrive by `git pull`, and the
+   Mac seat's clone has never had one - so the durable form is
+   `scripts\upstream-remote.ps1`, re-asserted every turn from
+   `go-loop-exec.ps1 claim` (the same argument as `core.hooksPath`, T948). It
+   adds the remote, corrects a drifted URL, and fetches at most once a day;
+   a fetch failure is a warning, never fatal, because an offline box must not
+   wedge the loop. `check` is the gate: it exits 1 unless every sha cited in
+   THIS FILE resolves and is reachable from `upstream/main`, so a re-cut stage
+   is covered the day it is written here.
 2. **The branding overlay as a script.** A checked-in script that re-applies
    the fork identity (`com.mitchellh.ghostty` -> `com.dzearing.ghoztty`,
    `Bundle.loggerSubsystem`, the `.win32` apprt arms) across a tree, plus a
    verifier that greps for any surviving upstream identity string. This turns
    52 of the 131 resolutions into "take theirs, run the script, run the
    verifier" - and makes the same 52 free in every later inventory.
-3. **`.gitattributes` merge drivers** for the union-merge files (`.gitignore`,
-   and any generated list where both sides only append), so those never
-   present as conflicts at all.
+3. **`.gitattributes` merge drivers** ✅ **Done (T957.)** `.gitignore` is under
+   git's built-in `merge=union`, measured on the real divergence: ours grew 28
+   lines and upstream's grew 4 in the same two regions, which conflicts without
+   the driver and merges clean with it, losing no entry from either side. Two
+   shared append-only ledgers joined it for a different reason - both seats
+   append to `windows-parity-log.md` and `windows-parity-feature-ideas.md` on
+   the same branch, so their conflict is a `git pull --rebase` away on any turn,
+   not a merge stage away.
+
+   The list stays short on purpose: union NEVER conflicts, so it is only
+   correct where taking both sides always is. A `.zig`, `.zon` or `.json` under
+   a union driver would merge into something that does not parse - worse than
+   the conflict it avoided - which is why `test\win32\upstream-remote.ps1`
+   section D asserts that no structured-syntax file is ever listed, and asks
+   `git check-attr` (not a re-implementation of its pattern matching) whether
+   each declared path really resolves to `union`.
 
 Stage 0 is pure infrastructure and lands on this branch with no upstream code,
 so it is safe to do at any time - including before the decision to merge is
-final.
+final. **Item 2 is what remains** - it is tracked as T956.
 
 ### Stage sequence and the gate after each
 

@@ -248,6 +248,20 @@ switch ($Action) {
             foreach ($line in ($guardOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
         }
 
+        # T957: keep the `upstream` remote wired up. Same argument as the commit
+        # guard above and the same remedy: a remote is LOCAL config, so it cannot
+        # arrive by `git pull` and a fresh clone has none - and without it every
+        # sha docs\design\windows-parity-merge-back-plan.md pins is reachable
+        # from no ref at all, which makes them `git gc` bait. Never fatal: a
+        # fetch needs GitHub, and a loop that cannot claim because the network
+        # is down is a worse failure than a stale upstream ref. Fetches at most
+        # once a day.
+        $upstreamScript = Join-Path $PSScriptRoot 'upstream-remote.ps1'
+        if (Test-Path -LiteralPath $upstreamScript) {
+            $upOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $upstreamScript ensure -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($upOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
+        }
+
         # T829: did the box come back from its last reboot by itself, or did the
         # loop sit dead until somebody signed in? Reported HERE for the same
         # reason the guard report above is: this is the one command every turn

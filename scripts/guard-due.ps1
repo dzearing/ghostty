@@ -87,6 +87,22 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # Stage 0 of the merge-back (T957): the upstream remote and the union merge
+    # drivers. Neither is exercised by any lane - the remote is git config and
+    # the drivers only fire inside a merge - so nothing else would notice a
+    # `.gitattributes` edit that stops matching, or an `ensure` that quietly
+    # stops repairing. Both failures are invisible until a merge stage needs
+    # them, which is the worst possible moment to find out.
+    [pscustomobject]@{
+        Name   = 'upstream-remote'
+        Script = 'test\win32\upstream-remote.ps1'
+        Stamp  = 'test\win32\upstream-remote.stamp.json'
+        Covers = @(
+            'test\win32\upstream-remote.ps1',
+            'scripts\upstream-remote.ps1',
+            '.gitattributes'
+        )
+    },
     # The startup job self-escape (T675): the only harness that proves a
     # pane-launched app respawns itself OUT of a kill-on-close job and
     # survives the teardown that used to kill it mid-refresh. Interactive
