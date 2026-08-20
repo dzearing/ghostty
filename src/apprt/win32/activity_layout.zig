@@ -101,6 +101,19 @@ pub const table_row_h: f32 = 22;
 /// Text inset inside a table cell, so adjacent columns never touch (§0.1).
 pub const cell_pad: f32 = 8;
 
+/// The selection indicator capsule on a selected row (T1008): Windows 11 marks
+/// a list selection with a small accent bar at the row's leading edge, and that
+/// bar is the ONLY accent the row carries. `4` is the design system's width for
+/// it (§2.2's list amendment, and `chooser_rows.rowMetrics` one dialog over);
+/// the inset is `xs`, which leaves the first cell's text — inset by `cell_pad` —
+/// clear of it.
+pub const row_indicator_w: f32 = 4;
+pub const row_indicator_inset_x: f32 = 2;
+/// How far the capsule stops short of the row's own top and bottom. A table row
+/// is a full-bleed band rather than an inset pill, so the bar cannot borrow a
+/// pill's gutter for its cap clearance and takes `sm` of its own.
+pub const row_indicator_inset_y: f32 = 4;
+
 /// Error-banner text line.
 const banner_text_h: f32 = 20;
 
@@ -399,6 +412,27 @@ pub fn rowRect(l: Layout, visible_index: i32) Rect {
         .top = l.table_rows.top + visible_index * l.row_h,
         .right = l.table.right,
         .bottom = l.table_rows.top + (visible_index + 1) * l.row_h,
+    };
+}
+
+/// The selection indicator capsule inside `row` — the accent bar at a selected
+/// row's leading edge (T1008), vertically centred and clear of the first cell's
+/// text. Its corner radius is half its width, so it reads as a capsule the way
+/// WinUI's does.
+///
+/// Rounded, never truncated, on the height: at 1.0 scale the row is 22 px and
+/// the bar 14, and a bar that rounded away to nothing on some scale would be a
+/// selection with no mark at all.
+pub fn rowIndicator(row: Rect, scale: f32) Rect {
+    const inset_y = px(row_indicator_inset_y, scale);
+    const left = row.left + px(row_indicator_inset_x, scale);
+    const h = @max(row.height() - 2 * inset_y, 1);
+    const top = row.top + @divTrunc(row.height() - h, 2);
+    return .{
+        .left = left,
+        .top = top,
+        .right = left + @max(px(row_indicator_w, scale), 1),
+        .bottom = top + h,
     };
 }
 
@@ -1128,6 +1162,40 @@ test "rowRect: visible rows stack from the row area's top, full bleed" {
         // And rows stack without a gap — the next one starts where this ends.
         try testing.expectEqual(first.bottom, rowRect(l, 1).top);
     }
+}
+
+test "rowIndicator: a centred capsule at the leading edge, clear of the first cell (T1008)" {
+    for (scales) |s| {
+        const l = defaultLayout(s);
+        const row = rowRect(l, 0);
+        const bar = rowIndicator(row, s);
+
+        // Inside the row, and a bar rather than a band: taller than it is wide,
+        // and nowhere near the row's full height.
+        try testing.expect(bar.left > row.left);
+        try testing.expect(bar.top > row.top);
+        try testing.expect(bar.bottom < row.bottom);
+        try testing.expect(bar.width() > 0 and bar.height() > 0);
+        try testing.expect(bar.height() > bar.width());
+        try testing.expect(bar.height() < row.height());
+
+        // Centred: the clearance above equals the clearance below, to the pixel
+        // an odd remainder allows.
+        const above = bar.top - row.top;
+        const below = row.bottom - bar.bottom;
+        try testing.expect(@abs(above - below) <= 1);
+
+        // §0.1: the first cell's text starts clear of it, so the mark never
+        // touches a pid.
+        const first_cell = cellRect(row, columnWidths(s, l.table.right - l.table.left), .pid, s);
+        try testing.expect(bar.right < first_cell.left);
+    }
+
+    // It scales with the row rather than sitting at a fixed pixel count.
+    const one = rowIndicator(rowRect(defaultLayout(1.0), 0), 1.0);
+    const two = rowIndicator(rowRect(defaultLayout(2.0), 0), 2.0);
+    try testing.expectEqual(one.width() * 2, two.width());
+    try testing.expect(two.height() > one.height());
 }
 
 test "focusRing: never rounds away, and its outer edge lands 1 DIP in" {

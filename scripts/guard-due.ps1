@@ -1172,11 +1172,34 @@ $GuardTable = @(
         Script = 'test\win32\chooser-selection.ps1'
         Stamp  = 'test\win32\chooser-selection.stamp.json'
         Covers = @(
+            'src\apprt\win32\list_selection.zig',
             'src\apprt\win32\chooser_rows.zig',
             'src\apprt\win32\chooser_sessions.zig',
             'src\apprt\win32\MachineChooser.zig',
             'src\apprt\win32\SessionRoster.zig',
             'test\win32\chooser-selection.ps1'
+        )
+    },
+    # The PROCESS TABLE's selection treatment (T1008): the second list on this
+    # platform, and the one that was still wearing the accent pill T828 retired
+    # on the chooser. Coverage is the shared model both lists resolve their
+    # colours from (list_selection.zig), the painter that draws them
+    # (ActivityMonitor.zig's paintTable / paintTableFocus) and the harness.
+    #
+    # ActivityMonitor.zig is deliberately in TWO rows - here and in
+    # 'activity-monitor' above - because the panel makes two separate claims and
+    # neither harness can check the other's: activity-monitor drives the panel's
+    # behavior and reads its log, and this one reads the pixels of one row. A
+    # painter edit owes both, which is the honest answer; the alternative is a
+    # hole exactly where T1008's defect lived.
+    [pscustomobject]@{
+        Name   = 'activity-selection'
+        Script = 'test\win32\activity-selection.ps1'
+        Stamp  = 'test\win32\activity-selection.stamp.json'
+        Covers = @(
+            'src\apprt\win32\list_selection.zig',
+            'src\apprt\win32\ActivityMonitor.zig',
+            'test\win32\activity-selection.ps1'
         )
     }
 )

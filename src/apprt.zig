@@ -335,6 +335,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");
 
+    // What a SELECTED ROW looks like in any win32 list (T828/T1008) — the
+    // neutral washes, the accent indicator and the neutral focus rim, shared by
+    // the machine chooser and the Activity Monitor's process table.
+    _ = @import("apprt/win32/list_selection.zig");
+
     // Pure win32 machine-chooser master-detail layout (T175), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_layout.zig");

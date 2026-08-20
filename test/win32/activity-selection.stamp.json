@@ -1,0 +1,11 @@
+{
+    "guard":  "activity-selection",
+    "script":  "test/win32/activity-selection.ps1",
+    "generated":  "2026-08-19T21:28:48-07:00",
+    "commit":  "e01034fbc",
+    "files":  {
+                  "src/apprt/win32/ActivityMonitor.zig":  "1c4c8be078636e90f97630e9de71ac6ff7b26f60338620098c677c3c8bc5949f",
+                  "src/apprt/win32/list_selection.zig":  "b7f5720b1a405deacf48309f6b34439b7148e73a19a876ef9c7f38faf5308913",
+                  "test/win32/activity-selection.ps1":  "cbfe69d243e9e1a0e67adc3dc1f624b9e4e801edec6d7ef55db9de9541dffb9f"
+              }
+}

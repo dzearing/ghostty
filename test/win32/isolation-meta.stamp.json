@@ -1,12 +1,13 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-19T20:30:48-07:00",
-    "commit":  "429293453",
+    "generated":  "2026-08-19T21:30:50-07:00",
+    "commit":  "e01034fbc",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
                   "test/win32/activity-monitor-remote.ps1":  "c4b4449dd7df216285a0fdb3dc607f4336d21e320a8752833cdf062392a10034",
+                  "test/win32/activity-selection.ps1":  "cbfe69d243e9e1a0e67adc3dc1f624b9e4e801edec6d7ef55db9de9541dffb9f",
                   "test/win32/activity-state.ps1":  "9cf643a93354cfadd2061c0a46a0018a22ada8a3b2833bab7ce3b47293569a70",
                   "test/win32/agent-adopt.ps1":  "5d595f428e084280958590817410538241a014f4d42a9f0033e2dcb425980764",
                   "test/win32/agent-attach-refused.ps1":  "afda0675b08258f43f32969ce906f665d6ffe532b50e10cf02633b3c8992c36e",

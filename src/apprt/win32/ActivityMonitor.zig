@@ -148,6 +148,11 @@ const icon_button_paint = @import("icon_button_paint.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const type_ramp = @import("type_ramp.zig");
 const panel_theme = @import("panel_theme.zig");
+/// What a selected row looks like in a win32 list (T828, generalized by T1008).
+/// The process table is a list, so it takes the platform's answer — a neutral
+/// wash at two weights plus one accent capsule — from the same module the
+/// machine chooser's rows do, rather than tinting the row toward the accent.
+const list_selection = @import("list_selection.zig");
 const brush_cache = @import("brush_cache.zig");
 const system_colors = @import("system_colors.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
@@ -3435,6 +3440,26 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
         return;
     }
 
+    // What a SELECTED ROW looks like (T1008): the platform's list treatment,
+    // resolved once for the whole pass because it is the same for every row —
+    // a neutral wash at the weight the table's focus earns, and the accent spent
+    // on one leading-edge capsule. The table is a list, so it answers this the
+    // way the machine chooser's rows do, out of the same module.
+    //
+    // "Focused" here is the TABLE, not a caret row: macOS's emphasized /
+    // unemphasized selection, and the same thing `RowState.focused` means for a
+    // single-select listbox whose caret is its selection. The caret's own rim is
+    // `paintTableFocus`.
+    const table_focused = self.panel_focused and self.focus == .table;
+    const sel = list_selection.rowPaint(p.bg, p.accent, .{
+        .selected = true,
+        .focused = table_focused,
+    });
+    const sel_fill = sel.fill.?;
+    const sel_text = chrome_theme.textOn(sel_fill);
+    const sel_secondary = chrome_theme.textSecondaryOn(sel_fill);
+    const hover_fill = list_selection.hoverFill(p.bg);
+
     const visible = layout_mod.visibleRows(l);
     var i: i32 = 0;
     while (i < visible) : (i += 1) {
@@ -3445,12 +3470,19 @@ fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
 
         const selected = self.isSelected(row.pid);
         if (selected) {
-            fill(hdc, rect(row_rect), cr(p.select));
+            fill(hdc, rect(row_rect), cr(sel_fill));
+            if (sel.indicator) |ink| {
+                const bar = layout_mod.rowIndicator(row_rect, self.scale);
+                roundRect(hdc, bar, @divTrunc(bar.width(), 2), cr(ink), cr(ink), 1);
+            }
         } else if (self.hover_row == idx) {
-            fill(hdc, rect(row_rect), cr(p.card));
+            fill(hdc, rect(row_rect), cr(hover_fill));
         }
 
-        self.paintRow(hdc, row_rect, widths, row, snap.host.ncpu, selected);
+        self.paintRow(hdc, row_rect, widths, row, snap.host.ncpu, .{
+            .text = if (selected) sel_text else p.text,
+            .secondary = if (selected) sel_secondary else p.secondary,
+        });
     }
 
     self.paintScrollThumb(hdc, l, visible);
@@ -3486,11 +3518,26 @@ fn paintTableFocus(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) v
     // A row is a square band, so its rim is square; the fallback is a
     // standalone element and takes the scale's smallest radius (§3.1).
     const radius: i32 = if (on_row != null) 0 else px(4, self.scale);
+
+    // NEUTRAL ink, not the accent (§2.2's list amendment, T828/T1008): a
+    // selected row already spends the accent on its indicator capsule, and an
+    // accent rim around it is a second accent mark on one control — the doubled
+    // outline the user reported on the chooser. Floored against what the rim
+    // actually sits on, which is the selection fill when the caret row is
+    // selected and the panel when it is not.
+    const p = self.pal();
+    const under: panel_theme.Rgb = blk: {
+        const idx = self.caretIndex() orelse break :blk p.bg;
+        if (on_row == null) break :blk p.bg;
+        const pid = self.pidAt(idx) orelse break :blk p.bg;
+        if (!self.isSelected(pid)) break :blk p.bg;
+        break :blk list_selection.selectionFillFocused(p.bg);
+    };
     strokeRoundRect(
         hdc,
         path,
         radius,
-        cr(self.pal().accent),
+        cr(list_selection.focusRim(under)),
         layout_mod.focusRing(self.scale).width,
     );
 }
@@ -3529,6 +3576,15 @@ fn paintSortArrow(hdc: w32.HDC, box: layout_mod.Rect, ascending: bool, scale: f3
     _ = w32.SelectObject(hdc, op);
 }
 
+/// The two text colors a row draws with, already floored against the surface
+/// the row actually paints — the selection fill when there is one, the panel
+/// otherwise. Resolved by the caller once per pass rather than per row (T1008;
+/// the T308 rule that a color is only correct relative to its own surface).
+const RowInk = struct {
+    text: panel_theme.Rgb,
+    secondary: panel_theme.Rgb,
+};
+
 fn paintRow(
     self: *ActivityMonitor,
     hdc: w32.HDC,
@@ -3536,13 +3592,12 @@ fn paintRow(
     widths: [layout_mod.column_count]i32,
     row: rows_mod.Row,
     ncpu: u32,
-    selected: bool,
+    ink: RowInk,
 ) void {
-    const p = self.pal();
     var buf: [32]u8 = undefined;
 
     _ = w32.SelectObject(hdc, self.num_font);
-    _ = w32.SetTextColor(hdc, cr(p.text));
+    _ = w32.SetTextColor(hdc, cr(ink.text));
     const pid_text = std.fmt.bufPrint(&buf, "{d}", .{row.pid}) catch "";
     drawText(hdc, pid_text, layout_mod.cellRect(row_rect, widths, .pid, self.scale), text_flags | w32.DT_LEFT);
 
@@ -3572,13 +3627,13 @@ fn paintRow(
     // The path is secondary text and ellipsizes in the MIDDLE, so the leaf
     // filename survives (Mac's `.truncationMode(.head)`, :1020).
     //
-    // On a SELECTED row it takes the primary color instead: secondary gray on
-    // the selection fill is 2.8:1, below §2.3's 4.5:1 text floor. The floor has
-    // to be re-checked against the fill a row actually sits on, not against the
-    // panel background.
-    // A selected row is filled with `p.select`, so its text is floored
-    // against THAT surface and not against the panel behind it (T308).
-    _ = w32.SetTextColor(hdc, if (selected) cr(p.text_on_select) else cr(p.secondary));
+    // Its color is the de-emphasized ramp resolved against the surface THIS row
+    // paints, not against the panel behind it (T308): a selected row is a
+    // different surface, and a grey measured on the panel was never measured on
+    // the selection fill. It used to jump to the PRIMARY color on a selected row
+    // because the old accent-tinted fill left no legible secondary; the neutral
+    // wash does, so the hierarchy survives being selected (T1008).
+    _ = w32.SetTextColor(hdc, cr(ink.secondary));
     drawText(
         hdc,
         if (row.cmd.len == 0) rows_mod.empty_cell else row.cmd,

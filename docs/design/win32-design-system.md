@@ -136,8 +136,15 @@ owner-drawn control reads as `ODS_NOFOCUSRECT` — so clicking a row selects it
 without painting a rim, and the first keyboard navigation brings the rim back.
 Everything else in the table stands: hover is still a fill, and the three list
 states still read as one ramp (hover < unfocused selection < focused
-selection). Implemented in `chooser_rows.zig` (`rowPaint`), shared by the
-machine chooser's rows and the session roster's keyboard cursor.
+selection). Implemented in `list_selection.zig` (`rowPaint`) and shared by every
+list on this platform: the machine chooser's rows, the session roster's keyboard
+cursor, and the Activity Monitor's process table. It lived in `chooser_rows.zig`
+until T1008, when the process table turned out to be a second list still wearing
+the accent pill — a rule that binds every list does not belong to one of them,
+and a second copy of the weights is how two panels drift apart a wash at a time.
+Each list keeps its own GEOMETRY (the chooser's rows are inset pills, the table's
+are full-bleed bands with the indicator inside the first cell's padding), because
+the shape of a row is that list's business and its colours are not.
 
 ### 2.3 Contrast (non-negotiable)
 
