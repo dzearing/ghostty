@@ -35,6 +35,19 @@
 #               renderer) captures the SAME pane at the SAME moment and sees
 #               the text. The limit is unrepealed; what changed is that there
 #               is now somewhere to send a probe that hits it.
+#               T303 (2026-08-20) widened the guard past the one class it knew:
+#               PrintWindow sees GDI, not composition, so EVERY WinUI/XAML
+#               window (Task Manager measured flat black 1379x1134, 1 color,
+#               reported success) captures as nothing. Three more assertions -
+#               the bitmap-level refusal fires on a known-flat surface, its
+#               message names the cause and the opt-out, and real chrome still
+#               sails through, which is the half that keeps a stricter guard
+#               from being a broken one.
+#
+# `-NegativeControl` inverts the three T303 assertions and the class refusal
+# beside them; that run must FAIL. Without it the guards are a superstition -
+# an assertion that cannot be made to fail proves nothing about the code it
+# claims to cover.
 #
 # The capture assertion carries its own negative control: the SAME probe runs
 # against a light-chrome window and a dark-chrome one and must separate them.
@@ -52,7 +65,7 @@
 # filed as T273 - not something this harness gets to decide by measuring.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath, [switch]$Interactive)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -183,9 +196,48 @@ try {
     $refused = $false
     try { Get-TestWindowPixels -Window $pane | Out-Null }
     catch { $refused = ($_.Exception.Message -match 'GhozttyTerminal') }
+    if ($NegativeControl) { $refused = -not $refused }
     Assert $refused 'Get-TestWindowPixels REFUSES the GhozttyTerminal surface by class'
 
-    $shot = Get-TestWindowPixels -Window $pane -AllowTerminalSurface
+    # --- THE SAME LIMIT, ONE CLASS WIDER (T303). The class refusal above knows
+    #     one window. Every WinUI/XAML window captures as the same flat fill and
+    #     no class list predicts them, so the SECOND guard reads the bitmap: a
+    #     non-trivial capture that is one color over its whole interior throws,
+    #     after retrying long enough to rule out a window that had not painted.
+    #     Fixture: this pane, which -AllowTerminalSurface lets past the class
+    #     refusal and which is known-flat forever - the permanent half of the
+    #     failure, measured rather than simulated. The two switches are separate
+    #     on purpose, which is what makes this fixture possible at all.
+    $uniformRefused = $false
+    $uniformMsg = ''
+    try { Get-TestWindowPixels -Window $pane -AllowTerminalSurface -UniformTimeoutMs 300 | Out-Null }
+    catch { $uniformMsg = $_.Exception.Message; $uniformRefused = ($uniformMsg -match 'UNIFORM') }
+    if ($uniformRefused) {
+        Write-Host "capture: uniform guard fired - $($uniformMsg.Substring(0, [math]::Min(120, $uniformMsg.Length)))..."
+    }
+    if ($NegativeControl) { $uniformRefused = -not $uniformRefused }
+    Assert $uniformRefused 'Get-TestWindowPixels REFUSES a UNIFORM capture (the WinUI/DirectComposition class of empty)'
+
+    $uniformMentions = ($uniformMsg -match 'DirectComposition') -and ($uniformMsg -match 'AllowUniform')
+    if ($NegativeControl) { $uniformMentions = -not $uniformMentions }
+    Assert $uniformMentions 'the uniform refusal names DirectComposition and the -AllowUniform opt-out'
+
+    #     ...and the other side of the control, which is the half that would
+    #     make this guard worse than nothing: real GDI chrome must sail through
+    #     it. A guard that also refuses the captures the suite depends on is not
+    #     a stricter harness, it is a broken one.
+    $chromeOk = $false
+    $chromeErr = ''
+    try {
+        $chromeShot = Get-TestWindowPixels -Window $top -Sync
+        try { $chromeOk = ((Get-TestDistinctColors -Shot $chromeShot) -ge 8) }
+        finally { Close-TestWindowPixels $chromeShot }
+    } catch { $chromeErr = $_.Exception.Message }
+    if ($chromeErr) { Write-Host "capture: chrome window threw - $chromeErr" }
+    if ($NegativeControl) { $chromeOk = -not $chromeOk }
+    Assert $chromeOk 'the uniform guard does NOT refuse a real ghoztty chrome window'
+
+    $shot = Get-TestWindowPixels -Window $pane -AllowTerminalSurface -AllowUniform
     try {
         $surfColors = Get-TestDistinctColors -Shot $shot
         $surfLum = Get-TestBrightness -Shot $shot
@@ -197,7 +249,7 @@ try {
     Send-TestText -Window $top -Target $pane -Text 'echo ZZZZZZZZZZZZZZZZ' | Out-Null
     Send-TestKeys -Window $top -Target $pane -Key Enter | Out-Null
     Start-Sleep -Milliseconds 1200
-    $shot2 = Get-TestWindowPixels -Window $pane -AllowTerminalSurface
+    $shot2 = Get-TestWindowPixels -Window $pane -AllowTerminalSurface -AllowUniform
     try {
         $surfColors2 = Get-TestDistinctColors -Shot $shot2
         $surfLum2 = Get-TestBrightness -Shot $shot2
@@ -305,6 +357,17 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'nothing the harness launched ever became foreground on the interactive desktop'
+}
+
+# --- stamp (T783, wired here by T303) --------------------------------------
+# A clean green run RECORDS the content of lib\TestDesktop.ps1 and this script,
+# so scripts\guard-due.ps1 can answer "has anybody run this against the library
+# as it now stands?". Stamped only on a run with no failures AND no skips - a
+# skipped section proved less than the whole harness claims - and never on a
+# -NegativeControl run, whose whole point is that it fails. Red stays due.
+if ($script:fail -eq 0 -and $script:skipped -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard test-desktop -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''

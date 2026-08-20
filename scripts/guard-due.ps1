@@ -1221,6 +1221,24 @@ $GuardTable = @(
             'test\win32\lib\FakeRelay.ps1',
             'test\win32\activity-monitor-dialed.ps1'
         )
+    },
+    # The shared test-desktop library itself (T303). lib\TestDesktop.ps1 is what
+    # every GUI acceptance script in this suite stands on - the desktop, the
+    # input, the capture and the capture's GUARDS - and until now nothing
+    # obliged anyone to run its acceptance after editing it, which is this
+    # table's whole subject asked about its own foundation. A guard that grew
+    # teeth here (T214's class refusal, T303's uniform refusal) is precisely
+    # what a silent edit could file back down: both refuse a capture, and a
+    # refusal that stops firing turns green without turning red first. About
+    # two minutes, off the input desktop.
+    [pscustomobject]@{
+        Name   = 'test-desktop'
+        Script = 'test\win32\test-desktop-harness.ps1'
+        Stamp  = 'test\win32\test-desktop-harness.stamp.json'
+        Covers = @(
+            'test\win32\lib\TestDesktop.ps1',
+            'test\win32\test-desktop-harness.ps1'
+        )
     }
 )
 

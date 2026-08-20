@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-20T00:42:42-07:00",
-    "commit":  "35eec13f8",
+    "generated":  "2026-08-20T02:40:11-07:00",
+    "commit":  "e525bb79e",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "383cc42ce06e2b0201ccc7aedb3951eef309584a36beebef0f4e0faaf8d52c07",
@@ -197,7 +197,7 @@
                   "test/win32/task-dashboard.ps1":  "b0e22ed5b0b3fb333c475ba04633e834db7f1e8f20a179b84ac5c83b060ddeec",
                   "test/win32/terminal-link-paths.ps1":  "3e363feec18c1f1792f2ca7e898418eee7f306677c79767a18927cef783f428d",
                   "test/win32/test-binary-soak.ps1":  "1b854b71a13f5eb6317024fc9dfc57e961f6591a012fe6f74279f9c85c217a39",
-                  "test/win32/test-desktop-harness.ps1":  "2464165b42a92896cb99a723988ef5fb0c99cec4cadf873192f7fa8d3fc13377",
+                  "test/win32/test-desktop-harness.ps1":  "7a9e9f5ee7202450f1a73ac69c40a70ca643ec93e04b7194eb739c4f9975d7b5",
                   "test/win32/test-desktop-spike.ps1":  "fa227aaf3ea2118c1bcb528a5e4854ab74665bacda59ef65b7280cbe940bbfb9",
                   "test/win32/title-font.ps1":  "c0d1b4531670354cc9d503a7ba11bf2e44e37af2848fcf1c11b7ac63ff6511a5",
                   "test/win32/title-jitter.ps1":  "781115d42e4fc982237004139913e3522573e158651655fb5468728e0bb8f890",

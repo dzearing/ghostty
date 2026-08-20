@@ -60,6 +60,32 @@
 # native chrome migrate; probes of rendered terminal content cannot, and must
 # not be "migrated" into an assertion that passes against a blank fill.
 #
+# THE GENERAL RULE (T303, 2026-08-20): PRINTWINDOW SEES GDI, NOT COMPOSITION.
+# The terminal surface is one instance of it, not the extent of it. Anything
+# that composites its pixels instead of painting them into the window DC comes
+# back as a flat fill, and that covers every WinUI/XAML window - Settings, Task
+# Manager, most of the Win11 shell. Measured: PrintWindow(PW_RENDERFULLCONTENT)
+# on Task Manager's main window returned a flat black 1379x1134 bitmap, 1
+# distinct color over a 7px grid, an 8 KB PNG, and reported SUCCESS; a
+# vertical-seam scan over it found zero seams, which reads as "this app has no
+# master-detail seam" rather than "there is no capture". The Win32 apps that DO
+# capture are classic GDI dialogs. This is architectural and permanent, not a
+# bug with a workaround.
+#
+# THE COROLLARY, for anyone reaching for a native reference: A WIN11 APP CANNOT
+# BE USED AS A PIXEL REFERENCE AT ALL. A spec that needs Windows metrics
+# measures them through SystemParametersInfoForDpi / GetSystemMetrics / uxtheme
+# / DWM instead (what T302 did) and cites Fluent as DOCUMENTATION, never as a
+# measurement. Second, smaller trap from the same probe: Task Manager launches
+# elevated, so a non-elevated session cannot close it again - Stop-Process,
+# CloseMainWindow and taskkill all return Access Denied. A fixture the harness
+# cannot clean up is not a fixture.
+#
+# Get-TestWindowPixels enforces this half of the limit after the fact, since no
+# class list could predict it: a non-trivial capture that is one color over its
+# whole interior THROWS, after retrying long enough to rule out a window that
+# simply had not painted yet. -AllowUniform opts out, for measuring the limit.
+#
 # THE ROUTE for a terminal-content probe (T214, decided 2026-08-01; route 0
 # added by T275, 2026-08-11). In order, and the first one that applies wins:
 #
@@ -3029,6 +3055,20 @@ Pass -AllowTerminalSurface only to MEASURE the limit itself (that is what
 terminal-capture-guard.ps1 does). For a real terminal-content probe, take one
 of the four routes in the CAPTURE LIMIT header instead.
 
+ALSO REFUSES A UNIFORM CAPTURE (T303). The class refusal above guards exactly
+one window; the SAME flat fill comes back from every WinUI/XAML window, and
+that family is most of the Win11 shell. PrintWindow on Task Manager's main
+window returned a flat black 1379x1134 bitmap - one distinct color - and
+reported SUCCESS, and a vertical-seam scan over it then found no seams, which
+reads as "this app has no seam" rather than "there is no capture". So a capture
+of a non-trivial window whose whole interior is one color is refused after the
+fact, since there is no class list that could have predicted it. It RETRIES
+first (-UniformTimeoutMs), because the other way a capture comes back uniform
+is a window that has not painted yet - transient, where composition is
+permanent - and the retry is what tells the two apart. -AllowUniform is the
+opt-in, and it is separate from -AllowTerminalSurface on purpose: measuring the
+terminal flat fill needs both, so neither switch quietly disarms the other.
+
 -Sync captures through WM_PRINTCLIENT instead of DWM (T835). USE IT FOR EVERY
 PIXEL ASSERTION on chrome that answers that message: the default DWM copy is
 asynchronous and returns torn frames, so a measurement over it is a coin flip.
@@ -3066,12 +3106,56 @@ function Remove-TestForeignWindow {
     return (Resolve-TestDesktop $Desktop).CloseForeignWindow([int64]$Window)
 }
 
+<#
+Is this capture a flat fill - one color over its whole interior?
+
+The two ways that happens are told apart by TIME, not by looking at the bitmap:
+a WinUI/XAML window composites through DirectComposition and never paints into
+the window DC, so it is uniform forever; a window caught mid-paint is uniform
+for a few hundred milliseconds. Get-TestWindowPixels uses this in a retry loop
+for exactly that reason.
+
+A trivially small window is exempt: a 16x16 tool window really can be one
+color, and a guard that fires on it is noise.
+#>
+function Test-TestCaptureUniform {
+    param(
+        [Parameter(Mandatory = $true)]$Shot,
+        [int]$Inset = 8,
+        [int]$MinSide = 64,
+        [int]$Samples = 24
+    )
+    if ($Shot.Width -lt $MinSide -or $Shot.Height -lt $MinSide) { return $false }
+    $x1 = $Shot.Width - $Inset
+    $y1 = $Shot.Height - $Inset
+    if ($x1 -le $Inset -or $y1 -le $Inset) { return $false }
+    $stepX = [math]::Max(1, [int](($x1 - $Inset) / $Samples))
+    $stepY = [math]::Max(1, [int](($y1 - $Inset) / $Samples))
+    $first = $null
+    for ($y = $Inset; $y -lt $y1; $y += $stepY) {
+        for ($x = $Inset; $x -lt $x1; $x += $stepX) {
+            $c = $Shot.Bitmap.GetPixel($x, $y)
+            if ($null -eq $first) { $first = $c; continue }
+            if ($c.R -ne $first.R -or $c.G -ne $first.G -or $c.B -ne $first.B) { return $false }
+        }
+    }
+    return $true
+}
+
 function Get-TestWindowPixels {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
         $Desktop,
         [switch]$AllowTerminalSurface,
-        [switch]$Sync
+        [switch]$AllowUniform,
+        [switch]$Sync,
+        # Long enough to outlast a mid-paint window by a wide margin (T216
+        # measured a context menu solid at 350ms and painted at 400ms), and to
+        # stay inside the retry budget the scripts that poll for real content
+        # already allow themselves - tab-color.ps1 gives a window 20 tries at
+        # 150ms. A guard that fails faster than the callers' own patience would
+        # turn a slow paint into a red run, which is the opposite of the job.
+        [int]$UniformTimeoutMs = 2000
     )
     $td = Resolve-TestDesktop $Desktop
     if (-not $AllowTerminalSurface) {
@@ -3086,17 +3170,40 @@ function Get-TestWindowPixels {
                    "-AllowTerminalSurface is for measuring the limit itself.")
         }
     }
-    $r = if ($Sync) { $td.CaptureWindowSync($Window) } else { $td.CaptureWindow($Window) }
-    if ($r[0] -eq 0) { throw "Get-TestWindowPixels failed: $($td.LastError)" }
-    $hbmp = [IntPtr]$r[0]
-    try {
-        $bmp = [System.Drawing.Image]::FromHbitmap($hbmp)
-    } finally {
-        $td.ReleaseCapture($r[0])
-    }
-    return [pscustomobject]@{
-        Bitmap = $bmp; Width = [int]$r[1]; Height = [int]$r[2]
-        Left = [int]$r[3]; Top = [int]$r[4]
+    $deadline = [datetime]::UtcNow.AddMilliseconds($UniformTimeoutMs)
+    $attempts = 0
+    while ($true) {
+        $r = if ($Sync) { $td.CaptureWindowSync($Window) } else { $td.CaptureWindow($Window) }
+        if ($r[0] -eq 0) { throw "Get-TestWindowPixels failed: $($td.LastError)" }
+        $hbmp = [IntPtr]$r[0]
+        try {
+            $bmp = [System.Drawing.Image]::FromHbitmap($hbmp)
+        } finally {
+            $td.ReleaseCapture($r[0])
+        }
+        $shot = [pscustomobject]@{
+            Bitmap = $bmp; Width = [int]$r[1]; Height = [int]$r[2]
+            Left = [int]$r[3]; Top = [int]$r[4]
+        }
+        $attempts++
+        if ($AllowUniform -or -not (Test-TestCaptureUniform -Shot $shot)) { return $shot }
+        $bmp.Dispose()
+        if ([datetime]::UtcNow -ge $deadline) {
+            throw ("Get-TestWindowPixels: the capture is UNIFORM - $($shot.Width)x$($shot.Height), one " +
+                   "color over its whole interior, still uniform after $attempts attempt(s) across " +
+                   "${UniformTimeoutMs}ms. That is not a picture of the window; it is what PrintWindow " +
+                   "returns when there is nothing GDI-painted to copy, and it is a perfectly valid " +
+                   "bitmap that 'is it dark?' assertions pass against for free (T303). The usual cause " +
+                   "is a WinUI/XAML window - Settings, Task Manager, most of the Win11 shell - which " +
+                   "composites through DirectComposition and never paints into the window DC: " +
+                   "PrintWindow sees GDI, not composition. A Win11 app therefore cannot be a pixel " +
+                   "REFERENCE at all; measure Windows metrics through SystemParametersInfoForDpi / " +
+                   "GetSystemMetrics / uxtheme / DWM instead, and cite Fluent as documentation rather " +
+                   "than as a measurement. The other cause is a window that had not painted yet, which " +
+                   "is what the retries above rule out. See the CAPTURE LIMIT header. -AllowUniform is " +
+                   "for measuring the limit itself.")
+        }
+        Start-Sleep -Milliseconds 150
     }
 }
 

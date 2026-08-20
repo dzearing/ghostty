@@ -1,8 +1,8 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-08-20T00:42:49-07:00",
-    "commit":  "35eec13f8",
+    "generated":  "2026-08-20T02:40:18-07:00",
+    "commit":  "e525bb79e",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "383cc42ce06e2b0201ccc7aedb3951eef309584a36beebef0f4e0faaf8d52c07",
@@ -146,7 +146,7 @@
                   "test/win32/lib/PipeBridge.ps1":  "5ae297c7cf5206a4533f905501158607d360fe6e87308048a6838e3f3b35a4b1",
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
-                  "test/win32/lib/TestDesktop.ps1":  "a9ad01fe403efadb0336a014500aad69521fe0522f3d5d5a44747d308e563a35",
+                  "test/win32/lib/TestDesktop.ps1":  "27be0e22f931cd45b5eda510f775ea821fe7ed69087209081521d93ce43f5aaa",
                   "test/win32/lib/TestScore.ps1":  "37db326a009ca4b70c4a4938efd120d7dff54801e8213afc1003cd12f584b3f8",
                   "test/win32/lib/VerdictExitAudit.ps1":  "8a22b157dc4e93add59e9b3da93a0620c667644cefb1b3641dc2f6cd370f226e",
                   "test/win32/local-split-no-command-rerun.ps1":  "3082b46b8f8bf46de32ed931df5442a4a5cdd145b5688cb3f8c87fda0302cb28",
@@ -221,7 +221,7 @@
                   "test/win32/task-dashboard.ps1":  "b0e22ed5b0b3fb333c475ba04633e834db7f1e8f20a179b84ac5c83b060ddeec",
                   "test/win32/terminal-link-paths.ps1":  "3e363feec18c1f1792f2ca7e898418eee7f306677c79767a18927cef783f428d",
                   "test/win32/test-binary-soak.ps1":  "1b854b71a13f5eb6317024fc9dfc57e961f6591a012fe6f74279f9c85c217a39",
-                  "test/win32/test-desktop-harness.ps1":  "2464165b42a92896cb99a723988ef5fb0c99cec4cadf873192f7fa8d3fc13377",
+                  "test/win32/test-desktop-harness.ps1":  "7a9e9f5ee7202450f1a73ac69c40a70ca643ec93e04b7194eb739c4f9975d7b5",
                   "test/win32/test-desktop-spike.ps1":  "fa227aaf3ea2118c1bcb528a5e4854ab74665bacda59ef65b7280cbe940bbfb9",
                   "test/win32/title-font.ps1":  "c0d1b4531670354cc9d503a7ba11bf2e44e37af2848fcf1c11b7ac63ff6511a5",
                   "test/win32/title-jitter.ps1":  "781115d42e4fc982237004139913e3522573e158651655fb5468728e0bb8f890",

@@ -1,0 +1,10 @@
+{
+    "guard":  "test-desktop",
+    "script":  "test/win32/test-desktop-harness.ps1",
+    "generated":  "2026-08-20T02:39:44-07:00",
+    "commit":  "e525bb79e",
+    "files":  {
+                  "test/win32/lib/TestDesktop.ps1":  "27be0e22f931cd45b5eda510f775ea821fe7ed69087209081521d93ce43f5aaa",
+                  "test/win32/test-desktop-harness.ps1":  "7a9e9f5ee7202450f1a73ac69c40a70ca643ec93e04b7194eb739c4f9975d7b5"
+              }
+}
