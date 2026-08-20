@@ -2222,6 +2222,17 @@ pub const Connection = struct {
         if (self.negotiated) |n| return n.relaunch_notice else |_| return false;
     }
 
+    /// True iff the negotiated peer advertised `capability.grid_snapshot` — i.e.
+    /// on ATTACH the agent appends a self-contained VT repaint of the session's
+    /// CURRENT visible screen, modes included, built from the child's own byte
+    /// stream. That makes the agent the authority on the live child's mode state,
+    /// which is what lets the client discard the mode state carried by its own
+    /// (possibly stale) persisted screen snapshot. False for an older agent or an
+    /// incomplete handshake, where the client must keep what it has.
+    pub fn supportsGridSnapshot(self: *Connection) bool {
+        if (self.negotiated) |n| return n.grid_snapshot else |_| return false;
+    }
+
     /// True iff the peer advertised `capability.cpu_units` — i.e. every `cpu_pct`
     /// it reports is in CORRECTED units and may be shown as fact.
     ///

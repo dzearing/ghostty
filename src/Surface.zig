@@ -2492,6 +2492,15 @@ pub fn sessionSnapshot(self: *Surface, alloc: Allocator) !?SessionSnapshot {
     });
     formatter.content = .{ .selection = terminal.Selection.init(tl, br, false) };
     formatter.extra = .all;
+    // …except the INPUT-REPORTING modes. This snapshot is a PICTURE, persisted to
+    // disk at quit and repainted at the next launch — and by then the pane's child
+    // may not be the program that asked for mouse reports. An agent restart in
+    // between relaunches every session as a plain login shell (session-relaunch =
+    // restore), and re-arming `?1003h`/`?1006h` over that shell makes it read
+    // every pointer move as typed input. The live child's true mode state comes
+    // from the agent's grid snapshot, which is built from that child's own output
+    // and lands right after this repaint.
+    formatter.extra.input_modes = false;
     formatter.format(&builder.writer) catch |err| {
         log.warn("error building session snapshot err={}", .{err});
         return null;
