@@ -183,6 +183,13 @@ pub const Vars = struct {
 /// reason and with the same cost: the buffer is plain text, so a page built
 /// from it would otherwise hold `[Image #3]` as ordinary characters that
 /// Backspace can bite a `]` off.
+/// `undo` says this seed stands for ONE user-visible edit — a quote or a chip
+/// going in at the caret — rather than for the document being replaced
+/// wholesale (T983). The page cannot tell the two apart by looking, and the
+/// difference is what Ctrl+Z does next: an edit is journalled, so the chord
+/// takes it back out once the engine's own steps are spent, while a fresh open
+/// or a report cleared behind a send throws the journal away with the document
+/// it described.
 pub fn seedJson(
     alloc: Allocator,
     text: []const u8,
@@ -190,6 +197,7 @@ pub fn seedJson(
     gen: u32,
     quotes: []const QuoteSpan,
     images: []const ImageSpan,
+    undo: bool,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, .{
         .t = "seed",
@@ -198,6 +206,7 @@ pub fn seedJson(
         .gen = gen,
         .quotes = quotes,
         .images = images,
+        .undo = undo,
     }, .{});
 }
 
@@ -601,7 +610,7 @@ test "vars serialize to the property names the script reads" {
 }
 
 test "seed carries the text verbatim and escapes what JSON must" {
-    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3, &.{}, &.{});
+    const out = try seedJson(testing.allocator, "line\n\"quoted\"\ttab", -1, 3, &.{}, &.{}, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"seed\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\\n") != null);
@@ -615,7 +624,7 @@ test "seed carries the text verbatim and escapes what JSON must" {
 test "a seed names the runs of the text that are quotes" {
     const out = try seedJson(testing.allocator, "intro\n\nquoted\n\n", -1, 1, &.{
         .{ .id = 4, .start = 7, .end = 13 },
-    }, &.{});
+    }, &.{}, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"quotes\":[{\"id\":4,\"start\":7,\"end\":13}]") != null);
     // ...and the page has to build them, or the seed's whole quote half is a
@@ -662,11 +671,45 @@ test "the image chip has no vertical air of its own" {
 test "a seed names the runs of the text that are image chips" {
     const out = try seedJson(testing.allocator, "see [Image #3] here", -1, 1, &.{}, &.{
         .{ .n = 3, .start = 4, .end = 14 },
-    });
+    }, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"images\":[{\"n\":3,\"start\":4,\"end\":14}]") != null);
     // ...and the page builds them, or the field is one nobody reads.
     try testing.expect(std.mem.indexOf(u8, js, "m.images") != null);
+}
+
+// ---------------------------------------------------------------------
+// Undo (T983)
+// ---------------------------------------------------------------------
+
+test "a seed says whether it is an edit or a replacement" {
+    // The flag is the whole protocol change: the page cannot see the
+    // difference between "a quote just went in at the caret" and "this
+    // document is being replaced", and Ctrl+Z has to.
+    const edit = try seedJson(testing.allocator, "x", -1, 1, &.{}, &.{}, true);
+    defer testing.allocator.free(edit);
+    try testing.expect(std.mem.indexOf(u8, edit, "\"undo\":true") != null);
+
+    const replace = try seedJson(testing.allocator, "x", -1, 1, &.{}, &.{}, false);
+    defer testing.allocator.free(replace);
+    try testing.expect(std.mem.indexOf(u8, replace, "\"undo\":false") != null);
+
+    // ...and the page reads it, or the flag is a field nobody acts on.
+    try testing.expect(std.mem.indexOf(u8, js, "m.undo") != null);
+}
+
+test "the page takes the undo chords itself" {
+    // A quote arrives as a whole-document rebuild, which the engine's undo
+    // stack has no step for — so the page has to handle the chord rather than
+    // let it through, ask the engine first, and fall back to its own journal.
+    // Each of those three is a line without which Ctrl+Z silently does nothing
+    // to a quote again.
+    try testing.expect(std.mem.indexOf(u8, js, "keydown") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "e.ctrlKey") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "preventDefault") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "\"undo\" : \"redo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "undoStack") != null);
+    try testing.expect(std.mem.indexOf(u8, js, "redoStack") != null);
 }
 
 test "a pasted picture arrives as bytes" {

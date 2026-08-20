@@ -18,7 +18,7 @@
 //
 // Down (`chrome.webview.addEventListener("message")`):
 //   {t:"vars", ...}                               the design numbers, per layout
-//   {t:"seed", text, caret, gen, quotes, images}  replace the document
+//   {t:"seed", text, caret, gen, quotes, images, undo}  replace the document
 //   {t:"focus"}                                   put the caret in the box
 //   {t:"pick", n}                                 select image chip n, whole
 //
@@ -65,6 +65,26 @@
 // own text and no line break, so a document with chips in it reads back
 // byte-for-byte as the buffer that seeded it.
 //
+// ## Ctrl+Z takes a quote or a chip back out (T983)
+//
+// A quote and a chip arrive as a SEED, because native cannot say "insert this
+// here" — and a seed rebuilds the document, which the engine's undo stack has
+// no entry for. (Nor can the page make one: in a `plaintext-only` box
+// `execCommand("insertHTML")` flattens a block or a chip to its own text, so
+// there is no engine command that inserts the NODES this composer is built
+// from.) So a seed that stands for one user-visible edit carries `undo:true`,
+// and the page keeps what it replaced on a journal of its own.
+//
+// Ctrl+Z then asks the engine FIRST and falls back to that journal: typing
+// since the quote landed unwinds keystroke by keystroke the way it does
+// everywhere else, and only once the engine has nothing left does the quote
+// itself come out. The order is right for free because a rebuild leaves the
+// engine's older steps unapplicable, and Chromium answers those with a no-op
+// rather than with damage — which is the same fact this fallback detects: an
+// undo that changed nothing is an undo the engine did not have.
+//
+// Ctrl+Y (and Ctrl+Shift+Z) is the same machine run backwards.
+//
 // ## Pictures arrive through the engine's own events
 //
 // `paste` and `drop` carry the picture already decoded. The composer takes it
@@ -94,6 +114,16 @@
   // everything": a paste in that window is better refused by the store, which
   // has the same number and a message for it.
   var imgMax = 0;
+
+  // The structural-edit journal (T983). Each entry is a whole document — the
+  // one an `undo:true` seed replaced — because the edit it stands for is a
+  // whole-document replacement and there is nothing smaller to record.
+  //
+  // Bounded, so a composer somebody quotes into all afternoon cannot grow a
+  // journal without end; the oldest step is the one nobody is coming back for.
+  var undoStack = [];
+  var redoStack = [];
+  var JOURNAL_MAX = 32;
 
   function post(msg) {
     if (host) host.postMessage(msg);
@@ -316,7 +346,20 @@
   // Writing the document
   // -----------------------------------------------------------------------
 
-  function seed(text, caret, atGen, quotes, images) {
+  function seed(text, caret, atGen, quotes, images, undoable) {
+    // `undoable` says this seed IS one user-visible edit — a quote or a chip
+    // going in — so what it replaces is worth keeping. Every other seed is the
+    // document being replaced by something unrelated (a fresh open, a report
+    // cleared behind a send, a native write), and the journal goes with it: an
+    // undo that resurrected a report the user already sent would be worse than
+    // no undo at all.
+    if (undoable) {
+      journalPush(undoStack, checkpoint());
+      redoStack.length = 0;
+    } else {
+      undoStack.length = 0;
+      redoStack.length = 0;
+    }
     gen = typeof atGen === "number" ? atGen : gen;
     build(text, sane(quotes, text.length, "id"), sane(images, text.length, "n"));
     var at = typeof caret === "number" && caret >= 0 ? Math.min(caret, text.length) : text.length;
@@ -471,6 +514,59 @@
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Undo and redo (T983)
+  // -----------------------------------------------------------------------
+
+  // What the document is right now, in one value: the markup (which carries
+  // the quote blocks with their ids and the chips with their numbers — the two
+  // things a plain-text checkpoint would lose) and where the caret sits in the
+  // string that markup serializes to.
+  function checkpoint() {
+    return { html: el.innerHTML, caret: caretOffset() };
+  }
+
+  function journalPush(stack, entry) {
+    stack.push(entry);
+    if (stack.length > JOURNAL_MAX) stack.shift();
+  }
+
+  // Put a checkpoint back, and tell the host — the snapshot that follows is
+  // what makes the pane's buffer, the report's quotes and the carousel's live
+  // pictures all agree with the document again, exactly as they do after an
+  // edit the user made by hand.
+  function journalRestore(entry) {
+    el.innerHTML = entry.html;
+    var text = readAll().s;
+    placeCaret(entry.caret >= 0 ? Math.min(entry.caret, text.length) : text.length);
+    report(true);
+  }
+
+  // One Ctrl+Z (or one Ctrl+Y), engine first.
+  //
+  // The engine is asked with its own command rather than by letting the key
+  // through, because the answer has to be read on this stack: an undo that
+  // moved nothing is the signal that its stack is spent and ours is next. That
+  // comparison is on the MARKUP, not the text — deleting a quote block can
+  // leave the same characters behind as plain text, and an engine step that
+  // only restored the block would otherwise read as "nothing happened".
+  function history(undoing) {
+    var before = el.innerHTML;
+    document.execCommand(undoing ? "undo" : "redo");
+    if (el.innerHTML !== before) {
+      // The engine had a step. Its own `input` event reports it; this is the
+      // belt for the paths where a command does not fire one.
+      report(false);
+      return;
+    }
+    var from = undoing ? undoStack : redoStack;
+    var to = undoing ? redoStack : undoStack;
+    if (!from.length) return;
+    var entry = from.pop();
+    journalPush(to, checkpoint());
+    journalRestore(entry);
+  }
+
   function applyVars(v) {
     var root = document.documentElement.style;
     if (v.face) root.setProperty("--face", v.face);
@@ -502,7 +598,14 @@
       var m = e.data;
       if (!m || typeof m !== "object") return;
       if (m.t === "seed")
-        seed(typeof m.text === "string" ? m.text : "", m.caret, m.gen, m.quotes, m.images);
+        seed(
+          typeof m.text === "string" ? m.text : "",
+          m.caret,
+          m.gen,
+          m.quotes,
+          m.images,
+          m.undo === true,
+        );
       else if (m.t === "vars") applyVars(m);
       else if (m.t === "focus") el.focus();
       else if (m.t === "pick") pick(m.n | 0);
@@ -511,6 +614,20 @@
 
   el.addEventListener("input", function () {
     report(false);
+  });
+
+  // Undo and redo, taken from the engine rather than left to it (T983): the
+  // chords are handled here so a quote or a chip that arrived as a seed can
+  // come back out once the engine's own steps are spent. Ctrl+Y is Windows'
+  // redo; Ctrl+Shift+Z is the one users bring with them from everywhere else.
+  el.addEventListener("keydown", function (e) {
+    if (!e.ctrlKey || e.altKey || e.metaKey) return;
+    var k = e.key ? e.key.toLowerCase() : "";
+    var undoing = k === "z" && !e.shiftKey;
+    var redoing = k === "y" || (k === "z" && e.shiftKey);
+    if (!undoing && !redoing) return;
+    e.preventDefault();
+    history(undoing);
   });
   // A narrower pane re-wraps the text, which moves the line count without any
   // edit at all - the composer that ends up two lines tall around three lines

@@ -634,7 +634,7 @@ fn closeComposer(self: *ViewerFeedbackBar) void {
 /// the right line box.
 pub fn composerReady(self: *ViewerFeedbackBar) void {
     self.pushComposerVars(true);
-    self.seedPage(null);
+    self.seedPage(null, false);
 }
 
 /// Make the page equal the pane's buffer, with the caret at byte offset
@@ -646,7 +646,12 @@ pub fn composerReady(self: *ViewerFeedbackBar) void {
 /// plain text, which is precisely the regression T935 exists to end. Building
 /// the span list HERE rather than at each call site is what makes that
 /// impossible to forget.
-fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
+///
+/// `undoable` is the other thing only this path can say: a seed that carries
+/// one insertion is an EDIT, and the page journals what it replaced so Ctrl+Z
+/// takes the quote or the chip back out (T983). Every other seed replaces the
+/// document with something unrelated and clears that journal.
+fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize, undoable: bool) void {
     const wv = self.web orelse return;
     const text = self.pane.feedbackText();
     const units: ?u32 = if (caret_at) |b|
@@ -666,7 +671,7 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
     // when there is one, and derived from the registry when the buffer has
     // moved behind the page's back (a reopen, a native insertion, a clear).
     const spans = self.pane.feedbackQuoteSpans(self.alloc) orelse {
-        wv.seed(text, units, &.{}, images);
+        wv.seed(text, units, &.{}, images, undoable);
         return;
     };
     defer self.alloc.free(spans);
@@ -674,7 +679,7 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
     const out = self.alloc.alloc(composer_page.QuoteSpan, spans.len) catch {
         // Seeding without the quotes still gets the user's words onto the
         // page; dropping the seed would lose them.
-        wv.seed(text, units, &.{}, images);
+        wv.seed(text, units, &.{}, images, undoable);
         return;
     };
     defer self.alloc.free(out);
@@ -689,7 +694,7 @@ fn seedPage(self: *ViewerFeedbackBar, caret_at: ?usize) void {
         };
         n += 1;
     }
-    wv.seed(text, units, out[0..n], images);
+    wv.seed(text, units, out[0..n], images, undoable);
 }
 
 /// Every live chip in `text`, as the page's UTF-16 spans. Empty rather than
@@ -787,7 +792,7 @@ fn publishQuoteSpans(
 pub fn composerSync(self: *ViewerFeedbackBar) void {
     if (self.suppress_sync) return;
     if (self.web == null) return;
-    self.seedPage(null);
+    self.seedPage(null, false);
 }
 
 /// Push the design-system numbers into the page's CSS custom properties.
@@ -1035,7 +1040,7 @@ pub fn seedControl(self: *ViewerFeedbackBar) void {
     // — the page owns the document, so there is no line-ending conversion and
     // no formatting to re-derive on this side.
     if (self.web) |_| {
-        self.seedPage(null);
+        self.seedPage(null, false);
         if (self.syncMetrics()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
         return;
     }
@@ -1218,7 +1223,7 @@ fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
         // Placing the caret means re-stating the document, because a `seed` is
         // the only write the page accepts. That is deliberate: one write path
         // cannot drift from the buffer, and the buffer is the truth.
-        self.seedPage(at);
+        self.seedPage(at, false);
         return;
     }
     const u = self.charIndex(at);
@@ -1236,9 +1241,10 @@ fn setCaret(self: *ViewerFeedbackBar, at: usize) void {
 ///
 /// The web surface has no `EM_REPLACESEL`: every native-side edit is "make the
 /// document equal the buffer", so the splice happens where the buffer lives and
-/// the page is told the result. The cost is the page's undo stack — a quote or
-/// a chip put in this way is not a step Ctrl+Z walks back, which is the one
-/// thing the RichEdit path did better and which T983 tracks. The quote's
+/// the page is told the result. That seed is marked UNDOABLE (T983), which is
+/// how the chord the RichEdit got from `EM_REPLACESEL`'s wparam survives the
+/// rebuild: the page keeps the document this one replaced and gives it back on
+/// Ctrl+Z once the engine's own steps are spent. The quote's
 /// IDENTITY does not depend on this path: the seed carries its span, the page
 /// builds it as a node with the id on it, and every snapshot after that reports
 /// where that node actually is (T935).
@@ -1258,7 +1264,7 @@ fn spliceComposer(self: *ViewerFeedbackBar, at: usize, insert: []const u8, caret
     self.pane.feedbackSetText(self.alloc, next.items);
     self.suppress_sync = false;
 
-    if (self.web != null) self.seedPage(caret_after);
+    if (self.web != null) self.seedPage(caret_after, true);
     // The band's height follows the page's next snapshot, which the seed above
     // is about to produce; all this owes is the repaint of the chrome around
     // it.

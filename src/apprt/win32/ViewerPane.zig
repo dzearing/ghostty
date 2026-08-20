@@ -7160,6 +7160,79 @@ test "host floor: a real controller on a real window, on this box" {
         }
 
         // ------------------------------------------------------------------
+        // T983: Ctrl+Z takes the quote back out, Ctrl+Y puts it back
+        // ------------------------------------------------------------------
+        //
+        // The quote arrived as a whole-document seed, because native cannot
+        // say "insert this here" to a browser — and a rebuilt document is not
+        // a step the engine's undo stack has. So the seed is marked as an EDIT
+        // and the page journals what it replaced; this is the proof that the
+        // chord the RichEdit got free from `EM_REPLACESEL` survived the move
+        // to a web surface.
+        //
+        // Driven by dispatching the chord INTO the page, which is the only way
+        // to reach it: the acceptance suite runs on a background desktop where
+        // a Chromium window ignores posted keys (T233). A synthetic event
+        // performs no default action of its own, which makes this arm strictly
+        // harder than a real keypress — everything that happens after it is
+        // the page's own handler doing the work.
+        {
+            const chord =
+                \\(function () {
+                \\  var el = document.getElementById("c");
+                \\  el.dispatchEvent(new KeyboardEvent("keydown", {
+                \\    key: "KEY", ctrlKey: true, bubbles: true, cancelable: true,
+                \\  }));
+                \\})()
+            ;
+            const undo_js = try std.mem.replaceOwned(u8, alloc, chord, "KEY", "z");
+            defer alloc.free(undo_js);
+            const redo_js = try std.mem.replaceOwned(u8, alloc, chord, "KEY", "y");
+            defer alloc.free(redo_js);
+
+            composer.web.?.executeScript(undo_js);
+
+            // The document the quote replaced, back byte for byte — including
+            // the five non-ASCII characters and the tail, which a journal that
+            // kept text instead of markup would still manage, and the LIVE
+            // QUOTE COUNT, which it would not: the block node is gone, so the
+            // report would no longer carry that passage.
+            const Undone = struct {
+                fn ready(p: *ViewerPane) bool {
+                    const spans = p.feedback_quote_spans orelse return false;
+                    return spans.len == 0 and std.mem.eql(u8, p.feedbackText(), seeded);
+                }
+            };
+            try waitFor(&msg, 30, Undone.ready, &pane);
+            try testing.expectEqualStrings(seeded, pane.feedbackText());
+            try testing.expectEqual(@as(usize, 0), pane.feedbackQuoteCount(alloc));
+            log.warn("undo: composer back to {d} bytes, {d} live quote(s)", .{
+                pane.feedbackText().len,
+                pane.feedbackQuoteCount(alloc),
+            });
+
+            // ...and redo is the same machine backwards: the block returns as
+            // a NODE carrying the same id, which is what makes the passage's
+            // heading and offset land on it again rather than the report
+            // losing its metadata to an undo the user changed their mind about.
+            composer.web.?.executeScript(redo_js);
+            const Redone = struct {
+                fn ready(p: *ViewerPane) bool {
+                    const spans = p.feedback_quote_spans orelse return false;
+                    return spans.len == 1;
+                }
+            };
+            try waitFor(&msg, 30, Redone.ready, &pane);
+            try testing.expectEqual(@as(usize, 1), pane.feedbackQuoteCount(alloc));
+            const back = pane.feedback_quote_spans.?;
+            try testing.expectEqualStrings(
+                entry.text,
+                pane.feedbackText()[back[0].start..back[0].end],
+            );
+            try testing.expectEqual(entry.id, pane.feedback_quotes.entries.items[back[0].index].id);
+        }
+
+        // ------------------------------------------------------------------
         // T636: press send, and read the report back off disk
         // ------------------------------------------------------------------
         //
@@ -7349,6 +7422,38 @@ test "host floor: a real controller on a real window, on this box" {
             // nothing else, or every read of the composer disagrees with what
             // was seeded. The trailing space is `insertion`'s, unchanged from
             // the RichEdit path.
+            try testing.expectEqualStrings("just my own words\n[Image #1] ", pane.feedbackText());
+
+            // T983: Ctrl+Z takes the chip back out, and the picture leaves the
+            // report with it. Same journal as the quote's — a chip is spliced
+            // in by the same undoable seed — but asserted separately because
+            // "the picture is no longer in the report" is a different claim
+            // from "the block is gone", and it is the one a user who pasted the
+            // wrong screenshot cares about.
+            bar.web.?.executeScript(
+                \\document.getElementById("c").dispatchEvent(new KeyboardEvent(
+                \\  "keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }))
+            );
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackImageCount(testing.allocator) == 0 and
+                        std.mem.eql(u8, p.feedbackText(), "just my own words\n");
+                }
+            }.ready, &pane);
+            try testing.expectEqualStrings("just my own words\n", pane.feedbackText());
+            log.warn("undo: chip gone, live={d}", .{pane.feedbackImageCount(alloc)});
+
+            // ...and Ctrl+Y puts it back, chip and picture together, which is
+            // what makes the undo safe to try.
+            bar.web.?.executeScript(
+                \\document.getElementById("c").dispatchEvent(new KeyboardEvent(
+                \\  "keydown", { key: "y", ctrlKey: true, bubbles: true, cancelable: true }))
+            );
+            try waitFor(&msg, 30, struct {
+                fn ready(p: *ViewerPane) bool {
+                    return p.feedbackImageCount(testing.allocator) == 1;
+                }
+            }.ready, &pane);
             try testing.expectEqualStrings("just my own words\n[Image #1] ", pane.feedbackText());
 
             // ...and it is a NODE, proven the only way that distinguishes it

@@ -405,12 +405,17 @@ pub fn pushVars(self: *ViewerFeedbackWeb, vars: page.Vars) void {
 /// units in (null means the end), and `quotes` naming the runs of it that are
 /// quoted blocks (T935 — in UTF-16 units too, and the only way the ids reach a
 /// page built from a buffer that outlived the last one).
+///
+/// `undoable` marks the seed as one user-visible edit rather than a wholesale
+/// replacement, which is what lets Ctrl+Z take a quote or a chip back out
+/// (T983); see `page.seedJson`.
 pub fn seed(
     self: *ViewerFeedbackWeb,
     text: []const u8,
     caret: ?u32,
     quotes: []const page.QuoteSpan,
     images: []const page.ImageSpan,
+    undoable: bool,
 ) void {
     if (!self.ready) return;
     self.seed_gen +%= 1;
@@ -423,6 +428,7 @@ pub fn seed(
         self.seed_gen,
         quotes,
         images,
+        undoable,
     ) catch return;
     defer self.alloc.free(json);
     self.post(json);
