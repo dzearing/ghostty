@@ -55,6 +55,12 @@
 #   Assert-GhozttyIsolatedBuild  (this file)  - the exe we are ABOUT to launch;
 #                                               works on a cold box, where
 #                                               nothing answers yet.
+#   Assert-GhozttyFreshBuild     (BuildFresh) - that same exe is older than the
+#                                               sources it would measure, so a
+#                                               green run would stamp a guard
+#                                               about code it never saw (T1028).
+#                                               Called from the assert below, so
+#                                               every caller gets it for free.
 #   Assert-GhozttyUnderTest      (CleanSlate) - the app ALREADY answering is a
 #                                               different install.
 #   Assert-GhozttyPrivateEndpoint / -Isolated (Isolation) - the suffix took, and
@@ -64,6 +70,12 @@
 # is the moment a leaked fixture becomes visible in the user's terminal.
 
 Set-StrictMode -Off
+
+# T1028: the freshness half of the same pre-flight. Dot-sourced HERE rather than
+# added to 49 scripts one by one, so the two questions about the exe about to be
+# launched - are these the user's endpoints, are these the code under test - are
+# asked together by everything that already asks the first.
+. (Join-Path $PSScriptRoot 'BuildFresh.ps1')
 
 # T675: suppress the app's startup job self-escape for everything this script
 # process launches. A script run from a Ghoztty pane hands every app it starts
@@ -171,7 +183,13 @@ function Assert-GhozttyIsolatedBuild {
     }
 
     $mode = Get-GhozttyBuildMode -Exe $Exe
-    if (Test-GhozttyIsolatedBuildMode -Mode $mode) { return $mode }
+    if (Test-GhozttyIsolatedBuildMode -Mode $mode) {
+        # T1028: the mode says these bytes are ours to drive; freshness says
+        # they are the bytes under test. Only the repo's own zig-out build is in
+        # scope, so a stub or an installed exe passes straight through.
+        Assert-GhozttyFreshBuild -Exe $Exe
+        return $mode
+    }
 
     $shown = if ($mode) { $mode } else { '<could not read `+version`>' }
     throw @"

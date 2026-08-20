@@ -404,6 +404,45 @@ been asked. Acceptance: `test\win32\guard-due.ps1`, whose sections D and E
 measure the two forces against each other (the same staleness must fail
 `validate` and must not fail `claim`).
 
+**And a harness that ran against a STALE EXE proves nothing either** (T1028).
+The stamp above answers "has this harness been run against the code as it now
+stands?" — and until now the run itself never checked. Every `test\win32` script
+defaults `-Exe` to `zig-out\bin\ghoztty.exe`; eleven of them build it first and
+the rest, the P1–P3 floor included, drive whatever copy is on disk. The false RED
+is self-correcting (T316's first `relay-account.ps1` run reported 3 FAILURE(S)
+against an exe built four hours earlier, and a rebuild made it green). The false
+GREEN is the defect: a change a stale exe still passes exits 0, exiting 0 STAMPS
+the guard, and the one question the stamp exists to answer has then been made to
+lie without anybody acting in bad faith.
+
+`test\win32\lib\BuildFresh.ps1` is the freshness half of the same pre-flight that
+already refuses a wrong-MODE build. It is dot-sourced by `lib\BuildMode.ps1` and
+called from `Assert-GhozttyIsolatedBuild`, so all 49 scripts that ask the first
+question ask the second one too, with no per-script edit:
+
+- **Newest source mtime vs the exe's, not the baked commit.** A commit
+  comparison is right for a *delivery* (`upgrade-staleness`) and wrong here in
+  both directions: blind to uncommitted work — the state a turn is in for the
+  whole of go.md steps 2–4 — and red on a commit that changed nothing, since the
+  loop builds, tests and only then commits.
+- **Sources are `build.zig`, `build.zig.zon` and `src\` minus `*.md` and
+  `src\apprt\gtk\`.** A docs-only edit and Linux's frontend cannot change these
+  bytes. ~1258 files in ~17ms, cached per process.
+- **Only `<repo>\zig-out\` is in scope.** An installed release, a portable copy
+  and a `$TEMP` stub are not claimed to be built from this tree, so "older than
+  `src\`" says nothing about them.
+- **Refuse by default, before anything is launched**, naming the exe, the source
+  that outran it, the drift and the build command. Two stated-intent hatches,
+  both loud: `GHOZTTY_TEST_REBUILD_STALE=1` builds and writes a witness beside
+  the exe (the exit from the one false positive — an edit outside this exe's
+  module graph relinks nothing, so the mtime would never move and the refusal
+  would never clear), and `GHOZTTY_TEST_ALLOW_STALE=1` accepts a result about
+  the old bytes and says so on the way past.
+
+Acceptance: `test\win32\build-fresh-guard.ps1`, which plays both sides in a
+throwaway fixture repo under `$TEMP` and keeps a positive control on the real
+`zig-out` exe.
+
 **And a script that can only run on the INPUT DESKTOP has to SAY so** (T272,
 widened by T276).
 T211–T218 moved the GUI suite onto a background desktop because the user's

@@ -70,6 +70,11 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   refuses such a run before anything is launched (acceptance:
   `test\win32\build-mode-guard.ps1`); `GHOZTTY_TEST_ALLOW_RELEASE=1` is the
   opt-in for a script whose subject really is the release build.
+- **And build it BEFORE you run an acceptance script, not after** (T1028). The
+  same pre-flight now also refuses a `zig-out` exe that is OLDER than the sources
+  it would measure: a stale exe that still passes exits 0, and exiting 0 stamps
+  the harness guard as having seen code it never saw. See the freshness rule in
+  `docs/claude/testing.md` (acceptance: `test\win32\build-fresh-guard.ps1`).
 - **Never run or overwrite an installed Ghoztty** — not the installed release
   under `%LOCALAPPDATA%\Programs\Ghoztty`, not an extracted portable copy. This
   is the on-box analog of the `/Applications/Ghoztty.app` rule. Always run the

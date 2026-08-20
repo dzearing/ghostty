@@ -1310,6 +1310,22 @@ $GuardTable = @(
             'test\win32\lib\TestDesktop.ps1',
             'test\win32\test-desktop-harness.ps1'
         )
+    },
+    # The freshness half of the pre-flight (T1028), and the most self-referential
+    # row in this table: lib\BuildFresh.ps1 is what stops a green run STAMPING a
+    # row here about an exe that was never built from the code it graded. It sits
+    # in front of all 49 scripts that call Assert-GhozttyIsolatedBuild, so an
+    # edit that quietly stops it refusing would turn every other stamp into a
+    # claim nobody checked. Non-interactive, launches nothing, a few seconds.
+    [pscustomobject]@{
+        Name   = 'build-fresh'
+        Script = 'test\win32\build-fresh-guard.ps1'
+        Stamp  = 'test\win32\build-fresh-guard.stamp.json'
+        Covers = @(
+            'test\win32\lib\BuildFresh.ps1',
+            'test\win32\lib\BuildMode.ps1',
+            'test\win32\build-fresh-guard.ps1'
+        )
     }
 )
 

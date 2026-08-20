@@ -1,0 +1,11 @@
+{
+    "guard":  "build-fresh",
+    "script":  "test/win32/build-fresh-guard.ps1",
+    "generated":  "2026-08-20T16:19:44-07:00",
+    "commit":  "aa9584fef",
+    "files":  {
+                  "test/win32/build-fresh-guard.ps1":  "e104706bfed3e0183b462abdf421b820556f5b1cb0552909c9d3c8e939870e65",
+                  "test/win32/lib/BuildFresh.ps1":  "8d1b427f31ff44769e165d80ae1358c429496d398ef3c642255a97ed5c3d6864",
+                  "test/win32/lib/BuildMode.ps1":  "f8e088ab6f0cc00c77aebfbf02d372e129d3c3296a9e61b8f9333a48052c7305"
+              }
+}
